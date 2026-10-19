@@ -186,10 +186,12 @@
 //!   it substitutes one value, an `iterations` of
 //!   [`ANIMATE_ITERATIONS_INFINITE`], with `Infinity`. `dom.listen` answers
 //!   each event with a sync-call activation whose body names the event, the
-//!   listener and the target, plus pointer, key and modifier detail for the
-//!   event classes that carry them ([`GestureBody`]).
-//!   `dom.prefers-reduced-motion` and `dom.utc-offset-minutes` are page facts
-//!   riding the same grant.
+//!   listener, the target and the listener's child the hit came through, plus
+//!   pointer, key and modifier detail for the event classes that carry them
+//!   ([`GestureBody`]).
+//!   `dom.prefers-reduced-motion`, `dom.utc-offset-minutes` and
+//!   `dom.instance` (the calling instance's own name, the one chrome reports
+//!   as an overlay `holder`) are page facts riding the same grant.
 //!
 //! A component's death is not on this list either: it panics, the host catches
 //! the trap, and the kernel error-cards that one instance. There is no way for a
@@ -574,7 +576,15 @@ pub struct GestureBody {
     /// The nearest handle-mapped ancestor of the event's target — how a
     /// delegated listener tells apart which child was hit.
     pub target: u64,
-    /// The detail objects, which sit beside the three fields above.
+    /// The listener's child on the path to the target: the outermost node the
+    /// instance holds a handle for strictly inside the listener, on the
+    /// target's ancestor chain. For a subtree the instance built itself, the
+    /// listener's direct child the hit came through; equal to `target` when
+    /// nothing mapped lies beneath that child. Absent, not `null`, when
+    /// `target` is the listener itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child: Option<u64>,
+    /// The detail objects, which sit beside the fields above.
     #[serde(flatten)]
     pub detail: GestureDetail,
 }
@@ -976,6 +986,7 @@ mod tests {
             event: "pointerdown".to_string(),
             listener: 7,
             target: 12,
+            child: Some(9),
             detail: GestureDetail {
                 pointer: Some(GesturePointer {
                     x: 123.5,
@@ -1008,7 +1019,7 @@ mod tests {
         assert_eq!(
             full,
             serde_json::json!({
-                "event": "pointerdown", "listener": 7, "target": 12,
+                "event": "pointerdown", "listener": 7, "target": 12, "child": 9,
                 "pointer": {"x": 123.5, "y": 40.0, "width": 1920.0, "height": 720.0,
                             "button": 0, "buttons": 1, "type": "touch"},
                 "key": {"key": "ArrowLeft", "code": "ArrowLeft", "repeat": false},
@@ -1019,9 +1030,11 @@ mod tests {
             serde_json::from_value::<GestureBody>(full).expect("parse"),
             full_gesture()
         );
-        // An unset detail object is absent, and a body without one parses.
+        // An unset `child` or detail object is absent, and a body without them —
+        // the one a host older than `child` writes — parses.
         let bare = r#"{"event":"click","listener":3,"target":3}"#;
         let parsed: GestureBody = serde_json::from_str(bare).expect("parse");
+        assert_eq!(parsed.child, None);
         assert_eq!(parsed.detail, GestureDetail::default());
         assert_eq!(serde_json::to_string(&parsed).expect("serialize"), bare);
         assert_eq!(GESTURE_CANCEL_FIELD, "cancel");
@@ -1074,11 +1087,21 @@ mod tests {
             ("Modifiers", names(&full["modifiers"])),
         ] {
             let body = guest_struct(name);
-            for field in fields {
+            for &field in &fields {
                 assert!(
                     declares(body, field),
                     "the guest's `{name}` declares no `{field}`; the two halves of the gesture \
                      body have drifted"
+                );
+            }
+            // A rename onto any other name moves a field off its wire name, and
+            // `serde(default)` would read every body as the field absent.
+            for renamed in body.split("rename = \"").skip(1) {
+                let wire = renamed.split('"').next().expect("a closing quote");
+                assert!(
+                    fields.contains(&wire),
+                    "the guest's `{name}` renames a field onto `{wire}`, which the host's body \
+                     does not carry; the two halves of the gesture body have drifted"
                 );
             }
         }

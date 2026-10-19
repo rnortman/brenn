@@ -669,7 +669,7 @@ Code site (`TODO(e2e-in-ci)`): `Makefile`, the `e2e` target.
 
 ## `e2e-tag-scheme-tie`
 
-`e2e/tests/bar.spec.ts` (`publishVia`) locates a mounted component by the
+`e2e/tests/bar.spec.ts` (`echoStubHost`) locates a mounted component by the
 attributes the kernel stamps on its host element, `data-kind` and
 `data-instance`, re-encoding in TypeScript a naming whose only home is
 `mount_host` (`surface/kernel/src/dom.rs`). Nothing mechanical ties the two — a
@@ -689,7 +689,7 @@ spec imports. Needs a design call first: the e2e/TS side deliberately has no
 bundler and no `ts-rs` bridge, so who emits the constant, when it runs, and
 which gate proves it current is a new seam rather than a local edit.
 
-Code site (`TODO(e2e-tag-scheme-tie)`): `e2e/tests/bar.spec.ts`, `publishVia`.
+Code site (`TODO(e2e-tag-scheme-tie)`): `e2e/tests/bar.spec.ts`, `echoStubHost`.
 
 ---
 

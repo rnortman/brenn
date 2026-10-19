@@ -840,6 +840,12 @@ pub fn brenn_dom_prefers_reduced_motion(instance: &str) -> Result<bool, JsValue>
     })
 }
 
+/// `dom.instance`.
+#[wasm_bindgen]
+pub fn brenn_dom_instance(instance: &str) -> Result<String, JsValue> {
+    with_dom_host("dom instance", |host| trap(host.instance(instance)))
+}
+
 /// `page-dom.page-root`.
 #[wasm_bindgen]
 pub fn brenn_dom_page_root(instance: &str) -> Result<u64, JsValue> {

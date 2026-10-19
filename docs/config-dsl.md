@@ -565,9 +565,10 @@ assembly StandardChrome(slug: String, layout: Channel) {
   no `optional`; each of those is a compile error on it, and an instance never
   binds it. A `sync` port with no caller is legal and ordinary — a gesture port
   has no caller anywhere in the document. A gesture's request body names the
-  event, the listening node and the target, and carries `pointer`, `key` and
-  `modifiers` detail for the event classes that have them (the `listen` doc in
-  `processor.wit` lists the fields). A `dom.listen` on a name the class
+  event, the listening node, the target and the listener's `child` the hit came
+  through, and carries `pointer`, `key` and `modifiers` detail for the event
+  classes that have them (the `listen` doc in `processor.wit` lists the
+  fields). A `dom.listen` on a name the class
   does not declare `sync` ends the activation, on the same terms a publish to
   an undeclared port does. The scaffold generates a `SyncPort` enum whose
   variants are exactly the class's `sync` ports, and `dom.listen` takes nothing

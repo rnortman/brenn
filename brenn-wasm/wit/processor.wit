@@ -729,8 +729,13 @@ interface dom {
     /// the event with a sync-call activation on `port`, carrying a synthesized
     /// JSON request body: `event` (the event type), `listener` (the listening
     /// node), `target` (the nearest handle-mapped ancestor of the event
-    /// target), and up to three detail objects, each present only for the
-    /// event class that carries it:
+    /// target), `child` (the listener's child on the path to the target: the
+    /// outermost node this instance holds a handle for strictly inside the
+    /// listener, on the target's ancestor chain — for a subtree the instance
+    /// built itself, the listener's direct child the hit came through, equal
+    /// to `target` when nothing mapped lies beneath it; absent when `target`
+    /// is the listener itself), and up to three detail objects, each present
+    /// only for the event class that carries it:
     ///
     /// - `pointer`, for a `MouseEvent` (every pointer, mouse, click and wheel
     ///   event): `x` and `y`, the event's client position less the listening
@@ -805,6 +810,18 @@ interface dom {
     /// than a DOM operation, admitted beside `utc-offset-minutes` for the same
     /// reason: a component cannot compute it and it earns no grant word.
     prefers-reduced-motion: func() -> bool;
+
+    /// This instance's name: the one its stamp gave it, the one
+    /// `page-dom.instance-wrapper` takes, the one the takeover plane's router
+    /// writes into a request's `instance`, and the one chrome reports as the
+    /// `holder` on `local:brenn/overlay-state`. A page fact rather than a DOM
+    /// operation, admitted beside `prefers-reduced-motion` for the same reason:
+    /// a component cannot compute it and it earns no grant word. It discloses
+    /// nothing — the name is the operator's and every instance on the page
+    /// already hangs under a wrapper that carries it. An instance that holds
+    /// the overlay, or wants it, compares this with `holder`: that is how it
+    /// tells a grant from a denial and a preemption from its own release.
+    instance: func() -> string;
 }
 
 /// Page-DOM authority: the ability to reach outside one's own subtree.

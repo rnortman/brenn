@@ -11,7 +11,9 @@
 //! real component, and its fourth asks the browser for an animation it
 //! refuses, which is how the `dom.animate` refusal path is exercised. A press
 //! that carries a pointer position appends it to the status line, which is how
-//! the gesture detail is exercised.
+//! the gesture detail is exercised; a click on a scrollback entry names the
+//! entry through the one delegating listener on the scrollback, which is how
+//! the gesture's `child` is exercised.
 
 use std::collections::VecDeque;
 
@@ -73,6 +75,10 @@ struct View {
     /// Where the `animate` button's outcome is written: `animated` or
     /// `refused: <the browser's message>`. Empty until the first press.
     animate_result: dom::Node,
+    /// Where a click on the scrollback is reported: `picked: <i>`, the
+    /// entry's position oldest-first, or `picked: none` for the scrollback's
+    /// own surface. Empty until the first pick.
+    picked: dom::Node,
 }
 
 impl EchoStub {
@@ -127,11 +133,16 @@ fn on_activation(activation: &Activation, echo: &mut EchoStub) -> Result<bool, E
     if activation.sync_is(brenn_guest::MOUNT) {
         echo.view = Some(build_view());
     } else if let Some(port) = SyncPort::of(activation)? {
-        pressed_at = activation
-            .gesture()
-            .ok_or_else(|| Error::failed("echo-stub: a sync-call activation carried no request"))??
-            .pointer;
-        on_gesture(port, echo)?;
+        let gesture = activation.gesture().ok_or_else(|| {
+            Error::failed("echo-stub: a sync-call activation carried no request")
+        })??;
+        // Only a button press reports where it landed; a pick's position is on
+        // the scrollback and says nothing about a press.
+        let is_press = !matches!(port, SyncPort::Pick);
+        on_gesture(port, &gesture, echo)?;
+        if is_press {
+            pressed_at = gesture.pointer;
+        }
     }
     let mut new_entries = 0usize;
     let mut fail_after_store = false;
@@ -192,7 +203,7 @@ fn trim_scrollback(echo: &mut EchoStub) {
 /// The counter is bumped where the publish either happens or does not: a
 /// refusal that left it advanced would make the status line claim a message the
 /// bus never saw.
-fn on_gesture(port: SyncPort, echo: &mut EchoStub) -> Result<(), Error> {
+fn on_gesture(port: SyncPort, gesture: &dom::Gesture, echo: &mut EchoStub) -> Result<(), Error> {
     let body = match port {
         SyncPort::Send => format!("echo-stub message #{}", echo.sent + 1),
         // The sync-call body carries no element content, so the field must be
@@ -204,6 +215,7 @@ fn on_gesture(port: SyncPort, echo: &mut EchoStub) -> Result<(), Error> {
             animate_status(echo.view());
             return Ok(());
         }
+        SyncPort::Pick => return pick(gesture, echo),
     };
     match publish(OUT, &body) {
         Ok(()) => echo.sent += 1,
@@ -223,6 +235,33 @@ fn on_gesture(port: SyncPort, echo: &mut EchoStub) -> Result<(), Error> {
     Ok(())
 }
 
+/// Name the scrollback entry a click came through, by its position in
+/// `entries` — oldest first, the DOM's order, because the cap trims both from
+/// the front together.
+///
+/// The kernel names the scrollback's child on the path to the target; with no
+/// child the click landed on the scrollback's own surface. A child that is not
+/// an entry means the kernel's walk named the wrong node or this component's
+/// bookkeeping has drifted from the DOM, and either is the error card's to
+/// show.
+fn pick(gesture: &dom::Gesture, echo: &EchoStub) -> Result<(), Error> {
+    let text = match gesture.child {
+        None => "picked: none".to_string(),
+        Some(child) => {
+            let index = echo
+                .entries
+                .iter()
+                .position(|entry| *entry == child)
+                .ok_or_else(|| {
+                    Error::failed("echo-stub: picked a child that is not a scrollback entry")
+                })?;
+            format!("picked: {index}")
+        }
+    };
+    dom::set_text(echo.view().picked, &text);
+    Ok(())
+}
+
 /// Ask for the animation on the status line and write what the browser said.
 /// A refusal is an answer, not a failure: the activation carries on.
 fn animate_status(view: &View) {
@@ -233,7 +272,8 @@ fn animate_status(view: &View) {
     dom::set_text(view.animate_result, &outcome);
 }
 
-/// Build the UI under this instance's host element and wire its four gestures.
+/// Build the UI under this instance's host element and wire its five gestures:
+/// the four buttons and the scrollback's pick.
 ///
 /// Called once, from the mount activation. Listeners are the kernel's and are
 /// page-lifetime: each press arrives as a sync-call activation on its port.
@@ -250,6 +290,7 @@ fn build_view() -> View {
     let panic_button = button("data-echo-panic", "panic");
     let animate_button = button("data-echo-animate", "animate");
     let animate_result = dom::marked("div", "data-echo-animate-result");
+    let picked = dom::marked("div", "data-echo-picked");
 
     for child in [
         status,
@@ -260,6 +301,7 @@ fn build_view() -> View {
         panic_button,
         animate_button,
         animate_result,
+        picked,
     ] {
         dom::append(root, child);
     }
@@ -268,12 +310,14 @@ fn build_view() -> View {
     dom::listen(send_custom, "click", SyncPort::SendCustom);
     dom::listen(panic_button, "click", SyncPort::Panic);
     dom::listen(animate_button, "click", SyncPort::Animate);
+    dom::listen(scrollback, "click", SyncPort::Pick);
 
     View {
         status,
         scrollback,
         input,
         animate_result,
+        picked,
     }
 }
 

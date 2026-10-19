@@ -444,6 +444,13 @@ impl DomHost {
             .is_some_and(|list| list.matches()))
     }
 
+    /// `dom.instance`: the calling instance's own name, the one the import
+    /// table was built for.
+    pub fn instance(&self, instance: &str) -> Result<String, String> {
+        self.granted(instance, ComponentGrant::Dom, "dom.instance")?;
+        Ok(instance.to_string())
+    }
+
     /// `dom.listen`: attach a kernel-owned listener that answers the event with a
     /// sync-call activation on `port`.
     ///
@@ -496,13 +503,14 @@ impl DomHost {
     /// Run one gesture: synthesize the request body, drive the sync door on the
     /// event's own stack, and honour the reply's one field.
     ///
-    /// The body names the event, the node whose listener fired, and the nearest
-    /// handle-mapped ancestor of the event's target — which is how a delegated
-    /// listener on a container tells apart which child was hit — plus the
-    /// pointer, key and modifier detail of [`gesture_detail`]. A target that
-    /// maps to nothing (the event fired on a node this instance never named) is
-    /// reported as the listening node itself, since that is the nearest thing the
-    /// component can be told about.
+    /// The body names the event, the node whose listener fired, the nearest
+    /// handle-mapped ancestor of the event's target, and the listener's child
+    /// that ancestor lies under — which is how a delegated listener on a
+    /// container tells apart which child was hit — plus the pointer, key and
+    /// modifier detail of [`gesture_detail`]. A target that maps to nothing
+    /// inside the listener (the event fired on a node this instance never
+    /// named) is reported as the listening node itself with no child, since
+    /// that is the nearest thing the component can be told about.
     fn on_gesture(
         &self,
         instance: &str,
@@ -511,20 +519,21 @@ impl DomHost {
         port: &str,
         fired: &Event,
     ) {
-        let target = fired
-            .target()
-            .and_then(|target| target.dyn_into::<Element>().ok())
-            .and_then(|target| self.nearest_mapped(instance, target))
-            .unwrap_or(listener);
         // While a listener runs, `currentTarget` is the element it is on.
         let listening = fired
             .current_target()
             .and_then(|current| current.dyn_into::<Element>().ok())
             .expect("dom: a listener ran without its element as currentTarget");
+        let (target, child) = fired
+            .target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+            .and_then(|target| self.mapped_path(instance, target, &listening))
+            .unwrap_or((listener, None));
         let body = GestureBody {
             event: event_type.to_string(),
             listener,
             target,
+            child,
             detail: gesture_detail(fired, &listening),
         };
         let body = serde_json::to_string(&body).expect("dom: serializing a gesture body");
@@ -537,20 +546,32 @@ impl DomHost {
         }
     }
 
-    /// The nearest ancestor-or-self of `element` this instance holds a handle
-    /// for, walking up through parents.
-    fn nearest_mapped(&self, instance: &str, element: Element) -> Option<u64> {
-        // One borrow for the whole walk: the ancestor chain is walked on every
-        // gesture, and the table cannot change under it — nothing here mints.
-        self.table(instance, |table| {
-            let mut current = Some(element);
-            while let Some(node) = current {
-                if let Some(handle) = table.lookup(&node) {
-                    return Some(handle);
-                }
-                current = node.parent_element();
+    /// Walk from `element` up to `listening`, exclusive: the first node on the
+    /// way this instance holds a handle for is the target, the last is the
+    /// listener's child (see [`HandleTable::hit_path`]). `None` when nothing
+    /// inside the listener is mapped, or when the walk never meets the listener
+    /// — the target was moved out from under it by an earlier listener on the
+    /// same event, and nothing inside the listener can be named.
+    fn mapped_path(
+        &self,
+        instance: &str,
+        element: Element,
+        listening: &Element,
+    ) -> Option<(u64, Option<u64>)> {
+        let mut chain = Vec::new();
+        let mut current = Some(element);
+        loop {
+            let node = current?;
+            if node == *listening {
+                break;
             }
-            None
+            current = node.parent_element();
+            chain.push(node);
+        }
+        self.table(instance, |table| {
+            table
+                .hit_path(&chain)
+                .map(|(target, child)| (target, Some(child)))
         })
     }
 
@@ -1475,6 +1496,11 @@ mod tests {
             "an ungranted instance reaches nothing"
         );
         assert!(rig.host.page_root("wbt-none").is_err());
+        assert!(
+            rig.host.instance("wbt-none").is_err(),
+            "the page facts are `dom` entries too"
+        );
+        assert!(rig.host.prefers_reduced_motion("wbt-none").is_err());
     }
 
     #[wasm_bindgen_test]
@@ -1930,20 +1956,29 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn instance_answers_the_calling_instance() {
+        let rig = dom_rig();
+        assert_eq!(rig.host.instance(DOM).expect("granted"), DOM);
+    }
+
+    #[wasm_bindgen_test]
     fn a_gesture_reports_the_nearest_mapped_ancestor_of_its_target() {
         // A delegated listener: one listener on the container, and the body must
-        // say which child was hit — the difference between acting on a row and
-        // acting on the wrong row.
+        // say which node was hit and which of the container's children it came
+        // through — the difference between acting on a row and acting on the
+        // wrong row.
         let rig = dom_rig();
         let root = rig.host.root(DOM).expect("mounted");
         let container = rig.host.create_element(DOM, "div").expect("create");
-        let row = rig.host.create_element(DOM, "button").expect("create");
+        let row = rig.host.create_element(DOM, "div").expect("create");
+        let cell = rig.host.create_element(DOM, "button").expect("create");
         rig.host.append(DOM, root, container).expect("append");
         rig.host.append(DOM, container, row).expect("append");
-        // Unnamed by the component, so an event on it retargets to `row`.
+        rig.host.append(DOM, row, cell).expect("append");
+        // Unnamed by the component, so an event on it retargets to `cell`.
         let inner = document().create_element("span").expect("create a span");
         rig.host
-            .element(DOM, row)
+            .element(DOM, cell)
             .expect("a live handle")
             .append_child(&inner)
             .expect("append");
@@ -1956,22 +1991,74 @@ mod tests {
             .expect("a span is an HtmlElement")
             .click();
 
-        let activation = rig.seen.borrow().last().cloned().expect("the entry ran");
-        assert_eq!(activation.sync.as_deref(), Some("press"));
-        let body = activation
-            .ports
-            .iter()
-            .find(|window| window.port == "press")
-            .and_then(|window| window.envelopes.last())
-            .map(|json| brenn_surface_test_fixtures::parse_envelope(json).body)
-            .expect("the sync window carries the request");
-        let body: GestureBody = serde_json::from_str(&body).expect("the body is a gesture");
+        let body = press_body(&rig);
         assert_eq!(body.event, "click");
         assert_eq!(body.listener, container);
         assert_eq!(
-            body.target, row,
+            body.target, cell,
             "the target is the nearest ancestor the instance holds a handle for"
         );
+        assert_eq!(
+            body.child,
+            Some(row),
+            "the child is the outermost mapped node strictly inside the listener"
+        );
+
+        // A hit on the container's own surface names no child.
+        rig.host
+            .element(DOM, container)
+            .expect("a live handle")
+            .dyn_ref::<HtmlElement>()
+            .expect("a div is an HtmlElement")
+            .click();
+        let body = press_body(&rig);
+        assert_eq!(body.target, container);
+        assert_eq!(
+            body.child, None,
+            "a hit on the listener itself has no child"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn a_target_moved_out_from_under_the_listener_names_only_the_listener() {
+        // A listener on the row runs first and re-parents the row outside the
+        // container. The container's listener still fires, and the row's new
+        // path never meets it, so the mapped node the row now sits in must not
+        // be reported as the target.
+        let rig = dom_rig();
+        let root = rig.host.root(DOM).expect("mounted");
+        let container = rig.host.create_element(DOM, "div").expect("create");
+        let elsewhere = rig.host.create_element(DOM, "div").expect("create");
+        let row = rig.host.create_element(DOM, "button").expect("create");
+        rig.host.append(DOM, root, container).expect("append");
+        rig.host.append(DOM, root, elsewhere).expect("append");
+        rig.host.append(DOM, container, row).expect("append");
+        rig.host
+            .listen(DOM, container, "click", "press")
+            .expect("granted");
+
+        let row_element = rig.host.element(DOM, row).expect("a live handle");
+        let away = rig.host.element(DOM, elsewhere).expect("a live handle");
+        let moving = row_element.clone();
+        let mover = Closure::<dyn Fn(Event)>::new(move |_: Event| {
+            away.append_child(&moving).expect("re-parent the row");
+        });
+        row_element
+            .add_event_listener_with_callback("click", mover.as_ref().unchecked_ref())
+            .expect("a listener on the row");
+        mover.forget();
+        row_element
+            .dyn_ref::<HtmlElement>()
+            .expect("a button is an HtmlElement")
+            .click();
+
+        let body = press_body(&rig);
+        assert_eq!(body.listener, container);
+        assert_eq!(
+            body.target, container,
+            "nothing on the row's new path lies inside the listener"
+        );
+        assert_eq!(body.child, None);
     }
 
     #[wasm_bindgen_test]
@@ -2126,6 +2213,7 @@ mod tests {
         rig.host
             .prefers_reduced_motion(WHO)
             .expect("prefers-reduced-motion");
+        rig.host.instance(WHO).expect("instance");
 
         // And every `page-dom` entry, which reaches further into the document
         // and no further into the kernel.

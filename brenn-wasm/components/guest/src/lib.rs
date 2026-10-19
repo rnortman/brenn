@@ -1781,14 +1781,24 @@ pub mod dom {
         raw::prefers_reduced_motion()
     }
 
+    /// This instance's name: the one its stamp gave it, the one the takeover
+    /// plane's router writes into a request's `instance`, and the one chrome
+    /// reports as the `holder` on `local:brenn/overlay-state`. An instance that
+    /// holds the overlay, or wants it, compares this with `holder`: that is how
+    /// it tells a grant from a denial and a preemption from its own release.
+    pub fn instance() -> String {
+        raw::instance()
+    }
+
     /// The synthesized body of a gesture's sync-call request.
     ///
-    /// The host names the event, the node whose listener fired, and the nearest
-    /// handle-mapped ancestor of the event target — which is how a delegated
-    /// listener on a container tells apart which child was hit.
+    /// The host names the event, the node whose listener fired, the nearest
+    /// handle-mapped ancestor of the event target, and the listener's child
+    /// that ancestor lies under — which is how a delegated listener on a
+    /// container tells apart which child was hit.
     ///
-    /// The detail objects are each present only for the event class that
-    /// carries them, and absent from a body an older host synthesized.
+    /// `child` and the detail objects are each present only when they apply,
+    /// and absent from a body an older host synthesized.
     ///
     /// The field names are a wire contract with the host that synthesizes
     /// them, spelled once on each side: `GestureBody` in
@@ -1802,6 +1812,14 @@ pub mod dom {
         pub listener: Node,
         /// The nearest handle-mapped ancestor of the event target.
         pub target: Node,
+        /// The listener's child on the path to the target: the outermost node
+        /// this instance holds a handle for strictly inside the listener, on
+        /// the target's ancestor chain. For a subtree the instance built
+        /// itself, the listener's direct child the hit came through; equal to
+        /// `target` when nothing mapped lies beneath that child. `None` when
+        /// `target` is the listener itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub child: Option<Node>,
         /// Where the pointer was, for a `MouseEvent` (every pointer, mouse,
         /// click and wheel event). A `click` from keyboard or assistive
         /// activation has no pointer and reads as client position 0,0; see

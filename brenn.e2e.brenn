@@ -66,6 +66,9 @@ uuid_pins {
   "brenn:surface.surface.bar-feeder.help" = "9d6d95c2-5763-4a5e-a203-5b187d830d99";
   "brenn:surface.surface.bar-feeder.geometry" = "befb1315-1bbf-4bbf-b380-196d95161c0a";
   "brenn:surface.surface.bar-feeder.status" = "ad89bcfa-9004-47c7-892f-9b51291a78ae";
+  "brenn:surface.surface.loopback.help" = "e887add3-567f-4c78-a689-e4c942b4aca8";
+  "brenn:surface.surface.loopback.geometry" = "88785ea0-383c-41b1-a46c-a86c5b7d5ac2";
+  "brenn:surface.surface.loopback.status" = "501eaf58-6e8f-4fb9-bf10-f916a0673ecb";
   "brenn:surface.kind.protobar.help" = "e01edb29-0c73-475f-bc57-a2ff204d99a1";
   "brenn:surface.kind.protobar.schema" = "d557bf65-99ce-404e-b834-d232548045ba";
   "brenn:surface.kind.echo-stub.help" = "f95e0ce1-363d-4c6b-89bf-63148106fe73";
@@ -84,6 +87,7 @@ new surface_commons: SurfaceCommons;
 new bar_desc: SurfaceDescription(slug = "bar");
 new bar_pixel_desc: SurfaceDescription(slug = "bar-pixel");
 new bar_feeder_desc: SurfaceDescription(slug = "bar-feeder");
+new loopback_desc: SurfaceDescription(slug = "loopback");
 
 new protobar_desc: KindDescription(kind = "protobar");
 new echo_stub_desc: KindDescription(kind = "echo-stub");
@@ -230,3 +234,41 @@ new bar_feeder_chrome: StandardChrome(slug = "bar-feeder",
 }
 // e2e:retire-block:end
 
+/// The echo-loop fixture channel. `retain_depth = 8` covers the depth-8 surface
+/// binding below: on a non-durable channel the retained window *is* the standing
+/// buffer, and no binding depth may exceed it.
+channel loopback_echo at "ephemeral:loopback.echo" {
+  push_depth = 1;
+  retain_depth = 8;
+}
+/// Placeholder layout channel for the loopback page: nothing publishes, so the
+/// chrome renders its default layout. `ephemeral:` rather than `local:` for the
+/// reason `bar_feeder_layout` gives.
+channel loopback_layout at "ephemeral:loopback.in.chrome.layout" {
+  description = "Layout documents for the loopback page (latest-wins)";
+  push_depth = 1;
+  retain_depth = 1;
+}
+/// One echo-stub reading its own output back, so what it sends renders in its
+/// scrollback where a real pointer can click an entry; `bar.spec.ts` drives the
+/// scrollback pick here. A lone instance is what the default `single` layout
+/// places.
+///
+/// `publish` covers the `out` binding; `subscribe` the `in` binding and the
+/// chrome's layout binding, as on `bar-feeder`.
+surface loopback {
+  grants = [subscribe, publish];
+  new echo-stub: EchoStub {
+    grants = [ports, log, dom];
+    in messages <- loopback_echo { push_depth = 8; }
+    out out -> loopback_echo;
+    io state { push_depth = 0; retain_depth = 1; }
+
+  }
+
+}
+
+new loopback_chrome: StandardChrome(slug = "loopback", layout = loopback_layout) {
+  grants = [dom, log, page-dom, ports, takeover];
+  surfaces = ["loopback"];
+}

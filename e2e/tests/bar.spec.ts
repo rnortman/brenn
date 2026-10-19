@@ -20,9 +20,13 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  *     instance reports it and keeps working.
  *  8. A press carries its pointer position, relative to the listening node,
  *     through the kernel's gesture body to the component.
+ *  9. A click on a scrollback entry reaches the component through the one
+ *     delegating listener on the scrollback, the gesture body's `child` naming
+ *     the entry it came through.
  *
  * Runs single-worker in declaration order (playwright.config.ts) against the
- * `brenn.e2e.brenn` bar surfaces (`bar`, `bar-pixel`, `bar-feeder`). The bar
+ * `brenn.e2e.brenn` bar surfaces (`bar`, `bar-pixel`, `bar-feeder`) and the
+ * `loopback` surface, one echo-stub reading its own output back. The bar
  * channels are durable with `retain_depth = 1` (latest-wins) and persist for
  * the whole server run, so spec 1 must run first against pristine empty
  * channels; the later specs republish their own layout/content preconditions
@@ -62,6 +66,20 @@ function panelMessage(page: Page, instance: string): Locator {
 }
 
 /**
+ * An echo-stub instance's kernel-owned wrapper: a div stamped with the kind and
+ * the instance (canonical source: `mount_wrapper` in
+ * `surface/kernel/src/dom.rs`). The component's own host element inside it
+ * carries no identity, so this names exactly one element.
+ */
+function echoStubHost(page: Page, instance: string): Locator {
+  // TODO(e2e-tag-scheme-tie): these literals re-encode the Rust naming with
+  // nothing mechanical tying the two together.
+  return page.locator(
+    `div[data-kind="echo-stub"][data-instance="${instance}"]`,
+  );
+}
+
+/**
  * Publish `body` verbatim onto the channel bound to the feeder's `instance`
  * output by driving that echo-stub's own "send custom" button: fill its
  * free-form field, then click it. The click is dispatched from page script
@@ -79,15 +97,7 @@ async function publishVia(
   instance: string,
   body: string,
 ): Promise<void> {
-  // An instance's kernel-owned wrapper is a div stamped with the kind and the
-  // instance (canonical source: `mount_wrapper` in
-  // `surface/kernel/src/dom.rs`); the component's own host element inside it
-  // carries no identity, so this names exactly one element.
-  // TODO(e2e-tag-scheme-tie): these literals re-encode the Rust naming with
-  // nothing mechanical tying the two together.
-  const el = feeder.locator(
-    `div[data-kind="echo-stub"][data-instance="${instance}"]`,
-  );
+  const el = echoStubHost(feeder, instance);
   await expect(el).toBeAttached({ timeout: CHAIN_TIMEOUT });
   await el.evaluate((node: Element, b: string) => {
     const field = node.querySelector("[data-echo-input]");
@@ -407,9 +417,7 @@ test("a browser-refused animation is reported and the instance carries on", asyn
 
   const feeder = await context.newPage();
   await openSurface(feeder, "bar-feeder");
-  const stub = feeder.locator(
-    'div[data-kind="echo-stub"][data-instance="feed-b"]',
-  );
+  const stub = echoStubHost(feeder, "feed-b");
   await expect(stub).toBeAttached({ timeout: CHAIN_TIMEOUT });
   await stub.evaluate((node: Element) => {
     const animate = node.querySelector("[data-echo-animate]");
@@ -445,9 +453,7 @@ test("a press carries its position on the button to the component", async ({
   // echo-stub writes the result after its counters.
   const feeder = await context.newPage();
   await openSurface(feeder, "bar-feeder");
-  const stub = feeder.locator(
-    'div[data-kind="echo-stub"][data-instance="feed-b"]',
-  );
+  const stub = echoStubHost(feeder, "feed-b");
   const send = stub.locator("[data-echo-send]");
   await expect(send).toBeVisible({ timeout: CHAIN_TIMEOUT });
   await send.click({ position: { x: 12, y: 3 } });
@@ -473,4 +479,46 @@ test("a press carries its position on the button to the component", async ({
   expect(Number(match[2])).toBeCloseTo(3 + border.top, 0);
 
   await feeder.close();
+});
+
+test("a click on a scrollback entry names it to the component through the delegating listener", async ({
+  context,
+}) => {
+  // The loopback stub's output is its own input, so what it sends lands as a
+  // scrollback entry. A real click on the newest entry walks the kernel's
+  // gesture path from the target up to the scrollback's listener; echo-stub
+  // looks the reported `child` up among its entries and writes its position.
+  const loopback = await context.newPage();
+  await openSurface(loopback, "loopback");
+  // One instance places as `single`; a second would leave this case clicking
+  // a hidden node, so say so here rather than time out below.
+  await expect(surfaceRoot(loopback)).toHaveAttribute("data-layout", "single", {
+    timeout: CHAIN_TIMEOUT,
+  });
+  const stub = echoStubHost(loopback, "echo-stub");
+  const entries = stub.locator("[data-echo-scrollback] [data-echo-message]");
+
+  const marker = `loopback-pick-${Date.now()}`;
+  await publishVia(loopback, "echo-stub", marker);
+  await expect(entries.filter({ hasText: marker })).toBeVisible({
+    timeout: CHAIN_TIMEOUT,
+  });
+  // Counted at click time: earlier runs leave entries in the channel's
+  // retained window, and the cap trims the DOM and the stub's entries together.
+  const count = await entries.count();
+  await entries.last().click();
+  await expect(stub.locator("[data-echo-picked]")).toHaveText(
+    `picked: ${count - 1}`,
+    { timeout: CHAIN_TIMEOUT },
+  );
+  await expect(stub.locator("[data-surface-error]")).toHaveCount(0);
+
+  // Still live: the next send lands as a new entry.
+  const again = `${marker}-again`;
+  await publishVia(loopback, "echo-stub", again);
+  await expect(entries.filter({ hasText: again })).toBeVisible({
+    timeout: CHAIN_TIMEOUT,
+  });
+
+  await loopback.close();
 });

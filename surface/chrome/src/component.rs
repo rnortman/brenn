@@ -240,9 +240,9 @@ fn on_gesture(port: SyncPort, activation: &Activation, chrome: &mut Chrome) -> R
 /// Tell the core which instance chrome runs as, the first time a surface-state
 /// roster names one whose wrapper is chrome's own.
 ///
-/// There is no instance-identity import, deliberately: what chrome needs is not
-/// its name but which row to leave out of the arrangement, and element identity
-/// answers that directly. Handles are canonical per element within an instance,
+/// Chrome does not ask `dom.instance` here: what it needs is not its name but
+/// which row to leave out of the arrangement, and element identity answers
+/// that directly. Handles are canonical per element within an instance,
 /// so the wrapper chrome's own host element hangs under is the same handle
 /// `page-dom` returns for chrome's row and for no other.
 fn identify_self(chrome: &mut Chrome, new_raw: &[String]) {

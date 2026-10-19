@@ -583,6 +583,7 @@ export interface KernelModule extends WasmModule {
         options: string,
     ): string | undefined;
     brenn_dom_prefers_reduced_motion(instance: string): boolean;
+    brenn_dom_instance(instance: string): string;
     brenn_dom_page_root(instance: string): bigint;
     brenn_dom_page_body(instance: string): bigint;
     brenn_dom_instance_wrapper(
@@ -926,6 +927,7 @@ function processorImports(
             },
             prefersReducedMotion: () =>
                 kernel.brenn_dom_prefers_reduced_motion(instance),
+            instance: () => kernel.brenn_dom_instance(instance),
         },
         "brenn:processor/page-dom": {
             pageRoot: () => kernel.brenn_dom_page_root(instance),

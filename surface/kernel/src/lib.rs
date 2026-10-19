@@ -114,9 +114,10 @@ pub mod dom;
 /// and is natively tested on every target the crate builds for.
 pub mod dom_handle;
 
-/// Per-instance DOM capability handle tables: slot reuse, generations, and
-/// reclamation. DOM-free — containment arrives as a predicate — so it compiles
-/// and is natively tested on every target the crate builds for.
+/// Per-instance DOM capability handle tables: slot reuse, generations,
+/// reclamation, and a gesture's hit path. DOM-free — containment and ancestry
+/// arrive from the caller — so it compiles and is natively tested on every
+/// target the crate builds for.
 pub mod dom_table;
 
 /// The DOM capability host: per-instance element handles, the operations the

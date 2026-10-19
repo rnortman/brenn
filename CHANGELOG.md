@@ -4,6 +4,24 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Components can read their own instance name** through the new WASM
+  import `dom.instance()` (`brenn_guest::dom::instance()` in the guest SDK).
+  An instance's name is the one the operator gave it in the layout. Chrome
+  reports the current overlay holder by that name, so a component that asks
+  for the full-screen overlay can now tell whether it was granted the
+  overlay, denied, or preempted by a takeover such as an alarm. Existing
+  components are unchanged.
+- **A gesture on a container names the child it came through.** When one
+  `dom.listen` listener sits on a container, the gesture now also carries
+  `child`: the container's own child that the hit landed inside
+  (`Gesture::child` in the guest SDK). A component that builds subtrees
+  under one listener can tell which subtree was hit without keeping a handle
+  for every node it created. The field is optional, so existing components
+  run unchanged; Rust code that builds a `Gesture` (or the contract crate's
+  `GestureBody`) as a struct literal, typically a test, adds `child: None`.
+  The echo-stub test component's scrollback reports which entry was
+  clicked.
+
 ## [0.26.0] — 2026-10-18
 
 - **Components can animate.** Two new imports on the WASM `dom` interface:

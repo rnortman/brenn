@@ -49,8 +49,7 @@ use std::sync::Arc;
 use brenn_envelope::grants::ComponentGrant;
 use brenn_envelope::testutils::{NOW_MS, envelope};
 use brenn_surface_contract::{
-    GestureBody, MOUNT_SYNC_PORT, dom_attribute_allowed, dom_attribute_value_allowed,
-    dom_tag_allowed,
+    MOUNT_SYNC_PORT, dom_attribute_allowed, dom_attribute_value_allowed, dom_tag_allowed,
 };
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};
@@ -178,6 +177,10 @@ pub struct Page {
     pub instance_wrappers: BTreeMap<String, u64>,
     /// What `dom.prefers-reduced-motion` answers.
     pub reduced_motion: bool,
+    /// What `dom.instance` answers: this instance's name, the one a kind's
+    /// suite writes as `holder` in an `overlay-state` body to mean "this
+    /// instance".
+    pub instance: String,
     /// The `dom.animate` call of the next activation, counted from 1, that the
     /// browser refuses, and the message it refuses it with. Cleared when that
     /// activation ends, whatever it did.
@@ -192,6 +195,10 @@ pub struct Page {
 /// The instance's host element: the kernel mounts it before the mount
 /// activation, so it is handle 1 before the component runs.
 pub const ROOT: u64 = 1;
+
+/// The instance name a page answers `dom.instance` with until told another —
+/// the name the envelope fixtures already mint under.
+pub const FIXTURE_INSTANCE: &str = "fixture";
 
 impl Page {
     pub fn new() -> Page {
@@ -214,6 +221,7 @@ impl Page {
             body: None,
             instance_wrappers: BTreeMap::new(),
             reduced_motion: false,
+            instance: FIXTURE_INSTANCE.to_string(),
             animate_refusal: None,
             animate_calls: 0,
             declared: None,
@@ -223,6 +231,12 @@ impl Page {
     /// Answer `dom.prefers-reduced-motion` with `reduced` from now on.
     pub fn with_reduced_motion(&mut self, reduced: bool) -> &mut Page {
         self.reduced_motion = reduced;
+        self
+    }
+
+    /// Answer `dom.instance` with `name` from now on.
+    pub fn with_instance(&mut self, name: &str) -> &mut Page {
+        self.instance = name.to_string();
         self
     }
 
@@ -278,11 +292,13 @@ impl Page {
     /// element under its own kernel wrapper, that wrapper under the surface
     /// root, the surface root under the body, and one sibling instance already
     /// registered — the shape a chrome component reads its own identity out of.
+    /// `dom.instance` answers `own_instance`.
     ///
     /// Built by hand rather than through the recording calls, so a transcript
     /// starts at what the component did.
     pub fn with_page_authority(own_instance: &str, sibling: &str) -> Page {
         let mut page = Page::new();
+        page.with_instance(own_instance);
         let own_wrapper = page.mint();
         let page_root = page.mint();
         let body = page.mint();
@@ -563,6 +579,12 @@ impl dom::Host for Page {
         let reduced = self.reduced_motion;
         self.record(format!("dom.prefers-reduced-motion -> {reduced}"));
         reduced
+    }
+
+    fn instance(&mut self) -> String {
+        let name = self.instance.clone();
+        self.record(format!("dom.instance -> {name:?}"));
+        name
     }
 }
 
@@ -1104,15 +1126,17 @@ pub fn gesture_at(port: &str, listener: u64, target: u64) -> types::Activation {
     gesture_with(port, "click", listener, target, &GestureDetail::default())
 }
 
-/// The detail objects a gesture body carries, and their parts — the kernel's
-/// own types, so a body scripted here is serialized exactly as the page writes
-/// one. The harness sends whatever is set, so a suite scripts the body a given
-/// event would produce.
-pub use brenn_surface_contract::{GestureDetail, GestureKey, GestureModifiers, GesturePointer};
+/// The gesture body and its parts — the kernel's own types, so a body scripted
+/// here is serialized exactly as the page writes one. The harness sends
+/// whatever is set, so a suite scripts the body a given event would produce.
+pub use brenn_surface_contract::{
+    GestureBody, GestureDetail, GestureKey, GestureModifiers, GesturePointer,
+};
 
 /// A gesture of any event type, carrying `detail` as the kernel's listener
 /// synthesizes it — a tap at a position, a key press — so a kind's suite
-/// drives input without a browser.
+/// drives input without a browser. The body carries no `child`, as a host
+/// older than that field writes it; [`gesture_body`] scripts one.
 pub fn gesture_with(
     port: &str,
     event: &str,
@@ -1120,13 +1144,23 @@ pub fn gesture_with(
     target: u64,
     detail: &GestureDetail,
 ) -> types::Activation {
-    let body = GestureBody {
-        event: event.to_string(),
-        listener,
-        target,
-        detail: detail.clone(),
-    };
-    let body = serde_json::to_string(&body).expect("a gesture body serializes");
+    gesture_body(
+        port,
+        &GestureBody {
+            event: event.to_string(),
+            listener,
+            target,
+            child: None,
+            detail: detail.clone(),
+        },
+    )
+}
+
+/// A gesture carrying `body` verbatim — every field the kernel's listener
+/// writes, `child` among them. The harness derives nothing from its fake tree:
+/// the suite scripts the body a hit would produce.
+pub fn gesture_body(port: &str, body: &GestureBody) -> types::Activation {
+    let body = serde_json::to_string(body).expect("a gesture body serializes");
     sync_call(port, envelope("gesture", &body))
 }
 
@@ -1296,7 +1330,7 @@ mod tests {
         );
         assert_eq!(
             names(&declared.sync_ports),
-            ["animate", "panic", "send", "send-custom"]
+            ["animate", "panic", "pick", "send", "send-custom"]
         );
         assert_eq!(names(&declared.inbound), ["messages", "state"]);
         assert_eq!(names(&declared.outbound), ["out", "state"]);
@@ -1418,7 +1452,7 @@ mod tests {
     }
 
     /// The synthesized request of a sync-call activation, parsed.
-    fn gesture_body(activation: &types::Activation) -> serde_json::Value {
+    fn body_sent(activation: &types::Activation) -> serde_json::Value {
         let envelope: serde_json::Value =
             serde_json::from_str(&activation.ports[0].envelopes[0]).expect("envelope JSON");
         let body = envelope["body"]
@@ -1448,7 +1482,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            gesture_body(&gesture_with("press", "pointerdown", 7, 12, &detail)),
+            body_sent(&gesture_with("press", "pointerdown", 7, 12, &detail)),
             serde_json::json!({
                 "event": "pointerdown", "listener": 7, "target": 12,
                 "pointer": {"x": 123.5, "y": 40.0, "width": 1920.0, "height": 720.0,
@@ -1466,11 +1500,36 @@ mod tests {
             ..GestureDetail::default()
         };
         assert_eq!(
-            gesture_body(&gesture_with("press", "keydown", 7, 7, &keyed)),
+            body_sent(&gesture_with("press", "keydown", 7, 7, &keyed)),
             serde_json::json!({
                 "event": "keydown", "listener": 7, "target": 7,
                 "key": {"key": "ArrowLeft", "code": "ArrowLeft", "repeat": false},
             })
+        );
+    }
+
+    #[test]
+    fn a_scripted_gesture_body_names_its_child_and_omits_it_when_unset() {
+        let through = GestureBody {
+            event: "click".to_string(),
+            listener: 7,
+            target: 12,
+            child: Some(9),
+            detail: GestureDetail::default(),
+        };
+        assert_eq!(
+            body_sent(&gesture_body("press", &through)),
+            serde_json::json!({"event": "click", "listener": 7, "target": 12, "child": 9})
+        );
+        let on_listener = GestureBody {
+            target: 7,
+            child: None,
+            ..through
+        };
+        assert_eq!(
+            body_sent(&gesture_body("press", &on_listener)),
+            serde_json::json!({"event": "click", "listener": 7, "target": 7}),
+            "no child is no field, not null"
         );
     }
 
@@ -1526,6 +1585,28 @@ mod tests {
                 "dom.prefers-reduced-motion -> false".to_string(),
                 "dom.prefers-reduced-motion -> true".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn the_instance_answers_its_page_name() {
+        let mut page = Page::new();
+        assert_eq!(page.instance(), FIXTURE_INSTANCE);
+        page.with_instance("motion");
+        assert_eq!(page.instance(), "motion");
+        assert_eq!(
+            page.transcript,
+            vec![
+                r#"dom.instance -> "fixture""#.to_string(),
+                r#"dom.instance -> "motion""#.to_string(),
+            ],
+        );
+
+        let mut chrome = Page::with_page_authority("chrome", "sibling");
+        assert_eq!(chrome.instance(), "chrome");
+        assert_eq!(
+            chrome.transcript,
+            vec![r#"dom.instance -> "chrome""#.to_string()]
         );
     }
 

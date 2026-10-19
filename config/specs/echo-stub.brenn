@@ -4,7 +4,8 @@
 ///
 /// It holds `dom` because it draws: a status line, a scrollback of the
 /// envelopes each activation delivered, and the four buttons whose presses
-/// arrive as sync-call activations. Its view handles and counters ride the
+/// arrive as sync-call activations, with the scrollback's pick — a click on an
+/// entry — arriving the same way. Its view handles and counters ride the
 /// retained `state` port between activations, because linear memory does not.
 component EchoStub {
   abi = processor;
@@ -14,6 +15,7 @@ component EchoStub {
   sync send-custom;
   sync panic;
   sync animate;
+  sync pick;
   out out;
   io state;
 }

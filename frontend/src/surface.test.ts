@@ -867,6 +867,7 @@ describe("surface processor bring-up", () => {
                 ): string | undefined => undefined,
             ),
             brenn_dom_prefers_reduced_motion: vi.fn((_i: string) => false),
+            brenn_dom_instance: vi.fn((_i: string) => "p1"),
             brenn_dom_page_root: vi.fn((_i: string) => 1n),
             brenn_dom_page_body: vi.fn((_i: string) => 1n),
             brenn_dom_instance_wrapper: vi.fn(
@@ -1246,6 +1247,7 @@ describe("surface processor bring-up", () => {
             [],
             "brenn_dom_prefers_reduced_motion",
         ],
+        ["brenn:processor/dom", "instance", [], "brenn_dom_instance"],
         ["brenn:processor/page-dom", "pageRoot", [], "brenn_dom_page_root"],
         ["brenn:processor/page-dom", "pageBody", [], "brenn_dom_page_body"],
         [

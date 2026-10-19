@@ -9,7 +9,10 @@
 //! publishes a fixed counter body, a free-form field plus a "send custom"
 //! button that publishes the field's value verbatim (the path a test drives to
 //! publish a structured or markdown body), and a "panic" button that traps —
-//! the last exercising the trap → error-card path from a real component.
+//! the last exercising the trap → error-card path from a real component. A
+//! press reports where it landed on its button, and a click on a scrollback
+//! entry names the entry, which is how the gesture body's pointer detail and
+//! its `child` are exercised.
 //!
 //! Its `messages` port is optional: a feeder instance binds only `out` and
 //! renders nothing but its own controls.

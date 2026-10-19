@@ -3,11 +3,12 @@
 //! destroyed node.
 //!
 //! The table is generic over what it holds and asks nothing of the DOM:
-//! containment — the one question only a real tree can answer — arrives as a
-//! predicate from the caller. That is what lets the free-list and generation
-//! arithmetic, whose failure modes are a silent leak and a cross-element handle
-//! alias, be exercised on every target the crate builds for rather than only in
-//! the browser. [`crate::dom_host`] holds the one instantiation that matters,
+//! containment and ancestry — the questions only a real tree can answer —
+//! arrive from the caller, as a predicate and as an ancestor chain. That is
+//! what lets the free-list and generation arithmetic, whose failure modes are a
+//! silent leak and a cross-element handle alias, and a gesture's hit path be
+//! exercised on every target the crate builds for rather than only in the
+//! browser. [`crate::dom_host`] holds the one instantiation that matters,
 //! over `web_sys::Element`.
 
 use crate::dom_handle::{next_generation, pack, unpack};
@@ -109,6 +110,27 @@ impl<T: Clone + PartialEq> HandleTable<T> {
         self.slots.iter().enumerate().find_map(|(index, slot)| {
             (slot.held.as_ref() == Some(held)).then(|| pack(index, slot.generation))
         })
+    }
+
+    /// The held nodes of a gesture's path: `chain` is the event target and its
+    /// ancestors, nearest first, up to the listening node exclusive. Answers the
+    /// handle of the nearest held node on it (the gesture's target) and of the
+    /// outermost (the listener's child), which is the target itself when nothing
+    /// above it is held; `None` when nothing on the chain is held.
+    ///
+    /// The chain is looked up from both ends, so a hit inside a subtree the
+    /// instance built (every node held) costs two lookups however deep.
+    pub fn hit_path(&self, chain: &[T]) -> Option<(u64, u64)> {
+        let (nearest, target) = chain
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| self.lookup(node).map(|handle| (index, handle)))?;
+        let child = chain[nearest + 1..]
+            .iter()
+            .rev()
+            .find_map(|node| self.lookup(node))
+            .unwrap_or(target);
+        Some((target, child))
     }
 
     /// The value `handle` names, or the refusal that traps the caller.
@@ -402,5 +424,76 @@ mod tests {
         let handle = yours.handle_for(&secret);
         assert!(mine.get(handle).is_err());
         assert_eq!(mine.lookup(&secret), None);
+    }
+
+    /// A table holding `held` of the toy nodes numbered 1..=9, and their handles
+    /// by number.
+    fn holding(held: &[u32]) -> (HandleTable<Node>, impl Fn(u32) -> u64) {
+        let mut table = HandleTable::default();
+        let handles: Vec<(u32, u64)> = held
+            .iter()
+            .map(|&id| (id, table.handle_for(&leaf(id))))
+            .collect();
+        let handle = move |id: u32| {
+            handles
+                .iter()
+                .find(|(held, _)| *held == id)
+                .map(|&(_, handle)| handle)
+                .expect("a held node")
+        };
+        (table, handle)
+    }
+
+    /// A target's chain, nearest first, from toy node numbers.
+    fn chain(ids: &[u32]) -> Vec<Node> {
+        ids.iter().map(|&id| leaf(id)).collect()
+    }
+
+    #[test]
+    fn a_hit_path_names_the_nearest_held_node_and_the_outermost() {
+        // listener > 4 (unheld wrapper) > 3 row > 2 cell > 1 button: the child is
+        // the row — not the cell a forward scan or the target's held parent
+        // would find, and not the unheld wrapper at the chain's top.
+        let (table, handle) = holding(&[1, 2, 3]);
+        assert_eq!(
+            table.hit_path(&chain(&[1, 2, 3, 4])),
+            Some((handle(1), handle(3)))
+        );
+        // An unheld span inside the button: the target is the button.
+        assert_eq!(
+            table.hit_path(&chain(&[5, 1, 2, 3, 4])),
+            Some((handle(1), handle(3)))
+        );
+    }
+
+    #[test]
+    fn a_hit_on_a_direct_held_child_names_it_as_target_and_child() {
+        let (table, handle) = holding(&[3]);
+        assert_eq!(
+            table.hit_path(&chain(&[3])),
+            Some((handle(3), handle(3))),
+            "the listener's own child, hit directly"
+        );
+        assert_eq!(
+            table.hit_path(&chain(&[5, 3])),
+            Some((handle(3), handle(3))),
+            "an unheld node inside that child"
+        );
+        assert_eq!(
+            table.hit_path(&chain(&[5, 3, 4])),
+            Some((handle(3), handle(3))),
+            "under an unheld wrapper, the one held node is both"
+        );
+    }
+
+    #[test]
+    fn a_hit_path_with_nothing_held_names_nothing() {
+        let (table, _) = holding(&[9]);
+        assert_eq!(table.hit_path(&[]), None, "a hit on the listener itself");
+        assert_eq!(
+            table.hit_path(&chain(&[5, 4])),
+            None,
+            "only nodes the instance never named"
+        );
     }
 }

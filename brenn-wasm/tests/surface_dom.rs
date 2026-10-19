@@ -27,8 +27,9 @@ use brenn_envelope::grants::ComponentGrant::{Alert, Config, Dom, Log, Ports, Sto
 use brenn_envelope::testutils::{NOW_MS, envelope};
 use brenn_meeting::logic::{AckTarget, SNOOZE_SECS, dismiss_body, snooze_body};
 use brenn_page_harness::{
-    Declared, GestureDetail, GestureModifiers, GesturePointer, Harness, Listener, Page, ROOT,
-    delivery_on, gesture, gesture_at, gesture_with, mount, ports, sync_call, types,
+    Declared, GestureBody, GestureDetail, GestureModifiers, GesturePointer, Harness, Listener,
+    Page, ROOT, delivery_on, gesture, gesture_at, gesture_body, gesture_with, mount, ports,
+    sync_call, types,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -43,12 +44,14 @@ const ECHO_OUT_PORT: &str = "out";
 /// The `io` port its state rides between activations.
 const ECHO_STATE_PORT: &str = "state";
 
-/// Echo-stub's four sync ports. Literals because this suite does not depend on
-/// its crate; must match the specification or the harness panics.
+/// Echo-stub's five sync ports: four buttons and the scrollback's pick.
+/// Literals because this suite does not depend on its crate; must match the
+/// specification or the harness panics.
 const SEND: &str = "send";
 const SEND_CUSTOM: &str = "send-custom";
 const PANIC: &str = "panic";
 const ANIMATE: &str = "animate";
+const PICK: &str = "pick";
 
 /// What echo-stub's `animate` button hands `dom.animate`, as the transcript
 /// records it: an easing no browser accepts, so the page refuses it.
@@ -199,6 +202,8 @@ const MOUNT_TRANSCRIPT: &[&str] = &[
     "dom.set-text(n8, \"animate\")",
     "dom.create-element(div) -> n9",
     "dom.set-attribute(n9, data-echo-animate-result, \"\")",
+    "dom.create-element(div) -> n10",
+    "dom.set-attribute(n10, data-echo-picked, \"\")",
     "dom.append(n1, n2)",
     "dom.append(n1, n3)",
     "dom.append(n1, n4)",
@@ -207,15 +212,17 @@ const MOUNT_TRANSCRIPT: &[&str] = &[
     "dom.append(n1, n7)",
     "dom.append(n1, n8)",
     "dom.append(n1, n9)",
+    "dom.append(n1, n10)",
     "dom.listen(n4, click, send)",
     "dom.listen(n6, click, send-custom)",
     "dom.listen(n7, click, panic)",
     "dom.listen(n8, click, animate)",
+    "dom.listen(n3, click, pick)",
     "dom.set-text(n2, \"sent: 0  drops: 0\")",
     // The last thing every activation does: the state the next one reads back.
     // The handles in it are the elements built above, which the mount owns and
     // the memory does not.
-    "ports.publish(state, \"{\\\"view\\\":{\\\"status\\\":2,\\\"scrollback\\\":3,\\\"input\\\":5,\\\"animate_result\\\":9},\\\"entries\\\":[],\\\"drops\\\":0,\\\"sent\\\":0}\")",
+    "ports.publish(state, \"{\\\"view\\\":{\\\"status\\\":2,\\\"scrollback\\\":3,\\\"input\\\":5,\\\"animate_result\\\":9,\\\"picked\\\":10},\\\"entries\\\":[],\\\"drops\\\":0,\\\"sent\\\":0}\")",
 ];
 
 #[test]
@@ -225,7 +232,7 @@ fn the_mount_activation_builds_the_view_and_wires_its_gestures() {
     assert_eq!(harness.transcript(), MOUNT_TRANSCRIPT);
 
     let root_children = harness.page().children(ROOT);
-    assert_eq!(root_children.len(), 8, "{root_children:?}");
+    assert_eq!(root_children.len(), 9, "{root_children:?}");
     assert_eq!(
         harness.page().listeners,
         vec![
@@ -248,6 +255,11 @@ fn the_mount_activation_builds_the_view_and_wires_its_gestures() {
                 node: 8,
                 event: "click".to_string(),
                 port: ANIMATE.to_string()
+            },
+            Listener {
+                node: 3,
+                event: "click".to_string(),
+                port: PICK.to_string()
             },
         ]
     );
@@ -729,6 +741,128 @@ fn the_scrollback_cap_detaches_the_oldest_entries() {
         overflow,
         "exactly the overflow is detached, one call each"
     );
+}
+
+/// echo-stub mounted with three envelopes delivered, and its scrollback's
+/// handle and entries, oldest first.
+fn echo_stub_with_three_entries() -> (Harness, u64, Vec<u64>) {
+    let mut harness = echo_stub_mounted();
+    harness.call(delivery(&[], &["first", "second", "third"], 0));
+    let scrollback = harness.page().marked_child(ROOT, "data-echo-scrollback");
+    let entries = harness.page().children(scrollback);
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    (harness, scrollback, entries)
+}
+
+/// A click on the scrollback as the kernel reports it: the scrollback is the
+/// listener, `target` the node hit, `child` the scrollback's child on the path,
+/// and the pointer position every mouse event carries.
+fn pick_body(scrollback: u64, target: u64, child: Option<u64>) -> types::Activation {
+    gesture_body(
+        PICK,
+        &GestureBody {
+            event: "click".to_string(),
+            listener: scrollback,
+            target,
+            child,
+            detail: GestureDetail {
+                pointer: Some(GesturePointer {
+                    x: 40.0,
+                    y: 9.5,
+                    width: 300.0,
+                    height: 120.0,
+                    button: 0,
+                    buttons: 0,
+                    pointer_type: None,
+                }),
+                modifiers: Some(GestureModifiers::default()),
+                ..GestureDetail::default()
+            },
+        },
+    )
+}
+
+fn picked_text(harness: &mut Harness) -> String {
+    let picked = harness.page().marked_child(ROOT, "data-echo-picked");
+    harness.page().text_of(picked)
+}
+
+/// The stub keys on `child`, as a delegating kind does: a hit on the entry
+/// itself and a hit on a node beneath it name the same entry.
+#[test]
+fn a_pick_names_the_entry_the_click_came_through() {
+    let (mut harness, scrollback, entries) = echo_stub_with_three_entries();
+    let status = harness.page().marked_child(ROOT, "data-echo-status");
+    let status_before = harness.page().text_of(status);
+
+    harness.call(pick_body(scrollback, entries[1], Some(entries[1])));
+    assert_eq!(picked_text(&mut harness), "picked: 1");
+
+    let beneath = harness.page().mint();
+    harness.page().link(entries[1], beneath);
+    harness.call(pick_body(scrollback, entries[0], Some(entries[0])));
+    assert_eq!(picked_text(&mut harness), "picked: 0");
+    harness.call(pick_body(scrollback, beneath, Some(entries[1])));
+    assert_eq!(picked_text(&mut harness), "picked: 1");
+
+    assert!(
+        harness.page().published_on(ECHO_OUT_PORT).is_empty(),
+        "a pick publishes nothing"
+    );
+    assert_eq!(
+        harness.page().text_of(status),
+        status_before,
+        "a pick moves no counter and reports no press position"
+    );
+}
+
+/// A click on the scrollback's own surface carries no `child` — the body a
+/// host writes when the target is the listener.
+#[test]
+fn a_pick_on_the_scrollback_itself_names_no_entry() {
+    let (mut harness, scrollback, _) = echo_stub_with_three_entries();
+    harness.call(pick_body(scrollback, scrollback, None));
+    assert_eq!(picked_text(&mut harness), "picked: none");
+}
+
+/// The cap trims `entries` and the DOM from the front together, so a position
+/// in one is a position in the other after a trim.
+#[test]
+fn a_pick_after_the_cap_trimmed_the_front_indexes_the_surviving_entries() {
+    let mut harness = echo_stub_mounted();
+    let bodies: Vec<String> = (0..=MAX_SCROLLBACK_ENTRIES)
+        .map(|i| format!("message {i}"))
+        .collect();
+    let new: Vec<&str> = bodies.iter().map(String::as_str).collect();
+    harness.call(delivery(&[], &new, 0));
+    let scrollback = harness.page().marked_child(ROOT, "data-echo-scrollback");
+    let first = harness.page().children(scrollback)[0];
+    assert!(harness.page().text_of(first).contains("message 1"));
+
+    harness.call(pick_body(scrollback, first, Some(first)));
+    assert_eq!(picked_text(&mut harness), "picked: 0");
+}
+
+/// A `child` the stub built but never put in `entries` is a walk that named
+/// the wrong node or bookkeeping that drifted from the DOM: the activation is
+/// refused and nothing it did is kept.
+#[test]
+fn a_pick_naming_a_child_that_is_not_an_entry_is_refused() {
+    let (mut harness, scrollback, _) = echo_stub_with_three_entries();
+    let send = harness.page().marked_child(ROOT, "data-echo-send");
+    harness.transcript();
+
+    let refusal = harness.call_expecting_a_refusal(pick_body(scrollback, send, Some(send)));
+    let refusal = format!("{refusal:?}");
+    assert!(
+        refusal.contains("echo-stub: picked a child that is not a scrollback entry"),
+        "{refusal}"
+    );
+    assert!(
+        state_writes(harness.transcript()).is_empty(),
+        "a refused pick writes no state"
+    );
+    assert_eq!(picked_text(&mut harness), "");
 }
 
 // ---------------------------------------------------------------------------
