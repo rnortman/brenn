@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.26.1] — 2026-10-19
+
 - **Components can read their own instance name** through the new WASM
   import `dom.instance()` (`brenn_guest::dom::instance()` in the guest SDK).
   An instance's name is the one the operator gave it in the layout. Chrome
