@@ -13,7 +13,6 @@ description = "Git subprocess plumbing for managed repos: the bounded spawn help
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
 futures = "0.3.32"
-indexmap = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.50.0", features = ["process", "time", "io-util", "rt", "macros", "sync"] }

@@ -715,7 +715,6 @@ dependencies = [
  "brenn-obs",
  "futures",
  "git-fixture",
- "indexmap",
  "libc",
  "serde",
  "serde_json",

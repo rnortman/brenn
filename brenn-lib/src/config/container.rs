@@ -9,7 +9,9 @@ pub struct ContainerConfig {
     /// Podman image name/tag (e.g. "brenn-cc:latest").
     pub image: String,
     /// Host path bind-mounted as the container's home directory.
-    /// This is where `.claude/`, `.ssh/`, etc. live persistently.
+    /// This is where `.claude/` and the agent's persistent state live. It
+    /// holds no git or SSH credentials: git's network operations run on the
+    /// host.
     pub home_dir: PathBuf,
     /// Container-side home directory path. Default: `/home/user`.
     /// Set via `-e HOME=` to ensure CC finds credentials regardless of image user config.

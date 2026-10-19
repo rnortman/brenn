@@ -62,8 +62,9 @@ pub(crate) async fn run_startup_hooks(
 }
 
 /// Create repo_dir and empty per-repo subdirectories so `validate_and_resolve`
-/// passes working_dir checks. Called before validation; actual cloning happens
-/// after via `brenn_git::repo_clone::auto_clone_repos`.
+/// passes working_dir checks and each clone has a target to run in. Called
+/// before validation; cloning happens after via
+/// `brenn_git::repo_clone::auto_clone_repos`.
 pub(crate) fn prepare_repo_dirs(config: &BrennConfig) {
     if let Some(ref repo_dir) = config.repo_sync.repo_dir {
         std::fs::create_dir_all(repo_dir)

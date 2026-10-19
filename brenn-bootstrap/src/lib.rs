@@ -343,9 +343,6 @@ pub async fn run_server(
         crate::pid_file::write_pid_file(pid_file_path);
     }
 
-    // Create repo_dir and empty subdirectories so validate_and_resolve()
-    // passes working_dir checks. Actual cloning happens after validation,
-    // when we have ContainerSpawnConfig for container-side clones.
     apps::prepare_repo_dirs(&config);
 
     // Shared with the reload driver; the factory set is a compile-time
@@ -386,12 +383,12 @@ pub async fn run_server(
         }
     }
 
-    // Auto-clone repos into the directories created above. Runs after
-    // validation so we have ContainerSpawnConfig for container-side clones
-    // (SSH keys live inside the container's persistent home). Clones run
-    // concurrently via join_all in auto_clone_repos.
+    // Auto-clone repos into the directories created above, host-side with the
+    // host's SSH setup. Runs after validation so a config that fails
+    // validation is rejected before any network work. A clone failure refuses
+    // boot once every clone has settled.
     if config.repo_sync.repo_dir.is_some() {
-        brenn_git::repo_clone::auto_clone_repos(&config, &apps, &guard.alert_dispatcher).await;
+        brenn_git::repo_clone::auto_clone_repos(&config, &guard.alert_dispatcher).await;
     }
 
     apps::prepare_and_validate(&apps);

@@ -1,35 +1,17 @@
-//! Repo clone selection and auto-cloning.
+//! Auto-cloning of declared repos into `repo_sync.repo_dir`.
+//!
+//! Every network leg of git in this crate — clone, fetch, push — runs on the
+//! host with the host's credentials. Containers never hold git credentials.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use futures::future::FutureExt as _;
-use indexmap::IndexMap;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use brenn_lib::config::{AppConfig, BrennConfig, ContainerSpawnConfig};
+use brenn_lib::config::BrennConfig;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 
-/// Pick the container config under which to clone a repo, if any.
-///
-/// Returns `Some(container_spawn)` if any containerized app mounts this repo
-/// with writable access. Otherwise returns `None`, meaning clone on the host.
-///
-/// Read-only-only repos must clone on the host: every containerized app that
-/// mounts the repo bind-mounts it `:ro`, so cloning into the container's view
-/// of that path writes through a read-only bind and fails with EROFS.
-pub fn select_clone_container<'a>(
-    apps: &'a IndexMap<String, AppConfig>,
-    repo_slug: &str,
-) -> Option<&'a ContainerSpawnConfig> {
-    apps.values()
-        .find(|app| {
-            app.container_spawn.is_some()
-                && app.mounts.iter().any(|m| {
-                    m.slug == repo_slug && m.access == brenn_lib::config::AccessLevel::ReadWrite
-                })
-        })
-        .and_then(|app| app.container_spawn.as_ref())
-}
+use crate::subprocess::{GitSubprocessError, run_git, sanitize_log_line};
 
 /// Read the on-disk clone's `remote.origin.url` and compare it against the
 /// configured remote URL. Fires a deduplicated warning alert on mismatch or
@@ -40,8 +22,6 @@ async fn check_remote_url_drift(
     clone_path: PathBuf,
     alert_dispatcher: AlertDispatcher,
 ) {
-    use crate::subprocess::{run_git, sanitize_log_line};
-
     match run_git(&clone_path, &["config", "--get", "remote.origin.url"]).await {
         Ok(actual) => {
             let actual = actual.trim().to_string();
@@ -110,147 +90,197 @@ async fn check_remote_url_drift(
     }
 }
 
-/// Auto-clone repos that don't have a `.git` directory yet.
+/// One repo whose clone failed. `failure` is single-line (newlines sanitized).
+struct CloneFailure {
+    slug: String,
+    remote: String,
+    target: PathBuf,
+    failure: String,
+}
+
+/// Render a clone error as one line: the error's `Display` plus the exit
+/// status for a non-zero exit.
+fn describe_clone_error(e: &GitSubprocessError) -> String {
+    let rendered = match e {
+        GitSubprocessError::NonZero {
+            exit_code: Some(code),
+            ..
+        } => format!("{e} (exit {code})"),
+        GitSubprocessError::NonZero {
+            exit_code: None, ..
+        } => format!("{e} (killed by signal)"),
+        _ => e.to_string(),
+    };
+    sanitize_log_line(&rendered)
+}
+
+/// Clone `remote` into `target`, which the caller has established is an empty
+/// directory.
+async fn clone_repo(slug: String, remote: String, target: PathBuf) -> Result<(), CloneFailure> {
+    match run_git(&target, &["clone", &remote, "."]).await {
+        Ok(_) => {
+            info!(slug = %slug, "auto-clone complete");
+            Ok(())
+        }
+        Err(e) => Err(CloneFailure {
+            failure: describe_clone_error(&e),
+            slug,
+            remote,
+            target,
+        }),
+    }
+}
+
+/// Name `.git` is moved to inside a failed target before the target is emptied.
+const DISCARDED_GIT_DIR: &str = ".git.failed-clone";
+
+/// Empty a target whose clone failed, keeping the directory itself (so a
+/// symlinked target stays a symlink). A clone killed on timeout leaves a
+/// partial `.git` behind; emptying the target keeps `.git` a reliable "clone
+/// completed" marker for the next boot. `.git` is renamed away in one step
+/// before anything is removed, so a removal that fails partway leaves a
+/// target without `.git`, which the next boot's emptiness check refuses.
+fn reset_failed_target(target: &Path) -> Result<(), String> {
+    let git_dir = target.join(".git");
+    match std::fs::rename(&git_dir, target.join(DISCARDED_GIT_DIR)) {
+        Ok(()) => {}
+        // git already removed its own `.git`.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("failed to move aside {git_dir:?}: {e}")),
+    }
+    let entries =
+        std::fs::read_dir(target).map_err(|e| format!("failed to read {target:?}: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to read {target:?}: {e}"))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("failed to stat {path:?}: {e}"))?;
+        let removed = if file_type.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.map_err(|e| format!("failed to remove {path:?}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Log every failed clone, attempt to reset every failed target, then panic
+/// once naming every failure and every target that could not be reset.
+fn refuse_boot_on_clone_failures(failures: Vec<CloneFailure>) -> ! {
+    for f in &failures {
+        error!(
+            slug = %f.slug,
+            remote = %sanitize_log_line(&f.remote),
+            target = %f.target.display(),
+            failure = %f.failure,
+            "auto-clone failed",
+        );
+    }
+    let reset_errors: Vec<String> = failures
+        .iter()
+        .filter_map(|f| reset_failed_target(&f.target).err())
+        .map(|e| sanitize_log_line(&e))
+        .collect();
+    let summary = failures
+        .iter()
+        .map(|f| format!("{}: {}", f.slug, f.failure))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if reset_errors.is_empty() {
+        panic!("git clone failed for {} repo(s): {summary}", failures.len());
+    }
+    panic!(
+        "git clone failed for {} repo(s): {summary}; could not reset {} failed target(s), \
+         remove them by hand before restarting: {}",
+        failures.len(),
+        reset_errors.len(),
+        reset_errors.join("; "),
+    );
+}
+
+/// Auto-clone repos that don't have a `.git` directory yet, and check the
+/// on-disk remote of those that do for drift against the config.
 ///
-/// Runs after `validate_and_resolve()` so we have `ContainerSpawnConfig` for
-/// container-side clones. Empty directories were created pre-validation so
-/// working_dir checks passed; now we populate them with actual git repos.
+/// Clones run on the host, concurrently, into the empty per-repo directories
+/// created before config validation.
 ///
-/// For each repo, uses `select_clone_container` to choose container-side
-/// (container-side SSH keys) vs host-side (RO-only repos and bare-process-only
-/// repos).
-///
-/// Clones run concurrently — each `git clone` is independent (different target
-/// directory, immutable `apps` read).
-pub async fn auto_clone_repos(
-    config: &BrennConfig,
-    apps: &IndexMap<String, AppConfig>,
-    alert_dispatcher: &AlertDispatcher,
-) {
+/// A target with no `.git` that is not empty panics before any clone is
+/// spawned, leaving the directory untouched. Every clone runs to completion
+/// or failure; each failed target is then reset to empty, and a single panic
+/// names every failed repo and any target whose reset failed.
+pub async fn auto_clone_repos(config: &BrennConfig, alert_dispatcher: &AlertDispatcher) {
     let repo_dir = config
         .repo_sync
         .repo_dir
         .as_ref()
         .expect("caller checked repo_sync.repo_dir");
 
-    let clone_futs: Vec<futures::future::BoxFuture<'static, ()>> = config
-        .repos
-        .iter()
-        .map(|repo| {
-            let target = repo_dir.join(&repo.slug);
-            if target.join(".git").exists() {
-                // Drift check: compare config remote against on-disk remote.origin.url.
-                let slug = repo.slug.clone();
-                let expected_remote = repo.remote.clone();
-                let ad = alert_dispatcher.clone();
-                return check_remote_url_drift(slug, expected_remote, target, ad).boxed();
-            }
-
-            info!(
-                slug = %repo.slug,
-                remote = %repo.remote,
-                target = %target.display(),
-                "auto-cloning repo",
+    // Futures are lazy: nothing runs until `join_all` polls them, which is
+    // after the emptiness check below.
+    let mut futs: Vec<futures::future::BoxFuture<'static, Result<(), CloneFailure>>> =
+        Vec::with_capacity(config.repos.len());
+    let mut to_clone: Vec<(&str, &str, PathBuf)> = Vec::new();
+    for repo in &config.repos {
+        let target = repo_dir.join(&repo.slug);
+        if target.join(".git").exists() {
+            let check = check_remote_url_drift(
+                repo.slug.clone(),
+                repo.remote.clone(),
+                target,
+                alert_dispatcher.clone(),
             );
+            futs.push(check.map(Ok).boxed());
+        } else {
+            to_clone.push((&repo.slug, &repo.remote, target));
+        }
+    }
 
-            let container_spawn = select_clone_container(apps, &repo.slug);
-
-            // Clone target path: container-side path if containerized, host path if bare.
-            let clone_target = if let Some(spawn) = container_spawn {
-                spawn
-                    .container_home
-                    .join("repos")
-                    .join(&repo.slug)
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                target.display().to_string()
-            };
-
-            let slug = repo.slug.clone();
-            let remote = repo.remote.clone();
-            let cmd = brenn_lib::subprocess::run_in_app_env(
-                "git",
-                &["clone", &remote, &clone_target],
-                &target,
-                container_spawn,
-                &[],
-                &[],
+    // Every clone is launched into a directory known to be empty, so whatever
+    // a failed clone leaves behind is its own and is safe to remove.
+    for (slug, _, target) in &to_clone {
+        let mut entries = std::fs::read_dir(target)
+            .unwrap_or_else(|e| panic!("failed to read repo target {target:?}: {e}"));
+        if entries.next().is_some() {
+            panic!(
+                "repo target {target:?} for {slug:?} is non-empty but has no .git; \
+                 remove it or clone into it by hand"
             );
-            async move {
-                let label = format!("git clone slug={slug}");
-                match crate::subprocess::run_with_bounded_output(cmd, &label).await {
-                    Ok(_) => info!(slug = %slug, "auto-clone complete"),
-                    Err(crate::subprocess::GitSubprocessError::NonZero {
-                        stderr,
-                        exit_code,
-                        // stdout intentionally omitted: git clone errors go to
-                        // stderr; stdout is empty or progress noise in practice.
-                        ..
-                    }) => {
-                        panic!("git clone failed for repo {slug:?} (exit {exit_code:?}): {stderr}")
-                    }
-                    Err(e) => panic!("git clone failed for repo {slug:?}: {e}"),
-                }
-            }
-            .boxed()
-        })
+        }
+    }
+
+    for (slug, remote, target) in to_clone {
+        info!(
+            slug = %slug,
+            remote = %remote,
+            target = %target.display(),
+            "auto-cloning repo",
+        );
+        futs.push(clone_repo(slug.to_string(), remote.to_string(), target).boxed());
+    }
+
+    let failures: Vec<CloneFailure> = futures::future::join_all(futs)
+        .await
+        .into_iter()
+        .filter_map(Result::err)
         .collect();
-
-    futures::future::join_all(clone_futs).await;
+    if !failures.is_empty() {
+        refuse_boot_on_clone_failures(failures);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::panic::AssertUnwindSafe;
 
     use git_fixture::{git as fixture_git, init_bare_repo, init_repo};
 
-    use brenn_lib::config::{AccessLevel, BrennConfig, RepoDeclRaw, repo_sync_at};
+    use brenn_lib::config::{BrennConfig, RepoDeclRaw, repo_sync_at};
     use brenn_obs::alerting::make_capturing_alerter;
-    use indexmap::IndexMap;
     use tracing_test::traced_test;
 
     use super::*;
-
-    /// An `AppConfig` carrying only what `select_clone_container` reads:
-    /// `slug`, `container_spawn`, `mounts`.
-    fn clone_test_app(
-        slug: &str,
-        container_spawn: Option<ContainerSpawnConfig>,
-        mounts: Vec<brenn_lib::config::ResolvedMount>,
-    ) -> AppConfig {
-        let mut cfg = brenn_lib::config::test_app_config(slug);
-        cfg.container_spawn = container_spawn;
-        cfg.mounts = mounts;
-        cfg
-    }
-
-    fn clone_test_mount(slug: &str, access: AccessLevel) -> brenn_lib::config::ResolvedMount {
-        brenn_lib::config::ResolvedMount {
-            slug: slug.into(),
-            host_path: PathBuf::from(format!("/tmp/{slug}")),
-            container_path: Some(PathBuf::from(format!("/home/user/repos/{slug}"))),
-            access,
-            auto_pull: false,
-            is_working_dir: false,
-            primary: false,
-        }
-    }
-
-    fn clone_test_container(home: &str) -> ContainerSpawnConfig {
-        ContainerSpawnConfig {
-            image: "brenn-cc:latest".into(),
-            home_dir: PathBuf::from(home),
-            container_home: PathBuf::from("/home/user"),
-            host_working_dir: PathBuf::from("/tmp/workdir"),
-            container_working_dir: PathBuf::from("/home/user/workdir"),
-            working_dir_is_repo: false,
-            repo_mounts: vec![],
-            extra_mounts: vec![],
-            extra_args: vec![],
-        }
-    }
 
     // -----------------------------------------------------------------------
     // auto_clone_repos integration tests
@@ -311,10 +341,9 @@ mod tests {
             "test-repo",
             &remote.path().display().to_string(),
         );
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher, captured, handle) = make_capturing_alerter();
 
-        auto_clone_repos(&config, &apps, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
 
         assert!(
             repo_dir.path().join("test-repo").join(".git").exists(),
@@ -339,16 +368,15 @@ mod tests {
             "test-repo",
             &remote.path().display().to_string(),
         );
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher, captured, handle) = make_capturing_alerter();
 
         // First clone.
-        auto_clone_repos(&config, &apps, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
         assert!(repo_dir.path().join("test-repo").join(".git").exists());
 
         // Second call: .git already exists, drift check runs. Config remote
         // matches the on-disk remote.origin.url — no alert expected.
-        auto_clone_repos(&config, &apps, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
         assert!(
             repo_dir.path().join("test-repo").join(".git").exists(),
             ".git must still be present after second call"
@@ -376,9 +404,8 @@ mod tests {
 
         // Clone from remote A.
         let config_a = minimal_config(repo_dir.path(), "drift-repo", &remote_a_url);
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher, _, handle_a) = make_capturing_alerter();
-        auto_clone_repos(&config_a, &apps, &dispatcher).await;
+        auto_clone_repos(&config_a, &dispatcher).await;
         drop(dispatcher);
         handle_a.await.expect("alert background task panicked");
 
@@ -386,7 +413,7 @@ mod tests {
         // changing the config but forgetting git remote set-url).
         let config_b = minimal_config(repo_dir.path(), "drift-repo", &remote_b_url);
         let (dispatcher2, captured, handle_b) = make_capturing_alerter();
-        auto_clone_repos(&config_b, &apps, &dispatcher2).await;
+        auto_clone_repos(&config_b, &dispatcher2).await;
         drop(dispatcher2);
         handle_b.await.expect("alert background task panicked");
 
@@ -418,12 +445,11 @@ mod tests {
             "no-drift-repo",
             &remote.path().display().to_string(),
         );
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher, captured, handle) = make_capturing_alerter();
 
         // Clone, then check again with the same config.
-        auto_clone_repos(&config, &apps, &dispatcher).await;
-        auto_clone_repos(&config, &apps, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
         drop(dispatcher);
         handle.await.expect("alert background task panicked");
 
@@ -445,9 +471,8 @@ mod tests {
             "dedup-drift-repo",
             &remote_a.path().display().to_string(),
         );
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher, _, handle_a) = make_capturing_alerter();
-        auto_clone_repos(&config_a, &apps, &dispatcher).await;
+        auto_clone_repos(&config_a, &dispatcher).await;
         drop(dispatcher);
         handle_a.await.expect("alert background task panicked");
 
@@ -459,8 +484,8 @@ mod tests {
         let (dispatcher2, captured, handle_b) = make_capturing_alerter();
 
         // Two calls with the same mismatch — dedup should suppress the second.
-        auto_clone_repos(&config_b, &apps, &dispatcher2).await;
-        auto_clone_repos(&config_b, &apps, &dispatcher2).await;
+        auto_clone_repos(&config_b, &dispatcher2).await;
+        auto_clone_repos(&config_b, &dispatcher2).await;
         drop(dispatcher2);
         handle_b.await.expect("alert background task panicked");
 
@@ -486,10 +511,9 @@ mod tests {
             "corrupt-repo",
             "https://example.com/repo.git",
         );
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher, captured, handle) = make_capturing_alerter();
 
-        auto_clone_repos(&config, &apps, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
         drop(dispatcher);
         handle.await.expect("alert background task panicked");
 
@@ -515,11 +539,10 @@ mod tests {
             "corrupt-dedup-repo",
             "https://example.com/repo.git",
         );
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher, captured, handle) = make_capturing_alerter();
 
-        auto_clone_repos(&config, &apps, &dispatcher).await;
-        auto_clone_repos(&config, &apps, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
         drop(dispatcher);
         handle.await.expect("alert background task panicked");
 
@@ -551,9 +574,8 @@ mod tests {
             }],
             ..BrennConfig::default()
         };
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher_clone, _, handle_clone) = make_capturing_alerter();
-        auto_clone_repos(&config_for_clone, &apps, &dispatcher_clone).await;
+        auto_clone_repos(&config_for_clone, &dispatcher_clone).await;
         drop(dispatcher_clone);
         handle_clone.await.expect("alert background task panicked");
 
@@ -575,7 +597,7 @@ mod tests {
             ..BrennConfig::default()
         };
         let (dispatcher, captured, handle) = make_capturing_alerter();
-        auto_clone_repos(&config, &apps, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
         drop(dispatcher);
         handle.await.expect("alert background task panicked");
 
@@ -605,10 +627,9 @@ mod tests {
             "unset-origin-repo",
             "https://example.com/expected.git",
         );
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher, captured, handle) = make_capturing_alerter();
 
-        auto_clone_repos(&config, &apps, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
         drop(dispatcher);
         handle.await.expect("alert background task panicked");
 
@@ -647,10 +668,9 @@ mod tests {
             "log-single-line-repo",
             "https://example.com/repo.git",
         );
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher, _captured, handle) = make_capturing_alerter();
 
-        auto_clone_repos(&config, &apps, &dispatcher).await;
+        auto_clone_repos(&config, &dispatcher).await;
         drop(dispatcher);
         handle.await.expect("alert background task panicked");
 
@@ -686,16 +706,15 @@ mod tests {
 
         // Clone from remote A.
         let config_a = minimal_config(repo_dir.path(), "drift-log-test-repo", &remote_a_url);
-        let apps: IndexMap<String, _> = IndexMap::new();
         let (dispatcher, _, handle_a) = make_capturing_alerter();
-        auto_clone_repos(&config_a, &apps, &dispatcher).await;
+        auto_clone_repos(&config_a, &dispatcher).await;
         drop(dispatcher);
         handle_a.await.expect("alert background task panicked");
 
         // Second call with a different expected remote → triggers drift path.
         let config_b = minimal_config(repo_dir.path(), "drift-log-test-repo", &remote_b_url);
         let (dispatcher2, _captured, handle_b) = make_capturing_alerter();
-        auto_clone_repos(&config_b, &apps, &dispatcher2).await;
+        auto_clone_repos(&config_b, &dispatcher2).await;
         drop(dispatcher2);
         handle_b.await.expect("alert background task panicked");
 
@@ -715,124 +734,286 @@ mod tests {
         });
     }
 
-    #[test]
-    fn select_clone_container_returns_none_for_ro_only_repo() {
-        // A repo mounted read-only in two containerized apps — the RO bind in
-        // each container makes container-side clone impossible. Must fall back
-        // to host-side clone (return None).
-        let mut apps = IndexMap::new();
-        apps.insert(
-            "pa-a".into(),
-            clone_test_app(
-                "pa-a",
-                Some(clone_test_container("/tmp/home-a")),
-                vec![clone_test_mount("src-brenn", AccessLevel::ReadOnly)],
-            ),
+    // -----------------------------------------------------------------------
+    // Clone failure handling
+    // -----------------------------------------------------------------------
+
+    /// `BrennConfig` with one repo declaration per `(slug, remote)` pair, each
+    /// target directory created as `prepare_repo_dirs` does at startup.
+    fn multi_repo_config(repo_dir: &std::path::Path, repos: &[(&str, &str)]) -> BrennConfig {
+        for (slug, _) in repos {
+            prepare_repo_dirs_for_test(repo_dir, slug);
+        }
+        BrennConfig {
+            repo_sync: repo_sync_at(repo_dir),
+            repos: repos
+                .iter()
+                .map(|(slug, remote)| RepoDeclRaw {
+                    slug: slug.to_string(),
+                    remote: remote.to_string(),
+                    auto_pull: true,
+                })
+                .collect(),
+            ..BrennConfig::default()
+        }
+    }
+
+    /// Run `auto_clone_repos` expecting a panic; return the panic message.
+    async fn auto_clone_repos_panic_message(config: &BrennConfig) -> String {
+        let (dispatcher, _captured, _handle) = make_capturing_alerter();
+        let payload = AssertUnwindSafe(auto_clone_repos(config, &dispatcher))
+            .catch_unwind()
+            .await
+            .expect_err("auto_clone_repos should panic");
+        panic_payload_message(payload)
+    }
+
+    fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(msg) => *msg,
+            Err(payload) => payload
+                .downcast_ref::<&str>()
+                .expect("panic payload should be a string")
+                .to_string(),
+        }
+    }
+
+    /// Populate `target` the way a clone killed mid-fetch leaves it: a partial
+    /// `.git` tree plus checked-out files.
+    fn plant_clone_junk(target: &std::path::Path) {
+        std::fs::create_dir_all(target.join(".git/objects/pack")).unwrap();
+        std::fs::write(target.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(target.join(".git/objects/pack/tmp_pack_x"), "partial").unwrap();
+        std::fs::create_dir_all(target.join("src")).unwrap();
+        std::fs::write(target.join("src/lib.rs"), "").unwrap();
+        std::fs::write(target.join("README"), "").unwrap();
+    }
+
+    fn clone_failure(slug: &str, target: &std::path::Path) -> CloneFailure {
+        CloneFailure {
+            slug: slug.to_string(),
+            remote: format!("ssh://git.example.com/{slug}.git"),
+            target: target.to_path_buf(),
+            failure: format!("git clone: timeout ({slug})"),
+        }
+    }
+
+    fn assert_empty_dir(dir: &std::path::Path) {
+        assert!(dir.is_dir(), "{dir:?} should exist as a directory");
+        let entries: Vec<_> = std::fs::read_dir(dir).unwrap().collect();
+        assert!(entries.is_empty(), "{dir:?} should be empty: {entries:?}");
+    }
+
+    #[tokio::test]
+    async fn auto_clone_repos_failure_resets_target_and_panics() {
+        let missing = tempfile::tempdir().unwrap();
+        let bad_remote = missing.path().join("no-such-remote");
+        let repo_dir = tempfile::tempdir().unwrap();
+        let config = multi_repo_config(
+            repo_dir.path(),
+            &[("bad-repo", &bad_remote.display().to_string())],
         );
-        apps.insert(
-            "pa-b".into(),
-            clone_test_app(
-                "pa-b",
-                Some(clone_test_container("/tmp/home-b")),
-                vec![clone_test_mount("src-brenn", AccessLevel::ReadOnly)],
-            ),
+
+        let msg = auto_clone_repos_panic_message(&config).await;
+
+        assert!(msg.contains("git clone failed"), "message: {msg}");
+        assert!(msg.contains("bad-repo"), "message: {msg}");
+        assert!(msg.contains("(exit "), "message: {msg}");
+        assert!(!msg.contains('\n'), "message must be one line: {msg:?}");
+        let target = repo_dir.path().join("bad-repo");
+        assert_empty_dir(&target);
+        assert!(!target.join(".git").exists());
+    }
+
+    #[tokio::test]
+    async fn auto_clone_repos_failure_does_not_abort_sibling_clone() {
+        let good_remote = make_bare_remote();
+        let missing = tempfile::tempdir().unwrap();
+        let bad_remote = missing.path().join("no-such-remote");
+        let repo_dir = tempfile::tempdir().unwrap();
+        let config = multi_repo_config(
+            repo_dir.path(),
+            &[
+                ("bad-repo", &bad_remote.display().to_string()),
+                ("good-repo", &good_remote.path().display().to_string()),
+            ],
         );
-        assert!(select_clone_container(&apps, "src-brenn").is_none());
+
+        let msg = auto_clone_repos_panic_message(&config).await;
+
+        assert!(msg.contains("bad-repo"), "message: {msg}");
+        assert!(!msg.contains("good-repo"), "message: {msg}");
+        let good = repo_dir.path().join("good-repo");
+        assert!(good.join(".git").join("HEAD").exists());
+        assert_eq!(
+            std::fs::read_to_string(good.join("file.txt")).unwrap(),
+            "initial",
+            "sibling clone must complete with its work tree checked out"
+        );
+        assert_empty_dir(&repo_dir.path().join("bad-repo"));
+    }
+
+    #[tokio::test]
+    async fn auto_clone_repos_panic_names_every_failed_slug() {
+        let missing = tempfile::tempdir().unwrap();
+        let bad_a = missing.path().join("no-such-a");
+        let bad_b = missing.path().join("no-such-b");
+        let repo_dir = tempfile::tempdir().unwrap();
+        let config = multi_repo_config(
+            repo_dir.path(),
+            &[
+                ("bad-repo-a", &bad_a.display().to_string()),
+                ("bad-repo-b", &bad_b.display().to_string()),
+            ],
+        );
+
+        let msg = auto_clone_repos_panic_message(&config).await;
+
+        assert!(msg.contains("2 repo(s)"), "message: {msg}");
+        assert!(msg.contains("bad-repo-a"), "message: {msg}");
+        assert!(msg.contains("bad-repo-b"), "message: {msg}");
+        assert_empty_dir(&repo_dir.path().join("bad-repo-a"));
+        assert_empty_dir(&repo_dir.path().join("bad-repo-b"));
+    }
+
+    #[tokio::test]
+    async fn auto_clone_repos_refuses_nonempty_target_without_git_untouched() {
+        let remote = make_bare_remote();
+        let remote_url = remote.path().display().to_string();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let config = multi_repo_config(
+            repo_dir.path(),
+            &[("occupied-repo", &remote_url), ("other-repo", &remote_url)],
+        );
+        let occupied = repo_dir.path().join("occupied-repo");
+        std::fs::write(occupied.join("notes.txt"), "operator content").unwrap();
+
+        let msg = auto_clone_repos_panic_message(&config).await;
+
+        assert!(msg.contains("occupied-repo"), "message: {msg}");
+        assert!(
+            msg.contains(&format!("{occupied:?}")),
+            "message should name the path: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(occupied.join("notes.txt")).unwrap(),
+            "operator content"
+        );
+        assert!(!occupied.join(".git").exists());
+        // The pre-check runs before any clone is spawned.
+        assert_empty_dir(&repo_dir.path().join("other-repo"));
     }
 
     #[test]
-    fn select_clone_container_picks_container_for_rw_mount() {
-        let mut apps = IndexMap::new();
-        apps.insert(
-            "pa-a".into(),
-            clone_test_app(
-                "pa-a",
-                Some(clone_test_container("/tmp/home-a")),
-                vec![clone_test_mount("life", AccessLevel::ReadWrite)],
-            ),
-        );
-        let spawn = select_clone_container(&apps, "life").expect("RW mount should yield container");
-        assert_eq!(spawn.home_dir, PathBuf::from("/tmp/home-a"));
+    fn reset_failed_target_empties_partial_clone() {
+        let target = tempfile::tempdir().unwrap();
+        plant_clone_junk(target.path());
+
+        reset_failed_target(target.path()).unwrap();
+
+        assert_empty_dir(target.path());
     }
 
     #[test]
-    fn select_clone_container_returns_none_when_only_bare_app_mounts_repo() {
-        // An RW mount in a bare (non-containerized) app does not contribute a
-        // container_spawn. No container → host-side clone (return None).
-        let mut apps = IndexMap::new();
-        apps.insert(
-            "bare".into(),
-            clone_test_app(
-                "bare",
-                None, // no container
-                vec![clone_test_mount("life", AccessLevel::ReadWrite)],
-            ),
+    fn reset_failed_target_keeps_symlinked_target() {
+        let storage = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let link = repo_dir.path().join("linked-repo");
+        std::os::unix::fs::symlink(storage.path(), &link).unwrap();
+        plant_clone_junk(&link);
+
+        reset_failed_target(&link).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive the reset"
         );
-        assert!(select_clone_container(&apps, "life").is_none());
+        assert_empty_dir(storage.path());
     }
 
     #[test]
-    fn select_clone_container_prefers_rw_over_ro() {
-        // Repo mounted RO in one app and RW in another. Return the RW's
-        // container so clone can write through.
-        let mut apps = IndexMap::new();
-        apps.insert(
-            "ro-app".into(),
-            clone_test_app(
-                "ro-app",
-                Some(clone_test_container("/tmp/ro-home")),
-                vec![clone_test_mount("mixed", AccessLevel::ReadOnly)],
-            ),
+    fn refuse_boot_resets_every_failed_target_and_reports_reset_failures() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        // A regular file where a directory is expected: its reset fails.
+        let unresettable = repo_dir.path().join("unresettable-repo");
+        std::fs::write(&unresettable, "").unwrap();
+        let partial = repo_dir.path().join("partial-repo");
+        plant_clone_junk(&partial);
+
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            refuse_boot_on_clone_failures(vec![
+                clone_failure("unresettable-repo", &unresettable),
+                clone_failure("partial-repo", &partial),
+            ])
+        }))
+        .expect_err("refuse_boot_on_clone_failures should panic");
+        let msg = panic_payload_message(payload);
+
+        assert!(msg.contains("git clone failed for 2 repo(s)"), "message: {msg}");
+        assert!(
+            msg.contains("unresettable-repo: git clone: timeout (unresettable-repo)"),
+            "message: {msg}"
         );
-        apps.insert(
-            "rw-app".into(),
-            clone_test_app(
-                "rw-app",
-                Some(clone_test_container("/tmp/rw-home")),
-                vec![clone_test_mount("mixed", AccessLevel::ReadWrite)],
-            ),
+        assert!(
+            msg.contains("partial-repo: git clone: timeout (partial-repo)"),
+            "message: {msg}"
         );
-        let spawn =
-            select_clone_container(&apps, "mixed").expect("RW mount should yield container");
-        assert_eq!(spawn.home_dir, PathBuf::from("/tmp/rw-home"));
+        assert!(msg.contains("could not reset 1 failed target(s)"), "message: {msg}");
+        assert!(
+            msg.contains(&format!("{:?}", unresettable.join(".git"))),
+            "message should name the unresettable path: {msg}"
+        );
+        assert!(!msg.contains('\n'), "message must be one line: {msg:?}");
+        // A failed reset does not stop the later targets being reset.
+        assert_empty_dir(&partial);
     }
 
     #[test]
-    fn select_clone_container_returns_none_when_ro_containerized_and_rw_bare() {
-        // Repo mounted RO in a containerized app AND RW in a bare app. No
-        // writable containerized mount exists, so return None (host clone).
-        // The host-side clone populates the dir that both apps see.
-        let mut apps = IndexMap::new();
-        apps.insert(
-            "containerized".into(),
-            clone_test_app(
-                "containerized",
-                Some(clone_test_container("/tmp/home-a")),
-                vec![clone_test_mount("shared", AccessLevel::ReadOnly)],
+    fn describe_clone_error_renders_every_variant_on_one_line() {
+        let label = || "git clone".to_string();
+        let cases = [
+            (
+                GitSubprocessError::NonZero {
+                    label: label(),
+                    stdout: String::new(),
+                    stderr: "Host key verification failed.\nfatal: Could not read\r\n".to_string(),
+                    exit_code: Some(128),
+                },
+                "git clone: non-zero exit: Host key verification failed. fatal: Could not read   (exit 128)",
             ),
-        );
-        apps.insert(
-            "bare".into(),
-            clone_test_app(
-                "bare",
-                None,
-                vec![clone_test_mount("shared", AccessLevel::ReadWrite)],
+            (
+                GitSubprocessError::NonZero {
+                    label: label(),
+                    stdout: String::new(),
+                    stderr: "partial\n".to_string(),
+                    exit_code: None,
+                },
+                "git clone: non-zero exit: partial  (killed by signal)",
             ),
-        );
-        assert!(select_clone_container(&apps, "shared").is_none());
-    }
-
-    #[test]
-    fn select_clone_container_returns_none_for_unknown_slug() {
-        let mut apps = IndexMap::new();
-        apps.insert(
-            "pa-a".into(),
-            clone_test_app(
-                "pa-a",
-                Some(clone_test_container("/tmp/home-a")),
-                vec![clone_test_mount("life", AccessLevel::ReadWrite)],
+            (
+                GitSubprocessError::Timeout { label: label() },
+                "git clone: timeout",
             ),
-        );
-        assert!(select_clone_container(&apps, "not-a-slug").is_none());
+            (
+                GitSubprocessError::SpawnFailed {
+                    label: label(),
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "no git\nhere"),
+                },
+                "git clone: spawn failed: no git here",
+            ),
+            (
+                GitSubprocessError::OutputTooLarge {
+                    label: label(),
+                    stream: crate::subprocess::OutputStream::Stderr,
+                },
+                "git clone: git output too large (stderr)",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(describe_clone_error(&error), expected, "{error:?}");
+        }
     }
 }

@@ -29,6 +29,19 @@ All notable changes to Brenn are documented here.
   See "Spawn artifacts and the runtime directory" in `docs/config-dsl.md`.
 - Tool-argument validation moved from the noop MCP stub into the server, so
   tool calls and commands are checked by the same code.
+- **New repositories are now cloned on the host, not inside the agent's
+  container.** When a configured git repo has not been cloned yet, Brenn
+  clones it at startup using the host's git and SSH setup, the same way
+  pulls and pushes already work. Previously a repo mounted read-write was
+  cloned inside the agent's container, which no longer holds SSH keys, so
+  adding any new writable repo failed. Containers never need git
+  credentials.
+- **A failed clone at startup is reported clearly.** Brenn now waits for
+  every clone to finish, logs each failure with the repo name and
+  (sanitized) git error, empties the failed target directory so the next
+  start retries cleanly, then refuses to boot with one message naming every
+  failed repo. Startup also refuses, before cloning, if a target directory
+  is non-empty but is not a git checkout.
 
 ## [0.26.1] — 2026-10-19
 

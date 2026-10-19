@@ -18,7 +18,7 @@ rust_library(
     ],
 )
 
-# 77 tests. Almost every one of them spawns real `git` or `/bin/sh` children
+# 78 tests. Almost every one of them spawns real `git` or `/bin/sh` children
 # against a temp directory, so per-test cost is fork/exec plus tempdir I/O
 # rather than the microseconds the pure sinks take: measured 0.55s for the
 # binary locally, 1.67s with `--test-threads=1`. Against the repo's one measured

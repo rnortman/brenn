@@ -1,7 +1,6 @@
 //! Shared git-subprocess helper for host-side and container-side `git` invocations.
 //!
-//! Both `repo_clone` and brenn-server's `repo_sync::git` spawn `git` as a
-//! child process.
+//! `repo_clone`, `pull` and `ops` spawn `git` as a child process.
 //! This module centralises the common concerns:
 //!
 //! - **Timeout** — 60-second wall-clock budget per invocation (one place).
@@ -28,17 +27,12 @@
 //! ## Entry points
 //!
 //! - `run_git(clone_path, args)` — host-only; builds `git -C <clone_path>
-//!   <args>` internally. Used by brenn-server's `repo_sync::git` for
-//!   operations that only
-//!   ever run on the host.
-//! - `run_with_bounded_output(cmd, label)` — accepts a pre-built
-//!   `tokio::process::Command` (from `brenn_lib::subprocess::run_in_app_env`
-//!   or any other builder). Used by `repo_clone` where the caller already
-//!   has a pre-formatted label string.
+//!   <args>` internally.
 //! - `run_with_bounded_output_lazy(cmd, make_label)` / `run_with_lossy_output_lazy`
-//!   — same but accept a closure; the label `String` is only allocated when
-//!   an error is constructed. Used by `ops` to avoid per-call label
-//!   allocations on the idle-hook success path.
+//!   — accept a pre-built `tokio::process::Command` (from
+//!   `brenn_lib::subprocess::run_in_app_env` or any other builder) and a
+//!   label closure; the label `String` is only allocated when an error is
+//!   constructed.
 //!
 //! ## Cap sizing
 //!
@@ -89,7 +83,7 @@ impl std::fmt::Display for OutputStream {
 /// Typed errors from the git subprocess helpers.
 ///
 /// Every variant carries a `label` field that identifies the invocation
-/// (e.g. `"git clone slug=foo"`, `"git status"`). `Display` prefixes every
+/// (e.g. `"git clone"`, `"git status"`). `Display` prefixes every
 /// rendering with `"{label}: "`.
 #[derive(Debug)]
 pub enum GitSubprocessError {
@@ -199,32 +193,14 @@ pub async fn run_git(clone_path: &Path, args: &[&str]) -> Result<String, GitSubp
 /// Run a pre-built `tokio::process::Command` with bounded reads, strict-UTF-8
 /// stdout, and a trailing single-newline strip on stdout.
 ///
-/// `label` is a short human-readable identifier for the invocation (e.g.
-/// `"git clone slug=foo"`, `"git status"`). It appears in all error
-/// `Display` renderings and tracing warn messages.
+/// `make_label` returns a short human-readable identifier for the invocation
+/// (e.g. `"git status"`) and is called **only** when an error variant is
+/// constructed; on the success path no label `String` is allocated.
 ///
 /// The caller is responsible for building the `Command` (e.g. via
 /// `brenn_lib::subprocess::run_in_app_env`). Stdin, stdout, stderr, and
 /// `kill_on_drop` are overwritten by this function; the caller need not set
 /// them.
-pub async fn run_with_bounded_output(
-    cmd: Command,
-    label: &str,
-) -> Result<String, GitSubprocessError> {
-    run_prepared(
-        cmd,
-        || label.to_string(),
-        GIT_CMD_TIMEOUT,
-        DecodeMode::Strict,
-    )
-    .await
-}
-
-/// Like `run_with_bounded_output` but accepts a lazy `make_label` closure that
-/// is called **only** when an error variant is constructed. On the success path
-/// no label `String` is allocated. Use from callers (e.g. `ops`) that
-/// would otherwise compute the label eagerly on every call regardless of
-/// outcome.
 pub async fn run_with_bounded_output_lazy(
     cmd: Command,
     make_label: impl Fn() -> String,
@@ -232,25 +208,13 @@ pub async fn run_with_bounded_output_lazy(
     run_prepared(cmd, make_label, GIT_CMD_TIMEOUT, DecodeMode::Strict).await
 }
 
-/// Like `run_with_lossy_output` but accepts a lazy `make_label` closure.
-/// See `run_with_bounded_output_lazy` for the motivation.
+/// Like `run_with_bounded_output_lazy` but decodes success-path stdout
+/// lossily, for callers that pass raw git output through to the LLM.
 pub async fn run_with_lossy_output_lazy(
     cmd: Command,
     make_label: impl Fn() -> String,
 ) -> Result<String, GitSubprocessError> {
     run_prepared(cmd, make_label, GIT_CMD_TIMEOUT, DecodeMode::Lossy).await
-}
-
-/// Like `run_with_bounded_output` but accepts an explicit `timeout`, used
-/// by tests to verify that the public API kills children on timeout without
-/// waiting the full `GIT_CMD_TIMEOUT` wall-clock budget.
-#[cfg(test)]
-pub(super) async fn run_with_bounded_output_for_test(
-    cmd: Command,
-    label: &str,
-    timeout: Duration,
-) -> Result<String, GitSubprocessError> {
-    run_prepared(cmd, || label.to_string(), timeout, DecodeMode::Strict).await
 }
 
 /// Stdout decode mode for the success path in `run_prepared`.
@@ -266,7 +230,7 @@ enum DecodeMode {
 /// Inner implementation: drive an already-configured `Command` with the
 /// full bounded-drain / timeout / decode pipeline.
 ///
-/// `run_git`, `run_with_bounded_output`, `run_with_bounded_output_lazy`, and
+/// `run_git`, `run_with_bounded_output_lazy`, and
 /// `run_with_lossy_output_lazy` all delegate here. Tests call this directly
 /// with a short timeout; the `#[cfg(test)] mod tests` block inside this file
 /// has access to private items in the parent module without any extra
@@ -694,10 +658,9 @@ mod tests {
         );
     }
 
-    // ── Test 8: run_with_bounded_output caps stdout ───────────────────────────
 
     #[tokio::test]
-    async fn run_with_bounded_output_caps_stdout() {
+    async fn run_with_bounded_output_lazy_caps_stdout() {
         let tmp = tempfile::TempDir::new().unwrap();
         let full_blocks = OUTPUT_BYTE_CAP / 4096;
         let script = write_script(
@@ -711,7 +674,7 @@ mod tests {
 
         let mut cmd = Command::new("/bin/sh");
         cmd.arg(&script);
-        let result = run_with_bounded_output(cmd, "test").await;
+        let result = run_with_bounded_output_lazy(cmd, || "test".to_string()).await;
 
         assert!(
             matches!(
@@ -721,14 +684,13 @@ mod tests {
                     ..
                 })
             ),
-            "expected OutputTooLarge(Stdout) via run_with_bounded_output, got {result:?}"
+            "expected OutputTooLarge(Stdout) via run_with_bounded_output_lazy, got {result:?}"
         );
     }
 
-    // ── Test 9: run_with_bounded_output strict UTF-8 ─────────────────────────
 
     #[tokio::test]
-    async fn run_with_bounded_output_strict_utf8() {
+    async fn run_with_bounded_output_lazy_strict_utf8() {
         let tmp = tempfile::TempDir::new().unwrap();
         let script = write_script(
             tmp.path(),
@@ -738,22 +700,21 @@ mod tests {
 
         let mut cmd = Command::new("/bin/sh");
         cmd.arg(&script);
-        let result = run_with_bounded_output(cmd, "test").await;
+        let result = run_with_bounded_output_lazy(cmd, || "test".to_string()).await;
 
         assert!(
             matches!(result, Err(GitSubprocessError::DecodeError { .. })),
-            "expected DecodeError via run_with_bounded_output, got {result:?}"
+            "expected DecodeError via run_with_bounded_output_lazy, got {result:?}"
         );
     }
 
-    // ── Test 10: run_with_bounded_output NonZero exposes stdout ──────────────
     //
     // Load-bearing for the repo_commit_and_push "nothing to commit" detection:
     // the helper must return stdout in the NonZero variant so callers can
     // substring-match it without a second subprocess call.
 
     #[tokio::test]
-    async fn run_with_bounded_output_nonzero_exposes_stdout() {
+    async fn run_with_bounded_output_lazy_nonzero_exposes_stdout() {
         let tmp = tempfile::TempDir::new().unwrap();
         let script = write_script(
             tmp.path(),
@@ -763,7 +724,7 @@ mod tests {
 
         let mut cmd = Command::new("/bin/sh");
         cmd.arg(&script);
-        let result = run_with_bounded_output(cmd, "test").await;
+        let result = run_with_bounded_output_lazy(cmd, || "test".to_string()).await;
 
         match result {
             Err(GitSubprocessError::NonZero {
@@ -818,62 +779,5 @@ mod tests {
                 .starts_with("git log: git stdout was not valid UTF-8"),
             "DecodeError Display missing label prefix: {err}"
         );
-    }
-
-    // ── Test 12: run_with_bounded_output kills child on timeout ──────────────
-    //
-    // Verifies the kill-on-timeout guarantee at the public API boundary.
-    // `timeout_kills_child` (test 6) exercises `run_prepared` directly with
-    // a short timeout; this test exercises `run_with_bounded_output` through
-    // the `run_with_bounded_output_for_test` helper so that any future logic
-    // interposed between the public entry and `run_prepared` is covered.
-
-    #[tokio::test]
-    async fn run_with_bounded_output_timeout_kills_child() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let pid_file = tmp.path().join("child.pid");
-        let script = write_script(
-            tmp.path(),
-            "fake-git-public-timeout",
-            &format!(
-                r#"echo $$ > "{pid_file}"; exec sleep 60"#,
-                pid_file = pid_file.display(),
-            ),
-        );
-
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg(&script);
-        let result =
-            run_with_bounded_output_for_test(cmd, "git status", Duration::from_millis(300)).await;
-
-        assert!(
-            matches!(result, Err(GitSubprocessError::Timeout { .. })),
-            "expected Timeout from run_with_bounded_output_for_test, got {result:?}"
-        );
-
-        // Wait for PID file, then verify child is dead — same pattern as test 6.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !pid_file.exists() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            pid_file.exists(),
-            "pid_file was not written — liveness check is vacuous"
-        );
-        let pid_str = std::fs::read_to_string(&pid_file).unwrap();
-        let pid: libc::pid_t = pid_str.trim().parse().unwrap();
-        let liveness_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let r = unsafe { libc::kill(pid, 0) };
-            if r != 0 {
-                break;
-            }
-            if std::time::Instant::now() >= liveness_deadline {
-                panic!(
-                    "child process {pid} still alive after timeout kill via run_with_bounded_output"
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
     }
 }
