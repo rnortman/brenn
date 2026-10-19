@@ -3365,3 +3365,30 @@ Code sites (`TODO(apple-touch-icon)`):
 
 Done = adding a Brenn page to the iOS home screen fetches only URLs Brenn
 serves, logs no `unrecognized_url` events, and shows the Brenn icon.
+
+## `guest-binary-body`
+
+`brenn-wasm/components/guest/BUILD.bazel` exports `serde` and `serde_json`
+from the guest hub so an out-of-tree crate can derive against the instance
+brenn-guest's bounds demand, and nothing else. An out-of-tree kind whose
+retained state outgrows JSON therefore has no format crate it can link: a
+`bincode` or `postcard` from its own hub implements against another serde
+instance, and a base64 crate from its own hub is a second hub in the guest.
+One out-of-tree kind already hand-writes both — a fixed-width layout and
+RFC 4648 base64 — and tracks it under the same slug. The base64 is there because
+`ports.publish` takes a `string` (`brenn-wasm/wit/processor.wit`), so a
+binary body pays 4/3 against `max_body_bytes`.
+
+Two shapes, and the choice is a design question: two more aliases from
+`wasm_crates` — a fixed-width binary format (`bincode` with fixed int
+encoding; `postcard`'s varints make a body's length depend on handle values,
+which an exact size projection cannot have) and a base64 crate — which is
+cheap and keeps the 4/3; or a byte payload on the port, which removes the
+4/3 and is a contract change on every host, harness and SDK. Decide when a
+second out-of-tree kind needs a binary body.
+
+Code sites (`TODO(guest-binary-body)`):
+`brenn-wasm/components/guest/BUILD.bazel`, at the `serde` alias.
+
+Done = an out-of-tree guest can store a binary retained body without
+writing its own codec: its state type is a derive.

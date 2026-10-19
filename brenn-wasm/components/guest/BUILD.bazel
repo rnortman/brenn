@@ -30,6 +30,8 @@ wasm_guest_library(
 # reason `//brenn-envelope` is built once per graph. A downstream component
 # names these two targets in place of a serde of its own; the alias set is
 # exactly the third-party crates that appear in brenn-guest's public API.
+# TODO(guest-binary-body): these two are the whole export; a guest that
+# wants a binary body hand-rolls its format and its base64.
 alias(
     name = "serde",
     actual = "@wasm_crates//:serde",
