@@ -952,7 +952,10 @@ mod tests {
         .expect_err("refuse_boot_on_clone_failures should panic");
         let msg = panic_payload_message(payload);
 
-        assert!(msg.contains("git clone failed for 2 repo(s)"), "message: {msg}");
+        assert!(
+            msg.contains("git clone failed for 2 repo(s)"),
+            "message: {msg}"
+        );
         assert!(
             msg.contains("unresettable-repo: git clone: timeout (unresettable-repo)"),
             "message: {msg}"
@@ -961,7 +964,10 @@ mod tests {
             msg.contains("partial-repo: git clone: timeout (partial-repo)"),
             "message: {msg}"
         );
-        assert!(msg.contains("could not reset 1 failed target(s)"), "message: {msg}");
+        assert!(
+            msg.contains("could not reset 1 failed target(s)"),
+            "message: {msg}"
+        );
         assert!(
             msg.contains(&format!("{:?}", unresettable.join(".git"))),
             "message should name the unresettable path: {msg}"

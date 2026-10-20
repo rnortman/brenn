@@ -658,7 +658,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn run_with_bounded_output_lazy_caps_stdout() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -687,7 +686,6 @@ mod tests {
             "expected OutputTooLarge(Stdout) via run_with_bounded_output_lazy, got {result:?}"
         );
     }
-
 
     #[tokio::test]
     async fn run_with_bounded_output_lazy_strict_utf8() {
