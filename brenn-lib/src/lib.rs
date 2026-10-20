@@ -11,6 +11,7 @@ pub mod mqtt;
 pub mod panic_util;
 pub mod pwa_push;
 pub mod runtime_dir;
+pub mod selinux;
 pub mod subprocess;
 #[cfg(test)]
 mod test_utils;

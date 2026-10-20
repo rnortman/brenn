@@ -4,6 +4,20 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-10-20
+
+- **Containerized agents on SELinux hosts can reach `brenn-tool`'s socket.**
+  On a host that confines containers (Fedora/RHEL with the container policy),
+  every `brenn-tool` call failed with `Permission denied`: the kernel refused
+  the container's connect to a socket labelled with the server's own domain.
+  A `container` definition's new `tool_socket_selinux_context` key labels the
+  conversation's tool socket for the container instead; on Fedora/RHEL set it
+  to `system_u:system_r:container_t:s0`. Unset (the default), nothing changes.
+  Boot stops naming the key if the host refuses the context. Brenn now logs
+  `tool socket bound` with the socket path and context for each conversation.
+  `docs/agent-tool-cli.md` "Verifying a deployment" shows how to recognise the
+  denial and choose the value.
+
 ## [0.27.0] — 2026-10-19
 
 - **Agents can run their Brenn tools as shell commands.** A new command,

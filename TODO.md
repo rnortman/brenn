@@ -1,5 +1,37 @@
 # TODOs
 
+## `brenn-tool-version`
+
+`brenn-tool --version` reports `0.0.0`: clap's `version` reads
+`CARGO_PKG_VERSION`, and `brenn-tool/BUILD.bazel` sets no `version`, so
+rules_rust leaves it at the default. The server carries a stamped `build_id`
+and releases carry a `VERSION` file; whether the agent-facing CLI should report
+the release's build id or drop the flag is a user-visible change to that CLI
+and needs deciding first.
+
+Code sites (`TODO(brenn-tool-version)`): `brenn-tool/src/main.rs`, at the
+`#[command(...)]` attribute.
+
+Done = `brenn-tool --version` reports the release's build id, or the flag is
+gone.
+
+## `test-selinux-positive-paths-silently-skip`
+
+The SELinux labelling tests that need a kernel accepting a context
+(`brenn-lib/src/selinux.rs`, the labelled `ToolSocket` test, the boot probe's
+usable-context test) return early, with one stderr line, wherever
+`/sys/fs/selinux/enforce` is unreadable, and are then reported as passed. They
+run only where `make check` runs on an SELinux host; public CI is
+`ubuntu-latest` and has none. A labelling, clear-on-panic or probe-cleanup
+regression merged through public CI alone goes untested. Closing this needs a
+CI lane with SELinux enforcing, which is a project infrastructure decision, and
+in that lane a switch that turns the skip into a failure.
+
+Code sites (`TODO(test-selinux-positive-paths-silently-skip)`):
+`brenn-lib/src/selinux.rs`, at `test_context`.
+
+Done = an SELinux-enforcing lane runs these tests, and a skip there fails.
+
 ## `harness-host-rule-parity`
 
 `surface/page-harness` sells itself, and `docs/component-packages.md` sells it,

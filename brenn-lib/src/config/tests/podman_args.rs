@@ -27,6 +27,7 @@ fn base_podman_args_includes_repo_mounts() {
         ],
         extra_mounts: vec![],
         extra_args: vec![],
+        tool_socket_selinux_context: None,
     };
 
     let args = spawn.base_podman_args();
@@ -61,6 +62,7 @@ fn base_podman_args_skips_working_dir_mount_when_repo() {
         }],
         extra_mounts: vec![],
         extra_args: vec![],
+        tool_socket_selinux_context: None,
     };
 
     let args = spawn.base_podman_args();
@@ -90,6 +92,7 @@ fn base_podman_args_includes_working_dir_mount_when_not_repo() {
         repo_mounts: vec![],
         extra_mounts: vec![],
         extra_args: vec![],
+        tool_socket_selinux_context: None,
     };
 
     let args = spawn.base_podman_args();

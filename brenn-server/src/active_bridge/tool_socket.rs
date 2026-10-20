@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
 use brenn_lib::integration::CliAccess;
 use brenn_lib::runtime_dir::{recreate_private_dir, tool_socket_dir, tool_socket_in};
+use brenn_lib::selinux::bind_listener;
 use brenn_obs::security::{SecurityEventType, log_app_security_event};
 use brenn_tool_proto::{CatalogEntry, MAX_REQUEST_BYTES, Request, Response, WireError};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -82,6 +83,9 @@ pub struct ToolSocket {
     accept_task: JoinHandle<()>,
     shared: Arc<Shared>,
     closed: AtomicBool,
+    /// The listening socket's fd, open while the accept task runs.
+    #[cfg(test)]
+    listener_fd: std::os::fd::RawFd,
 }
 
 impl ToolSocket {
@@ -89,11 +93,21 @@ impl ToolSocket {
     /// directory, removing whatever an earlier socket for the conversation
     /// left at that path, and start accepting. Must run inside a tokio
     /// runtime.
-    pub fn bind(tool_socket_root: &Path, app_slug: &str, conversation_id: i64) -> io::Result<Self> {
+    ///
+    /// With `selinux_context`, the listening socket (and so every connection
+    /// it accepts) carries that SELinux label instead of the server's domain,
+    /// so a confined container may `connectto` it.
+    pub fn bind(
+        tool_socket_root: &Path,
+        app_slug: &str,
+        conversation_id: i64,
+        selinux_context: Option<&str>,
+    ) -> io::Result<Self> {
         Self::bind_with_read_deadline(
             tool_socket_root,
             app_slug,
             conversation_id,
+            selinux_context,
             REQUEST_READ_DEADLINE,
         )
     }
@@ -102,14 +116,34 @@ impl ToolSocket {
         tool_socket_root: &Path,
         app_slug: &str,
         conversation_id: i64,
+        selinux_context: Option<&str>,
         read_deadline: Duration,
     ) -> io::Result<Self> {
         let dir = tool_socket_dir(tool_socket_root, app_slug, conversation_id);
         recreate_private_dir(&dir)?;
         let socket_path = tool_socket_in(&dir);
-        let listener = UnixListener::bind(&socket_path).map_err(|e| {
-            io::Error::new(e.kind(), format!("binding {}: {e}", socket_path.display()))
-        })?;
+        // Bound with std on this thread, so the socket is created inside the
+        // labelling guard, then handed to tokio.
+        let std_listener = bind_listener(&socket_path, selinux_context)?;
+        let listener = std_listener
+            .set_nonblocking(true)
+            .and_then(|()| UnixListener::from_std(std_listener))
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "handing the listener at {} to tokio: {e}",
+                        socket_path.display()
+                    ),
+                )
+            })?;
+        tracing::info!(
+            app = %app_slug,
+            conversation_id,
+            path = %socket_path.display(),
+            selinux_context = selinux_context.unwrap_or("none"),
+            "tool socket bound"
+        );
         let shared = Arc::new(Shared {
             app_slug: app_slug.to_string(),
             conversation_id,
@@ -117,12 +151,16 @@ impl ToolSocket {
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             read_deadline,
         });
+        #[cfg(test)]
+        let listener_fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
         let accept_task = tokio::spawn(accept_loop(listener, shared.clone()));
         Ok(Self {
             dir,
             accept_task,
             shared,
             closed: AtomicBool::new(false),
+            #[cfg(test)]
+            listener_fd,
         })
     }
 
@@ -401,7 +439,7 @@ mod tests {
     use crate::active_bridge::test_support::test_bridge;
 
     fn bind_in(root: &Path) -> ToolSocket {
-        ToolSocket::bind(root, "testapp", 42).unwrap()
+        ToolSocket::bind(root, "testapp", 42, None).unwrap()
     }
 
     /// Send `bytes`, close the write side, and read the one response line.
@@ -733,6 +771,7 @@ mod tests {
             root.path(),
             "testapp",
             42,
+            None,
             std::time::Duration::from_millis(200),
         )
         .unwrap();
@@ -848,9 +887,51 @@ mod tests {
     async fn bind_refuses_a_non_directory_in_the_way() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("testapp-conv42"), b"").unwrap();
-        let err = ToolSocket::bind(root.path(), "testapp", 42).err().unwrap();
+        let err = ToolSocket::bind(root.path(), "testapp", 42, None)
+            .err()
+            .unwrap();
         assert_eq!(err.kind(), io::ErrorKind::NotADirectory, "{err}");
         assert!(err.to_string().contains("testapp-conv42"), "{err}");
+    }
+
+    /// Refused with or without SELinux on the host, naming the context.
+    #[tokio::test]
+    async fn bind_refuses_a_context_the_kernel_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let err = ToolSocket::bind(root.path(), "testapp", 42, Some("not-a-context"))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("not-a-context"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("setting the socket-creation context"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_labelled_socket_serves_like_an_unlabelled_one() {
+        let Some(ctx) =
+            brenn_lib::selinux::test_context("a_labelled_socket_serves_like_an_unlabelled_one")
+        else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let (bridge, _e, _b, _a) = test_bridge().await;
+        let s = ToolSocket::bind(root.path(), "testapp", 42, Some(&ctx)).unwrap();
+        s.attach(Arc::downgrade(&bridge));
+        assert_eq!(
+            brenn_lib::selinux::socket_label(s.listener_fd),
+            ctx,
+            "the listener tokio accepts on carries the configured label"
+        );
+        assert!(matches!(
+            send(&sock(&s), &Request::List).await,
+            Response::Ok(_)
+        ));
+        assert!(logs_contain("tool socket bound"));
+        assert!(logs_contain(&ctx));
     }
 
     #[test]

@@ -786,6 +786,7 @@ async fn a_respawn_mounts_the_bridges_tool_socket() {
         repo_mounts: vec![],
         extra_mounts: vec![],
         extra_args: vec![],
+        tool_socket_selinux_context: None,
     });
     let (alert_dispatcher, _h) = noop_alert_dispatcher();
     let host = ServerSwapHost {

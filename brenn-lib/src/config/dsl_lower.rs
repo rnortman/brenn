@@ -1523,6 +1523,7 @@ fn container(body: &mut Body, errors: &mut Vec<Diagnostic>) -> ContainerConfig {
             .unwrap_or_else(default_container_home),
         extra_mounts: body.strings("extra_mounts", errors).unwrap_or_default(),
         extra_args: body.strings("extra_args", errors).unwrap_or_default(),
+        tool_socket_selinux_context: body.str("tool_socket_selinux_context", errors),
     }
 }
 

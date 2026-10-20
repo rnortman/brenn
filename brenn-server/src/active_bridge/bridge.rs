@@ -411,6 +411,24 @@ fn spawn_model_and_seed(
     (model, seed)
 }
 
+/// Bind the conversation's tool socket, labelled with the app's container
+/// definition's `tool_socket_selinux_context` when it sets one.
+fn bind_tool_socket(
+    app_config: &brenn_lib::config::AppConfig,
+    conversation_id: i64,
+) -> Result<super::tool_socket::ToolSocket, String> {
+    super::tool_socket::ToolSocket::bind(
+        &app_config.tool_socket_root,
+        &app_config.slug,
+        conversation_id,
+        app_config
+            .container_spawn
+            .as_ref()
+            .and_then(|c| c.tool_socket_selinux_context.as_deref()),
+    )
+    .map_err(|e| format!("failed to bind the tool socket: {e}"))
+}
+
 impl ActiveBridge {
     /// Spawn a new CC session and start the event loop task.
     ///
@@ -490,12 +508,7 @@ impl ActiveBridge {
 
         // Bound before the container exists so its directory can be mounted;
         // an early return below drops it, which removes the directory.
-        let tool_socket = super::tool_socket::ToolSocket::bind(
-            &app_config.tool_socket_root,
-            &app_config.slug,
-            conversation_id,
-        )
-        .map_err(|e| format!("failed to bind the tool socket: {e}"))?;
+        let tool_socket = bind_tool_socket(app_config, conversation_id)?;
 
         // Run start hooks for new conversations (not resume).
         let hook_warnings = if resume_session_id.is_none() {
@@ -1125,6 +1138,38 @@ mod tests {
             ("opus".to_string(), Some("opus".to_string())),
             "the seed follows the override, not the app default"
         );
+    }
+
+    /// The spawn binds its tool socket under the container definition's
+    /// context: one the kernel refuses fails the bind, on every host.
+    #[tokio::test]
+    async fn the_tool_socket_binds_under_the_container_context() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app_config = brenn_lib::config::test_app_config("testapp");
+        app_config.tool_socket_root = root.path().to_path_buf();
+        app_config.container_spawn = Some(brenn_lib::config::ContainerSpawnConfig {
+            image: "brenn-cc:latest".into(),
+            home_dir: std::path::PathBuf::from("/host/home/test"),
+            container_home: std::path::PathBuf::from("/home/user"),
+            host_working_dir: std::path::PathBuf::from("/host/home/test/work"),
+            container_working_dir: std::path::PathBuf::from("/home/user/work"),
+            working_dir_is_repo: false,
+            repo_mounts: vec![],
+            extra_mounts: vec![],
+            extra_args: vec![],
+            tool_socket_selinux_context: Some("not-a-context".into()),
+        });
+        let err = bind_tool_socket(&app_config, 7).err().unwrap();
+        assert!(err.starts_with("failed to bind the tool socket: "), "{err}");
+        assert!(err.contains("\"not-a-context\""), "{err}");
+
+        app_config
+            .container_spawn
+            .as_mut()
+            .unwrap()
+            .tool_socket_selinux_context = None;
+        let socket = bind_tool_socket(&app_config, 7).unwrap();
+        assert!(socket.host_dir().join("tool.sock").exists());
     }
 
     /// A resumed spawn is not seeded, so the first send re-asserts the

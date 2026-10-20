@@ -978,6 +978,7 @@ container cc {
     container_home = "/home/bob";
     extra_mounts = ["/srv/shared:/srv/shared"];
     extra_args = ["--pids-limit", "512"];
+    tool_socket_selinux_context = "system_u:system_r:container_t:s0";
 }
 "#,
         BrennConfig {
@@ -1119,6 +1120,9 @@ container cc {
                     container_home: PathBuf::from("/home/bob"),
                     extra_mounts: vec!["/srv/shared:/srv/shared".to_string()],
                     extra_args: vec!["--pids-limit".to_string(), "512".to_string()],
+                    tool_socket_selinux_context: Some(
+                        "system_u:system_r:container_t:s0".to_string(),
+                    ),
                 },
             )]),
             ..Default::default()
@@ -1176,6 +1180,7 @@ container cc {
                     container_home: default_container_home(),
                     extra_mounts: vec![],
                     extra_args: vec![],
+                    tool_socket_selinux_context: None,
                 },
             )]),
             ..Default::default()

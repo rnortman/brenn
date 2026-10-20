@@ -77,6 +77,9 @@ fn assert_build_id_valid(build_id: &str) {
 /// roots: a broken install is refused whether or not this configuration
 /// instantiates the name.
 ///
+/// A referenced container definition's `tool_socket_selinux_context` is probed
+/// here too: a context the host refuses would fail every spawn of it.
+///
 /// The same holds for the files every spawn hands to Claude Code: the noop MCP
 /// server always, and the `brenn-tool` binary whenever some app is
 /// containerized (it is the source of a bind mount). Both come back
@@ -112,6 +115,7 @@ fn assert_boot_preconditions(
     } else {
         defaults.tool_cli_path.clone()
     };
+    assert_tool_socket_labels_bind(config);
     let bare_tool_cli = config.apps.iter().any(|a| a.container.is_none()).then(|| {
         find_executable_on_path(path_var, TOOL_CLI_NAME).unwrap_or_else(|| {
             panic!(
@@ -125,6 +129,36 @@ fn assert_boot_preconditions(
         mcp_script_path,
         tool_cli_path,
         bare_tool_cli,
+    }
+}
+
+/// For every container definition some app references that sets
+/// `tool_socket_selinux_context`, bind a throwaway listener under that context
+/// the way a spawn binds the tool socket, and panic if the host refuses. This
+/// proves the server's side only: whether the container's domain may
+/// `connectto` the socket is the client's side of the host policy.
+fn assert_tool_socket_labels_bind(config: &BrennConfig) {
+    let mut labelled: Vec<(&String, &str)> = config
+        .container
+        .iter()
+        .filter(|(name, _)| {
+            config
+                .apps
+                .iter()
+                .any(|a| a.container.as_deref() == Some(name.as_str()))
+        })
+        .filter_map(|(name, c)| Some((name, c.tool_socket_selinux_context.as_deref()?)))
+        .collect();
+    labelled.sort();
+    for (name, context) in labelled {
+        if let Err(e) = brenn_lib::selinux::probe_sockcreate(context) {
+            panic!(
+                "container {name}.tool_socket_selinux_context = {context:?}: {e}: the context \
+                 must be valid for the loaded SELinux policy, and the server's domain must hold \
+                 process {{ setsockcreate }} and may create, bind and listen on a \
+                 unix_stream_socket of that label"
+            );
+        }
     }
 }
 
@@ -1640,6 +1674,72 @@ mod tests {
             Some(good.join("brenn-tool"))
         );
         assert_eq!(find_executable_on_path(Some(&path), "absent"), None);
+    }
+
+    /// `containerized_artifacts_config` with its `sandbox` definition, whose
+    /// tool socket context is `context`, and an unreferenced `spare`
+    /// definition whose context is `spare_context`.
+    fn labelled_config(
+        context: Option<&str>,
+        spare_context: Option<&str>,
+    ) -> (tempfile::TempDir, BrennConfig) {
+        let (dir, mut config) = containerized_artifacts_config();
+        let definition = |ctx: Option<&str>| brenn_lib::config::ContainerConfig {
+            image: "brenn-cc:latest".to_string(),
+            home_dir: dir.path().to_path_buf(),
+            container_home: PathBuf::from("/home/user"),
+            extra_mounts: vec![],
+            extra_args: vec![],
+            tool_socket_selinux_context: ctx.map(str::to_string),
+        };
+        config.container = std::collections::HashMap::from([
+            ("sandbox".to_string(), definition(context)),
+            ("spare".to_string(), definition(spare_context)),
+        ]);
+        (dir, config)
+    }
+
+    /// Refused with or without SELinux on the host: the context-setting step
+    /// fails either way.
+    #[test]
+    #[should_panic(
+        expected = "container sandbox.tool_socket_selinux_context = \"not-a-context\": setting the socket-creation context failed"
+    )]
+    fn a_referenced_container_with_an_unusable_socket_context_is_refused() {
+        let (dir, config) = labelled_config(Some("not-a-context"), None);
+        assert_boot_preconditions(
+            "test-build",
+            &Roots::default(),
+            &config,
+            Some(&tool_path(&dir)),
+        );
+    }
+
+    #[test]
+    fn a_referenced_container_with_a_usable_socket_context_boots() {
+        let Some(ctx) = brenn_lib::selinux::test_context(
+            "a_referenced_container_with_a_usable_socket_context_boots",
+        ) else {
+            return;
+        };
+        let (dir, config) = labelled_config(Some(&ctx), None);
+        assert_boot_preconditions(
+            "test-build",
+            &Roots::default(),
+            &config,
+            Some(&tool_path(&dir)),
+        );
+    }
+
+    #[test]
+    fn an_unreferenced_container_socket_context_is_not_probed() {
+        let (dir, config) = labelled_config(None, Some("not-a-context"));
+        assert_boot_preconditions(
+            "test-build",
+            &Roots::default(),
+            &config,
+            Some(&tool_path(&dir)),
+        );
     }
 
     /// A containerized-only config has no bare app and does not walk `PATH`.

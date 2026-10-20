@@ -229,6 +229,7 @@ mod tests {
             repo_mounts: vec![],
             extra_mounts: vec![],
             extra_args: vec![],
+            tool_socket_selinux_context: None,
         };
         let cmd = run_in_app_env(
             "graf",
@@ -264,6 +265,7 @@ mod tests {
             repo_mounts: vec![],
             extra_mounts: vec![],
             extra_args: vec![],
+            tool_socket_selinux_context: None,
         };
         let cmd = run_in_app_env(
             "pf",
@@ -301,6 +303,7 @@ mod tests {
             repo_mounts: vec![],
             extra_mounts: vec![],
             extra_args: vec![],
+            tool_socket_selinux_context: None,
         };
         let cmd = run_in_app_env(
             "pf",
@@ -335,6 +338,7 @@ mod tests {
             repo_mounts: vec![],
             extra_mounts: vec![],
             extra_args: vec![],
+            tool_socket_selinux_context: None,
         };
         let cmd = run_in_app_env(
             "graf",
@@ -366,6 +370,7 @@ mod tests {
             repo_mounts: vec![],
             extra_mounts: vec![],
             extra_args: vec![],
+            tool_socket_selinux_context: None,
         };
         let cmd = run_in_app_env(
             "pf",

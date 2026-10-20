@@ -22,6 +22,11 @@ pub struct ContainerConfig {
     pub extra_mounts: Vec<String>,
     /// Extra `podman run` arguments for things we haven't anticipated.
     pub extra_args: Vec<String>,
+    /// SELinux context the conversation's tool socket listener is created
+    /// under, so processes in this definition's containers may `connectto`
+    /// it (e.g. `system_u:system_r:container_t:s0` under the Fedora/RHEL
+    /// container policy). Unset: the listener carries the server's own domain.
+    pub tool_socket_selinux_context: Option<String>,
 }
 
 pub(crate) fn default_container_home() -> PathBuf {
@@ -69,6 +74,9 @@ pub struct ContainerSpawnConfig {
     pub extra_mounts: Vec<String>,
     /// Extra podman run arguments.
     pub extra_args: Vec<String>,
+    /// SELinux context the tool socket listener is created under; see
+    /// [`ContainerConfig::tool_socket_selinux_context`].
+    pub tool_socket_selinux_context: Option<String>,
 }
 
 /// A bind mount for a repo in a container.

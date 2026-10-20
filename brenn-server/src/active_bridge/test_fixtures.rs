@@ -299,7 +299,7 @@ fn fixture_tool_socket(app_slug: &str, conversation_id: i64) -> super::tool_sock
             .to_string(),
     );
     std::fs::create_dir(&dir).expect("fixture tool socket root");
-    super::tool_socket::ToolSocket::bind(&dir, app_slug, conversation_id)
+    super::tool_socket::ToolSocket::bind(&dir, app_slug, conversation_id, None)
         .expect("bind a fixture tool socket")
 }
 

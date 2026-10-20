@@ -34,6 +34,8 @@ use tokio::net::UnixStream;
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Parser)]
+// TODO(brenn-tool-version): `version` reads `CARGO_PKG_VERSION`, which the
+// Bazel build leaves at `0.0.0`.
 #[command(
     name = "brenn-tool",
     version,

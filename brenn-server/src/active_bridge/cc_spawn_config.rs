@@ -640,6 +640,7 @@ mod tests {
             repo_mounts: vec![],
             extra_mounts: vec![],
             extra_args: vec![],
+            tool_socket_selinux_context: None,
         }
     }
 

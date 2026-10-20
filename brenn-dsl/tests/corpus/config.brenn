@@ -118,6 +118,7 @@ container cc {
     container_home = "/home/user";
     extra_mounts = ["/srv/shared:/srv/shared"];
     extra_args = ["--pids-limit", "512"];
+    tool_socket_selinux_context = "system_u:system_r:container_t:s0";
 }
 
 /// Global defaults for one integration: an open body, so any key the

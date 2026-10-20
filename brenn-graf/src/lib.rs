@@ -550,6 +550,7 @@ default_slug = "life"
                 repo_mounts: vec![],
                 extra_mounts: vec![],
                 extra_args: vec![],
+                tool_socket_selinux_context: None,
             }),
             mounts: vec![mount],
             state_dir: state_dir.clone(),

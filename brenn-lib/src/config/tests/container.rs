@@ -23,6 +23,7 @@ fn validate_container_app_resolves_correctly() {
                 container_home: PathBuf::from("/home/user"),
                 extra_mounts: vec![],
                 extra_args: vec![],
+                tool_socket_selinux_context: Some("system_u:system_r:container_t:s0".to_string()),
             },
         )]),
         apps: vec![AppConfigRaw {
@@ -58,6 +59,10 @@ fn validate_container_app_resolves_correctly() {
     assert_eq!(spawn.image, "brenn-cc:latest");
     assert_eq!(spawn.home_dir, home_dir.path());
     assert_eq!(spawn.container_home, PathBuf::from("/home/user"));
+    assert_eq!(
+        spawn.tool_socket_selinux_context.as_deref(),
+        Some("system_u:system_r:container_t:s0")
+    );
     assert_eq!(
         spawn.container_working_dir,
         PathBuf::from("/home/user/work")
@@ -151,6 +156,7 @@ fn tool_socket_root_is_under_the_runtime_dir_for_every_app() {
                 container_home: PathBuf::from("/home/user"),
                 extra_mounts: vec![],
                 extra_args: vec![],
+                tool_socket_selinux_context: None,
             },
         )]),
         apps: vec![
@@ -242,6 +248,7 @@ fn validate_app_extra_mounts_appended_after_container_extra_mounts() {
                 container_home: PathBuf::from("/home/user"),
                 extra_mounts: vec!["/host/cmount:/container/cmount:ro,z".to_string()],
                 extra_args: vec![],
+                tool_socket_selinux_context: None,
             },
         )]),
         apps: vec![AppConfigRaw {
@@ -346,6 +353,7 @@ fn validate_container_without_working_dir_panics() {
                 container_home: PathBuf::from("/home/user"),
                 extra_mounts: vec![],
                 extra_args: vec![],
+                tool_socket_selinux_context: None,
             },
         )]),
         apps: vec![AppConfigRaw {
@@ -380,6 +388,7 @@ fn validate_relative_container_working_dir_panics() {
                 container_home: PathBuf::from("/home/user"),
                 extra_mounts: vec![],
                 extra_args: vec![],
+                tool_socket_selinux_context: None,
             },
         )]),
         apps: vec![AppConfigRaw {
@@ -414,6 +423,7 @@ fn validate_nonexistent_container_home_dir_panics() {
                 container_home: PathBuf::from("/home/user"),
                 extra_mounts: vec![],
                 extra_args: vec![],
+                tool_socket_selinux_context: None,
             },
         )]),
         apps: vec![AppConfigRaw {

@@ -1992,6 +1992,7 @@ vocabulary! {
         opt container_home: V,
         opt extra_mounts: V,
         opt extra_args: V,
+        opt tool_socket_selinux_context: V,
     }
 }
 

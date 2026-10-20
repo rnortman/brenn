@@ -1252,6 +1252,15 @@ nothing to what a bare CC can already do as that uid.
   connection under a byte cap; a bounded time to send it; a bounded number of
   open requests per conversation, beyond which a connection is answered `busy`
   before any of its bytes are read. No waiting gate sits in front of any tool.
+- **The listener carries the container's label, never the server's widened
+  policy.** Where the host confines containers with SELinux, the socket is
+  created under the context configured on the container definition, so the
+  confined container may connect to this one object. No host rule allows
+  containers to `connectto` the server's own domain: agent containers share
+  the host network namespace, and such a rule would open every
+  abstract-namespace listener of that domain on the host to every container.
+  The labelling context is cleared on the creating thread before it does
+  anything else, so no other socket the server creates carries it.
 - **Protocol violations are a security signal, sender-attributed.** A
   malformed, oversize or unterminated request is answered and recorded as a
   `ToolSocketViolation` event attributed by app and conversation, with the
@@ -1263,7 +1272,9 @@ nothing to what a bare CC can already do as that uid.
 hook path would prompt for; any socket, or socket directory, mounted into a
 container that is not the conversation's agent; any per-call policy (grant,
 ACL, budget, rate, validation, publish-denial signal) applied on one origin and
-not the other; any unbounded read on the socket.
+not the other; any unbounded read on the socket; any proposal to allow
+`container_t → unconfined_t connectto` (or the server's domain, whatever it
+is), or to run agent containers with `label=disable`.
 
 ---
 

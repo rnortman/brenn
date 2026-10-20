@@ -199,6 +199,16 @@ fn a_container_block_carries_its_name_and_requires_its_image() {
     );
     assert!(matches!(container.attrs.image.value.value(), Value::Str(_)));
     assert!(container.attrs.extra_args.is_some());
+    assert!(matches!(
+        container
+            .attrs
+            .tool_socket_selinux_context
+            .as_ref()
+            .expect("the socket's SELinux context")
+            .value
+            .value(),
+        Value::Str(_)
+    ));
 
     let error = typed_str("container cc { home_dir = \"/home/alice\"; }\n")
         .expect_err("an image is required");

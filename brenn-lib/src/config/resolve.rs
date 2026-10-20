@@ -704,6 +704,7 @@ pub fn resolve_apps(
                 repo_mounts: repo_bind_mounts,
                 extra_mounts,
                 extra_args: container.extra_args.clone(),
+                tool_socket_selinux_context: container.tool_socket_selinux_context.clone(),
             };
 
             (mapper, Some(spawn))

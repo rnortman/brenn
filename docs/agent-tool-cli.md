@@ -155,5 +155,20 @@ On a host running containerized agents, before relying on the socket:
 1. From a conversation, run `brenn-tool list`, then
    `brenn-tool call MessageChannelList`. Success proves the container's
    security label and user-namespace mapping admit the connection.
+
+   A `connect` error with `Permission denied` from a container that can see
+   the socket file is an SELinux `connectto` denial on the listener. On the
+   host, grep `/var/log/audit/audit.log` for `connectto` and `tool.sock`
+   (`ausearch -ts today` has been seen to return nothing while the records
+   were there). The remedy is `tool_socket_selinux_context` on the
+   `container` definition. The AVC's `scontext` is the container's domain;
+   the value is that context's `user:role:type` at level `s0` — for
+   `scontext=system_u:system_r:container_t:s0:c510,c623`, it is
+   `system_u:system_r:container_t:s0`. Set it and restart; boot refuses the
+   value if the server's domain cannot create sockets under it. Leave the key
+   unset until the AVC has been seen: a guessed value stops the server at
+   boot, an unset key is this diagnosable failure. With the key set, Brenn's
+   log shows `tool socket bound` with the context for each conversation, and
+   the audit log gains no `connectto` denial for `tool.sock`.
 2. `podman exec` into one of the app's hook containers and confirm
    `BRENN_TOOL_SOCKET` is not set there.

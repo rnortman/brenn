@@ -466,6 +466,7 @@ fn mount_working_dir_with_container_working_dir_panics() {
             container_home: PathBuf::from("/home/user"),
             extra_mounts: vec![],
             extra_args: vec![],
+            tool_socket_selinux_context: None,
         },
     );
     config.apps[0].container = Some("sandbox".to_string());
@@ -562,6 +563,7 @@ fn containerized_mount_resolves_path_mapper_and_repo_mounts() {
             container_home: PathBuf::from("/home/user"),
             extra_mounts: vec![],
             extra_args: vec![],
+            tool_socket_selinux_context: None,
         },
     );
     config.apps[0].container = Some("sandbox".to_string());

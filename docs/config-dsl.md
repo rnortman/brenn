@@ -374,6 +374,31 @@ exceed the 107-byte unix socket path limit is refused at load, naming the
 limit. An agent `env` naming `BRENN_TOOL_SOCKET` is refused: Brenn sets it for
 every conversation.
 
+On a host whose SELinux policy confines containers (enforcing targeted policy,
+`container_t` agents), the agent cannot connect to a listener carrying the
+server's own domain: the socket file's `:z` relabel admits the write, but the
+`connectto` check is against the listening socket's label. A `container`
+definition's `tool_socket_selinux_context` names the SELinux context every
+conversation's tool socket of that definition is created under:
+
+```
+container cc {
+  image = "brenn-cc:latest";
+  home_dir = "/home/alice/container-home";
+  tool_socket_selinux_context = "system_u:system_r:container_t:s0";
+}
+```
+
+That value is the one for the Fedora/RHEL container policy. Unset (the
+default), the listener keeps the server's domain and nothing is written. When
+set, boot binds a throwaway listener under the context for every definition
+some agent references, and stops naming the key if the kernel refuses the
+context or the server's domain may not create, bind and listen on a socket of
+that label. A refusal after boot (the policy changed under a running server)
+fails that conversation's spawn. Changing the key is refused by reload, like
+any container-definition change; restart to apply it. Choosing the value is in
+[the tool CLI guide](agent-tool-cli.md#verifying-a-deployment).
+
 ### Values and constants
 
 Values are strings, f-strings, raw strings (`"""…"""`), integers, floats,
