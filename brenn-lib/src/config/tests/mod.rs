@@ -141,6 +141,7 @@ fn minimal_app_config_for_budget_test(
         history_replay_limit: 2000,
         frontmatter: FrontmatterRenderConfig::default(),
         state_dir: PathBuf::from("/tmp/.brenn/test-state"),
+        tool_socket_root: PathBuf::from("/tmp/.brenn/brenn-tool-sockets"),
         messaging,
         messaging_default_send_budget: global_default,
         policy: std::sync::Arc::new(crate::access::AppPolicy::default()),

@@ -26,12 +26,52 @@ fn validate_resolves_defaults() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     assert_eq!(apps.len(), 1);
     let app = &apps["pfin"];
     assert_eq!(app.name, "pfin"); // defaults to slug
     assert_eq!(app.model, "sonnet"); // from claude_defaults
+}
+
+/// Resolution creates the tool socket root at 0700 and leaves what is already
+/// under the runtime dir alone: another server under this uid may hold live
+/// sockets there.
+#[test]
+fn validate_creates_the_tool_socket_root_without_clearing_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime_dir = crate::runtime_dir::validate_runtime_dir(runtime.path().to_path_buf());
+    let config = BrennConfig {
+        server: super::test_server_config(),
+        apps: vec![AppConfigRaw {
+            slug: "pfin".to_string(),
+            working_dir: Some(work.path().to_path_buf()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let resolve = || {
+        validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), &runtime_dir);
+    };
+
+    resolve();
+    let root = crate::runtime_dir::tool_socket_root(&runtime_dir);
+    let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+
+    let other = crate::runtime_dir::tool_socket_dir(&root, "e2e", 1);
+    std::fs::create_dir(&other).unwrap();
+    std::fs::write(crate::runtime_dir::tool_socket_in(&other), b"").unwrap();
+    let state = runtime_dir.join("brenn").join("pfin");
+    std::fs::write(state.join("keep"), b"x").unwrap();
+
+    resolve();
+    assert!(crate::runtime_dir::tool_socket_in(&other).exists());
+    assert!(state.join("keep").is_file());
 }
 
 #[test]
@@ -58,7 +98,7 @@ fn validate_per_app_model_override() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     let app = &apps["pfin"];
     assert_eq!(app.name, "Personal Finance");
@@ -99,7 +139,7 @@ fn resolve_models_config(config: &BrennConfig) -> ResolvedConfig {
     validate_and_resolve(
         config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     )
 }
 
@@ -172,7 +212,11 @@ fn models_excluding_claude_defaults_fallback_is_a_config_error() {
 #[should_panic(expected = "at least one [[app]] must be defined")]
 fn validate_no_apps_panics() {
     let config = BrennConfig::default();
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -188,7 +232,11 @@ fn validate_invalid_slug_uppercase_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -204,7 +252,11 @@ fn validate_invalid_slug_leading_hyphen_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -220,7 +272,11 @@ fn validate_invalid_slug_special_chars_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -246,7 +302,7 @@ fn validate_duplicate_slugs_panics() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 
@@ -262,7 +318,11 @@ fn validate_nonexistent_working_dir_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -281,7 +341,11 @@ fn validate_singleton_multiuser_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -299,7 +363,11 @@ fn validate_multiuser_without_allowed_users_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -316,7 +384,11 @@ fn validate_singleton_requires_compaction() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -333,7 +405,11 @@ fn validate_compaction_without_singleton_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -353,7 +429,11 @@ fn validate_compaction_soft_exceeds_hard_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -374,7 +454,11 @@ fn validate_compaction_soft_exceeds_default_hard_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -392,7 +476,11 @@ fn validate_compaction_reminder_exceeds_soft_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -412,7 +500,11 @@ fn validate_compaction_red_exceeds_hard_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 /// Build a minimal singleton `AppConfigRaw` with the given
@@ -451,7 +543,11 @@ fn validate_compaction_reminder_tokens_exceeds_soft_panics() {
         )],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -469,7 +565,11 @@ fn validate_compaction_soft_tokens_exceeds_red_panics() {
         )],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -487,7 +587,11 @@ fn validate_compaction_red_tokens_exceeds_hard_panics() {
         )],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -505,7 +609,11 @@ fn validate_compaction_reminder_tokens_below_1000_panics() {
         )],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -528,7 +636,7 @@ fn validate_compaction_soft_tokens_only_succeeds() {
     let ResolvedConfig { apps: resolved, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     let app = resolved.values().next().expect("one app resolved");
     let comp = app.compaction.as_ref().expect("compaction populated");
@@ -564,7 +672,7 @@ fn validate_compaction_mixed_pct_and_tokens_succeeds() {
     let ResolvedConfig { apps: resolved, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     let app = resolved.values().next().expect("one app resolved");
     let comp = app.compaction.as_ref().expect("compaction populated");
@@ -595,7 +703,7 @@ fn validate_compaction_idle_default_is_270() {
     let ResolvedConfig { apps: resolved, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     let app = resolved.values().next().expect("one app resolved");
     let comp = app.compaction.as_ref().expect("compaction populated");
@@ -785,7 +893,7 @@ fn validate_resolves_app_mqtt_subscriptions() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     let app = &apps["pa"];
     assert_eq!(
@@ -867,7 +975,7 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 
@@ -903,7 +1011,7 @@ fn validate_unknown_client_subscription_panics() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 
@@ -986,7 +1094,7 @@ fn validate_resolves_explicit_grants_and_acl_into_policy() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     let policy = &apps["home"].policy;
@@ -1064,7 +1172,7 @@ fn validate_app_without_grants_resolves_default_deny_policy() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     let policy = &apps["home"].policy;
@@ -1102,7 +1210,7 @@ fn validate_derives_chat_tree_authority_for_every_app() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     let harness = &apps["home"].chat_harness_policy;
@@ -1165,7 +1273,7 @@ fn validate_app_without_authored_grants_gets_no_bus_send_tool() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     let names: Vec<String> = crate::integration::core_virtual_tools(&apps["home"])
@@ -1208,7 +1316,7 @@ fn validate_dynamic_subscribe_does_not_reach_the_chat_tree() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     let policy = &apps["home"].policy;
@@ -1247,7 +1355,7 @@ fn validate_publish_grant_without_matcher_resolves_deny_all_no_panic() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     let policy = &apps["home"].policy;
@@ -1290,7 +1398,7 @@ fn validate_publish_grant_with_matchers_resolves_covering_policy() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     let policy = &apps["pa-alice"].policy;
@@ -1327,7 +1435,7 @@ fn validate_mqtt_publish_grant_without_matcher_resolves_deny_all_no_panic() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     let policy = &apps["home"].policy;
@@ -1369,7 +1477,7 @@ fn validate_malformed_mqtt_subscribe_filter_panics() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 
@@ -1404,7 +1512,7 @@ fn validate_acl_unconfigured_mqtt_client_panics() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 

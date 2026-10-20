@@ -1,5 +1,10 @@
 //! MCP tool-name constants for the brenn MCP server.
 
+/// MCP-server prefix CC prepends to every noop-server tool name. The
+/// virtual-tools file lists the short (unprefixed) names; a descriptor's
+/// `mcp_name` is the full `mcp__brenn__<Short>` form.
+pub(crate) const MCP_BRENN_PREFIX: &str = "mcp__brenn__";
+
 /// The MCP tool name for displaying files in the artifact viewer.
 /// CC sees this as `mcp__brenn__DisplayFile` (MCP server name prefix + tool name).
 pub(super) const MCP_DISPLAY_FILE_TOOL: &str = "mcp__brenn__DisplayFile";

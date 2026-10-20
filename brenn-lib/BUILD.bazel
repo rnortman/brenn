@@ -17,6 +17,7 @@ FIRST_PARTY_DEPS = [
     "//brenn-envelope",
     "//brenn-obs",
     "//brenn-queue",
+    "//brenn-tool-proto",
     "//brenn-usage-db",
     "//brenn-ws-types",
     "//surface/schema",

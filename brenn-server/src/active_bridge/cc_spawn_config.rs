@@ -10,12 +10,18 @@ use brenn_obs::alerting::AlertDispatcher;
 use brenn_obs::transcript::TranscriptWriter;
 use tracing::info;
 
+use super::mcp_constants::MCP_BRENN_PREFIX;
+
 /// The MCP server name used in the noop MCP config.
 #[cfg_attr(test, allow(dead_code))]
 pub(super) const MCP_SERVER_NAME: &str = "brenn";
 
 /// Container-side path where noop_mcp.py is bind-mounted.
 pub(super) const CONTAINER_MCP_SCRIPT_PATH: &str = "/opt/brenn/noop_mcp.py";
+
+/// Container-side path where the `brenn-tool` binary is bind-mounted: on the
+/// default `PATH` of any image.
+pub(super) const CONTAINER_TOOL_CLI_PATH: &str = "/usr/local/bin/brenn-tool";
 
 /// The podman container name a conversation's CC process runs under, as a
 /// suffix of `brenn-<app slug>-`. One spelling of the rule: the reaper matches
@@ -33,6 +39,10 @@ pub(crate) fn conversation_container_suffix(conversation_id: i64) -> String {
 pub(crate) struct CcSpawnInputs<'a> {
     pub app_config: &'a brenn_lib::config::AppConfig,
     pub mcp_script_path: &'a Path,
+    /// The conversation's tool socket directory on the host.
+    pub tool_socket_dir: &'a Path,
+    /// Host path of the `brenn-tool` binary; read only for a container.
+    pub tool_cli_path: &'a Path,
     /// The model CC starts on. The first send re-asserts it, so this is what
     /// runs until then.
     pub model: String,
@@ -56,6 +66,8 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
     let CcSpawnInputs {
         app_config,
         mcp_script_path,
+        tool_socket_dir,
+        tool_cli_path,
         model,
         container_name_suffix,
         resume_session_id,
@@ -116,6 +128,20 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
     // caught here rather than silently overriding it.
     spawn_env_vars.push(brenn_graf::graf_user_tz_env(user_tz));
 
+    // Where `brenn-tool` finds the conversation's socket: the container-side
+    // mount point, or the host path for a bare app. Reserved against the
+    // agent's `env` at resolve time; pushed before the duplicate-key assertion
+    // so it is covered here too.
+    let tool_socket_for_cc = if app_config.container_spawn.is_some() {
+        super::tool_socket::container_socket_path()
+    } else {
+        brenn_lib::runtime_dir::tool_socket_in(tool_socket_dir)
+    };
+    spawn_env_vars.push((
+        brenn_tool_proto::SOCKET_ENV.to_string(),
+        tool_socket_for_cc.display().to_string(),
+    ));
+
     // The agent's own environment joins the same slice so the duplicate-key
     // and outranking assertions below cover it. A collision with an
     // integration's key was refused at resolve time; here it is a BUG.
@@ -137,8 +163,8 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
             assert!(
                 seen.insert(key.as_str()),
                 "BUG: env var key {key:?} is supplied twice to the Claude Code process for \
-                 app {:?} (integrations, GRAF_USER_TZ and the agent's env share one slice); \
-                 one would silently override the other",
+                 app {:?} (integrations, GRAF_USER_TZ, BRENN_TOOL_SOCKET and the agent's env \
+                 share one slice); one would silently override the other",
                 app_config.slug,
             );
             // Claude Code ranks each of these above `CLAUDE_CODE_OAUTH_TOKEN`,
@@ -156,13 +182,22 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
     }
 
     // When containerized, the host-side noop_mcp.py must be bind-mounted in
-    // and the MCP config must reference the container-side path.
+    // and the MCP config must reference the container-side path. The tool
+    // socket directory and the `brenn-tool` binary are mounted into this
+    // per-spawn clone only, so hook and auto-pull containers get neither.
     let (mcp_script_for_config, container) = if let Some(ref spawn) = app_config.container_spawn {
         let mut spawn = spawn.clone();
         spawn.extra_mounts.push(format!(
             "{}:{}:ro,z",
             mcp_script_path.display(),
             CONTAINER_MCP_SCRIPT_PATH,
+        ));
+        spawn
+            .extra_mounts
+            .push(super::tool_socket::container_mount(tool_socket_dir));
+        spawn.extra_mounts.push(format!(
+            "{}:{CONTAINER_TOOL_CLI_PATH}:ro,z",
+            tool_cli_path.display(),
         ));
         for (key, val) in &spawn_env_vars {
             spawn.extra_args.push("-e".into());
@@ -237,11 +272,6 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
     }
 }
 
-/// MCP-server prefix CC prepends to every noop-server tool name. The
-/// virtual-tools file lists the short (unprefixed) names; a descriptor's
-/// `mcp_name` is the full `mcp__brenn__<Short>` form.
-const MCP_BRENN_PREFIX: &str = "mcp__brenn__";
-
 /// Project each registry tool the app is granted into a `VirtualToolDef` (MCP
 /// declaration). One declaration source for registry tools — the three-place
 /// name lockstep ends for every migrated tool. The short name is the
@@ -275,25 +305,31 @@ fn registry_virtual_tools(
             name: short.to_string(),
             description: desc.description.to_string(),
             input_schema: desc.input_schema.clone(),
+            // A tool the hook path would prompt for has no approval leg as a
+            // command.
+            cli: if desc.auto_approve {
+                brenn_lib::integration::CliAccess::Available
+            } else {
+                brenn_lib::integration::CliAccess::RequiresApproval
+            },
         });
     }
     out
 }
 
-/// The virtual tools JSON the noop MCP server reads for one agent: core virtual
-/// tools + granted registry tools + integration-contributed virtual tools.
+/// Every virtual tool one agent is offered: core virtual tools + granted
+/// registry tools + integration-contributed virtual tools. The noop MCP
+/// server's declaration file and `brenn-tool`'s catalog are both this list.
 ///
-/// Split from the write because a reload compares the two documents' renderings
-/// to decide whether a live session's tool list went stale — `noop_mcp.py` reads
-/// this file once at its start, so a difference is a process to retire rather
-/// than a table to swap.
-pub fn render_virtual_tools(
+/// Panics if two sources offer the same name: lookup by name would pick one
+/// tool while dispatch runs another.
+pub fn virtual_tools(
     app_config: &brenn_lib::config::AppConfig,
     registry: &brenn_tool_registry::ToolRegistry,
-) -> String {
-    use brenn_lib::integration::{VirtualToolDef, core_virtual_tools, repo_virtual_tools};
+) -> Vec<brenn_lib::integration::VirtualToolDef> {
+    use brenn_lib::integration::{core_virtual_tools, repo_virtual_tools};
 
-    let tools: Vec<VirtualToolDef> = core_virtual_tools(app_config)
+    let tools: Vec<_> = core_virtual_tools(app_config)
         .into_iter()
         .chain(repo_virtual_tools(&app_config.mounts))
         .chain(registry_virtual_tools(&app_config.policy, registry))
@@ -304,8 +340,46 @@ pub fn render_virtual_tools(
                 .flat_map(|i| i.virtual_tools()),
         )
         .collect();
+    assert_unique_tool_names(&app_config.slug, &tools);
+    tools
+}
 
-    serde_json::to_string_pretty(&tools).expect("virtual tools serialization should not fail")
+fn assert_unique_tool_names(app_slug: &str, tools: &[brenn_lib::integration::VirtualToolDef]) {
+    let mut seen = std::collections::HashSet::new();
+    for def in tools {
+        assert!(
+            seen.insert(def.name.as_str()),
+            "BUG: agent {app_slug:?} is offered two virtual tools named {:?}",
+            def.name
+        );
+    }
+}
+
+/// The entry of [`virtual_tools`] named `short_name` (the `mcp__brenn__`-less
+/// name), if the agent is offered that tool.
+pub fn find_virtual_tool(
+    app_config: &brenn_lib::config::AppConfig,
+    registry: &brenn_tool_registry::ToolRegistry,
+    short_name: &str,
+) -> Option<brenn_lib::integration::VirtualToolDef> {
+    virtual_tools(app_config, registry)
+        .into_iter()
+        .find(|def| def.name == short_name)
+}
+
+/// The virtual tools JSON the noop MCP server reads for one agent: the
+/// [`virtual_tools`] list in its MCP projection.
+///
+/// Split from the write because a reload compares the two documents' renderings
+/// to decide whether a live session's tool list went stale — `noop_mcp.py` reads
+/// this file once at its start, so a difference is a process to retire rather
+/// than a table to swap.
+pub fn render_virtual_tools(
+    app_config: &brenn_lib::config::AppConfig,
+    registry: &brenn_tool_registry::ToolRegistry,
+) -> String {
+    serde_json::to_string_pretty(&virtual_tools(app_config, registry))
+        .expect("virtual tools serialization should not fail")
 }
 
 /// Write the virtual tools JSON file for the noop MCP server.
@@ -402,6 +476,33 @@ mod tests {
     use super::*;
     use brenn_lib::config::PathMapper;
     use std::collections::HashMap;
+
+    fn tool_def(name: &str) -> brenn_lib::integration::VirtualToolDef {
+        brenn_lib::integration::VirtualToolDef {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+            cli: brenn_lib::integration::CliAccess::Available,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "two virtual tools named \"BrennSend\"")]
+    fn a_name_offered_twice_is_a_bug() {
+        assert_unique_tool_names(
+            "test",
+            &[
+                tool_def("BrennSend"),
+                tool_def("Other"),
+                tool_def("BrennSend"),
+            ],
+        );
+    }
+
+    #[test]
+    fn distinct_names_pass() {
+        assert_unique_tool_names("test", &[tool_def("A"), tool_def("B")]);
+    }
 
     // -----------------------------------------------------------------------
     // build_mcp_config
@@ -542,6 +643,73 @@ mod tests {
         }
     }
 
+    /// The host tool socket directory every test spawn is handed.
+    const TEST_TOOL_SOCKET_DIR: &str = "/run/user/1000/brenn-tool-sockets/test-conv-test";
+
+    /// A containerized spawn mounts the socket directory read-only at
+    /// `/run/brenn` and the binary on the container's `PATH`, and points
+    /// `BRENN_TOOL_SOCKET` at the container-side socket.
+    #[tokio::test]
+    async fn a_container_spawn_carries_the_tool_socket_and_binary() {
+        let mut app = minimal_test_app_config();
+        app.container_spawn = Some(test_container("/host/repos/life", "/home/user/repos/life"));
+        let cfg = run_build_cc_session_config(&app);
+        let container = cfg.container.expect("containerized");
+        assert!(
+            container
+                .extra_mounts
+                .contains(&format!("{TEST_TOOL_SOCKET_DIR}:/run/brenn:ro,z")),
+            "{:?}",
+            container.extra_mounts,
+        );
+        assert!(
+            container
+                .extra_mounts
+                .contains(&"/opt/brenn/brenn-tool:/usr/local/bin/brenn-tool:ro,z".to_string()),
+            "{:?}",
+            container.extra_mounts,
+        );
+        let env_pos = container
+            .extra_args
+            .iter()
+            .position(|a| a == "BRENN_TOOL_SOCKET=/run/brenn/tool.sock")
+            .expect("BRENN_TOOL_SOCKET is passed to the container");
+        assert_eq!(container.extra_args[env_pos - 1], "-e");
+        assert!(cfg.env_vars.is_empty());
+        // The app's own spawn config, which hook containers clone, gains nothing.
+        let own = app.container_spawn.as_ref().unwrap();
+        assert!(own.extra_mounts.iter().all(|m| !m.contains("/run/brenn")));
+        assert!(
+            own.extra_args
+                .iter()
+                .all(|a| !a.contains("BRENN_TOOL_SOCKET"))
+        );
+    }
+
+    /// A bare spawn gets the host socket path in its environment and no `PATH`
+    /// of Brenn's composing.
+    #[tokio::test]
+    async fn a_bare_spawn_carries_the_host_socket_path_and_no_path() {
+        let cfg = run_build_cc_session_config(&minimal_test_app_config());
+        assert!(cfg.container.is_none());
+        assert!(cfg.env_vars.contains(&(
+            "BRENN_TOOL_SOCKET".to_string(),
+            format!("{TEST_TOOL_SOCKET_DIR}/tool.sock"),
+        )));
+        assert!(cfg.env_vars.iter().all(|(k, _)| k != "PATH"));
+    }
+
+    /// The agent's `env` naming the socket variable is refused at resolve; one
+    /// reaching the spawn anyway is a BUG.
+    #[tokio::test]
+    #[should_panic(expected = "BUG: env var key \"BRENN_TOOL_SOCKET\" is supplied twice")]
+    async fn an_agent_env_naming_the_socket_variable_is_a_bug_at_spawn() {
+        let mut app = minimal_test_app_config();
+        app.env
+            .insert("BRENN_TOOL_SOCKET".to_string(), "/elsewhere".to_string());
+        run_build_cc_session_config(&app);
+    }
+
     /// Helper: invoke `build_cc_session_config` with test-grade defaults.
     fn run_build_cc_session_config(app_config: &brenn_lib::config::AppConfig) -> CcSessionConfig {
         run_build_cc_session_config_with_tz(app_config, chrono_tz::UTC)
@@ -583,6 +751,8 @@ mod tests {
         build_cc_session_config(CcSpawnInputs {
             app_config,
             mcp_script_path: Path::new("/opt/brenn/noop_mcp.py"),
+            tool_socket_dir: Path::new(TEST_TOOL_SOCKET_DIR),
+            tool_cli_path: Path::new("/opt/brenn/brenn-tool"),
             model: "sonnet".to_string(),
             container_name_suffix: "conv-test".to_string(),
             resume_session_id: None,

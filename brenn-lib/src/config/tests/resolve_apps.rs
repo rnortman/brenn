@@ -37,7 +37,7 @@ fn candidate_apps(config: &BrennConfig) -> IndexMap<String, AppConfig> {
     resolve_apps(
         config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
         &clients,
         &webhooks,
     )
@@ -48,7 +48,7 @@ fn booted_apps(config: &BrennConfig) -> IndexMap<String, AppConfig> {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     (*apps).clone()
 }
@@ -202,7 +202,7 @@ fn webhook_stamps_come_from_the_caller() {
     let apps = resolve_apps(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
         &clients,
         &webhooks,
     );
@@ -252,7 +252,7 @@ fn pwa_push_section_without_grant_is_accepted() {
     let ResolvedConfig { pwa_push, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     assert!(
         pwa_push.is_some(),

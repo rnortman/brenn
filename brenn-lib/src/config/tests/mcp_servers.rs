@@ -92,6 +92,6 @@ fn validate_mcp_server_reserved_name_panics() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }

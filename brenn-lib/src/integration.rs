@@ -67,6 +67,39 @@ pub struct VirtualToolDef {
     pub description: String,
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// Whether `brenn-tool` may invoke this tool from the agent's container.
+    /// Not serialized: the MCP projection CC reads carries no such field.
+    #[serde(skip)]
+    pub cli: CliAccess,
+}
+
+/// Whether a virtual tool is invocable as a `brenn-tool` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliAccess {
+    /// Invocable as a command with the same policy as a tool call.
+    Available,
+    /// Effect is on the chat or the CC session, not the world; meaningless
+    /// from a script.
+    ConversationBound,
+    /// Not auto-approved on the hook path; a command has no approval leg.
+    RequiresApproval,
+}
+
+impl CliAccess {
+    /// The wire spelling of a refusal reason: `None` for `Available`.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            CliAccess::Available => None,
+            CliAccess::ConversationBound => Some("conversation_bound"),
+            CliAccess::RequiresApproval => Some("requires_approval"),
+        }
+    }
+}
+
+impl std::fmt::Display for CliAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason().unwrap_or("available"))
+    }
 }
 
 /// Factory for creating per-app integration instances.
@@ -278,6 +311,7 @@ pub fn core_virtual_tools(app_config: &AppConfig) -> Vec<VirtualToolDef> {
     let mut tools = vec![
         VirtualToolDef {
             name: "DisplayFile".to_string(),
+            cli: CliAccess::ConversationBound,
             description: concat!(
                 "Display a markdown file in the user's artifact viewer, rendered with ",
                 "syntax highlighting. Use this when you want to show the user a markdown ",
@@ -298,6 +332,7 @@ pub fn core_virtual_tools(app_config: &AppConfig) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "RequestCompaction".to_string(),
+            cli: CliAccess::ConversationBound,
             description: concat!(
                 "Request that your conversation context be compacted. Use this when ",
                 "you've reached a natural break point and want to persist important ",
@@ -364,6 +399,7 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
     let mut tools = vec![
         VirtualToolDef {
             name: "MessageChannelList".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Cross-protocol discovery, scoped to THIS app: list what this app COULD ",
                 "subscribe to (\"what's available to me?\"), per the app's access-control ",
@@ -404,6 +440,7 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "MessageSubscriptionList".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "List ONLY the subscriptions THIS app already holds — the per-app ",
                 "subscription inventory (\"what am I subscribed to?\"). Contrast with ",
@@ -436,6 +473,7 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "MessageChannelGet".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Read message history from any messaging channel, sorted newest-first. ",
                 "Works across transports: `brenn:` (internal), `mqtt:` (broker ingress), ",
@@ -475,6 +513,7 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "MessageSubscribe".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Create a dynamic (runtime) subscription to a messaging channel, across ",
                 "transports: `brenn:` (internal), `mqtt:` (broker ingress), and `webhook:` ",
@@ -546,6 +585,7 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "MessageUnsubscribe".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Remove a dynamic (runtime) subscription this app created with ",
                 "MessageSubscribe, across transports: `brenn:` (internal), `mqtt:` (broker ",
@@ -579,6 +619,7 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "BrennPendingList".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "List all pending (undelivered) scheduled messages authored by this app. ",
                 "Returns `{ messages: [...] }` where each entry is a MessageEnvelope ",
@@ -602,6 +643,7 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "BrennMessageCancel".to_string(),
+            cli: CliAccess::Available,
             description: [
                 "Cancel a scheduled (still-parked, `deliver_after` in the future) message by ",
                 "message_id UUID. The message is withdrawn outright: it never enters retention, ",
@@ -636,6 +678,7 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "BrennMessageEdit".to_string(),
+            cli: CliAccess::Available,
             description: [
                 "Edit a scheduled (still-parked) message in-place. ",
                 "Same message_id (UUID handle) before and after. ",
@@ -697,6 +740,7 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
     if enabled {
         tools.push(VirtualToolDef {
             name: "BrennSend".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Publish a message to a Brenn messaging channel. Supports two address ",
                 "schemes: `brenn:` (durable channels) and `ephemeral:` (best-effort, ",
@@ -768,6 +812,7 @@ fn pwa_push_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
     if enabled {
         tools.push(VirtualToolDef {
             name: "PwaPushSend".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Send a web push notification to a PWA-installed device (`pwa_push:` addresses ",
                 "only). Example addresses: `\"pwa_push:alice\"` (fan-out to all of alice's ",
@@ -829,6 +874,7 @@ fn pwa_push_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
     }
     tools.push(VirtualToolDef {
         name: "PwaPushChannelGet".to_string(),
+        cli: CliAccess::Available,
         description: concat!(
             "Get per-target detail for a pwa_push address (`pwa_push:` addresses only). ",
             "Example address: `\"pwa_push:alice\"`. Returns `address`, `user`, `device` ",
@@ -876,6 +922,7 @@ pub fn repo_virtual_tools(mounts: &[ResolvedMount]) -> Vec<VirtualToolDef> {
     vec![
         VirtualToolDef {
             name: "GitRepoStatus".to_string(),
+            cli: CliAccess::Available,
             description: format!(
                 "Check the git status of managed repos. Shows dirty files, \
                  staged files, unpushed commits, and branch info. \
@@ -895,6 +942,7 @@ pub fn repo_virtual_tools(mounts: &[ResolvedMount]) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "GitRepoCommitAndPush".to_string(),
+            cli: CliAccess::RequiresApproval,
             description: format!(
                 "Stage all changes, commit with the given message, and push to upstream. \
                  Push refuses non-fast-forward (safe by default; never force-pushes). \
@@ -920,6 +968,7 @@ pub fn repo_virtual_tools(mounts: &[ResolvedMount]) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "GitListRepos".to_string(),
+            cli: CliAccess::Available,
             description: format!(
                 "List the managed git repos available to this app. \
                  Returns each repo's slug, filesystem path, access level, and auto-pull setting. \
@@ -932,6 +981,7 @@ pub fn repo_virtual_tools(mounts: &[ResolvedMount]) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "GitRepoRun".to_string(),
+            cli: CliAccess::RequiresApproval,
             description: format!(
                 "Run an arbitrary git command in a managed repo. The command runs as \
                  'git <args>' in the repo's directory. Use this for operations not covered \
@@ -963,6 +1013,7 @@ fn device_virtual_tools() -> Vec<VirtualToolDef> {
     vec![
         VirtualToolDef {
             name: "DeviceList".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "List devices that have connected to this app. Returns up to `limit` (default 10) ",
                 "device records ordered by last_seen_at DESC. Each record includes the numeric `id`, ",
@@ -991,6 +1042,7 @@ fn device_virtual_tools() -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "DeviceGet".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Look up a device by identifier. The `device` argument is matched against: ",
                 "numeric id (string form), guessed_slug (globally unique), or assigned_slug ",
@@ -1026,6 +1078,7 @@ fn device_virtual_tools() -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "DeviceAssignSlug".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Assign a human-friendly name (`slug`) to a device for the specified user. ",
                 "The `device` argument MUST be the numeric id (as string) or the globally-unique ",
@@ -1057,6 +1110,7 @@ fn device_virtual_tools() -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "SetUserTimezone".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Set or clear a per-device timezone override for a user. ",
                 "Use when the browser reports the wrong timezone (e.g. a laptop that ",
@@ -1110,6 +1164,7 @@ fn device_virtual_tools() -> Vec<VirtualToolDef> {
 fn usage_virtual_tools() -> Vec<VirtualToolDef> {
     vec![VirtualToolDef {
         name: "ExportUsage".to_string(),
+        cli: CliAccess::RequiresApproval,
         description: concat!(
             "Export usage sessions or events to a file on the server. ",
             "Exports are scoped to the calling user's own data only. ",
@@ -1172,6 +1227,7 @@ fn automation_virtual_tools() -> Vec<VirtualToolDef> {
     vec![
         VirtualToolDef {
             name: "AutoCreate".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Create a scheduled automation job. The job fires a send-message action ",
                 "on a cron schedule.\n\n",
@@ -1234,6 +1290,7 @@ fn automation_virtual_tools() -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "AutoList".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "List automation jobs owned by this app. Returns ",
                 "`{ ok: true, jobs: [...] }` with job details including `id`, `name`, ",
@@ -1254,6 +1311,7 @@ fn automation_virtual_tools() -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "AutoEdit".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Edit an automation job. `id` is the UUID returned by AutoCreate. ",
                 "Caller's app must own the job. ",
@@ -1278,6 +1336,7 @@ fn automation_virtual_tools() -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "AutoDelete".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Delete an automation job by `id` (UUID from AutoCreate). ",
                 "Caller's app must own the job. An in-flight fire already past ",
@@ -1312,6 +1371,7 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
     if enabled {
         tools.push(VirtualToolDef {
             name: "MqttSend".to_string(),
+            cli: CliAccess::Available,
             description: concat!(
                 "Publish a message to an MQTT topic. Address format: `mqtt:<client>:<topic>`. ",
                 "Example: `mqtt:homeassistant:home/sensor/temperature`.\n\n",

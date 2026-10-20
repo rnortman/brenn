@@ -197,6 +197,7 @@ impl WsConnection {
                     resume_session_id,
                     log_dir: &self.state.log_dir,
                     mcp_script_path: &self.state.mcp_script_path,
+                    tool_cli_path: &self.state.tool_cli_path,
                     app_config: &app_config,
                     apps_generation: app_config.generation(),
                     apps: self.state.apps.clone(),

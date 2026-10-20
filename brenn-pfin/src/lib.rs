@@ -290,13 +290,14 @@ fn transaction_schema() -> serde_json::Value {
 
 /// Virtual tool schemas for the pfin integration.
 fn pfin_virtual_tools() -> Vec<brenn_lib::integration::VirtualToolDef> {
-    use brenn_lib::integration::VirtualToolDef;
+    use brenn_lib::integration::{CliAccess, VirtualToolDef};
 
     let txn = transaction_schema();
 
     vec![
         VirtualToolDef {
             name: "ProposeReconciliation".to_string(),
+            cli: CliAccess::ConversationBound,
             description: concat!(
                 "Present multiple reconciliation proposals to the user for selection. ",
                 "Use this when you have 2-5 plausible ways to categorize or reconcile ",
@@ -336,6 +337,7 @@ fn pfin_virtual_tools() -> Vec<brenn_lib::integration::VirtualToolDef> {
         },
         VirtualToolDef {
             name: "BatchReconcile".to_string(),
+            cli: CliAccess::ConversationBound,
             description: concat!(
                 "Present a batch of high-confidence reconciliation proposals for ",
                 "the user to accept or reject individually. Each item pairs a ",
@@ -376,6 +378,7 @@ fn pfin_virtual_tools() -> Vec<brenn_lib::integration::VirtualToolDef> {
         },
         VirtualToolDef {
             name: "BatchAssign".to_string(),
+            cli: CliAccess::ConversationBound,
             description: concat!(
                 "Present a batch of import-assignment proposals to the user for ",
                 "accept/reject. All items are assigned to a single username. Use ",
@@ -646,7 +649,7 @@ new myapp: Assistant();
 "#,
             dir.path().display(),
         ));
-        let resolved = validate_and_resolve(&config, &registry, Some(test_runtime_dir()));
+        let resolved = validate_and_resolve(&config, &registry, test_runtime_dir());
         let app = resolved.apps.get("myapp").unwrap();
         let cfg = pfin_config(app).expect("pfin_config should return Some after resolve");
         assert_eq!(cfg.command, "pf");
@@ -684,7 +687,7 @@ new myapp: Assistant();
 "#,
             dir.path().display()
         ));
-        let resolved = validate_and_resolve(&config, &registry, Some(test_runtime_dir()));
+        let resolved = validate_and_resolve(&config, &registry, test_runtime_dir());
         let app = resolved.apps.get("myapp").unwrap();
         let cfg = pfin_config(app).expect("pfin_config should return Some after resolve");
         assert_eq!(cfg.command, "pf");
@@ -723,8 +726,12 @@ new myapp: Assistant();
 "#,
             dir.path().display()
         ));
-        // pfin factory panics before state_dir resolution; None is fine.
-        let _ = validate_and_resolve(&config, &registry, None);
+        // pfin factory panics before state_dir resolution.
+        let _ = validate_and_resolve(
+            &config,
+            &registry,
+            brenn_lib::runtime_dir::test_runtime_dir_once(),
+        );
     }
 
     // -----------------------------------------------------------------------

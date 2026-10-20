@@ -2648,42 +2648,6 @@ line, a run of `make check` passes with it, the `make check` sentence under
 clause removed, and the operator has said whether a scheduled CI run of
 `make npm-audit` is wanted alongside it.
 
-## `mcp-script-path-precondition`
-
-`claude_defaults.mcp_script_path` names the noop MCP server every Claude Code
-subprocess is spawned against (`brenn-server/src/active_bridge/cc_spawn_config.rs`,
-which writes it into the MCP server config verbatim). Nothing checks that the
-file exists: `dsl_lower` accepts any string, `assert_boot_preconditions` does
-not look at it, and `config-check` touches no filesystem. A deployment that
-names a file that is not there boots green, serves, and fails at the first
-session spawn — inside a subprocess, with whatever diagnosis Claude Code's
-MCP-failure handling gives. Every brenn tool that rides that server
-(`DisplayFile`, the approval routing) is silently absent.
-
-That is the shape the backend principle forbids, and every other artifact fact
-a deployment states — the components roots, the surface roots, the module roots
-— is refused at boot rather than at first use.
-
-Two questions have to be answered before the check can be written, which is why
-this is written down rather than done:
-
-- **Which cwd a relative path resolves against.** brenn's own configs spell it
-  `noop_mcp.py`, which resolves against the server's working directory when the
-  server reads it and against the agent's `working_dir` when Claude Code does.
-  Those are different directories for any agent that names one. A check has to
-  pick, and picking changes what a relative path means.
-- **Containerized apps.** An app with `container_spawn` bind-mounts the host
-  file to a fixed container path, so the host path is the one to check there —
-  but an app whose spawn config is per-app makes "the path" a per-app fact
-  rather than one default.
-
-Code site (`TODO(mcp-script-path-precondition)`):
-`brenn-bootstrap/src/lib.rs`, at `assert_boot_preconditions`.
-
-Done = a deployment naming an unreadable `mcp_script_path` is refused at boot,
-naming the path and the config key, with the resolution base stated in
-`docs/config-dsl.md`.
-
 ## `ceiling-principal-ids`
 
 `config.principals` is a `Vec`, and the ceiling check addresses a principal by

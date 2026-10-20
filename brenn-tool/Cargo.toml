@@ -1,0 +1,15 @@
+[package]
+name = "brenn-tool"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Runs an agent's Brenn tools as commands through its conversation's tool socket"
+
+[dependencies]
+brenn-tool-proto = { version = "0.1.0", path = "../brenn-tool-proto" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["io-util", "net", "rt", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

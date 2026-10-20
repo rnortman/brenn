@@ -1283,6 +1283,9 @@ fn claude_defaults(body: &mut Body, errors: &mut Vec<Diagnostic>) -> ClaudeDefau
         mcp_script_path: body
             .path("mcp_script_path", errors)
             .unwrap_or(defaults.mcp_script_path),
+        tool_cli_path: body
+            .path("tool_cli_path", errors)
+            .unwrap_or(defaults.tool_cli_path),
         model: body.str("model", errors).unwrap_or(defaults.model),
         profile_token_dir: body.path("profile_token_dir", errors),
     }

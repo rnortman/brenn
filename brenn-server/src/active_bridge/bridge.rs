@@ -320,6 +320,10 @@ pub struct ActiveBridge {
     /// A swap hands it to the replacement process so the existing loop stays the
     /// consumer, and a failed swap sends a synthetic `Died` down it.
     pub(in crate::active_bridge) cc_event_tx: mpsc::Sender<SessionEvent>,
+    /// The conversation's tool socket, through which `brenn-tool` in the
+    /// agent's environment calls this bridge's tools. Bound before the CC
+    /// process is spawned; closed by `release_host_resources`.
+    pub(in crate::active_bridge) tool_socket: super::tool_socket::ToolSocket,
     /// Set once the clean-slate death reset has run for this bridge (from the
     /// event loop's `Died` handler or the watchdog). Lets the watchdog tell a
     /// loop that ended after cleanly processing session death from one that died
@@ -346,6 +350,8 @@ pub struct SpawnContext<'a> {
     pub resume_session_id: Option<String>,
     pub log_dir: &'a Path,
     pub mcp_script_path: &'a Path,
+    /// Host path of the `brenn-tool` binary; mounted only into containers.
+    pub tool_cli_path: &'a Path,
     pub app_config: &'a brenn_lib::config::AppConfig,
     /// The agent registry the spawned bridge reads authority through. The
     /// `app_config` beside it is the snapshot this spawn builds its process
@@ -435,6 +441,7 @@ impl ActiveBridge {
             resume_session_id,
             log_dir,
             mcp_script_path,
+            tool_cli_path,
             app_config,
             apps,
             apps_generation,
@@ -481,6 +488,15 @@ impl ActiveBridge {
             .map_err(|e| format!("failed to register transcript SIGHUP handler: {e}"))?;
         let transcript = Arc::new(transcript_writer);
 
+        // Bound before the container exists so its directory can be mounted;
+        // an early return below drops it, which removes the directory.
+        let tool_socket = super::tool_socket::ToolSocket::bind(
+            &app_config.tool_socket_root,
+            &app_config.slug,
+            conversation_id,
+        )
+        .map_err(|e| format!("failed to bind the tool socket: {e}"))?;
+
         // Run start hooks for new conversations (not resume).
         let hook_warnings = if resume_session_id.is_none() {
             let hook_result = brenn_hooks::run_start_hooks(app_config, conversation_id).await?;
@@ -498,6 +514,8 @@ impl ActiveBridge {
         let config = build_cc_session_config(super::cc_spawn_config::CcSpawnInputs {
             app_config,
             mcp_script_path,
+            tool_socket_dir: tool_socket.host_dir(),
+            tool_cli_path,
             model,
             container_name_suffix,
             resume_session_id,
@@ -649,6 +667,8 @@ impl ActiveBridge {
                     models: swap_host_seed.models,
                     app_config: app_config.clone(),
                     mcp_script_path: mcp_script_path.to_path_buf(),
+                    tool_cli_path: tool_cli_path.to_path_buf(),
+                    tool_socket_dir: tool_socket.host_dir().to_path_buf(),
                     transcript,
                     alert_dispatcher: alert_dispatcher.clone(),
                     user_tz,
@@ -666,9 +686,11 @@ impl ActiveBridge {
             swapping: AtomicBool::new(false),
             swap_ack: std::sync::Mutex::new(None),
             cc_event_tx,
+            tool_socket,
             #[cfg(test)]
             event_loop_epoch: epoch_tx,
         });
+        bridge.tool_socket.attach(Arc::downgrade(&bridge));
 
         // Register idle hooks. `DirtyRepoHook` is registered when the app
         // declares any `[[app.repo]]` / `[[app.mount]]` entries — clones
@@ -760,6 +782,15 @@ impl ActiveBridge {
     /// bridge itself is gone.
     pub(in crate::active_bridge) fn stop_chat_adapter(&self) {
         self.chat_shutdown.notify_one();
+    }
+
+    /// Release what the bridge holds on the host for its conversation: end the
+    /// chat adapter and close the tool socket. Every teardown must call this before
+    /// deregistering, so the conversation's next spawn finds the socket
+    /// directory free.
+    pub(in crate::active_bridge) fn release_host_resources(&self) {
+        self.stop_chat_adapter();
+        self.tool_socket.close();
     }
 
     /// Whether the clean-slate death reset has already run for this bridge.

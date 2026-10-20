@@ -113,7 +113,11 @@ fn repo_duplicate_slug_panics() {
         ..Default::default()
     };
 
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -139,7 +143,11 @@ fn repo_reserved_slug_panics() {
         ..Default::default()
     };
 
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -208,7 +216,11 @@ fn repo_invalid_slug_format_panics() {
         ..Default::default()
     };
 
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -258,7 +270,11 @@ fn mount_references_nonexistent_repo_panics() {
         Some(app_dir),
         None,
     );
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -296,7 +312,11 @@ fn mount_duplicate_repo_panics() {
         Some(app_dir),
         None,
     );
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -325,7 +345,11 @@ fn mount_working_dir_and_explicit_working_dir_panics() {
         Some(app_dir), // explicit working_dir conflicts with mount
         None,
     );
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -352,7 +376,11 @@ fn mount_no_working_dir_source_panics() {
         None, // no explicit working_dir either
         None,
     );
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -397,7 +425,11 @@ fn mount_multiple_working_dir_panics() {
         None,
         None,
     );
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -437,7 +469,11 @@ fn mount_working_dir_with_container_working_dir_panics() {
         },
     );
     config.apps[0].container = Some("sandbox".to_string());
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -466,7 +502,7 @@ fn mount_working_dir_from_mount_resolves_correctly() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     let app = apps.get("test").unwrap();
     assert_eq!(app.working_dir, repo_dir);
@@ -530,8 +566,11 @@ fn containerized_mount_resolves_path_mapper_and_repo_mounts() {
     );
     config.apps[0].container = Some("sandbox".to_string());
 
-    let ResolvedConfig { apps, .. } =
-        validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    let ResolvedConfig { apps, .. } = validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
     let app = apps.get("test").unwrap();
 
     // Working dir resolved from mount.

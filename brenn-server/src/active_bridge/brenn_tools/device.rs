@@ -1,13 +1,16 @@
 //! Device tools: DeviceList, DeviceGet, DeviceAssignSlug. Plus the visibility-set resolver shared by these three.
 
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
+use serde_json::json;
 use tracing::warn;
 
 use super::super::ActiveBridge;
 use super::super::mcp_constants::{
     MCP_DEVICE_ASSIGN_SLUG_TOOL, MCP_DEVICE_GET_TOOL, MCP_DEVICE_LIST_TOOL,
 };
-use super::super::tool_summary::{HandleBrennToolResult, mark_tool_handled};
+use super::super::tool_summary::HandleBrennToolResult;
+use super::execute::ToolOutcome;
+use crate::intercept_helpers::{PostCard, answer_post_tool_use};
 
 enum UserScope {
     /// Username explicitly provided — scope all operations to this user.
@@ -21,11 +24,13 @@ enum UserScope {
 ///
 /// Must be called inside the `bridge.db.lock().await` block so the DB lookup and
 /// downstream operations are serialized.
+///
+/// `Err` carries the tool's `{"error":…}` answer.
 fn resolve_user_scope(
     bridge: &ActiveBridge,
     conn: &rusqlite::Connection,
     tool_input: &serde_json::Value,
-) -> Result<UserScope, HandleBrennToolResult> {
+) -> Result<UserScope, serde_json::Value> {
     let username = tool_input
         .get("username")
         .and_then(|v| v.as_str())
@@ -36,11 +41,7 @@ fn resolve_user_scope(
             app = %bridge.app_slug,
             "device tool called on shared bridge without username: rejecting"
         );
-        return Err(HandleBrennToolResult::Respond(
-            CcApprovalDecision::Continue {
-                updated_output: Some(r#"{"error":"not_allowed_on_shared_bridge"}"#.to_string()),
-            },
-        ));
+        return Err(json!({"error": "not_allowed_on_shared_bridge"}));
     }
 
     match username {
@@ -54,13 +55,7 @@ fn resolve_user_scope(
                     username = %uname,
                     "device tool called with username not in allowed_users: rejecting"
                 );
-                return Err(HandleBrennToolResult::Respond(
-                    CcApprovalDecision::Continue {
-                        updated_output: Some(
-                            serde_json::json!({"error": "user_not_in_app"}).to_string(),
-                        ),
-                    },
-                ));
+                return Err(json!({"error": "user_not_in_app"}));
             }
             match brenn_db::auth::user::get_user_by_username(conn, uname) {
                 Some(u) => Ok(UserScope::Explicit(u.id)),
@@ -70,13 +65,7 @@ fn resolve_user_scope(
                         username = %uname,
                         "device tool called with unknown username: rejecting"
                     );
-                    Err(HandleBrennToolResult::Respond(
-                        CcApprovalDecision::Continue {
-                            updated_output: Some(
-                                serde_json::json!({"error": "user_not_found"}).to_string(),
-                            ),
-                        },
-                    ))
+                    Err(json!({"error": "user_not_found"}))
                 }
             }
         }
@@ -85,15 +74,15 @@ fn resolve_user_scope(
 
 /// Resolve the acting user ID for write-mutation tools (SetUserTimezone, DeviceAssignSlug).
 ///
-/// Returns `Ok(user_id)` when resolved; `Err(HandleBrennToolResult)` on any error
-/// (shared-bridge with no username, unknown username, user not in app).
+/// Returns `Ok(user_id)` when resolved; `Err` carries the tool's `{"error":…}`
+/// answer (shared-bridge with no username, unknown username, user not in app).
 ///
 /// Must be called inside the `bridge.db.lock().await` block.
 pub(super) fn resolve_user_scope_for_write(
     bridge: &ActiveBridge,
     conn: &rusqlite::Connection,
     tool_input: &serde_json::Value,
-) -> Result<i64, HandleBrennToolResult> {
+) -> Result<i64, serde_json::Value> {
     let scope = resolve_user_scope(bridge, conn, tool_input)?;
     Ok(match scope {
         UserScope::Explicit(uid) => uid,
@@ -101,8 +90,20 @@ pub(super) fn resolve_user_scope_for_write(
     })
 }
 
+fn is_device_tool(tool_name: &str) -> bool {
+    [
+        MCP_DEVICE_LIST_TOOL,
+        MCP_DEVICE_GET_TOOL,
+        MCP_DEVICE_ASSIGN_SLUG_TOOL,
+    ]
+    .contains(&tool_name)
+}
+
 /// Handle PreToolUse + PostToolUse arms for the Device tool family
 /// (`MCP_DEVICE_LIST_TOOL`, `MCP_DEVICE_GET_TOOL`, `MCP_DEVICE_ASSIGN_SLUG_TOOL`).
+///
+/// PreToolUse auto-approves. PostToolUse marks the call handled and runs it
+/// through `execute_admitted`; the family emits no card.
 ///
 /// Returns `Some(...)` when the request is for one of these tools and `None`
 /// otherwise — letting the dispatcher fall through to other arms.
@@ -111,209 +112,160 @@ pub(super) async fn handle(
     req: &ApprovalRequest,
 ) -> Option<HandleBrennToolResult> {
     match &req.kind {
-        // --- DeviceList PreToolUse (auto-approve, read-only) ---
-        ApprovalKind::PreToolUse { tool_name, .. } if tool_name == MCP_DEVICE_LIST_TOOL => {
+        ApprovalKind::PreToolUse { tool_name, .. } if is_device_tool(tool_name) => {
             Some(HandleBrennToolResult::Respond(CcApprovalDecision::Allow {
                 updated_input: None,
             }))
         }
 
-        // --- DeviceList PostToolUse ---
         ApprovalKind::PostToolUse {
             tool_name,
             tool_input,
             tool_use_id,
+            tool_response,
             ..
-        } if tool_name == MCP_DEVICE_LIST_TOOL => {
-            mark_tool_handled(bridge, tool_use_id).await;
-            let limit = tool_input
-                .get("limit")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(10)
-                .clamp(1, 100) as usize;
-
-            let output = {
-                let conn = bridge.db.lock().await;
-                let scope = match resolve_user_scope(bridge, &conn, tool_input) {
-                    Ok(s) => s,
-                    Err(e) => return Some(e),
-                };
-                let visibility = match scope {
-                    UserScope::Explicit(uid) => vec![uid],
-                    UserScope::BridgeOwner => {
-                        resolve_device_visibility_set(&conn, &bridge.app_config().allowed_users)
-                    }
-                };
-
-                let limit_plus_one = limit + 1;
-                let mut device_ids = brenn_db::auth::device::list_device_ids_for_visibility_set(
-                    &conn,
-                    &visibility,
-                    limit_plus_one,
-                );
-                let truncated = device_ids.len() > limit;
-                if truncated {
-                    device_ids.truncate(limit);
-                }
-                let records =
-                    brenn_db::auth::device::fetch_device_records(&conn, &device_ids, &visibility);
-                if truncated {
-                    serde_json::json!({"devices": records, "truncated": true})
-                } else {
-                    serde_json::json!({"devices": records})
-                }
-            };
-
-            Some(HandleBrennToolResult::Respond(
-                CcApprovalDecision::Continue {
-                    updated_output: Some(output.to_string()),
-                },
-            ))
-        }
-
-        // --- DeviceGet PreToolUse (auto-approve, read-only) ---
-        ApprovalKind::PreToolUse { tool_name, .. } if tool_name == MCP_DEVICE_GET_TOOL => {
-            Some(HandleBrennToolResult::Respond(CcApprovalDecision::Allow {
-                updated_input: None,
-            }))
-        }
-
-        // --- DeviceGet PostToolUse ---
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            ..
-        } if tool_name == MCP_DEVICE_GET_TOOL => {
-            mark_tool_handled(bridge, tool_use_id).await;
-            let device_arg = match tool_input.get("device").and_then(|v| v.as_str()) {
-                Some(d) if !d.is_empty() => d.to_string(),
-                _ => {
-                    return Some(HandleBrennToolResult::Respond(
-                        CcApprovalDecision::Continue {
-                            updated_output: Some(r#"{"error":"missing_device_arg"}"#.to_string()),
-                        },
-                    ));
-                }
-            };
-            let limit = tool_input
-                .get("limit")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(10)
-                .clamp(1, 100) as usize;
-
-            let output = {
-                let conn = bridge.db.lock().await;
-                let scope = match resolve_user_scope(bridge, &conn, tool_input) {
-                    Ok(s) => s,
-                    Err(e) => return Some(e),
-                };
-                let visibility = match scope {
-                    UserScope::Explicit(uid) => vec![uid],
-                    UserScope::BridgeOwner => {
-                        resolve_device_visibility_set(&conn, &bridge.app_config().allowed_users)
-                    }
-                };
-                let mut device_ids = brenn_db::auth::device::resolve_device_ids_for_get(
-                    &conn,
-                    &device_arg,
-                    &visibility,
-                );
-                if device_ids.is_empty() {
-                    serde_json::json!({"error": "not_found"})
-                } else {
-                    let truncated = device_ids.len() > limit;
-                    if truncated {
-                        device_ids.truncate(limit);
-                    }
-                    let records = brenn_db::auth::device::fetch_device_records(
-                        &conn,
-                        &device_ids,
-                        &visibility,
-                    );
-                    if truncated {
-                        serde_json::json!({"devices": records, "truncated": true})
-                    } else {
-                        serde_json::json!({"devices": records})
-                    }
-                }
-            };
-
-            Some(HandleBrennToolResult::Respond(
-                CcApprovalDecision::Continue {
-                    updated_output: Some(output.to_string()),
-                },
-            ))
-        }
-
-        // --- DeviceAssignSlug PreToolUse (auto-approve) ---
-        ApprovalKind::PreToolUse { tool_name, .. } if tool_name == MCP_DEVICE_ASSIGN_SLUG_TOOL => {
-            Some(HandleBrennToolResult::Respond(CcApprovalDecision::Allow {
-                updated_input: None,
-            }))
-        }
-
-        // --- DeviceAssignSlug PostToolUse ---
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            ..
-        } if tool_name == MCP_DEVICE_ASSIGN_SLUG_TOOL => {
-            // mark_tool_handled unconditionally — both success and refusal paths
-            // send a response, so the tool is "handled" either way.
-            mark_tool_handled(bridge, tool_use_id).await;
-            let device_arg = match tool_input.get("device").and_then(|v| v.as_str()) {
-                Some(d) if !d.is_empty() => d.to_string(),
-                _ => {
-                    return Some(HandleBrennToolResult::Respond(
-                        CcApprovalDecision::Continue {
-                            updated_output: Some(r#"{"error":"missing_device_arg"}"#.to_string()),
-                        },
-                    ));
-                }
-            };
-            let slug = match tool_input.get("slug").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => {
-                    return Some(HandleBrennToolResult::Respond(
-                        CcApprovalDecision::Continue {
-                            updated_output: Some(r#"{"error":"missing_slug_arg"}"#.to_string()),
-                        },
-                    ));
-                }
-            };
-
-            let output = {
-                let conn = bridge.db.lock().await;
-                let effective_user_id =
-                    match resolve_user_scope_for_write(bridge, &conn, tool_input) {
-                        Ok(uid) => uid,
-                        Err(e) => return Some(e),
-                    };
-                match brenn_db::auth::device::resolve_device_for_assign(
-                    &conn,
-                    &device_arg,
-                    effective_user_id,
-                ) {
-                    Err(err_json) => err_json,
-                    Ok(device_id) => brenn_db::auth::device::assign_device_slug(
-                        &conn,
-                        device_id,
-                        &slug,
-                        effective_user_id,
-                    ),
-                }
-            };
-
-            Some(HandleBrennToolResult::Respond(
-                CcApprovalDecision::Continue {
-                    updated_output: Some(output.to_string()),
-                },
-            ))
-        }
+        } if is_device_tool(tool_name) => Some(HandleBrennToolResult::Respond(
+            answer_post_tool_use(
+                bridge,
+                "device tool",
+                tool_name,
+                tool_input,
+                tool_use_id,
+                tool_response,
+                PostCard::None,
+            )
+            .await,
+        )),
 
         _ => None,
+    }
+}
+
+/// Execute a device tool for the agent. `None` when `mcp_name` is not a
+/// device tool.
+pub(super) async fn execute_device_tool(
+    bridge: &ActiveBridge,
+    mcp_name: &str,
+    input: &serde_json::Value,
+) -> Option<ToolOutcome> {
+    match mcp_name {
+        MCP_DEVICE_LIST_TOOL => Some(execute_list(bridge, input).await),
+        MCP_DEVICE_GET_TOOL => Some(execute_get(bridge, input).await),
+        MCP_DEVICE_ASSIGN_SLUG_TOOL => Some(execute_assign_slug(bridge, input).await),
+        _ => None,
+    }
+}
+
+/// The device family's answers are an error iff they carry an `error` key.
+fn device_outcome(value: serde_json::Value) -> ToolOutcome {
+    if value.get("error").is_some() {
+        ToolOutcome::Err(value)
+    } else {
+        ToolOutcome::Ok(value)
+    }
+}
+
+/// `DeviceList`.
+async fn execute_list(bridge: &ActiveBridge, input: &serde_json::Value) -> ToolOutcome {
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10)
+        .clamp(1, 100) as usize;
+
+    let conn = bridge.db.lock().await;
+    let scope = match resolve_user_scope(bridge, &conn, input) {
+        Ok(s) => s,
+        Err(e) => return ToolOutcome::Err(e),
+    };
+    let visibility = match scope {
+        UserScope::Explicit(uid) => vec![uid],
+        UserScope::BridgeOwner => {
+            resolve_device_visibility_set(&conn, &bridge.app_config().allowed_users)
+        }
+    };
+
+    let limit_plus_one = limit + 1;
+    let mut device_ids = brenn_db::auth::device::list_device_ids_for_visibility_set(
+        &conn,
+        &visibility,
+        limit_plus_one,
+    );
+    let truncated = device_ids.len() > limit;
+    if truncated {
+        device_ids.truncate(limit);
+    }
+    let records = brenn_db::auth::device::fetch_device_records(&conn, &device_ids, &visibility);
+    ToolOutcome::Ok(if truncated {
+        json!({"devices": records, "truncated": true})
+    } else {
+        json!({"devices": records})
+    })
+}
+
+/// `DeviceGet`.
+async fn execute_get(bridge: &ActiveBridge, input: &serde_json::Value) -> ToolOutcome {
+    let device_arg = match input.get("device").and_then(|v| v.as_str()) {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => return ToolOutcome::Err(json!({"error": "missing_device_arg"})),
+    };
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10)
+        .clamp(1, 100) as usize;
+
+    let conn = bridge.db.lock().await;
+    let scope = match resolve_user_scope(bridge, &conn, input) {
+        Ok(s) => s,
+        Err(e) => return ToolOutcome::Err(e),
+    };
+    let visibility = match scope {
+        UserScope::Explicit(uid) => vec![uid],
+        UserScope::BridgeOwner => {
+            resolve_device_visibility_set(&conn, &bridge.app_config().allowed_users)
+        }
+    };
+    let mut device_ids =
+        brenn_db::auth::device::resolve_device_ids_for_get(&conn, &device_arg, &visibility);
+    if device_ids.is_empty() {
+        return ToolOutcome::Err(json!({"error": "not_found"}));
+    }
+    let truncated = device_ids.len() > limit;
+    if truncated {
+        device_ids.truncate(limit);
+    }
+    let records = brenn_db::auth::device::fetch_device_records(&conn, &device_ids, &visibility);
+    ToolOutcome::Ok(if truncated {
+        json!({"devices": records, "truncated": true})
+    } else {
+        json!({"devices": records})
+    })
+}
+
+/// `DeviceAssignSlug`.
+async fn execute_assign_slug(bridge: &ActiveBridge, input: &serde_json::Value) -> ToolOutcome {
+    let device_arg = match input.get("device").and_then(|v| v.as_str()) {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => return ToolOutcome::Err(json!({"error": "missing_device_arg"})),
+    };
+    let Some(slug) = input.get("slug").and_then(|v| v.as_str()) else {
+        return ToolOutcome::Err(json!({"error": "missing_slug_arg"}));
+    };
+
+    let conn = bridge.db.lock().await;
+    let effective_user_id = match resolve_user_scope_for_write(bridge, &conn, input) {
+        Ok(uid) => uid,
+        Err(e) => return ToolOutcome::Err(e),
+    };
+    match brenn_db::auth::device::resolve_device_for_assign(&conn, &device_arg, effective_user_id) {
+        Err(err_json) => ToolOutcome::Err(err_json),
+        Ok(device_id) => device_outcome(brenn_db::auth::device::assign_device_slug(
+            &conn,
+            device_id,
+            slug,
+            effective_user_id,
+        )),
     }
 }
 
@@ -1280,5 +1232,55 @@ mod tests {
             }
             other => panic!("expected Continue with user_not_in_app error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_device_answers_ok_and_err_outcomes() {
+        use super::super::super::test_support::test_bridge;
+        use super::super::execute::ToolOutcome;
+        use serde_json::json;
+
+        let (bridge, _e, _b, _a) = test_bridge().await;
+        let device_id = super::super::super::test_support::create_test_device_for_user(
+            &bridge.db,
+            bridge.user_id,
+            "Mozilla/5.0 Chrome/125",
+        )
+        .await;
+
+        match super::execute_device_tool(&bridge, MCP_DEVICE_LIST_TOOL, &json!({})).await {
+            Some(ToolOutcome::Ok(v)) => assert_eq!(v["devices"].as_array().unwrap().len(), 1),
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+        assert_eq!(
+            super::execute_device_tool(&bridge, MCP_DEVICE_GET_TOOL, &json!({"device": "99999"}))
+                .await,
+            Some(ToolOutcome::Err(json!({"error": "not_found"})))
+        );
+        // `assign_device_slug`'s own refusals are error outcomes too.
+        match super::execute_device_tool(
+            &bridge,
+            MCP_DEVICE_ASSIGN_SLUG_TOOL,
+            &json!({"device": device_id.to_string(), "slug": "Not A Slug!"}),
+        )
+        .await
+        {
+            Some(ToolOutcome::Err(v)) => assert_eq!(v["error"], "invalid_slug", "{v}"),
+            other => panic!("expected Err outcome, got {other:?}"),
+        }
+        match super::execute_device_tool(
+            &bridge,
+            MCP_DEVICE_ASSIGN_SLUG_TOOL,
+            &json!({"device": device_id.to_string(), "slug": "laptop"}),
+        )
+        .await
+        {
+            Some(ToolOutcome::Ok(v)) => assert_eq!(v["assigned_slug"], "laptop", "{v}"),
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+        assert_eq!(
+            super::execute_device_tool(&bridge, "mcp__brenn__BrennSend", &json!({})).await,
+            None
+        );
     }
 }

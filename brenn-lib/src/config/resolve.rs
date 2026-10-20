@@ -74,10 +74,10 @@ pub struct ResolvedConfig {
 /// global config is merged with per-app overrides, and the factory creates
 /// a configured instance.
 ///
-/// `runtime_dir` must be `Some(&validated_path)` when the config contains at
-/// least one bare (non-containerized) app, and `None` when all apps are
-/// containerized. The caller is responsible for resolving and validating
-/// `XDG_RUNTIME_DIR` exactly once at startup (see `crate::runtime_dir`).
+/// `runtime_dir` is the validated `XDG_RUNTIME_DIR`. Every config needs it:
+/// bare apps keep their state under it, and every app's conversations bind
+/// their tool sockets under it. The caller resolves and validates it exactly
+/// once at startup (see `crate::runtime_dir`).
 ///
 /// # Panics
 ///
@@ -93,13 +93,12 @@ pub struct ResolvedConfig {
 /// - Container `home_dir` does not exist or is not a directory
 /// - App enables an integration not in the registry
 /// - Integration-contributed MCP server name collides with explicit `mcp_servers`
-/// - A bare app is present but `runtime_dir` is `None` (bootstrap bug: the
-///   caller failed to gate on bare-app presence before resolving XDG)
+/// - An app slug is too long for its tool socket path to fit `sun_path`
 /// - `watchdog.sweep_interval_secs` is zero
 pub fn validate_and_resolve(
     config: &BrennConfig,
     integration_registry: &IntegrationRegistry,
-    runtime_dir: Option<&std::path::Path>,
+    runtime_dir: &std::path::Path,
 ) -> ResolvedConfig {
     assert!(
         !config.apps.is_empty(),
@@ -211,7 +210,8 @@ pub fn validate_and_resolve(
 /// # Side effects
 ///
 /// Reads `working_dir` and container `home_dir` stats; calls `create_dir_all`
-/// for each app's state directory.
+/// for each app's state directory; creates the tool socket root at 0700 if it
+/// is absent.
 ///
 /// # Panics
 ///
@@ -219,7 +219,7 @@ pub fn validate_and_resolve(
 pub fn resolve_apps(
     config: &BrennConfig,
     integration_registry: &IntegrationRegistry,
-    runtime_dir: Option<&std::path::Path>,
+    runtime_dir: &std::path::Path,
     mqtt_clients: &IndexMap<String, crate::mqtt::config::MqttClientIdentity>,
     webhook_subscriptions: &BTreeMap<
         String,
@@ -227,6 +227,23 @@ pub fn resolve_apps(
     >,
 ) -> IndexMap<String, AppConfig> {
     let slug_re = regex::Regex::new(r"^[a-z0-9][a-z0-9-]*$").unwrap();
+    let tool_socket_root = crate::runtime_dir::tool_socket_root(runtime_dir);
+    // Conversations bind their socket directories under the root. Creating it
+    // never touches what is already there: another server under this uid may
+    // hold live sockets in it.
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&tool_socket_root)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to create the tool socket root {}: {e}",
+                    tool_socket_root.display(),
+                )
+            });
+    }
 
     let mut apps = IndexMap::new();
 
@@ -235,6 +252,22 @@ pub fn resolve_apps(
             slug_re.is_match(&raw.slug),
             "invalid app slug {:?}: must match [a-z0-9][a-z0-9-]*",
             raw.slug,
+        );
+
+        // Each conversation binds a unix socket under the runtime dir, named
+        // after the slug; a slug that cannot fit `sun_path` would fail every
+        // spawn of the app.
+        let longest = crate::runtime_dir::longest_tool_socket_path(&tool_socket_root, &raw.slug);
+        assert!(
+            longest <= crate::runtime_dir::MAX_SOCKET_PATH_BYTES,
+            "app {:?}: slug is too long for its tool socket path: \
+             {}/{}-conv<id>/{} is up to {longest} bytes, over the {}-byte unix socket path \
+             limit; shorten the slug",
+            raw.slug,
+            tool_socket_root.display(),
+            raw.slug,
+            crate::runtime_dir::TOOL_SOCKET_FILE_NAME,
+            crate::runtime_dir::MAX_SOCKET_PATH_BYTES,
         );
 
         if let Some(ref wd) = raw.working_dir {
@@ -808,16 +841,11 @@ pub fn resolve_apps(
         // Containerized: piggyback on the existing home_dir mount so the state
         // dir is automatically visible inside the container via path_mapper.
         // Bare: $XDG_RUNTIME_DIR/brenn/<slug>; per-uid via XDG_RUNTIME_DIR
-        //   semantics on systemd hosts; pruned at logout. The caller must have
-        //   resolved XDG_RUNTIME_DIR at startup and passed it as `runtime_dir`.
+        //   semantics on systemd hosts; pruned at logout.
         let state_dir = if let Some(ref spawn) = container_spawn {
             spawn.home_dir.join(".config").join("brenn").join(&raw.slug)
         } else {
-            let xdg = runtime_dir.expect(
-                "bare app present but no validated XDG_RUNTIME_DIR was provided — \
-                 bootstrap must resolve XDG when any bare app is configured",
-            );
-            xdg.join("brenn").join(&raw.slug)
+            runtime_dir.join("brenn").join(&raw.slug)
         };
         std::fs::create_dir_all(&state_dir).unwrap_or_else(|e| {
             panic!(
@@ -902,6 +930,7 @@ pub fn resolve_apps(
                 .unwrap_or(DEFAULT_HISTORY_REPLAY_LIMIT),
             frontmatter: raw.frontmatter.clone(),
             state_dir,
+            tool_socket_root: tool_socket_root.clone(),
             // Per-app `[app.messaging]` is resolved in a follow-up pass below
             // (after the directory of channels is built). Default to None
             // here so the field stays compatible with apps that don't enable
@@ -926,9 +955,10 @@ pub fn resolve_apps(
             mqtt_subscriptions: vec![],
         };
 
-        // Refuse an agent `env` key that any integration may emit. Uses
-        // `env_var_names` (declared keys), not `env_vars` (currently emitted
-        // keys), because an integration may emit nothing yet at resolve time.
+        // Refuse an agent `env` key that Brenn or any integration may emit.
+        // Uses `env_var_names` (declared keys), not `env_vars` (currently
+        // emitted keys), because an integration may emit nothing yet at
+        // resolve time.
         if !resolved.env.is_empty() {
             let mut emitted: BTreeMap<String, String> = resolved
                 .integrations
@@ -942,6 +972,10 @@ pub fn resolve_apps(
             emitted.insert(
                 crate::integration::GRAF_USER_TZ_VAR.to_string(),
                 "the per-session timezone Brenn sets for every agent".to_string(),
+            );
+            emitted.insert(
+                brenn_tool_proto::SOCKET_ENV.to_string(),
+                "the tool socket Brenn binds for every conversation".to_string(),
             );
             for (key, source) in &emitted {
                 assert!(

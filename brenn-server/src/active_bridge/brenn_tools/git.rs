@@ -10,6 +10,8 @@ use super::super::mcp_constants::{
     MCP_GIT_REPO_STATUS_TOOL,
 };
 use super::super::tool_summary::{HandleBrennToolResult, emit_tool_summary, mark_tool_handled};
+use super::execute::ToolOutcome;
+use crate::intercept_helpers::{PostCard, answer_post_tool_use};
 
 /// Handle PreToolUse + PostToolUse arms for the Git tool family
 /// (`MCP_GIT_LIST_REPOS_TOOL`, `MCP_GIT_REPO_STATUS_TOOL`,
@@ -31,45 +33,25 @@ pub(super) async fn handle(
             }))
         }
 
-        // --- GitListRepos PostToolUse ---
+        // --- GitListRepos / GitRepoStatus PostToolUse ---
         ApprovalKind::PostToolUse {
             tool_name,
             tool_input,
             tool_use_id,
+            tool_response,
             ..
-        } if tool_name == MCP_GIT_LIST_REPOS_TOOL => {
-            mark_tool_handled(bridge, tool_use_id).await;
-
-            let containerized = bridge.container_spawn.is_some();
-            let repos: Vec<serde_json::Value> = bridge
-                .mounts
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "slug": m.slug,
-                        "path": m.visible_path(containerized).to_string_lossy(),
-                        "access": m.access,
-                        "auto_pull": m.auto_pull,
-                    })
-                })
-                .collect();
-
-            let output = serde_json::json!(repos);
-
-            emit_tool_summary(
-                bridge,
-                tool_name,
-                tool_input,
-                None,
-                Some(&ApprovalMatch::GlobalTool),
-                false,
-            )
-            .await;
-
+        } if tool_name == MCP_GIT_LIST_REPOS_TOOL || tool_name == MCP_GIT_REPO_STATUS_TOOL => {
             Some(HandleBrennToolResult::Respond(
-                CcApprovalDecision::Continue {
-                    updated_output: Some(output.to_string()),
-                },
+                answer_post_tool_use(
+                    bridge,
+                    "git tool",
+                    tool_name,
+                    tool_input,
+                    tool_use_id,
+                    tool_response,
+                    PostCard::Summary,
+                )
+                .await,
             ))
         }
 
@@ -79,57 +61,6 @@ pub(super) async fn handle(
             Some(HandleBrennToolResult::Respond(CcApprovalDecision::Allow {
                 updated_input: None,
             }))
-        }
-
-        // --- GitRepoStatus PostToolUse ---
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            ..
-        } if tool_name == MCP_GIT_REPO_STATUS_TOOL => {
-            mark_tool_handled(bridge, tool_use_id).await;
-
-            let repo_slug = tool_input
-                .get("repo")
-                .and_then(|v| v.as_str())
-                .unwrap_or("all");
-
-            let resolved = resolve_mounts(&bridge.mounts, repo_slug);
-            let results = match resolved {
-                Ok(mounts) => {
-                    let futs: Vec<_> = mounts
-                        .iter()
-                        .map(|m| brenn_git::ops::repo_status(m, &bridge.working_dir))
-                        .collect();
-                    futures::future::join_all(futs).await
-                }
-                Err(e) => {
-                    return Some(HandleBrennToolResult::Respond(
-                        CcApprovalDecision::Continue {
-                            updated_output: Some(serde_json::json!({"error": e}).to_string()),
-                        },
-                    ));
-                }
-            };
-
-            let output = serde_json::json!({ "repos": results });
-
-            emit_tool_summary(
-                bridge,
-                tool_name,
-                tool_input,
-                None,
-                Some(&ApprovalMatch::GlobalTool),
-                false,
-            )
-            .await;
-
-            Some(HandleBrennToolResult::Respond(
-                CcApprovalDecision::Continue {
-                    updated_output: Some(output.to_string()),
-                },
-            ))
         }
 
         // --- GitRepoPull ---
@@ -350,6 +281,55 @@ pub(super) async fn handle(
         }
 
         _ => None,
+    }
+}
+
+/// Execute a read-only git tool (`GitListRepos`, `GitRepoStatus`) for the
+/// agent. `None` for any other name; the mutating git tools run only on the
+/// hook path.
+pub(super) async fn execute_git_read_tool(
+    bridge: &ActiveBridge,
+    mcp_name: &str,
+    input: &serde_json::Value,
+) -> Option<ToolOutcome> {
+    match mcp_name {
+        MCP_GIT_LIST_REPOS_TOOL => Some(execute_list_repos(bridge)),
+        MCP_GIT_REPO_STATUS_TOOL => Some(execute_repo_status(bridge, input).await),
+        _ => None,
+    }
+}
+
+/// `GitListRepos`.
+fn execute_list_repos(bridge: &ActiveBridge) -> ToolOutcome {
+    let containerized = bridge.container_spawn.is_some();
+    let repos: Vec<serde_json::Value> = bridge
+        .mounts
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "slug": m.slug,
+                "path": m.visible_path(containerized).to_string_lossy(),
+                "access": m.access,
+                "auto_pull": m.auto_pull,
+            })
+        })
+        .collect();
+    ToolOutcome::Ok(serde_json::json!(repos))
+}
+
+/// `GitRepoStatus`.
+async fn execute_repo_status(bridge: &ActiveBridge, input: &serde_json::Value) -> ToolOutcome {
+    let repo_slug = input.get("repo").and_then(|v| v.as_str()).unwrap_or("all");
+    match resolve_mounts(&bridge.mounts, repo_slug) {
+        Ok(mounts) => {
+            let futs: Vec<_> = mounts
+                .iter()
+                .map(|m| brenn_git::ops::repo_status(m, &bridge.working_dir))
+                .collect();
+            let results = futures::future::join_all(futs).await;
+            ToolOutcome::Ok(serde_json::json!({ "repos": results }))
+        }
+        Err(e) => ToolOutcome::Err(serde_json::json!({ "error": e })),
     }
 }
 
@@ -700,7 +680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_list_repos_post_tool_use_returns_empty_when_no_repos() {
+    async fn git_list_repos_post_tool_use_refused_when_no_repos() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge().await;
 
         let (resp_tx, _) = oneshot::channel();
@@ -721,16 +701,47 @@ mod tests {
             Some(HandleBrennToolResult::Respond(CcApprovalDecision::Continue {
                 updated_output: Some(output),
             })) => {
+                // An agent with no mounts is not offered the git tools, so
+                // admission refuses the name.
                 let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-                let arr = parsed.as_array().expect("should be an array");
-                assert!(
-                    arr.is_empty(),
-                    "should return empty array when no repos configured"
-                );
+                assert_eq!(parsed["error"], "unknown_tool", "{parsed}");
             }
             other => {
                 panic!("PostToolUse for GitListRepos should Continue with output, got {other:?}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn execute_git_read_tools_answer_ok_and_err_outcomes() {
+        use super::super::execute::ToolOutcome;
+        use serde_json::json;
+
+        let (bridge, _e, _b, _a) = test_bridge().await;
+        assert_eq!(
+            super::execute_git_read_tool(&bridge, MCP_GIT_LIST_REPOS_TOOL, &json!({})).await,
+            Some(ToolOutcome::Ok(json!([])))
+        );
+        assert_eq!(
+            super::execute_git_read_tool(
+                &bridge,
+                super::super::super::mcp_constants::MCP_GIT_REPO_STATUS_TOOL,
+                &json!({})
+            )
+            .await,
+            Some(ToolOutcome::Err(
+                json!({"error": "No repos configured for this app."})
+            ))
+        );
+        // The mutating git tools are hook-only.
+        assert_eq!(
+            super::execute_git_read_tool(
+                &bridge,
+                MCP_GIT_REPO_COMMIT_AND_PUSH_TOOL,
+                &json!({"message": "m"})
+            )
+            .await,
+            None
+        );
     }
 }

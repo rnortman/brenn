@@ -67,6 +67,7 @@ pub fn test_app_config(slug: &str) -> AppConfig {
         history_replay_limit: 2000,
         frontmatter: FrontmatterRenderConfig::default(),
         state_dir: PathBuf::from("/tmp/.brenn/test-state"),
+        tool_socket_root: PathBuf::from("/tmp/.brenn/brenn-tool-sockets"),
         messaging: None,
         messaging_default_send_budget: 100,
         policy: std::sync::Arc::new(AppPolicy::default()),

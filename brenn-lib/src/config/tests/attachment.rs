@@ -46,7 +46,7 @@ fn attachment_target_valid_config() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     let app = apps.get("test").unwrap();
     assert_eq!(app.attachment_targets.len(), 1);
@@ -66,7 +66,11 @@ fn attachment_target_duplicate_name_panics() {
         )],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -81,7 +85,11 @@ fn attachment_target_reserved_chat_name_panics() {
         )],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -96,7 +104,11 @@ fn attachment_target_empty_name_panics() {
         )],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -110,7 +122,11 @@ fn attachment_target_empty_accept_panics() {
         apps: vec![app_raw_with_targets(dir.path(), vec![target])],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -124,5 +140,9 @@ fn attachment_target_extension_without_dot_panics() {
         apps: vec![app_raw_with_targets(dir.path(), vec![target])],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }

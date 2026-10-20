@@ -71,7 +71,7 @@ fn primary_implicit_on_single_rw_mount() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     let rw = apps.get("app-a").unwrap().mounts[0].clone();
     let ro = apps.get("app-b").unwrap().mounts[0].clone();
@@ -110,7 +110,7 @@ fn primary_explicit_redundant_ok_on_single_rw() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     assert!(apps.get("app-a").unwrap().mounts[0].primary);
 }
@@ -146,7 +146,7 @@ fn primary_explicit_on_multi_rw_ok() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     assert!(apps.get("app-a").unwrap().mounts[0].primary);
     assert!(!apps.get("app-b").unwrap().mounts[0].primary);
@@ -183,7 +183,7 @@ fn primary_undeclared_on_multi_rw_panics() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 
@@ -218,7 +218,7 @@ fn primary_double_declared_panics() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 
@@ -253,7 +253,7 @@ fn primary_on_ro_mount_panics() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 
@@ -288,7 +288,7 @@ fn primary_on_ro_only_clone_panics() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 
@@ -323,7 +323,7 @@ fn ro_only_clone_no_primary_no_panic() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     assert!(!apps.get("app-a").unwrap().mounts[0].primary);
     assert!(!apps.get("app-b").unwrap().mounts[0].primary);

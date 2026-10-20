@@ -212,6 +212,7 @@ mod tests {
             secure_cookies: false,
             log_dir: std::path::PathBuf::from("/tmp"),
             mcp_script_path: std::path::PathBuf::from("/tmp/mcp.py"),
+            tool_cli_path: std::path::PathBuf::from("/tmp/brenn-tool"),
             apps: brenn_lib::config::AppTable::empty(),
             bridge_notify_tx: tokio::sync::broadcast::channel(1).0,
             apps_swapped_tx: tokio::sync::broadcast::channel(1).0,

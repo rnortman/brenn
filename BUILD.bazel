@@ -161,6 +161,8 @@ filegroup(
         "//brenn-usage:policy_srcs",
         "//brenn-usage-db:policy_srcs",
         "//brenn-usage-obs:policy_srcs",
+        "//brenn-tool:policy_srcs",
+        "//brenn-tool-proto:policy_srcs",
         "//brenn-tool-registry:policy_srcs",
         "//brenn-wasm:policy_srcs",
         "//brenn-wasm/components:policy_srcs",

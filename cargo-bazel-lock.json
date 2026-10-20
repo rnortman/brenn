@@ -1,5 +1,5 @@
 {
-  "checksum": "98e30fed42f8679f4159c4cc8f92293221fae97066ca773360414c9872c7601d",
+  "checksum": "6f638854db640806402acd760c721f6ad239a67036a101e6107f6b0fd59f3fa2",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -5607,6 +5607,94 @@
             {
               "id": "tempfile 3.27.0",
               "target": "tempfile"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-tool 0.1.0": {
+      "name": "brenn-tool",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "clap 4.6.1",
+              "target": "clap"
+            },
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            },
+            {
+              "id": "tokio 1.52.3",
+              "target": "tokio"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "tempfile 3.27.0",
+              "target": "tempfile"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-tool-proto 0.1.0": {
+      "name": "brenn-tool-proto",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_tool_proto",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_tool_proto",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde 1.0.228",
+              "target": "serde"
+            },
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
             }
           ],
           "selects": {}
@@ -37425,6 +37513,8 @@
     "brenn-surface-schema 0.1.0": "surface/schema",
     "brenn-surface-server 0.1.0": "surface/server",
     "brenn-surface-test-fixtures 0.1.0": "surface/test-fixtures",
+    "brenn-tool 0.1.0": "brenn-tool",
+    "brenn-tool-proto 0.1.0": "brenn-tool-proto",
     "brenn-tool-registry 0.1.0": "brenn-tool-registry",
     "brenn-usage 0.1.0": "brenn-usage",
     "brenn-usage-db 0.1.0": "brenn-usage-db",

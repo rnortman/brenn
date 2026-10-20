@@ -283,6 +283,26 @@ impl RecordedSession {
     }
 }
 
+/// A fixture bridge's tool socket, bound as production binds one but in a
+/// directory of its own under one per-process root, so fixtures sharing an app
+/// slug and conversation id never clear each other's socket.
+fn fixture_tool_socket(app_slug: &str, conversation_id: i64) -> super::tool_socket::ToolSocket {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = ROOT.get_or_init(|| {
+        tempfile::tempdir()
+            .expect("tempdir for fixture tool sockets")
+            .keep()
+    });
+    let dir = root.join(
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    std::fs::create_dir(&dir).expect("fixture tool socket root");
+    super::tool_socket::ToolSocket::bind(&dir, app_slug, conversation_id)
+        .expect("bind a fixture tool socket")
+}
+
 impl ActiveBridge {
     /// Whether this bridge's CC is between turns, as a test wants to state it.
     /// A busy bridge is one a reload may not retire until its turn ends.
@@ -553,12 +573,17 @@ impl ActiveBridge {
         // Default: an empty first-class tool registry (no tools registered).
         let tools =
             tools.unwrap_or_else(|| Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])));
+        // Mounts and integrations go into the agent as well as onto the bridge,
+        // as production copies the bridge's from the agent at spawn: the tool
+        // catalog reads the agent's.
         let apps = apps.unwrap_or_else(|| {
             single_app_table(app_slug, |app| {
                 app.allowed_users = allowed_users;
                 app.messaging_default_send_budget = send_budget;
                 app.messaging = None;
                 app.policy_mut().tool_grants = tool_grants;
+                app.mounts = mounts.clone();
+                app.integrations = integrations.clone();
             })
         });
         // The per-process snapshot fields production takes from the map its
@@ -572,7 +597,7 @@ impl ActiveBridge {
         let bus_idle_timeout = messenger
             .as_ref()
             .map(|m| Duration::from_secs(m.llm_chat().idle_timeout_secs));
-        Arc::new(Self {
+        let bridge = Arc::new(Self {
             session: tokio::sync::Mutex::new(None),
             event_tx: broadcast_tx,
             alert_dispatcher,
@@ -654,9 +679,12 @@ impl ActiveBridge {
             swapping: AtomicBool::new(false),
             swap_ack: std::sync::Mutex::new(None),
             cc_event_tx: cc_event_tx.unwrap_or_else(|| tokio::sync::mpsc::channel(1).0),
+            tool_socket: fixture_tool_socket(app_slug, conversation_id),
             #[cfg(test)]
             event_loop_epoch: epoch_tx,
-        })
+        });
+        bridge.tool_socket.attach(Arc::downgrade(&bridge));
+        bridge
     }
 
     /// Test bridge with both a Messenger (one brenn channel) and a PwaPushService

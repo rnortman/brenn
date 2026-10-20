@@ -130,6 +130,10 @@ box for the same reason and goes one step further: a config-carrying mount's
 `config/` tree is deployment text somebody else wrote, and the operator's
 `under` line is the delegation.)
 
+(B11 runs alongside B3: the same CC-influenced actor, reaching the backend not
+through CC's output stream but through a unix socket mounted into its own
+container, from any process it starts there.)
+
 | ID | Boundary | Direction of distrust |
 |----|----------|----------------------|
 | **B0** | Unauthenticated network → backend | client untrusted |
@@ -143,6 +147,7 @@ box for the same reason and goes one step further: a config-carrying mount's
 | **B8** | Packaged module text → compiler | author-supplied configuration text untrusted; what an arrangement may confer is bounded by the ceiling the deployer stamped it under |
 | **B9** | Reload requester → running configuration | the requester chooses the *moment*, never the content; what a reload can do is bounded by what the document on disk says |
 | **B10** | Mount author → running configuration | the author chooses a config-carrying mount's content; the ceiling chooses what that content may reach; the mounts document and the root document stay outside every mount |
+| **B11** | Agent container → backend (tool socket) | process in the agent's container untrusted (CC-influenced content, the B3 actor); identity is the mount, never a credential |
 
 ---
 
@@ -1211,6 +1216,57 @@ is not spelled in ceiling words.
 
 ---
 
+## 9e. Boundary B11 — Agent Container → Backend (Tool Socket)
+
+**Who:** any process in a conversation's agent container — the agent's shell
+commands, the scripts it writes, code from repositories it cloned, its
+subagents. Everything there is CC-influenced, the B3 actor; the socket gives
+that actor a path to the backend that does not run through CC's output stream
+and so is never seen by a PreToolUse hook.
+
+**Trust decision: identity is the mount, never a credential.** Each
+conversation's backend owns one unix listener, in a directory under the
+validated runtime directory, bind-mounted into that conversation's agent
+container and into no other container. Whoever can connect *is* that
+conversation; there is no token to steal or replay. A bare app has no container
+and so no such boundary: any process of the server's uid can connect, which adds
+nothing to what a bare CC can already do as that uid.
+
+**Policies:**
+
+- **One listener per conversation, mounted into that conversation's agent
+  alone.** Hook containers, auto-pull containers and other conversations'
+  containers get no socket. The per-conversation directory lives outside the
+  app's home directory, which every container of the app shares.
+- **Same identity, same executor.** Every call carries the conversation's own
+  identity and runs the same executor, with the same argument validation, that
+  the hook path runs for the same tool. No check the hook path makes may exist
+  only in a hook arm.
+- **Nothing the hook path would prompt for is reachable.** Only tools whose
+  PreToolUse leg is an unconditional allow are callable; approval-gated and
+  conversation-bound tools are refused by name. The socket is an
+  observation-free path, so it may execute only what the hook path executes
+  without asking — §7.3 is not bypassed because nothing that needs §7.3's
+  authorization runs here.
+- **Intake is bounded and refuses, never queues.** One request line per
+  connection under a byte cap; a bounded time to send it; a bounded number of
+  open requests per conversation, beyond which a connection is answered `busy`
+  before any of its bytes are read. No waiting gate sits in front of any tool.
+- **Protocol violations are a security signal, sender-attributed.** A
+  malformed, oversize or unterminated request is answered and recorded as a
+  `ToolSocketViolation` event attributed by app and conversation, with the
+  offending bytes sanitized and bounded before they reach the log. It is never
+  fail2ban-matched (there is no IP); volume is the signal, as for malformed
+  chat commands (§6.4).
+
+**What the reviewer verifies:** any tool reachable through the socket that the
+hook path would prompt for; any socket, or socket directory, mounted into a
+container that is not the conversation's agent; any per-call policy (grant,
+ACL, budget, rate, validation, publish-denial signal) applied on one origin and
+not the other; any unbounded read on the socket.
+
+---
+
 ## 10. Rendering / XSS Boundary
 
 The server renders untrusted content (CC-authored and artifact text) into markup
@@ -1388,6 +1444,10 @@ Raise a finding when any of the following hold. Severity in brackets is guidance
 12. **Resource-exhaustion gap on an untrusted boundary.** [Medium] A boundary that
     ingests external input without a size/CPU/wall-clock bound where one is
     structurally expected. (§6, §8)
+13. **Tool-socket reach or exposure.** [Critical] A tool reachable through
+    the agent tool socket that the hook path would prompt for. [High] The
+    socket mounted into a container that is not the conversation's agent, or a
+    call policy enforced on the hook path but not at the socket. (§9e)
 
 A reviewer should **not** raise as a finding: operator-config trust (the operator
 is the trust anchor); a behavior the project has consciously accepted as tracked

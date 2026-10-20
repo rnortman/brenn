@@ -4,6 +4,32 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Agents can run their Brenn tools as shell commands.** A new command,
+  `brenn-tool`, lets an agent call the Brenn tools it already has from Bash,
+  a script, a loop or a pipeline: `brenn-tool list`, `describe <Tool>`, and
+  `call <Tool>` with the tool's input as JSON on the command line, on stdin,
+  or assembled from files (`--str-file` puts a large body in without
+  escaping it). The tool's result is printed as JSON; failures exit
+  non-zero with a JSON error. The command is only a proxy: it talks to a
+  per-conversation socket, and Brenn runs the call with exactly the checks a
+  tool call gets (channel permissions, send rate and budget, schema
+  validation). No credential is involved. Tools whose effect is on the chat
+  itself (showing a file, compaction, choice cards) and tools that need
+  approval are refused as commands. See `docs/agent-tool-cli.md`.
+- **Operators must update deployment for `brenn-tool`.**
+  - The launcher must now set `XDG_RUNTIME_DIR` to a directory owned by the
+    server's user with mode 0700, for every configuration. Boot stops if it
+    is missing or wrong. A systemd user service already has it.
+  - The binary is mounted into containerized agents from the new
+    `claude_defaults.tool_cli_path` (default `/opt/brenn/brenn-tool`). Boot
+    checks it when any agent is containerized. Bare agents must find
+    `brenn-tool` on Brenn's own `PATH`.
+  - An agent `env` may not set `BRENN_TOOL_SOCKET`, and an agent slug long
+    enough to overflow the socket path limit is refused at load.
+  See "Spawn artifacts and the runtime directory" in `docs/config-dsl.md`.
+- Tool-argument validation moved from the noop MCP stub into the server, so
+  tool calls and commands are checked by the same code.
+
 ## [0.26.1] — 2026-10-19
 
 - **Components can read their own instance name** through the new WASM

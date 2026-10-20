@@ -904,6 +904,7 @@ alerting {
 
 claude_defaults {
     mcp_script_path = "/opt/brenn/alice_mcp.py";
+    tool_cli_path = "/opt/brenn/alice-tool";
     model = "opus";
     profile_token_dir = "/home/alice/.secrets";
 }
@@ -1021,6 +1022,7 @@ container cc {
             }),
             claude_defaults: ClaudeDefaultsConfig {
                 mcp_script_path: PathBuf::from("/opt/brenn/alice_mcp.py"),
+                tool_cli_path: PathBuf::from("/opt/brenn/alice-tool"),
                 model: "opus".to_string(),
                 profile_token_dir: Some(PathBuf::from("/home/alice/.secrets")),
             },
@@ -3023,7 +3025,7 @@ new alice: Assistant();
     let resolved = crate::config::validate_and_resolve(
         &from_dsl,
         &crate::integration::IntegrationRegistry::new(vec![]),
-        Some(&runtime_dir),
+        &runtime_dir,
     );
     let app = resolved
         .apps

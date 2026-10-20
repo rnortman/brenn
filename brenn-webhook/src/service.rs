@@ -551,7 +551,7 @@ mod tests {
         let resolved = validate_and_resolve(
             &config,
             &IntegrationRegistry::new(vec![]),
-            Some(brenn_lib::runtime_dir::test_runtime_dir_once()),
+            brenn_lib::runtime_dir::test_runtime_dir_once(),
         );
 
         let svc = WebhookService::for_test(resolved.webhook_endpoints.into_values());

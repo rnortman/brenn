@@ -1785,7 +1785,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (bridge, _event_tx, _broadcast_rx, _ab) =
             test_bridge_with_mounts(vec![mk_rw_mount(tmp.path().to_path_buf())]).await;
-        let req = post_tool_use_req(MCP_EXPORT_USAGE_TOOL, serde_json::json!({"kind": "bogus"}));
+        let out_path = tmp.path().join("export.csv");
+        let req = post_tool_use_req(
+            MCP_EXPORT_USAGE_TOOL,
+            serde_json::json!({
+                "kind": "bogus",
+                "from": "2026-01-01T00:00:00Z",
+                "to": "2027-01-01T00:00:00Z",
+                "output_file": out_path.to_str().unwrap()
+            }),
+        );
         let result = handle_brenn_tools(&bridge, &req).await;
         assert_export_usage_error(result, "invalid kind");
     }
@@ -1802,7 +1811,8 @@ mod tests {
                 "kind": "sessions",
                 "from": "2026-01-01T00:00:00Z",
                 "to": "2027-01-01T00:00:00Z",
-                "format": "xml"
+                "format": "xml",
+                "output_file": tmp.path().join("export.csv").to_str().unwrap()
             }),
         );
         let result = handle_brenn_tools(&bridge, &req).await;
@@ -1820,14 +1830,16 @@ mod tests {
             serde_json::json!({
                 "kind": "sessions",
                 "from": "not-a-date",
-                "to": "2099-01-01T00:00:00Z"
+                "to": "2099-01-01T00:00:00Z",
+                "output_file": tmp.path().join("export.csv").to_str().unwrap()
             }),
         );
         let result = handle_brenn_tools(&bridge, &req).await;
         assert_export_usage_error(result, "invalid timestamp");
     }
 
-    /// T19: missing `output_file` is rejected; `kind`, `from`, `to`, `format` are valid.
+    /// A missing `output_file` is a schema violation, refused at admission
+    /// before the export runs.
     #[tokio::test]
     async fn mcp_export_usage_rejects_missing_output_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1843,7 +1855,18 @@ mod tests {
             }),
         );
         let result = handle_brenn_tools(&bridge, &req).await;
-        assert_export_usage_error(result, "missing output_file");
+        let Some(HandleBrennToolResult::Respond(CcApprovalDecision::Continue {
+            updated_output: Some(output),
+        })) = result
+        else {
+            panic!("expected Continue with output, got {result:?}");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["error"], "invalid_args", "{parsed}");
+        assert!(
+            parsed["detail"].as_str().unwrap().contains("output_file"),
+            "{parsed}"
+        );
     }
 
     /// T20: `event_type = "bogus_type"` is rejected after all earlier validation passes.

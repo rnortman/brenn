@@ -69,6 +69,11 @@ pub struct AppState {
     /// Path to the Brenn DisplayFile MCP stub script (server-global).
     #[cfg_attr(test, allow(dead_code))]
     pub mcp_script_path: PathBuf,
+    /// Host path of the `brenn-tool` binary, bind-mounted into every
+    /// containerized agent's container. Boot canonicalizes it when any app is
+    /// containerized; a bare-only config never reads it.
+    #[cfg_attr(test, allow(dead_code))]
+    pub tool_cli_path: PathBuf,
     /// Per-app configurations, keyed by slug. Iteration order is the
     /// declaration order of `agent` blocks in the config document.
     ///
@@ -738,6 +743,7 @@ impl AppState {
                 resume_session_id: resume_id,
                 log_dir: &self.log_dir,
                 mcp_script_path: &self.mcp_script_path,
+                tool_cli_path: &self.tool_cli_path,
                 app_config,
                 apps: self.apps.clone(),
                 apps_generation,
@@ -932,6 +938,7 @@ impl AppState {
             secure_cookies: false,
             log_dir: std::path::PathBuf::from("logs"),
             mcp_script_path: std::path::PathBuf::from("noop_mcp.py"),
+            tool_cli_path: std::path::PathBuf::from("brenn-tool"),
             apps,
             bridge_notify_tx: broadcast::channel(64).0,
             apps_swapped_tx: broadcast::channel(16).0,

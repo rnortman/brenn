@@ -48,7 +48,7 @@ fn public_url_none_panics() {
     validate_and_resolve(
         &minimal_config_with_public_url(None),
         &IntegrationRegistry::new(vec![]),
-        None,
+        crate::runtime_dir::test_runtime_dir_once(),
     );
 }
 
@@ -58,7 +58,7 @@ fn public_url_valid_https_passes() {
     validate_and_resolve(
         &valid_config_with_public_url(dir.path().to_path_buf(), Some("https://brenn.example.com")),
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 
@@ -71,7 +71,7 @@ fn public_url_valid_https_with_port_passes() {
             Some("https://brenn.example.com:8443"),
         ),
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 
@@ -81,7 +81,7 @@ fn public_url_malformed_panics() {
     validate_and_resolve(
         &minimal_config_with_public_url(Some("not a url")),
         &IntegrationRegistry::new(vec![]),
-        None,
+        crate::runtime_dir::test_runtime_dir_once(),
     );
 }
 
@@ -91,7 +91,7 @@ fn public_url_control_char_panics() {
     validate_and_resolve(
         &minimal_config_with_public_url(Some("https://brenn.example.com\x01")),
         &IntegrationRegistry::new(vec![]),
-        None,
+        crate::runtime_dir::test_runtime_dir_once(),
     );
 }
 
@@ -101,7 +101,7 @@ fn public_url_del_char_panics() {
     validate_and_resolve(
         &minimal_config_with_public_url(Some("https://brenn.example.com\x7F")),
         &IntegrationRegistry::new(vec![]),
-        None,
+        crate::runtime_dir::test_runtime_dir_once(),
     );
 }
 
@@ -111,7 +111,7 @@ fn public_url_empty_string_panics() {
     validate_and_resolve(
         &minimal_config_with_public_url(Some("")),
         &IntegrationRegistry::new(vec![]),
-        None,
+        crate::runtime_dir::test_runtime_dir_once(),
     );
 }
 
@@ -142,7 +142,11 @@ fn trusted_proxy_hops_over_cap_rejected() {
         },
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 /// The boundary value `8` (== the cap) is accepted, not rejected. Pins the
@@ -158,7 +162,7 @@ fn trusted_proxy_hops_cap_accepted() {
     validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 }
 

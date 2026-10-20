@@ -77,13 +77,107 @@ fn assert_build_id_valid(build_id: &str) {
 /// roots: a broken install is refused whether or not this configuration
 /// instantiates the name.
 ///
-/// TODO(mcp-script-path-precondition): `claude_defaults.mcp_script_path` is not
-/// among the artifact facts checked here, so a configuration naming a file that
-/// does not exist boots and fails at the first session spawn instead.
-fn assert_boot_preconditions(build_id: &str, roots: &Roots) {
+/// The same holds for the files every spawn hands to Claude Code: the noop MCP
+/// server always, and the `brenn-tool` binary whenever some app is
+/// containerized (it is the source of a bind mount). Both come back
+/// canonicalized: a relative config path is relative to the server's working
+/// directory, which works as a `python3` argument but is a named volume, not a
+/// bind mount, as a podman `-v` source.
+///
+/// A bare app's Claude Code inherits the server's environment, so whenever
+/// some app is bare, `brenn-tool` must be an executable file on `path_var`
+/// (the server's `PATH`).
+fn assert_boot_preconditions(
+    build_id: &str,
+    roots: &Roots,
+    config: &BrennConfig,
+    path_var: Option<&std::ffi::OsStr>,
+) -> SpawnArtifacts {
     assert_build_id_valid(build_id);
     brenn_lib::wasm_package::assert_components_roots(&roots.components_roots);
     brenn_lib::wasm_package::assert_disjoint_components_roots(&roots.components_roots);
+    let defaults = &config.claude_defaults;
+    let mcp_script_path = canonical_regular_file(
+        "claude_defaults.mcp_script_path",
+        &defaults.mcp_script_path,
+        false,
+    );
+    // Read only as a container mount source: a bare-only config never uses it.
+    let tool_cli_path = if config.apps.iter().any(|a| a.container.is_some()) {
+        canonical_regular_file(
+            "claude_defaults.tool_cli_path",
+            &defaults.tool_cli_path,
+            true,
+        )
+    } else {
+        defaults.tool_cli_path.clone()
+    };
+    let bare_tool_cli = config.apps.iter().any(|a| a.container.is_none()).then(|| {
+        find_executable_on_path(path_var, TOOL_CLI_NAME).unwrap_or_else(|| {
+            panic!(
+                "no executable `{TOOL_CLI_NAME}` on the server's PATH ({}): a bare app's \
+                     Claude Code runs it from the server's own environment",
+                path_var.map_or("unset".into(), |p| p.to_string_lossy()),
+            )
+        })
+    });
+    SpawnArtifacts {
+        mcp_script_path,
+        tool_cli_path,
+        bare_tool_cli,
+    }
+}
+
+/// The command name a bare app's Claude Code finds the tool CLI under.
+const TOOL_CLI_NAME: &str = "brenn-tool";
+
+/// The first executable regular file named `name` in the directories of
+/// `path_var`, in order. Empty entries are skipped rather than read as the
+/// working directory.
+fn find_executable_on_path(path_var: Option<&std::ffi::OsStr>, name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path_var?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// The host files every Claude Code spawn is handed, as boot checked them.
+#[derive(Debug)]
+struct SpawnArtifacts {
+    mcp_script_path: PathBuf,
+    tool_cli_path: PathBuf,
+    /// Where bare apps find `brenn-tool` on `PATH`; `None` with no bare app.
+    bare_tool_cli: Option<PathBuf>,
+}
+
+/// `path` canonicalized, panicking naming `key` unless it is a regular file
+/// (and, with `executable`, one with an execute bit set).
+fn canonical_regular_file(key: &str, path: &std::path::Path, executable: bool) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|e| {
+        panic!(
+            "{key} = {}: cannot resolve the file (relative paths resolve against the \
+             server's working directory): {e}",
+            path.display(),
+        )
+    });
+    let meta = std::fs::metadata(&canonical)
+        .unwrap_or_else(|e| panic!("{key} = {}: cannot stat: {e}", canonical.display()));
+    assert!(
+        meta.is_file(),
+        "{key} = {}: not a regular file",
+        canonical.display(),
+    );
+    assert!(
+        !executable || meta.permissions().mode() & 0o111 != 0,
+        "{key} = {}: not executable",
+        canonical.display(),
+    );
+    canonical
 }
 
 /// One line per mount, before anything reads a tree.
@@ -201,7 +295,12 @@ pub async fn run_server(
     mounts: LoadedMounts,
     build_id: &'static str,
 ) {
-    assert_boot_preconditions(build_id, &mounts.roots);
+    let spawn_artifacts = assert_boot_preconditions(
+        build_id,
+        &mounts.roots,
+        &document.config,
+        std::env::var_os("PATH").as_deref(),
+    );
     let components_roots = mounts.roots.components_roots.clone();
     let surface_asset_roots = mounts.roots.surface_roots.clone();
 
@@ -223,6 +322,9 @@ pub async fn run_server(
         "config loaded"
     );
     log_mounts(&mounts);
+    if let Some(path) = &spawn_artifacts.bare_tool_cli {
+        info!(path = %path.display(), "boot: brenn-tool for bare apps");
+    }
     // The document's own answer, not the flag's: with no `--config` the loader
     // probes for a fallback file, and a reload re-reads *that* root. Reporting
     // the flag here would leave a fallback boot publishing no root while
@@ -252,23 +354,17 @@ pub async fn run_server(
         Box::new(brenn_pfin::PfinFactory),
         Box::new(brenn_graf::GrafFactory),
     ]));
-    // Resolve XDG_RUNTIME_DIR at most once, and only when the config contains
-    // at least one bare (non-containerized) app. Container-only configs pay zero
-    // cost and never touch the env. The validated PathBuf is borrowed into
-    // validate_and_resolve via Option<&Path> so a single resolution serves all
-    // bare apps in the config.
-    let runtime_dir: Option<std::path::PathBuf> = config
-        .apps
-        .iter()
-        .any(|a| a.container.is_none())
-        .then(brenn_lib::runtime_dir::resolve_validated_xdg_runtime_dir);
+    // Resolve XDG_RUNTIME_DIR exactly once. Every config needs it: bare apps
+    // keep their state under it and every conversation binds its tool socket
+    // under it.
+    let runtime_dir = brenn_lib::runtime_dir::resolve_validated_xdg_runtime_dir();
     let ResolvedConfig {
         apps,
         webhook_endpoints,
         mqtt_clients,
         pwa_push: resolved_pwa_push,
         claude_profiles,
-    } = validate_and_resolve(&config, &integration_registry, runtime_dir.as_deref());
+    } = validate_and_resolve(&config, &integration_registry, &runtime_dir);
 
     // The one agent table of this process. Every gate that decides on an agent
     // reads it through a clone of this handle, so a reload converges them all by
@@ -850,7 +946,8 @@ pub async fn run_server(
         active_bridges,
         secure_cookies: config.server.secure_cookies,
         log_dir: config.logging.log_dir,
-        mcp_script_path: config.claude_defaults.mcp_script_path,
+        mcp_script_path: spawn_artifacts.mcp_script_path,
+        tool_cli_path: spawn_artifacts.tool_cli_path,
         apps: app_table.clone(),
         bridge_notify_tx: tokio::sync::broadcast::channel(64).0,
         apps_swapped_tx: tokio::sync::broadcast::channel(16).0,
@@ -1351,14 +1448,217 @@ mod tests {
         assert_build_id_valid(&"x".repeat(64));
     }
 
+    /// A config whose spawn artifacts exist: a bare-only config naming a real
+    /// `mcp_script_path`.
+    fn artifacts_config() -> (tempfile::TempDir, BrennConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("noop_mcp.py");
+        std::fs::write(&script, b"").unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        write_executable(&bin.join("brenn-tool"));
+        let mut config = BrennConfig::default();
+        config.claude_defaults.mcp_script_path = script;
+        config.claude_defaults.tool_cli_path = dir.path().join("absent-brenn-tool");
+        config.apps = vec![brenn_lib::config::AppConfigRaw {
+            slug: "bare".to_string(),
+            ..Default::default()
+        }];
+        (dir, config)
+    }
+
+    fn write_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, b"").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The `PATH` under which `artifacts_config`'s directory supplies
+    /// `brenn-tool`.
+    fn tool_path(dir: &tempfile::TempDir) -> std::ffi::OsString {
+        dir.path().join("bin").into_os_string()
+    }
+
+    /// `artifacts_config` with one containerized app and an executable
+    /// `tool_cli_path`.
+    fn containerized_artifacts_config() -> (tempfile::TempDir, BrennConfig) {
+        let (dir, mut config) = artifacts_config();
+        let tool = dir.path().join("brenn-tool");
+        write_executable(&tool);
+        config.claude_defaults.tool_cli_path = tool;
+        config.apps.push(brenn_lib::config::AppConfigRaw {
+            slug: "boxed".to_string(),
+            container: Some("sandbox".to_string()),
+            ..Default::default()
+        });
+        (dir, config)
+    }
+
+    fn preconditions(roots: &Roots) -> SpawnArtifacts {
+        let (dir, config) = artifacts_config();
+        assert_boot_preconditions("test-build", roots, &config, Some(&tool_path(&dir)))
+    }
+
+    #[test]
+    #[should_panic(expected = "claude_defaults.mcp_script_path")]
+    fn a_missing_mcp_script_is_refused_naming_the_key() {
+        let (dir, mut config) = artifacts_config();
+        config.claude_defaults.mcp_script_path = dir.path().join("gone.py");
+        assert_boot_preconditions(
+            "test-build",
+            &Roots::default(),
+            &config,
+            Some(&tool_path(&dir)),
+        );
+    }
+
+    #[test]
+    fn spawn_artifacts_come_back_canonical() {
+        let (dir, mut config) = containerized_artifacts_config();
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        config.claude_defaults.mcp_script_path = dir.path().join(".").join("noop_mcp.py");
+        let artifacts = assert_boot_preconditions(
+            "test-build",
+            &Roots::default(),
+            &config,
+            Some(&tool_path(&dir)),
+        );
+        assert_eq!(artifacts.mcp_script_path, canonical_dir.join("noop_mcp.py"));
+        assert_eq!(artifacts.tool_cli_path, canonical_dir.join("brenn-tool"));
+    }
+
+    /// A relative path resolves against the server's working directory and
+    /// comes back absolute.
+    #[test]
+    fn a_relative_mcp_script_path_comes_back_absolute() {
+        let (dir, mut config) = artifacts_config();
+        let absolute = std::fs::canonicalize(&config.claude_defaults.mcp_script_path).unwrap();
+        // `../` up to `/` from the working directory, then the absolute path
+        // without its leading `/`.
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(absolute.strip_prefix("/").unwrap());
+        config.claude_defaults.mcp_script_path = relative;
+        let artifacts = assert_boot_preconditions(
+            "test-build",
+            &Roots::default(),
+            &config,
+            Some(&tool_path(&dir)),
+        );
+        assert_eq!(artifacts.mcp_script_path, absolute);
+    }
+
+    #[test]
+    #[should_panic(expected = "claude_defaults.tool_cli_path")]
+    fn a_containerized_config_without_the_tool_binary_is_refused() {
+        let (dir, mut config) = containerized_artifacts_config();
+        config.claude_defaults.tool_cli_path = dir.path().join("absent-brenn-tool");
+        assert_boot_preconditions(
+            "test-build",
+            &Roots::default(),
+            &config,
+            Some(&tool_path(&dir)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not executable")]
+    fn a_containerized_config_with_a_non_executable_tool_binary_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, config) = containerized_artifacts_config();
+        std::fs::set_permissions(
+            &config.claude_defaults.tool_cli_path,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_boot_preconditions(
+            "test-build",
+            &Roots::default(),
+            &config,
+            Some(&tool_path(&dir)),
+        );
+    }
+
+    /// A bare-only config never mounts the binary, so its absence is not
+    /// checked; `brenn-tool` on `PATH` is, and comes back resolved.
+    #[test]
+    fn a_bare_only_config_does_not_check_the_tool_binary() {
+        let artifacts = preconditions(&Roots::default());
+        assert!(!artifacts.tool_cli_path.exists());
+        let found = artifacts
+            .bare_tool_cli
+            .expect("a bare app resolves brenn-tool");
+        assert!(found.ends_with("bin/brenn-tool"), "{}", found.display());
+    }
+
+    #[test]
+    #[should_panic(expected = "no executable `brenn-tool` on the server's PATH")]
+    fn a_bare_config_without_brenn_tool_on_path_is_refused() {
+        let (dir, config) = artifacts_config();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_boot_preconditions(
+            "test-build",
+            &Roots::default(),
+            &config,
+            Some(empty.as_os_str()),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "PATH (unset)")]
+    fn a_bare_config_with_no_path_is_refused() {
+        let (_dir, config) = artifacts_config();
+        assert_boot_preconditions("test-build", &Roots::default(), &config, None);
+    }
+
+    /// The walk takes the first executable match, skipping a non-executable
+    /// file and a directory of the same name.
+    #[test]
+    fn the_path_walk_finds_the_first_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let plain = root.path().join("plain");
+        let dir_named = root.path().join("dir");
+        let good = root.path().join("good");
+        let later = root.path().join("later");
+        for d in [&plain, &dir_named, &good, &later] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(plain.join("brenn-tool"), b"").unwrap();
+        std::fs::set_permissions(
+            plain.join("brenn-tool"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::create_dir(dir_named.join("brenn-tool")).unwrap();
+        write_executable(&good.join("brenn-tool"));
+        write_executable(&later.join("brenn-tool"));
+        let path = std::env::join_paths([&plain, &dir_named, &good, &later]).unwrap();
+        assert_eq!(
+            find_executable_on_path(Some(&path), "brenn-tool"),
+            Some(good.join("brenn-tool"))
+        );
+        assert_eq!(find_executable_on_path(Some(&path), "absent"), None);
+    }
+
+    /// A containerized-only config has no bare app and does not walk `PATH`.
+    #[test]
+    fn a_containerized_only_config_does_not_walk_path() {
+        let (_dir, mut config) = containerized_artifacts_config();
+        config.apps.retain(|a| a.container.is_some());
+        let artifacts = assert_boot_preconditions("test-build", &Roots::default(), &config, None);
+        assert_eq!(artifacts.bare_tool_cli, None);
+    }
+
     #[test]
     fn boot_preconditions_pass_on_a_real_components_root() {
         let dir = tempfile::tempdir().unwrap();
-        assert_boot_preconditions(
-            "test-build",
-            &components_only([("brenn", dir.path().to_path_buf())]),
-        );
-        assert_boot_preconditions("test-build", &Roots::default());
+        preconditions(&components_only([("brenn", dir.path().to_path_buf())]));
+        preconditions(&Roots::default());
     }
 
     /// The root is checked at startup, with no consumer configured and nothing
@@ -1369,7 +1669,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("brenn_demo.wasm");
         std::fs::write(&file, b"not a directory").unwrap();
-        assert_boot_preconditions("test-build", &components_only([("brenn", file)]));
+        preconditions(&components_only([("brenn", file)]));
     }
 
     /// Two releases' roots with disjoint package names boot; the same name
@@ -1384,7 +1684,7 @@ mod tests {
             ("brenn", brenn.path().to_path_buf()),
             ("demo", bundle.path().to_path_buf()),
         ]);
-        assert_boot_preconditions("test-build", &roots);
+        preconditions(&roots);
     }
 
     #[test]
@@ -1398,7 +1698,7 @@ mod tests {
             ("brenn", brenn.path().to_path_buf()),
             ("demo", bundle.path().to_path_buf()),
         ]);
-        assert_boot_preconditions("test-build", &roots);
+        preconditions(&roots);
     }
 
     /// The wiring assert's two directions: clones of one table pass, and a

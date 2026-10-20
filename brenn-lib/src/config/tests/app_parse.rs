@@ -163,7 +163,7 @@ fn validate_preserves_declared_app_order() {
     let ResolvedConfig { apps: resolved, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     let observed: Vec<&str> = resolved.keys().map(String::as_str).collect();
     assert_eq!(observed, slugs);
@@ -213,7 +213,7 @@ fn validate_resolves_messaging_layer_for_apps_with_messaging_blocks() {
     let ResolvedConfig { apps: resolved, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     assert!(
         resolved["sender"].messaging.is_some(),
@@ -327,7 +327,7 @@ fn validate_mcp_servers_carried_through() {
     let ResolvedConfig { apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     let app = &apps["pfin"];
     assert_eq!(app.mcp_servers.len(), 1);

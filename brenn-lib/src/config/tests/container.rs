@@ -34,8 +34,11 @@ fn validate_container_app_resolves_correctly() {
         }],
         ..Default::default()
     };
-    let ResolvedConfig { apps, .. } =
-        validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    let ResolvedConfig { apps, .. } = validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
     let app = apps.get("pfin").unwrap();
 
     // PathMapper should be Container variant.
@@ -103,7 +106,7 @@ fn validate_bare_app_state_dir_uses_validated_xdg_runtime_dir() {
         ..Default::default()
     };
     let ResolvedConfig { apps, .. } =
-        validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), Some(xdg_dir));
+        validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), xdg_dir);
     let app = apps.get("bare-test").unwrap();
 
     let expected = xdg_dir.join("brenn").join("bare-test");
@@ -124,6 +127,102 @@ fn validate_bare_app_state_dir_uses_validated_xdg_runtime_dir() {
     assert_eq!(
         app.virtual_tools_path(),
         app.state_dir.join("virtual-tools.json"),
+    );
+
+    // The tool socket root is a sibling of the per-slug namespace.
+    assert_eq!(app.tool_socket_root, xdg_dir.join("brenn-tool-sockets"));
+}
+
+/// Every app, containerized or bare, gets the same tool socket root under the
+/// runtime dir.
+#[test]
+fn tool_socket_root_is_under_the_runtime_dir_for_every_app() {
+    let xdg_dir = super::test_runtime_dir();
+    let home_dir = tempfile::tempdir().unwrap();
+    let working_dir = home_dir.path().join("work");
+    std::fs::create_dir(&working_dir).unwrap();
+    let config = BrennConfig {
+        server: super::test_server_config(),
+        container: HashMap::from([(
+            "sandbox".to_string(),
+            ContainerConfig {
+                image: "brenn-cc:latest".to_string(),
+                home_dir: home_dir.path().to_path_buf(),
+                container_home: PathBuf::from("/home/user"),
+                extra_mounts: vec![],
+                extra_args: vec![],
+            },
+        )]),
+        apps: vec![
+            AppConfigRaw {
+                slug: "boxed".to_string(),
+                working_dir: Some(working_dir.clone()),
+                container: Some("sandbox".to_string()),
+                container_working_dir: Some(PathBuf::from("/home/user/work")),
+                ..Default::default()
+            },
+            AppConfigRaw {
+                slug: "bare".to_string(),
+                working_dir: Some(working_dir.clone()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let ResolvedConfig { apps, .. } =
+        validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), xdg_dir);
+    for slug in ["boxed", "bare"] {
+        assert_eq!(
+            apps[slug].tool_socket_root,
+            xdg_dir.join("brenn-tool-sockets"),
+            "{slug}",
+        );
+    }
+}
+
+/// A slug whose longest socket path would overflow `sun_path` is refused at
+/// resolve, naming the limit; one byte shorter resolves.
+#[test]
+fn a_slug_too_long_for_the_socket_path_is_refused() {
+    let xdg_dir = super::test_runtime_dir();
+    let root = xdg_dir.join("brenn-tool-sockets");
+    let fixed = crate::runtime_dir::longest_tool_socket_path(&root, "");
+    let room = crate::runtime_dir::MAX_SOCKET_PATH_BYTES
+        .checked_sub(fixed)
+        .expect("the test runtime dir leaves room for a slug");
+    let working_dir = tempfile::tempdir().unwrap();
+    let config_with = |slug: String| BrennConfig {
+        server: super::test_server_config(),
+        apps: vec![AppConfigRaw {
+            slug,
+            working_dir: Some(working_dir.path().to_path_buf()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let fits = "a".repeat(room);
+    let ResolvedConfig { apps, .. } = validate_and_resolve(
+        &config_with(fits.clone()),
+        &IntegrationRegistry::new(vec![]),
+        xdg_dir,
+    );
+    assert!(apps.contains_key(&fits));
+
+    let over = "a".repeat(room + 1);
+    let payload = std::panic::catch_unwind(|| {
+        validate_and_resolve(
+            &config_with(over),
+            &IntegrationRegistry::new(vec![]),
+            xdg_dir,
+        )
+    })
+    .err()
+    .expect("an over-long slug is refused");
+    let msg = crate::test_utils::unwrap_panic_msg(payload);
+    assert!(
+        msg.contains("too long for its tool socket path") && msg.contains("107-byte"),
+        "{msg}"
     );
 }
 
@@ -155,8 +254,11 @@ fn validate_app_extra_mounts_appended_after_container_extra_mounts() {
         }],
         ..Default::default()
     };
-    let ResolvedConfig { apps, .. } =
-        validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    let ResolvedConfig { apps, .. } = validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
     let app = apps.get("pfin").unwrap();
     let spawn = app.container_spawn.as_ref().unwrap();
 
@@ -184,7 +286,11 @@ fn validate_bare_app_with_extra_mounts_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -218,7 +324,11 @@ fn validate_nonexistent_container_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -248,7 +358,11 @@ fn validate_container_without_working_dir_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -279,7 +393,11 @@ fn validate_relative_container_working_dir_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -307,7 +425,11 @@ fn validate_nonexistent_container_home_dir_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -327,7 +449,11 @@ fn validate_container_hooks_on_bare_app_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -347,7 +473,11 @@ fn validate_post_pull_container_hooks_on_bare_app_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]
@@ -367,7 +497,11 @@ fn validate_startup_container_hooks_on_bare_app_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &IntegrationRegistry::new(vec![]), None);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
 }
 
 #[test]

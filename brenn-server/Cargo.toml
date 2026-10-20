@@ -46,6 +46,7 @@ brenn-remote-server = { version = "0.1.0", path = "../brenn-remote-server" }
 brenn-render = { version = "0.1.0", path = "../brenn-render" }
 brenn-surface-schema = { version = "0.1.0", path = "../surface/schema" }
 brenn-surface-server = { version = "0.1.0", path = "../surface/server" }
+brenn-tool-proto = { version = "0.1.0", path = "../brenn-tool-proto" }
 brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry" }
 brenn-surface-contract = { version = "0.1.0", path = "../surface/contract" }
 brenn-wasm = { version = "0.1.0", path = "../brenn-wasm" }

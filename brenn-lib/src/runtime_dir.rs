@@ -1,5 +1,5 @@
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn validate_dir_owner(dir_uid: u32, euid: u32, path: &std::path::Path) {
     if dir_uid != euid {
@@ -112,6 +112,61 @@ pub(crate) fn resolve_xdg_value(v: Option<&str>) -> PathBuf {
 pub fn resolve_validated_xdg_runtime_dir() -> PathBuf {
     let v = std::env::var("XDG_RUNTIME_DIR").ok();
     resolve_xdg_value(v.as_deref())
+}
+
+/// Directory under the runtime dir holding every conversation's tool socket
+/// directory. A sibling of the per-slug `brenn/` namespace, not a child, so no
+/// app slug can name it.
+pub const TOOL_SOCKET_ROOT_NAME: &str = "brenn-tool-sockets";
+
+/// The socket's file name inside its per-conversation directory.
+pub const TOOL_SOCKET_FILE_NAME: &str = "tool.sock";
+
+/// Longest path a unix socket may be bound at: `sockaddr_un.sun_path` is 108
+/// bytes on Linux, one of which is the terminating NUL.
+pub const MAX_SOCKET_PATH_BYTES: usize = 107;
+
+/// `<runtime_dir>/brenn-tool-sockets`.
+pub fn tool_socket_root(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(TOOL_SOCKET_ROOT_NAME)
+}
+
+/// A conversation's tool socket directory: `<root>/<slug>-conv<id>`.
+pub fn tool_socket_dir(tool_socket_root: &Path, app_slug: &str, conversation_id: i64) -> PathBuf {
+    tool_socket_root.join(format!("{app_slug}-conv{conversation_id}"))
+}
+
+/// The socket inside a tool socket directory, on the host or as a container
+/// sees it.
+pub fn tool_socket_in(dir: &Path) -> PathBuf {
+    dir.join(TOOL_SOCKET_FILE_NAME)
+}
+
+/// Length in bytes of the longest tool socket path a conversation of
+/// `app_slug` can have: the socket of `tool_socket_dir` at `i64::MAX`, the
+/// longest id.
+pub fn longest_tool_socket_path(tool_socket_root: &Path, app_slug: &str) -> usize {
+    tool_socket_in(&tool_socket_dir(tool_socket_root, app_slug, i64::MAX))
+        .as_os_str()
+        .len()
+}
+
+/// Remove whatever is at `dir` (symlinks are removed, not followed) and create
+/// it empty at mode 0700. Errors name the path.
+pub fn recreate_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let with_path = |what: &str, e: std::io::Error| {
+        std::io::Error::new(e.kind(), format!("{what} {}: {e}", dir.display()))
+    };
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(with_path("clearing", e)),
+    }
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| with_path("creating", e))
 }
 
 /// Create a validated `XDG_RUNTIME_DIR`-like `PathBuf` exactly once per process
@@ -293,5 +348,70 @@ mod tests {
         );
         assert!(msg.contains("9999"), "missing observed_uid in: {msg}");
         assert!(msg.contains("1000"), "missing expected_euid in: {msg}");
+    }
+
+    /// The socket path layout is `<root>/<slug>-conv<id>/tool.sock`, and the
+    /// longest one is measured at the 19 digits of `i64::MAX`.
+    #[test]
+    fn tool_socket_layout_and_longest_path() {
+        let root = Path::new("/run/user/1000/brenn-tool-sockets");
+        assert_eq!(
+            tool_socket_in(&tool_socket_dir(root, "pfin", 42)),
+            Path::new("/run/user/1000/brenn-tool-sockets/pfin-conv42/tool.sock"),
+        );
+        assert_eq!(
+            longest_tool_socket_path(root, "pfin"),
+            "/run/user/1000/brenn-tool-sockets/pfin-conv9223372036854775807/tool.sock".len(),
+        );
+    }
+
+    /// `recreate_private_dir` empties what is there, or creates an absent
+    /// directory, at 0700.
+    #[test]
+    fn recreate_private_dir_leaves_an_empty_0700_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        recreate_private_dir(&dir).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::write(dir.join("stale"), b"x").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        recreate_private_dir(&dir).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// A symlink at `dir` is removed and replaced by a real directory; its
+    /// target and the target's contents are untouched.
+    #[test]
+    fn recreate_private_dir_replaces_a_symlink_without_following_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"x").unwrap();
+        let dir = tmp.path().join("d");
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+
+        recreate_private_dir(&dir).unwrap();
+
+        let meta = std::fs::symlink_metadata(&dir).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(target.join("keep").is_file());
+    }
+
+    /// A regular file in the way is an error naming the path, not replaced.
+    #[test]
+    fn recreate_private_dir_refuses_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let err = recreate_private_dir(&file).unwrap_err();
+        assert!(
+            err.to_string().contains(&file.display().to_string()),
+            "{err}"
+        );
+        assert!(file.is_file());
     }
 }

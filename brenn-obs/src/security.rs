@@ -125,6 +125,13 @@ pub enum SecurityEventType {
     /// principal (an app, a surface component, in-process machinery), so the
     /// response is operator action — revoking or correcting a grant — not a ban.
     ImpetusMintDenied,
+    /// A process in an agent's container sent the conversation's tool socket a
+    /// request no correct `brenn-tool` produces: not JSON, a wrong protocol
+    /// version, an unknown op, missing fields, or a line over the size cap.
+    /// Attributed to the app/conversation the socket belongs to via
+    /// `log_app_security_event` — the socket has no peer address, so fail2ban
+    /// never matches these lines. Volume is the signal.
+    ToolSocketViolation,
 }
 
 impl fmt::Display for SecurityEventType {
@@ -148,6 +155,7 @@ impl fmt::Display for SecurityEventType {
             Self::MqttPublishDenied => write!(f, "mqtt_publish_denied"),
             Self::WasmActivationThrottled => write!(f, "wasm_activation_throttled"),
             Self::ImpetusMintDenied => write!(f, "impetus_mint_denied"),
+            Self::ToolSocketViolation => write!(f, "tool_socket_violation"),
         }
     }
 }

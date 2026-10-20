@@ -110,7 +110,7 @@ fn integration_enabled_by_name() {
         ..Default::default()
     };
     let ResolvedConfig { apps, .. } =
-        validate_and_resolve(&config, &registry, Some(super::test_runtime_dir()));
+        validate_and_resolve(&config, &registry, super::test_runtime_dir());
     let app = apps.get("myapp").unwrap();
     assert!(app.integrations.contains_key("test-int"));
 
@@ -150,7 +150,7 @@ fn integration_per_app_override() {
         ..Default::default()
     };
     let ResolvedConfig { apps, .. } =
-        validate_and_resolve(&config, &registry, Some(super::test_runtime_dir()));
+        validate_and_resolve(&config, &registry, super::test_runtime_dir());
     let app = apps.get("myapp").unwrap();
     let mcp_servers = app.integrations["test-int"].mcp_servers();
     // Per-app override should take effect.
@@ -175,7 +175,7 @@ fn resolve_with_env(integrations: Vec<String>, env: &[(&str, &str)]) -> Resolved
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &registry, Some(super::test_runtime_dir()))
+    validate_and_resolve(&config, &registry, super::test_runtime_dir())
 }
 
 #[test]
@@ -196,6 +196,12 @@ fn agent_env_colliding_with_a_key_an_integration_may_emit_later_panics() {
 #[should_panic(expected = "already supplies")]
 fn agent_env_setting_graf_user_tz_panics() {
     resolve_with_env(vec![], &[("GRAF_USER_TZ", "UTC")]);
+}
+
+#[test]
+#[should_panic(expected = "already supplies")]
+fn agent_env_setting_brenn_tool_socket_panics() {
+    resolve_with_env(vec![], &[("BRENN_TOOL_SOCKET", "/tmp/elsewhere.sock")]);
 }
 
 #[test]
@@ -223,7 +229,7 @@ fn integration_unknown_name_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &registry, Some(super::test_runtime_dir()));
+    validate_and_resolve(&config, &registry, super::test_runtime_dir());
 }
 
 #[test]
@@ -257,7 +263,7 @@ fn integration_mcp_server_collision_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &registry, Some(super::test_runtime_dir()));
+    validate_and_resolve(&config, &registry, super::test_runtime_dir());
 }
 
 // -----------------------------------------------------------------------
@@ -443,5 +449,5 @@ fn inter_integration_mcp_server_collision_panics() {
         }],
         ..Default::default()
     };
-    validate_and_resolve(&config, &registry, Some(super::test_runtime_dir()));
+    validate_and_resolve(&config, &registry, super::test_runtime_dir());
 }

@@ -123,10 +123,9 @@ pub(crate) struct ReloadEnv {
     /// The integration factories this process was built with. Immutable after
     /// construction; every reload resolves the same factories.
     pub integration_registry: Arc<brenn_lib::integration::IntegrationRegistry>,
-    /// The validated `XDG_RUNTIME_DIR` boot resolved, present exactly when some
-    /// agent is bare. A candidate cannot change that: `container` is refused at
-    /// level 1, so the same answer serves every reload.
-    pub runtime_dir: Option<PathBuf>,
+    /// The validated `XDG_RUNTIME_DIR` boot resolved. Every reload resolves
+    /// against the same one.
+    pub runtime_dir: PathBuf,
     pub tool_registry: Arc<brenn_tool_registry::ToolRegistry>,
     /// The endpoint table every inbound webhook request is matched against.
     ///
@@ -853,7 +852,7 @@ impl ReloadDriver {
         >,
     ) -> Result<Arc<IndexMap<String, AppConfig>>, Vec<String>> {
         let registry = &self.env.integration_registry;
-        let runtime_dir = self.env.runtime_dir.as_deref();
+        let runtime_dir = self.env.runtime_dir.as_path();
         let resolved = catch_quietly(AssertUnwindSafe(|| {
             let apps = brenn_lib::config::resolve_apps(
                 candidate,
@@ -2368,7 +2367,7 @@ channel scratch at "ephemeral:scratch" {{
         brenn_lib::config::resolve_apps(
             config,
             &brenn_lib::integration::IntegrationRegistry::new(vec![]),
-            Some(runtime_dir),
+            runtime_dir,
             &client_identities(config),
             &webhook_stamps(config),
         )
@@ -2659,7 +2658,7 @@ channel scratch at "ephemeral:scratch" {{
                 integration_registry: Arc::new(brenn_lib::integration::IntegrationRegistry::new(
                     vec![],
                 )),
-                runtime_dir: Some(runtime_dir),
+                runtime_dir,
                 tool_registry,
                 webhook: webhook_service.clone(),
                 surface_roots: Arc::new(std::sync::RwLock::new(Arc::new(surface_roots))),

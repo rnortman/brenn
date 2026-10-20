@@ -1,4 +1,4 @@
-.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity example-check xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e dev-mounts
+.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity example-check xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e dev-mounts dev-bin
 # Delete partially-written targets on recipe failure. Without this, a failing
 # recipe leaves the target file with a fresh mtime, causing subsequent
 # incremental builds to skip it entirely.
@@ -223,10 +223,22 @@ build:
 # built. `build` stays the everything verb; this is the subset `launchdev` and
 # `e2e` need, so starting a dev server does not first compile and link every
 # test binary in the graph.
-RUN_TARGETS := //brenn:brenn //frontend:dist //surface:dist //brenn-wasm:install_tree
+RUN_TARGETS := //brenn:brenn //brenn-tool //frontend:dist //surface:dist //brenn-wasm:install_tree
+
+# Bare apps' Claude Code runs `brenn-tool` from the server's own PATH, and boot
+# refuses a bare app without it there; dev and e2e are bare-only. The directory
+# put on PATH holds that one binary: the Bazel package directory beside it also
+# holds the crate's test binaries, which would shadow commands of the same name.
+DEV_BIN_DIR := .dev-bin
+TOOL_PATH := PATH=$(abspath $(DEV_BIN_DIR)):$$PATH
 
 run-artifacts:
 	bazel build $(BAZEL_CONFIG) $(RUN_TARGETS)
+
+dev-bin: run-artifacts
+	@rm -rf $(DEV_BIN_DIR)
+	@mkdir -p $(DEV_BIN_DIR)
+	@ln -s $(abspath $(BAZEL_BIN))/brenn-tool/brenn-tool $(DEV_BIN_DIR)/brenn-tool
 
 # Install the scrub binary and point git at the tracked hooks. Idempotent.
 # Asserts the scrub gate is actually live on this clone: template shims in
@@ -324,7 +336,7 @@ E2E_DB := target/e2e/brenn.db
 # TODO(e2e-in-ci): no gate runs this suite, so it can rot red indefinitely —
 # blocked on chromium provisioning on the runner and on the port-3100 server
 # this target boots.
-e2e: run-artifacts dev-mounts e2e/node_modules
+e2e: run-artifacts dev-mounts dev-bin e2e/node_modules
 	@cd e2e && node -e "const{chromium}=require('@playwright/test');const fs=require('fs');const p=chromium.executablePath();if(!fs.existsSync(p)){console.error('ERROR: Playwright chromium browser not installed. Run: cd e2e && npx playwright install chromium');process.exit(1);}"
 	@rm -rf target/e2e
 	@mkdir -p target/e2e
@@ -334,7 +346,7 @@ e2e: run-artifacts dev-mounts e2e/node_modules
 	fi; \
 	cp brenn.e2e.brenn $(E2E_LIVE_CONFIG); \
 	invite=$$($(E2E_BIN) --config $(E2E_LIVE_CONFIG) --mounts $(DEV_MOUNTS) invite); \
-	$(E2E_BIN) --config $(E2E_LIVE_CONFIG) --mounts $(DEV_MOUNTS) serve & \
+	$(TOOL_PATH) $(E2E_BIN) --config $(E2E_LIVE_CONFIG) --mounts $(DEV_MOUNTS) serve & \
 	srv=$$!; \
 	trap 'kill $$srv 2>/dev/null || true' EXIT INT TERM; \
 	echo "e2e: server PID $$srv; polling $(E2E_BASE_URL)/auth/login ..."; \
@@ -357,11 +369,11 @@ e2e: run-artifacts dev-mounts e2e/node_modules
 # execs the built binary from the workspace root so the relative paths in
 # brenn.dev.brenn — the database, the log dir, the asset trees — resolve where
 # they always did.
-launchdev: run-artifacts dev-mounts
+launchdev: run-artifacts dev-mounts dev-bin
 	@if [ -f $(DEV_PIDFILE) ] && kill -0 $$(cat $(DEV_PIDFILE)) 2>/dev/null; then \
 		echo "Dev server already running (PID $$(cat $(DEV_PIDFILE)))"; \
 	else \
-		$(BAZEL_BIN)/brenn/brenn --config brenn.dev.brenn --mounts $(DEV_MOUNTS) serve & \
+		$(TOOL_PATH) $(BAZEL_BIN)/brenn/brenn --config brenn.dev.brenn --mounts $(DEV_MOUNTS) serve & \
 		echo $$! > $(DEV_PIDFILE); \
 		echo "Dev server started (PID $$!)"; \
 		sleep 1; \

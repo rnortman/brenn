@@ -133,7 +133,8 @@ No vaporware in the pitch, so:
   archaeology than onboarding. The configuration language itself has a prose
   reference — [the config DSL document](docs/config-dsl.md) — and one operational
   flow has a guide of its own, [Claude accounts: profiles and
-  switching](docs/claude-accounts.md), but there is no guide to a first
+  switching](docs/claude-accounts.md); agents running inside Brenn have [their
+  tools as shell commands](docs/agent-tool-cli.md). But there is no guide to a first
   deployment. It's not ready for anybody who doesn't know what
   they're doing to host it yet. I'd just rather not pretend it's turnkey. So if
   you were looking for the install guide, there isn't one. (Your LLM can figure

@@ -74,6 +74,10 @@ pub(in crate::active_bridge) struct ServerSwapHost {
     /// respawns the one app its bridge belongs to.
     pub(in crate::active_bridge) app_config: brenn_lib::config::AppConfig,
     pub(in crate::active_bridge) mcp_script_path: std::path::PathBuf,
+    pub(in crate::active_bridge) tool_cli_path: std::path::PathBuf,
+    /// The bridge's tool socket directory; the socket outlives the swap, so
+    /// the replacement container mounts the same one.
+    pub(in crate::active_bridge) tool_socket_dir: std::path::PathBuf,
     pub(in crate::active_bridge) transcript: Arc<TranscriptWriter>,
     pub(in crate::active_bridge) alert_dispatcher: AlertDispatcher,
     pub(in crate::active_bridge) user_tz: chrono_tz::Tz,
@@ -87,21 +91,34 @@ pub struct SwapHostSeed {
     pub(crate) models: ModelCache,
 }
 
-#[async_trait::async_trait]
-impl ProfileSwapHost for ServerSwapHost {
-    async fn respawn(&self, req: RespawnRequest) -> Result<(CcSession, InitAckInfo), CcError> {
-        let config = build_cc_session_config(CcSpawnInputs {
+impl ServerSwapHost {
+    /// The replacement process's spawn config, built through the same
+    /// `CcSpawnInputs` as the bridge's first spawn.
+    fn respawn_config(&self, req: &RespawnRequest) -> brenn_cc::session::CcSessionConfig {
+        build_cc_session_config(CcSpawnInputs {
             app_config: &self.app_config,
             mcp_script_path: &self.mcp_script_path,
-            model: req.model.unwrap_or_else(|| self.app_config.model.clone()),
+            tool_socket_dir: &self.tool_socket_dir,
+            tool_cli_path: &self.tool_cli_path,
+            model: req
+                .model
+                .clone()
+                .unwrap_or_else(|| self.app_config.model.clone()),
             container_name_suffix: conversation_container_suffix(req.conversation_id),
-            resume_session_id: req.resume_session_id,
+            resume_session_id: req.resume_session_id.clone(),
             transcript: self.transcript.clone(),
             alert_dispatcher: self.alert_dispatcher.clone(),
             user_tz: self.user_tz,
             server_shutting_down: self.server_shutting_down.clone(),
-            cc_profile: Some(req.profile),
-        });
+            cc_profile: Some(req.profile.clone()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ProfileSwapHost for ServerSwapHost {
+    async fn respawn(&self, req: RespawnRequest) -> Result<(CcSession, InitAckInfo), CcError> {
+        let config = self.respawn_config(&req);
         CcSession::spawn(config, req.events).await
     }
 

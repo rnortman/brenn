@@ -9,12 +9,20 @@ use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, Ap
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use tracing::{info, warn};
 
+use serde_json::json;
+
 use super::super::ActiveBridge;
-use super::super::mcp_constants::MCP_SET_USER_TIMEZONE_TOOL;
+use super::super::mcp_constants::{MCP_BRENN_PREFIX, MCP_SET_USER_TIMEZONE_TOOL};
 use super::super::tool_summary::{HandleBrennToolResult, mark_tool_handled};
 use super::device::resolve_user_scope_for_write;
+use super::execute::{ToolOutcome, execute_admitted};
+use crate::intercept_helpers::warn_if_unexpected_tool_response;
 
 /// Handle PreToolUse + PostToolUse arms for `MCP_SET_USER_TIMEZONE_TOOL`.
+///
+/// PreToolUse auto-approves. PostToolUse runs the call through
+/// `execute_admitted` and marks the call handled only on success; an error
+/// answer leaves the id to the normal ToolResult flow. No card is emitted.
 ///
 /// Returns `Some(...)` when the request is for this tool and `None` otherwise.
 pub(super) async fn handle(
@@ -29,232 +37,208 @@ pub(super) async fn handle(
             }))
         }
 
-        // --- SetUserTimezone PostToolUse ---
         ApprovalKind::PostToolUse {
             tool_name,
             tool_input,
             tool_use_id,
+            tool_response,
             ..
         } if tool_name == MCP_SET_USER_TIMEZONE_TOOL => {
-            // Extract `timezone` (string, null, or absent → clear).
-            let timezone_arg = tool_input.get("timezone");
-            let timezone_str: Option<&str> = match timezone_arg {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.as_str()),
-                Some(serde_json::Value::String(_)) => None, // empty string → clear
-                Some(v) => {
-                    // Non-string, non-null value — LLM type error; reject rather than silently clear.
-                    warn!(
-                        app = %bridge.app_slug,
-                        type_ = %v,
-                        "SetUserTimezone: timezone field has unexpected type (expected string or null)"
-                    );
-                    return Some(HandleBrennToolResult::Respond(
-                        CcApprovalDecision::Continue {
-                            updated_output: Some(
-                                r#"{"error":"invalid_timezone_type"}"#.to_string(),
-                            ),
-                        },
-                    ));
-                }
-            };
-
-            // Extract `expires_at` (string, null, or absent).
-            let expires_at_arg = tool_input.get("expires_at");
-            let expires_at_str: Option<&str> = match expires_at_arg {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.as_str()),
-                Some(serde_json::Value::String(_)) => None, // empty string → treat as absent
-                Some(v) => {
-                    // Non-string, non-null value — LLM type error; reject.
-                    warn!(
-                        app = %bridge.app_slug,
-                        type_ = %v,
-                        "SetUserTimezone: expires_at field has unexpected type (expected string or null)"
-                    );
-                    return Some(HandleBrennToolResult::Respond(
-                        CcApprovalDecision::Continue {
-                            updated_output: Some(
-                                r#"{"error":"invalid_expires_at_type"}"#.to_string(),
-                            ),
-                        },
-                    ));
-                }
-            };
-
-            // §2.4: expires_at is meaningless with timezone: null/absent.
-            if timezone_str.is_none() && expires_at_str.is_some() {
-                warn!(
-                    app = %bridge.app_slug,
-                    "SetUserTimezone: expires_at supplied without timezone — rejecting"
-                );
-                return Some(HandleBrennToolResult::Respond(
-                    CcApprovalDecision::Continue {
-                        updated_output: Some(r#"{"error":"expires_without_timezone"}"#.to_string()),
-                    },
-                ));
+            warn_if_unexpected_tool_response("timezone tool", tool_name, tool_response);
+            let short_name = tool_name
+                .strip_prefix(MCP_BRENN_PREFIX)
+                .expect("SetUserTimezone carries the brenn prefix");
+            // Admitted at the handle_brenn_tools choke point.
+            let outcome = execute_admitted(bridge, short_name, tool_input).await;
+            if !outcome.is_error() {
+                mark_tool_handled(bridge, tool_use_id).await;
             }
-
-            // Validate `timezone` before touching the DB.
-            let override_tz: Option<chrono_tz::Tz> = match timezone_str {
-                None => None,
-                Some(tz_str) => match tz_str.parse::<chrono_tz::Tz>() {
-                    Ok(tz) => Some(tz),
-                    Err(_) => {
-                        warn!(
-                            app = %bridge.app_slug,
-                            timezone = %tz_str,
-                            "SetUserTimezone: invalid timezone string"
-                        );
-                        return Some(HandleBrennToolResult::Respond(
-                            CcApprovalDecision::Continue {
-                                updated_output: Some(r#"{"error":"invalid_timezone"}"#.to_string()),
-                            },
-                        ));
-                    }
-                },
-            };
-
-            // Parse `expires_at` to a UTC epoch seconds value.
-            let expires_epoch: Option<i64> = match expires_at_str {
-                None => None,
-                Some(s) => {
-                    // Anchoring zone is the just-provided override_tz (§2.4).
-                    // override_tz is guaranteed Some here (validated above and
-                    // expires_without_timezone guard already fired when it's None).
-                    let anchor_tz =
-                        override_tz.expect("override_tz must be Some when expires_at is present");
-                    match parse_expires_at(s, anchor_tz) {
-                        Ok(epoch) => Some(epoch),
-                        Err(_) => {
-                            warn!(
-                                app = %bridge.app_slug,
-                                expires_at = %s,
-                                "SetUserTimezone: invalid expires_at"
-                            );
-                            return Some(HandleBrennToolResult::Respond(
-                                CcApprovalDecision::Continue {
-                                    updated_output: Some(
-                                        r#"{"error":"invalid_expires_at"}"#.to_string(),
-                                    ),
-                                },
-                            ));
-                        }
-                    }
-                }
-            };
-
-            // Resolve (device_id, user_id) — one DB lock for resolution + write.
-            let output = {
-                let conn = bridge.db.lock().await;
-
-                // Resolve acting user.
-                let effective_user_id =
-                    match resolve_user_scope_for_write(bridge, &conn, tool_input) {
-                        Ok(uid) => uid,
-                        Err(e) => return Some(e),
-                    };
-
-                // Resolve device.
-                let device_arg = match tool_input.get("device").and_then(|v| v.as_str()) {
-                    Some(d) if !d.is_empty() => d.to_string(),
-                    _ => {
-                        return Some(HandleBrennToolResult::Respond(
-                            CcApprovalDecision::Continue {
-                                updated_output: Some(
-                                    r#"{"error":"missing_device_arg"}"#.to_string(),
-                                ),
-                            },
-                        ));
-                    }
-                };
-                let device_id = match brenn_db::auth::device::resolve_device_for_assign(
-                    &conn,
-                    &device_arg,
-                    effective_user_id,
-                ) {
-                    Ok(id) => id,
-                    Err(err_json) => {
-                        return Some(HandleBrennToolResult::Respond(
-                            CcApprovalDecision::Continue {
-                                updated_output: Some(err_json.to_string()),
-                            },
-                        ));
-                    }
-                };
-
-                // Write the override.
-                let tz_str: Option<&str> = override_tz.as_ref().map(|tz| tz.name());
-                brenn_db::auth::device::set_tz_override(
-                    &conn,
-                    device_id,
-                    effective_user_id,
-                    tz_str,
-                    expires_epoch,
-                );
-
-                // Build summary response.
-                if let Some(tz) = override_tz {
-                    info!(
-                        device_id,
-                        user_id = effective_user_id,
-                        timezone = tz.name(),
-                        expires_at = ?expires_epoch,
-                        "SetUserTimezone: override set"
-                    );
-                    match expires_epoch {
-                        Some(exp) => {
-                            let exp_dt = match Utc.timestamp_opt(exp, 0).single() {
-                                Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                                None => {
-                                    warn!(
-                                        device_id,
-                                        user_id = effective_user_id,
-                                        epoch = exp,
-                                        "SetUserTimezone: expires_at epoch out of chrono range; returning raw integer in summary"
-                                    );
-                                    exp.to_string()
-                                }
-                            };
-                            serde_json::json!({
-                                "ok": true,
-                                "timezone": tz.name(),
-                                "expires_at": exp_dt
-                            })
-                        }
-                        None => serde_json::json!({
-                            "ok": true,
-                            "timezone": tz.name(),
-                            "expires_at": null
-                        }),
-                    }
-                } else {
-                    info!(
-                        device_id,
-                        user_id = effective_user_id,
-                        "SetUserTimezone: override cleared"
-                    );
-                    serde_json::json!({
-                        "ok": true,
-                        "timezone": null,
-                        "cleared": true
-                    })
-                }
-            };
-
-            // mark_tool_handled only on the success path — all validation and writes complete.
-            // Error return paths above do NOT mark handled; they return Continue with error JSON
-            // and the normal ToolResult flow handles the tool_use_id.
-            mark_tool_handled(bridge, tool_use_id).await;
-            Some(HandleBrennToolResult::Respond(
-                CcApprovalDecision::Continue {
-                    updated_output: Some(output.to_string()),
-                },
-            ))
+            Some(HandleBrennToolResult::Respond(outcome.into_continue()))
         }
 
         _ => None,
     }
+}
+
+/// Execute `SetUserTimezone` for the agent. `None` when `mcp_name` is not
+/// that tool.
+pub(super) async fn execute_timezone_tool(
+    bridge: &ActiveBridge,
+    mcp_name: &str,
+    input: &serde_json::Value,
+) -> Option<ToolOutcome> {
+    if mcp_name != MCP_SET_USER_TIMEZONE_TOOL {
+        return None;
+    }
+    Some(execute_set_user_timezone(bridge, input).await)
+}
+
+/// `SetUserTimezone`: resolve (device, user), validate args, write to
+/// `device_users`.
+async fn execute_set_user_timezone(
+    bridge: &ActiveBridge,
+    input: &serde_json::Value,
+) -> ToolOutcome {
+    let timezone_arg = input.get("timezone");
+    let timezone_str: Option<&str> = match timezone_arg {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.as_str()),
+        Some(serde_json::Value::String(_)) => None, // empty string → clear
+        Some(v) => {
+            // Non-string, non-null value — LLM type error; reject rather than silently clear.
+            warn!(
+                app = %bridge.app_slug,
+                type_ = %v,
+                "SetUserTimezone: timezone field has unexpected type (expected string or null)"
+            );
+            return ToolOutcome::Err(json!({"error": "invalid_timezone_type"}));
+        }
+    };
+
+    let expires_at_arg = input.get("expires_at");
+    let expires_at_str: Option<&str> = match expires_at_arg {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.as_str()),
+        Some(serde_json::Value::String(_)) => None, // empty string → treat as absent
+        Some(v) => {
+            // Non-string, non-null value — LLM type error; reject.
+            warn!(
+                app = %bridge.app_slug,
+                type_ = %v,
+                "SetUserTimezone: expires_at field has unexpected type (expected string or null)"
+            );
+            return ToolOutcome::Err(json!({"error": "invalid_expires_at_type"}));
+        }
+    };
+
+    // expires_at is meaningless with timezone: null/absent.
+    if timezone_str.is_none() && expires_at_str.is_some() {
+        warn!(
+            app = %bridge.app_slug,
+            "SetUserTimezone: expires_at supplied without timezone — rejecting"
+        );
+        return ToolOutcome::Err(json!({"error": "expires_without_timezone"}));
+    }
+
+    let override_tz: Option<chrono_tz::Tz> = match timezone_str {
+        None => None,
+        Some(tz_str) => match tz_str.parse::<chrono_tz::Tz>() {
+            Ok(tz) => Some(tz),
+            Err(_) => {
+                warn!(
+                    app = %bridge.app_slug,
+                    timezone = %tz_str,
+                    "SetUserTimezone: invalid timezone string"
+                );
+                return ToolOutcome::Err(json!({"error": "invalid_timezone"}));
+            }
+        },
+    };
+
+    // Parse `expires_at` to a UTC epoch seconds value.
+    let expires_epoch: Option<i64> = match expires_at_str {
+        None => None,
+        Some(s) => {
+            // Anchoring zone is the just-provided override_tz.
+            // override_tz is guaranteed Some here (validated above and
+            // expires_without_timezone guard already fired when it's None).
+            let anchor_tz =
+                override_tz.expect("override_tz must be Some when expires_at is present");
+            match parse_expires_at(s, anchor_tz) {
+                Ok(epoch) => Some(epoch),
+                Err(_) => {
+                    warn!(
+                        app = %bridge.app_slug,
+                        expires_at = %s,
+                        "SetUserTimezone: invalid expires_at"
+                    );
+                    return ToolOutcome::Err(json!({"error": "invalid_expires_at"}));
+                }
+            }
+        }
+    };
+
+    // Resolve (device_id, user_id) — one DB lock for resolution + write.
+    let output = {
+        let conn = bridge.db.lock().await;
+
+        let effective_user_id = match resolve_user_scope_for_write(bridge, &conn, input) {
+            Ok(uid) => uid,
+            Err(e) => return ToolOutcome::Err(e),
+        };
+
+        let device_arg = match input.get("device").and_then(|v| v.as_str()) {
+            Some(d) if !d.is_empty() => d.to_string(),
+            _ => {
+                return ToolOutcome::Err(json!({"error": "missing_device_arg"}));
+            }
+        };
+        let device_id = match brenn_db::auth::device::resolve_device_for_assign(
+            &conn,
+            &device_arg,
+            effective_user_id,
+        ) {
+            Ok(id) => id,
+            Err(err_json) => return ToolOutcome::Err(err_json),
+        };
+
+        let tz_str: Option<&str> = override_tz.as_ref().map(|tz| tz.name());
+        brenn_db::auth::device::set_tz_override(
+            &conn,
+            device_id,
+            effective_user_id,
+            tz_str,
+            expires_epoch,
+        );
+
+        if let Some(tz) = override_tz {
+            info!(
+                device_id,
+                user_id = effective_user_id,
+                timezone = tz.name(),
+                expires_at = ?expires_epoch,
+                "SetUserTimezone: override set"
+            );
+            match expires_epoch {
+                Some(exp) => {
+                    let exp_dt = match Utc.timestamp_opt(exp, 0).single() {
+                        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        None => {
+                            warn!(
+                                device_id,
+                                user_id = effective_user_id,
+                                epoch = exp,
+                                "SetUserTimezone: expires_at epoch out of chrono range; returning raw integer in summary"
+                            );
+                            exp.to_string()
+                        }
+                    };
+                    json!({
+                        "ok": true,
+                        "timezone": tz.name(),
+                        "expires_at": exp_dt
+                    })
+                }
+                None => json!({
+                    "ok": true,
+                    "timezone": tz.name(),
+                    "expires_at": null
+                }),
+            }
+        } else {
+            info!(
+                device_id,
+                user_id = effective_user_id,
+                "SetUserTimezone: override cleared"
+            );
+            json!({
+                "ok": true,
+                "timezone": null,
+                "cleared": true
+            })
+        }
+    };
+    ToolOutcome::Ok(output)
 }
 
 /// Parse `expires_at` value (bare date or RFC3339) to a UTC epoch seconds integer.
@@ -666,7 +650,7 @@ mod tests {
     async fn set_user_timezone_missing_device_rejected() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge().await;
 
-        // No device arg at all.
+        // No device arg at all: a schema violation, refused at admission.
         let req = post_tool_use_req(
             MCP_SET_USER_TIMEZONE_TOOL,
             serde_json::json!({ "timezone": "Asia/Tokyo" }),
@@ -677,9 +661,10 @@ mod tests {
                 updated_output: Some(output),
             })) => {
                 let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-                assert_eq!(
-                    parsed["error"], "missing_device_arg",
-                    "expected error: {parsed}"
+                assert_eq!(parsed["error"], "invalid_args", "expected error: {parsed}");
+                assert!(
+                    parsed["detail"].as_str().unwrap().contains("device"),
+                    "{parsed}"
                 );
             }
             other => panic!("expected Continue with error, got {other:?}"),
@@ -810,6 +795,43 @@ mod tests {
         assert!(
             names.contains(&"SetUserTimezone"),
             "SetUserTimezone must be in core_virtual_tools; got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_timezone_answers_ok_and_err_outcomes() {
+        use super::super::execute::ToolOutcome;
+        use serde_json::json;
+
+        let (bridge, _e, _b, _a) = test_bridge().await;
+        let device_id =
+            create_test_device_for_user(&bridge.db, bridge.user_id, "Mozilla/5.0 Chrome/125").await;
+
+        assert_eq!(
+            super::execute_timezone_tool(
+                &bridge,
+                MCP_SET_USER_TIMEZONE_TOOL,
+                &json!({"device": device_id.to_string(), "timezone": "Asia/Tokyo"}),
+            )
+            .await,
+            Some(ToolOutcome::Ok(json!({
+                "ok": true,
+                "timezone": "Asia/Tokyo",
+                "expires_at": null,
+            })))
+        );
+        assert_eq!(
+            super::execute_timezone_tool(
+                &bridge,
+                MCP_SET_USER_TIMEZONE_TOOL,
+                &json!({"device": device_id.to_string(), "timezone": "Mars/Olympus"}),
+            )
+            .await,
+            Some(ToolOutcome::Err(json!({"error": "invalid_timezone"})))
+        );
+        assert_eq!(
+            super::execute_timezone_tool(&bridge, "mcp__brenn__BrennSend", &json!({})).await,
+            None
         );
     }
 }

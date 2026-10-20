@@ -769,3 +769,69 @@ async fn a_goal_change_reaches_only_the_bridges_of_that_app() {
     );
     assert_eq!(other.cc_profile_name().as_deref(), Some("main"));
 }
+
+/// The replacement container mounts the same tool socket directory and binary
+/// the first spawn did, and names the same container-side socket.
+#[tokio::test]
+async fn a_respawn_mounts_the_bridges_tool_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app_config = brenn_lib::config::test_app_config("testapp");
+    app_config.container_spawn = Some(brenn_lib::config::ContainerSpawnConfig {
+        image: "brenn-cc:latest".into(),
+        home_dir: std::path::PathBuf::from("/host/home/test"),
+        container_home: std::path::PathBuf::from("/home/user"),
+        host_working_dir: std::path::PathBuf::from("/host/home/test/work"),
+        container_working_dir: std::path::PathBuf::from("/home/user/work"),
+        working_dir_is_repo: false,
+        repo_mounts: vec![],
+        extra_mounts: vec![],
+        extra_args: vec![],
+    });
+    let (alert_dispatcher, _h) = noop_alert_dispatcher();
+    let host = ServerSwapHost {
+        models: crate::model_cache::ModelCache {
+            db: crate::test_support::init_db_memory(),
+            apps: brenn_lib::config::AppTable::empty(),
+            cached: Default::default(),
+        },
+        app_config,
+        mcp_script_path: std::path::PathBuf::from("/opt/brenn/noop_mcp.py"),
+        tool_cli_path: std::path::PathBuf::from("/opt/brenn/brenn-tool"),
+        tool_socket_dir: std::path::PathBuf::from(
+            "/run/user/1000/brenn-tool-sockets/testapp-conv7",
+        ),
+        transcript: Arc::new(
+            brenn_obs::transcript::TranscriptWriter::new(dir.path(), "swap.ndjson").unwrap(),
+        ),
+        alert_dispatcher,
+        user_tz: chrono_tz::UTC,
+        server_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let (events, _rx) = mpsc::channel(1);
+    let config = host.respawn_config(&RespawnRequest {
+        conversation_id: 7,
+        profile: brenn_cc_profile::ResolvedProfile {
+            name: "main".to_string(),
+            token: SecretString::new("token".to_string()),
+        },
+        model: None,
+        resume_session_id: None,
+        events,
+    });
+    let container = config.container.expect("containerized");
+    assert!(
+        container.extra_mounts.contains(
+            &"/run/user/1000/brenn-tool-sockets/testapp-conv7:/run/brenn:ro,z".to_string()
+        )
+    );
+    assert!(
+        container
+            .extra_mounts
+            .contains(&"/opt/brenn/brenn-tool:/usr/local/bin/brenn-tool:ro,z".to_string())
+    );
+    assert!(
+        container
+            .extra_args
+            .contains(&"BRENN_TOOL_SOCKET=/run/brenn/tool.sock".to_string())
+    );
+}

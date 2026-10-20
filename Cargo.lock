@@ -798,6 +798,7 @@ dependencies = [
  "brenn-obs",
  "brenn-queue",
  "brenn-surface-schema",
+ "brenn-tool-proto",
  "brenn-usage-db",
  "brenn-ws-types",
  "chrono",
@@ -1143,6 +1144,7 @@ dependencies = [
  "brenn-surface-contract",
  "brenn-surface-schema",
  "brenn-surface-server",
+ "brenn-tool-proto",
  "brenn-tool-registry",
  "brenn-usage-db",
  "brenn-wasm",
@@ -1271,6 +1273,25 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uuid",
+]
+
+[[package]]
+name = "brenn-tool"
+version = "0.1.0"
+dependencies = [
+ "brenn-tool-proto",
+ "clap",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "brenn-tool-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

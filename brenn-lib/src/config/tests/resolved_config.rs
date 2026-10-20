@@ -68,7 +68,7 @@ fn resolved_config_webhook_round_trip() {
     } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     // apps contains the app and its webhook_subscriptions is non-empty.
@@ -195,7 +195,7 @@ fn app_owned_endpoint_stamps_resolved_wake_min() {
     } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     let app = apps.get("myapp").expect("myapp must be in resolved apps");
@@ -280,7 +280,7 @@ fn resolved_config_pwa_push_round_trip() {
     let ResolvedConfig { pwa_push, apps, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     // Phase 5 binding must produce Some(...).
@@ -327,7 +327,7 @@ fn resolved_config_pwa_push_absent_is_none() {
     let ResolvedConfig { pwa_push, .. } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
     assert!(pwa_push.is_none());
 }
@@ -402,7 +402,7 @@ fn git_pipeline_reference_config_resolves() {
     } = validate_and_resolve(
         &config,
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        super::test_runtime_dir(),
     );
 
     assert_eq!(webhook_endpoints.len(), 2, "both git endpoints resolve");

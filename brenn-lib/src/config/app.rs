@@ -297,8 +297,8 @@ pub struct AppConfig {
     /// **Containerized apps**: `<container_spawn.home_dir>/.config/brenn/<slug>/`
     /// (the CC-visible path resolves via `path_mapper.to_container`).
     ///
-    /// **Bare apps**: `$XDG_RUNTIME_DIR/brenn/<slug>/` when `XDG_RUNTIME_DIR` is
-    /// set (per-uid, pruned at logout by systemd); otherwise `/tmp/brenn/<slug>/`.
+    /// **Bare apps**: `$XDG_RUNTIME_DIR/brenn/<slug>/` (per-uid, pruned at
+    /// logout by systemd).
     ///
     /// **Invariant: must not be trusted to be empty.** Across restarts (bare: same
     /// uid restart reuses the dir; containerized: home_dir persists) a prior
@@ -309,6 +309,12 @@ pub struct AppConfig {
     /// robustness principle: startup FS failure is a config/permission bug, not
     /// transient).
     pub state_dir: PathBuf,
+    /// Root of the per-conversation tool socket directories:
+    /// `$XDG_RUNTIME_DIR/brenn-tool-sockets`. A sibling of the per-slug
+    /// `$XDG_RUNTIME_DIR/brenn/` namespace, so no slug can name it. The same
+    /// path on every app; each conversation's socket lives in
+    /// `<root>/<slug>-conv<id>/`.
+    pub tool_socket_root: PathBuf,
     /// Resolved per-app messaging config. `None` when the app states no
     /// subscriptions and no send budget. See
     /// `crate::messaging::config::ResolvedMessagingConfig`.
@@ -516,6 +522,7 @@ impl AppConfig {
             // Derived placements, not authored fields.
             path_mapper: _,
             state_dir: _,
+            tool_socket_root: _,
             // Boot-shaped: refused at reload, each for its own reason.
             startup_hooks: _,
             claude_profiles: _,

@@ -1884,6 +1884,7 @@ vocabulary! {
     /// The `claude_defaults` section: what every agent starts from.
     struct ClaudeDefaultsAttrs<V> {
         opt mcp_script_path: V,
+        opt tool_cli_path: V,
         opt model: V,
         opt profile_token_dir: V,
     }

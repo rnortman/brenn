@@ -1,12 +1,11 @@
-//! Intercept handlers for the three messaging MCP virtual tools.
+//! Intercept handlers for the messaging MCP virtual tools.
 //!
-//! All three tools are auto-approved:
+//! All messaging tools are auto-approved:
 //! - PreToolUse intercepted, returns `Allow`.
-//! - PostToolUse intercepted, executes the real work, returns
+//! - PostToolUse intercepted, runs the call through `execute_admitted`
+//!   (whose messaging arm is `execute_messaging_tool`), returns
 //!   `Continue { updated_output }` so CC sees the real result instead
-//!   of `__NOOP__`.
-//! - `emit_tool_summary` is invoked from PostToolUse so the chat-history
-//!   card renders.
+//!   of `__NOOP__`, and emits the chat-history card.
 //!
 //! The active bridge owns the conversation context (sender_conversation_id,
 //! sender_app_slug); these flow into `Messenger::publish` from the
@@ -25,8 +24,10 @@ use brenn_obs::security::{DenialKind, SecurityEventType, signal_publish_denial};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::active_bridge::ActiveBridge;
-use crate::intercept_helpers::{ToolErr, reject_tool, warn_if_unexpected_tool_response};
+use crate::active_bridge::{ActiveBridge, ToolOutcome};
+use crate::intercept_helpers::{
+    PostCard, answer_post_tool_use, outcome_err, outcome_ok, outcome_rejection,
+};
 use brenn_render::tools::messaging::{
     MCP_MESSAGE_CANCEL_TOOL, MCP_MESSAGE_EDIT_TOOL, MCP_MESSAGE_LIST_CHANNELS_TOOL,
     MCP_MESSAGE_PENDING_LIST_TOOL, MCP_MESSAGE_QUERY_CHANNEL_TOOL, MCP_MESSAGE_SEND_TOOL,
@@ -135,1094 +136,707 @@ pub enum MessagingHandled {
     Respond(CcApprovalDecision),
 }
 
+/// The MCP names of every messaging tool.
+const MESSAGING_TOOLS: [&str; 9] = [
+    MCP_MESSAGE_LIST_CHANNELS_TOOL,
+    MCP_MESSAGE_SUBSCRIPTION_LIST_TOOL,
+    MCP_MESSAGE_SEND_TOOL,
+    MCP_MESSAGE_QUERY_CHANNEL_TOOL,
+    MCP_MESSAGE_SUBSCRIBE_TOOL,
+    MCP_MESSAGE_UNSUBSCRIBE_TOOL,
+    MCP_MESSAGE_PENDING_LIST_TOOL,
+    MCP_MESSAGE_CANCEL_TOOL,
+    MCP_MESSAGE_EDIT_TOOL,
+];
+
+fn is_messaging_tool(tool_name: &str) -> bool {
+    MESSAGING_TOOLS.contains(&tool_name)
+}
+
 /// Try to handle a messaging tool intercept. Returns `Some` only when the
-/// tool name matches one of the three messaging tools.
+/// tool name is a messaging tool.
 ///
-/// The caller is `handle_brenn_tools` in `active_bridge.rs`. `emit_tool_summary`
-/// is invoked here for PostToolUse intercepts so the chat-history card
-/// fires alongside the substituted tool result.
+/// PreToolUse auto-approves. PostToolUse runs the call through
+/// `execute_admitted`, emits the chat-history card and substitutes the
+/// outcome for the stub's `__NOOP__`.
 pub async fn try_handle_messaging_tool(
     bridge: &ActiveBridge,
     req: &ApprovalRequest,
 ) -> Option<MessagingHandled> {
     match &req.kind {
-        // ---- PreToolUse: all messaging tools auto-approve ----
-        ApprovalKind::PreToolUse { tool_name, .. }
-            if tool_name == MCP_MESSAGE_LIST_CHANNELS_TOOL
-                || tool_name == MCP_MESSAGE_SUBSCRIPTION_LIST_TOOL
-                || tool_name == MCP_MESSAGE_SEND_TOOL
-                || tool_name == MCP_MESSAGE_QUERY_CHANNEL_TOOL
-                || tool_name == MCP_MESSAGE_SUBSCRIBE_TOOL
-                || tool_name == MCP_MESSAGE_UNSUBSCRIBE_TOOL
-                || tool_name == MCP_MESSAGE_PENDING_LIST_TOOL
-                || tool_name == MCP_MESSAGE_CANCEL_TOOL
-                || tool_name == MCP_MESSAGE_EDIT_TOOL =>
-        {
+        ApprovalKind::PreToolUse { tool_name, .. } if is_messaging_tool(tool_name) => {
             Some(MessagingHandled::Respond(CcApprovalDecision::Allow {
                 updated_input: None,
             }))
         }
 
-        // ---- PostToolUse: MessageChannelList ----
         ApprovalKind::PostToolUse {
             tool_name,
             tool_input,
             tool_use_id,
             tool_response,
             ..
-        } if tool_name == MCP_MESSAGE_LIST_CHANNELS_TOOL => {
-            warn_if_unexpected_tool_response("messaging intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            let app_slug = &bridge.app_slug;
-            // Start with the app's ACL-scoped brenn:/webhook: channels + mqtt:
-            // pattern rows (design §2.2 — "what could THIS app subscribe to?", not
-            // the old system-wide dump). Empty when messaging is not configured:
-            // this is intentional — pwa_push-only deployments have no Messenger,
-            // and the listing should still succeed (showing only pwa_push entries).
-            // This is not a silent fallback: the LLM receives a real result that
-            // reflects the actual configuration. Contrast with BrennSend, which
-            // cannot proceed without a Messenger and returns an explicit error.
-            let mut listing = match bridge.messenger() {
-                Some(m) => m.list_accessible_channels(app_slug),
-                None => vec![],
-            };
-            // Append pwa_push targets (already app-scoped; concrete existing
-            // targets, hence AccessKind::Existing).
-            if let Some(pwa_push_svc) = bridge.pwa_push_service() {
-                let push_targets = pwa_push_svc.list_targets(app_slug).await;
-                for target in push_targets {
-                    listing.push(brenn_messaging::ChannelListing {
-                        protocol: brenn_lib::messaging::ChannelScheme::PwaPush,
-                        address: target.address,
-                        description: None,
-                        access: brenn_messaging::AccessKind::Existing,
-                        details: Some(brenn_messaging::ChannelDetails::PwaPush(
-                            brenn_messaging::PwaPushDetails {
-                                user: target.user,
-                                device: target.device,
-                                last_seen_at: target.last_seen_at,
-                            },
-                        )),
-                    });
-                }
-            } else if bridge.messenger().is_none() {
-                // Both messenger and pwa_push_service are absent. The listing
-                // will be empty, which looks like a valid "no channels" state
-                // to the LLM. Log so an operator can distinguish a
-                // misconfiguration from a correctly-empty deployment.
-                tracing::warn!(
-                    app_slug = %app_slug,
-                    "MessageChannelList: neither Messenger nor PwaPushService configured; \
-                     returning empty channel listing"
-                );
-            }
-            // webhook: channels are now persisted in the directory and emitted
-            // by list_channels() above — no runtime synthesis needed here.
-
-            // Enrich mqtt: entries with runtime ingress health.
-            // `list_channels()` emits MqttDetails with client/topic and the
-            // health fields left `None` (Messenger has no MQTT dependency); fill
-            // qos/health/last_error from MqttService here, exactly as the
-            // pwa_push: targets are appended above. An entry whose client has no
-            // session keeps the fields absent — an honest "MQTT runtime not
-            // present for this client" state; the channel still lists with
-            // client/topic.
-            enrich_mqtt_listing(&mut listing, bridge.mqtt_service()).await;
-
-            let resp = MessageChannelListResponse { channels: &listing };
-            let output_str = serde_json::to_string(&resp)
-                .expect("MessageChannelListResponse serialization is infallible");
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, false,
-            )
-            .await;
-            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
-
-        // ---- PostToolUse: MessageSubscriptionList ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_MESSAGE_SUBSCRIPTION_LIST_TOOL => {
-            warn_if_unexpected_tool_response("messaging intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            let app_slug = &bridge.app_slug;
-            // App-scoped: only THIS app's own subscriptions. Empty when messaging
-            // is not configured — a pwa_push-only deployment has no Messenger, but
-            // the listing must still succeed (showing only pwa_push targets, which
-            // ARE subscriptions this app holds). Same honest-empty contract as the
-            // MessageChannelList arm: a real result reflecting the actual config,
-            // not a silent fallback.
-            let mut listing = match bridge.messenger() {
-                Some(m) => m.list_subscriptions(app_slug).await,
-                None => vec![],
-            };
-            // Append pwa_push targets: a PWA-push registration IS a subscription
-            // this app holds, and `list_targets(app_slug)` is already app-scoped.
-            // These are always concrete registrations (no static-vs-dynamic
-            // distinction), reported with `dynamic = false`, and with no depths:
-            // an egress target holds no queue, so any number here would be the
-            // listing describing a window that does not exist.
-            if let Some(pwa_push_svc) = bridge.pwa_push_service() {
-                let push_targets = pwa_push_svc.list_targets(app_slug).await;
-                for target in push_targets {
-                    listing.push(SubscriptionListing {
-                        protocol: brenn_lib::messaging::ChannelScheme::PwaPush,
-                        address: target.address,
-                        description: None,
-                        dynamic: false,
-                        push_depth: None,
-                        retain_depth: None,
-                        noise: brenn_lib::messaging::config::NoiseLevel::Silent,
-                        wake_min: brenn_lib::messaging::WakeMin::Normal,
-                        details: Some(brenn_messaging::ChannelDetails::PwaPush(
-                            brenn_messaging::PwaPushDetails {
-                                user: target.user,
-                                device: target.device,
-                                last_seen_at: target.last_seen_at,
-                            },
-                        )),
-                    });
-                }
-            } else if bridge.messenger().is_none() {
-                // Both messenger and pwa_push_service absent: the listing is empty,
-                // which looks like a valid "no subscriptions" state to the LLM. Log
-                // so an operator can distinguish a misconfiguration from a
-                // correctly-empty deployment (parallels the MessageChannelList arm).
-                tracing::warn!(
-                    app_slug = %app_slug,
-                    "MessageSubscriptionList: neither Messenger nor PwaPushService \
-                     configured; returning empty subscription listing"
-                );
-            }
-
-            // Enrich mqtt: entries with runtime ingress health, exactly as the
-            // MessageChannelList arm does. `list_subscriptions` leaves the health
-            // fields `None`; fill qos/health/last_error from MqttService here.
-            // Reuse the shared per-entry primitive directly: the
-            // SubscriptionListing rows carry the same `Option<ChannelDetails>`
-            // as ChannelListing, so no per-type wrapper is needed.
-            for entry in listing.iter_mut() {
-                enrich_mqtt_details(&mut entry.details, bridge.mqtt_service()).await;
-            }
-
-            let resp = MessageSubscriptionListResponse {
-                subscriptions: &listing,
-            };
-            let output_str = serde_json::to_string(&resp)
-                .expect("MessageSubscriptionListResponse serialization is infallible");
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, false,
-            )
-            .await;
-            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
-
-        // ---- PostToolUse: BrennSend ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_MESSAGE_SEND_TOOL => {
-            warn_if_unexpected_tool_response("messaging intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            // Extract `to` first so cross-protocol errors can fire before the
-            // messenger check (cross-protocol misuse doesn't require a messenger).
-            let to = match tool_input.get("to").and_then(|v| v.as_str()) {
-                Some(s) if !s.is_empty() => s,
-                _ => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "missing or empty `to` argument",
-                        )
-                        .await,
-                    );
-                }
-            };
-            // Cross-protocol misuse: pwa_push: addresses must go to PwaPushSend.
-            if brenn_lib::messaging::ChannelScheme::of(to)
-                == Some(brenn_lib::messaging::ChannelScheme::PwaPush)
-            {
-                tracing::debug!(
-                    tool = tool_name,
-                    to,
-                    "BrennSend called with pwa_push: address; redirecting LLM to PwaPushSend"
-                );
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "BrennSend only accepts `brenn:` and `ephemeral:` addresses. \
-                         Use PwaPushSend for `pwa_push:` addresses. \
-                         Use MessageChannelList to discover available channels.",
-                    )
-                    .await,
-                );
-            }
-            // Cross-protocol misuse: mqtt: addresses must go to MqttSend.
-            if brenn_lib::messaging::ChannelScheme::of(to)
-                == Some(brenn_lib::messaging::ChannelScheme::Mqtt)
-            {
-                tracing::debug!(
-                    tool = tool_name,
-                    to,
-                    "BrennSend called with mqtt: address; redirecting LLM to MqttSend"
-                );
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "BrennSend only accepts `brenn:` and `ephemeral:` addresses. \
-                         Use MqttSend for `mqtt:` addresses. \
-                         Use MessageChannelList to discover available channels.",
-                    )
-                    .await,
-                );
-            }
-            // Cross-protocol misuse: webhook: addresses are inbound-only (no outbound send tool in MVP).
-            if brenn_lib::messaging::ChannelScheme::of(to)
-                == Some(brenn_lib::messaging::ChannelScheme::Webhook)
-            {
-                tracing::debug!(
-                    tool = tool_name,
-                    to,
-                    "BrennSend called with webhook: address; webhook: is inbound-only in MVP"
-                );
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "BrennSend only accepts `brenn:` and `ephemeral:` addresses. \
-                         `webhook:` channels are inbound-only in this version. \
-                         Use MessageChannelList to discover available channels.",
-                    )
-                    .await,
-                );
-            }
-            let messenger = match bridge.messenger() {
-                Some(m) => m,
-                None => {
-                    tracing::warn!(
-                        tool = tool_name,
-                        "BrennSend: no Messenger configured; returning error to LLM"
-                    );
-                    return Some(missing_messenger_response());
-                }
-            };
-            let body = match tool_input.get("body").and_then(|v| v.as_str()) {
-                Some(s) => s,
-                None => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "missing `body` argument",
-                        )
-                        .await,
-                    );
-                }
-            };
-            // Reject legacy `wake` key — reject-and-teach so a stale-habit LLM
-            // isn't silently downgraded to the `urgency` default (§2.4).
-            if tool_input.get("wake").is_some() {
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "unknown field `wake`; use `urgency` (\"very-low\", \"low\", \"normal\", \"high\")",
-                    )
-                    .await,
-                );
-            }
-            // Reject `impetus` by name rather than ignoring it: carried
-            // user-interaction authority is not an LLM's to assert, and a model
-            // probing for it hears "no" instead of silence.
-            if tool_input.get("impetus").is_some() {
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "unknown field `impetus`; a message's user-interaction authority is set \
-                         by the server, never by a tool call",
-                    )
-                    .await,
-                );
-            }
-            let urgency_str = tool_input
-                .get("urgency")
-                .and_then(|v| v.as_str())
-                .unwrap_or("low");
-            let urgency = match Urgency::parse(urgency_str) {
-                Some(u) => u,
-                None => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            &format!(
-                                "unknown `urgency` value: {urgency_str:?}; \
-                                 must be one of \"very-low\", \"low\", \"normal\", \"high\""
-                            ),
-                        )
-                        .await,
-                    );
-                }
-            };
-            let reply_to = tool_input
-                .get("reply_to")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let deliver_after = match parse_optional_rfc3339(tool_input.get("deliver_after")) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Some(tool_error_response(bridge, tool_name, tool_input, &e).await);
-                }
-            };
-            let delivery_deadline =
-                match parse_optional_rfc3339(tool_input.get("delivery_deadline")) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Some(tool_error_response(bridge, tool_name, tool_input, &e).await);
-                    }
-                };
-
-            let result = messenger
-                .publish(
-                    PublishOrigin::Conversation {
-                        id: bridge.conversation_id,
-                    },
-                    &bridge.app_slug,
-                    to,
-                    body,
-                    urgency,
-                    reply_to.as_deref(),
-                    deliver_after,
-                    delivery_deadline,
-                )
-                .await;
-
-            // Shared error mapper: every failure arm produces the same
-            // `ToolErr { ok: false, error } -> (Value, is_error=true)` shape, so it
-            // lives in one place and cannot drift arm-to-arm.
-            let mkerr = |msg: Cow<'static, str>| {
-                (
-                    serde_json::to_value(&ToolErr {
-                        ok: false,
-                        error: msg,
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                )
-            };
-            // `missing_sender` and `body_too_large` share identical wording once,
-            // so no two arms can drift.
-            let missing_sender_msg =
-                || Cow::Borrowed("messaging not configured for this app (sender missing)");
-            let body_too_large_msg = |len: usize, max: usize| {
-                Cow::Owned(format!("body too large: {len} bytes (max {max})"))
-            };
-            // The log `kind` is derived from the result so it stays in lockstep
-            // with the `publish_denied` counter key.
-            if let Some(kind) = result.signal_kind() {
-                let event = match ChannelScheme::of(to) {
-                    Some(ChannelScheme::Ephemeral) => SecurityEventType::EphemeralPublishDenied,
-                    _ => SecurityEventType::BrennPublishDenied,
-                };
-                signal_publish_denial(
-                    bridge.alert_dispatcher(),
-                    event,
-                    bridge.denial_origin(),
-                    kind,
-                    result.denied_address().unwrap_or(to),
-                );
-            }
-            let (outcome_value, is_error) = match result {
-                PublishResult::Ok {
-                    message_id,
-                    address,
-                    remaining_budget,
-                } => {
-                    let ok = BrennSendOk {
-                        address: &address,
-                        message_id: message_id.to_string(),
-                        ok: true,
-                        remaining_budget: remaining_budget
-                            .expect("Conversation-origin publish returns Some(remaining_budget)"),
-                    };
-                    (
-                        serde_json::to_value(&ok).expect("BrennSendOk serialization is infallible"),
-                        false,
-                    )
-                }
-                PublishResult::BudgetExhausted => mkerr(Cow::Borrowed(
-                    "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
-                )),
-                // One byte-identical message for UnknownChannel and AclDenied —
-                // true in both cases, so the LLM-visible string reveals nothing
-                // about which gate fired; the real `kind` lives only in the
-                // server-side security log.
-                PublishResult::UnknownChannel(addr) | PublishResult::AclDenied(addr) => {
-                    mkerr(Cow::Owned(brenn_channel_denied_msg(&addr)))
-                }
-                PublishResult::MalformedAddress(addr) => mkerr(Cow::Owned(format!(
-                    "malformed channel address {addr:?}: must be of the form \"brenn:<name>\" \
-                     (or \"ephemeral:<name>\") with name matching ^[A-Za-z0-9._~-]+$"
-                ))),
-                PublishResult::MissingSender => mkerr(missing_sender_msg()),
-                PublishResult::BodyTooLarge { len, max } => mkerr(body_too_large_msg(len, max)),
-                PublishResult::RateLimited => mkerr(Cow::Borrowed(
-                    "rate limited: too many publishes to this channel; slow down",
-                )),
-                PublishResult::DeferredQuotaExceeded { cap } => mkerr(Cow::Owned(format!(
-                    "deferred-message quota exceeded: this channel already holds its cap of {cap} \
-                     scheduled messages; retry after some release"
-                ))),
-                // `Messenger::publish` carries no impetus and the `impetus` key
-                // is rejected by name before we get here, so this is a
-                // construction bug, not an outcome to hand the model.
-                PublishResult::ImpetusUnauthorized => unreachable!(
-                    "BrennSend publish returned ImpetusUnauthorized: this entry point passes no \
-                     impetus"
-                ),
-            };
-            let output_str = serde_json::to_string(&outcome_value)
-                .expect("outcome_value serialization is infallible");
-
-            // Plumb the publish outcome into `format_summary` via a
-            // synthetic field on a cloned `tool_input`, so the sent-message
-            // card shows a status badge ("delivered", "budget exhausted:
-            // 0 remaining", etc.); the badge text comes from `_outcome`.
-            let mut enriched = tool_input.clone();
-            if let serde_json::Value::Object(map) = &mut enriched {
-                map.insert("_outcome".to_string(), outcome_value);
-            }
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, &enriched, is_error,
-            )
-            .await;
-
-            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
-
-        // ---- PostToolUse: MessageChannelGet ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_MESSAGE_QUERY_CHANNEL_TOOL => {
-            warn_if_unexpected_tool_response("messaging intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            // Extract `address` first so cross-protocol errors fire before
-            // the messenger check.
-            let channel = match tool_input.get("address").and_then(|v| v.as_str()) {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "missing or empty `address` argument",
-                        )
-                        .await,
-                    );
-                }
-            };
-            // Cross-protocol misuse: pwa_push: addresses must go to PwaPushChannelGet.
-            if brenn_lib::messaging::ChannelScheme::of(&channel)
-                == Some(brenn_lib::messaging::ChannelScheme::PwaPush)
-            {
-                tracing::debug!(
-                    tool = tool_name,
-                    address = %channel,
-                    "MessageChannelGet called with pwa_push: address; redirecting LLM"
-                );
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "MessageChannelGet does not accept `pwa_push:` addresses. \
-                         Use PwaPushChannelGet for `pwa_push:` addresses. \
-                         Use MessageChannelList to discover available channels.",
-                    )
-                    .await,
-                );
-            }
-            let messenger = match bridge.messenger() {
-                Some(m) => m,
-                None => {
-                    tracing::warn!(
-                        tool = tool_name,
-                        "MessageChannelGet: no Messenger configured; returning error to LLM"
-                    );
-                    return Some(missing_messenger_response());
-                }
-            };
-            let limit = match tool_input.get("limit").and_then(|v| v.as_u64()) {
-                Some(n) if (1..=500).contains(&n) => n as u32,
-                _ => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "`limit` is required and must be between 1 and 500",
-                        )
-                        .await,
-                    );
-                }
-            };
-            let before = match parse_optional_rfc3339(tool_input.get("before")) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Some(tool_error_response(bridge, tool_name, tool_input, &e).await);
-                }
-            };
-            let after = match parse_optional_rfc3339(tool_input.get("after")) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Some(tool_error_response(bridge, tool_name, tool_input, &e).await);
-                }
-            };
-            let sender = tool_input
-                .get("sender")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let search = tool_input
-                .get("search")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let q = MessageQuery {
-                channel,
-                limit,
-                before,
-                after,
-                sender,
-                search,
-                calling_app_slug: bridge.app_slug.clone(),
-            };
-            let outcome = messenger.query(&q).await;
-            let (output_str, is_error) = match outcome {
-                Ok(envelopes) => (
-                    serde_json::to_string(&envelopes).expect("MessageEnvelope serialize"),
-                    false,
-                ),
-                Err(QueryError::UnknownChannel(addr)) => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("unknown channel address {addr:?}")),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-                Err(QueryError::Fts(msg)) => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("FTS query failed: {msg}")),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-            };
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, is_error,
-            )
-            .await;
-            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
-
-        // ---- PostToolUse: MessageSubscribe ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_MESSAGE_SUBSCRIBE_TOOL => {
-            warn_if_unexpected_tool_response("messaging intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            Some(handle_message_subscribe(bridge, tool_name, tool_input).await)
-        }
-
-        // ---- PostToolUse: MessageUnsubscribe ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_MESSAGE_UNSUBSCRIBE_TOOL => {
-            warn_if_unexpected_tool_response("messaging intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            Some(handle_message_unsubscribe(bridge, tool_name, tool_input).await)
-        }
-
-        // ---- PostToolUse: BrennPendingList ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_MESSAGE_PENDING_LIST_TOOL => {
-            warn_if_unexpected_tool_response("messaging intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            let messenger = match bridge.messenger() {
-                Some(m) => m,
-                None => {
-                    tracing::warn!(
-                        tool = tool_name,
-                        "BrennPendingList: no Messenger configured; returning error to LLM"
-                    );
-                    return Some(missing_messenger_response());
-                }
-            };
-            // Optional channel filter. Unknown / malformed addresses → empty result
-            // per §2.11 (no tool error; log malformed for operator visibility).
-            // Use `is_well_formed_address` (the canonical check) rather than a
-            // weaker prefix+length check so all malformed shapes are logged.
-            let channel_str = tool_input.get("channel").and_then(|v| v.as_str());
-            if let Some(s) = channel_str
-                && !brenn_messaging::is_well_formed_address(s)
-            {
-                tracing::warn!(
-                    tool = tool_name,
-                    channel = %sanitize_untrusted_str(s, MAX_LOGGED_UNTRUSTED_BYTES),
-                    "BrennPendingList: malformed channel address; returning empty list"
-                );
-                let empty: &[MessageEnvelope] = &[];
-                let resp = BrennPendingListResponse { messages: empty };
-                let output_str = serde_json::to_string(&resp)
-                    .expect("BrennPendingListResponse serialization is infallible");
-                crate::active_bridge::emit_tool_summary_for_intercept(
-                    bridge, tool_name, tool_input, false,
-                )
-                .await;
-                return Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
-                    updated_output: Some(output_str),
-                }));
-            }
-            let envelopes = messenger.list_pending(&bridge.app_slug, channel_str).await;
-            let resp = BrennPendingListResponse {
-                messages: &envelopes,
-            };
-            let output_str = serde_json::to_string(&resp)
-                .expect("BrennPendingListResponse serialization is infallible");
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, false,
-            )
-            .await;
-            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
-
-        // ---- PostToolUse: BrennMessageCancel ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_MESSAGE_CANCEL_TOOL => {
-            warn_if_unexpected_tool_response("messaging intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            let message_uuid = match parse_message_uuid(bridge, tool_name, tool_input).await {
-                Ok(u) => u,
-                Err(e) => return Some(e),
-            };
-            let messenger = match bridge.messenger() {
-                Some(m) => m,
-                None => {
-                    tracing::warn!(
-                        tool = tool_name,
-                        "BrennMessageCancel: no Messenger configured; returning error to LLM"
-                    );
-                    return Some(missing_messenger_response());
-                }
-            };
-            let result = messenger.cancel(&bridge.app_slug, message_uuid).await;
-            let (output_str, is_error) = match result {
-                CancelResult::Ok { message_id } => {
-                    let ok = BrennMessageCancelOk {
-                        cancelled: true,
-                        message_id: message_id.to_string(),
-                        ok: true,
-                    };
-                    (
-                        serde_json::to_string(&ok)
-                            .expect("BrennMessageCancelOk serialization is infallible"),
-                        false,
-                    )
-                }
-                CancelResult::UnknownMessage => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!(
-                            "{} {message_uuid}",
-                            brenn_lib::integration::UNKNOWN_MESSAGE_ERR
-                        )),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CancelResult::NotAuthorized => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "not authorized: caller's sender does not match this message's sender",
-                        ),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CancelResult::AlreadyDelivered => {
-                    // The tool description quotes this same constant, so what the
-                    // model was told to expect is what it gets.
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(brenn_lib::integration::CANCEL_ALREADY_PUBLISHED_ERR),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CancelResult::MissingSender => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "messaging not configured for this app (sender missing)",
-                        ),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-            };
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, is_error,
-            )
-            .await;
-            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
-
-        // ---- PostToolUse: BrennMessageEdit ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_MESSAGE_EDIT_TOOL => {
-            warn_if_unexpected_tool_response("messaging intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            let message_uuid = match parse_message_uuid(bridge, tool_name, tool_input).await {
-                Ok(u) => u,
-                Err(e) => return Some(e),
-            };
-            // Parse body — must be string if present.
-            let body = match tool_input.get("body") {
-                None => None,
-                Some(serde_json::Value::String(s)) => Some(s.clone()),
-                Some(_) => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "`body` must be a string",
-                        )
-                        .await,
-                    );
-                }
-            };
-            // Parse deliver_after: distinguish missing from explicit null.
-            let obj = tool_input.as_object();
-            let deliver_after = if let Some(obj) = obj
-                && obj.contains_key("deliver_after")
-            {
-                // Key present — use parse_present_rfc3339 so the type enforces
-                // that we've already confirmed the key exists.
-                let v = obj
-                    .get("deliver_after")
-                    .expect("key just confirmed present");
-                match parse_present_rfc3339(v) {
-                    Ok(ts) => Some(ts), // Some(None) = clear; Some(Some(t)) = set
-                    Err(e) => {
-                        return Some(tool_error_response(bridge, tool_name, tool_input, &e).await);
-                    }
-                }
-            } else {
-                None // field absent = leave unchanged
-            };
-            let delivery_deadline = if let Some(obj) = obj
-                && obj.contains_key("delivery_deadline")
-            {
-                let v = obj
-                    .get("delivery_deadline")
-                    .expect("key just confirmed present");
-                match parse_present_rfc3339(v) {
-                    Ok(ts) => Some(ts),
-                    Err(e) => {
-                        return Some(tool_error_response(bridge, tool_name, tool_input, &e).await);
-                    }
-                }
-            } else {
-                None
-            };
-            // Reject legacy `wake` key — reject-and-teach so a stale-habit LLM
-            // isn't silently downgraded to the `urgency` default (§2.4).
-            if tool_input.get("wake").is_some() {
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "unknown field `wake`; use `urgency` (\"very-low\", \"low\", \"normal\", \"high\")",
-                    )
-                    .await,
-                );
-            }
-            // Parse urgency — must be a ladder string if present.
-            let urgency = match tool_input.get("urgency").and_then(|v| v.as_str()) {
-                None => None,
-                Some(s) => match Urgency::parse(s) {
-                    Some(u) => Some(u),
-                    None => {
-                        return Some(
-                            tool_error_response(
-                                bridge,
-                                tool_name,
-                                tool_input,
-                                &format!(
-                                    "unknown `urgency` value: {s:?}; \
-                                     must be one of \"very-low\", \"low\", \"normal\", \"high\""
-                                ),
-                            )
-                            .await,
-                        );
-                    }
+        } if is_messaging_tool(tool_name) => Some(MessagingHandled::Respond(
+            answer_post_tool_use(
+                bridge,
+                "messaging intercept",
+                tool_name,
+                tool_input,
+                tool_use_id,
+                tool_response,
+                if tool_name == MCP_MESSAGE_SEND_TOOL {
+                    PostCard::SummaryWithOutcome
+                } else {
+                    PostCard::Summary
                 },
-            };
-            // Parse reply_to: distinguish missing, null (clear), string (set).
-            let reply_to = if obj.map(|o| o.contains_key("reply_to")).unwrap_or(false) {
-                match tool_input.get("reply_to") {
-                    Some(serde_json::Value::Null) => Some(None), // clear
-                    Some(serde_json::Value::String(s)) => Some(Some(s.clone())), // set
-                    None => unreachable!("contains_key returned true but get returned None"), // key present check above
-                    Some(_) => {
-                        return Some(
-                            tool_error_response(
-                                bridge,
-                                tool_name,
-                                tool_input,
-                                "`reply_to` must be a string or null",
-                            )
-                            .await,
-                        );
-                    }
-                }
-            } else {
-                None // absent = leave unchanged
-            };
-            // At least one mutable field required (intercept-side enforcement per §2.12).
-            if body.is_none()
-                && deliver_after.is_none()
-                && delivery_deadline.is_none()
-                && urgency.is_none()
-                && reply_to.is_none()
-            {
-                let err = ToolErr {
-                    ok: false,
-                    error: Cow::Borrowed(
-                        "no fields provided: at least one of body, deliver_after, \
-                         delivery_deadline, urgency, reply_to must be specified",
-                    ),
-                };
-                let output_str =
-                    serde_json::to_string(&err).expect("ToolErr serialization is infallible");
-                crate::active_bridge::emit_tool_summary_for_intercept(
-                    bridge, tool_name, tool_input, true,
-                )
-                .await;
-                return Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
-                    updated_output: Some(output_str),
-                }));
-            }
-            let messenger = match bridge.messenger() {
-                Some(m) => m,
-                None => {
-                    tracing::warn!(
-                        tool = tool_name,
-                        "BrennMessageEdit: no Messenger configured; returning error to LLM"
-                    );
-                    return Some(missing_messenger_response());
-                }
-            };
-            let fields = EditFields {
-                body,
-                reply_to,
-                deliver_after,
-                delivery_deadline,
-                urgency,
-            };
-            let result = messenger.edit(&bridge.app_slug, message_uuid, fields).await;
-            // Close the reply_to existence oracle the same way the BrennSend
-            // publish arm does: UnknownChannel and AclDenied render one
-            // byte-identical `brenn_channel_denied_msg` so the LLM-visible text
-            // never reveals whether a `brenn:` channel exists, and each reply_to
-            // denial is recorded through the shared security-signal helper (the
-            // existence bit lives only in the server-side security log's `kind`).
-            if let Some((kind, addr)) = match &result {
-                EditResult::MalformedAddress(a) => Some((DenialKind::MalformedAddress, a.as_str())),
-                EditResult::UnknownChannel(a) => Some((DenialKind::UnknownChannel, a.as_str())),
-                EditResult::AclDenied(a) => Some((DenialKind::AclDenied, a.as_str())),
-                _ => None,
-            } {
-                signal_publish_denial(
-                    bridge.alert_dispatcher(),
-                    SecurityEventType::BrennPublishDenied,
-                    bridge.denial_origin(),
-                    kind,
-                    addr,
-                );
-            }
-            // Ok arm requires a serde_json::Value to inject "ok": true into the
-            // envelope object; it serializes to String at the end. Error arms
-            // serialize to String directly (no intermediate Value needed).
-            let (output_str, is_error) = match result {
-                EditResult::Ok { envelope } => {
-                    let mut outcome_value =
-                        serde_json::to_value(&envelope).expect("MessageEnvelope serialize");
-                    // Add ok: true for consistency with BrennMessageCancel (correctness-2).
-                    if let serde_json::Value::Object(ref mut map) = outcome_value {
-                        map.insert("ok".to_string(), serde_json::Value::Bool(true));
-                    }
-                    (outcome_value.to_string(), false)
-                }
-                EditResult::UnknownMessage => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("unknown message {message_uuid}")),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-                EditResult::NotAuthorized => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "not authorized: caller's sender does not match this message's sender",
-                        ),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-                // As with cancel: the tool description quotes this constant.
-                EditResult::AlreadyDelivered => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(brenn_lib::integration::EDIT_ALREADY_PUBLISHED_ERR),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-                EditResult::NoFieldsProvided => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "no fields provided: at least one of body, deliver_after, \
-                             delivery_deadline, urgency, reply_to must be specified",
-                        ),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-                EditResult::BodyTooLarge { len, max } => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("body too large: {len} bytes (max {max})")),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-                EditResult::UnknownChannel(addr) | EditResult::AclDenied(addr) => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Owned(brenn_channel_denied_msg(&addr)),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-                EditResult::MalformedAddress(addr) => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!(
-                            "malformed reply_to address {addr:?}: must be of the form \
-                             \"brenn:<name>\" with name matching ^[A-Za-z0-9._~-]+$"
-                        )),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-                EditResult::MissingSender => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "messaging not configured for this app (sender missing)",
-                        ),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-            };
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, is_error,
             )
-            .await;
-            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
+            .await,
+        )),
 
         _ => None,
     }
 }
+
+/// Execute a messaging tool for the agent. `None` when `mcp_name` is not a
+/// messaging tool.
+pub(crate) async fn execute_messaging_tool(
+    bridge: &ActiveBridge,
+    mcp_name: &str,
+    input: &serde_json::Value,
+) -> Option<ToolOutcome> {
+    let outcome = match mcp_name {
+        MCP_MESSAGE_LIST_CHANNELS_TOOL => execute_channel_list(bridge).await,
+        MCP_MESSAGE_SUBSCRIPTION_LIST_TOOL => execute_subscription_list(bridge).await,
+        MCP_MESSAGE_SEND_TOOL => execute_send(bridge, mcp_name, input).await,
+        MCP_MESSAGE_QUERY_CHANNEL_TOOL => execute_channel_get(bridge, mcp_name, input).await,
+        MCP_MESSAGE_SUBSCRIBE_TOOL => execute_subscribe(bridge, mcp_name, input).await,
+        MCP_MESSAGE_UNSUBSCRIBE_TOOL => execute_unsubscribe(bridge, mcp_name, input).await,
+        MCP_MESSAGE_PENDING_LIST_TOOL => execute_pending_list(bridge, mcp_name, input).await,
+        MCP_MESSAGE_CANCEL_TOOL => execute_cancel(bridge, mcp_name, input).await,
+        MCP_MESSAGE_EDIT_TOOL => execute_edit(bridge, mcp_name, input).await,
+        _ => return None,
+    };
+    Some(outcome)
+}
+
+/// `MessageChannelList`.
+async fn execute_channel_list(bridge: &ActiveBridge) -> ToolOutcome {
+    let app_slug = &bridge.app_slug;
+    // Start with the app's ACL-scoped brenn:/webhook: channels + mqtt:
+    // pattern rows ("what could THIS app subscribe to?", not a system-wide
+    // dump). Empty when messaging is not configured: this is intentional —
+    // pwa_push-only deployments have no Messenger, and the listing should still
+    // succeed (showing only pwa_push entries). This is not a silent fallback:
+    // the LLM receives a real result that reflects the actual configuration.
+    // Contrast with BrennSend, which cannot proceed without a Messenger and
+    // returns an explicit error.
+    let mut listing = match bridge.messenger() {
+        Some(m) => m.list_accessible_channels(app_slug),
+        None => vec![],
+    };
+    // Append pwa_push targets (already app-scoped; concrete existing targets,
+    // hence AccessKind::Existing).
+    if let Some(pwa_push_svc) = bridge.pwa_push_service() {
+        let push_targets = pwa_push_svc.list_targets(app_slug).await;
+        for target in push_targets {
+            listing.push(brenn_messaging::ChannelListing {
+                protocol: brenn_lib::messaging::ChannelScheme::PwaPush,
+                address: target.address,
+                description: None,
+                access: brenn_messaging::AccessKind::Existing,
+                details: Some(brenn_messaging::ChannelDetails::PwaPush(
+                    brenn_messaging::PwaPushDetails {
+                        user: target.user,
+                        device: target.device,
+                        last_seen_at: target.last_seen_at,
+                    },
+                )),
+            });
+        }
+    } else if bridge.messenger().is_none() {
+        // Both messenger and pwa_push_service are absent. The listing will be
+        // empty, which looks like a valid "no channels" state to the LLM. Log so
+        // an operator can distinguish a misconfiguration from a correctly-empty
+        // deployment.
+        tracing::warn!(
+            app_slug = %app_slug,
+            "MessageChannelList: neither Messenger nor PwaPushService configured; \
+             returning empty channel listing"
+        );
+    }
+    // webhook: channels are persisted in the directory and emitted by
+    // list_channels() above — no runtime synthesis needed here.
+
+    // Enrich mqtt: entries with runtime ingress health. `list_channels()` emits
+    // MqttDetails with client/topic and the health fields left `None` (Messenger
+    // has no MQTT dependency); fill qos/health/last_error from MqttService here,
+    // exactly as the pwa_push: targets are appended above. An entry whose client
+    // has no session keeps the fields absent — an honest "MQTT runtime not
+    // present for this client" state; the channel still lists with client/topic.
+    enrich_mqtt_listing(&mut listing, bridge.mqtt_service()).await;
+
+    outcome_ok(&MessageChannelListResponse { channels: &listing })
+}
+
+/// `MessageSubscriptionList`.
+async fn execute_subscription_list(bridge: &ActiveBridge) -> ToolOutcome {
+    let app_slug = &bridge.app_slug;
+    // App-scoped: only THIS app's own subscriptions. Empty when messaging is
+    // not configured — a pwa_push-only deployment has no Messenger, but the
+    // listing must still succeed (showing only pwa_push targets, which ARE
+    // subscriptions this app holds). Same honest-empty contract as
+    // MessageChannelList: a real result reflecting the actual config, not a
+    // silent fallback.
+    let mut listing = match bridge.messenger() {
+        Some(m) => m.list_subscriptions(app_slug).await,
+        None => vec![],
+    };
+    // Append pwa_push targets: a PWA-push registration IS a subscription this
+    // app holds, and `list_targets(app_slug)` is already app-scoped. These are
+    // always concrete registrations (no static-vs-dynamic distinction),
+    // reported with `dynamic = false`, and with no depths: an egress target
+    // holds no queue, so any number here would be the listing describing a
+    // window that does not exist.
+    if let Some(pwa_push_svc) = bridge.pwa_push_service() {
+        let push_targets = pwa_push_svc.list_targets(app_slug).await;
+        for target in push_targets {
+            listing.push(SubscriptionListing {
+                protocol: brenn_lib::messaging::ChannelScheme::PwaPush,
+                address: target.address,
+                description: None,
+                dynamic: false,
+                push_depth: None,
+                retain_depth: None,
+                noise: brenn_lib::messaging::config::NoiseLevel::Silent,
+                wake_min: brenn_lib::messaging::WakeMin::Normal,
+                details: Some(brenn_messaging::ChannelDetails::PwaPush(
+                    brenn_messaging::PwaPushDetails {
+                        user: target.user,
+                        device: target.device,
+                        last_seen_at: target.last_seen_at,
+                    },
+                )),
+            });
+        }
+    } else if bridge.messenger().is_none() {
+        // Both messenger and pwa_push_service absent: the listing is empty,
+        // which looks like a valid "no subscriptions" state to the LLM. Log so
+        // an operator can distinguish a misconfiguration from a correctly-empty
+        // deployment (parallels MessageChannelList).
+        tracing::warn!(
+            app_slug = %app_slug,
+            "MessageSubscriptionList: neither Messenger nor PwaPushService \
+             configured; returning empty subscription listing"
+        );
+    }
+
+    // Enrich mqtt: entries with runtime ingress health, exactly as
+    // MessageChannelList does. `list_subscriptions` leaves the health fields
+    // `None`; fill qos/health/last_error from MqttService here. The
+    // SubscriptionListing rows carry the same `Option<ChannelDetails>` as
+    // ChannelListing, so the shared per-entry primitive applies directly.
+    for entry in listing.iter_mut() {
+        enrich_mqtt_details(&mut entry.details, bridge.mqtt_service()).await;
+    }
+
+    outcome_ok(&MessageSubscriptionListResponse {
+        subscriptions: &listing,
+    })
+}
+
+/// `BrennSend`.
+async fn execute_send(
+    bridge: &ActiveBridge,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> ToolOutcome {
+    // Extract `to` first so cross-protocol errors can fire before the
+    // messenger check (cross-protocol misuse doesn't require a messenger).
+    let to = match tool_input.get("to").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return reject(tool_name, "missing or empty `to` argument"),
+    };
+    // Cross-protocol misuse: pwa_push: addresses must go to PwaPushSend.
+    if ChannelScheme::of(to) == Some(ChannelScheme::PwaPush) {
+        tracing::debug!(
+            tool = tool_name,
+            to,
+            "BrennSend called with pwa_push: address; redirecting LLM to PwaPushSend"
+        );
+        return reject(
+            tool_name,
+            "BrennSend only accepts `brenn:` and `ephemeral:` addresses. \
+             Use PwaPushSend for `pwa_push:` addresses. \
+             Use MessageChannelList to discover available channels.",
+        );
+    }
+    // Cross-protocol misuse: mqtt: addresses must go to MqttSend.
+    if ChannelScheme::of(to) == Some(ChannelScheme::Mqtt) {
+        tracing::debug!(
+            tool = tool_name,
+            to,
+            "BrennSend called with mqtt: address; redirecting LLM to MqttSend"
+        );
+        return reject(
+            tool_name,
+            "BrennSend only accepts `brenn:` and `ephemeral:` addresses. \
+             Use MqttSend for `mqtt:` addresses. \
+             Use MessageChannelList to discover available channels.",
+        );
+    }
+    // Cross-protocol misuse: webhook: addresses are inbound-only (no outbound
+    // send tool).
+    if ChannelScheme::of(to) == Some(ChannelScheme::Webhook) {
+        tracing::debug!(
+            tool = tool_name,
+            to,
+            "BrennSend called with webhook: address; webhook: is inbound-only"
+        );
+        return reject(
+            tool_name,
+            "BrennSend only accepts `brenn:` and `ephemeral:` addresses. \
+             `webhook:` channels are inbound-only in this version. \
+             Use MessageChannelList to discover available channels.",
+        );
+    }
+    let Some(messenger) = bridge.messenger() else {
+        tracing::warn!(
+            tool = tool_name,
+            "BrennSend: no Messenger configured; returning error to LLM"
+        );
+        return missing_messenger();
+    };
+    let Some(body) = tool_input.get("body").and_then(|v| v.as_str()) else {
+        return reject(tool_name, "missing `body` argument");
+    };
+    // Reject legacy `wake` key — reject-and-teach so a stale-habit LLM isn't
+    // silently downgraded to the `urgency` default.
+    if tool_input.get("wake").is_some() {
+        return reject(
+            tool_name,
+            "unknown field `wake`; use `urgency` (\"very-low\", \"low\", \"normal\", \"high\")",
+        );
+    }
+    // Reject `impetus` by name rather than ignoring it: carried
+    // user-interaction authority is not an LLM's to assert, and a model probing
+    // for it hears "no" instead of silence.
+    if tool_input.get("impetus").is_some() {
+        return reject(
+            tool_name,
+            "unknown field `impetus`; a message's user-interaction authority is set \
+             by the server, never by a tool call",
+        );
+    }
+    let urgency_str = tool_input
+        .get("urgency")
+        .and_then(|v| v.as_str())
+        .unwrap_or("low");
+    let Some(urgency) = Urgency::parse(urgency_str) else {
+        return reject(
+            tool_name,
+            &format!(
+                "unknown `urgency` value: {urgency_str:?}; \
+                 must be one of \"very-low\", \"low\", \"normal\", \"high\""
+            ),
+        );
+    };
+    let reply_to = tool_input
+        .get("reply_to")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let deliver_after = match parse_optional_rfc3339(tool_input.get("deliver_after")) {
+        Ok(v) => v,
+        Err(e) => return reject(tool_name, &e),
+    };
+    let delivery_deadline = match parse_optional_rfc3339(tool_input.get("delivery_deadline")) {
+        Ok(v) => v,
+        Err(e) => return reject(tool_name, &e),
+    };
+
+    let result = messenger
+        .publish(
+            PublishOrigin::Conversation {
+                id: bridge.conversation_id,
+            },
+            &bridge.app_slug,
+            to,
+            body,
+            urgency,
+            reply_to.as_deref(),
+            deliver_after,
+            delivery_deadline,
+        )
+        .await;
+
+    // The log `kind` is derived from the result so it stays in lockstep with
+    // the `publish_denied` counter key.
+    if let Some(kind) = result.signal_kind() {
+        let event = match ChannelScheme::of(to) {
+            Some(ChannelScheme::Ephemeral) => SecurityEventType::EphemeralPublishDenied,
+            _ => SecurityEventType::BrennPublishDenied,
+        };
+        signal_publish_denial(
+            bridge.alert_dispatcher(),
+            event,
+            bridge.denial_origin(),
+            kind,
+            result.denied_address().unwrap_or(to),
+        );
+    }
+    match result {
+        PublishResult::Ok {
+            message_id,
+            address,
+            remaining_budget,
+        } => outcome_ok(&BrennSendOk {
+            address: &address,
+            message_id: message_id.to_string(),
+            ok: true,
+            remaining_budget: remaining_budget
+                .expect("Conversation-origin publish returns Some(remaining_budget)"),
+        }),
+        PublishResult::BudgetExhausted => outcome_err(Cow::Borrowed(
+            "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
+        )),
+        // One byte-identical message for UnknownChannel and AclDenied — true in
+        // both cases, so the LLM-visible string reveals nothing about which gate
+        // fired; the real `kind` lives only in the server-side security log.
+        PublishResult::UnknownChannel(addr) | PublishResult::AclDenied(addr) => {
+            outcome_err(Cow::Owned(brenn_channel_denied_msg(&addr)))
+        }
+        PublishResult::MalformedAddress(addr) => outcome_err(Cow::Owned(format!(
+            "malformed channel address {addr:?}: must be of the form \"brenn:<name>\" \
+             (or \"ephemeral:<name>\") with name matching ^[A-Za-z0-9._~-]+$"
+        ))),
+        PublishResult::MissingSender => outcome_err(Cow::Borrowed(MISSING_SENDER_ERR)),
+        PublishResult::BodyTooLarge { len, max } => outcome_err(Cow::Owned(format!(
+            "body too large: {len} bytes (max {max})"
+        ))),
+        PublishResult::RateLimited => outcome_err(Cow::Borrowed(
+            "rate limited: too many publishes to this channel; slow down",
+        )),
+        PublishResult::DeferredQuotaExceeded { cap } => outcome_err(Cow::Owned(format!(
+            "deferred-message quota exceeded: this channel already holds its cap of {cap} \
+             scheduled messages; retry after some release"
+        ))),
+        // `Messenger::publish` carries no impetus and the `impetus` key is
+        // rejected by name before we get here, so this is a construction bug,
+        // not an outcome to hand the model.
+        PublishResult::ImpetusUnauthorized => unreachable!(
+            "BrennSend publish returned ImpetusUnauthorized: this entry point passes no \
+             impetus"
+        ),
+    }
+}
+
+/// `MessageChannelGet`.
+async fn execute_channel_get(
+    bridge: &ActiveBridge,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> ToolOutcome {
+    // Extract `address` first so cross-protocol errors fire before the
+    // messenger check.
+    let channel = match tool_input.get("address").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return reject(tool_name, "missing or empty `address` argument"),
+    };
+    // Cross-protocol misuse: pwa_push: addresses must go to PwaPushChannelGet.
+    if ChannelScheme::of(&channel) == Some(ChannelScheme::PwaPush) {
+        tracing::debug!(
+            tool = tool_name,
+            address = %channel,
+            "MessageChannelGet called with pwa_push: address; redirecting LLM"
+        );
+        return reject(
+            tool_name,
+            "MessageChannelGet does not accept `pwa_push:` addresses. \
+             Use PwaPushChannelGet for `pwa_push:` addresses. \
+             Use MessageChannelList to discover available channels.",
+        );
+    }
+    let Some(messenger) = bridge.messenger() else {
+        tracing::warn!(
+            tool = tool_name,
+            "MessageChannelGet: no Messenger configured; returning error to LLM"
+        );
+        return missing_messenger();
+    };
+    let limit = match tool_input.get("limit").and_then(|v| v.as_u64()) {
+        Some(n) if (1..=500).contains(&n) => n as u32,
+        _ => {
+            return reject(
+                tool_name,
+                "`limit` is required and must be between 1 and 500",
+            );
+        }
+    };
+    let before = match parse_optional_rfc3339(tool_input.get("before")) {
+        Ok(v) => v,
+        Err(e) => return reject(tool_name, &e),
+    };
+    let after = match parse_optional_rfc3339(tool_input.get("after")) {
+        Ok(v) => v,
+        Err(e) => return reject(tool_name, &e),
+    };
+    let sender = tool_input
+        .get("sender")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let search = tool_input
+        .get("search")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let q = MessageQuery {
+        channel,
+        limit,
+        before,
+        after,
+        sender,
+        search,
+        calling_app_slug: bridge.app_slug.clone(),
+    };
+    match messenger.query(&q).await {
+        Ok(envelopes) => outcome_ok(&envelopes),
+        Err(QueryError::UnknownChannel(addr)) => {
+            outcome_err(Cow::Owned(format!("unknown channel address {addr:?}")))
+        }
+        Err(QueryError::Fts(msg)) => outcome_err(Cow::Owned(format!("FTS query failed: {msg}"))),
+    }
+}
+
+/// `BrennPendingList`.
+async fn execute_pending_list(
+    bridge: &ActiveBridge,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> ToolOutcome {
+    let Some(messenger) = bridge.messenger() else {
+        tracing::warn!(
+            tool = tool_name,
+            "BrennPendingList: no Messenger configured; returning error to LLM"
+        );
+        return missing_messenger();
+    };
+    // Optional channel filter. Unknown / malformed addresses → empty result (no
+    // tool error; log malformed for operator visibility). Use
+    // `is_well_formed_address` (the canonical check) rather than a weaker
+    // prefix+length check so all malformed shapes are logged.
+    let channel_str = tool_input.get("channel").and_then(|v| v.as_str());
+    if let Some(s) = channel_str
+        && !brenn_messaging::is_well_formed_address(s)
+    {
+        tracing::warn!(
+            tool = tool_name,
+            channel = %sanitize_untrusted_str(s, MAX_LOGGED_UNTRUSTED_BYTES),
+            "BrennPendingList: malformed channel address; returning empty list"
+        );
+        let empty: &[MessageEnvelope] = &[];
+        return outcome_ok(&BrennPendingListResponse { messages: empty });
+    }
+    let envelopes = messenger.list_pending(&bridge.app_slug, channel_str).await;
+    outcome_ok(&BrennPendingListResponse {
+        messages: &envelopes,
+    })
+}
+
+/// `BrennMessageCancel`.
+async fn execute_cancel(
+    bridge: &ActiveBridge,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> ToolOutcome {
+    let message_uuid = match parse_message_uuid(tool_name, tool_input) {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
+    let Some(messenger) = bridge.messenger() else {
+        tracing::warn!(
+            tool = tool_name,
+            "BrennMessageCancel: no Messenger configured; returning error to LLM"
+        );
+        return missing_messenger();
+    };
+    match messenger.cancel(&bridge.app_slug, message_uuid).await {
+        CancelResult::Ok { message_id } => outcome_ok(&BrennMessageCancelOk {
+            cancelled: true,
+            message_id: message_id.to_string(),
+            ok: true,
+        }),
+        CancelResult::UnknownMessage => outcome_err(Cow::Owned(format!(
+            "{} {message_uuid}",
+            brenn_lib::integration::UNKNOWN_MESSAGE_ERR
+        ))),
+        CancelResult::NotAuthorized => outcome_err(Cow::Borrowed(NOT_AUTHORIZED_ERR)),
+        // The tool description quotes this same constant, so what the model was
+        // told to expect is what it gets.
+        CancelResult::AlreadyDelivered => outcome_err(Cow::Borrowed(
+            brenn_lib::integration::CANCEL_ALREADY_PUBLISHED_ERR,
+        )),
+        CancelResult::MissingSender => outcome_err(Cow::Borrowed(MISSING_SENDER_ERR)),
+    }
+}
+
+/// `BrennMessageEdit`.
+async fn execute_edit(
+    bridge: &ActiveBridge,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> ToolOutcome {
+    let message_uuid = match parse_message_uuid(tool_name, tool_input) {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
+    let body = match tool_input.get("body") {
+        None => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(_) => return reject(tool_name, "`body` must be a string"),
+    };
+    // Parse deliver_after: distinguish missing from explicit null.
+    let obj = tool_input.as_object();
+    let deliver_after = if let Some(obj) = obj
+        && obj.contains_key("deliver_after")
+    {
+        let v = obj
+            .get("deliver_after")
+            .expect("key just confirmed present");
+        match parse_present_rfc3339(v) {
+            Ok(ts) => Some(ts), // Some(None) = clear; Some(Some(t)) = set
+            Err(e) => return reject(tool_name, &e),
+        }
+    } else {
+        None // field absent = leave unchanged
+    };
+    let delivery_deadline = if let Some(obj) = obj
+        && obj.contains_key("delivery_deadline")
+    {
+        let v = obj
+            .get("delivery_deadline")
+            .expect("key just confirmed present");
+        match parse_present_rfc3339(v) {
+            Ok(ts) => Some(ts),
+            Err(e) => return reject(tool_name, &e),
+        }
+    } else {
+        None
+    };
+    // Reject legacy `wake` key — reject-and-teach so a stale-habit LLM isn't
+    // silently downgraded to the `urgency` default.
+    if tool_input.get("wake").is_some() {
+        return reject(
+            tool_name,
+            "unknown field `wake`; use `urgency` (\"very-low\", \"low\", \"normal\", \"high\")",
+        );
+    }
+    let urgency = match tool_input.get("urgency").and_then(|v| v.as_str()) {
+        None => None,
+        Some(s) => match Urgency::parse(s) {
+            Some(u) => Some(u),
+            None => {
+                return reject(
+                    tool_name,
+                    &format!(
+                        "unknown `urgency` value: {s:?}; \
+                         must be one of \"very-low\", \"low\", \"normal\", \"high\""
+                    ),
+                );
+            }
+        },
+    };
+    // Parse reply_to: distinguish missing, null (clear), string (set).
+    let reply_to = if obj.map(|o| o.contains_key("reply_to")).unwrap_or(false) {
+        match tool_input.get("reply_to") {
+            Some(serde_json::Value::Null) => Some(None), // clear
+            Some(serde_json::Value::String(s)) => Some(Some(s.clone())), // set
+            None => unreachable!("contains_key returned true but get returned None"),
+            Some(_) => return reject(tool_name, "`reply_to` must be a string or null"),
+        }
+    } else {
+        None // absent = leave unchanged
+    };
+    // At least one mutable field required (enforced here, before the messenger).
+    if body.is_none()
+        && deliver_after.is_none()
+        && delivery_deadline.is_none()
+        && urgency.is_none()
+        && reply_to.is_none()
+    {
+        return outcome_err(Cow::Borrowed(NO_EDIT_FIELDS_ERR));
+    }
+    let Some(messenger) = bridge.messenger() else {
+        tracing::warn!(
+            tool = tool_name,
+            "BrennMessageEdit: no Messenger configured; returning error to LLM"
+        );
+        return missing_messenger();
+    };
+    let fields = EditFields {
+        body,
+        reply_to,
+        deliver_after,
+        delivery_deadline,
+        urgency,
+    };
+    let result = messenger.edit(&bridge.app_slug, message_uuid, fields).await;
+    // Close the reply_to existence oracle the same way BrennSend does:
+    // UnknownChannel and AclDenied render one byte-identical
+    // `brenn_channel_denied_msg` so the LLM-visible text never reveals whether a
+    // `brenn:` channel exists, and each reply_to denial is recorded through the
+    // shared security-signal helper (the existence bit lives only in the
+    // server-side security log's `kind`).
+    if let Some((kind, addr)) = match &result {
+        EditResult::MalformedAddress(a) => Some((DenialKind::MalformedAddress, a.as_str())),
+        EditResult::UnknownChannel(a) => Some((DenialKind::UnknownChannel, a.as_str())),
+        EditResult::AclDenied(a) => Some((DenialKind::AclDenied, a.as_str())),
+        _ => None,
+    } {
+        signal_publish_denial(
+            bridge.alert_dispatcher(),
+            SecurityEventType::BrennPublishDenied,
+            bridge.denial_origin(),
+            kind,
+            addr,
+        );
+    }
+    match result {
+        EditResult::Ok { envelope } => {
+            let mut outcome_value =
+                serde_json::to_value(&envelope).expect("MessageEnvelope serialize");
+            // `ok: true` for consistency with BrennMessageCancel.
+            if let serde_json::Value::Object(ref mut map) = outcome_value {
+                map.insert("ok".to_string(), serde_json::Value::Bool(true));
+            }
+            ToolOutcome::Ok(outcome_value)
+        }
+        EditResult::UnknownMessage => {
+            outcome_err(Cow::Owned(format!("unknown message {message_uuid}")))
+        }
+        EditResult::NotAuthorized => outcome_err(Cow::Borrowed(NOT_AUTHORIZED_ERR)),
+        // As with cancel: the tool description quotes this constant.
+        EditResult::AlreadyDelivered => outcome_err(Cow::Borrowed(
+            brenn_lib::integration::EDIT_ALREADY_PUBLISHED_ERR,
+        )),
+        EditResult::NoFieldsProvided => outcome_err(Cow::Borrowed(NO_EDIT_FIELDS_ERR)),
+        EditResult::BodyTooLarge { len, max } => outcome_err(Cow::Owned(format!(
+            "body too large: {len} bytes (max {max})"
+        ))),
+        EditResult::UnknownChannel(addr) | EditResult::AclDenied(addr) => {
+            outcome_err(Cow::Owned(brenn_channel_denied_msg(&addr)))
+        }
+        EditResult::MalformedAddress(addr) => outcome_err(Cow::Owned(format!(
+            "malformed reply_to address {addr:?}: must be of the form \
+             \"brenn:<name>\" with name matching ^[A-Za-z0-9._~-]+$"
+        ))),
+        EditResult::MissingSender => outcome_err(Cow::Borrowed(MISSING_SENDER_ERR)),
+    }
+}
+
+const MISSING_SENDER_ERR: &str = "messaging not configured for this app (sender missing)";
+const NOT_AUTHORIZED_ERR: &str =
+    "not authorized: caller's sender does not match this message's sender";
+const NO_EDIT_FIELDS_ERR: &str = "no fields provided: at least one of body, deliver_after, \
+     delivery_deadline, urgency, reply_to must be specified";
 
 /// Parse an RFC3339 timestamp from a present JSON value (key was already
 /// confirmed to exist via `contains_key`). Accepts null or empty-string as
@@ -1274,35 +888,16 @@ fn json_variant_name(v: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Parse `message_id` from `tool_input`. Returns `Ok(Uuid)` or `Err` with the
-/// `MessagingHandled` error response already built (caller returns `Some(err)`).
-async fn parse_message_uuid(
-    bridge: &ActiveBridge,
+/// Parse `message_id` from `tool_input`, or the rejection to return.
+fn parse_message_uuid(
     tool_name: &str,
     tool_input: &serde_json::Value,
-) -> Result<uuid::Uuid, MessagingHandled> {
-    let id_str = match tool_input.get("message_id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            return Err(tool_error_response(
-                bridge,
-                tool_name,
-                tool_input,
-                "missing `message_id` argument",
-            )
-            .await);
-        }
+) -> Result<uuid::Uuid, ToolOutcome> {
+    let Some(id_str) = tool_input.get("message_id").and_then(|v| v.as_str()) else {
+        return Err(reject(tool_name, "missing `message_id` argument"));
     };
-    match uuid::Uuid::parse_str(id_str) {
-        Ok(u) => Ok(u),
-        Err(_) => Err(tool_error_response(
-            bridge,
-            tool_name,
-            tool_input,
-            &format!("invalid UUID: {id_str:?}"),
-        )
-        .await),
-    }
+    uuid::Uuid::parse_str(id_str)
+        .map_err(|_| reject(tool_name, &format!("invalid UUID: {id_str:?}")))
 }
 
 /// Fill the runtime ingress-health fields on each `mqtt:` entry of a channel
@@ -1375,38 +970,32 @@ fn parse_depth_field(
     }
 }
 
-/// Handle the `MessageSubscribe` PostToolUse intercept: parse + validate input,
-/// call the runtime subscribe-activation wrapper, and map the typed outcome /
-/// error to a tool-facing JSON result (design §2.4). Owner = `bridge.app_slug`.
-async fn handle_message_subscribe(
+/// `MessageSubscribe`: parse + validate input, call the runtime
+/// subscribe-activation wrapper, and map the typed outcome / error to a
+/// tool-facing JSON result. Owner = `bridge.app_slug`.
+async fn execute_subscribe(
     bridge: &ActiveBridge,
     tool_name: &str,
     tool_input: &serde_json::Value,
-) -> MessagingHandled {
+) -> ToolOutcome {
     use brenn_messaging::subscribe::DynamicSubscribeParams;
 
     // `address` (required, non-empty).
     let address = match tool_input.get("address").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
-            return tool_error_response(
-                bridge,
-                tool_name,
-                tool_input,
-                "missing or empty `address` argument",
-            )
-            .await;
+            return reject(tool_name, "missing or empty `address` argument");
         }
     };
 
     // `push_depth` / `retain_depth` (both required, no defaults — design §7 A).
     let push_depth = match parse_depth_field(tool_input.get("push_depth"), "push_depth") {
         Ok(d) => d,
-        Err(e) => return tool_error_response(bridge, tool_name, tool_input, &e).await,
+        Err(e) => return reject(tool_name, &e),
     };
     let retain_depth = match parse_depth_field(tool_input.get("retain_depth"), "retain_depth") {
         Ok(d) => d,
-        Err(e) => return tool_error_response(bridge, tool_name, tool_input, &e).await,
+        Err(e) => return reject(tool_name, &e),
     };
 
     // `noise` / `wake_min` (optional; inherit on omission). A present-but-invalid
@@ -1420,13 +1009,10 @@ async fn handle_message_subscribe(
         {
             Some(n) => Some(n),
             None => {
-                return tool_error_response(
-                    bridge,
+                return reject(
                     tool_name,
-                    tool_input,
                     "`noise` must be one of \"silent\", \"metered\", \"alarm\"",
-                )
-                .await;
+                );
             }
         },
     };
@@ -1436,13 +1022,10 @@ async fn handle_message_subscribe(
         Some(v) => match v.as_str().and_then(brenn_lib::messaging::WakeMin::parse) {
             Some(w) => Some(w),
             None => {
-                return tool_error_response(
-                    bridge,
+                return reject(
                     tool_name,
-                    tool_input,
                     "`wake_min` must be one of \"very-low\", \"low\", \"normal\", \"high\", \"never\"",
-                )
-                .await;
+                );
             }
         },
     };
@@ -1455,13 +1038,7 @@ async fn handle_message_subscribe(
         Some(v) => match v.as_u64() {
             Some(n @ 0..=2) => Some(n as u8),
             _ => {
-                return tool_error_response(
-                    bridge,
-                    tool_name,
-                    tool_input,
-                    "`qos` must be 0, 1, or 2",
-                )
-                .await;
+                return reject(tool_name, "`qos` must be 0, 1, or 2");
             }
         },
     };
@@ -1480,7 +1057,7 @@ async fn handle_message_subscribe(
             .await;
 
     use crate::mqtt_subscribe::SubscribeActivation;
-    let (output_str, is_error) = match outcome {
+    match outcome {
         Ok(activation) => {
             // A send failure still leaves a durable subscription + route; the
             // reconnect re-assert retries. The status string (pure mapping)
@@ -1519,11 +1096,7 @@ async fn handle_message_subscribe(
                 ok: true,
                 status,
             };
-            (
-                serde_json::to_string(&resp)
-                    .expect("MessageSubscribeOk serialization is infallible"),
-                false,
-            )
+            outcome_ok(&resp)
         }
         Err(e) => {
             // An app exceeding its grant is worth surfacing (CC anomaly =
@@ -1552,43 +1125,24 @@ async fn handle_message_subscribe(
                     "MessageSubscribe denied — app exceeding its grant"
                 );
             }
-            let payload = ToolErr {
-                ok: false,
-                error: Cow::Owned(e.to_string()),
-            };
-            (
-                serde_json::to_string(&payload).expect("ToolErr serialization is infallible"),
-                true,
-            )
+            outcome_err(Cow::Owned(e.to_string()))
         }
-    };
-
-    crate::active_bridge::emit_tool_summary_for_intercept(bridge, tool_name, tool_input, is_error)
-        .await;
-    MessagingHandled::Respond(CcApprovalDecision::Continue {
-        updated_output: Some(output_str),
-    })
+    }
 }
 
-/// Handle the `MessageUnsubscribe` PostToolUse intercept: parse + validate input,
-/// call the runtime unsubscribe-activation wrapper, and map the typed outcome /
-/// error to a tool-facing JSON result (design §2.4). Owner = `bridge.app_slug`.
-async fn handle_message_unsubscribe(
+/// `MessageUnsubscribe`: parse + validate input, call the runtime
+/// unsubscribe-activation wrapper, and map the typed outcome / error to a
+/// tool-facing JSON result. Owner = `bridge.app_slug`.
+async fn execute_unsubscribe(
     bridge: &ActiveBridge,
     tool_name: &str,
     tool_input: &serde_json::Value,
-) -> MessagingHandled {
+) -> ToolOutcome {
     // `address` (required, non-empty).
     let address = match tool_input.get("address").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
-            return tool_error_response(
-                bridge,
-                tool_name,
-                tool_input,
-                "missing or empty `address` argument",
-            )
-            .await;
+            return reject(tool_name, "missing or empty `address` argument");
         }
     };
 
@@ -1597,7 +1151,7 @@ async fn handle_message_unsubscribe(
         crate::mqtt_subscribe::unsubscribe_dynamic_activated(bridge, &app_slug, &address).await;
 
     use crate::mqtt_subscribe::UnsubscribeActivation;
-    let (output_str, is_error) = match outcome {
+    match outcome {
         Ok(activation) => {
             // The caller's durable sub + directory subscriber are already gone and
             // the filter was dropped from the reconnect set even on a send failure;
@@ -1618,55 +1172,22 @@ async fn handle_message_unsubscribe(
                 ok: true,
                 status,
             };
-            (
-                serde_json::to_string(&resp)
-                    .expect("MessageUnsubscribeOk serialization is infallible"),
-                false,
-            )
+            outcome_ok(&resp)
         }
-        Err(e) => {
-            let payload = ToolErr {
-                ok: false,
-                error: Cow::Owned(e.to_string()),
-            };
-            (
-                serde_json::to_string(&payload).expect("ToolErr serialization is infallible"),
-                true,
-            )
-        }
-    };
-
-    crate::active_bridge::emit_tool_summary_for_intercept(bridge, tool_name, tool_input, is_error)
-        .await;
-    MessagingHandled::Respond(CcApprovalDecision::Continue {
-        updated_output: Some(output_str),
-    })
+        Err(e) => outcome_err(Cow::Owned(e.to_string())),
+    }
+}
+/// A rejection of the call's arguments: warn-logged, `{"ok":false,"error":…}`.
+fn reject(tool_name: &str, error: &str) -> ToolOutcome {
+    outcome_rejection("messaging tool", tool_name, error)
 }
 
-async fn tool_error_response(
-    bridge: &ActiveBridge,
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-    error: &str,
-) -> MessagingHandled {
-    MessagingHandled::Respond(
-        reject_tool(bridge, "messaging tool", tool_name, tool_input, error).await,
-    )
-}
-
-fn missing_messenger_response() -> MessagingHandled {
-    // Server constructed without a Messenger (no channels configured).
-    // Surface as a tool-result error rather than panic — the LLM can
-    // gracefully back off.
-    let err = ToolErr {
-        ok: false,
-        error: Cow::Borrowed("messaging is not configured on this brenn server"),
-    };
-    MessagingHandled::Respond(CcApprovalDecision::Continue {
-        updated_output: Some(
-            serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-        ),
-    })
+/// Server constructed without a Messenger (no channels configured). Surfaced
+/// as a tool-result error rather than a panic so the LLM can back off.
+fn missing_messenger() -> ToolOutcome {
+    outcome_err(Cow::Borrowed(
+        "messaging is not configured on this brenn server",
+    ))
 }
 
 /// The one LLM-visible reject for a durable (`brenn:`) publish/reply_to address
@@ -4822,5 +4343,134 @@ mod tests {
             v["error"].as_str().unwrap_or("").contains("address"),
             "error must name address: {v}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_messaging_tool: the hook-independent entry
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_send_answers_ok_and_err_outcomes_without_a_card() {
+        let bridge = crate::active_bridge::ActiveBridge::test_new_with_messenger(
+            ephemeral_intercept_messenger(),
+        )
+        .await;
+        let mut rx = bridge.subscribe();
+
+        let ok = execute_messaging_tool(
+            &bridge,
+            MCP_MESSAGE_SEND_TOOL,
+            &json!({ "to": "ephemeral:protobar", "body": "hello" }),
+        )
+        .await;
+        match ok {
+            Some(ToolOutcome::Ok(v)) => {
+                assert_eq!(v["ok"], json!(true), "{v}");
+                assert_eq!(v["address"], json!("ephemeral:protobar"), "{v}");
+            }
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+
+        let denied = execute_messaging_tool(
+            &bridge,
+            MCP_MESSAGE_SEND_TOOL,
+            &json!({ "to": "ephemeral:locked", "body": "hello" }),
+        )
+        .await;
+        assert_eq!(
+            denied,
+            Some(ToolOutcome::Err(json!({
+                "ok": false,
+                "error": brenn_channel_denied_msg("ephemeral:locked"),
+            })))
+        );
+
+        while let Ok(msg) = rx.try_recv() {
+            assert!(
+                !matches!(msg, brenn_ws_types::WsServerMessage::ToolUseSummary { .. }),
+                "execution alone must emit no chat card: {msg:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_rejection_and_missing_messenger_are_err_outcomes() {
+        let bridge = ActiveBridge::test_new_for_pwa_push().await;
+        assert!(bridge.messenger().is_none(), "fixture has no messenger");
+        let cross = execute_messaging_tool(
+            &bridge,
+            MCP_MESSAGE_SEND_TOOL,
+            &json!({ "to": "mqtt:client/topic", "body": "b" }),
+        )
+        .await
+        .expect("BrennSend is a messaging tool");
+        assert!(cross.is_error());
+        assert!(
+            cross.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("Use MqttSend"),
+            "{cross:?}"
+        );
+
+        let missing = execute_messaging_tool(
+            &bridge,
+            MCP_MESSAGE_CANCEL_TOOL,
+            &json!({ "message_id": uuid::Uuid::new_v4().to_string() }),
+        )
+        .await;
+        assert_eq!(
+            missing,
+            Some(ToolOutcome::Err(json!({
+                "ok": false,
+                "error": "messaging is not configured on this brenn server",
+            })))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_listing_is_ok_without_a_messenger() {
+        let bridge = ActiveBridge::test_new_for_pwa_push().await;
+        match execute_messaging_tool(&bridge, MCP_MESSAGE_LIST_CHANNELS_TOOL, &json!({})).await {
+            Some(ToolOutcome::Ok(v)) => assert!(v["channels"].is_array(), "{v}"),
+            other => panic!("expected Ok listing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_messaging_tool_is_none_for_other_tools() {
+        let bridge = ActiveBridge::test_new_for_pwa_push().await;
+        assert_eq!(
+            execute_messaging_tool(&bridge, "mcp__brenn__AutoList", &json!({})).await,
+            None
+        );
+    }
+
+    /// A BrennSend refused before the publish carries its outcome to the card,
+    /// which renders as an error naming the refusal.
+    #[tokio::test]
+    async fn send_rejection_card_carries_the_outcome() {
+        let bridge = ActiveBridge::test_new_for_pwa_push().await;
+        let mut rx = bridge.subscribe();
+        let req = post_tool_use_req(
+            MCP_MESSAGE_SEND_TOOL,
+            json!({ "to": "mqtt:client/topic", "body": "b" }),
+        );
+        try_handle_messaging_tool(&bridge, &req).await;
+        let mut summaries = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if let brenn_ws_types::WsServerMessage::ToolUseSummary {
+                rendered_summary, ..
+            } = msg
+            {
+                summaries += 1;
+                assert!(
+                    rendered_summary.contains("ts-denied")
+                        && rendered_summary.contains("Use MqttSend"),
+                    "a refused send renders as an error naming the refusal: {rendered_summary}"
+                );
+            }
+        }
+        assert_eq!(summaries, 1, "one card per hook call");
     }
 }

@@ -32,19 +32,22 @@ pub use test_fixtures::{RecordedSession, test_bridge_for_reload, test_bridge_rec
 #[cfg(test)]
 pub mod test_support;
 mod tool_card;
+pub mod tool_socket;
 mod tool_summary;
 mod user_send;
 mod watchdog;
 
 pub(in crate::active_bridge) use brenn_tools::handle_brenn_tools;
 pub(crate) use brenn_tools::render_pending_tool_request;
+pub(crate) use brenn_tools::{ToolOutcome, execute_admitted};
 pub use bridge::ActiveBridge;
+pub(crate) use mcp_constants::MCP_BRENN_PREFIX;
 // SpawnContext is not needed in tests because spawn_new is never called directly in tests
 // (inject_for_test is used instead). The cfg(not(test)) gate keeps test builds clean.
 #[cfg(not(test))]
 pub use bridge::SpawnContext;
 pub(crate) use cc_event_loop::drain::deliver_conversation_backlog;
-pub use cc_spawn_config::{render_virtual_tools, write_virtual_tools_file};
+pub use cc_spawn_config::{render_virtual_tools, virtual_tools, write_virtual_tools_file};
 pub(in crate::active_bridge) use compaction::CompactionPhase;
 pub use profile_swap::SwapHostSeed;
 pub use registry::ActiveBridges;

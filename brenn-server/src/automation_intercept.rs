@@ -2,11 +2,11 @@
 //!
 //! All four tools are auto-approved:
 //! - PreToolUse intercepted, returns `Allow`.
-//! - PostToolUse intercepted, executes the real work, returns
-//!   `Continue { updated_output }` so CC sees the real result instead
-//!   of `__NOOP__`.
+//! - PostToolUse intercepted, executes the real work through
+//!   `execute_admitted`, returns `Continue { updated_output }` so CC sees the
+//!   real result instead of `__NOOP__`.
 //!
-//! Pattern mirrors `messaging_intercept.rs`.
+//! `execute_automation_tool` is the execution, independent of the hook.
 //!
 //! The active bridge owns the conversation context (app_slug); this flows
 //! into `AutomationEngine::create/edit/delete/list`.
@@ -14,15 +14,17 @@
 use std::borrow::Cow;
 
 use brenn_automation::{
-    CreateJob, CreateResult, DeleteResult, EditJob, EditResult, ListResult, MCP_AUTO_CREATE_TOOL,
-    MCP_AUTO_DELETE_TOOL, MCP_AUTO_EDIT_TOOL, MCP_AUTO_LIST_TOOL,
+    AutomationEngine, CreateJob, CreateResult, DeleteResult, EditJob, EditResult, ListResult,
+    MCP_AUTO_CREATE_TOOL, MCP_AUTO_DELETE_TOOL, MCP_AUTO_EDIT_TOOL, MCP_AUTO_LIST_TOOL,
     job::{Action, CronTrigger, JobView, SendMessageAction, Trigger},
 };
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use serde::Serialize;
 
-use crate::active_bridge::ActiveBridge;
-use crate::intercept_helpers::{ToolErr, ToolOk, reject_tool, warn_if_unexpected_tool_response};
+use crate::active_bridge::{ActiveBridge, ToolOutcome};
+use crate::intercept_helpers::{
+    PostCard, ToolOk, answer_post_tool_use, outcome_err, outcome_ok, outcome_rejection,
+};
 
 /// Returned to CC when `AutomationCreate` succeeds.
 #[derive(Serialize)]
@@ -53,453 +55,235 @@ pub enum AutomationHandled {
     Respond(CcApprovalDecision),
 }
 
+fn is_automation_tool(tool_name: &str) -> bool {
+    [
+        MCP_AUTO_CREATE_TOOL,
+        MCP_AUTO_LIST_TOOL,
+        MCP_AUTO_EDIT_TOOL,
+        MCP_AUTO_DELETE_TOOL,
+    ]
+    .contains(&tool_name)
+}
+
 /// Try to handle an automation tool intercept. Returns `Some` only when the
 /// tool name matches one of the four automation tools.
+///
+/// PreToolUse auto-approves. PostToolUse runs the call through
+/// `execute_admitted`.
 pub async fn try_handle_automation_tool(
     bridge: &ActiveBridge,
     req: &ApprovalRequest,
 ) -> Option<AutomationHandled> {
     match &req.kind {
-        // ---- PreToolUse: all four automation tools auto-approve ----
-        ApprovalKind::PreToolUse { tool_name, .. }
-            if tool_name == MCP_AUTO_CREATE_TOOL
-                || tool_name == MCP_AUTO_LIST_TOOL
-                || tool_name == MCP_AUTO_EDIT_TOOL
-                || tool_name == MCP_AUTO_DELETE_TOOL =>
-        {
+        ApprovalKind::PreToolUse { tool_name, .. } if is_automation_tool(tool_name) => {
             Some(AutomationHandled::Respond(CcApprovalDecision::Allow {
                 updated_input: None,
             }))
         }
 
-        // ---- PostToolUse: AutoCreate ----
         ApprovalKind::PostToolUse {
             tool_name,
             tool_input,
             tool_use_id,
             tool_response,
             ..
-        } if tool_name == MCP_AUTO_CREATE_TOOL => {
-            warn_if_unexpected_tool_response("automation intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            let engine = match bridge.automation_engine() {
-                Some(e) => e,
-                None => {
-                    return Some(no_automation_response());
-                }
-            };
-            // Parse trigger.
-            let trigger = match parse_trigger(tool_input) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Some(tool_error_response(bridge, tool_name, tool_input, &e).await);
-                }
-            };
-            // Parse action.
-            let action = match parse_action(tool_input) {
-                Ok(a) => a,
-                Err(e) => {
-                    return Some(tool_error_response(bridge, tool_name, tool_input, &e).await);
-                }
-            };
-            let name = match tool_input.get("name").and_then(|v| v.as_str()) {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => {
-                    return Some(
-                        tool_error_response(bridge, tool_name, tool_input, "missing `name`").await,
-                    );
-                }
-            };
-            let enabled = tool_input
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let req = CreateJob {
-                name,
-                trigger,
-                action,
-                enabled,
-            };
-            let result = engine.create(&bridge.app_slug, req).await;
-            let (output_str, is_error) = match result {
-                CreateResult::Ok { id, next_fire_at } => {
-                    let ok = AutomationCreateOk {
-                        id,
-                        next_fire_at: next_fire_at.to_rfc3339(),
-                        ok: true,
-                    };
-                    (
-                        serde_json::to_string(&ok)
-                            .expect("AutomationCreateOk serialization is infallible"),
-                        false,
-                    )
-                }
-                CreateResult::MissingSender => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "automation not available: this app has no messaging sender configured",
-                        ),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CreateResult::OwnerHasNoUser => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "automation not available: this app has no allowed_users configured",
-                        ),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CreateResult::InvalidName(msg) => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("invalid name: {msg}")),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CreateResult::InvalidCron(e) => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("invalid cron: {e:?}")),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CreateResult::InvalidAddress { addr, kind } => {
-                    signal_address_denial(bridge, kind, &addr);
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(automation_address_denied_msg(&addr)),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CreateResult::BodyTooLarge { len, max } => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("body too large: {len} bytes (max {max})")),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CreateResult::InvalidDeadline(v) => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!(
-                            "delivery_deadline_secs {v} out of range [1, 2592000]"
-                        )),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CreateResult::TooManyJobs { count, max } => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!(
-                            "job limit reached: {count} jobs exist (max {max} per app); delete a job to free a slot"
-                        )),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-            };
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, is_error,
+        } if is_automation_tool(tool_name) => Some(AutomationHandled::Respond(
+            answer_post_tool_use(
+                bridge,
+                "automation intercept",
+                tool_name,
+                tool_input,
+                tool_use_id,
+                tool_response,
+                PostCard::Summary,
             )
-            .await;
-            Some(AutomationHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
-
-        // ---- PostToolUse: AutoList ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_AUTO_LIST_TOOL => {
-            warn_if_unexpected_tool_response("automation intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            let engine = match bridge.automation_engine() {
-                Some(e) => e,
-                None => {
-                    return Some(no_automation_response());
-                }
-            };
-            let enabled_only = tool_input
-                .get("enabled_only")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let result = engine.list(&bridge.app_slug, enabled_only).await;
-            let output_str = match result {
-                ListResult::Ok(jobs) => {
-                    let ok = AutomationListOk {
-                        jobs: &jobs,
-                        ok: true,
-                    };
-                    serde_json::to_string(&ok)
-                        .expect("AutomationListOk serialization is infallible")
-                }
-            };
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, false,
-            )
-            .await;
-            Some(AutomationHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
-
-        // ---- PostToolUse: AutoEdit ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_AUTO_EDIT_TOOL => {
-            warn_if_unexpected_tool_response("automation intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            let engine = match bridge.automation_engine() {
-                Some(e) => e,
-                None => {
-                    return Some(no_automation_response());
-                }
-            };
-            let id = match tool_input.get("id").and_then(|v| v.as_str()) {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => {
-                    return Some(
-                        tool_error_response(bridge, tool_name, tool_input, "missing `id`").await,
-                    );
-                }
-            };
-            // Parse optional fields.
-            let trigger = if tool_input.get("trigger").is_some() {
-                match parse_trigger(tool_input) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        return Some(tool_error_response(bridge, tool_name, tool_input, &e).await);
-                    }
-                }
-            } else {
-                None
-            };
-            let action = if tool_input.get("action").is_some() {
-                match parse_action(tool_input) {
-                    Ok(a) => Some(a),
-                    Err(e) => {
-                        return Some(tool_error_response(bridge, tool_name, tool_input, &e).await);
-                    }
-                }
-            } else {
-                None
-            };
-            let name = tool_input
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let enabled = tool_input.get("enabled").and_then(|v| v.as_bool());
-            let req = EditJob {
-                id,
-                name,
-                trigger,
-                action,
-                enabled,
-            };
-            let result = engine.edit(&bridge.app_slug, req).await;
-            let (output_str, is_error) = match result {
-                EditResult::Ok { next_fire_at } => {
-                    let ok = AutomationEditOk {
-                        next_fire_at: next_fire_at.to_rfc3339(),
-                        ok: true,
-                    };
-                    (
-                        serde_json::to_string(&ok)
-                            .expect("AutomationEditOk serialization is infallible"),
-                        false,
-                    )
-                }
-                EditResult::NotFound => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed("job not found"),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                EditResult::Forbidden { reason } => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("forbidden: {reason}")),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                EditResult::InvalidName(msg) => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("invalid name: {msg}")),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                EditResult::InvalidCron(e) => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("invalid cron: {e:?}")),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                EditResult::InvalidAddress { addr, kind } => {
-                    signal_address_denial(bridge, kind, &addr);
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(automation_address_denied_msg(&addr)),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                EditResult::BodyTooLarge { len, max } => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("body too large: {len} bytes (max {max})")),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                EditResult::InvalidDeadline(v) => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!(
-                            "delivery_deadline_secs {v} out of range [1, 2592000]"
-                        )),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                EditResult::Unauthorized(msg) => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("unauthorized: {msg}")),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-            };
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, is_error,
-            )
-            .await;
-            Some(AutomationHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
-
-        // ---- PostToolUse: AutoDelete ----
-        ApprovalKind::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_AUTO_DELETE_TOOL => {
-            warn_if_unexpected_tool_response("automation intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-            let engine = match bridge.automation_engine() {
-                Some(e) => e,
-                None => {
-                    return Some(no_automation_response());
-                }
-            };
-            let id = match tool_input.get("id").and_then(|v| v.as_str()) {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => {
-                    return Some(
-                        tool_error_response(bridge, tool_name, tool_input, "missing `id`").await,
-                    );
-                }
-            };
-            let result = engine.delete(&bridge.app_slug, &id).await;
-            let (output_str, is_error) = match result {
-                DeleteResult::Ok => {
-                    let ok = ToolOk::new();
-                    (
-                        serde_json::to_string(&ok).expect("ToolOk serialization is infallible"),
-                        false,
-                    )
-                }
-                DeleteResult::NotFound => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed("job not found"),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                DeleteResult::Forbidden { reason } => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("forbidden: {reason}")),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-            };
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, is_error,
-            )
-            .await;
-            Some(AutomationHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
+            .await,
+        )),
 
         _ => None,
+    }
+}
+
+/// Execute an automation tool for the agent. `None` when `mcp_name` is not an
+/// automation tool.
+pub(crate) async fn execute_automation_tool(
+    bridge: &ActiveBridge,
+    mcp_name: &str,
+    input: &serde_json::Value,
+) -> Option<ToolOutcome> {
+    if !is_automation_tool(mcp_name) {
+        return None;
+    }
+    let Some(engine) = bridge.automation_engine() else {
+        return Some(outcome_err(Cow::Borrowed(
+            "automation is not configured on this brenn server",
+        )));
+    };
+    Some(match mcp_name {
+        MCP_AUTO_CREATE_TOOL => execute_create(bridge, engine, mcp_name, input).await,
+        MCP_AUTO_LIST_TOOL => execute_list(bridge, engine, input).await,
+        MCP_AUTO_EDIT_TOOL => execute_edit(bridge, engine, mcp_name, input).await,
+        MCP_AUTO_DELETE_TOOL => execute_delete(bridge, engine, mcp_name, input).await,
+        _ => unreachable!("is_automation_tool admitted {mcp_name}"),
+    })
+}
+
+/// `AutoCreate`.
+async fn execute_create(
+    bridge: &ActiveBridge,
+    engine: &AutomationEngine,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> ToolOutcome {
+    let trigger = match parse_trigger(input) {
+        Ok(t) => t,
+        Err(e) => return reject(tool_name, &e),
+    };
+    let action = match parse_action(input) {
+        Ok(a) => a,
+        Err(e) => return reject(tool_name, &e),
+    };
+    let name = match input.get("name").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return reject(tool_name, "missing `name`"),
+    };
+    let enabled = input
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let req = CreateJob {
+        name,
+        trigger,
+        action,
+        enabled,
+    };
+    match engine.create(&bridge.app_slug, req).await {
+        CreateResult::Ok { id, next_fire_at } => outcome_ok(&AutomationCreateOk {
+            id,
+            next_fire_at: next_fire_at.to_rfc3339(),
+            ok: true,
+        }),
+        CreateResult::MissingSender => outcome_err(Cow::Borrowed(
+            "automation not available: this app has no messaging sender configured",
+        )),
+        CreateResult::OwnerHasNoUser => outcome_err(Cow::Borrowed(
+            "automation not available: this app has no allowed_users configured",
+        )),
+        CreateResult::InvalidName(msg) => outcome_err(Cow::Owned(format!("invalid name: {msg}"))),
+        CreateResult::InvalidCron(e) => outcome_err(Cow::Owned(format!("invalid cron: {e:?}"))),
+        CreateResult::InvalidAddress { addr, kind } => {
+            signal_address_denial(bridge, kind, &addr);
+            outcome_err(Cow::Owned(automation_address_denied_msg(&addr)))
+        }
+        CreateResult::BodyTooLarge { len, max } => outcome_err(Cow::Owned(format!(
+            "body too large: {len} bytes (max {max})"
+        ))),
+        CreateResult::InvalidDeadline(v) => outcome_err(Cow::Owned(format!(
+            "delivery_deadline_secs {v} out of range [1, 2592000]"
+        ))),
+        CreateResult::TooManyJobs { count, max } => outcome_err(Cow::Owned(format!(
+            "job limit reached: {count} jobs exist (max {max} per app); delete a job to free a slot"
+        ))),
+    }
+}
+
+/// `AutoList`.
+async fn execute_list(
+    bridge: &ActiveBridge,
+    engine: &AutomationEngine,
+    input: &serde_json::Value,
+) -> ToolOutcome {
+    let enabled_only = input
+        .get("enabled_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    match engine.list(&bridge.app_slug, enabled_only).await {
+        ListResult::Ok(jobs) => outcome_ok(&AutomationListOk {
+            jobs: &jobs,
+            ok: true,
+        }),
+    }
+}
+
+/// `AutoEdit`.
+async fn execute_edit(
+    bridge: &ActiveBridge,
+    engine: &AutomationEngine,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> ToolOutcome {
+    let id = match input.get("id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return reject(tool_name, "missing `id`"),
+    };
+    let trigger = if input.get("trigger").is_some() {
+        match parse_trigger(input) {
+            Ok(t) => Some(t),
+            Err(e) => return reject(tool_name, &e),
+        }
+    } else {
+        None
+    };
+    let action = if input.get("action").is_some() {
+        match parse_action(input) {
+            Ok(a) => Some(a),
+            Err(e) => return reject(tool_name, &e),
+        }
+    } else {
+        None
+    };
+    let name = input
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let enabled = input.get("enabled").and_then(|v| v.as_bool());
+    let req = EditJob {
+        id,
+        name,
+        trigger,
+        action,
+        enabled,
+    };
+    match engine.edit(&bridge.app_slug, req).await {
+        EditResult::Ok { next_fire_at } => outcome_ok(&AutomationEditOk {
+            next_fire_at: next_fire_at.to_rfc3339(),
+            ok: true,
+        }),
+        EditResult::NotFound => outcome_err(Cow::Borrowed("job not found")),
+        EditResult::Forbidden { reason } => outcome_err(Cow::Owned(format!("forbidden: {reason}"))),
+        EditResult::InvalidName(msg) => outcome_err(Cow::Owned(format!("invalid name: {msg}"))),
+        EditResult::InvalidCron(e) => outcome_err(Cow::Owned(format!("invalid cron: {e:?}"))),
+        EditResult::InvalidAddress { addr, kind } => {
+            signal_address_denial(bridge, kind, &addr);
+            outcome_err(Cow::Owned(automation_address_denied_msg(&addr)))
+        }
+        EditResult::BodyTooLarge { len, max } => outcome_err(Cow::Owned(format!(
+            "body too large: {len} bytes (max {max})"
+        ))),
+        EditResult::InvalidDeadline(v) => outcome_err(Cow::Owned(format!(
+            "delivery_deadline_secs {v} out of range [1, 2592000]"
+        ))),
+        EditResult::Unauthorized(msg) => outcome_err(Cow::Owned(format!("unauthorized: {msg}"))),
+    }
+}
+
+/// `AutoDelete`.
+async fn execute_delete(
+    bridge: &ActiveBridge,
+    engine: &AutomationEngine,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> ToolOutcome {
+    let id = match input.get("id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return reject(tool_name, "missing `id`"),
+    };
+    match engine.delete(&bridge.app_slug, &id).await {
+        DeleteResult::Ok => outcome_ok(&ToolOk::new()),
+        DeleteResult::NotFound => outcome_err(Cow::Borrowed("job not found")),
+        DeleteResult::Forbidden { reason } => {
+            outcome_err(Cow::Owned(format!("forbidden: {reason}")))
+        }
     }
 }
 
@@ -632,27 +416,9 @@ fn signal_address_denial(bridge: &ActiveBridge, kind: brenn_obs::security::Denia
     );
 }
 
-fn no_automation_response() -> AutomationHandled {
-    let err = ToolErr {
-        ok: false,
-        error: Cow::Borrowed("automation is not configured on this brenn server"),
-    };
-    AutomationHandled::Respond(CcApprovalDecision::Continue {
-        updated_output: Some(
-            serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-        ),
-    })
-}
-
-async fn tool_error_response(
-    bridge: &ActiveBridge,
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-    error: &str,
-) -> AutomationHandled {
-    AutomationHandled::Respond(
-        reject_tool(bridge, "automation tool", tool_name, tool_input, error).await,
-    )
+/// A rejection of the call's arguments: warn-logged, `{"ok":false,"error":…}`.
+fn reject(tool_name: &str, error: &str) -> ToolOutcome {
+    outcome_rejection("automation tool", tool_name, error)
 }
 
 #[cfg(test)]
@@ -1341,5 +1107,47 @@ mod tests {
         })
         .to_string();
         assert_eq!(produced, reference);
+    }
+
+    #[tokio::test]
+    async fn execute_automation_answers_ok_and_err_outcomes_without_a_card() {
+        let bridge = crate::active_bridge::ActiveBridge::test_new_with_automation().await;
+        let mut rx = bridge.subscribe();
+
+        match execute_automation_tool(&bridge, MCP_AUTO_LIST_TOOL, &json!({})).await {
+            Some(ToolOutcome::Ok(v)) => {
+                assert_eq!(v, json!({"jobs": [], "ok": true}));
+            }
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+        assert_eq!(
+            execute_automation_tool(&bridge, MCP_AUTO_DELETE_TOOL, &json!({"id": ""})).await,
+            Some(ToolOutcome::Err(
+                json!({"ok": false, "error": "missing `id`"})
+            ))
+        );
+
+        while let Ok(msg) = rx.try_recv() {
+            assert!(
+                !matches!(msg, brenn_ws_types::WsServerMessage::ToolUseSummary { .. }),
+                "execution alone must emit no chat card: {msg:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_automation_without_an_engine_is_an_err_outcome() {
+        let bridge = crate::active_bridge::ActiveBridge::test_new_for_pwa_push().await;
+        assert_eq!(
+            execute_automation_tool(&bridge, MCP_AUTO_LIST_TOOL, &json!({})).await,
+            Some(ToolOutcome::Err(json!({
+                "ok": false,
+                "error": "automation is not configured on this brenn server",
+            })))
+        );
+        assert_eq!(
+            execute_automation_tool(&bridge, "mcp__brenn__BrennSend", &json!({})).await,
+            None
+        );
     }
 }

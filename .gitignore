@@ -40,6 +40,9 @@ dev/graf-manifest.toml
 # The synthesized dev mounts document and the mount-shaped symlink trees under
 # it, regenerated on every `make launchdev` / `make e2e`.
 /.dev-mounts/
+# The directory `make launchdev` / `make e2e` put on the dev server's PATH: one
+# symlink to the built `brenn-tool`.
+/.dev-bin/
 # The writable copy of brenn.e2e.brenn that `make e2e` serves and the reload
 # specs rewrite in place.
 /.e2e-live.brenn

@@ -452,8 +452,10 @@ impl ActiveBridge {
         };
         drop(taken);
         // This bridge is done regardless of whether a replacement holds the slot,
-        // and its adapter is the one thing that would otherwise outlive it.
-        self.stop_chat_adapter();
+        // and its adapter and tool socket would otherwise outlive it. Before the
+        // deregistration: the conversation's next spawn binds the same socket
+        // directory.
+        self.release_host_resources();
         // Identity-checked: if a replacement bridge has already taken this
         // conversation_id slot (this bridge was deregistered by the watchdog and
         // the user reconnected), do not remove the replacement.

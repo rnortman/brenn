@@ -61,6 +61,7 @@ release_package(
     binaries = [
         "//brenn",
         "//brenn-cli",
+        "//brenn-tool",
     ],
     frontend = "//frontend:dist",
     lib_files = ["//:noop_mcp.py"],

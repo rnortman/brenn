@@ -187,12 +187,14 @@ impl Watchdog {
             drop(taken);
         }
 
-        // End the chat adapter. Nothing else can: it holds an `Arc` on the bridge
-        // whose broadcast it reads, so a reaped bridge would keep its adapter and
-        // everything the bridge holds alive for the rest of the process. Ordered
-        // after the reset so the error events that reset just broadcast are still
-        // in the buffer the adapter flushes on its way out.
-        bridge.stop_chat_adapter();
+        // End the chat adapter and close the tool socket. Nothing else can end
+        // the adapter: it holds an `Arc` on the bridge whose broadcast it reads,
+        // so a reaped bridge would keep its adapter and everything the bridge
+        // holds alive for the rest of the process. Ordered after the reset so
+        // the error events that reset just broadcast are still in the buffer the
+        // adapter flushes on its way out, and before the deregistration so the
+        // conversation's next spawn finds the socket directory free.
+        bridge.release_host_resources();
 
         // Deregister so each wedge fires exactly once and the next user message
         // spawns a fresh bridge. No auto-respawn: recovery is on user demand.

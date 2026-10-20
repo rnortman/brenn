@@ -328,6 +328,52 @@ Minting a token, rotating one, publishing a goal by hand, and the two ways an
 outranking credential can make the account a lie without Brenn noticing are in
 [the Claude accounts guide](claude-accounts.md).
 
+### Spawn artifacts and the runtime directory
+
+Every Claude Code process is handed two host files, both named in
+`claude_defaults`:
+
+```
+claude_defaults {
+  mcp_script_path = "/opt/brenn/noop_mcp.py";
+  tool_cli_path = "/opt/brenn/brenn-tool";
+}
+```
+
+- `mcp_script_path` — the noop MCP server every agent's Brenn tools ride on.
+  Default `/opt/brenn/noop_mcp.py`. Always checked at boot.
+- `tool_cli_path` — the `brenn-tool` binary, bind-mounted read-only into every
+  containerized agent's container at `/usr/local/bin/brenn-tool`. Default
+  `/opt/brenn/brenn-tool`. Read only for containerized agents, and checked at
+  boot only when some agent is containerized: it must be an executable regular
+  file. A bare agent's Claude Code inherits Brenn's own environment, so it
+  finds `brenn-tool` on Brenn's `PATH`; the launcher puts it there, and boot
+  stops naming `PATH` when some agent is bare and no executable `brenn-tool`
+  is on it. `make launchdev` and `make e2e` prepend `.dev-bin/`, which holds
+  one symlink to the built binary.
+
+A relative path resolves against the server's working directory, not an
+agent's `working_dir`. Boot canonicalizes both, so a missing file stops the
+process naming the key, and what reaches a spawn is always absolute.
+
+The launcher must provide `XDG_RUNTIME_DIR`: an absolute directory owned by
+the server's uid with mode exactly 0700. Every configuration needs it, bare or
+containerized; boot stops naming the variable when it is unset or wrong. A
+systemd user service has it already. A session-less launcher has to create the
+directory itself. Two trees live under it: `brenn/<slug>/`, a bare agent's
+state directory, and `brenn-tool-sockets/<slug>-conv<id>/`, one per live
+conversation, holding the socket `brenn-tool` connects to. A conversation's
+directory is replaced when the conversation spawns and removed when its
+session ends; nothing sweeps the tree at boot. Two servers under one uid —
+`make launchdev` and `make e2e` — therefore coexist provided no agent slug is
+shared, the rule the `brenn/<slug>` tree already imposes. What a crashed
+server leaves behind is replaced at the conversation's next spawn or pruned
+with the runtime dir at logout. An agent slug long enough that
+`<XDG_RUNTIME_DIR>/brenn-tool-sockets/<slug>-conv<19 digits>/tool.sock` would
+exceed the 107-byte unix socket path limit is refused at load, naming the
+limit. An agent `env` naming `BRENN_TOOL_SOCKET` is refused: Brenn sets it for
+every conversation.
+
 ### Values and constants
 
 Values are strings, f-strings, raw strings (`"""…"""`), integers, floats,

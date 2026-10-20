@@ -560,7 +560,6 @@ mod tests {
 
         let tool_input = serde_json::json!({
             "import_id": "imp-789",
-            "_pending_import": { "amount": "50.00", "payee": "TEST" },
             "proposals": [{
                 "label": "Match",
                 "transaction": {

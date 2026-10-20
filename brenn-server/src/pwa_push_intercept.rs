@@ -6,7 +6,7 @@
 //! - `mcp__brenn__PwaPushChannelGet` — auto-approved at PreToolUse; PostToolUse
 //!   returns per-target detail for the named pwa_push address.
 //!
-//! Pattern mirrors `messaging_intercept.rs`.
+//! `execute_pwa_push_tool` is the execution, independent of the hook.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -15,8 +15,10 @@ use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, Ap
 use brenn_pwa_push::publish::{GetTargetResult, PushSendResult, Urgency};
 use serde::Serialize;
 
-use crate::active_bridge::ActiveBridge;
-use crate::intercept_helpers::{ToolErr, reject_tool, warn_if_unexpected_tool_response};
+use crate::active_bridge::{ActiveBridge, ToolOutcome};
+use crate::intercept_helpers::{
+    PostCard, answer_post_tool_use, outcome_err, outcome_ok, outcome_rejection,
+};
 use brenn_render::tools::pwa_push::{MCP_PUSH_LIST_TARGETS_TOOL, MCP_PUSH_SEND_TOOL};
 
 // ---------------------------------------------------------------------------
@@ -66,569 +68,376 @@ pub enum PwaPushHandled {
     Respond(CcApprovalDecision),
 }
 
+fn is_pwa_push_tool(tool_name: &str) -> bool {
+    tool_name == MCP_PUSH_SEND_TOOL || tool_name == MCP_PUSH_LIST_TARGETS_TOOL
+}
+
 /// Try to handle a pwa_push tool intercept. Returns `Some` only when the
 /// tool name matches `mcp__brenn__PwaPushSend` or `mcp__brenn__PwaPushChannelGet`.
+///
+/// PreToolUse auto-approves. PostToolUse runs the call through
+/// `execute_admitted`; a `PwaPushSend` card carries the outcome as `_outcome`
+/// for its status badge.
 pub async fn try_handle_pwa_push_tool(
     bridge: &ActiveBridge,
     req: &ApprovalRequest,
 ) -> Option<PwaPushHandled> {
     match &req.kind {
-        // ---- PreToolUse: both tools auto-approve ----
-        ApprovalKind::PreToolUse { tool_name, .. }
-            if tool_name == MCP_PUSH_SEND_TOOL || tool_name == MCP_PUSH_LIST_TARGETS_TOOL =>
-        {
+        ApprovalKind::PreToolUse { tool_name, .. } if is_pwa_push_tool(tool_name) => {
             Some(PwaPushHandled::Respond(CcApprovalDecision::Allow {
                 updated_input: None,
             }))
         }
 
-        // ---- PostToolUse: PwaPushChannelGet ----
         ApprovalKind::PostToolUse {
             tool_name,
             tool_input,
             tool_use_id,
             tool_response,
             ..
-        } if tool_name == MCP_PUSH_LIST_TARGETS_TOOL => {
-            warn_if_unexpected_tool_response("pwa_push intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
-
-            // Extract required `address` — kept as `&str` through the cross-protocol
-            // guards to avoid a clone that is immediately discarded on the redirect path.
-            // Converted to `String` only when an `.await` forces ownership.
-            let address = match tool_input.get("address").and_then(|v| v.as_str()) {
-                Some(s) if !s.is_empty() => s,
-                _ => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "missing or empty `address` argument",
-                        )
-                        .await,
-                    );
-                }
-            };
-
-            // Cross-protocol misuse: brenn: addresses must go to MessageChannelGet.
-            if brenn_lib::messaging::ChannelScheme::of(address)
-                == Some(brenn_lib::messaging::ChannelScheme::Brenn)
-            {
-                tracing::debug!(
-                    tool = tool_name,
-                    address = %address,
-                    "PwaPushChannelGet called with brenn: address; redirecting LLM"
-                );
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "PwaPushChannelGet only accepts `pwa_push:` addresses. \
-                         Use MessageChannelGet for `brenn:` addresses. \
-                         Use MessageChannelList to discover available channels.",
-                    )
-                    .await,
-                );
-            }
-
-            let svc = match bridge.pwa_push_service() {
-                Some(s) => s,
-                None => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "pwa_push is not configured on this server",
-                        )
-                        .await,
-                    );
-                }
-            };
-
-            // Parse address first; query only the requested target — O(1) for
-            // device addresses, O(user-subs) for user fan-out — instead of
-            // scanning all subscriptions server-wide.
-            let parsed_addr = match brenn_pwa_push::targets::parse_pwa_push_address(address) {
-                Ok(a) => a,
-                Err(e) => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            &format!("invalid pwa_push address: {e}"),
-                        )
-                        .await,
-                    );
-                }
-            };
-
-            let target = svc.get_target(&bridge.app_slug, &parsed_addr).await;
-            let output_str = match target {
-                GetTargetResult::Found(t) => {
-                    let ok = PwaPushChannelGetOk {
-                        address: &t.address,
-                        device: t.device.as_deref(),
-                        last_seen_at: &t.last_seen_at,
-                        user: &t.user,
-                    };
-                    serde_json::to_string(&ok)
-                        .expect("PwaPushChannelGetOk serialization is infallible")
-                }
-                GetTargetResult::Forbidden => {
-                    tracing::warn!(
-                        address = %address,
-                        app = %bridge.app_slug,
-                        "PwaPushChannelGet: access denied"
-                    );
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "access denied; the user is not in this app's allowed_users list",
-                        ),
-                    };
-                    serde_json::to_string(&err).expect("ToolErr serialization is infallible")
-                }
-                GetTargetResult::Disabled => {
-                    tracing::debug!(
-                        address = %address,
-                        app = %bridge.app_slug,
-                        "PwaPushChannelGet: pwa_push disabled for app"
-                    );
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed("pwa_push is disabled for this app"),
-                    };
-                    serde_json::to_string(&err).expect("ToolErr serialization is infallible")
-                }
-                GetTargetResult::NotFound => {
-                    tracing::debug!(
-                        address = %address,
-                        app = %bridge.app_slug,
-                        "PwaPushChannelGet: no target found for address"
-                    );
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "no pwa_push target found; use MessageChannelList to see available targets",
-                        ),
-                    };
-                    serde_json::to_string(&err).expect("ToolErr serialization is infallible")
-                }
-            };
-
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, tool_input, false,
+        } if is_pwa_push_tool(tool_name) => Some(PwaPushHandled::Respond(
+            answer_post_tool_use(
+                bridge,
+                "pwa_push intercept",
+                tool_name,
+                tool_input,
+                tool_use_id,
+                tool_response,
+                if tool_name == MCP_PUSH_SEND_TOOL {
+                    PostCard::SummaryWithOutcome
+                } else {
+                    PostCard::Summary
+                },
             )
-            .await;
-            Some(PwaPushHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
-        }
+            .await,
+        )),
 
-        // ---- PostToolUse: PwaPushSend ----
-        ApprovalKind::PostToolUse {
+        _ => None,
+    }
+}
+
+/// Execute a pwa_push tool for the agent. `None` when `mcp_name` is not a
+/// pwa_push tool.
+pub(crate) async fn execute_pwa_push_tool(
+    bridge: &ActiveBridge,
+    mcp_name: &str,
+    input: &serde_json::Value,
+) -> Option<ToolOutcome> {
+    match mcp_name {
+        MCP_PUSH_LIST_TARGETS_TOOL => Some(execute_channel_get(bridge, mcp_name, input).await),
+        MCP_PUSH_SEND_TOOL => Some(execute_send(bridge, mcp_name, input).await),
+        _ => None,
+    }
+}
+
+/// `PwaPushChannelGet`.
+async fn execute_channel_get(
+    bridge: &ActiveBridge,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> ToolOutcome {
+    let address = match input.get("address").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return reject(tool_name, "missing or empty `address` argument"),
+    };
+
+    // Cross-protocol misuse: brenn: addresses must go to MessageChannelGet.
+    if brenn_lib::messaging::ChannelScheme::of(address)
+        == Some(brenn_lib::messaging::ChannelScheme::Brenn)
+    {
+        tracing::debug!(
+            tool = tool_name,
+            address = %address,
+            "PwaPushChannelGet called with brenn: address; redirecting LLM"
+        );
+        return reject(
             tool_name,
-            tool_input,
-            tool_use_id,
-            tool_response,
-            ..
-        } if tool_name == MCP_PUSH_SEND_TOOL => {
-            warn_if_unexpected_tool_response("pwa_push intercept", tool_name, tool_response);
-            crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
+            "PwaPushChannelGet only accepts `pwa_push:` addresses. \
+             Use MessageChannelGet for `brenn:` addresses. \
+             Use MessageChannelList to discover available channels.",
+        );
+    }
 
-            // Validate all inputs first (service check comes after, so argument
-            // errors surface cleanly regardless of server configuration).
+    let Some(svc) = bridge.pwa_push_service() else {
+        return reject(tool_name, "pwa_push is not configured on this server");
+    };
 
-            // Extract required `address` — kept as `&str` through all cross-protocol
-            // guards; cloned to String only at the `svc.send(…).await` call site.
-            let address = match tool_input.get("address").and_then(|v| v.as_str()) {
-                Some(s) if !s.is_empty() => s,
-                _ => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "missing or empty `address` argument",
-                        )
-                        .await,
-                    );
-                }
-            };
+    // Parse address first; query only the requested target — O(1) for
+    // device addresses, O(user-subs) for user fan-out — instead of
+    // scanning all subscriptions server-wide.
+    let parsed_addr = match brenn_pwa_push::targets::parse_pwa_push_address(address) {
+        Ok(a) => a,
+        Err(e) => return reject(tool_name, &format!("invalid pwa_push address: {e}")),
+    };
 
-            // Cross-protocol misuse: brenn: addresses must go to BrennSend.
-            if brenn_lib::messaging::ChannelScheme::of(address)
-                == Some(brenn_lib::messaging::ChannelScheme::Brenn)
-            {
-                tracing::debug!(
-                    tool = tool_name,
-                    address = %address,
-                    "PwaPushSend called with brenn: address; redirecting LLM to BrennSend"
-                );
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "PwaPushSend only accepts `pwa_push:` addresses. \
-                         Use BrennSend for `brenn:` addresses. \
-                         Use MessageChannelList to discover available channels.",
-                    )
-                    .await,
-                );
+    match svc.get_target(&bridge.app_slug, &parsed_addr).await {
+        GetTargetResult::Found(t) => outcome_ok(&PwaPushChannelGetOk {
+            address: &t.address,
+            device: t.device.as_deref(),
+            last_seen_at: &t.last_seen_at,
+            user: &t.user,
+        }),
+        GetTargetResult::Forbidden => {
+            tracing::warn!(
+                address = %address,
+                app = %bridge.app_slug,
+                "PwaPushChannelGet: access denied"
+            );
+            outcome_err(Cow::Borrowed(
+                "access denied; the user is not in this app's allowed_users list",
+            ))
+        }
+        GetTargetResult::Disabled => {
+            tracing::debug!(
+                address = %address,
+                app = %bridge.app_slug,
+                "PwaPushChannelGet: pwa_push disabled for app"
+            );
+            outcome_err(Cow::Borrowed("pwa_push is disabled for this app"))
+        }
+        GetTargetResult::NotFound => {
+            tracing::debug!(
+                address = %address,
+                app = %bridge.app_slug,
+                "PwaPushChannelGet: no target found for address"
+            );
+            outcome_err(Cow::Borrowed(
+                "no pwa_push target found; use MessageChannelList to see available targets",
+            ))
+        }
+    }
+}
+
+/// `PwaPushSend`.
+async fn execute_send(
+    bridge: &ActiveBridge,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> ToolOutcome {
+    // Validate all inputs first (service check comes after, so argument
+    // errors surface cleanly regardless of server configuration).
+
+    let address = match input.get("address").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return reject(tool_name, "missing or empty `address` argument"),
+    };
+
+    // Cross-protocol misuse: brenn: addresses must go to BrennSend.
+    if brenn_lib::messaging::ChannelScheme::of(address)
+        == Some(brenn_lib::messaging::ChannelScheme::Brenn)
+    {
+        tracing::debug!(
+            tool = tool_name,
+            address = %address,
+            "PwaPushSend called with brenn: address; redirecting LLM to BrennSend"
+        );
+        return reject(
+            tool_name,
+            "PwaPushSend only accepts `pwa_push:` addresses. \
+             Use BrennSend for `brenn:` addresses. \
+             Use MessageChannelList to discover available channels.",
+        );
+    }
+    // Cross-protocol misuse: mqtt: addresses must go to MqttSend.
+    if brenn_lib::messaging::ChannelScheme::of(address)
+        == Some(brenn_lib::messaging::ChannelScheme::Mqtt)
+    {
+        tracing::debug!(
+            tool = tool_name,
+            address = %address,
+            "PwaPushSend called with mqtt: address; redirecting LLM to MqttSend"
+        );
+        return reject(
+            tool_name,
+            "PwaPushSend only accepts `pwa_push:` addresses. \
+             Use MqttSend for `mqtt:` addresses. \
+             Use MessageChannelList to discover available channels.",
+        );
+    }
+    // Cross-protocol misuse: webhook: addresses are inbound-only.
+    if brenn_lib::messaging::ChannelScheme::of(address)
+        == Some(brenn_lib::messaging::ChannelScheme::Webhook)
+    {
+        tracing::debug!(
+            tool = tool_name,
+            address = %address,
+            "PwaPushSend called with webhook: address; webhook: is inbound-only in MVP"
+        );
+        return reject(
+            tool_name,
+            "PwaPushSend only accepts `pwa_push:` addresses. \
+             `webhook:` channels are inbound-only in this version. \
+             Use MessageChannelList to discover available channels.",
+        );
+    }
+
+    // Required `body`; the empty string is allowed.
+    let body = match input.get("body").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return reject(tool_name, "missing `body` argument"),
+    };
+
+    let title = input
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let ttl_seconds = input
+        .get("ttl_seconds")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(u64::from(brenn_pwa_push::publish::MAX_TTL_SECONDS)) as u32)
+        .unwrap_or(86400);
+    let urgency_str = input
+        .get("urgency")
+        .and_then(|v| v.as_str())
+        .unwrap_or("normal");
+    let Some(urgency) = Urgency::parse(urgency_str) else {
+        return reject(
+            tool_name,
+            "unknown `urgency` value; must be one of very-low, low, normal, high",
+        );
+    };
+    let topic = input
+        .get("topic")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    // RFC 8030 §5.4: topic must be ≤ 32 chars, URL-safe base64 alphabet,
+    // and non-empty (empty topic would inject a spurious `Topic: ` header).
+    if topic.as_deref().is_some_and(|t| {
+        t.is_empty()
+            || t.len() > 32
+            || !t
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    }) {
+        return reject(
+            tool_name,
+            "invalid `topic`: must be ≤ 32 chars of URL-safe base64 alphabet \
+             (A-Za-z0-9, -, _)",
+        );
+    }
+    let tag = input
+        .get("tag")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    // Normalize and validate `data` / `data.url`.
+    // The injected URL is always a redirector URL (/r/{uuid}?to={encoded_app_path})
+    // so that Android Firefox's task router sees a per-click-unique navigation
+    // rather than a back-stack restore.
+    let default_app_path = format!("/app/{}/c/{}", bridge.app_slug, bridge.conversation_id);
+    let default_data_url = make_redirector_url(&default_app_path);
+    let data = match input.get("data") {
+        // Absent or JSON null → inject default URL.
+        None | Some(serde_json::Value::Null) => {
+            tracing::debug!(tool = tool_name, "data.url auto-populated (data absent)");
+            let mut map = serde_json::Map::new();
+            map.insert(
+                "url".to_string(),
+                serde_json::Value::String(default_data_url),
+            );
+            Some(map)
+        }
+        // Object — check/inject `url` key. Validate type against the
+        // original reference first; clone only on the success path.
+        Some(serde_json::Value::Object(obj)) => {
+            if matches!(obj.get("url"), Some(v) if !v.is_string()) {
+                return reject(tool_name, "invalid `data.url`: must be a string");
             }
-            // Cross-protocol misuse: mqtt: addresses must go to MqttSend.
-            if brenn_lib::messaging::ChannelScheme::of(address)
-                == Some(brenn_lib::messaging::ChannelScheme::Mqtt)
-            {
-                tracing::debug!(
-                    tool = tool_name,
-                    address = %address,
-                    "PwaPushSend called with mqtt: address; redirecting LLM to MqttSend"
-                );
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "PwaPushSend only accepts `pwa_push:` addresses. \
-                         Use MqttSend for `mqtt:` addresses. \
-                         Use MessageChannelList to discover available channels.",
-                    )
-                    .await,
-                );
-            }
-            // Cross-protocol misuse: webhook: addresses are inbound-only.
-            if brenn_lib::messaging::ChannelScheme::of(address)
-                == Some(brenn_lib::messaging::ChannelScheme::Webhook)
-            {
-                tracing::debug!(
-                    tool = tool_name,
-                    address = %address,
-                    "PwaPushSend called with webhook: address; webhook: is inbound-only in MVP"
-                );
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "PwaPushSend only accepts `pwa_push:` addresses. \
-                         `webhook:` channels are inbound-only in this version. \
-                         Use MessageChannelList to discover available channels.",
-                    )
-                    .await,
-                );
-            }
-
-            // Extract required `body` (empty string is allowed per design §3 edge case 20).
-            let body = match tool_input.get("body").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
+            let mut map = obj.clone();
+            match map.get("url") {
+                // No `url` key → inject default, preserve other keys.
                 None => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "missing `body` argument",
-                        )
-                        .await,
-                    );
-                }
-            };
-
-            // Extract optional fields.
-            let title = tool_input
-                .get("title")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let ttl_seconds = tool_input
-                .get("ttl_seconds")
-                .and_then(|v| v.as_u64())
-                .map(|n| n.min(u64::from(brenn_pwa_push::publish::MAX_TTL_SECONDS)) as u32)
-                .unwrap_or(86400);
-            let urgency_str = tool_input
-                .get("urgency")
-                .and_then(|v| v.as_str())
-                .unwrap_or("normal");
-            let urgency = match Urgency::parse(urgency_str) {
-                Some(u) => u,
-                None => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "unknown `urgency` value; must be one of very-low, low, normal, high",
-                        )
-                        .await,
-                    );
-                }
-            };
-            let topic = tool_input
-                .get("topic")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            // RFC 8030 §5.4: topic must be ≤ 32 chars, URL-safe base64 alphabet,
-            // and non-empty (empty topic would inject a spurious `Topic: ` header).
-            if topic.as_deref().is_some_and(|t| {
-                t.is_empty()
-                    || t.len() > 32
-                    || !t
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-            }) {
-                return Some(
-                    tool_error_response(
-                        bridge,
-                        tool_name,
-                        tool_input,
-                        "invalid `topic`: must be ≤ 32 chars of URL-safe base64 alphabet \
-                         (A-Za-z0-9, -, _)",
-                    )
-                    .await,
-                );
-            }
-            let tag = tool_input
-                .get("tag")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            // Normalize and validate `data` / `data.url`.
-            // The injected URL is always a redirector URL (/r/{uuid}?to={encoded_app_path})
-            // so that Android Firefox's task router sees a per-click-unique navigation
-            // rather than a back-stack restore. See design §2.2.
-            let default_app_path = format!("/app/{}/c/{}", bridge.app_slug, bridge.conversation_id);
-            let default_data_url = make_redirector_url(&default_app_path);
-            let data = match tool_input.get("data") {
-                // Absent or JSON null → inject default URL.
-                None | Some(serde_json::Value::Null) => {
-                    tracing::debug!(tool = tool_name, "data.url auto-populated (data absent)");
-                    let mut map = serde_json::Map::new();
+                    tracing::debug!(tool = tool_name, "data.url auto-populated (url key absent)");
                     map.insert(
                         "url".to_string(),
                         serde_json::Value::String(default_data_url),
                     );
-                    Some(map)
                 }
-                // Not an object → reject.
-                Some(v) if !v.is_object() => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "invalid `data`: must be a JSON object",
-                        )
-                        .await,
-                    );
-                }
-                // Object — check/inject `url` key. Validate type against the
-                // original reference first; clone only on the success path.
-                Some(serde_json::Value::Object(obj)) => {
-                    // Reject before cloning if `url` is present but not a string.
-                    if matches!(obj.get("url"), Some(v) if !v.is_string()) {
-                        return Some(
-                            tool_error_response(
-                                bridge,
-                                tool_name,
-                                tool_input,
-                                "invalid `data.url`: must be a string",
-                            )
-                            .await,
-                        );
-                    }
-                    // Validation passed — clone now.
-                    let mut map = obj.clone();
-                    match map.get("url") {
-                        // No `url` key → inject default, preserve other keys.
-                        None => {
-                            tracing::debug!(
-                                tool = tool_name,
-                                "data.url auto-populated (url key absent)"
-                            );
+                // `url` is a string — validate format, require /app/ prefix,
+                // wrap in redirector.
+                Some(serde_json::Value::String(raw_url)) => {
+                    match validate_and_wrap_data_url(raw_url) {
+                        Ok(redirector_url) => {
                             map.insert(
                                 "url".to_string(),
-                                serde_json::Value::String(default_data_url),
+                                serde_json::Value::String(redirector_url),
                             );
                         }
-                        // `url` is a string — validate format, require /app/ prefix,
-                        // wrap in redirector.
-                        Some(serde_json::Value::String(raw_url)) => {
-                            match validate_and_wrap_data_url(raw_url) {
-                                Ok(redirector_url) => {
-                                    map.insert(
-                                        "url".to_string(),
-                                        serde_json::Value::String(redirector_url),
-                                    );
-                                }
-                                Err(msg) => {
-                                    return Some(
-                                        tool_error_response(bridge, tool_name, tool_input, msg)
-                                            .await,
-                                    );
-                                }
-                            }
-                        }
-                        Some(v) => {
-                            unreachable!("non-string url rejected before clone; value={v:?}")
-                        }
+                        Err(msg) => return reject(tool_name, msg),
                     }
-                    Some(map)
                 }
-                Some(v) => unreachable!("non-object handled above; value={v:?}"),
-            };
-
-            // All inputs validated — now check the service is present.
-            let svc = match bridge.pwa_push_service() {
-                Some(s) => s,
-                None => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "pwa_push is not configured on this server",
-                        )
-                        .await,
-                    );
+                Some(v) => {
+                    unreachable!("non-string url rejected before clone; value={v:?}")
                 }
-            };
-
-            let result = Arc::clone(svc)
-                .send(
-                    bridge.conversation_id,
-                    &bridge.app_slug,
-                    address,
-                    &body,
-                    title.as_deref(),
-                    ttl_seconds,
-                    urgency,
-                    topic.as_deref(),
-                    tag.as_deref(),
-                    data,
-                )
-                .await;
-
-            let (outcome_value, is_error) = match result {
-                PushSendResult::Ok {
-                    message_uuid,
-                    address: canonical_addr,
-                    delivered,
-                    gone,
-                    failed,
-                    failed_stale_user,
-                    failed_invalid_endpoint,
-                    remaining_budget,
-                } => {
-                    let ok = PwaPushSendOk {
-                        address: canonical_addr,
-                        attempted: delivered
-                            + gone
-                            + failed
-                            + failed_stale_user
-                            + failed_invalid_endpoint,
-                        delivered,
-                        failed,
-                        failed_invalid_endpoint,
-                        failed_stale_user,
-                        gone,
-                        message_id: message_uuid.to_string(),
-                        ok: true,
-                        remaining_budget,
-                    };
-                    (
-                        serde_json::to_value(&ok)
-                            .expect("PwaPushSendOk serialization is infallible"),
-                        false,
-                    )
-                }
-                PushSendResult::MissingSender => {
-                    // Covers two producer branches in pwa_push::publish:
-                    // (a) channel-disabled-via-config (!pwa_push_enabled()) and
-                    // (b) unknown-app routing bug (apps.get() returned None).
-                    // Both return the same variant; branch (b) also emits a
-                    // tracing::warn! inside the library. If on-call sees this
-                    // error with no obvious config reason, check the library-level
-                    // warn! log for the routing-bug indicator.
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed("push is not enabled for this app"),
-                    };
-                    (
-                        serde_json::to_value(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                PushSendResult::BodyTooLarge { len, max } => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!("body too large: {len} bytes (max {max})")),
-                    };
-                    (
-                        serde_json::to_value(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                PushSendResult::BudgetExhausted => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
-                        ),
-                    };
-                    (
-                        serde_json::to_value(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                PushSendResult::Forbidden { .. } => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "forbidden: the target user is not in this app's allowed_users list",
-                        ),
-                    };
-                    (
-                        serde_json::to_value(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                PushSendResult::MalformedAddress(addr) => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Owned(format!(
-                            "malformed address {addr:?}: must be \
-                             pwa_push:<user> or pwa_push:<user>@<device>"
-                        )),
-                    };
-                    (
-                        serde_json::to_value(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-            };
-            let output_str = serde_json::to_string(&outcome_value)
-                .expect("outcome_value serialization is infallible");
-
-            // Inject `_outcome` for the chat-history badge.
-            let mut enriched = tool_input.clone();
-            if let serde_json::Value::Object(map) = &mut enriched {
-                map.insert("_outcome".to_string(), outcome_value);
             }
-            crate::active_bridge::emit_tool_summary_for_intercept(
-                bridge, tool_name, &enriched, is_error,
-            )
-            .await;
-
-            Some(PwaPushHandled::Respond(CcApprovalDecision::Continue {
-                updated_output: Some(output_str),
-            }))
+            Some(map)
         }
+        Some(_) => return reject(tool_name, "invalid `data`: must be a JSON object"),
+    };
 
-        _ => None,
+    let Some(svc) = bridge.pwa_push_service() else {
+        return reject(tool_name, "pwa_push is not configured on this server");
+    };
+
+    let result = Arc::clone(svc)
+        .send(
+            bridge.conversation_id,
+            &bridge.app_slug,
+            address,
+            &body,
+            title.as_deref(),
+            ttl_seconds,
+            urgency,
+            topic.as_deref(),
+            tag.as_deref(),
+            data,
+        )
+        .await;
+
+    match result {
+        PushSendResult::Ok {
+            message_uuid,
+            address: canonical_addr,
+            delivered,
+            gone,
+            failed,
+            failed_stale_user,
+            failed_invalid_endpoint,
+            remaining_budget,
+        } => outcome_ok(&PwaPushSendOk {
+            address: canonical_addr,
+            attempted: delivered + gone + failed + failed_stale_user + failed_invalid_endpoint,
+            delivered,
+            failed,
+            failed_invalid_endpoint,
+            failed_stale_user,
+            gone,
+            message_id: message_uuid.to_string(),
+            ok: true,
+            remaining_budget,
+        }),
+        // Covers two producer branches in pwa_push::publish:
+        // (a) channel-disabled-via-config (!pwa_push_enabled()) and
+        // (b) unknown-app routing bug (apps.get() returned None).
+        // Both return the same variant; branch (b) also emits a
+        // tracing::warn! inside the library. If on-call sees this
+        // error with no obvious config reason, check the library-level
+        // warn! log for the routing-bug indicator.
+        PushSendResult::MissingSender => {
+            outcome_err(Cow::Borrowed("push is not enabled for this app"))
+        }
+        PushSendResult::BodyTooLarge { len, max } => outcome_err(Cow::Owned(format!(
+            "body too large: {len} bytes (max {max})"
+        ))),
+        PushSendResult::BudgetExhausted => outcome_err(Cow::Borrowed(
+            "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
+        )),
+        PushSendResult::Forbidden { .. } => outcome_err(Cow::Borrowed(
+            "forbidden: the target user is not in this app's allowed_users list",
+        )),
+        PushSendResult::MalformedAddress(addr) => outcome_err(Cow::Owned(format!(
+            "malformed address {addr:?}: must be \
+             pwa_push:<user> or pwa_push:<user>@<device>"
+        ))),
     }
 }
 
@@ -660,16 +469,9 @@ fn validate_and_wrap_data_url(raw: &str) -> Result<String, &'static str> {
     Ok(make_redirector_url(&canonical))
 }
 
-/// Common shape for "tool input failed validation" responses.
-async fn tool_error_response(
-    bridge: &ActiveBridge,
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-    error: &str,
-) -> PwaPushHandled {
-    PwaPushHandled::Respond(
-        reject_tool(bridge, "pwa_push tool", tool_name, tool_input, error).await,
-    )
+/// A rejection of the call's arguments: warn-logged, `{"ok":false,"error":…}`.
+fn reject(tool_name: &str, error: &str) -> ToolOutcome {
+    outcome_rejection("pwa_push tool", tool_name, error)
 }
 
 #[cfg(test)]
@@ -1725,5 +1527,82 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Execution without the hook
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_pwa_push_answers_ok_and_err_outcomes_without_a_card() {
+        let (bridge, _mock) = bridge_with_mock_push().await;
+        let mut rx = bridge.subscribe();
+
+        match execute_pwa_push_tool(
+            &bridge,
+            MCP_PUSH_SEND_TOOL,
+            &json!({ "address": "pwa_push:test", "body": "hi" }),
+        )
+        .await
+        {
+            Some(ToolOutcome::Ok(v)) => assert_eq!(v["ok"], json!(true), "{v}"),
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+        match execute_pwa_push_tool(
+            &bridge,
+            MCP_PUSH_LIST_TARGETS_TOOL,
+            &json!({ "address": "brenn:x" }),
+        )
+        .await
+        {
+            Some(ToolOutcome::Err(v)) => {
+                assert_eq!(v["ok"], json!(false), "{v}");
+                assert!(
+                    v["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Use MessageChannelGet"),
+                    "{v}"
+                );
+            }
+            other => panic!("expected Err outcome, got {other:?}"),
+        }
+        assert_eq!(
+            execute_pwa_push_tool(&bridge, "mcp__brenn__BrennSend", &json!({})).await,
+            None
+        );
+
+        while let Ok(msg) = rx.try_recv() {
+            assert!(
+                !matches!(msg, brenn_ws_types::WsServerMessage::ToolUseSummary { .. }),
+                "execution alone must emit no chat card: {msg:?}"
+            );
+        }
+    }
+
+    /// A failed `PwaPushChannelGet` shows an error card.
+    #[tokio::test]
+    async fn channel_get_error_card_is_an_error() {
+        let bridge = crate::active_bridge::ActiveBridge::test_new_with_combined_services().await;
+        let mut rx = bridge.subscribe();
+        let req = post_tool_use_req(
+            MCP_PUSH_LIST_TARGETS_TOOL,
+            json!({ "address": "pwa_push:nobody" }),
+        );
+        try_handle_pwa_push_tool(&bridge, &req).await.unwrap();
+        let mut cards = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if let brenn_ws_types::WsServerMessage::ToolUseSummary {
+                rendered_summary, ..
+            } = msg
+            {
+                assert!(
+                    rendered_summary.contains("ts-denied"),
+                    "a failed lookup's card must be an error: {rendered_summary}"
+                );
+                cards += 1;
+            }
+        }
+        assert_eq!(cards, 1);
     }
 }

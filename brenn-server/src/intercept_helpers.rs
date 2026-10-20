@@ -1,9 +1,8 @@
 //! Shared helpers used by all PostToolUse intercept modules.
 //!
-//! Each intercept (messaging, pwa_push, automation, mqtt) follows the same
-//! pattern for detecting the expected noop response, warning on deviation,
-//! and emitting a tool-rejection response.  This module extracts the invariant
-//! parts so they have a single implementation.
+//! Every tool family that executes outside the hook detects the expected noop
+//! response, warns on deviation, builds tool outcomes, and answers the
+//! PostToolUse through these helpers.
 
 use std::borrow::Cow;
 
@@ -11,7 +10,7 @@ use brenn_cc::session::ApprovalDecision as CcApprovalDecision;
 use serde::Serialize;
 use tracing::warn;
 
-use crate::active_bridge::ActiveBridge;
+use crate::active_bridge::{ActiveBridge, MCP_BRENN_PREFIX, ToolOutcome, execute_admitted};
 
 // ---------------------------------------------------------------------------
 // Shared tool-response types (D1 and all inline error arms)
@@ -45,7 +44,7 @@ impl Default for ToolOk {
 ///
 /// `error` is `Cow<'a, str>` so both borrowed (`&str`) and owned (`String`)
 /// error messages are accepted without extra allocation:
-/// - Borrowed: static strings, `error: &str` at `reject_tool` call site.
+/// - Borrowed: static strings, e.g. `outcome_rejection`'s `error: &str`.
 /// - Owned: `format!("…: {x}")` inline arms.
 ///
 /// Fields alphabetical: error, ok — matches serde_json BTreeMap sort order
@@ -92,74 +91,101 @@ pub fn warn_if_unexpected_tool_response(
     }
 }
 
-/// Warn-log a tool rejection, emit the tool summary card, and return a
-/// `CcApprovalDecision::Continue` response containing `{"ok":false,"error":"..."}`.
-///
-/// Callers wrap the returned decision in their module-specific handled type, e.g.
-/// `MessagingHandled::Respond(decision)`.
+/// `{"ok":false,"error":"..."}` as a JSON value.
+fn tool_err_json(error: Cow<'_, str>) -> serde_json::Value {
+    serde_json::to_value(ToolErr { ok: false, error }).expect("ToolErr serialization is infallible")
+}
+
+/// A successful call's response struct as the outcome.
+pub(crate) fn outcome_ok<T: Serialize + ?Sized>(resp: &T) -> ToolOutcome {
+    ToolOutcome::Ok(serde_json::to_value(resp).expect("tool response serialization is infallible"))
+}
+
+/// A failed call: `{"ok":false,"error":…}`.
+pub(crate) fn outcome_err(error: Cow<'_, str>) -> ToolOutcome {
+    ToolOutcome::Err(tool_err_json(error))
+}
+
+/// A rejection of the call's arguments: warn-logged, `{"ok":false,"error":…}`.
 ///
 /// `context` identifies the caller (e.g. `"messaging tool"`) for the warn log.
-pub async fn reject_tool(
+pub(crate) fn outcome_rejection(context: &str, tool_name: &str, error: &str) -> ToolOutcome {
+    warn!(tool = tool_name, error, "{context} rejected");
+    ToolOutcome::Err(tool_err_json(Cow::Borrowed(error)))
+}
+
+/// The chat card a tool family shows for an answered PostToolUse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostCard {
+    /// The tool-use summary card, from the call's input.
+    Summary,
+    /// The summary card with the outcome JSON added to its input under
+    /// `_outcome`, which the send cards read their status badge from.
+    SummaryWithOutcome,
+    /// No card.
+    None,
+}
+
+/// Answer the PostToolUse of an admitted `mcp__brenn__` tool whose family
+/// executes through `execute_admitted`: warn on an unexpected stub response,
+/// mark the call handled, run it, emit the family's card with `is_error`
+/// taken from the outcome, and substitute the outcome for the stub's
+/// `__NOOP__`.
+///
+/// `context` identifies the family (e.g. `"automation intercept"`) for the
+/// unexpected-response warning.
+pub(crate) async fn answer_post_tool_use(
     bridge: &ActiveBridge,
     context: &str,
     tool_name: &str,
     tool_input: &serde_json::Value,
-    error: &str,
+    tool_use_id: &str,
+    tool_response: &serde_json::Value,
+    card: PostCard,
 ) -> CcApprovalDecision {
-    warn!(tool = tool_name, error, "{context} rejected");
-    crate::active_bridge::emit_tool_summary_for_intercept(bridge, tool_name, tool_input, true)
-        .await;
-    let payload = ToolErr {
-        ok: false,
-        error: Cow::Borrowed(error),
+    warn_if_unexpected_tool_response(context, tool_name, tool_response);
+    crate::active_bridge::mark_tool_handled(bridge, tool_use_id).await;
+    let short_name = tool_name
+        .strip_prefix(MCP_BRENN_PREFIX)
+        .expect("intercepted brenn tool names carry the brenn prefix");
+    // Admitted at the handle_brenn_tools choke point.
+    let outcome = execute_admitted(bridge, short_name, tool_input).await;
+    let card_input = match card {
+        PostCard::None => None,
+        PostCard::Summary => Some(Cow::Borrowed(tool_input)),
+        PostCard::SummaryWithOutcome => {
+            let mut enriched = tool_input.clone();
+            if let serde_json::Value::Object(map) = &mut enriched {
+                map.insert("_outcome".to_string(), outcome.json().clone());
+            }
+            Some(Cow::Owned(enriched))
+        }
     };
-    CcApprovalDecision::Continue {
-        updated_output: Some(
-            serde_json::to_string(&payload).expect("ToolErr serialization is infallible"),
-        ),
+    if let Some(card_input) = card_input {
+        crate::active_bridge::emit_tool_summary_for_intercept(
+            bridge,
+            tool_name,
+            &card_input,
+            outcome.is_error(),
+        )
+        .await;
     }
+    outcome.into_continue()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::active_bridge::ActiveBridge;
 
-    /// `reject_tool` must return `CcApprovalDecision::Continue` with a JSON body
-    /// containing `{"ok": false, "error": "<error message>"}`.  Tests the exact
-    /// field names so a rename (`"error"` → `"err"` etc.) is caught immediately.
-    #[tokio::test]
-    async fn reject_tool_returns_ok_false_with_error_field() {
-        let bridge = ActiveBridge::test_new_for_pwa_push().await;
-        let decision = reject_tool(
-            &bridge,
-            "test context",
-            "TestTool",
-            &serde_json::json!({"param": "value"}),
-            "something went wrong",
-        )
-        .await;
-        match decision {
-            CcApprovalDecision::Continue {
-                updated_output: Some(json_str),
-            } => {
-                let v: serde_json::Value =
-                    serde_json::from_str(&json_str).expect("output must be valid JSON");
-                assert_eq!(v["ok"], serde_json::json!(false), "ok must be false");
-                assert_eq!(
-                    v["error"],
-                    serde_json::json!("something went wrong"),
-                    "error field must carry the error message"
-                );
-                // No extra fields should appear.
-                assert_eq!(
-                    v.as_object().map(|o| o.len()),
-                    Some(2),
-                    "output must have exactly two fields: ok and error"
-                );
-            }
-            other => panic!("expected Continue with updated_output, got: {other:?}"),
-        }
+    /// A rejection is `{"ok": false, "error": "<error message>"}` and nothing
+    /// else, so a rename (`"error"` → `"err"` etc.) is caught immediately.
+    #[test]
+    fn outcome_rejection_is_ok_false_with_error_field() {
+        let outcome = outcome_rejection("test context", "TestTool", "something went wrong");
+        assert_eq!(
+            outcome,
+            ToolOutcome::Err(serde_json::json!({"ok": false, "error": "something went wrong"}))
+        );
     }
 
     /// `ToolErr` must serialize to `{"ok":false,"error":"..."}` — byte-identical

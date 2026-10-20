@@ -567,16 +567,10 @@ mod tests {
         )
         .await;
 
-        // Pre-inject _pending_import so the PostToolUse handler skips the
-        // pf show fetch (test bridge has no pfin binary).
+        // The test environment has no `pf`, so the import-details fetch fails
+        // and the card renders without the import header.
         let tool_input = serde_json::json!({
             "import_id": "imp-456",
-            "_pending_import": {
-                "payee": "TEST STORE",
-                "amount": "-50.00",
-                "date": "2025-03-28T00:00:00+00:00",
-                "account": "Assets:Checking"
-            },
             "proposals": [
                 {
                     "label": "Groceries",
@@ -743,7 +737,6 @@ mod tests {
                 tool_name: MCP_PROPOSE_RECONCILIATION_TOOL.into(),
                 tool_input: serde_json::json!({
                     "import_id": "imp-abc",
-                    "_pending_import": { "payee": "X", "amount": "1" },
                     "proposals": [{"label": "X", "transaction": {}}]
                 }),
                 tool_response: serde_json::json!("__NOOP__"),
@@ -899,9 +892,10 @@ mod tests {
             Some(HandleBrennToolResult::Respond(CcApprovalDecision::Continue {
                 updated_output: Some(output),
             })) => {
+                // A schema violation, refused at admission.
                 assert!(
-                    output.contains("missing items"),
-                    "should mention missing items: {output}"
+                    output.contains("invalid_args") && output.contains(r#"[\"items\"]"#),
+                    "should refuse the missing items: {output}"
                 );
             }
             other => panic!("expected Continue with error, got {other:?}"),
@@ -1356,9 +1350,10 @@ mod tests {
             Some(HandleBrennToolResult::Respond(CcApprovalDecision::Continue {
                 updated_output: Some(output),
             })) => {
+                // A schema violation, refused at admission.
                 assert!(
-                    output.contains("missing items"),
-                    "should mention missing items: {output}"
+                    output.contains("invalid_args") && output.contains(r#"[\"items\"]"#),
+                    "should refuse the missing items: {output}"
                 );
             }
             other => panic!("expected Continue with error, got {other:?}"),
@@ -1367,9 +1362,8 @@ mod tests {
 
     #[tokio::test]
     async fn batch_assign_post_tool_use_rejects_missing_user() {
-        // Confirm validation fires BEFORE enrichment. intercept_tool returns
-        // Reject for a missing user, so the handler returns the error without
-        // ever reaching enrich_batch_items.
+        // A missing user is refused at admission, before the pfin handler
+        // and its enrichment run.
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_config(
             TestBridgeConfig {
                 integrations: pfin_test_integrations(),
@@ -1399,9 +1393,10 @@ mod tests {
             Some(HandleBrennToolResult::Respond(CcApprovalDecision::Continue {
                 updated_output: Some(output),
             })) => {
+                // A schema violation, refused at admission.
                 assert!(
-                    output.contains("missing user"),
-                    "should mention missing user: {output}"
+                    output.contains("invalid_args") && output.contains(r#"[\"user\"]"#),
+                    "should refuse the missing user: {output}"
                 );
                 assert!(
                     !output.contains("enrichment"),

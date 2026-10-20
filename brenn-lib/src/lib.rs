@@ -15,6 +15,7 @@ pub mod subprocess;
 #[cfg(test)]
 mod test_utils;
 pub mod token_bucket;
+pub mod tool_input;
 pub mod tools;
 pub mod util;
 pub mod wasm_package;

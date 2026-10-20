@@ -1,4 +1,5 @@
-//! Stale podman container cleanup on startup.
+//! Startup sweep of the podman containers a previous life of this brenn
+//! instance left behind.
 
 use tracing::info;
 use tracing::warn;

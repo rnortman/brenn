@@ -13,14 +13,15 @@
 //! call it. The adapter denies it from the agent's current grant table, and the
 //! warn is the expected trace of that case.
 
-use brenn_approval_rules::ApprovalMatch;
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use brenn_lib::messaging::ParticipantId;
 use serde_json::json;
 use tracing::{info, warn};
 
 use super::super::ActiveBridge;
-use super::super::tool_summary::{HandleBrennToolResult, emit_tool_summary, mark_tool_handled};
+use super::super::tool_summary::HandleBrennToolResult;
+use super::execute::ToolOutcome;
+use crate::intercept_helpers::{PostCard, answer_post_tool_use};
 use brenn_tool_registry::ToolError;
 
 /// Handle PreToolUse + PostToolUse for any registry tool. Returns `None` when
@@ -74,72 +75,73 @@ pub(super) async fn handle(
             tool_name,
             tool_input,
             tool_use_id,
+            tool_response,
             ..
         } => {
-            let canonical = bridge.tools.get_by_mcp_name(tool_name)?.descriptor().name;
-
-            let Some(grant) = bridge
-                .app_config()
-                .policy
-                .tool_grants
-                .get(canonical)
-                .cloned()
-            else {
-                // Ungranted at execution (Pre already denied; belt-and-suspenders).
-                warn!(
-                    tool = %tool_name,
-                    app = %bridge.app_slug,
-                    "registry_adapter: PostToolUse for ungranted tool",
-                );
-                mark_tool_handled(bridge, tool_use_id).await;
-                return Some(HandleBrennToolResult::Respond(
-                    CcApprovalDecision::Continue {
-                        updated_output: Some(
-                            tool_error_to_json(canonical, &ToolError::NotGranted).to_string(),
-                        ),
-                    },
-                ));
-            };
-
-            mark_tool_handled(bridge, tool_use_id).await;
-
-            let caller = ParticipantId::for_app(&bridge.app_slug, &bridge.server_origin);
-            let outcome = bridge
-                .tools
-                .invoke_for_llm(
-                    tool_name,
-                    caller,
-                    grant,
-                    Some(bridge.conversation_id),
-                    tool_input.clone(),
-                    &bridge.alert_dispatcher,
-                )
-                .await;
-
-            let output = match outcome {
-                Ok(value) => value,
-                Err(e) => tool_error_to_json(canonical, &e),
-            };
-
-            emit_tool_summary(
-                bridge,
-                tool_name,
-                tool_input,
-                None,
-                Some(&ApprovalMatch::GlobalTool),
-                false,
-            )
-            .await;
-
+            bridge.tools.get_by_mcp_name(tool_name)?;
             Some(HandleBrennToolResult::Respond(
-                CcApprovalDecision::Continue {
-                    updated_output: Some(output.to_string()),
-                },
+                answer_post_tool_use(
+                    bridge,
+                    "registry tool",
+                    tool_name,
+                    tool_input,
+                    tool_use_id,
+                    tool_response,
+                    PostCard::Summary,
+                )
+                .await,
             ))
         }
 
         _ => None,
     }
+}
+
+/// Run a registry tool for the agent: the grant-presence check, then
+/// `invoke_for_llm` with the agent as caller and its conversation as the
+/// acting conversation. A `ToolError` becomes `ToolOutcome::Err` in the
+/// registry's error shape. `None` when `mcp_name` is not a registered tool.
+pub(super) async fn execute_registry_tool(
+    bridge: &ActiveBridge,
+    mcp_name: &str,
+    input: &serde_json::Value,
+) -> Option<ToolOutcome> {
+    let canonical = bridge.tools.get_by_mcp_name(mcp_name)?.descriptor().name;
+    let Some(grant) = bridge
+        .app_config()
+        .policy
+        .tool_grants
+        .get(canonical)
+        .cloned()
+    else {
+        // Admission refuses a tool absent from the catalog, and the catalog
+        // holds only granted registry tools; a reload between the two lands here.
+        warn!(
+            tool = %mcp_name,
+            app = %bridge.app_slug,
+            "registry_adapter: execution of an ungranted tool",
+        );
+        return Some(ToolOutcome::Err(tool_error_to_json(
+            canonical,
+            &ToolError::NotGranted,
+        )));
+    };
+    let caller = ParticipantId::for_app(&bridge.app_slug, &bridge.server_origin);
+    let result = bridge
+        .tools
+        .invoke_for_llm(
+            mcp_name,
+            caller,
+            grant,
+            Some(bridge.conversation_id),
+            input.clone(),
+            &bridge.alert_dispatcher,
+        )
+        .await;
+    Some(match result {
+        Ok(value) => ToolOutcome::Ok(value),
+        Err(e) => ToolOutcome::Err(tool_error_to_json(canonical, &e)),
+    })
 }
 
 /// Render a tool error as the JSON body CC receives in place of tool output.
@@ -563,5 +565,29 @@ mod tests {
             saw_summary,
             "PostToolUse must emit a ToolUseSummary card for the pull",
         );
+    }
+
+    #[tokio::test]
+    async fn execute_registry_tool_is_none_for_a_non_registry_tool() {
+        let bridge = bridge_with(registry(), BTreeMap::new()).await;
+        let r = super::execute_registry_tool(
+            &bridge,
+            "mcp__brenn__MessageChannelList",
+            &serde_json::json!({}),
+        )
+        .await;
+        assert!(r.is_none());
+    }
+
+    /// A grant revoked between admission and execution is refused, not run.
+    #[tokio::test]
+    async fn execute_registry_tool_refuses_an_ungranted_tool() {
+        let bridge = bridge_with(registry(), BTreeMap::new()).await;
+        let r = super::execute_registry_tool(&bridge, MCP_PULL, &serde_json::json!({"repos": []}))
+            .await;
+        let Some(super::ToolOutcome::Err(output)) = r else {
+            panic!("expected an Err outcome, got {r:?}");
+        };
+        assert_eq!(output["error_type"], "not_granted", "{output}");
     }
 }
