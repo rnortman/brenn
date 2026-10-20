@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-10-19
+
 - **Agents can run their Brenn tools as shell commands.** A new command,
   `brenn-tool`, lets an agent call the Brenn tools it already has from Bash,
   a script, a loop or a pipeline: `brenn-tool list`, `describe <Tool>`, and
