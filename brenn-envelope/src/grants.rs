@@ -32,7 +32,7 @@
 //! the front end because three readers ask the question — the front end that
 //! refuses the illegal word, and the two hosts that assert what they linked.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ChannelScheme;
 
@@ -46,7 +46,7 @@ use crate::ChannelScheme;
 /// Serde `kebab-case`, matching [`ComponentGrant::word`] — every word is the
 /// interface name it links, spelled as WIT spells it, so the two spellings
 /// cannot drift apart in shape and a test pins them equal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComponentGrant {
     /// `brenn:processor/ports` — publish and defer through the declared output
@@ -657,12 +657,15 @@ mod tests {
     fn serde_spelling_is_the_word() {
         // The two spellings are separately declared (`rename_all` vs the `word`
         // match), and a config document authored against one must deserialize
-        // through the other.
+        // through the other; a bindings document serializes through
+        // `rename_all` and must emit the same word.
         for grant in ComponentGrant::ALL {
             let json = format!("\"{}\"", grant.word());
             let parsed: ComponentGrant =
                 serde_json::from_str(&json).expect("word must deserialize");
             assert_eq!(parsed, grant);
+            let emitted = serde_json::to_string(&grant).expect("grant must serialize");
+            assert_eq!(emitted, json);
         }
     }
 

@@ -102,7 +102,9 @@ pub fn build_bindings_document(
                 instance: c.instance.clone(),
                 kind: c.kind.clone(),
                 parked_batch_depth: c.parked_batch_depth,
-                grants: c.grants.iter().map(|g| g.word().to_string()).collect(),
+                // In the enum's `Ord`: resolution carries the grants as a
+                // `BTreeSet`.
+                grants: c.grants.iter().copied().collect(),
                 // Sorted by construction: resolution carries the vocabulary as a
                 // `BTreeSet`, and the document's determinism rule needs the order
                 // to be a function of the names alone.

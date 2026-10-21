@@ -205,9 +205,9 @@ impl SurfacePage {
 
     /// Phase 2: apply a bindings document and reconcile the page against it.
     ///
-    /// `Err` names what makes the body unusable, for the caller to go fatal on.
-    /// Nothing is half-applied: the document is parsed and checked whole before
-    /// any table is touched.
+    /// `Err` names what makes the body unusable, for the caller to reload on: the
+    /// body is peer skew, never a broken attachment. Nothing is half-applied:
+    /// the document is parsed and checked whole before any table is touched.
     ///
     /// The order is the one the passes require of each other:
     ///

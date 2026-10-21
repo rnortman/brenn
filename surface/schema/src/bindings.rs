@@ -119,8 +119,8 @@ pub struct PlatformSection {
 }
 
 /// Why a bindings document was refused. Carries a rendered message rather than
-/// a code: every one of these is fatal at the reader, and the message is what
-/// reaches the log a human reads.
+/// a code: the reader answers every one of these the same way, and the message
+/// is what reaches the report a human reads.
 pub type BindingsError = String;
 
 impl BindingsDocument {
@@ -763,6 +763,19 @@ mod tests {
         doc.v = BINDINGS_DOCUMENT_VERSION + 1;
         let err = BindingsDocument::parse(&doc.to_body()).expect_err("a future version is refused");
         assert!(err.contains("schema version"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn an_unknown_grant_word_fails_the_parse() {
+        let body = doc().to_body();
+        let skewed = body.replacen(r#""grants":[]"#, r#""grants":["telepathy"]"#, 1);
+        assert_ne!(
+            skewed, body,
+            "the fixture carries a grant list to splice over"
+        );
+        let err = BindingsDocument::parse(&skewed).expect_err("an unknown grant word is refused");
+        assert!(err.contains("does not parse"), "unexpected: {err}");
+        assert!(err.contains("telepathy"), "the word is named: {err}");
     }
 
     #[test]

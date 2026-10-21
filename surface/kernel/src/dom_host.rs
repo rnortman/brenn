@@ -956,7 +956,7 @@ mod tests {
     /// with a host element of its own so `dom.root` resolves, and each declaring
     /// [`PRESS`] as its one `sync` port — the vocabulary `dom.listen` is judged
     /// against, so a suite about gestures has a port to listen on.
-    fn rig(instances: &[(&str, &[&str])]) -> Rig {
+    fn rig(instances: &[(&str, &[ComponentGrant])]) -> Rig {
         fresh_root();
         let mut components: Vec<_> = instances
             .iter()
@@ -1040,7 +1040,7 @@ mod tests {
 
     /// The one instance every single-instance test uses, granted `dom`.
     fn dom_rig() -> Rig {
-        rig(&[("wbt-dom", &["dom"])])
+        rig(&[("wbt-dom", &[ComponentGrant::Dom])])
     }
 
     const DOM: &str = "wbt-dom";
@@ -1197,7 +1197,10 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn a_handle_names_nothing_in_another_instances_table() {
-        let mut rig = rig(&[("wbt-mine", &["dom"]), ("wbt-yours", &["dom"])]);
+        let mut rig = rig(&[
+            ("wbt-mine", &[ComponentGrant::Dom]),
+            ("wbt-yours", &[ComponentGrant::Dom]),
+        ]);
         let mine = rig
             .host
             .create_element("wbt-mine", "div")
@@ -1317,7 +1320,10 @@ mod tests {
         // containment sweep — and it is the shape almost every removal and every
         // `set-text` of an inline node takes. Narrowing that loop to the caller's
         // table reopens the leak on the commonest operation in the system.
-        let rig = rig(&[("wbt-reach", &["dom"]), ("wbt-page", &["dom", "page-dom"])]);
+        let rig = rig(&[
+            ("wbt-reach", &[ComponentGrant::Dom]),
+            ("wbt-page", &[ComponentGrant::Dom, ComponentGrant::PageDom]),
+        ]);
         let root = rig.host.root("wbt-reach").expect("a mounted root");
         let leaf = rig
             .host
@@ -1353,7 +1359,10 @@ mod tests {
         // Mounting is idempotent and clears whatever was there, so a re-mount is
         // a real destruction: the instance's own table goes, and so does a
         // sibling's handle to anything that was hanging under the wrapper.
-        let rig = rig(&[("wbt-reach", &["dom"]), ("wbt-page", &["dom", "page-dom"])]);
+        let rig = rig(&[
+            ("wbt-reach", &[ComponentGrant::Dom]),
+            ("wbt-page", &[ComponentGrant::Dom, ComponentGrant::PageDom]),
+        ]);
         let root = rig.host.root("wbt-reach").expect("a mounted root");
         let child = rig
             .host
@@ -1398,7 +1407,10 @@ mod tests {
         // `page-dom` holder appended there: dropping only the faulted instance's
         // table would leave the kernel holding those, and the holder mutating
         // orphans.
-        let rig = rig(&[("wbt-reach", &["dom"]), ("wbt-page", &["dom", "page-dom"])]);
+        let rig = rig(&[
+            ("wbt-reach", &[ComponentGrant::Dom]),
+            ("wbt-page", &[ComponentGrant::Dom, ComponentGrant::PageDom]),
+        ]);
         let wrapper = rig
             .host
             .instance_wrapper("wbt-page", "wbt-reach")
@@ -1427,7 +1439,10 @@ mod tests {
         // instances: a `page-dom` holder destroying a subtree invalidates every
         // handle to it, whoever minted them. The victim then traps rather than
         // operating on an orphan.
-        let mut rig = rig(&[("wbt-reach", &["dom"]), ("wbt-page", &["dom", "page-dom"])]);
+        let mut rig = rig(&[
+            ("wbt-reach", &[ComponentGrant::Dom]),
+            ("wbt-page", &[ComponentGrant::Dom, ComponentGrant::PageDom]),
+        ]);
         let mine = rig.host.root("wbt-reach").expect("a mounted root");
         let child = rig
             .host
@@ -1460,8 +1475,8 @@ mod tests {
     #[wasm_bindgen_test]
     fn the_grant_gate_splits_reach_from_page_authority() {
         let mut rig = rig(&[
-            ("wbt-reach", &["dom"]),
-            ("wbt-page", &["dom", "page-dom"]),
+            ("wbt-reach", &[ComponentGrant::Dom]),
+            ("wbt-page", &[ComponentGrant::Dom, ComponentGrant::PageDom]),
             ("wbt-none", &[]),
         ]);
 
@@ -1505,7 +1520,10 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn the_page_entries_hand_back_canonical_handles() {
-        let rig = rig(&[("wbt-page-2", &["dom", "page-dom"])]);
+        let rig = rig(&[(
+            "wbt-page-2",
+            &[ComponentGrant::Dom, ComponentGrant::PageDom],
+        )]);
         let body = rig.host.page_body("wbt-page-2").expect("granted");
         let root = rig.host.root("wbt-page-2").expect("mounted");
         assert_ne!(body, root);
@@ -1627,7 +1645,10 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn a_malformed_animate_call_and_a_foreign_handle_trap() {
-        let mut rig = rig(&[("wbt-anim-mine", &["dom"]), ("wbt-anim-yours", &["dom"])]);
+        let mut rig = rig(&[
+            ("wbt-anim-mine", &[ComponentGrant::Dom]),
+            ("wbt-anim-yours", &[ComponentGrant::Dom]),
+        ]);
         let mine = rig
             .host
             .create_element("wbt-anim-mine", "div")
@@ -2094,7 +2115,7 @@ mod tests {
     fn a_gesture_on_an_unregistered_instance_is_refused_without_cancelling() {
         // The door refuses when there is no entry, and a refusal is not an answer
         // that asked for `preventDefault`.
-        let rig = rig(&[("wbt-gone", &["dom"])]);
+        let rig = rig(&[("wbt-gone", &[ComponentGrant::Dom])]);
         let root = rig.host.root("wbt-gone").expect("mounted");
         let button = rig
             .host
@@ -2130,7 +2151,7 @@ mod tests {
         // wired here would fail once per gesture and name nothing, so the
         // refusal is at the `listen` and the element stays inert.
         const WHO: &str = "wbt-undeclared-port";
-        let rig = rig(&[(WHO, &["dom"])]);
+        let rig = rig(&[(WHO, &[ComponentGrant::Dom])]);
         let root = rig.host.root(WHO).expect("mounted");
         let button = rig.host.create_element(WHO, "button").expect("create");
         rig.host.append(WHO, root, button).expect("append");
@@ -2163,7 +2184,10 @@ mod tests {
         //
         // Stated as a test rather than a convention: the borrows below are the
         // in-flight activation, and every entry is called under them.
-        let rig = rig(&[("wbt-borrow", &["dom", "page-dom"])]);
+        let rig = rig(&[(
+            "wbt-borrow",
+            &[ComponentGrant::Dom, ComponentGrant::PageDom],
+        )]);
         const WHO: &str = "wbt-borrow";
         let root = rig.host.root(WHO).expect("mounted");
         let child = rig.host.create_element(WHO, "div").expect("an allowed tag");

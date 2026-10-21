@@ -28,11 +28,19 @@
 //! byte comparison below is what keeps an unchanged one from costing anything
 //! more.
 //!
-//! Every refusal here is fatal to the attachment rather than something to retry.
-//! Both ends of a live surface are built together and the peer resolves this
-//! document from configuration it validated at boot, so an empty replay or a
-//! document this kernel cannot apply is a broken peer, and reconnecting into the
-//! identical answer is the carry-on this project does not do.
+//! A config channel acknowledgement that breaks the peer's invariants — an
+//! empty replay, or a gap answering a resume claim never made — is fatal to the
+//! attachment rather than something to retry: the peer resolves this document
+//! from configuration it validated at boot, so either is a broken peer, and
+//! reconnecting into the identical answer is the carry-on this project does not
+//! do.
+//!
+//! A document this kernel cannot apply is not that. It is returned for the
+//! caller to answer with the capped reload, and the attachment stays up: on a
+//! page the peer served, the usual cause is assets older than the server, which
+//! the reload cures. A page past the reload cap keeps its attachment, so every
+//! reconnect redelivers the document and refuses it again, and a document the
+//! server later makes readable is applied like any first document.
 
 #[cfg(test)]
 mod tests;
@@ -265,10 +273,11 @@ impl SurfaceConnect {
 
     /// Phase 2: apply a bindings document delivered on the config channel.
     ///
-    /// `Err` names what makes the body unusable, for the caller to go fatal on.
-    /// There is no partial application and nothing to fall back on: the previous
-    /// wiring described a surface this page may no longer be, and a page that
-    /// cannot read its own wiring has nothing to render.
+    /// `Err` names what makes the body unusable, for the caller to reload on: the
+    /// body is peer skew, never a broken attachment. There is no partial
+    /// application and nothing to fall back on: the previous wiring described a
+    /// surface this page may no longer be, and a page that cannot read its own
+    /// wiring has nothing to render.
     ///
     /// # Panics
     ///

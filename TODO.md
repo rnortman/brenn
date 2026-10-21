@@ -166,30 +166,6 @@ sibling gap and the larger one: none of the three fit gates lowers, so no
 lowering-only refusal reaches any of them, whether or not a body was expanded.
 Closing this entry alone does not make the gates complete.
 
-## `bindings-doc-typed-grants`
-
-`ComponentEntry::grants` is `Vec<String>` while its sibling fields on the same
-struct are typed (`abi: Abi`), and `ComponentGrant` — the enum those strings
-spell — is already a dependency of the schema crate. So the closed vocabulary
-degrades to free strings on the wire and every reader owes a word-to-variant
-reparse, plus its own decision about an unknown word. That is the shape the
-single grant vocabulary exists to delete.
-
-Fix = derive `Serialize` on `ComponentGrant` (it derives `Deserialize` today,
-and a test already pins the serde spelling equal to `word()`), type the field as
-the enum, and let the writer clone instead of rendering. Build skew then becomes
-one serde error at document parse for free. Weigh against it: a typed field
-fails the *whole* document parse on an unknown word, which loses the pointed
-"this word, this instance" skew report a hand parse could give — so decide the
-skew diagnostic first, then the type.
-
-Done = the bindings document carries the vocabulary, not its spelling, and no
-reader reparses.
-
-Code sites (`TODO(bindings-doc-typed-grants)`): surface/schema/src/lib.rs, at
-`ComponentEntry::grants`.
-
-
 ## `budget-refusal-per-path`
 
 `brenn_budget::RefusalKind` is one enum spanning two paths, so neither host's

@@ -484,6 +484,44 @@ fn a_byte_equal_document_mid_attachment_announces_nothing() {
     assert!(effects.is_empty(), "{effects:?}");
 }
 
+/// A pass whose last document cannot be applied announces what did apply, then
+/// the refusal, and leaves the attachment as it is: the reload the platform half
+/// performs is what ends the page.
+#[test]
+fn an_unusable_document_announces_itself_after_what_applied() {
+    let mut page = page();
+    let detail = "the surface bindings document is unusable: junk".to_string();
+    let effects = fold(&mut page, |r, page| {
+        r.inbound(
+            page,
+            Inbound {
+                configured: vec![configured(true, false)],
+                unusable_document: Some(detail.clone()),
+                ..Inbound::default()
+            },
+            NOW,
+            NOW_MS,
+        );
+    });
+
+    match events(&effects)[..] {
+        [
+            Event::Connected { .. },
+            Event::BindingsUnusable { detail: carried },
+        ] => {
+            assert_eq!(carried, &detail);
+        }
+        ref other => panic!("expected Connected then BindingsUnusable: {other:?}"),
+    }
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::GoFatal { .. } | Effect::Close)),
+        "the attachment is not ended here: {effects:?}"
+    );
+    assert!(page.connect.facts().is_some(), "the attachment stays live");
+}
+
 #[test]
 fn phase_twos_subscribes_follow_the_announcement() {
     let mut page = page();

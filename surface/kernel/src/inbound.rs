@@ -34,10 +34,13 @@
 //! An `Err` is a peer contract the page cannot reconcile, and the caller's cue to
 //! go fatal on its connection: a delivery on a channel this attachment never had
 //! open, a pass with no rows, a span sequence that does not advance, a
-//! correlation nothing sent, a config channel with no document on it, a document
-//! this build cannot apply. The page takes its whole configuration from this peer
-//! on faith, so a peer that contradicts the contract is not something to carry on
-//! from.
+//! correlation nothing sent, a config channel with no document on it. The page
+//! takes its whole configuration from this peer on faith, so a peer that
+//! contradicts the contract is not something to carry on from.
+//!
+//! A document this build cannot apply is not an `Err`: it is peer skew — the
+//! page's assets are older than the server — and is carried as
+//! [`Inbound::unusable_document`] for the caller to reload on.
 //!
 //! A *straggler* is not fatal and not an error: a pass from a span the page has
 //! already left, in flight when its `Unsubscribe` crossed. It is discarded whole,
@@ -114,6 +117,11 @@ pub struct Inbound {
     /// The bindings documents this frame carried, applied in frame order —
     /// phase 2, whose own frames, steps and verdicts each one carries.
     pub configured: Vec<Configured>,
+    /// A bindings document this build cannot apply, with the reason
+    /// [`SurfacePage::apply_config`] gave. It follows every document in
+    /// [`configured`](Self::configured), and nothing after it in the pass was
+    /// applied.
+    pub unusable_document: Option<String>,
     /// A delivery pass discarded as a straggler, the first of its span.
     pub straggler: Option<Straggler>,
     /// A gap on a subscription that presented a resume claim.
@@ -271,12 +279,26 @@ fn on_deliver(
         // store and no reader, and a loss the peer reports on it is a superseded
         // document rolling out of a one-deep retained window — the newest
         // document of the pass is the current one either way.
-        let configured = rows
-            .iter()
-            .map(|row| page.apply_config(&row.envelope.body, now))
-            .collect::<Result<Vec<_>, _>>()?;
+        //
+        // Rows apply in order and the first one this build cannot apply ends
+        // the pass: the rows before it are folded as usual and the refusal
+        // rides behind them, so its reload is the last word on the pass. A
+        // refused document is peer skew, not a broken contract, so it is
+        // carried rather than returned as an `Err`.
+        let mut configured = Vec::new();
+        let mut unusable_document = None;
+        for row in &rows {
+            match page.apply_config(&row.envelope.body, now) {
+                Ok(applied) => configured.push(applied),
+                Err(detail) => {
+                    unusable_document = Some(detail);
+                    break;
+                }
+            }
+        }
         return Ok(Inbound {
             configured,
+            unusable_document,
             ..Inbound::default()
         });
     }

@@ -55,7 +55,8 @@ use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Binding, ComponentEntry, LocalChannel, NoiseLevel, OutputBinding, Urgency as SchemaUrgency,
+    Binding, ComponentEntry, ComponentGrant, LocalChannel, NoiseLevel, OutputBinding,
+    Urgency as SchemaUrgency,
 };
 
 use brenn_envelope::ChannelScheme;
@@ -201,10 +202,11 @@ fn document(spec: &MountSpec) -> BindingsDocument {
                 kind: "processor-transplant".to_string(),
                 parked_batch_depth: 2,
                 config: BTreeMap::new(),
-                grants: ["ports", "log", "config"]
-                    .iter()
-                    .map(|g| (*g).to_string())
-                    .collect(),
+                grants: vec![
+                    ComponentGrant::Ports,
+                    ComponentGrant::Log,
+                    ComponentGrant::Config,
+                ],
                 declared_out_ports,
                 // The probe's specification declares one sync port, and the
                 // document is where the page reads that declaration.
@@ -216,7 +218,7 @@ fn document(spec: &MountSpec) -> BindingsDocument {
                 kind: "chrome".to_string(),
                 parked_batch_depth: 2,
                 config: BTreeMap::new(),
-                grants: vec!["ports".to_string()],
+                grants: vec![ComponentGrant::Ports],
                 declared_out_ports: vec![],
                 sync_ports: vec![],
                 call_ports: vec![],

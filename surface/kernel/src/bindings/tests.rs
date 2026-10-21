@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::test_support::bindings::imply_vocabularies;
+use crate::test_support::bindings::{body_with_unknown_grant, imply_vocabularies};
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
@@ -99,11 +99,11 @@ fn refusal(doc: &BindingsDocument) -> String {
 
 /// The grant question is asked on the guest's synchronous path — once per
 /// chained call — and answered off the index built with the rest of them, so a
-/// word is parsed once and not compared per question.
+/// grant is collected once and not compared per question.
 #[test]
 fn an_instances_grants_are_read_off_the_parsed_index() {
     let mut doc = doc();
-    doc.components[0].grants = vec!["dom".to_string(), "ports".to_string()];
+    doc.components[0].grants = vec![ComponentGrant::Ports, ComponentGrant::Dom];
     let applied = applied(&doc);
     assert!(applied.instance_granted("p1", ComponentGrant::Dom));
     assert!(applied.instance_granted("p1", ComponentGrant::Ports));
@@ -118,17 +118,16 @@ fn an_instances_grants_are_read_off_the_parsed_index() {
     );
 }
 
-/// A word this build cannot parse is the kernel core's refusal of the whole
-/// document, made before the page is wired. Answering "not granted" here
-/// instead would be deny-by-typo — a capability the operator granted, silently
-/// disabled — so the seam that skipped the core is what dies.
+/// A grant word this build does not know is server/kernel skew, and it fails
+/// the document parse whole rather than reaching the index as a guess.
 #[test]
-#[should_panic(expected = "capability word this build does not know")]
-fn asking_about_an_instance_with_an_unknown_grant_word_is_a_panic() {
-    let mut doc = doc();
-    doc.components[0].grants = vec!["telepathy".to_string()];
-    let applied = applied(&doc);
-    let _ = applied.instance_granted("p1", ComponentGrant::Dom);
+fn a_body_naming_an_unknown_grant_word_is_refused() {
+    let refusal = AppliedBindings::apply(&body_with_unknown_grant(doc()))
+        .expect_err("the document is refused");
+    assert!(
+        refusal.contains("telepathy"),
+        "the refusal names the word: {refusal}"
+    );
 }
 
 #[test]

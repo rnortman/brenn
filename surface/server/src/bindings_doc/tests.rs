@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
+use brenn_lib::messaging::ComponentGrant;
 use brenn_lib::messaging::config::{ResolvedLocalChannel, ResolvedSurface, SurfaceCall};
-use brenn_lib::messaging::{ComponentGrant, ComponentHost};
 use brenn_surface_schema::{LOCAL_THEME_CHANNEL, LogLevel, reserved_local_channel};
 
 use super::*;
@@ -123,45 +123,44 @@ fn an_unconfigured_error_channel_clears_both_halves() {
 }
 
 /// The kernel gates each privileged entry on the instance's own grants, so the
-/// document has to carry them per component, in the canonical spellings the
-/// kernel parses.
+/// document has to carry them per component.
 #[test]
 fn instance_grants_reach_their_component_entry() {
     let mut surface = bar();
     surface.components[0].grants = [ComponentGrant::Ports, ComponentGrant::Log].into();
     let doc = build_bindings_document(&surface, &params());
-    assert_eq!(doc.components[0].grants, vec!["ports", "log"]);
+    assert_eq!(
+        doc.components[0].grants,
+        vec![ComponentGrant::Ports, ComponentGrant::Log]
+    );
     // The `config` map's reader is granted it; the chrome beside it is not.
     let mode = doc
         .components
         .iter()
         .find(|c| c.instance == "mode")
         .expect("the fixture declares a processor named mode");
-    assert_eq!(mode.grants, vec!["config"]);
+    assert_eq!(mode.grants, vec![ComponentGrant::Config]);
 }
 
-/// Every word the writer can emit is a word the reader parses. The document is
-/// the server/kernel contract, so the two halves of the spelling have to be one
-/// fact rather than two lists kept equal by hand.
+/// The document's bytes for the grant field, pinned against a fixed string
+/// rather than a second run of the same writer: the serde spelling, in
+/// `ComponentGrant`'s `Ord` whatever order the grants were handed in.
 #[test]
-fn every_emitted_grant_word_parses_back_to_its_grant() {
-    let hosted: Vec<ComponentGrant> = ComponentGrant::ALL
-        .iter()
-        .copied()
-        .filter(|grant| grant.illegal_on(ComponentHost::Surface).is_none())
-        .collect();
+fn grants_are_emitted_in_vocabulary_order_as_pinned_bytes() {
     let mut surface = bar();
-    surface.components[0].grants = hosted.iter().copied().collect();
-    let doc = build_bindings_document(&surface, &params());
-    let parsed: Vec<ComponentGrant> = doc.components[0]
-        .grants
-        .iter()
-        .map(|word| {
-            ComponentGrant::parse(word)
-                .unwrap_or_else(|| panic!("the document emitted {word:?}, which parses to nothing"))
-        })
-        .collect();
-    assert_eq!(parsed, hosted);
+    surface.components[0].grants = [
+        ComponentGrant::Dom,
+        ComponentGrant::Log,
+        ComponentGrant::Ports,
+        ComponentGrant::PageDom,
+    ]
+    .into();
+    let docs = build_bindings_documents(std::slice::from_ref(&surface), &params());
+    let body = &docs[0].1;
+    assert!(
+        body.contains(r#""grants":["ports","log","dom","page-dom"]"#),
+        "the grant field's bytes moved: {body}"
+    );
 }
 
 /// Determinism contract: same config, same bytes — consumers may use byte

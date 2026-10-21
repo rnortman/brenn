@@ -19,11 +19,10 @@
 //!    reloads the page. The document builder is deterministic for exactly this
 //!    comparison, so it is made on the bytes rather than on a structural walk.
 //!
-//! Every refusal here names a broken writer. The server resolves this document
-//! from config it boot-validated, and both ends of a live surface are built
-//! together, so a document this kernel cannot apply is not a difference of
-//! opinion to accommodate — the caller's answer to any of them is the same
-//! fatal.
+//! Every refusal here is a document this build cannot run. The usual cause is
+//! page assets older than the server; a writer bug or a depth this target
+//! cannot hold is the rare one. Nothing here tells them apart, and the caller's
+//! answer to every refusal is the same capped reload.
 
 #[cfg(test)]
 mod tests;
@@ -98,21 +97,18 @@ pub struct AppliedBindings {
     /// reason `outputs` is: resolving a call is two borrowed probes, on a path
     /// a guest reaches synchronously.
     calls: BTreeMap<String, BTreeMap<String, usize>>,
-    /// Instance id → the capabilities its entry declares, parsed once here
-    /// rather than re-scanned per question. `None` for an instance carrying a
-    /// word this build does not know: the kernel core refuses such a document
-    /// outright, so this map records the disagreement instead of guessing, and
-    /// asking about that instance is a panic rather than a quiet "not granted".
-    grants: BTreeMap<String, Option<GrantSet>>,
+    /// Instance id → the capabilities its entry declares, collected once here
+    /// rather than re-scanned per question.
+    grants: BTreeMap<String, GrantSet>,
 }
 
 impl AppliedBindings {
     /// Parse, check and index a retained bindings body.
     ///
-    /// One call for all of it because a caller has one answer to every failure:
-    /// a body that does not parse, does not validate, or names depths this build
-    /// cannot allocate is equally unusable, and there is nothing to be done with
-    /// the parts.
+    /// One call for all of it because a caller has one answer to every failure —
+    /// the capped reload: a body that does not parse, does not validate, or names
+    /// depths this build cannot allocate is equally unusable, and there is nothing
+    /// to be done with the parts.
     pub fn apply(body: &str) -> Result<Self, BindingsError> {
         let doc = BindingsDocument::parse(body)?;
         Self::index(body.to_string(), doc)
@@ -130,7 +126,7 @@ impl AppliedBindings {
     fn index(body: String, doc: BindingsDocument) -> Result<Self, BindingsError> {
         let mut components = BTreeMap::new();
         let mut declared_out_ports = BTreeMap::new();
-        let mut grants: BTreeMap<String, Option<GrantSet>> = BTreeMap::new();
+        let mut grants: BTreeMap<String, GrantSet> = BTreeMap::new();
         for (i, c) in doc.components.iter().enumerate() {
             let prior = components.insert(c.instance.clone(), i);
             assert!(
@@ -138,13 +134,7 @@ impl AppliedBindings {
                 "surface client: bindings document declares component instance {} twice",
                 c.instance
             );
-            grants.insert(
-                c.instance.clone(),
-                c.grants
-                    .iter()
-                    .map(|word| ComponentGrant::parse(word))
-                    .collect::<Option<GrantSet>>(),
-            );
+            grants.insert(c.instance.clone(), c.grants.iter().copied().collect());
             declared_out_ports.insert(
                 c.instance.clone(),
                 Arc::new(
@@ -317,24 +307,10 @@ impl AppliedBindings {
     /// guest's synchronous path, once per chained call.
     ///
     /// An instance the surface does not declare holds nothing.
-    ///
-    /// # Panics
-    ///
-    /// If `instance` declares a capability word this build does not know.
-    /// [`KernelCore::apply_bindings`](crate::logic::KernelCore) refuses the whole
-    /// document on such a word — dropping it would silently disable a capability
-    /// the operator granted — so reaching this means the page was wired from a
-    /// document the core had not ruled on, and answering "not granted" here would
-    /// turn that into deny-by-typo.
     pub fn instance_granted(&self, instance: &str, grant: ComponentGrant) -> bool {
-        match self.grants.get(instance) {
-            None => false,
-            Some(Some(held)) => held.contains(&grant),
-            Some(None) => panic!(
-                "surface client: instance {instance} declares a capability word this build does \
-                 not know, and the kernel core refuses such a document before the page is wired"
-            ),
-        }
+        self.grants
+            .get(instance)
+            .is_some_and(|held| held.contains(&grant))
     }
 
     /// Every page-local channel this surface declares, with the ring depth its

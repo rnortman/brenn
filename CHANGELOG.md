@@ -23,6 +23,12 @@ All notable changes to Brenn are documented here.
   re-run through `brennfmt`; the in-tree configs are already updated.
   One known defect stays open (`dsl-fmt-orphan-terminator` in `TODO.md`):
   a stray space can still precede a section keyword that starts a document.
+- A surface page that receives a component-bindings document it cannot use
+  (the list of components the page hosts and what each may do) now reports
+  the error and reloads, up to the usual reload cap, instead of failing.
+  The usual cause is a browser holding assets older than the server. Past
+  the cap the page stays connected, refuses the document again on each
+  reconnect, and configures itself once a readable document arrives.
 - Config errors about a wrongly-typed list element (for example a quoted
   `"publish"` where a bare word belongs in `grants`) now point at the
   offending element instead of the list's opening `[`, and no longer carry an

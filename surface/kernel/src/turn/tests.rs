@@ -18,12 +18,13 @@ use brenn_surface_contract::MOUNT_SYNC_PORT;
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::telemetry::{InstanceReport, StatusCounters};
 use brenn_surface_schema::{
-    Binding, CONTROL_PLANE_VERSION, InstanceState, LOCAL_OVERLAY_STATE_CHANNEL, NoiseLevel,
-    OverlayStateBody,
+    Binding, CONTROL_PLANE_VERSION, ComponentGrant, InstanceState, LOCAL_OVERLAY_STATE_CHANNEL,
+    LinkState, NoiseLevel, OverlayStateBody,
 };
 use uuid::Uuid;
 
 use crate::activation::ActivationOutcome;
+use crate::logic::KernelCore;
 use crate::outbound::PublishStatus;
 use crate::outbound::{PortPublish, resolve_output};
 use crate::publish_buffer::PublishBuffer;
@@ -1378,7 +1379,11 @@ fn a_sync_activation_settles_the_mount_debt() {
 /// — the one distinction the unmounted gate reads.
 fn mounting_with_renderer() -> SurfacePage {
     let mut document = doc();
-    document.components[0].grants = vec!["dom".to_string(), "log".to_string(), "ports".to_string()];
+    document.components[0].grants = vec![
+        ComponentGrant::Ports,
+        ComponentGrant::Log,
+        ComponentGrant::Dom,
+    ];
     pages::mounting_page(
         CONFIG,
         EPOCH,
@@ -1603,5 +1608,177 @@ fn a_trapped_reply_discards_the_buffer() {
     assert!(
         retained(&page, NOTES).is_empty(),
         "the buffer of a trapped activation is discarded, not routed",
+    );
+}
+
+/// One config-channel delivery carrying `body` as its only row, at `seq`.
+fn config_delivery(body: &str, seq: u64) -> Input {
+    Input::Frame(ServerFrame::Deliver {
+        channel: CONFIG.to_string(),
+        rows: vec![crate::test_support::frames::row(
+            CONFIG,
+            body,
+            seq,
+            0xc0f1_0000 + u128::from(seq),
+        )],
+    })
+}
+
+/// What `core` answers to every event the turn emitted, in order.
+fn core_answers(core: &mut KernelCore, effects: &[Effect]) -> Vec<crate::logic::KernelAction> {
+    events(effects)
+        .into_iter()
+        .flat_map(|event| core.on_event(event))
+        .collect()
+}
+
+/// The turn hands the refusal up as skew and `core` reloads on it, reporting
+/// the refusal in its own words — never the fatal a broken contract takes, and
+/// never a close of the attachment.
+fn assert_refused_with_a_reload(core: &mut KernelCore, effects: &[Effect], named: &str) {
+    use crate::logic::KernelAction;
+    assert!(
+        events(effects)
+            .iter()
+            .any(|event| matches!(event, Event::BindingsUnusable { .. })),
+        "the refusal is announced: {effects:?}"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::GoFatal { .. } | Effect::Close)),
+        "an unusable document is neither fatal nor a close: {effects:?}"
+    );
+    let actions = core_answers(core, effects);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            KernelAction::Report {
+                level: crate::schema::LogLevel::Error,
+                message,
+                ..
+            } if message.contains(named)
+        )),
+        "the report names {named:?}: {actions:?}"
+    );
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            KernelAction::RequestReload { reason } if reason == "unusable bindings document"
+        )),
+        "the core reloads: {actions:?}"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, KernelAction::StartProcessors { .. })),
+        "nothing is started from a refused document: {actions:?}"
+    );
+}
+
+#[test]
+fn an_unknown_grant_word_in_a_first_document_reloads() {
+    let mut page = pages::attached_page(CONFIG, EPOCH, pages::facts());
+    let effects = feed(
+        &mut page,
+        config_delivery(&fixtures::body_with_unknown_grant(doc()), 1),
+    );
+    assert_refused_with_a_reload(&mut KernelCore::new(), &effects, "telepathy");
+    assert!(page.bindings().is_none(), "nothing is in force");
+}
+
+#[test]
+fn an_unknown_grant_word_in_a_changed_document_reloads() {
+    let mut page = pages::attached_page(CONFIG, EPOCH, pages::facts());
+    let first = doc().to_body();
+    let mut core = KernelCore::new();
+    let connected = feed(&mut page, config_delivery(&first, 1));
+    assert!(
+        events(&connected)
+            .iter()
+            .any(|event| matches!(event, Event::Connected { .. })),
+        "the first document connects the page: {connected:?}"
+    );
+    core_answers(&mut core, &connected);
+    assert_eq!(core.link_state(), &LinkState::Connected);
+    let effects = feed(
+        &mut page,
+        config_delivery(&fixtures::body_with_unknown_grant(doc()), 2),
+    );
+    assert_refused_with_a_reload(&mut core, &effects, "telepathy");
+    assert_eq!(core.link_state(), &LinkState::Reloading);
+    assert!(
+        core.instance_granted("p1", ComponentGrant::Ports),
+        "the core keeps the wiring in force until the navigation"
+    );
+    assert!(
+        !events(&effects)
+            .iter()
+            .any(|event| matches!(event, Event::WiringChanged)),
+        "the refusal, not a wiring change, answers the document: {effects:?}"
+    );
+    assert_eq!(
+        page.bindings().map(|applied| applied.body()),
+        Some(first.as_str()),
+        "the prior document stays in force"
+    );
+}
+
+#[test]
+fn a_schema_version_mismatch_reloads() {
+    let mut page = pages::attached_page(CONFIG, EPOCH, pages::facts());
+    let mut skewed = doc();
+    skewed.v = crate::schema::bindings::BINDINGS_DOCUMENT_VERSION + 1;
+    let effects = feed(&mut page, config_delivery(&skewed.to_body(), 1));
+    assert_refused_with_a_reload(&mut KernelCore::new(), &effects, "schema version");
+    assert!(page.bindings().is_none(), "nothing is in force");
+}
+
+/// A page whose first document was refused keeps its attachment — the state a
+/// page past the bootstrap's reload cap is left in. A reconnect redelivers the
+/// document and it is refused again; a readable one configures the page.
+#[test]
+fn a_refused_first_document_is_refused_again_on_reconnect_and_a_readable_one_connects() {
+    let mut page = pages::attached_page(CONFIG, EPOCH, pages::facts());
+    let refused = fixtures::body_with_unknown_grant(doc());
+    let effects = feed(&mut page, config_delivery(&refused, 1));
+    assert_refused_with_a_reload(&mut KernelCore::new(), &effects, "telepathy");
+
+    feed(
+        &mut page,
+        Input::Conn(ConnEvent::Detached {
+            reason: brenn_attach_client::conn::DetachReason::LivenessTimeout,
+        }),
+    );
+    let reattached = feed(&mut page, Input::Conn(ConnEvent::Attached(pages::facts())));
+    assert!(
+        frames(&reattached).iter().any(
+            |frame| matches!(frame, ClientFrame::Subscribe { channel, .. } if channel == CONFIG)
+        ),
+        "the reattachment subscribes the config channel again: {reattached:?}"
+    );
+    feed(
+        &mut page,
+        Input::Frame(ServerFrame::SubscribeResult {
+            channel: CONFIG.to_string(),
+            outcome: SubscribeOutcome::Ok,
+            replay_count: 1,
+            gap: None,
+        }),
+    );
+    let again = feed(&mut page, config_delivery(&refused, 1));
+    assert_refused_with_a_reload(&mut KernelCore::new(), &again, "telepathy");
+    assert!(page.bindings().is_none(), "nothing is in force");
+
+    let readable = feed(&mut page, config_delivery(&doc().to_body(), 2));
+    assert!(
+        events(&readable)
+            .iter()
+            .any(|event| matches!(event, Event::Connected { .. })),
+        "a readable document configures the page: {readable:?}"
+    );
+    assert!(
+        page.bindings().is_some(),
+        "the readable document is in force"
     );
 }

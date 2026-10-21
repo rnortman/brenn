@@ -122,6 +122,12 @@ impl LogLevel {
 /// on overflow.
 pub use brenn_envelope::NoiseLevel;
 
+/// A component instance's capability grant, carried on [`ComponentEntry`] in
+/// its serde (`kebab-case`) spelling. The one grant vocabulary, defined in
+/// `brenn-envelope` so the configuration front end, the backend host and the
+/// page kernel name one type.
+pub use brenn_envelope::grants::ComponentGrant;
+
 // ---------------------------------------------------------------------------
 // Bindings
 // ---------------------------------------------------------------------------
@@ -156,23 +162,21 @@ pub struct ComponentEntry {
     /// the link down, so their flushes queue in page memory, and the operator
     /// bounds that queue per instance like any other.
     pub parked_batch_depth: u64,
-    /// The capability interfaces this instance is given, deny-by-default, in
-    /// canonical `ComponentGrant::word()` spellings, sorted and deduplicated.
+    /// The capability interfaces this instance is given, deny-by-default. The
+    /// writer emits them deduplicated and in `ComponentGrant`'s `Ord`, so the
+    /// document stays byte-stable.
     ///
     /// Enforced page-side: the kernel gates every privileged entry a component
     /// reaches on this list — the publish/defer family, the log router, the alert
     /// router, config reads, and the two DOM capabilities. A word this build
-    /// cannot parse means server/kernel skew and refuses the whole document.
+    /// does not know fails the document parse: server/kernel skew, which the
+    /// kernel answers with the capped reload.
     ///
     /// The backend judges the same grants again, at boot against a processor's
     /// imports and the surface's own grants, and per frame for an attributed
     /// alert. Page-side gating is containment within the page; the backend's is
     /// the security boundary.
-    ///
-    /// TODO(bindings-doc-typed-grants): carry `ComponentGrant` itself rather
-    /// than its spelling, so an unparseable word is a document-parse error
-    /// instead of a reparse obligation on every reader.
-    pub grants: Vec<String>,
+    pub grants: Vec<ComponentGrant>,
     /// Every port name this instance's component kind declares with direction
     /// `out` or `io` — the complete vocabulary of names it may legally publish
     /// to. Sorted and duplicate-free, so the document stays byte-stable.

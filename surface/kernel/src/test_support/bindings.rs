@@ -16,7 +16,7 @@ use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Binding, ComponentEntry, LocalChannel, NoiseLevel, OutputBinding, Urgency,
+    Binding, ComponentEntry, ComponentGrant, LocalChannel, NoiseLevel, OutputBinding, Urgency,
 };
 
 /// The chrome instance every fixture document names, declared like any other
@@ -36,19 +36,27 @@ pub(crate) fn component(instance: &str) -> ComponentEntry {
 /// privileged seam gets the shape a real page has; a suite about the gate itself
 /// says so with [`component_with_grants`].
 pub(crate) fn component_of_kind(instance: &str, kind: &str) -> ComponentEntry {
-    component_with_grants(instance, kind, &["ports", "log"])
+    component_with_grants(
+        instance,
+        kind,
+        &[ComponentGrant::Ports, ComponentGrant::Log],
+    )
 }
 
-/// As [`component_of_kind`], with the capability words spelled out — for the
+/// As [`component_of_kind`], with the capabilities spelled out — for the
 /// suite whose subject is what an instance may do, including the ungranted case
 /// (`&[]`), which no default may stand in for.
-pub(crate) fn component_with_grants(instance: &str, kind: &str, grants: &[&str]) -> ComponentEntry {
+pub(crate) fn component_with_grants(
+    instance: &str,
+    kind: &str,
+    grants: &[ComponentGrant],
+) -> ComponentEntry {
     ComponentEntry {
         instance: instance.to_string(),
         kind: kind.to_string(),
         parked_batch_depth: 2,
         config: BTreeMap::new(),
-        grants: grants.iter().map(|g| (*g).to_string()).collect(),
+        grants: grants.to_vec(),
         // Left empty here and folded from the wiring by [`imply_vocabularies`]:
         // a fixture component states a vocabulary only when the vocabulary is
         // what the suite is about.
@@ -164,4 +172,21 @@ pub(crate) fn doc(
         platform: platform(),
         calls: vec![],
     })
+}
+
+/// `doc`'s body with its first component's grant list naming `telepathy`, a word
+/// this build does not know: the body of a server newer than this page.
+///
+/// The grant list is set here before the splice, so the splice does not depend
+/// on any fixture's default grants.
+pub(crate) fn body_with_unknown_grant(mut doc: BindingsDocument) -> String {
+    doc.components[0].grants = vec![ComponentGrant::Ports];
+    let body = doc.to_body();
+    let skewed = body.replacen(
+        r#""grants":["ports"]"#,
+        r#""grants":["ports","telepathy"]"#,
+        1,
+    );
+    assert_ne!(skewed, body, "the splice lands on the grant list set above");
+    skewed
 }

@@ -270,13 +270,13 @@ fn phase_two_puts_the_wiring_in_force() {
 }
 
 #[test]
-fn a_document_this_kernel_cannot_apply_is_fatal() {
+fn a_document_this_kernel_cannot_apply_is_refused() {
     let mut subs = Subscriptions::new();
     let mut connect = awaiting_config(&mut subs);
 
     let err = connect
         .on_config_deliver("{\"v\":1,\"nonsense\":true}")
-        .expect_err("an unusable document is fatal");
+        .expect_err("an unusable document is refused");
 
     assert!(err.contains("bindings document is unusable"), "{err}");
     // Nothing half-applied.

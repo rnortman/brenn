@@ -649,12 +649,62 @@ fn the_config_channels_delivery_is_phase_two() {
 }
 
 #[test]
-fn an_unusable_config_document_is_fatal() {
+fn an_unusable_config_document_is_refused_not_fatal() {
     let mut page = attached();
-    let err = on_server_frame(&mut page, deliver(CONFIG, r#"{"v":99}"#, 1, 0), NOW)
-        .expect_err("a document from another version cannot be applied");
-    assert!(err.contains("unusable"));
+    let inbound = on_server_frame(&mut page, deliver(CONFIG, r#"{"v":99}"#, 1, 0), NOW)
+        .expect("a document this build cannot apply is skew, not a broken contract");
+    assert!(
+        inbound.configured.is_empty(),
+        "nothing applied: {inbound:?}"
+    );
+    let detail = inbound
+        .unusable_document
+        .expect("a document this build cannot apply is carried for the caller");
+    assert!(detail.contains("unusable"), "{detail}");
     assert!(page.bindings().is_none());
+}
+
+/// A pass whose middle document is unusable applies what came before it and
+/// nothing after: the refusal is the last thing the pass settled.
+#[test]
+fn a_config_pass_stops_at_its_first_unusable_document() {
+    let mut page = attached();
+    let narrow = body(W::default());
+    let refused = fixtures::body_with_unknown_grant(doc(W::default()));
+    let widened = {
+        let mut document = doc(W::default());
+        document
+            .subscriptions
+            .push(fixtures::subscription("p1", "in2", WIRE_TWO, 4, 2));
+        document.to_body()
+    };
+
+    let inbound = route(
+        &mut page,
+        deliver_pass(
+            CONFIG,
+            &[(&narrow, 1, 0), (&refused, 2, 0), (&widened, 3, 0)],
+        ),
+    );
+
+    assert_eq!(
+        inbound.configured.len(),
+        1,
+        "only the document before the refusal applied: {inbound:?}"
+    );
+    let detail = inbound
+        .unusable_document
+        .expect("the refusal is carried for the caller");
+    assert!(detail.contains("telepathy"), "{detail}");
+    assert_eq!(
+        page.bindings().map(|applied| applied.body()),
+        Some(narrow.as_str()),
+        "the document in force is the one before the refusal"
+    );
+    assert!(
+        page.stores.get(WIRE_TWO).is_none(),
+        "nothing after the refusal was applied"
+    );
 }
 
 #[test]

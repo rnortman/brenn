@@ -93,6 +93,23 @@ pub enum Event {
     /// document (both fire), and a second document mid-attachment changes the
     /// wiring without the page attaching again (only this one fires).
     WiringChanged,
+    /// The delivered bindings document is one this build cannot apply — it
+    /// does not parse, declares another schema version, fails the schema's own
+    /// validation, or names depths this build cannot allocate. On a page the
+    /// peer itself served the usual cause is assets older than the server, which
+    /// the reload cures; a server writer bug or a depth this build's target
+    /// cannot hold is not cured by it and ends at the cap. Nothing here tells
+    /// the causes apart. The platform half reloads (capped), as it does for
+    /// [`WiringChanged`](Event::WiringChanged) and
+    /// [`Incompatible`](Event::Incompatible). Not [`Fatal`](Event::Fatal): the
+    /// attachment is healthy and nothing here closes it. A page past the reload
+    /// cap therefore stays attached: each reconnect redelivers the document and
+    /// announces this again, and a readable document configures the page.
+    ///
+    /// `detail` embeds peer-supplied text (the document body's own words, via
+    /// the serde error). Render it as text only — never interpolate it into
+    /// markup or a URL.
+    BindingsUnusable { detail: String },
     /// The live attachment went away. Reconnection proceeds on the client's
     /// backoff schedule; the platform half surfaces it (a banner, the link-state
     /// plane).
@@ -292,8 +309,11 @@ impl Reactions {
     /// Fold what one routed server frame settled.
     ///
     /// The order is the order the frame produced it: the subscription frames it
-    /// enacts, then everything a document it carried applied, then the callers it
-    /// answered, then the losses it caused.
+    /// enacts, then everything a document it carried applied, then the document it
+    /// could not apply, then the callers it answered, then the losses it caused.
+    ///
+    /// An unusable document leaves the attachment as it is, as a changed one
+    /// does: the reload the platform half performs is what ends the page.
     pub fn inbound(&mut self, page: &mut SurfacePage, inbound: Inbound, now: Millis, now_ms: u64) {
         let Inbound {
             frames,
@@ -301,6 +321,7 @@ impl Reactions {
             drops,
             steps,
             configured,
+            unusable_document,
             straggler,
             gap,
             lost_flushes,
@@ -308,6 +329,9 @@ impl Reactions {
         self.frames(page, frames);
         for configured in configured {
             self.configured(page, configured, now, now_ms);
+        }
+        if let Some(detail) = unusable_document {
+            self.emit(Event::BindingsUnusable { detail });
         }
         self.answers(answers);
         self.steps(page, steps);

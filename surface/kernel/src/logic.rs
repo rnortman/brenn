@@ -525,41 +525,18 @@ struct DocumentRefusal {
 
 /// Index every component entry's per-instance facts, or refuse the document.
 ///
-/// An unknown word is server/kernel build skew — the document was written by a
-/// backend whose vocabulary this page's assets predate — and the page's answer is
-/// to refuse the whole document rather than guess which capability was meant.
-/// Guessing in either direction is wrong: dropping the word silently disables a
-/// capability the operator granted, and admitting it grants one this build cannot
-/// enforce.
-///
-/// A repeated instance id is refused on the same terms. The config layer refuses
-/// duplicate instance names, so a document carrying one is a server bug; keeping
+/// A repeated instance id is refused. The config layer refuses duplicate
+/// instance names, so a document carrying one is a server bug; keeping
 /// either entry would enforce one entry's grants while every other reader of this
 /// list (the config map, the mount plan) took the first — one instance name
 /// standing for two different components.
-fn parse_instance_facts(
+fn index_instance_facts(
     bindings: &BindingsDocument,
 ) -> Result<HashMap<String, InstanceFacts>, DocumentRefusal> {
     let mut parsed = HashMap::with_capacity(bindings.components.len());
     for entry in &bindings.components {
-        let mut grants = GrantSet::new();
-        for word in &entry.grants {
-            match ComponentGrant::parse(word) {
-                Some(grant) => {
-                    grants.insert(grant);
-                }
-                None => {
-                    return Err(DocumentRefusal {
-                        message: format!(
-                            "refused the bindings document: {word:?} is not a capability this build knows, so this page's assets are older than the server's vocabulary"
-                        ),
-                        reason: "unknown component grant",
-                    });
-                }
-            }
-        }
         let facts = InstanceFacts {
-            grants,
+            grants: entry.grants.iter().copied().collect(),
             sync_ports: entry.sync_ports.iter().cloned().collect(),
             call_ports: entry.call_ports.iter().cloned().collect(),
         };
@@ -1146,22 +1123,25 @@ impl KernelCore {
             // that can heal it, and the bootstrap's cap bounds a genuine
             // incompatibility to a finite number of attempts. Both ranges are
             // reported first, since after the reload nothing remembers them.
-            Event::Incompatible { ours, theirs } => {
-                let mut actions = vec![KernelAction::Report {
-                    level: LogLevel::Error,
-                    message: format!(
-                        "surface transport version mismatch: this build speaks {}..={}, \
-                         the server speaks {}..={}",
-                        ours.min, ours.max, theirs.min, theirs.max
-                    ),
-                    subject: None,
-                }];
-                actions.extend(self.set_link_state(LinkState::Reloading));
-                actions.push(KernelAction::RequestReload {
-                    reason: "protocol version".to_string(),
-                });
-                actions
-            }
+            Event::Incompatible { ours, theirs } => self.report_then_reload(
+                format!(
+                    "surface transport version mismatch: this build speaks {}..={}, \
+                     the server speaks {}..={}",
+                    ours.min, ours.max, theirs.min, theirs.max
+                ),
+                "protocol version",
+            ),
+            // The delivered bindings document is one this build cannot apply.
+            // Stale page assets are the usual cause, the same skew as a
+            // transport mismatch, and the same capped reload cures them; a
+            // refusal the reload cannot cure ends at the cap. `detail` already
+            // names what refused the document, so it is reported whole and no
+            // cause is claimed for it. Nothing is configured from it: the wiring
+            // in force, if any, stays until the navigation.
+            Event::BindingsUnusable { detail } => self.report_then_reload(
+                format!("{detail}; the page reloads (capped)"),
+                "unusable bindings document",
+            ),
             Event::Connected {
                 bindings,
                 alert_granted,
@@ -1346,25 +1326,14 @@ impl KernelCore {
         if self.bindings.is_some() {
             return self.set_link_state(LinkState::Connected);
         }
-        // Vocabulary first: a document naming a capability this build cannot
-        // enforce is refused whole, before a single instance is configured from
-        // it. Stale assets are the only way it happens and the capped bootstrap
-        // reload is the only thing that heals it — the same answer, for the same
-        // reason, as a transport-version mismatch.
-        let instance_facts = match parse_instance_facts(bindings) {
+        // Instances first: a document declaring one instance twice is refused
+        // whole, before a single instance is configured from it. The core does
+        // not assume the document was validated before it was handed one, so
+        // the refusal is its own; the capped reload is its answer, as for any
+        // document this page cannot run.
+        let instance_facts = match index_instance_facts(bindings) {
             Ok(parsed) => parsed,
-            Err(refusal) => {
-                let mut actions = vec![KernelAction::Report {
-                    level: LogLevel::Error,
-                    message: refusal.message,
-                    subject: None,
-                }];
-                actions.extend(self.set_link_state(LinkState::Reloading));
-                actions.push(KernelAction::RequestReload {
-                    reason: refusal.reason.to_string(),
-                });
-                return actions;
-            }
+            Err(refusal) => return self.report_then_reload(refusal.message, refusal.reason),
         };
         self.instance_facts = instance_facts;
         self.bindings = Some(bindings.clone());
@@ -1582,6 +1551,22 @@ impl KernelCore {
         } else {
             Vec::new()
         }
+    }
+
+    /// Report `message` at error level, then move the link to `Reloading` and ask
+    /// the platform half for the capped reload under `reason`. The report goes
+    /// first because after the navigation nothing remembers it.
+    fn report_then_reload(&mut self, message: String, reason: &str) -> Vec<KernelAction> {
+        let mut actions = vec![KernelAction::Report {
+            level: LogLevel::Error,
+            message,
+            subject: None,
+        }];
+        actions.extend(self.set_link_state(LinkState::Reloading));
+        actions.push(KernelAction::RequestReload {
+            reason: reason.to_string(),
+        });
+        actions
     }
 
     /// Publish a link-state transition on `local:brenn/link-state`, suppressing a
@@ -1862,10 +1847,10 @@ mod tests {
         }
     }
 
-    /// The same entry, holding the capability words an operator wrote for it.
-    fn granted_entry(instance: &str, kind: &str, grants: &[&str]) -> ComponentEntry {
+    /// The same entry, holding the capabilities an operator granted it.
+    fn granted_entry(instance: &str, kind: &str, grants: &[ComponentGrant]) -> ComponentEntry {
         ComponentEntry {
-            grants: grants.iter().map(|g| (*g).to_string()).collect(),
+            grants: grants.to_vec(),
             ..entry(instance, kind)
         }
     }
@@ -1959,8 +1944,16 @@ mod tests {
     fn routing_core() -> KernelCore {
         connect(
             vec![
-                granted_entry("p1", "protobar", &["log", "alert"]),
-                granted_entry("counter-a", "counter", &["log", "alert"]),
+                granted_entry(
+                    "p1",
+                    "protobar",
+                    &[ComponentGrant::Log, ComponentGrant::Alert],
+                ),
+                granted_entry(
+                    "counter-a",
+                    "counter",
+                    &[ComponentGrant::Log, ComponentGrant::Alert],
+                ),
             ],
             true,
         )
@@ -2111,8 +2104,12 @@ mod tests {
     fn a_configured_instances_grants_are_read_off_its_component_entry() {
         let core = connect(
             vec![
-                granted_entry("p1", "protobar", &["ports", "alert"]),
-                granted_entry("p2", "protobar", &["ports"]),
+                granted_entry(
+                    "p1",
+                    "protobar",
+                    &[ComponentGrant::Ports, ComponentGrant::Alert],
+                ),
+                granted_entry("p2", "protobar", &[ComponentGrant::Ports]),
             ],
             true,
         );
@@ -2127,7 +2124,10 @@ mod tests {
     #[test]
     fn an_undeclared_instance_and_an_unconfigured_page_both_hold_nothing() {
         assert!(KernelCore::new().instance_grants("p1").is_empty());
-        let core = connect(vec![granted_entry("p1", "protobar", &["alert"])], true);
+        let core = connect(
+            vec![granted_entry("p1", "protobar", &[ComponentGrant::Alert])],
+            true,
+        );
         assert!(
             core.instance_grants("ghost").is_empty(),
             "deny-by-default, and no existence oracle in the difference"
@@ -2220,54 +2220,20 @@ mod tests {
         );
     }
 
-    /// Build skew: the server's vocabulary has a word this page's assets predate.
-    /// The page refuses the whole document and takes the capped reload rather than
-    /// guessing which capability was meant.
-    #[test]
-    fn a_document_naming_an_unknown_capability_is_refused_whole() {
-        let mut core = KernelCore::new();
-        let actions = core.on_event(&connected_event_granted(
-            vec![granted_entry("p1", "protobar", &["ports", "telepathy"])],
-            vec![],
-            true,
-        ));
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                KernelAction::RequestReload { reason } if reason == "unknown component grant"
-            )),
-            "expected a reload request, got {actions:?}"
-        );
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                KernelAction::Report { level: LogLevel::Error, message, .. }
-                    if message.contains("telepathy")
-            )),
-            "expected a report naming the word, got {actions:?}"
-        );
-        assert!(
-            core.instance_grants("p1").is_empty(),
-            "nothing from a refused document is in force"
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, KernelAction::StartProcessors { .. })),
-            "no instance is configured from a refused document: {actions:?}"
-        );
-    }
-
-    /// A server bug rather than skew, and refused on the same terms: with two
-    /// entries under one name, the grants in force would come from one and the
-    /// config map every other reader finds from the other.
+    /// A server bug, and refused whole: with two entries under one name, the
+    /// grants in force would come from one and the config map every other
+    /// reader finds from the other.
     #[test]
     fn a_document_declaring_one_instance_twice_is_refused_whole() {
         let mut core = KernelCore::new();
         let actions = core.on_event(&connected_event_granted(
             vec![
-                granted_entry("p1", "protobar", &["ports"]),
-                granted_entry("p1", "protobar", &["ports", "alert"]),
+                granted_entry("p1", "protobar", &[ComponentGrant::Ports]),
+                granted_entry(
+                    "p1",
+                    "protobar",
+                    &[ComponentGrant::Ports, ComponentGrant::Alert],
+                ),
             ],
             vec![],
             true,
@@ -2687,8 +2653,8 @@ mod tests {
     fn the_dom_grant_is_what_earns_a_host_element_at_registration() {
         let mut core = KernelCore::new();
         core.on_event(&connected_event(vec![
-            granted_entry("panel-a", "panel", &["dom"]),
-            granted_entry("counter-a", "counter", &["config"]),
+            granted_entry("panel-a", "panel", &[ComponentGrant::Dom]),
+            granted_entry("counter-a", "counter", &[ComponentGrant::Config]),
         ]));
 
         let ProcessorRegistration {
@@ -2727,7 +2693,11 @@ mod tests {
     fn a_page_hosted_chrome_is_not_failed_by_the_mount_plan() {
         let mut core = KernelCore::new();
         let mut bindings = document(
-            vec![granted_entry("chrome", "chrome", &["dom", "page-dom"])],
+            vec![granted_entry(
+                "chrome",
+                "chrome",
+                &[ComponentGrant::Dom, ComponentGrant::PageDom],
+            )],
             vec![],
         );
         bindings.chrome_instance = "chrome".to_string();
@@ -2747,8 +2717,12 @@ mod tests {
         let mut core = KernelCore::new();
         let mut bindings = document(
             vec![
-                granted_entry("chrome", "chrome", &["dom", "page-dom"]),
-                granted_entry("panel-a", "panel", &["dom"]),
+                granted_entry(
+                    "chrome",
+                    "chrome",
+                    &[ComponentGrant::Dom, ComponentGrant::PageDom],
+                ),
+                granted_entry("panel-a", "panel", &[ComponentGrant::Dom]),
             ],
             vec![],
         );
@@ -2802,7 +2776,7 @@ mod tests {
         core.on_event(&connected_event(vec![granted_entry(
             "panel-a",
             "panel",
-            &["dom"],
+            &[ComponentGrant::Dom],
         )]));
 
         let actions = core.on_event(&Event::ActivationFailed {
@@ -2831,7 +2805,7 @@ mod tests {
         core.on_event(&connected_event(vec![granted_entry(
             "panel-a",
             "panel",
-            &["dom"],
+            &[ComponentGrant::Dom],
         )]));
 
         let failure = Event::ActivationFailed {
@@ -2863,7 +2837,7 @@ mod tests {
         core.on_event(&connected_event(vec![granted_entry(
             "panel-a",
             "panel",
-            &["dom"],
+            &[ComponentGrant::Dom],
         )]));
 
         let first = Event::ActivationFailed {
@@ -2906,7 +2880,7 @@ mod tests {
         core.on_event(&connected_event(vec![granted_entry(
             "panel-a",
             "panel",
-            &["dom"],
+            &[ComponentGrant::Dom],
         )]));
 
         let shared = "b".repeat(MAX_LOG_MESSAGE_BYTES);
@@ -2937,8 +2911,8 @@ mod tests {
     fn the_same_activation_failure_on_another_instance_reports_at_error() {
         let mut core = KernelCore::new();
         core.on_event(&connected_event(vec![
-            granted_entry("panel-a", "panel", &["dom"]),
-            granted_entry("panel-b", "panel", &["dom"]),
+            granted_entry("panel-a", "panel", &[ComponentGrant::Dom]),
+            granted_entry("panel-b", "panel", &[ComponentGrant::Dom]),
         ]));
 
         let message = "TypeError: expected a string".to_string();
@@ -2984,8 +2958,8 @@ mod tests {
     fn a_dead_rendering_instance_is_carded_and_a_headless_one_is_not() {
         let mut core = KernelCore::new();
         core.on_event(&connected_event(vec![
-            granted_entry("panel-a", "panel", &["dom"]),
-            granted_entry("counter-a", "counter", &["config"]),
+            granted_entry("panel-a", "panel", &[ComponentGrant::Dom]),
+            granted_entry("counter-a", "counter", &[ComponentGrant::Config]),
         ]));
 
         let carded = core.on_event(&Event::InstanceFailed {
@@ -3069,7 +3043,7 @@ mod tests {
         core.on_event(&connected_event(vec![granted_entry(
             "panel-a",
             "panel",
-            &["dom"],
+            &[ComponentGrant::Dom],
         )]));
 
         let reason = "b".repeat(MAX_LOG_MESSAGE_BYTES * 2);
@@ -3258,8 +3232,12 @@ mod tests {
         let mut core = KernelCore::new();
         let mut bindings = document(
             vec![
-                granted_entry("chrome", "chrome", &["dom", "page-dom"]),
-                granted_entry("panel-a", "panel", &["dom"]),
+                granted_entry(
+                    "chrome",
+                    "chrome",
+                    &[ComponentGrant::Dom, ComponentGrant::PageDom],
+                ),
+                granted_entry("panel-a", "panel", &[ComponentGrant::Dom]),
             ],
             vec![],
         );
@@ -3375,13 +3353,13 @@ mod tests {
         headless
             .config
             .insert("mode".to_string(), "loud".to_string());
-        headless.grants = vec!["config".to_string()];
-        let mut placed = granted_entry("p1", "protobar", &["config"]);
+        headless.grants = vec![ComponentGrant::Config];
+        let mut placed = granted_entry("p1", "protobar", &[ComponentGrant::Config]);
         placed
             .config
             .insert("mode".to_string(), "quiet".to_string());
         let mut sibling = entry("counter-b", "counter");
-        sibling.grants = vec!["config".to_string()];
+        sibling.grants = vec![ComponentGrant::Config];
         core.on_event(&connected_event(vec![headless, placed, sibling]));
 
         assert_eq!(
@@ -3429,7 +3407,10 @@ mod tests {
     /// breadcrumb naming the entry and the capability.
     #[test]
     fn every_ports_entry_shares_one_verdict() {
-        let granted = connect(vec![granted_entry("p1", "protobar", &["ports"])], true);
+        let granted = connect(
+            vec![granted_entry("p1", "protobar", &[ComponentGrant::Ports])],
+            true,
+        );
         let ungranted = ungranted_core();
         // The kernel export, and the WIT entry it asks under.
         let seams = [
@@ -3465,10 +3446,16 @@ mod tests {
     /// here, which is the whole reason the two verdicts are separate.
     #[test]
     fn the_calls_gate_is_not_the_ports_gate() {
-        let granted = connect(vec![granted_entry("p1", "protobar", &["calls"])], true);
+        let granted = connect(
+            vec![granted_entry("p1", "protobar", &[ComponentGrant::Calls])],
+            true,
+        );
         assert_eq!(granted.component_calls_gate("p1"), Ok(()));
 
-        let ports_only = connect(vec![granted_entry("p1", "protobar", &["ports"])], true);
+        let ports_only = connect(
+            vec![granted_entry("p1", "protobar", &[ComponentGrant::Ports])],
+            true,
+        );
         for instance in ["p1", "ghost"] {
             let Err(KernelAction::Report {
                 level,
@@ -3750,6 +3737,57 @@ mod tests {
         assert_eq!(
             control_body(&actions, LOCAL_LINK_STATE_CHANNEL),
             r#"{"v":1,"state":"reloading"}"#
+        );
+    }
+
+    #[test]
+    fn an_unusable_bindings_document_reports_and_reloads() {
+        // A document this build cannot apply arrives on a live link too: the
+        // refusal is reported whole, then the capped reload, and the wiring
+        // already in force stays until the navigation.
+        let mut core = connect(
+            vec![granted_entry("p1", "echo-stub", &[ComponentGrant::Ports])],
+            true,
+        );
+        assert_eq!(core.link_state(), &LinkState::Connected);
+        let detail = "the surface bindings document is unusable: bindings document \
+                      does not parse: unknown variant `telepathy`"
+            .to_string();
+        let actions = core.on_event(&Event::BindingsUnusable {
+            detail: detail.clone(),
+        });
+        assert!(
+            matches!(actions.first(), Some(KernelAction::Report { .. })),
+            "the report comes first: {actions:?}"
+        );
+        assert!(
+            matches!(actions.last(), Some(KernelAction::RequestReload { .. })),
+            "the reload comes last: {actions:?}"
+        );
+        let rest = without_platform_planes(&actions);
+        let [KernelAction::Report { level, message, .. }, reload] = rest.as_slice() else {
+            panic!("expected a report then a reload, got {actions:?}");
+        };
+        assert_eq!(*level, LogLevel::Error);
+        assert!(
+            message.starts_with(&detail),
+            "the detail leads the message: {message}"
+        );
+        assert_eq!(
+            *reload,
+            KernelAction::RequestReload {
+                reason: "unusable bindings document".to_string(),
+            }
+        );
+        assert_eq!(
+            control_body(&actions, LOCAL_LINK_STATE_CHANNEL),
+            r#"{"v":1,"state":"reloading"}"#
+        );
+        assert_eq!(core.link_state(), &LinkState::Reloading);
+        assert!(
+            core.instance_granted("p1", ComponentGrant::Ports),
+            "the wiring in force before the refusal stays: {:?}",
+            core.instance_grants("p1")
         );
     }
 
