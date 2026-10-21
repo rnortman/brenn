@@ -10,8 +10,7 @@ impl WsConnection {
     /// UI-channel activity: notify the active bridge so its idle-hook
     /// timer can cancel-and-rearm. No-op when no current bridge exists.
     /// Called at the top of UI-channel handlers (todo mutations, artifact
-    /// viewer interactions). See `docs/designs/idle-hooks.md` § "Defining
-    /// 'idle'".
+    /// viewer interactions).
     ///
     /// Called *before* per-handler validation (e.g. `reject_todo_no_graf`)
     /// — the user's intent to engage the conversation counts even when

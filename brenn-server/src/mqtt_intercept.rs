@@ -520,7 +520,7 @@ mod tests {
         // Policy lacks the `MqttPublish` grant (test_new_for_mqtt_no_grant
         // fixture). A valid mqtt: address is denied by the shared enforcement;
         // the intercept's secondary `has_grant` check (false) selects the
-        // grant-absent "not enabled" remedy string (design §2.3).
+        // grant-absent "not enabled" remedy string.
         let bridge = crate::active_bridge::ActiveBridge::test_new_for_mqtt_no_grant().await;
         let req = post_tool_use_req(
             MCP_MQTT_SEND_TOOL,
@@ -595,7 +595,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Seam C — MQTT publish per-client ACL (design §2.4)
+    // MQTT publish per-client ACL
     // -----------------------------------------------------------------------
 
     /// Denied (tool error naming `mqtt_publish`) when the app holds `MqttPublish`
@@ -654,7 +654,7 @@ mod tests {
     }
 
     /// Allowed: the client is in the `mqtt_publish` ACL **and** a connector exists,
-    /// so the publish passes the Seam-C check and reaches `MqttService::publish`.
+    /// so the publish passes the ACL check and reaches `MqttService::publish`.
     /// Without a live broker the publish returns `NotConnected`, but reaching that
     /// error proves the ACL check passed and connector resolution succeeded (it is
     /// distinct from both the ACL-denied and the no-connector errors).
@@ -692,7 +692,7 @@ mod tests {
         }
     }
 
-    /// Visibility is not enforcement (design §2.6 invariant): the Seam-C ACL check
+    /// Visibility is not enforcement: the per-client ACL check
     /// fires for a client not in `mqtt_publish` **even when a connector for that
     /// client exists**. Connector presence (the legacy proto-ACL) never implies
     /// authorization — authorization is the explicit `mqtt_publish` ACL.

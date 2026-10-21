@@ -311,8 +311,7 @@ pub fn graf_manifest_env(app: &brenn_lib::config::AppConfig) -> Option<(String, 
 /// graf's todo machinery uses this to compute "today" in the user's
 /// local zone (completion-log headers, tentative_date advances, horizon
 /// filters). The LLM can override per-call via graf's `today` MCP
-/// parameter; this env var is the fallback default. See
-/// `docs/designs/graf-user-tz.md`.
+/// parameter; this env var is the fallback default.
 ///
 /// Type matches `graf_manifest_env` so both pairs can be collected into
 /// the same `Vec<(String, String)>`.

@@ -2,8 +2,6 @@
 //! UI have gone quiet, runs registered hooks, and delivers their aggregated
 //! output to CC as a single compact-JSON system message.
 //!
-//! See `docs/designs/idle-hooks.md` for the full design.
-//!
 //! The bridge owns the timer and registration. This module holds the
 //! `IdleHook` trait, the first concrete hook (`DirtyRepoHook`), and the
 //! free functions `run_idle_hooks` / `run_idle_hooks_for_shutdown` that
@@ -180,8 +178,7 @@ impl DirtyRepoHook {
             // All clean. Clear the one-shot ourselves so the next dirty
             // cycle can fire again. (We don't rely on `on_resolved` here
             // because the framework calls `on_resolved` on every `None`,
-            // including the suppressed-dirty branch below — see
-            // "One-shot semantics" in the design.)
+            // including the suppressed-dirty branch below.)
             self.reminder_sent.store(false, Ordering::SeqCst);
             return None;
         }
@@ -196,7 +193,7 @@ impl DirtyRepoHook {
 
 /// Run all registered hooks under the regular timer-fired path.
 ///
-/// Steps (per `docs/designs/idle-hooks.md` "What `run_idle_hooks` does"):
+/// Steps:
 /// 1. Re-check compaction phase. If anything other than `Normal`, bail —
 ///    the next post-compaction turn-end will arm a fresh timer.
 /// 2. Concurrently call `hook.check()` on every registered hook whose

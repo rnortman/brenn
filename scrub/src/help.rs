@@ -70,7 +70,8 @@ stdin: the git pre-push contract, one line per ref (githooks(5)):
        An all-zero remote sha means a new ref (scanned back to the merge-base
        with the default branch); an all-zero local sha means a deletion
        (nothing to scan).
-scans: per-commit diffs with every rule; tip trees with the tree rule set.
+scans: per-commit diffs with every rule; tip trees with every rule the repo's
+       config does not tag `diff-only`.
 exits: 0 clean; 1 on findings. With --warn-only, findings are reported and the
        exit is 0 -- the pre-green rollout state.
 called by: .githooks/pre-push. Not a human-facing command -- there is no
@@ -84,8 +85,9 @@ tree is declared on.
 
 stdin: nothing -- do not pipe input. Piped input is ignored entirely.
 scans: tracked files only (never untracked or ignored ones), from the working
-       tree, so uncommitted fixes count. Diff-only rules are dropped, since a
-       grandfathered backlog would otherwise make the scan permanently red.
+       tree, so uncommitted fixes count. Rules tagged `diff-only` in
+       .gitleaks.toml are dropped here and enforced on diffs only -- the
+       opt-in for a repo still burning down a backlog.
        A submodule is scanned as the pointer git records for it, named on
        stderr; its own contents belong to another repository and are scanned
        under that repository's gates.

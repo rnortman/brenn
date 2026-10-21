@@ -188,7 +188,7 @@ describe("_handleNavigateTo", () => {
         expect(assignSpy).toHaveBeenCalledWith(`${window.location.origin}/app/`);
     });
 
-    it("§4.2 pre-Welcome race: currentUserId === 0 → full navigation, no WS message, no reportClientError", async () => {
+    it("pre-Welcome race: currentUserId === 0 → full navigation, no WS message, no reportClientError", async () => {
         // pre-Welcome: currentUserId === 0 → falls back to window.location.assign
         // (same end-state as the pre-rip openWindow path, no duplicate tab).
         const { app, ws } = await mountApp();
@@ -207,7 +207,7 @@ describe("_handleNavigateTo", () => {
     });
 
     it("same-conversation no-op: already on the target conversation → no SwitchConversation sent", async () => {
-        // Receive-side same-conversation guard (app.ts) — preserve post-change per design §3.
+        // Receive-side same-conversation guard (app.ts).
         const { app, ws } = await mountApp();
         signIn(app, 1);
         app.currentConversationId = 42;

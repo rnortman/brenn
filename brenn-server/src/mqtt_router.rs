@@ -221,7 +221,7 @@ impl MqttEventRouter for MqttEventRouterImpl {
         let state = &router_state.app_state;
 
         // Find every channel on this client whose topic filter matches the actual
-        // published topic. Standard MQTT `+`/`#` matching (design §2.6). Clone the
+        // published topic. Standard MQTT `+`/`#` matching. Clone the
         // matched routes out of the read-lock so the lock is released before the
         // publish loop below `.await`s (a std `RwLockReadGuard` is not `Send`, and
         // routes are small and rarely added).
@@ -256,7 +256,7 @@ impl MqttEventRouter for MqttEventRouterImpl {
 
         // Build the payload body once (shared across all matched channels). Binary
         // payloads are represented as a placeholder; raw bytes are NOT forwarded to
-        // the LLM/browser (prompt-injection trust boundary, design §2.2).
+        // the LLM/browser (prompt-injection trust boundary).
         let payload_body = match &payload {
             InboundPayload::Text(text) => MqttPayloadBody::Text { text: text.clone() },
             InboundPayload::Binary { content_type, .. } => MqttPayloadBody::Binary {
@@ -287,7 +287,7 @@ impl MqttEventRouter for MqttEventRouterImpl {
 
             // Resolve the mqtt:<client>:<topic> channel by its derived UUID. It was
             // derived from this channel at startup and upserted, so an unresolvable
-            // channel is a host-internal invariant violation: panic (fail-fast, §2.6).
+            // channel is a host-internal invariant violation: panic (fail-fast).
             let channel = messenger
                 .directory()
                 .by_uuid(&route.channel_uuid)
@@ -469,8 +469,7 @@ mod tests {
     /// The channel identity is `mqtt:<client>:<filter>`.
     fn route(client: &str, filter: &str, urgency: Urgency) -> IngressRoute {
         // Derive the address via the shared formatter, not ad-hoc concatenation,
-        // so the test exercises the same two-caller UUID contract as production
-        // (design §2.1: "never re-concatenate ad hoc").
+        // so the test exercises the same two-caller UUID contract as production.
         let address = parsed_address_canonical(client, filter);
         IngressRoute {
             client_slug: client.to_string(),
@@ -521,7 +520,7 @@ mod tests {
         // The stored channel_uuid must be the one derived from the canonical
         // `mqtt:<client>:<topic>` address — a non-NULL-but-wrong UUID (e.g. derived
         // from only the topic, or a legacy slug) would silently break the
-        // two-caller contract (design §2.1/§2.6) and go undelivered at runtime.
+        // two-caller contract and go undelivered at runtime.
         assert_eq!(
             channel_uuid_bytes,
             mqtt_channel_uuid_from_address("mqtt:homeassistant:home/+/state")
@@ -890,7 +889,7 @@ mod tests {
         );
     }
 
-    /// A route added at runtime via `add_route` (design §2.3 step 6) is picked up
+    /// A route added at runtime via `add_route` is picked up
     /// by `deliver_inbound`: a topic matching the runtime-added filter routes to
     /// its channel even though it was not in the `set_state` table. Regression
     /// guard that `deliver_inbound` reads the (now mutable) route set, not a frozen
@@ -1004,7 +1003,7 @@ mod tests {
         router.add_route(route("homeassistant", "home/+/state", Urgency::Normal));
     }
 
-    /// `remove_route` (design §2.3 unsubscribe) drops the route for a channel:
+    /// `remove_route` drops the route for a channel:
     /// after removal a matching delivery routes nowhere (no new row), and the
     /// removal is keyed on `channel_uuid` so other routes are untouched. Inverse
     /// of `deliver_inbound_routes_runtime_added_route`.
@@ -1096,8 +1095,8 @@ mod tests {
     /// End-to-end: a matched delivery enqueues a pending-push row for the
     /// subscribing app, even with `send_budget = 0` (host ingress bypasses the
     /// CC-facing budget gate). Also asserts the client's configured urgency is
-    /// threaded into the stored message row (it drives push scheduling, design
-    /// §2.3) — a non-default `High` is used so a hardcoded/dropped urgency would
+    /// threaded into the stored message row (it drives push scheduling) — a
+    /// non-default `High` is used so a hardcoded/dropped urgency would
     /// be caught.
     #[tokio::test]
     async fn deliver_inbound_enqueues_pending_push_for_subscriber() {

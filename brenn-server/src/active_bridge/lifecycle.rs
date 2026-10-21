@@ -192,8 +192,7 @@ impl ActiveBridge {
     /// connects between the caller's check and the drain decision.
     ///
     /// In the "CC idle, all subscribers gone" branch, runs idle hooks
-    /// before killing — see `docs/designs/idle-hooks.md` § "Bridge
-    /// shutdown sequence". If a hook delivers a message, CC becomes busy
+    /// before killing. If a hook delivers a message, CC becomes busy
     /// again and the kill defers to the next turn end.
     ///
     /// Called from `remove_subscriber` (subscriber-leave path) and from
@@ -220,8 +219,8 @@ impl ActiveBridge {
         // If CC is idle, try to kill now. Re-check drain_on_idle first.
         if self.cc_idle.load(Ordering::SeqCst) {
             // Re-read drain_on_idle: a subscriber may have arrived and
-            // cleared it between steps 3 and 5. Not fully race-free (see
-            // design doc), but narrows the window dramatically.
+            // cleared it between steps 3 and 5. Not fully race-free, but
+            // narrows the window dramatically.
             if !self.drain_on_idle.load(Ordering::SeqCst) {
                 info!(
                     conversation_id = self.conversation_id,
@@ -411,9 +410,7 @@ impl ActiveBridge {
         }
         // CC just started doing something. Cancel any pending idle-hook
         // timer; the next turn end (`set_idle_and_drain`) will arm a fresh
-        // one with `delay` measured from that moment. See
-        // `docs/designs/idle-hooks.md` § "Choice: one timer, two activity
-        // sources, arm-from-now".
+        // one with `delay` measured from that moment.
         self.cancel_idle_hook_timer();
     }
 

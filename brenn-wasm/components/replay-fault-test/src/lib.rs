@@ -5,13 +5,12 @@
 //                       Host's HostTransaction::drop detects the leak and traps.
 //   TRAP              — trigger a wasm unreachable trap. Host sees a runtime error.
 //   SPIN              — infinite loop over a volatile counter (optimizer cannot elide).
-//                       Drives the fuel / epoch-deadline traps (H1046, design §4).
+//                       Drives the fuel / epoch-deadline traps.
 //   GROW              — repeated large allocation in a loop. Drives the memory.grow cap
-//                       trap (H1046, design §4).
+//                       trap.
 //   LEAK_TX_THEN_TRAP — begin a transaction, then SPIN forever inside it. Combined with a
 //                       short epoch deadline this traps mid-transaction, exercising the
-//                       host's leaked-tx rollback on a resource-exhaustion trap cause
-//                       (H1046, design §2.5.1 / §4).
+//                       host's leaked-tx rollback on a resource-exhaustion trap cause.
 //
 // Any other header value or absent header → Ok(()) (no-op).
 // Not for production use.

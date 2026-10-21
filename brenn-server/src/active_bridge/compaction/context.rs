@@ -187,8 +187,7 @@ pub(super) fn broadcast_context_usage(bridge: &ActiveBridge, usage: &ContextUsag
 /// The caller holds `bridge.db` (tokio mutex). This function may additionally
 /// acquire `active_model_slug`, `context_usage`, and `cc_version` std mutexes
 /// under it. **No code path may acquire `bridge.db.lock()` while already
-/// holding any of these std mutexes — doing so deadlocks. See
-/// docs/adr/2026/05/17-db-lock-coalesce-turn-end/design.md.**
+/// holding any of these std mutexes — doing so deadlocks.**
 pub(super) fn update_max_tokens_from_result_sync(
     bridge: &ActiveBridge,
     result: &brenn_cc::protocol::incoming::ResultMessage,

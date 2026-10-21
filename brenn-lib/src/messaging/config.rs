@@ -764,8 +764,8 @@ impl WasmConsumerConfigRaw {
     }
 }
 
-/// Resolved per-consumer activation pacing (mqtt-wasm-republish-pacing design
-/// §3.2). Carried on `ResolvedWasmConsumer` (defaults already applied) and copied
+/// Resolved per-consumer activation pacing. Carried on `ResolvedWasmConsumer`
+/// (defaults already applied) and copied
 /// through to the off-loop dispatch task, which builds a `TokenBucket` from it.
 /// Sustained activation rate is one per `min_period`; up to `burst` activations
 /// may run back-to-back after idle.
@@ -1656,8 +1656,7 @@ pub struct ResolvedWasmConsumer {
     /// spans both app kinds. See `crate::access::AppPolicy`.
     pub policy: crate::access::AppPolicy,
     /// Per-component activation pacing (defaults applied). Always present; the
-    /// off-loop dispatch task builds its `TokenBucket` from this
-    /// (mqtt-wasm-republish-pacing design §3.2).
+    /// off-loop dispatch task builds its `TokenBucket` from this.
     pub activation_pacing: ActivationPacing,
     /// Resolved MQTT egress sink budgets, keyed by `[[mqtt_client]]` slug. One entry
     /// per client the component's `mqtt_publish_acl` allows; empty when the consumer
@@ -3037,8 +3036,7 @@ pub fn finalize_directory_with_subscribers(
     MessagingDirectory::with_entries(entries)
 }
 
-/// Fold durable dynamic-subscription rows into an already-finalized directory
-/// (design §2.1 boot merge).
+/// Fold durable dynamic-subscription rows into an already-finalized directory.
 ///
 /// Runs *after* [`finalize_directory_with_subscribers`] has populated the
 /// directory with the static (config-declared) and WASM subscribers. Each row in `rows` (loaded
@@ -5009,9 +5007,6 @@ new pfin: Finance();
     }
 
     /// An absent `send_budget` resolves to the global default through resolve.
-    /// (Formerly asserted on the removed `enabled` boolean; messaging
-    /// authorization is now carried by the app's `AppPolicy`, not this struct —
-    /// access-control §2.5.1.)
     #[test]
     fn absent_send_budget_resolves_to_global_default() {
         let (dir, _) = directory_with_one_channel();
@@ -5049,7 +5044,7 @@ new pfin: Finance();
     }
 
     // -----------------------------------------------------------------------
-    // Subscriber-set wiring (design §6 "Subscriber-set wiring")
+    // Subscriber-set wiring
     // -----------------------------------------------------------------------
 
     /// `finalize_directory_with_subscribers` places a `Wasm(slug)` entry on a
@@ -5351,7 +5346,7 @@ new pfin: Finance();
     }
 
     // -----------------------------------------------------------------------
-    // wake_min inheritance (urgency-redesign §2.3)
+    // wake_min inheritance
     // -----------------------------------------------------------------------
 
     /// Global default `wake_min` is `Normal` (migration parity).
@@ -5673,7 +5668,7 @@ new router: Router { grants = []; subscribe_acls = []; io tick {} }
     }
 
     // -----------------------------------------------------------------------
-    // Dynamic-subscription boot merge (design §2.1)
+    // Dynamic-subscription boot merge
     // -----------------------------------------------------------------------
 
     fn dyn_row(
@@ -5698,7 +5693,7 @@ new router: Router { grants = []; subscribe_acls = []; io tick {} }
     /// `MessagingSubscribe` grant + a covering `brenn_subscribe` matcher (the
     /// `<channel>` part of the address, without the `brenn:` prefix). This is the
     /// delivery-holding authorization the boot ACL gate checks (no
-    /// `DynamicSubscribe` — the merge gate uses `allows_channel_access`, design §2.2).
+    /// `DynamicSubscribe` — the merge gate uses `allows_channel_access`).
     fn covering_brenn_policy(channel: &str) -> crate::access::AppPolicy {
         // Shared `test_support` constructor (reuse-2); `Exact` scopes it to the one
         // channel this merge test covers.
@@ -6044,7 +6039,7 @@ new router: Router { grants = []; subscribe_acls = []; io tick {} }
     }
 
     /// A dynamic row whose app's policy no longer covers the channel is classified
-    /// `revoked` (design §2.2): NOT folded into the directory, NOT reported as
+    /// `revoked`: NOT folded into the directory, NOT reported as
     /// `dropped` (so the boot caller does not prune it — the durable row survives
     /// dormant). The channel itself remains present but with no subscriber.
     #[test]
@@ -6116,7 +6111,7 @@ new router: Router { grants = []; subscribe_acls = []; io tick {} }
 
     /// The same row that revokes under a non-covering policy is `kept` once the
     /// policy covers the channel — pinning that the gate is the only difference and
-    /// the row resumes when the ACL is re-granted (design §2.2 "revoked → kept").
+    /// the row resumes when the ACL is re-granted.
     #[test]
     fn merge_keeps_row_when_policy_covers_channel() {
         let (dir, _addr) = directory_with_one_channel();

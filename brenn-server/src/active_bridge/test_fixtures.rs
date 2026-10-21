@@ -738,7 +738,7 @@ impl ActiveBridge {
         };
         // A second registered channel that resolves in the directory but is
         // deliberately NOT covered by `testapp`'s `brenn_publish` ACL. Lets the
-        // Seam-A `AclDenied` intercept test (design §2.2) exercise the
+        // `AclDenied` intercept test exercise the
         // channel-resolves-but-not-authorized path without affecting the other
         // tests (which all target `test-channel`). No subscribers needed; the
         // publish ACL check fires before delivery resolution.
@@ -798,7 +798,7 @@ impl ActiveBridge {
             }],
         });
         // Grant the messaging capabilities so the intercept happy-path tests
-        // publish (the Seam-A publish gate, design §2.2, requires both the
+        // publish (the publish gate requires both the
         // MessagingPublish grant and a covering brenn_publish matcher).
         testapp_cfg
             .policy_mut()
@@ -809,7 +809,7 @@ impl ActiveBridge {
             .grants
             .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         // Layer-2 publish ACL: authorize publishing to `test-channel` so the
-        // happy-path send/cancel/edit intercept tests pass the Seam-A
+        // happy-path send/cancel/edit intercept tests pass the
         // brenn_publish gate (mirrors the brenn_subscribe matcher below;
         // scoped to the exact channel the tests use).
         testapp_cfg.policy_mut().acls.brenn_publish.push(
@@ -878,13 +878,13 @@ impl ActiveBridge {
     /// Test bridge whose Messenger directory holds one `mqtt:` ingress channel
     /// (`mqtt:home:sensors/+/temp`) and whose `MqttService` has a registered
     /// ingress supervisor handle for client `home` with that filter subscribed at
-    /// QoS 2. Used to exercise the `MessageChannelList` mqtt: health enrichment
-    /// (design §2.5): the listing's `MqttDetails` should be filled with
+    /// QoS 2. Used to exercise the `MessageChannelList` mqtt: health enrichment:
+    /// the listing's `MqttDetails` should be filled with
     /// `qos`/`health` from the service.
     ///
     /// App slug is "testapp", registered in the messenger with an `mqtt_subscribe`
     /// ACL matcher for `(home, sensors/+/temp)`. Since `MessageChannelList` is now
-    /// app-scoped (design §2.2) and sources `mqtt:` rows from ACL matchers (not the
+    /// app-scoped and sources `mqtt:` rows from ACL matchers (not the
     /// directory), the matcher is what makes the `mqtt:home:sensors/+/temp` Pattern
     /// row appear so the enrichment path can fill its health fields.
     pub(crate) async fn test_new_with_mqtt_ingress_listing() -> Arc<Self> {
@@ -920,7 +920,7 @@ impl ActiveBridge {
         };
         let dir = brenn_lib::messaging::MessagingDirectory::with_entries(vec![mqtt_entry]);
         // Register "testapp" with an mqtt_subscribe ACL matcher covering
-        // (home, sensors/+/temp): list_accessible_channels (design §2.2) sources
+        // (home, sensors/+/temp): list_accessible_channels sources
         // mqtt: Pattern rows from these matchers, so this is what makes the
         // mqtt:home:sensors/+/temp row appear (and then get health-enriched).
         let mut messenger_apps = indexmap::IndexMap::new();
@@ -977,7 +977,7 @@ impl ActiveBridge {
     }
 
     /// Test bridge for the runtime `mqtt:` subscribe-activation wrapper
-    /// (`crate::mqtt_subscribe`, design §2.3).
+    /// (`crate::mqtt_subscribe`).
     ///
     /// Wires the three collaborators the wrapper composes, sharing one DB and one
     /// `Messenger`:
@@ -1023,7 +1023,7 @@ impl ActiveBridge {
     /// **non-singleton** (and two `allowed_users`, so it also fails the
     /// single-user side of the push-enabled invariant). Used to drive the
     /// intercept→core handoff for a `push_depth > 0` subscribe on a non-singleton
-    /// app, which the shared resolver rejects as a tool error (design §5).
+    /// app, which the shared resolver rejects as a tool error.
     pub(crate) async fn test_new_for_mqtt_subscribe_non_singleton() -> Arc<Self> {
         Self::test_new_for_mqtt_subscribe_with_singleton(
             false,
@@ -1052,8 +1052,8 @@ impl ActiveBridge {
     /// `singleton` is `true` the app is a singleton single-user app (push-enabled
     /// subscribes pass the resolver invariants); when `false` it is a non-singleton
     /// multi-user app (push-enabled subscribes are rejected by the resolver).
-    /// `policy` is stamped on both `testapp` and `otherapp` (the Phase-1
-    /// dynamic-subscribe gate, §6.5).
+    /// `policy` is stamped on both `testapp` and `otherapp` (the
+    /// dynamic-subscribe gate).
     async fn test_new_for_mqtt_subscribe_with_singleton(
         singleton: bool,
         policy: brenn_lib::access::AppPolicy,
@@ -1424,7 +1424,7 @@ impl ActiveBridge {
     ///
     /// Use when a test needs to exercise MQTT send paths past the grant + ACL
     /// gates (e.g., testing wildcard rejection, qos validation, or the
-    /// server-global "MQTT not configured on this server" gate) — the Seam-C
+    /// server-global "MQTT not configured on this server" gate) — the
     /// per-client publish ACL check passes for `mqtt:ha:...` addresses so the test
     /// reaches the later validation it exercises.
     pub(crate) async fn test_new_with_mqtt_publish_acl() -> Arc<Self> {
@@ -1446,7 +1446,7 @@ impl ActiveBridge {
 
     /// Test bridge whose `"testapp"` policy does **not** grant `MqttPublish`, with
     /// an MQTT service present so the server-global readiness check passes and the
-    /// shared `enforce_and_publish` (design §2.3) reaches the grant/ACL gate and
+    /// shared `enforce_and_publish` reaches the grant/ACL gate and
     /// returns `AclDenied`. The intercept then selects the "MQTT publish is not
     /// enabled" remedy string (grant absent). Used by the grant-absent intercept
     /// test.
@@ -1469,7 +1469,7 @@ impl ActiveBridge {
         )
     }
 
-    /// Test bridge for the Seam-C MQTT publish per-client ACL (design §2.4).
+    /// Test bridge for the MQTT publish per-client ACL.
     ///
     /// - A real `Messenger` whose `"testapp"` policy grants `MqttPublish` and
     ///   holds an `mqtt_publish` ACL matcher for each client in `allowed_clients`.
@@ -1646,8 +1646,8 @@ async fn make_minimal_test_db_and_channel() -> (Db, broadcast::Sender<WsServerMe
 
 /// Build a `Messenger` (empty directory) whose `"testapp"` policy grants
 /// `MqttPublish` and holds an `mqtt_publish` ACL matcher for each client in
-/// `clients`. Used by MQTT-publish intercept fixtures/tests so the Seam-C
-/// per-client publish ACL check (design §2.4) — which reaches the policy via
+/// `clients`. Used by MQTT-publish intercept fixtures/tests so the
+/// per-client publish ACL check — which reaches the policy via
 /// `messenger.app_policy("testapp")` — resolves and passes for those clients.
 fn make_test_messenger_with_mqtt_publish(
     db: Db,
@@ -1682,7 +1682,7 @@ fn make_test_messenger_with_mqtt_publish(
 
 /// Build a `Messenger` (empty directory) whose `"testapp"` policy does **not**
 /// grant `MqttPublish`. Used by the MQTT-publish "grant absent" intercept test:
-/// after the shared-enforcement refactor (design §2.3) the intercept reaches the
+/// after the shared-enforcement refactor the intercept reaches the
 /// policy via `messenger.app_policy("testapp")` and `enforce_and_publish` returns
 /// `AclDenied`; the intercept's secondary `has_grant(MqttPublish)` check (false
 /// here) selects the "MQTT publish is not enabled" remedy string.

@@ -58,8 +58,8 @@ pub(super) async fn handle(
     // Delegate decision logic to PfinIntegration::intercept_tool.
     // Returns None if tool_name is not a pfin tool — fall through.
     //
-    // For PostToolUse, `mark_tool_handled` runs *before* `intercept_tool`
-    // (§5.3 invariant). The tool is already ours (guard above passed), so we
+    // For PostToolUse, `mark_tool_handled` runs *before* `intercept_tool`.
+    // The tool is already ours (guard above passed), so we
     // mark it handled unconditionally before dispatching. This ensures the
     // Reject early-return path also leaves the tool correctly marked, and
     // means the ordering invariant holds regardless of any future side effects

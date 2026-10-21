@@ -1,6 +1,5 @@
 //! Streaming-family tests: `handle_stream_event` (StreamEvent) and
-//! `handle_assistant_message` (AssistantMessage). Peeled out of `tests/mod.rs`
-//! per design §2.4.
+//! `handle_assistant_message` (AssistantMessage).
 
 use super::super::super::test_support::{
     await_fence, drain_broadcast, event_fence, recv_broadcast, test_bridge,

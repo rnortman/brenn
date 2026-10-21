@@ -238,9 +238,8 @@ fn app_owned_endpoint_stamps_resolved_wake_min() {
 /// `Some(...)` when an app has `pwa_push.enabled = true` and a valid global
 /// `[pwa_push]` block is present.
 ///
-/// Guards the Phase 5 binding (`let pwa_push = resolve_pwa_push_layer(...)`)
-/// against accidental short-circuiting in future `validate_and_resolve` edits
-/// (design §"Test plan").
+/// Guards the binding (`let pwa_push = resolve_pwa_push_layer(...)`)
+/// against accidental short-circuiting in future `validate_and_resolve` edits.
 ///
 #[test]
 fn resolved_config_pwa_push_round_trip() {
@@ -297,8 +296,8 @@ fn resolved_config_pwa_push_round_trip() {
     );
 
     // The app is resolved and has push authorized — now via the `PwaPush`
-    // grant (the legacy `[app.pwa_push].enabled` boolean was removed;
-    // access-control §2.5.1), surfaced through `pwa_push_enabled()`.
+    // grant (the legacy `[app.pwa_push].enabled` boolean was removed),
+    // surfaced through `pwa_push_enabled()`.
     let app = apps
         .get("pushapp")
         .expect("pushapp must be in resolved apps");

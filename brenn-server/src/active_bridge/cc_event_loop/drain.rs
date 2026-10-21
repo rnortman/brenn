@@ -7,12 +7,12 @@ use super::super::{ActiveBridge, emit_prerendered_summary};
 
 /// Drain pending events from the event queue and deliver as a batch message.
 ///
-/// Called at the start of cc_event_loop for singleton apps. Events are
+/// Called at the start of cc_event_loop for every bridge. Events are
 /// formatted as a single internal user message, delivered to CC, then marked
 /// delivered in the DB. At-least-once: if the send fails or the process
 /// crashes before marking, events stay pending for next wake.
 ///
-/// Extensions for repo-sync (see `docs/designs/repo-sync.md`):
+/// Extensions for repo-sync:
 /// - **Staleness filter**: `repo_sync:*` events for conversations whose
 ///   `updated_at` is older than `stale_conversation_days` are marked
 ///   delivered immediately without injection. Other event sources are
@@ -66,7 +66,7 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
         return;
     }
 
-    // Staleness filter — drain-time, not enqueue-time (see design). We only
+    // Staleness filter — drain-time, not enqueue-time. We only
     // apply it to repo_sync:* rows; cron/discord/pfin have their own
     // semantics. Drop stale repo_sync rows silently, mark delivered.
     //
@@ -97,8 +97,8 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
         return;
     }
 
-    // Stale rows get marked delivered immediately (drop-silently semantics
-    // per design). Their push IDs are carried in stale[].id (Event.id == push_id
+    // Stale rows get marked delivered immediately (drop-silently
+    // semantics). Their push IDs are carried in stale[].id (Event.id == push_id
     // by construction in row_to_drain_push).
     if !stale.is_empty() {
         let stale_push_ids: Vec<i64> = stale

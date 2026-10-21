@@ -5,8 +5,9 @@ useDefault = true
 
 # Section-symbol references to design/ADR docs. Those docs are ephemeral
 # point-in-time artifacts, so a comment citing one rots as soon as it moves.
-# Enforced on diffs only: the existing backlog is grandfathered and burns down
-# as lines are touched.
+# A repo that still carries a backlog of these may add `tags = ["diff-only"]`
+# to this rule: tree scans then skip it while every diff-scanning layer still
+# enforces it.
 [[rules]]
 id = "ephemeral-reference"
 description = "Section-symbol reference to an ephemeral doc"

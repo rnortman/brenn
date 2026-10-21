@@ -2243,7 +2243,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // handle_debug_viewport_snapshot handler tests (design §4)
+    // handle_debug_viewport_snapshot handler tests
     //
     // Tests the handler directly (not via dispatch) to verify:
     //   (a) With an active bridge: system message persisted with

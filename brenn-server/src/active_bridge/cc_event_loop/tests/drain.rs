@@ -5,7 +5,7 @@
 //! (combined event+push delivery, send-failure parking, messaging-only
 //! delivery), and the AC2/AC3 durability cases (real D1 broken-pipe window,
 //! drain-path recovery after session-death flush failure).
-//! Peeled out of `tests/mod.rs` per design §2.4; the shared helpers
+//! The shared helpers
 //! (`enqueue_ingress`, `pending_ingress_count`, `bridge_with_unspawned_event_loop`,
 //! `bridge_with_messenger_for_drain`, `seed_pending_push`) and
 //! `DRAIN_TEST_CHANNEL_UUID` remain in `tests/mod.rs` as their single home,
@@ -156,13 +156,9 @@ async fn submit_ingress_then_drain_roundtrip() {
 
 #[tokio::test]
 async fn drain_runs_for_non_singleton_at_event_loop_start() {
-    // Regression: the drain used to be singleton-gated. It was ungated
-    // in the repo-sync design (docs/designs/repo-sync.md — "Drain ungate
-    // to all apps (M7)"); the gate was a scope limiter, not a
-    // correctness guard. Ensure non-singleton bridges now attempt the
-    // drain at event-loop start. Test bridge has no real session, so
-    // the send will fail and the event stays pending — but the send
-    // attempt is observable as a SystemMessageBroadcast broadcast.
+    // Test bridge has no real session, so the send will fail and the
+    // event stays pending — but the send attempt is observable as a
+    // SystemMessageBroadcast broadcast.
     let (bridge, _event_tx, event_rx, mut broadcast_rx, alert_dispatcher, _active_bridges) =
         bridge_with_unspawned_event_loop(false).await;
 
@@ -323,7 +319,7 @@ async fn drain_drops_stale_repo_sync_events() {
 async fn drain_collapses_multiple_repo_sync_pulled_events() {
     // Integration: two `repo_sync:pulled` rows for the same slug from
     // two cycles fold into a single synthesized `repo_sync:summary`
-    // inject. Per design collapsing rules, we can observe the combined
+    // inject. We can observe the combined
     // event via the SystemMessageBroadcast rendered_html body.
     let (bridge, _event_tx, event_rx, mut broadcast_rx, alert_dispatcher, _active_bridges) =
         bridge_with_unspawned_event_loop(false).await;

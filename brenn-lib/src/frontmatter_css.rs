@@ -5,8 +5,6 @@
 //! can pull it for build-time generation of the matching frontend
 //! constant. The renderer module re-exports it as
 //! `brenn::frontmatter::FRONTMATTER_CSS`.
-//!
-//! See `docs/designs/frontmatter-rendering.md`.
 
 /// Static CSS for the frontmatter block.
 ///

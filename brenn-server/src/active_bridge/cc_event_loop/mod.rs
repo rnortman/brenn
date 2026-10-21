@@ -107,10 +107,6 @@ pub(super) async fn cc_event_loop(
     // If there are events to drain, send_system_message calls
     // set_cc_busy → cc_idle = false. CC processes the events, completes a
     // turn, and set_idle_and_drain restores cc_idle = true.
-    //
-    // Ungated: the drain runs for every bridge, not just singletons.
-    // See docs/designs/init-not-required.md and docs/designs/repo-sync.md
-    // (M7 — "Ungate to all apps").
     drain_pending_events(&bridge).await;
     // Signal that the startup drain is complete. Tests use this to know that
     // any queued events were processed before asserting on broadcasts or DB state.

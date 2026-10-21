@@ -30,7 +30,7 @@ pub struct TodoQueryResult {
     pub domains: Option<Vec<String>>,
 }
 
-/// Result of `graf todo done`. Phase 2 response shape (PRD-done §7).
+/// Result of `graf todo done`.
 ///
 /// - Non-recurring advance: `on_date` or `end_date` set, `terminal: false`.
 /// - Anchored rrule exhaustion: `on_date`/`end_date` set, `terminal: true`.
@@ -73,18 +73,18 @@ pub struct DoneResult {
 }
 
 /// Failure shape for `todo_done`. The interesting branch is `Structured`,
-/// which carries graf's PRD-done §7 `{error, reason, ...payload}` envelope
-/// — the Phase 4 UI reads `code` to pick a dialog (stale_anchor → catch-up
+/// which carries graf's `{error, reason, ...payload}` envelope
+/// — the UI reads `code` to pick a dialog (stale_anchor → catch-up
 /// vs. skip-ahead choice; already_done_or_not_due_yet → overwrite prompt).
 ///
 /// `Opaque` is the escape hatch for infrastructure failures (spawn, timeout,
 /// UTF-8 decode) and the "graf exited non-zero but stdout isn't JSON" case
-/// that shouldn't happen per design §7 but we fail safely on anyway.
+/// that shouldn't happen but we fail safely on anyway.
 #[derive(Debug)]
 pub enum DoneFailure {
     /// graf exited with a structured error envelope on stdout.
     Structured {
-        /// PRD-done §7 error code. Known variants are in `TodoErrorCode`; unknown
+        /// graf's error code. Known variants are in `TodoErrorCode`; unknown
         /// codes from future graf versions land in `Other`, preserving the raw string.
         code: TodoErrorCode,
         /// Human-readable reason string from graf.
@@ -185,8 +185,8 @@ fn mutation_args<'a>(subcommand: &'a str, repo: Option<&'a str>) -> Vec<&'a str>
 /// required when the manifest has multiple repos. `completion_date` is
 /// required by graf — the caller must source it from browser-local today.
 ///
-/// Errors arrive as [`DoneFailure::Structured`] when graf returned a PRD-done
-/// §7 envelope (structured errors printed to stdout on non-zero exit), or
+/// Errors arrive as [`DoneFailure::Structured`] when graf returned an error
+/// envelope (structured errors printed to stdout on non-zero exit), or
 /// [`DoneFailure::Opaque`] for infrastructure failures or malformed output.
 pub async fn todo_done(
     config: &GrafConfig,
@@ -209,9 +209,9 @@ pub async fn todo_done(
         serde_json::from_str(&raw.stdout)
             .map_err(|e| DoneFailure::Opaque(format!("failed to parse graf todo done output: {e}")))
     } else {
-        // Per design §7, graf prints the {error, reason, ...payload} envelope
+        // graf prints the {error, reason, ...payload} envelope
         // to stdout and exits non-zero. Parse it and surface as structured so
-        // the UI can branch on `code` (Phase 4: stale_anchor choice dialog).
+        // the UI can branch on `code` (stale_anchor choice dialog).
         match parse_done_error_envelope(&raw.stdout) {
             Some(failure) => Err(failure),
             None => Err(DoneFailure::Opaque(
@@ -231,7 +231,7 @@ pub async fn todo_done(
     }
 }
 
-/// Parse graf's PRD-done §7 error envelope from stdout. Returns
+/// Parse graf's error envelope from stdout. Returns
 /// `Some(Structured{..})` on a well-formed envelope, `None` when the output
 /// isn't the expected shape (caller falls back to `Opaque`).
 fn parse_done_error_envelope(stdout: &str) -> Option<DoneFailure> {
@@ -383,7 +383,7 @@ fn check_overflow(stdout: &[u8], stderr: &[u8], cap: usize) -> Result<(), String
 /// Like [`run_graf`] but hands back both streams plus the exit-success
 /// flag without collapsing non-zero-exit cases into an error. Used by
 /// `todo_done` to recover graf's structured error envelope (printed to
-/// stdout on exit 1 per PRD-done §7).
+/// stdout on exit 1).
 ///
 /// Infrastructure failures (spawn, timeout, UTF-8) still come back as
 /// `Err(String)` — those have no useful stdout to inspect.

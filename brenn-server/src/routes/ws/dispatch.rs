@@ -26,7 +26,7 @@ pub(super) async fn handle_client_message(
     // variants until server restart. (2) `resolve_or_create_device` creates a
     // new device row for the same authenticated user when the sentinel-token
     // blocks the old one, so a new WS connection can still be established.
-    // Closing both gaps requires §13 live-session registry (to drop the
+    // Closing both gaps requires a live-session registry (to drop the
     // broadcast channel for the affected WS task on unenroll) and/or
     // `sessions`-table revocation in `unenroll_device`. See also
     // `unenroll-cc-bridge-gate` for the parallel CC-tool-call gap.
@@ -590,8 +590,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Idle-hook timer plumbing through the WS dispatch
     //
-    // Verifies the design's "Defining 'idle'" / "Changes to routes/ws.rs"
-    // contract: UI-channel handlers cancel-and-rearm the bridge's idle-hook
+    // Verifies the contract: UI-channel handlers cancel-and-rearm the bridge's idle-hook
     // timer; non-UI messages don't touch it; ToolCardResponse routes via
     // `inject_tool_result_to_cc` (CC-channel), no separate UI touch.
     //
@@ -818,7 +817,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Device infrastructure tests (design §4, §2.4–2.9)
+    // Device infrastructure tests
     // -----------------------------------------------------------------------
 
     /// `SetDeviceInfo` updates the device row's platform, user_agent, screen
@@ -895,7 +894,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PWA Push WS handler tests (design §2.6.2, §4.2)
+    // PWA Push WS handler tests
     // -----------------------------------------------------------------------
 
     /// `PushVapidKeyRequest` from a pwa_push-enabled app returns the VAPID public key.
@@ -1556,7 +1555,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // DebugViewportSnapshot dispatch tests (design §2.3, §4)
+    // DebugViewportSnapshot dispatch tests
     //
     // A minimal valid JSON payload for DebugViewportSnapshot: all required
     // (non-Option) fields set; all Option fields set to null. Tests verify:
@@ -1613,7 +1612,7 @@ mod tests {
     /// A well-formed `DebugViewportSnapshot` must emit an INFO log with the
     /// greppable `debug_viewport_snapshot` tag (AC4) — even when there is no
     /// current conversation (bridge resolution returns None). Uses the no-bridge
-    /// fixture to exercise the path described in design §3 and AC4.
+    /// fixture to exercise that path.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn debug_viewport_snapshot_logs_info_tag() {

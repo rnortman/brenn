@@ -1,12 +1,12 @@
 // @vitest-environment happy-dom
 //
-// Tests for the Debug UI viewport snapshot feature (design §2.2, §2.4):
+// Tests for the Debug UI viewport snapshot feature:
 //   - Capture shape: assembled snapshot has correct fields and derived booleans.
 //   - Missing API: capture proceeds with null fields when visualViewport or
-//     input element is absent; derived booleans are null (AC2, AC7).
+//     input element is absent; derived booleans are null.
 //   - Toast gating: success toast + ws.send() when connected; failure toast only
-//     (no ws.send()) when not connected; failure toast when capture throws (AC9, §2.4).
-//   - Menu rendering: "Debug UI" item renders and its click invokes capture (AC1).
+//     (no ws.send()) when not connected; failure toast when capture throws.
+//   - Menu rendering: "Debug UI" item renders and its click invokes capture.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "./app.js";

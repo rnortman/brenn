@@ -7,9 +7,6 @@ use std::collections::HashMap;
 /// top-level key in file order, render `tldr`/`summary` as markdown,
 /// pin tldr/summary to the top, cap sequence values at 5 entries".
 ///
-/// See `docs/designs/frontmatter-rendering.md` for the full pipeline
-/// (filter → pin → cap → render).
-///
 /// `Default` is implemented by hand because `#[derive(Default)]` would
 /// give per-field language defaults (empty vec, `0_u32`, `false`),
 /// whereas the runtime semantics described above require the named

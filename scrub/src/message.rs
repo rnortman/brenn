@@ -105,6 +105,7 @@ mod tests {
             file: "src/a.rs".into(),
             matched: "matched-text".into(),
             commit: String::new(),
+            tags: vec![],
         }
     }
 

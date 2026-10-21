@@ -3,9 +3,9 @@
 //! Modes: `hook`, `staged`, `range`, `tree` -- see the `help` module for each
 //! mode's input contract, scope, and exit codes.
 //!
-//! Diff-scanning modes enforce every rule. Tree-scanning modes drop the
-//! diff-only rules (see gitleaks::DIFF_ONLY_RULES) so a grandfathered backlog
-//! cannot make them permanently un-green-able.
+//! Diff-scanning modes enforce every rule. Tree-scanning modes drop findings
+//! from rules the repo's config tags `diff-only`, so a repo with a
+//! grandfathered backlog can keep its tree scans green while it burns down.
 
 mod config;
 mod dest;
@@ -315,10 +315,11 @@ fn mode_range(warn_only: bool) -> ExitCode {
         let Some(log_opts) = git::log_opts_for(&repo, &update) else {
             continue;
         };
-        // Per-commit diffs: the full rule set, diff-only rules included.
+        // Per-commit diffs: the full rule set, diff-only-tagged rules included.
         findings.extend(gitleaks::scan_git(&resolved.config_path, &repo, &log_opts));
 
-        // Tip tree: what the remote ends up holding, tree rule set.
+        // Tip tree: what the remote ends up holding, minus the repo's
+        // diff-only-tagged rules.
         let tip = match &update {
             git::RefUpdate::New { local } => local,
             git::RefUpdate::Update { local, .. } => local,

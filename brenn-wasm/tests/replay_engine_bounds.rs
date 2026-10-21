@@ -1,7 +1,7 @@
-// Resource-bound tests for the replay-check WASM world (H1046, design §4).
+// Resource-bound tests for the replay-check WASM world.
 //
 // The replay world runs an operator-supplied guest on every inbound webhook POST.
-// These tests verify the in-engine bounds installed by H1046 — fuel, epoch deadline,
+// These tests verify the in-engine bounds — fuel, epoch deadline,
 // and the store memory cap — actually trap a pathological guest instead of letting it
 // hang, and that a guest trapping mid-transaction does not wedge the shared store.
 //
@@ -207,8 +207,7 @@ fn replay_memory_cap_excess_traps_deterministically() {
 /// A guest that traps mid-transaction (here via a resource-exhaustion trap, not the
 /// `HostTransaction::drop`-detected leak) leaves no active transaction on the shared
 /// store, and a subsequent check on the same component succeeds. Generalizes the
-/// existing `store_round_trip.rs` leak test to the new fuel/epoch trap causes
-/// (design §2.5.1 / §4).
+/// existing `store_round_trip.rs` leak test to the fuel/epoch trap causes.
 #[test]
 fn replay_trap_mid_transaction_rolls_back() {
     let (_db, component) = open_fault();
@@ -245,9 +244,9 @@ fn replay_trap_mid_transaction_rolls_back() {
 /// `memory.grow`. An over-cap initial-memory module fails inside `replay_pre.instantiate`
 /// and surfaces as an outer `Err`.
 ///
-/// Design §3's edge-case table claims "Guest declares huge initial memory
-/// (instantiation-time) → make_store limits apply to instantiate too → instantiation fails
-/// → outer Err". This test enforces that claim for the replay world: it drives the fault
+/// A guest that declares huge initial memory fails at instantiation, because
+/// `make_store` limits apply to instantiate too, and surfaces as an outer `Err`.
+/// This test enforces that for the replay world: it drives the fault
 /// fixture with a 1-byte memory cap (via the `check_with_memory_limit` accessor), so the
 /// fixture's own initial linear-memory allocation cannot fit and instantiation fails. If
 /// the limiter were installed incorrectly (e.g. not before `instantiate`), the module would

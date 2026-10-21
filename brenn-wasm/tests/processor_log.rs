@@ -1,5 +1,5 @@
 // Integration tests for the log/alert capability of `ProcessorComponent`
-// against the processor-log fixture (design §4, tests 1–9).
+// against the processor-log fixture.
 //
 // tracing-test is compiled with `no-env-filter` so all tracing events are
 // captured regardless of the `RUST_LOG` env var.  Test assertions filter on the

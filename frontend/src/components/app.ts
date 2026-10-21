@@ -124,8 +124,8 @@ type QueuedApproval =
  *  (implicit-settlement reconcile path) call through here so a copy
  *  change lands in one place — mirrors `SETTLED_TILE_LOOKS`'s
  *  glyph/class table in `todo-list.ts`. The `"reorder"` branch
- *  returns `""` because reorder never produces a settled tile
- *  (design §3.6) — callers must not invoke this for reorder. */
+ *  returns `""` because reorder never produces a settled tile —
+ *  callers must not invoke this for reorder. */
 function settledTileText(
   action: "done" | "snooze" | "schedule",
   targetDate: string | undefined,
@@ -211,7 +211,7 @@ export class BrennApp extends LitElement {
   @state() private pushSubscribed = false;
   /** Whether a push enable/disable operation is in progress. */
   @state() private pushPending = false;
-  /** Timer for deferred IDB set cleanup on WS close (5s grace period per §2.6.3). */
+  /** Timer for deferred IDB set cleanup on WS close (5s grace period). */
   private pushCleanupTimer: ReturnType<typeof setTimeout> | null = null;
   /** Whether the user dropdown menu is open. */
   @state() private userMenuOpen = false;
@@ -249,19 +249,16 @@ export class BrennApp extends LitElement {
   /** Current todo tasks from the last TodoState message. */
   @state() private todoTasks: TodoItem[] = [];
   /** Per-row slot state covering both in-flight (pending) and
-   *  just-settled (confirmation tile) rows. See
-   *  `docs/designs/todo-list-ui-state-preservation.md` for the design.
+   *  just-settled (confirmation tile) rows.
    *
-   *  Lit reactivity pattern: mutate-in-place + `requestUpdate()` (the
-   *  same pattern `todoPendingAction` used before this design).
+   *  Lit reactivity pattern: mutate-in-place + `requestUpdate()`.
    *  Identity-swap would allocate on every dispatch; the explicit
    *  requestUpdate keeps allocation off the hot path. The shared map
    *  reference is passed to `<brenn-todo-list>` via @property and
    *  re-read on each update. */
   @state() private todoSlotState: Map<string, SlotState> = new Map();
   /**
-   * Frozen render snapshot of the todo list (see
-   * `docs/designs/todo-tombstone-regression/design.md`). Non-null
+   * Frozen render snapshot of the todo list. Non-null
    * whenever any slot is pending, settled, or dismissed — i.e.
    * whenever the user is mid-triage or the idle timer hasn't yet
    * dismissed the last tile. While non-null, the todo list renders
@@ -279,21 +276,21 @@ export class BrennApp extends LitElement {
     groups: TaskGroup[];
     todayStr: string;
   } | null = null;
-  /** Per-slot watchdog timers (design §3.4.4). Fire at 30s if a pending
+  /** Per-slot watchdog timers. Fire at 30s if a pending
    *  slot's TodoDoneResult/TodoMutationResult never arrives — drop the slot so
    *  the row becomes interactive again. Not `@state` — rendering doesn't read
    *  timer handles. */
   private todoSlotWatchdogs: Map<string, ReturnType<typeof setTimeout>> =
     new Map();
-  /** Single list-level idle timer (design §3.5). Armed when at least
+  /** Single list-level idle timer. Armed when at least
    *  one settled slot exists and no slot is pending. Fires after 5s,
    *  collapses all settled slots at once. Cancelled on any new
    *  mutation dispatch so "active triage" keeps the tiles alive. */
   private todoIdleTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Per-row error message (Phase 4 §7.2): key → "Error: see chat" body.
+  /** Per-row error message: key → "Error: see chat" body.
    *  Cleared after 6s via `todoErrorTimers` or on next mutation. */
   @state() private todoErrorKeys: Map<string, string> = new Map();
-  /** Per-row debounce timers (Phase 4 §6). Keyed identically to the
+  /** Per-row debounce timers. Keyed identically to the
    *  slot map. A timer present means the row is in its 400ms lockout. */
   private todoDebounceTimers: Map<string, ReturnType<typeof setTimeout>> =
     new Map();
@@ -315,7 +312,7 @@ export class BrennApp extends LitElement {
   @state() private todoRefreshPending = false;
   private _todoRefreshTimeoutId: ReturnType<typeof setTimeout> | null = null;
   /** True while a user-clicked refresh is queued waiting on in-flight
-   *  mutations to settle (design §3.5). Distinct from
+   *  mutations to settle. Distinct from
    *  `todoRefreshPending` — that tracks the click → TodoState
    *  round-trip; this tracks the client-side wait before we even send
    *  the `TodoRefresh`. UI surfaces both as a single continuous busy
@@ -485,7 +482,7 @@ export class BrennApp extends LitElement {
     }) as EventListener);
 
     // On pagehide (tab close / navigation away), clean up signed_in_user_ids.
-    // This is a best-effort cleanup; crash leaves a residue (accepted per §2.6.3).
+    // This is a best-effort cleanup; crash leaves a residue (accepted).
     this.pagehideHandler = () => {
       if (this.currentUserId !== 0) {
         removeSignedInUserId(this.currentUserId).catch((err: unknown) =>
@@ -967,7 +964,7 @@ export class BrennApp extends LitElement {
     this._pendingReplay = [];
     this.hasTodoList = false;
     this.todoTasks = [];
-    // Design §3.4.3: drop all slot state + associated timers on a
+    // Drop all slot state + associated timers on a
     // true conversation switch.
     this.todoSlotState.clear();
     this.todoFrozenSnapshot = null;
@@ -1277,7 +1274,7 @@ export class BrennApp extends LitElement {
         this.resolveCurrentModel();
         this.currentUserId = msg.user_id;
         this.pwaPushEnabled = msg.pwa_push_enabled;
-        // Maintain the signed_in_user_ids IDB set (§2.6.3).
+        // Maintain the signed_in_user_ids IDB set.
         // Cancel any pending cleanup timer from a prior WS close.
         if (this.pushCleanupTimer !== null) {
           clearTimeout(this.pushCleanupTimer);
@@ -1504,7 +1501,7 @@ export class BrennApp extends LitElement {
   private handleConnectionStatus(connected: boolean): void {
     this.connected = connected;
     if (!connected && this.currentUserId !== 0) {
-      // WS closed — schedule deferred IDB set cleanup (5s grace period per §2.6.3).
+      // WS closed — schedule deferred IDB set cleanup (5s grace period).
       // The grace period lets an in-flight push arrive before the set shrinks,
       // preventing a race between a push dispatched just before disconnect and the
       // SW's signed_in_user_ids check.  Cancel any prior pending timer first.
@@ -1966,15 +1963,14 @@ export class BrennApp extends LitElement {
    * `todayStr` is the server's authoritative "today" in its resolved
    * timezone — use it directly for sectioning instead of
    * `localTodayStr()` (browser's local TZ), which can disagree when the
-   * server resolved a different zone. See
-   * `docs/designs/graf-user-tz.md`. */
+   * server resolved a different zone. */
   private _handleTodoState(tasks: TodoItem[], todayStr: string): void {
     const wasFirst = !this.hasTodoList;
     this.hasTodoList = true;
     this.todoTasks = tasks;
     this.todoTodayStr = todayStr;
 
-    // Design §3.4.3: reconcile slot state against the fresh task list
+    // Reconcile slot state against the fresh task list
     // rather than wholesale-clearing it. A pending slot whose task is
     // gone from the refresh has been implicitly settled by the server
     // (the TodoDoneResult/TodoMutationResult may arrive later, or may have been
@@ -1996,7 +1992,7 @@ export class BrennApp extends LitElement {
       // transition terminal.
       const action = entry.action;
       if (action === "reorder") {
-        // Reorder never has a settled tile (§3.6). Drop outright.
+        // Reorder never has a settled tile. Drop outright.
         keysToDrop.push(key);
       } else if (
         action === "done" ||
@@ -2188,12 +2184,12 @@ export class BrennApp extends LitElement {
     if (!success) {
       if (matchedKey) {
         // Drop the slot entirely (no tile for errors — the row stays
-        // interactive for retry). §6: also clear the debounce so the
+        // interactive for retry). Also clear the debounce so the
         // user can retry immediately.
         this._collapseSettledSlot(matchedKey);
         this._clearDebounce(matchedKey);
       }
-      // PRD-snooze §2 snap-back: revert the optimistic reorder so that
+      // Snap-back: revert the optimistic reorder so that
       // the post-thaw render (once all pending slots settle) shows the
       // original order rather than the optimistically-spliced order.
       // During the frozen-pending phase the renderer paints from
@@ -2208,8 +2204,8 @@ export class BrennApp extends LitElement {
         }
       }
       if (matchedKey) {
-        // §7.2: surface a row-level badge. Toast is suppressed for errors
-        // per §5.3 / §7.2 — the chat inject + badge is the only surface.
+        // Surface a row-level badge. Toast is suppressed for errors —
+        // the chat inject + badge is the only surface.
         this._showRowError(matchedKey, error ?? "see chat");
       }
       return;
@@ -2240,8 +2236,8 @@ export class BrennApp extends LitElement {
 
     // Success path:
     //  - `done` / `snooze` transition to settled (in-place tile) AND
-    //    still fire the toast — design §3.4.2 F6 keeps the toast.
-    //  - `reorder` clears the slot outright (no tile — §3.6).
+    //    still fire the toast.
+    //  - `reorder` clears the slot outright (no tile).
     //  - `action === null` (no matched pending slot): action for a
     //    row this client never dispatched (another tab / server
     //    synthesized ack). Nothing to settle; warn for visibility.
@@ -2250,7 +2246,7 @@ export class BrennApp extends LitElement {
         `Todo action success for unmatched path=${path}; no pending slot on this client`,
       );
     } else if (action === "done") {
-      // PRD-done §8: the "Next: …" label is driven by
+      // The "Next: …" label is driven by
       // `next_check_in_date` primarily, with `next_due_date` as a
       // fallback for tasks whose recurrence is anchored on `due_date`
       // (graf returns the check-in date for anchored tasks and the
@@ -2312,7 +2308,7 @@ export class BrennApp extends LitElement {
    *  Map in place + calls `requestUpdate()` — standard Lit pattern for
    *  mutable reactive state. On pending dispatch, arms the 30s
    *  watchdog so a dropped TodoDoneResult/TodoMutationResult doesn't leave the row
-   *  stuck greyed forever (design §3.4.4).
+   *  stuck greyed forever.
    *
    *  Lit coalesces consecutive synchronous `requestUpdate()` calls via
    *  its `isUpdatePending` guard (see
@@ -2401,7 +2397,7 @@ export class BrennApp extends LitElement {
   /** Transition a slot from pending to settled. Carries the
    *  `SlotSnapshot` fields through unchanged. Cancels the pending
    *  watchdog and arms the list-level idle timer if no pending slots
-   *  remain. Design §3.4.2. */
+   *  remain. */
   private _settleSlot(
     key: string,
     action: "done" | "snooze" | "schedule",
@@ -2436,14 +2432,11 @@ export class BrennApp extends LitElement {
    *  watchdog fire, bulk idle-fire, etc.). Cancels the slot's watchdog
    *  if any.
    *
-   *  Design §3.5 idle-timer contract has two sub-rules that interact
-   *  here:
-   *
-   *  1. "The timer is re-armed when the last pending slot transitions
+   *  1. The timer is re-armed when the last pending slot transitions
    *     to settled (or to cleared / errored), provided at least one
-   *     settled slot remains." → re-arm on pending→cleared.
-   *  2. "Manual `×` dismiss on a tile drops just that one slot; the
-   *     list-level idle timer keeps running for the others." → do NOT
+   *     settled slot remains. → re-arm on pending→cleared.
+   *  2. Manual `×` dismiss on a tile drops just that one slot; the
+   *     list-level idle timer keeps running for the others. → do NOT
    *     re-arm on settled→cleared (the currently-armed timer must
    *     keep its accumulated elapsed time, not be reset to a fresh
    *     5s).
@@ -2451,7 +2444,7 @@ export class BrennApp extends LitElement {
    *  The pre-delete `prev.kind` check discriminates: we only re-arm
    *  when the slot we just removed was pending. `_armIdleTimerIfNeeded`
    *  starts a fresh timer (`setTimeout`), so an unconditional re-arm
-   *  would violate rule 2 above — round-2 review caught the regression. */
+   *  would violate rule 2 above. */
   private _collapseSettledSlot(key: string): void {
     const prev = this.todoSlotState.get(key);
     const hadEntry = this.todoSlotState.delete(key);
@@ -2462,12 +2455,12 @@ export class BrennApp extends LitElement {
       this._cancelIdleTimer();
     } else if (prev?.kind === "pending") {
       // Pending → cleared (error / reorder-success / watchdog) is a
-      // "new action just finished" transition per §3.5 rule 1 —
+      // "new action just finished" transition per rule 1 above —
       // re-arm with fresh 5s for the surviving settled tiles.
       this._armIdleTimerIfNeeded();
     }
     // Settled → cleared (manual × / idle fire) intentionally leaves
-    // the existing idle timer alone (§3.5 rule 2).
+    // the existing idle timer alone.
     this.requestUpdate();
     this._maybeFireQueuedRefresh();
     // Freeze-thaw hook: if this collapse leaves zero pending + zero
@@ -2481,7 +2474,7 @@ export class BrennApp extends LitElement {
     this._maybeThawIfTriageEnded();
   }
 
-  /** Arm the 30s watchdog for a pending slot (design §3.4.4). */
+  /** Arm the 30s watchdog for a pending slot. */
   private _armSlotWatchdog(key: string, startedAt: number): void {
     this._clearSlotWatchdog(key);
     // Elapsed since dispatch may be nonzero on implicit-settlement
@@ -2548,7 +2541,7 @@ export class BrennApp extends LitElement {
 
   /** Arm the list-level idle timer if at least one settled slot exists
    *  and no slot is pending. Cancels any currently-armed idle timer
-   *  first; design §3.5 uses a single timer. */
+   *  first; there is a single timer. */
   private _armIdleTimerIfNeeded(): void {
     this._cancelIdleTimer();
     const counts = this._slotKindCounts();
@@ -2647,7 +2640,7 @@ export class BrennApp extends LitElement {
 
   /** Called after every slot transition that may have cleared the
    *  last pending entry. If a refresh is queued and no pending slots
-   *  remain, fire the refresh now (design §3.5). */
+   *  remain, fire the refresh now. */
   private _maybeFireQueuedRefresh(): void {
     if (!this.todoRefreshQueued) return;
     if (this._hasPendingSlots()) return;
@@ -2697,7 +2690,7 @@ export class BrennApp extends LitElement {
     this.todoSlotState.set(key, dismissed);
     // Settled → dismissed transition parallels settled → cleared in
     // terms of the idle timer: leave the currently-armed timer alone
-    // (§3.5 rule 2 — manual × doesn't reset the timer for other
+    // (manual × doesn't reset the timer for other
     // tiles). Check whether any settled remain; if not, cancel.
     const counts = this._slotKindCounts();
     if (!counts.anySettled) {
@@ -2711,7 +2704,7 @@ export class BrennApp extends LitElement {
     this._maybeFireQueuedRefresh();
   }
 
-  /** Per-row debounce guard (§6). Returns true if the row is currently
+  /** Per-row debounce guard. Returns true if the row is currently
    *  locked out and the caller must short-circuit. Otherwise arms the
    *  400ms timer and returns false. */
   private _armDebounce(path: string, repo?: string, ms = 400): boolean {
@@ -2736,7 +2729,7 @@ export class BrennApp extends LitElement {
     }
   }
 
-  /** Show a row-level error badge with 6s auto-dismiss (§7.2). */
+  /** Show a row-level error badge with 6s auto-dismiss. */
   private _showRowError(key: string, text: string): void {
     const existing = this.todoErrorTimers.get(key);
     if (existing !== undefined) clearTimeout(existing);
@@ -2762,7 +2755,7 @@ export class BrennApp extends LitElement {
 
   /** User tapped done on a task. */
   private _handleTodoDone(path: string, repo?: string): void {
-    // §3.5: a queued refresh is a hard gate on new mutations — the
+    // A queued refresh is a hard gate on new mutations — the
     // client has promised to send nothing until pending slots drain.
     if (this.todoRefreshQueued) return;
     if (this._armDebounce(path, repo)) return;
@@ -2834,7 +2827,7 @@ export class BrennApp extends LitElement {
       });
       return;
     }
-    // §3.5: queued-refresh short-circuit (same gate as `_armDebounce`).
+    // Queued-refresh short-circuit (same gate as `_armDebounce`).
     if (this.todoRefreshQueued) return;
     if (this._armDebounce(path, repo)) return;
     // Shared helper encodes `max(today, effective_date) + days` — a stale
@@ -2881,9 +2874,9 @@ export class BrennApp extends LitElement {
    *  Heading-drop fires `TodoSchedule` for each task: graf sets the
    *  `tentative_date` and removes any prior `sort_order`, so the task
    *  ranks naturally in its new bucket via
-   *  `COALESCE(sort_order, priority, UNRANKED)`. See design.md §4 / §5. */
+   *  `COALESCE(sort_order, priority, UNRANKED)`. */
   private _handleTodoSchedule(target: ScheduleTarget): void {
-    // §3.5: queued-refresh short-circuit (same gate as
+    // Queued-refresh short-circuit (same gate as
     // `_handleTodoSnooze` / `_handleTodoReorder` / `_handleMultiReorder`).
     if (this.todoRefreshQueued) return;
 
@@ -2925,8 +2918,8 @@ export class BrennApp extends LitElement {
     // Freeze BEFORE marking pending. The renderer uses the snapshot
     // during the triage session so the user sees "scheduling…" labels
     // on rows in their pre-drop positions until thaw. Idempotent.
-    // (Schedule does NOT mutate `todoTasks` optimistically — see
-    // design.md §5; we mirror snooze's "no optimistic mutation"
+    // (Schedule does NOT mutate `todoTasks` optimistically — we
+    // mirror snooze's "no optimistic mutation"
     // behavior since the renderer reads from the snapshot anyway.)
     this._freezeListIfNeeded();
 
@@ -2970,9 +2963,9 @@ export class BrennApp extends LitElement {
       return;
     }
 
-    // §3.5: queued-refresh short-circuit.
+    // Queued-refresh short-circuit.
     if (this.todoRefreshQueued) return;
-    // §6: gate duplicate sends at the entry point, same shape as
+    // Gate duplicate sends at the entry point, same shape as
     // `_handleTodoDone` / `_handleTodoSnooze`.
     if (this._armDebounce(target.path, target.repo)) return;
 
@@ -3000,7 +2993,7 @@ export class BrennApp extends LitElement {
     // the list.
     this._freezeListIfNeeded();
 
-    // Stash pre-splice state for snap-back on error (PRD-snooze §2).
+    // Stash pre-splice state for snap-back on error.
     // Store the reference to the current arrays — no clone needed because:
     //  • the next line assigns a fresh array to this.todoTasks (tasks.splice +
     //    reassign), leaving the original reference immutable for snap-back.
@@ -3041,7 +3034,7 @@ export class BrennApp extends LitElement {
       repo: target.repo,
       taskTldr: movedTask.tldr,
     });
-    // Design-fidelity §7.2: any row-level error badge is stale the
+    // Any row-level error badge is stale the
     // moment the user retries — match done/snooze behavior by clearing
     // it on dispatch rather than waiting for the success ack.
     this._clearRowError(todoKey(target.path, target.repo));
@@ -3054,8 +3047,7 @@ export class BrennApp extends LitElement {
    * Dropping into a concrete-dated section (TODAY/TOMORROW/WEEKDAY/FUTURE)
    * updates the task's `effective_date` to match so grouping renders
    * correctly before the server confirms. The `targetGroupDate === null`
-   * branch is defense-in-depth — under §4 of the today-earlier-bucket
-   * design, drops into pseudo-buckets (OVERDUE / EARLIER / DUE_TODAY,
+   * branch is defense-in-depth — drops into pseudo-buckets (OVERDUE / EARLIER / DUE_TODAY,
    * all of which have `canonicalDate: null`) are filtered out at the
    * hit-test level. If one slips through, leave `effective_date` alone.
    * The backend recomputes the authoritative `effective_date` on next
@@ -3076,9 +3068,9 @@ export class BrennApp extends LitElement {
    * relative order.
    */
   private _handleMultiReorder(target: ReorderTarget): void {
-    // §3.5: queued-refresh short-circuit.
+    // Queued-refresh short-circuit.
     if (this.todoRefreshQueued) return;
-    // §6: gate on the primary task's key — if any of the selected
+    // Gate on the primary task's key — if any of the selected
     // tasks is still inside its 400ms window, short-circuit the
     // whole batch so the operation is atomic (we don't want half a
     // multi-select going through).
@@ -3105,7 +3097,7 @@ export class BrennApp extends LitElement {
     // freeze. New order appears only on thaw.
     this._freezeListIfNeeded();
 
-    // Stash pre-splice state for snap-back on error (PRD-snooze §2).
+    // Stash pre-splice state for snap-back on error.
     // Store the snapshot under EACH task's key (not just the primary) so that
     // _handleTodoActionResult can find it regardless of which task's ack arrives
     // first or fails first. All N keys point at the same snapshot object; the
@@ -3167,7 +3159,7 @@ export class BrennApp extends LitElement {
         repo: task.repo ?? undefined,
         taskTldr: task.tldr,
       });
-      // Design-fidelity §7.2: match done/snooze dispatch behavior —
+      // Match done/snooze dispatch behavior —
       // clear any existing row-error badge on retry.
       this._clearRowError(key);
       // Arm per-task timer too so a subsequent done/snooze on any
@@ -3198,19 +3190,19 @@ export class BrennApp extends LitElement {
    * refresh itself keeps going on the backend. */
   private static readonly TODO_REFRESH_TIMEOUT_MS = 10_000;
 
-  /** Per-pending-slot watchdog threshold (design §3.4.4). Longer than
+  /** Per-pending-slot watchdog threshold. Longer than
    *  any reasonable server round-trip, short enough that a stuck row
    *  recovers within ~a minute. */
   private static readonly TODO_SLOT_WATCHDOG_MS = 30_000;
 
-  /** List-level idle timer for settled-slot dismissal (design §3.5).
+  /** List-level idle timer for settled-slot dismissal.
    *  Long enough for the user to read the tile; short enough that they
    *  don't have to click `×` on every one after a triage session. */
   private static readonly TODO_IDLE_DISMISS_MS = 5_000;
 
   /** User clicked the refresh button in the todo header.
    *
-   *  §3.5: serialize behind in-flight mutations. Drop all settled
+   *  Serialize behind in-flight mutations. Drop all settled
    *  tiles up front (the user has asked for a fresh view — the tiles'
    *  purpose is served). If any slot is still pending, set
    *  `todoRefreshQueued` and defer the TodoRefresh send until every

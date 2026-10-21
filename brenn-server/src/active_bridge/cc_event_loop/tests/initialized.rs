@@ -1,8 +1,7 @@
 //! Initialized event-family tests: `SessionEvent::Initialized` handling
 //! (`handle_initialized` — conversation metadata persistence, runtime tool
 //! validation, permission-mode broadcast + alert dedup, CC version floor,
-//! and seed-on-cache-miss behavior). Peeled out of `tests/mod.rs` per
-//! design §2.4.
+//! and seed-on-cache-miss behavior).
 
 use super::super::super::ActiveBridges;
 use super::super::super::test_support::{
@@ -303,7 +302,7 @@ async fn initialized_with_missing_permission_mode_alerts() {
 
 #[tokio::test]
 async fn initialized_with_cased_auto_permission_mode_alerts() {
-    // Edge case 4 in the design: "Auto"/"AUTO" must be treated as a
+    // "Auto"/"AUTO" must be treated as a
     // mismatch — CC is a strict producer, no case-folding. Pins the
     // tripwire against a future refactor that adds `.to_lowercase()`.
     let (dispatcher, captured, handle) = make_capturing_alerter();
@@ -352,7 +351,7 @@ async fn initialized_with_cased_auto_permission_mode_alerts() {
 
 #[tokio::test]
 async fn repeated_missing_permission_mode_dedups_alert_but_rebroadcasts() {
-    // Edge case 3 in the design: the once-per-process alert dedup must
+    // The once-per-process alert dedup must
     // engage at the handle_initialized call-site, and the broadcast must
     // fire on every init. A regression swapping the dedup key (e.g. to
     // `session_id`) or folding the broadcast into the match arms would

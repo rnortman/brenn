@@ -25,7 +25,7 @@ interface TodoListInternals {
  *
  * `effective_date` is required by graf's contract — every TodoItem has a
  * concrete date (null-date rows get partitioned into `lint_errors` at the
- * graf layer, per `docs/designs/todo-section-order-and-dated-invariant.md`). */
+ * graf layer). */
 function task(
   path: string,
   tldr: string,
@@ -67,7 +67,7 @@ describe("groupTasksByDate", () => {
   const today = "2026-04-12";
 
   /** Drop the always-emitted empty TODAY/TOMORROW/WEEKDAY placeholders
-   *  (design.md §3 — the 7-day window is seeded regardless of which
+   *  (the 7-day window is seeded regardless of which
    *  days are populated). Most pre-existing tests reason only about
    *  populated buckets; this filter restores that view without losing
    *  the empty-bucket behavior coverage in the dedicated tests below. */
@@ -184,7 +184,7 @@ describe("groupTasksByDate", () => {
 
   it("returns the 7-day always-visible window for no tasks", () => {
     // Empty input now seeds today + next 6 days as empty placeholders
-    // (design.md §3). All 7 are date-section buckets (TODAY, TOMORROW,
+    // All 7 are date-section buckets (TODAY, TOMORROW,
     // 5 WEEKDAYs). OVERDUE / DUE_TODAY / EARLIER / FUTURE are NOT
     // forced and absent here.
     const groups = groupTasksByDate([], today);
@@ -413,7 +413,7 @@ describe("groupTasksByDate", () => {
     expect(groups[1].canonicalDate).toBe("2026-06-01");
   });
 
-  // --- today-earlier-bucket split (design.md §6) ---
+  // --- Due-today / Earlier / Today split ---
 
   it("Due-today renders above Earlier and Today", () => {
     const tasks = [
@@ -467,7 +467,7 @@ describe("groupTasksByDate", () => {
   });
 
   it("due_date today + effective_date in the past is Due-today (not Earlier)", () => {
-    // Pins the §2 cascade decision: DUE_TODAY wins over EARLIER when both
+    // Pins the cascade decision: DUE_TODAY wins over EARLIER when both
     // apply. If the policy ever flips, this test flips with it.
     const tasks = [
       task("a.md", "Rolled forward, due today", "2026-04-09", {
@@ -494,7 +494,7 @@ describe("groupTasksByDate", () => {
     expect(groups[0].canonicalDate).toBeNull();
   });
 
-  // --- Always-visible 7-day window (design.md §3) ---
+  // --- Always-visible 7-day window ---
 
   it("emits empty TODAY/TOMORROW/WEEKDAY buckets when no tasks fall in the next 7 days", () => {
     // Tasks only in OVERDUE + FUTURE — the 7 forced date headers
@@ -550,10 +550,10 @@ describe("groupTasksByDate", () => {
   });
 });
 
-/** Phase 4 §5.4: `_pendingLabel` picks a label matching the in-flight
+/** `_pendingLabel` picks a label matching the in-flight
  * action — `completing…` / `snoozing…` / `reordering…`, with
  * `working…` as a defensive fallback. */
-describe("_pendingLabel dispatch (Phase 4 §5.4)", () => {
+describe("_pendingLabel dispatch", () => {
   function makeList(
     entries: [string, TodoPendingAction][],
   ): TodoListInternals {
@@ -645,7 +645,7 @@ describe("buildSlotGroups", () => {
   });
 
   it("empty tasks + no snapshot → 7 always-visible date buckets", () => {
-    // Mirror of `groupTasksByDate([], today)` in §3 above — the
+    // Mirror of `groupTasksByDate([], today)` above — the
     // always-visible 7-day window seeds 7 empty buckets even with zero
     // live tasks, and `buildSlotGroups` is a thin wrapper around it.
     const groups = buildSlotGroups([], today, null);
@@ -1105,9 +1105,9 @@ describe("_onDragStart interactionsDisabled gate", () => {
   });
 });
 
-/** Drop-side hit-test predicate for the today-earlier-bucket split.
- *  See `todo-list.ts::isDroppable` and design.md §4. */
-describe("isDroppable predicate (today-earlier-bucket §4)", () => {
+/** Drop-side hit-test predicate for the pseudo-buckets.
+ *  See `todo-list.ts::isDroppable`. */
+describe("isDroppable predicate", () => {
   it("rejects cross-bucket drop into OVERDUE", () => {
     expect(isDroppable("overdue", 3, 0)).toBe(false);
   });
@@ -1137,12 +1137,12 @@ describe("isDroppable predicate (today-earlier-bucket §4)", () => {
   });
 });
 
-/** Drag-start gate for OVERDUE and DUE_TODAY (today-earlier-bucket §4).
+/** Drag-start gate for OVERDUE and DUE_TODAY.
  *  Both buckets are keyed off `due_date`, which TodoReorder cannot
  *  change; allowing drag-out would cause snap-back on next render.
  *  EARLIER is *not* gated — drag-out of EARLIER is the legal
  *  cross-bucket move from a pseudo-bucket. */
-describe("_onDragStart pseudo-bucket gate (today-earlier-bucket §4)", () => {
+describe("_onDragStart pseudo-bucket gate", () => {
   interface DragInternals {
     _onDragStart(
       e: PointerEvent,
@@ -1256,13 +1256,13 @@ describe("action-btn CSS invariants", () => {
   });
 });
 
-/** Pure unit tests for the heading-drop hit-test (design.md §4.3).
+/** Pure unit tests for the heading-drop hit-test.
  *
  *  Synthetic `HitTestRow[]` arrays exercise the helper without DOM
  *  mounting: heading ownership bands, populated vs. empty buckets,
  *  pseudo-bucket rejection, `isDroppable` rejection, out-of-bounds
  *  pointer positions, and mixed populated + empty layouts. */
-describe("hitTestDrop (heading-drop §4.3)", () => {
+describe("hitTestDrop", () => {
   function header(
     gi: number,
     top: number,
@@ -1420,11 +1420,11 @@ describe("hitTestDrop (heading-drop §4.3)", () => {
   });
 });
 
-/** Heading-drop dispatch via `_onDragEnd` (design.md §4.6). Mounts a
+/** Heading-drop dispatch via `_onDragEnd`. Mounts a
  *  `<brenn-todo-list>`, simulates the drag state by reaching into the
  *  internals (`_drag`, `_cachedGroups`), and asserts that
  *  `_onDragEnd` fires `onSchedule` with the right `ScheduleTarget`. */
-describe("heading-drop dispatch (§4.6)", () => {
+describe("heading-drop dispatch", () => {
   interface DragEndInternals {
     _drag: {
       sourceKey: string;
@@ -1623,10 +1623,10 @@ describe("heading-drop dispatch (§4.6)", () => {
   });
 });
 
-/** Empty-input render contract (§3.3 flip): zero tasks + null
+/** Empty-input render contract: zero tasks + null
  *  snapshot now renders 7 group headers, not the retired
  *  `.empty-state` placeholder. */
-describe("empty-input rendering (§3.3 flip)", () => {
+describe("empty-input rendering", () => {
   it("renders 7 group headers and no .empty-state for tasks=[] + frozenSnapshot=null", async () => {
     const el = document.createElement("brenn-todo-list") as BrennTodoList;
     el.visible = true;
@@ -1643,7 +1643,7 @@ describe("empty-input rendering (§3.3 flip)", () => {
   });
 });
 
-/** Settled-tile rendering for the new schedule action (§5.1 #3). */
+/** Settled-tile rendering for the new schedule action. */
 describe("settled tile (schedule)", () => {
   it("renders 📅 glyph + .settled-schedule class with 'Scheduled for ...' text", async () => {
     const el = document.createElement("brenn-todo-list") as BrennTodoList;
@@ -1683,10 +1683,10 @@ describe("settled tile (schedule)", () => {
   });
 });
 
-/** Schedule-target heading highlight (§4.4): `.group-header.drop-target`
+/** Schedule-target heading highlight: `.group-header.drop-target`
  *  is retired; the new affordance is `.group-header.schedule-target`,
  *  applied while `dropMode === "schedule"`. */
-describe("schedule-target CSS retirement (§4.4)", () => {
+describe("schedule-target CSS retirement", () => {
   it("CSS does not declare a .group-header.drop-target rule", () => {
     const css = BrennTodoList.styles.cssText;
     expect(css).not.toMatch(/\.group-header\.drop-target/);
@@ -1698,8 +1698,8 @@ describe("schedule-target CSS retirement (§4.4)", () => {
   });
 });
 
-/** `_pendingLabel` for the new "schedule" action (§5.1 #4). */
-describe("_pendingLabel schedule (§5.1 #4)", () => {
+/** `_pendingLabel` for the new "schedule" action. */
+describe("_pendingLabel schedule", () => {
   it('"schedule" → "scheduling…"', () => {
     const el = document.createElement("brenn-todo-list") as BrennTodoList;
     const slotState = new Map<string, SlotState>();
@@ -1719,13 +1719,13 @@ describe("_pendingLabel schedule (§5.1 #4)", () => {
   });
 });
 
-/** Heading-drop integration tests (design.md §7) — exercise the wiring
+/** Heading-drop integration tests — exercise the wiring
  *  of `hitTestDrop` into `_updateDropTarget`, `_renderDropVisuals`'s
- *  visual-mutual-exclusion contract (§4.4), and the `_onDragEnd`
+ *  visual-mutual-exclusion contract, and the `_onDragEnd`
  *  branching from a real mounted component. happy-dom does not lay
  *  out elements, so each test stubs `getBoundingClientRect` on the
  *  task-list children to give the hit-test predictable geometry. */
-describe("heading-drop integration (§7)", () => {
+describe("heading-drop integration", () => {
   interface DragInternals {
     _drag: {
       sourceKey: string;
@@ -1929,14 +1929,14 @@ describe("heading-drop integration (§7)", () => {
     stubAllRowsAndHeaders(el, overrides);
   }
 
-  // F1: row → header flip at equal `(gi, insertIdx)` triggers
-  // `_renderDropVisuals` because the change-detection guard at §4.2
+  // Row → header flip at equal `(gi, insertIdx)` triggers
+  // `_renderDropVisuals` because the change-detection guard
   // includes `dropMode`. Pointer over TODAY's first task (reorder,
   // gi=TODAY, insertIdx=0) → pointer flips into TODAY's heading band
   // (schedule, gi=TODAY) — DOM must transition: drop-indicator gone,
   // schedule-target present.
 
-  it("row → heading flip at equal (gi, insertIdx) re-renders visuals (§4.2)", async () => {
+  it("row → heading flip at equal (gi, insertIdx) re-renders visuals", async () => {
     // Two-task TODAY bucket so the source is at ti=1 — the row hit
     // at gi=0/ti=0 is a real change relative to source, forcing
     // `_renderDropVisuals` to fire on the first `_updateDropTarget`.
@@ -1978,7 +1978,7 @@ describe("heading-drop integration (§7)", () => {
 
     // Flip the pointer up into TODAY's heading band (y=10). Same gi,
     // same insertIdx (0) — only `dropMode` changes. The change-
-    // detection guard at §4.2 includes `dropMode`, so visuals must
+    // detection guard includes `dropMode`, so visuals must
     // re-render: drop-indicator gone, schedule-target appears.
     inst._updateDropTarget(10);
     expect(inst._drag!.dropMode).toBe("schedule");
@@ -1994,7 +1994,7 @@ describe("heading-drop integration (§7)", () => {
     document.body.removeChild(el);
   });
 
-  it("heading → row reverse flip at equal (gi, insertIdx) re-renders visuals (§4.2)", async () => {
+  it("heading → row reverse flip at equal (gi, insertIdx) re-renders visuals", async () => {
     // Two-task TODAY bucket. Source is task B at ti=1; the schedule
     // hit and the row hit both differ from the source's initial
     // dropInsertIdx, so `_renderDropVisuals` fires on each call.
@@ -2032,7 +2032,7 @@ describe("heading-drop integration (§7)", () => {
     // insertIdx=0. Mode flipped from schedule → reorder; visuals
     // must re-render even though gi is unchanged (insertIdx
     // wasn't tracked under schedule, but `dropMode` is the
-    // discriminator that forces the render per §4.2).
+    // discriminator that forces the render).
     inst._updateDropTarget(25);
     expect(inst._drag!.dropMode).toBe("reorder");
     expect(inst._drag!.dropGroupIdx).toBe(0);
@@ -2047,7 +2047,7 @@ describe("heading-drop integration (§7)", () => {
   // F2: visual-indicator mutual exclusion (DOM-state). The static CSS
   // check covers "rule absent"; these two cover "DOM never has both".
 
-  it("on heading hit: zero .drop-indicator, exactly one .schedule-target (§7)", async () => {
+  it("on heading hit: zero .drop-indicator, exactly one .schedule-target", async () => {
     const el = await mountWith([task("a.md", "A", "2026-04-12")]);
     stubTodayTomorrowGeometry(el);
     const inst = primeDrag(el, ":a.md", el.tasks[0], 0, 0);
@@ -2065,7 +2065,7 @@ describe("heading-drop integration (§7)", () => {
     document.body.removeChild(el);
   });
 
-  it("on row hit: exactly one .drop-indicator, zero .schedule-target (§7)", async () => {
+  it("on row hit: exactly one .drop-indicator, zero .schedule-target", async () => {
     // Two-task TODAY bucket so a row hit can target ti>0 cleanly. The
     // user drags task A (gi=0, ti=0) and the pointer lands on task B's
     // bottom half (insertIdx=2 — past the end of the visible group).
@@ -2109,7 +2109,7 @@ describe("heading-drop integration (§7)", () => {
   // highlight, no schedule dispatch (rejected by canonicalDate ===
   // null at the hit-test level).
 
-  it("EARLIER heading hit from TODAY source: no schedule visual, no schedule dispatch (§4.1)", async () => {
+  it("EARLIER heading hit from TODAY source: no schedule visual, no schedule dispatch", async () => {
     // Build a list with one EARLIER task and one TODAY task. The
     // resulting groups are: [EARLIER (gi=0), TODAY (gi=1), TOMORROW
     // (gi=2), 5 weekdays...]. EARLIER's canonicalDate === null, so the
@@ -2163,7 +2163,7 @@ describe("heading-drop integration (§7)", () => {
   // — design listed this as a sanity-check regression. A pointerdown
   // on the drag handle of an OVERDUE row must not begin a drag.
 
-  it("OVERDUE drag-start gate: pointerdown on handle does not begin a drag (§7 regression)", async () => {
+  it("OVERDUE drag-start gate: pointerdown on handle does not begin a drag", async () => {
     const el = await mountWith([
       task("a.md", "Overdue", "2026-04-10", { due_date: "2026-04-10" }),
     ]);
@@ -2181,7 +2181,7 @@ describe("heading-drop integration (§7)", () => {
   // dispatch (not schedule). Verifies the not-taken branch of
   // `_onDragEnd`'s new dropMode switch still routes through onReorder.
 
-  it("row hit: drop fires onReorder (not onSchedule) (§7)", async () => {
+  it("row hit: drop fires onReorder (not onSchedule)", async () => {
     const el = await mountWith([
       task("a.md", "A", "2026-04-12"),
       task("b.md", "B", "2026-04-12"),
@@ -2225,14 +2225,14 @@ describe("heading-drop integration (§7)", () => {
   });
 });
 
-/** F6: mixed-source multi-select schedule. Two of three selected tasks
- *  already live on the target date; the third does not. Per design
- *  §4.6 the brenn-app handler dispatches all 3 messages — graf is
+/** Mixed-source multi-select schedule. Two of three selected tasks
+ *  already live on the target date; the third does not. The
+ *  brenn-app handler dispatches all 3 messages — graf is
  *  idempotent on the same-date cases, and per-task no-op filtering
  *  at the brenn layer is unnecessary. This test pins that decision so
  *  a future "optimization" that filters per-task in the brenn-app
  *  handler fails here. */
-describe("mixed-source multi-select schedule (§4.6)", () => {
+describe("mixed-source multi-select schedule", () => {
   // Lives in this file rather than app-debounce-toast.test.ts because
   // the assertion is about the brenn-todo-list dispatch (`onSchedule`
   // gets called once with all selected keys); the brenn-app handler's

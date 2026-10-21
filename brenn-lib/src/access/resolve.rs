@@ -277,8 +277,7 @@ pub fn build_wasm_policy(
     // `subscribe_acl` matcher is exactly the operator's statement that this consumer
     // may hold a subscription, so it is the right signal to derive the grant from.
     // Empty `subscribe_acl` ⇒ no grant ⇒ deny-by-default (a consumer with no declared
-    // subscribe ACL has no subscription authorization), matching the design's
-    // uniform delivery gate.
+    // subscribe ACL has no subscription authorization).
     if !subscribe_acl.is_empty() {
         grant_set.insert(AppCapability::MessagingSubscribe);
     }
@@ -559,10 +558,10 @@ fn validate_mqtt_client(
 /// Panics (operator-config, fail-fast) on:
 /// - an empty exact value (matches only the empty channel — never useful),
 /// - an empty prefix (a universal match — silent over-grant on the
-///   attacker-influenceable subscribe path, design §1.1),
+///   attacker-influenceable subscribe path),
 /// - a prefix that does not end at a segment boundary (`/` or `.`) — a bare
 ///   byte-prefix like `"alert"` would match `"alerts"`, over-granting beyond the
-///   intended `alert/…`/`alert.…` namespace (design §1.1, high-level fm4).
+///   intended `alert/…`/`alert.…` namespace.
 ///
 /// The `owner` argument is a pre-formatted participant label such as
 /// `app "home"`, `wasm consumer "filter"`, or `surface "deskbar"`. The fail-fast
@@ -730,7 +729,7 @@ mod tests {
         assert!(!policy.has_grant(AppCapability::DynamicSubscribe));
         assert!(policy.acls.mqtt_subscribe.is_empty());
         assert!(policy.acls.brenn_subscribe.is_empty());
-        // Deny-by-default holds for every transport, not just MQTT (design §6.1).
+        // Deny-by-default holds for every transport, not just MQTT.
         assert!(!policy.allows_mqtt_dynamic_subscribe("home", "sensors/temp"));
         assert!(!policy.allows_brenn_dynamic_subscribe("anything"));
         assert!(!policy.allows_webhook_dynamic_subscribe("anything"));
@@ -751,7 +750,7 @@ mod tests {
     fn wasm_host_grant_token_in_llm_grants_panics() {
         // A WASM-host capability token deserializes from an LLM `grants` list (the
         // whole `AppCapability` enum derives Deserialize), but it is not part of
-        // the LLM-authorable vocabulary — resolution must reject it (design §2.2).
+        // the LLM-authorable vocabulary — resolution must reject it.
         let grants = vec![AppCapability::WasmStore];
         build_app_policy("home", &grants, &AppAclRaw::default(), &clients(&[]));
     }
@@ -833,7 +832,7 @@ mod tests {
     fn mqtt_subscribe_matcher_names_unconfigured_client_panics() {
         // Syntactically valid slug, but no matching [[mqtt_client]]: a silent
         // never-match (deny where the operator intended allow) at runtime, so
-        // reject at resolution (design §2.5.2).
+        // reject at resolution.
         let acl = AppAclRaw {
             mqtt_subscribe: vec![MqttSubMatcherRaw {
                 client: "nonexistent".to_string(),
@@ -1330,9 +1329,8 @@ mod tests {
     fn wasm_mqtt_publish_acl_resolves_to_mqtt_publish_list() {
         // A WASM consumer's `mqtt_publish_acl` resolves into the same
         // `AppPolicy.acls.mqtt_publish` list, with the same `client`-keyed
-        // `MqttClientMatcher`, that the LLM `[[app.acl.mqtt_publish]]` block does
-        // (mqtt-egress-unify design §2.5 / §4 "Policy resolution"). The matcher type
-        // and field are identical across both caller kinds — the load-bearing
+        // `MqttClientMatcher`, that the LLM `[[app.acl.mqtt_publish]]` block does.
+        // The matcher type and field are identical across both caller kinds — the load-bearing
         // unification.
         let mqtt_publish_acl = vec![
             MqttClientMatcherRaw {
@@ -1371,7 +1369,7 @@ mod tests {
     #[test]
     fn wasm_mqtt_publish_acl_empty_denies_by_default() {
         // Grant held, empty matcher list ⇒ every client denied (`.any` over empty
-        // = false), the deny-by-default invariant (design §3.4).
+        // = false), the deny-by-default invariant.
         let policy = build_wasm_policy("proc", [ComponentGrant::Mqtt], WasmAclsRaw::default());
         assert!(policy.has_grant(AppCapability::MqttPublish));
         assert!(policy.acls.mqtt_publish.is_empty());
@@ -1382,7 +1380,7 @@ mod tests {
     #[should_panic(expected = "invalid client slug")]
     fn wasm_mqtt_publish_acl_invalid_client_slug_panics() {
         // Charset validation at resolution, mirroring the LLM side's
-        // `validate_mqtt_client` charset check (mqtt-egress-unify design §2.5).
+        // `validate_mqtt_client` charset check.
         build_wasm_policy(
             "proc",
             [ComponentGrant::Mqtt],

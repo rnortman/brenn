@@ -373,7 +373,7 @@ pub struct WebhookEnvelope {
 /// Binary payloads are represented as a placeholder only:
 /// `{ binary_placeholder: true, content_type }`. The raw bytes are **not**
 /// carried — they never reach the LLM/browser, preserving the prompt-injection
-/// trust boundary (design §2.2).
+/// trust boundary.
 ///
 /// `content_type` in the `Binary` variant has no
 /// `#[serde(skip_serializing_if)]`: the key is always emitted (as `null` when
@@ -400,8 +400,7 @@ pub enum MqttPayloadBody {
 ///
 /// Stored as the `body` JSON of a `messaging_messages` row with
 /// `envelope_type = 'mqtt'`. This is the owned host↔guest contract; the
-/// binary-crate router constructs it from the inbound `InboundPayload`
-/// (design §2.2).
+/// binary-crate router constructs it from the inbound `InboundPayload`.
 ///
 /// The struct is additive JSON: adding fields later leaves older stored rows
 /// valid (they simply lack the field). Deferred fields (MQTT retain flag,
@@ -427,7 +426,7 @@ pub struct MqttEnvelope {
 // Urgency
 // ---------------------------------------------------------------------------
 
-/// Per-message urgency intent set by the sender (design §2.1).
+/// Per-message urgency intent set by the sender.
 ///
 /// Ordered low-to-high: `VeryLow < Low < Normal < High`. The `derive(Ord)`
 /// is load-bearing — `WakeMin::wakes` relies on `>=` comparison.

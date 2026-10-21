@@ -282,7 +282,7 @@ impl WsConnection {
     /// different effective timezones — the exact divergence this feature exists to close.
     ///
     /// One lock, one `load_device_user`, one `Utc::now()` — mirrors the discipline
-    /// in `persist_and_send` (design §2.2).
+    /// in `persist_and_send`.
     pub(super) async fn build_graf_env_and_today(
         &self,
     ) -> (Vec<(String, String)>, chrono::NaiveDate) {

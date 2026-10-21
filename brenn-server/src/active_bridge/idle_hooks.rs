@@ -87,8 +87,7 @@ impl ActiveBridge {
     /// - no registered hook reports `has_pending_work() == true`.
     ///
     /// Otherwise: aborts any existing timer and spawns a new one for
-    /// the computed delay measured from now. See
-    /// `docs/designs/idle-hooks.md` § "Flow".
+    /// the computed delay measured from now.
     pub(crate) async fn maybe_arm_idle_hook_timer(self: &Arc<Self>) {
         // Snapshot once and reuse for the floor computation and the
         // pending-work check. `idle_hook_delay` returns `None` when
@@ -600,8 +599,8 @@ mod tests {
         // Note: `on_delivered` only runs when `send_system_message`
         // succeeds, which requires a live CC session. The test bridge has
         // `session: None`, so the send fails and `on_delivered` does not
-        // run — that's the expected behavior on the documented "session
-        // dead" branch (see `run_idle_hooks` step 5 in the design).
+        // run — that's the expected behavior on the "session dead" branch
+        // of `run_idle_hooks`.
     }
 
     /// Hook whose `check()` sleeps for an hour. Used by the shutdown-bound

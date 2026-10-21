@@ -52,7 +52,7 @@ pub use brenn_envelope::grants::{ComponentGrant, ComponentHost};
 ///
 /// Exported so integration tests can compute the same cutoff boundary without duplicating the
 /// constant. The component defines its own copy in-crate (WASM cannot import from this crate);
-/// if the component's value ever changes, update both. See design §2.2.
+/// if the component's value ever changes, update both.
 pub const LAST_GRACE_MS: i64 = 60 * 1000; // 60 s
 
 /// Amortization factor for the `last` namespace prune scan.
@@ -68,7 +68,7 @@ struct StoreData {
     kv_store: Arc<KvStore>,
     config: Arc<HashMap<String, String>>,
     /// Per-store resource limits (memory/table/instance caps). Installed via
-    /// `store.limiter(...)` in `make_store` (H1046, design §2.4).
+    /// `store.limiter(...)` in `make_store`.
     limits: StoreLimits,
 }
 
@@ -153,16 +153,14 @@ impl brenn::replay::store::HostTransaction for StoreData {
     }
 
     fn commit(&mut self, tx: Resource<Transaction>) -> Result<(), StoreError> {
-        // The replay endpoint slug exists on `ReplayComponent` (H1046) but is not threaded
-        // into `StoreData`, so pass "" for log context here. Wiring the slug through
-        // `host_commit`/`host_rollback` was left out of scope by H1046 (design §2.7-E);
-        // it is a small follow-up if a `slug=""` commit/rollback log ever needs disambiguation.
+        // The replay endpoint slug exists on `ReplayComponent` but is not threaded
+        // into `StoreData`, so pass "" for log context here.
         store::host_commit(&mut self.resource_table, &tx, "")
     }
 
     fn rollback(&mut self, tx: Resource<Transaction>) {
         // See `commit`: replay slug exists on the component but is not in `StoreData`, so
-        // pass "" for log context (H1046 design §2.7-E left the threading out of scope).
+        // pass "" for log context.
         store::host_rollback(&mut self.resource_table, &tx, "")
     }
 
@@ -191,7 +189,7 @@ pub struct ReplayComponent {
     store: DeferredStore,
     config: Arc<HashMap<String, String>>,
     /// Endpoint slug, used for the epoch-ticker thread name and the leaked-tx
-    /// cleanup `warn` (H1046, design §2.3).
+    /// cleanup `warn`.
     slug: Arc<str>,
 }
 
@@ -448,7 +446,7 @@ impl ReplayComponent {
     ///   KvStore's `quota_hit` AtomicBool so subsequent calls start clean.
     ///
     /// A trap (component panic, unreachable, resource exhaustion, etc.) causes this
-    /// function to panic — per backend robustness rules (design §2.5).
+    /// function to panic — per backend robustness rules.
     pub fn check(&self, input: &CheckInput) -> (Result<(), ReplayError>, bool) {
         let verdict = self
             .run_check(input, None)
@@ -466,7 +464,7 @@ impl ReplayComponent {
     /// Shared dispatch core: build the store, instantiate, call `check`, then run the
     /// unconditional leaked-transaction cleanup on **every** exit path (both the
     /// instantiate-fail `Err` and the `call_check` result), and return the captured
-    /// outcome (H1046, design §2.5.1).
+    /// outcome.
     ///
     /// Both production `check` and the test hatches `check_raw_for_testing` /
     /// `check_with_limits` funnel through here, so the cleanup is reachable from the
@@ -615,7 +613,7 @@ impl ReplayComponent {
     /// Sets the store-level memory cap below a fixture's initial memory declaration so the
     /// limit fires during `replay_pre.instantiate` (an instantiation-time resource-limit
     /// failure → outer `Err`), proving the `make_store` limiter applies to instantiation
-    /// and not only to a later `memory.grow` (design §3 edge-case table). Mirrors
+    /// and not only to a later `memory.grow`. Mirrors
     /// `ProcessorComponent::handle_with_memory_limit`.
     ///
     /// Pass a `memory_limit_bytes` well below the fixture's initial memory (e.g. 1) to
@@ -654,7 +652,7 @@ impl ReplayComponent {
 }
 
 // ---------------------------------------------------------------------------
-// Processor-component runtime (§2.2)
+// Processor-component runtime
 //
 // Bindgen for the `processor` WIT world: one export (`receive`), imports for
 // `ports` (publish) and `store` (KV transactions).
@@ -725,7 +723,7 @@ pub trait ProcessorAlerter: Send + Sync {
 /// depend on `brenn-lib` (where `enforce_and_publish` / `MqttEgressError` live);
 /// the binary crate builds a closure that calls `enforce_and_publish` and maps
 /// its `MqttEgressError` into this enum. This is the same crate-boundary seam as
-/// `OutputAclFn` and `ProcessorAlerter` (design §2.5).
+/// `OutputAclFn` and `ProcessorAlerter`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MqttPublishOutcome {
     /// Publish reached the broker and (for QoS >= 1) was acknowledged.
@@ -903,7 +901,7 @@ const PROCESSOR_EPOCH_TICK_MS: u64 = 100;
 /// Epoch deadline ticks per activation (300 × 100 ms ≈ 30 s wall).
 const PROCESSOR_EPOCH_DEADLINE_TICKS: u64 = 300;
 
-/// Per-invocation resource bound constants for `ProcessorComponent` (§2.2).
+/// Per-invocation resource bound constants for `ProcessorComponent`.
 ///
 /// Fuel: at 10M instructions per envelope entry and a default window of 32
 /// entries this gives 320M instructions — comfortably above any reasonable
@@ -992,7 +990,7 @@ pub const PROCESSOR_MAX_FAST_TOOL_RESULT_BYTES: usize = 256 * 1024;
 pub const PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION: usize = 64;
 
 // ---------------------------------------------------------------------------
-// Replay-world resource-bound constants (H1046, design §2.1).
+// Replay-world resource-bound constants.
 //
 // The replay check runs an operator-supplied guest on every inbound webhook POST
 // (external/untrusted input). These constants mirror the processor world's proven
@@ -4651,8 +4649,8 @@ mod processor_store_host_tests {
         assert!(got.5);
     }
 
-    /// The per-activation call-count budget is *shared* with `do_publish`
-    /// (design §2.5): interleaved `ports.publish` + `mqtt-publish` calls draw
+    /// The per-activation call-count budget is *shared* with `do_publish`:
+    /// interleaved `ports.publish` + `mqtt-publish` calls draw
     /// from the same `MAX_PUBLISH_CALLS_PER_ACTIVATION` cap, and once
     /// it is exhausted `mqtt-publish` returns `quota-exceeded`.
     #[test]
@@ -4808,8 +4806,8 @@ mod processor_store_host_tests {
     }
 
     /// `not-permitted` (an operator ACL actively blocking a WASM publish) emits a
-    /// server-side `warn!` carrying the consumer slug and the (capped) client slug
-    /// — design §3.3 ("Both callers must log the denial"). Without this assertion a
+    /// server-side `warn!` carrying the consumer slug and the (capped) client slug.
+    /// Without this assertion a
     /// refactor that dropped the `warn!` would silently regress WASM ACL-deny
     /// observability (test review).
     #[traced_test]
@@ -5200,7 +5198,7 @@ mod processor_store_host_tests {
         assert!(data.tool_request_buffer.is_empty());
     }
 
-    /// The call-budget gate sits *before* the output-ACL gate (design §2.3), so a
+    /// The call-budget gate sits *before* the output-ACL gate, so a
     /// component that floods publishes against a denying ACL still trips
     /// `QuotaExceeded` once the per-activation call budget is exhausted — it does
     /// not get `NotPermitted` forever. Pins that ordering: the first
@@ -5236,7 +5234,7 @@ mod processor_store_host_tests {
         );
     }
 
-    // ── per-sink publish token buckets (design §2.3, §3.4, §6) ────────────────
+    // ── per-sink publish token buckets ────────────────
 
     /// Helper: build a single-window activation with `envelopes.len()` total and
     /// `new_from` retained-context split.

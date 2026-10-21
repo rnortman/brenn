@@ -17,7 +17,7 @@ html {
      * 100dvh resolves to ~889.5px while window.innerHeight = 833px (a ~56.5px
      * discrepancy equal to the gesture-nav-bar band). height:100% anchors to
      * the layout viewport (= clientHeight = innerHeight = 833), which is the
-     * correct value. See docs/adr/2026/06/06-mobile-chat-input-offscreen/. */
+     * correct value. */
 }
 
 body {
@@ -1091,8 +1091,7 @@ brenn-input-bar {
  * at ~line 346. Both breakpoints match on 411px-wide devices; the later source
  * position of this block is what ensures the Phase-1 rules win the cascade for
  * properties (like padding/display) the two blocks share. Moving them above line
- * ~346 would silently lose on any device where the 600px block is also active.
- * See design-patchfix.md §2 Correction 2. */
+ * ~346 would silently lose on any device where the 600px block is also active. */
 @media (max-width: 600px) {
     /* .app-header { padding } intentionally omitted: display:none (Phase-1,
      * below) makes it irrelevant; restore here if ever un-hiding on mobile. */
@@ -1109,8 +1108,7 @@ brenn-input-bar {
         max-height: 4rem;
     }
 
-    /* Phase-1 mobile patch: close static-layout overflow on ≤600px viewports.
-     * See design-patchfix.md §2. */
+    /* Close static-layout overflow on ≤600px viewports. */
 
     /* Hide redundant body-level brand bar; brenn-app expands to fill. */
     .app-header { display: none; }

@@ -75,7 +75,10 @@ SCRUB_TEST_ENV = {
     for suite, extra_data in [
         ("exit_codes", []),
         ("hook_dest", []),
-        ("modes", ["//:.gitleaks.toml"]),
+        ("modes", [
+            "//:.gitleaks.toml",
+            "repo-template/gitleaks.toml",
+        ]),
         ("rules", [
             "//:.gitleaks.toml",
             "repo-template/gitleaks.toml",

@@ -12,7 +12,7 @@
 //
 // Special directive (body == "__urgency__:<level>"): publishes a short marker
 // string to "out1" via publish_with_urgency using the named urgency level.
-// Used by the typed-urgency-publish integration test (design §4).
+// Used by the typed-urgency-publish integration test.
 // Supported levels: very-low, low, normal, high.
 //
 // Does not import `store` (import-GC strips it; host links it regardless —

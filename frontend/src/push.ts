@@ -5,7 +5,7 @@
  *  - Pass a `BrennWs` instance that is currently connected.
  *  - Only call when the app has `pwa_push_enabled = true` (from Welcome).
  *
- * Design §2.6.3 — permission UI: gesture-gated, triggered from the
+ * Permission UI: gesture-gated, triggered from the
  * user-menu dropdown in the page header.
  */
 
@@ -18,7 +18,7 @@ export type EnablePushResult =
     | { ok: false; reason: "permission_denied" | "not_supported" | "error"; detail?: string };
 
 /**
- * Full enable-push flow (design §2.6.3):
+ * Full enable-push flow:
  * 1. Register SW if not yet registered.
  * 2. Request Notification permission.
  * 3. Fetch VAPID public key via WS request/response.
@@ -92,7 +92,7 @@ export async function enablePush(ws: BrennWs): Promise<EnablePushResult> {
 }
 
 /**
- * Disable-push flow (design §2.6.3):
+ * Disable-push flow:
  * 1. Unsubscribe via PushManager.
  * 2. Send PushUnsubscribe over WS.
  *

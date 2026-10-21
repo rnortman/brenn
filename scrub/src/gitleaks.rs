@@ -10,14 +10,13 @@ use std::process::Command;
 /// Release this wrapper's CLI and config surface was validated against.
 pub const PINNED_VERSION: &str = "8.30.0";
 
-/// The section-symbol-reference rule id, shared by the tree filter and the rejection
-/// message so the two cannot drift apart.
+/// The section-symbol-reference rule id, used by the rejection message.
 pub const EPHEMERAL_RULE: &str = "ephemeral-reference";
 
-/// Rules enforced on diffs only. Tree scans drop findings with these ids:
-/// the grandfathered backlog would otherwise make every tree scan permanently
-/// red, while every diff-scanning layer still enforces them from day one.
-pub const DIFF_ONLY_RULES: &[&str] = &[EPHEMERAL_RULE];
+/// Rule tag that opts a rule out of tree scans. A repo's `.gitleaks.toml` sets
+/// it on a rule whose grandfathered backlog would otherwise make every tree scan
+/// permanently red; every diff-scanning layer still enforces the rule.
+pub const DIFF_ONLY_TAG: &str = "diff-only";
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Finding {
@@ -33,6 +32,10 @@ pub struct Finding {
     pub matched: String,
     #[serde(rename = "Commit", default)]
     pub commit: String,
+    /// The tags of the rule that produced the finding, as the scanned repo's
+    /// config declares them.
+    #[serde(rename = "Tags", default)]
+    pub tags: Vec<String>,
 }
 
 impl Finding {
@@ -49,13 +52,13 @@ impl Finding {
     }
 }
 
-/// Drop findings whose rule is diff-only. Expressed as a subtraction from the
-/// full resolved config: narrowing the rule set gitleaks runs would silently
-/// disable built-in and overlay rules too.
+/// Drop findings from rules the scanned repo's config tags [`DIFF_ONLY_TAG`].
+/// Expressed as a subtraction from the full resolved config: narrowing the rule
+/// set gitleaks runs would silently disable built-in and overlay rules too.
 pub fn apply_tree_filter(findings: Vec<Finding>) -> Vec<Finding> {
     findings
         .into_iter()
-        .filter(|f| !DIFF_ONLY_RULES.contains(&f.rule_id.as_str()))
+        .filter(|f| !f.tags.iter().any(|t| t == DIFF_ONLY_TAG))
         .collect()
 }
 
@@ -178,31 +181,41 @@ mod tests {
             file: "/tmp/mirror/src/a.rs".into(),
             matched: "m".into(),
             commit: String::new(),
+            tags: vec![],
+        }
+    }
+
+    fn diff_only(rule: &str) -> Finding {
+        Finding {
+            tags: vec!["other-tag".into(), DIFF_ONLY_TAG.into()],
+            ..finding(rule)
         }
     }
 
     #[test]
-    fn tree_filter_drops_only_diff_only_rules() {
+    fn tree_filter_drops_only_diff_only_tagged_findings() {
         let input = vec![
-            finding("ephemeral-reference"),
-            finding("local-rule-a"),
+            diff_only("local-rule-a"),
+            finding("local-rule-b"),
             finding("generic-api-key"),
             finding("example-host"),
         ];
         let kept = apply_tree_filter(input);
         let ids: Vec<&str> = kept.iter().map(|f| f.rule_id.as_str()).collect();
-        assert_eq!(ids, vec!["local-rule-a", "generic-api-key", "example-host"]);
+        assert_eq!(ids, vec!["local-rule-b", "generic-api-key", "example-host"]);
     }
 
     #[test]
-    fn tree_filter_keeps_everything_when_no_diff_only_hits() {
-        let input = vec![finding("local-rule-a"), finding("local-rule-b")];
+    fn tree_filter_keeps_an_untagged_ephemeral_reference_finding() {
+        let mut tagged = finding(EPHEMERAL_RULE);
+        tagged.tags = vec!["other-tag".into()];
+        let input = vec![finding(EPHEMERAL_RULE), tagged, finding("local-rule-a")];
         assert_eq!(apply_tree_filter(input.clone()), input);
     }
 
     #[test]
     fn tree_filter_can_empty_the_list() {
-        assert!(apply_tree_filter(vec![finding("ephemeral-reference")]).is_empty());
+        assert!(apply_tree_filter(vec![diff_only(EPHEMERAL_RULE)]).is_empty());
     }
 
     #[test]
@@ -230,13 +243,14 @@ mod tests {
             r#"[{"RuleID":"ephemeral-reference","Description":"sec ref","StartLine":1,"#,
             r#""EndLine":1,"StartColumn":11,"EndColumn":12,"Match":"§","Secret":"§","#, // gitleaks:allow
             r#""File":"/m/src/a.rs","SymlinkFile":"","Commit":"","Entropy":0.5,"#,
-            r#""Author":"","Email":"","Date":"","Message":"","Tags":[],"Fingerprint":"f"}]"#,
+            r#""Author":"","Email":"","Date":"","Message":"","Tags":["diff-only"],"Fingerprint":"f"}]"#,
         );
         let findings = parse_report(json);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "ephemeral-reference");
         assert_eq!(findings[0].start_line, 1);
         assert_eq!(findings[0].file, "/m/src/a.rs");
+        assert_eq!(findings[0].tags, vec![DIFF_ONLY_TAG.to_string()]);
     }
 
     #[test]

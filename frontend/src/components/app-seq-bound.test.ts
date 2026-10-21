@@ -336,7 +336,7 @@ describe("seq bound check — AC6: null baseline accepts any non-negative magnit
   });
 });
 
-describe("seq bound check — negative seq rejection (design §2.2 step 2)", () => {
+describe("seq bound check — negative seq rejection", () => {
   it("rejects negative seq from null baseline: no advance, no render, console.error", async () => {
     const { app, ws } = await mountApp();
     await primeApp(app, ws);

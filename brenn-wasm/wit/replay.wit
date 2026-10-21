@@ -33,9 +33,7 @@ interface types {
     record check-input {
         /// All request headers as received, lowercased names. The host
         /// passes everything; per-provider filtering happens inside the
-        /// component. (A future optional `config` export can let the
-        /// component declare an allowlist so the host pre-filters; this
-        /// is purely additive and not part of iter 1. See design §2.2.1.)
+        /// component.
         headers: list<header>,
 
         /// Verified raw request body bytes (same bytes that were
@@ -137,14 +135,15 @@ interface store {
     /// Start a new transaction. SQLite BEGIN IMMEDIATE under the hood:
     /// acquires the write lock now. A second begin from the same component
     /// instance before commit/rollback returns backend("nested transaction
-    /// not supported"). The contention variant is reserved for iter-3+.
+    /// not supported"). The contention variant is reserved.
     begin: func() -> result<transaction, store-error>;
 
     /// All store failures the component can observe.
     variant store-error {
         /// Another writer holds the lock and the host's wait budget was
-        /// exhausted. Transient. Reserved; not produced in iter-2 (the
-        /// process-global path guard precludes cross-instance contention).
+        /// exhausted. Transient. Reserved; the host does not currently
+        /// produce it (the process-global path guard precludes
+        /// cross-instance contention).
         contention,
         /// Storage subsystem failure or contract violation. String is
         /// host-side diagnostic, opaque to the component. Covers nested

@@ -83,7 +83,7 @@ pub struct BrennConfig {
     /// Declared Claude accounts, keyed by profile name.
     pub claude_profiles: std::collections::BTreeMap<String, ClaudeProfileRaw>,
     /// Repo-sync settings (polling interval, staleness cap, webhook URL prefix
-    /// override). See `docs/designs/repo-sync.md`. Omitting the section falls
+    /// override). Omitting the section falls
     /// back to `RepoSyncConfig::default()`.
     pub repo_sync: RepoSyncConfig,
     /// Top-level repo declarations. Each repo is cloned to `<repo_dir>/<slug>/`

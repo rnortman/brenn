@@ -45,12 +45,12 @@ async function handlePushEvent(event: PushEvent): Promise<void> {
             payload = event.data.json() as PushPayload;
         }
     } catch {
-        // Malformed JSON — fall through to generic notification (§ SW behavior).
+        // Malformed JSON — fall through to generic notification.
     }
 
     if (payload !== null) {
         // Defense-in-depth: drop if user_id not in signed_in_user_ids set.
-        // Server-side current-user check is the primary defense (§2.7.3 step 7).
+        // Server-side current-user check is the primary defense.
         const signedIn = await readSignedInUserIds();
         if (!signedIn.includes(payload.user_id)) {
             // User logged out or push is for a different signed-in user — drop.

@@ -407,8 +407,7 @@ pub fn set_updated_at_for_test(conn: &Connection, conversation_id: i64, updated_
 /// No status filter — all statuses (active, completed, error) are returned.
 /// Empty `app_slugs` short-circuits to an empty result.
 ///
-/// Used by the repo-sync manager for consumer fan-out (see
-/// `docs/designs/repo-sync.md` — "Consumer lookup").
+/// Used by the repo-sync manager for consumer fan-out.
 ///
 /// **Why no status filter:** Brenn's conversation lifecycle cycles
 /// `active → completed → active → completed` across every turn —

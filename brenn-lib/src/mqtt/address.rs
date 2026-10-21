@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn missing_client_segment_is_error() {
         // `mqtt:home/x` — no `:` after the prefix, so there is no client segment.
-        // The client is mandatory (design §1 decision 1); this is a parse error,
+        // The client is mandatory; this is a parse error,
         // NOT a client-omission form that yields `client = ""` / topic `home/x`.
         let err = parse_mqtt_address("mqtt:home/x").unwrap_err();
         assert!(matches!(err, MqttError::AddressInvalid { .. }));

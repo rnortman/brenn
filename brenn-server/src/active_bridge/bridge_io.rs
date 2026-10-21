@@ -194,7 +194,7 @@ impl ActiveBridge {
     /// Persist a system message row, broadcast a `SystemMessageBroadcast` to
     /// all attached browsers, and send `cc_text` to the CC subprocess.
     ///
-    /// The delivered-marking point is post-flush (design §2.2, D1 fix): the
+    /// The delivered-marking point is post-flush: the
     /// session lock is released after enqueue so interactive ops on this bridge
     /// (chat, approvals, compaction) are never blocked by the flush await, while
     /// FIFO stdin order is fixed at enqueue time by the single writer task.
@@ -242,7 +242,7 @@ impl ActiveBridge {
         //    Acquire session lock, enqueue (fixing FIFO position in the writer),
         //    then DROP the lock before awaiting the ack. This ensures concurrent
         //    callers (user chat, approvals, compaction) on this bridge are not
-        //    blocked while CC processes the stdin bytes (design §2.6).
+        //    blocked while CC processes the stdin bytes.
         let ack_rx = {
             let session = self.session.lock().await;
             let session = session
@@ -268,7 +268,7 @@ impl ActiveBridge {
             // session guard drops here — lock released before the flush await.
         };
 
-        // 4. Await the flush ack with no timeout (design §2.6, Q1 resolution).
+        // 4. Await the flush ack with no timeout.
         //    CC crash/kill → broken pipe → writer errors → ack resolves Err →
         //    caller leaves the row delivered_at IS NULL → redelivered on restart.
         //    A permanently-hung-but-alive CC parks this await harmlessly: the
@@ -385,7 +385,7 @@ impl ActiveBridge {
 /// Sync inner used by `handle_turn_completed` inside the unified DB lock scope.
 /// The seq is required so callers can stamp live broadcasts with `seq: Some(db_seq)`,
 /// enabling frontend deduplication against history replay for the reconnect-from-idle
-/// race fix (see docs/adr/2026/05/06-system-message-race/).
+/// race fix.
 pub(super) fn persist_incoming_message_sync<T: serde::Serialize>(
     conn: &rusqlite::Connection,
     conversation_id: i64,
@@ -815,18 +815,17 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Acceptance 8 — flush-stall isolation (R11, design §2.6)
+    // Flush-stall isolation
     // -------------------------------------------------------------------------
 
-    /// Acceptance 8 — flush-stall isolation (design §4 item 8, R11).
+    /// Flush-stall isolation.
     ///
     /// While `persist_broadcast_send` is awaiting a held-back flush ack (simulating
     /// an alive-but-stalled CC writer), the `bridge.session` lock must be FREE so a
     /// concurrent `send_cc_only_system_text` on the same bridge is not serialized
     /// behind the stalled dispatch.
     ///
-    /// This validates the "enqueue under lock, release lock, then await ack" guarantee
-    /// from design §2.6 and R11(a).
+    /// This validates the "enqueue under lock, release lock, then await ack" guarantee.
     ///
     /// Test structure:
     ///   1. Install a stalling session (sends succeed; ack is not auto-fired).
@@ -874,7 +873,7 @@ mod tests {
         .await
         .expect(
             "send_cc_only_system_text timed out — session lock was NOT released before the ack \
-             await; design §2.6 lock-release guarantee is violated",
+             await; lock-release guarantee is violated",
         );
         // The second send must succeed (session is alive, channel has capacity).
         assert!(

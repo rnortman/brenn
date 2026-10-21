@@ -11,8 +11,6 @@
 //   3. Scan dedup namespace; expire stale entries; check for duplicate signature.
 //   4. Cap check (TooManyRequests on overflow).
 //   5. Insert new entry; commit.
-//
-// See design §3 for full specification.
 
 use bindings::brenn::replay::config;
 use bindings::brenn::replay::store;
@@ -52,10 +50,10 @@ fn read_window_ms() -> u64 {
 const CAP: usize = 1024;
 
 /// The header name carrying the per-request dedup identity.
-/// This is the HMAC signature header as configured in the endpoint TOML (§4).
+/// This is the HMAC signature header as configured in the endpoint TOML.
 /// The signature layer also uses this header for auth; a request missing it is
 /// rejected with 401 before the component runs. The guard below is therefore
-/// a defensive check against an impossible host state (design §3.2 step 1).
+/// a defensive check against an impossible host state.
 const SIG_HEADER: &str = "x-brenn-push-signature";
 
 /// Dedup namespace. Per-component fixed string; the store file is already
@@ -113,7 +111,7 @@ impl Guest for Component {
             None => {
                 // Defensive guard: this path is unreachable in practice because the
                 // signature layer rejects requests lacking this header before the
-                // component runs. See design §3.2 step 1.
+                // component runs.
                 return Err(ReplayError::MalformedInput(format!(
                     "absent {SIG_HEADER} header"
                 )));
@@ -198,7 +196,7 @@ impl Guest for Component {
             Ok(()) => {}
             Err(store::StoreError::QuotaExceeded) => {
                 // Host-enforced per-store size cap reached. Roll back and fail
-                // closed as TooManyRequests (design §2.D, §4.3).
+                // closed as TooManyRequests.
                 tx.rollback();
                 return Err(ReplayError::TooManyRequests);
             }

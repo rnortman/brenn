@@ -187,7 +187,7 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
 
     // Reload state for mpsc buffer-full recovery. When the per-tab mpsc fills up
     // during broadcast forwarding, we defer a full history reload until the buffer
-    // drains (via reserve()). See docs/designs/ws-buffer-full-recovery.md.
+    // drains (via reserve()).
     let mut reload_pending = false;
 
     // Main loop: read from WS and broadcast concurrently.
@@ -375,7 +375,6 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
                                 // behind the seam (>2000 messages lost), send_history emits a
                                 // ConversationSwitched{reload:true} to clear the client and replay
                                 // from the seam — a disruption, but correct after a buffer overflow.
-                                // (See docs/adr/2026/05/06-system-message-race/ for analysis.)
                                 // send_ws(Status) is fire-and-forget: a dropped Status frame
                                 // on buffer-full is a UI glitch (stale spinner) not data loss.
                                 // The subsequent send_history uses backpressure and handles

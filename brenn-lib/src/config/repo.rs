@@ -27,7 +27,6 @@ pub struct MountConfigRaw {
     /// Designate this mount as the *primary* for its clone. Only one mount
     /// per clone (across all apps) may be primary; consumers of the primary
     /// mount are the ones notified when a pull produces a conflict.
-    /// See `docs/designs/repo-sync.md`.
     ///
     /// Required (exactly one) when the clone has >1 RW mount; optional
     /// (implicit) when the clone has exactly one RW mount; forbidden when
@@ -84,7 +83,7 @@ impl ResolvedMount {
     }
 }
 
-/// Repo-sync feature config from `[repo_sync]`. See `docs/designs/repo-sync.md`.
+/// Repo-sync feature config from `[repo_sync]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoSyncConfig {
     /// Where Brenn stores repo clones on the host. Required if any `[[repo]]`

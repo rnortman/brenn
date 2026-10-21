@@ -5,8 +5,6 @@
 //! body. Used by the DisplayFile tool, the artifact-snapshot replay path,
 //! and the static `/file/...` route.
 //!
-//! See `docs/designs/frontmatter-rendering.md` for the design.
-//!
 //! Trust contract: this module is part of the assistant-message HTML
 //! pipeline. All scalar values pass through `html_escape`. The
 //! markdown-key path uses `crate::markdown::render_markdown`, which
@@ -556,7 +554,7 @@ fn render_sequence_row(escaped_key: &str, seq: &[Yaml<'_>], cap: usize) -> Strin
         );
     }
 
-    // Decide inline vs sublist. Inline rule (per design): sequence of
+    // Decide inline vs sublist. Inline rule: sequence of
     // scalars where every entry is short and total joined is short.
     if let Some(joined) = try_inline_scalar_seq(seq) {
         return format!("<div class=\"fm-row\"><dt>{escaped_key}</dt><dd>{joined}</dd></div>",);

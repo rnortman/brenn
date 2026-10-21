@@ -101,7 +101,7 @@ describe("shortDate", () => {
 });
 
 /**
- * The snooze menu's +3 days / +1 week / +1 month entries (Phase 4 §4.2)
+ * The snooze menu's +3 days / +1 week / +1 month entries
  * each compute their target date via `max(today, effective_date) + N`.
  * These cases cover the three N values and confirm the date labels
  * match what the snooze handler will ultimately send to the server.

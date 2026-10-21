@@ -21,7 +21,7 @@ impl WsConnection {
     pub(super) async fn send_todo_state(&self, config: &brenn_graf::GrafConfig) {
         let ac = self.app_config();
         // One lock, one load_device_user, one Utc::now() — both env and today derived
-        // from the same effective TZ snapshot so they can never disagree (design §2.2).
+        // from the same effective TZ snapshot so they can never disagree.
         // Two independent wrappers would leave a TOCTOU window where a TZ override write
         // or expiry crossing between the two DB reads produces an env and today from
         // different zones — the exact divergence this feature exists to close.
@@ -188,7 +188,7 @@ impl WsConnection {
                     "graf todo done returned structured error",
                 );
                 let _ = self.send_ws(WsServerMessage::todo_done_failure(path, repo, reason));
-                // §7.1: inject a system message describing the failure so
+                // Inject a system message describing the failure so
                 // the LLM can help the user recover. The chat is the
                 // surface; the row badge is just a pointer. The envelope
                 // is forwarded to the LLM only — not transmitted to the
@@ -208,8 +208,8 @@ impl WsConnection {
                 let _ = self.send_ws(WsServerMessage::todo_done_failure(path, repo, msg.clone()));
                 // Opaque failures (infra errors) also get injected so the
                 // LLM sees what happened. Structured envelope unavailable —
-                // wrap the flat string as a JSON string value (design §9
-                // fallback) so the payload is always valid JSON.
+                // wrap the flat string as a JSON string value so the
+                // payload is always valid JSON.
                 let payload = serde_json::Value::String(msg);
                 let completion_str = completion_date.to_string();
                 self.inject_todo_error(
@@ -297,7 +297,7 @@ impl WsConnection {
         }
     }
 
-    /// Phase 4 §7.1: inject a system message describing a failed todo
+    /// Inject a system message describing a failed todo
     /// mutation into the active bridge's chat. The LLM sees the attempted
     /// call + the server's structured response and can offer recovery.
     ///

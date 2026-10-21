@@ -48,7 +48,7 @@ export function shortDate(dateStr: string): string {
  * Compute the target date a snooze action will land on:
  * `addDays(max(todayStr, effectiveDate), days)`.
  *
- * Mirrors the rule in `prd-snooze.md` §2-3: the snooze caret changes only
+ * The snooze caret changes only
  * `N` in `max(today, effective_date) + N`. A stale `tentative_date` that
  * pushed `effective_date` into the future still compounds correctly —
  * snoozing a task already surfaced next week lands it `days` after that,

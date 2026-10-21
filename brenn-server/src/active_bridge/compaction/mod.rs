@@ -136,14 +136,13 @@ pub(in crate::active_bridge) async fn handle_turn_completed(
     //
     // NO `.await` inside this scope. The three regions are sync precisely so
     // this scope holds the tokio mutex without yielding. Adding any `.await`
-    // here is a refactor regression — see
-    // docs/adr/2026/05/17-db-lock-coalesce-turn-end/design.md.
+    // here is a refactor regression.
     //
     // Locking order: `bridge.db` (tokio mutex, held here) → `active_model_slug`,
     // `context_usage`, `cc_version` std mutexes (acquired inside
     // `update_max_tokens_from_result_sync`). No code path may acquire
     // `bridge.db.lock()` while holding any of these std mutexes — doing so
-    // deadlocks. See design doc above.
+    // deadlocks.
     let model_window_updated;
     let last_24h;
     {
@@ -1369,7 +1368,7 @@ pub(super) mod tests {
     /// Named "in_one_call" (not "in_one_lock"): asserts observable effects,
     /// not the number of `bridge.db.lock().await` acquisitions. The one-lock
     /// invariant is defended by comment blocks in `handle_turn_completed` and
-    /// by the `!Send` compile-error backstop (see design doc §"Edge cases").
+    /// by the `!Send` compile-error backstop.
     #[tokio::test]
     async fn turn_end_writes_message_cost_and_window_in_one_call() {
         let active_slug = "claude-sonnet-4-6";

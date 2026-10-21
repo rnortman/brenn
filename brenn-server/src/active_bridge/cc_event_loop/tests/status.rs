@@ -1,6 +1,6 @@
 //! Status/compaction-lifecycle tests: `handle_status_change` (StatusChange)
 //! and `handle_compact_boundary` (CompactBoundary), plus the TurnCompleted
-//! Idle broadcast. Peeled out of `tests/mod.rs` per design §2.4.
+//! Idle broadcast.
 
 use super::super::super::test_support::{
     await_fence, drain_broadcast, event_fence, recv_broadcast, test_bridge, test_bridge_singleton,

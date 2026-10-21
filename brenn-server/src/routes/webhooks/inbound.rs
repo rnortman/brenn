@@ -349,8 +349,8 @@ fn route_replay_error(
         ReplayError::TooManyRequests => {
             if quota_hit {
                 // Host-quota hit: the store has reached its configured size cap.
-                // The operator has already been alerted via the Warning path
-                // (§2.E layer 2). Do NOT fire ReplayCapHit here — that would
+                // The operator has already been alerted via the Warning path.
+                // Do NOT fire ReplayCapHit here — that would
                 // ban the sender's IP via fail2ban for a storage-capacity
                 // condition, not for abuse. Return 429 without a security event.
                 tracing::warn!(
@@ -418,7 +418,7 @@ fn rejection_response(rejection: &WebhookRejection) -> (StatusCode, &'static str
 /// `WrongContentType` and `BodyNotUtf8` are schema violations (fail2ban lane:
 /// `SchemaViolation`). All auth variants use `AuthFailure`. This distinction
 /// lets fail2ban apply different thresholds for structural probes vs auth
-/// failures (requirements v3 §6.5).
+/// failures.
 fn log_webhook_rejection(
     dispatcher: &AlertDispatcher,
     ip: IpAddr,
@@ -687,7 +687,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Acceptance §5.4 happy path
+    // Happy path
     // -----------------------------------------------------------------------
 
     /// A valid signed POST returns 204 and the raw body reaches `deliver_inbound`.
@@ -732,7 +732,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // §5 failure matrix: Content-Type / UTF-8
+    // Failure matrix: Content-Type / UTF-8
     // -----------------------------------------------------------------------
 
     /// Wrong Content-Type returns 415; no delivery.
@@ -786,7 +786,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // §5 failure matrix: signature / key-id auth
+    // Failure matrix: signature / key-id auth
     // -----------------------------------------------------------------------
 
     /// Missing signature header returns 401 with `{"error":"auth"}`; no delivery.
@@ -916,7 +916,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // §5.6 Timing-parity sanity: unknown key-id and HMAC mismatch both yield
+    // Timing-parity sanity: unknown key-id and HMAC mismatch both yield
     // 401 + same body (verified by code inspection above; this test confirms
     // neither leaks information via different response bodies).
     // -----------------------------------------------------------------------
@@ -967,7 +967,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // §5 acceptance: timestamp-out-of-window for HmacTimestampedBody → 401
+    // Timestamp-out-of-window for HmacTimestampedBody → 401
     // -----------------------------------------------------------------------
 
     /// For `HmacTimestampedBody`, a timestamp outside `max_skew_secs` returns 401.
@@ -1048,7 +1048,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // §5 deliver_inbound failure → 500
+    // deliver_inbound failure → 500
     // -----------------------------------------------------------------------
 
     /// A `WebhookEventRouter` implementation that always returns `Err(...)`.
@@ -1621,7 +1621,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // §4.3 Replay-protection tests
+    // Replay-protection tests
     //
     // All tests in this section use a real `ReplayComponent` loaded against a
     // tempfile SQLite store. Tests exercise the full HTTP stack with replay
@@ -2500,7 +2500,7 @@ mod tests {
             }
         }
 
-        // ── AC-trap-panics-host + §3.3 CatchPanicLayer ───────────────────────
+        // ── CatchPanicLayer ─────────────────────────────────────────────────
 
         /// A component trap propagated via resume_unwind returns 500 (not conn drop).
         /// Uses the fault-test component with TRAP sentinel (`x-brenn-fault-test: TRAP`
@@ -2545,7 +2545,7 @@ mod tests {
         // ── AC-quota-hit-alert: handler fires Warning alert on host-quota hit ──
 
         /// Host-quota hit: when the store reaches its cap and a check hits SQLITE_FULL,
-        /// the handler fires a Warning-severity phone alert (§2.E layer 2 / AC-7 alert half).
+        /// the handler fires a Warning-severity phone alert.
         ///
         /// Drives the store to cap via HTTP requests, then verifies that the handler
         /// fires a Warning alert titled "WASM store quota exceeded". The store is
@@ -2653,7 +2653,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // §6 B — replay-generic component tests (HmacTimestampedBody + text/plain)
+    // Replay-generic component tests (HmacTimestampedBody + text/plain)
     //
     // Loads the real `brenn_replay_generic.wasm` component. Each test uses a
     // distinct NamedTempFile store path (OPEN_PATHS process-global guard).
@@ -2807,7 +2807,7 @@ mod tests {
 
         // ── Fresh push → 204 ─────────────────────────────────────────────────
 
-        /// A fresh plain-text push returns 204 and delivers the body verbatim (design §6 B).
+        /// A fresh plain-text push returns 204 and delivers the body verbatim.
         #[tokio::test]
         async fn generic_fresh_push_returns_204_and_delivers() {
             let db = NamedTempFile::new().unwrap();
@@ -2859,8 +2859,8 @@ mod tests {
         // ── Swapped-unsigned-input replay → 409 (acceptance 2b) ─────────────
 
         /// Adding an extra unsigned header to a captured (t, body, sig) triple does NOT
-        /// produce a fresh dedup identity — the resend is still 409 duplicate (design §2.3,
-        /// B6). The dedup key is the signature, which is unchanged.
+        /// produce a fresh dedup identity — the resend is still 409 duplicate. The
+        /// dedup key is the signature, which is unchanged.
         #[tokio::test]
         async fn generic_swapped_unsigned_input_replay_returns_409() {
             let db = NamedTempFile::new().unwrap();
@@ -2899,12 +2899,12 @@ mod tests {
             }
         }
 
-        // ── Missing signature header → MalformedInput (design §3.2 step 1 guard) ──
+        // ── Missing signature header → MalformedInput ──
 
         /// Defensive guard: component returns MalformedInput when the signature header
         /// is absent from CheckInput. This path is unreachable via real requests
         /// (signature layer 401s first), but the guard's correctness is verified here
-        /// at the component level (design §6 B, fourth bullet; scope-3).
+        /// at the component level.
         #[test]
         fn generic_missing_sig_header_returns_malformed_input() {
             let db = NamedTempFile::new().unwrap();
@@ -2936,11 +2936,11 @@ mod tests {
             );
         }
 
-        // ── Arbitrary / non-JSON body (design §6 B, fifth bullet; acceptance 5) ──
+        // ── Arbitrary / non-JSON body ──
 
         /// Component treats the body as opaque: non-JSON, multi-byte UTF-8 body
         /// does not affect the dedup identity (acceptance 5: never assumes JSON).
-        /// The design §6 B example `b"\x01plain text"` is valid UTF-8 (control char).
+        /// `b"\x01plain text"` is valid UTF-8 (control char).
         #[tokio::test]
         async fn generic_non_json_body_accepted() {
             let db = NamedTempFile::new().unwrap();
@@ -2957,8 +2957,7 @@ mod tests {
             );
         }
 
-        /// Empty body → 204 on fresh send (design §1 verified: server accepts empty body;
-        /// design §6 B fifth bullet explicitly requests this case).
+        /// Empty body → 204 on fresh send.
         #[tokio::test]
         async fn generic_empty_body_accepted() {
             let db = NamedTempFile::new().unwrap();

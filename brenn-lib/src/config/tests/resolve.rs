@@ -738,8 +738,7 @@ fn minimal_app_config_for_budget_test(
     }
 }
 
-/// `messaging_send_budget` returns the per-app override when present
-/// (design §7.7 — first tier).
+/// `messaging_send_budget` returns the per-app override when present.
 #[test]
 fn messaging_send_budget_uses_per_app_override() {
     let messaging = crate::messaging::config::ResolvedMessagingConfig {
@@ -751,7 +750,7 @@ fn messaging_send_budget_uses_per_app_override() {
 }
 
 /// With no per-app messaging block, `messaging_send_budget` falls
-/// back to the global default (design §7.7 — second tier).
+/// back to the global default.
 #[test]
 fn messaging_send_budget_falls_back_to_global_default() {
     let app = minimal_app_config_for_budget_test(None, 50);
@@ -761,7 +760,7 @@ fn messaging_send_budget_falls_back_to_global_default() {
 /// `messaging_default_send_budget` is hand-set on every `AppConfig`
 /// from the global `[messaging].default_send_budget`. The default
 /// for `MessagingGlobalConfig` is 100, so an app constructed with
-/// that value returns 100 (design §7.7 — third tier).
+/// that value returns 100.
 #[test]
 fn messaging_send_budget_default_is_one_hundred() {
     let default = crate::messaging::config::MessagingGlobalConfig::default();
@@ -771,7 +770,7 @@ fn messaging_send_budget_default_is_one_hundred() {
 
 /// `messaging_enabled()` is sourced from the `MessagingPublish`/
 /// `MessagingSubscribe` *policy grants*, not from `[app.messaging]` section
-/// presence/`enabled` (access-control Phase 0, §2.5.1/§2.7). These tests pin the
+/// presence/`enabled`. These tests pin the
 /// decoupling so a future re-coupling (re-reading the section) is caught here,
 /// not only by incidental downstream coverage.
 #[test]
@@ -825,8 +824,8 @@ fn messaging_enabled_reads_grant_not_section_grant_without_block() {
 }
 
 /// `pwa_push_enabled()` is sourced from the `PwaPush` *policy grant*, not from
-/// `[app.pwa_push].enabled` section presence (access-control Phase 0,
-/// §2.5.1/§2.7). These two tests directly pin the decoupling so a future
+/// `[app.pwa_push].enabled` section presence. These two tests directly pin the
+/// decoupling so a future
 /// re-coupling (e.g. re-reading the section as a fallback) is caught by a
 /// single-method test, not only by incidental downstream coverage.
 #[test]
@@ -1411,8 +1410,8 @@ fn validate_publish_grant_with_matchers_resolves_covering_policy() {
 
 /// The `MqttPublish` branch of `warn_granted_publish_no_matcher`: an app holding
 /// the `mqtt_publish` grant but authoring no `mqtt_publish` matcher resolves
-/// without panicking (the legitimate intermediate state — access-control design §3
-/// failure mode 1), keeps the layer-1 grant, and `allows_mqtt_publish` is deny-all.
+/// without panicking (the legitimate intermediate state), keeps the layer-1
+/// grant, and `allows_mqtt_publish` is deny-all.
 /// Mirrors `validate_publish_grant_without_matcher_resolves_deny_all_no_panic` for
 /// the other publish capability so both warning branches are pinned.
 #[test]
@@ -1446,7 +1445,7 @@ fn validate_mqtt_publish_grant_without_matcher_resolves_deny_all_no_panic() {
 }
 
 /// A malformed `[app.acl.mqtt_subscribe]` topic filter panics at resolution
-/// (operator-authored config — fail-fast, §2.5.3 / §7.1 failure mode 4).
+/// (operator-authored config — fail-fast).
 #[test]
 #[should_panic(expected = "invalid topic filter")]
 fn validate_malformed_mqtt_subscribe_filter_panics() {
@@ -1483,7 +1482,7 @@ fn validate_malformed_mqtt_subscribe_filter_panics() {
 
 /// An `[app.acl.mqtt_subscribe]` matcher naming a client with no matching
 /// `[[mqtt_client]]` panics at resolution — a silent never-match (deny where the
-/// operator intended allow) is turned into a fail-fast startup error (§2.5.2).
+/// operator intended allow) is turned into a fail-fast startup error.
 #[test]
 #[should_panic(expected = "unconfigured MQTT client")]
 fn validate_acl_unconfigured_mqtt_client_panics() {

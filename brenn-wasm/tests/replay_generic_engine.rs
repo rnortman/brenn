@@ -267,10 +267,10 @@ fn restart_persists_dedup() {
 
 // ── Host-quota integration: store at cap returns TooManyRequests, quota_hit set ──
 //
-// Design §2.E / §5 integration test plan. Tests the full path from
+// Tests the full path from
 // KvStore::open(small_cap) → component.check → QuotaExceeded →
 // TooManyRequests (no panic), and verifies the quota_hit flag on the
-// ReplayComponent (the §2.E layer-2 alert seam).
+// ReplayComponent.
 //
 // Page arithmetic: 64 KiB / 4096 bytes = 16 pages. We use a very small cap
 // (e.g. 20 pages) to fill quickly without inserting thousands of entries.
@@ -302,7 +302,7 @@ fn host_quota_returns_too_many_requests_and_sets_quota_hit_flag() {
 
     // Insert entries until we hit either the guest CAP (TooManyRequests from
     // guest logic) or the host quota (QuotaExceeded → TooManyRequests via guest
-    // §2.D mapping). We record whether quota_hit was ever set to confirm the
+    // mapping). We record whether quota_hit was ever set to confirm the
     // host-quota path fires before the guest CAP.
     let mut quota_hit_observed = false;
     let mut final_err = None;

@@ -204,5 +204,5 @@ pub(in crate::active_bridge) async fn handle_initialized(
     // by the control_response received during spawn. CC may emit init at any
     // time (or not at all on a stale --resume session until stdin activity);
     // we record the metadata and move on. No state broadcast or drain happens
-    // here. See docs/designs/init-not-required.md.
+    // here.
 }

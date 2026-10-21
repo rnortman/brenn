@@ -1,4 +1,4 @@
-// MQTT-egress test fixture for the `brenn:processor` world (design §4 "WASM egress").
+// MQTT-egress test fixture for the `brenn:processor` world.
 //
 // This component calls `mqtt-publish` in a loop on every activation that contains
 // at least one new envelope, using the envelope body as the MQTT payload.  It
@@ -22,7 +22,7 @@
 //     the host returns `quota-exceeded` *before* invoking the callback — proving
 //     the cap is enforced on the synchronous MQTT surface end-to-end.
 //
-// A third shape (design §3.1 / §4 "WASM egress", trap-after-publish-no-rollback):
+// A third shape:
 // when the first new envelope's body contains the sentinel `TRAP_AFTER_PUBLISH`,
 // the fixture calls `mqtt-publish` exactly once (expecting `Ok`) and then panics,
 // which the host converts to `ProcessorOutcome::Trap`. Because MQTT egress is
@@ -68,7 +68,7 @@ struct ProcessorMqttTest;
 const PUBLISH_ATTEMPTS: usize = 513;
 
 /// Sentinel substring in the envelope body that selects the trap-after-publish
-/// path (design §3.1 / §4 "WASM egress" final acceptance test): publish exactly
+/// path: publish exactly
 /// once, then panic so the host reports `ProcessorOutcome::Trap`.
 const TRAP_AFTER_PUBLISH: &str = "TRAP_AFTER_PUBLISH";
 
@@ -121,7 +121,7 @@ impl Guest for ProcessorMqttTest {
         // Trap-after-publish path: publish ONCE (expecting Ok), then panic. The
         // panic becomes a wasm trap → `ProcessorOutcome::Trap`. The synchronous
         // MQTT publish has already gone to the broker by this point and is not
-        // retracted by the trap (§3.1); the test pins this via a host-callback
+        // retracted by the trap; the test pins this via a host-callback
         // counter that records exactly one invocation despite the trap.
         //
         // SDK wrapper here exercises `brenn_guest::mqtt` end to end; the loop

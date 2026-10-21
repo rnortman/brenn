@@ -90,7 +90,7 @@ function findTrace(
 beforeEach(() => { idCounter = 0; });
 
 // ---------------------------------------------------------------------------
-// Tests: §4 cascade tests (rewritten for simplified cascade)
+// Tests: cascade
 // ---------------------------------------------------------------------------
 
 describe("handleNotificationClick SW cascade", () => {
@@ -383,7 +383,7 @@ describe("handleNotificationClick SW cascade", () => {
         logSpy.mockRestore();
     });
 
-    // NavigateTo does NOT carry user_id (field dropped per §2.3).
+    // NavigateTo does NOT carry user_id.
     it("NavigateTo message has no user_id field", async () => {
         const client = makeClient("/auth/register", { focused: true });
         const fakeSelf = makeSelf([client]);

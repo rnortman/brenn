@@ -974,7 +974,7 @@ pub fn resolve_webhook_identities(
             }
         };
 
-        // Endpoint-level urgency intent (sender side). Default Normal per §2.7 mapping.
+        // Endpoint-level urgency intent (sender side). Default Normal.
         let urgency = raw.urgency.unwrap_or(Urgency::Normal);
 
         // App-owned endpoints stamp a resolved subscription (with a resolved

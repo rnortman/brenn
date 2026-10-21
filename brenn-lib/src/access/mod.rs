@@ -71,12 +71,12 @@ impl AppPolicy {
 
     /// Test-only constructor: a "messaging sender" policy that can publish to any
     /// `brenn:` channel — the `MessagingPublish` grant plus a universal
-    /// `brenn_publish` matcher (`Prefix("")`). After Phase-2 Seam A (design §2.2),
-    /// the grant alone no longer authorizes a publish; the publish path also needs
-    /// a covering `brenn_publish` matcher. Automation fire/create fixtures that
+    /// `brenn_publish` matcher (`Prefix("")`). The grant alone does not
+    /// authorize a publish; the publish path also needs a covering
+    /// `brenn_publish` matcher. Automation fire/create fixtures that
     /// just want "this app may publish" use this instead of bare
     /// `with_grants(&[MessagingPublish])` so they exercise the happy path rather
-    /// than the new deny-by-default ACL gate.
+    /// than the deny-by-default ACL gate.
     #[cfg(any(test, feature = "testutils"))]
     pub fn messaging_sender_policy() -> Self {
         let mut p = AppPolicy::with_grants(&[AppCapability::MessagingPublish]);
@@ -90,9 +90,7 @@ impl AppPolicy {
     ///
     /// Named `has_grant` (not `grants`) to avoid shadowing the same-named
     /// `grants` field: a method and a field both called `grants` would read as
-    /// two things at call sites (`p.grants(cap)` vs `p.grants.iter()` once a
-    /// later phase's logging iterates the set). The design §2.3 sketch wrote
-    /// `policy.grants(...)`; that sketch is not normative for the method name.
+    /// two things at call sites (`p.grants(cap)` vs `p.grants.iter()`).
     pub fn has_grant(&self, cap: AppCapability) -> bool {
         self.grants.has(cap)
     }
@@ -108,7 +106,7 @@ impl AppPolicy {
     ///
     /// The ACL-matcher half shared by `allows_mqtt_dynamic_subscribe` and
     /// `allows_mqtt_delivery`: the two differ only in whether they additionally
-    /// require the `DynamicSubscribe` grant (design §2.2 / §2.3). With no matcher
+    /// require the `DynamicSubscribe` grant. With no matcher
     /// the `.any(...)` is `false` — deny-by-default.
     fn mqtt_acl_covers(&self, client: &str, requested_filter: &str) -> bool {
         self.acls.mqtt_subscribe.iter().any(|m| {
@@ -127,13 +125,13 @@ impl AppPolicy {
     }
 
     /// Does some `brenn_subscribe` matcher cover `channel`? Shared ACL-matcher
-    /// half of the brenn dynamic-subscribe and delivery decisions (design §2.2).
+    /// half of the brenn dynamic-subscribe and delivery decisions.
     fn brenn_acl_covers(&self, channel: &str) -> bool {
         Self::acl_covers(&self.acls.brenn_subscribe, channel)
     }
 
     /// Does some `webhook` matcher exactly match `endpoint`? Shared ACL-matcher
-    /// half of the webhook dynamic-subscribe and delivery decisions (design §2.2).
+    /// half of the webhook dynamic-subscribe and delivery decisions.
     fn webhook_acl_covers(&self, endpoint: &str) -> bool {
         self.acls.webhook.iter().any(|m| m.endpoint == endpoint)
     }
@@ -144,10 +142,10 @@ impl AppPolicy {
     /// `MessageSubscribe` tool) **and** the `MqttSubscribe` transport grant
     /// **and** at least one `mqtt_subscribe` matcher whose `(client,
     /// allowed_filter)` covers the request (filter subset per `mqtt_match`). With
-    /// no matcher the `.any(...)` is `false` — deny-by-default (design §2.3).
+    /// no matcher the `.any(...)` is `false` — deny-by-default.
     ///
     /// Precondition: `requested_filter` is a *validated* MQTT topic filter; the
-    /// enforcement site validates it before calling (design §3.2, §5.2).
+    /// enforcement site validates it before calling.
     pub fn allows_mqtt_dynamic_subscribe(&self, client: &str, requested_filter: &str) -> bool {
         self.grants.has(AppCapability::DynamicSubscribe)
             && self.grants.has(AppCapability::MqttSubscribe)
@@ -156,7 +154,7 @@ impl AppPolicy {
 
     /// May this app dynamically subscribe to `brenn:` `channel`? Requires the
     /// `DynamicSubscribe` grant, the `MessagingSubscribe` transport grant, and a
-    /// `brenn_subscribe` matcher covering the channel (design §2.3).
+    /// `brenn_subscribe` matcher covering the channel.
     pub fn allows_brenn_dynamic_subscribe(&self, channel: &str) -> bool {
         self.grants.has(AppCapability::DynamicSubscribe)
             && self.grants.has(AppCapability::MessagingSubscribe)
@@ -165,7 +163,7 @@ impl AppPolicy {
 
     /// May this app dynamically subscribe to webhook `endpoint`? Requires the
     /// `DynamicSubscribe` grant, the `Webhook` transport grant, and a `webhook`
-    /// matcher for the endpoint (exact match, design §2.3).
+    /// matcher for the endpoint (exact match).
     pub fn allows_webhook_dynamic_subscribe(&self, endpoint: &str) -> bool {
         self.grants.has(AppCapability::DynamicSubscribe)
             && self.grants.has(AppCapability::Webhook)
@@ -193,7 +191,7 @@ impl AppPolicy {
 
     /// May this app still *receive a delivery* on MQTT `(client, topic)`?
     ///
-    /// The subscription-**holding** decision (design §2.2): the `MqttSubscribe`
+    /// The subscription-**holding** decision: the `MqttSubscribe`
     /// transport grant **plus** a covering `mqtt_subscribe` matcher, but **not**
     /// the `DynamicSubscribe` grant — `DynamicSubscribe` governs the runtime
     /// `MessageSubscribe` *tool*, not holding a subscription, so a static
@@ -205,7 +203,7 @@ impl AppPolicy {
 
     /// May this app still receive a delivery on `brenn:` `channel`? The
     /// `MessagingSubscribe` transport grant + a covering `brenn_subscribe`
-    /// matcher, **without** `DynamicSubscribe` (design §2.2).
+    /// matcher, **without** `DynamicSubscribe`.
     pub fn allows_brenn_delivery(&self, channel: &str) -> bool {
         self.grants.has(AppCapability::MessagingSubscribe) && self.brenn_acl_covers(channel)
     }
@@ -482,8 +480,7 @@ mod tests {
 
     #[test]
     fn mqtt_dynamic_subscribe_empty_acl_denies() {
-        // Both grants held, but no matcher on the list ⇒ deny-by-default
-        // (design §2.4). This is the §6.1 deny-all-empty-ACL case.
+        // Both grants held, but no matcher on the list ⇒ deny-by-default.
         let p = policy(
             &[
                 AppCapability::DynamicSubscribe,
@@ -521,8 +518,7 @@ mod tests {
 
     #[test]
     fn brenn_dynamic_subscribe_grants_and_acl() {
-        // Both matcher arms are exercised through the decision path (design §6.4:
-        // "Prove both the Exact and Prefix matcher arm via ChannelMatcher"): a
+        // Both matcher arms are exercised through the decision path: a
         // `Prefix` and an `Exact` entry on the same list. The arms are not
         // behaviorally equivalent (`Exact` requires equality, `Prefix` does not),
         // so an inverted dispatch in `ChannelMatcher::matches` would be caught
@@ -930,7 +926,7 @@ mod tests {
         assert!(p.allows_channel_access("ephemeral:anything"));
     }
 
-    // --- Publish-side decisions (design §2.1): grant + covering matcher, the send
+    // --- Publish-side decisions: grant + covering matcher, the send
     //     analogue of the delivery family.
 
     #[test]

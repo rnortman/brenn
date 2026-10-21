@@ -59,7 +59,7 @@ const TRANSIENT_ESCALATION_THRESHOLD: u32 = 4;
 
 /// Run one sync cycle for the given trigger.
 ///
-/// Steps (per `docs/designs/repo-sync.md`):
+/// Steps:
 /// 1. Identify the remote(s) in scope.
 /// 2. For each remote, acquire its Mutex (serializes cycles on the same
 ///    remote across trigger sources).
@@ -96,7 +96,7 @@ async fn run_cycle_for_remote(
     acting_conversation_id: Option<i64>,
 ) {
     // Resolve remote → clones. Unknown remote => ignore. Unknown-remote
-    // webhooks return 204 / info-log per the design; this branch handles
+    // webhooks return 204 / info-log; this branch handles
     // them plus any stale Poll triggers post-config-reload (not supported
     // today, but future-proof).
     let Some(slugs) = ctx.remote_to_slugs.get(remote) else {
@@ -148,7 +148,7 @@ async fn run_cycle_for_remote(
                 continue;
             }
 
-            // Per-clone `repo_sync::pull` span (per design). Fields:
+            // Per-clone `repo_sync::pull` span. Fields:
             // `outcome` is recorded below after `pull_clone` returns;
             // `prev_head` / `new_head` / `commit_count` are recorded from
             // inside `detect_and_notify_advance` via `Span::current()`.
@@ -581,8 +581,7 @@ async fn detect_and_notify_advance(
     // AFTER the DB transaction commits. Doing the cache write pre-commit
     // would silently advance past an un-persisted cursor if the process
     // restarted between cache-write and commit, losing the notification
-    // across restart. See
-    // `docs/designs/repo-sync-last-notified-head-loss-across-restart.md`.
+    // across restart.
     //
     // Serialization within a process is preserved because the per-remote
     // Mutex in `run_cycle_for_remote` still guards the whole cycle, so
@@ -780,7 +779,7 @@ async fn handle_conflict(
     );
 
     if info.primary_apps.is_empty() {
-        // Per design: AlertSeverity::Warning, dedup on (slug, reason).
+        // AlertSeverity::Warning, dedup on (slug, reason).
         ctx.alert_dispatcher
             .with_field("slug", info.slug.clone())
             .with_field("remote", info.remote.clone())
@@ -876,7 +875,7 @@ async fn handle_conflict(
 /// the bridge-inject window. If this shows up as a UX problem, add a
 /// per-conversation inject mutex around the fetch→send→mark sequence.
 async fn maybe_inject_pending(ctx: &RepoSyncCtx, conversation_id: i64, source: &str) {
-    // `repo_sync::deliver` observability span (per design). Records the
+    // `repo_sync::deliver` observability span. Records the
     // conversation, whether a live bridge was present, and the counts of
     // queued/injected rows. Lets us see at a glance which consumers got
     // live-injected vs queued for drain.

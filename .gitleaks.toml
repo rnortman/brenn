@@ -5,8 +5,6 @@ useDefault = true
 
 # Section-symbol references to design/ADR docs. Those docs are ephemeral
 # point-in-time artifacts, so a comment citing one rots as soon as it moves.
-# Enforced on diffs only: the existing backlog is grandfathered and burns down
-# as lines are touched.
 [[rules]]
 id = "ephemeral-reference"
 description = "Section-symbol reference to an ephemeral doc"

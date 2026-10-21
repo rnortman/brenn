@@ -563,8 +563,7 @@ fn two_webhook_envelopes_produce_two_buffered_publishes() {
     }
 }
 
-// ── per-sink publish token buckets, end-to-end through handle (design §2.3,
-//    §3.4, §6) ────────────────────────────────────────────────────────────────
+// ── per-sink publish token buckets, end-to-end through handle ────────────────
 
 /// Load the demo with `out` bound and explicit per-sink budget / input
 /// amplification (millitokens), so the token-bucket seeding, enforcement, and
@@ -738,7 +737,7 @@ fn per_sink_suppression_emits_post_activation_warn() {
 /// activation → each publish resolves to its own distinct channel_address.
 ///
 /// Regression gate for all-publishes-to-first-channel keying bugs in
-/// `ports::Host::publish` (design §2.2: port→channel resolution happens at
+/// `ports::Host::publish` (port→channel resolution happens at
 /// buffer time, one `output_ports` map lookup per call).
 #[test]
 fn multi_port_publishes_routed_independently() {
@@ -977,8 +976,7 @@ fn context_envelopes_count_matches_new_from() {
 /// `publish_with_urgency` on the guest side, which the host resolves to the
 /// named WIT `urgency` enum variant. The resulting publish must carry
 /// `ProcessorUrgency::High`, overriding the port's configured default
-/// (`ProcessorUrgency::Normal`). Closes the design §4 gap: no fixture
-/// exercised `publish-with-urgency` end-to-end before this test.
+/// (`ProcessorUrgency::Normal`).
 #[test]
 fn publish_with_urgency_overrides_port_default() {
     let comp = load_dual();
@@ -1642,7 +1640,7 @@ fn guest_observes_correct_new_from_and_ordering() {
 /// must return `Err(processing-failed)` — the demo component maps `QuotaExceeded`
 /// to `ProcessingFailed`. Uses webhook-typed envelopes so each triggers one publish.
 ///
-/// This exercises the count-cap branch in `ports::Host::publish` (design §2.2).
+/// This exercises the count-cap branch in `ports::Host::publish`.
 #[test]
 fn quota_exceeded_count_cap_returns_err() {
     use brenn_budget::MAX_PUBLISHES_PER_ACTIVATION;
@@ -1666,7 +1664,7 @@ fn quota_exceeded_count_cap_returns_err() {
 /// deadline; the per-component epoch ticker thread fires within ≈ 100 ms and
 /// trips the deadline.
 ///
-/// This exercises the epoch interrupt path (design §2.2, behavior 13).
+/// This exercises the epoch interrupt path.
 #[test]
 fn epoch_deadline_spins_guest_traps() {
     let comp = load_exhaust();

@@ -6,7 +6,7 @@
 //! we stash a `OnceCell<RouterState>` and call `set_state` after `AppState`
 //! construction, before any webhook request can arrive.
 //!
-//! Delivery path (design §2.5):
+//! Delivery path:
 //! 1. Build the `WebhookEnvelope` from the threaded HTTP metadata, masking
 //!    credential-bearing header values using `SignatureScheme::credential_header_names`.
 //! 2. Resolve the `webhook:<slug>` channel from the `MessagingDirectory`.
@@ -60,7 +60,7 @@ impl WebhookEventRouterImpl {
 }
 
 /// Build a `WebhookEnvelope` from the threaded HTTP metadata, applying
-/// scheme-driven credential-header masking (design §2.2).
+/// scheme-driven credential-header masking.
 ///
 /// All headers from the `HeaderMap` are captured as ordered `(name, value)`
 /// pairs (lowercased names, as axum exposes them). Header values for the
@@ -209,7 +209,7 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
 
         // Resolve the webhook: channel from the messaging directory.
         // The channel must exist — it was derived from this endpoint at startup and upserted.
-        // An unresolvable channel is a config-invariant violation: panic (fail-fast, §2.5).
+        // An unresolvable channel is a config-invariant violation: panic (fail-fast).
         let channel_address = format!("{WEBHOOK_ADDRESS_PREFIX}{endpoint_slug}");
         let messenger = state.messenger.as_ref().unwrap_or_else(|| {
             panic!(
@@ -259,7 +259,7 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
         let sender = key_id;
 
         // Publish via the real bus publish path. This durably enqueues the message +
-        // pending-push rows and dispatches to all channel subscribers (design §2.5).
+        // pending-push rows and dispatches to all channel subscribers.
         // `204` is returned by the HTTP handler only after this returns (durable enqueue
         // has completed). Never 204 if enqueue failed — the handler maps Err→500.
         messenger

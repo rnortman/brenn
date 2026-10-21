@@ -48,8 +48,8 @@ struct MessageChannelListResponse<'a> {
 
 /// Response for `MessageSubscriptionList`.
 ///
-/// Field order: subscriptions — matches the `{ subscriptions: [...] }` wrapper
-/// (design §2.1), analogous to `MessageChannelListResponse`.
+/// Field order: subscriptions — matches the `{ subscriptions: [...] }` wrapper,
+/// analogous to `MessageChannelListResponse`.
 #[derive(Serialize)]
 struct MessageSubscriptionListResponse<'a> {
     subscriptions: &'a [SubscriptionListing],
@@ -119,7 +119,7 @@ const NONDURABLE_SUBSCRIBE_NOTE: &str = "this channel is non-durable: the subscr
 /// Fields alphabetical: address, ok, status. `status` is the deactivation status
 /// string (`"unsubscribed"`, `"unsubscribed_others_remain"`, or
 /// `"unsubscribed_pending_reconnect"`) so the LLM gets an honest signal about
-/// whether the broker subscription was actually torn down (design §3 / §2.4).
+/// whether the broker subscription was actually torn down.
 #[derive(Serialize)]
 struct MessageUnsubscribeOk<'a> {
     // alphabetical: address, ok, status
@@ -988,7 +988,7 @@ async fn execute_subscribe(
         }
     };
 
-    // `push_depth` / `retain_depth` (both required, no defaults — design §7 A).
+    // `push_depth` / `retain_depth` (both required, no defaults).
     let push_depth = match parse_depth_field(tool_input.get("push_depth"), "push_depth") {
         Ok(d) => d,
         Err(e) => return reject(tool_name, &e),
@@ -1101,7 +1101,7 @@ async fn execute_subscribe(
         Err(e) => {
             // An app exceeding its grant is worth surfacing (CC anomaly =
             // log-and-surface), but NOT fail2ban signal: the request came from this
-            // app's own LLM, not a network attacker (§3.4 / CLAUDE.md logging
+            // app's own LLM, not a network attacker (CLAUDE.md logging
             // posture). Two over-grant shapes warn here: a policy-denied subscribe,
             // and a retain_depth exceeding the channel's standing window (an app
             // requesting a read window beyond the operator's baseline). Other
@@ -1698,7 +1698,7 @@ mod tests {
     /// `MessageChannelList` with an MqttService present enriches the `mqtt:`
     /// entry's `MqttDetails`: `protocol: mqtt`, `client`/`topic` from the address,
     /// `qos`/`health` filled from the service. `urgency` stays absent (not
-    /// reachable from the ingress registry; design §2.5 deviation).
+    /// reachable from the ingress registry).
     #[tokio::test]
     async fn message_channel_list_enriches_mqtt_entry_with_ingress_health() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_mqtt_ingress_listing().await;
@@ -1729,7 +1729,7 @@ mod tests {
             json!("disconnected"),
             "enriched health: {mqtt}"
         );
-        // urgency is not surfaced (no ingress urgency store; §2.5 deviation).
+        // urgency is not surfaced (no ingress urgency store).
         assert!(
             mqtt["details"].get("urgency").is_none(),
             "urgency should be absent: {mqtt}"
@@ -1769,7 +1769,7 @@ mod tests {
             mount: None,
         };
         let dir = brenn_lib::messaging::MessagingDirectory::with_entries(vec![entry]);
-        // mqtt: rows are now ACL-sourced (design §2.2), so register "testapp" with
+        // mqtt: rows are ACL-sourced, so register "testapp" with
         // an mqtt_subscribe matcher covering (home, sensors/+/temp); that Pattern
         // row is what appears in the listing (the directory mqtt: entry is ignored).
         let mut messenger_apps = indexmap::IndexMap::new();
@@ -1984,7 +1984,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // MessageSubscriptionList (design §2.1)
+    // MessageSubscriptionList
     // -----------------------------------------------------------------------
 
     /// `MessageSubscriptionList` PostToolUse returns `{ subscriptions: [...] }`
@@ -2129,10 +2129,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // §4.4: BrennPendingList, BrennMessageCancel, BrennMessageEdit intercept tests
+    // BrennPendingList, BrennMessageCancel, BrennMessageEdit intercept tests
     // -----------------------------------------------------------------------
 
-    /// §4.4: cancel_pre_tool_use_auto_approves — PreToolUse for all three new
+    /// cancel_pre_tool_use_auto_approves — PreToolUse for all three new
     /// tools returns Allow (not a user-visible prompt).
     #[tokio::test]
     async fn new_tools_pre_tool_use_auto_approve() {
@@ -2150,7 +2150,7 @@ mod tests {
         }
     }
 
-    /// §4.4: cancel_post_tool_use_with_no_messenger_returns_error.
+    /// cancel_post_tool_use_with_no_messenger_returns_error.
     #[tokio::test]
     async fn cancel_post_tool_use_with_no_messenger_returns_error() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_for_pwa_push().await;
@@ -2169,7 +2169,7 @@ mod tests {
         }
     }
 
-    /// §4.4: cancel_post_tool_use_with_invalid_uuid_returns_error.
+    /// cancel_post_tool_use_with_invalid_uuid_returns_error.
     #[tokio::test]
     async fn cancel_post_tool_use_with_invalid_uuid_returns_error() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_for_pwa_push().await;
@@ -2193,7 +2193,7 @@ mod tests {
         }
     }
 
-    /// §4.4: edit_post_tool_use_with_no_fields_returns_error.
+    /// edit_post_tool_use_with_no_fields_returns_error.
     #[tokio::test]
     async fn edit_post_tool_use_with_no_fields_returns_error() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_for_pwa_push().await;
@@ -2217,7 +2217,7 @@ mod tests {
         }
     }
 
-    /// §4.4: edit_post_tool_use_with_no_messenger_returns_error (with a field).
+    /// edit_post_tool_use_with_no_messenger_returns_error (with a field).
     #[tokio::test]
     async fn edit_post_tool_use_with_no_messenger_returns_error() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_for_pwa_push().await;
@@ -2239,7 +2239,7 @@ mod tests {
         }
     }
 
-    /// §4.4: edit_post_tool_use_distinguishes_missing_vs_null_deliver_after —
+    /// edit_post_tool_use_distinguishes_missing_vs_null_deliver_after —
     /// payload `{}` (plus message_id) has no `deliver_after`; `{deliver_after:null}` does.
     /// Verify the latter clears the schedule (passes Some(None)) while the former leaves it.
     ///
@@ -2292,7 +2292,7 @@ mod tests {
         );
     }
 
-    /// §4.4: pending_list_post_tool_use_returns_envelopes — messenger configured,
+    /// pending_list_post_tool_use_returns_envelopes — messenger configured,
     /// no messages seeded → returns ok shape with empty messages array.
     #[tokio::test]
     async fn pending_list_post_tool_use_returns_envelopes() {
@@ -2309,7 +2309,7 @@ mod tests {
         }
     }
 
-    /// §4.4: pending_list_unknown_channel_filter_returns_empty — pin §2.11 contract.
+    /// pending_list_unknown_channel_filter_returns_empty.
     /// A well-formed but non-existent channel address returns empty messages, not error.
     #[tokio::test]
     async fn pending_list_unknown_channel_filter_returns_empty() {
@@ -2333,7 +2333,7 @@ mod tests {
         }
     }
 
-    /// §4.4: malformed channel address in BrennPendingList returns empty (logged, no error).
+    /// Malformed channel address in BrennPendingList returns empty (logged, no error).
     #[tokio::test]
     async fn pending_list_malformed_channel_filter_returns_empty() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_combined_services().await;
@@ -2532,7 +2532,7 @@ mod tests {
         }
         let directory = Arc::new(MessagingDirectory::with_entries(vec![entry]));
         // webhook: rows survive list_accessible_channels' ACL filter only when the
-        // app's policy covers the endpoint (design §2.2): Webhook grant + a webhook
+        // app's policy covers the endpoint: Webhook grant + a webhook
         // matcher for `test-ep`. Register "testapp" accordingly.
         let mut messenger_apps = indexmap::IndexMap::new();
         let mut testapp_cfg =
@@ -2680,7 +2680,7 @@ mod tests {
     /// BrennSend to a channel that resolves in the directory but is NOT covered
     /// by the app's `brenn_publish` ACL returns `ok: false` with an error naming
     /// the `brenn_publish` allowlist. Exercises the `PublishResult::AclDenied` arm
-    /// and its LLM-facing serialization (design §2.2, Seam A) — the unit tests in
+    /// and its LLM-facing serialization — the unit tests in
     /// `publish_core.rs` prove the variant is returned, but only this test covers
     /// the intercept-layer error string and `ok: false` shape. The fixture
     /// registers `brenn:locked-channel` (resolvable) but scopes `brenn_publish` to
@@ -3382,7 +3382,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// BrennSend with legacy `wake` key returns `ok:false` error mentioning `urgency`.
-    /// Guards the reject-and-teach path (§2.4): a stale-habit LLM sending `wake` must
+    /// Guards the reject-and-teach path: a stale-habit LLM sending `wake` must
     /// get an explicit error rather than silent downgrade to the default urgency.
     #[tokio::test]
     async fn brenn_send_legacy_wake_key_returns_error() {
@@ -3539,7 +3539,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // MessageSubscribe intercept tests (design §2.4 / §5)
+    // MessageSubscribe intercept tests
     // -----------------------------------------------------------------------
 
     /// Run the `MessageSubscribe` intercept and return the parsed JSON result.
@@ -3752,7 +3752,7 @@ mod tests {
         .await;
         assert_eq!(v["ok"], json!(false), "expected error: {v}");
         // The guard's message names the unconfigured client — distinguishing this
-        // from a PolicyDenied response, which (by design §3.3) never echoes
+        // from a PolicyDenied response, which never echoes
         // whether the client exists.
         let err = v["error"].as_str().expect("error string present");
         assert!(
@@ -3771,7 +3771,7 @@ mod tests {
     }
 
     /// Subscribe to an `mqtt:` client the app is **not** authorized for →
-    /// ok:false with the policy-denied message, and (per design §3.3) the error
+    /// ok:false with the policy-denied message, and the error
     /// does **not** leak whether the client is configured. The default fixture's
     /// policy is scoped to the `home` client, so naming `nope` is denied by the
     /// ACL gate *before* the configured-client guard — the gate fires first and
@@ -3808,7 +3808,7 @@ mod tests {
         );
     }
 
-    /// The intercept-site observability contract (design §3.4): a `PolicyDenied`
+    /// The intercept-site observability contract: a `PolicyDenied`
     /// dynamic subscribe emits a WARN with `reason = "access policy"` (a
     /// CC-anomaly surface, **not** fail2ban signal), and a *different* subscribe
     /// error does **not** emit that same warn. This pins the `if let PolicyDenied
@@ -3966,8 +3966,8 @@ mod tests {
 
     /// Push-enabled (`push_depth > 0`) subscribe on a **non-singleton** app →
     /// ok:false, surfacing the singleton requirement. Exercises the
-    /// intercept→core handoff of the shared resolver's push-enabled invariant
-    /// (design §5): the resolver returns `PushEnabledRequiresSingleton`, the
+    /// intercept→core handoff of the shared resolver's push-enabled invariant:
+    /// the resolver returns `PushEnabledRequiresSingleton`, the
     /// runtime wrapper wraps it as `RuntimeSubscribeError::Params`, and the
     /// intercept maps that to a tool error rather than a panic.
     #[tokio::test]
@@ -4147,8 +4147,7 @@ mod tests {
     }
 
     /// `MessageChannelGet` with an `mqtt:` address reads persisted history through
-    /// the transport-blind `Messenger::query()` (design §2.4 / §5: "`mqtt:`
-    /// resolves ingress channel, returns persisted history"). Subscribe to create
+    /// the transport-blind `Messenger::query()`. Subscribe to create
     /// the `mqtt:` channel, inject one persisted ingress message, then query it.
     #[tokio::test]
     async fn message_channel_get_mqtt_address_returns_history() {
@@ -4228,7 +4227,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // MessageUnsubscribe intercept tests (design §2.4 / §5)
+    // MessageUnsubscribe intercept tests
     // -----------------------------------------------------------------------
 
     /// Run the `MessageUnsubscribe` intercept and return the parsed JSON result.

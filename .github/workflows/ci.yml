@@ -269,15 +269,12 @@ jobs:
             --exit-code 0 \
             --log-level error
 
-      # `ephemeral-reference` is enforced on diffs only: the existing backlog
-      # is grandfathered and burns down as lines are touched.
       - name: Report
         run: |
-          count=$(jq '[.[] | select(.RuleID != "ephemeral-reference")] | length' "$RUNNER_TEMP/findings.json")
+          count=$(jq 'length' "$RUNNER_TEMP/findings.json")
           if [ "$count" -ne 0 ]; then
             echo "::error::$count scrub finding(s) in tree scan"
-            jq -r '.[] | select(.RuleID != "ephemeral-reference")
-                   | "\(.File):\(.StartLine): [\(.RuleID)] \(.Description)"' "$RUNNER_TEMP/findings.json"
+            jq -r '.[] | "\(.File):\(.StartLine): [\(.RuleID)] \(.Description)"' "$RUNNER_TEMP/findings.json"
             exit 1
           fi
           echo "clean"

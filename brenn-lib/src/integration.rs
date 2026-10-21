@@ -1362,10 +1362,10 @@ fn automation_virtual_tools() -> Vec<VirtualToolDef> {
 /// client with no declared `[[mqtt_client]]` is rejected at boot validation.
 ///
 /// MQTT ingress discovery + health is surfaced by the typed, transport-agnostic
-/// `MessageChannelList` (design §2.5), not a MQTT-specific tool — the old
-/// `MqttSubscriptionList` is removed (design §2.4). Ad-hoc retained reads are
+/// `MessageChannelList`, not a MQTT-specific tool — the old
+/// `MqttSubscriptionList` is removed. Ad-hoc retained reads are
 /// served by `MessageSubscribe` (pull-only `push_depth=0`) + `MessageChannelGet`,
-/// the replacement for the removed `MqttGetRetained` (design §2.4).
+/// the replacement for the removed `MqttGetRetained`.
 fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
     let mut tools: Vec<VirtualToolDef> = Vec::new();
     if enabled {
@@ -1655,7 +1655,7 @@ mod tests {
     #[test]
     fn core_virtual_tools_send_tool_registration_all_enabled() {
         // All channels enabled, including BOTH messaging grants together (the
-        // prod scenario per design §4: publish + subscribe granted together) →
+        // prod scenario: publish + subscribe granted together) →
         // all three send tools present. Pinning `messaging_subscribe=true`
         // alongside `messaging_publish=true` exercises the `messaging` block's
         // `publish || subscribe` union path with both grants set.
@@ -1779,7 +1779,7 @@ mod tests {
     #[test]
     fn core_virtual_tools_send_tool_registration_mqtt_grant() {
         // An app with the `MqttPublish` grant is OFFERED `MqttSend` — advisory
-        // visibility tracks the *grant*, not the connection plumbing (Leg 2, §2.2).
+        // visibility tracks the *grant*, not the connection plumbing.
         // A send to a client with no session panics at boot-validated invariant, but
         // that is surfaced at the action site, not a reason to hide the tool.
         let cfg = minimal_app_config_for_tool_test(&[AppCapability::MqttPublish]);
@@ -1806,9 +1806,9 @@ mod tests {
         }
     }
 
-    /// MQTT-egress-unify §4 "LLM tool visibility" regression guard. The egress
+    /// LLM tool visibility regression guard. The egress
     /// unification refactor removed the `ActiveBridge.mqtt_publish_denied` cache
-    /// (design §2.3) and rewired the LLM intercept onto the shared
+    /// and rewired the LLM intercept onto the shared
     /// `enforce_and_publish`; none of that touches this visibility gate, which
     /// keys purely on the `MqttPublish` grant. This single assertion pins that
     /// invariant: flip *only* the grant, hold every other input identical, and
@@ -1886,7 +1886,7 @@ mod tests {
 
     #[test]
     fn core_virtual_tools_send_tool_registration_subscribe_only() {
-        // Headline Phase-4 assertion (design §4): an app granted only
+        // Headline assertion: an app granted only
         // `MessagingSubscribe` (neither publish grant held) must NOT be offered
         // `BrennSend`. This proves Leg 1 closed the publish/subscribe visibility
         // skew: under the old `messaging_enabled()` OR gate this app *would* have
@@ -1916,10 +1916,10 @@ mod tests {
         );
 
         // (c) The always-present `MessageSubscribe` tool is still present — its
-        // visibility is NOT gated on any subscribe capability (design §2.5).
+        // visibility is NOT gated on any subscribe capability.
         assert!(
             names.contains(&"MessageSubscribe"),
-            "MessageSubscribe must stay present (ungated at visibility, design §2.5)"
+            "MessageSubscribe must stay present (ungated at visibility)"
         );
         for name in ALWAYS_PRESENT {
             assert!(names.contains(name), "missing always-present tool {name}");
@@ -2048,7 +2048,7 @@ mod tests {
 
     /// `MessageChannelGet`'s description documents the transport-agnostic read
     /// (brenn/mqtt) and the `push_depth=0` ad-hoc-retained-read pattern that
-    /// replaces the removed `MqttGetRetained` (design §2.4). No messaging-tool
+    /// replaces the removed `MqttGetRetained`. No messaging-tool
     /// description still references the old `BrennChannelGet` name.
     #[test]
     fn message_channel_get_description_documents_cross_transport_and_push_depth_zero() {
@@ -2087,7 +2087,7 @@ mod tests {
     /// `MessageSubscriptionList` is registered with a no-argument input schema and
     /// its description distinguishes the per-app inventory role from
     /// `MessageChannelList`'s discovery role, cross-referencing both directions so
-    /// the LLM cannot re-collapse the two roles (design §2.1). The reciprocal
+    /// the LLM cannot re-collapse the two roles. The reciprocal
     /// cross-reference lives on `MessageChannelList`.
     #[test]
     fn message_subscription_list_registered_with_role_cross_references() {
@@ -2131,7 +2131,7 @@ mod tests {
     }
 
     /// `MessageChannelList`'s rewritten description must document its repurposed,
-    /// app-scoped meaning (design §2.2): it names the `access` field and the
+    /// app-scoped meaning: it names the `access` field and the
     /// `existing`-vs-`pattern` distinction, and explains that MQTT rows are
     /// ACL-derived wildcard *matchers*, not concrete broker channels. This guards
     /// against the prose drifting back to describing a system-wide unfiltered list
@@ -2167,7 +2167,7 @@ mod tests {
 
     /// `MessageSubscribe`'s description documents the cross-transport surface,
     /// the `push_depth=0` ad-hoc-retained-read trick, that subscriptions are
-    /// durable, and the MqttUnsubscribe-after-one-shot guidance (design §2.4).
+    /// durable, and the MqttUnsubscribe-after-one-shot guidance.
     #[test]
     fn message_subscribe_description_documents_push_depth_zero_and_durability() {
         let cfg = minimal_app_config_for_tool_test(&[AppCapability::MessagingPublish]);
@@ -2207,7 +2207,7 @@ mod tests {
 
     /// `MessageUnsubscribe`'s description documents the cross-transport surface,
     /// the own-subscriptions-only ownership rule, and that static (config)
-    /// subscriptions cannot be removed at runtime (design §2.4).
+    /// subscriptions cannot be removed at runtime.
     #[test]
     fn message_unsubscribe_description_documents_ownership_and_static_guard() {
         let cfg = minimal_app_config_for_tool_test(&[AppCapability::MessagingPublish]);

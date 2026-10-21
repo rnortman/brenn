@@ -244,7 +244,7 @@ domains?: Array<string> | null,
  * Tomorrow / Weekday / Future). The frontend was computing this
  * from `new Date()` in browser-local time, which disagreed with
  * graf's date math when the browser TZ and graf's resolved zone
- * differed. See `docs/designs/graf-user-tz.md`.
+ * differed.
  */
 today: string, } | { "type": "HistoryPage", messages: Array<HistoryPageMessage>, has_more: boolean, } | { "type": "TodoDoneResult", 
 /**

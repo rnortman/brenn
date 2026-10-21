@@ -229,6 +229,143 @@ fn an_excluded_prefix_is_neither_scanned_nor_counted() {
     );
 }
 
+/// A source line carrying a section symbol, built at runtime.
+fn section_reference() -> String {
+    let s = char::from_u32(0x00A7).expect("section symbol");
+    format!("// see design {s}3\n")
+}
+
+/// The template config with `tags = ["diff-only"]` on `ephemeral-reference`,
+/// written over the fixture repo's `.gitleaks.toml` and committed.
+fn tag_ephemeral_rule_diff_only(repo: &Path) {
+    let template = std::fs::read_to_string(repo_root().join("scrub/repo-template/gitleaks.toml"))
+        .expect("template");
+    let id_line = "id = \"ephemeral-reference\"\n";
+    assert!(
+        template.contains(id_line),
+        "template no longer defines the rule"
+    );
+    let tagged = template.replacen(id_line, &format!("{id_line}tags = [\"diff-only\"]\n"), 1);
+    std::fs::write(repo.join(".gitleaks.toml"), tagged).expect("write tagged config");
+    git(
+        repo,
+        &["commit", "-qam", "tag ephemeral-reference diff-only"],
+    );
+}
+
+fn rule_ids(out: &Output) -> Vec<String> {
+    tree_json(out)["findings"]
+        .as_array()
+        .expect("findings is an array")
+        .iter()
+        .map(|f| {
+            f["RuleID"]
+                .as_str()
+                .expect("finding has RuleID")
+                .to_string()
+        })
+        .collect()
+}
+
+/// The tree filter reads the rule's tag off each finding in gitleaks' report,
+/// so the opt-in works only if gitleaks copies the repo's `tags` into the
+/// report's `Tags`. Driven through the real binary and gitleaks, against an
+/// untagged control.
+#[test]
+fn a_diff_only_tagged_rule_is_dropped_from_tree_scans() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", &section_reference())]);
+
+    let untagged = run_in(dir.path(), &["tree"], "");
+    assert_eq!(untagged.code, Some(1), "stderr: {}", untagged.stderr);
+    assert_eq!(rule_ids(&untagged), vec!["ephemeral-reference".to_string()]);
+    assert_eq!(
+        tree_json(&untagged)["findings"][0]["Tags"],
+        serde_json::json!([]),
+        "an untagged rule reports no tags"
+    );
+
+    tag_ephemeral_rule_diff_only(dir.path());
+    let tagged = run_in(dir.path(), &["tree"], "");
+    assert_eq!(
+        tagged.code,
+        Some(0),
+        "the tagged rule must not fail a tree scan: {:?} / {}",
+        tagged.stdout,
+        tagged.stderr
+    );
+    assert!(rule_ids(&tagged).is_empty(), "{:?}", tagged.stdout);
+}
+
+/// The tag exempts a rule from tree scans only. Every finding carries its tags,
+/// so the filter applied on a diff path would turn the opt-in into "never
+/// enforced" with every tree-mode test still green.
+#[test]
+fn a_diff_only_tagged_rule_still_blocks_staged_and_range() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    tag_ephemeral_rule_diff_only(dir.path());
+    write_file(dir.path(), "src/b.rs", &section_reference());
+    git(dir.path(), &["add", "-A"]);
+
+    let staged = run_in(dir.path(), &["staged"], "");
+    assert_eq!(staged.code, Some(1), "stderr: {}", staged.stderr);
+    assert!(staged.stderr.contains("src/b.rs"), "{}", staged.stderr);
+
+    // A new ref's per-commit range is measured from its merge base with the
+    // default branch, so the commit has to sit on a branch of its own.
+    git(dir.path(), &["checkout", "-qb", "feature"]);
+    git(dir.path(), &["commit", "-qm", "add a section reference"]);
+    let sha = git(dir.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    let stdin = format!(
+        "refs/heads/feature {sha} refs/heads/feature {}\n",
+        "0".repeat(40)
+    );
+    let pushed = run_in(dir.path(), &["range"], &stdin);
+    assert_eq!(pushed.code, Some(1), "stderr: {}", pushed.stderr);
+    assert!(pushed.stderr.contains("src/b.rs"), "{}", pushed.stderr);
+}
+
+/// With an overlay present the scan runs a synthesized config that reaches the
+/// repo's rules through `[extend] path`; the tag has to survive that layering.
+/// The overlay's own rule firing proves the overlay was loaded.
+#[test]
+fn a_diff_only_tag_survives_the_overlay_layering() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[
+        ("src/a.rs", &section_reference()),
+        ("src/b.rs", "let marker = \"fixture-overlay-marker\";\n"),
+    ]);
+    tag_ephemeral_rule_diff_only(dir.path());
+    let overlay = dir.path().join("overlay.toml");
+    std::fs::write(
+        &overlay,
+        "[[rules]]\nid = \"fixture-overlay\"\n\
+         description = \"fixture rule proving the overlay loaded\"\n\
+         regex = '''fixture-overlay-marker'''\n",
+    )
+    .expect("write overlay");
+
+    let out = run_in_env(
+        dir.path(),
+        &["tree"],
+        "",
+        &[("BRENN_SCRUB_DENYLIST", overlay.to_str().expect("utf-8"))],
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(
+        rule_ids(&out),
+        vec!["fixture-overlay".to_string()],
+        "only the overlay rule may fire; the tagged rule must be dropped"
+    );
+}
+
 /// `staged` runs as a pre-commit hook, and a hook is exactly where git exports
 /// `GIT_DIR` and `GIT_INDEX_FILE`. Scrub must scan the index those name -- that
 /// is how `git commit --only` and linked-worktree commits get scanned at all --

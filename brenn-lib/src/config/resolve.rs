@@ -1001,7 +1001,7 @@ pub fn resolve_apps(
     //                         is a config error (you can't be primary on a
     //                         clone that nobody can write). Conflicts on
     //                         RO-only clones surface via AlertDispatcher at
-    //                         runtime (see docs/designs/repo-sync.md).
+    //                         runtime.
     //   1 RW mount          → implicit primary; we set `primary = true` on
     //                         that mount whether or not it declared so.
     //   >=2 RW mounts       → exactly one must declare `primary = true`.
@@ -1186,8 +1186,8 @@ fn resolve_access_policies(
     }
 }
 
-/// Resolution-time startup warning for the deny-by-default publish hole
-/// (access-control design §3 failure mode 1): an app that holds a *publish*
+/// Resolution-time startup warning for the deny-by-default publish hole: an
+/// app that holds a *publish*
 /// grant but authored **no** corresponding publish matcher resolves to a
 /// deny-all publish policy — every publish it attempts is silently denied at the
 /// action site. This is a legitimate intermediate state (a deferred/empty ACL),
@@ -1233,7 +1233,7 @@ fn warn_granted_publish_no_matcher(app_slug: &str, policy: &crate::access::AppPo
     }
 }
 
-/// Per-clone primary-ownership validation (see `docs/designs/repo-sync.md`).
+/// Per-clone primary-ownership validation.
 /// Runs after all apps have been resolved. Panics on ambiguity. Promotes
 /// the single RW mount on a one-RW clone to implicit primary in place.
 fn validate_primary_ownership(apps: &mut IndexMap<String, AppConfig>) {
@@ -1309,8 +1309,7 @@ fn validate_primary_ownership(apps: &mut IndexMap<String, AppConfig>) {
                 let candidates: Vec<String> = rw.iter().map(|(app, _)| app.clone()).collect();
                 panic!(
                     "repo {slug:?}: has {n} read-write mounts but no mount declares \
-                     `primary = true`. Exactly one of these must set `primary = true`: {candidates:?}. \
-                     See docs/designs/repo-sync.md for rationale.",
+                     `primary = true`. Exactly one of these must set `primary = true`: {candidates:?}.",
                     n = rw.len(),
                 );
             }

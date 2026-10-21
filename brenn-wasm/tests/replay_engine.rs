@@ -1,8 +1,8 @@
-// Integration tests for the iter-3 replay protection component.
+// Integration tests for the replay protection component.
 //
 // All tests load `brenn_replay.wasm` (the production component) via
 // `ReplayComponent::load` and drive `check_raw_for_testing` directly.
-// No HTTP, no axum, no tokio. Covers design §4.2 ACs.
+// No HTTP, no axum, no tokio.
 //
 // received_at is supplied as a fixed u64 ms value; no wall-clock dependency.
 

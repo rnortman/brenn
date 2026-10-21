@@ -130,8 +130,7 @@ pub async fn repo_status(mount: &ResolvedMount, working_dir: &Path) -> RepoStatu
     };
 
     // upstream: a non-zero exit from `rev-parse @{upstream}` is the
-    // documented signal for "no upstream configured" (per
-    // docs/designs/multi-repo-git.md). Don't push that into `errors` —
+    // documented signal for "no upstream configured". Don't push that into `errors` —
     // upstream=None is the signal. We can't easily distinguish a real
     // subprocess failure here from "no upstream" without inspecting
     // stderr, so preserve existing behavior: any error → upstream=None,

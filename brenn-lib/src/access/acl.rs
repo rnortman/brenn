@@ -2,24 +2,22 @@
 //! capability to specific clients / channels / topics.
 //!
 //! Deny-by-default end to end: a granted-but-scoped capability with **no** ACL
-//! matcher reaches nothing — `.any(...)` over an empty `Vec` is `false` (design
-//! §2.4). These are the resolved matcher types; the operator-authored raw forms
-//! and the validation that produces them land in a later increment.
+//! matcher reaches nothing — `.any(...)` over an empty `Vec` is `false`. These
+//! are the resolved matcher types.
 //!
 //! Backend-only, like the rest of `access` — no `ts-rs` derive.
 
 /// Layer-2 ACL block. Each field is a per-capability allowlist; an empty list
-/// denies everything for that capability (design §2.2 / §2.4).
+/// denies everything for that capability.
 ///
-/// `PwaPush` has no per-channel scope today (design §2.4 / high-level failure
-/// mode 9), so it has no field here — it is a pure, scope-less grant.
+/// `PwaPush` has no per-channel scope, so it has no field here — it is a pure,
+/// scope-less grant.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AclSet {
     /// MQTT subscribe allowlist: `(client, topic-filter)` pairs.
     pub mqtt_subscribe: Vec<MqttSubMatcher>,
     /// MQTT publish allowlist: client-slug only (publish targets a concrete
-    /// topic, not a filter — topic-level publish ACLs are out of scope, design
-    /// §2.1).
+    /// topic, not a filter — there are no topic-level publish ACLs).
     pub mqtt_publish: Vec<MqttClientMatcher>,
     /// `brenn:` subscribe allowlist.
     pub brenn_subscribe: Vec<ChannelMatcher>,
@@ -49,7 +47,7 @@ pub struct AclSet {
 
 /// MQTT subscribe matcher: a `(client, topic_filter)` pair. The `topic_filter`
 /// uses MQTT wildcard semantics and is subset-matched against a requested filter
-/// by `mqtt_match::filter_covers` at enforcement time (design §2.3, §5).
+/// by `mqtt_match::filter_covers` at enforcement time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MqttSubMatcher {
     /// MQTT client slug this matcher scopes to.
@@ -58,8 +56,8 @@ pub struct MqttSubMatcher {
     pub topic_filter: String,
 }
 
-/// MQTT publish matcher: client-slug only. Publish is client-scoped (design
-/// §2.1); there is no topic dimension on the publish side.
+/// MQTT publish matcher: client-slug only. Publish is client-scoped; there is
+/// no topic dimension on the publish side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MqttClientMatcher {
     /// MQTT client slug this matcher scopes to.
@@ -67,7 +65,7 @@ pub struct MqttClientMatcher {
 }
 
 /// `brenn:` channel matcher. Starts with `Exact` + `Prefix` only; full globs are
-/// deliberately deferred (design §2.2, high-level failure mode 4).
+/// deliberately deferred.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelMatcher {
     /// Matches `channel` exactly.
@@ -86,8 +84,7 @@ pub enum ChannelMatcher {
 
 impl ChannelMatcher {
     /// Does this matcher cover `channel`? `Exact` requires equality; `Prefix`
-    /// requires `channel` to start with the prefix. The live Phase-1 helper
-    /// consumed by `allows_brenn_dynamic_subscribe` (design §2.3).
+    /// requires `channel` to start with the prefix.
     pub fn matches(&self, channel: &str) -> bool {
         match self {
             ChannelMatcher::Exact(s) => channel == s,
@@ -96,7 +93,7 @@ impl ChannelMatcher {
     }
 }
 
-/// Inbound webhook matcher: an endpoint slug, matched exactly (design §2.3).
+/// Inbound webhook matcher: an endpoint slug, matched exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookMatcher {
     /// Webhook endpoint slug this matcher scopes to.

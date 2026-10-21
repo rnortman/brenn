@@ -861,7 +861,7 @@ pub(super) fn test_apps_with_pwa_push() -> Arc<IndexMap<String, AppConfig>> {
         default_title: None,
     });
     // Push authorization is the `PwaPush` grant (the legacy
-    // `[app.pwa_push].enabled` boolean was removed; §2.5.1); grant it so the gate
+    // `[app.pwa_push].enabled` boolean was removed); grant it so the gate
     // (pwa_push_enabled()) passes for this push-enabled fixture.
     cfg.policy_mut()
         .grants

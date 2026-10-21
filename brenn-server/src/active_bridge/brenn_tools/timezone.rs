@@ -709,7 +709,7 @@ mod tests {
     async fn set_user_timezone_isolates_second_user() {
         // Isolate user1 and user2 enrolled on the *same* device.
         //
-        // The key isolation claim (design §3): writing (device_id, user1) must not
+        // The key isolation claim: writing (device_id, user1) must not
         // touch (device_id, user2) even when both are enrolled on the identical device.
         // A WHERE clause that drops `AND user_id = ?` would overwrite user2's row; this
         // test would catch that regression (the old test used separate devices and could not).

@@ -68,7 +68,7 @@ pub(in crate::active_bridge) async fn handle_brenn_tools(
         return Some(result);
     }
     // Try the messaging intercepts first. They cover all three messaging
-    // tools (auto-approved per design §3.4 / §7.1.1).
+    // tools (auto-approved).
     if let Some(crate::messaging_intercept::MessagingHandled::Respond(decision)) =
         crate::messaging_intercept::try_handle_messaging_tool(bridge, req).await
     {

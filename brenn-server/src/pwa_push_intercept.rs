@@ -446,7 +446,7 @@ async fn execute_send(
 /// Produces `/r/{uuid}?to={percent-encoded-app-path}` where the `to` parameter
 /// is safe to round-trip through `serde_urlencoded` query extraction. The UUID
 /// is a fresh v4 per call — no server-side tracking needed; uniqueness alone
-/// defeats Android Firefox's task-restore behavior. See design §2.2.
+/// defeats Android Firefox's task-restore behavior.
 fn make_redirector_url(app_path: &str) -> String {
     let nonce = uuid::Uuid::new_v4();
     let mut s = url::form_urlencoded::Serializer::new(String::new());

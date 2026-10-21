@@ -40,14 +40,14 @@ export interface TaskGroup {
  *  drops fire `TodoSchedule` instead of `TodoReorder`: they pin the
  *  task to a date but do not write `sort_order`, so the task ranks
  *  naturally in its new bucket via `COALESCE(sort_order, priority,
- *  UNRANKED)` (see graf's `todo_schedule`). See design.md §4. */
+ *  UNRANKED)` (see graf's `todo_schedule`). */
 export interface ScheduleTarget {
   /** Path of the primary task (for single-task drag, the dragged task;
    *  for multi-select, the pointer-captured task). */
   path: string;
   repo?: string;
   /** Target bucket's canonical date. Never null (heading drops on
-   *  null-canonicalDate buckets are filtered by hit-test §4.1). */
+   *  null-canonicalDate buckets are filtered by the hit-test). */
   date: string;
   /** Display-ordered selected keys for multi-select schedule. Null for
    *  single-task drag. Caller iterates this for actual dispatches. */
@@ -155,8 +155,7 @@ export type SlotState =
  * numeric values drive sort order; within WEEKDAY and FUTURE, multiple
  * groups are ordered by their canonical date (ISO YYYY-MM-DD is lex-sortable).
  *
- * Order policy (extends `docs/designs/todo-section-order-and-dated-invariant.md`
- * with the today-earlier-bucket split):
+ * Order policy:
  * OVERDUE → DUE_TODAY → EARLIER → TODAY → TOMORROW → WEEKDAY (days 2–6
  * chronologically) → FUTURE (chronologically). The enum is the single
  * source of truth for section order; rendering never depends on input
@@ -183,7 +182,7 @@ export interface SectionAssignment {
  *  membership is keyed off something other than `effective_date == bucket
  *  date`, so dropping a task into one has no defensible optimistic
  *  assignment (`canonicalDate` is null for all three). The drop hit-test
- *  filters cross-bucket drops INTO any of these. See design.md §4. */
+ *  filters cross-bucket drops INTO any of these. */
 export const PSEUDO_BUCKET_HEADER_CLASSES: ReadonlySet<string> = new Set([
   "overdue",
   "earlier",
@@ -196,7 +195,7 @@ export const PSEUDO_BUCKET_HEADER_CLASSES: ReadonlySet<string> = new Set([
  *  the task only to have the next render snap it back. EARLIER is
  *  excluded — it's the one pseudo-bucket where drag-out is meaningful
  *  (rebasing `effective_date` to the target bucket's canonical date is
- *  exactly what the user wants). See design.md §4. */
+ *  exactly what the user wants). */
 export const DRAG_LOCKED_SOURCE_HEADER_CLASSES: ReadonlySet<string> = new Set([
   "overdue",
   "due-today",
@@ -240,7 +239,7 @@ export interface HitTestRow {
   /** Header class string (used by `isDroppable`); only set when
    *  `kind === "header"`. */
   headerClass?: string;
-  /** Bucket canonicalDate (used by §4.1); only set when
+  /** Bucket canonicalDate (used by the hit-test); only set when
    *  `kind === "header"`. */
   canonicalDate?: string | null;
   /** Vertical extent in viewport coordinates (`getBoundingClientRect`
@@ -262,7 +261,7 @@ export interface HitTestResult {
  *  1. Heading pass: each header owns the vertical band from its own
  *     top to the next row's top (or `+Infinity` if last). If `clientY`
  *     falls in a heading's band AND the heading is a valid schedule
- *     candidate (real-date bucket per §4.1, droppable per §4.1), return
+ *     candidate (real-date bucket, droppable), return
  *     `{ mode: "schedule", gi }`. Bands are non-overlapping by
  *     construction so the first match is the only match.
  *
@@ -271,9 +270,7 @@ export interface HitTestResult {
  *     `clientY > midY` → `insertIdx = ti + 1`.
  *
  *  Returns `null` if neither pass yields a candidate (caller leaves the
- *  previous drop target unchanged).
- *
- *  See design.md §4.3. */
+ *  previous drop target unchanged). */
 export function hitTestDrop(
   rows: HitTestRow[],
   clientY: number,
@@ -281,7 +278,7 @@ export function hitTestDrop(
 ): HitTestResult | null {
   if (rows.length === 0) return null;
   // Pointer above the entire list area: no candidate. Caller keeps
-  // the previous drop target unchanged. See design.md §4.3 step 3.
+  // the previous drop target unchanged.
   if (clientY < rows[0].top) return null;
 
   // Heading pass.
@@ -291,7 +288,7 @@ export function hitTestDrop(
     const bandTop = r.top;
     const bandBottom = i + 1 < rows.length ? rows[i + 1].top : Infinity;
     if (clientY < bandTop || clientY >= bandBottom) continue;
-    // Reject headings without a concrete date (§4.1) — pseudo-buckets
+    // Reject headings without a concrete date — pseudo-buckets
     // OVERDUE / EARLIER / DUE_TODAY have no concrete date to write
     // into `tentative_date`, so they are never schedule candidates.
     if (r.canonicalDate == null) continue;
@@ -348,8 +345,7 @@ export interface SlotGroup {
 /** Assign a date string to its date-section (TODAY / TOMORROW /
  *  WEEKDAY / FUTURE). Used by both `sectionOf` (after the OVERDUE /
  *  DUE_TODAY / EARLIER short-circuits) and `groupTasksByDate` (to seed
- *  the always-visible 7-day window of empty placeholder buckets — see
- *  design.md §3). */
+ *  the always-visible 7-day window of empty placeholder buckets). */
 export function sectionForDate(
   date: string,
   todayStr: string,
@@ -419,7 +415,7 @@ export function sectionOf(
   // or `== today` — the section is homogeneous in `due_date` only).
   // Sits before EARLIER by design — a task with both `due_date == today`
   // and `effective_date < today` lands here so the morning-scan headline
-  // surfaces what's actually due today (see design.md §2).
+  // surfaces what's actually due today.
   if (task.due_date === todayStr) {
     return {
       section: Section.DUE_TODAY,
@@ -496,7 +492,7 @@ export function groupTasksByDate(tasks: TodoItem[], todayStr: string): TaskGroup
   // days (TODAY, TOMORROW, plus 5 WEEKDAYs at today+2..today+6). The
   // user's morning view should preserve the weekday rhythm regardless
   // of which days are populated, and empty buckets serve as
-  // schedule-drop landing pads (see design.md §3, §4). OVERDUE,
+  // schedule-drop landing pads. OVERDUE,
   // DUE_TODAY, EARLIER, and FUTURE are NOT seeded — they appear only
   // when populated, exactly as before.
   for (let i = 0; i < 7; i++) {
@@ -534,7 +530,7 @@ export function groupTasksByDate(tasks: TodoItem[], todayStr: string): TaskGroup
 }
 
 /** Build the render list for the todo pane under the freeze-the-list
- *  contract (`docs/designs/todo-tombstone-regression/design.md`).
+ *  contract.
  *
  *  When `frozenSnapshot` is non-null, rendering is driven by the
  *  snapshot's pre-captured groups: every slot is a live-row
@@ -575,14 +571,12 @@ export class BrennTodoList extends LitElement {
    *    matching `action`.
    *  - `kind: "settled"` → render the in-place confirmation tile. The
    *    live row for the same key (if any) is suppressed by
-   *    `buildSlotGroups` (§3.2 key precedence rule).
+   *    `buildSlotGroups`.
    *
    *  Parent owns mutation; we only read. Mutated in place on the parent
-   *  with a matching `requestUpdate()` so Lit re-reads the reference —
-   *  see `todo-list-ui-state-preservation.md` §3.10. */
+   *  with a matching `requestUpdate()` so Lit re-reads the reference. */
   @property({ attribute: false }) slotState: Map<string, SlotState> = new Map();
-  /** Frozen render snapshot taken at first-pending (see the design
-   *  doc's "How the freeze is represented" section). When non-null,
+  /** Frozen render snapshot taken at first-pending. When non-null,
    *  `buildSlotGroups` renders from these pre-captured groups rather
    *  than from the current `tasks` prop, so incoming TodoState
    *  refreshes never change what the user sees mid-triage. Parent
@@ -618,7 +612,7 @@ export class BrennTodoList extends LitElement {
   /** Heading-drop schedule callback. Fired when the user drops on a
    *  date-bucket heading rather than between two task rows. The brenn-
    *  app handler dispatches `TodoSchedule` (one per task for multi-
-   *  select) — see design.md §5. */
+   *  select). */
   @property({ attribute: false }) onSchedule:
     | ((target: ScheduleTarget) => void)
     | null = null;
@@ -631,7 +625,7 @@ export class BrennTodoList extends LitElement {
   @property({ type: Boolean }) refreshPending = false;
   /** True when the parent has put the list into a "no new mutations"
    *  state (currently: while a click-refresh is queued waiting on
-   *  pending slots to settle — design §3.5). Gates `_onDragStart` so
+   *  pending slots to settle). Gates `_onDragStart` so
    *  the drag UI doesn't start an optimistic reorder whose dispatch
    *  the parent will short-circuit. Dispatch-level gates live on the
    *  parent (`_handleTodoDone` / `_handleTodoSnooze` /
@@ -677,7 +671,7 @@ export class BrennTodoList extends LitElement {
      *  "reorder"`; under `"schedule"` the heading owns the entire
      *  bucket so the insert index is irrelevant (graf's `todo_schedule`
      *  removes any prior `sort_order`, so the task ranks naturally
-     *  in its new bucket — see design.md §4.6). */
+     *  in its new bucket). */
     dropMode: "reorder" | "schedule";
     dropGroupIdx: number;
     dropInsertIdx: number;
@@ -900,8 +894,7 @@ export class BrennTodoList extends LitElement {
     }
 
     /* --- Settled tile (parks the slot after a successful done/snooze
-     * so the user's next click target doesn't shift — see
-     * docs/designs/todo-list-ui-state-preservation.md §3.3). --- */
+     * so the user's next click target doesn't shift). --- */
 
     .task-row.settled {
       background: #151c2e;
@@ -927,7 +920,7 @@ export class BrennTodoList extends LitElement {
     .task-row.settled.settled-schedule {
       /* Warm amber matches the .due-today header color; communicates
        * "scheduled, has a date attached" rather than the cool-blue
-       * snooze accent. See design.md §5.1 #3. */
+       * snooze accent. */
       border-left-color: #d4a44a;
     }
 
@@ -1118,7 +1111,7 @@ export class BrennTodoList extends LitElement {
       min-width: 16rem;
     }
 
-    /* --- Row error badge (Phase 4 §7.2) --- */
+    /* --- Row error badge --- */
 
     .row-error {
       color: #e94560;
@@ -1268,8 +1261,7 @@ export class BrennTodoList extends LitElement {
      * Mutually exclusive with .drop-indicator: a reorder hit shows
      * a 2-px bar between rows; a schedule hit shows this filled,
      * outlined block on the heading. The graphic gestalt of the two
-     * cues is deliberately distinct (line vs. block). See
-     * design.md §4.4. */
+     * cues is deliberately distinct (line vs. block). */
 
     .group-header.schedule-target {
       outline: 2px solid #4a6fa5;
@@ -1864,7 +1856,7 @@ export class BrennTodoList extends LitElement {
   private _onDragStart(e: PointerEvent, task: TodoItem, groupIdx: number, taskIdx: number): void {
     // Only primary button (left click / single touch).
     if (e.button !== 0) return;
-    // Design §3.5: while interactions are parent-disabled (currently a
+    // While interactions are parent-disabled (currently a
     // queued refresh waiting on pending slots), skip dragging entirely
     // so the user doesn't start an optimistic reorder whose dispatch
     // the parent is going to short-circuit anyway.
@@ -1873,14 +1865,14 @@ export class BrennTodoList extends LitElement {
     const existing = this.slotState.get(todoKey(task.path, task.repo));
     if (existing?.kind === "pending") return;
 
-    // Drag-out gate for OVERDUE and DUE_TODAY (design.md §4). Both
+    // Drag-out gate for OVERDUE and DUE_TODAY. Both
     // buckets are keyed off `due_date`, which the TodoReorder wire op
     // cannot change. Allowing drag-out would let the user appear to
     // move the task to e.g. TOMORROW only to have it snap back into
     // its source bucket on the next render. Block drag entirely from
     // these buckets; the user changes due_date elsewhere in the UI.
     // (This also blocks within-bucket reorder for these buckets — a
-    // deliberate simplification; see design.md §4.)
+    // deliberate simplification.)
     const sourceGroup = this._cachedGroups[groupIdx];
     if (
       sourceGroup &&
@@ -2073,7 +2065,7 @@ export class BrennTodoList extends LitElement {
    *  filtered out here. For multi-select with mixed source dates,
    *  the dispatch fires for the full set; per-task no-op filtering
    *  is unnecessary because graf's `todo_schedule` is idempotent on
-   *  a same-date schedule. See design.md §4.6. */
+   *  a same-date schedule. */
   private _dispatchScheduleDrop(drag: NonNullable<typeof this._drag>): void {
     if (!this.onSchedule) return;
     const targetGroup = this._cachedGroups[drag.dropGroupIdx];
@@ -2187,8 +2179,7 @@ export class BrennTodoList extends LitElement {
    *
    *  Thin wrapper: build `HitTestRow[]` from the current DOM + cached
    *  groups, delegate the hit-test to the pure `hitTestDrop` function,
-   *  and apply the change-detection guard before re-rendering visuals.
-   *  See design.md §4.3. */
+   *  and apply the change-detection guard before re-rendering visuals. */
   private _updateDropTarget(clientY: number): void {
     const drag = this._drag;
     if (!drag) return;
@@ -2283,7 +2274,7 @@ export class BrennTodoList extends LitElement {
    *  shows the heading-block highlight on the target heading.
    *
    *  Always clears prior visuals first, so calling this on every
-   *  state change is safe — see design.md §4.4 / §4.5. */
+   *  state change is safe. */
   private _renderDropVisuals(
     mode: "reorder" | "schedule",
     groupIdx: number,
@@ -2388,7 +2379,7 @@ export class BrennTodoList extends LitElement {
     return "p3";
   }
 
-  /** Phase 4 §5.4: pick a pending label that matches the in-flight
+  /** Pick a pending label that matches the in-flight
    *  action. Falls back to "working…" when the slot entry is absent
    *  or not pending (defensive — a live row only renders when
    *  `kind === "pending"`, so this should not fire in practice). */
@@ -2451,7 +2442,7 @@ export class BrennTodoList extends LitElement {
    *  ancestor) or resize moves the caret relative to the menu's fixed
    *  viewport coordinates. Matching native `<select>` behavior, close
    *  the menu rather than chase the caret with a reposition — cheap,
-   *  robust, and matches the design §10 risk acknowledgement. */
+   *  and robust. */
   private _boundViewportClose: (() => void) | null = null;
   private _installViewportListeners(): void {
     if (this._boundViewportClose) return;

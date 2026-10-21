@@ -567,8 +567,7 @@ impl AppState {
     /// Logs errors server-side but does not surface them to the user.
     ///
     /// `tz` is the spawning `WsConnection`'s browser-reported timezone,
-    /// used to seed `GRAF_USER_TZ` in CC's environment. See
-    /// `docs/designs/graf-user-tz.md`.
+    /// used to seed `GRAF_USER_TZ` in CC's environment.
     pub fn spawn_eager_wake(&self, conversation_id: i64, tz: chrono_tz::Tz) {
         // The browser attaching is its own door, and it takes its own hold.
         self.spawn_wake_task(conversation_id, tz, BusHold::Unheld);

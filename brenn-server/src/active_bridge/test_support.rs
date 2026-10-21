@@ -354,7 +354,7 @@ pub(in crate::active_bridge) async fn install_recording_session(
 /// `persist_broadcast_send`, or fires `Err` to simulate a flush failure, or drops `tx`
 /// to simulate the writer task exiting (RecvError → flush failure).
 ///
-/// Use this in tests validating the lock-release-before-await property of §2.6: the
+/// Use this in tests validating the lock-release-before-await property: the
 /// session lock is released after enqueue, so a second caller can proceed while the
 /// first is blocked awaiting its ack.
 pub(in crate::active_bridge) async fn install_stalling_session(
@@ -427,7 +427,7 @@ pub(in crate::active_bridge) async fn test_bridge_singleton() -> (
 }
 
 // -----------------------------------------------------------------------
-// Device virtual tool integration tests (design §4, §2.8)
+// Device virtual tool integration tests
 // -----------------------------------------------------------------------
 
 /// Helper: create a real device row + device_users membership and return the device_id.

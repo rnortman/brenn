@@ -487,7 +487,7 @@ pub async fn run_server(
     // Spawn the repo-sync manager. Returns `None` if no sync-enabled
     // clones are configured. `AppState::repo_sync_sender` keeps a sender
     // alive so the spawned task survives for the server lifetime.
-    // See `docs/designs/repo-sync.md`. The webhook index is built from the
+    // The webhook index is built from the
     // manager's own clone set so the two can't disagree on which remotes
     // count as live.
     let repo_sync_result = repo_sync::start_repo_sync(

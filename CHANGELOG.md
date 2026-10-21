@@ -4,6 +4,15 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Brenn's secret-and-hygiene scanner (`scrub`) now enforces the
+  design-reference rule on whole-tree scans, not just on diffs.** The rule
+  that rejects comments citing private design documents (`design §2.1`,
+  `docs/designs/...`) used to skip full-tree scans because the tree carried
+  a backlog of them; that backlog is now cleared, so CI's tree scan and
+  `scrub` tree mode report it like any other rule. Other repositories using
+  `scrub` that still carry such a backlog can opt out per rule by adding
+  `tags = ["diff-only"]` to it in their `.gitleaks.toml` (the repo template
+  explains how); diffs are still checked either way.
 - **Configs that give a surface-placed instance more authority than its
   surface now fail to load.** In a `.brenn` file, an instance placed on a
   surface (`new w: Widget { ... }`) may state its own `acl`. That statement

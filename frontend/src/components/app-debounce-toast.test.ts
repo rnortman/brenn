@@ -5,7 +5,7 @@ import { BrennApp } from "./app.js";
 import { MockWebSocket } from "../test-utils/mock-websocket.js";
 
 /**
- * Phase 4 coverage: per-row debounce (§6) and toast routing (§5.3).
+ * Coverage: per-row debounce and toast routing.
  *
  * Debounce: `_armDebounce` gates duplicate sends within 400ms of the
  * first tap, on a per-key basis. A different key is unaffected.
@@ -335,7 +335,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     expect(calls).toEqual([]);
   });
 
-  it("PRD-done §8: falls back to next_due_date when next_check_in_date is absent", async () => {
+  it("falls back to next_due_date when next_check_in_date is absent", async () => {
     const { app } = await mountApp();
     const calls = await toastInterceptor(app);
     const appI = app as unknown as AppInternals;
@@ -354,7 +354,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     expect(calls[0]).toMatch(/^Done\. Next: /);
   });
 
-  // --- Slot transitions on success (design §3.4.2) ---------------------
+  // --- Slot transitions on success -------------------------------------
 
   it("_handleTodoActionResult on success/done transitions slot to settled", async () => {
     const { app } = await mountApp();
@@ -412,7 +412,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     expect(appI.todoSlotState.has(":todo/foo.md")).toBe(false);
   });
 
-  // --- TodoState reconcile (§3.4.3) ------------------------------------
+  // --- TodoState reconcile ---------------------------------------------
 
   it("_handleTodoState preserves a still-pending key for a task still in the refresh", async () => {
     // Regression test for `todo-pending-state-lost-on-list-refresh`:
@@ -437,7 +437,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
   });
 
   it("_handleTodoState implicitly settles a pending key absent from the refresh (done)", async () => {
-    // Defensive branch for §3.4.3: WS reconnect may lose the
+    // Defensive branch: WS reconnect may lose the
     // TodoActionResult; the follow-up TodoState transitions the slot
     // to settled with a generic tile.
     const { app } = await mountApp();
@@ -450,7 +450,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     expect(entry!.kind).toBe("settled");
   });
 
-  it("_handleTodoState drops a pending reorder whose task is absent (no settled tile — §3.6)", async () => {
+  it("_handleTodoState drops a pending reorder whose task is absent (no settled tile)", async () => {
     const { app } = await mountApp();
     const appI = app as unknown as AppInternals;
     seedPending(appI, "todo/foo.md", undefined, "reorder");
@@ -458,7 +458,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     expect(appI.todoSlotState.has(":todo/foo.md")).toBe(false);
   });
 
-  // --- Idle-timer dismissal (§3.5) -------------------------------------
+  // --- Idle-timer dismissal --------------------------------------------
 
   it("idle timer dismisses settled tiles after 5s", async () => {
     vi.useFakeTimers();
@@ -511,7 +511,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     vi.useRealTimers();
   });
 
-  it("idle timer re-arms after a pending slot is cleared via error (§3.5)", async () => {
+  it("idle timer re-arms after a pending slot is cleared via error", async () => {
     // Regression test for deep-review F1: the old code only
     // cancelled the idle timer in `_collapseSettledSlot`; it never
     // re-armed it. With A settled and B pending, B erroring should
@@ -548,7 +548,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     vi.useRealTimers();
   });
 
-  it("idle timer re-arms after a pending slot is cleared via reorder-success (§3.5)", async () => {
+  it("idle timer re-arms after a pending slot is cleared via reorder-success", async () => {
     // Same as above but the pending clears via reorder-success
     // (another path that used to leak — no settled tile, just a
     // slot drop).
@@ -568,7 +568,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     vi.useRealTimers();
   });
 
-  // --- Pending-slot watchdog (§3.4.4) ----------------------------------
+  // --- Pending-slot watchdog -------------------------------------------
 
   it("pending watchdog drops the slot after 30s of silence", async () => {
     vi.useFakeTimers();
@@ -595,7 +595,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     vi.useRealTimers();
   });
 
-  it("idle timer re-arms after watchdog-fire clears the last pending (§3.5 F2)", async () => {
+  it("idle timer re-arms after watchdog-fire clears the last pending", async () => {
     // Regression test for deep-review F2: the old
     // `_onSlotWatchdogFire` did hand-rolled cleanup and never
     // re-armed the idle timer.
@@ -632,7 +632,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     vi.useRealTimers();
   });
 
-  // --- Refresh serialization (§3.5) ------------------------------------
+  // --- Refresh serialization -------------------------------------------
 
   it("refresh click with a pending slot: drops settled, queues refresh, does not send", async () => {
     const { app, ws } = await mountApp();
@@ -895,7 +895,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     expect(appI.todoSlotState.get(":todo/bar.md")?.kind).toBe("settled");
   });
 
-  it("manual dismiss does not reset the idle timer for surviving tiles (§3.5 rule 2)", async () => {
+  it("manual dismiss does not reset the idle timer for surviving tiles", async () => {
     // Regression test for round-2 F14: the list-level idle timer
     // must keep its accumulated elapsed time when a user clicks `×`
     // on one tile. An unconditional re-arm in `_collapseSettledSlot`
@@ -924,7 +924,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     vi.useRealTimers();
   });
 
-  // --- _primeForReplay slot-preservation (§3.4.3) ----------------------
+  // --- _primeForReplay slot-preservation -------------------------------
 
   it("_primeForReplay clears slots + watchdogs + snapshot", async () => {
     // _primeForReplay always clears todo state.
@@ -940,7 +940,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     expect(appI.todoRefreshQueued).toBe(false);
   });
 
-  // --- Entry-point debounce coverage (Phase 4 §6) -----------------------
+  // --- Entry-point debounce coverage ------------------------------------
 
   it("debounce blocks a second TodoSnooze within 400ms on the same key", async () => {
     vi.useFakeTimers();
@@ -1059,7 +1059,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     vi.useRealTimers();
   });
 
-  // --- Row-error badge auto-clear (Phase 4 §7.2) ------------------------
+  // --- Row-error badge auto-clear ---------------------------------------
 
   it("error badge auto-clears after 6s", async () => {
     vi.useFakeTimers();
@@ -1261,7 +1261,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     );
   });
 
-  // F1: pin the reorder freeze placement. The design's call-site
+  // Pin the reorder freeze placement. The call-site
   // contract requires `_freezeListIfNeeded()` to run BEFORE the
   // optimistic splice mutates `todoTasks`. A regression that moves
   // the freeze call below the splice (or removes it and relies on
@@ -1523,7 +1523,7 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     expect(rows[6].classList.contains("settled")).toBe(false);
   });
 
-  // --- Heading-drop schedule (empty-day-buckets-heading-drop §5) ------
+  // --- Heading-drop schedule -------------------------------------------
 
   it("debounce blocks a second TodoSchedule within 400ms on the same key", async () => {
     vi.useFakeTimers();
@@ -1709,14 +1709,13 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     expect(sends[0].date).toBe("2026-04-25");
   });
 
-  // F7: schedule does NOT optimistically mutate `todoTasks[i].effective_date`.
-  // Design §5 explicitly pins this contract ("No optimistic
-  // `effective_date` mutation … mirrors `_handleTodoSnooze`"). The
+  // Schedule does NOT optimistically mutate `todoTasks[i].effective_date`,
+  // mirroring `_handleTodoSnooze`. The
   // renderer reads from the frozen snapshot during the triage
   // session, so any local mutation would be invisible AND drift
   // would surface on thaw. Snooze deliberately skips this; schedule
   // must too.
-  it("schedule does not optimistically mutate todoTasks[i].effective_date (§5)", async () => {
+  it("schedule does not optimistically mutate todoTasks[i].effective_date", async () => {
     const { app } = await mountApp();
     const appI = app as unknown as AppInternals;
     appI.todoTasks = [
@@ -1738,13 +1737,13 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     expect(appI.todoTasks[0].effective_date).toBe("2026-04-22");
   });
 
-  // F9: mixed-source multi-select. 2 of 3 tasks already on the
-  // target date; the third is not. Per design §4.6 the brenn-app
+  // Mixed-source multi-select. 2 of 3 tasks already on the
+  // target date; the third is not. The brenn-app
   // handler dispatches all 3 messages — graf is idempotent on
   // same-date and per-task no-op filtering at the brenn layer is
   // unnecessary. A future "optimization" that filters per-task
   // would fail here.
-  it("mixed-source multi-select schedule: 2 already-on-target + 1 not = 3 wire messages (§4.6)", async () => {
+  it("mixed-source multi-select schedule: 2 already-on-target + 1 not = 3 wire messages", async () => {
     const { app, ws } = await mountApp();
     const appI = app as unknown as AppInternals;
     appI.todoTasks = [
@@ -1784,10 +1783,9 @@ describe("per-row debounce + toast routing (Phase 4)", () => {
     }
   });
 
-  // F10: schedule freezes the list before marking pending. Design §5
-  // calls out "Freeze BEFORE marking pending" as the freeze-invariant
-  // contract; existing reorder/snooze tests already pin this.
-  it("schedule freezes the list before marking pending (§5)", async () => {
+  // Schedule freezes the list before marking pending — the
+  // freeze-invariant contract; existing reorder/snooze tests already pin this.
+  it("schedule freezes the list before marking pending", async () => {
     const { app } = await mountApp();
     const appI = app as unknown as AppInternals;
     appI.todoTasks = [

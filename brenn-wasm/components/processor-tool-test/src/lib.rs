@@ -1,5 +1,4 @@
-// Async-tool end-to-end test fixture for the `brenn:processor` world
-// (design §6 "End-to-end").
+// Async-tool end-to-end test fixture for the `brenn:processor` world.
 //
 // This is the guest half of the cycle-2 consumption path, proven in cycle 1: a
 // real compiled WASM consumer holding a `git-repo-pull` grant makes an async

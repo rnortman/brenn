@@ -439,8 +439,7 @@ enum DrainerMsg {
 /// stay independent. Used for upgrade-detection alerts and first-occurrence
 /// security signals (e.g. `ephemeral_publish_denied`) — one page per key per
 /// process. Critical events like "CC process died" must keep paging
-/// per-occurrence and intentionally do not use this path. See
-/// `docs/designs/silence-known-cc-warnings.md`.
+/// per-occurrence and intentionally do not use this path.
 ///
 /// Private: callers interact with the dedup through
 /// `AlertDispatcher::alert_once_per_process`, not this type directly.
@@ -612,7 +611,7 @@ impl AlertDispatcher {
     /// suppression here is process-lifetime — one phone alert per `(title, key)`
     /// per brenn restart. Do NOT use for death / critical / panic events: if CC
     /// keeps dying we want one alert per occurrence so a flapping backend is
-    /// visible. See `docs/designs/silence-known-cc-warnings.md`.
+    /// visible.
     ///
     /// The alert body is augmented with a trailing line so the first
     /// (and only) phone alert explains what's happening — otherwise
@@ -1349,7 +1348,7 @@ mod tests {
     async fn once_per_process_state_shared_across_with_field_clones() {
         // Child dispatchers created via `with_field` must share the same
         // dedup set — otherwise per-conversation bridges would each re-fire
-        // the same alert once. See design.md.
+        // the same alert once.
         let (dispatcher, captured, handle) = make_capturing_alerter();
 
         let child_a = dispatcher.with_field("Conversation", "1");

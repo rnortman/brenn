@@ -1,4 +1,4 @@
-//! Runtime `mqtt:` subscribe-**activation** wrapper (design §2.3 composition).
+//! Runtime `mqtt:` subscribe-**activation** wrapper.
 //!
 //! The transport-agnostic *core* of a dynamic subscribe lives in `brenn-lib`
 //! ([`Messenger::subscribe_dynamic`]): it resolves params, persists the durable
@@ -14,26 +14,26 @@
 //! top of the lib core. `brenn:`/`webhook:` need no activation — the lib core is
 //! the whole operation for them.
 //!
-//! Ordering (design §2.3 steps 1/3/4/5/6):
-//! 1. **Configured-client guard, *before* persisting** (step 1). An `mqtt:`
+//! Ordering:
+//! 1. **Configured-client guard, *before* persisting**. An `mqtt:`
 //!    subscribe to a client with no running ingress supervisor is a tool error;
 //!    we never spawn supervisors at runtime. The guard runs first so the lib core
 //!    never creates a durable channel + row for an unconfigured client.
-//! 2. **`qos` default resolution** (step 5). An omitted `qos` for `mqtt:` defaults
+//! 2. **`qos` default resolution**. An omitted `qos` for `mqtt:` defaults
 //!    to the client's `[[mqtt_client]].qos` (the same value a static subscription
 //!    on this client would use), resolved from the live ingress handle.
-//! 3. **Lib core** ([`Messenger::subscribe_dynamic`], steps 3/4): resolve +
+//! 3. **Lib core** ([`Messenger::subscribe_dynamic`]): resolve +
 //!    persist + create-channel-if-absent + directory fold.
-//! 4. **Router `IngressRoute` add** (step 6), stamped with the client's ingress
+//! 4. **Router `IngressRoute` add**, stamped with the client's ingress
 //!    `urgency`, so `deliver_inbound` routes matching topics to the new channel.
-//! 5. **Broker SUBSCRIBE + reconnect-set registration** (step 5), via
+//! 5. **Broker SUBSCRIBE + reconnect-set registration**, via
 //!    [`MqttService::subscribe_filter`] (live now if connected, deferred to next
 //!    reconnect if disconnected — both survive reconnect).
 //!
 //! Every failure path is a returned error, never a panic — a misconfigured
 //! dynamic subscribe is LLM/attacker-shaped tool input, not a host bug (CLAUDE.md
 //! "panic on host bug, error on bad input"). The caller is the `MessageSubscribe`
-//! tool (design §2.4, a later increment).
+//! tool.
 
 use brenn_lib::messaging::ChannelScheme;
 use brenn_lib::mqtt::address::parse_mqtt_address;
@@ -46,15 +46,15 @@ use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use crate::active_bridge::ActiveBridge;
 use crate::mqtt_router::IngressRoute;
 
-/// Successful outcome of a runtime dynamic subscribe (design §2.3).
+/// Successful outcome of a runtime dynamic subscribe.
 ///
 /// Reports what activation did so the `MessageSubscribe` tool can give the LLM an
 /// honest status — in particular distinguishing "subscribed and live now" from
-/// "subscribed, delivery starts on the next broker reconnect" (design §3).
+/// "subscribed, delivery starts on the next broker reconnect".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscribeActivation {
     /// The calling app already held an identical dynamic subscription on this
-    /// channel — an idempotent no-op (design §2.4). Nothing was created and the
+    /// channel — an idempotent no-op. Nothing was created and the
     /// transport was NOT re-activated (it is already live). Applies to every
     /// transport.
     AlreadySubscribed,
@@ -139,7 +139,7 @@ impl std::fmt::Display for SubscribeActivateError {
             ),
             SubscribeActivateError::Core(e) => write!(f, "{e}"),
             // Deliberately does NOT echo whether the client/channel exists — avoid
-            // leaking config topology to an unauthorized caller (§3.3).
+            // leaking config topology to an unauthorized caller.
             SubscribeActivateError::PolicyDenied { address } => {
                 write!(
                     f,
@@ -159,7 +159,7 @@ impl From<RuntimeSubscribeError> for SubscribeActivateError {
 }
 
 /// Create a dynamic subscription for `app_slug` on `address` and activate the
-/// transport (design §2.3 composition). The single runtime subscribe entry point
+/// transport. The single runtime subscribe entry point
 /// the `MessageSubscribe` tool calls.
 ///
 /// `brenn:`/`webhook:` are pure lib-core operations (no activation).
@@ -171,8 +171,7 @@ impl From<RuntimeSubscribeError> for SubscribeActivateError {
 ///
 /// The `MessageSubscribe` tool is only offered to apps that resolved a config, so
 /// every live app carries a (possibly empty) policy; a missing one is a host
-/// wiring bug, not bad input — hence a panic rather than a returned error (design
-/// §3.1/§3.2).
+/// wiring bug, not bad input — hence a panic rather than a returned error.
 fn app_policy(
     messenger: &brenn_messaging::Messenger,
     app_slug: &str,
@@ -279,7 +278,7 @@ pub async fn subscribe_dynamic_activated(
         // which on this path is only called later inside the lib core's
         // resolve_or_create_channel. So the requested filter may be syntactically
         // invalid here (e.g. `sensors/#/extra`, `home/+x`), which would violate
-        // filter_covers' validated-input precondition (§5.2) and risk a mis-split
+        // filter_covers' validated-input precondition and risk a mis-split
         // over-match (a silent authorization bug). Validate it FIRST; on failure
         // skip the ACL check and fall through to the core, which returns the
         // canonical InvalidMqttFilter — never PolicyDenied a malformed filter
@@ -296,7 +295,7 @@ pub async fn subscribe_dynamic_activated(
         // InvalidMqttFilter.
     }
 
-    // Configured-client guard (design §2.3 step 1): the client must have a running
+    // Configured-client guard: the client must have a running
     // session. Checked before the core so no durable channel/row is created for an
     // unconfigured client. (If the address didn't parse, the core will reject it as
     // InvalidMqttFilter without creating anything.)
@@ -307,7 +306,7 @@ pub async fn subscribe_dynamic_activated(
                 client: client.to_string(),
             });
         }
-        // qos default resolution (design §2.3 step 5): an omitted qos defaults to
+        // qos default resolution: an omitted qos defaults to
         // the client's [[mqtt_client]].qos — the same value a static subscription
         // on this client uses. The client is configured (guard above), so
         // ingress_qos is Some.
@@ -316,12 +315,12 @@ pub async fn subscribe_dynamic_activated(
         }
     }
 
-    // Lib core (design §2.3 steps 3/4): resolve + persist durable row + mirror +
+    // Lib core: resolve + persist durable row + mirror +
     // create-channel-if-absent + directory fold. Returns the subscribe outcome.
     let outcome = messenger
         .subscribe_dynamic(app_slug, address, params.clone())
         .await?;
-    // Idempotent re-subscribe (identical params, design §2.4): nothing was
+    // Idempotent re-subscribe (identical params): nothing was
     // created and the subscription is already live — do NOT re-add the route or
     // re-issue the broker SUBSCRIBE. Return the no-op status.
     let resolved = match outcome {
@@ -347,7 +346,7 @@ pub async fn subscribe_dynamic_activated(
     let channel_uuid = resolved.channel_uuid;
     let canonical = resolved.channel_address.clone();
 
-    // Router IngressRoute add (design §2.3 step 6): stamp the route with the
+    // Router IngressRoute add: stamp the route with the
     // client's ingress urgency (the same the client's static routes carry) so
     // deliver_inbound routes broker deliveries on this filter to the new channel.
     // The client is configured (guard above), so ingress_urgency is Some.
@@ -379,7 +378,7 @@ pub async fn subscribe_dynamic_activated(
         urgency,
     });
 
-    // Broker SUBSCRIBE + reconnect-set registration (design §2.3 step 5). The
+    // Broker SUBSCRIBE + reconnect-set registration. The
     // resolved qos is concrete (defaulted above if omitted).
     let qos = params.qos.unwrap_or_else(|| {
         panic!(
@@ -421,7 +420,7 @@ pub async fn subscribe_dynamic_activated(
     })
 }
 
-/// Successful outcome of a runtime dynamic unsubscribe (design §2.3 unsubscribe).
+/// Successful outcome of a runtime dynamic unsubscribe.
 ///
 /// The inverse of [`SubscribeActivation`]. Reports what deactivation did so the
 /// `MessageUnsubscribe` tool can give the LLM an honest status — in particular
@@ -439,7 +438,7 @@ pub enum UnsubscribeActivation {
     /// `mqtt:` unsubscribe that removed the last subscriber; the client is
     /// currently disconnected. The filter is removed from the reconnect set (so a
     /// future reconnect will not re-subscribe it) and the route was dropped; no
-    /// live UNSUBSCRIBE was needed (design §3). Not an error.
+    /// live UNSUBSCRIBE was needed. Not an error.
     MqttDeferredDisconnected,
     /// `mqtt:` unsubscribe that removed the last subscriber; the client was live
     /// but the broker UNSUBSCRIBE *send* failed. The reconnect set no longer
@@ -448,13 +447,13 @@ pub enum UnsubscribeActivation {
     MqttSendFailed(String),
     /// `mqtt:` unsubscribe where **other subscribers remain** on the filter; the
     /// broker subscription, the reconnect-set entry, and the `IngressRoute` are all
-    /// left in place (design §2.3 unsubscribe). The caller's own dynamic sub was
+    /// left in place. The caller's own dynamic sub was
     /// removed; the channel keeps receiving for the other subscribers.
     MqttOthersRemain,
 }
 
 impl UnsubscribeActivation {
-    /// The LLM-facing status string for this outcome (design §2.4). Pure — the
+    /// The LLM-facing status string for this outcome. Pure — the
     /// caller logs a warn separately for [`Self::MqttSendFailed`]. The caller's
     /// durable sub + directory subscriber are already gone and the filter was
     /// dropped from the reconnect set even on a send failure, so the removal is
@@ -500,7 +499,7 @@ impl From<RuntimeUnsubscribeError> for UnsubscribeActivateError {
 }
 
 /// Remove `app_slug`'s dynamic subscription on `address` and deactivate the
-/// transport (design §2.3 unsubscribe). The single runtime unsubscribe entry
+/// transport. The single runtime unsubscribe entry
 /// point the `MessageUnsubscribe` tool calls — the inverse of
 /// [`subscribe_dynamic_activated`].
 ///
@@ -529,7 +528,7 @@ pub async fn unsubscribe_dynamic_activated(
         panic!("unsubscribe_dynamic_activated: Messenger required but absent on ActiveBridge")
     });
 
-    // Lib core (design §2.3 unsubscribe): delete the durable row + mirror and fold
+    // Lib core: delete the durable row + mirror and fold
     // the subscriber out of the directory. Errors (StaticSubscription /
     // NotSubscribed) are returned as tool input, never panicked.
     let UnsubscribeOutcome {
@@ -555,8 +554,7 @@ pub async fn unsubscribe_dynamic_activated(
     }
 
     // mqtt: deactivation. If other subscribers remain on the filter, leave the
-    // broker subscription, the reconnect-set entry, and the route in place
-    // (design §2.3 unsubscribe).
+    // broker subscription, the reconnect-set entry, and the route in place.
     if still_subscribed {
         return Ok(UnsubscribeActivation::MqttOthersRemain);
     }
@@ -876,7 +874,7 @@ mod tests {
         // wrapper hits add_route again — but the route must stay single. "otherapp"
         // is in the fixture's apps map with a policy granting DynamicSubscribe +
         // MqttSubscribe + an mqtt_subscribe matcher covering (client "home", filter
-        // "sensors/#"), so the Phase-1 gate admits its subscribe (§6.5).
+        // "sensors/#"), so the ACL gate admits its subscribe.
         subscribe_dynamic_activated(&bridge, "otherapp", addr, pull_only(None))
             .await
             .expect("second app subscribe on same filter");
@@ -992,15 +990,15 @@ mod tests {
 
     /// A subscribe to a **different client** than the app's `mqtt_subscribe`
     /// matcher names is `PolicyDenied` — and, because the ACL gate runs *before*
-    /// the configured-client guard (design §6.4 ordering), a denied subscribe to
+    /// the configured-client guard, a denied subscribe to
     /// an **unconfigured** client returns `PolicyDenied`, **not**
     /// `UnconfiguredMqttClient`. This pins two coupled security properties:
     /// (1) ordering — authorization precedes the existence check; (2) topology
-    /// non-leakage (§7.6) — the error type never reveals whether `other` is a
+    /// non-leakage — the error type never reveals whether `other` is a
     /// configured client. The fixture registers exactly one ingress (`home`), so
     /// `other` is both unauthorized (the matcher names `home`) AND unconfigured;
     /// the matcher grants `#` on `home`, proving the deny is the *client mismatch*
-    /// and not a too-narrow filter. (Per §6.4: do NOT add an `other` ingress to
+    /// and not a too-narrow filter. (Do NOT add an `other` ingress to
     /// the fixture — that would make this fail the configured-client guard
     /// instead, silently voiding the ordering/non-leak proof.)
     #[tokio::test]
@@ -1022,7 +1020,7 @@ mod tests {
             },
             "a wrong-client subscribe must be PolicyDenied by the ACL gate, never \
              UnconfiguredMqttClient — the ACL check precedes the configured-client \
-             guard and must not leak whether the client is configured (§6.4/§7.6)"
+             guard and must not leak whether the client is configured"
         );
         // Deny before persistence (and before the guard): no durable row, no channel.
         assert!(dynamic_rows(&bridge).await.is_empty());
@@ -1301,7 +1299,7 @@ mod tests {
     }
 
     /// An address with an **unrecognized protocol prefix** is *not* `PolicyDenied`
-    /// by the non-MQTT gate (the `true` sentinel, design §3.2): it falls through to
+    /// by the non-MQTT gate (the `true` sentinel): it falls through to
     /// the lib core, which returns its canonical address error. Pins that a future
     /// change flipping the sentinel to `false` (policy-denying an unparseable
     /// address) would be caught. The app is fully granted, so a `PolicyDenied` here
@@ -1327,7 +1325,7 @@ mod tests {
         assert!(
             !matches!(err, SubscribeActivateError::PolicyDenied { .. }),
             "an unrecognized prefix must fall through to the core's address error, \
-             never PolicyDenied (the §3.2 sentinel): {err:?}"
+             never PolicyDenied: {err:?}"
         );
         // Nothing persisted regardless of which core error fired.
         assert!(dynamic_rows(&bridge).await.is_empty());
@@ -1675,7 +1673,7 @@ mod tests {
     /// The `PolicyDenied` `Display` arm must reflect the caller-supplied address
     /// (it is the caller's own input) but must NOT echo whether the named
     /// client/channel exists — leaking config topology to an unauthorized caller
-    /// is the info-leak `§3.3` forbids. This pins that contract so a future
+    /// is an info leak. This pins that contract so a future
     /// refactor that adds `{client}`/`{channel}` to the message is caught.
     #[test]
     fn policy_denied_display_does_not_leak_topology() {

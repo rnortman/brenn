@@ -1,5 +1,5 @@
-// Integration tests for the WASM MQTT-egress path (design §4 "WASM egress",
-// first acceptance test: guest calls `mqtt-publish` naming an authorized client,
+// Integration tests for the WASM MQTT-egress path (first test: guest calls
+// `mqtt-publish` naming an authorized client,
 // the host callback reports a broker error, and the guest propagates it back).
 //
 // Uses the `processor-mqtt-test` raw-bindings fixture component: on any
@@ -44,8 +44,7 @@ fn single_activation() -> ProcessorActivation {
 }
 
 /// An envelope whose body carries the `TRAP_AFTER_PUBLISH` sentinel the fixture
-/// keys on to take the publish-once-then-panic path (design §3.1 / §4 final
-/// acceptance test).
+/// keys on to take the publish-once-then-panic path.
 fn trap_after_publish_envelope() -> String {
     r#"{"message_id":"00000000-0000-0000-0000-000000000002","source":"test","channel":"brenn:test","sender":"test-sender","publish_ts":"2026-01-01T00:00:00Z","body":"TRAP_AFTER_PUBLISH","urgency":"normal","envelope_type":"brenn"}"#.to_string()
 }
@@ -82,7 +81,7 @@ fn load_mqtt_test(mqtt_publish: MqttPublishFn) -> ProcessorComponent {
 /// Guest calls `mqtt-publish`; host callback returns `Broker("test-broker-error")`;
 /// guest propagates it as `ProcessingFailed("Broker:test-broker-error")`.
 ///
-/// This is the §4 "WASM egress" first acceptance test: proves the full host path
+/// Proves the full host path
 /// (linked `mqtt` interface → `do_mqtt_publish` → bootstrap closure) is wired
 /// end-to-end through a real WASM activation and that the guest receives and
 /// propagates the broker outcome inline.
@@ -108,7 +107,7 @@ fn mqtt_publish_broker_error_propagates_to_guest() {
     }
 }
 
-// ── test: ACL deny → not-permitted (design §4 "WASM egress", 2nd acceptance test) ──
+// ── test: ACL deny → not-permitted ──
 
 /// Guest calls `mqtt-publish` for a client its `mqtt_publish` ACL does not
 /// authorize; the host callback (which in production is the `bootstrap` closure
@@ -117,8 +116,8 @@ fn mqtt_publish_broker_error_propagates_to_guest() {
 /// `NotPermitted`; the guest receives `not-permitted` and propagates it as
 /// `ProcessingFailed("NotPermitted:")`.
 ///
-/// This is the §4 "WASM egress" second acceptance test. The host `warn!` carrying
-/// the consumer slug on this path (design §3.3 — an ACL deny on the WASM path must
+/// The host `warn!` carrying
+/// the consumer slug on this path (an ACL deny on the WASM path must
 /// surface server-side, parity with the LLM intercept) fires in `do_mqtt_publish`
 /// before the WIT mapping; it is unit-pinned by
 /// `do_mqtt_publish_maps_each_outcome` (lib tests). Here we assert the observable
@@ -145,7 +144,7 @@ fn mqtt_publish_not_permitted_propagates_to_guest() {
     }
 }
 
-// ── test: no connector → no-connector (design §4 "WASM egress", 3rd acceptance test) ──
+// ── test: no connector → no-connector ──
 
 /// Guest calls `mqtt-publish` for a client it is authorized to reach but for
 /// which no egress connector is configured; the host callback (in production the
@@ -154,8 +153,8 @@ fn mqtt_publish_not_permitted_propagates_to_guest() {
 /// `resolve_by_app_client` finds none) returns `NoConnector`; the guest receives
 /// `no-connector` and propagates it as `ProcessingFailed("NoConnector:")`.
 ///
-/// This is the §4 "WASM egress" third acceptance test. It is distinct from the
-/// `not-permitted` case (§3.5: connector presence is connection definition, never
+/// It is distinct from the
+/// `not-permitted` case (connector presence is connection definition, never
 /// authorization — ACL is checked before connector resolution): here ACL passes
 /// and the failure is the absence of a connector for the target client. Reuses
 /// the `processor-mqtt-test` fixture + `load_mqtt_test` helper.
@@ -181,17 +180,17 @@ fn mqtt_publish_no_connector_propagates_to_guest() {
     }
 }
 
-// ── test: malformed/wildcard topic → invalid-payload (design §4 "WASM egress", 4th acceptance test) ──
+// ── test: malformed/wildcard topic → invalid-payload ──
 
 /// Guest calls `mqtt-publish` with a wildcard/malformed topic; the host callback
 /// (in production the `bootstrap` closure, which builds `mqtt:<client>:<topic>`
 /// from the guest-supplied client + topic and runs `parse_topic_name` on it,
-/// mapping a parse/wildcard failure to `MqttPublishOutcome::InvalidPayload(reason)`
-/// — §2.5) returns `InvalidPayload`; the guest receives `invalid-payload(reason)`
+/// mapping a parse/wildcard failure to `MqttPublishOutcome::InvalidPayload(reason)`)
+/// returns `InvalidPayload`; the guest receives `invalid-payload(reason)`
 /// and propagates it as `ProcessingFailed("InvalidPayload:{reason}")`.
 ///
-/// This is the §4 "WASM egress" fourth acceptance test. Address validation is the
-/// caller's responsibility (§2.2: `parse_topic_name` stays at the call site; the
+/// Address validation is the
+/// caller's responsibility (`parse_topic_name` stays at the call site; the
 /// shared `enforce_and_publish` receives an already-validated `MqttAddress`), so on
 /// the WASM path the validation lives in the bootstrap closure ahead of
 /// `enforce_and_publish` and a failure never reaches the broker. The unit-level
@@ -221,16 +220,16 @@ fn mqtt_publish_invalid_payload_propagates_to_guest() {
     }
 }
 
-// ── test: trap after a successful publish does not roll back the broker send (design §4 "WASM egress", 6th acceptance test) ──
+// ── test: trap after a successful publish does not roll back the broker send ──
 
 /// A guest activation that publishes once via `mqtt-publish` (which the host
 /// callback fulfils with `Ok`) and then traps. The broker send is synchronous and
 /// direct — it has *already happened* by the time the trap aborts the activation,
-/// and it is NOT rolled back (§3.1). This is the cardinal semantic difference from
+/// and it is NOT rolled back. This is the cardinal semantic difference from
 /// `ports.publish`, whose buffered publishes are discarded when the activation
 /// returns `Err`/`Trap`.
 ///
-/// This is the §4 "WASM egress" sixth (final) acceptance test. The broker side
+/// The broker side
 /// effect is not retractable, so it cannot be observed *after* the trap; we pin it
 /// the only realizable way — a shared counter inside the host `MqttPublishFn`
 /// records how many times the callback (the broker round-trip) was invoked.
@@ -260,23 +259,23 @@ fn mqtt_publish_then_trap_does_not_roll_back_broker_send() {
                 1,
                 "mqtt-publish callback must fire exactly once even though the \
                  activation later traps — the synchronous broker send is not \
-                 retracted (§3.1)"
+                 retracted"
             );
         }
         other => panic!("expected ProcessorOutcome::Trap after publish; got {other:?}"),
     }
 }
 
-// ── test: shared per-activation call-count cap → quota-exceeded (design §4 "WASM egress", 5th acceptance test) ──
+// ── test: shared per-activation call-count cap → quota-exceeded ──
 
 /// A guest that publishes via `mqtt-publish` enough times in a single activation
 /// to exhaust the host's per-activation call-count budget
-/// (`MAX_PUBLISH_CALLS_PER_ACTIVATION`, 512 — §2.5) receives
+/// (`MAX_PUBLISH_CALLS_PER_ACTIVATION`, 512) receives
 /// `quota-exceeded`, even when the wired callback would otherwise return `Ok`.
 ///
-/// This is the §4 "WASM egress" fifth acceptance test. The `mqtt-publish` surface
+/// The `mqtt-publish` surface
 /// shares the same `publish_call_count` budget as `ports.publish` so a hostile
-/// guest cannot flood across the combined surface (design §2.5). The budget gate
+/// guest cannot flood across the combined surface. The budget gate
 /// runs *before* the callback inside `do_mqtt_publish` (the host returns
 /// `quota-exceeded` on the over-cap call without invoking the callback), so the
 /// `Ok`-returning callback here never produces the rejection — the host's cap does.

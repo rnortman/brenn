@@ -234,30 +234,6 @@ doc comment).
 
 ---
 
-## `section-ref-burndown`
-
-~968 pre-existing section-symbol references to ephemeral design docs in the
-Rust tree (comment-standard Rule 1). Grandfathered: the scrub rule is
-diff-only, so tree scans skip it and only newly touched lines are flagged.
-Post-release cleanup, blocks nothing.
-
-Same class, same burndown: 37 comment lines across 26 `.rs` files cite
-`docs/designs/*.md` paths, a directory that does not exist in the public tree
-(`docs/` holds five files); `repo-sync.md` alone accounts for 12 of them across
-9 files. Re-derive both figures before working the list —
-`grep -rn "docs/designs/" --include='*.rs' .` is what produced them. These are worse than the
-section-symbol refs — the referent is unresolvable outright, and the rationale
-each comment defers to lives only in the private ops annex, so replacing one
-means deciding what of that rationale may be restated publicly. That decision
-is the owner's, and it is why this burns down by hand rather than by sweep.
-Unlike the section-symbol refs there is no gate at all here: a dead doc path is
-mechanically checkable (path shape plus a stat), so part of the work is
-deciding whether a `docs`-path-existence guard beside the scrub rules is worth
-its false reds.
-
-No code site: the instances are the work list.
-
-
 ## `plane-version-check`
 
 Every control-plane body carries a `v` version field stamped with

@@ -1,4 +1,4 @@
-// Fuel-exhaustion test fixture for the `brenn:processor` world (design §4).
+// Fuel-exhaustion test fixture for the `brenn:processor` world.
 //
 // This component unconditionally spins in an infinite loop on any non-empty
 // new portion, exercising the fuel-exhaustion path in `ProcessorComponent::handle`.
@@ -41,7 +41,7 @@ impl Guest for ProcessorExhaust {
             let new_from = port_window.new_from as usize;
             if new_from < port_window.envelopes.len() {
                 // Spin forever — exhausts wasmtime fuel, causing a trap.
-                // The host converts this to ProcessorOutcome::Trap (design §2.2).
+                // The host converts this to ProcessorOutcome::Trap.
                 spin_forever();
             }
         }

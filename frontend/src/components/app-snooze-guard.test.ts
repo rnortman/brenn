@@ -5,7 +5,7 @@ import { BrennApp } from "./app.js";
 import { MockWebSocket } from "../test-utils/mock-websocket.js";
 
 /**
- * Tests for the §5 risk-1 runtime guard on `_handleTodoSnooze`.
+ * Tests for the runtime guard on `_handleTodoSnooze`.
  *
  * `TodoItem.effective_date` is non-nullable by wire contract, but the
  * guard catches a wire-level regression serving null/malformed
@@ -41,7 +41,7 @@ interface SnoozeHandle {
   }[];
 }
 
-describe("_handleTodoSnooze runtime guard (§5 risk #1)", () => {
+describe("_handleTodoSnooze runtime guard", () => {
   const realWebSocket = globalThis.WebSocket;
 
   beforeEach(() => {

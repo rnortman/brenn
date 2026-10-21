@@ -511,7 +511,7 @@ async fn drained_stderr_tail(
 fn build_cc_args(config: &CcSessionConfig) -> Vec<String> {
     // `--permission-mode auto` lets CC's classifier auto-approve safe tool
     // calls; risky ones still fall back to `--permission-prompt-tool stdio`
-    // and surface in Brenn's approval UI. See docs/designs/auto-mode-default.md.
+    // and surface in Brenn's approval UI.
     let mut args = vec![
         "--input-format".into(),
         "stream-json".into(),
@@ -801,7 +801,7 @@ impl CcSession {
     /// message has been flushed to CC's stdin (or on flush failure).
     ///
     /// The caller must await the returned `Receiver` **after** dropping any
-    /// `session.lock()` guards it may hold (see design §2.6): FIFO order is
+    /// `session.lock()` guards it may hold: FIFO order is
     /// fixed at `outgoing_tx.send` return; releasing the lock before the await
     /// cannot reorder stdin writes. `RecvError` on the receiver means the
     /// writer task exited before firing the ack — treat as flush failure (row

@@ -394,7 +394,7 @@ pub(crate) fn tx_put(
             let store_error = map_write_error(e);
             if matches!(store_error, StoreError::QuotaExceeded) {
                 // Set quota_hit flag before returning so ReplayComponent::check
-                // can read-and-clear it to drive the phone alert (§2.E layer 2).
+                // can read-and-clear it to drive the phone alert.
                 kv_store.quota_hit.store(true, Ordering::SeqCst);
                 // Set auto_rolled_back: SQLite implicitly rolls back the
                 // transaction on SQLITE_FULL, so the subsequent ROLLBACK from
@@ -509,8 +509,7 @@ fn scan_inner(
 //
 // The `slug` parameter carries the component identifier for warn/error log context.
 // The replay world passes `""` here: the endpoint slug exists on `ReplayComponent`
-// (H1046) but is not threaded into `StoreData`, so it is unavailable at these call sites.
-// Threading it through was left out of scope by H1046 (design §2.7-E).
+// but is not threaded into `StoreData`, so it is unavailable at these call sites.
 
 /// Shared `begin` body: nested-begin guard, `BEGIN IMMEDIATE`, push resource.
 ///
@@ -849,14 +848,14 @@ mod tests {
     // ── Quota / max_page_count tests ─────────────────────────────────────────────
     //
     // TODO(quota-statement-vs-commit): This block is the empirical gate for the
-    // design's load-bearing assumption that SQLITE_FULL fires at the INSERT
+    // load-bearing assumption that SQLITE_FULL fires at the INSERT
     // (tx_put / statement execution), NOT at COMMIT, under WAL + BEGIN IMMEDIATE.
-    // The whole §2.C "write path only" detection design rests on this.
+    // The whole "write path only" detection in `map_write_error` rests on this.
     //
     // If `quota_fires_at_statement_not_commit` fails (QuotaExceeded does NOT come
-    // from tx_put but instead some other error surfaces), the §2.C detection
+    // from tx_put but instead some other error surfaces), the detection
     // approach is wrong and map_write_error must also cover the commit path before
-    // proceeding. See design §5 GO/NO-GO GATE and §2.C commit-path asymmetry.
+    // proceeding.
 
     /// Open a store with a tiny cap (exactly 16 pages = 64 KiB — the minimum floor).
     fn open_tiny_store() -> (NamedTempFile, Arc<KvStore>) {
@@ -895,7 +894,7 @@ mod tests {
     ///
     /// Empirically validates that `PRAGMA max_page_count` under WAL + BEGIN IMMEDIATE
     /// causes `SQLITE_FULL` at INSERT execution, not at COMMIT. If this test passes,
-    /// the §2.C "write path only" map_write_error detection is correct.
+    /// the "write path only" map_write_error detection is correct.
     #[test]
     fn quota_fires_at_statement_not_commit() {
         let (_db, kv) = open_tiny_store();

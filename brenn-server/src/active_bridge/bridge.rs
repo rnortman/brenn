@@ -369,7 +369,7 @@ pub struct SpawnContext<'a> {
     pub server_shutting_down: Arc<AtomicBool>,
     /// Spawning context's IANA timezone (WS connection's browser-reported zone, or
     /// UTC fallback for autonomous wakes). Seeds `GRAF_USER_TZ` in CC's environment
-    /// for graf MCP tool calls. See `docs/designs/graf-user-tz.md`.
+    /// for graf MCP tool calls.
     pub user_tz: chrono_tz::Tz,
     pub repo_sync_sender: Option<brenn_git::sync::SyncTriggerSender>,
     pub messenger: Option<Arc<brenn_messaging::Messenger>>,
@@ -620,8 +620,7 @@ impl ActiveBridge {
             drain_on_idle: AtomicBool::new(false),
             // CC has completed its handshake (control_response received) and is
             // waiting for input. No turn is in progress. The system/init message
-            // is informational metadata, not a readiness signal — see
-            // docs/designs/init-not-required.md.
+            // is informational metadata, not a readiness signal.
             cc_idle: AtomicBool::new(true),
             lifetime: super::lifetime::LifetimeArbiter::new(
                 app_config.idle_timeout,
@@ -707,8 +706,7 @@ impl ActiveBridge {
 
         // Register idle hooks. `DirtyRepoHook` is registered when the app
         // declares any `[[app.repo]]` / `[[app.mount]]` entries — clones
-        // are the only thing it knows how to nudge about. See
-        // `docs/designs/idle-hooks.md` § "When no repos are declared".
+        // are the only thing it knows how to nudge about.
         if !bridge.mounts.is_empty() {
             bridge.register_idle_hook(Arc::new(crate::idle_hooks::DirtyRepoHook::new()));
         }
@@ -937,7 +935,7 @@ impl ActiveBridge {
     }
 
     // -----------------------------------------------------------------------
-    // Idle hooks — see `docs/designs/idle-hooks.md`.
+    // Idle hooks.
     // -----------------------------------------------------------------------
 
     /// Find the deepest `auto_pull = true` RW mount whose canonical root

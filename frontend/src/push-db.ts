@@ -10,7 +10,7 @@
  *   Object store: "signed_in_user_ids"
  *   Single record: key = "signed_in_user_ids", value = number[]
  *
- * Design §2.6.3: the SW checks `payload.user_id ∈ stored_set` before
+ * The SW checks `payload.user_id ∈ stored_set` before
  * showing a notification.  The main app inserts on Welcome and removes on
  * logout / WS close (with a 5-second grace period).
  */

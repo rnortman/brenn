@@ -39,7 +39,8 @@ impl ActiveBridge {
                 // Ownership guard: the row belongs to a different conversation than
                 // this bridge is attached to. Authority is re-derived from the
                 // session-attached `self.conversation_id`, never from the
-                // browser-supplied `request_id` (security-posture §6 B1). Reject
+                // browser-supplied `request_id` (`docs/security-posture.md`,
+                // boundary B1). Reject
                 // before the atomic claim so probing an id cannot mark a victim's
                 // row resolved as a side effect; the owner's pending request is left
                 // untouched. A request_id for an unattached conversation is a

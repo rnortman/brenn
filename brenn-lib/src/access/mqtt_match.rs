@@ -100,7 +100,7 @@ pub fn filter_covers(allowed: &str, requested: &str) -> bool {
 mod tests {
     use super::filter_covers;
 
-    /// The adversarial subset table (design §6.3 / Test Plan §4). Each row is
+    /// The adversarial subset table. Each row is
     /// `(allowed, requested, expected)`.
     #[test]
     fn subset_table() {

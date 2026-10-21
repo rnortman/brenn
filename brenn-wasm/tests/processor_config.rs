@@ -195,7 +195,7 @@ fn config_get_parsed_absent_key_publishes_absent() {
 // Self-defeating property: if get_parsed silently ignores parse errors or returns
 // Ok on an unparseable value, the activation would not return ProcessingFailed.
 //
-// Design §2.2: get_parsed returns Err(ProcessingFailed("config {key}: {e}")) on
+// get_parsed returns Err(ProcessingFailed("config {key}: {e}")) on
 // parse failure.
 
 #[test]
@@ -248,7 +248,7 @@ fn config_require_present_ok() {
 //
 // Self-defeating property: if require() silently returns Ok(None) or the wrong
 // error label for an absent key, the test catches the regression.
-// Design §2.2: require absent-key → Err(ProcessingFailed("config {key}: missing")).
+// require absent-key → Err(ProcessingFailed("config {key}: missing")).
 
 #[test]
 fn config_require_absent_key_returns_labeled_error() {
