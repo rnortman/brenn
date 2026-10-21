@@ -4326,12 +4326,9 @@ surface alice_desk {
 }
 
 /// A placed instance's own `acl` statement stops at this seam: `grants` crosses
-/// into the raw carrier and the ACL families do not, because the carrier has no
-/// field for them. The front end still refuses a binding outside the statement,
-/// so the statement is not inert — it is just not carried.
-///
-/// TODO(surface-instance-acl-bound) is the reason; when the field lands this
-/// test inverts rather than being written from scratch.
+/// into the raw carrier and the ACL families do not. The front end consumes the
+/// statement whole — every binding within it, and it within the surface's
+/// wire-plane authority — so the statement is not inert; it is just not carried.
 #[test]
 fn a_placed_instances_acl_statement_does_not_cross_the_lowering_seam() {
     assert_lowers(

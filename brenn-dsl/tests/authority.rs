@@ -2206,6 +2206,289 @@ fn a_binding_outside_a_placed_instances_own_statement_is_refused() {
     );
 }
 
+/// The refusal for placed instance `alice_desk.p1` holding the subscribe entry
+/// `matcher` (kind and quoted address) beyond its surface `alice_desk`.
+fn outside_surface(matcher: &str) -> String {
+    outside("alice_desk.p1", "alice_desk", "subscribe", matcher)
+}
+
+/// The refusal for placed instance `instance` holding the `plane` entry
+/// `matcher` beyond its surface `surface`.
+fn outside(instance: &str, surface: &str, plane: &str, matcher: &str) -> String {
+    format!(
+        "`acl {plane} [{matcher}]` on component `{instance}` reaches beyond its surface \
+         `{surface}`: a placed instance's `acl` is authority the instance holds within its \
+         surface, so what the surface may reach is written at the surface — widen the \
+         surface's `acl {plane}`, or narrow the instance's"
+    )
+}
+
+/// Two surfaces, `alice_desk` holding `prefix "brenn:alice."` and `bob_desk`
+/// holding `prefix "brenn:bob."` on subscribe, each with one `Panel`; the
+/// second surface's panel holds `body`.
+fn two_panels(body: &str) -> String {
+    format!(
+        "{}{}{}surface alice_desk {{\n    grants = [subscribe];\n    \
+         acl subscribe [prefix \"brenn:alice.\"];\n    new p1: Panel {{\n        \
+         chrome = true;\n        grants = [];\n        in messages <- cmd;\n    }}\n}}\n\
+         surface bob_desk {{\n    grants = [subscribe];\n    \
+         acl subscribe [prefix \"brenn:bob.\"];\n    new p2: Panel {{\n        \
+         chrome = true;\n        grants = [];\n{body}    }}\n}}\n",
+        durable("cmd", "brenn:alice.cmd"),
+        durable("bob_cmd", "brenn:bob.cmd"),
+        panel_class(""),
+    )
+}
+
+/// A surface stating no subscribe authority but granted `prefix "brenn:alice."`,
+/// with one `Panel` holding `body`.
+fn granted_panel(body: &str) -> String {
+    format!(
+        "{}{}grant alice_desk subscribe prefix \"brenn:alice.\";\n",
+        durable("cmd", "brenn:alice.cmd"),
+        panel_surface_with("subscribe", "", body),
+    )
+}
+
+#[test]
+fn a_placed_instances_exact_under_its_surfaces_prefix_is_accepted() {
+    let config = derived(&format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        placed_panel(
+            "",
+            "        acl subscribe [exact \"brenn:alice.cmd\"];\n        in messages <- cmd;\n",
+        ),
+    ));
+    assert_eq!(
+        patterns(&config.surface_components[0][0].acl.brenn_subscribe),
+        ["alice.cmd"]
+    );
+}
+
+#[test]
+fn a_placed_instances_narrower_prefix_is_accepted() {
+    let config = derived(&format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.p1.cmd"),
+        placed_panel(
+            "",
+            "        acl subscribe [prefix \"brenn:alice.p1.\"];\n        in messages <- cmd;\n",
+        ),
+    ));
+    assert_eq!(
+        patterns(&config.surface_components[0][0].acl.brenn_subscribe),
+        ["alice.p1."]
+    );
+}
+
+#[test]
+fn a_granted_prefix_is_the_surfaces_final_authority() {
+    let config = derived(&granted_panel(
+        "        acl subscribe [prefix \"brenn:alice.\"];\n        in messages <- cmd;\n",
+    ));
+    // The grant does not make the plane explicitly held, so the surface also
+    // derives the exact its instance's binding reaches.
+    assert_eq!(
+        patterns(&config.surfaces[0].acl.brenn_subscribe),
+        ["alice.", "alice.cmd"]
+    );
+    assert_eq!(
+        patterns(&config.surface_components[0][0].acl.brenn_subscribe),
+        ["alice."]
+    );
+}
+
+#[test]
+fn a_placed_instances_confined_statement_answers_to_no_surface() {
+    let config = derived(&placed_panel(
+        "ports",
+        "        acl publish [prefix \"local:p1/\"];\n        out acks -> \"local:p1/acks\";\n",
+    ));
+    assert_eq!(
+        patterns(&config.surface_components[0][0].acl.local_publish),
+        ["p1/"]
+    );
+    assert!(config.surfaces[0].acl.local_publish.is_empty());
+}
+
+#[test]
+fn a_placed_instance_wider_than_its_explicit_surface_is_refused() {
+    let source = format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        placed_panel(
+            "",
+            "        acl subscribe [prefix \"brenn:alice.\", exact \"brenn:bob.x\"];\n        \
+             in messages <- cmd;\n",
+        ),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].message, outside_surface("exact \"brenn:bob.x\""));
+    assert_eq!(errors[0].line_col(), at(&source, "brenn:bob.x\""));
+    assert_eq!(errors[0].related.len(), 1, "{:?}", errors[0].related);
+    assert_eq!(
+        errors[0].related[0].0,
+        "`alice_desk` states its `brenn_subscribe` authority here"
+    );
+}
+
+#[test]
+fn a_placed_instance_prefix_over_a_derived_surface_is_refused() {
+    let source = format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        panel_surface_with(
+            "subscribe",
+            "",
+            "        acl subscribe [prefix \"brenn:alice.\"];\n        in messages <- cmd;\n",
+        ),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        outside_surface("prefix \"brenn:alice.\"")
+    );
+    assert_eq!(errors[0].line_col(), at(&source, "brenn:alice.\"]"));
+    assert_eq!(errors[0].related.len(), 1, "{:?}", errors[0].related);
+    assert_eq!(errors[0].related[0].0, "derived from this binding");
+    assert_eq!(
+        Diagnostic::span_line_col(&errors[0].related[0].1),
+        at(&source, "messages <- cmd")
+    );
+}
+
+#[test]
+fn a_placed_instance_wider_than_its_granted_surface_points_at_the_grant() {
+    let source = granted_panel(
+        "        acl subscribe [prefix \"brenn:alice.\", exact \"brenn:bob.x\"];\n        \
+         in messages <- cmd;\n",
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].message, outside_surface("exact \"brenn:bob.x\""));
+    assert_eq!(errors[0].line_col(), at(&source, "brenn:bob.x\""));
+    assert_eq!(errors[0].related.len(), 2, "{:?}", errors[0].related);
+    assert_eq!(errors[0].related[0].0, "granted to `alice_desk` here");
+    assert_eq!(
+        Diagnostic::span_line_col(&errors[0].related[0].1),
+        at(&source, "brenn:alice.\";")
+    );
+    assert_eq!(errors[0].related[1].0, "derived from this binding");
+}
+
+#[test]
+fn a_refused_placed_instance_is_not_held_to_its_surface_again() {
+    let source = format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        placed_panel(
+            "",
+            "        acl subscribe [exact \"brenn:bob.x\"];\n        in messages <- cmd;\n",
+        ),
+    );
+    assert_eq!(
+        derive_refusal(&source),
+        "this binding reaches `brenn:alice.cmd`, which nothing in alice_desk.p1's \
+         `brenn_subscribe` authority covers: an explicit `acl subscribe` is the whole \
+         authority for the plane, so a binding beside it derives nothing"
+    );
+}
+
+#[test]
+fn a_placed_instance_answers_to_its_own_surface() {
+    let config = derived(&two_panels(
+        "        acl subscribe [prefix \"brenn:bob.\"];\n        in messages <- bob_cmd;\n",
+    ));
+    assert_eq!(
+        patterns(&config.surface_components[1][0].acl.brenn_subscribe),
+        ["bob."]
+    );
+}
+
+#[test]
+fn a_placed_instance_is_not_held_within_another_surface() {
+    let source = two_panels(
+        "        acl subscribe [prefix \"brenn:bob.\", exact \"brenn:alice.x\"];\n        \
+         in messages <- bob_cmd;\n",
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        outside(
+            "bob_desk.p2",
+            "bob_desk",
+            "subscribe",
+            "exact \"brenn:alice.x\""
+        )
+    );
+}
+
+#[test]
+fn a_placed_instances_ephemeral_entry_answers_to_the_surfaces_ephemeral_plane() {
+    // The surface holds `brenn:alice.` on both planes and nothing ephemeral; the
+    // same pattern under the other scheme is another family.
+    let source = format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        placed_panel(
+            "",
+            "        acl subscribe [prefix \"brenn:alice.\", prefix \"ephemeral:alice.\"];\n        \
+             in messages <- cmd;\n",
+        ),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        outside_surface("prefix \"ephemeral:alice.\"")
+    );
+    assert!(errors[0].related.is_empty(), "{:?}", errors[0].related);
+}
+
+#[test]
+fn a_placed_instances_publish_entry_answers_to_the_surfaces_publish_plane() {
+    // The surface subscribes under `brenn:alice.` and publishes nowhere.
+    let source = panel_surface(
+        "    acl subscribe [prefix \"brenn:alice.\"];\n",
+        "        acl publish [prefix \"brenn:alice.\"];\n",
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        outside(
+            "alice_desk.p1",
+            "alice_desk",
+            "publish",
+            "prefix \"brenn:alice.\""
+        )
+    );
+}
+
+#[test]
+fn a_refused_surface_does_not_hold_its_instances_to_it() {
+    // The surface's own statement misses the binding it serves, so its list is
+    // refused and its instance's wider entry is not reported against it.
+    let source = format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        panel_surface(
+            "    acl subscribe [prefix \"brenn:bob.\"];\n",
+            "        acl subscribe [prefix \"brenn:alice.\"];\n        in messages <- cmd;\n",
+        ),
+    );
+    assert_eq!(
+        derive_refusal(&source),
+        "this binding reaches `brenn:alice.cmd`, which nothing in alice_desk's \
+         `brenn_subscribe` authority covers: an explicit `acl subscribe` is the whole \
+         authority for the plane, so a binding beside it derives nothing"
+    );
+}
+
 #[test]
 fn a_placed_instance_that_sends_and_grants_no_ports_is_refused() {
     let source = format!(

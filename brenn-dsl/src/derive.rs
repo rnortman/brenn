@@ -665,13 +665,10 @@ enum Origin {
     Grant(usize),
 }
 
-/// One ACL list the runtime keeps, named as the field that holds it.
-///
-/// The plane and the scheme together select the list; which entity types have it
-/// is the second half of the table.
-///
-/// The runtime structs that hold these lists must carry exactly the fields this
-/// table names; a parity test in `brenn-lib` asserts the equality.
+/// One ACL list, as the DSL knows it: the plane and the scheme that together
+/// select it (`of`), and which entity kinds hold it (`held_by`). What any
+/// runtime struct calls the list is that struct's own business; brenn-lib's
+/// parity tests hold its structs to this table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Family {
     BrennSubscribe,
@@ -683,24 +680,6 @@ pub enum Family {
     MqttSubscribe,
     MqttPublish,
     Webhook,
-}
-
-/// How a struct spells the ACL list a [`Family`] names.
-///
-/// The same nine lists are fielded three ways across the runtime's structs;
-/// keeping the transforms here avoids ad-hoc mapping in each parity test.
-// TODO(acl-field-spelling-home): these transforms are brenn-lib's field-naming
-// conventions, held in the crate that cannot see brenn-lib's structs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AclShape {
-    /// An LLM app's ACL block, which spells the `brenn:` families in full.
-    App,
-    /// A borrowed view of a component's or an attacher's lists, where the
-    /// unqualified word means `brenn:`.
-    View,
-    /// A consumer's or a remote's own config struct, where the unqualified word
-    /// means `brenn:` and every list carries an `_acl` suffix.
-    ConsumerConfig,
 }
 
 impl Family {
@@ -843,24 +822,8 @@ impl Family {
         }
     }
 
-    /// The field this list is held in, in a struct of this shape.
-    ///
-    /// [`Family::name`] is the `App` spelling; the other two drop the `brenn_`
-    /// qualifier, because a struct that is already about one entity's
-    /// `brenn:` lists says it once in the type rather than nine times in the
-    /// fields, and a config struct appends `_acl` because its ACL lists sit
-    /// beside its ports and its budgets.
-    pub fn field_name(self, shape: AclShape) -> String {
-        let name = self.name();
-        match shape {
-            AclShape::App => name.to_string(),
-            AclShape::View => name.strip_prefix("brenn_").unwrap_or(name).to_string(),
-            AclShape::ConsumerConfig => {
-                format!("{}_acl", name.strip_prefix("brenn_").unwrap_or(name))
-            }
-        }
-    }
-    /// The field this list is held in.
+    /// The list's one spelling in the DSL's vocabulary — the scheme and the plane,
+    /// joined — which is how a diagnostic names it.
     pub fn name(self) -> &'static str {
         match self {
             Self::BrennSubscribe => "brenn_subscribe",
@@ -1003,6 +966,9 @@ struct Subject<'a> {
     /// The `tool` statements it holds. A component's are coupled to its `tools`
     /// word; an agent's are its whole tool authority, coupled to nothing.
     tools: &'a [RToolGrant],
+    /// For a surface-placed instance, the position among the document's
+    /// surfaces of the surface hosting it; `None` for every other entity.
+    host: Option<usize>,
 }
 
 impl Subject<'_> {
@@ -1043,7 +1009,8 @@ impl Subject<'_> {
 }
 
 /// Every running entity in the document, in the order the derived model holds
-/// them: surfaces, consumers, agents, remotes.
+/// them: surfaces, placed instances in surface order, consumers, agents,
+/// remotes.
 fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
     let surfaces = config.surfaces.iter().map(|entity| Subject {
         kind: EntityKind::Surface,
@@ -1059,23 +1026,29 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         words: Some(&entity.attrs.grants.value.words),
         spec: None,
         tools: &[],
+        host: None,
     });
-    let components = config.surfaces.iter().flat_map(|surface| {
-        let prefix = surface.handle.dotted();
-        surface.components.iter().map(move |instance| Subject {
-            kind: EntityKind::Component(ComponentHost::Surface),
-            label: format!("{prefix}.{}", instance.instance.value()),
-            stamp: instance.stamp,
-            span: instance.instance.span().clone(),
-            acls: &instance.acls,
-            bounds: binding_bounds(&instance.bindings),
-            owns_bindings: false,
-            free_send: free_send(&instance.bindings),
-            words: instance.grants.as_ref().map(|list| list.words.as_slice()),
-            spec: Some(&instance.class),
-            tools: &instance.tools,
-        })
-    });
+    let components = config
+        .surfaces
+        .iter()
+        .enumerate()
+        .flat_map(|(host, surface)| {
+            let prefix = surface.handle.dotted();
+            surface.components.iter().map(move |instance| Subject {
+                kind: EntityKind::Component(ComponentHost::Surface),
+                label: format!("{prefix}.{}", instance.instance.value()),
+                stamp: instance.stamp,
+                span: instance.instance.span().clone(),
+                acls: &instance.acls,
+                bounds: binding_bounds(&instance.bindings),
+                owns_bindings: false,
+                free_send: free_send(&instance.bindings),
+                words: instance.grants.as_ref().map(|list| list.words.as_slice()),
+                spec: Some(&instance.class),
+                tools: &instance.tools,
+                host: Some(host),
+            })
+        });
     let consumers = config.consumers.iter().map(|entity| Subject {
         kind: EntityKind::Component(ComponentHost::TopLevel),
         label: entity.handle.dotted(),
@@ -1088,6 +1061,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         words: entity.grants.as_ref().map(|list| list.words.as_slice()),
         spec: Some(&entity.class),
         tools: &entity.tools,
+        host: None,
     });
     let agents = config.agents.iter().map(|entity| Subject {
         kind: EntityKind::Agent,
@@ -1105,6 +1079,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
             .map(|attr| attr.value.words.as_slice()),
         spec: None,
         tools: &entity.tools,
+        host: None,
     });
     let remotes = config.remotes.iter().map(|entity| Subject {
         kind: EntityKind::Remote,
@@ -1120,6 +1095,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         words: Some(&entity.attrs.grants.value.words),
         spec: None,
         tools: &[],
+        host: None,
     });
     surfaces
         .chain(components)
@@ -1288,6 +1264,7 @@ fn derive_authorities(
         derive_bounds(held, subject, refs, errors);
         check_mqtt_sinks(subject, held, errors);
     }
+    check_placed_within_surfaces(&subjects, &mut stated, errors);
 
     let mut authorities = DAuthorities::default();
     // Flat, in `subjects` walk order; re-nested per surface below.
@@ -1335,6 +1312,90 @@ fn derive_authorities(
             grants: granted,
         },
     )
+}
+
+/// That every placed instance's wire-plane authority lies within its
+/// surface's.
+///
+/// Run once every entity's entries are final, so the surface is compared as it
+/// holds: what it states, what is granted to it, and what its bindings derive.
+/// A `local:` entry answers to no surface — a surface holds none, and the
+/// channel reaches only the component that binds it — so confined families are
+/// not asked about. A refused surface or instance is skipped: its lists are not
+/// what the document states, and the refusal already reported is the answer.
+fn check_placed_within_surfaces(
+    subjects: &[Subject<'_>],
+    stated: &mut [Stated],
+    errors: &mut Vec<Diagnostic>,
+) {
+    // The surface rows are the document's surfaces, in order, wherever the
+    // subject list places them.
+    let surface_rows: Vec<usize> = subjects
+        .iter()
+        .enumerate()
+        .filter(|(_, subject)| subject.kind == EntityKind::Surface)
+        .map(|(index, _)| index)
+        .collect();
+    let mut outside = Vec::new();
+    for (index, subject) in subjects.iter().enumerate() {
+        let Some(host) = subject.host.map(|surface| surface_rows[surface]) else {
+            continue;
+        };
+        let (surface, instance) = (&stated[host], &stated[index]);
+        if surface.refused || instance.refused {
+            continue;
+        }
+        let surface_label = &subjects[host].label;
+        let mut refused = false;
+        for (family, entry, _) in &instance.entries {
+            if family.confined() {
+                continue;
+            }
+            let within = surface
+                .entries
+                .iter()
+                .any(|(held_family, held, _)| held_family == family && entry.subsumed_by(held));
+            if within {
+                continue;
+            }
+            let mut refusal = Diagnostic::at(
+                format!(
+                    "`{}` on component `{}` reaches beyond its surface `{surface_label}`: a \
+                     placed instance's `acl` is authority the instance holds within its \
+                     surface, so what the surface may reach is written at the surface — widen \
+                     the surface's `acl {}`, or narrow the instance's",
+                    entry_line(*family, entry),
+                    subject.label,
+                    family.plane().word(),
+                ),
+                entry.span().clone(),
+            );
+            refusal.related = surface
+                .entries
+                .iter()
+                .filter(|(held_family, _, _)| held_family == family)
+                .map(|(_, held, origin)| {
+                    let note = match origin {
+                        Origin::Statement => format!(
+                            "`{surface_label}` states its `{}` authority here",
+                            family.name()
+                        ),
+                        Origin::Grant(_) => format!("granted to `{surface_label}` here"),
+                        Origin::Binding => "derived from this binding".to_string(),
+                    };
+                    (note, held.span().clone())
+                })
+                .collect();
+            errors.push(refusal);
+            refused = true;
+        }
+        if refused {
+            outside.push(index);
+        }
+    }
+    for index in outside {
+        stated[index].refused = true;
+    }
 }
 
 /// The authority-side inputs the ceiling fold needs.
@@ -4125,7 +4186,7 @@ fn check_fit(
 
 /// One reach entry written back out as the `acl` line that would hold it.
 ///
-/// The refusal writes the deployer's line for them, so the address carries its
+/// A refusal writes the deployer's line for them, so the address carries its
 /// scheme and the matcher its kind — which is exactly how the entry was
 /// resolved, read backwards.
 fn entry_line(family: Family, entry: &DEntry) -> String {
@@ -4137,10 +4198,10 @@ fn entry_line(family: Family, entry: &DEntry) -> String {
         DEntry::Chan(DMatcher::Prefix(pattern)) => {
             (MatcherKind::Prefix, format!("{prefix}{}", pattern.value()))
         }
-        // A remote's entry reaches no refusal here: a remote is never stamped,
-        // so nothing a stamp confers is one.
+        // Only a remote holds a ceiling, and no caller writes a remote's entry
+        // back: a remote is never stamped and never placed on a surface.
         DEntry::Ceiling(_) => {
-            unreachable!("a remote's entry is in nothing a stamp confers")
+            unreachable!("no refusal that writes an entry back is about a remote")
         }
         DEntry::MqttSub(entry) => (
             MatcherKind::TopicFilter,

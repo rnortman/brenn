@@ -6,7 +6,9 @@
 //! through the whole messaging planner ([`resolve_messaging_offline`]), which
 //! reads nothing but the configuration, so the consumer gates and the
 //! per-instance surface gates — grant/binding coherence, chrome placement —
-//! decide the verdict here rather than only at a service start.
+//! decide the verdict here rather than only at a service start. A placed
+//! instance's ACL containment within its surface is the front end's, refused in
+//! derive before either offline pass runs.
 //!
 //! Between the two runs the document half of webhook resolution
 //! ([`brenn_lib::webhook::resolve_webhook_identities`]), which answers every
@@ -1080,9 +1082,8 @@ surface panel {{
         assert!(message.contains("\"w\""), "{message}");
     }
 
-    /// A `config` map with no `config` grant to read it. The per-instance `acl`
-    /// containment gate is not yet wired (`TODO(surface-instance-acl-bound)`);
-    /// this tests the dead-config direction of the gate that does run.
+    /// A `config` map with no `config` grant to read it: the dead-config
+    /// direction of the grant/binding coherence gate.
     #[test]
     fn a_config_map_without_the_config_grant_is_refused() {
         let message = boot_gate_refusal(&format!(
@@ -1100,6 +1101,36 @@ surface panel {{
         ));
         assert!(message.contains("declares a `config` map"), "{message}");
         assert!(message.contains("\"w\""), "{message}");
+    }
+
+    /// A placed instance stating wire-plane authority its surface does not hold.
+    /// A front-end refusal: `check_config` runs derive, so the verdict is decided
+    /// before either offline pass is handed anything.
+    #[test]
+    fn a_placed_instance_acl_outside_its_surface_is_refused() {
+        let (ok, report) = check(
+            "main.brenn",
+            &format!(
+                r#"{preamble}
+surface panel {{
+    grants = [subscribe];
+    acl subscribe [prefix "brenn:alice."];
+    new w: Widget {{
+        grants = [log];
+        acl subscribe [prefix "brenn:alice.", exact "brenn:bob.x"];
+        in messages <- feed {{ push_depth = 4; }}
+    }}
+{CHROME}}}
+"#,
+                preamble = preamble("log")
+            ),
+        );
+        assert!(!ok);
+        assert!(
+            report.contains(r#"`acl subscribe [exact "brenn:bob.x"]`"#),
+            "{report}"
+        );
+        assert!(report.contains("`panel.w`"), "{report}");
     }
 
     /// The channel-depth asserts reach the verdict too: `build_channel_entries`

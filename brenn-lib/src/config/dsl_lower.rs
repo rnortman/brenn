@@ -3206,12 +3206,11 @@ fn surface_components(
             // spellings. A capability names no scheme, so derivation expands
             // nothing here and the list crosses as written.
             //
-            // TODO(surface-instance-acl-bound): `authority` also carries this
-            // instance's derived-or-explicit ACL families, and only `grants`
-            // crosses. What the front end already refuses is a binding outside
-            // the instance's own explicit statement; what nothing checks is the
-            // instance's set against its surface's on the wire planes, because
-            // the raw carrier has no field for it.
+            // The ACL families on `authority` are consumed whole in derive —
+            // binding coverage, and containment within the surface's wire-plane
+            // authority — and do not cross this seam: the runtime contains an
+            // instance by its bindings, and the surface's own four lists are the
+            // transport policy.
             grants: authority
                 .grants
                 .iter()

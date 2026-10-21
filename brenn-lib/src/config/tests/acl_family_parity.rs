@@ -7,32 +7,64 @@
 //! predicate. So the equality is asserted here instead: each struct is
 //! destructured exhaustively (a field added, removed or renamed fails to compile
 //! in the destructure) and its fields are held equal to exactly the families
-//! `Family::held_by` gives that kind, spelled through `Family::field_name`.
+//! `Family::held_by` gives that kind, spelled by this file's `Shape`, because
+//! how a struct names a list is the struct's fact and not the vocabulary's.
 //!
 //! Two structs per component, deliberately. `WasmAclsRaw` is a borrowed view
 //! handed to policy building; `WasmConsumerConfigRaw` is what lowering fills.
 //! Gating the view alone would leave a field added to one and not the other
-//! uncaught, which is the drift this file exists to catch.
+//! uncaught, which is the drift this file exists to catch. The surface's config
+//! struct, `SurfaceConfigRaw`, is gated the same way, against
+//! `EntityKind::Surface`, beside the attacher view that is its borrowed twin.
 
 use std::collections::BTreeSet;
 
-use brenn_dsl::derive::{AclShape, Family, MQTT_SINK_KEYS, REMOTE_CEILING_KEYS};
+use brenn_dsl::derive::{Family, MQTT_SINK_KEYS, REMOTE_CEILING_KEYS};
 use brenn_envelope::grants::{ComponentHost, EntityKind};
 
 use crate::access::raw::{
     AppAclRaw, AttachAclsRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw,
     WasmAclsRaw, WebhookMatcherRaw,
 };
-use crate::messaging::config::{WasmConsumerConfigRaw, WasmConsumerMqttOutputRaw};
+use crate::messaging::config::{
+    SurfaceConfigRaw, WasmConsumerConfigRaw, WasmConsumerMqttOutputRaw,
+};
 use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
+
+/// How a brenn-lib struct spells the list a `Family` names.
+///
+/// Three spellings across the structs this file gates; the transforms live
+/// here because the structs do.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// An LLM app's ACL block: the DSL's spelling, `brenn_` and all.
+    App,
+    /// A borrowed view of one entity's lists, where the unqualified word
+    /// means `brenn:`.
+    View,
+    /// A config struct that lowering fills: the unqualified word means
+    /// `brenn:`, and every list carries an `_acl` suffix because it sits
+    /// beside ports, budgets and identity.
+    Config,
+}
+
+/// The field a struct of this shape holds this family's list in.
+fn spelled(family: Family, shape: Shape) -> String {
+    let name = family.name();
+    match shape {
+        Shape::App => name.to_string(),
+        Shape::View => name.strip_prefix("brenn_").unwrap_or(name).to_string(),
+        Shape::Config => format!("{}_acl", name.strip_prefix("brenn_").unwrap_or(name)),
+    }
+}
 
 /// The field names this entity kind's lists are held under, in a struct of this
 /// shape.
-fn held(kind: EntityKind, shape: AclShape) -> BTreeSet<String> {
+fn held(kind: EntityKind, shape: Shape) -> BTreeSet<String> {
     Family::ALL
         .into_iter()
         .filter(|family| family.held_by(kind))
-        .map(|family| family.field_name(shape))
+        .map(|family| spelled(family, shape))
         .collect()
 }
 
@@ -42,7 +74,7 @@ fn named(fields: &[&str]) -> BTreeSet<String> {
 
 /// Every field of the struct is an ACL list, so the whole field set is the
 /// family set.
-fn assert_all_fields_are_lists(what: &str, fields: &[&str], kind: EntityKind, shape: AclShape) {
+fn assert_all_fields_are_lists(what: &str, fields: &[&str], kind: EntityKind, shape: Shape) {
     assert_eq!(
         named(fields),
         held(kind, shape),
@@ -64,7 +96,7 @@ fn assert_acl_fields_are_lists(
     what: &str,
     fields: &[&str],
     kind: EntityKind,
-    shape: AclShape,
+    shape: Shape,
     rest: &[&str],
 ) {
     let suffixed: Vec<&str> = fields
@@ -129,7 +161,7 @@ fn an_agents_acl_block_holds_exactly_its_families() {
         local_publish,
         webhook,
     });
-    assert_all_fields_are_lists("app acl", &fields, EntityKind::Agent, AclShape::App);
+    assert_all_fields_are_lists("app acl", &fields, EntityKind::Agent, Shape::App);
 }
 
 #[test]
@@ -149,7 +181,7 @@ fn a_components_acl_view_holds_exactly_its_families() {
         "wasm acl view",
         &fields,
         EntityKind::Component(ComponentHost::TopLevel),
-        AclShape::View,
+        Shape::View,
     );
 }
 
@@ -161,12 +193,7 @@ fn an_attachers_acl_view_holds_exactly_its_families() {
         ephemeral_subscribe,
         ephemeral_publish,
     });
-    assert_all_fields_are_lists(
-        "attach acl view",
-        &fields,
-        EntityKind::Surface,
-        AclShape::View,
-    );
+    assert_all_fields_are_lists("attach acl view", &fields, EntityKind::Surface, Shape::View);
 }
 
 #[test]
@@ -204,7 +231,7 @@ fn a_consumers_config_holds_exactly_its_families() {
         "consumer config",
         &fields,
         EntityKind::Component(ComponentHost::TopLevel),
-        AclShape::ConsumerConfig,
+        Shape::Config,
         &[
             "slug",
             "package",
@@ -247,7 +274,7 @@ fn a_remotes_config_holds_exactly_its_families() {
         "remote config",
         &fields,
         EntityKind::Remote,
-        AclShape::ConsumerConfig,
+        Shape::Config,
         &[
             "slug",
             "token_file",
@@ -256,6 +283,46 @@ fn a_remotes_config_holds_exactly_its_families() {
             "publish_per_sec",
             "max_sessions",
             "max_subscriptions",
+        ],
+    );
+}
+
+#[test]
+fn a_surfaces_config_holds_exactly_its_families() {
+    let fields = field_names!(SurfaceConfigRaw {
+        slug,
+        grants,
+        subscribe_acl,
+        publish_acl,
+        ephemeral_subscribe_acl,
+        ephemeral_publish_acl,
+        components,
+        subscriptions,
+        outputs,
+        io_ports,
+        calls,
+        skin,
+        allowed_users,
+        publish_burst,
+        publish_per_sec,
+    });
+    assert_acl_fields_are_lists(
+        "surface config",
+        &fields,
+        EntityKind::Surface,
+        Shape::Config,
+        &[
+            "slug",
+            "grants",
+            "components",
+            "subscriptions",
+            "outputs",
+            "io_ports",
+            "calls",
+            "skin",
+            "allowed_users",
+            "publish_burst",
+            "publish_per_sec",
         ],
     );
 }
@@ -292,7 +359,7 @@ fn the_lists_carrying_ceilings_are_the_ones_typed_for_them() {
     let ceilings: BTreeSet<String> = Family::ALL
         .into_iter()
         .filter(|family| family.carries_ceilings())
-        .map(|family| family.field_name(AclShape::ConsumerConfig))
+        .map(|family| spelled(family, Shape::Config))
         .collect();
     assert_eq!(
         ceilings,

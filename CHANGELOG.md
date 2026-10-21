@@ -4,6 +4,16 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Configs that give a surface-placed instance more authority than its
+  surface now fail to load.** In a `.brenn` file, an instance placed on a
+  surface (`new w: Widget { ... }`) may state its own `acl`. That statement
+  must now lie within the surface's own `acl` on the `brenn:` and
+  `ephemeral:` channels; a wider one is refused at load (and by config
+  checking) with an error naming the extra entry and the instance, e.g.
+  `panel.w`. Nothing was exploitable before — the surface's own lists always
+  governed at runtime — but the config could claim authority it did not
+  have. Fix any refused config by narrowing the instance's `acl` or widening
+  the surface's.
 - **`brennfmt` output changed: reformat your configs before deploying.**
   Brenn's config formatter, `brennfmt`, now uses a newer fltk (the parser and
   formatter library it is built on). The formatter no longer invents blank lines it

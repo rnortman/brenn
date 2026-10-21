@@ -190,30 +190,6 @@ Code sites (`TODO(bindings-doc-typed-grants)`): surface/schema/src/lib.rs, at
 `ComponentEntry::grants`.
 
 
-## `acl-field-spelling-home`
-
-`Family::field_name(AclShape)` in `brenn-dsl/src/derive.rs` encodes brenn-lib's
-struct-naming conventions inside the crate that deliberately cannot see them:
-that `WasmConsumerConfigRaw` suffixes its ACL fields with `_acl`, that the view
-structs drop the `brenn_` qualifier, and a variant named `ConsumerConfig` after a
-brenn-lib type. So a rename on the brenn-lib side fails the parity gate with a
-message pointing at another crate, and the fix for it is an edit in brenn-dsl for
-a change that happened entirely in brenn-lib; every future ACL-holding struct
-with a fourth spelling adds a fourth variant here.
-
-Fix = keep `Family::name()`, the one spelling the DSL owns, and move the two
-transforms beside `held()` in `brenn-lib/src/config/tests/acl_family_parity.rs`,
-where the structs are. Weigh against it: the transforms were put in brenn-dsl so
-that the mapping is part of the vocabulary rather than left to the test author,
-which is the tradeoff to re-decide rather than a refactor to do in passing.
-
-Done = brenn-dsl exports one ACL family spelling and carries no knowledge of how
-a brenn-lib struct fields it.
-
-Code sites (`TODO(acl-field-spelling-home)`): brenn-dsl/src/derive.rs, at
-`AclShape`.
-
-
 ## `budget-refusal-per-path`
 
 `brenn_budget::RefusalKind` is one enum spanning two paths, so neither host's
@@ -239,39 +215,6 @@ refusal formats a string its host discards.
 
 Code sites (`TODO(budget-refusal-per-path)`): brenn-budget/src/refusal.rs, at
 `RefusalKind`.
-
-
-## `surface-instance-acl-bound`
-
-A surface-placed instance may state its own `acl`, and the front end derives one
-from its bindings when it does not. Half of what that statement promises is
-enforced: an explicit statement must cover every binding of that plane, refused
-at derive time. The other half is not enforced anywhere — an instance's ACL set
-on the wire planes (`brenn:`/`ephemeral:`) is never checked against its
-surface's, so an operator can write a bound wider than the surface principal
-holds and get a document that loads. Nothing widens at runtime (the surface's
-own binding-coverage check still refuses the binding), so what is missing is the
-refusal that says the config is lying, not a containment hole.
-
-The carrier stops at the front end: lowering reads only `grants` off the
-per-instance authority the derive layer computes, and the raw surface-component
-struct has no ACL fields for the rest to cross into.
-
-Fix = decide where the check belongs. Either carry the per-instance ACL families
-into the raw config (with the key-parity re-pin that forces), resolve them, and
-assert at boot — instance bindings within the instance's set, and the instance's
-wire-plane set within the surface's — or state both asserts at derive time,
-where both authorities are already in hand, and say so where the design says
-boot.
-
-Done = an instance ACL wider than its surface's is refused, and the derived
-per-instance authority is either consumed whole or not carried. When it lands it
-also owes `brenn config-check` a fixture: that gate family is one of the three
-the check tool's boot-gate tests were meant to cover, and it stands substituted
-today because there is no gate to certify (`brenn-bootstrap/src/config_check.rs`).
-
-Code sites (`TODO(surface-instance-acl-bound)`): brenn-lib/src/config/dsl_lower.rs,
-in `surface_components` where the per-instance authority's `grants` is read.
 
 
 ## `dsl-list-element-span`
