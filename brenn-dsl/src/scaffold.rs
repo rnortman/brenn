@@ -33,9 +33,9 @@ use std::fmt::Write as _;
 use brenn_envelope::grants::ComponentGrant;
 
 use crate::diag::Diagnostic;
-use crate::model::{ComponentClass, DocComment, File, PortDecl, PortDir, StrLike};
-use crate::resolve::decode_str;
-use crate::resolved::Abi;
+use crate::model::{ComponentClass, DocComment, File, PortDecl, StrLike};
+use crate::resolve::{decode_str, port_dir};
+use crate::resolved::{Abi, PortDir};
 
 /// The one component class a scaffold is generated from.
 ///
@@ -187,51 +187,26 @@ struct PortName {
 
 impl PortName {
     fn inbound(&self) -> bool {
-        inbound(&self.dir)
+        self.dir.inbound()
     }
 
     fn outbound(&self) -> bool {
-        outbound(&self.dir)
+        self.dir.outbound()
     }
 
     fn sync(&self) -> bool {
-        sync(&self.dir)
+        self.dir.sync()
     }
 
     fn call(&self) -> bool {
-        call(&self.dir)
+        self.dir.call()
     }
 }
 
-// ── port directions ──────────────────────────────────────────────────────────
-//
-// What each direction means to a class's vocabulary, stated once. Everything
-// that reads an authored class's ports — this module's emitters, the identifier
-// refusals, and the page harness through [`port_vocabulary`] — answers these
-// four predicates rather than matching the enum again, so a direction that
-// gains a meaning gains it everywhere.
-
-/// An activation may window this port: `in` and both halves of `io`.
-pub fn inbound(dir: &PortDir) -> bool {
-    matches!(dir, PortDir::Into | PortDir::Both)
-}
-
-/// A publish may name this port: `out` and both halves of `io`.
-pub fn outbound(dir: &PortDir) -> bool {
-    matches!(dir, PortDir::Outof | PortDir::Both)
-}
-
-/// A sync call may name this port, and a `dom.listen` may cause one on it.
-pub fn sync(dir: &PortDir) -> bool {
-    matches!(dir, PortDir::Sync)
-}
-
-/// The guest may call out on this port.
-pub fn call(dir: &PortDir) -> bool {
-    matches!(dir, PortDir::Call)
-}
-
 /// One class's port names, split by what each direction admits.
+///
+/// The split answers [`PortDir`]'s predicates through the resolver's rename,
+/// so it is the same statement lowering writes into the hosts' configuration.
 ///
 /// An `io` port is in both `inbound` and `outbound`, which is the whole reason
 /// this is four sets rather than a map from name to direction: a reader asks
@@ -249,17 +224,17 @@ pub fn port_vocabulary(class: &ComponentClass) -> PortVocabulary {
     let mut vocabulary = PortVocabulary::default();
     for port in &class.ports {
         let name = port.name.value();
-        let dir = port.dir.value();
-        if inbound(dir) {
+        let dir = port_dir(port.dir.value());
+        if dir.inbound() {
             vocabulary.inbound.insert(name.clone());
         }
-        if outbound(dir) {
+        if dir.outbound() {
             vocabulary.outbound.insert(name.clone());
         }
-        if sync(dir) {
+        if dir.sync() {
             vocabulary.sync.insert(name.clone());
         }
-        if call(dir) {
+        if dir.call() {
             vocabulary.call.insert(name.clone());
         }
     }
@@ -493,12 +468,12 @@ fn map_port(decl: &PortDecl, abi: Abi) -> Result<PortName, Diagnostic> {
     // named `in` emits the variant `In` and the constant `IN`, and no function,
     // so the keyword its publish handle would have been is never written. A dom
     // class writes no handle at all.
-    let dir = decl.dir.value();
+    let dir = port_dir(decl.dir.value());
     let emitted: [(&str, bool); 4] = [
-        (variant.as_str(), inbound(dir)),
-        (handle.as_str(), outbound(dir) && abi == Abi::Processor),
-        (variant.as_str(), sync(dir)),
-        (handle.as_str(), call(dir) && abi == Abi::Processor),
+        (variant.as_str(), dir.inbound()),
+        (handle.as_str(), dir.outbound() && abi == Abi::Processor),
+        (variant.as_str(), dir.sync()),
+        (handle.as_str(), dir.call() && abi == Abi::Processor),
     ];
     for (identifier, emitted) in emitted {
         if emitted && is_keyword(identifier) {
@@ -517,7 +492,7 @@ fn map_port(decl: &PortDecl, abi: Abi) -> Result<PortName, Diagnostic> {
         handle,
         constant,
         payload_trait,
-        dir: dir.clone(),
+        dir,
         doctype: doctype_note(decl)?,
     })
 }

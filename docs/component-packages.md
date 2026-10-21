@@ -527,15 +527,32 @@ records, and recording `alert` and `config` implementations.
 specification the artifact was built from — the grants it links, and the ports
 it admits — so nothing about the profile is typed at the call site.
 
-What it then refuses, each as a panic naming the port, is what the kernel host
-refuses:
+What it then refuses falls into two groups, each refusal a panic naming the
+port. These mirror what the hosts refuse:
 
-- a `dom.listen` on a port the specification does not declare `sync`;
-- a publish on a port it does not declare `out` or `io`;
+- a publish — plain, urgent or deferred — on a port the specification does not
+  declare `out` or `io`;
+- a `defer-cancel` or `defer-edit` on such a port;
+- a `dom.listen` on a port it does not declare `sync`;
 - a scripted activation whose sync cause is neither the reserved mount port nor
-  a declared `sync` port;
-- a scripted window on a port it does not declare `in` or `io`;
+  a declared `sync` port.
+
+They are read off the same `brenn_dsl::resolved::PortDir` predicates lowering
+writes into the hosts' configuration, so the harness cannot drift from the
+hosts on them.
+
+These are the harness's own checks on the script, with no runtime
+counterpart — the real hosts window from the document's bindings, and a binding
+on a port the class does not declare in that direction is refused when the
+document resolves:
+
+- a scripted window on a port the specification does not declare `in` or `io`;
 - `retaining_state` on a port that is not `io`.
+
+Two things are not checked. `calls` is not a capability the harness links —
+`Kind::compile` refuses a class that grants it — so a `call` port is carried
+in `Declared::call_ports` as vocabulary only, and no `calls.call` behaviour is
+exercised here. And a deferred op's `index` is recorded, not held to a window.
 
 So a component reaching for a capability or a port its specification does not
 declare fails in the author's own suite rather than working in a test and

@@ -42,10 +42,9 @@ use brenn_dsl::model::{
 };
 use brenn_dsl::resolve::SURFACE_CHROME_KEY;
 use brenn_dsl::resolved::{
-    ClassRef, HandlePath, MatcherKind, PortDir, RAgent, RAttachmentTarget, RChanRef,
-    RComponentInst, RConsumer, RHooks, RMatcherVal, RMcp, RNamed, RRemote, RRepoMount, RSection,
-    RSubscribe, RSurface, RTail, RToolGrant, RVal, RValue, RWebhook, RWebhookBlock,
-    ResolvedConfig as DslResolved, scheme,
+    HandlePath, MatcherKind, RAgent, RAttachmentTarget, RChanRef, RComponentInst, RConsumer,
+    RHooks, RMatcherVal, RMcp, RNamed, RRemote, RRepoMount, RSection, RSubscribe, RSurface, RTail,
+    RToolGrant, RVal, RValue, RWebhook, RWebhookBlock, ResolvedConfig as DslResolved, scheme,
 };
 use brenn_dsl::{Span, Spanned};
 
@@ -2688,9 +2687,13 @@ fn consumer(
             .expect("a top-level consumer's class is declared in a packaged module"),
         // A class fact, not a body key: carried from the declaring file.
         spec_sha256: instance.class.spec_sha256.clone(),
-        declared_out_ports: declared_out_ports(&instance.class),
-        sync_ports: sync_ports(&instance.class),
-        call_ports: call_ports(&instance.class),
+        // Inbound ports do not travel: the host builds activation windows from
+        // the bindings, so a name it never bound is a name it never delivers
+        // to. Neither do doctypes or optionality — nothing at runtime reads
+        // them, and the configuration carries no fact without a reader.
+        declared_out_ports: instance.class.outbound_ports(),
+        sync_ports: instance.class.sync_ports(),
+        call_ports: instance.class.call_ports(),
         calls: instance
             .calls
             .iter()
@@ -2727,64 +2730,6 @@ fn consumer(
     };
     body.finish(errors);
     raw
-}
-
-/// Every port name a class declares outbound: its `out` ports and both halves
-/// of its `io` ports, sorted and duplicate-free.
-///
-/// This is the vocabulary the hosts refuse a publish outside of. Inbound ports
-/// do not travel: the host builds activation windows from the bindings, so a
-/// name it never bound is a name it never delivers to. Neither do doctypes or
-/// optionality — nothing at runtime reads them, and the configuration carries
-/// no fact without a reader.
-fn declared_out_ports(class: &ClassRef) -> Vec<String> {
-    let mut names: Vec<String> = class
-        .ports
-        .iter()
-        .filter(|port| matches!(port.dir, PortDir::Out | PortDir::Io))
-        .map(|port| port.name.value().clone())
-        .collect();
-    names.sort();
-    // The resolver refuses a class that declares one name twice, so this
-    // removes nothing; it holds the duplicate-free half of the contract at the
-    // seam that states it.
-    names.dedup();
-    names
-}
-
-/// Every port name a class declares `sync`, sorted and duplicate-free.
-///
-/// The caller-facing half of the same contract `declared_out_ports` holds for
-/// publishes: a host refuses a sync call on a name outside this set, because a
-/// name the specification never declared is a name the artifact it is
-/// hash-bound to cannot read.
-fn sync_ports(class: &ClassRef) -> Vec<String> {
-    ports_named(class, PortDir::Sync)
-}
-
-/// Every port name a class declares `call`, sorted and duplicate-free.
-///
-/// The vocabulary a guest's `calls.call` is held to: a name in it that the
-/// document wired reaches its peer, a name in it the document left unbound is
-/// answered `unwired`, and a name outside it traps the activation.
-fn call_ports(class: &ClassRef) -> Vec<String> {
-    ports_named(class, PortDir::Call)
-}
-
-/// The declared names of one port direction, sorted and duplicate-free.
-fn ports_named(class: &ClassRef, dir: PortDir) -> Vec<String> {
-    let mut names: Vec<String> = class
-        .ports
-        .iter()
-        .filter(|port| port.dir == dir)
-        .map(|port| port.name.value().clone())
-        .collect();
-    names.sort();
-    // The resolver refuses a class declaring one name twice, so this removes
-    // nothing; it holds the duplicate-free half of the contract at the seam
-    // that states it.
-    names.dedup();
-    names
 }
 
 /// The `call` statements one surface instance holds, in the surface's flat
@@ -3188,9 +3133,9 @@ fn surface_components(
             instance: Some(name.clone()),
             // A class fact, not a body key: carried from the declaring file.
             spec_sha256: instance.class.spec_sha256.clone(),
-            declared_out_ports: declared_out_ports(&instance.class),
-            sync_ports: sync_ports(&instance.class),
-            call_ports: call_ports(&instance.class),
+            declared_out_ports: instance.class.outbound_ports(),
+            sync_ports: instance.class.sync_ports(),
+            call_ports: instance.class.call_ports(),
             send_burst: body.int("send_burst", errors),
             send_refill_secs: body.int("send_refill_secs", errors),
             // A depth is a count or a bare word, so it was projected out of

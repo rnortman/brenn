@@ -616,6 +616,51 @@ pub struct ClassRef {
     pub package: Option<String>,
 }
 
+impl ClassRef {
+    /// Every port name this class declares outbound — its `out` ports and both
+    /// halves of its `io` ports — sorted and duplicate-free: the vocabulary the
+    /// hosts refuse a publish or a deferred op outside of.
+    pub fn outbound_ports(&self) -> Vec<String> {
+        self.ports_where(PortDir::outbound)
+    }
+
+    /// Every port name this class declares `sync`, sorted and duplicate-free.
+    ///
+    /// The caller-facing half of the contract [`ClassRef::outbound_ports`]
+    /// holds for publishes: a host refuses a sync call on a name outside this
+    /// set, because a name the specification never declared is a name the
+    /// artifact it is hash-bound to cannot read.
+    pub fn sync_ports(&self) -> Vec<String> {
+        self.ports_where(PortDir::sync)
+    }
+
+    /// Every port name this class declares `call`, sorted and duplicate-free.
+    ///
+    /// The vocabulary a guest's `calls.call` is held to: a name in it that the
+    /// document wired reaches its peer, a name in it the document left unbound
+    /// is answered `unwired`, and a name outside it traps the activation.
+    pub fn call_ports(&self) -> Vec<String> {
+        self.ports_where(PortDir::call)
+    }
+
+    /// The names of every port whose direction `admits`, sorted and
+    /// duplicate-free.
+    fn ports_where(&self, admits: fn(PortDir) -> bool) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .ports
+            .iter()
+            .filter(|port| admits(port.dir))
+            .map(|port| port.name.value().clone())
+            .collect();
+        names.sort();
+        // The resolver refuses a class declaring one name twice, so this
+        // removes nothing; it holds the duplicate-free half of the contract at
+        // the seam that states it.
+        names.dedup();
+        names
+    }
+}
+
 /// One port a class declares.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RPort {
@@ -663,6 +708,77 @@ impl PortDir {
             PortDir::Call => "call",
         }
     }
+
+    /// The one statement of what each direction admits at runtime. A reader
+    /// asking what a direction admits answers the four predicates below rather
+    /// than matching on it, so a new direction fails to compile here rather
+    /// than landing in no vocabulary. Questions about the word itself — its
+    /// spelling, or equality with the direction a binding wrote — match for
+    /// themselves.
+    const fn admits(self) -> Admits {
+        match self {
+            PortDir::In => Admits {
+                inbound: true,
+                outbound: false,
+                sync: false,
+                call: false,
+            },
+            PortDir::Out => Admits {
+                inbound: false,
+                outbound: true,
+                sync: false,
+                call: false,
+            },
+            PortDir::Io => Admits {
+                inbound: true,
+                outbound: true,
+                sync: false,
+                call: false,
+            },
+            PortDir::Sync => Admits {
+                inbound: false,
+                outbound: false,
+                sync: true,
+                call: false,
+            },
+            PortDir::Call => Admits {
+                inbound: false,
+                outbound: false,
+                sync: false,
+                call: true,
+            },
+        }
+    }
+
+    /// An activation may window this port: `in` and both halves of `io`.
+    pub fn inbound(self) -> bool {
+        self.admits().inbound
+    }
+
+    /// A publish or a deferred op may name this port: `out` and both halves of
+    /// `io`.
+    pub fn outbound(self) -> bool {
+        self.admits().outbound
+    }
+
+    /// A sync call may name this port, and a `dom.listen` may cause one on it.
+    pub fn sync(self) -> bool {
+        self.admits().sync
+    }
+
+    /// The guest may call out on this port.
+    pub fn call(self) -> bool {
+        self.admits().call
+    }
+}
+
+/// What one direction admits at runtime, as the hosts refuse against it.
+#[derive(Clone, Copy)]
+struct Admits {
+    inbound: bool,
+    outbound: bool,
+    sync: bool,
+    call: bool,
 }
 
 /// A port connected to a channel, or a free io port tuned in place.
@@ -1076,6 +1192,64 @@ mod tests {
         assert_eq!(
             named.into_rval().into_value(),
             RValue::Str("depths.geometry".into())
+        );
+    }
+
+    #[test]
+    fn every_direction_admits_what_the_hosts_refuse_against() {
+        // (direction, inbound, outbound, sync, call)
+        let table = [
+            (PortDir::In, true, false, false, false),
+            (PortDir::Out, false, true, false, false),
+            (PortDir::Io, true, true, false, false),
+            (PortDir::Sync, false, false, true, false),
+            (PortDir::Call, false, false, false, true),
+        ];
+        for (dir, inbound, outbound, sync, call) in table {
+            assert_eq!(dir.inbound(), inbound, "{} inbound", dir.as_str());
+            assert_eq!(dir.outbound(), outbound, "{} outbound", dir.as_str());
+            assert_eq!(dir.sync(), sync, "{} sync", dir.as_str());
+            assert_eq!(dir.call(), call, "{} call", dir.as_str());
+        }
+    }
+
+    fn port(name: &str, dir: PortDir) -> RPort {
+        RPort {
+            name: Spanned::new(name.to_string(), Span::unknown()),
+            dir,
+            optional: false,
+            doctype: None,
+        }
+    }
+
+    #[test]
+    fn a_class_splits_its_ports_by_what_each_direction_admits() {
+        let class = ClassRef {
+            name: Spanned::new("widget".into(), Span::unknown()),
+            abi: Spanned::new(Abi::Processor, Span::unknown()),
+            requires: Vec::new(),
+            optional: Vec::new(),
+            ports: vec![
+                port("state", PortDir::Io),
+                port("press", PortDir::Sync),
+                port("events", PortDir::In),
+                port("receipts", PortDir::Out),
+                port("ask", PortDir::Call),
+            ],
+            spec_sha256: "00".into(),
+            package: None,
+        };
+        assert_eq!(class.outbound_ports(), ["receipts", "state"]);
+        assert_eq!(class.sync_ports(), ["press"]);
+        assert_eq!(class.call_ports(), ["ask"]);
+        let every = [
+            class.outbound_ports(),
+            class.sync_ports(),
+            class.call_ports(),
+        ];
+        assert!(
+            every.iter().flatten().all(|name| name != "events"),
+            "an `in` port is in no lowered vocabulary"
         );
     }
 }

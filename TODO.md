@@ -35,34 +35,6 @@ Code sites (`TODO(test-selinux-positive-paths-silently-skip)`):
 
 Done = an SELinux-enforcing lane runs these tests, and a skip there fails.
 
-## `harness-host-rule-parity`
-
-`surface/page-harness` sells itself, and `docs/component-packages.md` sells it,
-as refusing what the kernel and backend hosts refuse: a `dom.listen` outside the
-declared `sync` ports, a publish outside `out`/`io`, an activation windowing a
-port the class does not bind. It reads those vocabularies off the authored
-`.brenn` through `brenn_dsl::scaffold::port_vocabulary`; the hosts read theirs
-off the *resolved* model, in `brenn-lib/src/config/dsl_lower.rs`
-(`declared_out_ports`, `sync_ports`, `call_ports`). The `listen` half is held by
-the type system now — a guest can only name a generated `SyncPort` — but the
-publish and window halves are two readings of one rule with nothing comparing
-them. Narrow the publish rule on the host side and an out-of-tree author's suite
-stays green against a component the host refuses, which is the population the
-harness exists for.
-
-What to decide first is which reading is canonical and where the gate lives: a
-parity test in the shape of `brenn-dsl/src/grant_parity.rs`, or the harness
-reading the lowered model rather than the AST, or `dsl_lower`'s predicates
-moving into `brenn-dsl` beside the AST ones. The first needs `dsl_lower`'s
-private helpers exposed to a test; the second changes what a `testonly` crate
-depends on. It is a design question, not a missing assertion.
-
-Code sites (`TODO(harness-host-rule-parity)`):
-`surface/page-harness/src/lib.rs`, at `Declared::from_spec`.
-
-Done = one mechanical gate holds the harness's refusal vocabulary equal to the
-one the hosts refuse outside of, for every direction.
-
 ## `harness-flush-on-err`
 
 The page kernel buffers an activation's port calls and discards the whole
@@ -86,9 +58,7 @@ harness's recorded calls into a real `PublishBuffer` whatever the outcome, so
 the real kernel does the discard and charges the budget; discarding in the
 harness first would weaken that proof. The harness needs to distinguish
 *attempted* effects (what the conformance replay wants) from *committed* ones
-(what an author asserts on), and expose both. Decide the API alongside
-`harness-host-rule-parity`, which is the same question — the harness agreeing
-with the hosts — from the refusal-vocabulary side.
+(what an author asserts on), and expose both.
 
 `brenn-wasm/components/processor-transplant` already parks and then fails, so
 it is the fixture for the harness test.
@@ -245,8 +215,9 @@ substring in `surface_tests.rs` / `auto_tests.rs` / the boot suites, and
 half-migrating is worse than either end state because a reader cannot then tell
 which mentions are stale and which are load-bearing. A grep gate — `[[` inside a
 string literal or doc line under the config, messaging, webhook, mqtt and access
-modules — is what keeps it from regrowing, and where that gate lives is the same
-open question `harness-host-rule-parity` has.
+modules — is what keeps it from regrowing. A gate rather than shared code,
+because a string literal shares nothing with the DSL grammar; where the gate
+lives is still to decide.
 
 Done = no config concept is named in table notation in a string an operator or an
 agent can see, the raw-struct field docs name the DSL spelling, and a check fails

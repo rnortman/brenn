@@ -186,12 +186,8 @@ fn check_links(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
             }
             _ => {}
         }
-        let publishes = endpoints
-            .iter()
-            .any(|end| matches!(end.dir, PortDir::Out | PortDir::Io));
-        let subscribes = endpoints
-            .iter()
-            .any(|end| matches!(end.dir, PortDir::In | PortDir::Io));
+        let publishes = endpoints.iter().any(|end| end.dir.outbound());
+        let subscribes = endpoints.iter().any(|end| end.dir.inbound());
         for (present, missing, role) in [
             (publishes, "publisher", "out"),
             (subscribes, "subscriber", "in"),
@@ -212,7 +208,7 @@ fn check_links(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
             // Direction decides whether the question applies at all: an `out`
             // port folds nothing into the ring's retention and states no
             // window.
-            if !matches!(endpoint.dir, PortDir::In | PortDir::Io) || endpoint.windowed {
+            if !endpoint.dir.inbound() || endpoint.windowed {
                 continue;
             }
             errors.push(Diagnostic::at(
@@ -2266,13 +2262,13 @@ struct Position {
 
 /// The planes a direction covers.
 fn planes(dir: PortDir) -> &'static [Plane] {
-    match dir {
-        PortDir::In => &[Plane::Subscribe],
-        PortDir::Out => &[Plane::Publish],
-        PortDir::Io => &[Plane::Subscribe, Plane::Publish],
-        // Neither a sync nor a call port is on either plane: neither is bound
-        // to a channel, so there is no position for an acl entry to be about.
-        PortDir::Sync | PortDir::Call => &[],
+    match (dir.inbound(), dir.outbound()) {
+        (true, true) => &[Plane::Subscribe, Plane::Publish],
+        (true, false) => &[Plane::Subscribe],
+        (false, true) => &[Plane::Publish],
+        // A sync or call port is on neither plane: neither is bound to a
+        // channel, so there is no position for an acl entry to be about.
+        (false, false) => &[],
     }
 }
 
@@ -2324,9 +2320,7 @@ fn free_send(bindings: &[RBinding]) -> Option<Span> {
         .iter()
         .find(|binding| match &binding.chan {
             None => true,
-            Some(RChanRef::Link(_)) => {
-                matches!(binding.dir(), PortDir::Out | PortDir::Io)
-            }
+            Some(RChanRef::Link(_)) => binding.dir().outbound(),
             Some(_) => false,
         })
         .map(|binding| binding.port.span().clone())

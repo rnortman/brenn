@@ -29,6 +29,13 @@ All notable changes to Brenn are documented here.
   The usual cause is a browser holding assets older than the server. Past
   the cap the page stays connected, refuses the document again on each
   reconnect, and configures itself once a readable document arrives.
+- The page-component test harness (`surface/page-harness`, which component
+  authors run before deploying) now judges port directions by the same rule
+  as the production hosts, so it refuses exactly what a deploy would. It
+  now also refuses cancelling or editing a deferred message on a port the
+  component never declared for output. Its documentation separates checks
+  that mirror the host from the harness's own script checks, and notes that
+  `calls` ports are not hosted.
 - Config errors about a wrongly-typed list element (for example a quoted
   `"publish"` where a bare word belongs in `grants`) now point at the
   offending element instead of the list's opening `[`, and no longer carry an

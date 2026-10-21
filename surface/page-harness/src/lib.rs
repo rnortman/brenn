@@ -33,10 +33,19 @@
 //!
 //! The recording host is held to the real vocabulary: the allow-list
 //! predicates, the mount port and the gesture body field names all come from
-//! `brenn-surface-contract`, and the grants, the port directions and the sync
-//! vocabulary come from the class's own `.brenn` through [`Declared`], so a
-//! component — or a script — that steps outside what the kernel host would
-//! admit fails here instead of in a browser.
+//! `brenn-surface-contract`, and the grants and port directions come from the
+//! class's own `.brenn` through [`Declared`]. What a direction admits is the
+//! compiler's statement — `brenn_dsl::resolved::PortDir`'s predicates — and the
+//! hosts' configuration is lowered from the same one, so the refusals that
+//! mirror the hosts cannot disagree with them: a publish or deferred op on a
+//! port not declared `out` or `io`, a `dom.listen` or a sync cause on a port
+//! not declared `sync`. A component that steps outside those fails here
+//! instead of in a browser. The checks on the script itself — a window on a
+//! port not declared `in` or `io`, [`Harness::retaining_state`] on a port that
+//! is not `io` — are this crate's own; the real hosts window from the
+//! document's bindings, which resolution has already held to the class. The
+//! `calls` capability is not hosted here: [`Kind::compile`] refuses a class
+//! that grants it.
 //!
 //! The artifact and the specification both arrive as paths, so a consumer
 //! outside this repository points the harness at whatever its own build
@@ -78,7 +87,7 @@ pub struct Declared {
     pub grants: BTreeSet<ComponentGrant>,
     /// `in` and `io`: the ports an activation may window.
     pub inbound: BTreeSet<String>,
-    /// `out` and `io`: the ports a publish may name.
+    /// `out` and `io`: the ports a publish or a deferred op may name.
     pub outbound: BTreeSet<String>,
     pub sync_ports: BTreeSet<String>,
     pub call_ports: BTreeSet<String>,
@@ -89,13 +98,13 @@ impl Declared {
     /// `class` names.
     ///
     /// Delegates to `brenn_dsl::scaffold` so that what a grant word means and
-    /// what a port direction admits are the compiler's, not this crate's.
+    /// what a port direction admits are the compiler's, not this crate's: the
+    /// port sets answer `brenn_dsl::resolved::PortDir`'s predicates, the same
+    /// ones lowering writes into the hosts' configuration.
     ///
     /// Panics on a parse failure, an unknown grant word or an unresolvable
     /// class name: the specification is the test subject's own file, and a
     /// malformed one is a broken fixture rather than a condition to tolerate.
-    // TODO(harness-host-rule-parity): nothing mechanically holds these refusals
-    // equal to the ones the production hosts make.
     pub fn from_spec(spec: &Path, class: Option<&str>) -> Declared {
         let filename = spec.display().to_string();
         let file = brenn_dsl::parse_file(spec)
@@ -589,11 +598,12 @@ impl dom::Host for Page {
 }
 
 impl Page {
-    /// A publish must name a port the specification declares `out` or `io`.
+    /// A publish or a deferred op must name a port the specification declares
+    /// `out` or `io`.
     fn assert_outbound(&self, port: &str) {
         assert!(
             self.declared().outbound.contains(port),
-            "ports: this instance publishes on port {port:?}, which its specification does not \
+            "ports: this instance names port {port:?}, which its specification does not \
              declare `out` or `io`"
         );
     }
@@ -662,6 +672,7 @@ impl ports::Host for Page {
     fn defer_cancel(&mut self, port: String, index: u32) -> Result<(), ports::DeferError> {
         // The repark cancels the tick it just rode in on, so this is called
         // once per parked-port activation and answers as the kernel does.
+        self.assert_outbound(&port);
         self.record(format!("ports.defer-cancel({port}, {index})"));
         Ok(())
     }
@@ -673,6 +684,7 @@ impl ports::Host for Page {
         payload: Option<String>,
         deliver_after: Option<u64>,
     ) -> Result<(), ports::DeferError> {
+        self.assert_outbound(&port);
         self.record(format!(
             "ports.defer-edit({port}, {index}, {payload:?}, {deliver_after:?})"
         ));
@@ -1247,8 +1259,9 @@ mod tests {
     #[test]
     fn editing_a_parked_message_is_recorded() {
         let mut page = Page::new();
+        page.declare(echo_stub_declared());
         page.defer_edit(
-            "tick".to_string(),
+            "out".to_string(),
             0,
             Some("{}".to_string()),
             Some(NOW_MS + 1_000),
@@ -1257,7 +1270,7 @@ mod tests {
         assert_eq!(
             page.transcript,
             vec![format!(
-                r#"ports.defer-edit(tick, 0, Some("{{}}"), Some({}))"#,
+                r#"ports.defer-edit(out, 0, Some("{{}}"), Some({}))"#,
                 NOW_MS + 1_000
             )],
         );
@@ -1416,6 +1429,37 @@ mod tests {
         let mut page = Page::new();
         page.declare(echo_stub_declared());
         let _ = page.publish_deferred("no-such-port".to_string(), "{}".to_string(), NOW_MS);
+    }
+
+    /// A deferred op names its port as a publish does, and the hosts hold it to
+    /// the same vocabulary.
+    #[test]
+    #[should_panic(expected = "does not declare `out` or `io`")]
+    fn cancelling_a_deferred_on_an_undeclared_port_panics() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        let _ = page.defer_cancel("no-such-port".to_string(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not declare `out` or `io`")]
+    fn editing_a_deferred_on_an_undeclared_port_panics() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        let _ = page.defer_edit("no-such-port".to_string(), 0, Some("{}".to_string()), None);
+    }
+
+    /// An `io` port takes a deferred op like an `out` one.
+    #[test]
+    fn cancelling_a_deferred_on_an_io_port_is_recorded() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        page.defer_cancel("state".to_string(), 0)
+            .expect("the cancel is accepted");
+        assert_eq!(
+            page.transcript,
+            vec!["ports.defer-cancel(state, 0)".to_string()]
+        );
     }
 
     const KEYFRAMES: &str = r#"[{"opacity":0},{"opacity":1}]"#;

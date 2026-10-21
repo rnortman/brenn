@@ -5938,6 +5938,65 @@ fn a_consumers_call_binding_lowers_to_its_call_table() {
     assert_eq!(geo.calls, vec![]);
 }
 
+/// One class declaring a port of every direction, for the two tests below that
+/// hold which lowered vocabulary each direction lands in.
+const EVERY_DIRECTION_CLASS: &str = concat!(
+    "component Widget {\n    abi = processor; requires = [ports];\n",
+    "    optional in events;\n    optional out receipts;\n    io state;\n",
+    "    sync press;\n    call ask;\n}\n",
+);
+
+/// Each lowered vocabulary carries the directions that admit it and nothing
+/// else, so a field wired to the wrong set at the consumer call site fails
+/// here: `io` is outbound, `in` is in no set.
+#[test]
+fn a_consumer_lowers_each_direction_into_its_own_vocabulary() {
+    let config = config_from_dsl(&format!(
+        concat!(
+            "// ── packaged ──\n",
+            "{}",
+            "// ── packaged ──\n",
+            "new widget: Widget {{\n",
+            "    grants = [ports];\n",
+            "    io state {{ push_depth = 1; retain_depth = 1; }}\n",
+            "}}\n",
+        ),
+        EVERY_DIRECTION_CLASS
+    ));
+    let consumer = &config.wasm_consumers[0];
+    assert_eq!(
+        consumer.declared_out_ports,
+        vec!["receipts".to_string(), "state".to_string()]
+    );
+    assert_eq!(consumer.sync_ports, vec!["press".to_string()]);
+    assert_eq!(consumer.call_ports, vec!["ask".to_string()]);
+}
+
+/// The same split at the surface call site.
+#[test]
+fn a_surface_component_lowers_each_direction_into_its_own_vocabulary() {
+    let config = config_from_dsl(&format!(
+        concat!(
+            "// ── packaged ──\n",
+            "{}",
+            "// ── packaged ──\n",
+            "surface kiosk {{\n    grants = [];\n",
+            "    new widget: Widget {{\n        chrome = true;\n        grants = [ports];\n",
+            "        io state {{ push_depth = 1; retain_depth = 1; }}\n",
+            "    }}\n",
+            "}}\n",
+        ),
+        EVERY_DIRECTION_CLASS
+    ));
+    let component = &config.surfaces[0].components[0];
+    assert_eq!(
+        component.declared_out_ports,
+        vec!["receipts".to_string(), "state".to_string()]
+    );
+    assert_eq!(component.sync_ports, vec!["press".to_string()]);
+    assert_eq!(component.call_ports, vec!["ask".to_string()]);
+}
+
 /// A surface `call` binding lands in the surface's flat table, carrying the
 /// calling instance — the shape every other surface binding table has, and what
 /// lets the bindings document name both ends.

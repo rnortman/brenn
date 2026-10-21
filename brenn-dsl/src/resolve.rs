@@ -4865,7 +4865,7 @@ fn class_grants(class: &ComponentClass, errors: &mut Vec<Diagnostic>) -> Option<
 }
 
 /// The direction a port declaration faces, spelled the way a binding spells it.
-fn port_dir(dir: &DeclDir) -> PortDir {
+pub(crate) fn port_dir(dir: &DeclDir) -> PortDir {
     match dir {
         DeclDir::Into => PortDir::In,
         DeclDir::Outof => PortDir::Out,
