@@ -42,7 +42,7 @@
 use std::fmt;
 
 use fltk_cst_core::Span;
-use fltk_serde_core::{Raw, Spanned};
+use fltk_serde_core::{DeserializeError, Raw, Spanned, positioned_error};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
@@ -2285,19 +2285,10 @@ impl WordList {
                 value.span().clone(),
             ));
         };
-        // The element's own position survives a direct call and is lost on the
-        // bridge path, where the span is re-attached at the whole list. Naming
-        // the element in the message is what keeps the refusal findable there.
         let words = list
             .items
             .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                Word::from_value(item).map_err(|mut error| {
-                    error.message = format!("element {}: {}", index + 1, error.message);
-                    error
-                })
-            })
+            .map(Word::from_value)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(WordList { words })
     }
@@ -2359,17 +2350,21 @@ impl IntOrWord {
 
 /// The three projections deserialize by reading the value and projecting it.
 ///
-/// Reading `Spanned<Value>` first is what carries the span into the message.
-/// The error goes out through `serde::de::Error::custom`, which drops it — the
-/// bridge positions it again at the frame that knows where the value was — so
-/// the span here only serves the direct `from_value` callers.
+/// Reading `Spanned<Value>` first is what gives `from_value` the span, and the
+/// refusal returns through [`positioned_error`], so the bridge path reports the
+/// same message and position as a direct `from_value` call.
+///
+/// The diagnostic is handed to `positioned_error` with its own message, and
+/// nothing in this crate calls `serde::de::Error::custom` between that hand-off
+/// and the return — the condition `positioned_error`'s contract states for the
+/// position to survive.
 macro_rules! projection_deserialize {
     ($target:ty) => {
         impl<'de> Deserialize<'de> for $target {
             fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 let value = Spanned::<Value>::deserialize(deserializer)?;
                 <$target>::from_value(&value)
-                    .map_err(|error| serde::de::Error::custom(error.message))
+                    .map_err(|error| positioned_error(DeserializeError::from(error)))
             }
         }
     };
@@ -2653,39 +2648,91 @@ mod tests {
         );
     }
 
-    /// On the bridge path a bad list element is positioned at the whole list —
-    /// hence the element ordinal in the message — while a bad scalar value is
-    /// positioned at the value.
     #[test]
-    fn a_projection_refusal_is_positioned_at_the_list_or_at_the_value() {
-        let file = parse_str(
+    fn a_projection_refusal_is_positioned_at_the_element_or_at_the_value() {
+        let error = projection_refusal(
             "probe {\n    planes = [subscribe, \"publish\"];\n    depth = 8;\n}\n",
-            "t.brenn",
-        )
-        .expect("a parse");
-        let held = file.sections().next().expect("one section");
-        let error = typed::<ProjectionAttrs>(held).expect_err("the second element is a string");
-        assert_eq!(
-            error.message,
-            "element 2: expected a bare word, found a string"
         );
-        // The span lands on the whole list, not on the element — hence the
-        // element number in the message.
-        // TODO(dsl-list-element-span): narrow this to the offending element.
-        assert_eq!(error.line_col(), Some((2, 14)));
+        assert_eq!(error.message, "expected a bare word, found a string");
+        assert_eq!(error.line_col(), Some((2, 26)));
 
-        let file = parse_str(
-            "probe {\n    planes = [subscribe];\n    depth = \"8\";\n}\n",
-            "t.brenn",
-        )
-        .expect("a parse");
-        let held = file.sections().next().expect("one section");
-        let error = typed::<ProjectionAttrs>(held).expect_err("a quoted count is not a count");
+        let error =
+            projection_refusal("probe {\n    planes = [subscribe];\n    depth = \"8\";\n}\n");
         assert!(
             error.message.contains("a count, the word `unbounded`"),
             "{}",
             error.message
         );
         assert_eq!(error.line_col(), Some((3, 13)));
+    }
+
+    /// A list written over several lines, refused at its second element — on
+    /// a later line than the `[` at `(2, 14)`, so only the element's own
+    /// position satisfies the assertion.
+    const LATER_LINE_ELEMENT: &str = "probe {\n    planes = [\n        subscribe,\n        \"publish\"\n    ];\n    depth = 8;\n}\n";
+
+    /// The first section of `source`, typed through the bridge.
+    fn typed_source<A>(source: &str) -> Result<TypedBlock<A>, Diagnostic>
+    where
+        TypedBlock<A>: serde::de::DeserializeOwned,
+    {
+        let file = parse_str(source, "t.brenn").expect("a parse");
+        let held = file.sections().next().expect("one section");
+        typed(held)
+    }
+
+    /// The bridge refusal for a `ProjectionAttrs` body written as `source`.
+    fn projection_refusal(source: &str) -> Diagnostic {
+        typed_source::<ProjectionAttrs>(source).expect_err("the body is refused")
+    }
+
+    #[test]
+    fn a_bad_element_on_a_later_line_is_refused_at_that_element() {
+        let error = projection_refusal(LATER_LINE_ELEMENT);
+        assert_eq!(error.message, "expected a bare word, found a string");
+        assert_eq!(error.line_col(), Some((4, 9)));
+    }
+
+    #[test]
+    fn a_qualified_reference_element_is_refused_at_that_element() {
+        let error = projection_refusal(
+            "probe {\n    planes = [subscribe, alice.desk];\n    depth = 8;\n}\n",
+        );
+        assert_eq!(
+            error.message,
+            "expected a bare word, found a qualified reference"
+        );
+        assert_eq!(error.line_col(), Some((2, 26)));
+    }
+
+    #[test]
+    fn an_empty_list_projects_to_no_words() {
+        let block: TypedBlock<ProjectionAttrs> =
+            typed_source("probe {\n    planes = [];\n    depth = 8;\n}\n")
+                .expect("an empty list is a list");
+        assert!(block.attrs.planes.value.words.is_empty());
+    }
+
+    #[test]
+    fn a_scalar_where_a_list_goes_is_refused_at_the_value() {
+        let error = projection_refusal("probe {\n    planes = subscribe;\n    depth = 8;\n}\n");
+        assert_eq!(
+            error.message,
+            "expected a list of bare words, found a reference"
+        );
+        assert_eq!(error.line_col(), Some((2, 14)));
+    }
+
+    #[test]
+    fn a_bad_element_reads_the_same_on_the_direct_and_bridge_paths() {
+        let bridge = projection_refusal(LATER_LINE_ELEMENT);
+
+        let block: TypedBlock<AttrMap> = typed_source(LATER_LINE_ELEMENT).expect("a generic body");
+        let planes = block.attrs.get("planes").expect("the list is written");
+        let direct = WordList::from_value(planes).expect_err("the second element is a string");
+
+        assert_eq!(direct.message, bridge.message);
+        assert_eq!(direct.line_col(), bridge.line_col());
+        assert_eq!(direct.line_col(), Some((4, 9)));
     }
 }

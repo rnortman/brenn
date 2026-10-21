@@ -310,8 +310,9 @@ fn a_word_list_context_refuses_a_string_and_a_quoted_element() {
 
     let error = refusal("agent A {\n    grants = [\"publish\"];\n}\n");
     assert!(
-        error.message.contains("element 1"),
-        "the message names the element: {}",
+        error.message.contains("expected a bare word"),
+        "the refusal is at the element: {}",
         error.message
     );
+    assert_eq!(error.line_col(), Some((2, 15)));
 }

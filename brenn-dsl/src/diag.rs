@@ -217,6 +217,18 @@ where
     held
 }
 
+/// A diagnostic handed back to the deserializer as its own error, span and
+/// `related` intact.
+///
+/// `file` is not carried: every diagnostic that reaches this conversion was
+/// raised with [`Diagnostic::at`] on a span that came out of a parse, so the
+/// span names its file and [`Diagnostic::from_deserialize_error`] recovers it.
+impl From<Diagnostic> for DeserializeError {
+    fn from(diagnostic: Diagnostic) -> Self {
+        DeserializeError::with_related(diagnostic.message, diagnostic.span, diagnostic.related)
+    }
+}
+
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.line_col() {
@@ -306,6 +318,29 @@ mod tests {
     #[test]
     fn render_all_of_nothing_is_nothing() {
         assert_eq!(render_all(&[]), "");
+    }
+
+    #[test]
+    fn a_diagnostic_survives_the_round_trip_through_a_deserialize_error() {
+        let span = parsed_span();
+        let mut diagnostic = Diagnostic::at("no acl at the top level", span.clone());
+        diagnostic
+            .related
+            .push(("declared here".to_string(), span.clone()));
+        diagnostic
+            .related
+            .push(("and here".to_string(), Span::unknown()));
+        let back = Diagnostic::from_deserialize_error(DeserializeError::from(diagnostic));
+        assert_eq!(back.message, "no acl at the top level");
+        assert_eq!(back.file, "main.brenn");
+        assert_eq!(back.span, span);
+        assert_eq!(
+            back.related,
+            vec![
+                ("declared here".to_string(), span),
+                ("and here".to_string(), Span::unknown()),
+            ]
+        );
     }
 
     #[test]

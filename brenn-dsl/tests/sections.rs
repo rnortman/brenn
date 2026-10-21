@@ -548,10 +548,7 @@ fn a_word_list_projects_every_element_and_reports_the_first_that_is_not_a_word()
 
     let value = only_const_value("const a = [subscribe, \"publish\"];\n");
     let error = WordList::from_value(&value).expect_err("the second element is a string");
-    assert_eq!(
-        error.message,
-        "element 2: expected a bare word, found a string"
-    );
+    assert_eq!(error.message, "expected a bare word, found a string");
     assert_eq!(error.line_col(), Some((1, 23)));
 
     let value = only_const_value("const a = subscribe;\n");
