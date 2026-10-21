@@ -109,4 +109,12 @@ new pull_bot: Syncer {
       sustained_per_minute = 10;
     }
   }
+
+  // Two sections written on one line: the formatter breaks between them.
+  tool a {
+    x = 1;
+  }
+  tool b {
+    y = 2;
+  }
 }

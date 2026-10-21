@@ -4,6 +4,20 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **`brennfmt` output changed: reformat your configs before deploying.**
+  Brenn's config formatter, `brennfmt`, now uses a newer fltk (the parser and
+  formatter library it is built on). The formatter no longer invents blank lines it
+  previously added inside sections, keeps comments in the right place, and
+  never rewrites a raw-string value. Because `brennfmt --check` is
+  byte-exact, configs formatted by the old version fail the check until
+  re-run through `brennfmt`; the in-tree configs are already updated.
+  One known defect stays open (`dsl-fmt-orphan-terminator` in `TODO.md`):
+  a stray space can still precede a section keyword that starts a document.
+- Bumped wasmtime from 48.0.6 to 48.0.7, clearing RUSTSEC-2026-0378 and
+  RUSTSEC-2026-0379; rustls-webpki from 0.103.15 to 0.103.16, clearing
+  RUSTSEC-2026-0382; and webpki-root-certs from 1.0.7 to 1.0.10, clearing
+  RUSTSEC-2026-0383.
+
 ## [0.27.1] — 2026-10-20
 
 - **Containerized agents on SELinux hosts can reach `brenn-tool`'s socket.**

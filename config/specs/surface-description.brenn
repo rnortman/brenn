@@ -28,7 +28,6 @@ assembly SurfaceCommons(errors_retain: Int = 100, errors_standing: Int = 1024) {
     retain_depth = 1;
     standing_retain_depth = 1;
   }
-
 }
 
 /// The four self-description channels one surface carries: the boot-published
@@ -83,7 +82,6 @@ assembly SurfaceDescription(slug: String,
     push_depth = 1;
     retain_depth = 1;
   }
-
 }
 
 /// The help and schema documents one component kind carries. Keyed by kind, not
@@ -102,5 +100,4 @@ assembly KindDescription(kind: String) {
     retain_depth = 1;
     standing_retain_depth = 1;
   }
-
 }

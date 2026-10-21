@@ -87,4 +87,7 @@ new pull_bot: Syncer {
         allow { repo = "notes"; }
         rate_limit { burst = 2; sustained_per_minute = 10; }
     }
+
+    // Two sections written on one line: the formatter breaks between them.
+    tool a { x = 1; } tool b { y = 2; }
 }

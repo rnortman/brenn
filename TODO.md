@@ -4,16 +4,19 @@
 
 `brenn-tool --version` reports `0.0.0`: clap's `version` reads
 `CARGO_PKG_VERSION`, and `brenn-tool/BUILD.bazel` sets no `version`, so
-rules_rust leaves it at the default. The server carries a stamped `build_id`
-and releases carry a `VERSION` file; whether the agent-facing CLI should report
-the release's build id or drop the flag is a user-visible change to that CLI
-and needs deciding first.
+rules_rust leaves it at the default. `brennfmt --version` reports the crate
+version (`0.1.0`, the `version` attribute in `brenn-dsl/BUILD.bazel`), which
+does not move between releases. The server carries a stamped `build_id` and
+releases carry a `VERSION` file; whether the Brenn CLIs should report the
+release's build id or drop the flag is a user-visible change to both and needs
+deciding once for both.
 
 Code sites (`TODO(brenn-tool-version)`): `brenn-tool/src/main.rs`, at the
-`#[command(...)]` attribute.
+`#[command(...)]` attribute; `brenn-dsl/BUILD.bazel`, at the `brennfmt`
+target's `version`.
 
-Done = `brenn-tool --version` reports the release's build id, or the flag is
-gone.
+Done = `brenn-tool --version` and `brennfmt --version` report the release's
+build id, or the flag is gone from both.
 
 ## `test-selinux-positive-paths-silently-skip`
 
@@ -290,96 +293,30 @@ Code site (`TODO(dsl-list-element-span)`): brenn-dsl/src/model.rs, the list half
 of that test.
 
 
-## `dsl-fmt-trivia-placement`
-
-`brennfmt` renders a comment written on its own line inside a body at column
-zero rather than at the body's indent. It comes from fltk's unparser: trivia is
-written before the enclosing nest takes effect. Comments survive and the output
-is idempotent, so this is cosmetic — but it is what a `.brenn` file looks like
-after formatting, so it is worth fixing upstream. The canonical goldens pin the
-current placement and will change when it is fixed.
-
-The other half of this entry — a comment after a statement's `;` rendering
-before the semicolon — is fixed: fltk binds trivia to the gap it was parsed
-from, so a terminator is emitted before whatever follows it in source.
-
-Done = a comment keeps its source-relative indentation through a format pass,
-with the fix in fltk and the goldens updated here.
-
-Code site (`TODO(dsl-fmt-trivia-placement)`): brenn-dsl/grammar/brenn.fltkfmt.
-
-
-## `dsl-fmt-block-blank-line`
-
-A statement whose last token is a body's `}` — a binding with an attribute
-tail, a nested `new` — leaves a blank line before its enclosing block's closing
-brace. The break after the inner `}` and the break before the outer one are two
-hard lines in a row, and fltk's unparser renders that pair as a blank. Saying
-only one of them is not an option: dropping the inner break runs the next
-statement onto the same line. Cosmetic, idempotent, and pinned by the canonical
-goldens.
-
-Done = a block-ended statement is followed by exactly one newline whatever
-follows it, with the fix in fltk and the goldens updated here.
-
-Code site (`TODO(dsl-fmt-block-blank-line)`): brenn-dsl/grammar/brenn.fltkfmt.
-
-
-## `dsl-fmt-tail-block-blank-line`
-
-The mirror image of the entry above: a blank line the author wrote *after* a
-tail-block statement — `mount ws { working_dir = true; }`, `subscribe c {
-push_depth = 1; }` — is deleted by a format pass, while the same blank after a
-body-block statement or a plain `;` statement survives. `tail_block`'s
-`after "}" { hard; }` stands at the same gap the blank was written in and wins,
-so `preserve_blanks: 1` never sees it. Cosmetic, idempotent, and older than the
-trivia-ownership fix (the pre-fix formatter drops it too). It is pinned by
-`brenn-dsl/tests/corpus/statements.canonical.brenn`, where the blank after
-`mount notes { … }` in `statements.brenn` does not survive.
-
-Done = a blank line after a tail-block statement survives a format pass like any
-other preserved blank, with the fix in fltk and the goldens updated here.
-
-Code site (`TODO(dsl-fmt-tail-block-blank-line)`): brenn-dsl/grammar/brenn.fltkfmt.
-
-
-## `dsl-fmt-rawstring-indent`
-
-An indented multi-line raw string (`"""…"""` written inside a block) has its
-continuation lines re-indented by a format pass, and the re-indentation lands
-*in the string's value* — the pass is neither format-stable nor value-stable. A
-formatter that changes what a config means is a correctness defect, not
-cosmetics; the fix belongs in the formatting core, not in the grammar's layout
-rules. In-tree exposure is self-limiting: an affected file can never be
-byte-identical to its own formatting, so it can never pass the canonical-format
-gate. The bite is out-of-tree `brennfmt --in-place`. Until it is fixed, the
-corpus's only multi-line raw string stays at indentation zero and in-tree
-configs write multi-line values as a single-line string with `\n` escapes.
-
-Done = an indented raw string round-trips a format pass with its value
-unchanged, with the fix in fltk and the goldens updated here.
-
-Code site (`TODO(dsl-fmt-rawstring-indent)`): brenn-dsl/src/bin/brennfmt.rs.
-
-
 ## `dsl-fmt-orphan-terminator`
 
-One layout wart left in the formatter's statement handling: a tail-block
-statement (`mount r { working_dir = true; }`) immediately followed by a block
-statement inside the same body gains one extra leading space, and so does a
-body-less `section` followed by a blank line. Layout only — no value changes,
-and the output is its own fixed point, so `--check` accepts it. The trigger is
-a `section` with an absent body or a tail block before a block statement, not a
-terminator.
+A document whose first item is a section (`tool alice;` at byte 0, no header
+comment) formats with a leading space on line 1. The cause is `rule section`'s
+rule-wide `ws_allowed: nbsp` in `brenn.fltkfmt`, which also fills the gap before
+the kindword when nothing precedes it. Layout only; the output is its own fixed
+point.
 
-The orphaned-terminator half of this entry is fixed: fltk now binds trivia to
-the gap it was parsed from, so a `;` stays with its item and the canonical
-goldens were regenerated in one commit.
+The same rule-wide `nbsp` is the only separator in the trailing gap of a section
+with neither body nor `;`, so the fix cannot just remove it: spacing the name
+alone (`before name { nbsp; }`) leaves every existing golden byte-identical yet
+renders `tool alice tool bob;` as `tool alicetool bob;` and
+`tool x abi = processor;` as `tool xabi = processor;` — a different document,
+or an unparseable one. The existing goldens are therefore not an adequate oracle
+for a spec change on this rule; the `leading-section` pair now pins the trailing
+gap, and a candidate is measured against that pair plus a headerless
+first-section document.
 
-Done = the tail-block/block pair and the body-less `section` indent like their
-neighbours, with the fix in fltk and the goldens updated here.
+Done = a headerless document's first section renders at column 0, the
+`leading-section` pair's trailing-gap shapes stay two sections each, and
+`leading-section.brenn` opens with a section instead of its header comment.
 
-Code site (`TODO(dsl-fmt-orphan-terminator)`): brenn-dsl/src/bin/brennfmt.rs.
+Code site (`TODO(dsl-fmt-orphan-terminator)`): brenn-dsl/grammar/brenn.fltkfmt,
+`rule section`.
 
 
 ## `config-syntax-in-operator-messages`

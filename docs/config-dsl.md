@@ -402,8 +402,10 @@ any container-definition change; restart to apply it. Choosing the value is in
 ### Values and constants
 
 Values are strings, f-strings, raw strings (`"""…"""`), integers, floats,
-booleans, lists, inline tables, matchers, and references to names. An f-string
-interpolates a dotted path in braces:
+booleans, lists, inline tables, matchers, and references to names. The
+continuation lines of a raw string are literal, leading columns included, and
+the formatter does not move them. An f-string interpolates a dotted path in
+braces:
 
 ```
 const secrets_dir = "/var/lib/brenn/secrets";
@@ -615,9 +617,7 @@ assembly StandardChrome(slug: String, layout: Channel) {
       out overlay-state -> "local:brenn/overlay-state";
       io toast-tick { push_depth = 1; retain_depth = 2; }
       io state { push_depth = 0; retain_depth = 1; }
-
     }
-
   }
 }
 ```

@@ -1,10 +1,12 @@
 //! Corpus suite: what the grammar accepts, what it refuses, and what the model
 //! makes of it.
 
+use std::fmt::Debug;
+
 use fltk_cst_core::Span;
 
 use brenn_dsl::model::{
-    BraceEscape, ConstDef, FStrPart, File, InstBody, Item, PathSeg, StrPart, Value,
+    BraceEscape, ConstDef, FStrPart, File, InstBody, Item, PathSeg, SectionNode, StrPart, Value,
     section_kindword,
 };
 use brenn_dsl::{parse_file, parse_str};
@@ -494,11 +496,64 @@ fn formatting_preserves_the_model() {
 
     // A held section compares by its whole subtree, layout included, which is
     // what formatting moves — so the comparison is over what the kindwords say.
-    fn kindwords(file: &File) -> Vec<String> {
-        file.sections()
-            .map(|node| section_kindword(node).0)
+    fn kindwords<'a>(nodes: impl Iterator<Item = &'a SectionNode>) -> Vec<String> {
+        nodes.map(|node| section_kindword(node).0).collect()
+    }
+    assert_eq!(
+        kindwords(source.sections()),
+        kindwords(canonical.sections())
+    );
+    assert_eq!(kindwords(source.sections()), ["server"]);
+
+    // An instantiation compares field by field, its held sub-blocks by
+    // kindword as sections are.
+    fn instances(file: &File) -> Vec<impl PartialEq + Debug + '_> {
+        file.instantiations()
+            .map(|new| {
+                let body = new.body.as_ref().map(|body| {
+                    let body = body.value();
+                    (
+                        &body.attrs,
+                        &body.bindings,
+                        &body.acls,
+                        kindwords(body.blocks.iter()),
+                    )
+                });
+                (
+                    &new.doc,
+                    &new.handle,
+                    &new.cls,
+                    &new.args,
+                    &new.under,
+                    new.semi,
+                    body,
+                )
+            })
             .collect()
     }
-    assert_eq!(kindwords(&source), kindwords(&canonical));
-    assert_eq!(kindwords(&source), ["server"]);
+    assert_eq!(instances(&source), instances(&canonical));
+    assert_eq!(instances(&source).len(), 1);
+}
+
+/// A multi-line raw string inside a nested body keeps its exact interior
+/// through formatting: the body's nest indent is layout, and the continuation
+/// lines' columns are value. Asserted on both parses, so a formatter that
+/// rewrote the value fails on the canonical side.
+#[test]
+fn a_raw_string_in_a_body_keeps_its_value_through_formatting() {
+    for name in ["lexical.brenn", "lexical.canonical.brenn"] {
+        let file = parse_str(&read(name), name).expect("the corpus parses");
+        let banner = instance_body(&file)
+            .attrs
+            .get("banner")
+            .expect("the instance body writes `banner`");
+        let Value::Raw(banner) = banner.value() else {
+            panic!("{name}: a raw string");
+        };
+        assert_eq!(
+            banner.value(),
+            "top line\n    indented continuation\ntrailing space \nlast",
+            "{name}"
+        );
+    }
 }

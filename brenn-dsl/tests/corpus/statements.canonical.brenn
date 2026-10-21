@@ -65,6 +65,7 @@ component EchoStub {
 // declaration keywords, so a port literally named `in` reads as `in in <- …`
 // and one named `optional` can itself be optional.
 component Reserved {
+  // A comment first in a body renders at the body's indent.
   abi = processor;
   requires = [ports];
   in in;
@@ -84,12 +85,11 @@ agent PersonalAssistant(slug: String,
   mount ws { working_dir = true; }
   mount life;
 
-  // The blank line below this block is deleted by the formatter, and the
-  // canonical records that deletion — the defect TODO(dsl-fmt-tail-block-blank-line)
-  // names, not the intended layout. When that TODO closes, the blank comes back
-  // and the canonical hunk is expected.
+  // The blank line below this tail-block statement is authored and survives
+  // formatting like any other preserved blank.
   mount notes { working_dir = false; // A tail statement keeps its `;` too.
   }
+
   mcp_server graf;
   mcp_server pfin {
     command = "pf";
@@ -102,6 +102,7 @@ agent PersonalAssistant(slug: String,
 
   subscribe alice_cmd { push_depth = 1000; }
   subscribe f"webhook:push-{user}" { push_depth = 10; }
+
   acl subscribe [prefix "brenn:surface.", exact "brenn:surface-errors"];
 }
 
@@ -126,6 +127,7 @@ assembly Deskbar(slug: String, driver: Agent) {
     push_depth = 8;
     retain_depth = 32;
   }
+
   surface panel {
     slug = f"{slug}-panel";
     grants = [subscribe, publish, takeover];
@@ -137,8 +139,8 @@ assembly Deskbar(slug: String, driver: Agent) {
       acl subscribe [prefix f"brenn:{slug}."];
       in messages <- messages_p1;
       io tick { push_depth = 1; retain_depth = 2; }
-
     }
+
     new echo: EchoStub {
       grants = [ports, takeover];
       io acks <-> acks;
@@ -149,7 +151,6 @@ assembly Deskbar(slug: String, driver: Agent) {
       // language reaches an instance rather than a channel.
       call ask -> p1.ping;
     }
-
   }
 
   // A surface is one thing however many blocks wrote it. This block places a
@@ -163,7 +164,6 @@ assembly Deskbar(slug: String, driver: Agent) {
       in in <- acks { push_depth = 4; }
       out out -> relay;
     }
-
   }
 
   // A surface and a top-level instantiation in one body: placement is the
@@ -178,6 +178,7 @@ assembly Deskbar(slug: String, driver: Agent) {
     in in <- acks { push_depth = 8; }
     out out -> relay;
   }
+
   grant driver subscribe prefix f"brenn:{slug}.";
 }
 
@@ -197,7 +198,6 @@ extend surface "alice-desk-panel" {
     in inbound <- relay { push_depth = 8; }
     out outbound -> relay;
   }
-
 }
 
 // The `client` entry that authorizes egress is what mints the sink, so the
@@ -212,6 +212,7 @@ new consume_demo: EchoStub {
       publish_capacity = 4.0
     }];
 }
+
 new reserved_demo: Reserved {
   slug = "reserved-demo";
   grants = [ports];
@@ -219,9 +220,16 @@ new reserved_demo: Reserved {
   in in <- relay { push_depth = 4; retain_depth = 8; }
   out out -> wasm_demo_out;
 }
+
 remote reachy00 {
   token_file = f"{secrets}/remote-reachy00.token";
-  grants = [subscribe, publish];
+  grants = [
+    // A comment first after `[` breaks the list and sits at its elements'
+    // indent; this is not a width break.
+    subscribe,
+    publish
+    // So does a comment last before `]`.
+  ];
   acl publish [prefix "brenn:reachy00.out."];
 }
 
@@ -269,7 +277,7 @@ principal ui {
 principal ui_readonly under ui {
   grants = [dom, log, page-dom, ports];
 
-// A list-valued attr, last in its body: its value ends on a suppressed `]`.
+  // A list-valued attr, last in its body: its value ends on a suppressed `]`.
 }
 
 /// Exactly what `ui_readonly` holds, and no ceiling of its own.

@@ -238,9 +238,7 @@ surface dev-stub {
     in messages <- dev_stub { push_depth = 8; noise = alarm; }
     out out -> dev_stub;
     io state { push_depth = 0; retain_depth = 1; }
-
   }
-
 }
 
 new dev_stub_chrome: StandardChrome(slug = "dev-stub", layout = dev_stub_layout) {
@@ -256,21 +254,18 @@ surface bar {
     in messages <- bar_a;
     io tick { push_depth = 1; retain_depth = 2; }
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new p2: Protobar {
     grants = [ports, log, dom];
     in messages <- bar_b;
     io tick { push_depth = 1; retain_depth = 2; }
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new p3: Protobar {
     grants = [ports, log, dom];
     in messages <- bar_c;
     io tick { push_depth = 1; retain_depth = 2; }
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new mode: ModeClock {
     grants = [ports, log, dom];
@@ -278,7 +273,6 @@ surface bar {
     out theme -> "local:brenn/theme";
     io tick { push_depth = 1; retain_depth = 2; }
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new meeting: Meeting {
     grants = [ports, log, takeover, dom];
@@ -287,9 +281,7 @@ surface bar {
     out takeover -> "local:brenn/takeover";
     io tick { push_depth = 1; retain_depth = 2; }
     io state { push_depth = 0; retain_depth = 1; }
-
   }
-
 }
 
 new bar_chrome: StandardChrome(slug = "bar", layout = bar_layout) {
@@ -306,21 +298,18 @@ surface bar-pixel {
     in messages <- bar_a;
     io tick { push_depth = 1; retain_depth = 2; }
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new p2: Protobar {
     grants = [ports, log, dom];
     in messages <- bar_b;
     io tick { push_depth = 1; retain_depth = 2; }
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new p3: Protobar {
     grants = [ports, log, dom];
     in messages <- bar_c;
     io tick { push_depth = 1; retain_depth = 2; }
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new meeting: Meeting {
     grants = [ports, log, takeover, dom];
@@ -329,9 +318,7 @@ surface bar-pixel {
     out takeover -> "local:brenn/takeover";
     io tick { push_depth = 1; retain_depth = 2; }
     io state { push_depth = 0; retain_depth = 1; }
-
   }
-
 }
 
 new bar_pixel_chrome: StandardChrome(slug = "bar-pixel", layout = bar_layout) {
@@ -353,45 +340,37 @@ surface bar-feeder {
     grants = [ports, log, dom];
     out out -> bar_a;
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new feed-b: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_b;
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new feed-c: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_c;
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new feed-layout: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_layout;
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new feed-mode: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_mode;
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new feed-agenda: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_agenda;
     io state { push_depth = 0; retain_depth = 1; }
-
   }
   new feed-acks: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_acks;
     io state { push_depth = 0; retain_depth = 1; }
-
   }
-
 }
 
 new bar_feeder_chrome: StandardChrome(slug = "bar-feeder",

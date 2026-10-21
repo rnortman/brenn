@@ -1210,6 +1210,78 @@ fn cargo_env_violations(
     found
 }
 
+/// Every `version` attribute a `BUILD.bazel` states, and how many times the
+/// attribute is assigned at all.
+///
+/// rules_rust sets a target's `CARGO_PKG_VERSION` from this attribute, so it is
+/// the same restatement of the manifest's version as a `rustc_env` entry. As
+/// there, an assignment the scan cannot read is counted so the caller can
+/// report it rather than read it as no restatement.
+fn version_attr_literals(text: &str) -> (Vec<String>, usize) {
+    let mut values = Vec::new();
+    let mut mentions = 0usize;
+    for line in text.lines().map(str::trim_start) {
+        let Some(rest) = line.strip_prefix("version") else {
+            continue;
+        };
+        if !rest.trim_start().starts_with('=') {
+            continue;
+        }
+        mentions += 1;
+        if let Some((value, _)) = rest.strip_prefix(" = \"").and_then(|r| r.split_once('"')) {
+            values.push(value.to_string());
+        }
+    }
+    (values, mentions)
+}
+
+/// A `BUILD.bazel` that states a target `version` has to state the manifest's
+/// `[package] version`: the attribute is what the binary reports as its
+/// version, and nothing else compares it.
+fn version_attr_violations(
+    build_rel: &Path,
+    cargo_rel: &Path,
+    build_text: &str,
+    cargo_text: &str,
+) -> Vec<String> {
+    let (stated_values, mentions) = version_attr_literals(build_text);
+    if mentions == 0 {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    if stated_values.len() != mentions {
+        found.push(format!(
+            "{} assigns `version` {mentions} time(s) but states a readable string literal for {} \
+             of them. A restatement this guard cannot read is a restatement nothing checks; \
+             write it as `version = \"<value>\"`.",
+            build_rel.display(),
+            stated_values.len(),
+        ));
+    }
+    let parsed: toml::Value = toml::from_str(cargo_text)
+        .unwrap_or_else(|e| panic!("sync guard: malformed {}: {e}", cargo_rel.display()));
+    let declared = parsed
+        .get("package")
+        .and_then(|p| p.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "sync guard: {} states a target version, but {} declares no [package] version",
+                build_rel.display(),
+                cargo_rel.display(),
+            )
+        });
+    for stated in stated_values.iter().filter(|v| v.as_str() != declared) {
+        found.push(format!(
+            "{} states version = {stated:?} but {} declares version = {declared:?}. Bump both: \
+             cargo reports the manifest's version, Bazel the attribute's.",
+            build_rel.display(),
+            cargo_rel.display(),
+        ));
+    }
+    found
+}
+
 fn edition_violations_from(
     build_rel: &Path,
     cargo_rel: &Path,
@@ -1344,6 +1416,12 @@ fn manifest_pair_violations(root: &Path, files: &[PathBuf]) -> Vec<String> {
             &cargo_edition,
         ));
         found.extend(cargo_env_violations(
+            build_rel,
+            &cargo_rel,
+            &build_text,
+            &cargo_text,
+        ));
+        found.extend(version_attr_violations(
             build_rel,
             &cargo_rel,
             &build_text,
@@ -1716,6 +1794,68 @@ snapshots:
             assert_eq!(out.len(), 1, "{out:?}");
             assert!(out[0].contains("cannot read"), "{}", out[0]);
         }
+    }
+
+    fn version_attr_check(build_text: &str) -> Vec<String> {
+        version_attr_violations(
+            Path::new("c/BUILD.bazel"),
+            Path::new("c/Cargo.toml"),
+            build_text,
+            A_MANIFEST,
+        )
+    }
+
+    #[test]
+    fn a_target_version_is_held_to_the_manifest() {
+        let agreeing = "rust_binary(\n    name = \"a\",\n    version = \"0.1.0\",\n)\n";
+        assert!(version_attr_check(agreeing).is_empty());
+
+        let bumped = agreeing.replace("0.1.0", "0.2.0");
+        let out = version_attr_check(&bumped);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("0.2.0"), "{}", out[0]);
+    }
+
+    #[test]
+    fn a_build_file_stating_no_version_is_not_checked() {
+        // `edition` and `rustc_env` lines are other arms' business, and a
+        // `version_*` name is not the attribute.
+        let text = "rust_binary(\n    edition = \"2024\",\n    version_file = \"v\",\n)\n";
+        assert!(version_attr_check(text).is_empty());
+    }
+
+    #[test]
+    fn every_target_version_in_a_build_file_is_checked() {
+        let two = "rust_binary(\n    version = \"0.1.0\",\n)\n\
+                   rust_binary(\n    version = \"0.1.1\",\n)\n";
+        let out = version_attr_check(two);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("0.1.1"), "{}", out[0]);
+    }
+
+    #[test]
+    fn a_target_version_this_scan_cannot_read_is_a_violation_not_a_skip() {
+        for build_text in [
+            "rust_binary(\n    version=\"0.1.0\",\n)\n",
+            "rust_binary(\n    version = VERSION,\n)\n",
+        ] {
+            let out = version_attr_check(build_text);
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert!(out[0].contains("cannot read"), "{}", out[0]);
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "c/BUILD.bazel states a target version, but c/Cargo.toml declares no [package] version"
+    )]
+    fn a_target_version_against_a_manifest_with_no_version_panics() {
+        version_attr_violations(
+            Path::new("c/BUILD.bazel"),
+            Path::new("c/Cargo.toml"),
+            "rust_binary(\n    version = \"0.1.0\",\n)\n",
+            "[package]\nname = \"a-crate\"\n",
+        );
     }
 
     fn edition_check(build_editions: &BTreeSet<String>, cargo_edition: &str) -> Vec<String> {

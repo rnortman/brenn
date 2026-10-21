@@ -65,6 +65,7 @@ component EchoStub {
 // declaration keywords, so a port literally named `in` reads as `in in <- …`
 // and one named `optional` can itself be optional.
 component Reserved {
+    // A comment first in a body renders at the body's indent.
     abi = processor;
     requires = [ports];
     in in;
@@ -81,10 +82,8 @@ agent PersonalAssistant(slug: String, user: String, ws: Repo, skin: String = "be
     mount ws { working_dir = true; }
     mount life;
 
-    // The blank line below this block is deleted by the formatter, and the
-    // canonical records that deletion — the defect TODO(dsl-fmt-tail-block-blank-line)
-    // names, not the intended layout. When that TODO closes, the blank comes back
-    // and the canonical hunk is expected.
+    // The blank line below this tail-block statement is authored and survives
+    // formatting like any other preserved blank.
     mount notes { working_dir = false; // A tail statement keeps its `;` too.
     }
 
@@ -212,7 +211,13 @@ new reserved_demo: Reserved {
 
 remote reachy00 {
     token_file = f"{secrets}/remote-reachy00.token";
-    grants = [subscribe, publish];
+    grants = [
+        // A comment first after `[` breaks the list and sits at its elements'
+        // indent; this is not a width break.
+        subscribe,
+        publish
+        // So does a comment last before `]`.
+    ];
     acl publish [prefix "brenn:reachy00.out."];
 }
 

@@ -12,6 +12,7 @@ channel utterance at "brenn:alice-pod.out.utterance" {
   wake_min = low;
   send_rate = { burst = 4, refill_interval_secs = 60, refill = 2 };
 }
+
 /// A depth position also takes a name that resolves to a count, written bare or
 /// as a table field.
 channel geometry at "brenn:alice-desk.geometry" {
@@ -19,6 +20,7 @@ channel geometry at "brenn:alice-desk.geometry" {
   retain_depth = depths.geometry;
   standing_retain_depth = depths.status;
 }
+
 component Shell {
   abi = processor;
   requires = [];
@@ -35,7 +37,6 @@ surface alice_desk {
     chrome = true;
     grants = [];
   }
-
 }
 
 agent PersonalAssistant(slug: String) {

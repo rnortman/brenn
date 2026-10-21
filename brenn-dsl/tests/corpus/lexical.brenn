@@ -1,4 +1,5 @@
-// The value vocabulary, imports, constants and generic sections.
+// The value vocabulary, imports, constants, an instance body and generic
+// sections.
 
 use wiring::alice::Deskbar;
 use wiring::bob::*;
@@ -39,6 +40,25 @@ const trailing_string = "b"; // A same-line comment stays on the line.
 // A comment followed by a blank line survives as both.
 
 const after_a_comment = 1;
+
+// A raw string's interior is its value, continuation columns included, so
+// inside a list's nest the formatter leaves those lines where they were written.
+const raw_list = [
+    """first line
+ends in a newline
+""",
+    """second line
+      indented continuation"""
+];
+
+// The same inside an instance body: the leading spaces and the trailing space
+// below are part of the value.
+new pad: Shell {
+    banner = """top line
+    indented continuation
+trailing space 
+last""";
+}
 
 /// The one generic body shape, and a sub-block of the same shape.
 server {

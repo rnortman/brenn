@@ -61,8 +61,6 @@ assembly StandardChrome(slug: String, layout: Channel) {
       out overlay-state -> "local:brenn/overlay-state";
       io toast-tick { push_depth = 1; retain_depth = 2; }
       io state { push_depth = 0; retain_depth = 1; }
-
     }
-
   }
 }

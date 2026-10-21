@@ -26,5 +26,4 @@ assembly DemoLoop(slug: String, source: Channel) {
     in in <- source { push_depth = 8; retain_depth = 8; }
     out out -> out;
   }
-
 }

@@ -44,5 +44,4 @@ assembly ConfigReload(requests_retain: Int = 4,
     retain_depth = 1;
     standing_retain_depth = status_standing;
   }
-
 }

@@ -155,6 +155,10 @@ rust_binary(
     srcs = ["src/bin/brennfmt.rs"],
     crate_root = "src/bin/brennfmt.rs",
     edition = "2024",
+    # `version` in Cargo.toml, held equal by the xtask sync guard;
+    # `brennfmt --version` prints it.
+    # TODO(brenn-tool-version): report the release's build id, or drop the flag.
+    version = "0.1.0",
     # The root package's format gate needs this binary.
     visibility = ["//:__pkg__"],
     deps = [
@@ -189,6 +193,8 @@ format_goldens(name = "sections")
 format_goldens(name = "entities")
 
 format_goldens(name = "config")
+
+format_goldens(name = "leading-section")
 
 scaffold_goldens(name = "processor-full")
 

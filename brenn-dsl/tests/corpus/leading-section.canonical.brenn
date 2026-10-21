@@ -1,0 +1,44 @@
+// Layout of the gaps around a section's kindword and name: one space between
+// kindword and name, none before a bare `;`, one before a name-less `{`.
+tool alice;
+settings {
+  key = 1;
+}
+tool alice {
+  key = 2;
+}
+settings;
+/// A doc'd section: the doc line, then the kindword at column 0.
+tool alice {
+  key = 3;
+}
+
+// A section with neither body nor `;` is followed by a space, never glued to
+// the next word: these stay two sections each.
+tool alice tool bob;
+tool alice const x = 1;
+
+// The bodies below put a tail block directly before a section, with no blank
+// line between them: the section's keyword starts at the body indent and
+// nothing else moves.
+agent Alice {
+  mount ws { working_dir = true; }
+  start_hooks {
+    key = 4;
+  }
+  subscribe cmd { push_depth = 1; }
+  settings;
+  tool x tool y;
+}
+
+new pad: Shell {
+  in p <- c { push_depth = 1; }
+  tool t {
+    key = 5;
+  }
+  in q <- c { push_depth = 2; }
+  // A comment between a tail block and a section stays at the body indent.
+  tool u {
+    key = 6;
+  }
+}
