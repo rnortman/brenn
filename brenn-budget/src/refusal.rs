@@ -16,24 +16,55 @@
 //! entirely. A kind for it here would invite a host to route it through this
 //! classification and lose the distinction.
 
+use std::fmt;
+
 use crate::GateRefusal;
 
-/// What a guest is told about a refused call, in the vocabulary both hosts'
-/// error types share.
-///
-/// The variants are the intersection of the WIT `publish-error`/`defer-error`
-/// pair and their surface-contract twins, minus `not-permitted` and
-/// `out-of-range` — the two answers no gate verdict can produce.
-///
-/// TODO(budget-refusal-per-path): one enum over two paths leaves each host an
-/// `unreachable!` arm per path, and always builds the `InvalidPayload` detail
-/// even for the host that drops it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RefusalKind {
-    /// The call's argument is wrong, with the detail a guest needs to fix it.
-    InvalidPayload(String),
-    /// A control op's release time is not a representable timestamp. Distinct
-    /// from a quota refusal precisely so the guest does not retry.
+/// What is wrong with a published argument, with the numbers a guest needs to
+/// fix it. `Display` is the diagnostic a host hands a guest whose error
+/// vocabulary carries one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadFault {
+    /// The body exceeds the per-message cap.
+    BodyTooLarge { len: usize, max: usize },
+    /// The release time is not a representable timestamp.
+    UnrepresentableDeliverAfter { ms: u64 },
+}
+
+impl fmt::Display for PayloadFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PayloadFault::BodyTooLarge { len, max } => {
+                write!(f, "payload {len} bytes exceeds max {max}")
+            }
+            PayloadFault::UnrepresentableDeliverAfter { ms } => {
+                write!(f, "deliver_after {ms} ms is not a representable timestamp")
+            }
+        }
+    }
+}
+
+/// What a guest is told about a refused publish or peer call: the half both
+/// hosts' publish-error and call-error types share, minus `not-permitted`, the
+/// one answer no gate verdict can produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishRefusalKind {
+    /// The call's argument is wrong; the detail says how. This includes an
+    /// impossible release time: a publish has no op to reissue, so the guest is
+    /// told its argument is wrong, with the number in it, rather than being
+    /// given the control-op path's do-not-retry answer.
+    InvalidPayload(PayloadFault),
+    /// A budget is spent: a per-activation cap or a sink's token bucket.
+    QuotaExceeded,
+}
+
+/// What a guest is told about a refused deferred-message control op: the half
+/// both hosts' defer-error types share, minus `not-permitted` and
+/// `out-of-range`, the two answers no gate verdict can produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferRefusalKind {
+    /// The op's release time is not a representable timestamp. Distinct from a
+    /// quota refusal precisely so the guest does not retry.
     InvalidDeliverAfter,
     /// A budget is spent: a per-activation cap or a sink's token bucket.
     QuotaExceeded,
@@ -43,19 +74,19 @@ pub enum RefusalKind {
 ///
 /// An oversize body and an impossible release time are facts about the
 /// argument; everything else is a budget.
-pub fn publish_refusal_kind(refusal: GateRefusal) -> RefusalKind {
+pub fn publish_refusal_kind(refusal: GateRefusal) -> PublishRefusalKind {
     match refusal {
         GateRefusal::BodyTooLarge { len, max } => {
-            RefusalKind::InvalidPayload(format!("payload {len} bytes exceeds max {max}"))
+            PublishRefusalKind::InvalidPayload(PayloadFault::BodyTooLarge { len, max })
         }
-        GateRefusal::UnrepresentableDeliverAfter { ms } => RefusalKind::InvalidPayload(format!(
-            "deliver_after {ms} ms is not a representable timestamp"
-        )),
+        GateRefusal::UnrepresentableDeliverAfter { ms } => {
+            PublishRefusalKind::InvalidPayload(PayloadFault::UnrepresentableDeliverAfter { ms })
+        }
         GateRefusal::CallCap { .. }
         | GateRefusal::SinkExhausted
         | GateRefusal::EntryCap { .. }
         | GateRefusal::ByteCap { .. }
-        | GateRefusal::OpCap { .. } => RefusalKind::QuotaExceeded,
+        | GateRefusal::OpCap { .. } => PublishRefusalKind::QuotaExceeded,
     }
 }
 
@@ -64,15 +95,15 @@ pub fn publish_refusal_kind(refusal: GateRefusal) -> RefusalKind {
 /// An impossible release time answers for itself. An oversize edit body is a
 /// quota refusal, because the body is charged against the activation's
 /// aggregate like any other.
-pub fn defer_refusal_kind(refusal: GateRefusal) -> RefusalKind {
+pub fn defer_refusal_kind(refusal: GateRefusal) -> DeferRefusalKind {
     match refusal {
-        GateRefusal::UnrepresentableDeliverAfter { .. } => RefusalKind::InvalidDeliverAfter,
+        GateRefusal::UnrepresentableDeliverAfter { .. } => DeferRefusalKind::InvalidDeliverAfter,
         GateRefusal::CallCap { .. }
         | GateRefusal::BodyTooLarge { .. }
         | GateRefusal::SinkExhausted
         | GateRefusal::EntryCap { .. }
         | GateRefusal::ByteCap { .. }
-        | GateRefusal::OpCap { .. } => RefusalKind::QuotaExceeded,
+        | GateRefusal::OpCap { .. } => DeferRefusalKind::QuotaExceeded,
     }
 }
 
@@ -82,23 +113,26 @@ mod tests {
 
     #[test]
     fn a_published_body_over_the_cap_is_the_guests_fault_and_says_the_numbers() {
-        assert_eq!(
-            publish_refusal_kind(GateRefusal::BodyTooLarge { len: 9, max: 8 }),
-            RefusalKind::InvalidPayload("payload 9 bytes exceeds max 8".to_string())
-        );
+        let kind = publish_refusal_kind(GateRefusal::BodyTooLarge { len: 9, max: 8 });
+        let fault = PayloadFault::BodyTooLarge { len: 9, max: 8 };
+        assert_eq!(kind, PublishRefusalKind::InvalidPayload(fault));
+        assert_eq!(fault.to_string(), "payload 9 bytes exceeds max 8");
     }
 
     #[test]
     fn an_impossible_release_time_is_a_bad_publish_but_its_own_defer_answer() {
+        let fault = PayloadFault::UnrepresentableDeliverAfter { ms: 42 };
         assert_eq!(
             publish_refusal_kind(GateRefusal::UnrepresentableDeliverAfter { ms: 42 }),
-            RefusalKind::InvalidPayload(
-                "deliver_after 42 ms is not a representable timestamp".to_string()
-            )
+            PublishRefusalKind::InvalidPayload(fault)
+        );
+        assert_eq!(
+            fault.to_string(),
+            "deliver_after 42 ms is not a representable timestamp"
         );
         assert_eq!(
             defer_refusal_kind(GateRefusal::UnrepresentableDeliverAfter { ms: 42 }),
-            RefusalKind::InvalidDeliverAfter
+            DeferRefusalKind::InvalidDeliverAfter
         );
     }
 
@@ -106,7 +140,7 @@ mod tests {
     fn an_edit_body_over_the_cap_is_a_quota_refusal() {
         assert_eq!(
             defer_refusal_kind(GateRefusal::BodyTooLarge { len: 9, max: 8 }),
-            RefusalKind::QuotaExceeded
+            DeferRefusalKind::QuotaExceeded
         );
     }
 
@@ -119,29 +153,11 @@ mod tests {
             GateRefusal::ByteCap { cap: 16 },
             GateRefusal::OpCap { cap: 3 },
         ] {
-            assert_eq!(publish_refusal_kind(refusal), RefusalKind::QuotaExceeded);
-            assert_eq!(defer_refusal_kind(refusal), RefusalKind::QuotaExceeded);
-        }
-    }
-
-    #[test]
-    fn the_publish_path_never_answers_invalid_deliver_after() {
-        // That answer exists to stop a guest retrying an op. A publish carrying
-        // an impossible release time is told its argument is wrong instead, with
-        // the number in it, because there is no op to reissue.
-        for refusal in [
-            GateRefusal::CallCap { cap: 4 },
-            GateRefusal::BodyTooLarge { len: 9, max: 8 },
-            GateRefusal::UnrepresentableDeliverAfter { ms: u64::MAX },
-            GateRefusal::SinkExhausted,
-            GateRefusal::EntryCap { cap: 2 },
-            GateRefusal::ByteCap { cap: 16 },
-            GateRefusal::OpCap { cap: 3 },
-        ] {
-            assert_ne!(
+            assert_eq!(
                 publish_refusal_kind(refusal),
-                RefusalKind::InvalidDeliverAfter
+                PublishRefusalKind::QuotaExceeded
             );
+            assert_eq!(defer_refusal_kind(refusal), DeferRefusalKind::QuotaExceeded);
         }
     }
 }

@@ -136,33 +136,6 @@ sibling gap and the larger one: none of the three fit gates lowers, so no
 lowering-only refusal reaches any of them, whether or not a body was expanded.
 Closing this entry alone does not make the gates complete.
 
-## `budget-refusal-per-path`
-
-`brenn_budget::RefusalKind` is one enum spanning two paths, so neither host's
-conversion is total: the page's publish arm cannot see `InvalidDeliverAfter` and
-its defer arm cannot see `InvalidPayload`, and each writes an `unreachable!` for
-a state the type permits (`surface/kernel/src/publish_buffer.rs`,
-`brenn-wasm/src/lib.rs` — four arms in all). The same shape also makes both
-hosts pay for `InvalidPayload(String)`: the classification always formats the
-detail, and the page drops it, because the surface contract's `invalid-payload`
-carries none. That allocation is on a guest-drivable refusal path.
-
-Fix = one of two shapes, and the choice is a design decision rather than a
-mechanical edit, because the single enum is what the shared-classification
-design deliberately chose over per-family vocabularies. Either split into
-`PublishRefusalKind`/`DeferRefusalKind` so both hosts' matches are total and the
-`unreachable!`s (and the module doc's "no `NotPermitted` variant" argument)
-disappear, or keep one enum and make the detail path-shaped
-(`InvalidPayload { len, max }` and friends) so a host formats only if it has
-somewhere to put it.
-
-Done = no host writes an `unreachable!` over a gate classification, and no
-refusal formats a string its host discards.
-
-Code sites (`TODO(budget-refusal-per-path)`): brenn-budget/src/refusal.rs, at
-`RefusalKind`.
-
-
 ## `dsl-fmt-orphan-terminator`
 
 A document whose first item is a section (`tool alice;` at byte 0, no header

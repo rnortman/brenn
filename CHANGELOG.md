@@ -40,6 +40,10 @@ All notable changes to Brenn are documented here.
   `"publish"` where a bare word belongs in `grants`) now point at the
   offending element instead of the list's opening `[`, and no longer carry an
   `element N:` prefix. This matters most for lists that span several lines.
+- Internal cleanup of how publish refusals are classified for components
+  (the shared publish-budget code both the server and the browser page use).
+  Six "can't happen" panic paths are gone because the types no longer allow
+  those cases. Components see the same refusals and messages as before.
 - Bumped wasmtime from 48.0.6 to 48.0.7, clearing RUSTSEC-2026-0378 and
   RUSTSEC-2026-0379; rustls-webpki from 0.103.15 to 0.103.16, clearing
   RUSTSEC-2026-0382; and webpki-root-certs from 1.0.7 to 1.0.10, clearing

@@ -17,16 +17,17 @@
 //! The budget arithmetic and the order the checks fire in are not here: they are
 //! [`brenn_budget::ActivationGate`], which both hosts run their guests' calls
 //! through; so is the classification of its verdicts, which arrives here as
-//! [`brenn_budget::RefusalKind`]. What is here is the page's own half — the port
-//! table, the deferred snapshot, the buffered entries — plus the last step onto
-//! the contract's error vocabulary.
+//! [`brenn_budget::PublishRefusalKind`] and [`brenn_budget::DeferRefusalKind`].
+//! What is here is the page's own half — the port table, the deferred snapshot,
+//! the buffered entries — plus the last step onto the contract's error
+//! vocabulary.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use brenn_budget::{
-    ActivationGate, GateRefusal, PublishCheck, RefusalKind, check_deliver_after,
-    defer_refusal_kind, publish_refusal_kind,
+    ActivationGate, DeferRefusalKind, GateRefusal, PublishCheck, PublishRefusalKind,
+    check_deliver_after, defer_refusal_kind, publish_refusal_kind,
 };
 use brenn_envelope::Urgency;
 use brenn_surface_contract::{CallError, DeferError, PublishError};
@@ -82,11 +83,8 @@ fn port_for_report(port: &str) -> String {
 /// backend host.
 fn publish_error(refusal: GateRefusal) -> PublishFault {
     PortFault::Refused(match publish_refusal_kind(refusal) {
-        RefusalKind::InvalidPayload(_) => PublishError::InvalidPayload,
-        RefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
-        RefusalKind::InvalidDeliverAfter => {
-            unreachable!("publish_refusal_kind never answers invalid-deliver-after")
-        }
+        PublishRefusalKind::InvalidPayload(_) => PublishError::InvalidPayload,
+        PublishRefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
     })
 }
 
@@ -98,11 +96,8 @@ fn publish_error(refusal: GateRefusal) -> PublishFault {
 /// exactly as a published body is.
 fn call_error(refusal: GateRefusal) -> CallError {
     match publish_refusal_kind(refusal) {
-        RefusalKind::InvalidPayload(detail) => CallError::InvalidPayload(detail),
-        RefusalKind::QuotaExceeded => CallError::QuotaExceeded,
-        RefusalKind::InvalidDeliverAfter => {
-            unreachable!("publish_refusal_kind never answers invalid-deliver-after")
-        }
+        PublishRefusalKind::InvalidPayload(fault) => CallError::InvalidPayload(fault.to_string()),
+        PublishRefusalKind::QuotaExceeded => CallError::QuotaExceeded,
     }
 }
 
@@ -112,11 +107,8 @@ fn call_error(refusal: GateRefusal) -> CallError {
 /// backend host.
 fn defer_error(refusal: GateRefusal) -> DeferFault {
     PortFault::Refused(match defer_refusal_kind(refusal) {
-        RefusalKind::InvalidDeliverAfter => DeferError::InvalidDeliverAfter,
-        RefusalKind::QuotaExceeded => DeferError::QuotaExceeded,
-        RefusalKind::InvalidPayload(_) => {
-            unreachable!("defer_refusal_kind never answers invalid-payload")
-        }
+        DeferRefusalKind::InvalidDeliverAfter => DeferError::InvalidDeliverAfter,
+        DeferRefusalKind::QuotaExceeded => DeferError::QuotaExceeded,
     })
 }
 

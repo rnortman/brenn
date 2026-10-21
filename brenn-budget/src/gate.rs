@@ -68,11 +68,13 @@ use crate::{
 
 /// Why the gate refused a call.
 ///
-/// One vocabulary, shared: each host maps these onto its own guest-facing error
-/// type (the WIT-generated enums on the backend, the contract's verbatim enums
-/// on the page). The mapping is per call site, because the same refusal is not
-/// always the same guest error — an oversize published body is an invalid
-/// payload, while an oversize *edit* body is a quota refusal, on both hosts.
+/// One vocabulary, shared. `refusal.rs` classifies it per path — a publish or
+/// peer call gets a [`crate::PublishRefusalKind`], a control op a
+/// [`crate::DeferRefusalKind`] — because the same refusal is not always the
+/// same guest error: an oversize published body is an invalid payload, while an
+/// oversize *edit* body is a quota refusal, on both hosts. Each host keeps only
+/// the final conversion onto its own guest-facing enum (the WIT-generated enums
+/// on the backend, the contract's enums on the page).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateRefusal {
     /// The activation's total call ceiling (accepted + refused) is spent.

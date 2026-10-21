@@ -1211,8 +1211,8 @@ pub enum ProcessorUrgency {
 }
 
 use brenn_budget::{
-    ActivationGate, GateRefusal, PublishCheck, RefusalKind, check_deliver_after,
-    defer_refusal_kind, publish_refusal_kind, seed_sink_budget,
+    ActivationGate, DeferRefusalKind, GateRefusal, PublishCheck, PublishRefusalKind,
+    check_deliver_after, defer_refusal_kind, publish_refusal_kind, seed_sink_budget,
 };
 /// The publish-budget vocabulary, re-exported: this crate's public API hands
 /// out `SinkBudget`s and charges `MILLITOKENS_PER_PUBLISH` per publish, so the
@@ -1465,11 +1465,10 @@ fn epoch_extension(own: std::time::Duration, budget: std::time::Duration) -> Opt
 /// surface kernel.
 fn publish_error(refusal: GateRefusal) -> PublishError {
     match publish_refusal_kind(refusal) {
-        RefusalKind::InvalidPayload(detail) => PublishError::InvalidPayload(detail),
-        RefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
-        RefusalKind::InvalidDeliverAfter => {
-            unreachable!("publish_refusal_kind never answers invalid-deliver-after")
+        PublishRefusalKind::InvalidPayload(fault) => {
+            PublishError::InvalidPayload(fault.to_string())
         }
+        PublishRefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
     }
 }
 
@@ -1481,11 +1480,10 @@ fn publish_error(refusal: GateRefusal) -> PublishError {
 /// guest — exactly as a published body is.
 fn call_error(refusal: GateRefusal) -> CallWitError {
     match publish_refusal_kind(refusal) {
-        RefusalKind::InvalidPayload(detail) => CallWitError::InvalidPayload(detail),
-        RefusalKind::QuotaExceeded => CallWitError::QuotaExceeded,
-        RefusalKind::InvalidDeliverAfter => {
-            unreachable!("publish_refusal_kind never answers invalid-deliver-after")
+        PublishRefusalKind::InvalidPayload(fault) => {
+            CallWitError::InvalidPayload(fault.to_string())
         }
+        PublishRefusalKind::QuotaExceeded => CallWitError::QuotaExceeded,
     }
 }
 
@@ -1495,11 +1493,8 @@ fn call_error(refusal: GateRefusal) -> CallWitError {
 /// surface kernel.
 fn defer_error(refusal: GateRefusal) -> DeferError {
     match defer_refusal_kind(refusal) {
-        RefusalKind::InvalidDeliverAfter => DeferError::InvalidDeliverAfter,
-        RefusalKind::QuotaExceeded => DeferError::QuotaExceeded,
-        RefusalKind::InvalidPayload(detail) => {
-            unreachable!("defer_refusal_kind never answers invalid-payload: {detail}")
-        }
+        DeferRefusalKind::InvalidDeliverAfter => DeferError::InvalidDeliverAfter,
+        DeferRefusalKind::QuotaExceeded => DeferError::QuotaExceeded,
     }
 }
 

@@ -416,10 +416,13 @@ use serde::{Deserialize, Serialize};
 /// Why a buffered publish was refused, returned synchronously to the component
 /// from inside its activation entry.
 ///
-/// The `processor.wit` triple verbatim — a component's publish-error vocabulary
-/// does not change with its hosting. Refusal is an answer, never a failure: a
-/// refused publish is simply not buffered, the rest of the buffer is intact, and
-/// the activation continues. What to do about it is the component's decision, as
+/// The three tags are `processor.wit`'s publish-error tags, so a component's
+/// publish-error vocabulary does not change with its hosting. `InvalidPayload`
+/// is deliberately narrower here: the WIT variant carries a diagnostic string
+/// and this one does not, because the page's wire form ([`publish_status_str`])
+/// is a bare tag. Refusal is an answer, never a failure: a refused publish is
+/// simply not buffered, the rest of the buffer is intact, and the activation
+/// continues. What to do about it is the component's decision, as
 /// it is on the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishError {

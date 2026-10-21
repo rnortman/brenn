@@ -27,7 +27,8 @@
 //! host runs a guest's publish and control-op calls through: the counters, the
 //! buckets, and the order the checks fire in. What a guest is *told* about a
 //! refusal is shared too — [`publish_refusal_kind`] and [`defer_refusal_kind`]
-//! classify a [`GateRefusal`] onto [`RefusalKind`], leaving each host only the
+//! classify a [`GateRefusal`] onto the publish path's [`PublishRefusalKind`] or
+//! the control-op path's [`DeferRefusalKind`], leaving each host only the
 //! conversion onto its own guest-facing enum.
 //!
 //! Config parsing lives elsewhere: the `f64` knobs an operator writes are
@@ -40,7 +41,9 @@ mod gate;
 mod refusal;
 
 pub use gate::{ActivationGate, GateRefusal, PublishCheck, check_deliver_after};
-pub use refusal::{RefusalKind, defer_refusal_kind, publish_refusal_kind};
+pub use refusal::{
+    DeferRefusalKind, PayloadFault, PublishRefusalKind, defer_refusal_kind, publish_refusal_kind,
+};
 
 /// Millitokens charged per publish: the token-bucket fixed-point scale.
 ///
