@@ -6,9 +6,9 @@
 //! rejection ladder tells authors to use, training everyone to reach for
 //! `gitleaks:allow`.
 //!
-//! These run gitleaks against the repo's real `.gitleaks.toml`. Skipped with a
-//! message when the pinned gitleaks is absent, so a machine without it is not
-//! broken by them.
+//! These run gitleaks against the template's rules,
+//! `scrub/repo-template/gitleaks.toml`. Skipped with a message when the pinned
+//! gitleaks is absent, so a machine without it is not broken by them.
 //!
 //! Fixture strings that a rule is meant to match are assembled at runtime, so
 //! this file never contains a literal the gate would flag and never needs to
@@ -16,20 +16,12 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use common::{gitleaks_available, gitleaks_command};
-
-fn repo_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR is <repo>/scrub.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("scrub crate has a parent directory")
-        .to_path_buf()
-}
+use common::{gitleaks_available, gitleaks_command, template_config};
 
 /// Rule ids gitleaks reports for a directory of fixtures, scanned with the
-/// repo's public config.
+/// template's rules.
 fn rule_ids_for(files: &[(&str, &str)]) -> Vec<String> {
     let dir = tempfile::tempdir().expect("temp dir");
     for (name, body) in files {
@@ -43,7 +35,7 @@ fn rule_ids_for(files: &[(&str, &str)]) -> Vec<String> {
 }
 
 fn scan(dir: &Path) -> Vec<String> {
-    let config = repo_root().join(".gitleaks.toml");
+    let config = template_config();
     let out = gitleaks_command()
         .args(["dir", "--config"])
         .arg(&config)
@@ -171,30 +163,5 @@ fn builtin_secret_rules_are_still_active() {
     assert!(
         !ids.contains(&"ephemeral-reference".to_string()),
         "unexpected rule fired: {ids:?}"
-    );
-}
-
-/// The tracked template is what the other repos copy; drift means they get a
-/// different gate than brenn. Only enforcement-bearing lines are compared:
-/// comments and rule descriptions may differ, because the template cannot
-/// cite in-tree docs that consuming repos do not have.
-#[test]
-fn repo_template_matches_the_tracked_public_config() {
-    /// Drop comment lines, blank lines, and `description` (prose, not enforcement).
-    fn enforcing_lines(src: &str) -> Vec<&str> {
-        src.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("description"))
-            .collect()
-    }
-
-    let root = repo_root();
-    let live = std::fs::read_to_string(root.join(".gitleaks.toml")).expect("public config");
-    let template =
-        std::fs::read_to_string(root.join("scrub/repo-template/gitleaks.toml")).expect("template");
-    assert_eq!(
-        enforcing_lines(&live),
-        enforcing_lines(&template),
-        "scrub/repo-template/gitleaks.toml has drifted from .gitleaks.toml"
     );
 }

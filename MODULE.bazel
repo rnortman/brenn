@@ -21,6 +21,9 @@ bazel_dep(name = "bazel_skylib", version = "1.8.2")
 # linux platform and link every host tool against musl. Hidden from
 # dependents, present for brenn as root.
 bazel_dep(name = "toolchains_musl", version = "0.1.27.bcr.1", dev_dependency = True)
+# `dev_dependency`: `sh_binary` for //tools/scrub, a package only brenn's own
+# check lane builds.
+bazel_dep(name = "rules_shell", version = "0.6.1", dev_dependency = True)
 bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
 bazel_dep(name = "aspect_rules_js", version = "3.4.0")
 bazel_dep(name = "rules_nodejs", version = "6.7.3")
@@ -181,7 +184,7 @@ register_toolchains("@llvm_toolchain//:all", dev_dependency = True)
 # `members` list itself, so member manifests never have to be enumerated here
 # and cannot fall out of sync with Cargo.toml.
 #
-# Both hubs carry a committed cargo-bazel `lockfile` in addition to the cargo
+# Every hub carries a committed cargo-bazel `lockfile` in addition to the cargo
 # one. rules_rust refuses to load a hub from a non-root module without it
 # (repinning is not supported across module boundaries), so the lockfiles are
 # what lets another Bazel module `bazel_dep` on brenn and build a component
@@ -225,6 +228,40 @@ use_repo(
     "crates",
     "wasm_crates",
 )
+
+# ---------------------------------------------------------------------------
+# brenn-scrub: the scrub gate's binary, built from crates.io
+# ---------------------------------------------------------------------------
+# The release `make check` and `make scrub-tree` run, through
+# //tools/scrub:brenn-scrub, with the gitleaks archives below first on its
+# PATH. Pinned in tools/scrub/Cargo.toml; see there.
+#
+# A second usage of the crate extension, `dev_dependency`, like
+# toolchains_musl above: the hub exists for brenn's own check lane and a
+# module that `bazel_dep`s on brenn must not evaluate, pin or fetch it. The
+# two workspace hubs above stay on the non-dev usage because dependents
+# build brenn's crates from them.
+#
+# A hub of its own: a build tool nothing links must not join a workspace
+# hub's feature unification. The annotation's `repositories` scopes it to this
+# hub.
+crate_dev = use_extension(
+    "@rules_rust//crate_universe:extensions.bzl",
+    "crate",
+    dev_dependency = True,
+)
+crate_dev.annotation(
+    crate = "brenn-scrub",
+    gen_binaries = ["brenn-scrub"],
+    repositories = ["scrub_crates"],
+)
+crate_dev.from_cargo(
+    name = "scrub_crates",
+    cargo_lockfile = "//tools/scrub:Cargo.lock",
+    lockfile = "//tools/scrub:cargo-bazel-lock.json",
+    manifests = ["//tools/scrub:Cargo.toml"],
+)
+use_repo(crate_dev, "scrub_crates")
 
 # ---------------------------------------------------------------------------
 # WASM component tooling
@@ -275,17 +312,21 @@ http_archive(
 )
 
 # ---------------------------------------------------------------------------
-# Secret scanning: the gitleaks scrub is validated against
+# Secret scanning: the gitleaks release the scrub gate runs
 # ---------------------------------------------------------------------------
-# scrub wraps one gitleaks release and its integration suites spawn the real
-# binary. PATH lookups are invisible to the sandbox; pinning the binary here
-# makes it a declared input of the test targets, so the assertions cannot
-# silently skip.
+# Two consumers. The in-tree scrub crate wraps one gitleaks release and its
+# integration suites spawn the real binary: PATH lookups are invisible to the
+# sandbox, so pinning the binary here makes it a declared input of the test
+# targets and the assertions cannot silently skip. And
+# //tools/scrub:brenn-scrub runs with this gitleaks first on PATH; the
+# published crate refuses any gitleaks but the one it pins, so this version
+# must equal the gitleaks release the brenn-scrub that tools/scrub/Cargo.toml
+# pins was built against.
 #
-# The tree-scan job that runs gitleaks over the whole checkout is commit-hook
-# machinery and stays outside the build graph. It downloads the same release
-# from its own pin, so xtask's sync guard holds this version and this checksum
-# equal to the wrapper's pin and to the workflow's.
+# CI's tree-scan job runs gitleaks over the whole checkout outside the build
+# graph. It downloads the same release from its own pin, so xtask's sync guard
+# holds this version and this checksum equal to the in-tree crate's pin and to
+# the workflow's.
 GITLEAKS_VERSION = "8.30.0"
 
 GITLEAKS_SHA256_X86_64 = "79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e"

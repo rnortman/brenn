@@ -1,0 +1,44 @@
+"""`bazel run //tools/scrub:brenn-scrub -- <mode>`: the published brenn-scrub
+crate at the release tools/scrub/Cargo.toml pins, run with the pinned
+gitleaks.
+
+The target is named `brenn-scrub` so that a hook running
+`bazel run //tools/scrub:brenn-scrub -- staged` contains `brenn-scrub --
+staged`, which `brenn-scrub init --check` accepts as the invocation.
+"""
+
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+    "cargo-bazel-lock.json",
+])
+
+sh_binary(
+    name = "brenn-scrub",
+    srcs = ["scrub.sh"],
+    data = [
+        "//bazel/tools:gitleaks",
+        "@scrub_crates//:brenn-scrub__brenn-scrub",
+    ],
+    env = {
+        "GITLEAKS_BIN": "$(rlocationpath //bazel/tools:gitleaks)",
+        "SCRUB_BIN": "$(rlocationpath @scrub_crates//:brenn-scrub__brenn-scrub)",
+    },
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)
+
+# The hook-binary floor's version comparison and exit statuses, which
+# `make setup-hooks` decides its install on, against a stub cargo.
+sh_test(
+    name = "scrub_hook_floor_test",
+    size = "small",
+    srcs = ["scrub_hook_floor_test.sh"],
+    args = ["$(rootpath //:dev/scrub-hook-floor.sh)"],
+    data = ["//:dev/scrub-hook-floor.sh"],
+)
+
+policy_srcs()

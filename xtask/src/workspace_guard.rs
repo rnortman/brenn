@@ -5,14 +5,17 @@
 //! ([`crate::deny::WORKSPACES`]), because a workspace resolves its own
 //! dependency graph out of its own `Cargo.lock` and a run in one sees nothing
 //! of another. A list is the right shape — a second workspace is a deliberate
-//! act — but a list with no backstop stops asserting anything the moment a
-//! third workspace appears: the advisory gate would print "checking 2 units"
+//! act — but a list with no backstop stops asserting anything the moment an
+//! unlisted workspace appears: the advisory gate would print its unit count
 //! and pass over dependencies nothing ever looked at.
 //!
 //! This guard is that backstop. It observes which tracked `Cargo.toml`s carry a
-//! top-level `[workspace]` table and requires the set to equal the declared one,
-//! in both directions — an undeclared workspace and a declared one that no
-//! longer exists are both drift.
+//! top-level `[workspace]` table and which directories hold a tracked
+//! `Cargo.lock`, and requires the workspaces to equal the declared ones, in
+//! both directions — an undeclared workspace and a declared one that no longer
+//! exists are both drift. A `Cargo.lock` with no workspace manifest beside it
+//! is a dependency graph `cargo deny` cannot run on (a manifest-less
+//! crate_universe hub resolves one), and is drift too.
 
 use std::path::{Path, PathBuf};
 
@@ -39,9 +42,19 @@ fn declares_workspace(text: &str, rel: &Path) -> bool {
     value.get("workspace").is_some()
 }
 
-fn violations_from(observed: &[String]) -> Vec<String> {
+/// What the tree holds: repo-root-relative directories, sorted, the root as
+/// the empty string.
+#[derive(Debug, PartialEq)]
+struct Observed {
+    /// Directories whose tracked `Cargo.toml` declares a workspace.
+    manifests: Vec<String>,
+    /// Directories holding a tracked `Cargo.lock`.
+    lockfiles: Vec<String>,
+}
+
+fn violations_from(observed: &Observed) -> Vec<String> {
     let mut found = Vec::new();
-    for dir in observed {
+    for dir in &observed.manifests {
         if !WORKSPACES.contains(&dir.as_str()) {
             found.push(format!(
                 "{}: a Cargo workspace that xtask/src/deny.rs does not list. Every \
@@ -53,13 +66,24 @@ fn violations_from(observed: &[String]) -> Vec<String> {
         }
     }
     for declared in WORKSPACES {
-        if !observed.iter().any(|dir| dir == declared) {
+        if !observed.manifests.iter().any(|dir| dir == declared) {
             found.push(format!(
                 "{}: listed in xtask/src/deny.rs WORKSPACES but no tracked Cargo.toml \
                  there declares a workspace. `xtask deny` would run cargo-deny in a \
                  directory that is not a workspace root — drop the entry or fix the \
                  path.",
                 display_dir(declared)
+            ));
+        }
+    }
+    for dir in &observed.lockfiles {
+        if !observed.manifests.contains(dir) && !WORKSPACES.contains(&dir.as_str()) {
+            found.push(format!(
+                "{}: a tracked Cargo.lock outside xtask/src/deny.rs WORKSPACES. A \
+                 dependency graph resolves here — a manifest-less crate_universe \
+                 hub makes one too — and `xtask deny` never audits it. Give it a \
+                 manifest with a `[workspace]` table and list it there.",
+                display_dir(dir)
             ));
         }
     }
@@ -72,10 +96,14 @@ fn display_dir(dir: &str) -> &str {
     if dir.is_empty() { "<repo root>" } else { dir }
 }
 
-fn collect_workspaces(root: &Path, files: &[PathBuf]) -> Vec<String> {
-    let mut dirs: Vec<String> = files
-        .iter()
-        .filter(|rel| rel.file_name().is_some_and(|n| n == "Cargo.toml"))
+/// Reads each `Cargo.toml`; a `Cargo.lock` counts by its file name alone.
+fn collect_workspaces(root: &Path, files: &[PathBuf]) -> Observed {
+    let named = |name: &'static str| {
+        files
+            .iter()
+            .filter(move |rel| rel.file_name().is_some_and(|n| n == name))
+    };
+    let mut manifests: Vec<String> = named("Cargo.toml")
         .filter(|rel| {
             let text = std::fs::read_to_string(root.join(rel))
                 .unwrap_or_else(|e| panic!("workspace guard: cannot read {rel:?}: {e}"));
@@ -83,8 +111,13 @@ fn collect_workspaces(root: &Path, files: &[PathBuf]) -> Vec<String> {
         })
         .map(|rel| workspace_dir(rel))
         .collect();
-    dirs.sort();
-    dirs
+    manifests.sort();
+    let mut lockfiles: Vec<String> = named("Cargo.lock").map(|rel| workspace_dir(rel)).collect();
+    lockfiles.sort();
+    Observed {
+        manifests,
+        lockfiles,
+    }
 }
 
 /// True if the tree's Cargo workspaces are exactly the declared ones.
@@ -114,19 +147,38 @@ mod tests {
         v
     }
 
+    /// Workspace manifests only, no lockfiles.
+    fn manifests_only(manifests: Vec<String>) -> Observed {
+        Observed {
+            manifests,
+            lockfiles: Vec::new(),
+        }
+    }
+
     /// A control for the matching logic, not for the declared list: the
     /// observation is built *from* `WORKSPACES`, so it says only that an exact
     /// match yields nothing. Whether the tree matches is the guard's job.
     #[test]
     fn observed_equal_to_the_declared_list_yields_no_violations() {
-        assert!(violations_from(&baseline()).is_empty());
+        assert!(violations_from(&manifests_only(baseline())).is_empty());
+    }
+
+    /// A declared workspace with its lockfile beside the manifest is the normal
+    /// shape; the lockfile adds nothing to report.
+    #[test]
+    fn declared_workspaces_with_lockfiles_yield_no_violations() {
+        let observed = Observed {
+            manifests: baseline(),
+            lockfiles: baseline(),
+        };
+        assert!(violations_from(&observed).is_empty());
     }
 
     #[test]
     fn an_undeclared_workspace_fails() {
         let mut observed = baseline();
         observed.push("tools/scratch".to_string());
-        let out = violations_from(&observed);
+        let out = violations_from(&manifests_only(observed));
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(
             out[0].starts_with("tools/scratch: a Cargo workspace"),
@@ -142,7 +194,7 @@ mod tests {
             .into_iter()
             .filter(|d| d != "brenn-wasm/components")
             .collect();
-        let out = violations_from(&observed);
+        let out = violations_from(&manifests_only(observed));
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(
             out[0].starts_with("brenn-wasm/components: listed in"),
@@ -155,9 +207,42 @@ mod tests {
     #[test]
     fn the_root_workspace_is_named_in_messages() {
         let observed: Vec<String> = baseline().into_iter().filter(|d| !d.is_empty()).collect();
-        let out = violations_from(&observed);
+        let out = violations_from(&manifests_only(observed));
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(out[0].starts_with("<repo root>: listed in"), "{}", out[0]);
+    }
+
+    /// A lockfile with no workspace manifest and no `WORKSPACES` entry is a
+    /// graph the gate never sees: one violation, the lockfile one.
+    #[test]
+    fn an_undeclared_lockfile_without_a_manifest_fails() {
+        let observed = Observed {
+            manifests: baseline(),
+            lockfiles: dirs(&["tools/hub"]),
+        };
+        let out = violations_from(&observed);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(
+            out[0].starts_with("tools/hub: a tracked Cargo.lock outside"),
+            "{}",
+            out[0]
+        );
+    }
+
+    /// A declared directory holding only a lockfile is reported once, as a
+    /// declared workspace with no manifest: `cargo deny` cannot run there.
+    #[test]
+    fn a_declared_lockfile_without_a_manifest_fails_as_vanished() {
+        let observed = Observed {
+            manifests: baseline()
+                .into_iter()
+                .filter(|d| d != "tools/scrub")
+                .collect(),
+            lockfiles: dirs(&["tools/scrub"]),
+        };
+        let out = violations_from(&observed);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].starts_with("tools/scrub: listed in"), "{}", out[0]);
     }
 
     /// Detection is by top-level table, not by substring: a member manifest
@@ -179,9 +264,9 @@ mod tests {
         ));
     }
 
-    /// The collector half: only `Cargo.toml` files are read, at any depth, and
-    /// the reported directory is repo-root-relative with the root as the empty
-    /// string.
+    /// The collector half: only `Cargo.toml` files are read, at any depth; a
+    /// `Cargo.lock` is observed by name; the reported directories are
+    /// repo-root-relative with the root as the empty string.
     #[test]
     fn the_collector_reports_workspace_dirs_relative_to_the_root() {
         let root = tempfile::tempdir().unwrap();
@@ -193,7 +278,20 @@ mod tests {
         std::fs::write(nested.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
         std::fs::write(root.join("member.toml"), "[workspace]\nmembers = []\n").unwrap();
 
-        let files = ["Cargo.toml", "guests/Cargo.toml", "member.toml"].map(PathBuf::from);
-        assert_eq!(collect_workspaces(root, &files), dirs(&["", "guests"]));
+        let files = [
+            "Cargo.toml",
+            "Cargo.lock",
+            "guests/Cargo.toml",
+            "hub/Cargo.lock",
+            "member.toml",
+        ]
+        .map(PathBuf::from);
+        assert_eq!(
+            collect_workspaces(root, &files),
+            Observed {
+                manifests: dirs(&["", "guests"]),
+                lockfiles: dirs(&["", "hub"]),
+            }
+        );
     }
 }

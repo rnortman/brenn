@@ -1,0 +1,30 @@
+# The one pin on the published brenn-scrub: the release `make check` and
+# `make scrub-tree` run through //tools/scrub:brenn-scrub, which Bazel builds
+# from crates.io out of this manifest and the Cargo.lock beside it (the
+# `scrub_crates` hub in MODULE.bazel). `dev/scrub-hook-floor.sh` reads the
+# version below as the floor for the brenn-scrub the git and Claude hooks
+# exec from PATH, which is the developer's to install (`make setup-hooks`)
+# and cannot be pinned from here. Bump it and repin
+# (`CARGO_BAZEL_REPIN=1 bazel mod deps`); move GITLEAKS_VERSION in
+# MODULE.bazel with it when the release's gitleaks pin moves.
+#
+# A workspace of its own: the graph resolves apart from the root workspace,
+# and `xtask deny` audits it as the unit xtask/src/deny.rs WORKSPACES lists.
+# The package is a shell around one dependency. Nothing builds it, so its
+# lib path names no file.
+[workspace]
+
+[package]
+name = "scrub-pin"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+# TODO(scrub-diff-only-tag-upstream): this release drops `ephemeral-reference`
+# findings from `tree` and range tip-tree scans; CI's gitleaks job still
+# enforces the rule tree-wide.
+brenn-scrub = "=0.2.0"

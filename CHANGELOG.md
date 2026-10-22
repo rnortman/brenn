@@ -4,6 +4,23 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Brenn's own checks now use the published `brenn-scrub` from crates.io,
+  not the copy in this repo.** `brenn-scrub` is the secret-and-hygiene
+  scanner behind the git hooks and `make check`. `make check` and
+  `make scrub-tree` run it built by Bazel at the release
+  `tools/scrub/Cargo.toml` pins (currently 0.2.0), the same bytes on every
+  machine.
+  The git and Claude Code hooks run the `brenn-scrub` on your `PATH`, which
+  `make setup-hooks` installs from crates.io and `make check` requires to be
+  at or above that release. Action needed on each developer machine: run
+  `make setup-hooks` once; it also replaces an older install of the in-tree
+  crate. Until you do, `make check` (and therefore every commit) fails and
+  tells you why. The in-tree `scrub/` crate stays for other repositories that
+  have not switched yet; nothing in brenn's own checks runs it. Known gap:
+  release 0.2.0 skips the design-reference rule on whole-tree scans, so
+  `make scrub-tree` and the pre-push scan no longer report it locally; CI
+  still enforces it (tracked as `scrub-diff-only-tag-upstream` in `TODO.md`).
+
 ## [0.28.0] — 2026-10-22
 
 - **Chat can now hand the agent a secret, and paste text as a file.** The

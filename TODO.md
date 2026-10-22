@@ -1108,13 +1108,50 @@ Code site (`TODO(wasm-messenger-test-helper)`):
 Wire the `scrub-tree` release-gate sweep into an automated check so the
 green-tree invariant (and the stale-exclude panic that is meant to force
 cleanup after the GitHub migration) fires on its own instead of only when
-someone remembers to run `make scrub-tree`. Blocked on a decision: CI never
-installs `brenn-scrub`, so wiring the sweep into `make check` or a CI job
-either needs the binary installed there or a hermetic `bazel run //scrub`
-invocation (which changes the design's deliberate "verify the installed
-binary" semantics).
+someone remembers to run `make scrub-tree`. The target is already
+`bazel run //tools/scrub:brenn-scrub -- tree`, hermetic and the same bytes CI
+would run; what remains is adding that line to `check` and to CI's Bazel job
+in place of the hand-rolled gitleaks scan (`.github/workflows/ci.yml`, job
+`scrub`). That waits on a release whose `tree` honours the `diff-only` tag
+(see `scrub-diff-only-tag-upstream`): 0.2.0's `tree` drops
+`ephemeral-reference` unconditionally, and CI enforces it.
 
 Code site (`TODO(scrub-tree-auto-gate)`): `Makefile` (`scrub-tree` target).
+
+---
+
+## `scrub-diff-only-tag-upstream`
+
+Port the in-tree `diff-only` tag semantics into the `brenn-scrub`
+repository: `scrub/src/gitleaks.rs` `DIFF_ONLY_TAG`, `Finding.tags`,
+`apply_tree_filter`, the `modes` tests covering tagged and untagged configs,
+and the `scrub/repo-template/gitleaks.toml` note (all from commit
+`c3567ab2`). Release it, bump the `brenn-scrub` pin in
+`tools/scrub/Cargo.toml` to that release and repin
+(`CARGO_BAZEL_REPIN=1 bazel mod deps`). Until
+then the published 0.2.0 drops `ephemeral-reference` findings from `tree` and
+`range`'s tip-tree scan unconditionally, so `make scrub-tree` and the
+pre-push tip-tree scan do not report the rule that CI's gitleaks job
+enforces.
+
+Code site (`TODO(scrub-diff-only-tag-upstream)`): `tools/scrub/Cargo.toml`
+(the `brenn-scrub` pin line).
+
+---
+
+## `scrub-binary-version-flag`
+
+Add a `--version` flag to the published `brenn-scrub` crate, release it, bump
+the pin in `tools/scrub/Cargo.toml`, and have `dev/scrub-hook-floor.sh`
+compare `brenn-scrub --version` against the floor instead of parsing
+`cargo install --list`. The script is the one site: `make scrub-selfcheck`
+and the `make setup-hooks` install guard both call it. What the flag buys:
+the floor is then checked on the binary `PATH` resolves — the one the hooks
+run — so a `brenn-scrub` shadowing `~/.cargo/bin` is caught, and a
+`brenn-scrub` installed by anything but cargo passes on its version instead
+of failing as `none`. Done when the script no longer runs `cargo`.
+
+Code site (`TODO(scrub-binary-version-flag)`): `dev/scrub-hook-floor.sh`.
 
 ---
 

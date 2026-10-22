@@ -76,11 +76,9 @@ SCRUB_TEST_ENV = {
         ("exit_codes", []),
         ("hook_dest", []),
         ("modes", [
-            "//:.gitleaks.toml",
             "repo-template/gitleaks.toml",
         ]),
         ("rules", [
-            "//:.gitleaks.toml",
             "repo-template/gitleaks.toml",
         ]),
     ]

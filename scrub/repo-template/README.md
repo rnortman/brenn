@@ -91,6 +91,10 @@ will be blocked until the tree is clean.
 The per-repo `.gitleaks.toml` may diverge in its path allowlists. It must not
 diverge in rules — those belong upstream in this template.
 
-In brenn itself the live copies must match this template byte-for-byte
-(`.gitleaks.toml`, both `.claude` hooks, `.githooks/pre-push`);
-`scrub/selfcheck.sh` runs under `make check` and fails on drift.
+Brenn itself runs the published `brenn-scrub` crate: `make check` and
+`make scrub-tree` run the release its `tools/scrub/Cargo.toml` pins, built by
+Bazel (`//tools/scrub:brenn-scrub`), and `make check` verifies the kit with
+that binary's `init --check`; its hooks exec the `brenn-scrub` on `PATH`,
+which `make setup-hooks` installs and `make check` holds to the same release
+as a floor. This template is the copy for repositories not yet migrated;
+`brenn-scrub init` from the published crate is the current way to lay the kit.

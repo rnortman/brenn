@@ -1,5 +1,6 @@
 # cargo-deny policy for the Brenn repository.
-# Applied to all workspace units (root + standalone WASM workspaces) via `cargo xtask deny`.
+# Applied to all workspace units (root + standalone WASM workspaces + the
+# brenn-scrub pin workspace in tools/scrub) via `cargo xtask deny`.
 
 [advisories]
 # Fail on any published RUSTSEC security advisory.
@@ -18,7 +19,8 @@ version = 2
 unused-allowed-license = "allow"
 
 # Third-party SPDX license identifiers present in the resolved dependency graphs
-# of all workspace units (root workspace + standalone WASM workspaces).
+# of all workspace units (root workspace + standalone WASM workspaces + the
+# brenn-scrub pin workspace).
 # Derived mechanically at implementation time (2026-06-14).
 allow = [
     "0BSD",

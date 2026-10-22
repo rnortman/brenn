@@ -11,8 +11,8 @@ exports_files([
     "cargo-bazel-lock.json",
     "rust-toolchain.toml",
     "MODULE.bazel",
-    # Read by scrub's rule-semantics suite.
-    ".gitleaks.toml",
+    # Run by //tools/scrub:scrub_hook_floor_test.
+    "dev/scrub-hook-floor.sh",
     # Shipped in the release tarball's lib/.
     "noop_mcp.py",
 ])
@@ -207,6 +207,7 @@ filegroup(
         "//surface/schema:policy_srcs",
         "//surface/server:policy_srcs",
         "//surface/test-fixtures:policy_srcs",
+        "//tools/scrub:policy_srcs",
         "//xtask:policy_srcs",
     ],
     visibility = ["//visibility:public"],

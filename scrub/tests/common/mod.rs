@@ -42,6 +42,11 @@ fn absolute(named: impl Into<PathBuf>) -> PathBuf {
     }
 }
 
+/// The template's gitleaks config.
+pub fn template_config() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("repo-template/gitleaks.toml")
+}
+
 /// The binary under test.
 pub fn scrub_bin() -> PathBuf {
     absolute(BIN)

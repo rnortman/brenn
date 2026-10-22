@@ -13,10 +13,12 @@ use std::process::{Command, Output};
 ///
 /// Stated rather than discovered: the manifests are build inputs now (Bazel's
 /// `crate.from_cargo` reads them), not a tree of lint units, and a second
-/// workspace is a deliberate act that belongs in this list. `workspace_guard`
-/// holds the list to the tree in both directions, so a third workspace cannot
-/// sit outside this gate silently.
-pub(crate) const WORKSPACES: [&str; 2] = ["", "brenn-wasm/components"];
+/// workspace is a deliberate act that belongs in this list. A crate_universe
+/// hub with its own lockfile is such a workspace, manifest or not, which is
+/// why `workspace_guard` keys on lockfiles as well as manifests. It holds the
+/// list to the tree in both directions, so a further workspace cannot sit
+/// outside this gate silently.
+pub(crate) const WORKSPACES: [&str; 3] = ["", "brenn-wasm/components", "tools/scrub"];
 
 /// Run cargo-deny over every workspace under `repo_root`. Returns true on success (all pass).
 pub fn run_deny(repo_root: &Path) -> bool {

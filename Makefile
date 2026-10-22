@@ -183,10 +183,11 @@ example-check:
 	cd examples/component && bazel build $(EXAMPLE_BAZEL_CONFIG) @brenn//surface:echo-stub_assets
 	cd examples/component && bazel build $(EXAMPLE_BAZEL_CONFIG) @brenn//frontend:dist
 
-# The advisory gate over both Cargo workspaces. Outside `bazel-check` because
-# cargo-deny fetches an advisory database over the network, which a sandboxed
-# test target has no business doing. `--root` is explicit: `bazel run` starts
-# the binary in its runfiles tree, not the workspace.
+# The advisory gate over every Cargo workspace `xtask/src/deny.rs`
+# `WORKSPACES` lists. Outside `bazel-check` because cargo-deny fetches an
+# advisory database over the network, which a sandboxed test target has no
+# business doing. `--root` is explicit: `bazel run` starts the binary in its
+# runfiles tree, not the workspace.
 # Install with: cargo install --locked cargo-deny
 xtask-deny:
 	bazel run $(BAZEL_CONFIG) //xtask -- deny --root $(CURDIR)
@@ -195,9 +196,9 @@ xtask-deny:
 # parity against git, the Rust advisory gate, and the scrub gate's own
 # liveness. Each step is independently invocable and streams its own output.
 #
-# `scrub-selfcheck` is here because nothing else runs it: the stale-installed-
-# scrubber check is local by nature — it needs neither cargo nor Bazel, and CI
-# never runs `make check`.
+# `scrub-selfcheck` is here because nothing else runs it: the hook-binary floor
+# is local by nature (it reads cargo's install registry), and CI never runs
+# `make check`.
 #
 # TODO(npm-audit-precommit): `npm-audit` is not a step here, so nothing audits
 # the three npm trees — that gate has no CI job either, and nothing but the
@@ -240,37 +241,54 @@ dev-bin: run-artifacts
 	@mkdir -p $(DEV_BIN_DIR)
 	@ln -s $(abspath $(BAZEL_BIN))/brenn-tool/brenn-tool $(DEV_BIN_DIR)/brenn-tool
 
-# Install the scrub binary and point git at the tracked hooks. Idempotent.
-# Asserts the scrub gate is actually live on this clone: template shims in
-# sync, git hooks activated, installed binary not stale. See scrub/selfcheck.sh.
+# How the scrub gate's pinned binary is reached: the crates.io release
+# tools/scrub/Cargo.toml pins, built and run by Bazel with the vended gitleaks
+# first on its PATH; nothing is installed. The mode and its arguments follow
+# the `--`.
+BRENN_SCRUB := bazel run $(BAZEL_CONFIG) //tools/scrub:brenn-scrub --
+
+# Asserts the scrub gate is live on this clone. The hook binary — the
+# brenn-scrub the git and Claude hooks exec from PATH — exists and is at or
+# above the release tools/scrub/Cargo.toml pins (dev/scrub-hook-floor.sh); the
+# repo's kit (.gitleaks.toml, the three hook shims, .gitignore,
+# core.hooksPath) passes `init --check` as run by the pinned binary Bazel
+# builds from crates.io, the same bytes on every machine.
 scrub-selfcheck:
-	@./scrub/selfcheck.sh
+	@./dev/scrub-hook-floor.sh
+	$(BRENN_SCRUB) init --check
 
-# Canonical release-gate sweep: the tree must be free of disallowed strings.
-# Invokes the installed brenn-scrub (the same binary the git hooks use;
-# scrub-selfcheck asserts it is not stale). The exclude list is now empty: the
-# private instance-config TOMLs and the CI workflow that carried private
-# git-dependency URLs have moved to the brenn-ops annex, and the git deps are
-# repointed to public sources. A prefix that matches no tracked file panics, so
-# a stale exclude fails this target loudly rather than silently passing.
-# TODO(scrub-tree-auto-gate): nothing runs this automatically, so the green-tree
-# invariant and the stale-exclude panic only fire when someone remembers to
-# invoke it. Wiring it into `check` needs a decision on the CI binary (CI does
-# not install brenn-scrub) or a hermetic invocation.
+# Canonical release-gate sweep: the tree must be free of disallowed strings,
+# scanned by the pinned binary with the pinned gitleaks. An `--exclude`
+# prefix that matches no tracked file panics, so a stale exclude added here
+# would fail this target loudly rather than silently pass.
+# TODO(scrub-tree-auto-gate): nothing runs this automatically, so the
+# green-tree invariant and the stale-exclude panic only fire when someone
+# remembers to invoke it. Wiring it into `check` and CI waits on a release
+# whose `tree` honours the `diff-only` tag.
 scrub-tree:
-	brenn-scrub tree
+	$(BRENN_SCRUB) tree
 
-# Developer-machine setup, not a build lane: the scrub binary the git hooks
-# exec has to exist on PATH, and cargo is how a Rust binary gets installed
-# there.
+# Developer-machine setup, not a build lane. The hooks exec brenn-scrub from
+# PATH, so the developer installs it: the newest crates.io release, unless
+# cargo's registry already lists one at or above the floor
+# tools/scrub/Cargo.toml pins (so re-running is free). Only the floor script's
+# below-floor status (3) installs; any other failure stops the target with its
+# own message. `--force` is required the first time on a machine that
+# installed the in-tree crate: cargo refuses to overwrite a binary owned by
+# another package (`scrub`) without it. `--locked` builds the dependency
+# versions the release was tested with. The pinned bytes `make check`
+# validates are Bazel's (//tools/scrub:brenn-scrub) and need nothing
+# installed.
 setup-hooks:
-	cargo install --path scrub
+	@./dev/scrub-hook-floor.sh --registry >/dev/null || { \
+	    s=$$?; [ $$s -eq 3 ] || exit $$s; \
+	    cargo install --locked --force brenn-scrub; \
+	}
+	@./dev/scrub-hook-floor.sh
 	git config core.hooksPath .githooks
 	@rm -f .git/hooks/pre-commit
 	@command -v gitleaks >/dev/null 2>&1 || { \
-	    echo "gitleaks not found on PATH."; \
-	    echo "Install the pinned release from https://github.com/gitleaks/gitleaks/releases"; \
-	    echo "(version pin: see PINNED_VERSION in scrub/src/gitleaks.rs)"; \
+	    echo "gitleaks not found on PATH. Run 'brenn-scrub tree': it names the release it requires and where to get it."; \
 	}
 	@echo "setup-hooks: done."
 

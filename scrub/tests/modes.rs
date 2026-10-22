@@ -16,15 +16,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use common::{gitleaks_available, scrub_bin};
+use common::{gitleaks_available, scrub_bin, template_config};
 use git_fixture::{git, init_repo, try_git};
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("scrub crate has a parent directory")
-        .to_path_buf()
-}
 
 /// A token the built-in rules catch, assembled at runtime so this file never
 /// contains a literal the gate would flag.
@@ -41,13 +34,13 @@ fn write_file(repo: &Path, rel: &str, body: &str) {
     std::fs::write(path, body).expect("write fixture");
 }
 
-/// A repo carrying the real public config, so these exercise the shipped rules.
+/// A repo carrying the template's rules, so these exercise the rules the
+/// template ships.
 fn repo_with(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
     let p = dir.path();
     init_repo(p);
-    std::fs::copy(repo_root().join(".gitleaks.toml"), p.join(".gitleaks.toml"))
-        .expect("copy public config");
+    std::fs::copy(template_config(), p.join(".gitleaks.toml")).expect("copy template config");
     for (rel, body) in files {
         write_file(p, rel, body);
     }
@@ -238,8 +231,7 @@ fn section_reference() -> String {
 /// The template config with `tags = ["diff-only"]` on `ephemeral-reference`,
 /// written over the fixture repo's `.gitleaks.toml` and committed.
 fn tag_ephemeral_rule_diff_only(repo: &Path) {
-    let template = std::fs::read_to_string(repo_root().join("scrub/repo-template/gitleaks.toml"))
-        .expect("template");
+    let template = std::fs::read_to_string(template_config()).expect("template");
     let id_line = "id = \"ephemeral-reference\"\n";
     assert!(
         template.contains(id_line),
@@ -384,14 +376,11 @@ fn staged_mode_scans_the_index_named_by_the_hook_environment() {
     write_file(fixture.path(), "src/planted.rs", &canary());
     git(fixture.path(), &["add", "-A"]);
 
-    // Somewhere else entirely: not a git repo, carrying only the public rules
-    // so config resolution has something to load once the root lands here.
+    // Somewhere else entirely: not a git repo, carrying only the template's
+    // rules so config resolution has something to load once the root lands here.
     let elsewhere = tempfile::tempdir().expect("temp dir");
-    std::fs::copy(
-        repo_root().join(".gitleaks.toml"),
-        elsewhere.path().join(".gitleaks.toml"),
-    )
-    .expect("copy public config");
+    std::fs::copy(template_config(), elsewhere.path().join(".gitleaks.toml"))
+        .expect("copy template config");
 
     // Hermetic first, then one explicit `GIT_DIR`: the contract under test is
     // that the environment passed to scrub overrides its cwd, and stripping
