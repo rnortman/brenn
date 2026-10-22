@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-10-22
+
 - **Chat can now hand the agent a secret, and paste text as a file.** The
   attachment menu gains **Snippet**: an inline composer where you type or
   paste text, name it (default `snippet.txt`) and attach it as a file instead
