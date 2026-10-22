@@ -1078,6 +1078,117 @@ brenn-input-bar {
     color: #e94560;
 }
 
+/* Secret attachment chip: lock glyph, amber edge, no thumbnail. */
+.attachment-chip.secret {
+    border-color: #b08a3e;
+    background: #221e24;
+    color: #d8c08a;
+}
+
+/* Snippet composer: inline panel between the attachment strip and input row. */
+.snippet-composer {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    margin: 0.25rem 0 0.5rem;
+    padding: 0.5rem;
+    background: #1a1a2e;
+    border: 1px solid #2a2a40;
+    border-radius: 6px;
+}
+
+.snippet-composer.secret {
+    border-color: #b08a3e;
+}
+
+.input-form .snippet-composer textarea.snippet-text {
+    flex: none;
+    width: 100%;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+}
+
+/* Masked secret text: glyphs drawn as discs where supported. */
+.input-form .snippet-composer textarea.snippet-text.masked {
+    -webkit-text-security: disc;
+}
+
+/* Elsewhere the glyphs are blurred to an unreadable smear. The literal
+ * fallback is required: --fg is undefined on this page, and a bare var()
+ * would drop the whole declaration and leave the text plainly visible. */
+@supports not (-webkit-text-security: disc) {
+    .input-form .snippet-composer textarea.snippet-text.masked {
+        color: transparent;
+        text-shadow: 0 0 0.45em var(--fg, #cdd6f4);
+    }
+}
+
+.snippet-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.snippet-name {
+    flex: 0 1 12rem;
+    min-width: 6rem;
+    padding: 0.3rem 0.5rem;
+    border: 1px solid #2a2a40;
+    background: #141427;
+    color: #d0d0d8;
+    font-family: inherit;
+    font-size: 0.85rem;
+}
+
+.snippet-name:focus {
+    outline: none;
+    border-color: #4a6fa5;
+}
+
+.snippet-secret {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.85rem;
+    color: #a0a0b8;
+    cursor: pointer;
+    user-select: none;
+}
+
+.snippet-composer.secret .snippet-secret {
+    color: #d8c08a;
+}
+
+.snippet-spacer {
+    flex: 1;
+}
+
+.snippet-btn {
+    min-height: 32px;
+    padding: 0.25rem 0.75rem;
+    background: transparent;
+    color: #a0a0b8;
+    border: 1px solid #2a2a40;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.snippet-btn:hover:not(:disabled) {
+    color: #d0d0d8;
+    border-color: #4a6fa5;
+}
+
+.snippet-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+.snippet-btn.snippet-attach:not(:disabled) {
+    color: var(--accent, #61afef);
+    border-color: var(--accent, #61afef);
+}
+
 /* Drag-over visual feedback on the input form */
 .input-form.drag-over {
     border-color: #4a6fa5;

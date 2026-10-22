@@ -804,6 +804,7 @@ pub(super) async fn inject_pending_upload(
             size: 12345,
             uploaded_at: tokio::time::Instant::now(),
             uploader_user_id: user_id,
+            secret: false,
         },
     );
 }

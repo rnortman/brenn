@@ -141,6 +141,7 @@ pub(crate) async fn accept_user_send(
                         media_type: r.media_type,
                         size: r.size,
                         disk_filename: r.disk_filename,
+                        secret: r.secret,
                     })
                     .collect()
             },

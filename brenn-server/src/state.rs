@@ -40,6 +40,8 @@ pub struct PendingUpload {
     pub size: u64,
     pub uploaded_at: tokio::time::Instant,
     pub uploader_user_id: i64,
+    /// The file is in the app's secrets directory, not `working_dir/attachments`.
+    pub secret: bool,
 }
 
 /// Thread-safe registry of pending (not yet sent) uploads.

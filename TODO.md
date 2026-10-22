@@ -1,5 +1,86 @@
 # TODOs
 
+## `security-host-paths-follow-agent-symlinks`
+
+Brenn's host process creates, writes and deletes under trees the agent's
+container can rewrite, and follows any symlink the agent plants there. The
+container home is a read-write bind mount, so the agent can replace
+`~/.config/brenn/<slug>` (or the `secrets` directory under it, or
+`attachments/` in a repo working tree) with a symlink to any host path. The
+next secret upload then creates `secrets/`, chmods it 0700 and writes the
+upload under that host path; an ordinary upload does the same through
+`attachments/`, `write_virtual_tools_file` writes through a planted
+`virtual-tools.json` symlink at startup, and a config reload that changes an
+agent's tool list stages `virtual-tools.json.next` through a planted symlink
+there and then renames that symlink onto `virtual-tools.json`. The orphan sweep lists `secrets/` and
+`attachments/` through the same symlinks and deletes the unreferenced
+`<uuid>_<name>` files older than 24 h that it finds at the target. Config
+resolution's `create_dir_all` on the state directory follows a symlinked
+ancestor and creates directories at the target; the canonical check after it
+panics on a redirect into the working directory or a repo mount, but not on
+one to any other host path. This is a finding under
+`docs/security-posture.md` §7.4, not a tidy-up. The worst case is the two
+virtual-tools writes: through a planted `virtual-tools.json` symlink at
+startup, or a planted `virtual-tools.json.next` symlink on a reload while the
+agent runs, Brenn overwrites any host file its own uid can write; the two
+upload sinks create a new file with an
+unguessable name in a directory the agent chose. The final-component part of
+that worst case does not depend on the mechanism below and is tracked
+separately as
+`quality-virtual-tools-final-symlink-left-open-though-local-fix-exists`.
+`ensure_secrets_dir` refuses a symlink at the last component only.
+`docs/security-posture.md` §7.4 asks for these sinks to be confined to their
+sanctioned root. Closing this means choosing a mechanism for every host-side
+filesystem operation under an agent-writable tree — `openat2` with
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` from an fd on the operator-configured
+root, or an `O_NOFOLLOW | O_DIRECTORY` walk with
+`fchmod`/`openat`/`unlinkat`/`renameat` relative to the directory fd — and the
+crate that provides it, then applying it to every such operation.
+
+Known code sites (`TODO(security-host-paths-follow-agent-symlinks)`), not an
+exhaustive list — any other host-side path operation under the container home
+or a repo mount is in scope: `brenn-server/src/routes/upload.rs`, at
+`ensure_secrets_dir`, at the `attachments/` branch of the upload directory
+selection in the upload handler, and at `sweep_orphans` (delete);
+`brenn-server/src/active_bridge/cc_spawn_config.rs`, at
+`write_virtual_tools_file`; `brenn-bootstrap/src/reload/driver.rs`, at
+`stage_virtual_tools`; `brenn-lib/src/config/resolve.rs`, at the
+`create_dir_all` of the per-app state directory.
+
+Done = no host-side write, delete or directory creation under the container
+home or a repo mount follows a symlink out of its sanctioned root, with a test
+that plants one in an ancestor.
+
+## `quality-virtual-tools-final-symlink-left-open-though-local-fix-exists`
+
+`write_virtual_tools_file` writes `<state_dir>/virtual-tools.json` with
+`std::fs::write`, which follows a symlink the agent plants at the file itself
+and truncates whatever host file it points to. That final-component case needs
+no confinement mechanism: write the JSON to a temp name in the state directory
+opened with `create_new` (the pattern `write_new_file` in
+`brenn-server/src/routes/upload.rs` already uses), then `rename` it onto
+`virtual-tools.json`, which replaces a planted symlink instead of following
+it. A config reload's prepare step has the same bug at its staging file:
+`stage_virtual_tools` writes `<state_dir>/virtual-tools.json.next` with
+`std::fs::write`, so a symlink the agent plants there has its target
+truncated and overwritten; commit then renames the symlink itself onto
+`virtual-tools.json`, and a refused reload only unlinks it. The same fix
+applies: remove any leftover `.next` with `remove_file` (which unlinks a
+symlink rather than following it) and open the staged file with `create_new`.
+A redirected ancestor still places the file in a directory the agent chose
+and replaces any `virtual-tools.json` there; that part stays with
+`security-host-paths-follow-agent-symlinks`.
+
+Code sites (`TODO(quality-virtual-tools-final-symlink-left-open-though-local-fix-exists)`):
+`brenn-server/src/active_bridge/cc_spawn_config.rs`, at
+`write_virtual_tools_file`; `brenn-bootstrap/src/reload/driver.rs`, at
+`stage_virtual_tools`.
+
+Done = neither the startup write of `virtual-tools.json` nor the reload's
+staging of `virtual-tools.json.next` follows a symlink planted at its own
+path, with a test for each that plants one and asserts its target is
+untouched.
+
 ## `brenn-tool-version`
 
 `brenn-tool --version` reports `0.0.0`: clap's `version` reads

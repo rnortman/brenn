@@ -965,6 +965,8 @@ pub struct StoredAttachment {
     pub media_type: String,
     pub size: u64,
     pub disk_filename: String,
+    /// The bytes live in the app's secrets directory and are never served.
+    pub secret: bool,
 }
 
 /// Insert attachment rows for a message. Called within the same DB lock as
@@ -972,8 +974,9 @@ pub struct StoredAttachment {
 pub fn insert_attachments(conn: &Connection, attachments: &[StoredAttachment]) {
     for att in attachments {
         conn.execute(
-            "INSERT INTO message_attachments (upload_id, message_id, filename, media_type, size, disk_filename) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO message_attachments \
+             (upload_id, message_id, filename, media_type, size, disk_filename, secret) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 &att.upload_id,
                 att.message_id,
@@ -981,6 +984,7 @@ pub fn insert_attachments(conn: &Connection, attachments: &[StoredAttachment]) {
                 &att.media_type,
                 att.size as i64,
                 &att.disk_filename,
+                att.secret,
             ),
         )
         .expect("failed to insert message_attachment");
@@ -997,7 +1001,7 @@ pub fn get_attachments_for_conversation(
 
     let mut stmt = conn
         .prepare(
-            "SELECT ma.upload_id, ma.message_id, ma.filename, ma.media_type, ma.size \
+            "SELECT ma.upload_id, ma.message_id, ma.filename, ma.media_type, ma.size, ma.secret \
              FROM message_attachments ma \
              INNER JOIN messages m ON m.id = ma.message_id \
              WHERE m.conversation_id = ?1",
@@ -1013,6 +1017,7 @@ pub fn get_attachments_for_conversation(
                 filename: row.get(2)?,
                 media_type: row.get(3)?,
                 size: row.get::<_, i64>(4)? as u64,
+                secret: row.get(5)?,
             };
             Ok((message_id, meta))
         })
@@ -1045,7 +1050,7 @@ pub fn get_attachments_for_messages(
 
     let placeholders: Vec<String> = (1..=message_ids.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
-        "SELECT upload_id, message_id, filename, media_type, size \
+        "SELECT upload_id, message_id, filename, media_type, size, secret \
          FROM message_attachments \
          WHERE message_id IN ({})",
         placeholders.join(", "),
@@ -1069,6 +1074,7 @@ pub fn get_attachments_for_messages(
                 filename: row.get(2)?,
                 media_type: row.get(3)?,
                 size: row.get::<_, i64>(4)? as u64,
+                secret: row.get(5)?,
             };
             Ok((message_id, meta))
         })
@@ -2400,5 +2406,53 @@ mod tests {
         let _c = create_conversation(&conn, uid, "real-app", false);
         let ids = conversation_ids_for_apps(&conn, &["ghost".to_string()]);
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn attachment_secret_flag_round_trips_through_both_readers() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        let user_id = setup_user(&conn);
+        let conv_id = create_conversation(&conn, user_id, "test", false);
+        let (msg_id, _) = append_message(
+            &conn,
+            conv_id,
+            MessageDirection::Outgoing,
+            "user",
+            None,
+            None,
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            Some(user_id),
+            None,
+            None,
+        );
+        let stored = |upload_id: &str, secret: bool| StoredAttachment {
+            upload_id: upload_id.to_string(),
+            message_id: msg_id,
+            filename: "token.json".to_string(),
+            media_type: "text/plain".to_string(),
+            size: 42,
+            disk_filename: format!("{upload_id}_token.json"),
+            secret,
+        };
+        insert_attachments(&conn, &[stored("u-secret", true), stored("u-plain", false)]);
+
+        let flags = |metas: &[brenn_ws_types::AttachmentMeta]| {
+            let mut v: Vec<(String, bool)> = metas
+                .iter()
+                .map(|m| (m.upload_id.clone(), m.secret))
+                .collect();
+            v.sort();
+            v
+        };
+        let expected = vec![
+            ("u-plain".to_string(), false),
+            ("u-secret".to_string(), true),
+        ];
+
+        let by_conv = get_attachments_for_conversation(&conn, conv_id);
+        assert_eq!(flags(&by_conv[&msg_id]), expected);
+        let by_msgs = get_attachments_for_messages(&conn, &[msg_id]);
+        assert_eq!(flags(&by_msgs[&msg_id]), expected);
     }
 }

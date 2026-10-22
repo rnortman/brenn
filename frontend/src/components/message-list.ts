@@ -15,6 +15,7 @@ import type { AttachmentMeta } from "../generated/AttachmentMeta.js";
 import type { SelectedTask } from "../generated/SelectedTask.js";
 import type { HistoryPageMessage } from "../generated/HistoryPageMessage.js";
 import type { SystemMessageCategory } from "../generated/SystemMessageCategory.js";
+import { SECRET_ATTACHMENT_TITLE } from "./secret-attachment.js";
 
 /**
  * Typed batch item for `BrennMessageList.bulkAppend`. The wire-format
@@ -563,6 +564,14 @@ export class BrennMessageList extends LitElement {
       .msg-attachment-chip:hover {
         background: #2a2a40;
         color: #d0d0d8;
+      }
+      /* A secret is shown by name and size only: no link, no hover. */
+      .msg-attachment-chip.secret,
+      .msg-attachment-chip.secret:hover {
+        background: #221e24;
+        border-color: #b08a3e;
+        color: #d8c08a;
+        cursor: default;
       }
 
       /* === Selected task chips (in message echo) === */
@@ -1143,7 +1152,13 @@ export class BrennMessageList extends LitElement {
     const attachEl = document.createElement("div");
     attachEl.className = "msg-attachments";
     for (const att of attachments) {
-      if (att.media_type.startsWith("image/")) {
+      if (att.secret) {
+        const chip = document.createElement("span");
+        chip.className = "msg-attachment-chip secret";
+        chip.title = SECRET_ATTACHMENT_TITLE;
+        chip.textContent = `\u{1F512} ${att.filename} (${humanFileSize(att.size)})`;
+        attachEl.appendChild(chip);
+      } else if (att.media_type.startsWith("image/")) {
         const link = document.createElement("a");
         link.href = `/app/${this.appSlug}/attachment/${att.upload_id}/${encodeURIComponent(att.filename)}`;
         link.target = "_blank";

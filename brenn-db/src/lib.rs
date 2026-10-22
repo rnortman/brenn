@@ -360,6 +360,16 @@ pub fn run_base_migrations(conn: &Connection) {
     // any other way — born before any epoch. No backfill needed.
     add_column_if_missing(conn, "conversations", "epoch", "TEXT");
 
+    // Add the secret flag to message_attachments if not present: 1 when the
+    // upload was delivered to the agent's secrets directory and has no
+    // retrieval route. Every pre-existing row is a normal attachment.
+    add_column_if_missing(
+        conn,
+        "message_attachments",
+        "secret",
+        "INTEGER NOT NULL DEFAULT 0",
+    );
+
     // Active-devices view: the safe default for any query that should exclude
     // unenrolled devices. SQLite views are syntactic rewrites; the query planner
     // inlines `WHERE unenrolled_at IS NULL` at compile time, so there is no

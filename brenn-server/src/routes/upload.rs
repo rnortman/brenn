@@ -1,6 +1,7 @@
 //! Upload and attachment serving routes.
 //!
-//! `POST /app/{slug}/upload` — multipart file upload to the app's working directory.
+//! `POST /app/{slug}/upload` — multipart file upload to the app's working
+//! directory, or to its secrets directory when the upload is flagged secret.
 //! `GET /app/{slug}/attachment/{upload_id}/{filename}` — serve an attached file.
 
 use axum::Extension;
@@ -60,6 +61,11 @@ pub struct TargetUploadResponse {
 /// When no `target` field is present (or target is "chat"), behaves as a single-file
 /// upload for chat attachments. When `target` is set to an app-defined attachment target,
 /// the handler runs and returns a `TargetUploadResponse`.
+///
+/// A `secret` field with value `"1"` marks a chat upload secret: its bytes go to
+/// one 0600 file in [`AppConfig::secrets_dir`](brenn_lib::config::AppConfig::secrets_dir)
+/// instead of `working_dir/attachments/`. Any other value, or `secret` with a
+/// non-chat target, is rejected.
 pub async fn upload(
     AxumPath(slug): AxumPath<String>,
     Extension(session): Extension<Session>,
@@ -98,6 +104,7 @@ pub async fn upload(
     // field ordering, so `target` may arrive after `file` fields.
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut target_field: Option<String> = None;
+    let mut secret_field: Option<String> = None;
 
     // Map multipart errors to an HTTP status: 413 propagates to the client so
     // the browser can surface a specific message; all other errors become 400
@@ -132,6 +139,13 @@ pub async fn upload(
                 })?;
                 target_field = Some(value);
             }
+            "secret" => {
+                let value = field.text().await.map_err(|e| {
+                    warn!(error = %e, "upload: failed to read secret field");
+                    map_multipart_err(e)
+                })?;
+                secret_field = Some(value);
+            }
             _ => {
                 // Ignore unknown fields (don't fail2ban — browsers may add extras).
             }
@@ -156,6 +170,36 @@ pub async fn upload(
         }
         _ => None,
     };
+
+    let secret = match secret_field.as_deref() {
+        None => false,
+        Some("1") => true,
+        Some(other) => {
+            log_and_alert_security_event(
+                &state.alert_dispatcher,
+                SecurityEventType::SchemaViolation,
+                ip,
+                &format!("upload: invalid secret value {other:?} for app {slug}"),
+            );
+            return Err((StatusCode::BAD_REQUEST, "Invalid secret field".into()));
+        }
+    };
+    // Targets run commands over working-directory files; a secret never goes there.
+    if secret && let Some(t) = target {
+        log_and_alert_security_event(
+            &state.alert_dispatcher,
+            SecurityEventType::SchemaViolation,
+            ip,
+            &format!(
+                "upload: secret combined with target {:?} for app {slug}",
+                t.name
+            ),
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Secret uploads cannot use a target".into(),
+        ));
+    }
 
     // Validate file count.
     if files.is_empty() {
@@ -182,17 +226,31 @@ pub async fn upload(
     }
 
     // Validate, sanitize, and write each file to disk.
-    let attachments_dir = app.working_dir.join("attachments");
-    tokio::fs::create_dir_all(&attachments_dir)
-        .await
-        .map_err(|e| {
+    let attachments_dir = if secret {
+        let dir = app.secrets_dir();
+        ensure_secrets_dir(&dir).await.map_err(|e| {
             warn!(
                 error = %e,
-                dir = %attachments_dir.display(),
+                dir = %dir.display(),
+                "upload: failed to prepare secrets directory"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, "Server error".into())
+        })?;
+        dir
+    } else {
+        let dir = app.attachments_dir();
+        // TODO(security-host-paths-follow-agent-symlinks): create_dir_all
+        // follows a symlink at `attachments/` or any ancestor; the upload lands at its target.
+        tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+            warn!(
+                error = %e,
+                dir = %dir.display(),
                 "upload: failed to create attachments directory"
             );
             (StatusCode::INTERNAL_SERVER_ERROR, "Server error".into())
         })?;
+        dir
+    };
 
     let mut written_files: Vec<WrittenFile> = Vec::with_capacity(files.len());
 
@@ -252,7 +310,9 @@ pub async fn upload(
         let tmp_path = attachments_dir.join(format!(".tmp_{upload_id}"));
         let final_path = attachments_dir.join(&disk_filename);
 
-        tokio::fs::write(&tmp_path, bytes).await.map_err(|e| {
+        // 0o666 is the default `tokio::fs::write` would use: the umask decides.
+        let mode = if secret { 0o600 } else { 0o666 };
+        write_new_file(&tmp_path, bytes, mode).await.map_err(|e| {
             warn!(error = %e, "upload: failed to write temp file");
             cleanup_written_files(&written_files);
             (StatusCode::INTERNAL_SERVER_ERROR, "Server error".into())
@@ -305,6 +365,7 @@ pub async fn upload(
                         size: wf.size,
                         uploaded_at: Instant::now(),
                         uploader_user_id: session.user.id,
+                        secret: false,
                     },
                 );
             }
@@ -331,6 +392,7 @@ pub async fn upload(
             size: wf.size,
             uploaded_at: Instant::now(),
             uploader_user_id: session.user.id,
+            secret,
         };
         state
             .pending_uploads
@@ -346,6 +408,57 @@ pub async fn upload(
         };
         Ok(Json(resp).into_response())
     }
+}
+
+/// Make `dir` a real 0700 directory: create it with that mode if missing, then
+/// set the mode unconditionally so a directory created wider (by an operator
+/// or an earlier process) is tightened rather than trusted. A symlink or any
+/// non-directory at `dir` itself is refused. Symlinks in its ancestors are
+/// followed, and each later call resolves the path afresh.
+// TODO(security-host-paths-follow-agent-symlinks): confine
+// host-side writes under agent-writable trees to their sanctioned root.
+async fn ensure_secrets_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match tokio::fs::DirBuilder::new().mode(0o700).create(dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = tokio::fs::symlink_metadata(dir).await?;
+    if !meta.file_type().is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await
+}
+
+/// Write `bytes` to a new file created with `mode` (before the umask).
+/// `create_new` refuses any existing path, so a planted file or symlink at
+/// `path` is an error rather than a write-through. A failed write removes the
+/// partial file: the sweep never touches temp names, so nothing else would.
+async fn write_new_file(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .await?;
+    let written = match file.write_all(bytes).await {
+        Ok(()) => file.flush().await,
+        Err(e) => Err(e),
+    };
+    drop(file);
+    if written.is_err()
+        && let Err(e) = tokio::fs::remove_file(path).await
+    {
+        warn!(error = %e, path = %path.display(), "upload: failed to remove partial temp file");
+    }
+    written
 }
 
 /// Best-effort cleanup of already-written files on partial upload failure.
@@ -423,26 +536,42 @@ pub async fn serve_attachment(
 
     // Look up in DB to get media_type and verify the attachment exists.
     let disk_filename = format!("{upload_id}_{filename}");
-    let (media_type, db_disk_filename) = {
+    let (media_type, db_disk_filename, secret) = {
         let conn = state.db.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT media_type, disk_filename FROM message_attachments WHERE upload_id = ?1",
+                "SELECT media_type, disk_filename, secret \
+                 FROM message_attachments WHERE upload_id = ?1",
             )
             .expect("failed to prepare attachment lookup");
         stmt.query_row([upload_id.to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
         })
         .map_err(|_| StatusCode::NOT_FOUND)?
     };
+
+    // No route serves a secret; the frontend never builds this URL, so one
+    // arriving is crafted.
+    if secret {
+        log_and_alert_security_event(
+            &state.alert_dispatcher,
+            SecurityEventType::MalformedMessage,
+            ip,
+            &format!("attachment: secret requested: {upload_id}"),
+        );
+        return Err(StatusCode::NOT_FOUND);
+    }
 
     // Verify filename matches (prevents URL manipulation).
     if db_disk_filename != disk_filename {
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Resolve file path (always under working_dir/attachments/).
-    let file_path = app.working_dir.join("attachments").join(&disk_filename);
+    let file_path = app.attachments_dir().join(&disk_filename);
 
     // Belt+suspenders containment check.
     let canonical = file_path
@@ -554,9 +683,15 @@ fn detect_media_type(bytes: &[u8]) -> String {
     }
 
     // Text: check if valid UTF-8 with no null bytes (check a reasonable prefix).
-    // Null bytes are valid UTF-8 but indicate binary content.
+    // Null bytes are valid UTF-8 but indicate binary content. A cut prefix may
+    // end inside a multi-byte character; that incomplete tail is not an error.
     let check_len = bytes.len().min(8192);
-    if std::str::from_utf8(&bytes[..check_len]).is_ok() && !bytes[..check_len].contains(&0) {
+    let prefix = &bytes[..check_len];
+    let utf8 = match std::str::from_utf8(prefix) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none() && check_len < bytes.len(),
+    };
+    if utf8 && !prefix.contains(&0) {
         return "text/plain".to_string();
     }
 
@@ -588,6 +723,11 @@ pub struct ResolvedAttachment {
     pub disk_filename: String,
     pub media_type: String,
     pub size: u64,
+    /// The file is in the app's secrets directory.
+    pub secret: bool,
+    /// The path CC is told: `attachments/<disk>` relative to its working
+    /// directory, or a secret's absolute agent-visible path.
+    pub cc_path: String,
 }
 
 impl ResolvedAttachment {
@@ -597,16 +737,29 @@ impl ResolvedAttachment {
             filename: self.filename.clone(),
             media_type: self.media_type.clone(),
             size: self.size,
+            secret: self.secret,
         }
     }
 
-    /// Format the CC notification line for this attachment.
+    /// Format the CC notification line for this attachment. A secret's line
+    /// carries its path, type and size and the handling instruction, never
+    /// its contents.
     pub fn cc_notification(&self) -> String {
         let human_size = human_file_size(self.size);
-        format!(
-            "[Attached file: attachments/{} ({}, {})]",
-            self.disk_filename, self.media_type, human_size
-        )
+        if self.secret {
+            format!(
+                "[Attached secret: {} ({}, {}) — this file is a secret: do not read, print \
+                 or display its contents; move it out of this directory to where it is \
+                 needed (the directory is an inbox Brenn prunes, not a store) and tell the \
+                 user where it went]",
+                self.cc_path, self.media_type, human_size
+            )
+        } else {
+            format!(
+                "[Attached file: {} ({}, {})]",
+                self.cc_path, self.media_type, human_size
+            )
+        }
     }
 }
 
@@ -618,7 +771,7 @@ pub async fn resolve_attachments(
     refs: &[brenn_ws_types::AttachmentRef],
     app_slug: &str,
     user_id: i64,
-    working_dir: &std::path::Path,
+    app_config: &brenn_lib::config::AppConfig,
     pending: &PendingUploads,
 ) -> Result<Vec<ResolvedAttachment>, String> {
     if refs.is_empty() {
@@ -655,7 +808,11 @@ pub async fn resolve_attachments(
         }
 
         // Verify file still exists on disk.
-        let file_path = working_dir.join("attachments").join(&entry.disk_filename);
+        let file_path = if entry.secret {
+            app_config.secrets_dir().join(&entry.disk_filename)
+        } else {
+            app_config.attachments_dir().join(&entry.disk_filename)
+        };
         if !file_path.exists() {
             return Err(format!(
                 "upload_id {upload_id}: file missing from disk: {}",
@@ -663,12 +820,47 @@ pub async fn resolve_attachments(
             ));
         }
 
+        let cc_path = if entry.secret {
+            // The home mapping always covers `state_dir`; no mapping means the
+            // config invariant is broken and the agent would get a path it
+            // cannot open.
+            let agent_path = app_config
+                .path_mapper
+                .to_container(&file_path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "secrets path {} has no container mapping",
+                        file_path.display()
+                    )
+                });
+            agent_path
+                .into_os_string()
+                .into_string()
+                .unwrap_or_else(|p| panic!("secrets path {p:?} is not UTF-8"))
+        } else {
+            // CC runs in `working_dir`, so it is told the path relative to it.
+            let relative = file_path
+                .strip_prefix(&app_config.working_dir)
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "attachment path {} is not under the working directory",
+                        file_path.display()
+                    )
+                });
+            relative
+                .to_str()
+                .unwrap_or_else(|| panic!("attachment path {relative:?} is not UTF-8"))
+                .to_string()
+        };
+
         resolved.push(ResolvedAttachment {
             upload_id,
             filename: entry.filename.clone(),
             disk_filename: entry.disk_filename.clone(),
             media_type: entry.media_type.clone(),
             size: entry.size,
+            secret: entry.secret,
+            cc_path,
         });
     }
 
@@ -696,9 +888,8 @@ fn human_file_size(bytes: u64) -> String {
 
 /// Background task: periodically clean up orphaned upload files and expired pending entries.
 ///
-/// Runs every 10 minutes. Deletes files in `{working_dir}/attachments/` that are:
-/// - Older than 24 hours (by mtime)
-/// - Not referenced in `message_attachments`
+/// Runs every 10 minutes. For each app, sweeps `{working_dir}/attachments/` and
+/// the app's secrets directory with [`sweep_orphans`].
 ///
 /// Also prunes expired entries from the in-memory pending uploads map.
 pub async fn orphan_cleanup_loop(
@@ -706,7 +897,7 @@ pub async fn orphan_cleanup_loop(
     pending: PendingUploads,
     db: Db,
 ) {
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
     use tokio::time;
 
     let mut interval = time::interval(Duration::from_secs(600));
@@ -728,61 +919,86 @@ pub async fn orphan_cleanup_loop(
         // and the next cycle sweeps the new one.
         let apps = apps.load();
         for app in apps.values() {
-            let dir = app.working_dir.join("attachments");
-            let mut entries = match tokio::fs::read_dir(&dir).await {
-                Ok(e) => e,
-                Err(_) => continue, // Directory may not exist yet.
-            };
+            sweep_orphans(&app.attachments_dir(), &db, max_age).await;
+            sweep_orphans(&app.secrets_dir(), &db, max_age).await;
+        }
+    }
+}
 
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let filename = entry.file_name();
-                let filename_str = filename.to_string_lossy();
+/// Delete the files in `dir` that Brenn wrote and nothing references: a name
+/// of the form `<uuid>_<name>` (the UUID in canonical hyphenated form), an
+/// mtime older than `max_age`, and an upload id absent from
+/// `message_attachments`. Any other name — a temp file, or a file the agent
+/// put there — is not Brenn's to remove. A missing `dir` is skipped silently;
+/// any other failure to list it ends this sweep of `dir` with a warning, and a
+/// file whose metadata cannot be read is left in place with a warning.
+// TODO(security-host-paths-follow-agent-symlinks): read_dir follows a symlink at
+// `dir` or any ancestor; the sweep then deletes matching files at its target.
+pub(crate) async fn sweep_orphans(dir: &std::path::Path, db: &Db, max_age: std::time::Duration) {
+    use std::time::SystemTime;
 
-                // Skip temp files (they'll be cleaned up by their creator or next cycle).
-                if filename_str.starts_with(".tmp_") {
-                    continue;
-                }
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(error = %e, dir = %dir.display(), "orphan cleanup: cannot read directory");
+            return;
+        }
+    };
 
-                // Extract UUID from filename: {uuid}_{original_name}
-                let uuid_str = match filename_str.find('_') {
-                    Some(pos) => &filename_str[..pos],
-                    None => continue, // Not our file format.
-                };
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(error = %e, dir = %dir.display(), "orphan cleanup: cannot list directory");
+                break;
+            }
+        };
+        let filename = entry.file_name();
+        let filename_str = filename.to_string_lossy();
 
-                // Check mtime.
-                let metadata = match entry.metadata().await {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let modified = match metadata.modified() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let age = SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default();
+        let uuid_str = match filename_str.split_once('_') {
+            Some((prefix, _)) => prefix,
+            None => continue,
+        };
+        match Uuid::parse_str(uuid_str) {
+            Ok(id) if id.hyphenated().to_string() == uuid_str => {}
+            _ => continue,
+        }
 
-                if age < max_age {
-                    continue; // Not old enough.
-                }
+        let modified = match entry.metadata().await.and_then(|m| m.modified()) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    file = %filename_str,
+                    "orphan cleanup: cannot read file metadata"
+                );
+                continue;
+            }
+        };
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if age < max_age {
+            continue;
+        }
 
-                // Check if referenced in DB.
-                let referenced = {
-                    let conn = db.lock().await;
-                    conversation::attachment_exists(&conn, uuid_str)
-                };
+        let referenced = {
+            let conn = db.lock().await;
+            conversation::attachment_exists(&conn, uuid_str)
+        };
 
-                if !referenced {
-                    if let Err(e) = tokio::fs::remove_file(entry.path()).await {
-                        warn!(
-                            error = %e,
-                            file = %filename_str,
-                            "orphan cleanup: failed to remove file"
-                        );
-                    } else {
-                        tracing::debug!(file = %filename_str, "orphan cleanup: removed orphan");
-                    }
-                }
+        if !referenced {
+            if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+                warn!(
+                    error = %e,
+                    file = %filename_str,
+                    "orphan cleanup: failed to remove file"
+                );
+            } else {
+                tracing::debug!(file = %filename_str, "orphan cleanup: removed orphan");
             }
         }
     }
@@ -889,6 +1105,31 @@ mod tests {
     }
 
     #[test]
+    fn detect_text_with_character_across_prefix_end() {
+        // "€" is three bytes; place it across the 8192-byte prefix boundary.
+        let mut bytes = vec![b'a'; 8191];
+        bytes.extend_from_slice("€".as_bytes());
+        bytes.extend_from_slice(b"tail");
+        assert_eq!(detect_media_type(&bytes), "text/plain");
+    }
+
+    #[test]
+    fn detect_truncated_character_at_end_is_binary() {
+        // The same incomplete sequence is invalid when it ends the whole file.
+        let mut bytes = b"abc".to_vec();
+        bytes.extend_from_slice(&"€".as_bytes()[..2]);
+        assert_eq!(detect_media_type(&bytes), "application/octet-stream");
+    }
+
+    #[test]
+    fn detect_invalid_byte_inside_prefix_is_binary() {
+        let mut bytes = vec![b'a'; 100];
+        bytes.push(0xFF);
+        bytes.extend_from_slice(&[b'a'; 9000]);
+        assert_eq!(detect_media_type(&bytes), "application/octet-stream");
+    }
+
+    #[test]
     fn detect_binary() {
         let bytes = [0x00, 0x01, 0x02, 0x03];
         assert_eq!(detect_media_type(&bytes), "application/octet-stream");
@@ -916,7 +1157,9 @@ mod tests {
 
     use crate::router::build_router;
     use crate::test_support::app_config::default_test_app_config;
-    use crate::test_support::http::{body_string, multipart_body, setup_authenticated_user};
+    use crate::test_support::http::{
+        body_string, multipart_body, multipart_body_with_fields, setup_authenticated_user,
+    };
     use crate::test_support::state::{test_app_with_working_dir, test_state_with_apps};
 
     #[tokio::test]
@@ -1091,6 +1334,7 @@ mod tests {
                     media_type: "text/plain".to_string(),
                     size: 15,
                     disk_filename: format!("{upload_id}_note.txt"),
+                    secret: false,
                 }],
             );
         }
@@ -1135,5 +1379,464 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // Secret attachments
+    // -----------------------------------------------------------------------
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    use brenn_lib::config::{AppConfig, PathMapper, PathMapping};
+
+    use crate::test_support::app_config::{single_app, test_app_config_under};
+    use crate::test_support::files_under;
+
+    fn secret_test_state(cfg: AppConfig) -> (AppState, Db) {
+        let db = crate::test_support::init_db_memory();
+        let state = test_state_with_apps(&db, single_app(cfg));
+        (state, db)
+    }
+
+    async fn post_upload(
+        state: &AppState,
+        session_token: &str,
+        filename: &str,
+        content: &[u8],
+        fields: &[(&str, &str)],
+    ) -> Response {
+        let (content_type, body) = multipart_body_with_fields(filename, content, fields);
+        build_router(state.clone(), None, 0, 2576)
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))))
+            .oneshot(
+                Request::post("/app/test/upload")
+                    .header("cookie", format!("brenn_session={session_token}"))
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[tokio::test]
+    async fn upload_secret_lands_in_secrets_dir_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_app_config_under(dir.path());
+        let secrets_dir = cfg.secrets_dir();
+        let working_dir = cfg.working_dir.clone();
+        let (state, db) = secret_test_state(cfg);
+        let (session_token, _csrf) = setup_authenticated_user(&db).await;
+
+        let response = post_upload(
+            &state,
+            &session_token,
+            "token.json",
+            b"{\"refresh\":\"r-1\"}",
+            &[("secret", "1")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let resp: serde_json::Value =
+            serde_json::from_str(&body_string(response.into_body()).await).unwrap();
+        assert_eq!(resp["filename"], "token.json");
+        assert_eq!(resp["media_type"], "text/plain");
+        assert_eq!(resp["size"], 17);
+        let upload_id: Uuid = resp["upload_id"].as_str().unwrap().parse().unwrap();
+
+        let path = secrets_dir.join(format!("{upload_id}_token.json"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"refresh\":\"r-1\"}");
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(mode_of(&secrets_dir), 0o700);
+        assert_eq!(files_under(&secrets_dir), vec![path]);
+        assert!(
+            files_under(&working_dir).is_empty(),
+            "nothing may land under the working directory"
+        );
+
+        let pending = state.pending_uploads.lock().await;
+        assert!(pending[&upload_id].secret, "the pending entry is secret");
+    }
+
+    #[tokio::test]
+    async fn upload_secret_tightens_loose_secrets_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_app_config_under(dir.path());
+        let secrets_dir = cfg.secrets_dir();
+        std::fs::create_dir(&secrets_dir).unwrap();
+        std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (state, db) = secret_test_state(cfg);
+        let (session_token, _csrf) = setup_authenticated_user(&db).await;
+
+        let response =
+            post_upload(&state, &session_token, "k.txt", b"key", &[("secret", "1")]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(mode_of(&secrets_dir), 0o700);
+    }
+
+    #[tokio::test]
+    async fn upload_secret_refuses_symlinked_secrets_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_app_config_under(dir.path());
+        let elsewhere = cfg.working_dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, cfg.secrets_dir()).unwrap();
+        let (state, db) = secret_test_state(cfg);
+        let (session_token, _csrf) = setup_authenticated_user(&db).await;
+
+        let response =
+            post_upload(&state, &session_token, "k.txt", b"key", &[("secret", "1")]).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(files_under(&elsewhere).is_empty());
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn upload_secret_with_target_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_app_config_under(dir.path());
+        cfg.attachment_targets = vec![brenn_lib::config::AttachmentTarget {
+            name: "import".to_string(),
+            label: "Import".to_string(),
+            accept: vec![".txt".to_string()],
+            multi: false,
+            handler: brenn_lib::config::AttachmentHandlerConfig::Command {
+                program: "true".to_string(),
+                args: vec![],
+                file_roles: std::collections::HashMap::new(),
+                timeout_secs: 5,
+                cc_instructions: None,
+            },
+        }];
+        let root = dir.path().to_path_buf();
+        let (state, db) = secret_test_state(cfg);
+        let (session_token, _csrf) = setup_authenticated_user(&db).await;
+
+        let response = post_upload(
+            &state,
+            &session_token,
+            "k.txt",
+            b"key",
+            &[("target", "import"), ("secret", "1")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(logs_contain("security_event=true"));
+        assert!(logs_contain("upload: secret combined with target"));
+        assert!(files_under(&root).is_empty(), "nothing is written");
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn upload_secret_bad_value_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_app_config_under(dir.path());
+        let root = dir.path().to_path_buf();
+        let (state, db) = secret_test_state(cfg);
+        let (session_token, _csrf) = setup_authenticated_user(&db).await;
+
+        let response = post_upload(
+            &state,
+            &session_token,
+            "k.txt",
+            b"key",
+            &[("secret", "true")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(logs_contain("security_event=true"));
+        assert!(logs_contain("upload: invalid secret value"));
+        assert!(files_under(&root).is_empty(), "nothing is written");
+    }
+
+    /// Insert a user message in a new conversation carrying `atts`.
+    async fn persist_attachments(db: &Db, atts: &[(Uuid, &str, bool)]) {
+        let conn = db.lock().await;
+        let user_id = conn
+            .query_row("SELECT id FROM users LIMIT 1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let conv_id = brenn_db::conversation::create_conversation(&conn, user_id, "test", false);
+        let (msg_id, _seq) = brenn_db::conversation::append_message(
+            &conn,
+            conv_id,
+            brenn_db::conversation::MessageDirection::Outgoing,
+            "user",
+            None,
+            None,
+            r#"{"type":"user","message":{"role":"user","content":"test"}}"#,
+            Some(user_id),
+            None,
+            None,
+        );
+        let stored: Vec<_> = atts
+            .iter()
+            .map(
+                |(id, name, secret)| brenn_db::conversation::StoredAttachment {
+                    upload_id: id.to_string(),
+                    message_id: msg_id,
+                    filename: name.to_string(),
+                    media_type: "text/plain".to_string(),
+                    size: 3,
+                    disk_filename: format!("{id}_{name}"),
+                    secret: *secret,
+                },
+            )
+            .collect();
+        brenn_db::conversation::insert_attachments(&conn, &stored);
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn serve_attachment_refuses_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_app_config_under(dir.path());
+        let secrets_dir = cfg.secrets_dir();
+        let (state, db) = secret_test_state(cfg);
+        let (session_token, _csrf) = setup_authenticated_user(&db).await;
+
+        let response =
+            post_upload(&state, &session_token, "k.txt", b"key", &[("secret", "1")]).await;
+        let resp: serde_json::Value =
+            serde_json::from_str(&body_string(response.into_body()).await).unwrap();
+        let upload_id: Uuid = resp["upload_id"].as_str().unwrap().parse().unwrap();
+        persist_attachments(&db, &[(upload_id, "k.txt", true)]).await;
+
+        let response = build_router(state, None, 0, 2576)
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))))
+            .oneshot(
+                Request::get(format!("/app/test/attachment/{upload_id}/k.txt"))
+                    .header("cookie", format!("brenn_session={session_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(logs_contain("security_event=true"));
+        assert!(logs_contain("attachment: secret requested"));
+        let path = secrets_dir.join(format!("{upload_id}_k.txt"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"key", "file untouched");
+    }
+
+    /// Three files in `dir`, all older than a day: one referenced, one
+    /// unreferenced Brenn-named, one with a name Brenn never writes. Only
+    /// the unreferenced Brenn-named file is removed.
+    async fn assert_sweep_keeps_referenced_and_foreign(dir: &Path, db: &Db) {
+        std::fs::create_dir_all(dir).unwrap();
+        let referenced = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+        let referenced_path = dir.join(format!("{referenced}_kept.txt"));
+        let orphan_path = dir.join(format!("{orphan}_x"));
+        let foreign_path = dir.join("foo_bar.json");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        for path in [&referenced_path, &orphan_path, &foreign_path] {
+            std::fs::write(path, b"abc").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        persist_attachments(db, &[(referenced, "kept.txt", false)]).await;
+
+        sweep_orphans(dir, db, std::time::Duration::from_secs(24 * 3600)).await;
+
+        assert!(referenced_path.exists(), "referenced file is never removed");
+        assert!(!orphan_path.exists(), "unreferenced Brenn file is removed");
+        assert!(foreign_path.exists(), "a name Brenn never wrote is skipped");
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_sweeps_unreferenced_secret_and_keeps_referenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_app_config_under(dir.path());
+        let secrets_dir = cfg.secrets_dir();
+        let attachments_dir = cfg.attachments_dir();
+        let (_state, db) = secret_test_state(cfg);
+        setup_authenticated_user(&db).await;
+
+        assert_sweep_keeps_referenced_and_foreign(&secrets_dir, &db).await;
+        assert_sweep_keeps_referenced_and_foreign(&attachments_dir, &db).await;
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_spares_young_and_non_canonical_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::test_support::init_db_memory();
+        let young = dir.path().join(format!("{}_new.txt", Uuid::new_v4()));
+        let simple = dir.path().join(format!("{}_x", Uuid::new_v4().simple()));
+        std::fs::write(&young, b"a").unwrap();
+        std::fs::write(&simple, b"a").unwrap();
+
+        sweep_orphans(dir.path(), &db, std::time::Duration::from_secs(3600)).await;
+        assert!(young.exists(), "a file younger than max_age stays");
+        sweep_orphans(dir.path(), &db, std::time::Duration::ZERO).await;
+        assert!(!young.exists());
+        assert!(
+            simple.exists(),
+            "only canonical hyphenated UUIDs are Brenn's"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn orphan_cleanup_warns_on_unreadable_dir_but_not_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::test_support::init_db_memory();
+
+        sweep_orphans(&dir.path().join("absent"), &db, std::time::Duration::ZERO).await;
+        assert!(
+            !logs_contain("orphan cleanup"),
+            "a missing dir is skipped silently"
+        );
+
+        let not_a_dir = dir.path().join("file");
+        std::fs::write(&not_a_dir, b"a").unwrap();
+        sweep_orphans(&not_a_dir, &db, std::time::Duration::ZERO).await;
+        assert!(logs_contain("orphan cleanup: cannot read directory"));
+    }
+
+    #[tokio::test]
+    async fn resolve_attachments_secret_checks_secrets_dir_and_builds_container_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let mut cfg = default_test_app_config("test", "Test App");
+        cfg.working_dir = home.join("repos").join("ws");
+        cfg.state_dir = home.join(".config").join("brenn").join("test");
+        cfg.path_mapper = PathMapper::container(vec![PathMapping {
+            host_root: home.clone(),
+            container_root: PathBuf::from("/home/agent"),
+        }]);
+        std::fs::create_dir_all(cfg.secrets_dir()).unwrap();
+
+        let upload_id = Uuid::new_v4();
+        let disk_filename = format!("{upload_id}_token.json");
+        let pending: PendingUploads = Default::default();
+        pending.lock().await.insert(
+            upload_id,
+            PendingUpload {
+                app_slug: "test".to_string(),
+                filename: "token.json".to_string(),
+                disk_filename: disk_filename.clone(),
+                media_type: "text/plain".to_string(),
+                size: 2048,
+                uploaded_at: Instant::now(),
+                uploader_user_id: 7,
+                secret: true,
+            },
+        );
+        let refs = [brenn_ws_types::AttachmentRef {
+            upload_id: upload_id.to_string(),
+        }];
+
+        let err = resolve_attachments(&refs, "test", 7, &cfg, &pending)
+            .await
+            .expect_err("the file is not in the secrets directory yet");
+        assert!(err.contains("file missing from disk"), "got {err}");
+
+        // Present under the working directory is not present for a secret.
+        std::fs::create_dir_all(cfg.attachments_dir()).unwrap();
+        std::fs::write(cfg.attachments_dir().join(&disk_filename), b"x").unwrap();
+        resolve_attachments(&refs, "test", 7, &cfg, &pending)
+            .await
+            .expect_err("a secret resolves only from the secrets directory");
+
+        std::fs::write(cfg.secrets_dir().join(&disk_filename), b"x").unwrap();
+        let resolved = resolve_attachments(&refs, "test", 7, &cfg, &pending)
+            .await
+            .expect("resolves from the secrets directory");
+        assert_eq!(resolved.len(), 1);
+        let r = &resolved[0];
+        assert!(r.secret);
+        assert_eq!(
+            r.cc_path,
+            format!("/home/agent/.config/brenn/test/secrets/{disk_filename}")
+        );
+        assert!(r.to_meta().secret);
+        let line = r.cc_notification();
+        assert!(line.starts_with("[Attached secret: "), "got {line}");
+        assert!(line.contains(&r.cc_path), "got {line}");
+        assert!(line.contains("2.0 KB"), "got {line}");
+        assert!(!line.contains("attachments/"), "got {line}");
+        assert!(
+            line.contains("do not read, print or display its contents"),
+            "got {line}"
+        );
+        assert!(line.contains("move it out of this directory"), "got {line}");
+        assert!(
+            pending.lock().await.is_empty(),
+            "resolved entry leaves pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_attachments_plain_is_relative_to_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = default_test_app_config("test", "Test App");
+        // A trailing separator must not change the relative path.
+        cfg.working_dir = PathBuf::from(format!("{}/", dir.path().display()));
+        std::fs::create_dir_all(cfg.attachments_dir()).unwrap();
+
+        let upload_id = Uuid::new_v4();
+        let disk_filename = format!("{upload_id}_notes.txt");
+        std::fs::write(cfg.attachments_dir().join(&disk_filename), b"x").unwrap();
+        let pending: PendingUploads = Default::default();
+        pending.lock().await.insert(
+            upload_id,
+            PendingUpload {
+                app_slug: "test".to_string(),
+                filename: "notes.txt".to_string(),
+                disk_filename: disk_filename.clone(),
+                media_type: "text/plain".to_string(),
+                size: 2048,
+                uploaded_at: Instant::now(),
+                uploader_user_id: 7,
+                secret: false,
+            },
+        );
+        let refs = [brenn_ws_types::AttachmentRef {
+            upload_id: upload_id.to_string(),
+        }];
+
+        let resolved = resolve_attachments(&refs, "test", 7, &cfg, &pending)
+            .await
+            .expect("resolves from the attachments directory");
+        let r = &resolved[0];
+        assert!(!r.secret);
+        assert_eq!(r.cc_path, format!("attachments/{disk_filename}"));
+        assert_eq!(
+            r.cc_notification(),
+            format!("[Attached file: attachments/{disk_filename} (text/plain, 2.0 KB)]")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_new_file_refuses_planted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"original").unwrap();
+        let tmp = dir.path().join(".tmp_x");
+        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+
+        let err = write_new_file(&tmp, b"secret bytes", 0o600)
+            .await
+            .expect_err("an existing path is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert!(
+            std::fs::symlink_metadata(&tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted symlink is left as it was"
+        );
     }
 }

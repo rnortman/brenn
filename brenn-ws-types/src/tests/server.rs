@@ -113,6 +113,7 @@ fn server_message_variants_serialize() {
                 filename: "receipt.jpg".into(),
                 media_type: "image/jpeg".into(),
                 size: 123456,
+                secret: true,
             }],
             selected_tasks: vec![],
             seq: Some(7),
@@ -558,6 +559,7 @@ fn history_page_wire_format() {
                     filename: "receipt.jpg".into(),
                     media_type: "image/jpeg".into(),
                     size: 123456,
+                    secret: false,
                 }],
             },
         ],
@@ -565,7 +567,7 @@ fn history_page_wire_format() {
     };
     assert_wire(
         &page,
-        r#"{"type":"HistoryPage","messages":[{"seq":3,"role":"user","rendered_html":"<details class=\"brenn-system\">sys</details>","timestamp":"2026-03-26T14:32:00+09:00","category":"EventDrain"},{"seq":4,"role":"user","rendered_html":"<p>check this receipt</p>","timestamp":"2026-03-26T14:33:00+09:00","username":"bob","attachments":[{"upload_id":"550e8400-e29b-41d4-a716-446655440000","filename":"receipt.jpg","media_type":"image/jpeg","size":123456}]}],"has_more":true}"#,
+        r#"{"type":"HistoryPage","messages":[{"seq":3,"role":"user","rendered_html":"<details class=\"brenn-system\">sys</details>","timestamp":"2026-03-26T14:32:00+09:00","category":"EventDrain"},{"seq":4,"role":"user","rendered_html":"<p>check this receipt</p>","timestamp":"2026-03-26T14:33:00+09:00","username":"bob","attachments":[{"upload_id":"550e8400-e29b-41d4-a716-446655440000","filename":"receipt.jpg","media_type":"image/jpeg","size":123456,"secret":false}]}],"has_more":true}"#,
     );
 }
 

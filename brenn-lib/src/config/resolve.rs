@@ -848,6 +848,9 @@ pub fn resolve_apps(
         } else {
             runtime_dir.join("brenn").join(&raw.slug)
         };
+        // TODO(security-host-paths-follow-agent-symlinks): create_dir_all follows a
+        // symlinked ancestor and creates directories at its target; the check below
+        // catches only a target inside the working directory or a repo mount.
         std::fs::create_dir_all(&state_dir).unwrap_or_else(|e| {
             panic!(
                 "app {:?}: failed to create state_dir {}: {e}",
@@ -860,6 +863,7 @@ pub fn resolve_apps(
             dir = %state_dir.display(),
             "resolved per-app state_dir",
         );
+        assert_state_dir_outside_trees(&raw.slug, &state_dir, &working_dir, &resolved_mounts);
 
         let resolved = AppConfig {
             slug: raw.slug.clone(),
@@ -1229,6 +1233,62 @@ fn warn_granted_publish_no_matcher(app_slug: &str, policy: &crate::access::AppPo
                  — it resolves to a deny-all publish policy; author an \
                  [[app.acl.{acl_table}]] matcher",
             );
+        }
+    }
+}
+
+/// Panic if `state_dir` lies inside the working directory or a repo mount. The
+/// state directory holds the app's secrets inbox; the file route serves the
+/// working directory, and every repo tree can be staged and pushed.
+fn assert_state_dir_outside_trees(
+    slug: &str,
+    state_dir: &std::path::Path,
+    working_dir: &std::path::Path,
+    mounts: &[ResolvedMount],
+) {
+    let state = canonical_with_missing_tail(state_dir);
+    let roots = std::iter::once(working_dir).chain(mounts.iter().map(|m| m.host_path.as_path()));
+    for root in roots {
+        let canonical_root = canonical_with_missing_tail(root);
+        assert!(
+            !state.starts_with(&canonical_root),
+            "app {slug:?}: state_dir {} ({}) is inside {} ({}); the secrets directory \
+             under it would be served and could be committed",
+            state_dir.display(),
+            state.display(),
+            root.display(),
+            canonical_root.display(),
+        );
+    }
+}
+
+/// Canonicalize the longest existing ancestor of `path` and append the
+/// components below it unchanged. A repo mount may not be cloned yet at
+/// resolution, so its own path need not exist.
+fn canonical_with_missing_tail(path: &std::path::Path) -> std::path::PathBuf {
+    let mut existing = path;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        let probe = if existing.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            existing
+        };
+        match std::fs::canonicalize(probe) {
+            Ok(mut out) => {
+                out.extend(tail.iter().rev());
+                return out;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing
+                    .file_name()
+                    .unwrap_or_else(|| panic!("cannot canonicalize {}: {e}", path.display()));
+                tail.push(name);
+                existing = existing
+                    .parent()
+                    .unwrap_or_else(|| panic!("cannot canonicalize {}: {e}", path.display()));
+            }
+            Err(e) => panic!("cannot canonicalize {}: {e}", path.display()),
         }
     }
 }

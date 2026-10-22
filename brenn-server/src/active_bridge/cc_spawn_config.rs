@@ -388,6 +388,10 @@ pub fn render_virtual_tools(
 /// state_dir is guaranteed to exist (created at config-resolve time).
 ///
 /// Called once per app at startup (not per CC spawn).
+// TODO(security-host-paths-follow-agent-symlinks): std::fs::write
+// follows a symlink planted at `virtual-tools.json` and overwrites its target at startup.
+// TODO(quality-virtual-tools-final-symlink-left-open-though-local-fix-exists): a
+// `create_new` temp file renamed onto the path would replace that symlink, not follow it.
 pub fn write_virtual_tools_file(
     app_config: &brenn_lib::config::AppConfig,
     registry: &brenn_tool_registry::ToolRegistry,

@@ -564,3 +564,56 @@ new myapp: Assistant();
     ));
     assert!(config.apps[0].cc_extra_args.is_empty());
 }
+
+fn container_app_config(home_dir: &Path, working_dir: PathBuf) -> BrennConfig {
+    BrennConfig {
+        server: super::test_server_config(),
+        container: HashMap::from([(
+            "sandbox".to_string(),
+            ContainerConfig {
+                image: "brenn-cc:latest".to_string(),
+                home_dir: home_dir.to_path_buf(),
+                container_home: PathBuf::from("/home/user"),
+                extra_mounts: vec![],
+                extra_args: vec![],
+                tool_socket_selinux_context: None,
+            },
+        )]),
+        apps: vec![AppConfigRaw {
+            slug: "pfin".to_string(),
+            working_dir: Some(working_dir),
+            container: Some("sandbox".to_string()),
+            container_working_dir: Some(PathBuf::from("/home/user")),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+#[should_panic(expected = "is inside")]
+fn validate_working_dir_equal_to_home_dir_panics() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let config = container_app_config(home_dir.path(), home_dir.path().to_path_buf());
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "is inside")]
+fn validate_working_dir_symlinked_to_home_dir_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let home_dir = dir.path().join("home");
+    std::fs::create_dir(&home_dir).unwrap();
+    let link = dir.path().join("work");
+    std::os::unix::fs::symlink(&home_dir, &link).unwrap();
+    let config = container_app_config(&home_dir, link);
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        crate::runtime_dir::test_runtime_dir_once(),
+    );
+}

@@ -13,6 +13,12 @@
  * File attachments: supports file picker button, paste-to-attach, and drag-and-drop.
  * Files are uploaded via POST /app/{slug}/upload, tracked as pending attachments,
  * and included in the SendMessage when the user sends.
+ *
+ * Snippet composer: an inline panel whose text is attached as a text file. It
+ * opens from the menu, or pre-filled when a large text paste lands in the main
+ * box. Its Secret box, and the "Attach secret file" menu item, mark the
+ * upload secret: the server delivers it to the agent only, and the chip shows
+ * a lock instead of a preview.
  */
 
 import { LitElement, html, nothing } from "lit";
@@ -24,12 +30,45 @@ import type { TargetInfo } from "../generated/TargetInfo";
 import type { TargetUploadResponse } from "../generated/TargetUploadResponse";
 import type { UploadResponse } from "../generated/UploadResponse";
 import { setChatHasText } from "../keyboard-guard.js";
-import { maybeResizeImage } from "../image-resize.js";
+import { maybeResizeImage, type ResizeResult } from "../image-resize.js";
 import { describeReason, describeReasonShort, reportClientError } from "../error-reporter.js";
 import { MenuController } from "./menu-controller.js";
+import { SECRET_ATTACHMENT_TITLE } from "./secret-attachment.js";
 
 /** Max textarea height in px before scrollbar appears. */
 const MAX_HEIGHT = 120;
+
+/** A main-box text paste at least this many characters opens the snippet composer. */
+export const SNIPPET_OFFER_CHARS = 2000;
+/** A main-box text paste at least this many lines opens the snippet composer. */
+export const SNIPPET_OFFER_LINES = 20;
+/** Name given to a snippet whose name field is left empty. */
+const DEFAULT_SNIPPET_NAME = "snippet.txt";
+
+/** A caret range in the main box. */
+interface CaretRange {
+  start: number;
+  end: number;
+}
+
+/** One open snippet composer session. */
+interface ComposerState {
+  /** Current text of the composer textarea. */
+  text: string;
+  /** Current value of the name field. */
+  name: string;
+  /** Whether the Secret box is checked. */
+  secret: boolean;
+  /** Whether the user has unmasked a secret composer's text. */
+  show: boolean;
+  /**
+   * Caret range in the main box recorded when a large paste was diverted into
+   * the composer; non-null while "Paste inline" is offered. Any later change
+   * to the main box withdraws it, since the range no longer means the same
+   * place.
+   */
+  pasteOffer: CaretRange | null;
+}
 
 /** A file being uploaded or ready to attach. */
 interface PendingAttachment {
@@ -45,6 +84,8 @@ interface PendingAttachment {
   size: number;
   /** Local object URL for image preview (revoked on removal). */
   previewUrl: string | null;
+  /** Delivered to the agent only; never previewed, resized or served back. */
+  secret: boolean;
   /** Upload state. */
   status: "uploading" | "ready" | "error";
   /** Error message if status is "error". */
@@ -105,14 +146,32 @@ export class BrennInputBar extends LitElement {
   @state() private pendingAttachments: PendingAttachment[] = [];
   /** Whether the bottom menu popup is open. */
   @state() private menuOpen = false;
+  /** The open snippet composer session; null while the panel is closed. */
+  @state() private composer: ComposerState | null = null;
 
   @query("#input") private inputEl!: HTMLTextAreaElement;
   @query("#file-input") private fileInputEl!: HTMLInputElement;
   @query("#camera-input") private cameraInputEl!: HTMLInputElement;
   @query("#target-input") private targetInputEl!: HTMLInputElement;
+  @query(".snippet-text") private composerTextEl!: HTMLTextAreaElement | null;
 
   /** Name of the target being uploaded to (set before opening file picker). */
   private pendingTargetName = "";
+
+  /**
+   * Whether the next #file-input `change` uploads secret. Both "Attach file"
+   * menu items write it before opening the picker; handleFileSelect resets it.
+   */
+  private nextFileIsSecret = false;
+
+  private get composerHasText(): boolean {
+    return (this.composer?.text.length ?? 0) > 0;
+  }
+
+  /** Publish "some chat box holds text" to the keyboard guard. */
+  private syncKeyboardGuard(): void {
+    setChatHasText(this.hasText || this.composerHasText);
+  }
 
   /** Whether we have content to send (text or attachments). */
   private get hasContent(): boolean {
@@ -168,7 +227,7 @@ export class BrennInputBar extends LitElement {
     // Auto-focus on initial render.
     this.inputEl?.focus();
     // Sync initial text state to keyboard guard (covers restored drafts).
-    setChatHasText(this.hasText);
+    this.syncKeyboardGuard();
   }
 
   protected updated(changed: Map<string, unknown>): void {
@@ -201,6 +260,7 @@ export class BrennInputBar extends LitElement {
         ${this.pendingAttachments.length > 0
           ? html`<div class="attachment-strip">${this.renderAttachments()}</div>`
           : nothing}
+        ${this.composer ? this.renderComposer(this.composer) : nothing}
         <div class="input-row">
           <div class="menu-anchor">
             <button type="button"
@@ -253,9 +313,10 @@ export class BrennInputBar extends LitElement {
   /** Pre-fill the textarea with text (used by share target pickup). */
   prefillText(text: string): void {
     if (!this.inputEl) return;
+    this.withdrawPasteOffer();
     this.inputEl.value = text;
     this.hasText = text.trim().length > 0;
-    setChatHasText(this.hasText);
+    this.syncKeyboardGuard();
     this.autoResize();
   }
 
@@ -272,10 +333,13 @@ export class BrennInputBar extends LitElement {
   private renderAttachments() {
     return this.pendingAttachments.map(
       (att, idx) => html`
-        <div class="attachment-chip ${att.status}">
-          ${att.previewUrl
-            ? html`<img class="attachment-thumb" src=${att.previewUrl} alt=${att.filename}>`
-            : html`<span class="attachment-icon">\u{1F4C4}</span>`}
+        <div class="attachment-chip ${att.status} ${att.secret ? "secret" : ""}"
+             title=${att.secret ? SECRET_ATTACHMENT_TITLE : nothing}>
+          ${att.secret
+            ? html`<span class="attachment-icon">\u{1F512}</span>`
+            : att.previewUrl
+              ? html`<img class="attachment-thumb" src=${att.previewUrl} alt=${att.filename}>`
+              : html`<span class="attachment-icon">\u{1F4C4}</span>`}
           <span class="attachment-name">${att.filename}</span>
           ${att.status === "uploading"
             ? html`<span class="attachment-uploading">\u2026</span>`
@@ -307,9 +371,17 @@ export class BrennInputBar extends LitElement {
             </button>
           `,
         )}
-        <button type="button" class="menu-item" role="menuitem"
+        <button type="button" class="menu-item attach-file-menu-item" role="menuitem"
                 @click=${this.handleMenuAttach}>
           <span class="menu-item-icon">\u{1F4CE}</span> Attach file
+        </button>
+        <button type="button" class="menu-item attach-secret-menu-item" role="menuitem"
+                @click=${this.handleMenuAttachSecret}>
+          <span class="menu-item-icon">\u{1F512}</span> Attach secret file
+        </button>
+        <button type="button" class="menu-item snippet-menu-item" role="menuitem"
+                @click=${this.handleMenuSnippet}>
+          <span class="menu-item-icon">\u{1F4DD}</span> Snippet
         </button>
         <button type="button" class="menu-item camera-menu-item" role="menuitem"
                 @click=${this.handleMenuCamera}>
@@ -348,7 +420,202 @@ export class BrennInputBar extends LitElement {
 
   private handleMenuAttach(): void {
     this._setMenuOpen(false);
+    this.nextFileIsSecret = false;
     this.fileInputEl?.click();
+  }
+
+  private handleMenuAttachSecret(): void {
+    this._setMenuOpen(false);
+    this.nextFileIsSecret = true;
+    this.fileInputEl?.click();
+  }
+
+  private handleMenuSnippet(): void {
+    this._setMenuOpen(false);
+    this.openComposer("", null);
+  }
+
+  private renderComposer(c: ComposerState) {
+    const masked = c.secret && !c.show;
+    const canAttach = c.text.trim().length > 0;
+    return html`
+      <div class="snippet-composer ${c.secret ? "secret" : ""}"
+           @dragover=${this.handleComposerDragOver}
+           @drop=${this.handleComposerDrop}>
+        <textarea
+          class="snippet-text ${masked ? "masked" : ""}"
+          placeholder="Paste or type the snippet"
+          rows="3"
+          autocomplete="off"
+          autocapitalize="off"
+          autocorrect="off"
+          spellcheck="false"
+          data-lpignore="true"
+          data-1p-ignore
+          data-bwignore
+          .value=${c.text}
+          @input=${this.handleComposerInput}
+          @keydown=${this.handleComposerKeydown}
+          @paste=${this.handleComposerPaste}
+        ></textarea>
+        <div class="snippet-controls">
+          <input type="text"
+                 class="snippet-name"
+                 placeholder=${DEFAULT_SNIPPET_NAME}
+                 aria-label="Snippet file name"
+                 autocomplete="off"
+                 spellcheck="false"
+                 .value=${c.name}
+                 @input=${this.handleComposerNameInput}
+                 @keydown=${this.handleComposerKeydown}>
+          <label class="snippet-secret">
+            <input type="checkbox"
+                   class="snippet-secret-box"
+                   .checked=${c.secret}
+                   @change=${this.handleComposerSecretChange}>
+            \u{1F512} Secret
+          </label>
+          ${c.secret
+            ? html`<button type="button" class="snippet-btn snippet-show"
+                           aria-pressed=${c.show}
+                           @click=${this.handleComposerShowToggle}>
+                     ${c.show ? "Hide" : "Show"}
+                   </button>`
+            : nothing}
+          <span class="snippet-spacer"></span>
+          ${c.pasteOffer
+            ? html`<button type="button" class="snippet-btn snippet-paste-inline"
+                           @click=${this.handlePasteInline}>Paste inline</button>`
+            : nothing}
+          <button type="button" class="snippet-btn snippet-cancel"
+                  @click=${this.closeComposer}>Cancel</button>
+          <button type="button" class="snippet-btn snippet-attach"
+                  ?disabled=${!canAttach}
+                  @click=${this.attachSnippet}>Attach</button>
+        </div>
+      </div>
+    `;
+  }
+
+  /** Open the composer holding `text`; `offer` enables "Paste inline" at that range. */
+  private openComposer(text: string, offer: CaretRange | null): void {
+    this.composer = {
+      text,
+      name: DEFAULT_SNIPPET_NAME,
+      secret: false,
+      show: false,
+      pasteOffer: offer,
+    };
+    this.syncKeyboardGuard();
+    this.updateComplete
+      .then(() => {
+        const el = this.composerTextEl;
+        if (!el) return;
+        this.autoResize(el);
+        el.focus();
+      })
+      .catch(e => reportClientError(`composer focus escaped: ${String(e)}`));
+  }
+
+  private closeComposer(): void {
+    this.composer = null;
+    this.syncKeyboardGuard();
+    this.inputEl?.focus();
+  }
+
+  /** Replace the open composer session with `patch` applied; no-op while closed. */
+  private updateComposer(patch: Partial<ComposerState>): void {
+    if (this.composer) this.composer = { ...this.composer, ...patch };
+  }
+
+  private handleComposerInput(e: Event): void {
+    const el = e.target as HTMLTextAreaElement;
+    this.updateComposer({ text: el.value });
+    this.syncKeyboardGuard();
+    this.autoResize(el);
+  }
+
+  private handleComposerNameInput(e: Event): void {
+    this.updateComposer({ name: (e.target as HTMLInputElement).value });
+  }
+
+  private handleComposerSecretChange(e: Event): void {
+    this.updateComposer({ secret: (e.target as HTMLInputElement).checked, show: false });
+  }
+
+  private handleComposerShowToggle(): void {
+    if (this.composer) this.updateComposer({ show: !this.composer.show });
+  }
+
+  private handleComposerKeydown(e: KeyboardEvent): void {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      this.closeComposer();
+    } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.attachSnippet();
+    } else if (e.key === "Enter") {
+      // Plain Enter is a newline in the composer and never sends the message.
+      e.stopPropagation();
+      if (e.target instanceof HTMLInputElement) e.preventDefault();
+    }
+  }
+
+  private handleComposerPaste(e: ClipboardEvent): void {
+    const files = e.clipboardData?.files;
+    if (files && files.length > 0) {
+      e.preventDefault();
+      this.uploadFiles(files, this.composer?.secret ?? false);
+    }
+    // Text paste: the browser inserts it into the composer.
+  }
+
+  private handleComposerDragOver(e: DragEvent): void {
+    // Accept the drop here and keep the form's drop handler and highlight
+    // out of it.
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  /**
+   * Files dropped on the composer upload with its Secret flag, as pasted ones
+   * do; a drop without files is left to the browser.
+   */
+  private handleComposerDrop(e: DragEvent): void {
+    e.stopPropagation();
+    this.querySelector("form")?.classList.remove("drag-over");
+    const files = e.dataTransfer?.files;
+    if (files && files.length > 0) {
+      e.preventDefault();
+      this.uploadFiles(files, this.composer?.secret ?? false);
+    }
+  }
+
+  /** Attach the composer text as a text file, then clear and close the composer. */
+  private attachSnippet(): void {
+    if (!this.composer) return;
+    const { text, secret } = this.composer;
+    if (text.trim().length === 0) return;
+    const name = this.composer.name.trim() || DEFAULT_SNIPPET_NAME;
+    const file = new File([text], name, { type: "text/plain" });
+    this.closeComposer();
+    this.uploadFile(file, secret).catch(e => reportClientError(`uploadFile escaped: ${String(e)}`));
+  }
+
+  /** Drop "Paste inline": its recorded range is stale once the main box changes. */
+  private withdrawPasteOffer(): void {
+    if (this.composer?.pasteOffer) this.updateComposer({ pasteOffer: null });
+  }
+
+  /** Insert the diverted paste into the main box at its recorded caret range. */
+  private handlePasteInline(): void {
+    const offer = this.composer?.pasteOffer;
+    if (!this.composer || !offer || !this.inputEl) return;
+    this.inputEl.setRangeText(this.composer.text, offer.start, offer.end, "end");
+    this.closeComposer();
+    this.handleInput();
   }
 
   private handleMenuCamera(): void {
@@ -454,12 +721,14 @@ export class BrennInputBar extends LitElement {
       filename: a.filename,
       media_type: a.mediaType,
       size: a.size,
+      secret: a.secret,
     }));
     this.onSubmit?.(text, refs, meta);
 
+    this.withdrawPasteOffer();
     this.inputEl.value = "";
     this.hasText = false;
-    setChatHasText(false);
+    this.syncKeyboardGuard();
     this.clearAttachments();
     this.autoResize();
   }
@@ -486,8 +755,9 @@ export class BrennInputBar extends LitElement {
   }
 
   private handleInput(): void {
+    this.withdrawPasteOffer();
     this.hasText = (this.inputEl?.value.trim().length ?? 0) > 0;
-    setChatHasText(this.hasText);
+    this.syncKeyboardGuard();
     this.autoResize();
   }
 
@@ -496,8 +766,17 @@ export class BrennInputBar extends LitElement {
     if (files && files.length > 0) {
       e.preventDefault();
       this.uploadFiles(files);
+      return;
     }
-    // Text paste: let browser handle it normally.
+    // A large text paste is offered to the composer; the browser inserts the
+    // rest. An open composer already holding text is left alone.
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (!isLargePaste(text) || this.composerHasText || !this.inputEl) return;
+    e.preventDefault();
+    this.openComposer(text, {
+      start: this.inputEl.selectionStart,
+      end: this.inputEl.selectionEnd,
+    });
   }
 
   private handleCameraCapture(): void {
@@ -509,9 +788,11 @@ export class BrennInputBar extends LitElement {
   }
 
   private handleFileSelect(): void {
+    const secret = this.nextFileIsSecret;
+    this.nextFileIsSecret = false;
     const files = this.fileInputEl?.files;
     if (files && files.length > 0) {
-      this.uploadFiles(files);
+      this.uploadFiles(files, secret);
       // Reset so the same file can be selected again.
       this.fileInputEl.value = "";
     }
@@ -540,15 +821,20 @@ export class BrennInputBar extends LitElement {
 
   // --- Upload logic ---
 
-  private async uploadFiles(files: FileList): Promise<void> {
+  private async uploadFiles(files: FileList, secret = false): Promise<void> {
     for (const file of Array.from(files)) {
-      await this.uploadFile(file);
+      await this.uploadFile(file, secret);
     }
   }
 
-  private async uploadFile(file: File): Promise<void> {
+  /**
+   * Upload one chat attachment. A secret upload is sent byte-for-byte: no
+   * resize (so the image-disabled guard, which protects resize, does not
+   * apply) and no preview URL.
+   */
+  private async uploadFile(file: File, secret = false): Promise<void> {
     // Reject image uploads when config delivery failed at startup.
-    if (this.imageAttachmentsDisabled && file.type.startsWith("image/")) {
+    if (!secret && this.imageAttachmentsDisabled && file.type.startsWith("image/")) {
       this.onError?.("Image attachment disabled — server config error; reload page");
       return;
     }
@@ -560,7 +846,7 @@ export class BrennInputBar extends LitElement {
     const mimeOrDefault = (f: File): string =>
       f.type || "application/octet-stream";
 
-    const previewUrl = makePreviewUrl(file);
+    const previewUrl = secret ? null : makePreviewUrl(file);
 
     const placeholder: PendingAttachment = {
       localKey,
@@ -569,13 +855,16 @@ export class BrennInputBar extends LitElement {
       mediaType: mimeOrDefault(file),
       size: file.size,
       previewUrl,
+      secret,
       status: "uploading",
     };
 
     this.pendingAttachments = [...this.pendingAttachments, placeholder];
 
     // --- Resize (after placeholder is visible) ---
-    const resizeResult = await maybeResizeImage(file, this.maxLongEdge);
+    const resizeResult: ResizeResult = secret
+      ? { resized: false, file }
+      : await maybeResizeImage(file, this.maxLongEdge);
     if (resizeResult.resized) {
       const { from, to } = resizeResult;
       this.onResized?.(
@@ -617,6 +906,7 @@ export class BrennInputBar extends LitElement {
     try {
       const formData = new FormData();
       formData.append("file", fileToUpload);
+      if (secret) formData.append("secret", "1");
 
       const resp = await this.postUpload(formData);
 
@@ -688,8 +978,8 @@ export class BrennInputBar extends LitElement {
 
   // --- Resize ---
 
-  private autoResize(): void {
-    const el = this.inputEl;
+  /** Fit a textarea (the main box by default) to its content, up to MAX_HEIGHT. */
+  private autoResize(el: HTMLTextAreaElement | null = this.inputEl): void {
     if (!el) return;
     // Reset to auto to measure natural scrollHeight.
     el.style.height = "auto";
@@ -733,6 +1023,12 @@ export class BrennInputBar extends LitElement {
     const nextIdx = (idx + 1) % this.availableModels.length;
     this.onModelChange?.(this.availableModels[nextIdx].value);
   }
+}
+
+/** Whether a main-box text paste is large enough to offer the snippet composer. */
+export function isLargePaste(text: string): boolean {
+  if (text.length >= SNIPPET_OFFER_CHARS) return true;
+  return text.split("\n").length >= SNIPPET_OFFER_LINES;
 }
 
 declare global {

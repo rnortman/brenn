@@ -391,7 +391,7 @@ impl WsConnection {
             attachment_refs,
             &self.app_slug,
             self.user_id,
-            &app_config.working_dir,
+            &app_config,
             &self.state.pending_uploads,
         )
         .await
@@ -935,6 +935,213 @@ mod tests {
 
         // Upload should be removed from pending.
         assert!(conn.state.pending_uploads.lock().await.is_empty());
+    }
+
+    /// Every (table, column) in the test database whose text contains `needle`.
+    fn db_columns_containing(conn: &rusqlite::Connection, needle: &str) -> Vec<String> {
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut hits = Vec::new();
+        for table in tables {
+            let columns: Vec<String> = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for column in columns {
+                let found = conn
+                    .prepare(&format!(
+                        "SELECT 1 FROM \"{table}\" WHERE instr(CAST(\"{column}\" AS TEXT), ?1) > 0 LIMIT 1"
+                    ))
+                    .unwrap()
+                    .exists([needle])
+                    .unwrap();
+                if found {
+                    hits.push(format!("{table}.{column}"));
+                }
+            }
+        }
+        hits
+    }
+
+    /// The bytes of a secret file and a secret snippet reach exactly one file
+    /// each under the secrets directory: not the DB, not the text sent to CC,
+    /// not the echo, not the working directory, not the logs.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn secret_attachment_bytes_reach_only_the_secrets_file() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use std::os::unix::fs::PermissionsExt;
+        use tower::ServiceExt;
+
+        const FILE_SENTINEL: &str = "SENTINEL-FILE-7f3a2c";
+        const SNIPPET_SENTINEL: &str = "SENTINEL-SNIPPET-91c4e0";
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::test_support::app_config::test_app_config_under(dir.path());
+        let working_dir = cfg.working_dir.clone();
+        let secrets_dir = cfg.secrets_dir();
+        let (mut conn, _ws_rx, db, user_id, _conv_id) = test_ws_conn_with_resume_conv_and_apps(
+            crate::test_support::app_config::single_app(cfg),
+        )
+        .await;
+        let (session_token, _csrf) = {
+            let db_conn = db.lock().await;
+            brenn_db::auth::session::create_session(&db_conn, user_id)
+        };
+
+        let mut file_bytes = vec![0u8, 1, 2];
+        file_bytes.extend_from_slice(FILE_SENTINEL.as_bytes());
+        file_bytes.push(0xff);
+        let uploads = [
+            ("key.bin", file_bytes.clone()),
+            ("snippet.txt", SNIPPET_SENTINEL.as_bytes().to_vec()),
+        ];
+        let mut upload_ids = Vec::new();
+        for (name, bytes) in &uploads {
+            let (content_type, body) = crate::test_support::http::multipart_body_with_fields(
+                name,
+                bytes,
+                &[("secret", "1")],
+            );
+            let response = crate::router::build_router(conn.state.clone(), None, 0, 2576)
+                .layer(MockConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    9999,
+                ))))
+                .oneshot(
+                    axum::http::Request::post("/app/test/upload")
+                        .header("cookie", format!("brenn_session={session_token}"))
+                        .header("content-type", content_type)
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let resp: serde_json::Value = serde_json::from_str(
+                &crate::test_support::http::body_string(response.into_body()).await,
+            )
+            .unwrap();
+            upload_ids.push(resp["upload_id"].as_str().unwrap().to_string());
+        }
+
+        let bridge = conn.test_bridge.clone().expect("test_bridge is populated");
+        let mut echo_rx = bridge.subscribe();
+        let mut cc_rx = bridge.install_recording_session_for_test().await;
+
+        conn.handle_send_message(
+            "here are the credentials",
+            upload_ids
+                .iter()
+                .map(|id| brenn_ws_types::AttachmentRef {
+                    upload_id: id.clone(),
+                })
+                .collect(),
+            None,
+            vec![],
+        )
+        .await;
+
+        let secret_paths: Vec<std::path::PathBuf> = upload_ids
+            .iter()
+            .zip(&uploads)
+            .map(|(id, (name, _))| secrets_dir.join(format!("{id}_{name}")))
+            .collect();
+
+        // The database holds neither sentinel, in any table or column.
+        {
+            let db_conn = db.lock().await;
+            assert!(
+                !db_columns_containing(&db_conn, "here are the credentials").is_empty(),
+                "the scan finds the message text it is meant to search alongside"
+            );
+            for sentinel in [FILE_SENTINEL, SNIPPET_SENTINEL] {
+                let hits = db_columns_containing(&db_conn, sentinel);
+                assert!(hits.is_empty(), "{sentinel} found in DB at {hits:?}");
+            }
+        }
+
+        // CC is told each secret's path, never its contents.
+        // Every user turn CC received, concatenated; control requests (the
+        // model assertion) carry no message text.
+        let mut user_turns = Vec::new();
+        while let Ok(envelope) = cc_rx.try_recv() {
+            if let brenn_cc::protocol::CcOutgoing::User { message } = &envelope.msg {
+                for block in &message.content {
+                    if let brenn_cc::protocol::UserContentBlock::Text { text } = block {
+                        user_turns.push(text.clone());
+                    }
+                }
+            }
+        }
+        assert!(!user_turns.is_empty(), "the message reached CC");
+        let cc_text = user_turns.join("\n");
+        for path in &secret_paths {
+            assert!(
+                cc_text.contains(&format!("[Attached secret: {}", path.display())),
+                "CC text lacks the notification for {}: {cc_text}",
+                path.display()
+            );
+        }
+        assert!(!cc_text.contains("attachments/"), "CC text: {cc_text}");
+        for sentinel in [FILE_SENTINEL, SNIPPET_SENTINEL] {
+            assert!(!cc_text.contains(sentinel), "CC text carries {sentinel}");
+        }
+
+        // The echo marks both secret and carries no bytes.
+        let echo = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match tokio::time::timeout_at(deadline, echo_rx.recv()).await {
+                    Ok(Ok(msg @ WsServerMessage::UserMessageEcho { .. })) => break msg,
+                    Ok(Ok(_)) => continue,
+                    _ => panic!("no UserMessageEcho received within 2s"),
+                }
+            }
+        };
+        let WsServerMessage::UserMessageEcho { attachments, .. } = &echo else {
+            unreachable!()
+        };
+        assert_eq!(attachments.len(), 2);
+        assert!(attachments.iter().all(|a| a.secret), "{attachments:?}");
+        let echo_json = serde_json::to_string(&echo).unwrap();
+        for sentinel in [FILE_SENTINEL, SNIPPET_SENTINEL] {
+            assert!(!echo_json.contains(sentinel), "echo carries {sentinel}");
+        }
+
+        // Nothing under the working directory holds either sentinel.
+        for path in crate::test_support::files_under(&working_dir) {
+            let bytes = std::fs::read(&path).unwrap();
+            for sentinel in [FILE_SENTINEL, SNIPPET_SENTINEL] {
+                assert!(
+                    !bytes
+                        .windows(sentinel.len())
+                        .any(|w| w == sentinel.as_bytes()),
+                    "{} carries {sentinel}",
+                    path.display()
+                );
+            }
+        }
+
+        // Each secrets file holds exactly its bytes, 0600.
+        for (path, (_, bytes)) in secret_paths.iter().zip(&uploads) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        assert!(!logs_contain(FILE_SENTINEL));
+        assert!(!logs_contain(SNIPPET_SENTINEL));
     }
 
     #[tokio::test]

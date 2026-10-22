@@ -7,6 +7,21 @@ pub mod mqtt;
 pub mod state;
 pub mod wasm;
 
+/// Every non-directory path under `dir`, recursively. Panics if `dir` cannot
+/// be read.
+pub fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(files_under(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// Open an in-memory database carrying the server's slice.
 ///
 /// Uses `crate::db::run_server_slice_migrations` — the same function the

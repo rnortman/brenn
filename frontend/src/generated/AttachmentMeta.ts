@@ -3,4 +3,8 @@
 /**
  * Attachment metadata sent in `UserMessageEcho` and history replay.
  */
-export type AttachmentMeta = { upload_id: string, filename: string, media_type: string, size: number, };
+export type AttachmentMeta = { upload_id: string, filename: string, media_type: string, size: number, 
+/**
+ * Delivered to the agent's secrets directory; rendered without a link.
+ */
+secret: boolean, };

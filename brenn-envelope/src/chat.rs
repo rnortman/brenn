@@ -325,6 +325,10 @@ pub struct AttachmentMeta {
     pub filename: String,
     pub media_type: String,
     pub size: u64,
+    /// The file was delivered to the agent only; no retrieval route exists.
+    /// Present on the wire only when `true`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secret: bool,
 }
 
 /// A model the conversation may be switched to, as reported by the harness.
@@ -757,9 +761,22 @@ mod tests {
                 filename: "notes.md".to_string(),
                 media_type: "text/markdown".to_string(),
                 size: 17,
+                secret: false,
             }],
             sender: legacy_ws_sender("alice"),
             correlation: Some("alice-42".to_string()),
+        });
+        round_trip_event(ChatEvent::UserMessage {
+            text: "here is the token".to_string(),
+            attachments: vec![AttachmentMeta {
+                upload_id: "b0a1c2d3-0000-4000-8000-000000000003".to_string(),
+                filename: "token.json".to_string(),
+                media_type: "text/plain".to_string(),
+                size: 312,
+                secret: true,
+            }],
+            sender: legacy_ws_sender("alice"),
+            correlation: None,
         });
         round_trip_event(ChatEvent::AssistantMessage {
             text: "# heading\n\nbody".to_string(),
@@ -899,6 +916,26 @@ mod tests {
                 correlation: None,
             }
         );
+    }
+
+    #[test]
+    fn attachment_secret_is_on_the_wire_only_when_true() {
+        let meta = |secret| AttachmentMeta {
+            upload_id: "b0a1c2d3-0000-4000-8000-000000000004".to_string(),
+            filename: "notes.md".to_string(),
+            media_type: "text/plain".to_string(),
+            size: 5,
+            secret,
+        };
+        let plain = serde_json::to_value(meta(false)).expect("meta serializes");
+        assert!(plain.get("secret").is_none(), "got {plain}");
+        let secret = serde_json::to_value(meta(true)).expect("meta serializes");
+        assert_eq!(secret["secret"], serde_json::json!(true));
+
+        let body = r#"{"upload_id":"b0a1c2d3-0000-4000-8000-000000000004","filename":"notes.md","media_type":"text/plain","size":5}"#;
+        let parsed: AttachmentMeta =
+            serde_json::from_str(body).expect("meta without secret decodes");
+        assert_eq!(parsed, meta(false));
     }
 
     #[test]

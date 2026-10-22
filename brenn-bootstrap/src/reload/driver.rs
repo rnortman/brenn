@@ -764,6 +764,10 @@ impl ReloadDriver {
             let path = super::agents::staged_virtual_tools_path(app);
             let rendered =
                 brenn_server::active_bridge::render_virtual_tools(app, &self.env.tool_registry);
+            // TODO(security-host-paths-follow-agent-symlinks): std::fs::write follows a
+            // symlink planted at `virtual-tools.json.next` and overwrites its target.
+            // TODO(quality-virtual-tools-final-symlink-left-open-though-local-fix-exists):
+            // removing any leftover `.next` and opening it `create_new` would refuse that symlink.
             if let Err(error) = std::fs::write(&path, rendered) {
                 for path in &written {
                     let _: std::io::Result<()> = std::fs::remove_file(path);

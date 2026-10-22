@@ -343,8 +343,25 @@ pub async fn assert_stale_client_close_and_no_alert(
 
 /// Build a minimal multipart/form-data body with one file field.
 pub fn multipart_body(filename: &str, content: &[u8]) -> (String, Vec<u8>) {
+    multipart_body_with_fields(filename, content, &[])
+}
+
+/// Build a multipart/form-data body with text `fields` followed by one file field.
+pub fn multipart_body_with_fields(
+    filename: &str,
+    content: &[u8],
+    fields: &[(&str, &str)],
+) -> (String, Vec<u8>) {
     let boundary = "----TestBoundary12345";
     let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(
         format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")

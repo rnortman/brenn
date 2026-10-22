@@ -1259,6 +1259,8 @@ pub struct AttachmentMeta {
     pub media_type: String,
     #[ts(type = "number")]
     pub size: u64,
+    /// Delivered to the agent's secrets directory; rendered without a link.
+    pub secret: bool,
 }
 
 /// Transient state of the CC interaction, for UI rendering.

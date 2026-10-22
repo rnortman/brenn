@@ -1169,6 +1169,7 @@ fn translate(msg: WsServerMessage, turns: &mut TurnIds) -> Vec<Outbound> {
                     filename: a.filename,
                     media_type: a.media_type,
                     size: a.size,
+                    secret: a.secret,
                 })
                 .collect(),
             sender: legacy_ws_sender(&username),
@@ -1432,6 +1433,7 @@ mod tests {
                     filename: "notes.md".to_string(),
                     media_type: "text/markdown".to_string(),
                     size: 17,
+                    secret: false,
                 }],
                 selected_tasks: vec![],
                 seq: Some(5),
@@ -1444,11 +1446,57 @@ mod tests {
                     filename: "notes.md".to_string(),
                     media_type: "text/markdown".to_string(),
                     size: 17,
+                    secret: false,
                 }],
                 sender: "legacy-ws:bob".to_string(),
                 correlation: None,
             },
             "input that arrived over the legacy websocket is attributed as such"
+        );
+
+        let secret_record = record(WsServerMessage::UserMessageEcho {
+            text: "the token".to_string(),
+            username: "bob".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            attachments: vec![ws::AttachmentMeta {
+                upload_id: "u2".to_string(),
+                filename: "token.json".to_string(),
+                media_type: "text/plain".to_string(),
+                size: 312,
+                secret: true,
+            }],
+            selected_tasks: vec![],
+            seq: Some(6),
+            bus_sender: None,
+        });
+        assert_eq!(
+            secret_record,
+            ChatEvent::UserMessage {
+                text: "the token".to_string(),
+                attachments: vec![chat::AttachmentMeta {
+                    upload_id: "u2".to_string(),
+                    filename: "token.json".to_string(),
+                    media_type: "text/plain".to_string(),
+                    size: 312,
+                    secret: true,
+                }],
+                sender: "legacy-ws:bob".to_string(),
+                correlation: None,
+            },
+            "a secret attachment's flag reaches the bus record"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&brenn_envelope::chat::encode(&secret_record))
+                .expect("record body is JSON");
+        let meta = body["attachments"][0]
+            .as_object()
+            .expect("record carries the attachment meta");
+        let mut keys: Vec<&str> = meta.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["filename", "media_type", "secret", "size", "upload_id"],
+            "the record names the secret file and its size, nothing else"
         );
     }
 

@@ -132,6 +132,7 @@ describe("appendUserMessage / _buildUserMessageEl", () => {
             filename: "live.png",
             media_type: "image/png",
             size: 512,
+            secret: false,
           },
         ],
       }),
@@ -299,6 +300,7 @@ describe("prependMessages", () => {
             filename: "my photo.png",
             media_type: "image/png",
             size: 1024,
+            secret: false,
           },
         ],
       },
@@ -343,6 +345,7 @@ describe("prependMessages", () => {
             filename: "report.pdf",
             media_type: "application/pdf",
             size: 5120,
+            secret: false,
           },
         ],
       },
@@ -362,6 +365,46 @@ describe("prependMessages", () => {
     expect(chip!.href).toContain("/app/myapp/attachment/u2/report.pdf");
     expect(chip!.textContent).toContain("report.pdf");
     expect(chip!.target).toBe("_blank");
+  });
+
+  it("renders a secret attachment as an unlinked lock chip", async () => {
+    const el = document.createElement("brenn-message-list") as BrennMessageList;
+    el.appSlug = "myapp";
+    document.body.appendChild(el);
+    await el.updateComplete;
+
+    const msgs: HistoryPageMessage[] = [
+      {
+        seq: 7,
+        role: "user",
+        rendered_html: '<div class="msg-text">here is the key</div>',
+        timestamp: new Date().toISOString(),
+        attachments: [
+          {
+            upload_id: "u3",
+            filename: "client.png",
+            media_type: "image/png",
+            size: 2048,
+            secret: true,
+          },
+        ],
+      },
+    ];
+    el.prependMessages(msgs);
+
+    const bubble = el.shadowRoot!.querySelector(".message-scroll .msg-user") as HTMLElement | null;
+    expect(bubble).toBeTruthy();
+    const attachDiv = bubble!.querySelector(".msg-attachments") as HTMLElement | null;
+    expect(attachDiv).toBeTruthy();
+
+    const chip = attachDiv!.querySelector(".msg-attachment-chip.secret") as HTMLElement | null;
+    expect(chip).toBeTruthy();
+    expect(chip!.tagName).toBe("SPAN");
+    expect(chip!.hasAttribute("href")).toBe(false);
+    expect(chip!.textContent).toContain("client.png");
+    expect(chip!.textContent).toContain("2.0 KB");
+    expect(attachDiv!.querySelector("img")).toBeNull();
+    expect(attachDiv!.querySelector("a")).toBeNull();
   });
 
   it("renders no attachment div when attachments absent", async () => {

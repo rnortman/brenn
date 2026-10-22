@@ -203,7 +203,9 @@ pub struct AppConfig {
     pub description: String,
     /// Icon shown on the app selector card (emoji or short string).
     pub icon: String,
-    /// Host-side working directory. Attachments are stored here.
+    /// Host-side working directory. Chat attachments are stored under its
+    /// `attachments/` subdirectory ([`AppConfig::attachments_dir`]); secret
+    /// attachments are not (see [`AppConfig::secrets_dir`]).
     pub working_dir: PathBuf,
     pub model: String,
     /// Allow-list of CC model aliases offered/accepted for this app.
@@ -308,6 +310,10 @@ pub struct AppConfig {
     /// Created unconditionally at config-resolve time; panics on failure (Brenn
     /// robustness principle: startup FS failure is a config/permission bug, not
     /// transient).
+    ///
+    /// Its `secrets/` subdirectory ([`AppConfig::secrets_dir`]) receives chat
+    /// attachments flagged secret: outside every repo mount, 0700, one 0600
+    /// file per upload.
     pub state_dir: PathBuf,
     /// Root of the per-conversation tool socket directories:
     /// `$XDG_RUNTIME_DIR/brenn-tool-sockets`. A sibling of the per-slug
@@ -584,6 +590,23 @@ impl AppConfig {
     /// the returned path through `self.path_mapper.to_container`.
     pub fn virtual_tools_path(&self) -> PathBuf {
         self.state_dir.join("virtual-tools.json")
+    }
+
+    /// Host-side directory for chat and target attachments: `attachments/`
+    /// under `working_dir`, so CC sees each file at the relative path
+    /// `attachments/<upload_id>_<name>`. Secret attachments are never written
+    /// here ([`AppConfig::secrets_dir`]).
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.working_dir.join("attachments")
+    }
+
+    /// Host-side inbox for secret chat attachments. Brenn writes one file per
+    /// upload as `<upload_id>_<name>` and sweeps only unreferenced files of
+    /// that shape; the agent is told to move each file out. Callers that need
+    /// the CC-visible path for a containerized app must run a file path
+    /// through `self.path_mapper.to_container`.
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.state_dir.join("secrets")
     }
 
     /// Check if a username has access to this app.

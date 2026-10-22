@@ -257,7 +257,7 @@ through.
 | field | type | meaning |
 |---|---|---|
 | `text` | string | the accepted text |
-| `attachments` | array | attachment metadata (`upload_id`, `filename`, `media_type`, `size`); omitted when empty |
+| `attachments` | array | attachment metadata (`upload_id`, `filename`, `media_type`, `size`, and `secret: true` when the file was delivered to the agent only and no retrieval route exists; `secret` is omitted otherwise); omitted when empty |
 | `sender` | string | who sent it — §3.1 |
 | `correlation` | string | the command's correlation, when it had one |
 

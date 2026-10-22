@@ -13,6 +13,26 @@ pub fn default_test_app_config(slug: &str, name: &str) -> AppConfig {
     }
 }
 
+/// The shared test `AppConfig` for slug `"test"` with `working_dir` at
+/// `root/wd` and `state_dir` at `root/state`, both created. The stock config
+/// points `state_dir` at the shared `/tmp`; anything a test writes under the
+/// state directory (the secrets inbox, say) belongs under `root` instead.
+pub fn test_app_config_under(root: &std::path::Path) -> AppConfig {
+    let mut cfg = default_test_app_config("test", "Test App");
+    cfg.working_dir = root.join("wd");
+    cfg.state_dir = root.join("state");
+    std::fs::create_dir_all(&cfg.working_dir).unwrap();
+    std::fs::create_dir_all(&cfg.state_dir).unwrap();
+    cfg
+}
+
+/// A registry holding `cfg` alone, keyed by its slug.
+pub fn single_app(cfg: AppConfig) -> Arc<IndexMap<String, AppConfig>> {
+    let mut apps = IndexMap::new();
+    apps.insert(cfg.slug.clone(), cfg);
+    Arc::new(apps)
+}
+
 /// `AppPolicy` for dynamic-subscribe fixture/gate tests. Grants
 /// `DynamicSubscribe` + `MqttSubscribe` + `MessagingSubscribe`. The `(client,
 /// filter)` params scope the single `mqtt_subscribe` matcher, so the MQTT gate's

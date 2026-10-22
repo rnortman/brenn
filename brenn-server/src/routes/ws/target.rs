@@ -138,7 +138,7 @@ impl WsConnection {
 
         // Extract everything we need from app_config upfront to avoid holding
         // the borrow across &mut self calls (ensure_bridge_for_target).
-        let (target, working_dir, container_spawn, path_mapper) = {
+        let (target, working_dir, attachments_dir, container_spawn, path_mapper) = {
             let app_config = self.app_config();
             let target = match app_config
                 .attachment_targets
@@ -165,6 +165,7 @@ impl WsConnection {
             (
                 target,
                 app_config.working_dir.clone(),
+                app_config.attachments_dir(),
                 app_config.container_spawn.clone(),
                 app_config.path_mapper.clone(),
             )
@@ -231,8 +232,23 @@ impl WsConnection {
                     });
                     return None;
                 }
+                // A secret never meets a target: the frontend never builds this
+                // request, so one arriving is crafted. The entry stays pending
+                // for the user's real SendMessage.
+                if entry.secret {
+                    log_and_alert_security_event(
+                        &self.state.alert_dispatcher,
+                        SecurityEventType::SchemaViolation,
+                        self.client_ip,
+                        &format!("RunTarget: upload_id {upload_id} is a secret attachment"),
+                    );
+                    let _ = self.send_ws(WsServerMessage::Error {
+                        message: "Upload not found".to_string(),
+                    });
+                    return None;
+                }
 
-                let file_path = working_dir.join("attachments").join(&entry.disk_filename);
+                let file_path = attachments_dir.join(&entry.disk_filename);
                 written_files.push(crate::routes::upload::WrittenFile {
                     upload_id,
                     filename: entry.filename.clone(),
@@ -439,6 +455,7 @@ mod tests {
             size: 12,
             uploaded_at: tokio::time::Instant::now(),
             uploader_user_id: user_id,
+            secret: false,
         };
         state
             .pending_uploads
@@ -542,6 +559,7 @@ mod tests {
                 size: 5,
                 uploaded_at: tokio::time::Instant::now(),
                 uploader_user_id: uid,
+                secret: false,
             };
             conn.state
                 .pending_uploads
@@ -581,6 +599,7 @@ mod tests {
                 size: 1,
                 uploaded_at: tokio::time::Instant::now(),
                 uploader_user_id: 9999, // Different user
+                secret: false,
             };
             conn.state
                 .pending_uploads
@@ -598,6 +617,56 @@ mod tests {
                 |m| matches!(m, WsServerMessage::Error { message } if message.contains("Upload not found"))
             ),
             "expected upload not found error for wrong user, got: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn run_target_refuses_secret_upload() {
+        let (mut conn, mut ws_rx, _db, uid, _wd, _tmp) = test_ws_conn_for_target(true).await;
+
+        let upload_id = uuid::Uuid::new_v4();
+        {
+            let pending = crate::state::PendingUpload {
+                app_slug: TEST_APP_SLUG.to_string(),
+                filename: "token.txt".to_string(),
+                disk_filename: format!("{upload_id}_token.txt"),
+                media_type: "text/plain".to_string(),
+                size: 5,
+                uploaded_at: tokio::time::Instant::now(),
+                uploader_user_id: uid,
+                secret: true,
+            };
+            conn.state
+                .pending_uploads
+                .lock()
+                .await
+                .insert(upload_id, pending);
+        }
+
+        let handle = conn
+            .handle_run_target("import", &[upload_id.to_string()])
+            .await;
+        assert!(handle.is_none(), "no target task may start for a secret");
+
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, WsServerMessage::Error { message } if message == "Upload not found")
+            ),
+            "expected upload not found error for a secret, got: {msgs:?}"
+        );
+        assert!(logs_contain("security_event=true"));
+        assert!(logs_contain(&format!(
+            "RunTarget: upload_id {upload_id} is a secret attachment"
+        )));
+        assert!(
+            conn.state
+                .pending_uploads
+                .lock()
+                .await
+                .contains_key(&upload_id),
+            "the secret stays pending for the user's real SendMessage"
         );
     }
 

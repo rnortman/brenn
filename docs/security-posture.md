@@ -254,6 +254,39 @@ be escaped or rendered through the sanctioned rendering boundary (§10). The
 security of the browser depends entirely on the backend's escaping; the browser
 performs no sanitization of its own and must not be relied on to.
 
+**Secret attachments.** A chat upload flagged secret is a credential the user
+hands to the agent. Brenn writes its bytes to one path — a file, mode 0600, in
+the app's secrets directory (`<state_dir>/secrets/`, mode 0700, derived from
+the state directory and checked at resolve time to lie outside the working
+directory and every repo mount) — and formats them into nothing else: the
+attachment route refuses a secret upload before touching the filesystem; the
+database, the bus record, Brenn's transcript and every log hold its name and
+size only; and so do the echo and conversation history Brenn sends back to the
+browser, which supplied the bytes and never receives them. The text sent to CC carries its agent-visible
+path and size and an instruction not to read it. A serve request or a target
+run naming a secret upload, a `secret` value other than `"1"`, or `secret`
+combined with a target is rejected and logged as a security event — the
+frontend builds none of them. The directory is an inbox Brenn prunes (files
+Brenn wrote that no message references, after 24 h), not a store; the agent is
+told to move each file where it is needed. The directory is per app, not per
+user, as `attachments/` is. Two limits. First, the agent's container can read
+any file it can move, so the guarantee is the transport, not confidentiality
+from the model, which holds the credential under the same terms as CC's own
+account credential (§7.1a). Second, where the write lands is the agent's
+filesystem to redirect. For a containerized app the secrets directory sits in
+the container home, a tree the agent can rewrite: an agent that replaces
+`~/.config/brenn/<slug>` or an ancestor with a symlink sends the host-side
+write to the symlink's target — the working directory or a repo mount, where
+Brenn's file routes serve it to every user of the app and, in a repo mount,
+`GitRepoCommitAndPush` stages it with `git add -A` on the next approved push,
+or a host path outside the container's mounts altogether. That is the pre-existing unconfined-sink
+finding under §7.4 — the path is Brenn's, the filesystem it resolves through is
+the agent's — shared with `attachments/` and `virtual-tools.json` and tracked
+as `security-host-paths-follow-agent-symlinks` in `TODO.md`. A bare agent runs
+as Brenn's own uid with no filesystem restriction (§9d), and neither placement
+claim bounds it. On a home the agent has not rewritten, the placement above is
+exact: the file is in no git tree and no Brenn git operation touches it.
+
 **What the reviewer verifies:** authority comes from the session everywhere; the
 inbound schema is closed and rejects+signals unknowns; every security-relevant
 field is bound/allowlisted at intake; state-changing entry points carry CSRF-

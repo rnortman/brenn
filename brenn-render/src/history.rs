@@ -672,6 +672,7 @@ mod tests {
                 media_type: "image/jpeg".to_string(),
                 size: 12345,
                 disk_filename: "550e8400-e29b-41d4-a716-446655440000_receipt.jpg".to_string(),
+                secret: false,
             }],
         );
 
@@ -2322,6 +2323,7 @@ mod tests {
                     media_type: "image/png".to_string(),
                     size: 2048,
                     disk_filename: "test-upload-id-001_photo.png".to_string(),
+                    secret: false,
                 },
                 conversation::StoredAttachment {
                     upload_id: "test-upload-id-002".to_string(),
@@ -2330,6 +2332,7 @@ mod tests {
                     media_type: "application/pdf".to_string(),
                     size: 4096,
                     disk_filename: "test-upload-id-002_doc.pdf".to_string(),
+                    secret: false,
                 },
             ],
         );
@@ -2425,6 +2428,7 @@ mod tests {
                 media_type: "application/pdf".to_string(),
                 size: 5000,
                 disk_filename: "test-upload-id-002_doc.pdf".to_string(),
+                secret: false,
             }],
         );
 

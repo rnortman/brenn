@@ -4,6 +4,24 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Chat can now hand the agent a secret, and paste text as a file.** The
+  attachment menu gains **Snippet**: an inline composer where you type or
+  paste text, name it (default `snippet.txt`) and attach it as a file instead
+  of putting it in the message. Pasting a large block (2000+ characters or
+  20+ lines) into the message box offers the same composer, with a
+  **Paste inline** button to keep the old behaviour. Both the composer and
+  file attachments have a 🔒 **Secret** checkbox. A secret attachment is
+  written only to a private per-app inbox, `<state_dir>/secrets/` (mode
+  0700, each file 0600, outside the working directory and every repo
+  mount); the database, logs, message bus and the chat history keep only its
+  name and size, it can never be downloaded back, and the agent is told its
+  path and asked to move it where needed without reading it. Unclaimed
+  files are deleted after 24 hours. This protects the transport, not the
+  secret from the model: the agent can still read the file. A known gap,
+  tracked as `security-host-paths-follow-agent-symlinks` in `TODO.md`: an
+  agent that replaces part of its container home with a symlink can
+  redirect where Brenn writes the file. `docs/security-posture.md`
+  describes the full policy.
 - **Brenn's secret-and-hygiene scanner (`scrub`) now enforces the
   design-reference rule on whole-tree scans, not just on diffs.** The rule
   that rejects comments citing private design documents (`design §2.1`,
