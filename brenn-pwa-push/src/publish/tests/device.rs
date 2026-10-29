@@ -275,3 +275,88 @@ async fn delivery_attaches_vapid_authorization_header() {
         "each JWT segment must be non-empty; got: {jwt}"
     );
 }
+
+/// The delivery POST carries the RFC 8030 / RFC 8291 headers and a body whose
+/// RFC 8188 header is well formed: salt, record size `len + 17`, a 65-byte
+/// `keyid` that is the ephemeral application-server P-256 key.
+#[tokio::test(flavor = "multi_thread")]
+async fn delivery_sends_aes128gcm_body_and_headers() {
+    let db = make_db_with_users().await;
+    let ep_url = "https://ep.example.com/push/alice";
+    {
+        let conn = db.lock().await;
+        upsert_subscription(
+            &conn,
+            1,
+            1,
+            &ValidatedEndpoint::for_testing(ep_url),
+            &valid_p256dh(),
+            &valid_auth(),
+        );
+    }
+
+    let mut responses = StdHashMap::new();
+    responses.insert(
+        ep_url.to_string(),
+        MockResponse::Ok {
+            status: 201,
+            delay: Duration::ZERO,
+        },
+    );
+    let poster = MockHttpPoster::new(responses);
+    let mock = Arc::clone(&poster);
+    let svc = make_service_with_poster(db, poster);
+    let ttl = 3600;
+    let result = Arc::clone(&svc)
+        .send(
+            1,
+            "graf",
+            "pwa_push:alice@laptop",
+            "body",
+            None,
+            ttl,
+            Urgency::Normal,
+            None,
+            None,
+            None,
+        )
+        .await;
+    match result {
+        PushSendResult::Ok { delivered, .. } => assert_eq!(delivered, 1),
+        other => panic!("expected Ok, got {other:?}"),
+    }
+
+    let captured = mock.take_captured();
+    assert_eq!(captured.len(), 1, "exactly one delivery request expected");
+    let req = &captured[0];
+    assert_eq!(req.method(), reqwest::Method::POST);
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} header must be set"))
+            .to_str()
+            .expect("header is ASCII")
+            .to_owned()
+    };
+    assert_eq!(header("content-encoding"), "aes128gcm");
+    assert_eq!(header("content-type"), "application/octet-stream");
+    assert_eq!(header("ttl"), ttl.to_string());
+
+    let body = req
+        .body()
+        .and_then(|b| b.as_bytes())
+        .expect("delivery body is in memory");
+    assert_eq!(header("content-length"), body.len().to_string());
+    assert!(
+        body.len() > 86,
+        "body holds the 86-byte header and a record"
+    );
+    let record_size = u32::from_be_bytes(body[16..20].try_into().expect("4 bytes"));
+    // One record: the plaintext, the 0x02 delimiter and the 16-byte tag, so
+    // the encrypted record is exactly `len + 17` = `record_size` bytes.
+    assert_eq!(record_size as usize, body.len() - 86);
+    assert_eq!(body[20], 65, "keyid length is an uncompressed P-256 point");
+    p256::PublicKey::from_sec1_bytes(&body[21..86])
+        .expect("keyid is a valid SEC1 uncompressed P-256 point");
+    assert_eq!(body[21], 0x04, "keyid is uncompressed");
+}

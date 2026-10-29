@@ -395,6 +395,7 @@ pub async fn run_server(
         mqtt_clients,
         pwa_push: resolved_pwa_push,
         claude_profiles,
+        oauth,
     } = validate_and_resolve(&config, &integration_registry, &runtime_dir);
 
     // The one agent table of this process. Every gate that decides on an agent
@@ -542,15 +543,27 @@ pub async fn run_server(
     let tool_server_origin: std::sync::Arc<str> = messaging_server_origin
         .clone()
         .unwrap_or_else(|| std::sync::Arc::from(config.server.bind_address.to_string()));
+    // Users' OAuth credentials: one service for the process, over the providers
+    // resolved at boot. A changed provider is a restart, so it is never rebuilt.
+    let oauth_service = oauth.map(|resolved| {
+        std::sync::Arc::new(brenn_oauth::OAuthService::new(
+            resolved,
+            guard.alert_dispatcher.clone(),
+        ))
+    });
     let tool_registry_core: std::sync::Arc<brenn_tool_registry::ToolRegistry> = {
         let git_repo_pull = brenn_tool_registry::GitRepoPullTool::new(
             repo_sync_result.clones.clone(),
             repo_sync_result.remote_locks.clone(),
             repo_sync_result.sender.clone(),
         );
-        let registry = brenn_tool_registry::ToolRegistry::new(vec![
-            brenn_tool_registry::RegisteredTool::Async(std::sync::Arc::new(git_repo_pull)),
-        ]);
+        let mut tools = vec![brenn_tool_registry::RegisteredTool::Async(
+            std::sync::Arc::new(git_repo_pull),
+        )];
+        if let Some(service) = &oauth_service {
+            tools.extend(service.tools());
+        }
+        let registry = brenn_tool_registry::ToolRegistry::new(tools);
         registry.validate_config(&apps);
         std::sync::Arc::new(registry)
     };
@@ -1008,6 +1021,7 @@ pub async fn run_server(
         attach_heartbeat_secs: brenn_surface_server::HEARTBEAT_SECS,
         cc_profiles: cc_profiles.clone(),
         epoch_reconciler: epoch_reconciler.clone(),
+        oauth: oauth_service,
     };
 
     // One table, or a reload swaps a map some gate is not reading.

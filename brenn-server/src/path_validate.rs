@@ -99,9 +99,69 @@ pub fn validate_app_path(raw: &str) -> Result<String, &'static str> {
     Ok(canonical)
 }
 
+/// The longest `next` the login page carries back.
+pub const MAX_LOGIN_NEXT_BYTES: usize = 2048;
+
+/// The path prefixes an unauthenticated GET is returned to after login.
+pub const LOGIN_NEXT_PREFIXES: &[&str] = &["/app/", "/r/", "/oauth/"];
+
+/// Validate and canonicalize a post-login return path.
+///
+/// [`validate_same_origin_path`], plus: at most [`MAX_LOGIN_NEXT_BYTES`]; no
+/// fragment; the path portion begins with one of [`LOGIN_NEXT_PREFIXES`].
+pub fn validate_login_next(raw: &str) -> Result<String, &'static str> {
+    static ERR_NEXT: &str =
+        "invalid next: must be a same-origin `/app/`, `/r/` or `/oauth/` path without a fragment";
+    if raw.len() > MAX_LOGIN_NEXT_BYTES || raw.contains('#') {
+        return Err(ERR_NEXT);
+    }
+    let canonical = validate_same_origin_path(raw)?;
+    let path_only = canonical
+        .split_once('?')
+        .map_or(canonical.as_str(), |(p, _)| p);
+    if !LOGIN_NEXT_PREFIXES
+        .iter()
+        .any(|prefix| path_only.starts_with(prefix))
+    {
+        return Err(ERR_NEXT);
+    }
+    Ok(canonical)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- validate_login_next ---
+
+    #[test]
+    fn login_next_accepts_each_prefix_with_a_query() {
+        for raw in [
+            "/app/x",
+            "/r/0123abcd?to=/app/x/c/1",
+            "/oauth/google/callback?state=ab&code=4%2F0A",
+        ] {
+            assert_eq!(validate_login_next(raw).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn login_next_refuses_what_it_must() {
+        let long = format!("/app/x?{}", "a".repeat(MAX_LOGIN_NEXT_BYTES));
+        for raw in [
+            "https://evil.example/app/x",
+            "//evil.example/app/x",
+            "/health",
+            "/",
+            "/application/x",
+            "/app/x#frag",
+            "/app/../health",
+            "/app/%2E%2E/health",
+            long.as_str(),
+        ] {
+            assert!(validate_login_next(raw).is_err(), "{raw} must be refused");
+        }
+    }
 
     // --- validate_same_origin_path (migrated from pwa_push_intercept.rs) ---
 

@@ -8,6 +8,7 @@
 //!   - `service`: the `list_targets` / `get_target` query methods + accessors.
 //!   - `send`: the `send()` publish pipeline.
 //!   - `delivery`: single-subscription delivery + fan-out collection.
+//!   - `encrypt`: RFC 8291 push-payload encryption.
 //!   - `http_poster`: the `HttpPoster` trait + `ReqwestPoster`.
 
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use brenn_lib::pwa_push::config::ResolvedPwaPushConfig;
 use brenn_obs::alerting::AlertDispatcher;
 
 mod delivery;
+mod encrypt;
 mod http_poster;
 mod send;
 mod service;

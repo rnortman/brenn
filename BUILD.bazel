@@ -151,6 +151,7 @@ filegroup(
         "//brenn-messaging-boot:policy_srcs",
         "//brenn-messaging-store:policy_srcs",
         "//brenn-mqtt:policy_srcs",
+        "//brenn-oauth:policy_srcs",
         "//brenn-obs:policy_srcs",
         "//brenn-pfin:policy_srcs",
         "//brenn-pwa-push:policy_srcs",

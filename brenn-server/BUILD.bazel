@@ -42,6 +42,7 @@ rust_library(
         "//brenn-messaging",
         "//brenn-messaging-store",
         "//brenn-mqtt",
+        "//brenn-oauth",
         "//brenn-obs",
         "//brenn-pfin",
         "//brenn-pwa-push",

@@ -1,11 +1,67 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-fn validate_dir_owner(dir_uid: u32, euid: u32, path: &std::path::Path) {
+fn validate_dir_owner(label: &str, dir_uid: u32, euid: u32, path: &Path) {
     if dir_uid != euid {
         panic!(
-            "XDG_RUNTIME_DIR validation failed: directory is not owned by the current euid \
+            "{label} validation failed: directory is not owned by the current euid \
              (path={}, observed_uid={dir_uid}, expected_euid={euid})",
+            path.display(),
+        );
+    }
+}
+
+/// Refuse a directory the server keeps private to itself unless it is
+/// absolute, exists, is a directory, is owned by the current effective uid,
+/// and has mode (low 9 bits) exactly `0o700`.
+///
+/// Panics with a message starting `"<label> validation failed:"`. A dangling
+/// symlink is "does not exist". Symlinks at the root are tolerated:
+/// `std::fs::metadata` follows them, so what is checked is the ownership and
+/// mode of the final target. High bits (setuid/setgid/sticky) are not checked.
+/// Canonicalisation is deliberately skipped.
+pub fn validate_private_dir(label: &str, path: &Path) {
+    if !path.is_absolute() {
+        panic!(
+            "{label} validation failed: path must be absolute \
+             (path={}, got a relative path)",
+            path.display(),
+        );
+    }
+
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            panic!(
+                "{label} validation failed: path does not exist (path={}); create it, owned \
+                 by the server's user, mode 0700",
+                path.display(),
+            );
+        }
+        Err(e) => {
+            panic!(
+                "{label} validation failed: could not stat path (path={}, error={e})",
+                path.display(),
+            );
+        }
+    };
+
+    if !meta.is_dir() {
+        panic!(
+            "{label} validation failed: path is not a directory (path={})",
+            path.display(),
+        );
+    }
+
+    // SAFETY: geteuid() has no failure mode and no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    validate_dir_owner(label, meta.uid(), euid, path);
+
+    let mode = meta.mode() & 0o777;
+    if mode != 0o700 {
+        panic!(
+            "{label} validation failed: directory mode must be 0700 \
+             (path={}, observed_mode={mode:04o}, expected_mode=0700)",
             path.display(),
         );
     }
@@ -15,65 +71,9 @@ fn validate_dir_owner(dir_uid: u32, euid: u32, path: &std::path::Path) {
 ///
 /// This is a pure function over its argument — it does not read the process
 /// environment. Panics — with a message starting `"XDG_RUNTIME_DIR validation
-/// failed:"` — if any of the following hold:
-///
-/// - The path is not absolute.
-/// - The path does not exist (includes dangling symlinks, since `metadata`
-///   follows symlinks).
-/// - The path does not resolve to a directory.
-/// - The resolved directory is not owned by the current effective uid.
-/// - The resolved directory's mode (low 9 bits) is not exactly `0o700`.
-///
-/// Symlinks at the root are tolerated: `std::fs::metadata` follows them, so
-/// what is checked is the ownership and mode of the final target. High bits
-/// (setuid/setgid/sticky) are not checked. Canonicalisation is deliberately
-/// skipped.
+/// failed:"` — under every condition [`validate_private_dir`] refuses.
 pub fn validate_runtime_dir(path: PathBuf) -> PathBuf {
-    if !path.is_absolute() {
-        panic!(
-            "XDG_RUNTIME_DIR validation failed: path must be absolute \
-             (path={}, got a relative path)",
-            path.display(),
-        );
-    }
-
-    let meta = match std::fs::metadata(&path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            panic!(
-                "XDG_RUNTIME_DIR validation failed: path does not exist (path={})",
-                path.display(),
-            );
-        }
-        Err(e) => {
-            panic!(
-                "XDG_RUNTIME_DIR validation failed: could not stat path (path={}, error={e})",
-                path.display(),
-            );
-        }
-    };
-
-    if !meta.is_dir() {
-        panic!(
-            "XDG_RUNTIME_DIR validation failed: path is not a directory (path={})",
-            path.display(),
-        );
-    }
-
-    // SAFETY: geteuid() has no failure mode and no preconditions.
-    let euid = unsafe { libc::geteuid() };
-    let dir_uid = meta.uid();
-    validate_dir_owner(dir_uid, euid, &path);
-
-    let mode = meta.mode() & 0o777;
-    if mode != 0o700 {
-        panic!(
-            "XDG_RUNTIME_DIR validation failed: directory mode must be 0700 \
-             (path={}, observed_mode={mode:04o}, expected_mode=0700)",
-            path.display(),
-        );
-    }
-
+    validate_private_dir("XDG_RUNTIME_DIR", &path);
     path
 }
 
@@ -339,7 +339,7 @@ mod tests {
         // functions (`validate_runtime_dir`, `resolve_xdg_value`) which take
         // `PathBuf`/`&str` (both `UnwindSafe`) and need no wrapper.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            validate_dir_owner(9999, 1000, fake_path)
+            validate_dir_owner("XDG_RUNTIME_DIR", 9999, 1000, fake_path)
         }));
         let msg = unwrap_panic_msg(result.unwrap_err());
         assert!(

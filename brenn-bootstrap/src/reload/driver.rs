@@ -844,8 +844,9 @@ impl ReloadDriver {
     /// step 2w: an agent's MQTT authority is validated against the declared
     /// clients and its webhook subscriptions are stamped off the declared
     /// endpoints, and both blocks converge, so the booted answer would be the
-    /// wrong one to gate the new document with. A panic out of the resolver is
-    /// classified as a refusal.
+    /// wrong one to gate the new document with. The credential vault is checked
+    /// against the candidate's roots, which a reload may move. A panic out of
+    /// the resolver is classified as a refusal.
     fn resolve_candidate_apps(
         &self,
         candidate: &brenn_lib::config::BrennConfig,
@@ -866,6 +867,7 @@ impl ReloadDriver {
                 webhook_subscriptions,
             );
             self.env.tool_registry.validate_config(&apps);
+            brenn_lib::config::assert_vault_disjoint_from_apps(candidate, &apps);
             apps
         }))
         .map_err(|payload| vec![app_resolver_refusal(payload)])?;
@@ -5239,6 +5241,37 @@ channel spare at "brenn:spare" {
         );
     }
 
+    /// An agent whose reloaded `working_dir` would expose the credential vault
+    /// is refused as boot would refuse it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_working_dir_that_covers_the_vault_is_refused() {
+        let host = tempfile::tempdir().expect("a host directory");
+        let vault = host.path().join("vault");
+        std::fs::create_dir(&vault).expect("a vault directory");
+        let server = format!(
+            "server {{ public_url = \"https://brenn.example.com\"; vault_dir = {:?}; }}",
+            vault.display().to_string()
+        );
+        let tree = Tree::holding(&document(&server));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        tree.write(&document(&server).replace(
+            "working_dir = \".\";",
+            &format!("working_dir = {:?};", host.path().display().to_string()),
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.refusals);
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        assert!(
+            status.refusals[0].contains("server.vault_dir validation failed")
+                && status.refusals[0].contains("working_dir"),
+            "{:?}",
+            status.refusals
+        );
+    }
+
     /// The whole point of the mounts document: a bundle installed after boot is
     /// a tree this process may read, with no restart and no argv edit. The
     /// consumer's record must name the *mount* as its root, since that is the
@@ -5925,6 +5958,7 @@ channel extra at "brenn:extra" {
                 acl_keys: &["repo"],
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
+                user_binding: brenn_tool_registry::UserBinding::None,
             }))),
         ]))
     }

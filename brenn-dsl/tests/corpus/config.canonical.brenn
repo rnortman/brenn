@@ -60,6 +60,18 @@ claude_profile spare {
   expires = "2027-09-01";
 }
 
+// One authorization server users connect their accounts through.
+oauth_provider google {
+  app_name = "Brenn";
+  client_secret_file = "/etc/brenn/google/client_secret.json";
+  authorize_url = "https://accounts.example.com/o/oauth2/v2/auth";
+  token_url = "https://oauth2.example.com/token";
+  userinfo_url = "https://openid.example.com/v1/userinfo";
+  account_field = "email";
+  scope_sets = { mail_readonly = ["https://mail.example.com/auth/readonly"] };
+  api_hosts = ["https://mail.example.com"];
+}
+
 repo_sync {
   repo_dir = "/home/alice/repos";
   poll_interval_secs = 300;

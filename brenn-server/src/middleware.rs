@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header::COOKIE;
-use axum::http::{Request, StatusCode};
+use axum::http::header::{COOKIE, UPGRADE};
+use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use brenn_db::auth::device::{Device, resolve_or_create_device};
@@ -10,10 +10,13 @@ use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 use tracing::info;
 
 use crate::client_ip::ClientIp;
+use crate::path_validate::validate_login_next;
 use crate::state::AppState;
 
 /// Auth middleware. Validates the session cookie and injects the Session and
-/// Device into request extensions. Returns 302 → /login if not authenticated.
+/// Device into request extensions. Returns 303 → `/auth/login` if not
+/// authenticated, carrying the requested path as `next` on a non-upgrade GET
+/// whose path [`validate_login_next`] admits.
 ///
 /// Device resolution runs only after authentication succeeds. Failed-auth
 /// paths short-circuit before any device DB access.
@@ -77,12 +80,72 @@ pub async fn require_auth(
         );
     }
 
-    Redirect::to("/auth/login").into_response()
+    Redirect::to(&login_redirect(&request)).into_response()
+}
+
+/// Where an unauthenticated request is sent: the login page, with the request
+/// as `next` when it is a page GET the login may return to. A websocket
+/// upgrade never follows the redirect, so it gets none.
+fn login_redirect(request: &Request<Body>) -> String {
+    if request.method() != Method::GET || request.headers().contains_key(UPGRADE) {
+        return "/auth/login".to_string();
+    }
+    let Some(path_and_query) = request.uri().path_and_query() else {
+        return "/auth/login".to_string();
+    };
+    match validate_login_next(path_and_query.as_str()) {
+        Ok(next) => format!("/auth/login?{}", login_next_query(&next)),
+        Err(_) => "/auth/login".to_string(),
+    }
+}
+
+/// `next=<next>`, form-urlencoded.
+pub(crate) fn login_next_query(next: &str) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("next", next)
+        .finish()
 }
 
 // CSRF validation is done per-handler for form-based endpoints (the handler has
 // access to the parsed form body). For future API endpoints using JSON bodies,
-// an X-CSRF-Token header check can be added as middleware here.
+// an X-CSRF-Token header check can be added as middleware here. The forms that
+// mint a session have no session to hold a token, so they refuse cross-site
+// posts by origin instead: `cross_site_form_post`.
+
+/// Why a form post that mints a session (login, registration) is refused as
+/// sent from another site, or `None` when it came from one of Brenn's own pages
+/// or from no browser at all.
+///
+/// A post from another site would sign the browser into an account its owner
+/// did not choose (login CSRF). `Sec-Fetch-Site` decides when present: only
+/// `same-origin`, and `none` (the user's own navigation), are Brenn's pages. A
+/// browser that sends no fetch metadata still sends `Origin` on a form post,
+/// which must name the host the request was sent to. A request with neither
+/// header came from no browser, so it holds no one else's cookie jar.
+pub(crate) fn cross_site_form_post(headers: &HeaderMap) -> Option<String> {
+    let text = |name: &str| {
+        headers
+            .get(name)
+            .map(|v| v.to_str().unwrap_or("<not text>").to_string())
+    };
+    if let Some(site) = text("sec-fetch-site") {
+        return match site.as_str() {
+            "same-origin" | "none" => None,
+            _ => Some(format!("Sec-Fetch-Site: {site}")),
+        };
+    }
+    let origin = text("origin")?;
+    let host = text("host");
+    let same_host = match (origin.split_once("://"), &host) {
+        (Some((_, authority)), Some(host)) => authority.eq_ignore_ascii_case(host),
+        _ => false,
+    };
+    if same_host {
+        None
+    } else {
+        Some(format!("Origin {origin:?} is not the host {host:?}"))
+    }
+}
 
 /// Extract a named cookie value from the request.
 ///

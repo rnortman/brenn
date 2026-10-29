@@ -1831,6 +1831,9 @@ vocabulary! {
         /// Required: a server without it does not start, and refusing the block
         /// here says so at the block instead of at startup with no position.
         req public_url: V,
+        /// Where Brenn keeps the users' third-party credentials. Required
+        /// exactly when an `oauth_provider` is declared; checked at boot.
+        opt vault_dir: V,
     }
 
     /// The `database` section.
@@ -1897,6 +1900,23 @@ vocabulary! {
     struct ClaudeProfileAttrs<V> {
         opt token_file: V,
         opt expires: V,
+    }
+
+    /// An `oauth_provider` block: one authorization server Brenn connects
+    /// users' accounts through. The block's name is the provider's slug.
+    struct OAuthProviderAttrs<V> {
+        req app_name: V,
+        req client_secret_file: V,
+        req authorize_url: V,
+        req token_url: V,
+        opt revoke_url: V,
+        req userinfo_url: V,
+        req account_field: V,
+        opt base_scopes: V,
+        req scope_sets: V,
+        opt extra_authorize_params: V,
+        req api_hosts: V,
+        opt max_response_bytes: V,
     }
 
     /// The `repo_sync` section: where repo clones live, how often repos are
@@ -2022,6 +2042,7 @@ kindword_dispatch! {
     "watchdog" unnamed => Watchdog(WatchdogAttrs),
     "container" named => Container(ContainerAttrs),
     "claude_profile" named => ClaudeProfile(ClaudeProfileAttrs),
+    "oauth_provider" named => OAuthProvider(OAuthProviderAttrs),
     "integration" named => Integration(OpenAttrs),
 }
 

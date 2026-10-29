@@ -4779,6 +4779,7 @@ mod tests {
             trusted_proxy_hops: 0,
             pid_file: None,
             public_url: public_url.map(str::to_string),
+            vault_dir: None,
         }
     }
 

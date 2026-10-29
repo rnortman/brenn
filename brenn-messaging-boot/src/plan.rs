@@ -417,7 +417,9 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
         }
         if let Some(registry) = tool_registry {
             registry.validate_grants(
-                &format!("wasm consumer {:?}", consumer.slug),
+                brenn_tool_registry::GrantOwner::WasmConsumer {
+                    slug: &consumer.slug,
+                },
                 &consumer.policy.tool_grants,
             );
         }

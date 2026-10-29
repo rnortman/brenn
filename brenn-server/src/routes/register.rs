@@ -1,8 +1,8 @@
 use axum::Extension;
 use axum::Form;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::http::header::SET_COOKIE;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use brenn_db::auth::invite::{has_unused_invite_codes, use_invite_code, validate_invite_code};
 use brenn_db::auth::password::hash_password;
@@ -13,7 +13,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::client_ip::ClientIp;
-use crate::middleware::session_cookie;
+use crate::middleware::{cross_site_form_post, session_cookie};
 use crate::state::AppState;
 
 /// Minimum password length. 12 characters — not a consumer SaaS with password fatigue.
@@ -98,8 +98,18 @@ pub async fn register_page(
 pub async fn register_submit(
     State(state): State<AppState>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
+    headers: HeaderMap,
     Form(form): Form<RegisterForm>,
 ) -> Response {
+    if let Some(reason) = cross_site_form_post(&headers) {
+        log_and_alert_security_event(
+            &state.alert_dispatcher,
+            SecurityEventType::SchemaViolation,
+            ip,
+            &format!("register: cross-site form post refused ({reason})"),
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
     info!(username = %form.username, %ip, "registration attempt");
     state.alert_dispatcher.alert(
         AlertSeverity::Info,

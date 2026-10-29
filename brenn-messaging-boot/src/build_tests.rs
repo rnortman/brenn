@@ -3289,6 +3289,13 @@ async fn a_remote_and_a_surface_of_one_slug_hold_separate_send_budgets() {
 /// A registry holding one async tool `apull` (acl key `repo`), matching the
 /// git-repo-pull shape without needing the real repo-sync handles.
 fn async_tool_registry() -> std::sync::Arc<brenn_tool_registry::ToolRegistry> {
+    async_tool_registry_bound(brenn_tool_registry::UserBinding::None)
+}
+
+/// [`async_tool_registry`] with `apull` declaring `user_binding`.
+fn async_tool_registry_bound(
+    user_binding: brenn_tool_registry::UserBinding,
+) -> std::sync::Arc<brenn_tool_registry::ToolRegistry> {
     use brenn_tool_registry::ToolError;
     use brenn_tool_registry::descriptor::{AclDenied, Idempotency, ToolClass, ToolDescriptor};
     use brenn_tool_registry::tool::{AsyncTool, RegisteredTool, ToolCtx};
@@ -3321,6 +3328,7 @@ fn async_tool_registry() -> std::sync::Arc<brenn_tool_registry::ToolRegistry> {
             acl_keys: &["repo"],
             idempotency: Idempotency::Natural,
             auto_approve: true,
+            user_binding,
         }))),
     ]))
 }
@@ -3381,6 +3389,41 @@ async fn build_messaging_wires_async_tool_bus_for_granted_consumer() {
     );
     // A different consumer's inbox is not covered (the derivation is per-slug).
     assert!(!policy.allows_channel_access("brenn:tool-results/other"));
+}
+
+/// A wasm consumer's grant for a tool that acts as the acting user is refused
+/// at plan build, naming the consumer: a component call carries no acting user.
+#[tokio::test]
+#[should_panic(expected = "wasm consumer \"probe\": tool_grant for \"apull\" is refused")]
+async fn build_messaging_refuses_acting_user_tool_on_consumer() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_server::test_support::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let repo_clause = std::collections::BTreeMap::from([("repo".to_string(), "brenn".to_string())]);
+    let mut consumer = minimal_wasm_consumer();
+    consumer.tool_grants = vec![brenn_lib::tools::config::ToolGrantRaw {
+        tool: "apull".to_string(),
+        acl: vec![repo_clause],
+        rate_limit: None,
+    }];
+    let mut config = BrennConfig {
+        wasm_consumers: vec![consumer],
+        ..BrennConfig::default()
+    };
+    config.channels.push(surface_index_channel());
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+
+    boot_messaging_with_tools(
+        &config,
+        init_db_memory(),
+        &apps,
+        alert_dispatcher,
+        "brenn://test",
+        &async_tool_registry_bound(brenn_tool_registry::UserBinding::ActingUser),
+    )
+    .await;
 }
 
 /// The grant table the planner derives survives the hop boot carries it over:

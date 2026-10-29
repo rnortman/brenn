@@ -40,6 +40,7 @@ brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
 brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
 brenn-mqtt = { version = "0.1.0", path = "../brenn-mqtt" }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
+brenn-oauth = { version = "0.1.0", path = "../brenn-oauth" }
 brenn-pfin = { version = "0.1.0", path = "../brenn-pfin" }
 brenn-pwa-push = { version = "0.1.0", path = "../brenn-pwa-push" }
 brenn-remote-server = { version = "0.1.0", path = "../brenn-remote-server" }
@@ -100,6 +101,7 @@ brenn-db = { version = "0.1.0", path = "../brenn-db", features = ["testutils"] }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
 brenn-messaging = { version = "0.1.0", path = "../brenn-messaging", features = ["testutils"] }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
+brenn-oauth = { version = "0.1.0", path = "../brenn-oauth", features = ["testutils"] }
 brenn-pwa-push = { version = "0.1.0", path = "../brenn-pwa-push", features = ["testutils"] }
 brenn-render = { version = "0.1.0", path = "../brenn-render", features = ["testutils"] }
 brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry", features = ["testutils"] }

@@ -20,11 +20,37 @@ use brenn_dsl::diag::Diagnostic;
 use crate::access::AppPolicy;
 use crate::access::raw::ChannelMatcherRaw;
 use crate::config::{
-    AppConfig, BrennConfig, FrontmatterRenderConfig, PathMapper, PostPullHooksConfig,
-    RepoSyncConfig, StartHooksConfig, StartupHooksConfig,
+    AppConfig, BrennConfig, DEFAULT_MAX_RESPONSE_BYTES, FrontmatterRenderConfig, OAuthProviderRaw,
+    PathMapper, PostPullHooksConfig, RepoSyncConfig, StartHooksConfig, StartupHooksConfig,
 };
 use crate::messaging::AttachGrant;
 use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
+
+/// An `oauth_provider` section whose endpoints all live under `base` (an
+/// origin, which is also its one `api_hosts` entry): `<base>/authorize`,
+/// `/token`, `/revoke`, `/userinfo`; account field `email`; base scope
+/// `openid`; scope sets `mail` = `[mail.read]` and `calendar` =
+/// `[calendar.read]`; the default response limit. Tests override the fields
+/// they exercise with struct update.
+pub fn test_oauth_provider_raw(base: &str) -> OAuthProviderRaw {
+    OAuthProviderRaw {
+        app_name: "Brenn".to_string(),
+        client_secret_file: PathBuf::from("/unused/client_secret.json"),
+        authorize_url: format!("{base}/authorize"),
+        token_url: format!("{base}/token"),
+        revoke_url: Some(format!("{base}/revoke")),
+        userinfo_url: format!("{base}/userinfo"),
+        account_field: "email".to_string(),
+        base_scopes: vec!["openid".to_string()],
+        scope_sets: BTreeMap::from([
+            ("mail".to_string(), vec!["mail.read".to_string()]),
+            ("calendar".to_string(), vec!["calendar.read".to_string()]),
+        ]),
+        extra_authorize_params: BTreeMap::new(),
+        api_hosts: vec![base.to_string()],
+        max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+    }
+}
 
 /// A minimal `AppConfig`: `slug` for both the slug and the display name, and
 /// default-shape values for everything else, so the fields a test actually

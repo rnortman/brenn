@@ -5,10 +5,9 @@
 //! task-restore behavior so notification taps always open a fresh Brenn URL
 //! rather than the browser's last-active tab.
 //!
-//! The route is registered behind `require_auth` (see `main.rs`). An
-//! unauthenticated hit gets 303→`/auth/login` from the middleware before
-//! this handler is reached; the deep link is lost (same behavior as any
-//! protected `/app/` route today; no regression).
+//! The route is registered behind `require_auth`. An unauthenticated hit gets
+//! 303→`/auth/login?next=…` from the middleware before this handler is
+//! reached, and the login returns the browser here.
 
 use std::net::IpAddr;
 
@@ -240,6 +239,7 @@ mod tests {
             attach_heartbeat_secs: 1,
             cc_profiles: None,
             epoch_reconciler: None,
+            oauth: None,
             test_wake_bridge: Default::default(),
             wake_spawns: Default::default(),
         };

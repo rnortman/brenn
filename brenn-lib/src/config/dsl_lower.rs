@@ -93,6 +93,7 @@ use super::hooks::{PostPullHooksConfig, StartHooksConfig, StartupHooksConfig};
 use super::llm_chat::LlmChatConfig;
 use super::logging::{LevelFilter, LoggingConfig, deserialize_level_filter};
 use super::mcp::McpServerConfig;
+use super::oauth_provider::{DEFAULT_MAX_RESPONSE_BYTES, OAuthProviderRaw};
 use super::observability::{
     ObservabilityConfig, UsageObservabilityConfig, default_surface_error_publish_floor,
 };
@@ -173,6 +174,7 @@ pub fn lower(derived: DerivedConfig) -> Result<BrennConfig, Vec<Diagnostic>> {
         alerting: sections.alerting,
         claude_defaults: sections.claude_defaults.unwrap_or_default(),
         claude_profiles,
+        oauth_providers: sections.oauth_providers,
         repo_sync: sections.repo_sync.unwrap_or_default(),
         repos,
         container: sections.container,
@@ -890,11 +892,11 @@ impl<'a> Body<'a> {
 
     /// A map of string lists the target requires, as the map the raw field
     /// stores.
-    fn required_string_list_map(
+    fn required_string_list_map<M: FromIterator<(String, Vec<String>)>>(
         &mut self,
         key: &'static str,
         errors: &mut Vec<Diagnostic>,
-    ) -> Option<HashMap<String, Vec<String>>> {
+    ) -> Option<M> {
         let value = self.required(key, errors)?;
         expect_string_list_map(value, key, errors)
     }
@@ -956,6 +958,7 @@ struct Sections {
     /// applied: that needs `claude_defaults`, which the document may state
     /// after the profiles.
     claude_profiles: BTreeMap<String, StatedProfile>,
+    oauth_providers: BTreeMap<String, OAuthProviderRaw>,
 }
 
 /// One `claude_profile` block's body, held until the token-path convention can
@@ -1028,6 +1031,19 @@ fn sections(list: &[RSection], errors: &mut Vec<Diagnostic>) -> Sections {
                         at: section.kindword.span().clone(),
                     },
                 );
+            }
+            "oauth_provider" => {
+                let name = section
+                    .name
+                    .as_ref()
+                    .expect("an oauth_provider section carries a name")
+                    .value()
+                    .clone();
+                if let Some(provider) =
+                    oauth_provider(&name, section.kindword.span(), &mut body, errors)
+                {
+                    out.oauth_providers.insert(name, provider);
+                }
             }
             "integration" => {
                 let name = section
@@ -1182,6 +1198,7 @@ fn server(body: &mut Body, errors: &mut Vec<Diagnostic>) -> ServerConfig {
         // An `Option` the config refuses to boot without, and the vocabulary
         // requires: absence is refused here rather than at startup.
         public_url: body.required_str("public_url", errors),
+        vault_dir: body.path("vault_dir", errors),
     }
 }
 
@@ -1343,6 +1360,91 @@ fn claude_profiles(
         );
     }
     profiles
+}
+
+/// One `oauth_provider` block.
+///
+/// The name is a URL path segment and a vault directory name, so it is a slug.
+/// A provider with no scope set, an empty set, or no API host could connect
+/// nothing or send nothing, and is refused here. URLs, origins, the size limit
+/// and the client file are boot checks (`resolve_oauth`).
+fn oauth_provider(
+    name: &str,
+    at: &Span,
+    body: &mut Body,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<OAuthProviderRaw> {
+    let before = errors.len();
+    let what = format!("`oauth_provider {name}`");
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        errors.push(Diagnostic::at(
+            format!(
+                "{what}: the name must be lowercase letters, digits and `-` — it is a URL \
+                 path segment and a vault directory name"
+            ),
+            at.clone(),
+        ));
+    }
+    let app_name = body.required_str("app_name", errors);
+    let client_secret_file = body.required_path("client_secret_file", errors);
+    let authorize_url = body.required_str("authorize_url", errors);
+    let token_url = body.required_str("token_url", errors);
+    let revoke_url = body.str("revoke_url", errors);
+    let userinfo_url = body.required_str("userinfo_url", errors);
+    let account_field = body.required_str("account_field", errors);
+    let base_scopes = body.strings("base_scopes", errors).unwrap_or_default();
+    let scope_sets: Option<BTreeMap<String, Vec<String>>> =
+        body.required_string_list_map("scope_sets", errors);
+    if let Some(sets) = &scope_sets {
+        if sets.is_empty() {
+            errors.push(Diagnostic::at(
+                format!("{what}: `scope_sets` names no scope set; a connect could request nothing"),
+                at.clone(),
+            ));
+        }
+        for (set, scopes) in sets {
+            if scopes.is_empty() {
+                errors.push(Diagnostic::at(
+                    format!("{what}: `scope_sets.{set}` lists no scope"),
+                    at.clone(),
+                ));
+            }
+        }
+    }
+    let extra_authorize_params = body
+        .string_map("extra_authorize_params", errors)
+        .unwrap_or_default();
+    let api_hosts = body.required_strings("api_hosts", errors);
+    if api_hosts.as_ref().is_some_and(Vec::is_empty) {
+        errors.push(Diagnostic::at(
+            format!("{what}: `api_hosts` lists no origin; no request could be sent"),
+            at.clone(),
+        ));
+    }
+    let max_response_bytes = body
+        .int("max_response_bytes", errors)
+        .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
+    if errors.len() != before {
+        return None;
+    }
+    Some(OAuthProviderRaw {
+        app_name: app_name?,
+        client_secret_file: client_secret_file?,
+        authorize_url: authorize_url?,
+        token_url: token_url?,
+        revoke_url,
+        userinfo_url: userinfo_url?,
+        account_field: account_field?,
+        base_scopes,
+        scope_sets: scope_sets?,
+        extra_authorize_params,
+        api_hosts: api_hosts?,
+        max_response_bytes,
+    })
 }
 
 fn repo_sync(body: &mut Body, errors: &mut Vec<Diagnostic>) -> RepoSyncConfig {

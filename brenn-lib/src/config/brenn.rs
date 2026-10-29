@@ -12,6 +12,7 @@ use super::container::ContainerConfig;
 use super::events::EventsConfig;
 use super::logging::LoggingConfig;
 use super::mounts::{Roots, deployment_inputs};
+use super::oauth_provider::OAuthProviderRaw;
 use super::observability::ObservabilityConfig;
 use super::repo::{RepoDeclRaw, RepoSyncConfig};
 use super::security::SecurityConfig;
@@ -82,6 +83,8 @@ pub struct BrennConfig {
     pub claude_defaults: ClaudeDefaultsConfig,
     /// Declared Claude accounts, keyed by profile name.
     pub claude_profiles: std::collections::BTreeMap<String, ClaudeProfileRaw>,
+    /// Declared OAuth providers, keyed by provider slug.
+    pub oauth_providers: std::collections::BTreeMap<String, OAuthProviderRaw>,
     /// Repo-sync settings (polling interval, staleness cap, webhook URL prefix
     /// override). Omitting the section falls
     /// back to `RepoSyncConfig::default()`.

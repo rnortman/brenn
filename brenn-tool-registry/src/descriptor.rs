@@ -30,6 +30,16 @@ pub const MAX_FAST_RESULT_BYTES: usize = 256 * 1024;
 /// Maximum serialized result size for an async-class result activation.
 pub const MAX_ASYNC_RESULT_BYTES: usize = 512 * 1024;
 
+// An OAuth provider's response body limit is refused above this cap at boot;
+// the config layer holds its own copy because it cannot depend on this crate.
+const _: () = assert!(brenn_lib::config::MAX_RESPONSE_BYTES_CEILING == MAX_ASYNC_RESULT_BYTES);
+
+/// Bytes reserved for the executor's result envelope (`v`, `tool`, `call_id`,
+/// `outcome.ok`) around a tool's serialized value. A tool that bounds its own
+/// value to `MAX_ASYNC_RESULT_BYTES - ENVELOPE_MARGIN` never trips the
+/// executor's over-cap substitution.
+pub const ENVELOPE_MARGIN: usize = 4 * 1024;
+
 // The guest-facing caps live in `brenn-wasm` (which cannot depend on this crate)
 // and are enforced there; these copies exist so brenn-server code can reason
 // about the same numbers. brenn-server *does* see both crates, so pin the two
@@ -71,6 +81,21 @@ pub enum Idempotency {
     RequiresKey,
 }
 
+/// Whether a tool acts as a human user, and which callers may therefore hold a
+/// grant for it. Enforced by `ToolRegistry::validate_grants` at boot and reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserBinding {
+    /// The tool does not act as a user (e.g. `git-repo-pull`).
+    None,
+    /// The tool acts with the acting user's identity or credentials and
+    /// requires `ToolCtx::acting_user` to be `Some`: only a conversation caller
+    /// may hold the grant.
+    ActingUser,
+    /// As `ActingUser`, but a caller with no acting user is also admitted; the
+    /// tool then derives a lent user from the caller's own grant.
+    ActingOrLentUser,
+}
+
 /// Static per-tool metadata. Canonical `name` is the registry key and the grant
 /// name; `mcp_name` is the explicit (never derived) MCP projection.
 pub struct ToolDescriptor {
@@ -96,6 +121,9 @@ pub struct ToolDescriptor {
     pub idempotency: Idempotency,
     /// LLM path: skip user approval when the grant permits the call.
     pub auto_approve: bool,
+    /// Whether the tool acts as a user; bounds which participants may be
+    /// granted it.
+    pub user_binding: UserBinding,
 }
 
 /// ACL denial from a tool's `check_acl`: the call named a resource outside the

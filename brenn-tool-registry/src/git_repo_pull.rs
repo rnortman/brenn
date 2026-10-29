@@ -13,13 +13,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use brenn_lib::tools::AclClause;
+use brenn_lib::tools::{AclClause, acl_admits};
 use futures::future::join_all;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use super::descriptor::{AclDenied, Idempotency, ToolClass, ToolDescriptor, ToolError};
+use super::descriptor::{
+    AclDenied, Idempotency, ToolClass, ToolDescriptor, ToolError, UserBinding,
+};
 use super::tool::{AsyncTool, ToolCtx};
 use brenn_git::pull::{pull_clone, pull_outcome_to_json};
 use brenn_git::sync::{CloneInfo, SyncTriggerSender};
@@ -89,18 +91,16 @@ impl GitRepoPullTool {
             acl_keys: &["repo"],
             idempotency: Idempotency::Natural,
             auto_approve: true,
+            user_binding: UserBinding::None,
         }
     }
 
-    /// Does `acl` admit a call naming clone `slug`? Empty ACL admits all (a
-    /// tool with no ACL); otherwise any clause matching `{repo: slug}` admits.
+    /// Does `acl` admit a call naming clone `slug`, as `{repo: slug}`?
     fn slug_allowed(acl: &[AclClause], slug: &str) -> bool {
-        if acl.is_empty() {
-            return true;
-        }
-        let mut attrs = BTreeMap::new();
-        attrs.insert("repo".to_string(), slug.to_string());
-        acl.iter().any(|c| c.matches(&attrs))
+        acl_admits(
+            acl,
+            &BTreeMap::from([("repo".to_string(), slug.to_string())]),
+        )
     }
 }
 
@@ -270,6 +270,7 @@ mod tests {
                 rate_limit: None,
             },
             acting_conversation_id: acting,
+            acting_user: None,
         }
     }
 

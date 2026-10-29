@@ -102,6 +102,7 @@ pub(crate) fn non_convergible_differences(
         alerting,
         claude_defaults,
         claude_profiles,
+        oauth_providers,
         repo_sync,
         repos,
         container,
@@ -132,6 +133,7 @@ pub(crate) fn non_convergible_differences(
         alerting: b_alerting,
         claude_defaults: b_claude_defaults,
         claude_profiles: b_claude_profiles,
+        oauth_providers: b_oauth_providers,
         repo_sync: b_repo_sync,
         repos: b_repos,
         container: b_container,
@@ -171,6 +173,14 @@ pub(crate) fn non_convergible_differences(
         "claude_profiles",
         &by_key(claude_profiles),
         &by_key(b_claude_profiles),
+        &mut out,
+    );
+    // Tools are built once at boot from the providers and their client files;
+    // a changed provider takes a restart, as a changed Claude profile does.
+    keyed_map(
+        "oauth_providers",
+        &by_key(oauth_providers),
+        &by_key(b_oauth_providers),
         &mut out,
     );
     plain("repo_sync", repo_sync, b_repo_sync, &mut out);
@@ -1097,6 +1107,34 @@ mod tests {
         assert_eq!(
             refusals(&profile("/keys/one"), &profile("/keys/two")),
             vec!["claude_profiles[work] differs: this change needs a restart".to_string()],
+        );
+    }
+
+    /// A changed provider is refused by name: its tools and client identity
+    /// are built once at boot.
+    #[test]
+    fn a_changed_oauth_provider_is_named_and_needs_a_restart() {
+        let provider = |token_url: &str| {
+            let mut config = base();
+            config.oauth_providers.insert(
+                "google".to_string(),
+                brenn_lib::config::OAuthProviderRaw {
+                    token_url: token_url.to_string(),
+                    ..brenn_lib::config::test_oauth_provider_raw("https://accounts.example.com")
+                },
+            );
+            config
+        };
+        assert_eq!(
+            refusals(
+                &provider("https://oauth2.example.com/token"),
+                &provider("https://oauth2.example.com/v2/token"),
+            ),
+            vec!["oauth_providers[google] differs: this change needs a restart".to_string()],
+        );
+        assert_eq!(
+            refusals(&base(), &provider("https://oauth2.example.com/token")),
+            vec!["oauth_providers[google] added: this change needs a restart".to_string()],
         );
     }
 }

@@ -1,0 +1,44 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//brenn-lib",
+    "//brenn-obs",
+    "//brenn-tool-registry",
+]
+
+# `testutils` exposes the stub authorization server to the crates above; the
+# release configs clear the flag.
+rust_library(
+    name = "brenn-oauth",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# The vault against a scratch directory, the pending-flow table, and the
+# connect exchange against a stub token/userinfo server on 127.0.0.1. Sub-second
+# locally; `small` (60s) holds with margin on a cold 4-vCPU runner.
+rust_test(
+    name = "brenn-oauth_test",
+    size = "small",
+    crate = ":brenn-oauth",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
+)
+
+rust_doc_test(
+    name = "brenn-oauth_doc_test",
+    crate = ":brenn-oauth",
+)

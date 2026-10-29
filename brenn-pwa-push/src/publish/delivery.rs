@@ -10,9 +10,8 @@ use std::time::Duration;
 
 use base64ct::{Base64UrlUnpadded, Encoding as _};
 use http::header::{HeaderName, HeaderValue};
+use p256::PublicKey;
 use uuid::Uuid;
-use web_push_native::p256::PublicKey;
-use web_push_native::{Auth, WebPushBuilder};
 
 use crate::db::SubscriptionRow;
 use crate::endpoint_validator::{RejectReason, validate_endpoint};
@@ -20,6 +19,7 @@ use crate::payload::PushPayload;
 use brenn_lib::pwa_push::vapid::build_vapid_authorization;
 use brenn_obs::security::log_and_alert_ssrf_attempt;
 
+use super::encrypt::{Auth, encrypt};
 use super::{PwaPushService, Urgency};
 
 /// Publish-wide fanout timeout. All spawned delivery tasks must complete
@@ -132,7 +132,10 @@ impl PwaPushService {
             );
             return DeliveryOutcome::Failed("auth length error".to_string());
         }
-        let ua_auth = Auth::clone_from_slice(&auth_bytes);
+        let ua_auth: Auth = auth_bytes
+            .as_slice()
+            .try_into()
+            .expect("auth length checked to be 16 just above");
 
         let endpoint: http::Uri = match sub.endpoint.parse() {
             Ok(u) => u,
@@ -159,25 +162,19 @@ impl PwaPushService {
         let payload_bytes =
             serde_json::to_vec(&payload).expect("PushPayload serialization is infallible");
 
-        // Build the web push request.
         let valid_duration = Duration::from_secs(u64::from(ttl));
-        let builder = WebPushBuilder::new(endpoint.clone(), ua_public, ua_auth)
-            .with_valid_duration(valid_duration);
+        let ciphertext = encrypt(payload_bytes, &ua_public, &ua_auth);
+        let mut http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(endpoint.clone())
+            .header("TTL", ttl)
+            .header(http::header::CONTENT_ENCODING, "aes128gcm")
+            .header(http::header::CONTENT_TYPE, "application/octet-stream")
+            .header(http::header::CONTENT_LENGTH, ciphertext.len())
+            .body(ciphertext)
+            .expect("push request has a parsed URI and static, ASCII header names and values");
 
-        let mut http_req = match builder.build(payload_bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    subscription_id = sub.id,
-                    "PushSend: web-push-native build failed: {e}"
-                );
-                return DeliveryOutcome::Failed(format!("build error: {e}"));
-            }
-        };
-
-        // Inject VAPID Authorization header (RFC 8292 ES256 JWT).
-        // web-push-native's build() without vapid omits the Authorization header;
-        // we build it in-tree with p256/ecdsa and inject it here.
+        // VAPID Authorization header (RFC 8292 ES256 JWT).
         let auth_value = build_vapid_authorization(
             &self.config.vapid,
             &endpoint,
@@ -190,7 +187,7 @@ impl PwaPushService {
                 .expect("VAPID Authorization header value must be valid ASCII"),
         );
 
-        // Inject Urgency and Topic headers (web-push-native doesn't expose them).
+        // Urgency and Topic headers (RFC 8030 §5.3, §5.4).
         if urgency != Urgency::Normal {
             http_req.headers_mut().insert(
                 HeaderName::from_static("urgency"),

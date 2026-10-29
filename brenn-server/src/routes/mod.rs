@@ -2,6 +2,7 @@ pub mod app;
 pub mod file;
 pub mod login;
 pub mod logout;
+pub mod oauth;
 pub mod redirector;
 pub mod register;
 pub mod remote;

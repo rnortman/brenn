@@ -36,6 +36,12 @@ impl AclClause {
         self.0.keys().map(String::as_str)
     }
 
+    /// The clause's `(key, value)` requirements, in key order. For a tool that
+    /// reads a value with its own semantics instead of [`AclClause::matches`].
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
     /// Does this clause admit a call whose resource attributes are `attrs`?
     /// Every constrained key must be present with a matching value (`"*"` any).
     pub fn matches(&self, attrs: &BTreeMap<String, String>) -> bool {
@@ -43,6 +49,13 @@ impl AclClause {
             .iter()
             .all(|(k, allowed)| attrs.get(k).is_some_and(|v| allowed == "*" || allowed == v))
     }
+}
+
+/// Does an ACL (clauses OR'd) admit a call whose resource attributes are
+/// `attrs`? An empty ACL admits everything (a tool that takes no ACL);
+/// otherwise any clause that [`AclClause::matches`] admits.
+pub fn acl_admits(acl: &[AclClause], attrs: &BTreeMap<String, String>) -> bool {
+    acl.is_empty() || acl.iter().any(|c| c.matches(attrs))
 }
 
 /// Resolved per-`(participant, tool)` rate limit (token-bucket parameters).
@@ -64,10 +77,9 @@ pub struct ResolvedToolGrant {
 
 impl ResolvedToolGrant {
     /// Does this grant's ACL admit a call whose resource attributes are `attrs`?
-    /// An empty ACL admits everything (a tool that takes no ACL); otherwise any
-    /// covering clause (OR semantics) admits.
+    /// See [`acl_admits`].
     pub fn acl_allows(&self, attrs: &BTreeMap<String, String>) -> bool {
-        self.acl.is_empty() || self.acl.iter().any(|c| c.matches(attrs))
+        acl_admits(&self.acl, attrs)
     }
 }
 
@@ -138,5 +150,20 @@ mod tests {
         let mut keys: Vec<&str> = c.keys().collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["branch", "repo"]);
+    }
+
+    #[test]
+    fn clause_iter_yields_pairs_in_key_order() {
+        let c = clause(&[("repo", "brenn"), ("branch", "*")]);
+        let pairs: Vec<(&str, &str)> = c.iter().collect();
+        assert_eq!(pairs, vec![("branch", "*"), ("repo", "brenn")]);
+    }
+
+    #[test]
+    fn clause_match_on_a_path_key_is_exact() {
+        // The primitive never reads a value as a pattern, whatever its key.
+        let c = clause(&[("path", "/a/*")]);
+        assert!(c.matches(&attrs(&[("path", "/a/*")])));
+        assert!(!c.matches(&attrs(&[("path", "/a/b")])));
     }
 }

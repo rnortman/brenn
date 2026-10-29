@@ -64,6 +64,9 @@ pub struct ResolvedConfig {
     /// Declared Claude accounts, keyed by profile name, with each token file
     /// read exactly once during startup.
     pub claude_profiles: std::collections::BTreeMap<String, super::ClaudeProfile>,
+    /// The credential vault and every OAuth provider, each client file read
+    /// once. `Some` iff an `oauth_provider` is declared.
+    pub oauth: Option<super::ResolvedOAuth>,
 }
 
 /// Validate raw config and resolve defaults, producing the final app registry
@@ -95,6 +98,7 @@ pub struct ResolvedConfig {
 /// - Integration-contributed MCP server name collides with explicit `mcp_servers`
 /// - An app slug is too long for its tool socket path to fit `sun_path`
 /// - `watchdog.sweep_interval_secs` is zero
+/// - The credential vault or an `oauth_provider` is refused (`resolve_oauth`)
 pub fn validate_and_resolve(
     config: &BrennConfig,
     integration_registry: &IntegrationRegistry,
@@ -194,12 +198,16 @@ pub fn validate_and_resolve(
     // another local account is a misconfiguration and stops the process.
     let claude_profiles = super::load_claude_profiles(&config.claude_profiles);
 
+    // After `resolve_apps`: the vault is checked against the paths it settled.
+    let oauth = super::resolve_oauth(config, &apps);
+
     ResolvedConfig {
         apps: Arc::new(apps),
         webhook_endpoints,
         mqtt_clients: resolved_clients,
         pwa_push,
         claude_profiles,
+        oauth,
     }
 }
 
@@ -1265,7 +1273,7 @@ fn assert_state_dir_outside_trees(
 /// Canonicalize the longest existing ancestor of `path` and append the
 /// components below it unchanged. A repo mount may not be cloned yet at
 /// resolution, so its own path need not exist.
-fn canonical_with_missing_tail(path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn canonical_with_missing_tail(path: &std::path::Path) -> std::path::PathBuf {
     let mut existing = path;
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
     loop {

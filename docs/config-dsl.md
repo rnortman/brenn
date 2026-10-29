@@ -328,6 +328,152 @@ Minting a token, rotating one, publishing a goal by hand, and the two ways an
 outranking credential can make the account a lie without Brenn noticing are in
 [the Claude accounts guide](claude-accounts.md).
 
+### OAuth providers and the credential vault
+
+An `oauth_provider` block names an authorization server through which users
+connect their own third-party accounts (a Google account, say). Brenn keeps the
+resulting tokens in a vault on the host. No agent can read the vault: requests
+go out with a credential attached by Brenn, outside the container.
+
+```
+server {
+  public_url = "https://brenn.example.com";
+  vault_dir = "/var/lib/brenn/vault";
+}
+
+oauth_provider google {
+  app_name = "Brenn";
+  client_secret_file = "/etc/brenn/google/client_secret.json";
+  authorize_url = "https://accounts.google.com/o/oauth2/v2/auth";
+  token_url = "https://oauth2.googleapis.com/token";
+  revoke_url = "https://oauth2.googleapis.com/revoke";
+  userinfo_url = "https://openidconnect.googleapis.com/v1/userinfo";
+  account_field = "email";
+  base_scopes = ["openid", "https://www.googleapis.com/auth/userinfo.email"];
+  scope_sets = {
+    gmail_readonly = ["https://www.googleapis.com/auth/gmail.readonly"],
+    calendar_readonly = ["https://www.googleapis.com/auth/calendar.readonly"],
+  };
+  extra_authorize_params = { access_type = "offline", prompt = "consent" };
+  api_hosts = ["https://gmail.googleapis.com", "https://www.googleapis.com"];
+}
+```
+
+The block's name is the provider's slug: lowercase letters, digits and `-`. It
+appears in the callback URL and in the vault's directory names.
+
+- `app_name` — the name the provider's consent screen shows. Brenn repeats it
+  on its own pages so the user recognises it.
+- `client_secret_file` — the host path to the provider's client file, 0600.
+  Two shapes are accepted: Google's Web-client download
+  (`{"web": {"client_id", "client_secret", "redirect_uris", …}}`) or a bare
+  object with `client_id` and `client_secret`. Anything else is refused,
+  naming the keys found. When the file lists `redirect_uris`, the callback
+  `<server.public_url>/oauth/<name>/callback` must be one of them.
+- `authorize_url`, `token_url`, `userinfo_url` — required. `revoke_url` is
+  optional; without it, disconnecting deletes the credential without revoking
+  it.
+- `account_field` — the field of the userinfo JSON whose string value names the
+  account (`email` for Google).
+- `base_scopes` — scopes requested on every connect. Defaults to none.
+- `scope_sets` — named groups of scopes that a connect request chooses among.
+  There must be at least one set, and no set may be empty.
+- `extra_authorize_params` — query parameters added to every authorize URL.
+- `api_hosts` — the origins a credentialed request may go to, each written
+  canonically as `scheme://host[:port]`, with no path and no trailing `/`.
+  There must be at least one.
+- `max_response_bytes` — the most response-body bytes a credentialed request
+  reads. Defaults to 256 KiB; above 512 KiB (the tool result cap) is refused.
+
+Every URL a credential is sent to (`token_url`, `userinfo_url`, `revoke_url`
+and each `api_hosts` origin) must be `https`. Plain `http` is accepted only
+for `127.0.0.1`, `[::1]` or `localhost`.
+
+`server.vault_dir` is required when any provider is declared, and refused when
+none is. At boot it must be an absolute path to an existing directory owned by
+the server's user, mode exactly `0700`. The operator creates it; Brenn creates
+only `<provider>/<username>/` beneath it. The vault must neither lie inside nor
+contain any of the agent-reachable paths the configuration declares: an
+agent's working directory, repo mounts, state directory, container home or
+`extra_mounts` host paths, `repo_sync.repo_dir`, or any declared container's
+home. This is checked at boot and again on every reload, which can move those
+paths. A container's `extra_args` reach podman unread, so a mount written there
+is not checked: mount host paths through `extra_mounts`. Brenn uses the vault
+at the path its symlinks resolve to at boot. Each provider's client
+file is read once at startup. Changing a provider takes a restart; a reload
+that changes one is refused, naming it.
+
+#### The OAuth tools
+
+Declaring a provider registers four tools. Each is granted like any other tool
+(see *Tool grants*), and each takes `provider` as an ACL key:
+
+- `oauth-connect` — starts a connect for the conversation's owner and returns
+  the link and the steps to relay.
+- `oauth-accounts` — lists the owner's connected accounts and their granted
+  scopes. It never returns a token.
+- `oauth-disconnect` — revokes one of the owner's credentials at the provider
+  and deletes it.
+- `api-request` — sends one HTTP request to a provider's `api_hosts` with the
+  credential attached. Its ACL keys are `provider`, `user`, `account`,
+  `method`, `host` and `path`.
+
+These tools act as a Brenn user, so some grants are refused at boot and on
+reload:
+
+- Any of the four on a `multiuser` app, because the person typing in a shared
+  conversation need not be its owner.
+- Any of the four on an app with no `container`, because a bare agent runs as
+  Brenn's user and could read the vault.
+- `oauth-connect`, `oauth-accounts` or `oauth-disconnect` on a WASM component.
+  A component has no user to act for.
+
+A conversation's calls always use its owner's credentials. A component's
+`api-request` call has no owner, so it uses a *lent* credential. Every one of
+its clauses for the provider must name the same `user` (not `"*"`), and that
+user's credential is used. A lent credential is read-only: only `GET` and
+`HEAD` are admitted. `account` picks one of the user's accounts. When it is
+omitted and the user has more than one, the call is refused and lists them.
+
+```
+agent PersonalAssistant {
+  container = "sandbox";
+  tool api-request {
+    allow { provider = "google"; method = "GET"; }
+    allow { provider = "google"; method = "POST"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/drafts"; }
+  }
+  tool oauth-connect { allow { provider = "google"; } }
+}
+
+new agenda_sync: AgendaSync {
+  grants = [ports, tools];
+  tool api-request {
+    allow { provider = "google"; user = "alice"; account = "alice@example.com"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events"; }
+  }
+}
+```
+
+**`api-request` reads its `path` key as a segment template.** This is that
+tool's own rule. The exact-or-`"*"` matching of *Tool grants* still holds for
+every other key and every other tool. A `path` value is either `"*"`, which
+admits any path, or a template beginning with `/`. Both the template and the
+request path are split on `/`. They must have the same number of segments, and
+each template segment either equals the request's segment or is `*`, which
+matches exactly one segment. There is no prefix matching:
+`"/gmail/v1/users/me/drafts"` admits `drafts` but not `drafts/send`, and
+`"/calendar/v3/calendars/*/events"` does not admit `calendars/x/clear`. A
+template with an empty segment, or a `.`, `..` or `%` segment, is refused at
+boot.
+
+The request path is checked after each segment is percent-decoded once. A
+decoded segment that is empty (including from a trailing `/`), that is `.` or
+`..`, or that contains `/`, `\` or `%` is refused before matching. So `%2F`
+can never act as a separator, and double encoding is refused. A decoded `?` or
+`#` is ordinary segment content (calendar IDs contain `#`). Brenn builds the
+outgoing URL from the matched segments, re-encoding each one, so what is sent
+is exactly what was matched. `host` is `host[:port]`, matched exactly against
+the provider's `api_hosts`.
+
 ### Spawn artifacts and the runtime directory
 
 Every Claude Code process is handed two host files, both named in

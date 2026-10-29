@@ -88,6 +88,10 @@ In rough order of severity if compromised:
   may read, write, or execute outside the scope the operator sanctioned for it.
 - **User credentials and sessions.** Password material, session and CSRF tokens,
   device identifiers. Compromise means account takeover.
+- **Users' third-party credentials (the vault).** The OAuth refresh and access
+  tokens a user granted Brenn at a provider (their mailbox, their calendar).
+  Compromise means acting as that user at the provider, outside Brenn, for as
+  long as the token lives.
 - **Cross-user and cross-app isolation.** Conversation history, per-app data,
   per-app filesystem scope, per-component WASM storage. One user or one app must
   not reach another's data.
@@ -134,6 +138,10 @@ box for the same reason and goes one step further: a config-carrying mount's
 through CC's output stream but through a unix socket mounted into its own
 container, from any process it starts there.)
 
+(B12 points outward: the backend calling a third-party API with a user's
+credential, on behalf of an agent or a component. Its inbound half is the
+provider's redirect back to Brenn, which a B1 browser carries.)
+
 | ID | Boundary | Direction of distrust |
 |----|----------|----------------------|
 | **B0** | Unauthenticated network → backend | client untrusted |
@@ -148,6 +156,7 @@ container, from any process it starts there.)
 | **B9** | Reload requester → running configuration | the requester chooses the *moment*, never the content; what a reload can do is bounded by what the document on disk says |
 | **B10** | Mount author → running configuration | the author chooses a config-carrying mount's content; the ceiling chooses what that content may reach; the mounts document and the root document stay outside every mount |
 | **B11** | Agent container → backend (tool socket) | process in the agent's container untrusted (CC-influenced content, the B3 actor); identity is the mount, never a credential |
+| **B12** | Backend → third-party API as the user | the request's content is caller-chosen (CC-influenced, or a guest's); the credential and its owner are the backend's alone; the provider's redirect back is provider-authored data a B1 browser carries |
 
 ---
 
@@ -1308,6 +1317,91 @@ ACL, budget, rate, validation, publish-denial signal) applied on one origin and
 not the other; any unbounded read on the socket; any proposal to allow
 `container_t → unconfined_t connectto` (or the server's domain, whatever it
 is), or to run agent containers with `label=disable`.
+
+---
+
+## 9f. Boundary B12 — Backend → Third-party API as the User
+
+**Who:** an agent or a WASM component that asks the backend to call a
+provider's API (a mailbox, a calendar) with a credential a user granted Brenn,
+and the provider itself on the way back, through the connect redirect.
+
+**Trust decision: the credential is attached host-side and never enters the
+container.** The caller names the request. The operator's grant bounds which
+requests may be made. The backend picks the credential and attaches it. The
+user whose credential is used is the conversation's owner, stamped by the
+backend for the conversation. A caller never names it. A component has no
+owner, so its credential is lent by the operator's own grant, which names the
+user. Tokens live in a vault the backend alone reads. No tool result, log line
+or page carries a token.
+
+**Policies:**
+
+- **Vault placement.** The vault is a host directory owned by the server's
+  user, mode `0700`, with credential files `0600`. It is disjoint, in both
+  directions, from every agent-visible root the configuration declares:
+  working directories, repo mounts, state directories, container homes, extra
+  mounts and the sync directory. This is checked at boot and on every reload,
+  and a vault that is not disjoint from those roots is refused. A container's
+  `extra_args` reach podman unread, so a mount written there is not checked:
+  host mounts belong in `extra_mounts`, where the check sees them.
+- **Only container apps.** An app with no container runs its agent as the
+  server's user, which could read the vault, so it is refused every
+  credential-bearing grant. A `multiuser` app is refused too: whoever types in a
+  shared conversation need not be its owner, and the owner's credential would
+  act for them.
+- **No owner, no owner-bound tool.** A WASM component is never granted the tools
+  that connect, list or disconnect an owner's accounts, because there is no
+  owner to act for.
+- **Lent credentials are read-only.** A component's credentialed request is
+  admitted for reading methods only. A component's call can be re-run from its
+  channel window, and a re-run write (a second draft, a second event) is the
+  wrong thing. Until writes are deduplicated, a lent credential does not write.
+- **The caller cannot touch the credential or the transport.** `Authorization`,
+  `Cookie`, `Host` and the framing headers are refused from the caller.
+- **No redirect is followed.** A 3xx is returned to the caller, so the
+  credential never goes to a `Location` the provider or an attacker chose.
+- **Exact destination.** The host must be one of the provider's configured
+  origins, matched exactly. Every credentialed URL is `https`; plain `http` is
+  allowed only on loopback, for tests. The path is matched as a
+  segment template on segments decoded exactly once. Traversal, an encoded
+  separator and double encoding are refused before matching. The URL sent is
+  built from the matched segments, so the bytes on the wire are the bytes
+  that were authorized.
+- **Bounded results.** A response is cut to a configured size, and then to what
+  the tool result can carry, on every caller path.
+- **The redirect back is provider-authored data carried by a B1 browser.** The
+  provider composes the query string of the callback, and its vocabulary is not
+  Brenn's to allowlist. Unknown parameters are ignored and raise no event: a
+  provider adding a parameter must never feed fail2ban against the user's own
+  IP. Only the values Brenn minted (`state`) or relies on (`code`, `error`) are
+  checked strictly. A missing, duplicated or malformed one is a B1 schema
+  violation, since no provider echoes a `state` it was not given. A flow
+  completes only for the user who started it, once, within a short lifetime. A
+  different signed-in user is an authentication failure.
+- **Login return is same-origin and narrow.** The path a login returns to is a
+  same-origin path under a few fixed prefixes, bounded in length, with no
+  fragment. Anything else is a schema violation and is ignored.
+- **No login from another site.** The callback stores a credential under
+  whichever Brenn user the browser's session names, so a page that could sign
+  the browser into another user's session would send the next consent to that
+  user's vault. A form post that mints a session (login, registration) is
+  refused, with a schema violation, when the browser marks it as sent from
+  another site (`Sec-Fetch-Site` other than `same-origin` or `none`), or, from
+  a browser without fetch metadata, when its `Origin` is not the host it was
+  sent to. The "Connected" page names the Brenn user the credential was
+  stored under.
+
+**What the reviewer verifies:** any token in a tool result, log line, page or
+container-visible path; any route by which a caller names the user whose
+credential is used; a credential-bearing grant admitted on a bare or
+`multiuser` app, or an owner-bound one on a component; a write through a
+lent credential; a caller-supplied `Authorization` or transport header; a
+redirect followed with the credential; a destination matched by prefix,
+or a path sent other than the one matched; a vault location an agent can
+reach; a session-minting form post admitted from another site; an unknown
+callback parameter treated as a violation, or a missing `state` treated as
+anything else.
 
 ---
 

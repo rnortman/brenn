@@ -184,6 +184,10 @@ pub struct AppState {
     /// holds the epoch handle the conversation-epoch drain moves. `None` when
     /// no agent names a `conversation_epoch`. Built once at boot.
     pub epoch_reconciler: Option<Arc<crate::conversation_epoch::EpochReconciler>>,
+    /// Users' OAuth credentials and the pending connect flows. `None` when no
+    /// `oauth_provider` is declared; every `/oauth/` path is then an
+    /// unrecognized URL. Built once at boot.
+    pub oauth: Option<Arc<brenn_oauth::OAuthService>>,
     /// Usage session gap in seconds. A new usage event that arrives more than
     /// this many seconds after `last_activity_at` closes the prior session and
     /// opens a new one. Default (and test fixture value): 1800 (30 minutes).
@@ -967,6 +971,7 @@ impl AppState {
             attach_heartbeat_secs: 1,
             cc_profiles: None,
             epoch_reconciler: None,
+            oauth: None,
             // These two fields, and the wake stubs that read them, exist only
             // in this crate's own test build.
             #[cfg(test)]

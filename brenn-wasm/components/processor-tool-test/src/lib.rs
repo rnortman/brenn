@@ -1,13 +1,14 @@
 // Async-tool end-to-end test fixture for the `brenn:processor` world.
 //
-// This is the guest half of the cycle-2 consumption path, proven in cycle 1: a
-// real compiled WASM consumer holding a `git-repo-pull` grant makes an async
-// tool call and later acts on the result activation.
+// A real compiled WASM consumer holding a tool grant makes an async tool call
+// and later acts on the result activation. The tool and its arguments are the
+// operator config keys `tool` and `args` (a JSON object); either one absent
+// fails the activation.
 //
 // Two activation shapes, distinguished by the input port an envelope arrives on:
 //
 //   - Any port OTHER than "tool-results" (the trigger): on a new envelope, fire
-//     one `call-async("git-repo-pull", {"repos":["testclone"]}, "call-1")`. The
+//     one `call-async(<tool>, <args>, "call-1")`. The
 //     request is validated + buffered at call time and rides the activation's
 //     transactional flush — it reaches the bus iff this `receive` returns Ok, so
 //     a trap fires no tool call. The guest then returns Ok immediately (run to
@@ -28,6 +29,7 @@
 mod bindings;
 
 use bindings::Guest;
+use bindings::brenn::processor::config;
 use bindings::brenn::processor::ports::publish;
 use bindings::brenn::processor::tools::call_async;
 use bindings::brenn::processor::types::{Activation, ReceiveError};
@@ -37,10 +39,10 @@ use bindings::brenn::processor::types::{Activation, ReceiveError};
 const TOOL_RESULTS_PORT: &str = "tool-results";
 /// Output port bound to the channel the test reads.
 const OUT_PORT: &str = "out";
-/// The async tool this fixture calls, and its fixed args + correlation id. The
-/// slug matches the fixture clone the test mounts.
-const TOOL: &str = "git-repo-pull";
-const ARGS: &str = r#"{"repos":["testclone"]}"#;
+/// Config keys naming the async tool this fixture calls and its JSON args.
+const TOOL_KEY: &str = "tool";
+const ARGS_KEY: &str = "args";
+/// The correlation id of the one call.
 const CALL_ID: &str = "call-1";
 /// A trigger envelope containing this marker makes the guest abort the activation
 /// after buffering the async call, exercising the transactional trap-discard
@@ -67,7 +69,9 @@ impl Guest for ProcessorToolTest {
                 }
             } else {
                 // Trigger: fire the async tool call. Buffered now, flushed on Ok.
-                call_async(TOOL, ARGS, CALL_ID)
+                let tool = required_config(TOOL_KEY)?;
+                let args = required_config(ARGS_KEY)?;
+                call_async(&tool, &args, CALL_ID)
                     .map_err(|e| ReceiveError::ProcessingFailed(format!("call-async: {e:?}")))?;
                 // Trap-discard probe: a marked trigger aborts the activation after
                 // the request is buffered. The transactional flush must then drop
@@ -84,6 +88,12 @@ impl Guest for ProcessorToolTest {
         }
         Ok(None)
     }
+}
+
+/// The config value at `key`; absent fails the activation.
+fn required_config(key: &str) -> Result<String, ReceiveError> {
+    config::get(key)
+        .ok_or_else(|| ReceiveError::ProcessingFailed(format!("config key `{key}` is not set")))
 }
 
 bindings::export!(ProcessorToolTest with_types_in bindings);

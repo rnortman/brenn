@@ -52,6 +52,9 @@ pub struct ActiveBridge {
     pub conversation_id: i64,
     /// User who owns this conversation.
     pub user_id: i64,
+    /// `user_id`'s username, read from the DB on first use. Usernames are
+    /// never renamed, so one read serves the bridge's lifetime.
+    pub(super) username: tokio::sync::OnceCell<String>,
     /// App this bridge belongs to. Immutable after creation.
     pub app_slug: String,
     /// App's working directory (host-side). Used for stable file URL computation.
@@ -611,6 +614,7 @@ impl ActiveBridge {
             pending_permissions: tokio::sync::Mutex::new(HashMap::new()),
             conversation_id,
             user_id,
+            username: tokio::sync::OnceCell::new(),
             app_slug: app_config.slug.clone(),
             working_dir: app_config.working_dir.clone(),
             path_mapper: app_config.path_mapper.clone(),
@@ -809,12 +813,17 @@ impl ActiveBridge {
         self.died_handled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Helper to get the brenn username for the bridge's user.
+    /// The brenn username of the bridge's user.
     pub(super) async fn get_username(&self) -> String {
-        let conn = self.db.lock().await;
-        conversation::get_username(&conn, self.user_id).unwrap_or_else(|| {
-            panic!("BUG: user_id {} not found in DB", self.user_id);
-        })
+        self.username
+            .get_or_init(|| async {
+                let conn = self.db.lock().await;
+                conversation::get_username(&conn, self.user_id).unwrap_or_else(|| {
+                    panic!("BUG: user_id {} not found in DB", self.user_id);
+                })
+            })
+            .await
+            .clone()
     }
 
     /// Artifact-display roots for this bridge: thin wrapper around

@@ -23,7 +23,8 @@ use tracing::warn;
 use crate::client_ip;
 use crate::middleware;
 use crate::routes::{
-    app, file, login, logout, redirector, register, remote, statics, surface, upload, webhooks, ws,
+    app, file, login, logout, oauth, redirector, register, remote, statics, surface, upload,
+    webhooks, ws,
 };
 use crate::state::AppState;
 
@@ -462,6 +463,7 @@ pub fn build_router(
         .route("/surface/{slug}", get(surface::page::surface_page))
         .route("/surface/{slug}/ws", get(surface::surface_ws_handler))
         .route("/r/{nonce}", get(redirector::redirect))
+        .route("/oauth/{provider}/callback", get(oauth::callback))
         .route("/logout", post(logout::logout))
         .layer(Extension(MaxImageLongEdge(max_image_long_edge)))
         .layer(axum_mw::from_fn_with_state(
@@ -663,7 +665,8 @@ mod tests {
     }
 
     /// The redirector route must be behind `require_auth`.
-    /// Without a session cookie, the middleware 303s to `/auth/login`.
+    /// Without a session cookie, the middleware 303s to `/auth/login`,
+    /// carrying the deep link as `next`.
     /// A 303 (not 404) proves the route is registered behind the auth
     /// middleware — not absent from the router entirely.
     #[tokio::test]
@@ -684,7 +687,10 @@ mod tests {
             .expect("303 must carry Location header")
             .to_str()
             .unwrap();
-        assert_eq!(location, "/auth/login");
+        assert_eq!(
+            location,
+            "/auth/login?next=%2Fr%2F550e8400-e29b-41d4-a716-446655440000%3Fto%3D%2Fapp%2Fgraf%2Fc%2F42"
+        );
     }
 
     /// Regression guard: the success-path 303 survives the full middleware stack
@@ -1041,6 +1047,79 @@ mod tests {
         assert!(cookie.contains("SameSite=Lax"));
     }
 
+    /// A login posted from another site's page would sign the browser into an
+    /// account its owner did not choose: refused, no cookie, a schema
+    /// violation. Brenn's own page, and a client that is no browser, log in.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_cross_site_login_post_sets_no_cookie() {
+        let (app, db) = test_app();
+        {
+            let conn = db.lock().await;
+            create_user(&conn, "alice", &hash_password(b"correct-password1"));
+        }
+        let post = |headers: &[(&str, &str)]| {
+            let mut request = Request::post("/auth/login")
+                .header("host", "brenn.example.com")
+                .header("content-type", "application/x-www-form-urlencoded");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            app.clone().oneshot(
+                request
+                    .body(Body::from("username=alice&password=correct-password1"))
+                    .unwrap(),
+            )
+        };
+
+        for headers in [
+            &[("sec-fetch-site", "cross-site")][..],
+            &[("sec-fetch-site", "same-site")],
+            &[
+                ("sec-fetch-site", "cross-site"),
+                ("origin", "https://brenn.example.com"),
+            ],
+            &[("origin", "https://attacker.example.net")],
+            &[("origin", "null")],
+        ] {
+            let response = post(headers).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{headers:?}");
+            assert!(get_set_cookie(&response).is_none(), "{headers:?}");
+        }
+        assert!(logs_contain("schema_violation"));
+        assert!(logs_contain("cross-site form post refused"));
+
+        for headers in [
+            &[("sec-fetch-site", "same-origin")][..],
+            &[("sec-fetch-site", "none")],
+            &[("origin", "https://brenn.example.com")],
+            &[],
+        ] {
+            let response = post(headers).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{headers:?}");
+            assert!(get_set_cookie(&response).is_some(), "{headers:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cross_site_registration_post_is_refused() {
+        let (app, _db) = test_app();
+        let response = app
+            .oneshot(
+                Request::post("/auth/register")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "cross-site")
+                    .body(Body::from(
+                        "invite_code=x&username=mallory&password=long-enough-password",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(get_set_cookie(&response).is_none());
+    }
+
     #[tokio::test]
     async fn login_failure_redirects_with_error() {
         let (app, db) = test_app();
@@ -1096,6 +1175,194 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "/auth/login?error=1"
+        );
+    }
+
+    // --- Login return (`next`) ---
+
+    fn location(response: &axum::http::Response<Body>) -> &str {
+        response
+            .headers()
+            .get("location")
+            .expect("redirect carries Location")
+            .to_str()
+            .unwrap()
+    }
+
+    async fn post_login(app: &Router, body: &str) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::post("/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn login_page_body(app: &Router, uri: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_string(response.into_body()).await
+    }
+
+    fn form_value(value: &str) -> String {
+        url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_get_carries_the_path_and_query_as_next() {
+        let (app, _db) = test_app();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/oauth/google/callback?state=ab&code=x%2Fy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            location(&response),
+            "/auth/login?next=%2Foauth%2Fgoogle%2Fcallback%3Fstate%3Dab%26code%3Dx%252Fy"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_non_get_and_other_paths_get_the_bare_login() {
+        let (app, _db) = test_app();
+        for request in [
+            Request::post("/logout").body(Body::empty()).unwrap(),
+            Request::get("/surface/x").body(Body::empty()).unwrap(),
+            Request::get("/app/test/ws")
+                .header("upgrade", "websocket")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(location(&response), "/auth/login");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_page_renders_the_hidden_next_only_when_valid() {
+        let (app, _db) = test_app();
+        let body = login_page_body(&app, "/auth/login?next=%2Fapp%2Fx%3Fa%3D1%26b%3D2").await;
+        assert!(
+            body.contains(r#"<input type="hidden" name="next" value="/app/x?a=1&amp;b=2">"#),
+            "{body}"
+        );
+
+        for bad in [
+            "%2Fhealth",
+            "https%3A%2F%2Fevil.example%2Fapp%2Fx",
+            "%2F%2Fevil.example",
+        ] {
+            let body = login_page_body(&app, &format!("/auth/login?next={bad}")).await;
+            assert!(!body.contains(r#"name="next""#), "{bad}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_with_a_valid_next_returns_there() {
+        let (app, db) = test_app();
+        setup_authenticated_user(&db).await;
+        let next = "/oauth/google/callback?state=ab&code=4%2F0A";
+        let response = post_login(
+            &app,
+            &format!(
+                "username=testuser&password=test-password-12chars&next={}",
+                form_value(next)
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&response), next);
+        assert!(get_set_cookie(&response).is_some());
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn login_with_an_invalid_next_lands_on_root_and_is_a_schema_violation() {
+        let (app, db) = test_app();
+        setup_authenticated_user(&db).await;
+        let three_kib = format!("/app/x?{}", "a".repeat(3 * 1024));
+        for bad in [
+            "https://evil.example/app/x",
+            "//evil.example/app/x",
+            "/health",
+            "/app/x#frag",
+            three_kib.as_str(),
+        ] {
+            let response = post_login(
+                &app,
+                &format!(
+                    "username=testuser&password=test-password-12chars&next={}",
+                    form_value(bad)
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(location(&response), "/", "{bad}");
+        }
+        assert!(logs_contain("schema_violation"));
+        assert!(logs_contain("login: invalid `next`"));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_keeps_next_through_the_retry() {
+        let (app, db) = test_app();
+        setup_authenticated_user(&db).await;
+        let next = "/app/test/c/7";
+
+        let response = post_login(
+            &app,
+            &format!(
+                "username=testuser&password=wrong-password11&next={}",
+                form_value(next)
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let retry = location(&response).to_string();
+        assert_eq!(retry, "/auth/login?error=1&next=%2Fapp%2Ftest%2Fc%2F7");
+
+        let body = login_page_body(&app, &retry).await;
+        assert!(body.contains("Invalid username or password"));
+        assert!(body.contains(r#"<input type="hidden" name="next" value="/app/test/c/7">"#));
+
+        let response = post_login(
+            &app,
+            &format!(
+                "username=testuser&password=test-password-12chars&next={}",
+                form_value(next)
+            ),
+        )
+        .await;
+        assert_eq!(location(&response), next);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_user_keeps_next_too() {
+        let (app, _db) = test_app();
+        let response = post_login(
+            &app,
+            &format!(
+                "username=nobody&password=doesnt-matter1&next={}",
+                form_value("/r/abcdef01")
+            ),
+        )
+        .await;
+        assert_eq!(
+            location(&response),
+            "/auth/login?error=1&next=%2Fr%2Fabcdef01"
         );
     }
 
@@ -1509,7 +1776,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "/auth/login"
+            "/auth/login?next=%2Fapp%2Ftest"
         );
     }
 

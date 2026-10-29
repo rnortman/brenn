@@ -15,6 +15,7 @@ mod llm_chat;
 mod logging;
 mod mcp;
 mod mounts;
+mod oauth_provider;
 mod observability;
 mod path_mapper;
 mod repo;
@@ -64,6 +65,7 @@ pub use llm_chat::*;
 pub use logging::*;
 pub use mcp::*;
 pub use mounts::*;
+pub use oauth_provider::*;
 pub use observability::*;
 pub use path_mapper::*;
 pub use repo::*;
@@ -81,7 +83,7 @@ pub use surface_description::*;
 pub use test_fixtures::{
     PACKAGED, PACKAGED_MODULE, config_from_dsl, declaring_text, lower_document, lower_tree,
     remote_exact_ceiling, remote_fleet, remote_prefix_ceiling, remote_raw, repo_sync_at,
-    sole_refusal, split_packaged, stage_fixture, test_app_config,
+    sole_refusal, split_packaged, stage_fixture, test_app_config, test_oauth_provider_raw,
 };
 pub use watchdog::*;
 

@@ -19,9 +19,78 @@ use indexmap::IndexMap;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
-use super::descriptor::{Idempotency, MAX_FAST_BUDGET, ToolClass, ToolError};
+use super::descriptor::{Idempotency, MAX_FAST_BUDGET, ToolClass, ToolError, UserBinding};
 use super::rate_limit::RateLimiter;
-use super::tool::{RegisteredTool, ToolCtx};
+use super::tool::{ActingUser, RegisteredTool, ToolCtx};
+
+/// The participant whose grants are being validated, carrying the facts the
+/// user-binding refusals depend on.
+#[derive(Debug, Clone, Copy)]
+pub enum GrantOwner<'a> {
+    /// An LLM app. Its conversations' calls carry the conversation owner as
+    /// acting user.
+    App {
+        slug: &'a str,
+        /// Shared conversations: the typist need not be the owner.
+        multiuser: bool,
+        /// The agent runs in a container rather than as Brenn's uid.
+        has_container: bool,
+    },
+    /// A WASM consumer. Its calls carry no acting user.
+    WasmConsumer { slug: &'a str },
+}
+
+impl<'a> GrantOwner<'a> {
+    /// The owner of an app's grants, read from its resolved config.
+    pub fn for_app(slug: &'a str, app: &AppConfig) -> Self {
+        GrantOwner::App {
+            slug,
+            multiuser: app.multiuser,
+            has_container: app.container_spawn.is_some(),
+        }
+    }
+}
+
+impl std::fmt::Display for GrantOwner<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GrantOwner::App { slug, .. } => write!(f, "app {slug:?}"),
+            GrantOwner::WasmConsumer { slug } => write!(f, "wasm consumer {slug:?}"),
+        }
+    }
+}
+
+/// Why `owner` may not hold a grant for a tool with `binding`, or `None` when
+/// it may.
+fn user_binding_refusal(owner: &GrantOwner<'_>, binding: UserBinding) -> Option<&'static str> {
+    match (binding, owner) {
+        (UserBinding::None, _) => None,
+        (
+            UserBinding::ActingUser | UserBinding::ActingOrLentUser,
+            GrantOwner::App {
+                multiuser: true, ..
+            },
+        ) => Some(
+            "the tool acts as a user and the app is multiuser (a shared conversation's \
+             typist need not be its owner)",
+        ),
+        (
+            UserBinding::ActingUser | UserBinding::ActingOrLentUser,
+            GrantOwner::App {
+                has_container: false,
+                ..
+            },
+        ) => Some(
+            "the tool acts as a user and the app has no container (a bare agent runs as \
+             Brenn's uid and could read the user's credentials)",
+        ),
+        (UserBinding::ActingUser | UserBinding::ActingOrLentUser, GrantOwner::App { .. }) => None,
+        (UserBinding::ActingUser, GrantOwner::WasmConsumer { .. }) => {
+            Some("the tool acts as the acting user and a wasm consumer's calls carry none")
+        }
+        (UserBinding::ActingOrLentUser, GrantOwner::WasmConsumer { .. }) => None,
+    }
+}
 
 /// The immutable tool table. Lookup is by canonical name or MCP name; async
 /// tools additionally carry a global concurrency semaphore.
@@ -156,10 +225,12 @@ impl ToolRegistry {
     /// # Panics
     ///
     /// Panics on any grant that names an unknown tool, uses an ACL key the tool
-    /// does not declare, or omits ACL clauses on a tool that takes an ACL.
+    /// does not declare, omits ACL clauses on a tool that takes an ACL, holds a
+    /// clause the tool's `validate_clause` refuses, or grants a user-bound tool
+    /// to an owner that may not hold it (see [`UserBinding`]).
     pub fn validate_config(&self, apps: &IndexMap<String, AppConfig>) {
         for (slug, app) in apps.iter() {
-            self.validate_grants(&format!("app {slug:?}"), &app.policy.tool_grants);
+            self.validate_grants(GrantOwner::for_app(slug, app), &app.policy.tool_grants);
         }
     }
 
@@ -170,7 +241,7 @@ impl ToolRegistry {
     /// See [`ToolRegistry::validate_config`].
     pub fn validate_grants(
         &self,
-        owner: &str,
+        owner: GrantOwner<'_>,
         grants: &std::collections::BTreeMap<String, ResolvedToolGrant>,
     ) {
         for (tool_name, grant) in grants {
@@ -179,6 +250,9 @@ impl ToolRegistry {
                 .get(tool_name.as_str())
                 .unwrap_or_else(|| panic!("{owner}: tool_grant names unknown tool {tool_name:?}"));
             let desc = registered.descriptor();
+            if let Some(reason) = user_binding_refusal(&owner, desc.user_binding) {
+                panic!("{owner}: tool_grant for {tool_name:?} is refused: {reason}");
+            }
             if !desc.acl_keys.is_empty() {
                 assert!(
                     !grant.acl.is_empty(),
@@ -192,6 +266,11 @@ impl ToolRegistry {
                         "{owner}: tool_grant for {tool_name:?} uses unknown ACL key {key:?} \
                          (tool declares {:?})",
                         desc.acl_keys,
+                    );
+                }
+                if let Err(reason) = registered.validate_clause(clause) {
+                    panic!(
+                        "{owner}: tool_grant for {tool_name:?} has an invalid ACL clause: {reason}"
                     );
                 }
             }
@@ -316,13 +395,16 @@ impl ToolRegistry {
     ///
     /// The caller must already have confirmed the grant (the adapter checks it
     /// at PreToolUse and re-reads it here); `grant` is that resolved grant.
+    /// `acting_user` is the conversation's owner, passed through to the tool.
     /// Returns the tool's raw output value or a typed [`ToolError`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn invoke_for_llm(
         &self,
         mcp_name: &str,
         caller: ParticipantId,
         grant: ResolvedToolGrant,
         acting_conversation_id: Option<i64>,
+        acting_user: Option<ActingUser>,
         args: serde_json::Value,
         alert: &AlertDispatcher,
     ) -> Result<serde_json::Value, ToolError> {
@@ -337,6 +419,7 @@ impl ToolRegistry {
             caller,
             grant: grant.clone(),
             acting_conversation_id,
+            acting_user,
         };
 
         let invoke_started = Instant::now();
@@ -428,6 +511,7 @@ mod tests {
             acl_keys,
             idempotency,
             auto_approve: true,
+            user_binding: UserBinding::None,
         }
     }
 
@@ -575,7 +659,7 @@ mod tests {
             "stub".to_string(),
             grant(vec![clause(&[("repo", "brenn")])]),
         );
-        reg.validate_grants("app \"pfin\"", &grants);
+        reg.validate_grants(app_owner(), &grants);
     }
 
     #[test]
@@ -587,7 +671,7 @@ mod tests {
             "nope".to_string(),
             grant(vec![clause(&[("repo", "brenn")])]),
         );
-        reg.validate_grants("app \"pfin\"", &grants);
+        reg.validate_grants(app_owner(), &grants);
     }
 
     #[test]
@@ -599,7 +683,7 @@ mod tests {
             "stub".to_string(),
             grant(vec![clause(&[("branch", "main")])]),
         );
-        reg.validate_grants("app \"pfin\"", &grants);
+        reg.validate_grants(app_owner(), &grants);
     }
 
     #[test]
@@ -608,7 +692,7 @@ mod tests {
         let reg = ToolRegistry::new(vec![fast("stub", "mcp__brenn__Stub", &["repo"])]);
         let mut grants = BTreeMap::new();
         grants.insert("stub".to_string(), grant(vec![]));
-        reg.validate_grants("app \"pfin\"", &grants);
+        reg.validate_grants(app_owner(), &grants);
     }
 
     #[test]
@@ -617,7 +701,7 @@ mod tests {
         let reg = ToolRegistry::new(vec![fast("noacl", "mcp__brenn__NoAcl", &[])]);
         let mut grants = BTreeMap::new();
         grants.insert("noacl".to_string(), grant(vec![]));
-        reg.validate_grants("app \"pfin\"", &grants);
+        reg.validate_grants(app_owner(), &grants);
     }
 
     /// A fast tool whose `execute` blocks for a configured duration, so a test
@@ -703,13 +787,22 @@ mod tests {
                 caller(),
                 g.clone(),
                 None,
+                None,
                 json!({}),
                 &alert,
             )
             .await;
         assert!(first.is_ok(), "first fast call should pass: {first:?}");
         let second = reg
-            .invoke_for_llm("mcp__brenn__FastRl", caller(), g, None, json!({}), &alert)
+            .invoke_for_llm(
+                "mcp__brenn__FastRl",
+                caller(),
+                g,
+                None,
+                None,
+                json!({}),
+                &alert,
+            )
             .await;
         assert!(
             matches!(second, Err(ToolError::RateLimited)),
@@ -740,7 +833,15 @@ mod tests {
             rate_limit: None,
         };
         let result = reg
-            .invoke_for_llm("mcp__brenn__SlowFast", caller(), g, None, json!({}), &alert)
+            .invoke_for_llm(
+                "mcp__brenn__SlowFast",
+                caller(),
+                g,
+                None,
+                None,
+                json!({}),
+                &alert,
+            )
             .await;
         assert!(
             result.is_ok(),
@@ -784,6 +885,7 @@ mod tests {
             caller(),
             g.clone(),
             None,
+            None,
             json!({}),
             &alert,
         )
@@ -794,6 +896,7 @@ mod tests {
             "mcp__brenn__AThrottle",
             caller(),
             g,
+            None,
             None,
             json!({}),
             &alert,
@@ -815,5 +918,240 @@ mod tests {
                 .any(|(title, _)| title.contains("rate-throttled")),
             "sustained throttle should fire the rate-throttle alert: {captured:?}",
         );
+    }
+
+    fn app_owner() -> GrantOwner<'static> {
+        GrantOwner::App {
+            slug: "pfin",
+            multiuser: false,
+            has_container: true,
+        }
+    }
+
+    /// An async tool with a configurable user binding that refuses any clause
+    /// whose `path` is `"bad"`, and returns the acting user it was handed.
+    struct BoundTool {
+        descriptor: ToolDescriptor,
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncTool for BoundTool {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.descriptor
+        }
+        fn check_acl(
+            &self,
+            _args: &serde_json::Value,
+            _acl: &[AclClause],
+        ) -> Result<(), AclDenied> {
+            Ok(())
+        }
+        fn validate_clause(&self, clause: &AclClause) -> Result<(), String> {
+            match clause.iter().find(|(k, _)| *k == "path") {
+                Some((_, "bad")) => Err("path \"bad\" is not a template".to_string()),
+                _ => Ok(()),
+            }
+        }
+        async fn execute(
+            &self,
+            ctx: &ToolCtx,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, ToolError> {
+            let user = ctx.require_acting_user(self.descriptor.name);
+            Ok(json!({ "id": user.id, "username": user.username }))
+        }
+    }
+
+    fn bound(name: &'static str, binding: UserBinding) -> RegisteredTool {
+        let mcp_name: &'static str = Box::leak(format!("mcp__brenn__{name}").into_boxed_str());
+        let mut d = descriptor(
+            name,
+            mcp_name,
+            ToolClass::Async { max_concurrency: 2 },
+            &["provider", "path"],
+            Idempotency::Natural,
+        );
+        d.user_binding = binding;
+        RegisteredTool::Async(Arc::new(BoundTool { descriptor: d }))
+    }
+
+    fn one_grant(tool: &str, pairs: &[(&str, &str)]) -> BTreeMap<String, ResolvedToolGrant> {
+        BTreeMap::from([(tool.to_string(), grant(vec![clause(pairs)]))])
+    }
+
+    fn bound_registry() -> ToolRegistry {
+        ToolRegistry::new(vec![
+            bound("acting", UserBinding::ActingUser),
+            bound("lent", UserBinding::ActingOrLentUser),
+            fast("unbound", "mcp__brenn__Unbound", &["provider"]),
+        ])
+    }
+
+    #[test]
+    fn user_bound_tools_admitted_on_a_single_user_container_app() {
+        let reg = bound_registry();
+        for tool in ["acting", "lent", "unbound"] {
+            reg.validate_grants(app_owner(), &one_grant(tool, &[("provider", "google")]));
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "app \"pfin\": tool_grant for \"acting\" is refused: the tool acts as a user and the app is multiuser"
+    )]
+    fn acting_user_tool_refused_on_multiuser_app() {
+        let owner = GrantOwner::App {
+            slug: "pfin",
+            multiuser: true,
+            has_container: true,
+        };
+        bound_registry().validate_grants(owner, &one_grant("acting", &[("provider", "google")]));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "tool_grant for \"lent\" is refused: the tool acts as a user and the app is multiuser"
+    )]
+    fn lent_user_tool_refused_on_multiuser_app() {
+        let owner = GrantOwner::App {
+            slug: "pfin",
+            multiuser: true,
+            has_container: true,
+        };
+        bound_registry().validate_grants(owner, &one_grant("lent", &[("provider", "google")]));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "tool_grant for \"lent\" is refused: the tool acts as a user and the app has no container"
+    )]
+    fn user_bound_tool_refused_on_bare_app() {
+        let owner = GrantOwner::App {
+            slug: "pfin",
+            multiuser: false,
+            has_container: false,
+        };
+        bound_registry().validate_grants(owner, &one_grant("lent", &[("provider", "google")]));
+    }
+
+    #[test]
+    fn unbound_tool_admitted_on_multiuser_bare_app() {
+        let owner = GrantOwner::App {
+            slug: "pfin",
+            multiuser: true,
+            has_container: false,
+        };
+        bound_registry().validate_grants(owner, &one_grant("unbound", &[("provider", "google")]));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "wasm consumer \"sync\": tool_grant for \"acting\" is refused: the tool acts as the acting user and a wasm consumer's calls carry none"
+    )]
+    fn acting_user_tool_refused_on_wasm_consumer() {
+        bound_registry().validate_grants(
+            GrantOwner::WasmConsumer { slug: "sync" },
+            &one_grant("acting", &[("provider", "google")]),
+        );
+    }
+
+    #[test]
+    fn lent_user_tool_admitted_on_wasm_consumer() {
+        bound_registry().validate_grants(
+            GrantOwner::WasmConsumer { slug: "sync" },
+            &one_grant("lent", &[("provider", "google")]),
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "tool_grant for \"lent\" has an invalid ACL clause: path \"bad\" is not a template"
+    )]
+    fn validate_clause_refusal_stops_validation() {
+        bound_registry().validate_grants(
+            app_owner(),
+            &one_grant("lent", &[("provider", "google"), ("path", "bad")]),
+        );
+    }
+
+    #[test]
+    fn validate_clause_default_admits_every_clause() {
+        let reg = bound_registry();
+        let unbound = reg.get("unbound").unwrap();
+        assert_eq!(
+            unbound.validate_clause(&clause(&[("provider", "bad")])),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn grant_owner_for_app_reads_multiuser_and_container() {
+        let mut app = brenn_lib::config::test_app_config("pfin");
+        app.multiuser = true;
+        let owner = GrantOwner::for_app("pfin", &app);
+        assert!(matches!(
+            owner,
+            GrantOwner::App {
+                slug: "pfin",
+                multiuser: true,
+                has_container: false,
+            }
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "app \"shared\": tool_grant for \"acting\" is refused")]
+    fn validate_config_reads_each_app_as_its_grant_owner() {
+        let mut solo = brenn_lib::config::test_app_config("solo");
+        solo.container_spawn = None;
+        std::sync::Arc::make_mut(&mut solo.policy).tool_grants =
+            one_grant("unbound", &[("provider", "google")]);
+        let mut shared = brenn_lib::config::test_app_config("shared");
+        shared.multiuser = true;
+        std::sync::Arc::make_mut(&mut shared.policy).tool_grants =
+            one_grant("acting", &[("provider", "google")]);
+        let apps = IndexMap::from([("solo".to_string(), solo), ("shared".to_string(), shared)]);
+        bound_registry().validate_config(&apps);
+    }
+
+    #[tokio::test]
+    async fn invoke_for_llm_passes_the_acting_user_through() {
+        let reg = bound_registry();
+        let (alert, _h) = brenn_obs::alerting::noop_alert_dispatcher();
+        let user = ActingUser {
+            id: 7,
+            username: "alice".to_string(),
+        };
+        let out = reg
+            .invoke_for_llm(
+                "mcp__brenn__acting",
+                caller(),
+                grant(vec![clause(&[("provider", "google")])]),
+                Some(3),
+                Some(user),
+                json!({}),
+                &alert,
+            )
+            .await
+            .expect("acting-user call succeeds");
+        assert_eq!(out, json!({ "id": 7, "username": "alice" }));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "BUG: tool \"acting\" requires an acting user")]
+    async fn acting_user_tool_without_acting_user_panics() {
+        let reg = bound_registry();
+        let (alert, _h) = brenn_obs::alerting::noop_alert_dispatcher();
+        let _ = reg
+            .invoke_for_llm(
+                "mcp__brenn__acting",
+                caller(),
+                grant(vec![clause(&[("provider", "google")])]),
+                None,
+                None,
+                json!({}),
+                &alert,
+            )
+            .await;
     }
 }

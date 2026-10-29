@@ -23,6 +23,7 @@ brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
 brenn-messaging-boot = { version = "0.1.0", path = "../brenn-messaging-boot" }
 brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
 brenn-mqtt = { version = "0.1.0", path = "../brenn-mqtt" }
+brenn-oauth = { version = "0.1.0", path = "../brenn-oauth" }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
 brenn-pfin = { version = "0.1.0", path = "../brenn-pfin" }
 brenn-pwa-push = { version = "0.1.0", path = "../brenn-pwa-push" }

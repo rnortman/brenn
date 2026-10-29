@@ -32,6 +32,7 @@ use crate::config::hooks::{PostPullHooksConfig, StartHooksConfig, StartupHooksCo
 use crate::config::llm_chat::LlmChatConfig;
 use crate::config::logging::{LevelFilter, LoggingConfig};
 use crate::config::mcp::McpServerConfig;
+use crate::config::oauth_provider::{DEFAULT_MAX_RESPONSE_BYTES, OAuthProviderRaw};
 use crate::config::observability::{ObservabilityConfig, UsageObservabilityConfig};
 use crate::config::repo::{AccessLevel, MountConfigRaw, RepoDeclRaw, RepoSyncConfig, default_true};
 use crate::config::security::SecurityConfig;
@@ -869,6 +870,7 @@ server {
     trusted_proxy_hops = 1;
     pid_file = "/run/brenn/brenn.pid";
     public_url = "https://brenn.example.com";
+    vault_dir = "/var/lib/brenn/vault";
 }
 
 database { path = "/var/lib/brenn/alice.db"; }
@@ -914,6 +916,24 @@ claude_profile main;
 claude_profile spare { expires = "2027-09-01"; }
 
 claude_profile legacy { token_file = "/srv/old-secrets/claude-legacy.token"; }
+
+oauth_provider google {
+    app_name = "Alice's Brenn";
+    client_secret_file = "/etc/brenn/google/client_secret.json";
+    authorize_url = "https://accounts.example.com/o/oauth2/v2/auth";
+    token_url = "https://oauth2.example.com/token";
+    revoke_url = "https://oauth2.example.com/revoke";
+    userinfo_url = "https://openid.example.com/v1/userinfo";
+    account_field = "email";
+    base_scopes = ["openid", "email"];
+    scope_sets = {
+        mail_readonly = ["https://mail.example.com/auth/readonly"],
+        calendar_events = ["https://calendar.example.com/auth/events", "https://calendar.example.com/auth/read"],
+    };
+    extra_authorize_params = { access_type = "offline", prompt = "consent" };
+    api_hosts = ["https://mail.example.com", "https://calendar.example.com"];
+    max_response_bytes = 131072;
+}
 
 repo_sync {
     repo_dir = "/home/alice/repos";
@@ -989,6 +1009,7 @@ container cc {
                 trusted_proxy_hops: 1,
                 pid_file: Some(PathBuf::from("/run/brenn/brenn.pid")),
                 public_url: Some("https://brenn.example.com".to_string()),
+                vault_dir: Some(PathBuf::from("/var/lib/brenn/vault")),
             },
             database: DatabaseConfig {
                 path: PathBuf::from("/var/lib/brenn/alice.db"),
@@ -1027,6 +1048,41 @@ container cc {
                 model: "opus".to_string(),
                 profile_token_dir: Some(PathBuf::from("/home/alice/.secrets")),
             },
+            oauth_providers: BTreeMap::from([(
+                "google".to_string(),
+                OAuthProviderRaw {
+                    app_name: "Alice's Brenn".to_string(),
+                    client_secret_file: PathBuf::from("/etc/brenn/google/client_secret.json"),
+                    authorize_url: "https://accounts.example.com/o/oauth2/v2/auth".to_string(),
+                    token_url: "https://oauth2.example.com/token".to_string(),
+                    revoke_url: Some("https://oauth2.example.com/revoke".to_string()),
+                    userinfo_url: "https://openid.example.com/v1/userinfo".to_string(),
+                    account_field: "email".to_string(),
+                    base_scopes: vec!["openid".to_string(), "email".to_string()],
+                    scope_sets: BTreeMap::from([
+                        (
+                            "mail_readonly".to_string(),
+                            vec!["https://mail.example.com/auth/readonly".to_string()],
+                        ),
+                        (
+                            "calendar_events".to_string(),
+                            vec![
+                                "https://calendar.example.com/auth/events".to_string(),
+                                "https://calendar.example.com/auth/read".to_string(),
+                            ],
+                        ),
+                    ]),
+                    extra_authorize_params: BTreeMap::from([
+                        ("access_type".to_string(), "offline".to_string()),
+                        ("prompt".to_string(), "consent".to_string()),
+                    ]),
+                    api_hosts: vec![
+                        "https://mail.example.com".to_string(),
+                        "https://calendar.example.com".to_string(),
+                    ],
+                    max_response_bytes: 131072,
+                },
+            )]),
             claude_profiles: BTreeMap::from([
                 (
                     "main".to_string(),
@@ -1242,7 +1298,7 @@ fn a_partial_watchdog_section_keeps_the_defaults_for_the_rest() {
 /// is the tripwire for that: the test below asserts it covers every kindword the
 /// language admits, and lowers all of them, so a kindword added to the
 /// vocabulary is a red test rather than a boot panic.
-const MINIMAL_SECTIONS: [(&str, &str); 19] = [
+const MINIMAL_SECTIONS: [(&str, &str); 20] = [
     (
         "server",
         r#"server { public_url = "https://brenn.example.com"; }"#,
@@ -1271,7 +1327,132 @@ const MINIMAL_SECTIONS: [(&str, &str); 19] = [
         "claude_profile",
         r#"claude_profile main { token_file = "/home/alice/.secrets/claude-main.token"; }"#,
     ),
+    ("oauth_provider", MINIMAL_OAUTH_PROVIDER),
 ];
+
+/// An `oauth_provider` block stating only its required keys.
+const MINIMAL_OAUTH_PROVIDER: &str = r#"oauth_provider google {
+    app_name = "Brenn";
+    client_secret_file = "/etc/brenn/google/client_secret.json";
+    authorize_url = "https://accounts.example.com/o/oauth2/v2/auth";
+    token_url = "https://oauth2.example.com/token";
+    userinfo_url = "https://openid.example.com/v1/userinfo";
+    account_field = "email";
+    scope_sets = { mail_readonly = ["https://mail.example.com/auth/readonly"] };
+    api_hosts = ["https://mail.example.com"];
+}"#;
+
+/// The optional keys of a minimal provider take the module's defaults.
+#[test]
+fn a_minimal_oauth_provider_takes_its_defaults() {
+    let config = config_from_dsl(MINIMAL_OAUTH_PROVIDER);
+    assert_eq!(
+        config.oauth_providers,
+        BTreeMap::from([(
+            "google".to_string(),
+            OAuthProviderRaw {
+                app_name: "Brenn".to_string(),
+                client_secret_file: PathBuf::from("/etc/brenn/google/client_secret.json"),
+                authorize_url: "https://accounts.example.com/o/oauth2/v2/auth".to_string(),
+                token_url: "https://oauth2.example.com/token".to_string(),
+                revoke_url: None,
+                userinfo_url: "https://openid.example.com/v1/userinfo".to_string(),
+                account_field: "email".to_string(),
+                base_scopes: vec![],
+                scope_sets: BTreeMap::from([(
+                    "mail_readonly".to_string(),
+                    vec!["https://mail.example.com/auth/readonly".to_string()],
+                )]),
+                extra_authorize_params: BTreeMap::new(),
+                api_hosts: vec!["https://mail.example.com".to_string()],
+                max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            },
+        )]),
+    );
+}
+
+/// `MINIMAL_OAUTH_PROVIDER` with one line replaced.
+fn provider_with(line: &str, replacement: &str) -> String {
+    assert!(MINIMAL_OAUTH_PROVIDER.contains(line), "{line}");
+    MINIMAL_OAUTH_PROVIDER.replace(line, replacement)
+}
+
+#[test]
+fn an_oauth_provider_name_must_be_a_slug() {
+    let diagnostic = refusal(&MINIMAL_OAUTH_PROVIDER.replace("google", "Google_Work"));
+    assert!(
+        diagnostic.message.contains("`oauth_provider Google_Work`")
+            && diagnostic.message.contains("vault directory name"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn an_oauth_provider_without_a_scope_set_or_with_an_empty_one_is_refused() {
+    let line = r#"scope_sets = { mail_readonly = ["https://mail.example.com/auth/readonly"] };"#;
+    let diagnostic = refusal(&provider_with(line, "scope_sets = { };"));
+    assert!(
+        diagnostic
+            .message
+            .contains("`scope_sets` names no scope set"),
+        "{}",
+        diagnostic.message
+    );
+    let diagnostic = refusal(&provider_with(line, "scope_sets = { mail_readonly = [] };"));
+    assert!(
+        diagnostic
+            .message
+            .contains("`scope_sets.mail_readonly` lists no scope"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn an_oauth_provider_without_an_api_host_is_refused() {
+    let diagnostic = refusal(&provider_with(
+        r#"api_hosts = ["https://mail.example.com"];"#,
+        "api_hosts = [];",
+    ));
+    assert!(
+        diagnostic.message.contains("`api_hosts` lists no origin"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn an_oauth_provider_missing_a_required_key_or_stating_an_unknown_one_is_refused() {
+    let messages: Vec<String> = refusals(&provider_with(
+        r#"    account_field = "email";
+"#,
+        "",
+    ))
+    .into_iter()
+    .map(|diagnostic| diagnostic.message)
+    .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("account_field")),
+        "{messages:?}"
+    );
+    let messages: Vec<String> = refusals(&provider_with(
+        r#"    account_field = "email";
+"#,
+        r#"    account_field = "email";
+    client_id = "cid";
+"#,
+    ))
+    .into_iter()
+    .map(|diagnostic| diagnostic.message)
+    .collect();
+    assert!(
+        messages.iter().any(|message| message.contains("client_id")),
+        "{messages:?}"
+    );
+}
 
 /// Asserts a test table's words are exactly the words a vocabulary admits, as
 /// multisets: a missing, extra or duplicated row fails, naming `what`.

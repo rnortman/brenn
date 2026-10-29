@@ -488,6 +488,8 @@ async fn admit_and_dispatch(
         // Bus/executor calls carry no acting conversation (no self-notification
         // suppression); only LLM-originated calls do.
         acting_conversation_id: None,
+        // Bus requests come from components, which act for no user.
+        acting_user: None,
     };
 
     // Spawn only the `execute` future (holding the permit) so a long pull never
@@ -665,6 +667,7 @@ mod tests {
                     acl_keys: &["repo"],
                     idempotency: Idempotency::Natural,
                     auto_approve: true,
+                    user_binding: crate::UserBinding::None,
                 },
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -708,6 +711,7 @@ mod tests {
                 acl_keys: &["repo"],
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
+                user_binding: crate::UserBinding::None,
             })
         }
     }
@@ -1238,6 +1242,38 @@ mod tests {
             captured.iter().any(|(t, _)| t.contains("over-cap result")),
             "result-cap alert should fire: {captured:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn envelope_around_a_result_at_the_tool_budget_is_under_the_cap() {
+        // A tool bounding its serialized value to
+        // `MAX_ASYNC_RESULT_BYTES - ENVELOPE_MARGIN` never trips the over-cap
+        // substitution, even under a maximal call id and a long tool name.
+        use crate::descriptor::ENVELOPE_MARGIN;
+        let budget = MAX_ASYNC_RESULT_BYTES - ENVELOPE_MARGIN;
+        let skeleton = serde_json::to_string(&json!({ "body": "" })).unwrap().len();
+        let value = json!({ "body": "x".repeat(budget - skeleton) });
+        assert_eq!(serde_json::to_string(&value).unwrap().len(), budget);
+
+        let (alert, captured, handle) = make_capturing_alerter();
+        let call_id = "c".repeat(128);
+        let tool = "a-tool-name-of-generous-length-for-the-envelope-test";
+        let body = build_result_body(tool, &call_id, &Ok(value.clone()), &alert);
+        assert!(
+            body.len() <= MAX_ASYNC_RESULT_BYTES,
+            "envelope {} over cap",
+            body.len()
+        );
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["outcome"]["ok"], value,
+            "the value is delivered, not substituted"
+        );
+
+        alert.flush().await;
+        drop(alert);
+        handle.await.unwrap();
+        assert!(captured.lock().unwrap().is_empty(), "no over-cap alert");
     }
 
     #[tokio::test]

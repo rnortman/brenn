@@ -28,13 +28,13 @@ pub mod wasm_host;
 pub mod testutil;
 
 pub use descriptor::{
-    AclDenied, DEFAULT_FAST_BUDGET, Idempotency, MAX_ARGS_BYTES, MAX_ASYNC_RESULT_BYTES,
-    MAX_FAST_BUDGET, MAX_FAST_CALLS_PER_ACTIVATION, MAX_FAST_RESULT_BYTES, ToolClass,
-    ToolDescriptor, ToolError,
+    AclDenied, DEFAULT_FAST_BUDGET, ENVELOPE_MARGIN, Idempotency, MAX_ARGS_BYTES,
+    MAX_ASYNC_RESULT_BYTES, MAX_FAST_BUDGET, MAX_FAST_CALLS_PER_ACTIVATION, MAX_FAST_RESULT_BYTES,
+    ToolClass, ToolDescriptor, ToolError, UserBinding,
 };
 pub use executor::{CallerGrantTable, TOOL_EXECUTOR_COMPONENT, ToolCallerGrants, ToolExecutor};
 pub use git_repo_pull::GitRepoPullTool;
 pub use rate_limit::RateLimiter;
-pub use registry::ToolRegistry;
-pub use tool::{AsyncTool, FastTool, RegisteredTool, ToolCtx};
+pub use registry::{GrantOwner, ToolRegistry};
+pub use tool::{ActingUser, AsyncTool, FastTool, RegisteredTool, ToolCtx};
 pub use wasm_host::WasmToolHost;

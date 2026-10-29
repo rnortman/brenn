@@ -604,6 +604,7 @@ impl ActiveBridge {
             pending_permissions: tokio::sync::Mutex::new(HashMap::new()),
             conversation_id,
             user_id,
+            username: tokio::sync::OnceCell::new(),
             app_slug: app_slug.to_string(),
             working_dir: PathBuf::from("."),
             path_mapper,

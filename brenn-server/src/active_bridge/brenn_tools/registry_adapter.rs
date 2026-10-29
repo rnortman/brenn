@@ -22,7 +22,7 @@ use super::super::ActiveBridge;
 use super::super::tool_summary::HandleBrennToolResult;
 use super::execute::ToolOutcome;
 use crate::intercept_helpers::{PostCard, answer_post_tool_use};
-use brenn_tool_registry::ToolError;
+use brenn_tool_registry::{ActingUser, ToolError};
 
 /// Handle PreToolUse + PostToolUse for any registry tool. Returns `None` when
 /// the request's tool name does not resolve to a registered tool (letting the
@@ -98,8 +98,8 @@ pub(super) async fn handle(
 }
 
 /// Run a registry tool for the agent: the grant-presence check, then
-/// `invoke_for_llm` with the agent as caller and its conversation as the
-/// acting conversation. A `ToolError` becomes `ToolOutcome::Err` in the
+/// `invoke_for_llm` with the agent as caller, its conversation as the acting
+/// conversation, and the conversation's owner as the acting user. A `ToolError` becomes `ToolOutcome::Err` in the
 /// registry's error shape. `None` when `mcp_name` is not a registered tool.
 pub(super) async fn execute_registry_tool(
     bridge: &ActiveBridge,
@@ -127,6 +127,10 @@ pub(super) async fn execute_registry_tool(
         )));
     };
     let caller = ParticipantId::for_app(&bridge.app_slug, &bridge.server_origin);
+    let acting_user = ActingUser {
+        id: bridge.user_id,
+        username: bridge.get_username().await,
+    };
     let result = bridge
         .tools
         .invoke_for_llm(
@@ -134,6 +138,7 @@ pub(super) async fn execute_registry_tool(
             caller,
             grant,
             Some(bridge.conversation_id),
+            Some(acting_user),
             input.clone(),
             &bridge.alert_dispatcher,
         )
@@ -214,6 +219,7 @@ mod tests {
                     acl_keys: &[],
                     idempotency: Idempotency::Natural,
                     auto_approve: false,
+                    user_binding: brenn_tool_registry::UserBinding::None,
                 },
             }
         }
@@ -236,6 +242,54 @@ mod tests {
             _args: serde_json::Value,
         ) -> Result<serde_json::Value, ToolError> {
             Ok(serde_json::json!({}))
+        }
+    }
+
+    const MCP_WHOAMI: &str = "mcp__brenn__WhoAmI";
+
+    /// A user-bound tool that returns the acting user it was handed.
+    struct WhoAmITool {
+        descriptor: ToolDescriptor,
+    }
+
+    impl WhoAmITool {
+        fn new() -> Self {
+            Self {
+                descriptor: ToolDescriptor {
+                    name: "who-am-i",
+                    mcp_name: MCP_WHOAMI,
+                    description: "echoes the acting user",
+                    input_schema: serde_json::json!({ "type": "object" }),
+                    class: ToolClass::Fast {
+                        budget: DEFAULT_FAST_BUDGET,
+                    },
+                    acl_keys: &[],
+                    idempotency: Idempotency::Natural,
+                    auto_approve: true,
+                    user_binding: brenn_tool_registry::UserBinding::ActingUser,
+                },
+            }
+        }
+    }
+
+    impl FastTool for WhoAmITool {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.descriptor
+        }
+        fn check_acl(
+            &self,
+            _args: &serde_json::Value,
+            _acl: &[AclClause],
+        ) -> Result<(), AclDenied> {
+            Ok(())
+        }
+        fn execute(
+            &self,
+            ctx: &ToolCtx,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, ToolError> {
+            let user = ctx.require_acting_user(self.descriptor.name);
+            Ok(serde_json::json!({ "id": user.id, "username": user.username }))
         }
     }
 
@@ -589,5 +643,36 @@ mod tests {
             panic!("expected an Err outcome, got {r:?}");
         };
         assert_eq!(output["error_type"], "not_granted", "{output}");
+    }
+
+    /// A user-bound tool runs as the conversation's owner: the bridge's user
+    /// id and that user's name from the database, the second call answered
+    /// from the bridge's cached name.
+    #[tokio::test]
+    async fn execute_registry_tool_acts_as_the_conversation_owner() {
+        let registry = Arc::new(ToolRegistry::new(vec![RegisteredTool::Fast(Arc::new(
+            WhoAmITool::new(),
+        ))]));
+        let grants = BTreeMap::from([(
+            "who-am-i".to_string(),
+            ResolvedToolGrant {
+                acl: vec![],
+                rate_limit: None,
+            },
+        )]);
+        let bridge = bridge_with(registry, grants).await;
+        let expected = serde_json::json!({ "id": bridge.user_id, "username": "adapt-user" });
+        for call in ["first", "cached"] {
+            let r = super::execute_registry_tool(&bridge, MCP_WHOAMI, &serde_json::json!({})).await;
+            let Some(super::ToolOutcome::Ok(output)) = r else {
+                panic!("{call} call: expected an Ok outcome, got {r:?}");
+            };
+            assert_eq!(output, expected, "{call} call");
+            assert_eq!(
+                bridge.username.get().map(String::as_str),
+                Some("adapt-user"),
+                "{call} call",
+            );
+        }
     }
 }

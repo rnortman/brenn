@@ -4,6 +4,29 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Users can connect their own Google accounts, and the assistant can act
+  through them.** Configure it with a new `oauth_provider` section and a
+  `server.vault_dir` key; `docs/google-workspace.md` walks through the Google
+  console setup, the configuration, the per-app grants and a first-connect
+  check. Four new tools: `oauth-connect` (the assistant gives the user a link
+  to sign in with Google), `oauth-accounts`, `oauth-disconnect`, and
+  `api-request`, which calls the provider's API with the conversation
+  owner's credential attached by Brenn. Tokens are kept in a host-side vault
+  directory that no agent can reach and never enter a container. Grants are
+  refused on `multiuser` apps and on apps without a `container`; a WASM
+  component may hold only read-only `api-request`. The `path` access rule of
+  `api-request` is a segment template (see `docs/config-dsl.md`). Nothing
+  changes for a deployment that declares no provider.
+
+- **Four RustSec advisories cleared; push encryption moved in tree.**
+  tokio, ctutils and pulldown-cmark are bumped (RUSTSEC-2026-0385, -0386,
+  -0414). RUSTSEC-2026-0387 (`crypto-bigint` 0.5) is cleared by moving to
+  `p256` 0.14: the `web-push-native` crate, which pinned the old curve line,
+  is removed, and PWA push payloads are now encrypted by Brenn itself (RFC
+  8291 over `ece-native`), checked against the RFC's own test vector. The
+  wire format is unchanged and no configuration or VAPID key changes; watch
+  the first push after deploy as usual.
+
 - **Brenn's own checks now use the published `brenn-scrub` from crates.io,
   not the copy in this repo.** `brenn-scrub` is the secret-and-hygiene
   scanner behind the git hooks and `make check`. `make check` and
@@ -20,6 +43,10 @@ All notable changes to Brenn are documented here.
   release 0.2.0 skips the design-reference rule on whole-tree scans, so
   `make scrub-tree` and the pre-push scan no longer report it locally; CI
   still enforces it (tracked as `scrub-diff-only-tag-upstream` in `TODO.md`).
+
+- Logging in from a link to `/app/…`, `/r/…` or `/oauth/…` now returns you
+  to that link, even after a mistyped password. Login and registration forms
+  posted from another site are refused (403).
 
 ## [0.28.0] — 2026-10-22
 

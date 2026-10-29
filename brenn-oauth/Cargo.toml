@@ -1,0 +1,44 @@
+[package]
+name = "brenn-oauth"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Users' OAuth credentials: the vault they are kept in, the connect flow that obtains them, and the registry tools that act through them"
+
+[features]
+# Expose `testutil` — a stub authorization server and a service over a scratch
+# vault — to the crates above, whose tests drive the callback route. Not for
+# production builds.
+testutils = ["dep:axum", "dep:tempfile", "brenn-lib/testutils", "brenn-obs/testutils"]
+
+# Reaches down to brenn-tool-registry for the tool traits, to brenn-lib for the
+# resolved provider config and `SecretString`, to brenn-obs for the operator
+# alert a provider's protocol breach raises. Nothing above is named here:
+# brenn-server serves the callback route over the service this crate builds.
+[dependencies]
+async-trait = "0.1.89"
+base64ct = { version = "1.8.3", features = ["alloc"] }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
+brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry" }
+chrono = { version = "0.4.44", features = ["serde"] }
+hex = "0.4.3"
+percent-encoding = "2.3.2"
+rand = "0.10"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "form"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["sync", "time", "macros", "rt"] }
+tracing = "0.1.44"
+url = "2.5.8"
+# Optional, enabled by "testutils": the stub server in `testutil`. Both are
+# dev-dependencies below as well.
+axum = { version = "0.8.8", optional = true }
+tempfile = { version = "3.27.0", optional = true }
+
+[dev-dependencies]
+axum = "0.8.8"
+brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
+tempfile = "3.27.0"
+tokio = { version = "1.50.0", features = ["full", "test-util"] }

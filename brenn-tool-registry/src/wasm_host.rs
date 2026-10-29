@@ -91,6 +91,7 @@ impl ToolHost for WasmToolHost {
             caller: self.caller.clone(),
             grant,
             acting_conversation_id: None,
+            acting_user: None,
         };
         // `invoke_fast` emits the unified invocation log (tool, caller, class,
         // duration, outcome) on every path, so nothing is logged here.
@@ -171,6 +172,7 @@ mod tests {
                 acl_keys: &["repo"],
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
+                user_binding: crate::UserBinding::None,
             })
         }
         fn check_acl(&self, args: &serde_json::Value, acl: &[AclClause]) -> Result<(), AclDenied> {
@@ -200,6 +202,7 @@ mod tests {
                 acl_keys: &["repo"],
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
+                user_binding: crate::UserBinding::None,
             })
         }
         fn check_acl(&self, args: &serde_json::Value, acl: &[AclClause]) -> Result<(), AclDenied> {

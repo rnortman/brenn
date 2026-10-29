@@ -25,7 +25,8 @@ use std::sync::Arc;
 use base64ct::{Base64UrlUnpadded, Encoding as _};
 use p256::ecdsa::SigningKey;
 use p256::ecdsa::signature::Signer as _;
-use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+use p256::elliptic_curve::Generate as _;
+use p256::elliptic_curve::sec1::ToSec1Point as _;
 use serde::{Deserialize, Serialize};
 
 /// Loaded VAPID keypair.
@@ -131,15 +132,13 @@ fn parse_keypair_file(content: &str, path: &Path) -> VapidKeypair {
 /// Returns the 65-byte uncompressed point (0x04 || X || Y) encoded as
 /// base64url-no-pad (87 chars). This is the exact on-disk format.
 fn derive_public_b64url(secret: &p256::SecretKey) -> String {
-    // to_encoded_point(false) = uncompressed (0x04 + X + Y = 65 bytes).
-    let raw = secret.public_key().to_encoded_point(false);
+    // to_sec1_point(false) = uncompressed (0x04 + X + Y = 65 bytes).
+    let raw = secret.public_key().to_sec1_point(false);
     Base64UrlUnpadded::encode_string(raw.as_bytes())
 }
 
 fn generate_and_write(path: &Path) -> VapidKeypair {
-    // OsRng is available via p256's elliptic_curve re-export.
-    let mut rng = p256::elliptic_curve::rand_core::OsRng;
-    let secret = p256::SecretKey::random(&mut rng);
+    let secret = p256::SecretKey::generate_from_rng(&mut rand::rng());
     let private_bytes = secret.to_bytes();
     let public_b64url = derive_public_b64url(&secret);
     let private_b64url = Base64UrlUnpadded::encode_string(&private_bytes);
@@ -202,8 +201,8 @@ fn generate_and_write(path: &Path) -> VapidKeypair {
 /// Build a VAPID `Authorization` header value for an RFC 8292-conformant JWT.
 ///
 /// Implements ES256 JWT signing in-tree to avoid pulling `jwt-simple` and the
-/// `rsa` chain. The JWT structure exactly matches what `web-push-native`'s
-/// `with_vapid` produced:
+/// `rsa` chain. The JWT is the RFC 8292 §2 VAPID token, signed as RFC 7515
+/// ES256:
 ///   - Header: `{"typ":"JWT","alg":"ES256"}`
 ///   - Claims: `{"aud":"<scheme>://<host>","sub":"<contact>","exp":<unix-secs>}`
 ///   - Signature: ES256 = ECDSA-P256 + SHA-256, fixed-length 64-byte `r||s`

@@ -260,6 +260,7 @@ mod tests {
             acl_keys: &[],
             idempotency: Idempotency::Natural,
             auto_approve: true,
+            user_binding: crate::UserBinding::None,
         }
     }
 

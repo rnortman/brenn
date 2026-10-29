@@ -43,6 +43,13 @@ pub struct ServerConfig {
     /// explanatory load-time panic (`validate_and_resolve`) rather than a terse
     /// one; a config without it does not start.
     pub public_url: Option<String>,
+    /// Host directory holding users' third-party credentials, one file per
+    /// account under `<provider>/<username>/`. Required exactly when an
+    /// `oauth_provider` is declared; owned by the server's uid, mode 0700, and
+    /// disjoint from every agent-reachable path the configuration declares
+    /// (checked at boot and on reload; a container's `extra_args` are not
+    /// read).
+    pub vault_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -54,6 +61,7 @@ impl Default for ServerConfig {
             trusted_proxy_hops: 0,
             pid_file: None,
             public_url: None,
+            vault_dir: None,
         }
     }
 }
