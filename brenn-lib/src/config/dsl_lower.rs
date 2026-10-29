@@ -78,6 +78,7 @@ use crate::webhook::config::{
 use brenn_envelope::grants::AppCapability;
 
 use super::alerting::{AlertingConfig, MailConfig, NtfyConfig, default_subject_label};
+use super::api_key_provider::ApiKeyProviderRaw;
 use super::app::AppConfigRaw;
 use super::attachment::{AttachmentHandlerConfig, AttachmentTargetRaw, default_timeout_secs};
 use super::automation::AutomationGlobalConfig;
@@ -175,6 +176,7 @@ pub fn lower(derived: DerivedConfig) -> Result<BrennConfig, Vec<Diagnostic>> {
         claude_defaults: sections.claude_defaults.unwrap_or_default(),
         claude_profiles,
         oauth_providers: sections.oauth_providers,
+        api_key_providers: sections.api_key_providers,
         repo_sync: sections.repo_sync.unwrap_or_default(),
         repos,
         container: sections.container,
@@ -959,6 +961,7 @@ struct Sections {
     /// after the profiles.
     claude_profiles: BTreeMap<String, StatedProfile>,
     oauth_providers: BTreeMap<String, OAuthProviderRaw>,
+    api_key_providers: BTreeMap<String, ApiKeyProviderRaw>,
 }
 
 /// One `claude_profile` block's body, held until the token-path convention can
@@ -1039,10 +1042,41 @@ fn sections(list: &[RSection], errors: &mut Vec<Diagnostic>) -> Sections {
                     .expect("an oauth_provider section carries a name")
                     .value()
                     .clone();
+                refuse_shared_provider_name(
+                    &name,
+                    "oauth_provider",
+                    out.api_key_providers
+                        .contains_key(&name)
+                        .then_some("api_key_provider"),
+                    section.kindword.span(),
+                    errors,
+                );
                 if let Some(provider) =
                     oauth_provider(&name, section.kindword.span(), &mut body, errors)
                 {
                     out.oauth_providers.insert(name, provider);
+                }
+            }
+            "api_key_provider" => {
+                let name = section
+                    .name
+                    .as_ref()
+                    .expect("an api_key_provider section carries a name")
+                    .value()
+                    .clone();
+                refuse_shared_provider_name(
+                    &name,
+                    "api_key_provider",
+                    out.oauth_providers
+                        .contains_key(&name)
+                        .then_some("oauth_provider"),
+                    section.kindword.span(),
+                    errors,
+                );
+                if let Some(provider) =
+                    api_key_provider(&name, section.kindword.span(), &mut body, errors)
+                {
+                    out.api_key_providers.insert(name, provider);
                 }
             }
             "integration" => {
@@ -1376,11 +1410,7 @@ fn oauth_provider(
 ) -> Option<OAuthProviderRaw> {
     let before = errors.len();
     let what = format!("`oauth_provider {name}`");
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
+    if !is_provider_slug(name) {
         errors.push(Diagnostic::at(
             format!(
                 "{what}: the name must be lowercase letters, digits and `-` — it is a URL \
@@ -1418,16 +1448,7 @@ fn oauth_provider(
     let extra_authorize_params = body
         .string_map("extra_authorize_params", errors)
         .unwrap_or_default();
-    let api_hosts = body.required_strings("api_hosts", errors);
-    if api_hosts.as_ref().is_some_and(Vec::is_empty) {
-        errors.push(Diagnostic::at(
-            format!("{what}: `api_hosts` lists no origin; no request could be sent"),
-            at.clone(),
-        ));
-    }
-    let max_response_bytes = body
-        .int("max_response_bytes", errors)
-        .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
+    let (api_hosts, max_response_bytes) = provider_egress(&what, at, body, errors);
     if errors.len() != before {
         return None;
     }
@@ -1442,6 +1463,95 @@ fn oauth_provider(
         base_scopes,
         scope_sets: scope_sets?,
         extra_authorize_params,
+        api_hosts: api_hosts?,
+        max_response_bytes,
+    })
+}
+
+/// The keys every provider kind lowers alike: `api_hosts`, refused when it
+/// lists no origin, and `max_response_bytes`, defaulted. `what` names the
+/// block in the diagnostic.
+fn provider_egress(
+    what: &str,
+    at: &Span,
+    body: &mut Body,
+    errors: &mut Vec<Diagnostic>,
+) -> (Option<Vec<String>>, usize) {
+    let api_hosts = body.required_strings("api_hosts", errors);
+    if api_hosts.as_ref().is_some_and(Vec::is_empty) {
+        errors.push(Diagnostic::at(
+            format!("{what}: `api_hosts` lists no origin; no request could be sent"),
+            at.clone(),
+        ));
+    }
+    let max_response_bytes = body
+        .int("max_response_bytes", errors)
+        .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
+    (api_hosts, max_response_bytes)
+}
+
+/// Refuse a provider block whose name an earlier block of the other provider
+/// kind (`earlier`) already declared: an `api-request` call and its ACL
+/// clauses name a provider by that name alone.
+fn refuse_shared_provider_name(
+    name: &str,
+    kindword: &str,
+    earlier: Option<&str>,
+    at: &Span,
+    errors: &mut Vec<Diagnostic>,
+) {
+    if let Some(earlier) = earlier {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{kindword} {name}`: an `{earlier}` is already named `{name}`; the two kinds \
+                 share one namespace, the `provider` an api-request call names"
+            ),
+            at.clone(),
+        ));
+    }
+}
+
+/// Whether `name` is a provider slug: lowercase letters, digits and `-`.
+fn is_provider_slug(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// One `api_key_provider` block.
+///
+/// The name takes `oauth_provider`'s slug rule: both kinds are named by the
+/// same `provider` argument and ACL key. A block with no API host is refused
+/// here. The key file, the header name and the origins are boot checks
+/// (`resolve_api_key_providers`).
+fn api_key_provider(
+    name: &str,
+    at: &Span,
+    body: &mut Body,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<ApiKeyProviderRaw> {
+    let before = errors.len();
+    let what = format!("`api_key_provider {name}`");
+    if !is_provider_slug(name) {
+        errors.push(Diagnostic::at(
+            format!(
+                "{what}: the name must be lowercase letters, digits and `-` — it is the \
+                 `provider` an api-request call and its ACL clauses name, shared with \
+                 oauth_provider"
+            ),
+            at.clone(),
+        ));
+    }
+    let key_file = body.required_path("key_file", errors);
+    let header = body.required_str("header", errors);
+    let (api_hosts, max_response_bytes) = provider_egress(&what, at, body, errors);
+    if errors.len() != before {
+        return None;
+    }
+    Some(ApiKeyProviderRaw {
+        key_file: key_file?,
+        header: header?,
         api_hosts: api_hosts?,
         max_response_bytes,
     })

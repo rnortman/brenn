@@ -66,6 +66,13 @@ oauth_provider google {
     api_hosts = ["https://mail.example.com"];
 }
 
+// One service Brenn sends a deployment-wide key to.
+api_key_provider maps {
+    key_file = "/etc/brenn/maps/api-key";
+    header = "X-Api-Key";
+    api_hosts = ["https://weather.example.com"];
+}
+
 repo_sync {
     repo_dir = "/home/alice/repos";
     poll_interval_secs = 300;

@@ -148,12 +148,7 @@ pub fn redirect_uri(public_url: &str, provider: &str) -> String {
 
 fn resolve_provider(name: &str, raw: &OAuthProviderRaw, public_url: &str) -> OAuthProviderConfig {
     let label = format!("oauth_provider `{name}`");
-    assert!(
-        raw.max_response_bytes > 0 && raw.max_response_bytes <= MAX_RESPONSE_BYTES_CEILING,
-        "config: {label}: max_response_bytes = {} is outside 1..={MAX_RESPONSE_BYTES_CEILING} \
-         (the tool result cap); page the request instead",
-        raw.max_response_bytes,
-    );
+    assert_max_response_bytes(&label, raw.max_response_bytes);
     let authorize = parse_url(&label, "authorize_url", &raw.authorize_url);
     assert!(
         matches!(authorize.scheme(), "https" | "http"),
@@ -165,14 +160,7 @@ fn resolve_provider(name: &str, raw: &OAuthProviderRaw, public_url: &str) -> OAu
     if let Some(revoke_url) = &raw.revoke_url {
         validate_credential_url(&label, "revoke_url", revoke_url);
     }
-    let api_origins = raw
-        .api_hosts
-        .iter()
-        .map(|text| {
-            let url = validate_origin(&label, text);
-            (origin_host(&url), url)
-        })
-        .collect();
+    let api_origins = resolve_api_origins(&label, &raw.api_hosts);
 
     let redirect_uri = redirect_uri(public_url, name);
     let text = load_secret_file_private(&label, &raw.client_secret_file);
@@ -193,6 +181,16 @@ fn resolve_provider(name: &str, raw: &OAuthProviderRaw, public_url: &str) -> OAu
         redirect_uri,
         api_origins,
     }
+}
+
+/// Refuse a provider's `max_response_bytes` outside
+/// `1..=`[`MAX_RESPONSE_BYTES_CEILING`].
+pub(crate) fn assert_max_response_bytes(label: &str, bytes: usize) {
+    assert!(
+        bytes > 0 && bytes <= MAX_RESPONSE_BYTES_CEILING,
+        "config: {label}: max_response_bytes = {bytes} is outside \
+         1..={MAX_RESPONSE_BYTES_CEILING} (the tool result cap); page the request instead",
+    );
 }
 
 fn parse_url(label: &str, key: &str, text: &str) -> url::Url {
@@ -236,6 +234,24 @@ pub fn origin_host(origin: &url::Url) -> String {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     }
+}
+
+/// A provider's `api_hosts`, each validated as an origin and paired with its
+/// [`origin_host`], the key a request's host is matched against. Every
+/// provider kind resolves its hosts here, so the match compares alike across
+/// kinds.
+///
+/// # Panics
+///
+/// An entry is not a canonical https (or loopback http) origin.
+pub(crate) fn resolve_api_origins(label: &str, hosts: &[String]) -> Vec<(String, url::Url)> {
+    hosts
+        .iter()
+        .map(|text| {
+            let url = validate_origin(label, text);
+            (origin_host(&url), url)
+        })
+        .collect()
 }
 
 /// An `api_hosts` entry: exactly an origin, written canonically, so the exact

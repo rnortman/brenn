@@ -67,6 +67,9 @@ pub struct ResolvedConfig {
     /// The credential vault and every OAuth provider, each client file read
     /// once. `Some` iff an `oauth_provider` is declared.
     pub oauth: Option<super::ResolvedOAuth>,
+    /// Every API-key provider, each key file read once; empty when none is
+    /// declared.
+    pub api_key_providers: std::collections::BTreeMap<String, super::ApiKeyProviderConfig>,
 }
 
 /// Validate raw config and resolve defaults, producing the final app registry
@@ -99,6 +102,7 @@ pub struct ResolvedConfig {
 /// - An app slug is too long for its tool socket path to fit `sun_path`
 /// - `watchdog.sweep_interval_secs` is zero
 /// - The credential vault or an `oauth_provider` is refused (`resolve_oauth`)
+/// - An `api_key_provider` is refused (`resolve_api_key_providers`)
 pub fn validate_and_resolve(
     config: &BrennConfig,
     integration_registry: &IntegrationRegistry,
@@ -200,6 +204,7 @@ pub fn validate_and_resolve(
 
     // After `resolve_apps`: the vault is checked against the paths it settled.
     let oauth = super::resolve_oauth(config, &apps);
+    let api_key_providers = super::resolve_api_key_providers(config);
 
     ResolvedConfig {
         apps: Arc::new(apps),
@@ -208,6 +213,7 @@ pub fn validate_and_resolve(
         pwa_push,
         claude_profiles,
         oauth,
+        api_key_providers,
     }
 }
 

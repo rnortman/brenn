@@ -474,6 +474,53 @@ outgoing URL from the matched segments, re-encoding each one, so what is sent
 is exactly what was matched. `host` is `host[:port]`, matched exactly against
 the provider's `api_hosts`.
 
+### API-key providers
+
+An `api_key_provider` block names a service that authenticates with one
+deployment-wide key, such as Google's Maps Platform APIs. The operator places
+the key in a file on the host; Brenn reads it at boot and attaches it to
+requests itself. No agent ever holds the key.
+
+```
+api_key_provider google-maps {
+  key_file = "/etc/brenn/google/maps-api-key";
+  header = "X-Goog-Api-Key";
+  api_hosts = [
+    "https://weather.googleapis.com",
+    "https://places.googleapis.com",
+    "https://routes.googleapis.com",
+  ];
+}
+```
+
+The block's name follows the `oauth_provider` rule: lowercase letters, digits
+and `-`. Both kinds of provider share one namespace, so a name declared as both
+is refused at the second block.
+
+- `key_file` — required. The host path to a file holding the key: mode `0600`
+  or tighter, not empty. Surrounding whitespace is trimmed. The file is read
+  once at boot and its content is never logged.
+- `header` — required. The header the key is sent in on each request:
+  `header = "X-Goog-Api-Key"` sends the file's content as that header's value.
+  The content is sent verbatim, so a provider that wants
+  `Authorization: Bearer <key>` takes `header = "Authorization"` and a file
+  holding `Bearer <key>`. Boot refuses a `header` that is not a valid header
+  name, or that names `host`, `content-length`, `transfer-encoding`,
+  `connection` or `cookie`. It also refuses a key holding anything but visible
+  ASCII and spaces, such as a control character, a byte-order mark or a
+  non-ASCII character pasted in with it.
+- `api_hosts` — required. As for `oauth_provider`: the origins requests
+  carrying the key may go to, each written canonically. Each origin must be
+  `https`; plain `http` is accepted only for `127.0.0.1`, `[::1]` or
+  `localhost`.
+- `max_response_bytes` — as for `oauth_provider`: defaults to 256 KiB, and
+  values above 512 KiB are refused.
+
+A key provider needs no `server.vault_dir`. That key stays required exactly
+when an `oauth_provider` is declared. Changing a key provider takes a restart,
+and a reload that changes one is refused, naming it. A key file replaced in
+place is not noticed until the next restart.
+
 ### Spawn artifacts and the runtime directory
 
 Every Claude Code process is handed two host files, both named in

@@ -1919,6 +1919,16 @@ vocabulary! {
         opt max_response_bytes: V,
     }
 
+    /// An `api_key_provider` block: one service Brenn sends a deployment-wide
+    /// key to. The block's name is the provider's slug, shared with
+    /// `oauth_provider` names. The key is sent as the value of `header`.
+    struct ApiKeyProviderAttrs<V> {
+        req key_file: V,
+        req header: V,
+        req api_hosts: V,
+        opt max_response_bytes: V,
+    }
+
     /// The `repo_sync` section: where repo clones live, how often repos are
     /// polled, and when a pending event is too old to inject.
     struct RepoSyncAttrs<V> {
@@ -2043,6 +2053,7 @@ kindword_dispatch! {
     "container" named => Container(ContainerAttrs),
     "claude_profile" named => ClaudeProfile(ClaudeProfileAttrs),
     "oauth_provider" named => OAuthProvider(OAuthProviderAttrs),
+    "api_key_provider" named => ApiKeyProvider(ApiKeyProviderAttrs),
     "integration" named => Integration(OpenAttrs),
 }
 

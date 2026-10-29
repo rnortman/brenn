@@ -5,6 +5,7 @@ use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::{DocumentInputs, SourceFile};
 
 use super::alerting::AlertingConfig;
+use super::api_key_provider::ApiKeyProviderRaw;
 use super::app::AppConfigRaw;
 use super::claude_defaults::ClaudeDefaultsConfig;
 use super::claude_profile::ClaudeProfileRaw;
@@ -85,6 +86,9 @@ pub struct BrennConfig {
     pub claude_profiles: std::collections::BTreeMap<String, ClaudeProfileRaw>,
     /// Declared OAuth providers, keyed by provider slug.
     pub oauth_providers: std::collections::BTreeMap<String, OAuthProviderRaw>,
+    /// Declared API-key providers, keyed by provider slug. No name is also an
+    /// `oauth_providers` key.
+    pub api_key_providers: std::collections::BTreeMap<String, ApiKeyProviderRaw>,
     /// Repo-sync settings (polling interval, staleness cap, webhook URL prefix
     /// override). Omitting the section falls
     /// back to `RepoSyncConfig::default()`.

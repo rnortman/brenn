@@ -20,6 +20,13 @@ All notable changes to Brenn are documented here.
   "Install lld" step, which never chose the linker. The first build after
   updating rebuilds the host lane from scratch.
 
+- **New `api_key_provider` config section** for services that use one
+  operator-held API key (such as Google Maps Platform). The key lives in a
+  host file (mode `0600`) that Brenn reads at boot and checks; no agent ever
+  sees it. Declaring one is accepted but has no effect yet: `api-request`
+  does not use key providers until a following change. Changing one needs a
+  restart. See `docs/config-dsl.md`, "API-key providers".
+
 ## [0.29.0] — 2026-10-29
 
 - **Users can connect their own Google accounts, and the assistant can act

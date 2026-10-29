@@ -417,3 +417,57 @@ fn git_pipeline_reference_config_resolves() {
         }
     }
 }
+
+/// A config declaring an `api_key_provider` with the key file at `mode`.
+fn config_with_key_provider(dir: &std::path::Path, mode: u32) -> BrennConfig {
+    use std::os::unix::fs::PermissionsExt;
+    let key_file = dir.join("maps-api-key");
+    std::fs::write(&key_file, "k3y-value\n").unwrap();
+    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(mode)).unwrap();
+    let app_dir = dir.join("myapp");
+    std::fs::create_dir(&app_dir).unwrap();
+    BrennConfig {
+        server: super::test_server_config(),
+        apps: vec![AppConfigRaw {
+            slug: "myapp".to_string(),
+            working_dir: Some(app_dir),
+            ..Default::default()
+        }],
+        api_key_providers: std::collections::BTreeMap::from([(
+            "maps".to_string(),
+            crate::config::ApiKeyProviderRaw {
+                key_file,
+                ..crate::config::test_api_key_provider_raw("https://api.example.com")
+            },
+        )]),
+        ..Default::default()
+    }
+}
+
+/// `validate_and_resolve` resolves every declared key provider into
+/// `ResolvedConfig.api_key_providers`, key in hand.
+#[test]
+fn resolved_config_carries_api_key_providers() {
+    let dir = tempfile::tempdir().unwrap();
+    let ResolvedConfig {
+        api_key_providers, ..
+    } = validate_and_resolve(
+        &config_with_key_provider(dir.path(), 0o600),
+        &IntegrationRegistry::new(vec![]),
+        super::test_runtime_dir(),
+    );
+    assert_eq!(api_key_providers.keys().collect::<Vec<_>>(), ["maps"]);
+    assert_eq!(api_key_providers["maps"].key.expose(), "k3y-value");
+}
+
+/// A key provider whose key file is group-readable refuses boot.
+#[test]
+#[should_panic(expected = "api_key_provider `maps`")]
+fn a_group_readable_key_file_refuses_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    validate_and_resolve(
+        &config_with_key_provider(dir.path(), 0o640),
+        &IntegrationRegistry::new(vec![]),
+        super::test_runtime_dir(),
+    );
+}

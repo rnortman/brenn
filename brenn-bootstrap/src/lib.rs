@@ -396,6 +396,8 @@ pub async fn run_server(
         pwa_push: resolved_pwa_push,
         claude_profiles,
         oauth,
+        // Read and validated at boot; nothing here consumes them.
+        api_key_providers: _,
     } = validate_and_resolve(&config, &integration_registry, &runtime_dir);
 
     // The one agent table of this process. Every gate that decides on an agent

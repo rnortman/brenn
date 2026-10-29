@@ -51,6 +51,29 @@ Done = no host-side write, delete or directory creation under the container
 home or a repo mount follows a symlink out of its sanctioned root, with a test
 that plants one in an ancestor.
 
+## `security-key-file-not-checked-disjoint-from-agent-visible-paths`
+
+Operator-placed secret files are checked for mode only, never for placement.
+An `api_key_provider`'s `key_file` (`brenn-lib/src/config/api_key_provider.rs`,
+`resolve_provider`) is a complete bearer credential billed to the operator, yet
+nothing refuses one that sits inside an app's `working_dir`, `state_dir`, repo
+mount, container home, an `extra_mounts` host side or `repo_sync.repo_dir`,
+where the agent can read it and use it outside `api-request`'s ACL and rate
+limit. Only `server.vault_dir` is checked against those roots, at boot
+(`assert_vault_disjoint_from_apps`) and on reload (`reload/driver.rs`). The
+same gap holds for `oauth_provider`'s `client_secret_file`, the webhook
+`secret_file`s and the Claude profile token files.
+
+Deciding it is a posture question: which operator-placed file kinds are held
+outside every agent-visible root, whether the check runs on reload as the
+vault's does, and what `docs/security-posture.md` promises about it. The
+existing `vault_roots` and the canonicalised file-inside-root relation of
+`assert_vault_disjoint` are the machinery a check would reuse, with the label
+and message generalised beyond `server.vault_dir`.
+
+Done = every file kind the posture covers is refused at boot and on reload when
+it lies inside an agent-visible root, with a test per kind.
+
 ## `quality-virtual-tools-final-symlink-left-open-though-local-fix-exists`
 
 `write_virtual_tools_file` writes `<state_dir>/virtual-tools.json` with

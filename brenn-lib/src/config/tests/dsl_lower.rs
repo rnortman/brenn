@@ -19,6 +19,7 @@ use crate::access::raw::{
     AppAclRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
 };
 use crate::config::alerting::{AlertingConfig, MailConfig, NtfyConfig, default_subject_label};
+use crate::config::api_key_provider::ApiKeyProviderRaw;
 use crate::config::app::AppConfigRaw;
 use crate::config::attachment::{
     AttachmentHandlerConfig, AttachmentTargetRaw, default_timeout_secs,
@@ -935,6 +936,13 @@ oauth_provider google {
     max_response_bytes = 131072;
 }
 
+api_key_provider maps {
+    key_file = "/etc/brenn/maps/api-key";
+    header = "X-Api-Key";
+    api_hosts = ["https://weather.example.com", "https://places.example.com"];
+    max_response_bytes = 65536;
+}
+
 repo_sync {
     repo_dir = "/home/alice/repos";
     poll_interval_secs = 301;
@@ -1081,6 +1089,18 @@ container cc {
                         "https://calendar.example.com".to_string(),
                     ],
                     max_response_bytes: 131072,
+                },
+            )]),
+            api_key_providers: BTreeMap::from([(
+                "maps".to_string(),
+                ApiKeyProviderRaw {
+                    key_file: PathBuf::from("/etc/brenn/maps/api-key"),
+                    header: "X-Api-Key".to_string(),
+                    api_hosts: vec![
+                        "https://weather.example.com".to_string(),
+                        "https://places.example.com".to_string(),
+                    ],
+                    max_response_bytes: 65536,
                 },
             )]),
             claude_profiles: BTreeMap::from([
@@ -1298,7 +1318,7 @@ fn a_partial_watchdog_section_keeps_the_defaults_for_the_rest() {
 /// is the tripwire for that: the test below asserts it covers every kindword the
 /// language admits, and lowers all of them, so a kindword added to the
 /// vocabulary is a red test rather than a boot panic.
-const MINIMAL_SECTIONS: [(&str, &str); 20] = [
+const MINIMAL_SECTIONS: [(&str, &str); 21] = [
     (
         "server",
         r#"server { public_url = "https://brenn.example.com"; }"#,
@@ -1328,6 +1348,7 @@ const MINIMAL_SECTIONS: [(&str, &str); 20] = [
         r#"claude_profile main { token_file = "/home/alice/.secrets/claude-main.token"; }"#,
     ),
     ("oauth_provider", MINIMAL_OAUTH_PROVIDER),
+    ("api_key_provider", MINIMAL_API_KEY_PROVIDER),
 ];
 
 /// An `oauth_provider` block stating only its required keys.
@@ -1452,6 +1473,143 @@ fn an_oauth_provider_missing_a_required_key_or_stating_an_unknown_one_is_refused
         messages.iter().any(|message| message.contains("client_id")),
         "{messages:?}"
     );
+}
+
+/// An `api_key_provider` block stating only its required keys.
+const MINIMAL_API_KEY_PROVIDER: &str = r#"api_key_provider maps {
+    key_file = "/etc/brenn/maps/api-key";
+    header = "X-Api-Key";
+    api_hosts = ["https://api.example.com"];
+}"#;
+
+/// The optional keys of a minimal key provider take the module's defaults.
+#[test]
+fn a_minimal_api_key_provider_takes_its_defaults() {
+    let config = config_from_dsl(MINIMAL_API_KEY_PROVIDER);
+    assert_eq!(
+        config.api_key_providers,
+        BTreeMap::from([(
+            "maps".to_string(),
+            ApiKeyProviderRaw {
+                key_file: PathBuf::from("/etc/brenn/maps/api-key"),
+                header: "X-Api-Key".to_string(),
+                api_hosts: vec!["https://api.example.com".to_string()],
+                max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            },
+        )]),
+    );
+}
+
+/// `MINIMAL_API_KEY_PROVIDER` with one line replaced.
+fn key_provider_with(line: &str, replacement: &str) -> String {
+    assert!(MINIMAL_API_KEY_PROVIDER.contains(line), "{line}");
+    MINIMAL_API_KEY_PROVIDER.replace(line, replacement)
+}
+
+const KEY_HEADER_LINE: &str = r#"    header = "X-Api-Key";
+"#;
+
+#[test]
+fn an_api_key_provider_name_must_be_a_slug() {
+    let diagnostic = refusal(&MINIMAL_API_KEY_PROVIDER.replace("maps", "google_maps"));
+    assert!(
+        diagnostic
+            .message
+            .contains("`api_key_provider google_maps`")
+            && diagnostic.message.contains("shared with oauth_provider"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn a_mistyped_header_is_refused() {
+    let diagnostic = refusal(&key_provider_with(KEY_HEADER_LINE, "    header = 5;\n"));
+    assert!(
+        diagnostic.message.contains("`header`: expected a string"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn an_api_key_provider_without_an_api_host_is_refused() {
+    let diagnostic = refusal(&key_provider_with(
+        r#"api_hosts = ["https://api.example.com"];"#,
+        "api_hosts = [];",
+    ));
+    assert!(
+        diagnostic.message.contains("`api_hosts` lists no origin"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn an_api_key_provider_missing_a_required_key_or_stating_an_unknown_one_is_refused() {
+    for (line, key) in [
+        (
+            r#"    key_file = "/etc/brenn/maps/api-key";
+"#,
+            "key_file",
+        ),
+        (KEY_HEADER_LINE, "header"),
+    ] {
+        let messages: Vec<String> = refusals(&key_provider_with(line, ""))
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(
+            messages.iter().any(|message| message.contains(key)),
+            "{key}: {messages:?}"
+        );
+    }
+    let messages: Vec<String> = refusals(&key_provider_with(
+        KEY_HEADER_LINE,
+        r#"    header = "X-Api-Key";
+    key = "inline";
+"#,
+    ))
+    .into_iter()
+    .map(|diagnostic| diagnostic.message)
+    .collect();
+    assert!(
+        messages.iter().any(|message| message.contains("`key`")),
+        "{messages:?}"
+    );
+}
+
+/// The two provider kinds share one namespace; whichever block comes second
+/// is refused, at its own kindword.
+#[test]
+fn a_name_declared_as_both_provider_kinds_is_refused_at_the_second_block() {
+    let key = MINIMAL_API_KEY_PROVIDER.replace("maps", "google");
+    for (first, second, message) in [
+        (
+            MINIMAL_OAUTH_PROVIDER,
+            key.as_str(),
+            "`api_key_provider google`: an `oauth_provider` is already named `google`",
+        ),
+        (
+            key.as_str(),
+            MINIMAL_OAUTH_PROVIDER,
+            "`oauth_provider google`: an `api_key_provider` is already named `google`",
+        ),
+    ] {
+        let diagnostic = refusal(&format!("{first}\n{second}\n"));
+        assert!(
+            diagnostic.message.contains(message),
+            "{}",
+            diagnostic.message
+        );
+        let second_starts = i64::try_from(first.lines().count()).unwrap() + 1;
+        assert_eq!(
+            diagnostic.line_col(),
+            Some((second_starts, 1)),
+            "{}",
+            diagnostic.render()
+        );
+    }
 }
 
 /// Asserts a test table's words are exactly the words a vocabulary admits, as

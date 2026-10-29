@@ -103,6 +103,7 @@ pub(crate) fn non_convergible_differences(
         claude_defaults,
         claude_profiles,
         oauth_providers,
+        api_key_providers,
         repo_sync,
         repos,
         container,
@@ -134,6 +135,7 @@ pub(crate) fn non_convergible_differences(
         claude_defaults: b_claude_defaults,
         claude_profiles: b_claude_profiles,
         oauth_providers: b_oauth_providers,
+        api_key_providers: b_api_key_providers,
         repo_sync: b_repo_sync,
         repos: b_repos,
         container: b_container,
@@ -181,6 +183,13 @@ pub(crate) fn non_convergible_differences(
         "oauth_providers",
         &by_key(oauth_providers),
         &by_key(b_oauth_providers),
+        &mut out,
+    );
+    // Keys are read once at boot, as client files are.
+    keyed_map(
+        "api_key_providers",
+        &by_key(api_key_providers),
+        &by_key(b_api_key_providers),
         &mut out,
     );
     plain("repo_sync", repo_sync, b_repo_sync, &mut out);
@@ -1135,6 +1144,35 @@ mod tests {
         assert_eq!(
             refusals(&base(), &provider("https://oauth2.example.com/token")),
             vec!["oauth_providers[google] added: this change needs a restart".to_string()],
+        );
+    }
+
+    /// An added, removed or changed key provider is refused by name: its key
+    /// is read once at boot.
+    #[test]
+    fn a_changed_api_key_provider_is_named_and_needs_a_restart() {
+        let provider = |key_file: &str| {
+            let mut config = base();
+            config.api_key_providers.insert(
+                "maps".to_string(),
+                brenn_lib::config::ApiKeyProviderRaw {
+                    key_file: std::path::PathBuf::from(key_file),
+                    ..brenn_lib::config::test_api_key_provider_raw("https://api.example.com")
+                },
+            );
+            config
+        };
+        assert_eq!(
+            refusals(&provider("/keys/one"), &provider("/keys/two")),
+            vec!["api_key_providers[maps] differs: this change needs a restart".to_string()],
+        );
+        assert_eq!(
+            refusals(&base(), &provider("/keys/one")),
+            vec!["api_key_providers[maps] added: this change needs a restart".to_string()],
+        );
+        assert_eq!(
+            refusals(&provider("/keys/one"), &base()),
+            vec!["api_key_providers[maps] removed: this change needs a restart".to_string()],
         );
     }
 }
