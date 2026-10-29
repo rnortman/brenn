@@ -1,16 +1,19 @@
-//! `api-request`: an HTTP request to a provider's API with a user's stored
-//! credential attached by Brenn.
+//! `api-request`: an HTTP request to a provider's API with a credential
+//! attached by Brenn — a user's stored OAuth credential, or the deployment's
+//! key for an `api_key_provider`.
 //!
-//! The caller names the request; the credential is never an argument. A
-//! conversation caller acts with its owner's credential; a caller with no
-//! acting user (a WASM component) with the one user its own grant names, and
-//! only to read.
+//! The caller names the request; the credential is never an argument. On an
+//! OAuth provider a conversation caller acts with its owner's credential, and
+//! a caller with no acting user (a WASM component) with the one user its own
+//! grant names. On a key provider every caller sends the same key. A caller
+//! with no acting user only reads, on either kind.
 //!
 //! The ACL is matched here, not by [`AclClause::matches`]: `path` is a segment
 //! template (see [`crate::path_template`]) and every other key exact or `*`.
-//! `check_acl` sees only the arguments, so it defers `user` (and an omitted
-//! `account`); `execute` matches the full attribute set once the credential is
-//! resolved.
+//! `check_acl` sees only the arguments, so on an OAuth provider it defers
+//! `user` (and an omitted `account`); `execute` matches the full attribute set
+//! once the credential is resolved. A key-provider call has no `user` or
+//! `account`: a clause constraining either never admits it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -18,7 +21,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use base64ct::{Base64, Encoding};
-use brenn_lib::config::OAuthProviderConfig;
+use brenn_lib::config::{ApiKeyProviderConfig, OAuthProviderConfig, TRANSPORT_HEADERS};
 use brenn_lib::tools::AclClause;
 use brenn_tool_registry::{
     AclDenied, AsyncTool, ENVELOPE_MARGIN, Idempotency, MAX_ASYNC_RESULT_BYTES, ToolClass, ToolCtx,
@@ -29,7 +32,7 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
-use crate::http::{ApiCall, ApiResponse, CallFailure, Refreshed};
+use crate::http::{ApiCall, ApiResponse, Auth, CallFailure, OAuthHttp, Refreshed};
 use crate::path_template::{
     build_url, decode_path, display_path, template_admits, validate_template,
 };
@@ -39,19 +42,8 @@ const NAME: &str = "api-request";
 
 const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
 
-/// Methods a caller with a lent credential may use.
+/// Methods a caller with no acting user may use.
 const READ_METHODS: &[&str] = &["GET", "HEAD"];
-
-/// Request headers the caller may not set: the credential and the transport
-/// are Brenn's.
-const FORBIDDEN_HEADERS: &[&str] = &[
-    "authorization",
-    "host",
-    "content-length",
-    "transfer-encoding",
-    "cookie",
-    "connection",
-];
 
 /// An access token expiring sooner than this is refreshed before use.
 const REFRESH_MARGIN: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
@@ -89,30 +81,53 @@ enum QueryValue {
 
 /// A provider `api-request` can attach a credential for, by kind.
 enum ResolvedProvider<'a> {
-    OAuth(&'a OAuthProviderConfig),
+    OAuth {
+        service: &'a OAuthService,
+        config: &'a OAuthProviderConfig,
+    },
+    Key(&'a ApiKeyProviderConfig),
 }
 
 impl ResolvedProvider<'_> {
     /// Each API origin's `host[:port]` and the origin.
     fn api_origins(&self) -> &[(String, url::Url)] {
         match self {
-            ResolvedProvider::OAuth(config) => &config.api_origins,
+            ResolvedProvider::OAuth { config, .. } => &config.api_origins,
+            ResolvedProvider::Key(config) => &config.api_origins,
         }
     }
 
-    fn max_response_bytes(&self) -> usize {
+    /// The header Brenn sends the key in, for a key provider.
+    fn key_header(&self) -> Option<&HeaderName> {
         match self {
-            ResolvedProvider::OAuth(config) => config.raw.max_response_bytes,
+            ResolvedProvider::OAuth { .. } => None,
+            ResolvedProvider::Key(config) => Some(&config.header),
         }
     }
 }
 
-/// The ACL attributes of a call. `None` is a deferred attribute: a clause
-/// constraining it is not refused for it.
+/// One ACL attribute of a call.
+#[derive(Clone, Copy)]
+enum Attr<'a> {
+    /// Not known yet: any constraint on it admits.
+    Deferred,
+    /// The call has none: no constraint on it admits, `*` included.
+    Absent,
+    /// Matched by `*` or this value.
+    Is(&'a str),
+}
+
+impl<'a> From<Option<&'a str>> for Attr<'a> {
+    fn from(value: Option<&'a str>) -> Self {
+        value.map_or(Attr::Deferred, Attr::Is)
+    }
+}
+
+/// The ACL attributes of a call.
 struct Attrs<'a> {
     provider: &'a str,
-    user: Option<&'a str>,
-    account: Option<&'a str>,
+    user: Attr<'a>,
+    account: Attr<'a>,
     method: &'a str,
     host: &'a str,
     segments: &'a [String],
@@ -121,14 +136,17 @@ struct Attrs<'a> {
 /// Whether `clause` admits `attrs`: every constrained key is deferred or
 /// matches — `path` as a segment template, every other key exactly or `*`.
 fn clause_admits(clause: &AclClause, attrs: &Attrs<'_>) -> bool {
-    let exact =
-        |allowed: &str, value: Option<&str>| value.is_none_or(|v| allowed == "*" || allowed == v);
+    let exact = |allowed: &str, value: Attr<'_>| match value {
+        Attr::Deferred => true,
+        Attr::Absent => false,
+        Attr::Is(v) => allowed == "*" || allowed == v,
+    };
     clause.iter().all(|(key, allowed)| match key {
-        "provider" => exact(allowed, Some(attrs.provider)),
+        "provider" => exact(allowed, Attr::Is(attrs.provider)),
         "user" => exact(allowed, attrs.user),
         "account" => exact(allowed, attrs.account),
-        "method" => exact(allowed, Some(attrs.method)),
-        "host" => exact(allowed, Some(attrs.host)),
+        "method" => exact(allowed, Attr::Is(attrs.method)),
+        "host" => exact(allowed, Attr::Is(attrs.host)),
         "path" => template_admits(allowed, attrs.segments),
         other => panic!(
             "BUG: {NAME} clause constrains {other:?}, which grant validation admits only for \
@@ -182,7 +200,7 @@ struct Prepared {
 }
 
 impl Prepared {
-    fn attrs<'a>(&'a self, user: Option<&'a str>, account: Option<&'a str>) -> Attrs<'a> {
+    fn attrs<'a>(&'a self, user: Attr<'a>, account: Attr<'a>) -> Attrs<'a> {
         Attrs {
             provider: &self.provider,
             user,
@@ -196,6 +214,56 @@ impl Prepared {
     fn line(&self) -> String {
         request_line(&self.provider, &self.method, &self.host, &self.segments)
     }
+
+    /// The request as sent, before its credential is placed.
+    fn call(&self) -> ApiCall {
+        ApiCall {
+            method: reqwest::Method::from_bytes(self.method.as_bytes())
+                .expect("METHODS are valid methods"),
+            url: build_url(&self.origin, &self.segments, &self.query),
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+        }
+    }
+
+    /// A request that got no answer, logged with its scrubbed text, as the
+    /// tool's error. `account` is set on an OAuth provider only.
+    fn transport_failed(&self, user: &str, account: Option<&str>, text: &str) -> ToolError {
+        error!(
+            provider = %self.provider,
+            user = %user,
+            account = account.map(tracing::field::display),
+            error = %text,
+            "api-request: transport failure"
+        );
+        ToolError::Internal(format!("{NAME}: {text}"))
+    }
+
+    /// The completion line of an answered request. `account` and `refreshed`
+    /// are set on an OAuth provider only; the query is never logged.
+    fn log_sent(
+        &self,
+        user: &str,
+        account: Option<&str>,
+        refreshed: Option<bool>,
+        response: &ApiResponse,
+        started: Instant,
+    ) {
+        info!(
+            provider = %self.provider,
+            user = %user,
+            account = account.map(tracing::field::display),
+            method = %self.method,
+            host = %self.host,
+            path = %display_path(&self.segments),
+            status = response.status,
+            bytes = response.content_length.unwrap_or(response.body.len() as u64),
+            truncated = response.truncated,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            refreshed,
+            "api-request"
+        );
+    }
 }
 
 /// The request line as logs and refusals name it.
@@ -205,6 +273,14 @@ fn request_line(provider: &str, method: &str, host: &str, segments: &[String]) -
 
 fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, ToolError> {
     let invalid = |detail: String| ToolError::InvalidArgs(format!("{NAME}: {detail}"));
+    let key_header = provider.key_header();
+    if key_header.is_some() && args.account.is_some() {
+        return Err(invalid(format!(
+            "`account` applies to OAuth providers only; {:?} is an api_key_provider and sends \
+             the deployment's key",
+            args.provider
+        )));
+    }
     if !METHODS.contains(&args.method.as_str()) {
         return Err(invalid(format!(
             "method {:?} is not one of {METHODS:?}",
@@ -228,6 +304,11 @@ fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, T
         })?
         .clone();
     let segments = decode_path(&args.path).map_err(invalid)?;
+    let reserved = |what: &str, name: &str| {
+        invalid(format!(
+            "{what} {name:?} is Brenn's to set, not the caller's"
+        ))
+    };
     let query = args
         .query
         .into_iter()
@@ -240,11 +321,11 @@ fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, T
     for (name, value) in &args.headers {
         let name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| invalid(format!("{name:?} is not a header name")))?;
-        if FORBIDDEN_HEADERS.contains(&name.as_str()) {
-            return Err(invalid(format!(
-                "header {:?} is Brenn's to set, not the caller's",
-                name.as_str()
-            )));
+        if name == reqwest::header::AUTHORIZATION
+            || TRANSPORT_HEADERS.contains(&name.as_str())
+            || key_header == Some(&name)
+        {
+            return Err(reserved("header", name.as_str()));
         }
         let value = HeaderValue::from_str(value)
             .map_err(|_| invalid(format!("header {:?} has an invalid value", name.as_str())))?;
@@ -408,42 +489,68 @@ fn bounded_result(response: ApiResponse) -> Result<serde_json::Value, ToolError>
     }
 }
 
-/// The `api-request` tool.
+/// The `api-request` tool, over the OAuth providers of `oauth` and the key
+/// providers of `keys`.
 pub struct ApiRequestTool {
     descriptor: ToolDescriptor,
-    service: Arc<OAuthService>,
+    oauth: Option<Arc<OAuthService>>,
+    keys: BTreeMap<String, ApiKeyProviderConfig>,
+    /// Sends every API request: a clone of the service's client when there is
+    /// a service, so requests and refreshes share one pool.
+    http: OAuthHttp,
 }
 
 impl ApiRequestTool {
-    pub fn new(service: Arc<OAuthService>) -> Self {
+    /// # Panics
+    ///
+    /// A provider name is declared as both kinds.
+    pub fn new(
+        oauth: Option<Arc<OAuthService>>,
+        keys: BTreeMap<String, ApiKeyProviderConfig>,
+    ) -> Self {
+        if let Some(service) = &oauth {
+            for name in service.provider_names() {
+                assert!(
+                    !keys.contains_key(name),
+                    "BUG: provider {name:?} is both an oauth_provider and an api_key_provider; \
+                     config lowering refuses that"
+                );
+            }
+        }
+        let http = oauth
+            .as_ref()
+            .map_or_else(OAuthHttp::new, |service| service.http().clone());
         Self {
             descriptor: ToolDescriptor {
                 name: NAME,
                 mcp_name: "mcp__brenn__ApiRequest",
-                description: "Make an HTTP request to a provider's API as the user, with the \
-                              user's connected credential attached by Brenn (never by you). \
-                              Name the provider, the API host and the path; for Google, Gmail \
-                              is host `gmail.googleapis.com` under `/gmail/v1/users/me/...` and \
-                              Calendar is `www.googleapis.com` under `/calendar/v3/...`. The \
-                              response's status, headers and body come back as they are, \
-                              non-2xx included; redirects are not followed. Results are \
-                              capped: when `truncated` is true, page (`maxResults`, \
-                              `pageToken`, `format=metadata`) rather than retry. A result with \
-                              `error: \"credential_invalid\"` means the user must connect \
-                              again: run `oauth-connect` and relay its steps; after the user \
-                              says done, `oauth-accounts` confirms. With several accounts \
-                              connected for a provider, name `account`.",
+                description: "Make an HTTP request to a provider's API with a credential Brenn \
+                              attaches (never you): the user's connected account for an OAuth \
+                              provider, or the deployment's key for an API-key provider. Name \
+                              the provider, the API host and the path; the operator's \
+                              instructions say which providers and hosts exist. The response's \
+                              status, headers and body come back as they are, non-2xx \
+                              included; redirects are not followed. Results are capped: when \
+                              `truncated` is true, page or ask for fewer fields rather than \
+                              retry. OAuth providers only: a result with `error: \
+                              \"credential_invalid\"` means the user must connect again: run \
+                              `oauth-connect` and relay its steps; after the user says done, \
+                              `oauth-accounts` confirms. With several accounts connected for \
+                              an OAuth provider, name `account`; `account` is refused on an \
+                              API-key provider.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "provider": {
                             "type": "string",
-                            "description": "The provider's configured name, e.g. \"google\".",
+                            "description": "The provider's configured name, e.g. \"google\" \
+                                            or \"google-maps\".",
                         },
                         "account": {
                             "type": "string",
-                            "description": "The account, as `oauth-accounts` lists it. \
-                                            Omitted: the user's only account there.",
+                            "description": "OAuth providers only: the account, as \
+                                            `oauth-accounts` lists it. Omitted: the user's \
+                                            only account there.",
                         },
                         "method": {
                             "type": "string",
@@ -451,12 +558,12 @@ impl ApiRequestTool {
                         },
                         "host": {
                             "type": "string",
-                            "description": "host[:port], e.g. \"gmail.googleapis.com\".",
+                            "description": "host[:port], e.g. \"api.example.com\".",
                         },
                         "path": {
                             "type": "string",
                             "description": "Absolute path, percent-encoded within each \
-                                            segment, e.g. \"/gmail/v1/users/me/messages\".",
+                                            segment, e.g. \"/v1/things\".",
                         },
                         "query": {
                             "type": "object",
@@ -473,7 +580,8 @@ impl ApiRequestTool {
                             "type": "object",
                             "additionalProperties": { "type": "string" },
                             "description": "Extra request headers. Not Authorization, Host, \
-                                            Cookie or transport headers.",
+                                            Cookie, transport headers, or the provider's key \
+                                            header.",
                         },
                         "body": {
                             "type": "string",
@@ -495,19 +603,47 @@ impl ApiRequestTool {
                 auto_approve: true,
                 user_binding: UserBinding::ActingOrLentUser,
             },
-            service,
+            oauth,
+            keys,
+            http,
         }
     }
 
-    fn resolve(&self, provider: &str) -> Result<ResolvedProvider<'_>, ToolError> {
-        self.service
-            .require_provider(provider)
-            .map(ResolvedProvider::OAuth)
+    /// The provider named `name`, of either kind, or the refusal naming every
+    /// configured provider with its kind.
+    fn resolve(&self, name: &str) -> Result<ResolvedProvider<'_>, ToolError> {
+        if let Some(config) = self.keys.get(name) {
+            return Ok(ResolvedProvider::Key(config));
+        }
+        if let Some(service) = &self.oauth
+            && let Some(config) = service.provider(name)
+        {
+            return Ok(ResolvedProvider::OAuth { service, config });
+        }
+        let mut configured: Vec<String> = self
+            .oauth
+            .iter()
+            .flat_map(|service| service.provider_names())
+            .map(|name| format!("{name} (oauth_provider)"))
+            .chain(
+                self.keys
+                    .keys()
+                    .map(|name| format!("{name} (api_key_provider)")),
+            )
+            .collect();
+        configured.sort();
+        Err(ToolError::InvalidArgs(format!(
+            "unknown provider {name:?}; configured: {configured:?}"
+        )))
     }
 
     /// The account to use when the caller named none: the user's only one.
-    async fn sole_account(&self, provider: &str, user: &str) -> Result<Option<String>, ToolError> {
-        let accounts = self.service.vault().accounts(provider, user).await;
+    async fn sole_account(
+        service: &OAuthService,
+        provider: &str,
+        user: &str,
+    ) -> Result<Option<String>, ToolError> {
+        let accounts = service.vault().accounts(provider, user).await;
         match accounts.as_slice() {
             [] => Ok(None),
             [account] => Ok(Some(account.clone())),
@@ -520,7 +656,7 @@ impl ApiRequestTool {
     /// A refresh that produced nothing usable, logged once, as the tool's
     /// error.
     fn refresh_failed(
-        &self,
+        service: &OAuthService,
         provider: &str,
         user: &str,
         account: &str,
@@ -532,7 +668,7 @@ impl ApiRequestTool {
             user: Some(user),
             account: Some(account),
         };
-        let detail = self.service.report_failure(site, failure).into_detail();
+        let detail = service.report_failure(site, failure).into_detail();
         ToolError::Internal(format!(
             "{NAME}: refreshing the access token failed ({detail})"
         ))
@@ -541,14 +677,14 @@ impl ApiRequestTool {
     /// The access token for one credential, refreshed under the credential's
     /// lock when it expires within [`REFRESH_MARGIN`] or is `rejected`.
     async fn token(
-        &self,
+        service: &OAuthService,
         config: &OAuthProviderConfig,
         provider: &str,
         user: &str,
         account: &str,
         rejected: Option<&str>,
     ) -> Result<Token, ToolError> {
-        let vault = self.service.vault();
+        let vault = service.vault();
         let guard = vault.lock(provider, user, account).await;
         let Some(mut credential) = vault.read(guard.path()).await else {
             return Ok(Token::Invalid(
@@ -565,8 +701,7 @@ impl ApiRequestTool {
                 refreshed: false,
             });
         }
-        let outcome = match self
-            .service
+        let outcome = match service
             .http()
             .refresh(config, &credential.refresh_token)
             .await
@@ -578,10 +713,15 @@ impl ApiRequestTool {
                     "the provider refused the stored credential ({detail})"
                 )));
             }
-            Err(failure) => return Err(self.refresh_failed(provider, user, account, failure)),
+            Err(failure) => {
+                return Err(Self::refresh_failed(
+                    service, provider, user, account, failure,
+                ));
+            }
         };
         let Some(expires_at) = crate::expiry(now, outcome.expires_in) else {
-            return Err(self.refresh_failed(
+            return Err(Self::refresh_failed(
+                service,
                 provider,
                 user,
                 account,
@@ -619,8 +759,26 @@ impl AsyncTool for ApiRequestTool {
     }
 
     fn validate_clause(&self, clause: &AclClause) -> Result<(), String> {
-        match clause.iter().find(|(key, _)| *key == "path") {
-            Some((_, template)) => validate_template(template),
+        let value = |name: &str| clause.iter().find(|(key, _)| *key == name).map(|(_, v)| v);
+        if value("user").is_some() || value("account").is_some() {
+            if let Some(provider) = value("provider")
+                && self.keys.contains_key(provider)
+            {
+                return Err(format!(
+                    "`user` and `account` have no meaning for api_key_provider {provider:?}; the \
+                     clause admits no call"
+                ));
+            }
+            if self.oauth.is_none() {
+                return Err(
+                    "`user` and `account` have no meaning for an api_key_provider and no \
+                     oauth_provider is declared; the clause admits no call"
+                        .to_string(),
+                );
+            }
+        }
+        match value("path") {
+            Some(template) => validate_template(template),
             None => Ok(()),
         }
     }
@@ -634,10 +792,15 @@ impl AsyncTool for ApiRequestTool {
         let Ok(segments) = decode_path(&args.path) else {
             return Ok(());
         };
+        let (user, account) = if self.keys.contains_key(&args.provider) {
+            (Attr::Absent, Attr::Absent)
+        } else {
+            (Attr::Deferred, Attr::from(args.account.as_deref()))
+        };
         let attrs = Attrs {
             provider: &args.provider,
-            user: None,
-            account: args.account.as_deref(),
+            user,
+            account,
             method: &args.method,
             host: &args.host,
             segments: &segments,
@@ -661,20 +824,74 @@ impl AsyncTool for ApiRequestTool {
             .map_err(|e| ToolError::InvalidArgs(format!("{NAME} args: {e}")))?;
         let provider = self.resolve(&args.provider)?;
         let request = prepare(&provider, args)?;
-        let (user, lent) = match &ctx.acting_user {
-            Some(acting) => (acting.username.clone(), false),
-            None => (lent_user(&ctx.grant.acl, &request.provider)?, true),
-        };
-        if lent && !READ_METHODS.contains(&request.method.as_str()) {
+        // A component's call can be replayed from its channel window, so it
+        // only reads, whatever the credential.
+        if ctx.acting_user.is_none() && !READ_METHODS.contains(&request.method.as_str()) {
             return Err(ToolError::Denied(format!(
-                "{}: a caller with no acting user may only read ({READ_METHODS:?}) with a lent \
-                 credential",
+                "{}: a caller with no acting user may only read ({READ_METHODS:?})",
                 request.line()
             )));
         }
+        match provider {
+            ResolvedProvider::Key(config) => self.execute_key(ctx, config, request, started).await,
+            ResolvedProvider::OAuth { service, config } => {
+                self.execute_oauth(ctx, service, config, request, started)
+                    .await
+            }
+        }
+    }
+}
+
+impl ApiRequestTool {
+    /// One request with the deployment's key: sent once, its answer returned
+    /// whatever the status.
+    async fn execute_key(
+        &self,
+        ctx: &ToolCtx,
+        config: &ApiKeyProviderConfig,
+        request: Prepared,
+        started: Instant,
+    ) -> Result<serde_json::Value, ToolError> {
+        if !acl_admits(&ctx.grant.acl, &request.attrs(Attr::Absent, Attr::Absent)) {
+            return Err(ToolError::Denied(format!(
+                "{} (an api_key_provider call has no user or account)",
+                request.line()
+            )));
+        }
+        let user = ctx
+            .acting_user
+            .as_ref()
+            .map_or("-", |acting| acting.username.as_str());
+        let auth = Auth::Header {
+            name: &config.header,
+            value: config.key.expose(),
+        };
+        let response = self
+            .http
+            .api(request.call(), auth, config.raw.max_response_bytes)
+            .await
+            .map_err(|text| request.transport_failed(user, None, &text))?;
+        request.log_sent(user, None, None, &response, started);
+        bounded_result(response)
+    }
+
+    /// One request with a user's OAuth credential, refreshed and resent once
+    /// on a 401 to a token that was not fresh.
+    async fn execute_oauth(
+        &self,
+        ctx: &ToolCtx,
+        service: &OAuthService,
+        config: &OAuthProviderConfig,
+        request: Prepared,
+        started: Instant,
+    ) -> Result<serde_json::Value, ToolError> {
+        let user = match &ctx.acting_user {
+            Some(acting) => acting.username.clone(),
+            None => lent_user(&ctx.grant.acl, &request.provider)?,
+        };
         let account = match &request.account {
             Some(account) => account.clone(),
-            None => match self.sole_account(&request.provider, &user).await? {
+            None => match Self::sole_account(service, &request.provider, &user).await? {
                 Some(account) => account,
                 None => {
                     info!(provider = %request.provider, user = %user, "api-request: no account connected");
@@ -686,26 +903,28 @@ impl AsyncTool for ApiRequestTool {
                 }
             },
         };
-        if !acl_admits(&ctx.grant.acl, &request.attrs(Some(&user), Some(&account))) {
+        if !acl_admits(
+            &ctx.grant.acl,
+            &request.attrs(Attr::Is(&user), Attr::Is(&account)),
+        ) {
             return Err(ToolError::Denied(format!(
                 "{} as user {user:?}, account {account:?}",
                 request.line()
             )));
         }
-        let ResolvedProvider::OAuth(config) = provider;
 
         let mut rejected: Option<String> = None;
         let mut refreshed = false;
         let response = loop {
-            let token = self
-                .token(
-                    config,
-                    &request.provider,
-                    &user,
-                    &account,
-                    rejected.as_deref(),
-                )
-                .await?;
+            let token = Self::token(
+                service,
+                config,
+                &request.provider,
+                &user,
+                &account,
+                rejected.as_deref(),
+            )
+            .await?;
             let (access, fresh) = match token {
                 Token::Ready {
                     access,
@@ -724,22 +943,15 @@ impl AsyncTool for ApiRequestTool {
                     ));
                 }
             };
-            let call = ApiCall {
-                method: reqwest::Method::from_bytes(request.method.as_bytes())
-                    .expect("METHODS are valid methods"),
-                url: build_url(&request.origin, &request.segments, &request.query),
-                headers: request.headers.clone(),
-                body: request.body.clone(),
-            };
             let response = self
-                .service
-                .http()
-                .api(call, &access, provider.max_response_bytes())
+                .http
+                .api(
+                    request.call(),
+                    Auth::Bearer(&access),
+                    config.raw.max_response_bytes,
+                )
                 .await
-                .map_err(|text| {
-                    error!(provider = %request.provider, user = %user, account = %account, error = %text, "api-request: transport failure");
-                    ToolError::Internal(format!("{NAME}: {text}"))
-                })?;
+                .map_err(|text| request.transport_failed(&user, Some(&account), &text))?;
             if response.status != 401 {
                 break response;
             }
@@ -755,20 +967,7 @@ impl AsyncTool for ApiRequestTool {
             // and resend.
             rejected = Some(access);
         };
-        info!(
-            provider = %request.provider,
-            user = %user,
-            account = %account,
-            method = %request.method,
-            host = %request.host,
-            path = %display_path(&request.segments),
-            status = response.status,
-            bytes = response.content_length.unwrap_or(response.body.len() as u64),
-            truncated = response.truncated,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            refreshed,
-            "api-request"
-        );
+        request.log_sent(&user, Some(&account), Some(refreshed), &response, started);
         bounded_result(response)
     }
 }
@@ -781,8 +980,8 @@ mod tests {
 
     use super::*;
     use crate::testutil::{
-        Stub, alice, credential, provider_clause, provider_config, service, service_with_alerts,
-        start_stub, tool_ctx,
+        KEY, Stub, alice, credential, key_provider_config, provider_clause, provider_config,
+        service, service_with_alerts, start_stub, tool_ctx,
     };
     use crate::vault::Credential;
 
@@ -828,7 +1027,7 @@ mod tests {
             .store("alice", &credential("google", "alice@example.com", "RT-a"))
             .await;
         Fixture {
-            tool: ApiRequestTool::new(svc.clone()),
+            tool: ApiRequestTool::new(Some(svc.clone()), BTreeMap::new()),
             svc,
             stub,
             host: base.trim_start_matches("http://").to_string(),
@@ -1025,7 +1224,7 @@ mod tests {
     #[tokio::test]
     async fn validate_clause_checks_path_templates() {
         let (svc, _dir) = service(vec![provider_config("google", "http://127.0.0.1:9")]);
-        let tool = ApiRequestTool::new(svc);
+        let tool = ApiRequestTool::new(Some(svc), BTreeMap::new());
         assert_eq!(tool.validate_clause(&clause(&[("path", "/a/*/b")])), Ok(()));
         assert_eq!(tool.validate_clause(&clause(&[("path", "*")])), Ok(()));
         assert_eq!(tool.validate_clause(&clause(&[("method", "GET")])), Ok(()));
@@ -1462,5 +1661,300 @@ mod tests {
         assert!(d.auto_approve);
         assert!(matches!(d.class, ToolClass::Async { max_concurrency: 8 }));
         assert_eq!(d.idempotency, Idempotency::Natural);
+    }
+
+    /// A tool over the OAuth provider `google` and the key provider `maps`,
+    /// both pointed at one stub.
+    struct KeyFixture {
+        tool: ApiRequestTool,
+        stub: Stub,
+        host: String,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn key_fixture() -> KeyFixture {
+        let (base, stub) = start_stub().await;
+        let (svc, dir) = service(vec![provider_config("google", &base)]);
+        let keys = BTreeMap::from([key_provider_config("maps", &base)]);
+        KeyFixture {
+            tool: ApiRequestTool::new(Some(svc), keys),
+            stub,
+            host: base.trim_start_matches("http://").to_string(),
+            _dir: dir,
+        }
+    }
+
+    impl KeyFixture {
+        fn args(&self, method: &str, path: &str) -> serde_json::Value {
+            serde_json::json!({
+                "provider": "maps", "method": method, "host": self.host, "path": path,
+            })
+        }
+
+        async fn call(
+            &self,
+            user: Option<ActingUser>,
+            acl: Vec<AclClause>,
+            args: serde_json::Value,
+        ) -> Result<serde_json::Value, ToolError> {
+            self.tool.execute(&tool_ctx(user, acl), args).await
+        }
+
+        fn seen(&self) -> Vec<crate::testutil::ApiSeen> {
+            self.stub.lock().unwrap().api_seen.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_key_is_sent_in_its_header() {
+        let f = key_fixture().await;
+        f.stub.lock().unwrap().api_body = br#"{"ok":true}"#.to_vec();
+        let mut args = f.args("GET", "/v1/things");
+        // Only the configured name is reserved: `key` is any parameter here.
+        args["query"] = serde_json::json!({"a": "1", "key": "mine"});
+        let out = f
+            .call(Some(alice()), vec![provider_clause("maps")], args)
+            .await
+            .unwrap();
+        assert_eq!(out["status"], 200);
+        assert_eq!(out["body"], r#"{"ok":true}"#);
+        assert!(!out.to_string().contains(KEY), "{out}");
+        let seen = f.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path_and_query, "/v1/things?a=1&key=mine");
+        assert_eq!(seen[0].headers["x-api-key"], KEY);
+        assert!(!seen[0].headers.contains_key("authorization"));
+    }
+
+    #[tokio::test]
+    async fn the_key_header_and_account_are_refused_to_the_caller() {
+        let f = key_fixture().await;
+        let with = |key: &str, value: serde_json::Value| {
+            let mut args = f.args("GET", "/v1/things");
+            args[key] = value;
+            args
+        };
+        for args in [
+            with("headers", serde_json::json!({"X-API-KEY": "theirs"})),
+            with("headers", serde_json::json!({"x-api-key": "theirs"})),
+            with("headers", serde_json::json!({"Authorization": "Bearer x"})),
+            with("headers", serde_json::json!({"Cookie": "a=b"})),
+            with("account", serde_json::json!("alice@example.com")),
+        ] {
+            let out = f
+                .call(Some(alice()), vec![provider_clause("*")], args.clone())
+                .await;
+            assert!(
+                matches!(out, Err(ToolError::InvalidArgs(_))),
+                "{args}: {out:?}"
+            );
+        }
+        assert!(f.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clauses_admit_a_key_call_on_method_host_and_path_only() {
+        let f = key_fixture().await;
+        let host = f.host.clone();
+        let admitting = [
+            vec![provider_clause("maps")],
+            vec![provider_clause("*")],
+            vec![clause(&[
+                ("provider", "maps"),
+                ("method", "GET"),
+                ("host", &host),
+                ("path", "/v1/*"),
+            ])],
+        ];
+        for acl in admitting {
+            assert_eq!(f.tool.check_acl(&f.args("GET", "/v1/things"), &acl), Ok(()));
+            f.call(Some(alice()), acl.clone(), f.args("GET", "/v1/things"))
+                .await
+                .unwrap_or_else(|e| panic!("{acl:?}: {e:?}"));
+        }
+        let denying = [
+            vec![clause(&[("provider", "maps"), ("method", "POST")])],
+            vec![clause(&[
+                ("provider", "maps"),
+                ("host", "other.example.com"),
+            ])],
+            vec![clause(&[("provider", "maps"), ("path", "/v2/*")])],
+            vec![provider_clause("google")],
+            vec![clause(&[("provider", "*"), ("user", "alice")])],
+            vec![clause(&[("provider", "*"), ("user", "*")])],
+            vec![clause(&[("provider", "*"), ("account", "*")])],
+        ];
+        for acl in denying {
+            assert!(
+                f.tool
+                    .check_acl(&f.args("GET", "/v1/things"), &acl)
+                    .is_err(),
+                "{acl:?}"
+            );
+            let out = f
+                .call(Some(alice()), acl.clone(), f.args("GET", "/v1/things"))
+                .await;
+            assert!(matches!(out, Err(ToolError::Denied(_))), "{acl:?}: {out:?}");
+        }
+        assert_eq!(f.seen().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn validate_clause_refuses_user_and_account_on_a_named_key_provider() {
+        let f = key_fixture().await;
+        for bad in [
+            clause(&[("provider", "maps"), ("user", "alice")]),
+            clause(&[("provider", "maps"), ("account", "*")]),
+        ] {
+            let err = f.tool.validate_clause(&bad).unwrap_err();
+            assert!(err.contains("api_key_provider \"maps\""), "{err}");
+        }
+        for good in [
+            clause(&[("provider", "maps"), ("method", "GET")]),
+            clause(&[("provider", "*"), ("user", "alice")]),
+            clause(&[("provider", "google"), ("user", "alice")]),
+            clause(&[("user", "alice")]),
+        ] {
+            assert_eq!(f.tool.validate_clause(&good), Ok(()), "{good:?}");
+        }
+    }
+
+    /// With no OAuth provider every call has no `user` or `account`, so a
+    /// clause naming either admits nothing whatever its `provider`.
+    #[test]
+    fn validate_clause_refuses_user_and_account_without_an_oauth_provider() {
+        let base = "http://127.0.0.1:9";
+        let keys = BTreeMap::from([key_provider_config("maps", base)]);
+        let tool = ApiRequestTool::new(None, keys);
+        for bad in [
+            clause(&[("provider", "*"), ("user", "alice")]),
+            clause(&[("user", "alice"), ("host", "weather.example.com")]),
+            clause(&[("provider", "other"), ("account", "*")]),
+        ] {
+            let err = tool.validate_clause(&bad).unwrap_err();
+            assert!(err.contains("no oauth_provider is declared"), "{err}");
+        }
+        let err = tool
+            .validate_clause(&clause(&[("provider", "maps"), ("user", "alice")]))
+            .unwrap_err();
+        assert!(err.contains("api_key_provider \"maps\""), "{err}");
+        for good in [
+            clause(&[("provider", "maps"), ("method", "GET")]),
+            clause(&[("provider", "*")]),
+        ] {
+            assert_eq!(tool.validate_clause(&good), Ok(()), "{good:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_key_providers_own_response_limit_applies() {
+        let (base, stub) = start_stub().await;
+        let (name, mut config) = key_provider_config("maps", &base);
+        config.raw.max_response_bytes = 9;
+        let tool = ApiRequestTool::new(None, BTreeMap::from([(name, config)]));
+        stub.lock().unwrap().api_body = b"abcdefghijklmnop".to_vec();
+        let args = serde_json::json!({
+            "provider": "maps", "method": "GET",
+            "host": base.trim_start_matches("http://"), "path": "/v1/things",
+        });
+        let out = tool
+            .execute(
+                &tool_ctx(Some(alice()), vec![provider_clause("maps")]),
+                args,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["body"], "abcdefghi");
+        assert_eq!(out["truncated"], true);
+        assert_eq!(out["bytes"], 16);
+    }
+
+    #[tokio::test]
+    async fn an_answer_quoting_the_key_is_returned_unchanged() {
+        let f = key_fixture().await;
+        let echo = format!("{{\"error\":\"bad key\",\"x-api-key\":\"{KEY}\"}}");
+        {
+            let mut s = f.stub.lock().unwrap();
+            s.api_statuses = [400].into();
+            s.api_body = echo.clone().into_bytes();
+        }
+        let mut args = f.args("GET", "/v1/things");
+        args["headers"] = serde_json::json!({"Accept-Encoding": "identity", "Range": "bytes=0-"});
+        let out = f
+            .call(Some(alice()), vec![provider_clause("maps")], args)
+            .await
+            .unwrap();
+        assert_eq!(out["status"], 400);
+        assert_eq!(out["body"], echo);
+        assert_eq!(f.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_caller_with_no_acting_user_only_reads_with_a_key() {
+        let f = key_fixture().await;
+        let out = f
+            .call(
+                None,
+                vec![provider_clause("maps")],
+                f.args("GET", "/v1/things"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["status"], 200);
+        let mut post = f.args("POST", "/v1/things:search");
+        post["body"] = serde_json::json!("{}");
+        let out = f.call(None, vec![provider_clause("maps")], post).await;
+        let Err(ToolError::Denied(detail)) = out else {
+            panic!("expected Denied, got {out:?}");
+        };
+        assert!(detail.contains("may only read"), "{detail}");
+        assert_eq!(f.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_key_is_returned_once_as_the_providers_answer() {
+        let f = key_fixture().await;
+        for status in [401, 403] {
+            f.stub.lock().unwrap().api_statuses = [status].into();
+            let out = f
+                .call(
+                    Some(alice()),
+                    vec![provider_clause("maps")],
+                    f.args("GET", "/v1/things"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(out["status"], status);
+            assert!(out.get("error").is_none(), "{out}");
+        }
+        assert_eq!(f.seen().len(), 2);
+        assert!(f.stub.lock().unwrap().token_forms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_provider_names_both_kinds() {
+        let f = key_fixture().await;
+        let mut args = f.args("GET", "/v1/things");
+        args["provider"] = serde_json::json!("nope");
+        let out = f
+            .call(Some(alice()), vec![provider_clause("*")], args)
+            .await;
+        let Err(ToolError::InvalidArgs(detail)) = out else {
+            panic!("expected InvalidArgs, got {out:?}");
+        };
+        assert!(
+            detail.contains("google (oauth_provider)")
+                && detail.contains("maps (api_key_provider)"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "both an oauth_provider and an api_key_provider")]
+    async fn one_name_as_both_kinds_is_a_bug() {
+        let base = "http://127.0.0.1:9";
+        let (svc, _dir) = service(vec![provider_config("maps", base)]);
+        let keys = BTreeMap::from([key_provider_config("maps", base)]);
+        ApiRequestTool::new(Some(svc), keys);
     }
 }

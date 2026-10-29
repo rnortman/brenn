@@ -52,7 +52,9 @@ pub struct TokenResponse {
     pub scope: Option<Vec<String>>,
 }
 
-/// The shared client.
+/// The client for authorization-server and API calls. Clones share one
+/// connection pool.
+#[derive(Clone)]
 pub struct OAuthHttp {
     client: reqwest::Client,
 }
@@ -141,23 +143,15 @@ impl OAuthHttp {
         }
     }
 
-    /// Send a credentialed API request: `request` with `access_token` as the
-    /// bearer, never following a redirect, reading at most `limit` body bytes.
+    /// Send a credentialed API request: `request` with `auth` placed on it,
+    /// never following a redirect, reading at most `limit` body bytes.
     pub async fn api(
         &self,
         request: ApiCall,
-        access_token: &str,
+        auth: Auth<'_>,
         limit: usize,
     ) -> Result<ApiResponse, String> {
-        let mut builder = self
-            .client
-            .request(request.method, request.url)
-            .headers(request.headers)
-            .bearer_auth(access_token)
-            .timeout(API_TIMEOUT);
-        if let Some(body) = request.body {
-            builder = builder.body(body);
-        }
+        let builder = self.credentialed(request, auth);
         let mut response = builder.send().await.map_err(|e| transport_text(&e))?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
@@ -180,6 +174,39 @@ impl OAuthHttp {
             truncated,
             content_length,
         })
+    }
+
+    /// `request` as a builder with `auth` placed on it: a bearer or key header
+    /// marked sensitive.
+    fn credentialed(&self, request: ApiCall, auth: Auth<'_>) -> reqwest::RequestBuilder {
+        let ApiCall {
+            method,
+            url,
+            mut headers,
+            body,
+        } = request;
+        let mut bearer = None;
+        match auth {
+            Auth::Bearer(token) => bearer = Some(token),
+            Auth::Header { name, value } => {
+                let mut value = reqwest::header::HeaderValue::from_str(value)
+                    .expect("a key's bytes are checked at boot to be a valid header value");
+                value.set_sensitive(true);
+                headers.insert(name.clone(), value);
+            }
+        }
+        let mut builder = self
+            .client
+            .request(method, url)
+            .headers(headers)
+            .timeout(API_TIMEOUT);
+        if let Some(token) = bearer {
+            builder = builder.bearer_auth(token);
+        }
+        if let Some(body) = body {
+            builder = builder.body(body);
+        }
+        builder
     }
 
     /// Fetch the userinfo document with `access_token` as the bearer.
@@ -225,6 +252,18 @@ pub enum Refreshed {
     /// `detail` is the status and the redacted body.
     Invalid {
         detail: String,
+    },
+}
+
+/// Where [`OAuthHttp::api`] places a request's credential.
+#[derive(Clone, Copy)]
+pub enum Auth<'a> {
+    /// A user's access token, as `Authorization: Bearer`.
+    Bearer(&'a str),
+    /// A deployment key as the whole value of the header `name`.
+    Header {
+        name: &'a reqwest::header::HeaderName,
+        value: &'a str,
     },
 }
 
@@ -397,6 +436,50 @@ pub fn redacted_body(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(url: &str) -> ApiCall {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "application/json".parse().unwrap());
+        ApiCall {
+            method: reqwest::Method::GET,
+            url: url::Url::parse(url).unwrap(),
+            headers,
+            body: None,
+        }
+    }
+
+    #[test]
+    fn each_credential_placement() {
+        let http = OAuthHttp::new();
+        let name = reqwest::header::HeaderName::from_static("x-goog-api-key");
+        let request = http
+            .credentialed(
+                call("https://api.example.com/v1/things?a=1"),
+                Auth::Header {
+                    name: &name,
+                    value: "K3Y",
+                },
+            )
+            .build()
+            .unwrap();
+        let value = &request.headers()["x-goog-api-key"];
+        assert_eq!(value, "K3Y");
+        assert!(value.is_sensitive());
+        assert!(!request.headers().contains_key("authorization"));
+        assert_eq!(request.headers()["accept"], "application/json");
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.example.com/v1/things?a=1"
+        );
+
+        let request = http
+            .credentialed(call("https://api.example.com/v1"), Auth::Bearer("AT"))
+            .build()
+            .unwrap();
+        let value = &request.headers()["authorization"];
+        assert_eq!(value, "Bearer AT");
+        assert!(value.is_sensitive());
+    }
 
     #[test]
     fn token_response_reads_the_fields_brenn_uses() {

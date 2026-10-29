@@ -405,8 +405,10 @@ that changes one is refused, naming it.
 
 #### The OAuth tools
 
-Declaring a provider registers four tools. Each is granted like any other tool
-(see *Tool grants*), and each takes `provider` as an ACL key:
+Declaring an `oauth_provider` registers four tools. Each is granted like any
+other tool (see *Tool grants*), and each takes `provider` as an ACL key.
+`api-request` is also registered when only an `api_key_provider` is declared
+(see *API-key providers*); the other three are not.
 
 - `oauth-connect` — starts a connect for the conversation's owner and returns
   the link and the steps to relay.
@@ -415,7 +417,8 @@ Declaring a provider registers four tools. Each is granted like any other tool
 - `oauth-disconnect` — revokes one of the owner's credentials at the provider
   and deletes it.
 - `api-request` — sends one HTTP request to a provider's `api_hosts` with the
-  credential attached. Its ACL keys are `provider`, `user`, `account`,
+  credential attached: a user's OAuth credential, or the deployment's key for
+  an `api_key_provider`. Its ACL keys are `provider`, `user`, `account`,
   `method`, `host` and `path`.
 
 These tools act as a Brenn user, so some grants are refused at boot and on
@@ -520,6 +523,60 @@ A key provider needs no `server.vault_dir`. That key stays required exactly
 when an `oauth_provider` is declared. Changing a key provider takes a restart,
 and a reload that changes one is refused, naming it. A key file replaced in
 place is not noticed until the next restart.
+
+#### `api-request` on a key provider
+
+A key provider is called through `api-request`, named by its block's name as
+`provider`. The `method`, `host` and `path` keys, the path template, and the
+request rules are those of *The OAuth tools*. What differs:
+
+- **Every caller sends the same key.** The key is the deployment's, not a
+  user's: there is no account to connect and no consent. Its spend is the
+  operator's.
+- **The key's header is Brenn's.** A caller header with the configured
+  `header` name (in any case) is refused before anything is sent. Only that
+  name is reserved: a caller may still send a `key` query parameter.
+  `Authorization`, `Host`, `Cookie` and the transport headers are refused to
+  callers on both kinds.
+- **`account` is refused.** An `account` argument on a key-provider call is an
+  invalid argument; it is never silently ignored.
+- **`user` and `account` never admit a key call.** A clause constraining
+  either, even to `"*"`, admits no key-provider call. A clause whose `provider`
+  names a key provider exactly and also names `user` or `account` admits
+  nothing, so it is refused at boot and on reload. A clause with
+  `provider = "*"` and a `user` is valid and admits only OAuth calls; on a
+  deployment with no `oauth_provider` it admits nothing and is refused too.
+  Give key providers their own clauses.
+- **The answer is returned as it is.** The request is sent once. A 401 or 403
+  is the provider's answer, returned like any other status: there is no
+  refresh and no `credential_invalid`. Brenn does not read provider bodies, so
+  it cannot tell a dead key from a refused request; the operator finds a dead
+  key by testing the deployment. Brenn does not inspect the answer: a provider
+  that quotes request headers in its own error bodies would return the key to
+  the caller.
+- **A WASM component only reads.** A caller with no acting user is admitted
+  with `GET` and `HEAD` only, as with a lent OAuth credential. A component's
+  call can be replayed from its channel window, and a replayed write is the
+  wrong thing whatever the credential. No `user` is named or lent.
+- **Grants are admitted as for OAuth.** An `api-request` grant is still
+  refused on a `multiuser` app and on an app with no `container`, even when it
+  names only key providers. A bare agent that can read the host could read the
+  key file.
+
+The final log line of a key call names the provider, the acting user (`-` for
+a component), the method, host and path, the status and the sizes. It never
+carries the query.
+
+```
+agent PersonalAssistant {
+  container = "sandbox";
+  tool api-request {
+    allow { provider = "google"; method = "GET"; }
+    allow { provider = "google-maps"; host = "weather.googleapis.com"; method = "GET"; }
+    allow { provider = "google-maps"; host = "places.googleapis.com"; method = "POST"; path = "/v1/places:searchText"; }
+  }
+}
+```
 
 ### Spawn artifacts and the runtime directory
 

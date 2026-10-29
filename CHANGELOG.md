@@ -4,6 +4,23 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **`api-request` can call services that use an operator's API key.** Name
+  an `api_key_provider` block as the `provider` and Brenn attaches the key
+  as the request header the block names, sending only to that block's
+  configured hosts and following no redirects. The provider's answer comes
+  back unchanged, whatever its status. A caller cannot set the key's header
+  or pass `account`, a WASM component may only read (`GET`/`HEAD`), and a
+  grant clause that names a key provider together with `user` or `account`
+  is refused at boot. `api-request` is now available on a deployment that
+  declares only key providers. See `docs/config-dsl.md`, "`api-request` on a
+  key provider".
+
+- **New `api_key_provider` config section** for services that use one
+  operator-held API key (such as Google Maps Platform). The key lives in a
+  host file (mode `0600`) that Brenn reads at boot and checks; no agent ever
+  sees it. Changing one needs a restart. See `docs/config-dsl.md`,
+  "API-key providers".
+
 - **The MQTT integration tests no longer need mosquitto installed.** The
   test broker (mosquitto 2.0.22) is now built from source by Bazel and
   handed to the tests, so they run the same on every machine and in CI. This
@@ -19,13 +36,6 @@ All notable changes to Brenn are documented here.
   failed there. `make check` now works on those hosts, and CI drops its
   "Install lld" step, which never chose the linker. The first build after
   updating rebuilds the host lane from scratch.
-
-- **New `api_key_provider` config section** for services that use one
-  operator-held API key (such as Google Maps Platform). The key lives in a
-  host file (mode `0600`) that Brenn reads at boot and checks; no agent ever
-  sees it. Declaring one is accepted but has no effect yet: `api-request`
-  does not use key providers until a following change. Changing one needs a
-  restart. See `docs/config-dsl.md`, "API-key providers".
 
 ## [0.29.0] — 2026-10-29
 

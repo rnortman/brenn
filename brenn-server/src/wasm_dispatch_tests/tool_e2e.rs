@@ -457,7 +457,10 @@ async fn guest_api_request_reads_with_a_lent_credential() {
     let mut other = testutil::credential("stub", "alice@example.com", "RT-bob");
     other.access_token = "AT-bob".to_string();
     service.vault().store("bob", &other).await;
-    let registry = Arc::new(ToolRegistry::new(service.tools()));
+    let registry = Arc::new(ToolRegistry::new(brenn_oauth::tools::registered(
+        Some(&service),
+        std::collections::BTreeMap::new(),
+    )));
 
     let host = base
         .strip_prefix("http://")

@@ -3,7 +3,8 @@
 //! [`OAuthService`] is built once at boot from the resolved providers. It owns
 //! the vault, the pending connect flows and the outbound HTTP client; the
 //! server's callback route completes a flow through it, and the registry tools
-//! in [`tools`] act through it on a conversation owner's behalf.
+//! in [`tools`] act through it on a conversation owner's behalf. `api-request`
+//! also sends the deployment's keys for the `api_key_provider`s.
 
 pub mod flow;
 pub mod http;
@@ -12,11 +13,10 @@ pub mod tools;
 pub mod vault;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use brenn_lib::config::{OAuthProviderConfig, ResolvedOAuth};
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
-use brenn_tool_registry::{RegisteredTool, ToolError};
+use brenn_tool_registry::ToolError;
 use chrono::{DateTime, Utc};
 use tracing::{error, info};
 
@@ -143,24 +143,6 @@ impl OAuthService {
 
     pub fn http(&self) -> &OAuthHttp {
         &self.http
-    }
-
-    /// The registry tools that act through this service.
-    pub fn tools(self: &Arc<Self>) -> Vec<RegisteredTool> {
-        vec![
-            RegisteredTool::Async(Arc::new(tools::connect::OAuthConnectTool::new(
-                self.clone(),
-            ))),
-            RegisteredTool::Async(Arc::new(tools::accounts::OAuthAccountsTool::new(
-                self.clone(),
-            ))),
-            RegisteredTool::Async(Arc::new(tools::disconnect::OAuthDisconnectTool::new(
-                self.clone(),
-            ))),
-            RegisteredTool::Async(Arc::new(tools::api_request::ApiRequestTool::new(
-                self.clone(),
-            ))),
-        ]
     }
 
     /// Finish the flow a provider's redirect names: consume it, check whose it

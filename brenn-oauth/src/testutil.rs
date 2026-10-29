@@ -10,7 +10,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use brenn_lib::config::{OAuthProviderConfig, OAuthProviderRaw, ResolvedOAuth, SecretString};
+use brenn_lib::config::{
+    ApiKeyProviderConfig, OAuthProviderConfig, OAuthProviderRaw, ResolvedOAuth, SecretString,
+};
 
 use crate::OAuthService;
 
@@ -29,6 +31,25 @@ pub fn provider_config(name: &str, base: &str) -> (String, OAuthProviderConfig) 
             let url = url::Url::parse(base).unwrap();
             (brenn_lib::config::origin_host(&url), url)
         }],
+    };
+    (name.to_string(), config)
+}
+
+/// The key every [`key_provider_config`] provider sends.
+pub const KEY: &str = "K3Y-deployment-secret";
+
+/// A key provider named `name` whose one API origin is `base`, sending
+/// [`KEY`] in the header `test_api_key_provider_raw` names. Tests needing
+/// another header or limit override the fields with struct update.
+pub fn key_provider_config(name: &str, base: &str) -> (String, ApiKeyProviderConfig) {
+    let url = url::Url::parse(base).unwrap();
+    let raw = brenn_lib::config::test_api_key_provider_raw(base);
+    let header = reqwest::header::HeaderName::from_bytes(raw.header.as_bytes()).unwrap();
+    let config = ApiKeyProviderConfig {
+        raw,
+        key: SecretString::new(KEY.to_string()),
+        header,
+        api_origins: vec![(brenn_lib::config::origin_host(&url), url)],
     };
     (name.to_string(), config)
 }

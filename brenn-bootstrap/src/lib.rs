@@ -396,8 +396,7 @@ pub async fn run_server(
         pwa_push: resolved_pwa_push,
         claude_profiles,
         oauth,
-        // Read and validated at boot; nothing here consumes them.
-        api_key_providers: _,
+        api_key_providers,
     } = validate_and_resolve(&config, &integration_registry, &runtime_dir);
 
     // The one agent table of this process. Every gate that decides on an agent
@@ -562,9 +561,10 @@ pub async fn run_server(
         let mut tools = vec![brenn_tool_registry::RegisteredTool::Async(
             std::sync::Arc::new(git_repo_pull),
         )];
-        if let Some(service) = &oauth_service {
-            tools.extend(service.tools());
-        }
+        tools.extend(brenn_oauth::tools::registered(
+            oauth_service.as_ref(),
+            api_key_providers,
+        ));
         let registry = brenn_tool_registry::ToolRegistry::new(tools);
         registry.validate_config(&apps);
         std::sync::Arc::new(registry)
