@@ -9,6 +9,10 @@ The configuration keys are documented in `docs/config-dsl.md`, under *OAuth
 providers and the credential vault*. This guide covers the Google side, a
 working block, the grants, and the first connect.
 
+Google Maps Platform APIs (Weather, Places, Routes) take a deployment-wide API
+key rather than a user's account; they are set up in
+`docs/google-maps-platform.md`.
+
 ## 1. The Google Cloud project
 
 One project serves every user of this Brenn deployment.

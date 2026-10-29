@@ -482,7 +482,8 @@ the provider's `api_hosts`.
 An `api_key_provider` block names a service that authenticates with one
 deployment-wide key, such as Google's Maps Platform APIs. The operator places
 the key in a file on the host; Brenn reads it at boot and attaches it to
-requests itself. No agent ever holds the key.
+requests itself. Brenn never passes the key into an agent's container.
+`docs/google-maps-platform.md` walks through a Google Maps Platform setup.
 
 ```
 api_key_provider google-maps {
@@ -502,7 +503,8 @@ is refused at the second block.
 
 - `key_file` — required. The host path to a file holding the key: mode `0600`
   or tighter, not empty. Surrounding whitespace is trimmed. The file is read
-  once at boot and its content is never logged.
+  once at boot and its content is never written to the diagnostic or
+  security log.
 - `header` — required. The header the key is sent in on each request:
   `header = "X-Goog-Api-Key"` sends the file's content as that header's value.
   The content is sent verbatim, so a provider that wants

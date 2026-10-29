@@ -4,22 +4,22 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
-- **`api-request` can call services that use an operator's API key.** Name
-  an `api_key_provider` block as the `provider` and Brenn attaches the key
-  as the request header the block names, sending only to that block's
-  configured hosts and following no redirects. The provider's answer comes
-  back unchanged, whatever its status. A caller cannot set the key's header
+- **`api-request` can call services that use one operator-held API key**,
+  such as Google Maps Platform. Declare the service in a new
+  `api_key_provider` config section and name it as the `provider`. The key
+  is held in a host file (mode `0600`) that Brenn reads at boot; Brenn
+  attaches it as the request header the block names, sends it only to the
+  block's configured hosts, follows no redirects, never passes it into the
+  container and never writes it to a diagnostic or security log line. An
+  answer that echoes it is recorded in the conversation's transcript like any
+  other tool result. The provider's answer comes back unchanged, whatever its
+  status. A caller cannot set the key's header
   or pass `account`, a WASM component may only read (`GET`/`HEAD`), and a
   grant clause that names a key provider together with `user` or `account`
-  is refused at boot. `api-request` is now available on a deployment that
-  declares only key providers. See `docs/config-dsl.md`, "`api-request` on a
-  key provider".
-
-- **New `api_key_provider` config section** for services that use one
-  operator-held API key (such as Google Maps Platform). The key lives in a
-  host file (mode `0600`) that Brenn reads at boot and checks; no agent ever
-  sees it. Changing one needs a restart. See `docs/config-dsl.md`,
-  "API-key providers".
+  is refused at boot. A deployment may declare key providers alone, with no
+  `oauth_provider` or `vault_dir`. Changing a block or its key file needs a
+  restart. See `docs/google-maps-platform.md` for a Google setup and
+  `docs/config-dsl.md`, "API-key providers", for the reference.
 
 - **The MQTT integration tests no longer need mosquitto installed.** The
   test broker (mosquitto 2.0.22) is now built from source by Bazel and

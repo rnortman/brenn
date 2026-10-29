@@ -139,8 +139,9 @@ through CC's output stream but through a unix socket mounted into its own
 container, from any process it starts there.)
 
 (B12 points outward: the backend calling a third-party API with a user's
-credential, on behalf of an agent or a component. Its inbound half is the
-provider's redirect back to Brenn, which a B1 browser carries.)
+credential or the deployment's API key, on behalf of an agent or a component.
+Its inbound half is the provider's redirect back to Brenn, which a B1 browser
+carries.)
 
 | ID | Boundary | Direction of distrust |
 |----|----------|----------------------|
@@ -156,7 +157,7 @@ provider's redirect back to Brenn, which a B1 browser carries.)
 | **B9** | Reload requester → running configuration | the requester chooses the *moment*, never the content; what a reload can do is bounded by what the document on disk says |
 | **B10** | Mount author → running configuration | the author chooses a config-carrying mount's content; the ceiling chooses what that content may reach; the mounts document and the root document stay outside every mount |
 | **B11** | Agent container → backend (tool socket) | process in the agent's container untrusted (CC-influenced content, the B3 actor); identity is the mount, never a credential |
-| **B12** | Backend → third-party API as the user | the request's content is caller-chosen (CC-influenced, or a guest's); the credential and its owner are the backend's alone; the provider's redirect back is provider-authored data a B1 browser carries |
+| **B12** | Backend → third-party API as the user or the deployment | the request's content is caller-chosen (CC-influenced, or a guest's); the credential and its owner are the backend's alone; the provider's redirect back is provider-authored data a B1 browser carries |
 
 ---
 
@@ -1320,11 +1321,13 @@ is), or to run agent containers with `label=disable`.
 
 ---
 
-## 9f. Boundary B12 — Backend → Third-party API as the User
+## 9f. Boundary B12 — Backend → Third-party API as the User or the Deployment
 
 **Who:** an agent or a WASM component that asks the backend to call a
 provider's API (a mailbox, a calendar) with a credential a user granted Brenn,
-and the provider itself on the way back, through the connect redirect.
+or a provider's API (weather, places) with an API key the operator gave the
+deployment; and the provider itself on the way back, through the connect
+redirect and in every answer.
 
 **Trust decision: the credential is attached host-side and never enters the
 container.** The caller names the request. The operator's grant bounds which
@@ -1334,6 +1337,30 @@ backend for the conversation. A caller never names it. A component has no
 owner, so its credential is lent by the operator's own grant, which names the
 user. Tokens live in a vault the backend alone reads. No tool result, log line
 or page carries a token.
+
+**A deployment key is the operator's, not a user's.** An `api_key_provider`
+holds one key for the whole deployment. The operator places it by hand in a
+host file; the backend reads it once at boot and attaches it host-side. It has
+no owner, no account and no consent: every caller a grant admits sends the
+same key, and its spend is the operator's. What Brenn guarantees for it is
+exactly this: the key is sent only as a request header, to a configured
+origin, by Brenn; redirects are not followed; Brenn never passes the key into
+the container and never writes it to a diagnostic or security log line, a
+transport error or reqwest's debug output (the header value is marked sensitive, and is
+never-indexed under HPACK); a caller that sets the key's header,
+`Authorization`, a transport header or `Cookie` is refused before anything is
+sent. Two limits stand beside that guarantee:
+
+- **Echo.** A provider that quotes request headers in its own error bodies
+  would return the key in the tool result; Brenn does not inspect answers for
+  it. The answer is kept as it is wherever Brenn keeps tool results: for an
+  agent, the conversation's transcript in the log directory and the
+  conversation's history in the database; for a component, the bus record of
+  its `brenn:tool-results` inbox. The caller receives it unchanged, and a
+  component that passes it to its `log` interface puts it in the diagnostic
+  log as a guest log line.
+- **Placement.** Keeping the key file outside agent-visible paths is the
+  operator's responsibility; Brenn checks the file's mode and nothing else.
 
 **Policies:**
 
@@ -1345,11 +1372,16 @@ or page carries a token.
   and a vault that is not disjoint from those roots is refused. A container's
   `extra_args` reach podman unread, so a mount written there is not checked:
   host mounts belong in `extra_mounts`, where the check sees them.
+- **Key placement.** A deployment key is a host file of mode `0600` or
+  tighter, outside the vault, read once at boot and never written to the
+  diagnostic or security log. Unlike the vault, its location is not checked
+  against the agent-visible roots; the operator places it outside them.
 - **Only container apps.** An app with no container runs its agent as the
   server's user, which could read the vault, so it is refused every
   credential-bearing grant. A `multiuser` app is refused too: whoever types in a
   shared conversation need not be its owner, and the owner's credential would
-  act for them.
+  act for them. The rule holds for a grant naming only key providers: a bare
+  agent could read the key file as it could the vault.
 - **No owner, no owner-bound tool.** A WASM component is never granted the tools
   that connect, list or disconnect an owner's accounts, because there is no
   owner to act for.
@@ -1357,8 +1389,14 @@ or page carries a token.
   admitted for reading methods only. A component's call can be re-run from its
   channel window, and a re-run write (a second draft, a second event) is the
   wrong thing. Until writes are deduplicated, a lent credential does not write.
+  The same holds for a component's call on a key provider: no user is lent,
+  but a re-run write is as wrong with the deployment's key, so only reading
+  methods are admitted.
 - **The caller cannot touch the credential or the transport.** `Authorization`,
   `Cookie`, `Host` and the framing headers are refused from the caller.
+- **Reserved injection name.** The key's header is Brenn's. A caller header of
+  that name, in any case, is refused on a key-provider call before anything is
+  sent.
 - **No redirect is followed.** A 3xx is returned to the caller, so the
   credential never goes to a `Location` the provider or an attacker chose.
 - **Exact destination.** The host must be one of the provider's configured
@@ -1401,7 +1439,14 @@ redirect followed with the credential; a destination matched by prefix,
 or a path sent other than the one matched; a vault location an agent can
 reach; a session-minting form post admitted from another site; an unknown
 callback parameter treated as a violation, or a missing `state` treated as
-anything else.
+anything else. For a deployment key: the key in no diagnostic or security
+log line, no transport error and no container path Brenn writes; the key sent
+as a header only, to a configured origin, with redirects not followed; a
+caller setting the key's header refused; the key file's mode `0600` or
+tighter; that this text claims neither a key-free tool result, a key-free log
+directory, nor a placement check as an absolute; and that
+no text the feature ships — reference, changelog, operator guide, posture,
+module doc — states an absolute about an agent's view of the key.
 
 ---
 

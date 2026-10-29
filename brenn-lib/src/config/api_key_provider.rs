@@ -2,8 +2,8 @@
 //! caller's behalf.
 //!
 //! The key is the operator's: one `0600` host file per provider, read once at
-//! boot and held as a [`SecretString`]. No agent reads it; Brenn attaches it to
-//! a request as the value of the header the block names.
+//! boot and held as a [`SecretString`]. Brenn attaches it to a request as the
+//! value of the header the block names; it is never passed into a container.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
