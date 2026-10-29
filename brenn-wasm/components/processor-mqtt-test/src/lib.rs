@@ -94,7 +94,8 @@ fn rendered(e: brenn_guest::Error) -> String {
     match e {
         brenn_guest::Error::MalformedEnvelope(m)
         | brenn_guest::Error::ProcessingFailed(m)
-        | brenn_guest::Error::QuotaExceeded(m) => m,
+        | brenn_guest::Error::QuotaExceeded(m)
+        | brenn_guest::Error::NotPending(m) => m,
     }
 }
 

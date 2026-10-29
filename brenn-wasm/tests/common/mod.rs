@@ -11,8 +11,9 @@
 use brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT;
 use brenn_wasm::{
     GuestAlertSeverity, KvStore, MqttPublishFn, MqttPublishOutcome, OutputAclFn, OutputPortSpec,
-    ProcessorAlerter, ProcessorLoadSpec, ProcessorUrgency, QueuedToolRequest, ReplayComponent,
-    SinkBudget, ToolCallError, ToolHost, ToolHostFn,
+    ProcessorAlerter, ProcessorLoadSpec, ProcessorUrgency, ProvidesCallError, ProvidesHost,
+    ProvidesHostFn, QueuedToolRequest, ReplayComponent, SinkBudget, ToolCallError, ToolHost,
+    ToolHostFn,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -129,6 +130,33 @@ impl ToolHost for NotGrantedToolHost {
 /// No-op tool-host handle for tests that grant `Tools` but do not invoke a tool.
 pub fn noop_tool_host() -> ToolHostFn {
     Arc::new(NotGrantedToolHost)
+}
+
+/// `ProvidesHost` that holds no pending request: every completion is
+/// `not-pending` and every on-behalf-of call is `denied`.
+///
+/// For tests that grant `Provides` but do not serve a request — the `load`
+/// invariant requires a `Some` provides_host whenever the grant is present.
+pub struct NothingPendingProvidesHost;
+
+impl ProvidesHost for NothingPendingProvidesHost {
+    fn complete(&self, _id: &str, _outcome_json: &str) -> Result<(), ProvidesCallError> {
+        Err(ProvidesCallError::NotPending)
+    }
+    fn queue_async_for(
+        &self,
+        _serving: &str,
+        _tool: &str,
+        _args_json: &str,
+        _call_id: &str,
+    ) -> Result<QueuedToolRequest, ToolCallError> {
+        Err(ToolCallError::Denied("not pending".to_string()))
+    }
+}
+
+/// No-op provides-host handle for tests that grant `Provides` but serve nothing.
+pub fn noop_provides_host() -> ProvidesHostFn {
+    Arc::new(NothingPendingProvidesHost)
 }
 
 /// Publish amplification map covering the input port every processor fixture

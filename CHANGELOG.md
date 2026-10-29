@@ -29,6 +29,15 @@ All notable changes to Brenn are documented here.
   mosquitto kept only for the tests; the `BRENN_MOSQUITTO_BIN` override is no
   longer forwarded from your shell into Bazel tests.
 
+- **WASM components can import a new `provides` interface** (granted by
+  the new `provides` grant word), the first step toward components that
+  serve tools to the assistant and to other components. It lets a
+  component answer a pending tool request and make tool calls on behalf of
+  the user it is serving; the guest SDK gains a matching `provides` module.
+  A component cannot yet declare a tool it provides, so nothing changes for
+  existing deployments. Also fixed: a top-level WASM consumer granted
+  `calls` no longer crashes Brenn at boot.
+
 - **Building Brenn no longer loads the host's `libxml2`.** The hermetic C
   toolchain is now LLVM 23.1.4 (toolchains_llvm 1.12.0); LLVM 22.1.8's linker
   needed `libxml2.so.2`, which hosts with libxml2 2.14 or newer (Ubuntu 26.04,

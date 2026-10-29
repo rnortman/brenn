@@ -23,6 +23,7 @@ COMPONENT_NAMES = [
     "processor-mem-exhaust",
     "processor-mqtt-test",
     "processor-multiport",
+    "processor-provider-test",
     "processor-store-rt",
     "processor-tool-test",
     "processor-transplant",
@@ -357,6 +358,7 @@ WASM_TEST_SUITES = [
     ("processor_config", ["processor-config"], [], [], []),
     ("processor_log", ["processor-log"], [], [], []),
     ("processor_mqtt", ["processor-mqtt-test"], [], [], []),
+    ("processor_provides", ["processor-provider-test"], [], [], []),
     (
         "processor_transplant",
         ["processor-transplant"],

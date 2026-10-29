@@ -81,6 +81,19 @@ surface — and needs a brenn new enough to link it, which is the ordering rule
 every bundle already follows: release brenn before a bundle that needs a newer
 brenn.
 
+A second additive change in force: **`brenn:processor/provides`**, the interface
+a component serves registry tools through. It is a new interface and a new
+grant word (`provides`), and its requests arrive on a new reserved input port,
+`tool-requests`. A kind that does not name `provides` in `requires` does not
+import it, and its artifact, its record and its spec are what they were;
+`examples/component/` (which requires `[ports, log]`) builds unchanged against
+the grown world. A kind that does name it is backend-only — a surface host
+links no tool substrate — and needs a brenn new enough to link it, by the same
+ordering rule as `calls`. The request body (`{"v": 1, "id", "tool", "args"}`)
+and the tool-result body grow by added fields, which `brenn-guest` ignores; `v`
+moves only for a change a provider built against the older body would misread,
+and `brenn-guest` refuses a version it does not know.
+
 One runtime contract is a **candidate for deletion**, recorded here so that a
 bundle author meets it before it happens rather than after: `brenn:replay` is
 the one world native backend code calls synchronously per request, and the
@@ -100,7 +113,12 @@ already deployed reads them. `examples/component/` is the canary that a cut is
 complete on brenn's side; a consumer repository's CI at its next pin bump is
 where the cut is paid.
 
-A cut of this kind in force now: **a `dom.listen` port must be declared `sync`
+A cut of this kind in force now: **`brenn_guest::Error` gained `NotPending`**,
+the refusal a provider draws completing a request the host no longer holds. A
+kind that matches `Error` exhaustively adds the arm at its next pin bump; one
+that only propagates it with `?` is unaffected.
+
+Another cut of this kind in force now: **a `dom.listen` port must be declared `sync`
 in the specification, and is reached through the generated `spec::SyncPort`.**
 A `dom`-granted kind that calls `listen` adds a `sync <name>;` line per port it
 listens on and passes the variant the scaffold emits for it; there is no

@@ -670,14 +670,16 @@ mod processor_bindings {
         with: {
             "brenn:processor/store.transaction": crate::store::Transaction,
         },
-        // `ports` and `calls` are the imports that can end an activation rather
-        // than answer it: naming a port the component's specification does not
-        // declare is a contract violation, and the host traps instead of
-        // refusing call by call. Every other interface keeps the plain result
-        // signature.
+        // `ports`, `calls` and `provides` are the imports that can end an
+        // activation rather than answer it: naming a port the component's
+        // specification does not declare, or completing more requests than any
+        // provider can hold, is a contract violation, and the host traps
+        // instead of refusing call by call. Every other interface keeps the
+        // plain result signature.
         imports: {
             "brenn:processor/ports": trappable,
             "brenn:processor/calls": trappable,
+            "brenn:processor/provides": trappable,
         },
     });
 }
@@ -687,6 +689,7 @@ use processor_bindings::brenn::processor::calls::CallError as CallWitError;
 use processor_bindings::brenn::processor::mqtt::MqttPublishError as MqttPublishWitError;
 use processor_bindings::brenn::processor::ports::DeferError;
 use processor_bindings::brenn::processor::ports::PublishError;
+use processor_bindings::brenn::processor::provides::CompleteError as CompleteWitError;
 use processor_bindings::brenn::processor::store::StoreError as ProcessorStoreError;
 use processor_bindings::brenn::processor::tools::ToolError as ToolWitError;
 
@@ -851,6 +854,55 @@ pub trait ToolHost: Send + Sync {
 /// fns unreachable, so `None` is a structural backstop, like `mqtt_publish`).
 pub type ToolHostFn = Arc<dyn ToolHost>;
 
+/// Failure modes returned across the `ProvidesHost` seam by `complete`.
+///
+/// Mirror of the WIT `provides.complete-error` variant, so the seam exposes no
+/// bindgen-generated type. Same crate-boundary seam as [`ToolCallError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvidesCallError {
+    /// The id is not pending for this component — completed, expired, from
+    /// before a restart, or never this component's. Indistinguishable.
+    NotPending,
+    /// The outcome JSON is malformed, names an error kind a provider may not
+    /// produce, or exceeds the result cap. The id stays pending.
+    InvalidOutcome(String),
+}
+
+/// Host seam for the `provides` WIT interface — the pending-call table and the
+/// native tool substrate as seen from `brenn-wasm`.
+///
+/// `Some(provides_host)` on `ProcessorLoadSpec` iff the component holds the
+/// `Provides` capability (asserted at load, as for `tool_host`). The binary
+/// crate builds the concrete impl over the pending-call table and the
+/// consumer's tool grants; checking that an id is pending for *this* component
+/// lives behind this seam.
+///
+/// Contract: neither method may panic on guest-supplied input — an unknown id,
+/// malformed outcome or bad tool/args maps to a typed error. A host-side wiring
+/// invariant may panic per the project posture.
+pub trait ProvidesHost: Send + Sync {
+    /// Answer the pending request `id` with `outcome_json`
+    /// (`{"ok": value}` / `{"err": {"kind", "detail"}}`). Immediate: the
+    /// waiting caller is answered before this returns.
+    fn complete(&self, id: &str, outcome_json: &str) -> Result<(), ProvidesCallError>;
+
+    /// `ToolHost::queue_async` on behalf of the user whose request `serving`
+    /// is. Does NOT publish — the caller buffers the returned request for the
+    /// activation's transactional flush, exactly as for `call-async`.
+    fn queue_async_for(
+        &self,
+        serving: &str,
+        tool: &str,
+        args_json: &str,
+        call_id: &str,
+    ) -> Result<QueuedToolRequest, ToolCallError>;
+}
+
+/// Host callback for the `provides` interface. `Some` iff the `Provides`
+/// capability is linked; `None` = the interface is unlinked and its host fns
+/// unreachable, a structural backstop like [`ToolHostFn`].
+pub type ProvidesHostFn = Arc<dyn ProvidesHost>;
+
 /// One `call` port of a component, resolved to the peer it reaches.
 ///
 /// The document is the only source of call wiring, so this table is complete:
@@ -986,8 +1038,30 @@ pub const PROCESSOR_MAX_FAST_TOOL_RESULT_BYTES: usize = 256 * 1024;
 ///
 /// Bounds host-fn flood from a hostile or buggy component. Calls beyond the cap
 /// return `internal`; the overflow is surfaced as a single post-activation warn
-/// (same family as the publish/log per-activation quotas).
+/// (same family as the publish/log per-activation quotas). `call-async` and
+/// `provides.call-async-for` count against the same cap.
+// TODO(correctness-call-async-for-capped-below-provider-window): a provider's
+// request window may hand one activation more new requests than this cap lets
+// it serve with `call-async-for`.
 pub const PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION: usize = 64;
+/// Maximum `provides.complete` calls per activation (4 × the window ceiling).
+///
+/// A provider's outstanding requests are bounded by its request window, which
+/// is never deeper than [`WINDOW_DEPTH_CEILING`](brenn_activation::WINDOW_DEPTH_CEILING);
+/// one activation can name each live id, each stale id that window delivers
+/// after a restart, and retry once after a rejected outcome, all inside this
+/// cap. A call past it is a guest looping on `complete`, and traps the
+/// activation.
+pub const PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION: usize =
+    4 * brenn_activation::WINDOW_DEPTH_CEILING as usize;
+/// Maximum bytes in a guest-supplied `provides.complete` `outcome-json`
+/// (512 KiB, the registry's async result cap).
+///
+/// Bounds the text before any host parses it: over-cap is `invalid-outcome`
+/// and never reaches the provides host, so the id stays pending. Duplicated
+/// across the crate boundary like [`PROCESSOR_MAX_TOOL_ARGS_BYTES`]; the
+/// registry asserts the two agree.
+pub const PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES: usize = 512 * 1024;
 
 // ---------------------------------------------------------------------------
 // Replay-world resource-bound constants.
@@ -1381,6 +1455,10 @@ struct ProcessorData {
     /// then unreachable (the interface is unlinked), so `None` is a structural
     /// backstop rather than a live path.
     tool_host: Option<ToolHostFn>,
+    /// Host seam for the `provides` interface (completion + on-behalf-of async
+    /// calls). `None` when the component lacks the `Provides` grant; the host
+    /// fns are then unreachable, so `None` is a structural backstop.
+    provides_host: Option<ProvidesHostFn>,
     /// Validated async tool requests buffered this activation. `take_ok_publishes`
     /// appends them to the publish flush iff the activation returns ok (a trap
     /// discards them); each publishes to its `brenn:tools/<tool>` request channel,
@@ -1388,6 +1466,8 @@ struct ProcessorData {
     tool_request_buffer: Vec<QueuedToolRequest>,
     /// Count of fast-tool calls this activation; quota enforcement (anti-flood).
     tool_call_count: usize,
+    /// Count of `provides.complete` calls this activation; quota enforcement.
+    complete_call_count: usize,
     /// Deferred control ops (`defer-cancel` / `defer-edit`) buffered this
     /// activation. Flushed by `take_ok_deferred_ops` iff the guest returns ok; a
     /// trap/err drops the buffer with the store, so a failed activation cancels
@@ -2155,16 +2235,18 @@ impl ProcessorData {
         }
     }
 
-    /// Validate + buffer an async-class tool call (the `tools.call-async` import).
+    /// Validate + buffer an async-class tool call (the `tools.call-async` import,
+    /// or `provides.call-async-for` when `serving` is `Some`).
     ///
     /// The grant/ACL/class check runs synchronously via the seam so caller mistakes
     /// fail fast; on success the resolved request is buffered for the activation's
-    /// transactional flush (increment 6). Bounds enforced here: the `call-id` length
+    /// transactional flush. Bounds enforced here: the `call-id` length
     /// cap, the `args-json` byte cap, and the per-activation request-buffer cap
     /// (async requests flush as bus publishes, so they share the publish-count
-    /// ceiling).
+    /// ceiling). Both imports share every bound; only the seam differs.
     fn do_queue_async(
         &mut self,
+        serving: Option<&str>,
         tool: String,
         args_json: String,
         call_id: &str,
@@ -2210,10 +2292,25 @@ impl ProcessorData {
                 PROCESSOR_MAX_TOOL_ARGS_BYTES
             )));
         }
-        let host = self.tool_host.as_ref().expect(
-            "call-async host fn invoked without a tool_host (Tools grant linked but host unset)",
-        );
-        match host.queue_async(&tool, &args_json, call_id) {
+        let queued = match serving {
+            None => self
+                .tool_host
+                .as_ref()
+                .expect(
+                    "call-async host fn invoked without a tool_host (Tools grant linked but host \
+                     unset)",
+                )
+                .queue_async(&tool, &args_json, call_id),
+            Some(serving) => self
+                .provides_host
+                .as_ref()
+                .expect(
+                    "call-async-for host fn invoked without a provides_host (Provides grant \
+                     linked but host unset)",
+                )
+                .queue_async_for(serving, &tool, &args_json, call_id),
+        };
+        match queued {
             Ok(request) => {
                 // Buffered here; `take_ok_publishes` appends it to the activation's
                 // publish flush iff the guest returns Ok. A trap/err drops the buffer
@@ -2269,7 +2366,86 @@ impl processor_bindings::brenn::processor::tools::Host for ProcessorData {
         args_json: String,
         call_id: String,
     ) -> Result<(), ToolWitError> {
-        self.do_queue_async(tool, args_json, &call_id)
+        self.do_queue_async(None, tool, args_json, &call_id)
+    }
+}
+
+// --- provides host impls ---
+
+impl ProcessorData {
+    /// Answer one pending request (the `provides.complete` import). Immediate:
+    /// the seam completes the waiting caller before this returns, whatever the
+    /// activation's own outcome turns out to be.
+    ///
+    /// The outer `Err` traps the activation once the guest passes
+    /// [`PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION`]. An outcome over
+    /// [`PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES`] is `invalid-outcome` without
+    /// reaching the seam, whatever the id. `not-pending` is logged at
+    /// debug: a restart's stale requests and a completion after the host's
+    /// ceiling both produce it in normal operation, and the ceiling alerts on
+    /// its own.
+    fn do_complete(
+        &mut self,
+        id: &str,
+        outcome_json: &str,
+    ) -> wasmtime::Result<Result<(), CompleteWitError>> {
+        self.complete_call_count += 1;
+        if self.complete_call_count > PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION {
+            return Err(wasmtime::Error::msg(format!(
+                "processor {}: more than {PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION} \
+                 provides.complete calls in one activation",
+                self.slug
+            )));
+        }
+        // Guest-controlled outcome text: cap before any host parses it.
+        if outcome_json.len() > PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES {
+            return Ok(Err(CompleteWitError::InvalidOutcome(format!(
+                "outcome {} bytes exceeds max {PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES}",
+                outcome_json.len()
+            ))));
+        }
+        let host = self.provides_host.as_ref().expect(
+            "complete host fn invoked without a provides_host (Provides grant linked but host \
+             unset)",
+        );
+        Ok(match host.complete(id, outcome_json) {
+            Ok(()) => Ok(()),
+            Err(ProvidesCallError::NotPending) => {
+                debug!(
+                    slug = %self.slug,
+                    id = %cap_guest_for_log(id),
+                    "wasm provides: complete named an id not pending for this component"
+                );
+                Err(CompleteWitError::NotPending)
+            }
+            Err(ProvidesCallError::InvalidOutcome(detail)) => {
+                Err(CompleteWitError::InvalidOutcome(detail))
+            }
+        })
+    }
+}
+
+/// The `provides` entry points are trappable imports: the outer
+/// `wasmtime::Result` is the host's own verdict on whether the activation may
+/// continue, and the inner result is what the guest sees. Only a `complete`
+/// past the per-activation cap takes the outer `Err`.
+impl processor_bindings::brenn::processor::provides::Host for ProcessorData {
+    fn complete(
+        &mut self,
+        id: String,
+        outcome_json: String,
+    ) -> wasmtime::Result<Result<(), CompleteWitError>> {
+        self.do_complete(&id, &outcome_json)
+    }
+
+    fn call_async_for(
+        &mut self,
+        serving: String,
+        tool: String,
+        args_json: String,
+        call_id: String,
+    ) -> wasmtime::Result<Result<(), ToolWitError>> {
+        Ok(self.do_queue_async(Some(&serving), tool, args_json, &call_id))
     }
 }
 
@@ -2669,6 +2845,12 @@ fn add_capability_to_linker(
             _,
             HasSelf<ProcessorData>,
         >(linker, |d| d),
+        ComponentGrant::Provides => {
+            processor_bindings::brenn::processor::provides::add_to_linker::<_, HasSelf<ProcessorData>>(
+                linker,
+                |d| d,
+            )
+        }
         // Callers must not pass a word that names no interface.
         ComponentGrant::Takeover => unreachable!("`takeover` links no interface"),
         // Callers must not pass a word this host cannot implement. Both are
@@ -2738,6 +2920,10 @@ pub struct ProcessorLoadSpec<'a> {
     /// when the `Tools` capability is not linked, so `None` is a structural
     /// backstop.
     pub tool_host: Option<ToolHostFn>,
+    /// Host seam for the `provides` interface (completion + on-behalf-of async
+    /// calls). `Some` iff the component has the `Provides` grant; `None` = no
+    /// provider surface. Asserted at load, as `tool_host` is.
+    pub provides_host: Option<ProvidesHostFn>,
     /// Every port name the component's specification declares `call`. A call to
     /// a name in it that `calls` does not wire is answered `unwired`; a name
     /// outside it traps the activation.
@@ -2788,6 +2974,7 @@ impl<'a> ProcessorLoadSpec<'a> {
             output_acl: Arc::new(|_| true),
             mqtt_publish: None,
             tool_host: None,
+            provides_host: None,
             declared_call_ports: std::collections::BTreeSet::new(),
             calls: HashMap::new(),
             sync_caller: None,
@@ -2877,6 +3064,9 @@ pub struct ProcessorComponent {
     /// `None` when the component lacks the `Tools` grant (the `tools` interface is
     /// then unlinked and the host fns unreachable).
     tool_host: Option<ToolHostFn>,
+    /// `None` when the component lacks the `Provides` grant (the `provides`
+    /// interface is then unlinked and the host fns unreachable).
+    provides_host: Option<ProvidesHostFn>,
     /// The specification's declared `call` port vocabulary.
     declared_call_ports: Arc<std::collections::BTreeSet<String>>,
     /// Declared `call` port → the peer the document wired it to.
@@ -2909,6 +3099,31 @@ fn processor_store_limits_with_memory(memory_size: usize) -> StoreLimits {
         .tables(PROCESSOR_MAX_TABLES)
         .trap_on_grow_failure(true)
         .build()
+}
+
+/// Panic unless a load spec's host seam is set exactly when its grant is held.
+///
+/// Bootstrap wires each seam iff it grants the matching word; `load` re-asserts
+/// it because it is a public API callable by out-of-tree hosts that bypass the
+/// config-layer cross-validation. A linked interface without its seam would
+/// `.expect`-panic at the first guest call; a seam without its grant is wiring
+/// the component was never given. `seam` names the field as the message shows
+/// it (`"tool_host seam"`, `"store_path"`).
+fn assert_seam_iff_grant(
+    slug: &str,
+    seam: &str,
+    has_seam: bool,
+    grants: &std::collections::BTreeSet<ComponentGrant>,
+    grant: ComponentGrant,
+) {
+    let granted = grants.contains(&grant);
+    assert_eq!(
+        has_seam,
+        granted,
+        "component {slug}: {seam} ({}) and {grant:?} grant ({}) must both be set or both absent",
+        if has_seam { "Some" } else { "None" },
+        if granted { "granted" } else { "not granted" },
+    );
 }
 
 impl ProcessorComponent {
@@ -2955,91 +3170,40 @@ impl ProcessorComponent {
             });
         }
 
-        // Invariant: store_path and Store grant must agree.
-        // Bootstrap config validation enforces this; re-asserted here because
-        // load() is a public API callable by out-of-tree hosts that bypass config-layer
-        // cross-validation.
-        assert_eq!(
+        assert_seam_iff_grant(
+            spec.slug,
+            "store_path",
             spec.store_path.is_some(),
-            spec.grants.contains(&ComponentGrant::Store),
-            "component {}: store_path ({}) and Store grant ({}) must both be set or both absent",
-            spec.slug,
-            if spec.store_path.is_some() {
-                "Some"
-            } else {
-                "None"
-            },
-            if spec.grants.contains(&ComponentGrant::Store) {
-                "granted"
-            } else {
-                "not granted"
-            },
+            &spec.grants,
+            ComponentGrant::Store,
         );
-
-        // Invariant: the MQTT-publish callback and the Mqtt grant must agree.
-        // Bootstrap wires the callback iff it grants Mqtt; re-asserted here because
-        // load() is a public API callable by out-of-tree hosts that bypass the
-        // config-layer cross-validation. Without the callback a linked `mqtt`
-        // interface would `.expect`-panic at the first guest call.
-        assert_eq!(
+        assert_seam_iff_grant(
+            spec.slug,
+            "mqtt_publish callback",
             spec.mqtt_publish.is_some(),
-            spec.grants.contains(&ComponentGrant::Mqtt),
-            "component {}: mqtt_publish callback ({}) and Mqtt grant ({}) must both be set or both absent",
-            spec.slug,
-            if spec.mqtt_publish.is_some() {
-                "Some"
-            } else {
-                "None"
-            },
-            if spec.grants.contains(&ComponentGrant::Mqtt) {
-                "granted"
-            } else {
-                "not granted"
-            },
+            &spec.grants,
+            ComponentGrant::Mqtt,
         );
-
-        // Invariant: the tool-host seam and the Tools grant must agree. Same
-        // rationale as the mqtt assert — a linked `tools` interface without a host
-        // would `.expect`-panic at the first guest call; re-asserted here because
-        // `load` is a public API callable by out-of-tree hosts that bypass the
-        // config-layer cross-validation.
-        assert_eq!(
+        assert_seam_iff_grant(
+            spec.slug,
+            "tool_host seam",
             spec.tool_host.is_some(),
-            spec.grants.contains(&ComponentGrant::Tools),
-            "component {}: tool_host seam ({}) and Tools grant ({}) must both be set or both absent",
-            spec.slug,
-            if spec.tool_host.is_some() {
-                "Some"
-            } else {
-                "None"
-            },
-            if spec.grants.contains(&ComponentGrant::Tools) {
-                "granted"
-            } else {
-                "not granted"
-            },
+            &spec.grants,
+            ComponentGrant::Tools,
         );
-
-        // Invariant: the sync-caller seam and the Calls grant must agree, on
-        // the same terms and for the same reason as the two above — a linked
-        // `calls` interface without a caller would `.expect`-panic at the first
-        // guest call.
-        assert_eq!(
-            spec.sync_caller.is_some(),
-            spec.grants.contains(&ComponentGrant::Calls),
-            "component {}: sync_caller seam ({}) and Calls grant ({}) must both be set or both \
-             absent",
+        assert_seam_iff_grant(
             spec.slug,
-            if spec.sync_caller.is_some() {
-                "Some"
-            } else {
-                "None"
-            },
-            if spec.grants.contains(&ComponentGrant::Calls) {
-                "granted"
-            } else {
-                "not granted"
-            },
+            "provides_host seam",
+            spec.provides_host.is_some(),
+            &spec.grants,
+            ComponentGrant::Provides,
+        );
+        assert_seam_iff_grant(
+            spec.slug,
+            "sync_caller seam",
+            spec.sync_caller.is_some(),
+            &spec.grants,
+            ComponentGrant::Calls,
         );
 
         let component = Component::from_file(&engine, spec.component_path).unwrap_or_else(|e| {
@@ -3155,6 +3319,7 @@ impl ProcessorComponent {
             output_acl: spec.output_acl,
             mqtt_publish: spec.mqtt_publish,
             tool_host: spec.tool_host,
+            provides_host: spec.provides_host,
             declared_call_ports: Arc::new(spec.declared_call_ports),
             calls: Arc::new(spec.calls),
             sync_caller: spec.sync_caller,
@@ -3270,8 +3435,10 @@ impl ProcessorComponent {
                 log_call_count: 0,
                 alert_call_count: 0,
                 tool_host: self.tool_host.clone(),
+                provides_host: self.provides_host.clone(),
                 tool_request_buffer: Vec::new(),
                 tool_call_count: 0,
+                complete_call_count: 0,
                 deferred_op_buffer: Vec::new(),
                 deferred_index_bounds: HashMap::new(),
                 sync_caller: self.sync_caller.clone(),
@@ -3858,8 +4025,10 @@ mod processor_store_host_tests {
             log_call_count: 0,
             alert_call_count: 0,
             tool_host: None,
+            provides_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            complete_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
             sync_caller: None,
@@ -3917,8 +4086,10 @@ mod processor_store_host_tests {
             log_call_count: 0,
             alert_call_count: 0,
             tool_host: None,
+            provides_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            complete_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
             sync_caller: None,
@@ -4547,8 +4718,10 @@ mod processor_store_host_tests {
             log_call_count: 0,
             alert_call_count: 0,
             tool_host: None,
+            provides_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            complete_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
             sync_caller: None,
@@ -4904,8 +5077,10 @@ mod processor_store_host_tests {
             log_call_count: 0,
             alert_call_count: 0,
             tool_host: Some(host),
+            provides_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            complete_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
             sync_caller: None,
@@ -5046,11 +5221,11 @@ mod processor_store_host_tests {
         };
         let mut data = make_tool_data(StubToolHost::queue_ok(req));
         for _ in 0..PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION {
-            data.do_queue_async("apull".into(), "{}".into(), "c")
+            data.do_queue_async(None, "apull".into(), "{}".into(), "c")
                 .expect("calls within the cap succeed");
         }
         let err = data
-            .do_queue_async("apull".into(), "{}".into(), "c")
+            .do_queue_async(None, "apull".into(), "{}".into(), "c")
             .expect_err("the over-cap async call must be rejected");
         assert!(matches!(err, ToolWitError::Internal(_)));
         assert_eq!(
@@ -5058,6 +5233,86 @@ mod processor_store_host_tests {
             PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION,
             "the over-cap call must not buffer a request"
         );
+    }
+
+    /// `ProvidesHost` that answers every completion `not-pending` and counts
+    /// the calls that reach it.
+    struct CountingProvidesHost {
+        completes: Mutex<usize>,
+    }
+
+    impl ProvidesHost for CountingProvidesHost {
+        fn complete(&self, _id: &str, _outcome_json: &str) -> Result<(), ProvidesCallError> {
+            *self.completes.lock().unwrap() += 1;
+            Err(ProvidesCallError::NotPending)
+        }
+        fn queue_async_for(
+            &self,
+            _serving: &str,
+            _tool: &str,
+            _args_json: &str,
+            _call_id: &str,
+        ) -> Result<QueuedToolRequest, ToolCallError> {
+            Err(ToolCallError::Denied("not pending".to_string()))
+        }
+    }
+
+    /// `complete` answers the guest up to the per-activation cap; the call
+    /// past it traps the activation and never reaches the seam.
+    #[test]
+    fn do_complete_per_activation_cap_traps() {
+        let host = Arc::new(CountingProvidesHost {
+            completes: Mutex::new(0),
+        });
+        let mut data = make_tool_data(StubToolHost::fast_ok("{}"));
+        data.provides_host = Some(host.clone());
+        for _ in 0..PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION {
+            let answer = data
+                .do_complete("feedface", "{\"ok\":1}")
+                .expect("calls within the cap do not trap");
+            assert!(matches!(answer, Err(CompleteWitError::NotPending)));
+        }
+        let trap = data
+            .do_complete("feedface", "{\"ok\":1}")
+            .expect_err("the over-cap call must trap");
+        assert!(
+            trap.to_string()
+                .contains("provides.complete calls in one activation")
+        );
+        assert_eq!(
+            *host.completes.lock().unwrap(),
+            PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION,
+            "the over-cap call must not reach the provides host"
+        );
+    }
+
+    /// An outcome over the byte cap is `invalid-outcome` naming its size and
+    /// the cap, and never reaches the provides host; one at the cap does.
+    #[test]
+    fn do_complete_rejects_oversize_outcome() {
+        let host = Arc::new(CountingProvidesHost {
+            completes: Mutex::new(0),
+        });
+        let mut data = make_tool_data(StubToolHost::fast_ok("{}"));
+        data.provides_host = Some(host.clone());
+        let over = "x".repeat(PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES + 1);
+        match data.do_complete("feedface", &over) {
+            Ok(Err(CompleteWitError::InvalidOutcome(detail))) => {
+                assert!(
+                    detail.contains(&over.len().to_string())
+                        && detail.contains(&PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES.to_string()),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected invalid-outcome, got {other:?}"),
+        }
+        assert_eq!(*host.completes.lock().unwrap(), 0);
+        let at = "x".repeat(PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES);
+        assert!(matches!(
+            data.do_complete("feedface", &at),
+            Ok(Err(CompleteWitError::NotPending))
+        ));
+        assert_eq!(*host.completes.lock().unwrap(), 1);
     }
 
     /// Buffered async requests and port publishes answer to one entry ceiling,
@@ -5088,10 +5343,10 @@ mod processor_store_host_tests {
         }
         assert_eq!(data.gate.entries(), MAX_PUBLISHES_PER_ACTIVATION - 1);
 
-        data.do_queue_async("apull".into(), "{}".into(), "c")
+        data.do_queue_async(None, "apull".into(), "{}".into(), "c")
             .expect("the last slot is free");
         let err = data
-            .do_queue_async("apull".into(), "{}".into(), "c")
+            .do_queue_async(None, "apull".into(), "{}".into(), "c")
             .expect_err("the combined count is at the ceiling");
         assert!(
             matches!(&err, ToolWitError::Internal(m) if m == "too-many-async-requests"),
@@ -5116,8 +5371,13 @@ mod processor_store_host_tests {
             body_json: "{\"v\":1}".to_string(),
         };
         let mut data = make_tool_data(StubToolHost::queue_ok(req.clone()));
-        data.do_queue_async("git-repo-pull".into(), "{\"repos\":[]}".into(), "call-1")
-            .expect("valid async call must buffer");
+        data.do_queue_async(
+            None,
+            "git-repo-pull".into(),
+            "{\"repos\":[]}".into(),
+            "call-1",
+        )
+        .expect("valid async call must buffer");
         assert_eq!(data.tool_request_buffer, vec![req]);
     }
 
@@ -5144,7 +5404,7 @@ mod processor_store_host_tests {
         data.gate = ActivationGate::new(1024, budgets);
         data.do_publish_declared("out".into(), "port-body".into(), None, None)
             .expect("a bound port publish must buffer");
-        data.do_queue_async("git-repo-pull".into(), "{}".into(), "c1")
+        data.do_queue_async(None, "git-repo-pull".into(), "{}".into(), "c1")
             .expect("valid async call must buffer");
         assert_eq!(data.tool_request_buffer.len(), 1);
 
@@ -5176,7 +5436,7 @@ mod processor_store_host_tests {
         let mut data = make_tool_data(StubToolHost::queue_ok(req));
         let long_id = "z".repeat(PROCESSOR_MAX_TOOL_CALL_ID_LEN + 1);
         let err = data
-            .do_queue_async("git-repo-pull".into(), "{}".into(), &long_id)
+            .do_queue_async(None, "git-repo-pull".into(), "{}".into(), &long_id)
             .expect_err("over-length call_id must be rejected");
         assert!(matches!(err, ToolWitError::InvalidArgs(_)));
         assert!(data.tool_request_buffer.is_empty());
@@ -5192,7 +5452,7 @@ mod processor_store_host_tests {
         });
         let mut data = make_tool_data(host);
         let err = data
-            .do_queue_async("mystery".into(), "{}".into(), "c1")
+            .do_queue_async(None, "mystery".into(), "{}".into(), "c1")
             .expect_err("ungranted async tool must error");
         assert!(matches!(err, ToolWitError::NotGranted));
         assert!(data.tool_request_buffer.is_empty());
@@ -5410,8 +5670,10 @@ mod processor_store_host_tests {
             log_call_count: 0,
             alert_call_count: 0,
             tool_host: None,
+            provides_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            complete_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
             sync_caller: None,
@@ -5754,8 +6016,10 @@ mod processor_calls_host_tests {
             log_call_count: 0,
             alert_call_count: 0,
             tool_host: None,
+            provides_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            complete_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
             sync_caller: Some(caller),
@@ -5970,8 +6234,10 @@ mod processor_config_host_tests {
             log_call_count: 0,
             alert_call_count: 0,
             tool_host: None,
+            provides_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            complete_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
             sync_caller: None,

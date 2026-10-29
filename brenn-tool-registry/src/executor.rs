@@ -573,13 +573,16 @@ fn build_result_body(
     result: &Result<Value, ToolError>,
     alert: &AlertDispatcher,
 ) -> String {
-    let body = json!({
-        "v": 1,
-        "tool": tool,
-        "call_id": call_id,
-        "outcome": outcome_json(result),
-    });
-    let s = serde_json::to_string(&body).expect("result envelope serializes");
+    let envelope = |outcome: Value| {
+        let body = json!({
+            "v": 1,
+            "tool": tool,
+            "call_id": call_id,
+            "outcome": outcome,
+        });
+        serde_json::to_string(&body).expect("result envelope serializes")
+    };
+    let s = envelope(outcome_json(result));
     if s.len() > MAX_ASYNC_RESULT_BYTES {
         warn!(%tool, len = s.len(), cap = MAX_ASYNC_RESULT_BYTES, "tool executor: result over cap (tool bug)");
         alert.alert_once_per_process(
@@ -592,13 +595,9 @@ fn build_result_body(
                 s.len(),
             ),
         );
-        let capped = json!({
-            "v": 1,
-            "tool": tool,
-            "call_id": call_id,
-            "outcome": { "err": { "kind": "internal", "detail": "result exceeded size cap" } },
-        });
-        return serde_json::to_string(&capped).expect("capped result envelope serializes");
+        return envelope(
+            json!({ "err": { "kind": "internal", "detail": "result exceeded size cap" } }),
+        );
     }
     s
 }

@@ -10,6 +10,9 @@
 // - `RetainedState<T>` — a component's state on a retained `io` port, which
 //   is where it lives: linear memory is activation-scoped
 // - `calls` module — call a peer component and read its reply inline
+// - `tools` module — async tool calls and the result envelope they answer with
+// - `provides` module — serve the tools the class declares, acting for the
+//   requesting user
 // - `dom` module — element handles and mutators, for a page-hosted component
 // - `export_processor!` macro — wires `Processor` impl to the WIT export
 //
@@ -66,6 +69,12 @@ pub enum Error {
     /// and carries on from it has hidden a permanent fault. Deciding between the
     /// two needs the variant, not a diagnostic string.
     QuotaExceeded(String),
+    /// The host does not hold the named pending request for this component: it
+    /// was already completed, expired at the host's ceiling, delivered before a
+    /// restart, or was never this component's. Structural for that request and
+    /// harmless for the component — a provider drops the request rather than
+    /// failing the activation.
+    NotPending(String),
 }
 
 impl Error {
@@ -93,7 +102,7 @@ impl From<Error> for bindings::ReceiveError {
             // The host has one failure arm for both: the distinction is the
             // guest's, drawn so a component can decide, and the diagnostic text
             // already names the variant.
-            Error::ProcessingFailed(msg) | Error::QuotaExceeded(msg) => {
+            Error::ProcessingFailed(msg) | Error::QuotaExceeded(msg) | Error::NotPending(msg) => {
                 bindings::ReceiveError::ProcessingFailed(msg)
             }
         }
@@ -388,6 +397,17 @@ pub struct PortWindow {
     /// All envelopes: context (..new_from) then new (new_from..).
     envelopes: Vec<String>,
     new_from: usize,
+}
+
+impl Activation {
+    /// The window of a reserved input port the host wires, or
+    /// `Err(MalformedEnvelope)` when this component has none.
+    fn reserved_window(&self, port: &str) -> Result<&PortWindow, Error> {
+        self.windows
+            .iter()
+            .find(|window| window.port == port)
+            .ok_or_else(|| Error::malformed(format!("no `{port}` port in this activation")))
+    }
 }
 
 impl PortWindow {
@@ -1523,7 +1543,7 @@ pub mod tools {
     use crate::bindings::brenn::processor::tools::{self as raw, ToolError};
 
     /// Human-readable rendering of a `ToolError` for a diagnostic message.
-    fn tool_err(tool: &str, e: ToolError) -> Error {
+    pub(crate) fn tool_err(tool: &str, e: ToolError) -> Error {
         let variant = match e {
             ToolError::NotGranted => String::from("not-granted"),
             ToolError::Denied(r) => format!("denied: {r}"),
@@ -1555,6 +1575,268 @@ pub mod tools {
         let args_json = serde_json::to_string(args)
             .map_err(|e| Error::failed(format!("serialize args: {e}")))?;
         call_async(tool, &args_json, call_id)
+    }
+
+    /// One result delivered on the `tool-results` port.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ToolResult {
+        /// Envelope schema version; always `1`, the only version this SDK
+        /// parses.
+        pub v: u32,
+        /// The tool that ran.
+        pub tool: String,
+        /// The caller-chosen correlation string, echoed verbatim.
+        pub call_id: String,
+        /// The tool's value, or the typed error it ended in.
+        pub outcome: Result<serde_json::Value, ToolOutcomeError>,
+        /// The pending request this call was issued for, when it was issued
+        /// through [`crate::provides::call_async_for`]; `None` for a plain
+        /// [`call_async`].
+        pub serving: Option<crate::provides::PendingId>,
+    }
+
+    /// A tool's typed error, as the executor writes it:
+    /// `{"err": {"kind", "detail"}}`.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+    pub struct ToolOutcomeError {
+        /// The error's stable token (`denied`, `invalid_args`, `internal`, …).
+        pub kind: String,
+        /// Diagnostic text.
+        pub detail: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "lowercase", deny_unknown_fields)]
+    enum WireOutcome {
+        Ok(serde_json::Value),
+        Err(ToolOutcomeError),
+    }
+
+    #[derive(serde::Deserialize)]
+    struct WireResult {
+        v: u32,
+        tool: String,
+        call_id: String,
+        outcome: WireOutcome,
+        #[serde(default)]
+        serving: Option<String>,
+    }
+
+    /// Parse one result body. A body the host built that does not parse, or
+    /// carries a version other than `1`, is a host bug, surfaced as
+    /// `MalformedEnvelope`.
+    pub(crate) fn parse_result(body: &str) -> Result<ToolResult, Error> {
+        let wire: WireResult = serde_json::from_str(body)
+            .map_err(|e| Error::malformed(format!("tool result body: {e}")))?;
+        if wire.v != 1 {
+            return Err(Error::malformed(format!(
+                "tool result body: version {} is not 1",
+                wire.v
+            )));
+        }
+        Ok(ToolResult {
+            v: wire.v,
+            tool: wire.tool,
+            call_id: wire.call_id,
+            outcome: match wire.outcome {
+                WireOutcome::Ok(value) => Ok(value),
+                WireOutcome::Err(err) => Err(err),
+            },
+            serving: wire.serving.map(crate::provides::PendingId::from),
+        })
+    }
+
+    impl crate::Activation {
+        /// Every NEW result on the `tool-results` port, in delivery order.
+        ///
+        /// `Err(MalformedEnvelope)` when this component has no `tool-results`
+        /// port or a body does not parse: both are host-built, so either is a
+        /// fault for the activation to surface rather than skip.
+        pub fn tool_results(&self) -> Result<Vec<ToolResult>, Error> {
+            self.reserved_window(brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT)?
+                .new_envelopes()
+                .map(|envelope| parse_result(&envelope?.body))
+                .collect()
+        }
+    }
+}
+
+// ── provides ──────────────────────────────────────────────────────────────────
+
+pub mod provides {
+    //! Serving the registry tools this component's class declares.
+    //!
+    //! **Requires grant:** `provides`. The host admits every call before the
+    //! component sees it and delivers it on the reserved `tool-requests` port
+    //! as a [`ToolRequest`]: a host-minted [`PendingId`], the tool name and its
+    //! arguments — never the caller or the user. Several requests may arrive
+    //! new in one activation; serve every one.
+    //!
+    //! A request is answered with [`complete`] / [`complete_err`], which reach
+    //! the waiting caller immediately and are not retracted if the activation
+    //! later fails. Work that needs another tool is issued with
+    //! [`call_async_for`], which acts for the request's user; its result
+    //! arrives on `tool-results` with [`crate::tools::ToolResult::serving`]
+    //! naming the request, to be completed from there.
+
+    use super::Error;
+    use crate::bindings::brenn::processor::provides::{self as raw, CompleteError};
+
+    /// A host-minted pending-request id, opaque to the component.
+    ///
+    /// Serializable so a provider can carry it in its own published state
+    /// between activations. Constructible from a string for the same reason;
+    /// an id the host did not mint for this component is refused like any
+    /// other id that is not pending, so nothing is gained by forging one.
+    #[derive(
+        Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    )]
+    #[serde(transparent)]
+    pub struct PendingId(String);
+
+    impl From<String> for PendingId {
+        fn from(id: String) -> PendingId {
+            PendingId(id)
+        }
+    }
+
+    impl PendingId {
+        /// The id as the host spells it — for logs and for correlating state.
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl core::fmt::Display for PendingId {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    /// One request delivered on the `tool-requests` port.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ToolRequest {
+        /// The id to complete, and to name in [`call_async_for`].
+        pub id: PendingId,
+        /// The provided tool called — one the class declares.
+        pub tool: String,
+        /// The caller's arguments, as admitted by the host.
+        pub args: serde_json::Value,
+    }
+
+    /// The error kinds a provider may complete with. The admission kinds
+    /// (`not_granted`, `rate_limited`, `wrong_class`) are the host's alone.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum OutcomeErrorKind {
+        /// The request named something its arguments may not reach.
+        Denied,
+        /// The arguments are malformed for this tool.
+        InvalidArgs,
+        /// The provider failed.
+        Internal,
+    }
+
+    impl OutcomeErrorKind {
+        /// The kind's wire token.
+        pub fn token(self) -> &'static str {
+            match self {
+                OutcomeErrorKind::Denied => "denied",
+                OutcomeErrorKind::InvalidArgs => "invalid_args",
+                OutcomeErrorKind::Internal => "internal",
+            }
+        }
+    }
+
+    /// Fields the host adds to a version-1 body are ignored: the body grows
+    /// additively, and `v` moves only for a change an older guest would
+    /// misread.
+    #[derive(serde::Deserialize)]
+    struct WireRequest {
+        v: u32,
+        id: String,
+        tool: String,
+        args: serde_json::Value,
+    }
+
+    /// Parse one request body. A body the host built that does not parse is a
+    /// host bug, surfaced as `MalformedEnvelope`.
+    pub(crate) fn parse_request(body: &str) -> Result<ToolRequest, Error> {
+        let wire: WireRequest = serde_json::from_str(body)
+            .map_err(|e| Error::malformed(format!("tool request body: {e}")))?;
+        if wire.v != 1 {
+            return Err(Error::malformed(format!(
+                "tool request body: version {} is not 1",
+                wire.v
+            )));
+        }
+        Ok(ToolRequest {
+            id: PendingId(wire.id),
+            tool: wire.tool,
+            args: wire.args,
+        })
+    }
+
+    impl crate::Activation {
+        /// Every NEW request on the `tool-requests` port, in delivery order.
+        ///
+        /// `Err(MalformedEnvelope)` when this component has no `tool-requests`
+        /// port or a body does not parse: both are host-built, so either is a
+        /// fault for the activation to surface rather than skip.
+        pub fn tool_requests(&self) -> Result<Vec<ToolRequest>, Error> {
+            self.reserved_window(brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT)?
+                .new_envelopes()
+                .map(|envelope| parse_request(&envelope?.body))
+                .collect()
+        }
+    }
+
+    fn complete_raw(id: &PendingId, outcome_json: &str) -> Result<(), Error> {
+        raw::complete(&id.0, outcome_json).map_err(|e| match e {
+            CompleteError::NotPending => Error::NotPending(format!("complete {id}: not-pending")),
+            CompleteError::InvalidOutcome(m) => {
+                Error::failed(format!("complete {id}: invalid-outcome: {m}"))
+            }
+        })
+    }
+
+    /// Answer request `id` with `value`. Immediate: the caller has its answer
+    /// when this returns. `Err(NotPending)` when the host holds no such
+    /// request for this component; a value that does not serialize, or an
+    /// over-cap one, is `ProcessingFailed` and leaves the request pending.
+    pub fn complete(id: &PendingId, value: &impl serde::Serialize) -> Result<(), Error> {
+        let value = serde_json::to_value(value)
+            .map_err(|e| Error::failed(format!("serialize outcome: {e}")))?;
+        complete_raw(id, &serde_json::json!({ "ok": value }).to_string())
+    }
+
+    /// Answer request `id` with a typed error. Same immediacy and refusals as
+    /// [`complete`].
+    pub fn complete_err(id: &PendingId, kind: OutcomeErrorKind, detail: &str) -> Result<(), Error> {
+        let outcome = serde_json::json!({ "err": { "kind": kind.token(), "detail": detail } });
+        complete_raw(id, &outcome.to_string())
+    }
+
+    /// `tools::call_async_json` on behalf of the user whose request `id` is.
+    /// Buffered with the activation's publishes, under the same budgets; the
+    /// result arrives on `tool-results` with `serving == Some(id)`.
+    ///
+    /// An `id` not pending for this component is refused `denied`, the same
+    /// error as a refusal of the nested call itself, so the `Err` alone does
+    /// not say whether the request is stale. Answer a refusal with
+    /// [`complete_err`] rather than returning it: a live request's caller gets
+    /// the refusal at once, and a stale request draws `Err(NotPending)`, which
+    /// the provider drops. Returning the `Err` fails the activation, and with
+    /// it every other request served in the same window.
+    pub fn call_async_for(
+        id: &PendingId,
+        tool: &str,
+        args: &impl serde::Serialize,
+        call_id: &str,
+    ) -> Result<(), Error> {
+        let args_json = serde_json::to_string(args)
+            .map_err(|e| Error::failed(format!("serialize args: {e}")))?;
+        raw::call_async_for(&id.0, tool, &args_json, call_id)
+            .map_err(|e| crate::tools::tool_err(tool, e))
     }
 }
 

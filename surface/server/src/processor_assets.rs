@@ -44,7 +44,7 @@ pub const MANIFEST_VERSION: u32 = 3;
 const PROCESSOR_PACKAGE: &str = "brenn:processor";
 
 /// The WIT interfaces a surface-hosted processor may import: the transpilable
-/// profile. `store`/`mqtt`/`tools` are backend-only in v1; `dom`/`page-dom` run
+/// profile. `store`/`mqtt`/`tools`/`provides` are backend-only; `dom`/`page-dom` run
 /// the other way and are surface-only, because only a page has a DOM.
 ///
 /// `types` is in the set but is not a capability: it defines the shared record
@@ -60,9 +60,9 @@ const SURFACE_IMPORTS: [&str; 8] = [
 /// is manifest/toolchain drift (the build wrote a name no world declares), which
 /// is a different operator problem from declaring a backend-only component on a
 /// surface — and gets its own panic.
-const KNOWN_IMPORTS: [&str; 11] = [
-    "types", "ports", "log", "alert", "config", "store", "mqtt", "tools", "calls", "dom",
-    "page-dom",
+const KNOWN_IMPORTS: [&str; 12] = [
+    "types", "ports", "log", "alert", "config", "store", "mqtt", "tools", "provides", "calls",
+    "dom", "page-dom",
 ];
 
 /// The one promise every record makes, whatever version wrote it: an integer
@@ -567,7 +567,7 @@ mod tests {
     /// The interface names the world defines and only a surface host links.
     /// [`KNOWN_IMPORTS`] is "every interface `processor.wit` defines", so it
     /// carries them; a top-level component may not be granted them. That is the
-    /// mirror image of `store`/`mqtt`/`tools`, which the world defines and only
+    /// mirror image of `store`/`mqtt`/`tools`/`provides`, which the world defines and only
     /// the backend links.
     const SURFACE_ONLY: [&str; 2] = ["dom", "page-dom"];
 

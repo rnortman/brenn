@@ -121,6 +121,19 @@ fn wasm_consumer_resolves_with_non_empty_acl() {
     assert!(c.policy.acls.webhook.is_empty());
 }
 
+/// `calls` is legal on a top-level consumer and names no policy capability;
+/// resolution passes it through to the resolved grant set rather than refusing
+/// it while building the policy.
+#[test]
+fn a_top_level_consumer_granted_calls_resolves() {
+    let (dir, chan_addr) = make_brenn_dir("brenn:calls-passthrough");
+    let mut raw = minimal_wasm_consumer_raw("caller", "/tmp/a.wasm", &chan_addr);
+    raw.grants = vec![ComponentGrant::Ports, ComponentGrant::Calls];
+
+    let resolved = resolve(&[raw], &dir);
+    assert!(resolved[0].grants.contains(&ComponentGrant::Calls));
+}
+
 /// A WASM consumer subscribing to an `ephemeral:` channel resolves the input
 /// when `ephemeral_subscribe_acl` covers it.
 #[test]

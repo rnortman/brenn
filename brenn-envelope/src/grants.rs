@@ -69,6 +69,10 @@ pub enum ComponentGrant {
     /// and read its reply inline. Legal on both hosts: the callee side of a
     /// sync call is an ordinary activation, which both hosts assemble.
     Calls,
+    /// `brenn:processor/provides` — answer the registry-tool requests the
+    /// component's class declares, and act for the requesting user while
+    /// serving one. Backend-only: a surface host links no tool substrate.
+    Provides,
     /// Fullscreen takeover of the page the component is placed on. Names no WIT
     /// interface: the capability is a binding to a takeover-plane channel, and
     /// the grant is what consents to that binding.
@@ -98,7 +102,7 @@ pub enum ComponentHost {
 impl ComponentGrant {
     /// Every capability a component may be granted, in the order they are
     /// listed.
-    pub const ALL: [ComponentGrant; 11] = [
+    pub const ALL: [ComponentGrant; 12] = [
         ComponentGrant::Ports,
         ComponentGrant::Store,
         ComponentGrant::Log,
@@ -107,6 +111,7 @@ impl ComponentGrant {
         ComponentGrant::Mqtt,
         ComponentGrant::Tools,
         ComponentGrant::Calls,
+        ComponentGrant::Provides,
         ComponentGrant::Takeover,
         ComponentGrant::Dom,
         ComponentGrant::PageDom,
@@ -123,6 +128,7 @@ impl ComponentGrant {
             Self::Mqtt => "mqtt",
             Self::Tools => "tools",
             Self::Calls => "calls",
+            Self::Provides => "provides",
             Self::Takeover => "takeover",
             Self::Dom => "dom",
             Self::PageDom => "page-dom",
@@ -160,6 +166,7 @@ impl ComponentGrant {
             Self::Mqtt => "brenn:processor/mqtt@0.1.0",
             Self::Tools => "brenn:processor/tools@0.1.0",
             Self::Calls => "brenn:processor/calls@0.1.0",
+            Self::Provides => "brenn:processor/provides@0.1.0",
             Self::Dom => "brenn:processor/dom@0.1.0",
             Self::PageDom => "brenn:processor/page-dom@0.1.0",
             Self::Takeover => return None,
@@ -184,6 +191,9 @@ impl ComponentGrant {
             (ComponentHost::Surface, Self::Tools) => {
                 Some("`tools` is backend-only in v1: the surface host links no tools interface")
             }
+            (ComponentHost::Surface, Self::Provides) => Some(
+                "`provides` is backend-only: the surface host links no tool substrate to serve requests from",
+            ),
             (ComponentHost::TopLevel, Self::Takeover) => {
                 Some("`takeover` is a page capability; a top-level consumer has no page")
             }
@@ -200,10 +210,12 @@ impl ComponentGrant {
     /// The unified capability this grant becomes once a policy is built, or
     /// `None` for the one grant that names no capability.
     ///
-    /// Five grants name none, for four reasons. `Takeover` is consent to a
+    /// Six grants name none, for five reasons. `Takeover` is consent to a
     /// binding, gated at the binding, and no policy grant set carries it.
     /// `Tools` names authority the resolved tool-grant map carries in full, key
-    /// by key, so there is no single capability it becomes. `Calls` reaches a
+    /// by key, so there is no single capability it becomes. `Provides` answers
+    /// requests the host itself delivers and admits, so the authority is the
+    /// class's declaration and the system-minted request inbox. `Calls` reaches a
     /// peer of the caller's own placement and no channel, so no ACL plane names
     /// what it may do; the document's wiring is the whole authority. `Dom` and
     /// `PageDom` are gated in the page, by the kernel, on the grant word
@@ -217,7 +229,12 @@ impl ComponentGrant {
             Self::Alert => AppCapability::WasmAlert,
             Self::Config => AppCapability::WasmConfig,
             Self::Mqtt => AppCapability::MqttPublish,
-            Self::Tools | Self::Calls | Self::Takeover | Self::Dom | Self::PageDom => {
+            Self::Tools
+            | Self::Calls
+            | Self::Provides
+            | Self::Takeover
+            | Self::Dom
+            | Self::PageDom => {
                 return None;
             }
         })
@@ -751,6 +768,7 @@ mod tests {
             | ComponentGrant::Mqtt
             | ComponentGrant::Tools
             | ComponentGrant::Calls
+            | ComponentGrant::Provides
             | ComponentGrant::Takeover
             | ComponentGrant::Dom
             | ComponentGrant::PageDom => {}
@@ -943,13 +961,14 @@ mod tests {
     }
 
     #[test]
-    fn five_component_grants_name_no_capability_and_the_rest_name_one() {
+    fn six_component_grants_name_no_capability_and_the_rest_name_one() {
         for grant in ComponentGrant::ALL {
             let mapped = grant.app_capability();
             match grant {
                 ComponentGrant::Takeover
                 | ComponentGrant::Tools
                 | ComponentGrant::Calls
+                | ComponentGrant::Provides
                 | ComponentGrant::Dom
                 | ComponentGrant::PageDom => assert_eq!(mapped, None),
                 _ => assert!(mapped.is_some(), "{grant:?} names no capability"),
@@ -996,17 +1015,17 @@ mod tests {
     }
 
     #[test]
-    fn tools_is_a_backend_only_word() {
-        assert!(
-            ComponentGrant::Tools
-                .illegal_on(ComponentHost::Surface)
-                .is_some()
-        );
-        assert!(
-            ComponentGrant::Tools
-                .illegal_on(ComponentHost::TopLevel)
-                .is_none()
-        );
+    fn tools_and_provides_are_backend_only_words() {
+        for grant in [ComponentGrant::Tools, ComponentGrant::Provides] {
+            assert!(
+                grant.illegal_on(ComponentHost::Surface).is_some(),
+                "{grant:?} is admitted on a host with no tool substrate"
+            );
+            assert!(
+                grant.illegal_on(ComponentHost::TopLevel).is_none(),
+                "{grant:?} is refused on the only host that can implement it"
+            );
+        }
     }
 
     /// The inverse of `tools`: two words a page host links and a backend host

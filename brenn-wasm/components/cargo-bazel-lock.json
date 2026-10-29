@@ -1,5 +1,5 @@
 {
-  "checksum": "4f5ecff9453769ed32d88a229a872a96929d22134e512408404b7479daed540e",
+  "checksum": "d7ea38d88fac1a9d9d3349c3b314e636c3fb480a71defb10d6a61f7bfdcef03c",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -578,6 +578,24 @@
           ],
           "selects": {}
         },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-provider-test 0.1.0": {
+      "name": "brenn-processor-provider-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -4002,6 +4020,7 @@
     "brenn-processor-mem-exhaust 0.1.0": "brenn-wasm/components/processor-mem-exhaust",
     "brenn-processor-mqtt-test 0.1.0": "brenn-wasm/components/processor-mqtt-test",
     "brenn-processor-multiport 0.1.0": "brenn-wasm/components/processor-multiport",
+    "brenn-processor-provider-test 0.1.0": "brenn-wasm/components/processor-provider-test",
     "brenn-processor-store-rt 0.1.0": "brenn-wasm/components/processor-store-rt",
     "brenn-processor-tool-test 0.1.0": "brenn-wasm/components/processor-tool-test",
     "brenn-processor-transplant 0.1.0": "brenn-wasm/components/processor-transplant",

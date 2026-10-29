@@ -2333,7 +2333,7 @@ fn a_need_names_a_capability() {
         refusal("component Panel {\n    abi = processor; requires = [frobnicate];\n}\n"),
         "`frobnicate` is not a capability a component holds; a spec's `requires` names \
          the same words a `grants` list does: `ports`, `store`, `log`, `alert`, \
-         `config`, `mqtt`, `tools`, `calls`, `takeover`, `dom` or `page-dom`"
+         `config`, `mqtt`, `tools`, `calls`, `provides`, `takeover`, `dom` or `page-dom`"
     );
     assert!(
         refusal(

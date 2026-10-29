@@ -370,6 +370,9 @@ pub(crate) fn load_consumer(
             output_acl,
             mqtt_publish,
             tool_host,
+            // No provider seam is built here, so a consumer granted `provides`
+            // trips the seam-iff-grant assert in `ProcessorComponent::load`.
+            provides_host: None,
             declared_call_ports: consumer.call_ports.clone(),
             calls,
             sync_caller,
@@ -577,6 +580,7 @@ mod tests {
                 output_acl: std::sync::Arc::new(|_| true),
                 mqtt_publish: None,
                 tool_host: None,
+                provides_host: None,
                 declared_call_ports: Default::default(),
                 calls: Default::default(),
                 sync_caller: None,

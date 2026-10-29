@@ -4390,8 +4390,8 @@ fn a_refused_ceiling_word_suppresses_the_fit_check() {
         derive_refusal(&packaged_page(" { grants = [dom, chrome, subscribe]; }")),
         "`chrome` is not a grant word, so it caps nothing; a ceiling names `alert`, \
          `calls`, `config`, `dom`, `dynamic_subscribe`, `ephemeral_publish`, \
-         `ephemeral_subscribe`, `log`, `mqtt`, `page-dom`, `ports`, `publish`, `pwa_push`, \
-         `store`, `subscribe`, `takeover` or `tools`"
+         `ephemeral_subscribe`, `log`, `mqtt`, `page-dom`, `ports`, `provides`, `publish`, \
+         `pwa_push`, `store`, `subscribe`, `takeover` or `tools`"
     );
 }
 

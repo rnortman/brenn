@@ -780,8 +780,8 @@ new sync: GitSyncConsumer {
   document.querySelector("#fig-c .grants-static").hidden = true;
   var g = function (k) { return root.querySelector('[data-g="' + k + '"]'); };
 
-  var WORDS = ["ports", "store", "log", "alert", "config", "mqtt", "tools", "calls", "takeover", "dom", "page-dom"];
-  var BACKEND_ONLY = { store: 1, mqtt: 1, tools: 1 };
+  var WORDS = ["ports", "store", "log", "alert", "config", "mqtt", "tools", "provides", "calls", "takeover", "dom", "page-dom"];
+  var BACKEND_ONLY = { store: 1, mqtt: 1, tools: 1, provides: 1 };
   var SURFACE_ONLY = { dom: 1, "page-dom": 1, takeover: 1 };
   var CLASSES = {
     GitSyncConsumer: { requires: ["ports", "log", "store", "alert", "config", "tools"], optional: [], place: "backend" },

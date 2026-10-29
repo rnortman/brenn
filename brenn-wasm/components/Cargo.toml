@@ -34,6 +34,7 @@ members = [
     "processor-mem-exhaust",
     "processor-mqtt-test",
     "processor-multiport",
+    "processor-provider-test",
     "processor-store-rt",
     "processor-tool-test",
     "processor-transplant",

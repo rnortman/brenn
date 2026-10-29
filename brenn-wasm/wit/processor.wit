@@ -613,6 +613,47 @@ interface tools {
         -> result<_, tool-error>;
 }
 
+/// Serve the registry tools this component's class declares with `provide`.
+///
+/// The host admits every call (grant, rate limit, concurrency) before the
+/// component sees it, mints a pending id for it, and delivers
+/// `{"v": 1, "id", "tool", "args"}` as an ordinary activation on the reserved
+/// `tool-requests` input port. The request names neither the caller nor the
+/// user it acts for: the host keeps both on the pending record. The component
+/// answers through `complete`, and acts for the request's user through
+/// `call-async-for`; it addresses no channel and names no user.
+interface provides {
+    use tools.{tool-error};
+
+    /// Failure modes of `complete`.
+    variant complete-error {
+        /// The id is not pending for this component: already completed, expired
+        /// at the host's ceiling, delivered before a restart, or never this
+        /// component's. Indistinguishable on purpose.
+        not-pending,
+        /// The outcome is not `{"ok": value}` / `{"err": {"kind", "detail"}}`
+        /// with a kind this interface admits (`denied`, `invalid_args`,
+        /// `internal`), or the value exceeds the result cap, or the outcome
+        /// text exceeds 512 KiB (checked first, whatever the id). The id stays
+        /// pending, so a smaller or an error outcome may follow.
+        invalid-outcome(string),
+    }
+
+    /// Answer one request. IMMEDIATE, not transactional with the activation:
+    /// the caller is waiting and a completion is its answer, not a side effect
+    /// on the bus, so an activation that later errs or traps does not retract
+    /// it. The id is consumed; a second completion is `not-pending`.
+    complete: func(id: string, outcome-json: string) -> result<_, complete-error>;
+
+    /// `tools.call-async` issued on behalf of the user whose request `serving`
+    /// is. Buffered and flushed exactly as `call-async`, with the same budgets,
+    /// caps and grant checks; the result arrives on `tool-results` carrying
+    /// `"serving": <id>`. A `serving` id not pending for this component is
+    /// `denied`.
+    call-async-for: func(serving: string, tool: string, args-json: string, call-id: string)
+        -> result<_, tool-error>;
+}
+
 interface config {
     /// Read one operator-supplied config value. Values are opaque strings;
     /// the guest parses. The map is fixed for the process lifetime (seeded
@@ -858,6 +899,7 @@ world processor {
     import config;
     import mqtt;
     import tools;
+    import provides;
     import calls;
     import dom;
     import page-dom;

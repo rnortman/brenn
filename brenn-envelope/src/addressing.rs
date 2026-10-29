@@ -119,6 +119,13 @@ pub const TOOL_RESULTS_NAMESPACE: &str = "tool-results/";
 /// the one both depend on.
 pub const TOOL_RESULT_INPUT_PORT: &str = "tool-results";
 
+/// Logical input port a providing consumer's tool requests are delivered on.
+///
+/// The provider-side twin of [`TOOL_RESULT_INPUT_PORT`], spelled here for the
+/// same reason: the guest SDK, the config language and the tool substrate must
+/// agree on it.
+pub const TOOL_REQUEST_INPUT_PORT: &str = "tool-requests";
+
 /// Does `address` (a scheme-stripped `brenn:` channel name) fall in a reserved
 /// tool namespace? True for an exact segment match (`"tools"`) or a leading
 /// segment followed by a `.`/`/` boundary (`"tools/x"`, `"tools.x"`), so a

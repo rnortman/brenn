@@ -166,6 +166,7 @@ mod tests {
             ("processor-dual", Family::Guest),
             ("processor-log", Family::Guest),
             ("processor-multiport", Family::Guest),
+            ("processor-provider-test", Family::Guest),
             ("processor-store-rt", Family::Guest),
             ("processor-transplant", Family::Guest),
         ]

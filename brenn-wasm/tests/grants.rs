@@ -246,6 +246,8 @@ fn superset_grants_loads() {
         mqtt_publish: Some(common::ok_mqtt_publish()),
         // ALL grants includes Tools; the load invariant requires a seam then.
         tool_host: Some(common::noop_tool_host()),
+        // ALL grants includes Provides; the load invariant requires a seam then.
+        provides_host: Some(common::noop_provides_host()),
         // ALL grants includes Calls; the load invariant requires a caller then.
         sync_caller: Some(std::sync::Arc::new(|_: &str, _: &str, _, _| {
             brenn_activation::sync::SyncAnswer::Ok(None)
@@ -617,6 +619,47 @@ fn tools_grant_without_seam_panics() {
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
         ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_exhaust"), "tools-no-seam")
+    });
+}
+
+/// The provides seam and the `Provides` grant must agree at load, on the same
+/// terms as the tool-host seam above.
+#[test]
+#[should_panic(
+    expected = "provides_host seam (None) and Provides grant (granted) must both be set or both \
+                absent"
+)]
+fn provides_grant_without_seam_panics() {
+    let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Provides].into_iter().collect();
+    ProcessorComponent::load(ProcessorLoadSpec {
+        input_amplification_mt: common::amp_in(),
+        grants,
+        alerter: noop_alerter(),
+        output_acl: common::allow_all(),
+        ..ProcessorLoadSpec::minimal(
+            &component_path("brenn_processor_exhaust"),
+            "provides-no-seam",
+        )
+    });
+}
+
+/// The other direction: a seam handed in with no `Provides` grant is a caller
+/// that built the two from different facts.
+#[test]
+#[should_panic(
+    expected = "provides_host seam (Some) and Provides grant (not granted) must both be set or \
+                both absent"
+)]
+fn provides_seam_without_grant_panics() {
+    ProcessorComponent::load(ProcessorLoadSpec {
+        input_amplification_mt: common::amp_in(),
+        alerter: noop_alerter(),
+        output_acl: common::allow_all(),
+        provides_host: Some(common::noop_provides_host()),
+        ..ProcessorLoadSpec::minimal(
+            &component_path("brenn_processor_exhaust"),
+            "provides-no-grant",
+        )
     });
 }
 

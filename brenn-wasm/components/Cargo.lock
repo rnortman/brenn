@@ -137,6 +137,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-processor-provider-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
 name = "brenn-processor-store-rt"
 version = "0.1.0"
 dependencies = [

@@ -233,13 +233,17 @@ pub fn build_wasm_policy(
 
     let mut grant_set = GrantSet::default();
     for grant in grants {
-        // Four grants name no capability. `tools` is authority the resolved
-        // tool-grant map carries key by key, so there is nothing to insert here.
-        // `takeover`, `dom` and `page-dom` are page capabilities and this is the
-        // backend consumer path, which has no page; the DSL refuses all three on
-        // a top-level instance, so reaching here means that refusal was bypassed.
+        // Six grants name no capability. `tools` is authority the resolved
+        // tool-grant map carries key by key; `calls` reaches a peer of the
+        // consumer's own placement, wired by the document; `provides` answers
+        // requests the host delivers to a system-minted inbox. None of the three
+        // has anything to insert here. `takeover`, `dom` and `page-dom` are page
+        // capabilities and this is the backend consumer path, which has no page;
+        // the DSL refuses all three on a top-level instance, so reaching here
+        // means that refusal was bypassed.
         let Some(cap) = grant.app_capability() else {
-            if grant == crate::messaging::ComponentGrant::Tools {
+            use crate::messaging::ComponentGrant::{Calls, Provides, Tools};
+            if matches!(grant, Tools | Calls | Provides) {
                 continue;
             }
             panic!(
@@ -1186,6 +1190,30 @@ mod tests {
         // An ungranted capability is denied.
         assert!(!policy.has_grant(AppCapability::MessagingSubscribe));
         assert!(!policy.has_grant(AppCapability::DynamicSubscribe));
+    }
+
+    #[test]
+    fn wasm_tools_calls_and_provides_insert_no_capability() {
+        // All three are legal on a top-level consumer and name no capability;
+        // the policy carries none of them and the build does not refuse them.
+        let policy = build_wasm_policy(
+            "proc",
+            [
+                ComponentGrant::Tools,
+                ComponentGrant::Calls,
+                ComponentGrant::Provides,
+            ],
+            WasmAclsRaw::default(),
+        );
+        for cap in AppCapability::ALL {
+            assert!(!policy.has_grant(cap), "{cap:?} granted from no word");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "granted `dom`, which is a page capability")]
+    fn wasm_page_capability_is_refused() {
+        build_wasm_policy("proc", [ComponentGrant::Dom], WasmAclsRaw::default());
     }
 
     #[test]
