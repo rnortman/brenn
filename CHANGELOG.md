@@ -4,6 +4,14 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **The MQTT integration tests no longer need mosquitto installed.** The
+  test broker (mosquitto 2.0.22) is now built from source by Bazel and
+  handed to the tests, so they run the same on every machine and in CI. This
+  fixes CI failures where Ubuntu's packaged mosquitto, confined by AppArmor,
+  could not read the tests' config files. Developers can uninstall a system
+  mosquitto kept only for the tests; the `BRENN_MOSQUITTO_BIN` override is no
+  longer forwarded from your shell into Bazel tests.
+
 ## [0.29.0] — 2026-10-29
 
 - **Users can connect their own Google accounts, and the assistant can act

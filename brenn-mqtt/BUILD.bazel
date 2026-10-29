@@ -49,35 +49,28 @@ rust_test(
 )
 
 # The MQTT suite spawns a real mosquitto per test and talks to it over
-# loopback. mosquitto stays a system binary — it is the one non-hermetic
-# dependency left — and the env gate is set here so a missing broker fails the
-# test instead of skipping it. Dropping the gate does not quietly restore the
-# skip: the suite panics when the gate is unset under Bazel's test runner.
+# loopback. The broker is //bazel/tools:mosquitto, built from the source
+# tarball MODULE.bazel pins and handed over as a declared input:
+# BRENN_MOSQUITTO_BIN is its runfile path. Dropping the `data` entry or the
+# `env` entry fails every case at spawn with a message naming this target.
+# `requires-network` lets the sandbox reach loopback.
 #
-# PATH is pinned because a test action's default is a fixed
-# `/bin:/usr/bin:/usr/local/bin`, not the invoking shell's, and Debian-family
-# packaging installs the daemon at /usr/sbin/mosquitto — off that list, so the
-# harness's PATH lookup misses on a host where the install succeeded. The two
-# sbin directories are appended to Bazel's own default rather than replacing it.
-# A static string, so the action key stays machine-independent; the operator's
-# BRENN_MOSQUITTO_BIN override reaches the test through .bazelrc's --test_env.
-#
-# `medium` (300s): 16 tests, each spawning its own broker and waiting for it to
-# bind a TLS port, finish in 1.3s locally. The budget is sized for the readiness
+# `medium` (300s): each test spawns its own broker and waits for it to bind a
+# TLS port; the suite finishes in seconds locally. The budget is sized for the readiness
 # wait, not the assertions — a loaded runner pays seconds per spawn, not minutes.
 rust_test(
     name = "mqtt_integration",
     size = "medium",
     srcs = ["tests/mqtt_integration.rs"] + glob(["tests/common/*.rs"]),
     crate_root = "tests/mqtt_integration.rs",
-    data = glob(["tests/mqtt_assets/**"]),
+    data = glob(["tests/mqtt_assets/**"]) + ["//bazel/tools:mosquitto"],
     edition = "2024",
     # BRENN_MQTT_INTEGRATION is brenn_mqtt::test_support::BROKER_GATE, read by
     # broker_available(); dropping it here turns every broker case into a panic
     # rather than a silent skip.
     env = {
+        "BRENN_MOSQUITTO_BIN": "$(rootpath //bazel/tools:mosquitto)",
         "BRENN_MQTT_INTEGRATION": "1",
-        "PATH": "/bin:/usr/bin:/usr/local/bin:/usr/sbin:/usr/local/sbin",
     },
     proc_macro_deps = all_crate_deps(
         proc_macro = True,

@@ -11,10 +11,12 @@
 //! a document that grows an ingress binding, and then publish on the new topic
 //! from outside brenn.
 //!
-//! `mosquitto` is a system binary and the only non-hermetic dependency in the
-//! build, so this module is filtered out of the hermetic test target and run by
-//! one of its own. The gate that decides between running and skipping is
-//! `brenn_mqtt::broker_gate!`, beside the harness it gates.
+//! These cases need loopback and a `large` time budget the in-process suite
+//! should not carry, so this module is filtered out of the crate's main test
+//! target and run by one of its own, which also declares the broker
+//! (`//bazel/tools:mosquitto`) as an input. The gate that decides between
+//! running and skipping is `brenn_mqtt::broker_gate!`, beside the harness it
+//! gates.
 
 use std::sync::Arc;
 

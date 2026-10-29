@@ -64,8 +64,9 @@ rust_library(
 rust_test(
     name = "brenn-bootstrap_test",
     size = "large",
-    # The broker cases are `:brenn-bootstrap_mqtt_broker_test`'s: they need a
-    # `mosquitto` on the host, which every other test here does not. The skip
+    # The broker cases are `:brenn-bootstrap_mqtt_broker_test`'s: they spawn
+    # `//bazel/tools:mosquitto` and need loopback and the `large` budget, which
+    # every other test here does not. The skip
     # and that target's filter name the same module, so a case moving out of it
     # runs in both places rather than in neither.
     args = [
@@ -144,28 +145,20 @@ rust_test(
 
 # Reload's MQTT convergence against a real broker. Same binary as the suite
 # above, filtered to the one module that spawns `mosquitto` — a second target
-# rather than a second binary, so the cases live beside the fixtures they boot
-# and the hermetic suite keeps its hermeticity.
+# rather than a second binary, so the cases live beside the fixtures they boot,
+# and only this target carries `requires-network` and the broker as a declared
+# input.
 #
-# The env gate and the PATH pin match `//brenn-mqtt:mqtt_integration`: an unset
-# gate is a target that lost its `env`, which the module panics on rather than
-# skipping, and Debian-family packaging puts the daemon in /usr/sbin, off a test
-# action's default PATH.
+# The env gate and the broker wiring match `//brenn-mqtt:mqtt_integration`: an
+# unset gate is a target that lost its `env`, which the module panics on rather
+# than skipping; BRENN_MOSQUITTO_BIN is the runfile path of
+# `//bazel/tools:mosquitto`, and dropping it or the `data` entry fails every
+# case at spawn with a message naming this target.
 #
-# Eight cases, each spawning a broker of its own: six are a boot and a reload
-# apiece — a consumer binding arriving and leaving, the first binding on an idle
-# broker, an agent's binding arriving, and a dynamic subscription revived and
-# revoked, those two over a store a first boot seeded — and two compare a
-# reloaded process against a fresh boot, twice each, with every comparison
-# booting two processes and reloading once against the broker. The two removal
-# cases additionally poll their broker's own log for the UNSUBSCRIBE it
-# processed, which is a local file read and moves the number by tenths, and the
-# consumer-binding one publishes and waits for a body on both sides of its
-# reload rather than only after it. The binary finishes in 15.0s locally,
-# re-measured over three runs, the eight brokers running
-# concurrently. `large` (900s), not `medium` (300s): at the repo's one measured
+# Every case spawns a broker of its own. The binary finishes in 14.4s locally,
+# measured over three runs, the brokers running concurrently. `large` (900s), not `medium` (300s): at the repo's one measured
 # local-to-CD-runner factor for a suite of this shape, ~21x (see the wiring
-# suite above), that is ~315s on a loaded capacity-1 runner, past the medium
+# suite above), that is ~302s on a loaded capacity-1 runner, past the medium
 # budget and inside the large one. The budget is sized for the readiness and
 # connect waits on that runner, not the assertions. Re-measure both numbers
 # when the suite grows again rather than carrying this arithmetic forward: a
@@ -181,14 +174,15 @@ rust_test(
         "//brenn-wasm:fixture_processor_demo",
         "//brenn-wasm:fixture_processor_dual",
         "//brenn-wasm:fixture_replay",
+        "//bazel/tools:mosquitto",
     ],
     edition = "2024",
     # BRENN_MQTT_INTEGRATION is brenn_mqtt::test_support::BROKER_GATE, read by
     # broker_available(); dropping it here turns every broker case into a panic
     # rather than a silent skip.
     env = {
+        "BRENN_MOSQUITTO_BIN": "$(rootpath //bazel/tools:mosquitto)",
         "BRENN_MQTT_INTEGRATION": "1",
-        "PATH": "/bin:/usr/bin:/usr/local/bin:/usr/sbin:/usr/local/sbin",
     },
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-bootstrap"},

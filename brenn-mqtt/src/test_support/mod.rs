@@ -37,11 +37,11 @@ pub const BAZEL_TEST_MARKER: &str = "TEST_SRCDIR";
 /// Whether the cases that need a real `mosquitto` may run.
 ///
 /// The one place this decision is made, for every suite in the workspace that
-/// drives a broker: `mosquitto` is a system binary, so a developer running a
-/// test binary by hand is not required to have one and the cases return without
-/// spawning anything. Under Bazel the gate is set by the target, so an unset
-/// gate there can only mean the target lost its `env` entry — and a skip would
-/// report a pass over nothing asserted, which is a panic instead.
+/// drives a broker. Outside Bazel the gate is unset and the cases return
+/// without spawning anything. Under Bazel the gate is set by every target that
+/// also declares the broker as an input, so an unset gate there can only mean
+/// the target lost its `env` entry — and a skip would report a pass over
+/// nothing asserted, which is a panic instead.
 ///
 /// # Panics
 ///

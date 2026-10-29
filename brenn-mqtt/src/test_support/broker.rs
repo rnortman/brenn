@@ -6,13 +6,31 @@
 //! make each test independent with no teardown coordination, and `persistence
 //! false` means no state bleeds between them.
 //!
-//! `mosquitto` is the one non-hermetic dependency in the build. A suite that
-//! uses this harness sets its own gate so a missing broker fails the test
+//! The broker is `//bazel/tools:mosquitto`, built from the source tarball
+//! `MODULE.bazel` pins. A test target hands it over as a declared input: the
+//! binary in `data`, its runfile path in [`MOSQUITTO_BIN_VAR`]. A suite that
+//! uses this harness also sets its own gate so a missing broker fails the test
 //! instead of skipping it.
+//!
+//! The broker links OpenSSL statically, and OpenSSL loads its compiled-in
+//! default config, `/etc/ssl/openssl.cnf`, at start-up. That file is the host's
+//! crypto policy and is not a Bazel input. Each broker therefore gets
+//! `OPENSSL_CONF` pointing at an empty file in its temp directory, and runs on
+//! OpenSSL's built-in defaults on every host. The client side of the TLS cases
+//! is rustls, which reads no OpenSSL config.
+//!
+//! Readiness is read from the broker's own log, not probed on its port: a TCP
+//! connect succeeds against any listener on the port, including a broker
+//! another test spawned on the same ephemeral port, and cannot tell this
+//! harness's broker from that one. The log is a file in this harness's temp
+//! directory, so its `running` line was written by this harness's child. Every
+//! template a broker is started from therefore needs `log_dest file __LOG__`
+//! and a `log_type` that includes `information`.
 
 use std::io::Read as _;
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt as _;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use tempfile::TempDir;
@@ -97,6 +115,17 @@ pub const AUTH_CREDENTIALS: (&str, &str) = ("brenn-itest", "brenn-itest-password
 pub const ROTATED_CREDENTIALS: (&str, &str) =
     ("brenn-itest-rotated", "brenn-itest-rotated-password");
 
+/// The environment variable naming the broker binary.
+///
+/// Set by every broker-backed test target to
+/// `$(rootpath //bazel/tools:mosquitto)`; nothing else resolves the binary.
+pub const MOSQUITTO_BIN_VAR: &str = "BRENN_MOSQUITTO_BIN";
+
+/// The empty OpenSSL config written into each broker's temp directory and
+/// named by its `OPENSSL_CONF`, so the host's `/etc/ssl/openssl.cnf` is never
+/// read.
+const OPENSSL_CONF_FILE: &str = "openssl.cnf";
+
 /// How many ephemeral ports to try before giving up.
 ///
 /// A port is chosen by binding and dropping a listener, so another process can
@@ -126,8 +155,10 @@ impl BrokerHarness {
     ///
     /// # Panics
     ///
-    /// - `mosquitto` binary not found.
-    /// - TCP-connect readiness poll exceeds 2 seconds on every attempt.
+    /// - [`MOSQUITTO_BIN_VAR`] unset, or naming something that is not a file.
+    /// - `mosquitto` exits before binding for any reason but a port collision;
+    ///   the message carries the log tail and the broker's stderr.
+    /// - The broker has not logged `running` within 2 seconds.
     pub fn start() -> Self {
         Self::start_with(DEFAULT_CONF_TEMPLATE, &[("acl", DEFAULT_ACL.as_bytes())])
     }
@@ -156,23 +187,33 @@ impl BrokerHarness {
     /// an extra called `acl`. The TLS material and `__PORT__` / `__LOG__` are
     /// always substituted.
     ///
+    /// The template must contain `log_dest file __LOG__` and a `log_type` that
+    /// includes `information` (`all` does): readiness is the broker's
+    /// `running` line in that log. A template without them starts a broker that
+    /// never reports ready, and every start panics at the readiness timeout
+    /// with the log printed.
+    ///
     /// # Panics
     ///
     /// Same as [`BrokerHarness::start`], plus a template whose substitutions
     /// name a file no extra provides (mosquitto then refuses to start, which
-    /// this reports with the log tail).
+    /// this reports with the log tail), or a template mosquitto rejects before
+    /// its log is open (reported with its stderr).
     pub fn start_with(template: &str, extras: &[(&str, &[u8])]) -> Self {
         let tempdir = TempDir::new().expect("failed to create tempdir for mosquitto");
         let tmp = tempdir.path();
         let log_path = tmp.join("mosquitto.log");
+        let stderr_path = tmp.join("mosquitto.stderr");
 
         // TLS assets are generated per-run (no key material in the repo). Write
         // the shared CA + server cert/key so mosquitto's cafile/certfile/keyfile
-        // resolve to real files.
+        // resolve to real files, and the empty OpenSSL config its
+        // `OPENSSL_CONF` names.
         for (name, contents) in &[
             ("ca.pem", certs::ca_pem()),
             ("server.crt", certs::server_cert_pem()),
             ("server.key", certs::server_key_pem()),
+            (OPENSSL_CONF_FILE, ""),
         ] {
             std::fs::write(tmp.join(name), contents)
                 .unwrap_or_else(|e| panic!("failed to write generated {name} into tempdir: {e}"));
@@ -199,7 +240,7 @@ impl BrokerHarness {
             ));
         }
 
-        let bin = std::env::var("BRENN_MOSQUITTO_BIN").unwrap_or_else(|_| "mosquitto".to_string());
+        let bin = mosquitto_bin();
         let mut last_log_tail = String::new();
 
         for attempt in 1..=MAX_BIND_RETRIES {
@@ -211,11 +252,17 @@ impl BrokerHarness {
             let config_path = tmp.join("mosquitto.conf");
             std::fs::write(&config_path, &config_str).expect("failed to write mosquitto.conf");
 
+            // Everything mosquitto reports before `log_dest file` is open — a
+            // config it cannot read, an unknown directive — goes to stderr and
+            // nowhere else, so it is kept for the failure messages.
+            let stderr_file = std::fs::File::create(&stderr_path)
+                .unwrap_or_else(|e| panic!("failed to create {}: {e}", stderr_path.display()));
             let mut cmd = Command::new(&bin);
             cmd.arg("-c")
                 .arg(&config_path)
+                .env("OPENSSL_CONF", tmp.join(OPENSSL_CONF_FILE))
                 .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .stderr(stderr_file);
 
             // SAFETY: prctl is a simple syscall with no allocator interaction.
             // Linux-only, which this project is.
@@ -226,15 +273,15 @@ impl BrokerHarness {
                 });
             }
 
-            let mut child = cmd.spawn().unwrap_or_else(|e| {
-                panic!(
-                    "mosquitto binary not found in PATH; install mosquitto or set \
-                     BRENN_MOSQUITTO_BIN=/path/to/mosquitto. Tried: {bin:?}. Error: {e}"
-                )
-            });
-            eprintln!("[BrokerHarness] mosquitto spawned on port {port} (attempt {attempt})");
+            let mut child = cmd
+                .spawn()
+                .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", bin.display()));
+            eprintln!(
+                "[BrokerHarness] {} spawned on port {port} (attempt {attempt})",
+                bin.display()
+            );
 
-            match Self::await_ready(&mut child, port, attempt, &log_path) {
+            match Self::await_ready(&mut child, port, attempt, &log_path, &stderr_path) {
                 Ready::Bound => {
                     eprintln!("[BrokerHarness] mosquitto ready on port {port}");
                     return Self {
@@ -250,12 +297,14 @@ impl BrokerHarness {
 
         panic!(
             "BrokerHarness: failed to start mosquitto after {MAX_BIND_RETRIES} attempts; \
-             repeated ephemeral-port collisions. Last log tail:\n{last_log_tail}"
+             repeated ephemeral-port collisions.\n{}",
+            failure_diagnostics(&last_log_tail, &log_path, &stderr_path)
         );
     }
 
-    /// Poll TCP-connect readiness every 25ms, capped at 2s, watching for an
-    /// early exit.
+    /// Poll the broker's log every 25ms, capped at 2s, for the line mosquitto
+    /// writes once every listener is bound and listening, watching for an early
+    /// exit.
     ///
     /// A bind collision is the one retryable exit: another process took the port
     /// between this harness dropping its probe listener and mosquitto binding.
@@ -265,11 +314,12 @@ impl BrokerHarness {
         child: &mut Child,
         port: u16,
         attempt: usize,
-        log_path: &std::path::Path,
+        log_path: &Path,
+        stderr_path: &Path,
     ) -> Ready {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            if read_complete_log(log_path).is_some_and(|log| log_says_running(&log)) {
                 return Ready::Bound;
             }
             match child.try_wait() {
@@ -286,9 +336,8 @@ impl BrokerHarness {
                     }
                     panic!(
                         "mosquitto exited with status {status} before binding port {port} \
-                         (attempt {attempt}; not a bind collision)\n\
-                         Log ({}):\n{tail}",
-                        log_path.display()
+                         (attempt {attempt}; not a bind collision)\n{}",
+                        failure_diagnostics(&tail, log_path, stderr_path)
                     );
                 }
                 Ok(None) => {}
@@ -301,9 +350,8 @@ impl BrokerHarness {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!(
-                    "mosquitto readiness timeout on port {port} (attempt {attempt})\n\
-                     Log ({}):\n{tail}",
-                    log_path.display()
+                    "mosquitto readiness timeout on port {port} (attempt {attempt})\n{}",
+                    failure_diagnostics(&tail, log_path, stderr_path)
                 );
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -344,13 +392,12 @@ impl BrokerHarness {
     /// If the file cannot be read. The harness wrote its path into the config
     /// it started `mosquitto` on, so a missing log is a harness bug.
     fn log(&self) -> String {
-        let raw = std::fs::read_to_string(&self.log_path).unwrap_or_else(|e| {
+        read_complete_log(&self.log_path).unwrap_or_else(|| {
             panic!(
-                "failed to read the broker log at {}: {e}",
+                "failed to read the broker log at {}: no such file",
                 self.log_path.display()
             )
-        });
-        complete_lines(&raw).to_string()
+        })
     }
 
     /// The length of the current [`log`](Self::log) snapshot, to hand a later
@@ -520,6 +567,28 @@ pub fn log_records_publish_to_subscriber(log: &str, subscriber: &str, topic: &st
         .any(|line| line.contains(&sending) && line.contains(&quoted))
 }
 
+/// Whether `log` holds the line mosquitto writes after every listener is bound
+/// and listening: `mosquitto version <v> running`.
+fn log_says_running(log: &str) -> bool {
+    complete_lines(log)
+        .lines()
+        .any(|line| line.contains("mosquitto version ") && line.ends_with(" running"))
+}
+
+/// The broker log at `path` up to its last complete line, or `None` if the
+/// broker has not created it yet.
+///
+/// # Panics
+///
+/// On any read error but the file not existing.
+fn read_complete_log(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Some(complete_lines(&raw).to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("failed to read the broker log at {}: {e}", path.display()),
+    }
+}
+
 /// `log` up to and including its last newline — the lines `mosquitto` has
 /// finished writing. Empty when nothing complete has been written yet.
 fn complete_lines(log: &str) -> &str {
@@ -535,10 +604,61 @@ impl Drop for BrokerHarness {
     }
 }
 
-/// The outcome of one readiness poll: bound, or exited on a port that was taken.
+/// The outcome of one readiness poll: running, or exited on a port that was
+/// taken.
 enum Ready {
     Bound,
     BindCollision(String),
+}
+
+/// The broker binary [`MOSQUITTO_BIN_VAR`] names, made absolute.
+///
+/// Bazel hands over a path relative to the runfiles root, which is the test's
+/// working directory; the absolute form is what the spawn line and every panic
+/// print, so a reader can open it.
+///
+/// # Panics
+///
+/// If the variable is unset, or names something that is not a file.
+fn mosquitto_bin() -> PathBuf {
+    let raw = std::env::var_os(MOSQUITTO_BIN_VAR).unwrap_or_else(|| {
+        panic!(
+            "{MOSQUITTO_BIN_VAR} is unset: a broker test target sets it to \
+             `$(rootpath //bazel/tools:mosquitto)` (//brenn-mqtt:mqtt_integration, \
+             //brenn-bootstrap:brenn-bootstrap_mqtt_broker_test). Either the target lost its \
+             `env` entry, or the broker gate was set by hand without it"
+        )
+    });
+    let bin = std::path::absolute(&raw)
+        .unwrap_or_else(|e| panic!("{MOSQUITTO_BIN_VAR}={raw:?} cannot be made absolute: {e}"));
+    assert!(
+        bin.is_file(),
+        "{MOSQUITTO_BIN_VAR} names {}, which is not a file: the test target lost \
+         `//bazel/tools:mosquitto` from its `data`",
+        bin.display()
+    );
+    bin
+}
+
+/// The log tail and the broker's stderr, each under a heading naming its file.
+fn failure_diagnostics(log_tail: &str, log_path: &Path, stderr_path: &Path) -> String {
+    format!(
+        "Log ({}):\n{log_tail}\nstderr ({}):\n{}",
+        log_path.display(),
+        stderr_path.display(),
+        read_stderr(stderr_path)
+    )
+}
+
+/// The broker's stderr, whole: it holds a line or two, written before exit.
+///
+/// # Panics
+///
+/// If the file cannot be read; the harness created it before spawning.
+fn read_stderr(path: &Path) -> String {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("failed to read mosquitto stderr {}: {e}", path.display()));
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn path_str(dir: &std::path::Path, name: &str) -> String {
@@ -577,8 +697,59 @@ fn read_tail_4k(path: &std::path::Path) -> String {
 mod tests {
     use super::{
         complete_lines, log_records_disconnect_before_reconnect, log_records_publish_to_subscriber,
-        log_records_unsubscribe,
+        log_records_unsubscribe, log_says_running, read_complete_log,
     };
+
+    /// A broker's start-up in mosquitto's own shape, up to the line written once
+    /// its listener is bound.
+    const START_UP: &str = "\
+1700000000: mosquitto version 2.0.22 starting
+1700000000: Config loaded from /tmp/x/mosquitto.conf.
+1700000000: Opening ipv4 listen socket on port 36992.
+1700000000: mosquitto version 2.0.22 running
+";
+
+    /// A start-up that lost its port to another listener.
+    const COLLISION: &str = "\
+1700000000: mosquitto version 2.0.22 starting
+1700000000: Config loaded from /tmp/x/mosquitto.conf.
+1700000000: Opening ipv4 listen socket on port 36992.
+1700000000: Error: Address already in use
+";
+
+    #[test]
+    fn the_running_line_is_readiness() {
+        assert!(log_says_running(START_UP));
+    }
+
+    #[test]
+    fn start_up_without_the_running_line_is_not_ready() {
+        let before = START_UP
+            .strip_suffix("1700000000: mosquitto version 2.0.22 running\n")
+            .unwrap();
+        assert!(!log_says_running(before));
+        assert!(!log_says_running(COLLISION));
+    }
+
+    #[test]
+    fn a_torn_running_line_is_not_ready() {
+        let torn = START_UP.strip_suffix("ing\n").unwrap();
+        assert!(torn.ends_with("mosquitto version 2.0.22 runn"));
+        assert!(!log_says_running(torn));
+    }
+
+    #[test]
+    fn a_log_not_yet_opened_reads_as_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mosquitto.log");
+        assert_eq!(read_complete_log(&path), None);
+        let torn = START_UP.strip_suffix("ing\n").unwrap();
+        std::fs::write(&path, torn).unwrap();
+        assert_eq!(
+            read_complete_log(&path),
+            Some(complete_lines(torn).to_string())
+        );
+    }
 
     /// One `log_type all` transcript in mosquitto's own shape: a SUBSCRIBE for
     /// three filters, an UNSUBSCRIBE for one of them, a publish delivered on one

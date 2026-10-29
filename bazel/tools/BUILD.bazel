@@ -7,6 +7,10 @@ tests. The first three are action tools consumed through `cfg = "exec"`
 attributes, which is why the selects key on the execution platform's cpu rather
 than on the target's; gitleaks is a test runfile and resolves in the target
 configuration, where the same settings read the same on a host build.
+
+mosquitto, the broker the MQTT integration suites spawn, is built from a
+pinned source tarball rather than a release binary, because upstream
+publishes none.
 """
 
 load("@bazel_skylib//rules:native_binary.bzl", "native_binary")
@@ -68,6 +72,15 @@ alias(
         },
         no_match_error = _NO_ARCHIVE.format(tool = "gitleaks"),
     ),
+)
+
+# The broker the two MQTT suites spawn, built from the release tarball
+# MODULE.bazel pins rather than taken from the host: a test runfile, like
+# gitleaks, resolving in the target configuration. No per-cpu select — it is
+# compiled for whatever platform the test runs on.
+alias(
+    name = "mosquitto",
+    actual = "@mosquitto_src//:mosquitto",
 )
 
 # The wasm-bindgen toolchain wants an executable target, not a file, so the

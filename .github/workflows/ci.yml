@@ -50,11 +50,11 @@ jobs:
       # the scrub job; converging to commit-SHA pins is tracked separately.
       - uses: actions/checkout@v7
 
-      # The MQTT integration tests spawn their own broker, and mosquitto is the
-      # one system dependency the build graph does not vend. Rust, node, the
-      # three WASM CLIs and gitleaks are all hermetic toolchains behind
-      # bazelisk, which GitHub runners preinstall and which reads .bazelversion
-      # — so there is no toolchain install step here at all.
+      # The test graph has no system dependency: Rust, node, the three WASM
+      # CLIs, gitleaks and the mosquitto broker the MQTT suites spawn are all
+      # vended by the build behind bazelisk, which GitHub runners preinstall
+      # and which reads .bazelversion — so there is no toolchain install step
+      # here at all.
       #
       # lld is for the host C toolchain rules_cc autodetects: its probe takes
       # lld if present, else gold, and hard-wires the winner into every link the
@@ -62,8 +62,8 @@ jobs:
       # warns about on every link — and will eventually stop supporting. Only
       # the host lane is affected (test binaries, build tools); release binaries
       # link through the hermetic musl toolchain either way.
-      - name: Install mosquitto and lld
-        run: sudo apt-get update && sudo apt-get install -y mosquitto lld
+      - name: Install lld
+        run: sudo apt-get update && sudo apt-get install -y lld
 
       # --config=ci points both bazel caches inside the workspace so
       # actions/cache can carry them; the GC size cap is what keeps the disk
@@ -186,7 +186,7 @@ jobs:
           key: bazel-disk-${{ github.sha }}
 
   # Belt and braces against the residual class Bazel cannot see: an undeclared
-  # *system* input — the apt mosquitto, the kernel, the runner image. No cache
+  # *system* input — the kernel, the runner image. No cache
   # is restored and no test result is reused, so this is a cold build and a full
   # suite.
   #
@@ -202,11 +202,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Same pair as the gate job, for the same reasons: mosquitto is the one
-      # system dependency the graph does not vend, and lld keeps the
+      # Same step as the gate job, for the same reason: lld keeps the
       # autodetected C toolchain off the deprecated gold linker.
-      - name: Install mosquitto and lld
-        run: sudo apt-get update && sudo apt-get install -y mosquitto lld
+      - name: Install lld
+        run: sudo apt-get update && sudo apt-get install -y lld
 
       - run: bazel test --config=ci --nocache_test_results //...
 

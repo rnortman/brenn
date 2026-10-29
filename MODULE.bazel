@@ -350,6 +350,51 @@ http_archive(
 )
 
 # ---------------------------------------------------------------------------
+# MQTT: the broker the integration suites spawn
+# ---------------------------------------------------------------------------
+# `//brenn-mqtt:mqtt_integration` and
+# `//brenn-bootstrap:brenn-bootstrap_mqtt_broker_test` spawn a real mosquitto
+# per case. It is compiled here from upstream's source release under the
+# hermetic C toolchain above and handed to both targets as a runfile, so no
+# host install is read. All three entries are `dev_dependency`: only brenn's
+# own test graph consumes them, and a module that `bazel_dep`s on brenn must
+# not resolve, pin or fetch them.
+
+# A C rule set the mosquitto build file loads; rules_rust already carries it
+# transitively, but a build file brenn owns can only load what brenn declares.
+# 0.2.18 is the version the module graph already resolves to, so this line
+# adds a load path and changes no action key: a higher pin here would be a
+# graph-wide rules_cc upgrade riding on a test tool, since a root bazel_dep
+# takes part in version selection even as a dev_dependency.
+bazel_dep(name = "rules_cc", version = "0.2.18", dev_dependency = True)
+
+# OpenSSL for the mosquitto below: the BCR module builds from pre-generated
+# sources with plain cc rules (`--@openssl//:use-pregenerated`, on by
+# default), so no perl or make runs in the build. 3.x, not 4.x: mosquitto
+# 2.0 is built against OpenSSL 3 by every distribution that ships it, and
+# 4.0 removes API surface the broker still compiles against.
+bazel_dep(name = "openssl", version = "3.5.9.bcr.1", dev_dependency = True)
+
+# The broker, built from upstream's release tarball
+# (//bazel/tools:mosquitto.BUILD.bazel). 2.0.x rather than 2.1.x: the 2.0
+# broker depends on OpenSSL alone, where 2.1 adds cJSON, its own libcommon
+# and picohttpparser; the five log wordings the harness matches are identical
+# in both; and 2.0 is the series Debian-family packaging ships. The build
+# file's VERSION define repeats this version and must stay equal to it; a
+# bump to 2.1 also redoes the build file's source list against 2.1's
+# src/Makefile.
+MOSQUITTO_VERSION = "2.0.22"
+
+http_archive(
+    name = "mosquitto_src",
+    build_file = "//bazel/tools:mosquitto.BUILD.bazel",
+    dev_dependency = True,
+    sha256 = "2f752589ef7db40260b633fbdb536e9a04b446a315138d64a7ff3c14e2de6b68",
+    strip_prefix = "mosquitto-" + MOSQUITTO_VERSION,
+    url = "https://mosquitto.org/files/source/mosquitto-" + MOSQUITTO_VERSION + ".tar.gz",
+)
+
+# ---------------------------------------------------------------------------
 # Surface browser bundles: the wasm-bindgen CLI
 # ---------------------------------------------------------------------------
 # The CLI must be the exact version of the `wasm-bindgen` crate the browser

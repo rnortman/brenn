@@ -18,7 +18,7 @@ pub mod relay;
 pub mod router;
 
 pub use brenn_mqtt::test_support::broker::{
-    AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, log_records_disconnect,
+    AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, log_records_disconnect,
     log_records_disconnect_before_reconnect, log_records_publish_to_subscriber,
     log_records_unsubscribe,
 };

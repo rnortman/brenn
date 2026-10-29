@@ -21,11 +21,12 @@ use brenn_mqtt::payload::InboundPayload;
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use brenn_mqtt::state::ConnectorHealthLabel;
 use common::{
-    AUTH_CREDENTIALS, BrokerHarness, SpawnedClient, TcpRelay, await_puback, broker_auth,
-    broker_tls13, certs, direct_publisher_acked, direct_subscriber, log_records_disconnect,
-    log_records_disconnect_before_reconnect, log_records_publish_to_subscriber,
-    log_records_unsubscribe, recv_delivery, session_client_id, spawn_client, spawn_client_tls13,
-    spawn_client_with_config, subscribe_live_confirmed, test_client_config, wait_for_health,
+    AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, SpawnedClient, TcpRelay,
+    await_puback, broker_auth, broker_tls13, certs, direct_publisher_acked, direct_subscriber,
+    log_records_disconnect, log_records_disconnect_before_reconnect,
+    log_records_publish_to_subscriber, log_records_unsubscribe, recv_delivery, session_client_id,
+    spawn_client, spawn_client_tls13, spawn_client_with_config, subscribe_live_confirmed,
+    test_client_config, wait_for_health,
 };
 use rumqttc::mqttbytes::QoS;
 
@@ -1063,4 +1064,40 @@ async fn auth_bad_credentials_drives_failed_with_reason() {
     );
 
     handle.stop();
+}
+
+// ---------------------------------------------------------------------------
+// A config rejected before the log opens is reported through stderr
+// ---------------------------------------------------------------------------
+
+/// mosquitto reads its whole config before it opens `log_dest file`, so a
+/// directive it does not know makes it exit with no log at all and the reason
+/// on stderr only. The harness's start-up panic must carry that stderr.
+///
+/// Only the directive's name is asserted — it is this test's own word, and a
+/// config parser rejecting an unknown directive names it — so neither the
+/// broker's wording nor its exit code is pinned here.
+#[test]
+fn a_config_the_broker_rejects_is_reported_with_its_stderr() {
+    broker_gate!();
+
+    const DIRECTIVE: &str = "brenn_itest_bogus_directive";
+    let template = format!("{DEFAULT_CONF_TEMPLATE}{DIRECTIVE} 1\n");
+
+    let payload = std::thread::spawn(move || {
+        BrokerHarness::start_with(&template, &[("acl", DEFAULT_ACL.as_bytes())])
+    })
+    .join()
+    .err()
+    .expect("the harness started a broker on a config naming an unknown directive");
+    let message = payload
+        .downcast_ref::<String>()
+        .expect("the harness's start-up panic carries a formatted message");
+
+    // The broker exits before its log is open, so the directive's name can
+    // reach the panic only through the broker's stderr.
+    assert!(
+        message.contains(DIRECTIVE),
+        "the start-up panic does not carry the broker's stderr naming the rejected directive:\n{message}"
+    );
 }

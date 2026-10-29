@@ -1,0 +1,156 @@
+"""Build file for the mosquitto release tarball: the broker only.
+
+Upstream's src/Makefile, transcribed: the broker is src/*.c plus the subset
+of lib/*.c the Makefile lists, compiled with the feature set config.mk
+enables by default on Linux minus the two that pull in libraries the suites
+never exercise (websockets, systemd). The client library, the clients,
+mosquitto_passwd and the plugins are not built; the suites spawn the broker
+and nothing else.
+"""
+
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+# src/Makefile's OBJS, split by directory. src/plugin_debug.c and
+# src/plugin_defer.c are in the tree but not in OBJS.
+_BROKER_SRCS = ["src/" + f + ".c" for f in [
+    "mosquitto",
+    "bridge",
+    "bridge_topic",
+    "conf",
+    "conf_includedir",
+    "context",
+    "control",
+    "database",
+    "handle_auth",
+    "handle_connack",
+    "handle_connect",
+    "handle_disconnect",
+    "handle_publish",
+    "handle_subscribe",
+    "handle_unsubscribe",
+    "keepalive",
+    "logging",
+    "loop",
+    "memory_public",
+    "mux",
+    "mux_epoll",
+    "mux_poll",
+    "net",
+    "password_mosq",
+    "property_broker",
+    "persist_read",
+    "persist_read_v234",
+    "persist_read_v5",
+    "persist_write",
+    "persist_write_v5",
+    "plugin",
+    "plugin_public",
+    "read_handle",
+    "retain",
+    "security",
+    "security_default",
+    "send_auth",
+    "send_connack",
+    "send_suback",
+    "send_unsuback",
+    "service",
+    "session_expiry",
+    "signals",
+    "subs",
+    "sys_tree",
+    "topic_tok",
+    "websockets",
+    "will_delay",
+    "xtreport",
+]]
+
+_LIB_SRCS = ["lib/" + f + ".c" for f in [
+    "alias_mosq",
+    "handle_ping",
+    "handle_pubackcomp",
+    "handle_pubrec",
+    "handle_pubrel",
+    "handle_suback",
+    "handle_unsuback",
+    "memory_mosq",
+    "misc_mosq",
+    "net_mosq",
+    "net_mosq_ocsp",
+    "packet_datatypes",
+    "packet_mosq",
+    "property_mosq",
+    "send_connect",
+    "send_disconnect",
+    "send_mosq",
+    "send_publish",
+    "send_subscribe",
+    "send_unsubscribe",
+    "strings_mosq",
+    "time_mosq",
+    "tls_mosq",
+    "utf8_mosq",
+    "util_mosq",
+    "util_topic",
+    "will_mosq",
+]]
+
+cc_library(
+    name = "broker",
+    srcs = _BROKER_SRCS + _LIB_SRCS + glob([
+        "src/*.h",
+        "lib/*.h",
+    ]),
+    hdrs = glob([
+        "include/*.h",
+        "deps/*.h",
+    ]) + ["config.h"],
+    # Upstream's warning set is upstream's to act on; this build only has
+    # to be correct.
+    copts = ["-w"],
+    includes = [
+        ".",
+        "deps",
+        "include",
+        "lib",
+        "src",
+    ],
+    # config.mk's BROKER_CPPFLAGS on Linux with WITH_WEBSOCKETS=no,
+    # WITH_SYSTEMD=no, WITH_WRAP unset, WITH_ADNS unset. VERSION must equal
+    # MOSQUITTO_VERSION in MODULE.bazel.
+    local_defines = [
+        "WITH_BROKER",
+        "WITH_TLS",
+        "WITH_TLS_PSK",
+        "WITH_BRIDGE",
+        "WITH_PERSISTENCE",
+        "WITH_MEMORY_TRACKING",
+        "WITH_SYS_TREE",
+        "WITH_EC",
+        "WITH_CONTROL",
+        "WITH_EPOLL",
+        "WITH_UNIX_SOCKETS",
+        "OPENSSL_API_COMPAT=0x10100000L",
+        'VERSION=\\"2.0.22\\"',
+    ],
+    deps = [
+        "@openssl//:crypto",
+        "@openssl//:ssl",
+    ],
+)
+
+cc_binary(
+    name = "mosquitto",
+    # config.mk's BROKER_LDADD on Linux. -ldl is real against the bullseye
+    # sysroot (glibc 2.31 keeps dlopen outside libc); the plugin loader
+    # references it even though no suite loads a plugin. Upstream also links
+    # -Wl,--dynamic-list=linker.syms so dlopen'd plugins resolve broker
+    # symbols; no suite loads a plugin, so it is omitted.
+    linkopts = [
+        "-ldl",
+        "-lm",
+        "-lrt",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [":broker"],
+)
