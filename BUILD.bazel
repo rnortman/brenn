@@ -124,6 +124,7 @@ filegroup(
         "//bazel/release/tests:policy_srcs",
         "//bazel/surface:policy_srcs",
         "//bazel/surface/tests:policy_srcs",
+        "//bazel/toolchain/tests:policy_srcs",
         "//bazel/tools:policy_srcs",
         "//bazel/wasm:policy_srcs",
         "//bazel/wasm/tests:policy_srcs",

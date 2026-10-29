@@ -50,20 +50,12 @@ jobs:
       # the scrub job; converging to commit-SHA pins is tracked separately.
       - uses: actions/checkout@v7
 
-      # The test graph has no system dependency: Rust, node, the three WASM
-      # CLIs, gitleaks and the mosquitto broker the MQTT suites spawn are all
-      # vended by the build behind bazelisk, which GitHub runners preinstall
-      # and which reads .bazelversion — so there is no toolchain install step
-      # here at all.
-      #
-      # lld is for the host C toolchain rules_cc autodetects: its probe takes
-      # lld if present, else gold, and hard-wires the winner into every link the
-      # toolchain does. This image ships gold, which rustc has deprecated and
-      # warns about on every link — and will eventually stop supporting. Only
-      # the host lane is affected (test binaries, build tools); release binaries
-      # link through the hermetic musl toolchain either way.
-      - name: Install lld
-        run: sudo apt-get update && sudo apt-get install -y lld
+      # The test graph vends every tool it runs: Rust, node, the three WASM
+      # CLIs, gitleaks, the mosquitto broker the MQTT suites spawn and the C
+      # toolchain are all fetched by the build behind bazelisk, which GitHub
+      # runners preinstall and which reads .bazelversion. The C toolchain's
+      # binaries load only libz, libstdc++ and glibc from the host — libraries
+      # every runner image has — so there is no install step here.
 
       # --config=ci points both bazel caches inside the workspace so
       # actions/cache can carry them; the GC size cap is what keeps the disk
@@ -201,11 +193,6 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
-
-      # Same step as the gate job, for the same reason: lld keeps the
-      # autodetected C toolchain off the deprecated gold linker.
-      - name: Install lld
-        run: sudo apt-get update && sudo apt-get install -y lld
 
       - run: bazel test --config=ci --nocache_test_results //...
 

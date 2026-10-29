@@ -12,6 +12,14 @@ All notable changes to Brenn are documented here.
   mosquitto kept only for the tests; the `BRENN_MOSQUITTO_BIN` override is no
   longer forwarded from your shell into Bazel tests.
 
+- **Building Brenn no longer loads the host's `libxml2`.** The hermetic C
+  toolchain is now LLVM 23.1.4 (toolchains_llvm 1.12.0); LLVM 22.1.8's linker
+  needed `libxml2.so.2`, which hosts with libxml2 2.14 or newer (Ubuntu 26.04,
+  and the `ubuntu-latest` CI image with it) no longer ship, so every link
+  failed there. `make check` now works on those hosts, and CI drops its
+  "Install lld" step, which never chose the linker. The first build after
+  updating rebuilds the host lane from scratch.
+
 ## [0.29.0] — 2026-10-29
 
 - **Users can connect their own Google accounts, and the assistant can act

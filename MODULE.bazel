@@ -14,7 +14,7 @@ module(
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_rust", version = "0.73.0")
 bazel_dep(name = "rules_rust_wasm_bindgen", version = "0.73.0")
-bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
 # `dev_dependency`: the musl cc toolchain exists for brenn's own static release
 # binary, and the module registers its toolchains unconditionally — a
 # dependent module would inherit a musl `cc` toolchain matching its plain
@@ -142,7 +142,7 @@ toolchains_musl.config(
 # Constrained to `:libc_glibc` so the musl platform keeps resolving to
 # toolchains_musl. `dev_dependency` for the same reason as toolchains_musl:
 # registration is unconditional, and a dependent module brings its own.
-bazel_dep(name = "toolchains_llvm", version = "1.9.0", dev_dependency = True)
+bazel_dep(name = "toolchains_llvm", version = "1.12.0", dev_dependency = True)
 
 sysroot = use_repo_rule("@toolchains_llvm//toolchain:sysroot.bzl", "sysroot")
 sysroot(
@@ -161,7 +161,12 @@ llvm = use_extension(
 llvm.toolchain(
     name = "llvm_toolchain",
     cxx_include_layout = {"linux-x86_64": "debian"},
-    llvm_version = "22.1.8",
+    # The release build's binaries must load nothing from the host beyond libz,
+    # libstdc++, libgcc_s and glibc. LLVM 22's `lld` loaded the host's
+    # `libxml2.so.2`, which Ubuntu 26.04 no longer ships, and every host link
+    # (Rust test binaries, rules_rust's `process_wrapper`, the mosquitto broker)
+    # runs that linker. `//bazel/toolchain/tests:host_libs_check_test` holds it.
+    llvm_version = "23.1.4",
 )
 llvm.sysroot(
     name = "llvm_toolchain",

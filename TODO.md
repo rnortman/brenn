@@ -99,6 +99,33 @@ target's `version`.
 Done = `brenn-tool --version` and `brennfmt --version` report the release's
 build id, or the flag is gone from both.
 
+## `test-downstream-llvm-pins-unguarded`
+
+`//bazel/toolchain/tests:host_libs_check_test` checks that the hermetic LLVM
+distribution brenn pins loads nothing from the host beyond libz, libstdc++,
+libgcc_s and glibc. Every module that registers its own copy of the
+`llvm_toolchain` block runs no such check: the in-tree
+`examples/component/MODULE.bazel`, the dependent component repositories, and
+any out-of-tree component repository built from the example. Their
+`llvm_version` comment asks for a manual `readelf -d` when they bump ahead of
+brenn. A divergent bump that brings back a host library (as LLVM 22's `lld`
+did with `libxml2.so.2`) shows up only as a loader error in that repository's
+CI.
+
+The shape needs deciding: brenn exports the check (a loadable macro plus the
+script, parameterised on the caller's toolchain repository) so that dependents
+instantiate it, or each dependent carries its own copy. Exporting it makes the
+check part of the authoring kit that out-of-tree components consume, and the
+dependents can only load it after their brenn `git_override` pin moves to a
+commit that has it.
+
+Code site (`TODO(test-downstream-llvm-pins-unguarded)`):
+`bazel/toolchain/tests/BUILD.bazel`, above the test.
+
+Done = every module that registers this toolchain block runs the host-library
+check against its own pinned distribution, and the manual-`readelf` sentence
+is gone from their `llvm_version` comments.
+
 ## `test-selinux-positive-paths-silently-skip`
 
 The SELinux labelling tests that need a kernel accepting a context

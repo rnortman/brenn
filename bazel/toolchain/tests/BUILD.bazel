@@ -1,0 +1,37 @@
+"""Host-library check over the hermetic C toolchain's binaries.
+
+The binaries are the ones the registered toolchain runs: the compiler driver,
+the linkers, and the binutils replacements.
+"""
+
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+_TOOLCHAIN_BINARIES = [
+    "@llvm_toolchain_llvm//:ar",
+    "@llvm_toolchain_llvm//:as",
+    "@llvm_toolchain_llvm//:clang",
+    "@llvm_toolchain_llvm//:dwp",
+    "@llvm_toolchain_llvm//:ld",
+    "@llvm_toolchain_llvm//:nm",
+    "@llvm_toolchain_llvm//:objcopy",
+    "@llvm_toolchain_llvm//:objdump",
+    "@llvm_toolchain_llvm//:strip",
+]
+
+# TODO(test-downstream-llvm-pins-unguarded): modules that register their own
+# copy of this toolchain block run no host-library check; expose this test so
+# they can instantiate it against their own toolchain repository.
+native_test(
+    name = "host_libs_check_test",
+    size = "small",
+    src = "host_libs_check_test.sh",
+    args = ["$(rootpath @llvm_toolchain_llvm//:readelf)"] +
+           ["$(rootpaths %s)" % label for label in _TOOLCHAIN_BINARIES],
+    data = ["@llvm_toolchain_llvm//:readelf"] + _TOOLCHAIN_BINARIES,
+    out = "host_libs_check_test.run",
+    target_compatible_with = HOST_ONLY,
+)
