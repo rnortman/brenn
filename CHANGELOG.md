@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-10-29
+
 - **Users can connect their own Google accounts, and the assistant can act
   through them.** Configure it with a new `oauth_provider` section and a
   `server.vault_dir` key; `docs/google-workspace.md` walks through the Google
