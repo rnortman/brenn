@@ -14,7 +14,8 @@
 //             which acts for no one, and complete at once with
 //             `{"queued": true}`.
 //   "stale" — complete a made-up id, then complete the real request with the
-//             error text that drew: `{"stale": "<diagnostic>"}`.
+//             error text that drew and whether `drop_not_pending` dropped a
+//             second such completion: `{"stale": "<diagnostic>", "dropped": true}`.
 //   "fail"  — return `Err` from the activation, completing nothing.
 //   other   — complete with an `invalid_args` error.
 //
@@ -26,7 +27,7 @@
 // the tool's error otherwise. A result whose request is no longer pending is
 // dropped, as a provider must after an expiry or a restart.
 
-use brenn_guest::provides::{self, OutcomeErrorKind, PendingId, ToolRequest};
+use brenn_guest::provides::{self, OutcomeErrorKind, PendingId, ToolRequest, drop_not_pending};
 use brenn_guest::serde_json::{Value, json};
 use brenn_guest::tools::{self, ToolResult};
 use brenn_guest::{Activation, Error, Processor};
@@ -58,7 +59,7 @@ fn serve(request: &ToolRequest) -> Result<(), Error> {
                 Err(refused) => drop_not_pending(provides::complete_err(
                     &request.id,
                     OutcomeErrorKind::Internal,
-                    &format!("{refused:?}"),
+                    &refused.to_string(),
                 )),
             }
         }
@@ -72,9 +73,11 @@ fn serve(request: &ToolRequest) -> Result<(), Error> {
                 Err(Error::NotPending(diagnostic)) => diagnostic,
                 other => format!("unexpected: {other:?}"),
             };
-            provides::complete(&request.id, &json!({ "stale": drew }))
+            let dropped = drop_not_pending(provides::complete(&made_up, &json!({}))).is_ok();
+            provides::complete(&request.id, &json!({ "stale": drew, "dropped": dropped }))
         }
-        Some("fail") => Err(Error::failed("fail mode")),
+        // Through `drop_not_pending`, which passes every error but `NotPending`.
+        Some("fail") => drop_not_pending(Err(Error::failed("fail mode"))),
         other => provides::complete_err(
             &request.id,
             OutcomeErrorKind::InvalidArgs,
@@ -96,15 +99,6 @@ fn answer(result: ToolResult) -> Result<(), Error> {
         ),
     };
     drop_not_pending(completed)
-}
-
-/// A completion of a request the host no longer holds is dropped, as a
-/// provider must after an expiry or a restart.
-fn drop_not_pending(completed: Result<(), Error>) -> Result<(), Error> {
-    match completed {
-        Err(Error::NotPending(_)) => Ok(()),
-        other => other,
-    }
 }
 
 brenn_guest::export_processor!(ProcessorProviderTest);

@@ -541,6 +541,30 @@ async fn a_made_up_id_is_not_pending() {
         .as_str()
         .expect("the fixture names what it drew");
     assert!(drew.contains("not-pending"), "{drew}");
+    assert_eq!(
+        answer["dropped"], true,
+        "drop_not_pending drops not-pending"
+    );
+}
+
+/// A nested call Brenn refuses at queue time is answered with the refusal's
+/// text as the SDK renders it: the message alone, not the error variant.
+#[tokio::test]
+async fn a_refused_nested_call_is_answered_with_its_text() {
+    let r = rig(vec![], json!({})).await;
+    let call = r.call_for_alice(json!({
+        "mode": "api",
+        "request": { "provider": "stub", "method": "GET", "host": r.host, "path": "/" },
+    }));
+    r.requested_id().await;
+    r.serve().await;
+    let answer = call.await.unwrap();
+    assert_eq!(
+        answer,
+        Err(ToolError::Internal(
+            "call-async api-request: not-granted".to_string()
+        ))
+    );
 }
 
 /// A provider activation that fails answers the request it was handed at

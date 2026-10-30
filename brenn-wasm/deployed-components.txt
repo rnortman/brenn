@@ -18,3 +18,4 @@ replay-generic
 git-forge-parser
 git-sync-consumer
 conversation-recycler
+google-maps-tools

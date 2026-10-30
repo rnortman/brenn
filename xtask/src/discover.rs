@@ -160,6 +160,7 @@ mod tests {
             ("conversation-recycler", Family::Guest),
             ("git-forge-parser", Family::Guest),
             ("git-sync-consumer", Family::Guest),
+            ("google-maps-tools", Family::Guest),
             ("processor-call-test", Family::Guest),
             ("processor-config", Family::Guest),
             ("processor-demo", Family::Guest),

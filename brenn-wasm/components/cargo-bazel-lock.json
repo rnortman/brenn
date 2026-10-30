@@ -1,5 +1,5 @@
 {
-  "checksum": "d7ea38d88fac1a9d9d3349c3b314e636c3fb480a71defb10d6a61f7bfdcef03c",
+  "checksum": "1133e9e80a8cac9a8f8c105f47ff7d2742b18c6938556ae93fc8928197c6cee4",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -288,6 +288,37 @@
     },
     "brenn-git-sync-consumer 0.1.0": {
       "name": "brenn-git-sync-consumer",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            },
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-google-maps-tools 0.1.0": {
+      "name": "brenn-google-maps-tools",
       "version": "0.1.0",
       "package_url": null,
       "repository": null,
@@ -4010,6 +4041,7 @@
     "brenn-envelope 0.1.0": "brenn-wasm/components/host-crates/brenn-envelope",
     "brenn-git-forge-parser 0.1.0": "brenn-wasm/components/git-forge-parser",
     "brenn-git-sync-consumer 0.1.0": "brenn-wasm/components/git-sync-consumer",
+    "brenn-google-maps-tools 0.1.0": "brenn-wasm/components/google-maps-tools",
     "brenn-guest 0.1.0": "brenn-wasm/components/guest",
     "brenn-processor-call-test 0.1.0": "brenn-wasm/components/processor-call-test",
     "brenn-processor-config 0.1.0": "brenn-wasm/components/processor-config",

@@ -4,6 +4,18 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **New `google-maps-tools` component: Google Maps Platform as assistant
+  tools.** Instead of composing raw `api-request` calls, the assistant gets
+  native tools that call Google through an `api_key_provider` (the key stays
+  with Brenn, never with the component) and return compact answers. This
+  first release has `Geocode`: an address to coordinates, or coordinates to
+  addresses. The component's class spec, `config/specs/google-maps-tools.brenn`,
+  documents its configuration keys and the result-inbox sizing it needs. For
+  WASM component authors, the guest SDK (`brenn-guest`) now implements
+  `Display` for its `Error` and adds `brenn_guest::provides::drop_not_pending`,
+  which lets a provider drop a completion for a request that has expired
+  instead of failing; both are additive.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key

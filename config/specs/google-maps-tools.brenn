@@ -1,0 +1,38 @@
+/// Google Maps Platform for an assistant, as native tools, each answered by
+/// one or two `api-request` calls against the `api_key_provider` the instance
+/// names, compacted to what a model needs. The key never reaches this
+/// component; `api-request` attaches it host-side.
+///
+/// Every capability is load-bearing: `config` names the provider and its
+/// hosts, without which no call can be addressed; `store` carries each
+/// request's state between the activation that issues its nested call and the
+/// one that receives the answer; `tools` is the authority to call
+/// `api-request`; `provides` is what makes the tools exist; `log` records each
+/// step's tool, status and size — never a body, never a header.
+///
+/// The instance's `config = { ... };` map is flat: `provider` is the
+/// `api_key_provider` name; `weather_host`, `geocoding_host`, `places_host`
+/// and `routes_host` are the `host[:port]` values `api-request` matches
+/// against that provider's `api_hosts`; `units` is `METRIC` (default) or
+/// `IMPERIAL`; `language` is an optional BCP-47 tag passed to Google as
+/// `languageCode`. A missing or malformed key fails every activation, naming
+/// the key.
+///
+/// Size the instance's result inbox with a `channel at
+/// "brenn:tool-results/<slug>"` block: each live request has at most one
+/// nested call outstanding, so the window must hold Σ max_concurrency results,
+/// twice over for a re-delivered result. 64 is the documented value: it holds
+/// any Σ max_concurrency up to the 32 ceiling twice over, and the family
+/// default of 16 is too small for a full window.
+component GoogleMapsTools {
+  abi = processor;
+  requires = [log, store, config, tools, provides];
+  in tool-results;
+  in tool-requests;
+  provide geocode {
+    mcp_name = "Geocode";
+    description = "Turn an address into coordinates, or coordinates into addresses, with Google's Geocoding API. Pass `address` (free text, or \"<lat>,<lng>\" for a reverse lookup) or `lat` and `lng` (decimal degrees), not both; `max` (1-5, default 3) caps the results. Each result has the formatted address, `lat`, `lng`, the Places `place_id`, Google's `granularity` and its `types`; `results_omitted` counts results beyond `max`. Maps Platform endpoints this component does not wrap (air quality, time zone, weather history, nearby search, …) are listed with `api-request` examples in `docs/providers/google-maps.md`.";
+    input_schema = """{ "type": "object", "properties": { "address": { "type": "string" }, "lat": { "type": "number", "minimum": -90, "maximum": 90 }, "lng": { "type": "number", "minimum": -180, "maximum": 180 }, "max": { "type": "integer", "minimum": 1, "maximum": 5 } }, "additionalProperties": false }""";
+    max_concurrency = 2;
+  }
+}

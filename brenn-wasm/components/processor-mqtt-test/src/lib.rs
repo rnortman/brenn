@@ -87,18 +87,6 @@ const PUBLISH_TEXT: &str = "PUBLISH_TEXT";
 /// variant no callback can.
 const CLASSIFY: &str = "CLASSIFY";
 
-/// The message inside a guest-SDK error, for reporting it through this
-/// fixture's own `ReceiveError` (the SDK's bindings and this crate's are
-/// separate generations of the same WIT, so the types do not convert).
-fn rendered(e: brenn_guest::Error) -> String {
-    match e {
-        brenn_guest::Error::MalformedEnvelope(m)
-        | brenn_guest::Error::ProcessingFailed(m)
-        | brenn_guest::Error::QuotaExceeded(m)
-        | brenn_guest::Error::NotPending(m) => m,
-    }
-}
-
 impl Guest for ProcessorMqttTest {
     fn receive(a: Activation) -> Result<Option<String>, ReceiveError> {
         // Only act when there is at least one new envelope.
@@ -146,7 +134,10 @@ impl Guest for ProcessorMqttTest {
         // SDK content-type paths. Each sends exactly once and returns Ok, so
         // the host test reads the callback's captured arguments rather than an
         // outcome variant: what is under test is the payload and the content
-        // type the SDK chose, neither of which any other test observes.
+        // type the SDK chose, neither of which any other test observes. An SDK
+        // error is reported by its message: the SDK's bindings and this
+        // crate's are separate generations of the same WIT, so the error types
+        // do not convert.
         if first_new.is_some_and(|s| s.contains(PUBLISH_JSON)) {
             let body = first_new.expect("the sentinel came from a body").as_str();
             return match brenn_guest::mqtt::publish_json(
@@ -157,7 +148,7 @@ impl Guest for ProcessorMqttTest {
                 false,
             ) {
                 Ok(()) => Ok(None),
-                Err(e) => Err(ReceiveError::ProcessingFailed(rendered(e))),
+                Err(e) => Err(ReceiveError::ProcessingFailed(e.to_string())),
             };
         }
         if first_new.is_some_and(|s| s.contains(PUBLISH_TEXT)) {
@@ -170,7 +161,7 @@ impl Guest for ProcessorMqttTest {
                 false,
             ) {
                 Ok(()) => Ok(None),
-                Err(e) => Err(ReceiveError::ProcessingFailed(rendered(e))),
+                Err(e) => Err(ReceiveError::ProcessingFailed(e.to_string())),
             };
         }
 
@@ -205,7 +196,7 @@ impl Guest for ProcessorMqttTest {
                     false,
                 ) {
                     Ok(()) => String::from("second call unexpectedly succeeded"),
-                    Err(e) => rendered(e),
+                    Err(e) => e.to_string(),
                 };
                 return Err(ReceiveError::ProcessingFailed(format!(
                     "transient={transient} {message}"

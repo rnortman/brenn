@@ -1,0 +1,51 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "guest_spec_scaffold", "wasm_component", "wasm_guest_cdylib")
+
+policy_srcs()
+
+# Bindings come from the brenn-guest SDK's `generate!`; this crate names no
+# WIT of its own.
+# The port surface, generated from the authored specification this
+# component ships with. Untracked: the specification is the source, and
+# editing it stops this crate compiling until the guest keeps up.
+guest_spec_scaffold(
+    name = "spec",
+    spec = "//:config/specs/google-maps-tools.brenn",
+)
+
+wasm_guest_cdylib(
+    name = "brenn-google-maps-tools",
+    generated_srcs = {"src/spec.rs": ":spec"},
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-wasm/components/guest:brenn-guest",
+    ],
+)
+
+wasm_component(
+    name = "component",
+    module = ":brenn-google-maps-tools",
+    visibility = ["//visibility:public"],
+)
+
+# Argument validation, request assembly, result reading and compaction are
+# std + serde only, so they run on the host; the glue in lib.rs needs the
+# guest SDK and builds for wasm32 alone. The generated `spec` module compiles
+# here too, since its SDK-facing items are wasm32-only: the tools the planner
+# matches on are the specification's own `Provided`.
+rust_test(
+    name = "logic_test",
+    srcs = [
+        "src/logic.rs",
+        ":spec",
+    ],
+    crate_root = "src/logic.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    target_compatible_with = HOST_ONLY,
+    deps = all_crate_deps(normal = True),
+)

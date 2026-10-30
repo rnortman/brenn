@@ -95,6 +95,20 @@ impl Error {
     }
 }
 
+/// The diagnostic message alone, without the variant: the SDK writes each
+/// message to name what failed, so it reads as text a model or an operator
+/// is shown.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::MalformedEnvelope(msg)
+            | Error::ProcessingFailed(msg)
+            | Error::QuotaExceeded(msg)
+            | Error::NotPending(msg) => f.write_str(msg),
+        }
+    }
+}
+
 impl From<Error> for bindings::ReceiveError {
     fn from(e: Error) -> Self {
         match e {
@@ -1816,6 +1830,17 @@ pub mod provides {
         complete_raw(id, &outcome.to_string())
     }
 
+    /// A [`complete`] or [`complete_err`] the host refused `NotPending`, made
+    /// `Ok`: nobody is waiting on a request that expired at the host's
+    /// ceiling or was delivered before a restart, so a provider drops it
+    /// rather than failing the activation. Every other `Err` passes through.
+    pub fn drop_not_pending(completed: Result<(), Error>) -> Result<(), Error> {
+        match completed {
+            Err(Error::NotPending(_)) => Ok(()),
+            other => other,
+        }
+    }
+
     /// `tools::call_async_json` on behalf of the user whose request `id` is.
     /// Buffered with the activation's publishes, under the same budgets; the
     /// result arrives on `tool-results` with `serving == Some(id)`.
@@ -1825,8 +1850,9 @@ pub mod provides {
     /// not say whether the request is stale. Answer a refusal with
     /// [`complete_err`] rather than returning it: a live request's caller gets
     /// the refusal at once, and a stale request draws `Err(NotPending)`, which
-    /// the provider drops. Returning the `Err` fails the activation, and with
-    /// it every other request served in the same window.
+    /// the provider drops with [`drop_not_pending`]. Returning the `Err` fails
+    /// the activation, and with it every other request served in the same
+    /// window.
     pub fn call_async_for(
         id: &PendingId,
         tool: &str,
