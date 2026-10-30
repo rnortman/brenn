@@ -54,9 +54,9 @@ use crate::access::raw::{
 use crate::messaging::config::{
     BACKEND_FATAL_NOISE_REFUSAL, ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw,
     LinkHostRaw, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel,
-    SendRate, SurfaceCallRaw, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw,
-    SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerCallRaw, WasmConsumerConfigRaw,
-    WasmConsumerIoPortRaw, WasmConsumerMqttOutputRaw, WasmConsumerOutputRaw,
+    ProvidedToolDecl, SendRate, SurfaceCallRaw, SurfaceComponentRaw, SurfaceConfigRaw,
+    SurfaceIoPortRaw, SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerCallRaw,
+    WasmConsumerConfigRaw, WasmConsumerIoPortRaw, WasmConsumerMqttOutputRaw, WasmConsumerOutputRaw,
     WasmConsumerSubscriptionRaw,
 };
 use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
@@ -2913,6 +2913,20 @@ fn consumer(
                 port: call.port.value().clone(),
                 target: call.target.value().clone(),
                 target_port: call.target_port.value().clone(),
+            })
+            .collect(),
+        // A class fact, not a body key: the class's `provide` statements.
+        provides: instance
+            .class
+            .provides
+            .iter()
+            .map(|tool| ProvidedToolDecl {
+                name: tool.name.value().clone(),
+                mcp_name: tool.mcp_name.value().clone(),
+                description: tool.description.clone(),
+                input_schema: tool.input_schema.clone(),
+                max_concurrency: tool.max_concurrency,
+                auto_approve: tool.auto_approve,
             })
             .collect(),
         grants: authority

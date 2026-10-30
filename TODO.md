@@ -827,27 +827,6 @@ registration panic), `TODO(tool-registry-idempotency-dedupe)`.
 
 ---
 
-## `correctness-call-async-for-capped-below-provider-window`
-
-A provider's `tool-requests` window is sized to Σ `max_concurrency` over its
-provided tools, up to `WINDOW_DEPTH_CEILING` (1000), so one activation can
-carry that many new requests. Serving each with `provides.call-async-for`
-draws on `PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION` (64), shared with
-`call-fast` and `call-async`, and every buffered request also counts against
-`MAX_PUBLISHES_PER_ACTIVATION` (256). Past the cap the nested call is refused
-`internal("call-count-exceeded")`; a provider that completes refusals with an
-error answers those callers `internal` at once. Decide the bound: refuse a
-class whose Σ `max_concurrency` exceeds what one activation can serve with
-nested calls (beside the window-ceiling refusal), or give `call-async-for` its
-own per-activation count sized to the window and name the publish ceiling in
-the rule. State it in `docs/config-dsl.md` and test a burst above the cap.
-
-Code site: `brenn-wasm/src/lib.rs`
-(`PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION`),
-`TODO(correctness-call-async-for-capped-below-provider-window)`.
-
----
-
 ## `meeting-tick-visibility`
 
 A headless (no-layout-slot) meeting component ticks at 1 s for the entire ±1 h

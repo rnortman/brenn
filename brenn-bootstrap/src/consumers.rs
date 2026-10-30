@@ -810,6 +810,7 @@ mod tests {
             },
             mqtt_sinks: std::collections::HashMap::new(),
             calls: vec![],
+            provides: vec![],
         }
     }
 

@@ -51,8 +51,8 @@ use crate::messaging::Urgency;
 use crate::messaging::WakeMin;
 use crate::messaging::config::{
     ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw, MessagingConfigRaw,
-    MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel, SendRate, Sink, SurfaceCallRaw,
-    SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw, SurfaceOutputRaw,
+    MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel, ProvidedToolDecl, SendRate, Sink,
+    SurfaceCallRaw, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw, SurfaceOutputRaw,
     SurfaceSubscriptionRaw, WasmConsumerCallRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
     WasmConsumerMqttOutputRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
 };
@@ -6309,6 +6309,58 @@ fn a_consumer_lowers_each_direction_into_its_own_vocabulary() {
     );
     assert_eq!(consumer.sync_ports, vec!["press".to_string()]);
     assert_eq!(consumer.call_ports, vec!["ask".to_string()]);
+}
+
+/// A class's `provide` statements travel to the consumer as written, in
+/// declaration order, with the defaults the language applied; a consumer whose
+/// class provides nothing carries an empty list.
+#[test]
+fn a_providing_class_lowers_its_tools_onto_the_consumer() {
+    let config = config_from_dsl(concat!(
+        "// ── packaged ──\n",
+        "component Mail {\n    abi = processor; requires = [provides];\n",
+        "    in tool-requests;\n",
+        "    provide mail-search {\n",
+        "        mcp_name = \"MailSearch\";\n",
+        "        description = \"Search mail.\";\n",
+        "        input_schema = \"\"\"{ \"type\": \"object\" }\"\"\";\n",
+        "        max_concurrency = 4;\n",
+        "        auto_approve = false;\n",
+        "    }\n",
+        "    provide mail-read {\n",
+        "        mcp_name = \"MailRead\";\n",
+        "        description = \"Read one message.\";\n",
+        "        input_schema = \"\"\"{}\"\"\";\n",
+        "    }\n",
+        "}\n",
+        "// ── packaged ──\n",
+        "new mail: Mail {\n    grants = [provides];\n}\n",
+    ));
+    let consumer = &config.wasm_consumers[0];
+    assert_eq!(consumer.grants, vec![ComponentGrant::Provides]);
+    assert_eq!(
+        consumer.provides,
+        vec![
+            ProvidedToolDecl {
+                name: "mail-search".to_string(),
+                mcp_name: "MailSearch".to_string(),
+                description: "Search mail.".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                max_concurrency: 4,
+                auto_approve: false,
+            },
+            ProvidedToolDecl {
+                name: "mail-read".to_string(),
+                mcp_name: "MailRead".to_string(),
+                description: "Read one message.".to_string(),
+                input_schema: serde_json::json!({}),
+                max_concurrency: 1,
+                auto_approve: true,
+            },
+        ]
+    );
+    // The request inbox is the substrate's to wire: no binding lowers for it.
+    assert_eq!(consumer.subscriptions, vec![]);
 }
 
 /// The same split at the surface call site.

@@ -252,7 +252,7 @@ fn walk_call_edges<'a>(
 ///
 /// # Panics
 ///
-/// On a schemeless address, and on a `brenn:` address in either tool namespace.
+/// On a schemeless address, and on a `brenn:` address in a tool namespace.
 fn assert_not_tool_namespace(context: &str, address: &str) {
     use brenn_lib::messaging::ChannelScheme;
     let (scheme, bare) = ChannelScheme::split(address)
@@ -261,7 +261,8 @@ fn assert_not_tool_namespace(context: &str, address: &str) {
         !(scheme == ChannelScheme::Brenn && brenn_envelope::addressing::in_a_tool_namespace(bare)),
         "{context} is bound to {address:?}, which is in a namespace the tool substrate owns; \
          component ports do not reach the tool substrate's channels — a result inbox is wired \
-         by a tool grant, and a request channel is reached only through the registry",
+         by a tool grant, a provider's request inbox by its class's `provide` statements, \
+         and a request channel is reached only through the registry",
     );
 }
 

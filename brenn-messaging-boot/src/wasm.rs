@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use brenn_envelope::addressing::{PROVIDER_CONCURRENCY_CEILING, PROVIDER_CONCURRENCY_REFUSAL};
 use brenn_lib::messaging::config::{
     ActivationPacing, BACKEND_FATAL_NOISE_REFUSAL, DEFAULT_WASM_INPUT_AMPLIFICATION,
     DEFAULT_WASM_PUBLISH_CAPACITY, DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth,
@@ -143,6 +144,38 @@ pub(crate) fn resolve_wasm_consumers(
             );
         }
 
+        // 4d. `provides` granted iff the class provides a tool, each with a
+        //     concurrency of at least one and the sum within the ceiling — the
+        //     class rules the config language refuses, held again for a
+        //     hand-built config.
+        assert_eq!(
+            grants.contains(&ComponentGrant::Provides),
+            !consumer.provides.is_empty(),
+            "[[wasm_consumer]] {slug:?}: \"provides\" is granted iff the consumer provides \
+             a tool — the word links the interface a provider answers through, and the \
+             provided tools are what it consents to",
+        );
+        for tool in &consumer.provides {
+            assert!(
+                tool.max_concurrency >= 1,
+                "[[wasm_consumer]] {slug:?}: provided tool {:?} has max_concurrency = 0; \
+                 `max_concurrency` is a count of at least one",
+                tool.name,
+            );
+        }
+        let provided_concurrency: u64 = consumer
+            .provides
+            .iter()
+            .map(|tool| u64::from(tool.max_concurrency))
+            .sum();
+        assert!(
+            provided_concurrency <= PROVIDER_CONCURRENCY_CEILING,
+            "[[wasm_consumer]] {slug:?} declares Σ max_concurrency = {provided_concurrency} \
+             across its provided tools; a provider may hold at most \
+             {PROVIDER_CONCURRENCY_CEILING} requests in flight (`PROVIDER_CONCURRENCY_CEILING`): \
+             {PROVIDER_CONCURRENCY_REFUSAL}",
+        );
+
         // Validate and resolve store_path (only when Store is granted).
         // `std::path::absolute` consults the cwd and nothing on disk, so the
         // resolved consumer carries the absolute path a boot on any machine
@@ -206,16 +239,27 @@ pub(crate) fn resolve_wasm_consumers(
                 &format!("[[wasm_consumer]] {slug:?}: {context} port name"),
                 port,
             );
-            assert!(
-                port != brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT,
-                "[[wasm_consumer]] {slug:?}: {context} port name {:?} is reserved for the \
-                 async tool-result inbox; a consumer holding an async tool grant has this \
-                 port folded in automatically, so an operator-declared port of the same name \
-                 would collide",
-                port,
-            );
+            for (reserved, inbox, holder) in [
+                (
+                    brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT,
+                    "async tool-result inbox",
+                    "holding an async tool grant",
+                ),
+                (
+                    brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT,
+                    "provider request inbox",
+                    "that provides a tool",
+                ),
+            ] {
+                assert!(
+                    port != reserved,
+                    "[[wasm_consumer]] {slug:?}: {context} port name {port:?} is reserved for \
+                     the {inbox}; a consumer {holder} has this port folded in automatically, \
+                     so an operator-declared port of the same name would collide",
+                );
+            }
         };
-        // A port bound onto either tool namespace is a hand-rolled path around
+        // A port bound onto a tool namespace is a hand-rolled path around
         // the substrate's wiring, refused here even though the executor
         // re-checks every dequeued request.
         let validate_bound_address = |address: &str, kind: &str, port: &str| {
@@ -940,6 +984,7 @@ pub(crate) fn resolve_wasm_consumers(
             sync_ports,
             call_ports,
             calls,
+            provides: consumer.provides.clone(),
             grants,
             store_path,
             max_page_count,

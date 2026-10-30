@@ -42,8 +42,8 @@ use uuid::Uuid;
 
 use brenn_envelope::ChannelScheme;
 use brenn_envelope::addressing::{
-    MATCHER_BOUNDARIES, TUNING_BOUNDARIES, ends_at_matcher_boundary, ends_at_tuning_boundary,
-    in_a_tool_namespace, is_auto_channel_name, nondurable_channel_uuid,
+    MATCHER_BOUNDARIES, TOOL_REQUESTS_NAMESPACE, TUNING_BOUNDARIES, ends_at_matcher_boundary,
+    ends_at_tuning_boundary, in_a_tool_namespace, is_auto_channel_name, nondurable_channel_uuid,
 };
 use brenn_envelope::channel_model::{
     ChannelBlockRole, ChannelDepthKey, TUNING_DURABILITY_IGNORED, depth_required, sink_admitted,
@@ -62,8 +62,8 @@ use crate::model::Word;
 use crate::resolved::scheme::{config_identified, spellable_quoted_list, split_spellable};
 use crate::resolved::{
     ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef,
-    RChannel, RMatcher, RMatcherVal, RPort, RStamp, RSurface, RTail, RToolGrant, RTuning, RVal,
-    RValue, RWordList, ResolvedConfig, StampId, StampOrigin, str_value,
+    RChannel, RMatcher, RMatcherVal, RPort, RProvidedTool, RStamp, RSurface, RTail, RToolGrant,
+    RTuning, RVal, RValue, RWordList, ResolvedConfig, StampId, StampOrigin, str_value,
 };
 
 /// Derive a resolved document.
@@ -81,6 +81,7 @@ pub fn derive(config: ResolvedConfig) -> Result<DerivedConfig, Vec<Diagnostic>> 
     let surface_component_kinds = fold_component_kinds(&config, &mut errors);
     check_links(&config, &mut errors);
     check_doctypes(&config, &refs, &mut errors);
+    check_provided_tools(&config, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -95,15 +96,24 @@ pub fn derive(config: ResolvedConfig) -> Result<DerivedConfig, Vec<Diagnostic>> 
 /// Is this address one the system mints for itself?
 ///
 /// The ingress families (`mqtt:`, `webhook:`) and the tool substrate's
-/// (`brenn:tools/`, `brenn:tool-results/`). Everything else is an
-/// operator-declared channel's address. A total function of the address, which
-/// is what makes the declaring and tuning roles disjoint.
+/// (`brenn:tools/`, `brenn:tool-results/`, `brenn:tool-requests/`). Everything
+/// else is an operator-declared channel's address. A total function of the
+/// address, which is what makes the declaring and tuning roles disjoint.
 fn is_system_minted(address: &str) -> bool {
     match split_spellable(address) {
         Some((ChannelScheme::Mqtt | ChannelScheme::Webhook, _)) => true,
         Some((ChannelScheme::Brenn, name)) => in_a_tool_namespace(name),
         _ => false,
     }
+}
+
+/// Is this address, or the family a prefix names, a provider's request inbox
+/// (`brenn:tool-requests/…`)?
+fn is_request_inbox(address: &str) -> bool {
+    matches!(
+        split_spellable(address),
+        Some((ChannelScheme::Brenn, name)) if name.starts_with(TOOL_REQUESTS_NAMESPACE)
+    )
 }
 
 /// One port bound to a link, as the link's own rules see it.
@@ -234,12 +244,21 @@ fn check_links(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
 /// one channel, and there is no attribute merge to define.
 fn check_channel_roles(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
     for channel in &config.channels {
-        if is_system_minted(channel.address.value()) {
+        let address = channel.address.value();
+        if is_request_inbox(address) {
             errors.push(Diagnostic::at(
                 format!(
-                    "`{}` is an address the system mints, so there is nothing to declare; \
-                     write `channel at \"…\"` without a handle to tune its depths",
-                    channel.address.value()
+                    "`{address}` is an address the system mints, so there is nothing to \
+                     declare; a provider's request inbox is sized by its class and tuned by \
+                     no block"
+                ),
+                channel.address.span().clone(),
+            ));
+        } else if is_system_minted(address) {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{address}` is an address the system mints, so there is nothing to \
+                     declare; write `channel at \"…\"` without a handle to tune its depths"
                 ),
                 channel.address.span().clone(),
             ));
@@ -297,7 +316,16 @@ fn check_tuning_address(tuning: &RTuning, errors: &mut Vec<Diagnostic>) {
             span.clone(),
         ));
     }
-    if classify && !is_system_minted(address) {
+    if classify && is_request_inbox(address) {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{address}` is in the provider request-inbox family, which no block tunes: \
+                 an inbox holds every request that can be in flight at once, the sum of \
+                 its class's `max_concurrency`, and that depth is the class's to state"
+            ),
+            span.clone(),
+        ));
+    } else if classify && !is_system_minted(address) {
         errors.push(Diagnostic::at(
             format!(
                 "`{address}` names no system-minted family, so a handle-less block tunes \
@@ -2558,7 +2586,8 @@ fn bound_address(
             format!(
                 "this {} of {} `{label}` names `{address}`, in a namespace the tool \
                  substrate owns: component ports do not reach the tool substrate's \
-                 channels — a result inbox is wired by a `tool` grant, and a request \
+                 channels — a result inbox is wired by a `tool` grant, a provider's \
+                 request inbox by its class's `provide` statements, and a request \
                  channel is reached only through the registry",
                 bound.what,
                 kind.label(),
@@ -5072,6 +5101,67 @@ pub fn wire_kind(class_name: &str) -> String {
     kind
 }
 
+/// The registry facts a document can see about the tools its consumers provide.
+///
+/// A provided tool's name and `mcp_name` are registry keys, so two consumers
+/// providing either one are refused here — two instances of one providing
+/// class included, since each instance would register the class's tools. A
+/// collision with a native tool is a registration fact the document cannot see
+/// and is refused at boot. A consumer whose own `tool` statement names a tool
+/// its class provides would call itself, a loop nobody wrote.
+fn check_provided_tools(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
+    // The consumer that first provided each name, and the statement it did it in.
+    let mut names: HashMap<&str, (&str, &Span)> = HashMap::new();
+    let mut mcp_names: HashMap<&str, (&str, &Span)> = HashMap::new();
+    for consumer in &config.consumers {
+        let slug = consumer.slug.value().as_str();
+        for tool in &consumer.class.provides {
+            for (key, spanned, claimed) in [
+                ("tool", &tool.name, &mut names),
+                ("mcp_name", &tool.mcp_name, &mut mcp_names),
+            ] {
+                let value = spanned.value().as_str();
+                match claimed.get(value) {
+                    Some((first, site)) => errors.push(two_site(
+                        format!(
+                            "consumer `{slug}` provides {key} `{value}`, which consumer \
+                             `{first}` already provides: the registry holds one tool per \
+                             name, and a providing class is instantiated at most once"
+                        ),
+                        consumer.slug.span().clone(),
+                        format!("`{first}` provides it here"),
+                        (*site).clone(),
+                    )),
+                    None => {
+                        claimed.insert(value, (slug, spanned.span()));
+                    }
+                }
+            }
+        }
+        for grant in &consumer.tools {
+            let Some(provided) = consumer
+                .class
+                .provides
+                .iter()
+                .find(|tool| tool.name.value() == grant.tool.value())
+            else {
+                continue;
+            };
+            errors.push(two_site(
+                format!(
+                    "consumer `{slug}` states a `tool {}` grant, and its class `{}` provides \
+                     that tool: a provider calling itself is a loop",
+                    grant.tool.value(),
+                    consumer.class.name.value()
+                ),
+                grant.tool.span().clone(),
+                "provided here",
+                provided.name.span().clone(),
+            ));
+        }
+    }
+}
+
 /// The kind each surface-placed instance is served under.
 ///
 /// Only surface-placed instances: a top-level instance is loaded from its
@@ -5135,6 +5225,7 @@ fn same_class_facts(left: &ClassRef, right: &ClassRef) -> bool {
         ports: left_ports,
         spec_sha256: _,
         package: _,
+        provides: left_provides,
     } = left;
     let ClassRef {
         name: right_name,
@@ -5144,6 +5235,7 @@ fn same_class_facts(left: &ClassRef, right: &ClassRef) -> bool {
         ports: right_ports,
         spec_sha256: _,
         package: _,
+        provides: right_provides,
     } = right;
     left_name.value() == right_name.value()
         && left_abi.value() == right_abi.value()
@@ -5154,6 +5246,38 @@ fn same_class_facts(left: &ClassRef, right: &ClassRef) -> bool {
             .iter()
             .zip(right_ports)
             .all(|(left, right)| same_port(left, right))
+        && left_provides.len() == right_provides.len()
+        && left_provides
+            .iter()
+            .zip(right_provides)
+            .all(|(left, right)| same_provided_tool(left, right))
+}
+
+/// One `provide` statement's facts, spans excluded. Both sides destructured
+/// for the same reason [`same_class_facts`] destructures.
+fn same_provided_tool(left: &RProvidedTool, right: &RProvidedTool) -> bool {
+    let RProvidedTool {
+        name: left_name,
+        mcp_name: left_mcp_name,
+        description: left_description,
+        input_schema: left_input_schema,
+        max_concurrency: left_max_concurrency,
+        auto_approve: left_auto_approve,
+    } = left;
+    let RProvidedTool {
+        name: right_name,
+        mcp_name: right_mcp_name,
+        description: right_description,
+        input_schema: right_input_schema,
+        max_concurrency: right_max_concurrency,
+        auto_approve: right_auto_approve,
+    } = right;
+    left_name.value() == right_name.value()
+        && left_mcp_name.value() == right_mcp_name.value()
+        && left_description == right_description
+        && left_input_schema == right_input_schema
+        && left_max_concurrency == right_max_concurrency
+        && left_auto_approve == right_auto_approve
 }
 
 /// One grant list's facts, span excluded and order included: a list is

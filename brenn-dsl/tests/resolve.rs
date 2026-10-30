@@ -4505,6 +4505,425 @@ fn an_unresolvable_value_in_an_attachment_target_is_reported() {
     );
 }
 
+// ── provided tools ───────────────────────────────────────────────────────────
+
+/// A providing class with the statements written into it, and one instance of
+/// it granted what the class requires.
+fn provider_doc(statements: &str) -> String {
+    format!(
+        concat!(
+            packaged!(),
+            "component Mail {{\n    abi = processor; requires = [provides];\n",
+            "    in tool-requests;\n",
+            "{}",
+            "}}\n",
+            packaged!(),
+            "new alice_mail: Mail {{\n",
+            "    grants = [provides];\n",
+            "}}\n",
+        ),
+        statements
+    )
+}
+
+/// One `provide` statement with the required keys and the extras written.
+fn provide(name: &str, mcp_name: &str, extra: &str) -> String {
+    format!(
+        "    provide {name} {{\n        mcp_name = \"{mcp_name}\";\n        \
+         description = \"Search mail.\";\n        \
+         input_schema = \"\"\"{{ \"type\": \"object\" }}\"\"\";\n{extra}    }}\n"
+    )
+}
+
+/// A minimal statement, and the defaults the optional keys take.
+#[test]
+fn a_providing_class_resolves_its_statements() {
+    let config = resolved(&provider_doc(concat!(
+        "    provide gmail-search {\n",
+        "        mcp_name = \"GmailSearch\";\n",
+        "        description = \"Search the connected Gmail account.\";\n",
+        "        input_schema = \"\"\"{ \"type\": \"object\", \"$schema\": \"x\", ",
+        "\"required\": [\"q\"] }\"\"\";\n",
+        "        max_concurrency = 4;\n",
+        "        auto_approve = false;\n",
+        "    }\n",
+        "    provide gmail-read {\n",
+        "        mcp_name = \"GmailRead\";\n",
+        "        description = \"Read one message.\";\n",
+        "        input_schema = \"\"\"{}\"\"\";\n",
+        "    }\n",
+    )));
+    let provides = &config.consumers[0].class.provides;
+    assert_eq!(provides.len(), 2);
+    let search = &provides[0];
+    assert_eq!(search.name.value(), "gmail-search");
+    assert_eq!(
+        search.mcp_name.value(),
+        "GmailSearch",
+        "the bare suffix, as written"
+    );
+    assert_eq!(search.description, "Search the connected Gmail account.");
+    assert_eq!(search.input_schema["required"][0], "q");
+    assert_eq!(search.input_schema["$schema"], "x");
+    assert_eq!(search.max_concurrency, 4);
+    assert!(!search.auto_approve);
+    let read = &provides[1];
+    assert_eq!(read.name.value(), "gmail-read");
+    assert_eq!(read.max_concurrency, 1, "one at a time unless stated");
+    assert!(read.auto_approve, "approved unless stated");
+}
+
+/// The word with nothing to answer for.
+#[test]
+fn the_provides_word_needs_a_provide_statement() {
+    let source = "component Mail {\n    abi = processor; requires = [provides];\n    \
+                  in tool-requests;\n}\n";
+    let errors = resolve_errors(source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "`Mail` requires `provides` and declares no `provide` statement: the word links the \
+         interface a provider answers through, and a class with nothing to answer for reaches \
+         nothing"
+    );
+    assert_eq!(errors[0].line_col(), at(source, "provides"));
+    assert_eq!(errors[0].related[0].0, "the class is declared here");
+}
+
+/// The statement without the consent it needs.
+#[test]
+fn a_provide_statement_needs_the_provides_word() {
+    let source = format!(
+        "component Mail {{\n    abi = processor; requires = [ports];\n{}}}\n",
+        provide("mail-search", "MailSearch", "")
+    );
+    let errors = resolve_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "`Mail` declares `provide mail-search` and does not require `provides`: the statement \
+         is what the word consents to"
+    );
+    assert_eq!(errors[0].line_col(), at(&source, "provide mail-search"));
+}
+
+/// The request inbox follows the `tool-results` rule, in each of its halves.
+#[test]
+fn the_provides_word_needs_the_tool_request_inbox() {
+    let source = format!(
+        "component Mail {{\n    abi = processor; requires = [provides];\n{}}}\n",
+        provide("mail-search", "MailSearch", "")
+    );
+    let errors = resolve_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "`Mail` requires `provides` but declares no `in tool-requests;`; the substrate \
+         delivers calls to the tools it provides as activations on that port, and a component \
+         that does not declare it fails the first request it is handed"
+    );
+    assert_eq!(errors[0].line_col(), at(&source, "provides"));
+}
+
+#[test]
+fn the_tool_request_inbox_needs_the_provides_word() {
+    let source =
+        "component Mail {\n    abi = processor; requires = [ports];\n    in tool-requests;\n}\n";
+    let errors = resolve_errors(source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "`Mail` declares `tool-requests` but does not require `provides`; the substrate wires \
+         that port from a class's `provide` statements, so nothing would ever deliver on it"
+    );
+    assert_eq!(errors[0].line_col(), at(source, "tool-requests"));
+}
+
+#[test]
+fn the_tool_request_inbox_faces_in_and_is_not_optional() {
+    for (port, expected) in [
+        (
+            "out tool-requests;",
+            "`tool-requests` is the tool-request inbox, an `in` port the substrate delivers \
+             on; it is not an `out` port",
+        ),
+        (
+            "optional in tool-requests;",
+            "`tool-requests` cannot be `optional`: its presence is decided by the class's \
+             `provides` requirement, not by an instance, which never binds it",
+        ),
+    ] {
+        let source = format!(
+            "component Mail {{\n    abi = processor; requires = [provides];\n    {port}\n{}}}\n",
+            provide("mail-search", "MailSearch", "")
+        );
+        let errors = resolve_errors(&source);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, expected);
+    }
+}
+
+/// The word names an interface, so the general optional-word refusal reaches
+/// it: an artifact cannot import the interface conditionally.
+#[test]
+fn the_provides_word_is_not_optional() {
+    let errors = refusals(&format!(
+        "component Mail {{\n    abi = processor; requires = [ports]; optional = [provides];\n    \
+         in tool-requests;\n{}}}\n",
+        provide("mail-search", "MailSearch", "")
+    ));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.starts_with("`provides` cannot be optional on a processor class")),
+        "{errors:?}"
+    );
+}
+
+/// The substrate wires the request inbox; no instance binds it, in any direction.
+#[test]
+fn binding_the_tool_request_inbox_is_refused() {
+    for binding in [
+        "    in tool-requests <- requests;\n",
+        "    out tool-requests -> requests;\n",
+    ] {
+        let source = provider_doc(&provide("mail-search", "MailSearch", "")).replace(
+            "    grants = [provides];\n",
+            &format!("    grants = [provides];\n{binding}"),
+        );
+        assert_eq!(
+            refusal(&format!(
+                "channel requests at \"brenn:requests\";\n{source}"
+            )),
+            "port `tool-requests` is the tool-request inbox, wired by the substrate from the \
+             class's `provide` statements; nothing binds it, and its window is the statements' \
+             summed `max_concurrency`",
+            "{binding}"
+        );
+    }
+}
+
+/// The registry's naming rule: the tool name is a grant name and a channel
+/// segment.
+#[test]
+fn a_provided_tool_name_is_kebab_case() {
+    for name in ["mail_search", "Mail-search", "mail--search", "mail-9-x_y"] {
+        assert_eq!(
+            refusal(&provider_doc(&provide(name, "MailSearch", ""))),
+            format!(
+                "`{name}` is not a tool name: a tool is named in kebab case — lowercase letters \
+                 and digits in hyphen-separated runs, leading with a letter"
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn an_mcp_name_is_a_bare_capitalized_suffix() {
+    for mcp_name in ["mailSearch", "mcp__brenn__MailSearch", "Mail-Search", ""] {
+        assert_eq!(
+            refusal(&provider_doc(&provide("mail-search", mcp_name, ""))),
+            format!(
+                "{mcp_name:?} is not an `mcp_name`: it is the bare name an MCP client sees \
+                 after the server's prefix, an uppercase ASCII letter followed by ASCII letters \
+                 and digits"
+            ),
+            "{mcp_name}"
+        );
+    }
+}
+
+/// A packaged `mcp_name` is author text: the refusal quotes it escaped, so a
+/// newline or terminal control code in it cannot start a forged output line.
+#[test]
+fn a_misshapen_mcp_name_is_quoted_with_its_control_characters_escaped() {
+    let source = provider_doc(&provide("mail-search", "X\\nmain.brenn: ok\u{1b}[2K", ""));
+    let message = refusal(&source);
+    assert_eq!(
+        message,
+        "\"X\\nmain.brenn: ok\\u{1b}[2K\" is not an `mcp_name`: it is the bare name an MCP \
+         client sees after the server's prefix, an uppercase ASCII letter followed by ASCII \
+         letters and digits"
+    );
+    assert!(!message.contains(['\n', '\u{1b}']), "{message}");
+}
+
+#[test]
+fn an_input_schema_is_a_json_object() {
+    let with_schema = |schema: &str| {
+        provider_doc(&provide("mail-search", "MailSearch", "").replace(
+            "\"\"\"{ \"type\": \"object\" }\"\"\"",
+            &format!("\"\"\"{schema}\"\"\""),
+        ))
+    };
+    assert_eq!(
+        refusal(&with_schema("[1, 2]")),
+        "`input_schema` is a JSON schema, which is a JSON object; this JSON is not one"
+    );
+    assert!(
+        refusal(&with_schema("{ type: object }"))
+            .starts_with("`input_schema` is JSON text; this does not parse: "),
+    );
+}
+
+/// A count of at least one that fits a `u32`, so the class's sum cannot wrap.
+#[test]
+fn max_concurrency_is_a_u32_count_of_at_least_one() {
+    for value in ["0", "-1", "4294967296", "9223372036854775807"] {
+        assert_eq!(
+            refusal(&provider_doc(&provide(
+                "mail-search",
+                "MailSearch",
+                &format!("        max_concurrency = {value};\n")
+            ))),
+            format!(
+                "`max_concurrency` is a count of at least one that fits a `u32`; this one is \
+                 {value}"
+            ),
+        );
+    }
+    assert_eq!(
+        refusal(&provider_doc(&provide(
+            "mail-search",
+            "MailSearch",
+            "        max_concurrency = \"4\";\n"
+        ))),
+        "`max_concurrency` is a count; this is a string"
+    );
+}
+
+/// An operand the `u32` lowering refuses never reaches the sum: the pair is
+/// answered once, at the out-of-range count.
+#[test]
+fn an_out_of_range_count_is_refused_before_the_sum() {
+    let errors = refusals(&provider_doc(&format!(
+        "{}{}",
+        provide(
+            "mail-search",
+            "MailSearch",
+            "        max_concurrency = 4294967296;\n"
+        ),
+        provide("mail-read", "MailRead", "        max_concurrency = 2;\n"),
+    )));
+    assert_eq!(
+        errors,
+        ["`max_concurrency` is a count of at least one that fits a `u32`; this one is 4294967296"]
+    );
+}
+
+/// The largest `u32` operand is a legal count, and the sum it joins is folded
+/// wide enough not to wrap: the refusal names the true sum.
+#[test]
+fn the_sum_of_the_largest_counts_does_not_wrap() {
+    let errors = refusals(&provider_doc(&format!(
+        "{}{}",
+        provide(
+            "mail-search",
+            "MailSearch",
+            "        max_concurrency = 4294967295;\n"
+        ),
+        provide("mail-read", "MailRead", "        max_concurrency = 2;\n"),
+    )));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].starts_with("`Mail` declares Σ max_concurrency = 4294967297 across"),
+        "{errors:?}"
+    );
+}
+
+/// One activation can be handed the whole window and serves each request with
+/// a nested call, so the class's sum is held to the ceiling.
+#[test]
+fn the_summed_concurrency_is_held_to_the_ceiling() {
+    let pair = |first: u32, second: u32| {
+        provider_doc(&format!(
+            "{}{}",
+            provide(
+                "mail-search",
+                "MailSearch",
+                &format!("        max_concurrency = {first};\n")
+            ),
+            provide(
+                "mail-read",
+                "MailRead",
+                &format!("        max_concurrency = {second};\n")
+            ),
+        ))
+    };
+    let config = resolved(&pair(16, 16));
+    assert_eq!(config.consumers[0].class.provides.len(), 2);
+    let source = pair(17, 16);
+    assert_eq!(
+        refusal(&source),
+        "`Mail` declares Σ max_concurrency = 33 across its provide statements; a provider may \
+         hold at most 32 requests in flight (`PROVIDER_CONCURRENCY_CEILING`): one activation \
+         can be handed a full window of new requests and serves each with one nested call, and \
+         the ceiling is half an activation's tool-call budget so the activation keeps calls for \
+         its other work"
+    );
+}
+
+#[test]
+fn a_tool_is_provided_once_by_a_class() {
+    let errors = refusals(&provider_doc(&format!(
+        "{}{}",
+        provide("mail-search", "MailSearch", ""),
+        provide("mail-search", "MailFind", ""),
+    )));
+    assert!(errors[0].contains("`provide mail-search`"), "{errors:?}");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[test]
+fn an_mcp_name_is_provided_once_by_a_class() {
+    let source = provider_doc(&format!(
+        "{}{}",
+        provide("mail-search", "MailSearch", ""),
+        provide("mail-find", "MailSearch", ""),
+    ));
+    assert_eq!(
+        refusal(&source),
+        "`mcp_name = \"MailSearch\"` is declared by two `provide` statements of `Mail`; an MCP \
+         client names a tool by it, so it names one tool"
+    );
+}
+
+/// The statement nests nothing, and its flag is a boolean.
+#[test]
+fn a_provide_statement_holds_no_blocks_and_a_boolean_flag() {
+    assert_eq!(
+        refusal(&provider_doc(&provide(
+            "mail-search",
+            "MailSearch",
+            "        allow { user = \"*\"; }\n"
+        ))),
+        "the `provide` block holds no sub-blocks, so `allow` has no meaning here"
+    );
+    assert_eq!(
+        refusal(&provider_doc(&provide(
+            "mail-search",
+            "MailSearch",
+            "        auto_approve = \"yes\";\n"
+        ))),
+        "`auto_approve` is a boolean; this is a string"
+    );
+}
+
+/// The class body admits one statement kindword.
+#[test]
+fn a_class_body_admits_only_provide_statements() {
+    let errors = refusals(
+        "component Mail {\n    abi = processor; requires = [ports];\n    tool git-repo-pull {}\n}\n",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("a component class body") && error.contains("provide")),
+        "{errors:?}"
+    );
+}
+
 // ── tool grants ──────────────────────────────────────────────────────────────
 
 /// A top-level instance holding the `tool` statements written into it.

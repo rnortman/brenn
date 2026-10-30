@@ -22,6 +22,9 @@ pub mod no_outbound;
 #[path = "corpus/scaffold/no-ports.rs"]
 pub mod no_ports;
 
+#[path = "corpus/scaffold/provider.rs"]
+pub mod provider;
+
 /// The payload binding the generated publish handles exist for, exercised in
 /// both shapes a guest writes.
 ///

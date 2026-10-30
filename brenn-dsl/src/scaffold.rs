@@ -8,8 +8,8 @@
 //! Rust module the guest crate compiles: an enum over the inbound ports, a
 //! second one over the ports it answers sync calls on, a payload marker trait
 //! and a typed publish handle per outbound port, a call handle per `call` port,
-//! the raw names for the parts of the SDK that still take one, and a re-export
-//! per capability the spec declares. No SDK entry point for a sync or a call
+//! the raw names for the parts of the SDK that still take one, an enum over the
+//! tools the class provides, and a re-export per capability the spec declares. No SDK entry point for a sync or a call
 //! port takes a string; the string constants remain for `publish` and its kin.
 //!
 //! The specification is the source of truth, and the bytes generated from are
@@ -33,7 +33,7 @@ use std::fmt::Write as _;
 use brenn_envelope::grants::ComponentGrant;
 
 use crate::diag::Diagnostic;
-use crate::model::{ComponentClass, DocComment, File, PortDecl, StrLike};
+use crate::model::{ClassBlock, ComponentClass, DocComment, File, PortDecl, StrLike};
 use crate::resolve::{decode_str, port_dir};
 use crate::resolved::{Abi, PortDir};
 
@@ -116,6 +116,7 @@ pub fn generate(
     let class = select_class(file, class, filename)?;
     let abi = abi_of(class)?;
     let ports = PortNames::of(class, abi)?;
+    let provided = provided_variants(class)?;
     let grants = grant_modules(class)?;
 
     let mut out = String::new();
@@ -132,6 +133,7 @@ pub fn generate(
     if abi == Abi::Processor {
         write_publish_handles(&mut out, &ports);
         write_call_handles(&mut out, &ports);
+        write_provided(&mut out, &provided);
     }
     write_port_names(&mut out, &ports);
     if abi == Abi::Processor {
@@ -562,6 +564,124 @@ fn is_keyword(identifier: &str) -> bool {
     identifier == "Self" || KEYWORDS.contains(&identifier)
 }
 
+// ── provided tools ───────────────────────────────────────────────────────────
+
+/// One tool the class provides: its name as the registry knows it, and the
+/// enum variant it maps to.
+struct ProvidedName {
+    raw: String,
+    variant: String,
+}
+
+/// The tools the class's `provide` statements name, mapped to variants and
+/// checked for collisions.
+///
+/// The variant is spelled from the tool name rather than from `mcp_name`: the
+/// name is a bare word in the statement, where `mcp_name` is a value this pass
+/// has no scope to resolve. A statement that does not type is skipped, as the
+/// compiler reports it; whatever does type is emitted.
+fn provided_variants(class: &ComponentClass) -> Result<Vec<ProvidedName>, Diagnostic> {
+    let mut provided: Vec<(ProvidedName, fltk_cst_core::Span)> = Vec::new();
+    for node in &class.blocks {
+        let Ok(ClassBlock::Provide(block)) = crate::model::class_block(node) else {
+            continue;
+        };
+        let Some(name) = block.name.as_ref() else {
+            continue;
+        };
+        let raw = name.value().clone();
+        let Some(words) = split_words(&raw) else {
+            return Err(Diagnostic::at(
+                format!(
+                    "provided tool `{raw}` does not map to a Rust identifier: a tool name is \
+                     hyphen-separated groups of letters and digits, starting with a letter"
+                ),
+                name.span().clone(),
+            ));
+        };
+        let variant = words
+            .iter()
+            .map(|word| capitalize(word))
+            .collect::<String>();
+        if is_keyword(&variant) {
+            return Err(Diagnostic::at(
+                format!(
+                    "provided tool `{raw}` maps to `{variant}`, which is a Rust keyword; rename \
+                     the tool — there is no raw-identifier escape here"
+                ),
+                name.span().clone(),
+            ));
+        }
+        if let Some((prior, prior_span)) =
+            provided.iter().find(|(other, _)| other.variant == variant)
+        {
+            let mut error = Diagnostic::at(
+                format!(
+                    "provided tools `{raw}` and `{}` both map to the enum variant `{variant}`; \
+                     tool names that differ only in punctuation are one name in Rust",
+                    prior.raw
+                ),
+                name.span().clone(),
+            );
+            error
+                .related
+                .push(("it also maps here".to_string(), prior_span.clone()));
+            return Err(error);
+        }
+        provided.push((ProvidedName { raw, variant }, name.span().clone()));
+    }
+    Ok(provided.into_iter().map(|(name, _)| name).collect())
+}
+
+/// The enum over the tools the class provides, and the classifier from a
+/// delivered request to it. A class that provides nothing gets neither: unlike
+/// the port enums, which every guest dispatches on, this one exists only for a
+/// guest that serves requests.
+fn write_provided(out: &mut String, provided: &[ProvidedName]) {
+    if provided.is_empty() {
+        return;
+    }
+    write_name_enum(
+        out,
+        &NameEnum {
+            ty: "Provided",
+            doc: &["The tools the specification's `provide` statements declare."],
+            all_doc: "Every provided tool, in the order the specification declares them.",
+            name_doc: "The name the registry knows this tool by.",
+            from_name_doc: "The provided tool a name spells, or nothing where it spells none.",
+            variants: provided
+                .iter()
+                .map(|tool| NameVariant {
+                    variant: &tool.variant,
+                    raw: &tool.raw,
+                    doc: String::new(),
+                })
+                .collect(),
+        },
+    );
+    out.push_str(
+        "\n\
+         \x20   /// Classify a delivered request.\n\
+         \x20   ///\n\
+         \x20   /// The host delivers a request only for a tool this class declares, and\n\
+         \x20   /// the artifact is hash-bound to the specification that generated this\n\
+         \x20   /// module, so a tool name the specification does not declare is a host\n\
+         \x20   /// fault. The activation fails.\n\
+         \x20   #[cfg(target_arch = \"wasm32\")]\n\
+         \x20   pub fn of(\n\
+         \x20       request: &brenn_guest::provides::ToolRequest,\n\
+         \x20   ) -> Result<Provided, brenn_guest::Error> {\n\
+         \x20       Provided::from_name(&request.tool).ok_or_else(|| {\n\
+         \x20           brenn_guest::Error::failed(format!(\n\
+         \x20               \"request for tool `{}`, which this component does not provide\",\n\
+         \x20               request.tool\n\
+         \x20           ))\n\
+         \x20       })\n\
+         \x20   }\n\
+         }\n",
+    );
+}
+
 // ── grants ───────────────────────────────────────────────────────────────────
 
 /// The SDK module a grant word names, where it names one.
@@ -665,77 +785,131 @@ fn write_header(out: &mut String, spec_basename: &str, doc: Option<&DocComment>)
     );
 }
 
-fn write_in_port(out: &mut String, ports: &PortNames, abi: Abi) {
-    let inbound: Vec<&PortName> = ports.inbound().collect();
-    out.push_str(
-        "\n/// The ports the specification declares as inbound — `in` and `io`.\n\
-         #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n",
-    );
-    if inbound.is_empty() {
-        // Uninhabited, and legal: such a component is activated only for its
-        // own deferred views, which arrive on the activation rather than as a
-        // port window.
-        out.push_str("pub enum InPort {}\n");
+/// One variant of a generated name enum.
+struct NameVariant<'a> {
+    variant: &'a str,
+    /// As the specification spells it, which `name()` returns.
+    raw: &'a str,
+    /// Doc lines written above the variant, each ending in a newline.
+    doc: String,
+}
+
+/// An enum over the names a specification declares, in the one shape the
+/// scaffold emits for each of them.
+struct NameEnum<'a> {
+    ty: &'static str,
+    /// The enum's doc comment, one entry per line.
+    doc: &'static [&'static str],
+    all_doc: &'static str,
+    name_doc: &'static str,
+    from_name_doc: &'static str,
+    variants: Vec<NameVariant<'a>>,
+}
+
+/// The enum, its `ALL`, `name()` and `from_name()`, leaving the `impl` open for
+/// the caller's classifier and closing brace.
+///
+/// With no variants the enum is uninhabited, and `name()` and `from_name()` say
+/// so directly: a one-armed match over a name no variant can answer is what
+/// clippy refuses.
+fn write_name_enum(out: &mut String, spec: &NameEnum) {
+    let ty = spec.ty;
+    out.push('\n');
+    for line in spec.doc {
+        let _ = writeln!(out, "/// {line}");
+    }
+    out.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n");
+    if spec.variants.is_empty() {
+        let _ = writeln!(out, "pub enum {ty} {{}}");
     } else {
-        out.push_str("pub enum InPort {\n");
-        for port in &inbound {
-            write_doctype_doc(out, port, "    ");
-            let _ = writeln!(out, "    {},", port.variant);
+        let _ = writeln!(out, "pub enum {ty} {{");
+        for entry in &spec.variants {
+            out.push_str(&entry.doc);
+            let _ = writeln!(out, "    {},", entry.variant);
         }
         out.push_str("}\n");
     }
-    out.push_str("\nimpl InPort {\n");
+    let _ = writeln!(out, "\nimpl {ty} {{");
 
-    out.push_str("    /// Every inbound port, in the order the specification declares them.\n");
-    let variants: Vec<String> = inbound
+    let _ = writeln!(out, "    /// {}", spec.all_doc);
+    let variants: Vec<String> = spec
+        .variants
         .iter()
-        .map(|port| format!("InPort::{}", port.variant))
+        .map(|entry| format!("{ty}::{}", entry.variant))
         .collect();
     let _ = writeln!(
         out,
-        "    pub const ALL: [InPort; {}] = [{}];",
-        inbound.len(),
+        "    pub const ALL: [{ty}; {}] = [{}];",
+        spec.variants.len(),
         variants.join(", ")
     );
     out.push('\n');
 
-    out.push_str("    /// The name this port is published and bound under.\n");
+    let _ = writeln!(out, "    /// {}", spec.name_doc);
     out.push_str("    pub const fn name(self) -> &'static str {\n");
-    if inbound.is_empty() {
+    if spec.variants.is_empty() {
         out.push_str("        match self {}\n");
     } else {
         out.push_str("        match self {\n");
-        for port in &inbound {
+        for entry in &spec.variants {
             let _ = writeln!(
                 out,
-                "            InPort::{} => \"{}\",",
-                port.variant, port.raw
+                "            {ty}::{} => \"{}\",",
+                entry.variant, entry.raw
             );
         }
         out.push_str("        }\n");
     }
     out.push_str("    }\n\n");
 
-    out.push_str("    /// The port a name spells, or nothing where it spells none.\n");
-    if inbound.is_empty() {
-        // A one-armed match over a name no variant can answer is what clippy
-        // refuses, so a component with no inbound port says so directly.
-        out.push_str(
-            "    pub fn from_name(_name: &str) -> Option<InPort> {\n        None\n    }\n",
+    let _ = writeln!(out, "    /// {}", spec.from_name_doc);
+    if spec.variants.is_empty() {
+        let _ = writeln!(
+            out,
+            "    pub fn from_name(_name: &str) -> Option<{ty}> {{\n        None\n    }}"
         );
     } else {
-        out.push_str(
-            "    pub fn from_name(name: &str) -> Option<InPort> {\n        match name {\n",
+        let _ = writeln!(
+            out,
+            "    pub fn from_name(name: &str) -> Option<{ty}> {{\n        match name {{"
         );
-        for port in &inbound {
+        for entry in &spec.variants {
             let _ = writeln!(
                 out,
-                "            \"{}\" => Some(InPort::{}),",
-                port.raw, port.variant
+                "            \"{}\" => Some({ty}::{}),",
+                entry.raw, entry.variant
             );
         }
         out.push_str("            _ => None,\n        }\n    }\n");
     }
+}
+
+fn write_in_port(out: &mut String, ports: &PortNames, abi: Abi) {
+    // An empty enum is legal: such a component is activated only for its own
+    // deferred views, which arrive on the activation rather than as a port
+    // window.
+    write_name_enum(
+        out,
+        &NameEnum {
+            ty: "InPort",
+            doc: &["The ports the specification declares as inbound — `in` and `io`."],
+            all_doc: "Every inbound port, in the order the specification declares them.",
+            name_doc: "The name this port is published and bound under.",
+            from_name_doc: "The port a name spells, or nothing where it spells none.",
+            variants: ports
+                .inbound()
+                .map(|port| {
+                    let mut doc = String::new();
+                    write_doctype_doc(&mut doc, port, "    ");
+                    NameVariant {
+                        variant: &port.variant,
+                        raw: &port.raw,
+                        doc,
+                    }
+                })
+                .collect(),
+        },
+    );
 
     if abi == Abi::Processor {
         out.push_str(
@@ -766,73 +940,29 @@ fn write_in_port(out: &mut String, ports: &PortNames, abi: Abi) {
 /// what makes a gesture's two halves one spelling, because the only inhabited
 /// `SyncPortName` a guest can name is a variant of it.
 fn write_sync_port(out: &mut String, ports: &PortNames, abi: Abi) {
-    let sync: Vec<&PortName> = ports.sync().collect();
-    out.push_str(
-        "\n/// The ports the specification declares `sync` — the causes this component\n\
-         /// answers a call on.\n\
-         #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n",
-    );
-    if sync.is_empty() {
-        // Uninhabited, and legal: such a class answers no call at all. It may
-        // still be mounted, which is a cause no specification declares.
-        out.push_str("pub enum SyncPort {}\n");
-    } else {
-        out.push_str("pub enum SyncPort {\n");
-        for port in &sync {
-            let _ = writeln!(out, "    {},", port.variant);
-        }
-        out.push_str("}\n");
-    }
-    out.push_str("\nimpl SyncPort {\n");
-
-    out.push_str("    /// Every sync port, in the order the specification declares them.\n");
-    let variants: Vec<String> = sync
-        .iter()
-        .map(|port| format!("SyncPort::{}", port.variant))
-        .collect();
-    let _ = writeln!(
+    // An empty enum is legal: such a class answers no call at all. It may
+    // still be mounted, which is a cause no specification declares.
+    write_name_enum(
         out,
-        "    pub const ALL: [SyncPort; {}] = [{}];",
-        sync.len(),
-        variants.join(", ")
+        &NameEnum {
+            ty: "SyncPort",
+            doc: &[
+                "The ports the specification declares `sync` — the causes this component",
+                "answers a call on.",
+            ],
+            all_doc: "Every sync port, in the order the specification declares them.",
+            name_doc: "The name this port is called on.",
+            from_name_doc: "The port a name spells, or nothing where it spells none.",
+            variants: ports
+                .sync()
+                .map(|port| NameVariant {
+                    variant: &port.variant,
+                    raw: &port.raw,
+                    doc: String::new(),
+                })
+                .collect(),
+        },
     );
-    out.push('\n');
-
-    out.push_str("    /// The name this port is called on.\n");
-    out.push_str("    pub const fn name(self) -> &'static str {\n");
-    if sync.is_empty() {
-        out.push_str("        match self {}\n");
-    } else {
-        out.push_str("        match self {\n");
-        for port in &sync {
-            let _ = writeln!(
-                out,
-                "            SyncPort::{} => \"{}\",",
-                port.variant, port.raw
-            );
-        }
-        out.push_str("        }\n");
-    }
-    out.push_str("    }\n\n");
-
-    out.push_str("    /// The port a name spells, or nothing where it spells none.\n");
-    if sync.is_empty() {
-        out.push_str(
-            "    pub fn from_name(_name: &str) -> Option<SyncPort> {\n        None\n    }\n",
-        );
-    } else {
-        out.push_str(
-            "    pub fn from_name(name: &str) -> Option<SyncPort> {\n        match name {\n",
-        );
-        for port in &sync {
-            let _ = writeln!(
-                out,
-                "            \"{}\" => Some(SyncPort::{}),",
-                port.raw, port.variant
-            );
-        }
-        out.push_str("            _ => None,\n        }\n    }\n");
-    }
 
     if abi == Abi::Processor {
         out.push_str(

@@ -134,6 +134,121 @@ fn a_top_level_consumer_granted_calls_resolves() {
     assert!(resolved[0].grants.contains(&ComponentGrant::Calls));
 }
 
+/// One provided tool at `max_concurrency`, for the `provides` asserts.
+fn provided_tool(
+    name: &str,
+    max_concurrency: u32,
+) -> brenn_lib::messaging::config::ProvidedToolDecl {
+    brenn_lib::messaging::config::ProvidedToolDecl {
+        name: name.to_string(),
+        mcp_name: "EchoForUser".to_string(),
+        description: "Echo.".to_string(),
+        input_schema: serde_json::json!({}),
+        max_concurrency,
+        auto_approve: true,
+    }
+}
+
+/// A consumer granted `provides` and providing `tools`.
+fn provider_raw(
+    tools: Vec<brenn_lib::messaging::config::ProvidedToolDecl>,
+) -> WasmConsumerConfigRaw {
+    WasmConsumerConfigRaw {
+        slug: "provider".to_string(),
+        package: "processor-provider-test".to_string(),
+        grants: vec![ComponentGrant::Provides],
+        provides: tools,
+        ..minimal_wasm_consumer()
+    }
+}
+
+/// The provided tools ride onto the resolved consumer as declared.
+#[test]
+fn a_providing_consumer_resolves_its_tools() {
+    let dir = dir_of(vec![]);
+    let tools = vec![
+        provided_tool("echo-for-user", 2),
+        provided_tool("echo-twice", 30),
+    ];
+    let resolved = resolve(&[provider_raw(tools.clone())], &dir);
+    assert_eq!(resolved[0].provides, tools);
+    assert!(resolved[0].grants.contains(&ComponentGrant::Provides));
+}
+
+#[test]
+#[should_panic(expected = "\"provides\" is granted iff the consumer provides a tool")]
+fn a_provides_grant_with_no_provided_tool_panics() {
+    resolve(&[provider_raw(vec![])], &dir_of(vec![]));
+}
+
+#[test]
+#[should_panic(expected = "\"provides\" is granted iff the consumer provides a tool")]
+fn a_provided_tool_without_the_provides_grant_panics() {
+    let raw = WasmConsumerConfigRaw {
+        grants: vec![],
+        ..provider_raw(vec![provided_tool("echo-for-user", 1)])
+    };
+    resolve(&[raw], &dir_of(vec![]));
+}
+
+#[test]
+#[should_panic(expected = "has max_concurrency = 0")]
+fn a_provided_tool_with_no_concurrency_panics() {
+    resolve(
+        &[provider_raw(vec![provided_tool("echo-for-user", 0)])],
+        &dir_of(vec![]),
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "[[wasm_consumer]] \"provider\" declares Σ max_concurrency = 33 across \
+                           its provided tools; a provider may hold at most 32 requests in flight \
+                           (`PROVIDER_CONCURRENCY_CEILING`)"
+)]
+fn a_provider_above_the_concurrency_ceiling_panics() {
+    resolve(
+        &[provider_raw(vec![
+            provided_tool("echo-for-user", 32),
+            provided_tool("echo-twice", 1),
+        ])],
+        &dir_of(vec![]),
+    );
+}
+
+/// An operator port wearing the request inbox's name would collide with the
+/// port the substrate folds into a provider.
+#[test]
+#[should_panic(expected = "is reserved for the provider request inbox")]
+fn reserved_tool_requests_input_port_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:ch1")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "reserved-in".to_string(),
+        package: "a".to_string(),
+        subscriptions: vec![sub_raw(
+            "brenn:ch1",
+            brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT,
+        )],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// A port bound onto the request-inbox namespace is refused as the other tool
+/// namespaces are.
+#[test]
+#[should_panic(expected = "in a namespace the tool substrate owns")]
+fn a_port_bound_to_a_request_inbox_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:tool-requests/other")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "squatter".to_string(),
+        package: "a".to_string(),
+        subscriptions: vec![sub_raw("brenn:tool-requests/other", "in")],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
 /// A WASM consumer subscribing to an `ephemeral:` channel resolves the input
 /// when `ephemeral_subscribe_acl` covers it.
 #[test]

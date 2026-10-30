@@ -16,7 +16,10 @@
 //! Diagnostics accumulate rather than stopping at the first: independent errors
 //! in one document are all reported.
 
-use brenn_envelope::addressing::{TOOL_RESULT_INPUT_PORT, is_unreserved_name};
+use brenn_envelope::addressing::{
+    PROVIDER_CONCURRENCY_CEILING, PROVIDER_CONCURRENCY_REFUSAL, TOOL_REQUEST_INPUT_PORT,
+    TOOL_RESULT_INPUT_PORT, is_unreserved_name,
+};
 use brenn_envelope::grants::ComponentGrant;
 
 use std::collections::{HashMap, HashSet};
@@ -33,21 +36,22 @@ use crate::diag::{Diagnostic, check_unique, duplicate_statement, or_list, two_si
 use crate::model::{
     AclStmt, AgentBlock, AgentClass, Arg, ArgList, AssemblyDef, AssemblyItem,
     AttachmentTargetAttrs, Attr, AttrBlock, AttrMap, Binding as BindStmt, CallBinding, ChanAddr,
-    ChanRef, ChannelAttrs, ChannelDef, ComponentClass, ConstDef, FStrPart, File, GrantStmt, InTail,
-    InlineTable, InstBody, IntOrWord, IoTail, Item, LinkStmt, MapDepths, MapValues, Matcher,
-    MatcherVal, McpServerStmt, MountDef, MountStmt, MountTail, NamedAttrDef, NewStmt, OpenAttrs,
-    OutTail, Param, ParamList, PathRef, PathSeg, PortDir as DeclDir, PrincipalDef, RateLimitAttrs,
-    SectionNode, StrLike, StrLit, StrPart, SubscribeStmt, SubscribeTail, SurfaceDef, SurfaceExt,
-    ToolBlock, TypedBlock, UNBOUNDED, UseStmt, UuidPin, Value, WordList,
+    ChanRef, ChannelAttrs, ChannelDef, ClassBlock, ComponentClass, ConstDef, FStrPart, File,
+    GrantStmt, InTail, InlineTable, InstBody, IntOrWord, IoTail, Item, LinkStmt, MapDepths,
+    MapValues, Matcher, MatcherVal, McpServerStmt, MountDef, MountStmt, MountTail, NamedAttrDef,
+    NewStmt, OpenAttrs, OutTail, Param, ParamList, PathRef, PathSeg, PortDir as DeclDir,
+    PrincipalDef, ProvideAttrs, RateLimitAttrs, SectionNode, StrLike, StrLit, StrPart,
+    SubscribeStmt, SubscribeTail, SurfaceDef, SurfaceExt, ToolBlock, TypedBlock, UNBOUNDED,
+    UseStmt, UuidPin, Value, WordList,
 };
 use crate::resolved::scheme::{spellable_list, split_spellable};
 use crate::resolved::{
     Abi, ChanId, ClassRef, HandlePath, LinkId, MatcherKind, McpId, PortDir, RAcl, RAgent,
     RAttachmentTarget, RBinding, RCall, RChanRef, RChannel, RComponentInst, RConsumer,
     RContribution, RGrant, RHooks, RLink, RMatcher, RMatcherVal, RMcp, RMount, RNamed, RPin, RPort,
-    RPrincipal, RRateLimit, RRemote, RRepoMount, RSection, RStamp, RSubscribe, RSurface,
-    RSurfaceExt, RTail, RToolGrant, RTuning, RVal, RValue, RWebhook, RWebhookBlock, RWordList,
-    ResolvedConfig, StampId, StampOrigin, str_value,
+    RPrincipal, RProvidedTool, RRateLimit, RRemote, RRepoMount, RSection, RStamp, RSubscribe,
+    RSurface, RSurfaceExt, RTail, RToolGrant, RTuning, RVal, RValue, RWebhook, RWebhookBlock,
+    RWordList, ResolvedConfig, StampId, StampOrigin, str_value,
 };
 use crate::roots::{RootList, RootSource, scan_roots};
 use crate::source::SourceFile;
@@ -4574,8 +4578,12 @@ fn class_ref(
             doctype,
         });
     }
-    check_tool_result_port(class, &ports, &needs.requires, errors);
+    for inbox in RESERVED_INBOXES {
+        check_reserved_inbox(class, &ports, &needs.requires, inbox, errors);
+    }
     check_unbound_ports(&ports, errors);
+    let provides = class_provides(class, scope, errors);
+    check_provides_coupling(class, &needs.requires, &provides, errors);
     Some(ClassRef {
         name: class.name.clone(),
         abi,
@@ -4584,7 +4592,315 @@ fn class_ref(
         ports,
         spec_sha256: spec_sha256.clone(),
         package: package.clone(),
+        provides,
     })
+}
+
+/// The `provide` statements a class body holds, resolved in declaration order.
+///
+/// A statement that does not come out whole is dropped with its refusal
+/// recorded. The class itself still resolves: the refusal has already failed
+/// the compile, and an instance check run against the class would only repeat
+/// what the statement's own diagnostic says.
+fn class_provides(
+    class: &ComponentClass,
+    scope: &Scope<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<RProvidedTool> {
+    let duplicates = duplicate_sections(
+        class.blocks.iter().enumerate(),
+        "a component class",
+        crate::model::CLASS_BLOCK_KINDWORDS,
+        errors,
+    );
+    let mut resolved = Vec::new();
+    for (offset, node) in class.blocks.iter().enumerate() {
+        if duplicates.contains(&offset) {
+            continue;
+        }
+        let block = match crate::model::class_block(node) {
+            Ok(ClassBlock::Provide(block)) => *block,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        if let Some(tool) = provided_tool(block, scope, errors) {
+            resolved.push(tool);
+        }
+    }
+    check_unique(
+        resolved
+            .iter()
+            .map(|tool| (tool.mcp_name.value().as_str(), (), tool.mcp_name.span())),
+        |mcp_name, (), span, (), prior| {
+            two_site(
+                format!(
+                    "`mcp_name = \"{mcp_name}\"` is declared by two `provide` statements of \
+                     `{}`; an MCP client names a tool by it, so it names one tool",
+                    class.name.value()
+                ),
+                span.clone(),
+                "first declared here",
+                prior.clone(),
+            )
+        },
+        errors,
+    );
+    resolved
+}
+
+/// One `provide` statement: the tool's name and the facts the registry
+/// describes it with.
+///
+/// `None` where any part did not come out whole: a tool registered with a
+/// value other than the one written is a tool the author did not declare.
+fn provided_tool(
+    block: TypedBlock<ProvideAttrs>,
+    scope: &Scope<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<RProvidedTool> {
+    let TypedBlock {
+        doc: _,
+        kindword,
+        name,
+        attrs,
+        subs,
+        open: _,
+        close: _,
+        semi: _,
+    } = block;
+    refuse_subs(kindword.value(), &subs, errors);
+    let (attrs, refused) = resolve_attrs(attrs, scope, errors);
+    // The dispatch refuses a `provide` block with no name before this, so the
+    // absence here is that refusal already reported.
+    let name = name?;
+    let ProvideAttrs {
+        mcp_name,
+        description,
+        input_schema,
+        max_concurrency,
+        auto_approve,
+    } = attrs;
+    let name_ok = is_tool_name(name.value());
+    if !name_ok {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{}` is not a tool name: a tool is named in kebab case — lowercase letters \
+                 and digits in hyphen-separated runs, leading with a letter",
+                name.value()
+            ),
+            name.span().clone(),
+        ));
+    }
+    let mcp_name = provided_mcp_name(&mcp_name.value, errors);
+    let description = match str_value(&description.value, "a `description`") {
+        Ok(text) => Some(text.to_string()),
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    };
+    let input_schema = provided_input_schema(&input_schema.value, errors);
+    let max_concurrency = match &max_concurrency {
+        Some(attr) => concurrency_count(&attr.value, errors),
+        None => Some(1),
+    };
+    let auto_approve = match &auto_approve {
+        Some(attr) => match attr.value.value() {
+            RValue::Bool(flag) => Some(*flag),
+            other => {
+                errors.push(Diagnostic::at(
+                    format!("`auto_approve` is a boolean; this is {}", other.kind()),
+                    attr.value.span().clone(),
+                ));
+                None
+            }
+        },
+        None => Some(true),
+    };
+    match (
+        refused.any() || !name_ok,
+        mcp_name,
+        description,
+        input_schema,
+        max_concurrency,
+        auto_approve,
+    ) {
+        (
+            false,
+            Some(mcp_name),
+            Some(description),
+            Some(input_schema),
+            Some(max_concurrency),
+            Some(auto_approve),
+        ) => Some(RProvidedTool {
+            name,
+            mcp_name,
+            description,
+            input_schema,
+            max_concurrency,
+            auto_approve,
+        }),
+        _ => None,
+    }
+}
+
+/// A registry tool's canonical name: lowercase letters and digits in
+/// hyphen-separated runs, leading with a letter. It is the grant name and the
+/// last segment of the tool's request channel, so it admits nothing a channel
+/// name or a `tool` statement would read differently.
+fn is_tool_name(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_lowercase())
+        && text.split('-').all(|run| {
+            !run.is_empty()
+                && run
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
+}
+
+/// A `provide` statement's `mcp_name`: the bare suffix an MCP client sees,
+/// `[A-Z][A-Za-z0-9]*`, kept as written.
+fn provided_mcp_name(value: &RVal, errors: &mut Vec<Diagnostic>) -> Option<Spanned<String>> {
+    let text = match str_value(value, "an `mcp_name`") {
+        Ok(text) => text,
+        Err(error) => {
+            errors.push(error);
+            return None;
+        }
+    };
+    let shaped = text.starts_with(|c: char| c.is_ascii_uppercase())
+        && text.chars().all(|c| c.is_ascii_alphanumeric());
+    if !shaped {
+        errors.push(Diagnostic::at(
+            format!(
+                "{text:?} is not an `mcp_name`: it is the bare name an MCP client sees after \
+                 the server's prefix, an uppercase ASCII letter followed by ASCII letters and \
+                 digits"
+            ),
+            value.span().clone(),
+        ));
+        return None;
+    }
+    Some(Spanned::new(text.to_string(), value.span().clone()))
+}
+
+/// A `provide` statement's `input_schema`: JSON text that parses as an object.
+fn provided_input_schema(value: &RVal, errors: &mut Vec<Diagnostic>) -> Option<serde_json::Value> {
+    let text = match str_value(value, "an `input_schema`") {
+        Ok(text) => text,
+        Err(error) => {
+            errors.push(error);
+            return None;
+        }
+    };
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(schema @ serde_json::Value::Object(_)) => Some(schema),
+        Ok(_) => {
+            errors.push(Diagnostic::at(
+                "`input_schema` is a JSON schema, which is a JSON object; this JSON is not one",
+                value.span().clone(),
+            ));
+            None
+        }
+        Err(error) => {
+            errors.push(Diagnostic::at(
+                format!("`input_schema` is JSON text; this does not parse: {error}"),
+                value.span().clone(),
+            ));
+            None
+        }
+    }
+}
+
+/// A `provide` statement's `max_concurrency`: a count of at least one that
+/// fits a `u32`.
+///
+/// Bounded here so the class's sum, folded as a `u64` over `u32` operands,
+/// cannot wrap.
+fn concurrency_count(value: &RVal, errors: &mut Vec<Diagnostic>) -> Option<u32> {
+    match value.value() {
+        RValue::Int(count) => match u32::try_from(*count) {
+            Ok(count) if count >= 1 => Some(count),
+            _ => {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`max_concurrency` is a count of at least one that fits a `u32`; \
+                         this one is {count}"
+                    ),
+                    value.span().clone(),
+                ));
+                None
+            }
+        },
+        other => {
+            errors.push(Diagnostic::at(
+                format!("`max_concurrency` is a count; this is {}", other.kind()),
+                value.span().clone(),
+            ));
+            None
+        }
+    }
+}
+
+/// The `provides` word against the `provide` statements it consents to, and
+/// the statements' summed concurrency against what one activation can serve.
+///
+/// Read over the statements written rather than the ones that resolved, so a
+/// statement refused for its own values does not also report the word as
+/// unmatched.
+fn check_provides_coupling(
+    class: &ComponentClass,
+    requires: &[Spanned<ComponentGrant>],
+    provides: &[RProvidedTool],
+    errors: &mut Vec<Diagnostic>,
+) {
+    let word = requires
+        .iter()
+        .find(|word| *word.value() == ComponentGrant::Provides);
+    let statement = class.blocks.iter().find_map(|node| {
+        let (kindword, span) = crate::model::section_kindword(node);
+        (kindword == "provide").then(|| (crate::model::section_name(node), span))
+    });
+    match (word, statement) {
+        (Some(word), None) => errors.push(two_site(
+            format!(
+                "`{}` requires `provides` and declares no `provide` statement: the word links \
+                 the interface a provider answers through, and a class with nothing to answer \
+                 for reaches nothing",
+                class.name.value()
+            ),
+            word.span().clone(),
+            "the class is declared here",
+            class.name.span().clone(),
+        )),
+        (None, Some((tool, span))) => errors.push(Diagnostic::at(
+            format!(
+                "`{}` declares `provide {}` and does not require `provides`: the statement is \
+                 what the word consents to",
+                class.name.value(),
+                tool.unwrap_or_default()
+            ),
+            span,
+        )),
+        _ => {}
+    }
+    let sum: u64 = provides
+        .iter()
+        .map(|tool| u64::from(tool.max_concurrency))
+        .sum();
+    if sum > PROVIDER_CONCURRENCY_CEILING {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{}` declares Σ max_concurrency = {sum} across its provide statements; a \
+                 provider may hold at most {PROVIDER_CONCURRENCY_CEILING} requests in flight \
+                 (`PROVIDER_CONCURRENCY_CEILING`): {PROVIDER_CONCURRENCY_REFUSAL}",
+                class.name.value()
+            ),
+            class.name.span().clone(),
+        ));
+    }
 }
 
 /// A `sync` or `call` port's declaration, against the two annotations neither
@@ -4634,73 +4950,125 @@ fn check_unbound_ports(ports: &[RPort], errors: &mut Vec<Diagnostic>) {
     }
 }
 
-/// The `tool-results` port, which is the class's to declare and nobody's to
-/// bind, checked against the `tools` requirement that fills it.
+/// A port the substrate delivers on and no instance binds, reserved to the
+/// grant word whose wiring fills it.
+struct ReservedInbox {
+    /// The port's name.
+    port: &'static str,
+    /// The word whose grant folds the port into a consumer.
+    word: ComponentGrant,
+    /// What the port is, for a refusal that has to say so.
+    what: &'static str,
+    /// What arrives on it.
+    delivers: &'static str,
+    /// One of what arrives, for the first-delivery failure.
+    first: &'static str,
+    /// What the substrate wires the port from.
+    wired_from: &'static str,
+    /// The refusal of an instance binding the port, after "port `<name>` is
+    /// the <what>, ": where the wiring comes from and how the window is tuned.
+    unbindable: &'static str,
+}
+
+/// The async tool-result inbox, matched by `tools`.
+const RESULT_INBOX: ReservedInbox = ReservedInbox {
+    port: TOOL_RESULT_INPUT_PORT,
+    word: ComponentGrant::Tools,
+    what: "async tool-result inbox",
+    delivers: "async tool results",
+    first: "result",
+    wired_from: "a component's tool grants",
+    unbindable: "wired by the substrate from this instance's `tool` grants; nothing binds it. \
+                 Its window is tuned with `channel at \"brenn:tool-results/<slug>\" { … }`",
+};
+
+/// The tool-request inbox, matched by `provides`.
+const REQUEST_INBOX: ReservedInbox = ReservedInbox {
+    port: TOOL_REQUEST_INPUT_PORT,
+    word: ComponentGrant::Provides,
+    what: "tool-request inbox",
+    delivers: "calls to the tools it provides",
+    first: "request",
+    wired_from: "a class's `provide` statements",
+    unbindable: "wired by the substrate from the class's `provide` statements; nothing binds \
+                 it, and its window is the statements' summed `max_concurrency`",
+};
+
+/// Every reserved inbox, for the checks that ask whether a port name is one.
+const RESERVED_INBOXES: [&ReservedInbox; 2] = [&RESULT_INBOX, &REQUEST_INBOX];
+
+/// A reserved inbox port, which is the class's to declare and nobody's to
+/// bind, checked against the requirement that fills it.
 ///
-/// The substrate folds an input port of this name into every consumer holding
-/// an async tool grant and delivers results on it. So the name carries one
-/// meaning: a class either declares it as the inbox, matched by the `tools`
-/// word, or does not use the name at all. Both halves of the coupling are
-/// refused, because a `tools` class without the declaration compiles and then
-/// fails its first result activation in the guest, where the port it was
-/// handed is one it never declared.
-fn check_tool_result_port(
+/// The substrate folds an input port of the inbox's name into every consumer
+/// holding the matching grant and delivers on it. So the name carries one
+/// meaning: a class either declares it as the inbox, matched by the word, or
+/// does not use the name at all. Both halves of the coupling are refused,
+/// because a class with the word and without the declaration compiles and then
+/// fails its first delivery in the guest, where the port it was handed is one
+/// it never declared.
+fn check_reserved_inbox(
     class: &ComponentClass,
     ports: &[RPort],
     requires: &[Spanned<ComponentGrant>],
+    inbox: &ReservedInbox,
     errors: &mut Vec<Diagnostic>,
 ) {
-    let tools = requires
-        .iter()
-        .find(|word| *word.value() == ComponentGrant::Tools);
-    let inbox = ports
-        .iter()
-        .find(|port| port.name.value() == TOOL_RESULT_INPUT_PORT);
-    let Some(inbox) = inbox else {
-        if let Some(tools) = tools {
+    let ReservedInbox {
+        port: name,
+        word,
+        what,
+        delivers,
+        first,
+        wired_from,
+        unbindable: _,
+    } = inbox;
+    let word_text = word.word();
+    let required = requires.iter().find(|held| held.value() == word);
+    let declared = ports.iter().find(|port| port.name.value() == name);
+    let Some(declared) = declared else {
+        if let Some(required) = required {
             errors.push(two_site(
                 format!(
-                    "`{}` requires `tools` but declares no `in {TOOL_RESULT_INPUT_PORT};`; \
-                     the substrate delivers async tool results as activations on that port, \
-                     and a component that does not declare it fails the first result it is \
-                     handed",
+                    "`{}` requires `{word_text}` but declares no `in {name};`; the substrate \
+                     delivers {delivers} as activations on that port, and a component that \
+                     does not declare it fails the first {first} it is handed",
                     class.name.value()
                 ),
-                tools.span().clone(),
+                required.span().clone(),
                 "the class is declared here",
                 class.name.span().clone(),
             ));
         }
         return;
     };
-    if inbox.dir != PortDir::In {
+    if declared.dir != PortDir::In {
         errors.push(Diagnostic::at(
             format!(
-                "`{TOOL_RESULT_INPUT_PORT}` is the async tool-result inbox, an `in` port the \
-                 substrate delivers on; it is not an `{}` port",
-                inbox.dir.as_str()
+                "`{name}` is the {what}, an `in` port the substrate delivers on; it is not an \
+                 `{}` port",
+                declared.dir.as_str()
             ),
-            inbox.name.span().clone(),
+            declared.name.span().clone(),
         ));
     }
-    if inbox.optional {
+    if declared.optional {
         errors.push(Diagnostic::at(
             format!(
-                "`{TOOL_RESULT_INPUT_PORT}` cannot be `optional`: its presence is decided by \
-                 the class's `tools` requirement, not by an instance, which never binds it"
+                "`{name}` cannot be `optional`: its presence is decided by the class's \
+                 `{word_text}` requirement, not by an instance, which never binds it"
             ),
-            inbox.name.span().clone(),
+            declared.name.span().clone(),
         ));
     }
-    if tools.is_none() {
+    if required.is_none() {
         errors.push(two_site(
             format!(
-                "`{}` declares `{TOOL_RESULT_INPUT_PORT}` but does not require `tools`; the \
-                 substrate wires that port from a component's tool grants, so nothing would \
-                 ever deliver on it",
+                "`{}` declares `{name}` but does not require `{word_text}`; the substrate \
+                 wires that port from {wired_from}, so nothing would ever deliver on it",
                 class.name.value()
             ),
-            inbox.name.span().clone(),
+            declared.name.span().clone(),
             "the class is declared here",
             class.name.span().clone(),
         ));
@@ -5407,7 +5775,9 @@ fn bound_port(binding: &BindStmt) -> &Spanned<String> {
 /// already closed — the port exists only on a class requiring `tools`, an
 /// instance of such a class must grant `tools` to fit its spec, and the `tools`
 /// word must come with at least one `tool` statement, which is what the fold-in
-/// keys on.
+/// keys on. `tool-requests` is skipped on the same chain: the port exists only
+/// on a class requiring `provides`, which the class's own `provide` statements
+/// require.
 fn check_required_ports(
     class: &ClassRef,
     named_ports: &[String],
@@ -5422,7 +5792,9 @@ fn check_required_ports(
         // the component is written for.
         if port.optional
             || matches!(port.dir, PortDir::Sync | PortDir::Call)
-            || port.name.value() == TOOL_RESULT_INPUT_PORT
+            || RESERVED_INBOXES
+                .iter()
+                .any(|inbox| port.name.value() == inbox.port)
             || named_ports.iter().any(|named| named == port.name.value())
         {
             continue;
@@ -5670,12 +6042,14 @@ fn check_port(
     // Ahead of the class-port lookup, so the answer is what to do instead
     // rather than the direction the class declared. The binding is dropped and
     // the instance withheld, as an undeclared port's is.
-    if port.value() == TOOL_RESULT_INPUT_PORT {
+    if let Some(inbox) = RESERVED_INBOXES
+        .iter()
+        .find(|inbox| port.value() == inbox.port)
+    {
         errors.push(Diagnostic::at(
             format!(
-                "port `{TOOL_RESULT_INPUT_PORT}` is the async tool-result inbox, wired by the \
-                 substrate from this instance's `tool` grants; nothing binds it. Its window is \
-                 tuned with `channel at \"brenn:tool-results/<slug>\" {{ … }}`"
+                "port `{}` is the {}, {}",
+                inbox.port, inbox.what, inbox.unbindable
             ),
             port.span().clone(),
         ));

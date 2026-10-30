@@ -435,6 +435,17 @@ fn a_named_channel_in_the_auto_namespace_panics() {
 }
 
 #[test]
+#[should_panic(
+    expected = "reserved namespace (`tools`, `tool-results` or `tool-requests` are \
+                owned by the tool substrate"
+)]
+fn a_named_channel_in_the_tool_requests_namespace_panics_naming_it() {
+    let mut consumer = timer_consumer("etl");
+    consumer.io_ports[0].channel = Some("brenn:tool-requests.mine".to_string());
+    lower_auto_wiring(&[], &[consumer], &[], &[], &globals());
+}
+
+#[test]
 #[should_panic(expected = "carries no scheme prefix")]
 fn a_named_channel_without_a_scheme_panics() {
     let mut consumer = timer_consumer("etl");

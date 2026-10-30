@@ -1,0 +1,19 @@
+/// A component that serves registry tools: the `Provided` enum, its request
+/// classifier, and the `provides` re-export.
+component ScaffoldProvider {
+  abi = processor;
+  requires = [ports, log, tools, provides];
+  in tool-results;
+  in tool-requests;
+  provide echo-for-user {
+    mcp_name = "EchoForUser";
+    description = "Echo the arguments back.";
+    input_schema = """{ "type": "object" }""";
+    max_concurrency = 2;
+  }
+  provide look-up {
+    mcp_name = "LookUp";
+    description = "Look a thing up.";
+    input_schema = """{ "type": "object" }""";
+  }
+}

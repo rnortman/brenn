@@ -527,8 +527,11 @@ fn a_class_with_no_inbound_port_yields_an_uninhabited_enum() {
 #[test]
 fn every_item_naming_the_sdk_is_gated_to_wasm32() {
     let module = module(
-        &processor("  in orders;\n  out results;\n")
-            .replace("requires = [ports]", "requires = [ports, log, dom]"),
+        &processor(&format!(
+            "  in orders;\n  out results;\n{}",
+            provide("look-up")
+        ))
+        .replace("requires = [ports]", "requires = [ports, log, dom]"),
         None,
     );
     let gate = "#[cfg(target_arch = \"wasm32\")]";
@@ -572,6 +575,68 @@ fn every_item_naming_the_sdk_is_gated_to_wasm32() {
     );
 }
 
+// ── provided tools ───────────────────────────────────────────────────────────
+
+/// A `provide` statement for the named tool, with every required attribute.
+fn provide(tool: &str) -> String {
+    format!(
+        "  provide {tool} {{\n    mcp_name = \"Tool\";\n    description = \"A tool.\";\n    \
+         input_schema = \"\"\"{{}}\"\"\";\n  }}\n"
+    )
+}
+
+#[test]
+fn provided_tools_map_to_an_enum_with_a_request_classifier() {
+    let module = module(&processor(&provide("look-up")), None);
+    assert!(module.contains("pub enum Provided {"), "{module}");
+    assert!(
+        module.contains("Provided::LookUp => \"look-up\""),
+        "{module}"
+    );
+    assert!(
+        module.contains("\"look-up\" => Some(Provided::LookUp)"),
+        "{module}"
+    );
+    assert!(
+        module.contains("request: &brenn_guest::provides::ToolRequest"),
+        "{module}"
+    );
+}
+
+#[test]
+fn a_class_providing_nothing_has_no_provided_enum() {
+    let module = module(&processor("  in orders;\n"), None);
+    assert!(!module.contains("Provided"), "{module}");
+}
+
+#[test]
+fn provided_tools_differing_only_in_punctuation_collide() {
+    let error = refusal(
+        &processor(&format!("{}{}", provide("a-1b"), provide("a1b"))),
+        None,
+    );
+    assert!(
+        error
+            .message
+            .contains("`a1b` and `a-1b` both map to the enum variant `A1b`"),
+        "{}",
+        error.message
+    );
+    assert_eq!(error.related.len(), 1, "{}", error.render());
+}
+
+#[test]
+fn a_provided_tool_spelling_a_keyword_is_refused() {
+    let error = refusal(&processor(&provide("self")), None);
+    assert!(
+        error
+            .message
+            .contains("provided tool `self` maps to `Self`, which is a Rust keyword"),
+        "{}",
+        error.message
+    );
+}
+
 /// The port names are plain Rust and reach both builds, which is what lets a
 /// host-tested state machine and its help generator name their ports through
 /// the specification rather than by literal.
@@ -603,7 +668,13 @@ fn the_port_names_reach_the_host_build() {
 /// because it never resolves.
 #[test]
 fn every_golden_fixture_generates() {
-    for name in ["processor-full", "no-inbound", "no-outbound", "no-ports"] {
+    for name in [
+        "processor-full",
+        "no-inbound",
+        "no-outbound",
+        "no-ports",
+        "provider",
+    ] {
         let source = support::corpus_text(&format!("scaffold/{name}.brenn"));
         let file = parse_str(&source, name).unwrap_or_else(|error| panic!("{}", error.render()));
         generate(&file, None, name, name)

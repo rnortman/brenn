@@ -1,0 +1,16 @@
+/// Provided-tool test fixture. Serves `echo-for-user` on its request inbox,
+/// choosing by the request's `mode` argument whether to answer at once, act for
+/// the caller's user through a nested `api-request`, issue a plain call, try a
+/// made-up id, or fail the activation.
+component ProcessorProviderTest {
+  abi = processor;
+  requires = [tools, provides];
+  in tool-results;
+  in tool-requests;
+  provide echo-for-user {
+    mcp_name = "EchoForUser";
+    description = "Test fixture: answer by the `mode` argument, for the caller's user.";
+    input_schema = """{ "type": "object", "properties": { "mode": { "type": "string" }, "request": { "type": "object" } }, "required": ["mode"] }""";
+    max_concurrency = 2;
+  }
+}

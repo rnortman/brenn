@@ -1,6 +1,6 @@
 load("@wasm_crates//:defs.bzl", "all_crate_deps")
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load("//bazel/wasm:defs.bzl", "wasm_component", "wasm_guest_cdylib")
+load("//bazel/wasm:defs.bzl", "grant_parity_test", "wasm_component", "wasm_guest_cdylib")
 
 policy_srcs()
 
@@ -19,4 +19,12 @@ wasm_component(
     name = "component",
     module = ":brenn-processor-provider-test",
     visibility = ["//visibility:public"],
+)
+
+# The specification is held to the artifact's imports here rather than through
+# `COMPONENT_PACKAGES`: the fixture is test-only and never packaged.
+grant_parity_test(
+    name = "grant_parity",
+    component = ":component",
+    spec = "spec/processor-provider-test.brenn",
 )

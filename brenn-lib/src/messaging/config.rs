@@ -553,6 +553,10 @@ pub struct WasmConsumerConfigRaw {
     /// wired to one top-level peer's `sync` port. Carried by a statement, not a
     /// key.
     pub calls: Vec<WasmConsumerCallRaw>,
+    /// The registry tools this instance's class provides, in declaration
+    /// order. Not a body key: the class's `provide` statements, carried through
+    /// lowering. Non-empty iff `grants` holds `provides`.
+    pub provides: Vec<ProvidedToolDecl>,
     /// Capability interfaces to link for this component (deny-by-default).
     /// Required — no default. The operator states intent explicitly; an unstated
     /// `grants` is refused. Empty list = zero-capability consumer.
@@ -682,6 +686,25 @@ pub struct WasmConsumerConfigRaw {
     pub tool_grants: Vec<crate::tools::config::ToolGrantRaw>,
 }
 
+/// One `provide` statement of a consumer's class: a registry tool the
+/// instance serves.
+///
+/// The same shape raw and resolved — a class fact with nothing for the
+/// operator to state, so resolution has nothing to add to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvidedToolDecl {
+    /// The tool's canonical registry name (kebab-case).
+    pub name: String,
+    /// The bare MCP suffix (`GmailSearch`), as the class wrote it.
+    pub mcp_name: String,
+    pub description: String,
+    /// A JSON object: the schema the tool's arguments are described by.
+    pub input_schema: serde_json::Value,
+    /// The most calls of this tool outstanding at once; at least one.
+    pub max_concurrency: u32,
+    pub auto_approve: bool,
+}
+
 /// One `call` binding of a top-level consumer (`call <port> -> <slug>.<port>`).
 ///
 /// A call names an instance, never a channel, so this carries no address and no
@@ -713,6 +736,7 @@ impl WasmConsumerConfigRaw {
             sync_ports: vec![],
             call_ports: vec![],
             calls: vec![],
+            provides: vec![],
             grants: vec![],
             store_path: None,
             store_size_limit: None,
@@ -1635,6 +1659,9 @@ pub struct ResolvedWasmConsumer {
     /// leaves unbound is absent here, and the host answers its caller
     /// `unwired`.
     pub calls: Vec<WasmCallPort>,
+    /// The registry tools this consumer provides, in declaration order.
+    /// Non-empty iff `grants` holds `Provides`.
+    pub provides: Vec<ProvidedToolDecl>,
     /// Granted capability interfaces for this component (deny-by-default).
     /// Determines which host functions are linked at component load time.
     pub grants: BTreeSet<ComponentGrant>,
@@ -2331,8 +2358,9 @@ pub const TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(16);
 pub enum SystemChannelFamily {
     /// `webhook:<slug>` and `mqtt:<client>:<topic>` — inbound facts from outside.
     Ingress,
-    /// `brenn:tools/<tool>` and `brenn:tool-results/<slug>` — the async-tool
-    /// request/result substrate.
+    /// `brenn:tools/<tool>`, `brenn:tool-results/<slug>` and
+    /// `brenn:tool-requests/<slug>` — the async-tool request/result substrate
+    /// and the per-provider request inboxes.
     Tool,
 }
 

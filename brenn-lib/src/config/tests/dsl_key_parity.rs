@@ -87,6 +87,7 @@ fn consumer_keys_account_for_every_field() {
         sync_ports,
         call_ports,
         calls,
+        provides,
         grants,
         store_path,
         store_size_limit,
@@ -144,6 +145,10 @@ fn consumer_keys_account_for_every_field() {
         (
             "call_ports",
             "is the class's declared call vocabulary, carried through lowering",
+        ),
+        (
+            "provides",
+            "is the class's `provide` statements, carried through lowering",
         ),
     ];
     assert_parity("consumer", &fields, &CONSUMER_KEYS, &omitted);

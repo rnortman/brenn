@@ -284,6 +284,8 @@ pub struct ComponentClass {
     pub name: Spanned<String>,
     pub attrs: ComponentClassAttrs,
     pub ports: Vec<PortDecl>,
+    /// The named statements — `provide` — held until their kindword is read.
+    pub blocks: Vec<SectionNode>,
 }
 
 /// One port of a component class, with its optional doctype annotation.
@@ -1568,6 +1570,22 @@ vocabulary! {
         req sustained_per_minute: V,
     }
 
+    /// `provide gmail-search { mcp_name = "GmailSearch"; … }` — one registry
+    /// tool a component class answers calls to.
+    ///
+    /// The statement's name is the tool's canonical name. `mcp_name` is the
+    /// bare suffix an MCP client sees after the server prefix; `input_schema`
+    /// is JSON text, the one place a `.brenn` file carries JSON, because an
+    /// inline table cannot spell a `$schema`-style key. What each value must
+    /// be is the resolver's to check: the vocabulary closes the key set.
+    struct ProvideAttrs<V> {
+        req mcp_name: V,
+        req description: V,
+        req input_schema: V,
+        opt max_concurrency: V,
+        opt auto_approve: V,
+    }
+
     /// The `handler` block of an attachment target: the union of every handler
     /// type's fields.
     ///
@@ -1772,6 +1790,17 @@ kindword_dispatch! {
     fn instance_block;
     context "an instance body";
     "tool" named => Tool(OpenAttrs),
+}
+
+kindword_dispatch! {
+    /// A named statement of a `component` class body, typed by its kindword.
+    enum ClassBlock;
+    /// The kindwords a `component` class body admits.
+    const CLASS_BLOCK_KINDWORDS;
+    /// Type a `component` class body's held statement.
+    fn class_block;
+    context "a component class body";
+    "provide" named => Provide(ProvideAttrs),
 }
 
 kindword_dispatch! {

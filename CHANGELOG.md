@@ -34,9 +34,23 @@ All notable changes to Brenn are documented here.
   serve tools to the assistant and to other components. It lets a
   component answer a pending tool request and make tool calls on behalf of
   the user it is serving; the guest SDK gains a matching `provides` module.
-  A component cannot yet declare a tool it provides, so nothing changes for
-  existing deployments. Also fixed: a top-level WASM consumer granted
-  `calls` no longer crashes Brenn at boot.
+  Nothing changes for existing deployments. Also fixed: a top-level WASM
+  consumer granted `calls` no longer crashes Brenn at boot.
+
+- **Component classes can declare the tools they provide.** A new `provide`
+  statement in a class spec names a tool, the name the assistant sees it by
+  (`mcp_name`), a description, its input schema (JSON text) and how many
+  requests it may serve at once (`max_concurrency`, at most 32 summed over
+  the class). It goes with the `provides` grant word and an
+  `in tool-requests` port. `config-check` refuses a malformed declaration,
+  two instances providing the same tool, and an instance granted a tool it
+  provides itself; generated component scaffolding gains a `Provided` enum.
+  Brenn does not yet register or serve these tools. Adding, removing or
+  changing a declaration needs a restart. Channel names under
+  `tool-requests` are now reserved, like `tools` and `tool-results`.
+
+- Bumped wasmtime from 48.0.7 to 48.0.8, clearing RUSTSEC-2026-0422,
+  RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
 
 - **Building Brenn no longer loads the host's `libxml2`.** The hermetic C
   toolchain is now LLVM 23.1.4 (toolchains_llvm 1.12.0); LLVM 22.1.8's linker

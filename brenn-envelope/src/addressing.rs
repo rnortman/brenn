@@ -95,10 +95,11 @@ pub fn nondurable_channel_uuid(scheme: ChannelScheme, name: &str) -> Uuid {
 // ---------------------------------------------------------------------------
 
 /// Reserved channel-name segments owned by the tool substrate: the async-tool
-/// request channels (`brenn:tools/<tool>`) and the per-participant result
-/// inboxes (`brenn:tool-results/<slug>`). Operator-declared channel addresses
-/// may not fall in these namespaces.
-pub const RESERVED_CHANNEL_SEGMENTS: [&str; 2] = ["tools", "tool-results"];
+/// request channels (`brenn:tools/<tool>`), the per-participant result
+/// inboxes (`brenn:tool-results/<slug>`) and the per-provider request inboxes
+/// (`brenn:tool-requests/<slug>`). Operator-declared channel addresses may not
+/// fall in these namespaces.
+pub const RESERVED_CHANNEL_SEGMENTS: [&str; 3] = ["tools", "tool-results", "tool-requests"];
 
 /// Reserved namespace of the async-tool request channels (`brenn:tools/<tool>`).
 pub const TOOLS_NAMESPACE: &str = "tools/";
@@ -109,6 +110,10 @@ pub const TOOLS_NAMESPACE: &str = "tools/";
 /// language classifies a tuning block by this namespace and cannot see that
 /// crate.
 pub const TOOL_RESULTS_NAMESPACE: &str = "tool-results/";
+/// Reserved namespace of the per-provider request inboxes
+/// (`brenn:tool-requests/<slug>`), beside [`TOOL_RESULTS_NAMESPACE`] for the
+/// same reason.
+pub const TOOL_REQUESTS_NAMESPACE: &str = "tool-requests/";
 
 /// Logical input port a consumer's async tool-result inbox is delivered on.
 ///
@@ -125,6 +130,26 @@ pub const TOOL_RESULT_INPUT_PORT: &str = "tool-results";
 /// same reason: the guest SDK, the config language and the tool substrate must
 /// agree on it.
 pub const TOOL_REQUEST_INPUT_PORT: &str = "tool-requests";
+
+/// The most requests a providing instance may hold in flight: the sum of
+/// `max_concurrency` over its class's `provide` statements.
+///
+/// Derived from what one activation can do. A provider can be handed its whole
+/// request window as new requests in one activation and serves each with one
+/// nested call, so the window must fit in half an activation's tool-call
+/// budget, leaving the other half for whatever else that activation calls.
+/// Lives here because the config language refuses a class above it and
+/// depends on nothing but this crate; the budgets it derives from are pinned to
+/// it by a compile-time assertion in `brenn-wasm`.
+pub const PROVIDER_CONCURRENCY_CEILING: u64 = 32;
+
+/// The reason half of every refusal of a provider above
+/// [`PROVIDER_CONCURRENCY_CEILING`], so the operator reads the same derivation
+/// wherever the sum is refused. Callers state the sum, the ceiling and the
+/// constant's name ahead of it.
+pub const PROVIDER_CONCURRENCY_REFUSAL: &str = "one activation can be handed a full window of \
+     new requests and serves each with one nested call, and the ceiling is half an activation's \
+     tool-call budget so the activation keeps calls for its other work";
 
 /// Does `address` (a scheme-stripped `brenn:` channel name) fall in a reserved
 /// tool namespace? True for an exact segment match (`"tools"`) or a leading
@@ -163,7 +188,7 @@ pub fn in_a_tool_namespace(name: &str) -> bool {
 pub const AUTO_CHANNEL_SEGMENT: &str = "auto";
 
 /// Does `name` (a scheme-stripped channel name) fall in a namespace reserved by
-/// the host — the tool substrate's (`tools`, `tool-results`) or the
+/// the host — the tool substrate's (`tools`, `tool-results`, `tool-requests`) or the
 /// auto-channel machinery's (`auto`)?
 ///
 /// True for an exact segment match or a leading segment followed by a `.`/`/`
@@ -297,17 +322,25 @@ pub fn ends_at_tuning_boundary(pattern: &str) -> bool {
 /// set renders it from the const, so widening [`MATCHER_BOUNDARIES`] cannot
 /// leave a message naming the old set.
 pub fn matcher_boundary_list() -> String {
-    boundary_list(&MATCHER_BOUNDARIES)
+    quoted_list(&MATCHER_BOUNDARIES)
 }
 
 /// The tuning boundaries as a refusal lists them, in the order of
 /// [`TUNING_BOUNDARIES`] so the last one named is the mqtt client colon.
 pub fn tuning_boundary_list() -> String {
-    boundary_list(&TUNING_BOUNDARIES)
+    quoted_list(&TUNING_BOUNDARIES)
 }
 
-fn boundary_list(boundaries: &[char]) -> String {
-    let quoted: Vec<String> = boundaries.iter().map(|b| format!("`{b}`")).collect();
+/// The reserved channel-name segments as a refusal lists them:
+/// `` `tools`, `tool-results` or `tool-requests` ``, in the order of
+/// [`RESERVED_CHANNEL_SEGMENTS`].
+pub fn reserved_segment_list() -> String {
+    quoted_list(&RESERVED_CHANNEL_SEGMENTS)
+}
+
+/// Renders `items` backquoted and joined as "`a`, `b` or `c`".
+fn quoted_list<T: core::fmt::Display>(items: &[T]) -> String {
+    let quoted: Vec<String> = items.iter().map(|b| format!("`{b}`")).collect();
     match quoted.split_last() {
         Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
         Some((last, _)) => last.clone(),
@@ -644,20 +677,28 @@ mod tests {
         assert!(is_reserved_channel("tool-results"));
         assert!(is_reserved_channel("tool-results/pfin"));
         assert!(is_reserved_channel("tool-results.pfin"));
+        assert!(is_reserved_channel("tool-requests"));
+        assert!(is_reserved_channel("tool-requests/gmail"));
+        assert!(is_reserved_channel("tool-requests.gmail"));
         // Sibling names sharing a byte prefix are NOT reserved.
         assert!(!is_reserved_channel("toolsmith"));
         assert!(!is_reserved_channel("tool"));
         assert!(!is_reserved_channel("tool-results-archive"));
+        assert!(!is_reserved_channel("tool-requests-log"));
         assert!(!is_reserved_channel("alerts.high"));
     }
 
     #[test]
     fn namespace_prefixes_are_reserved_channel_segments() {
-        // Two independently written spellings of the same two namespaces: the
+        // Two independently written spellings of the same namespaces: the
         // prefixes the substrate formats addresses with, and the segments
         // `is_reserved_channel` refuses declarations in. Compared by content so
         // a segment added later does not break the assertion.
-        for namespace in [TOOLS_NAMESPACE, TOOL_RESULTS_NAMESPACE] {
+        for namespace in [
+            TOOLS_NAMESPACE,
+            TOOL_RESULTS_NAMESPACE,
+            TOOL_REQUESTS_NAMESPACE,
+        ] {
             let segment = namespace.trim_end_matches('/');
             assert!(
                 RESERVED_CHANNEL_SEGMENTS.contains(&segment),
@@ -671,6 +712,8 @@ mod tests {
         // Only the `/` form names a channel the substrate mints.
         assert!(in_a_tool_namespace("tools/git-repo-pull"));
         assert!(in_a_tool_namespace("tool-results/pfin"));
+        assert!(in_a_tool_namespace("tool-requests/gmail"));
+        assert!(!in_a_tool_namespace("tool-requests"));
         assert!(!in_a_tool_namespace("tools"));
         assert!(!in_a_tool_namespace("tools.git-repo-pull"));
         assert!(!in_a_tool_namespace("toolsmith/x"));
@@ -692,11 +735,15 @@ mod tests {
     }
 
     #[test]
-    fn the_boundary_sets_read_as_a_refusal_names_them() {
-        // The rendered text is the point of these two: a refusal that names the
+    fn the_reserved_sets_read_as_a_refusal_names_them() {
+        // The rendered text is the point of these: a refusal that names the
         // set is only actionable if it names it the way an author writes it.
         assert_eq!(matcher_boundary_list(), "`/` or `.`");
         assert_eq!(tuning_boundary_list(), "`/`, `.` or `:`");
+        assert_eq!(
+            reserved_segment_list(),
+            "`tools`, `tool-results` or `tool-requests`"
+        );
     }
 
     #[test]

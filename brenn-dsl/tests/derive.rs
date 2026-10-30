@@ -1687,3 +1687,169 @@ fn an_agent_cannot_subscribe_to_a_link() {
         "{refusals:?}"
     );
 }
+
+// ── provided tools: what only the whole document shows ───────────────────────
+
+/// A packaged providing class `name` with one `provide` statement.
+fn provider_class(name: &str, tool: &str, mcp_name: &str) -> String {
+    format!(
+        "component {name} {{\n    abi = processor; requires = [provides];\n    \
+         in tool-requests;\n    provide {tool} {{\n        mcp_name = \"{mcp_name}\";\n        \
+         description = \"Search.\";\n        input_schema = \"\"\"{{}}\"\"\";\n    }}\n}}\n"
+    )
+}
+
+/// A top-level instance of `class` granted `provides`.
+fn provider_instance(slug: &str, class: &str) -> String {
+    format!("new {slug}: {class} {{\n    grants = [provides];\n}}\n")
+}
+
+#[test]
+fn a_single_provider_derives() {
+    let config = derived(&format!(
+        "{}{}{}{}",
+        packaged!(),
+        provider_class("Mail", "mail-search", "MailSearch"),
+        packaged!(),
+        provider_instance("alice_mail", "Mail"),
+    ));
+    assert_eq!(config.resolved.consumers[0].class.provides.len(), 1);
+}
+
+/// Each instance would register the class's tools, so a providing class is
+/// instantiated once.
+#[test]
+fn two_instances_of_one_providing_class_are_refused() {
+    let source = format!(
+        "{}{}{}{}{}",
+        packaged!(),
+        provider_class("Mail", "mail-search", "MailSearch"),
+        packaged!(),
+        provider_instance("alice_mail", "Mail"),
+        provider_instance("bob_mail", "Mail"),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(
+        support::messages(&errors),
+        [
+            "consumer `bob_mail` provides tool `mail-search`, which consumer `alice_mail` \
+             already provides: the registry holds one tool per name, and a providing class is \
+             instantiated at most once",
+            "consumer `bob_mail` provides mcp_name `MailSearch`, which consumer `alice_mail` \
+             already provides: the registry holds one tool per name, and a providing class is \
+             instantiated at most once",
+        ]
+    );
+    assert_eq!(errors[0].line_col(), support::at(&source, "bob_mail"));
+    assert_eq!(errors[0].related[0].0, "`alice_mail` provides it here");
+}
+
+/// Two classes may not both provide one name, in either key.
+#[test]
+fn two_classes_providing_one_name_are_refused() {
+    let refusal = derive_refusal(&format!(
+        "{}{}{}{}{}{}",
+        packaged!(),
+        provider_class("Mail", "mail-search", "MailSearch"),
+        provider_class("Post", "post-search", "MailSearch"),
+        packaged!(),
+        provider_instance("alice_mail", "Mail"),
+        provider_instance("alice_post", "Post"),
+    ));
+    assert_eq!(
+        refusal,
+        "consumer `alice_post` provides mcp_name `MailSearch`, which consumer `alice_mail` \
+         already provides: the registry holds one tool per name, and a providing class is \
+         instantiated at most once"
+    );
+    let refusal = derive_refusal(&format!(
+        "{}{}{}{}{}{}",
+        packaged!(),
+        provider_class("Mail", "mail-search", "MailSearch"),
+        provider_class("Post", "mail-search", "PostSearch"),
+        packaged!(),
+        provider_instance("alice_mail", "Mail"),
+        provider_instance("alice_post", "Post"),
+    ));
+    assert!(
+        refusal.starts_with("consumer `alice_post` provides tool `mail-search`"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn a_provider_granted_its_own_tool_is_refused() {
+    let source = format!(
+        "{}{}{}{}",
+        packaged!(),
+        concat!(
+            "component Mail {\n    abi = processor; requires = [provides, tools];\n",
+            "    in tool-requests;\n    in tool-results;\n",
+            "    provide mail-search {\n        mcp_name = \"MailSearch\";\n",
+            "        description = \"Search.\";\n        input_schema = \"\"\"{}\"\"\";\n    }\n",
+            "}\n",
+        ),
+        packaged!(),
+        "new alice_mail: Mail {\n    grants = [provides, tools];\n    tool mail-search {}\n}\n",
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(
+        support::messages(&errors),
+        [
+            "consumer `alice_mail` states a `tool mail-search` grant, and its class `Mail` \
+          provides that tool: a provider calling itself is a loop"
+        ]
+    );
+    assert_eq!(errors[0].line_col(), support::at(&source, "mail-search {}"));
+    assert_eq!(errors[0].related[0].0, "provided here");
+}
+
+/// A surface host links no tool substrate, so a providing class is a backend
+/// component.
+#[test]
+fn a_provider_placed_on_a_surface_is_refused() {
+    let refusals = derive_refusals(&format!(
+        "{}surface alice_desk {{\n    grants = [];\n    \
+         new mail: Mail {{ chrome = true; grants = [provides]; }}\n}}\n",
+        provider_class("Mail", "mail-search", "MailSearch"),
+    ));
+    assert!(
+        refusals.contains(
+            &"`provides` is backend-only: the surface host links no tool substrate to serve \
+              requests from"
+                .to_string()
+        ),
+        "{refusals:?}"
+    );
+}
+
+/// A provider's request inbox is sized by its class, so no block tunes it.
+#[test]
+fn a_block_tuning_a_request_inbox_is_refused() {
+    for block in [
+        tuning("brenn:tool-requests/alice_mail"),
+        prefix_tuning("brenn:tool-requests/"),
+    ] {
+        let refusal = derive_refusal(&block);
+        assert!(
+            refusal.contains(
+                "is in the provider request-inbox family, which no block tunes: an inbox \
+                 holds every request that can be in flight at once, the sum of its class's \
+                 `max_concurrency`, and that depth is the class's to state"
+            ),
+            "{refusal}"
+        );
+    }
+}
+
+/// The request inbox is the substrate's to mint, and the refusal does not
+/// point at a tuning block that would be refused in turn.
+#[test]
+fn a_declaration_in_the_request_inbox_family_is_refused() {
+    assert_eq!(
+        derive_refusal(&durable("inbox", "brenn:tool-requests/alice_mail")),
+        "`brenn:tool-requests/alice_mail` is an address the system mints, so there is \
+         nothing to declare; a provider's request inbox is sized by its class and tuned by \
+         no block"
+    );
+}

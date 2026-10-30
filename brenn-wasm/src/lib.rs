@@ -42,6 +42,7 @@ pub use brenn::replay::types::Header;
 
 use brenn_activation::sync::CallDisposition;
 use brenn_common::sanitize_untrusted_str;
+use brenn_envelope::addressing::PROVIDER_CONCURRENCY_CEILING;
 
 /// The grant vocabulary, re-exported: what a load spec grants, what this host
 /// links and what an operator writes are one set of words, and a caller
@@ -1039,21 +1040,30 @@ pub const PROCESSOR_MAX_FAST_TOOL_RESULT_BYTES: usize = 256 * 1024;
 /// Bounds host-fn flood from a hostile or buggy component. Calls beyond the cap
 /// return `internal`; the overflow is surfaced as a single post-activation warn
 /// (same family as the publish/log per-activation quotas). `call-async` and
-/// `provides.call-async-for` count against the same cap.
-// TODO(correctness-call-async-for-capped-below-provider-window): a provider's
-// request window may hand one activation more new requests than this cap lets
-// it serve with `call-async-for`.
+/// `provides.call-async-for` count against the same cap. A provider's request
+/// window is bounded by [`PROVIDER_CONCURRENCY_CEILING`], pinned to half this
+/// cap by the assertions below it, which pin the publish ceiling the same way.
 pub const PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION: usize = 64;
-/// Maximum `provides.complete` calls per activation (4 × the window ceiling).
+const _: () = assert!(
+    2 * PROVIDER_CONCURRENCY_CEILING as usize <= PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION,
+    "a provider's request window must fit a nested call per request in half of one \
+     activation's call budget"
+);
+const _: () = assert!(
+    2 * PROVIDER_CONCURRENCY_CEILING as usize <= brenn_budget::MAX_PUBLISHES_PER_ACTIVATION,
+    "a provider's request window must fit a nested call per request in half of one \
+     activation's publish budget"
+);
+/// Maximum `provides.complete` calls per activation (4 × the provider
+/// concurrency ceiling).
 ///
 /// A provider's outstanding requests are bounded by its request window, which
-/// is never deeper than [`WINDOW_DEPTH_CEILING`](brenn_activation::WINDOW_DEPTH_CEILING);
-/// one activation can name each live id, each stale id that window delivers
-/// after a restart, and retry once after a rejected outcome, all inside this
-/// cap. A call past it is a guest looping on `complete`, and traps the
-/// activation.
+/// is never deeper than [`PROVIDER_CONCURRENCY_CEILING`]; one activation can
+/// name each live id, each stale id that window delivers after a restart, and
+/// retry once after a rejected outcome, all inside this cap. A call past it is
+/// a guest looping on `complete`, and traps the activation.
 pub const PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION: usize =
-    4 * brenn_activation::WINDOW_DEPTH_CEILING as usize;
+    4 * PROVIDER_CONCURRENCY_CEILING as usize;
 /// Maximum bytes in a guest-supplied `provides.complete` `outcome-json`
 /// (512 KiB, the registry's async result cap).
 ///

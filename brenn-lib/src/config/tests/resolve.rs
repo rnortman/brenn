@@ -934,6 +934,7 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
         declared_out_ports: vec![],
         sync_ports: vec![],
         call_ports: vec![],
+        provides: vec![],
         grants: vec![ComponentGrant::Mqtt],
         store_path: None,
         store_size_limit: None,

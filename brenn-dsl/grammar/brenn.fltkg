@@ -75,8 +75,11 @@ pin := addr:string , %"=" , uuid:string , %";" , ;
 // ── classes and instantiation ────────────────────────────────────────────────
 
 // The class carries the ports and the implementation reference; instances never
-// do.
-component_class := doc:doc? , %"component" : name:cname , %"{" , (attrs:attr | ports:port_decl)* , %"}"  , ;
+// do. `section` is last, as the agent and instance bodies order it: it carries
+// the class's named statements (`provide`), and it is identifier-led, so a port
+// declaration that fails partway through is not taken for one.
+component_class := doc:doc? , %"component" : name:cname , %"{" ,
+    (attrs:attr | ports:port_decl | blocks:section)* , %"}"  , ;
 
 // `in messages: "brenn.panel.message@1";` — the doctype names the document
 // contract the port's binding must agree with; derive checks it against the
@@ -84,10 +87,10 @@ component_class := doc:doc? , %"component" : name:cname , %"{" , (attrs:attr | p
 //
 // `optional` is the author's statement that an instance may leave the port
 // unwired; without it the resolver refuses an instance that does. It leads the
-// rule inside the class body's `(attrs:attr | ports:port_decl)*` alternation,
-// where `attr` is tried first and consumes the word as a key before failing for
-// want of `=`; the declaration form then gets the input back, exactly as
-// `channel_def`'s two alternatives rely on.
+// rule inside the class body's alternation, where `attr` is tried first and
+// consumes the word as a key before failing for want of `=`; the declaration
+// form then gets the input back, exactly as `channel_def`'s two alternatives
+// rely on.
 port_decl := optional:"optional"? , dir:port_dir : name:name , doctype:port_doctype? , %";" , ;
 // `sync` and `call` are the two odd classes: neither is bound to a channel, so
 // neither takes a tail, a doctype or `optional`. `sync` names the port a caller

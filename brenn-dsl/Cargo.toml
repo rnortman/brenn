@@ -15,6 +15,8 @@ brenn-envelope = { path = "../brenn-envelope" }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
+# A `provide` statement's `input_schema` is JSON text, checked at resolution.
+serde_json = "1.0.149"
 sha2 = "0.11.0"
 # Durable channel identity is a pinned UUIDv5 derivation, so v5 is the whole
 # reason this is here.

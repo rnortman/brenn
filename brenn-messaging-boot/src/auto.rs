@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use brenn_envelope::addressing::reserved_segment_list;
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::AppPolicy;
 use brenn_lib::access::acl::ChannelMatcher;
@@ -1032,8 +1033,9 @@ fn decide_placement(label: &str, endpoints: &[Endpoint], declared: Option<&str>)
     );
     assert!(
         !is_reserved_channel_name(bare),
-        "config: {label}: channel {address:?} is in a reserved namespace (tools/tool-results are \
-         owned by the tool substrate; auto is owned by the auto-channel machinery)",
+        "config: {label}: channel {address:?} is in a reserved namespace ({} are owned by the \
+         tool substrate; auto is owned by the auto-channel machinery)",
+        reserved_segment_list(),
     );
 
     let durable = scheme == ChannelScheme::Brenn;

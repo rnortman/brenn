@@ -204,6 +204,8 @@ scaffold_goldens(name = "no-outbound")
 
 scaffold_goldens(name = "no-ports")
 
+scaffold_goldens(name = "provider")
+
 # The goldens, compiled the only way they can be: against the guest SDK, for
 # wasm32. A golden is otherwise only ever diffed, so nothing asks rustc or clippy
 # whether the emitter's output is valid Rust. The in-tree components cover the
@@ -218,6 +220,7 @@ rust_library(
         "tests/corpus/scaffold/no-outbound.rs",
         "tests/corpus/scaffold/no-ports.rs",
         "tests/corpus/scaffold/processor-full.rs",
+        "tests/corpus/scaffold/provider.rs",
         "tests/scaffold_processor_goldens.rs",
     ],
     crate_root = "tests/scaffold_processor_goldens.rs",

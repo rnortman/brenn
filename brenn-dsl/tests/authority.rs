@@ -1092,8 +1092,9 @@ fn a_component_port_cannot_name_a_tool_namespace_address() {
         )),
         "this binding of consumer `alice_sync` names `brenn:tool-results/other`, in a \
          namespace the tool substrate owns: component ports do not reach the tool substrate's \
-         channels — a result inbox is wired by a `tool` grant, and a request channel is \
-         reached only through the registry"
+         channels — a result inbox is wired by a `tool` grant, a provider's request inbox \
+         by its class's `provide` statements, and a request channel is reached only through \
+         the registry"
     );
     assert_eq!(
         derive_refusal(&doc(
@@ -1103,8 +1104,20 @@ fn a_component_port_cannot_name_a_tool_namespace_address() {
         )),
         "this binding of consumer `alice_sync` names `brenn:tools/git-repo-pull`, in a \
          namespace the tool substrate owns: component ports do not reach the tool substrate's \
-         channels — a result inbox is wired by a `tool` grant, and a request channel is \
-         reached only through the registry"
+         channels — a result inbox is wired by a `tool` grant, a provider's request inbox \
+         by its class's `provide` statements, and a request channel is reached only through \
+         the registry"
+    );
+    assert_eq!(
+        derive_refusal(&doc(
+            "    in push-events;\n",
+            "    in push-events <- \"brenn:tool-requests/other\";\n",
+        )),
+        "this binding of consumer `alice_sync` names `brenn:tool-requests/other`, in a \
+         namespace the tool substrate owns: component ports do not reach the tool substrate's \
+         channels — a result inbox is wired by a `tool` grant, a provider's request inbox \
+         by its class's `provide` statements, and a request channel is reached only through \
+         the registry"
     );
 }
 
@@ -1121,8 +1134,9 @@ fn a_surface_placed_component_port_cannot_name_a_tool_namespace_address() {
         )),
         "this binding of surface `alice_desk` names `brenn:tool-results/other`, in a \
          namespace the tool substrate owns: component ports do not reach the tool substrate's \
-         channels — a result inbox is wired by a `tool` grant, and a request channel is \
-         reached only through the registry"
+         channels — a result inbox is wired by a `tool` grant, a provider's request inbox \
+         by its class's `provide` statements, and a request channel is reached only through \
+         the registry"
     );
     assert_eq!(
         derive_refusal(&placed_panel(
@@ -1131,8 +1145,9 @@ fn a_surface_placed_component_port_cannot_name_a_tool_namespace_address() {
         )),
         "this binding of surface `alice_desk` names `brenn:tools/git-repo-pull`, in a \
          namespace the tool substrate owns: component ports do not reach the tool substrate's \
-         channels — a result inbox is wired by a `tool` grant, and a request channel is \
-         reached only through the registry"
+         channels — a result inbox is wired by a `tool` grant, a provider's request inbox \
+         by its class's `provide` statements, and a request channel is reached only through \
+         the registry"
     );
 }
 

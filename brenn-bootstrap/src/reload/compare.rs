@@ -27,6 +27,10 @@
 //!   sets `spawn_changed`, and the agent's live sessions are retired at their
 //!   next idle moment so their successors are spawned from the new map.
 //!
+//! One part of a convergible block is not: the tools a consumer provides join
+//! the tool registry, which is built once per process, so a change to them is
+//! refused per consumer.
+//!
 //! What is left is boot-shaped: folded into another subsystem's tables or side
 //! effects, so converging it means converging that subsystem. Those fields are
 //! refused by name, each arm carrying its reason.
@@ -41,6 +45,7 @@
 use std::collections::BTreeMap;
 
 use brenn_lib::config::{AppConfigRaw, BrennConfig, sort_order_dead_collections};
+use brenn_lib::messaging::config::{ProvidedToolDecl, WasmConsumerConfigRaw};
 
 use super::NEEDS_RESTART;
 
@@ -119,7 +124,7 @@ pub(crate) fn non_convergible_differences(
         mqtt_clients: _,
         webhook_endpoints: _,
         events,
-        wasm_consumers: _,
+        wasm_consumers,
         surfaces: _,
         remotes,
         links: _,
@@ -151,7 +156,7 @@ pub(crate) fn non_convergible_differences(
         mqtt_clients: _,
         webhook_endpoints: _,
         events: b_events,
-        wasm_consumers: _,
+        wasm_consumers: b_wasm_consumers,
         surfaces: _,
         remotes: b_remotes,
         links: _,
@@ -222,6 +227,7 @@ pub(crate) fn non_convergible_differences(
     keyed_vec("remotes", remotes, b_remotes, |r| &r.slug, &mut out);
     plain("wasm", wasm, b_wasm, &mut out);
     plain("watchdog", watchdog, b_watchdog, &mut out);
+    provided_tools(wasm_consumers, b_wasm_consumers, &mut out);
     LevelOne {
         refusals: out,
         app_diffs,
@@ -574,6 +580,30 @@ fn compare_app(
     }
 }
 
+/// The tools each consumer provides, the one part of a convergible block that
+/// is not.
+///
+/// The tool registry is built once per process, so a provided tool cannot
+/// appear, vanish or change shape without a restart. Every other change to a
+/// providing consumer converges; removing the consumer removes its tools and is
+/// refused with them. Consumers that provide nothing are absent from both maps,
+/// so adding or removing one is not this pass's business.
+fn provided_tools(a: &[WasmConsumerConfigRaw], b: &[WasmConsumerConfigRaw], out: &mut Vec<String>) {
+    fn providing(consumers: &[WasmConsumerConfigRaw]) -> BTreeMap<&str, &Vec<ProvidedToolDecl>> {
+        consumers
+            .iter()
+            .filter(|consumer| !consumer.provides.is_empty())
+            .map(|consumer| (consumer.slug.as_str(), &consumer.provides))
+            .collect()
+    }
+    keyed_refusals(
+        |slug| format!("wasm_consumers[{slug}].provides"),
+        &providing(a),
+        &providing(b),
+        out,
+    );
+}
+
 /// A section that is a map: reported per key, in key order.
 fn keyed_map<V: PartialEq>(
     field: &str,
@@ -581,18 +611,29 @@ fn keyed_map<V: PartialEq>(
     b: &BTreeMap<&str, &V>,
     out: &mut Vec<String>,
 ) {
+    keyed_refusals(|k| format!("{field}[{k}]"), a, b, out);
+}
+
+/// Each key added, removed or changed between two keyed views, refused under
+/// the name `label` gives the key, in key order.
+fn keyed_refusals<V: PartialEq>(
+    label: impl Fn(&str) -> String,
+    a: &BTreeMap<&str, &V>,
+    b: &BTreeMap<&str, &V>,
+    out: &mut Vec<String>,
+) {
     for (k, v) in a {
         match b.get(k) {
-            None => out.push(format!("{field}[{k}] removed: {NEEDS_RESTART}")),
+            None => out.push(format!("{} removed: {NEEDS_RESTART}", label(k))),
             Some(other) if v != other => {
-                out.push(format!("{field}[{k}] differs: {NEEDS_RESTART}"));
+                out.push(format!("{} differs: {NEEDS_RESTART}", label(k)));
             }
             Some(_) => {}
         }
     }
     for k in b.keys() {
         if !a.contains_key(k) {
-            out.push(format!("{field}[{k}] added: {NEEDS_RESTART}"));
+            out.push(format!("{} added: {NEEDS_RESTART}", label(k)));
         }
     }
 }
@@ -612,7 +653,7 @@ mod tests {
 
     use brenn_lib::access::raw::{AppAclRaw, ChannelMatcherRaw};
     use brenn_lib::config::AppConfigRaw;
-    use brenn_lib::messaging::config::{ChannelConfigRaw, Depth, WasmConsumerConfigRaw};
+    use brenn_lib::messaging::config::{ChannelConfigRaw, Depth, ProvidedToolDecl};
     use brenn_lib::mqtt::config::MqttClientConfigRaw;
 
     /// An `[[app]]` block with nothing but a slug.
@@ -653,6 +694,83 @@ mod tests {
         let mut candidate = base();
         edit(&mut candidate.apps[0]);
         candidate
+    }
+
+    /// One provided tool, `echo-for-user`, at the given concurrency.
+    fn provided(max_concurrency: u32) -> ProvidedToolDecl {
+        ProvidedToolDecl {
+            name: "echo-for-user".to_string(),
+            mcp_name: "EchoForUser".to_string(),
+            description: "Echo the arguments.".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            max_concurrency,
+            auto_approve: true,
+        }
+    }
+
+    /// `base()` with one consumer `slug`, providing `tools`.
+    fn with_provider(slug: &str, tools: Vec<ProvidedToolDecl>) -> BrennConfig {
+        let mut config = base();
+        config.wasm_consumers = vec![WasmConsumerConfigRaw {
+            provides: tools,
+            ..WasmConsumerConfigRaw::minimal(slug, "processor-provider-test", &[])
+        }];
+        config
+    }
+
+    #[test]
+    fn a_provided_tool_added_or_removed_needs_a_restart() {
+        let without = with_provider("provider", vec![]);
+        let with = with_provider("provider", vec![provided(2)]);
+        assert_eq!(
+            refusals(&without, &with),
+            vec![format!(
+                "wasm_consumers[provider].provides added: {NEEDS_RESTART}"
+            )],
+        );
+        assert_eq!(
+            refusals(&with, &without),
+            vec![format!(
+                "wasm_consumers[provider].provides removed: {NEEDS_RESTART}"
+            )],
+        );
+    }
+
+    #[test]
+    fn a_provided_tool_that_differs_needs_a_restart() {
+        assert_eq!(
+            refusals(
+                &with_provider("provider", vec![provided(2)]),
+                &with_provider("provider", vec![provided(3)]),
+            ),
+            vec![format!(
+                "wasm_consumers[provider].provides differs: {NEEDS_RESTART}"
+            )],
+        );
+    }
+
+    /// Removing the consumer removes the tools it provides.
+    #[test]
+    fn removing_a_providing_consumer_needs_a_restart() {
+        assert_eq!(
+            refusals(&with_provider("provider", vec![provided(2)]), &base()),
+            vec![format!(
+                "wasm_consumers[provider].provides removed: {NEEDS_RESTART}"
+            )],
+        );
+    }
+
+    /// Everything else about a providing consumer converges.
+    #[test]
+    fn a_binding_change_on_a_provider_converges() {
+        let baseline = with_provider("provider", vec![provided(2)]);
+        let mut candidate = baseline.clone();
+        candidate.wasm_consumers[0] = WasmConsumerConfigRaw {
+            provides: vec![provided(2)],
+            ..WasmConsumerConfigRaw::minimal("provider", "processor-provider-test", &["brenn:work"])
+        };
+        assert_ne!(baseline, candidate);
+        assert!(refusals(&baseline, &candidate).is_empty());
     }
 
     #[test]

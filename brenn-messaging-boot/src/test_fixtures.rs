@@ -181,6 +181,7 @@ pub fn minimal_wasm_consumer() -> WasmConsumerConfigRaw {
         declared_out_ports: vec![],
         sync_ports: vec![],
         call_ports: vec![],
+        provides: vec![],
         grants: vec![],
         store_path: None,
         store_size_limit: None,

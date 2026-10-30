@@ -303,6 +303,7 @@ pub fn sort_order_dead_collections(config: &mut BrennConfig) {
             sync_ports: _,
             call_ports: _,
             calls: _,
+            provides: _,
             grants,
             store_path: _,
             store_size_limit: _,

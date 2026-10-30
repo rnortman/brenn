@@ -614,6 +614,26 @@ pub struct ClassRef {
     /// through an assembly in another module still names the module that
     /// declares it, which is the one whose component the host installs.
     pub package: Option<String>,
+    /// The registry tools the class answers calls to, in declaration order.
+    /// Empty exactly when the class does not require `provides`.
+    pub provides: Vec<RProvidedTool>,
+}
+
+/// One `provide` statement, resolved: a registry tool a class answers calls to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RProvidedTool {
+    /// The tool's canonical, kebab-case name: its registry key and grant name.
+    pub name: Spanned<String>,
+    /// The bare MCP suffix, `[A-Z][A-Za-z0-9]*`, as written. The server prefix
+    /// is the registry's to add.
+    pub mcp_name: Spanned<String>,
+    pub description: String,
+    /// The tool's argument schema: a JSON object.
+    pub input_schema: serde_json::Value,
+    /// How many calls to this tool may be outstanding at once; at least one.
+    pub max_concurrency: u32,
+    /// Whether an LLM call the grant permits skips user approval.
+    pub auto_approve: bool,
 }
 
 impl ClassRef {
@@ -1238,6 +1258,7 @@ mod tests {
             ],
             spec_sha256: "00".into(),
             package: None,
+            provides: Vec::new(),
         };
         assert_eq!(class.outbound_ports(), ["receipts", "state"]);
         assert_eq!(class.sync_ports(), ["press"]);
