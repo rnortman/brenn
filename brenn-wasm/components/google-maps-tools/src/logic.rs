@@ -26,6 +26,10 @@ pub const INFLIGHT_TTL_MS: u64 = 300_000;
 /// the wrapper builds from caller text therefore has a known upper size.
 pub const TEXT_MAX_BYTES: usize = 1024;
 
+/// The most bytes a `page` token may hold. Google's tokens are opaque and run
+/// to a few hundred characters.
+pub const PAGE_TOKEN_MAX_BYTES: usize = 4096;
+
 /// A compact result larger than this is a bug in a size bound, answered
 /// `internal` rather than sent.
 pub const COMPACT_RESULT_CEILING: usize = 256 * 1024;
@@ -41,11 +45,57 @@ const GEOCODE_FIELD_MASK: &str =
 const GEOCODE_MAX: u64 = 5;
 const GEOCODE_DEFAULT_MAX: u64 = 3;
 
+/// Weather's steps: the geocode of a `place`, then the Weather lookup. A
+/// request given coordinates starts at the lookup.
+const WEATHER_GEOCODE_STEP: u8 = 1;
+const WEATHER_LOOKUP_STEP: u8 = 2;
+
+/// Google's hourly page size, which is also its maximum.
+const HOURLY_PAGE_SIZE: u64 = 24;
+/// The hourly horizon from the current hour: Google's range, and the default.
+const HOURS_MAX: u64 = 240;
+const HOURS_DEFAULT: u64 = 24;
+/// The daily horizon: Google's range, and the default.
+const DAYS_MAX: u64 = 10;
+const DAYS_DEFAULT: u64 = 5;
+
+/// The most alerts one answer carries, and the most characters of an alert's
+/// description.
+const ALERTS_MAX: usize = 20;
+const ALERT_DESCRIPTION_MAX_CHARS: usize = 1000;
+/// The most instructions and safety recommendations carried per alert.
+const ALERT_ADVICE_MAX: usize = 5;
+
+/// How Google splits a forecast day, stated once in a daily answer.
+const DAY_PARTS: &str = "day 07:00–19:00, night 19:00–07:00 local";
+
 /// The unit system Google is asked to answer in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Units {
     Metric,
     Imperial,
+}
+
+impl Units {
+    /// The Weather API's `unitsSystem` value.
+    fn google(self) -> &'static str {
+        match self {
+            Units::Metric => "METRIC",
+            Units::Imperial => "IMPERIAL",
+        }
+    }
+
+    /// The units a Weather answer's numbers are in, stated in the answer.
+    fn weather_labels(self) -> Value {
+        match self {
+            Units::Metric => json!({
+                "temperature": "°C", "speed": "km/h", "distance": "km", "precipitation": "mm",
+            }),
+            Units::Imperial => json!({
+                "temperature": "°F", "speed": "mph", "distance": "mi", "precipitation": "in",
+            }),
+        }
+    }
 }
 
 /// The instance's `config` map, validated.
@@ -197,16 +247,29 @@ pub struct InFlight {
 }
 
 impl InFlight {
-    pub fn new(id: &str, tool: Provided, args: &Value, call: &Call, now_ms: u64) -> InFlight {
+    pub fn new(
+        id: &str,
+        tool: Provided,
+        args: &Value,
+        call: &Call,
+        derived: Map<String, Value>,
+        now_ms: u64,
+    ) -> InFlight {
         InFlight {
             id: id.to_string(),
             tool,
             step: call.step,
             args: args.clone(),
-            derived: Map::new(),
+            derived,
             target: call.api.target(),
             issued_at_ms: now_ms,
         }
+    }
+
+    /// The same request's row for its next call, carrying what this step
+    /// learned in `derived`.
+    pub fn next(&self, call: &Call, derived: Map<String, Value>, now_ms: u64) -> InFlight {
+        InFlight::new(&self.id, self.tool, &self.args, call, derived, now_ms)
     }
 
     pub fn call_id(&self) -> String {
@@ -280,6 +343,11 @@ mod provided_name {
 pub enum Next {
     Complete(Value),
     Fail(Failure),
+    /// Issue the request's next step, carrying what this one learned.
+    Call {
+        call: Call,
+        derived: Map<String, Value>,
+    },
 }
 
 type Args = Map<String, Value>;
@@ -304,11 +372,17 @@ fn object<'a>(args: &'a Value, allowed: &[&str]) -> Result<&'a Args, String> {
 /// A free-text argument, capped at [`TEXT_MAX_BYTES`] before anything else is
 /// done with it.
 fn text<'a>(args: &'a Args, key: &str) -> Result<Option<&'a str>, String> {
+    capped(args, key, TEXT_MAX_BYTES)
+}
+
+/// A string argument of at most `cap` bytes, checked before anything else is
+/// done with it.
+fn capped<'a>(args: &'a Args, key: &str, cap: usize) -> Result<Option<&'a str>, String> {
     match args.get(key) {
         None => Ok(None),
         Some(Value::String(value)) => {
-            if value.len() > TEXT_MAX_BYTES {
-                return Err(format!("`{key}` is longer than {TEXT_MAX_BYTES} bytes"));
+            if value.len() > cap {
+                return Err(format!("`{key}` is longer than {cap} bytes"));
             }
             if value.trim().is_empty() {
                 return Err(format!("`{key}` is empty"));
@@ -396,39 +470,164 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                 api: geocode_call(&geocode.query, settings),
             })
         }
+        Provided::Weather => {
+            let weather = WeatherArgs::parse(args)?;
+            Ok(match &weather.at {
+                Where::Text(_) => Call {
+                    step: WEATHER_GEOCODE_STEP,
+                    api: geocode_call(&weather.at, settings),
+                },
+                Where::At(lat, lng) => Call {
+                    step: WEATHER_LOOKUP_STEP,
+                    api: weather_call(&weather, *lat, *lng, settings),
+                },
+            })
+        }
     }
 }
 
-/// What a geocode looks up.
+/// Where a tool is asked about: coordinates, or a place text to geocode.
 #[derive(Clone, Debug, PartialEq)]
-enum GeocodeQuery {
-    Address(String),
-    Location(f64, f64),
+enum Where {
+    At(f64, f64),
+    Text(String),
+}
+
+/// The text argument `key` or `lat` and `lng`, exactly one. A text of the
+/// form `<lat>,<lng>` is coordinates.
+fn place_or_coordinates(args: &Args, key: &str) -> Result<Where, String> {
+    match (text(args, key)?, coordinates(args)?) {
+        (Some(_), Some(_)) => Err(format!("pass `{key}` or `lat` and `lng`, not both")),
+        (None, None) => Err(format!("pass `{key}` or `lat` and `lng`")),
+        (None, Some((lat, lng))) => Ok(Where::At(lat, lng)),
+        (Some(text), None) => Ok(match parse_lat_lng(text, key)? {
+            Some((lat, lng)) => Where::At(lat, lng),
+            None => Where::Text(text.to_string()),
+        }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeatherKind {
+    Current,
+    Hourly,
+    Daily,
+    Alerts,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct WeatherArgs {
+    kind: WeatherKind,
+    at: Where,
+    /// The hourly horizon; read for `hourly` only.
+    hours: u64,
+    /// The daily horizon; read for `daily` only.
+    days: u64,
+    page: Option<String>,
+}
+
+impl WeatherArgs {
+    fn parse(args: &Value) -> Result<WeatherArgs, String> {
+        let args = object(
+            args,
+            &["kind", "lat", "lng", "place", "hours", "days", "page"],
+        )?;
+        let kind = match args.get("kind") {
+            None => return Err("`kind` is required".to_string()),
+            Some(Value::String(kind)) => match kind.as_str() {
+                "current" => WeatherKind::Current,
+                "hourly" => WeatherKind::Hourly,
+                "daily" => WeatherKind::Daily,
+                "alerts" => WeatherKind::Alerts,
+                _ => return Err(KIND_CHOICES.to_string()),
+            },
+            Some(_) => return Err(KIND_CHOICES.to_string()),
+        };
+        let page = capped(args, "page", PAGE_TOKEN_MAX_BYTES)?;
+        let at = place_or_coordinates(args, "place")?;
+        let hours = integer(args, "hours", 1, HOURS_MAX)?;
+        let days = integer(args, "days", 1, DAYS_MAX)?;
+        if hours.is_some() && kind != WeatherKind::Hourly {
+            return Err("`hours` applies to `kind: hourly` only".to_string());
+        }
+        if days.is_some() && kind != WeatherKind::Daily {
+            return Err("`days` applies to `kind: daily` only".to_string());
+        }
+        if page.is_some() && !matches!(kind, WeatherKind::Hourly | WeatherKind::Alerts) {
+            return Err("`page` applies to `kind: hourly` and `kind: alerts` only".to_string());
+        }
+        Ok(WeatherArgs {
+            kind,
+            at,
+            hours: hours.unwrap_or(HOURS_DEFAULT),
+            days: days.unwrap_or(DAYS_DEFAULT),
+            page: page.map(str::to_string),
+        })
+    }
+}
+
+const KIND_CHOICES: &str = "`kind` must be one of `current`, `hourly`, `daily`, `alerts`";
+
+/// A Weather API lookup at a location: one page, never followed.
+fn weather_call(args: &WeatherArgs, lat: f64, lng: f64, settings: &Settings) -> ApiCall {
+    let mut params = BTreeMap::from([
+        ("location.latitude".to_string(), lat.to_string()),
+        ("location.longitude".to_string(), lng.to_string()),
+    ]);
+    let mut set = |key: &str, value: String| params.insert(key.to_string(), value);
+    let units = settings.units.google().to_string();
+    let path = match args.kind {
+        WeatherKind::Current => {
+            set("unitsSystem", units);
+            "/v1/currentConditions:lookup"
+        }
+        WeatherKind::Hourly => {
+            set("unitsSystem", units);
+            set("hours", args.hours.to_string());
+            set("pageSize", HOURLY_PAGE_SIZE.to_string());
+            "/v1/forecast/hours:lookup"
+        }
+        WeatherKind::Daily => {
+            set("unitsSystem", units);
+            set("days", args.days.to_string());
+            set("pageSize", args.days.to_string());
+            "/v1/forecast/days:lookup"
+        }
+        // Alerts take no unit system. Google pages at the compact answer's
+        // cap, so `next_page` reaches every alert.
+        WeatherKind::Alerts => {
+            set("pageSize", ALERTS_MAX.to_string());
+            "/v1/publicAlerts:lookup"
+        }
+    };
+    if let Some(page) = &args.page {
+        set("pageToken", page.clone());
+    }
+    if let Some(language) = &settings.language {
+        set("languageCode", language.clone());
+    }
+    ApiCall {
+        provider: settings.provider.clone(),
+        method: "GET".to_string(),
+        host: settings.weather_host.clone(),
+        path: path.to_string(),
+        query: params,
+        headers: BTreeMap::new(),
+        body: None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct GeocodeArgs {
-    query: GeocodeQuery,
+    query: Where,
     max: usize,
 }
 
 impl GeocodeArgs {
     fn parse(args: &Value) -> Result<GeocodeArgs, String> {
         let args = object(args, &["address", "lat", "lng", "max"])?;
-        let address = text(args, "address")?;
-        let location = coordinates(args)?;
+        let query = place_or_coordinates(args, "address")?;
         let max = integer(args, "max", 1, GEOCODE_MAX)?.unwrap_or(GEOCODE_DEFAULT_MAX);
-        let query = match (address, location) {
-            (Some(_), Some(_)) => {
-                return Err("pass `address` or `lat` and `lng`, not both".to_string());
-            }
-            (None, None) => return Err("pass `address` or `lat` and `lng`".to_string()),
-            (None, Some((lat, lng))) => GeocodeQuery::Location(lat, lng),
-            (Some(address), None) => match parse_lat_lng(address, "address")? {
-                Some((lat, lng)) => GeocodeQuery::Location(lat, lng),
-                None => GeocodeQuery::Address(address.to_string()),
-            },
-        };
         Ok(GeocodeArgs {
             query,
             max: usize::try_from(max).expect("max is at most 5"),
@@ -439,14 +638,14 @@ impl GeocodeArgs {
 /// A Geocoding v4 lookup: forward by `addressQuery`, reverse by location,
 /// both as query parameters so the path is fixed and no caller text becomes a
 /// path segment.
-fn geocode_call(query: &GeocodeQuery, settings: &Settings) -> ApiCall {
+fn geocode_call(query: &Where, settings: &Settings) -> ApiCall {
     let mut params = BTreeMap::new();
     let path = match query {
-        GeocodeQuery::Address(address) => {
+        Where::Text(address) => {
             params.insert("addressQuery".to_string(), address.clone());
             "/v4/geocode/address"
         }
-        GeocodeQuery::Location(lat, lng) => {
+        Where::At(lat, lng) => {
             params.insert("location.latitude".to_string(), lat.to_string());
             params.insert("location.longitude".to_string(), lng.to_string());
             "/v4/geocode/location"
@@ -599,28 +798,493 @@ fn google_error(status: u64, body: &str) -> Failure {
     Failure { kind, detail }
 }
 
-/// What the request does with its nested call's answer.
-pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>) -> Next {
+/// What the request does with its nested call's answer: complete, fail, or
+/// issue its next step.
+pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
     let body = match read_api_result(outcome, &state.target) {
         Ok(body) => body,
         Err(failure) => return Next::Fail(failure),
     };
-    let compact = match (state.tool, state.step) {
-        (Provided::Geocode, 1) => match GeocodeArgs::parse(&state.args) {
-            Ok(args) => compact_geocode(&body, args.max),
-            Err(reason) => Err(internal(format!(
-                "stored geocode arguments no longer parse: {reason}"
-            ))),
-        },
+    let next = match (state.tool, state.step) {
+        (Provided::Geocode, 1) => stored(state, GeocodeArgs::parse)
+            .and_then(|args| compact_geocode(&body, args.max))
+            .map(Next::Complete),
+        (Provided::Weather, WEATHER_GEOCODE_STEP) => stored(state, WeatherArgs::parse)
+            .and_then(|args| weather_after_geocode(&args, &body, settings)),
+        (Provided::Weather, WEATHER_LOOKUP_STEP) => stored(state, WeatherArgs::parse)
+            .and_then(|args| compact_weather(&args, &state.derived, &body, settings.units))
+            .map(Next::Complete),
         (tool, step) => Err(internal(format!(
             "in-flight row names step {step} of {}, which has no such step",
             tool.name()
         ))),
     };
-    match compact {
-        Ok(value) => bounded(value, COMPACT_RESULT_CEILING),
+    match next {
+        Ok(Next::Complete(value)) => bounded(value, COMPACT_RESULT_CEILING),
+        Ok(next) => next,
         Err(failure) => Next::Fail(failure),
     }
+}
+
+/// A row's stored arguments, parsed again. They were validated when the
+/// request was served, so a failure here is the wrapper's.
+fn stored<T>(state: &InFlight, parse: fn(&Value) -> Result<T, String>) -> Result<T, Failure> {
+    parse(&state.args).map_err(|reason| {
+        internal(format!(
+            "stored {} arguments no longer parse: {reason}",
+            state.tool.name()
+        ))
+    })
+}
+
+/// A geocoded place: the first result's location and the address Google
+/// resolved the text to.
+#[derive(Clone, Debug, PartialEq)]
+struct Located {
+    lat: f64,
+    lng: f64,
+    address: Option<String>,
+}
+
+impl Located {
+    /// The compact `location` object, and the form a later step's `derived`
+    /// carries it in.
+    fn to_map(&self) -> Args {
+        let mut out = Args::new();
+        out.insert("lat".to_string(), json!(self.lat));
+        out.insert("lng".to_string(), json!(self.lng));
+        if let Some(address) = &self.address {
+            out.insert("place".to_string(), json!(address));
+        }
+        out
+    }
+}
+
+/// The first location a Geocoding v4 answer for `text` gives. No result is
+/// the caller's: no location matches the text.
+fn first_location(body: &Value, text: &str) -> Result<Located, Failure> {
+    let Value::Object(body) = body else {
+        return Err(shape("Geocoding"));
+    };
+    let first = match body.get("results") {
+        None => None,
+        Some(Value::Array(results)) => results.first(),
+        Some(_) => return Err(shape("Geocoding")),
+    };
+    let Some(first) = first else {
+        return Err(Failure {
+            kind: ErrorKind::InvalidArgs,
+            detail: format!("no location found for {text}"),
+        });
+    };
+    let coordinate = |key: &str| {
+        first
+            .get("location")
+            .and_then(|location| location.get(key))
+            .and_then(Value::as_f64)
+    };
+    let (Some(lat), Some(lng)) = (coordinate("latitude"), coordinate("longitude")) else {
+        return Err(shape("Geocoding"));
+    };
+    Ok(Located {
+        lat,
+        lng,
+        address: first
+            .get("formattedAddress")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// Weather's lookup at the location its `place` geocoded to; the location
+/// rides in `derived` to the answer.
+fn weather_after_geocode(
+    args: &WeatherArgs,
+    body: &Value,
+    settings: &Settings,
+) -> Result<Next, Failure> {
+    let Where::Text(place) = &args.at else {
+        return Err(internal(
+            "in-flight row names weather's geocode step for a request given coordinates",
+        ));
+    };
+    let located = first_location(body, place)?;
+    Ok(Next::Call {
+        call: Call {
+            step: WEATHER_LOOKUP_STEP,
+            api: weather_call(args, located.lat, located.lng, settings),
+        },
+        derived: located.to_map(),
+    })
+}
+
+/// The compact `location` of a Weather answer: the caller's coordinates, or
+/// what the geocode step resolved the place to.
+fn weather_location(args: &WeatherArgs, derived: &Args) -> Result<Value, Failure> {
+    match &args.at {
+        Where::At(lat, lng) => Ok(Value::Object(
+            Located {
+                lat: *lat,
+                lng: *lng,
+                address: None,
+            }
+            .to_map(),
+        )),
+        Where::Text(_) => {
+            if !(derived.contains_key("lat") && derived.contains_key("lng")) {
+                return Err(internal(
+                    "in-flight row for weather's lookup carries no geocoded location",
+                ));
+            }
+            Ok(Value::Object(derived.clone()))
+        }
+    }
+}
+
+/// The value at `path` through nested objects.
+fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |value, key| value.get(*key))
+}
+
+/// Insert `inner` as `to[name]` unless nothing was copied into it.
+fn nest(to: &mut Args, name: &str, inner: Args) {
+    if !inner.is_empty() {
+        to.insert(name.to_string(), Value::Object(inner));
+    }
+}
+
+/// The first `max` items of a Google list, each through `map`, into
+/// `to[name]`, with `<name>_omitted` counting what was cut. A value that is
+/// not a list is a shape error, as is any item `map` refuses.
+fn first_items(
+    to: &mut Args,
+    name: &str,
+    list: &Value,
+    max: usize,
+    api: &str,
+    map: impl Fn(&Value) -> Result<Value, Failure>,
+) -> Result<(), Failure> {
+    let Value::Array(items) = list else {
+        return Err(shape(api));
+    };
+    let kept = items
+        .iter()
+        .take(max)
+        .map(map)
+        .collect::<Result<Vec<_>, _>>()?;
+    to.insert(name.to_string(), Value::Array(kept));
+    if items.len() > max {
+        to.insert(format!("{name}_omitted"), json!(items.len() - max));
+    }
+    Ok(())
+}
+
+/// A list item that must be an object; anything else is a shape error.
+fn record<'a>(item: &'a Value, api: &str) -> Result<&'a Value, Failure> {
+    if item.is_object() {
+        Ok(item)
+    } else {
+        Err(shape(api))
+    }
+}
+
+/// Google's `nextPageToken`, when it names a further page.
+fn next_page(to: &mut Args, body: &Value) {
+    if let Some(token) = body
+        .get("nextPageToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+    {
+        to.insert("next_page".to_string(), json!(token));
+    }
+}
+
+/// A Weather API answer as the tool's compact result for its kind.
+fn compact_weather(
+    args: &WeatherArgs,
+    derived: &Args,
+    body: &Value,
+    units: Units,
+) -> Result<Value, Failure> {
+    let location = weather_location(args, derived)?;
+    if !body.is_object() {
+        return Err(shape("Weather"));
+    }
+    let mut out = Args::new();
+    out.insert("location".to_string(), location);
+    match args.kind {
+        WeatherKind::Current => compact_current(&mut out, body, units)?,
+        WeatherKind::Hourly => compact_hourly(&mut out, body, units)?,
+        WeatherKind::Daily => compact_daily(&mut out, body, units)?,
+        WeatherKind::Alerts => compact_alerts(&mut out, body)?,
+    }
+    Ok(Value::Object(out))
+}
+
+/// The time zone and units every forecast answer states.
+fn weather_header(out: &mut Args, body: &Value, units: Units) {
+    copy(
+        out,
+        "timezone",
+        body.get("timeZone").and_then(|tz| tz.get("id")),
+    );
+    out.insert("units".to_string(), units.weather_labels());
+}
+
+/// Where Google puts the wind and precipitation of a reading; current
+/// conditions nest them, hours and day parts flatten them.
+const WIND_SPEED: &[&str] = &["wind", "speed", "value"];
+const WIND_DIRECTION: &[&str] = &["wind", "direction", "cardinal"];
+const PRECIP_PERCENT: &[&str] = &["precipitation", "probability", "percent"];
+const PRECIP_TYPE: &[&str] = &["precipitation", "probability", "type"];
+const PRECIP_AMOUNT: &[&str] = &["precipitation", "qpf", "quantity"];
+
+/// The sky and air of any reading: current conditions, an hour or a day part.
+fn sky(out: &mut Args, from: &Value) {
+    copy(
+        out,
+        "condition",
+        at(from, &["weatherCondition", "description", "text"]),
+    );
+    copy(out, "humidity_percent", from.get("relativeHumidity"));
+    copy(out, "uv_index", from.get("uvIndex"));
+    copy(out, "cloud_cover_percent", from.get("cloudCover"));
+}
+
+/// The temperature and how it feels, of current conditions or an hour.
+fn temperatures(out: &mut Args, from: &Value) {
+    copy(out, "temperature", at(from, &["temperature", "degrees"]));
+    copy(
+        out,
+        "feels_like",
+        at(from, &["feelsLikeTemperature", "degrees"]),
+    );
+}
+
+/// The conditions an hour and a day part share, flattened.
+fn period(out: &mut Args, from: &Value) {
+    sky(out, from);
+    copy(out, "precip_probability_percent", at(from, PRECIP_PERCENT));
+    copy(out, "precip_type", at(from, PRECIP_TYPE));
+    copy(out, "precip_amount", at(from, PRECIP_AMOUNT));
+    copy(out, "wind_speed", at(from, WIND_SPEED));
+    copy(out, "wind_direction", at(from, WIND_DIRECTION));
+}
+
+fn compact_current(out: &mut Args, from: &Value, units: Units) -> Result<(), Failure> {
+    if from.get("temperature").is_none() {
+        return Err(shape("Weather"));
+    }
+    copy(out, "time", from.get("currentTime"));
+    weather_header(out, from, units);
+    sky(out, from);
+    temperatures(out, from);
+    copy(out, "is_daytime", from.get("isDaytime"));
+    copy(out, "dew_point", at(from, &["dewPoint", "degrees"]));
+    copy(
+        out,
+        "thunderstorm_percent",
+        from.get("thunderstormProbability"),
+    );
+    let mut wind = Args::new();
+    copy(&mut wind, "speed", at(from, WIND_SPEED));
+    copy(&mut wind, "gust", at(from, &["wind", "gust", "value"]));
+    copy(&mut wind, "direction", at(from, WIND_DIRECTION));
+    nest(out, "wind", wind);
+    let mut precipitation = Args::new();
+    copy(
+        &mut precipitation,
+        "probability_percent",
+        at(from, PRECIP_PERCENT),
+    );
+    copy(&mut precipitation, "type", at(from, PRECIP_TYPE));
+    copy(&mut precipitation, "amount", at(from, PRECIP_AMOUNT));
+    nest(out, "precipitation", precipitation);
+    copy(
+        out,
+        "pressure_mb",
+        at(from, &["airPressure", "meanSeaLevelMillibars"]),
+    );
+    copy(out, "visibility", at(from, &["visibility", "distance"]));
+    let mut today = Args::new();
+    copy(
+        &mut today,
+        "high",
+        at(
+            from,
+            &["currentConditionsHistory", "maxTemperature", "degrees"],
+        ),
+    );
+    copy(
+        &mut today,
+        "low",
+        at(
+            from,
+            &["currentConditionsHistory", "minTemperature", "degrees"],
+        ),
+    );
+    nest(out, "today", today);
+    Ok(())
+}
+
+/// A `google.type.Date`, or the date part of a `DateTime`, as `YYYY-MM-DD`.
+fn date(value: &Value) -> Option<String> {
+    let part = |key: &str| value.get(key).and_then(Value::as_u64);
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        part("year")?,
+        part("month")?,
+        part("day")?
+    ))
+}
+
+/// A `google.type.DateTime` as local `YYYY-MM-DDTHH:MM`. Google's JSON omits
+/// a zero hour or minute, so an absent one is zero.
+fn local_time(value: &Value) -> Option<String> {
+    let part = |key: &str| value.get(key).map_or(Some(0), Value::as_u64);
+    Some(format!(
+        "{}T{:02}:{:02}",
+        date(value)?,
+        part("hours")?,
+        part("minutes")?
+    ))
+}
+
+fn compact_hourly(out: &mut Args, body: &Value, units: Units) -> Result<(), Failure> {
+    let hours = body.get("forecastHours").ok_or_else(|| shape("Weather"))?;
+    weather_header(out, body, units);
+    let limit = usize::try_from(HOURLY_PAGE_SIZE).expect("a page size fits usize");
+    first_items(out, "hours", hours, limit, "Weather", |hour| {
+        let hour = record(hour, "Weather")?;
+        let mut item = Args::new();
+        if let Some(time) = hour.get("displayDateTime").and_then(local_time) {
+            item.insert("time".to_string(), json!(time));
+        }
+        temperatures(&mut item, hour);
+        period(&mut item, hour);
+        copy(&mut item, "is_daytime", hour.get("isDaytime"));
+        Ok(Value::Object(item))
+    })?;
+    next_page(out, body);
+    Ok(())
+}
+
+fn compact_daily(out: &mut Args, body: &Value, units: Units) -> Result<(), Failure> {
+    let days = body.get("forecastDays").ok_or_else(|| shape("Weather"))?;
+    weather_header(out, body, units);
+    let limit = usize::try_from(DAYS_MAX).expect("a day count fits usize");
+    first_items(out, "days", days, limit, "Weather", |day| {
+        let day = record(day, "Weather")?;
+        let mut item = Args::new();
+        if let Some(date) = day.get("displayDate").and_then(date) {
+            item.insert("date".to_string(), json!(date));
+        }
+        copy(&mut item, "high", at(day, &["maxTemperature", "degrees"]));
+        copy(&mut item, "low", at(day, &["minTemperature", "degrees"]));
+        copy(
+            &mut item,
+            "feels_like_high",
+            at(day, &["feelsLikeMaxTemperature", "degrees"]),
+        );
+        copy(
+            &mut item,
+            "feels_like_low",
+            at(day, &["feelsLikeMinTemperature", "degrees"]),
+        );
+        copy(&mut item, "sunrise", at(day, &["sunEvents", "sunriseTime"]));
+        copy(&mut item, "sunset", at(day, &["sunEvents", "sunsetTime"]));
+        for (name, key) in [("day", "daytimeForecast"), ("night", "nighttimeForecast")] {
+            if let Some(part) = day.get(key) {
+                let mut compact = Args::new();
+                period(&mut compact, part);
+                copy(
+                    &mut compact,
+                    "thunderstorm_percent",
+                    part.get("thunderstormProbability"),
+                );
+                nest(&mut item, name, compact);
+            }
+        }
+        Ok(Value::Object(item))
+    })?;
+    out.insert("day_parts".to_string(), json!(DAY_PARTS));
+    next_page(out, body);
+    Ok(())
+}
+
+/// Public alerts. An answer holding only `regionCode` is `alerts: []`: Google
+/// answers that way when no alert is active and when a provider's alert
+/// lacked a required field, and does not say which.
+fn compact_alerts(out: &mut Args, body: &Value) -> Result<(), Failure> {
+    if body.get("weatherAlerts").is_none() && body.get("regionCode").is_none() {
+        return Err(shape("Weather"));
+    }
+    copy(out, "region", body.get("regionCode"));
+    let empty = Value::Array(Vec::new());
+    let alerts = body.get("weatherAlerts").unwrap_or(&empty);
+    first_items(out, "alerts", alerts, ALERTS_MAX, "Weather", compact_alert)?;
+    next_page(out, body);
+    Ok(())
+}
+
+/// One alert. Google's terms require its source's name and link wherever the
+/// alert is shown, so `source` carries both. An alert Google sends without
+/// them is still relayed, with whichever part it has or no `source`.
+fn compact_alert(alert: &Value) -> Result<Value, Failure> {
+    let alert = record(alert, "Weather")?;
+    let mut item = Args::new();
+    copy(&mut item, "title", at(alert, &["alertTitle", "text"]));
+    copy(&mut item, "event", alert.get("eventType"));
+    copy(&mut item, "severity", alert.get("severity"));
+    copy(&mut item, "certainty", alert.get("certainty"));
+    copy(&mut item, "urgency", alert.get("urgency"));
+    copy(&mut item, "area", alert.get("areaName"));
+    copy(&mut item, "starts", alert.get("startTime"));
+    copy(&mut item, "ends", alert.get("expirationTime"));
+    if let Some(description) = alert.get("description").and_then(Value::as_str) {
+        item.insert(
+            "description".to_string(),
+            json!(cut(description, ALERT_DESCRIPTION_MAX_CHARS)),
+        );
+    }
+    if let Some(lines) = alert.get("instruction") {
+        first_items(
+            &mut item,
+            "instructions",
+            lines,
+            ALERT_ADVICE_MAX,
+            "Weather",
+            |line| match line {
+                Value::String(_) => Ok(line.clone()),
+                _ => Err(shape("Weather")),
+            },
+        )?;
+    }
+    if let Some(recommendations) = alert.get("safetyRecommendations") {
+        first_items(
+            &mut item,
+            "recommendations",
+            recommendations,
+            ALERT_ADVICE_MAX,
+            "Weather",
+            |recommendation| {
+                let recommendation = record(recommendation, "Weather")?;
+                let mut compact = Args::new();
+                copy(&mut compact, "directive", recommendation.get("directive"));
+                copy(&mut compact, "subtext", recommendation.get("subtext"));
+                Ok(Value::Object(compact))
+            },
+        )?;
+    }
+    let mut source = Args::new();
+    copy(&mut source, "name", at(alert, &["dataSource", "name"]));
+    copy(
+        &mut source,
+        "url",
+        at(alert, &["dataSource", "authorityUri"]),
+    );
+    nest(&mut item, "source", source);
+    Ok(Value::Object(item))
 }
 
 /// `value` as the request's answer, unless it serializes larger than
@@ -652,34 +1316,31 @@ fn copy(to: &mut Args, name: &str, from: Option<&Value>) {
 /// A Geocoding v4 answer as at most `max` results. Google omits `results`
 /// when nothing matched, which is an empty list.
 fn compact_geocode(body: &Value, max: usize) -> Result<Value, Failure> {
-    let Value::Object(body) = body else {
+    if !body.is_object() {
         return Err(shape("Geocoding"));
-    };
-    let results: &[Value] = match body.get("results") {
-        None => &[],
-        Some(Value::Array(results)) => results,
-        Some(_) => return Err(shape("Geocoding")),
-    };
-    let mut compact = Vec::new();
-    for result in results.iter().take(max) {
-        let Value::Object(result) = result else {
-            return Err(shape("Geocoding"));
-        };
-        let mut out = Args::new();
-        let location = result.get("location");
-        copy(&mut out, "address", result.get("formattedAddress"));
-        copy(&mut out, "lat", location.and_then(|l| l.get("latitude")));
-        copy(&mut out, "lng", location.and_then(|l| l.get("longitude")));
-        copy(&mut out, "place_id", result.get("placeId"));
-        copy(&mut out, "granularity", result.get("granularity"));
-        copy(&mut out, "types", result.get("types"));
-        compact.push(Value::Object(out));
     }
-    let mut answer = json!({ "results": compact });
-    if results.len() > max {
-        answer["results_omitted"] = json!(results.len() - max);
-    }
-    Ok(answer)
+    let none = Value::Array(Vec::new());
+    let mut answer = Args::new();
+    let results = body.get("results").unwrap_or(&none);
+    first_items(
+        &mut answer,
+        "results",
+        results,
+        max,
+        "Geocoding",
+        |result| {
+            let result = record(result, "Geocoding")?;
+            let mut out = Args::new();
+            copy(&mut out, "address", result.get("formattedAddress"));
+            copy(&mut out, "lat", at(result, &["location", "latitude"]));
+            copy(&mut out, "lng", at(result, &["location", "longitude"]));
+            copy(&mut out, "place_id", result.get("placeId"));
+            copy(&mut out, "granularity", result.get("granularity"));
+            copy(&mut out, "types", result.get("types"));
+            Ok(Value::Object(out))
+        },
+    )?;
+    Ok(Value::Object(answer))
 }
 
 #[cfg(test)]
@@ -1148,7 +1809,14 @@ mod tests {
 
     fn geocode_state(args: Value) -> InFlight {
         let call = plan(Provided::Geocode, &args, &settings()).unwrap();
-        InFlight::new(&"a".repeat(32), Provided::Geocode, &args, &call, 1_000)
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::Geocode,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        )
     }
 
     const GEOCODE_BODY: &str = r#"{
@@ -1167,7 +1835,7 @@ mod tests {
     fn geocode_compacts_googles_answer() {
         let state = geocode_state(json!({ "address": "Googleplex", "max": 2 }));
         assert_eq!(
-            advance(&state, http(200, GEOCODE_BODY)),
+            advance(&state, http(200, GEOCODE_BODY), &settings()),
             Next::Complete(json!({
                 "results": [
                     { "address": "1600 Amphitheatre Pkwy, Mountain View, CA 94043, USA",
@@ -1185,7 +1853,7 @@ mod tests {
     #[test]
     fn geocode_omits_absent_fields_and_keeps_the_default_max() {
         let state = geocode_state(json!({ "address": "Santa Clara County" }));
-        let Next::Complete(answer) = advance(&state, http(200, GEOCODE_BODY)) else {
+        let Next::Complete(answer) = advance(&state, http(200, GEOCODE_BODY), &settings()) else {
             panic!("expected an answer");
         };
         assert_eq!(answer["results"].as_array().unwrap().len(), 3);
@@ -1200,7 +1868,7 @@ mod tests {
     fn geocode_with_no_match_is_an_empty_list() {
         let state = geocode_state(json!({ "lat": 0, "lng": 0 }));
         assert_eq!(
-            advance(&state, http(200, "{}")),
+            advance(&state, http(200, "{}"), &settings()),
             Next::Complete(json!({ "results": [] }))
         );
     }
@@ -1210,7 +1878,7 @@ mod tests {
         let state = geocode_state(json!({ "address": "Paris" }));
         for body in ["[]", "{\"results\": {}}", "{\"results\": [1]}"] {
             assert_eq!(
-                advance(&state, http(200, body)),
+                advance(&state, http(200, body), &settings()),
                 Next::Fail(failure(
                     ErrorKind::Internal,
                     "unexpected Geocoding API response shape"
@@ -1226,7 +1894,8 @@ mod tests {
         assert_eq!(
             advance(
                 &state,
-                http(403, &google(403, "PERMISSION_DENIED", "no key"))
+                http(403, &google(403, "PERMISSION_DENIED", "no key")),
+                &settings()
             ),
             Next::Fail(failure(
                 ErrorKind::Internal,
@@ -1240,7 +1909,7 @@ mod tests {
         let mut state = geocode_state(json!({ "address": "Paris" }));
         state.step = 2;
         assert_eq!(
-            advance(&state, http(200, "{}")),
+            advance(&state, http(200, "{}"), &settings()),
             Next::Fail(failure(
                 ErrorKind::Internal,
                 "in-flight row names step 2 of geocode, which has no such step"
@@ -1361,7 +2030,7 @@ mod tests {
         let mut state = geocode_state(json!({ "address": "Paris" }));
         state.args = json!({ "address": "Paris", "max": 9 });
         assert_eq!(
-            advance(&state, http(200, GEOCODE_BODY)),
+            advance(&state, http(200, GEOCODE_BODY), &settings()),
             Next::Fail(failure(
                 ErrorKind::Internal,
                 "stored geocode arguments no longer parse: `max` must be an integer from 1 to 5"
@@ -1393,5 +2062,648 @@ mod tests {
             error.contains("no provided tool is named `Geocode`"),
             "{error}"
         );
+    }
+
+    fn weather(args: Value) -> Result<Call, String> {
+        plan(Provided::Weather, &args, &settings())
+    }
+
+    fn weather_state(args: Value, call: &Call, derived: Args) -> InFlight {
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::Weather,
+            &args,
+            call,
+            derived,
+            1_000,
+        )
+    }
+
+    #[test]
+    fn weather_at_coordinates_is_one_lookup() {
+        let call = weather(json!({ "kind": "current", "lat": 37.422, "lng": -122.0841 })).unwrap();
+        assert_eq!(call.step, WEATHER_LOOKUP_STEP);
+        assert_eq!(call.api.provider, "maps");
+        assert_eq!(call.api.method, "GET");
+        assert_eq!(call.api.host, "weather.example.com");
+        assert_eq!(call.api.path, "/v1/currentConditions:lookup");
+        assert_eq!(
+            call.api.query,
+            query(&[
+                ("location.latitude", "37.422"),
+                ("location.longitude", "-122.0841"),
+                ("unitsSystem", "METRIC"),
+            ])
+        );
+        assert!(call.api.headers.is_empty());
+        assert_eq!(call.api.body, None);
+        // A coordinate place is not geocoded.
+        let call = weather(json!({ "kind": "current", "place": "37.422,-122.0841" })).unwrap();
+        assert_eq!(call.step, WEATHER_LOOKUP_STEP);
+        assert_eq!(call.api.query["location.latitude"], "37.422");
+    }
+
+    #[test]
+    fn weather_hourly_asks_for_one_page_of_the_horizon() {
+        let call = weather(json!({ "kind": "hourly", "lat": 1, "lng": 2 })).unwrap();
+        assert_eq!(call.api.path, "/v1/forecast/hours:lookup");
+        assert_eq!(
+            call.api.query,
+            query(&[
+                ("location.latitude", "1"),
+                ("location.longitude", "2"),
+                ("unitsSystem", "METRIC"),
+                ("hours", "24"),
+                ("pageSize", "24"),
+            ])
+        );
+        let s = Settings::from_lookup(lookup(&with(&[("units", "IMPERIAL"), ("language", "de")])))
+            .unwrap();
+        let call = plan(
+            Provided::Weather,
+            &json!({ "kind": "hourly", "lat": 1, "lng": 2, "hours": 240, "page": "tok" }),
+            &s,
+        )
+        .unwrap();
+        assert_eq!(call.api.query["hours"], "240");
+        assert_eq!(call.api.query["pageSize"], "24");
+        assert_eq!(call.api.query["pageToken"], "tok");
+        assert_eq!(call.api.query["unitsSystem"], "IMPERIAL");
+        assert_eq!(call.api.query["languageCode"], "de");
+    }
+
+    #[test]
+    fn weather_daily_is_one_page_of_days() {
+        let call = weather(json!({ "kind": "daily", "lat": 1, "lng": 2 })).unwrap();
+        assert_eq!(call.api.path, "/v1/forecast/days:lookup");
+        assert_eq!(call.api.query["days"], "5");
+        assert_eq!(call.api.query["pageSize"], "5");
+        let call = weather(json!({ "kind": "daily", "lat": 1, "lng": 2, "days": 10 })).unwrap();
+        assert_eq!(call.api.query["days"], "10");
+        assert_eq!(call.api.query["pageSize"], "10");
+        assert!(!call.api.query.contains_key("pageToken"));
+    }
+
+    #[test]
+    fn weather_alerts_take_no_unit_system_and_page_at_the_cap() {
+        let call = weather(json!({ "kind": "alerts", "lat": 1, "lng": 2, "page": "tok" })).unwrap();
+        assert_eq!(call.api.path, "/v1/publicAlerts:lookup");
+        assert_eq!(
+            call.api.query,
+            query(&[
+                ("location.latitude", "1"),
+                ("location.longitude", "2"),
+                ("pageSize", "20"),
+                ("pageToken", "tok"),
+            ])
+        );
+        assert_eq!(ALERTS_MAX, 20);
+    }
+
+    #[test]
+    fn weather_for_a_place_geocodes_first() {
+        let call = weather(json!({ "kind": "current", "place": "Mountain View" })).unwrap();
+        assert_eq!(call.step, WEATHER_GEOCODE_STEP);
+        assert_eq!(call.api.host, "geocode.example.com");
+        assert_eq!(call.api.path, "/v4/geocode/address");
+        assert_eq!(call.api.query, query(&[("addressQuery", "Mountain View")]));
+        assert_eq!(
+            call.api.headers,
+            query(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
+        );
+    }
+
+    #[test]
+    fn weather_refuses_bad_arguments_by_name() {
+        let cases = [
+            (json!({ "lat": 1, "lng": 2 }), "`kind` is required"),
+            (
+                json!({ "kind": "minutely", "lat": 1, "lng": 2 }),
+                KIND_CHOICES,
+            ),
+            (json!({ "kind": 1, "lat": 1, "lng": 2 }), KIND_CHOICES),
+            (
+                json!({ "kind": "current" }),
+                "pass `place` or `lat` and `lng`",
+            ),
+            (
+                json!({ "kind": "current", "place": "Paris", "lat": 1, "lng": 2 }),
+                "pass `place` or `lat` and `lng`, not both",
+            ),
+            (
+                json!({ "kind": "daily", "lat": 1, "lng": 2, "hours": 5 }),
+                "`hours` applies to `kind: hourly` only",
+            ),
+            (
+                json!({ "kind": "hourly", "lat": 1, "lng": 2, "days": 5 }),
+                "`days` applies to `kind: daily` only",
+            ),
+            (
+                json!({ "kind": "current", "lat": 1, "lng": 2, "page": "tok" }),
+                "`page` applies to `kind: hourly` and `kind: alerts` only",
+            ),
+            (
+                json!({ "kind": "daily", "lat": 1, "lng": 2, "page": "tok" }),
+                "`page` applies to `kind: hourly` and `kind: alerts` only",
+            ),
+            (
+                json!({ "kind": "hourly", "lat": 1, "lng": 2, "hours": 241 }),
+                "`hours` must be an integer from 1 to 240",
+            ),
+            (
+                json!({ "kind": "hourly", "lat": 1, "lng": 2, "hours": 0 }),
+                "`hours` must be an integer from 1 to 240",
+            ),
+            (
+                json!({ "kind": "daily", "lat": 1, "lng": 2, "days": 11 }),
+                "`days` must be an integer from 1 to 10",
+            ),
+            (
+                json!({ "kind": "hourly", "lat": 1, "lng": 2, "page": "" }),
+                "`page` is empty",
+            ),
+        ];
+        for (args, want) in cases {
+            assert_eq!(weather(args.clone()).unwrap_err(), want, "{args}");
+        }
+        let err = weather(json!({ "kind": "current", "place": "x", "address": "y" })).unwrap_err();
+        assert!(err.starts_with("unknown argument `address`"), "{err}");
+        let err = weather(json!({ "kind": "current", "place": "95,1" })).unwrap_err();
+        assert!(err.contains("latitude 95"), "{err}");
+    }
+
+    #[test]
+    fn weather_caps_place_and_page_in_bytes() {
+        let place = "a".repeat(TEXT_MAX_BYTES);
+        assert!(weather(json!({ "kind": "current", "place": place })).is_ok());
+        assert_eq!(
+            weather(json!({ "kind": "current", "place": format!("{place}a") })).unwrap_err(),
+            "`place` is longer than 1024 bytes"
+        );
+        let page = "t".repeat(PAGE_TOKEN_MAX_BYTES);
+        let ok = json!({ "kind": "hourly", "lat": 1, "lng": 2, "page": page });
+        assert_eq!(weather(ok).unwrap().api.query["pageToken"], page);
+        let over = json!({ "kind": "hourly", "lat": 1, "lng": 2, "page": format!("{page}t") });
+        assert_eq!(
+            weather(over).unwrap_err(),
+            "`page` is longer than 4096 bytes"
+        );
+    }
+
+    const CURRENT_BODY: &str = r#"{
+      "currentTime": "2025-07-01T12:33:24.606422609Z",
+      "timeZone": { "id": "America/Los_Angeles" },
+      "isDaytime": true,
+      "weatherCondition": { "iconBaseUri": "https://maps.example.com/i", "description": { "text": "Partly cloudy", "languageCode": "en" }, "type": "PARTLY_CLOUDY" },
+      "temperature": { "degrees": 16, "unit": "CELSIUS" },
+      "feelsLikeTemperature": { "degrees": 15.5, "unit": "CELSIUS" },
+      "dewPoint": { "degrees": 12, "unit": "CELSIUS" },
+      "heatIndex": { "degrees": 16, "unit": "CELSIUS" },
+      "relativeHumidity": 78, "uvIndex": 0, "thunderstormProbability": 0, "cloudCover": 40,
+      "precipitation": { "probability": { "percent": 3, "type": "RAIN" }, "qpf": { "quantity": 0, "unit": "MILLIMETERS" } },
+      "airPressure": { "meanSeaLevelMillibars": 1013.2 },
+      "wind": { "direction": { "degrees": 270, "cardinal": "WEST" }, "speed": { "value": 10, "unit": "KILOMETERS_PER_HOUR" }, "gust": { "value": 19, "unit": "KILOMETERS_PER_HOUR" } },
+      "visibility": { "distance": 16, "unit": "KILOMETERS" },
+      "currentConditionsHistory": { "maxTemperature": { "degrees": 21 }, "minTemperature": { "degrees": 11 } }
+    }"#;
+
+    const MOUNTAIN_VIEW: &str = r#"{ "results": [
+      { "placeId": "ChIJ1", "location": { "latitude": 37.39, "longitude": -122.08 },
+        "formattedAddress": "Mountain View, CA, USA" },
+      { "placeId": "ChIJ2", "location": { "latitude": 1, "longitude": 2 } }
+    ] }"#;
+
+    #[test]
+    fn weather_for_a_place_looks_up_where_the_geocode_landed() {
+        let args = json!({ "kind": "current", "place": "Mountain View" });
+        let step1 = weather(args.clone()).unwrap();
+        let state = weather_state(args.clone(), &step1, Map::new());
+        let Next::Call { call, derived } = advance(&state, http(200, MOUNTAIN_VIEW), &settings())
+        else {
+            panic!("expected the lookup step");
+        };
+        assert_eq!(call.step, WEATHER_LOOKUP_STEP);
+        assert_eq!(call.api.host, "weather.example.com");
+        assert_eq!(call.api.path, "/v1/currentConditions:lookup");
+        assert_eq!(call.api.query["location.latitude"], "37.39");
+        assert_eq!(call.api.query["location.longitude"], "-122.08");
+        let want = json!({ "lat": 37.39, "lng": -122.08, "place": "Mountain View, CA, USA" });
+        assert_eq!(Value::Object(derived.clone()), want);
+
+        // The lookup's row is the same request's, and carries the location
+        // through the store.
+        let step2 = state.next(&call, derived, 2_000);
+        assert_eq!(step2.call_id(), format!("{}/2", "a".repeat(32)));
+        assert_eq!(
+            (step2.tool, &step2.args, step2.step, step2.issued_at_ms),
+            (Provided::Weather, &args, WEATHER_LOOKUP_STEP, 2_000)
+        );
+        assert_eq!(step2.target, call.api.target());
+        let step2 = InFlight::decode(&step2.encode()).unwrap();
+        let Next::Complete(answer) = advance(&step2, http(200, CURRENT_BODY), &settings()) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["location"], want);
+    }
+
+    #[test]
+    fn weather_for_a_place_nothing_matches_is_the_callers() {
+        let args = json!({ "kind": "daily", "place": "Nowhere Special" });
+        let state = weather_state(args.clone(), &weather(args).unwrap(), Map::new());
+        for body in ["{}", "{\"results\": []}"] {
+            assert_eq!(
+                advance(&state, http(200, body), &settings()),
+                Next::Fail(failure(
+                    ErrorKind::InvalidArgs,
+                    "no location found for Nowhere Special"
+                )),
+                "{body}"
+            );
+        }
+        for body in [
+            "[]",
+            "{\"results\": [{\"placeId\": \"x\"}]}",
+            "{\"results\": 1}",
+        ] {
+            assert_eq!(
+                advance(&state, http(200, body), &settings()),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    "unexpected Geocoding API response shape"
+                )),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn weather_geocode_step_for_coordinates_is_internal() {
+        let args = json!({ "kind": "current", "lat": 1, "lng": 2 });
+        let call = Call {
+            step: WEATHER_GEOCODE_STEP,
+            api: geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
+        };
+        let state = weather_state(args, &call, Map::new());
+        assert_eq!(
+            advance(&state, http(200, MOUNTAIN_VIEW), &settings()),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row names weather's geocode step for a request given coordinates"
+            ))
+        );
+    }
+
+    #[test]
+    fn weather_lookup_without_its_geocoded_location_is_internal() {
+        let args = json!({ "kind": "current", "place": "Mountain View" });
+        let call = Call {
+            step: WEATHER_LOOKUP_STEP,
+            api: weather_call(&WeatherArgs::parse(&args).unwrap(), 1.0, 2.0, &settings()),
+        };
+        let state = weather_state(args, &call, Map::new());
+        assert_eq!(
+            advance(&state, http(200, CURRENT_BODY), &settings()),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row for weather's lookup carries no geocoded location"
+            ))
+        );
+    }
+
+    /// The answer to a Weather lookup made at coordinates.
+    fn weather_answer(args: Value, body: &str, settings: &Settings) -> Next {
+        let call = plan(Provided::Weather, &args, settings).unwrap();
+        advance(
+            &weather_state(args, &call, Map::new()),
+            http(200, body),
+            settings,
+        )
+    }
+
+    #[test]
+    fn weather_current_is_compacted() {
+        let answer = weather_answer(
+            json!({ "kind": "current", "lat": 37.4, "lng": -122.1 }),
+            CURRENT_BODY,
+            &settings(),
+        );
+        assert_eq!(
+            answer,
+            Next::Complete(json!({
+                "location": { "lat": 37.4, "lng": -122.1 },
+                "time": "2025-07-01T12:33:24.606422609Z",
+                "timezone": "America/Los_Angeles",
+                "units": { "temperature": "°C", "speed": "km/h", "distance": "km", "precipitation": "mm" },
+                "condition": "Partly cloudy",
+                "is_daytime": true,
+                "temperature": 16, "feels_like": 15.5, "dew_point": 12, "humidity_percent": 78,
+                "uv_index": 0, "cloud_cover_percent": 40, "thunderstorm_percent": 0,
+                "wind": { "speed": 10, "gust": 19, "direction": "WEST" },
+                "precipitation": { "probability_percent": 3, "type": "RAIN", "amount": 0 },
+                "pressure_mb": 1013.2,
+                "visibility": 16,
+                "today": { "high": 21, "low": 11 },
+            }))
+        );
+        let imperial = Settings::from_lookup(lookup(&with(&[("units", "IMPERIAL")]))).unwrap();
+        let Next::Complete(answer) = weather_answer(
+            json!({ "kind": "current", "lat": 1, "lng": 2 }),
+            r#"{ "temperature": { "degrees": 60 } }"#,
+            &imperial,
+        ) else {
+            panic!("expected an answer");
+        };
+        // Absent fields are omitted, never invented.
+        assert_eq!(
+            answer,
+            json!({
+                "location": { "lat": 1.0, "lng": 2.0 },
+                "units": { "temperature": "°F", "speed": "mph", "distance": "mi", "precipitation": "in" },
+                "temperature": 60,
+            })
+        );
+    }
+
+    fn hour(day: u64, hour: Option<u64>) -> Value {
+        let mut when = json!({ "year": 2025, "month": 7, "day": day, "utcOffset": "-25200s" });
+        if let Some(hour) = hour {
+            when["hours"] = json!(hour);
+        }
+        json!({
+            "interval": { "startTime": "2025-07-01T19:00:00Z" },
+            "displayDateTime": when,
+            "weatherCondition": { "description": { "text": "Clear" } },
+            "temperature": { "degrees": 20 }, "feelsLikeTemperature": { "degrees": 19 },
+            "precipitation": { "probability": { "percent": 10, "type": "RAIN" }, "qpf": { "quantity": 0.1 } },
+            "wind": { "direction": { "cardinal": "NORTH" }, "speed": { "value": 7 } },
+            "relativeHumidity": 50, "uvIndex": 3, "cloudCover": 5, "isDaytime": false,
+            "airPressure": { "meanSeaLevelMillibars": 1000 },
+        })
+    }
+
+    #[test]
+    fn weather_hourly_is_compacted_with_its_next_page() {
+        let body = json!({
+            "forecastHours": [hour(1, Some(12)), hour(2, None)],
+            "timeZone": { "id": "America/Los_Angeles" },
+            "nextPageToken": "next-tok",
+        });
+        let answer = weather_answer(
+            json!({ "kind": "hourly", "lat": 1, "lng": 2 }),
+            &body.to_string(),
+            &settings(),
+        );
+        let Next::Complete(answer) = answer else {
+            panic!("expected an answer: {answer:?}");
+        };
+        assert_eq!(answer["timezone"], "America/Los_Angeles");
+        assert_eq!(answer["units"]["temperature"], "°C");
+        assert_eq!(answer["next_page"], "next-tok");
+        assert_eq!(
+            answer["hours"][0],
+            json!({
+                "time": "2025-07-01T12:00", "condition": "Clear", "temperature": 20, "feels_like": 19,
+                "precip_probability_percent": 10, "precip_type": "RAIN", "precip_amount": 0.1,
+                "wind_speed": 7, "wind_direction": "NORTH", "humidity_percent": 50, "uv_index": 3,
+                "cloud_cover_percent": 5, "is_daytime": false,
+            })
+        );
+        // Google's JSON omits a zero hour.
+        assert_eq!(answer["hours"][1]["time"], "2025-07-02T00:00");
+        assert!(answer.get("hours_omitted").is_none());
+    }
+
+    #[test]
+    fn weather_hourly_beyond_a_page_is_counted_not_dropped() {
+        let hours: Vec<Value> = (0..25).map(|h| hour(1, Some(h % 24))).collect();
+        let body = json!({ "forecastHours": hours });
+        let Next::Complete(answer) = weather_answer(
+            json!({ "kind": "hourly", "lat": 1, "lng": 2 }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["hours"].as_array().unwrap().len(), 24);
+        assert_eq!(answer["hours_omitted"], 1);
+        assert!(answer.get("next_page").is_none());
+    }
+
+    #[test]
+    fn weather_daily_is_compacted_with_day_and_night() {
+        let part = |text: &str| {
+            json!({
+                "weatherCondition": { "description": { "text": text } },
+                "precipitation": { "probability": { "percent": 20, "type": "SNOW" } },
+                "relativeHumidity": 40, "uvIndex": 6, "thunderstormProbability": 5, "cloudCover": 30,
+            })
+        };
+        let body = json!({
+            "forecastDays": [{
+                "displayDate": { "year": 2025, "month": 2, "day": 3 },
+                "daytimeForecast": part("Sunny"),
+                "nighttimeForecast": part("Clear"),
+                "maxTemperature": { "degrees": 25 }, "minTemperature": { "degrees": 12 },
+                "feelsLikeMaxTemperature": { "degrees": 26 }, "feelsLikeMinTemperature": { "degrees": 11 },
+                "sunEvents": { "sunriseTime": "2025-02-03T14:00:00Z" },
+            }],
+            "timeZone": { "id": "Europe/Paris" },
+        });
+        let Next::Complete(answer) = weather_answer(
+            json!({ "kind": "daily", "lat": 1, "lng": 2, "days": 1 }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["timezone"], "Europe/Paris");
+        assert_eq!(answer["day_parts"], DAY_PARTS);
+        let day_part = |text: &str| {
+            json!({
+                "condition": text, "precip_probability_percent": 20, "precip_type": "SNOW",
+                "humidity_percent": 40, "uv_index": 6, "cloud_cover_percent": 30,
+                "thunderstorm_percent": 5,
+            })
+        };
+        assert_eq!(
+            answer["days"],
+            json!([{
+                "date": "2025-02-03", "high": 25, "low": 12, "feels_like_high": 26,
+                "feels_like_low": 11, "sunrise": "2025-02-03T14:00:00Z",
+                "day": day_part("Sunny"), "night": day_part("Clear"),
+            }])
+        );
+    }
+
+    #[test]
+    fn weather_daily_beyond_the_cap_is_counted_with_its_next_page() {
+        let days: Vec<Value> = (1..=DAYS_MAX + 1)
+            .map(|d| json!({ "displayDate": { "year": 2025, "month": 2, "day": d } }))
+            .collect();
+        let body = json!({ "forecastDays": days, "nextPageToken": "more-days" });
+        let Next::Complete(answer) = weather_answer(
+            json!({ "kind": "daily", "lat": 1, "lng": 2, "days": 10 }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        let dates: Vec<Value> = (1..=DAYS_MAX)
+            .map(|d| json!({ "date": format!("2025-02-{d:02}") }))
+            .collect();
+        assert_eq!(answer["days"], Value::Array(dates));
+        assert_eq!(answer["days_omitted"], 1);
+        assert_eq!(answer["next_page"], "more-days");
+        // The cap is the API's 10, not the `days` asked for: a shorter
+        // request answered with more days relays them.
+        let Next::Complete(answer) = weather_answer(
+            json!({ "kind": "daily", "lat": 1, "lng": 2, "days": 2 }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["days"].as_array().unwrap().len(), 10);
+        assert_eq!(answer["days_omitted"], 1);
+    }
+
+    fn alert(n: usize) -> Value {
+        json!({
+            "alertId": format!("urn:{n}"),
+            "alertTitle": { "text": "Flash Flood Warning", "languageCode": "en" },
+            "eventType": "FLASH_FLOOD", "areaName": "Wake, NC",
+            "description": "d".repeat(ALERT_DESCRIPTION_MAX_CHARS + 1),
+            "severity": "SEVERE", "certainty": "LIKELY", "urgency": "IMMEDIATE",
+            "instruction": ["one", "two", "three", "four", "five", "six"],
+            "safetyRecommendations": [{ "directive": "Move to higher ground", "subtext": "now" }],
+            "timezoneOffset": "-14400s",
+            "startTime": "2025-08-06T18:24:00Z", "expirationTime": "2025-08-06T21:30:00Z",
+            "dataSource": { "publisher": "NOAA", "name": "National Weather Service", "authorityUri": "https://weather.example.com/" },
+            "polygon": "{}",
+        })
+    }
+
+    #[test]
+    fn weather_alerts_are_compacted_with_their_source() {
+        let body =
+            json!({ "weatherAlerts": [alert(1)], "regionCode": "US", "nextPageToken": "p2" });
+        let Next::Complete(answer) = weather_answer(
+            json!({ "kind": "alerts", "lat": 1, "lng": 2 }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(
+            answer,
+            json!({
+                "location": { "lat": 1.0, "lng": 2.0 },
+                "region": "US",
+                "alerts": [{
+                    "title": "Flash Flood Warning", "event": "FLASH_FLOOD", "severity": "SEVERE",
+                    "certainty": "LIKELY", "urgency": "IMMEDIATE", "area": "Wake, NC",
+                    "starts": "2025-08-06T18:24:00Z", "ends": "2025-08-06T21:30:00Z",
+                    "description": format!("{}…", "d".repeat(ALERT_DESCRIPTION_MAX_CHARS)),
+                    "instructions": ["one", "two", "three", "four", "five"],
+                    "instructions_omitted": 1,
+                    "recommendations": [{ "directive": "Move to higher ground", "subtext": "now" }],
+                    "source": { "name": "National Weather Service", "url": "https://weather.example.com/" },
+                }],
+                "next_page": "p2",
+            })
+        );
+    }
+
+    #[test]
+    fn weather_alert_without_a_full_source_is_still_relayed() {
+        let mut bare = alert(1);
+        bare.as_object_mut().unwrap().remove("dataSource");
+        let mut nameless = alert(2);
+        nameless["dataSource"] = json!({ "authorityUri": "https://weather.example.com/" });
+        let body = json!({ "weatherAlerts": [bare, nameless], "regionCode": "US" });
+        let Next::Complete(answer) = weather_answer(
+            json!({ "kind": "alerts", "lat": 1, "lng": 2 }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["alerts"][0]["title"], "Flash Flood Warning");
+        assert!(answer["alerts"][0].get("source").is_none());
+        assert_eq!(
+            answer["alerts"][1]["source"],
+            json!({ "url": "https://weather.example.com/" })
+        );
+    }
+
+    #[test]
+    fn weather_alerts_only_a_region_is_an_empty_list() {
+        let Next::Complete(answer) = weather_answer(
+            json!({ "kind": "alerts", "lat": 1, "lng": 2 }),
+            r#"{ "regionCode": "FR" }"#,
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(
+            answer,
+            json!({ "location": { "lat": 1.0, "lng": 2.0 }, "region": "FR", "alerts": [] })
+        );
+    }
+
+    #[test]
+    fn weather_alerts_beyond_the_cap_are_counted() {
+        let alerts: Vec<Value> = (0..ALERTS_MAX + 3).map(alert).collect();
+        let body = json!({ "weatherAlerts": alerts, "regionCode": "US" });
+        let Next::Complete(answer) = weather_answer(
+            json!({ "kind": "alerts", "lat": 1, "lng": 2 }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["alerts"].as_array().unwrap().len(), ALERTS_MAX);
+        assert_eq!(answer["alerts_omitted"], 3);
+    }
+
+    #[test]
+    fn weather_refuses_an_unexpected_shape_per_kind() {
+        let cases = [
+            ("current", r#"{ "currentTime": "x" }"#),
+            ("hourly", r#"{ "timeZone": { "id": "UTC" } }"#),
+            ("hourly", r#"{ "forecastHours": {} }"#),
+            ("hourly", r#"{ "forecastHours": [1] }"#),
+            ("daily", r#"{ "forecastHours": [] }"#),
+            ("alerts", r#"{ "nextPageToken": "x" }"#),
+            (
+                "alerts",
+                r#"{ "regionCode": "US", "weatherAlerts": [{ "instruction": [1] }] }"#,
+            ),
+            (
+                "alerts",
+                r#"{ "regionCode": "US", "weatherAlerts": [{ "safetyRecommendations": ["x"] }] }"#,
+            ),
+            (
+                "alerts",
+                r#"{ "regionCode": "US", "weatherAlerts": [{ "instruction": null }] }"#,
+            ),
+            ("alerts", r#"{ "regionCode": "US", "weatherAlerts": [1] }"#),
+            ("daily", r#"{ "forecastDays": [[]] }"#),
+            ("current", "[]"),
+        ];
+        for (kind, body) in cases {
+            assert_eq!(
+                weather_answer(
+                    json!({ "kind": kind, "lat": 1, "lng": 2 }),
+                    body,
+                    &settings()
+                ),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    "unexpected Weather API response shape"
+                )),
+                "{kind} {body}"
+            );
+        }
     }
 }

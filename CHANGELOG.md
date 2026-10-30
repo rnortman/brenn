@@ -16,6 +16,13 @@ All notable changes to Brenn are documented here.
   which lets a provider drop a completion for a request that has expired
   instead of failing; both are additive.
 
+- **`google-maps-tools` adds a `Weather` tool**: current conditions, an
+  hourly forecast, up to ten days of day and night forecasts, and public
+  weather alerts, for a named place or for coordinates. An alert's source
+  is shown with it when Google gives one. An empty alerts list is not proof
+  that no alert is in force: Google gives the same answer when a provider's
+  alert lacked a required field.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key

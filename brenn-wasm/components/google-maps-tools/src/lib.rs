@@ -6,12 +6,13 @@
 //! commits before returning, so the nested calls it buffered flush against
 //! committed state.
 //!
-//! Serving a request validates its arguments and issues one nested
+//! Serving a request validates its arguments and issues its first nested
 //! `api-request` for the caller's user through `call_async_for`, recording the
 //! request's state in the store under the call's id. Answering a result reads
-//! that state back, deletes it, and completes the request from
-//! `api-request`'s answer. A request's own problem — bad arguments, Brenn's
-//! refusal, Google's error — is answered with `complete_err`; only a
+//! that state back, deletes it, and either completes the request from
+//! `api-request`'s answer or issues the request's next step the same way, so a
+//! request has at most one nested call outstanding. A request's own problem —
+//! bad arguments, Brenn's refusal, Google's error — is answered with `complete_err`; only a
 //! structural fault (a bad `config`, a store failure, a malformed envelope)
 //! fails the activation. A completion the host no longer holds is dropped.
 
@@ -19,7 +20,7 @@ mod logic;
 mod spec;
 
 use brenn_guest::provides::{OutcomeErrorKind, PendingId, ToolRequest, drop_not_pending};
-use brenn_guest::serde_json::Value;
+use brenn_guest::serde_json::Map;
 use brenn_guest::tools::ToolResult;
 use brenn_guest::{Activation, Error, Processor};
 
@@ -45,7 +46,7 @@ impl Processor for GoogleMapsTools {
             serve(&tx, &settings, now_ms, &request)?;
         }
         for result in activation.tool_results()? {
-            answer(&tx, result)?;
+            answer(&tx, &settings, now_ms, result)?;
         }
         tx.commit()?;
         Ok(None)
@@ -79,27 +80,34 @@ fn serve(
             OutcomeErrorKind::InvalidArgs,
             &reason,
         )),
-        Ok(call) => issue(tx, &request.id, tool, &request.args, &call, now_ms),
+        Ok(call) => {
+            let state = InFlight::new(
+                request.id.as_str(),
+                tool,
+                &request.args,
+                &call,
+                Map::new(),
+                now_ms,
+            );
+            issue(tx, &request.id, &call, &state)
+        }
     }
 }
 
-/// Issue `call` for request `id` and record its state, or answer the request
-/// with Brenn's refusal when the call cannot be queued.
+/// Issue `call` for request `id` and record `state`, its in-flight row, or
+/// answer the request with Brenn's refusal when the call cannot be queued.
 fn issue(
     tx: &store::Transaction,
     id: &PendingId,
-    tool: Provided,
-    args: &Value,
     call: &Call,
-    now_ms: u64,
+    state: &InFlight,
 ) -> Result<(), Error> {
-    let state = InFlight::new(id.as_str(), tool, args, call, now_ms);
     let call_id = state.call_id();
     match provides::call_async_for(id, NESTED_TOOL, &call.api, &call_id) {
         Ok(()) => {
             log::info(format!(
                 "{} step {} {} {}{}",
-                tool.name(),
+                state.tool.name(),
                 call.step,
                 call.api.method,
                 call.api.host,
@@ -115,7 +123,12 @@ fn issue(
     }
 }
 
-fn answer(tx: &store::Transaction, result: ToolResult) -> Result<(), Error> {
+fn answer(
+    tx: &store::Transaction,
+    settings: &Settings,
+    now_ms: u64,
+    result: ToolResult,
+) -> Result<(), Error> {
     // Every call this component makes serves a request.
     let Some(id) = result.serving else {
         log::debug(format!(
@@ -145,13 +158,14 @@ fn answer(tx: &store::Transaction, result: ToolResult) -> Result<(), Error> {
         state.step,
         logic::result_summary(&outcome)
     ));
-    match logic::advance(&state, outcome) {
+    match logic::advance(&state, outcome, settings) {
         Next::Complete(value) => drop_not_pending(provides::complete(&id, &value)),
         Next::Fail(failure) => drop_not_pending(provides::complete_err(
             &id,
             outcome_kind(failure.kind),
             &failure.detail,
         )),
+        Next::Call { call, derived } => issue(tx, &id, &call, &state.next(&call, derived, now_ms)),
     }
 }
 
