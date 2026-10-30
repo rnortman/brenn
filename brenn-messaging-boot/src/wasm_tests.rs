@@ -143,7 +143,7 @@ fn provided_tool(
         name: name.to_string(),
         mcp_name: "EchoForUser".to_string(),
         description: "Echo.".to_string(),
-        input_schema: serde_json::json!({}),
+        input_schema: serde_json::json!({ "type": "object" }),
         max_concurrency,
         auto_approve: true,
     }
@@ -214,6 +214,23 @@ fn a_provider_above_the_concurrency_ceiling_panics() {
         ])],
         &dir_of(vec![]),
     );
+}
+
+/// A schema whose `required` names a key `properties` lacks would have every
+/// call checked against nothing; a hand-built config gets the compile-time
+/// rule's refusal.
+#[test]
+#[should_panic(
+    expected = "[[wasm_consumer]] \"provider\": provided tool \"echo-for-user\": `input_schema` \
+                is a JSON schema of the shape a tool's arguments are checked against: \
+                `required` names \"q\", which is not a key of `properties`"
+)]
+fn a_provided_tool_with_a_misshaped_schema_panics() {
+    let tool = brenn_lib::messaging::config::ProvidedToolDecl {
+        input_schema: serde_json::json!({ "type": "object", "required": ["q"] }),
+        ..provided_tool("echo-for-user", 1)
+    };
+    resolve(&[provider_raw(vec![tool])], &dir_of(vec![]));
 }
 
 /// An operator port wearing the request inbox's name would collide with the

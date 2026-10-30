@@ -23,7 +23,7 @@ rust_test(
     crate = ":brenn-pfin",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
-    deps = all_crate_deps(normal_dev = True),
+    deps = all_crate_deps(normal_dev = True) + ["//brenn-envelope"],
 )
 
 rust_doc_test(

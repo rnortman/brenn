@@ -698,7 +698,8 @@ pub struct ProvidedToolDecl {
     /// The bare MCP suffix (`GmailSearch`), as the class wrote it.
     pub mcp_name: String,
     pub description: String,
-    /// A JSON object: the schema the tool's arguments are described by.
+    /// The schema the tool's arguments are checked against: an object of the
+    /// shape `brenn_envelope::tool_schema::check_input_schema` admits.
     pub input_schema: serde_json::Value,
     /// The most calls of this tool outstanding at once; at least one.
     pub max_concurrency: u32,

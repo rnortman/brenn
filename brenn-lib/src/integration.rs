@@ -2371,6 +2371,54 @@ mod tests {
     // repo_virtual_tools
     // -----------------------------------------------------------------------
 
+    /// Every core and repo virtual tool, conditional ones included: every
+    /// send-enabling capability held and one mount.
+    fn every_core_and_repo_virtual_tool() -> Vec<VirtualToolDef> {
+        let cfg = minimal_app_config_for_tool_test(&[
+            AppCapability::MessagingPublish,
+            AppCapability::PwaPush,
+            AppCapability::MqttPublish,
+        ]);
+        core_virtual_tools(&cfg)
+            .into_iter()
+            .chain(repo_virtual_tools(&[test_mount("notes")]))
+            .collect()
+    }
+
+    /// The config language refuses a provided `mcp_name` against a literal
+    /// list; it must name exactly what the builders can emit.
+    #[test]
+    fn the_core_virtual_tool_name_list_is_what_the_builders_emit() {
+        let emitted: std::collections::BTreeSet<String> = every_core_and_repo_virtual_tool()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        let listed: std::collections::BTreeSet<String> =
+            brenn_envelope::addressing::CORE_VIRTUAL_TOOL_NAMES
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+        assert_eq!(
+            listed.len(),
+            brenn_envelope::addressing::CORE_VIRTUAL_TOOL_NAMES.len(),
+            "CORE_VIRTUAL_TOOL_NAMES lists a name twice"
+        );
+        assert_eq!(emitted, listed);
+    }
+
+    /// Every core and repo schema has the shape a call is validated against.
+    #[test]
+    fn every_core_and_repo_virtual_tool_schema_has_the_checked_shape() {
+        for def in every_core_and_repo_virtual_tool() {
+            assert_eq!(
+                brenn_envelope::tool_schema::check_input_schema(&def.input_schema),
+                Ok(()),
+                "{}",
+                def.name
+            );
+        }
+    }
+
     #[test]
     fn repo_virtual_tools_empty_repos_returns_empty() {
         assert!(repo_virtual_tools(&[]).is_empty());

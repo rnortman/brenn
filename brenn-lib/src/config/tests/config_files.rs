@@ -235,8 +235,9 @@ fn config_sources() -> Vec<(String, String)> {
 /// else would notice the day the spec grows a port and the transcription does
 /// not, so the equality is held here.
 ///
-/// TODO(dsl-doc-examples-ungated): this is the only block in that document held
-/// against anything; the other snippets are prose nothing parses.
+/// TODO(dsl-doc-examples-ungated): this and the providing-class example below
+/// are the only blocks in that document held against anything; the other
+/// snippets are prose nothing parses.
 #[test]
 fn the_dsl_doc_transcribes_the_chrome_spec_verbatim() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -261,6 +262,39 @@ fn the_dsl_doc_transcribes_the_chrome_spec_verbatim() {
         "the `component Chrome` block in docs/config-dsl.md has drifted from \
          config/specs/chrome.brenn; re-copy the spec into the block"
     );
+}
+
+/// The DSL prose reference's providing-class example compiles.
+///
+/// `docs/config-dsl.md` writes the `GmailTools` class once, under the class
+/// specification. The block is staged as a packaged module with one instance of
+/// it beside it, and the document must pass `check_config` — so an attribute
+/// the language renames, or a rule the example stops satisfying, fails here.
+#[test]
+fn the_dsl_doc_providing_class_compiles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let doc_path = root.join("docs/config-dsl.md");
+    let doc = std::fs::read_to_string(&doc_path)
+        .unwrap_or_else(|error| panic!("{} must be readable: {error}", doc_path.display()));
+    let block = fenced_blocks(&doc)
+        .into_iter()
+        .find(|block| block.contains("component GmailTools {"))
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/config-dsl.md carries no fenced block declaring `component GmailTools {{`; \
+                 the providing-class example is gone, not merely stale"
+            )
+        });
+    let document = format!(
+        "{PACKAGED}{block}{PACKAGED}\
+         new gmail: GmailTools {{\n    grants = [log, tools, provides];\n    \
+         tool api-request {{}}\n}}\n"
+    );
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let inputs = crate::config::stage_fixture(dir.path(), "main.brenn", &document);
+    if let Err(report) = check_config(&inputs) {
+        panic!("the `component GmailTools` example in docs/config-dsl.md must compile:\n{report}");
+    }
 }
 
 /// The contents of every fenced code block in a markdown document.

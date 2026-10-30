@@ -4543,14 +4543,14 @@ fn a_providing_class_resolves_its_statements() {
         "        mcp_name = \"GmailSearch\";\n",
         "        description = \"Search the connected Gmail account.\";\n",
         "        input_schema = \"\"\"{ \"type\": \"object\", \"$schema\": \"x\", ",
-        "\"required\": [\"q\"] }\"\"\";\n",
+        "\"properties\": { \"q\": { \"type\": \"string\" } }, \"required\": [\"q\"] }\"\"\";\n",
         "        max_concurrency = 4;\n",
         "        auto_approve = false;\n",
         "    }\n",
         "    provide gmail-read {\n",
         "        mcp_name = \"GmailRead\";\n",
         "        description = \"Read one message.\";\n",
-        "        input_schema = \"\"\"{}\"\"\";\n",
+        "        input_schema = \"\"\"{ \"type\": \"object\" }\"\"\";\n",
         "    }\n",
     )));
     let provides = &config.consumers[0].class.provides;
@@ -4564,6 +4564,7 @@ fn a_providing_class_resolves_its_statements() {
     );
     assert_eq!(search.description, "Search the connected Gmail account.");
     assert_eq!(search.input_schema["required"][0], "q");
+    assert_eq!(search.input_schema["properties"]["q"]["type"], "string");
     assert_eq!(search.input_schema["$schema"], "x");
     assert_eq!(search.max_concurrency, 4);
     assert!(!search.auto_approve);
@@ -4747,6 +4748,76 @@ fn a_misshapen_mcp_name_is_quoted_with_its_control_characters_escaped() {
          letters and digits"
     );
     assert!(!message.contains(['\n', '\u{1b}']), "{message}");
+}
+
+/// A core or repo virtual tool's name is taken in every agent's tool list.
+#[test]
+fn an_mcp_name_may_not_take_a_core_virtual_tools_name() {
+    let source = provider_doc(&provide("mail-search", "DisplayFile", ""));
+    let errors = resolve_errors(&source);
+    assert_eq!(
+        messages(&errors),
+        [
+            "`DisplayFile` is the name of a core virtual tool every agent may be offered \
+          (`CORE_VIRTUAL_TOOL_NAMES`); a provided tool's `mcp_name` may not take it"
+        ]
+    );
+    assert_eq!(errors[0].line_col(), at(&source, "\"DisplayFile\""));
+}
+
+/// Each clause of the shape rule, refused at the schema's value.
+#[test]
+fn an_input_schema_has_the_shape_arguments_are_checked_against() {
+    let cases = [
+        (
+            r#"{ "properties": {} }"#,
+            "the root has no `\"type\": \"object\"`",
+        ),
+        (
+            r#"{ "type": "array" }"#,
+            "the root has no `\"type\": \"object\"`",
+        ),
+        (
+            r#"{ "type": "object", "properties": [] }"#,
+            "`properties` is not an object",
+        ),
+        (
+            r#"{ "type": "object", "properties": { "q": "string" } }"#,
+            "`properties.\"q\"` is not an object",
+        ),
+        (
+            r#"{ "type": "object", "properties": { "q": {} }, "required": "q" }"#,
+            "`required` is not an array of strings",
+        ),
+        (
+            r#"{ "type": "object", "properties": { "q": {} }, "required": [1] }"#,
+            "`required` holds 1, which is not a string",
+        ),
+        (
+            r#"{ "type": "object", "required": ["q"] }"#,
+            "`required` names \"q\", which is not a key of `properties`",
+        ),
+    ];
+    for (schema, reason) in cases {
+        let source = provider_doc(&provide("mail-search", "MailSearch", "").replace(
+            "\"\"\"{ \"type\": \"object\" }\"\"\"",
+            &format!("\"\"\"{schema}\"\"\""),
+        ));
+        let errors = resolve_errors(&source);
+        assert_eq!(
+            messages(&errors),
+            [format!(
+                "`input_schema` is a JSON schema of the shape a tool's arguments are checked \
+                 against: {reason}"
+            )],
+            "{schema}"
+        );
+        assert_eq!(
+            errors[0].line_col(),
+            at(&source, &format!("\"\"\"{schema}")),
+            "{schema}"
+        );
+    }
 }
 
 #[test]

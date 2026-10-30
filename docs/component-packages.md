@@ -89,7 +89,10 @@ import it, and its artifact, its record and its spec are what they were;
 `examples/component/` (which requires `[ports, log]`) builds unchanged against
 the grown world. A kind that does name it is backend-only — a surface host
 links no tool substrate — and needs a brenn new enough to link it, by the same
-ordering rule as `calls`. The request body (`{"v": 1, "id", "tool", "args"}`)
+ordering rule as `calls`. The tools a kind serves are declared in its spec by
+a new class statement, `provide <tool> { … }` (`docs/config-dsl.md`, "Provided
+tools"), part of the packaged-DSL subset; a class writes none by default, and a
+kind with no `provide` statement is unaffected. The request body (`{"v": 1, "id", "tool", "args"}`)
 and the tool-result body grow by added fields, which `brenn-guest` ignores; `v`
 moves only for a change a provider built against the older body would misread,
 and `brenn-guest` refuses a version it does not know.

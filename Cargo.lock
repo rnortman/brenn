@@ -979,6 +979,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64ct",
+ "brenn-envelope",
  "brenn-lib",
  "brenn-obs",
  "brenn-tool-registry",
@@ -1031,6 +1032,7 @@ name = "brenn-pfin"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "brenn-envelope",
  "brenn-lib",
  "brenn-ws-types",
  "serde",

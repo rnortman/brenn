@@ -922,6 +922,65 @@ assembly StandardChrome(slug: String, layout: Channel) {
   capability it reaches through a WIT import in `requires`; only a word with no
   interface behind it may be optional. See *Authority* below.
 
+#### Provided tools: the `provide` statement
+
+A class may make its component a source of registry tools. Each `provide`
+statement declares one tool the component answers; an agent or another
+component then calls it like any registry tool, through a `tool` statement
+naming it.
+
+```
+/// Search the user's mailbox.
+component GmailTools {
+  abi = processor;
+  requires = [log, tools, provides];
+  in tool-results;
+  in tool-requests;
+  provide gmail-search {
+    mcp_name = "GmailSearch";
+    description = "Search the connected Gmail account.";
+    input_schema = """{ "type": "object", "properties": { "q": { "type": "string" } }, "required": ["q"] }""";
+    max_concurrency = 4;
+  }
+}
+```
+
+- The statement's name is the tool's canonical registry name: kebab case,
+  lowercase letters and digits in hyphen-separated runs, leading with a letter.
+  It is the name a `tool` statement grants and the last segment of the tool's
+  request channel.
+- `mcp_name` (required) is the bare name an MCP client sees after the server's
+  prefix, `[A-Z][A-Za-z0-9]*`: write `GmailSearch`, and the registry forms
+  `mcp__brenn__GmailSearch` from it. It may not be the name of a core or repo
+  virtual tool (`DisplayFile`, `BrennSend`, `GitRepoStatus`, …): every agent's
+  tool list is one namespace, and those names are already taken in it.
+- `description` (required) is the text an agent is shown for the tool.
+- `input_schema` (required) is a JSON schema object of the shape a tool's
+  arguments are checked against — root `"type": "object"`; `properties`, if
+  present, an object of objects; `required`, if present, an array of strings
+  each naming a property. Nothing else is constrained: `$schema`,
+  `additionalProperties`, descriptions and nested keywords are free. It is
+  written as a raw string (`"""…"""`, no escapes, may span lines), because JSON
+  keys like `$schema` cannot be written as DSL identifiers; this is the one place
+  JSON text lives in a `.brenn` file.
+- `max_concurrency` (default `1`) is the most calls of this tool outstanding at
+  once. It is a count of at least one that fits a `u32`, and **the class's sum
+  over its `provide` statements is at most 32** (`PROVIDER_CONCURRENCY_CEILING`).
+  The ceiling comes from what one activation can do: a provider can be handed
+  its whole request window as new requests in one activation and serves each
+  with one nested call, so the window must fit in half an activation's
+  tool-call budget, leaving the other half for whatever else that activation
+  calls. Above it the class is refused: "`{Class}` declares Σ max_concurrency =
+  {sum} across its provide statements; a provider may hold at most 32 requests
+  in flight (`PROVIDER_CONCURRENCY_CEILING`): …".
+- `auto_approve` (default `true`) is whether a call skips the approval prompt.
+- A `provide` statement takes no sub-blocks. Two statements in one class may not
+  name the same tool, nor the same `mcp_name`.
+
+The class also owes the `provides` word and the `tool-requests` port; both are
+described under *Tool grants* below, with the rest of what the document checks
+about a provider.
+
 The class carries the contract; **instances never restate it**. Neither does the
 deployment restate where the artifact lives: a top-level instance is resolved
 from the package its class's module names, and a surface-placed instance from
@@ -1139,6 +1198,41 @@ port is neither the class's option nor the instance's to wire:
 
 So a tool-using instance's body holds its `tool` statements and the bindings for
 its own ports, and says nothing at all about `tool-results`.
+
+#### The request inbox port
+
+The provider side mirrors it. A class with `provide` statements (see *Provided
+tools* above) answers through the `provides` word and is handed its requests on
+a reserved input port named `tool-requests`:
+
+- `provides` in `requires` iff the class declares at least one `provide`
+  statement, refused in both directions: a word with nothing to answer for
+  reaches nothing, and a statement is what the word consents to. On the
+  instance, `provides` is granted iff its class requires it, as for any word.
+  `provides` is backend-only, like `tools`: a surface-placed instance granted it
+  is refused.
+- A class requiring `provides` **must** declare `in tool-requests;`, and a class
+  that does not may not use the name. The port is never `optional`, and no
+  instance binding names it.
+- The channel behind it is `brenn:tool-requests/<slug>`, minted by the
+  substrate and sized from the class's summed `max_concurrency`, so that no
+  request is pushed out of the window before the component sees it while the
+  component takes delivery of each within the provided-tool deadline (240 s). A
+  request whose caller the deadline has already answered `internal` frees its
+  slot, so a component paced or stalled past the deadline can have such a
+  request pushed out unseen; nothing is lost, as its caller is answered. Unlike
+  the result inbox it is not the operator's to tune: a `channel at
+  "brenn:tool-requests/…"` tuning block, exact or prefix, is refused, and so is
+  a channel declaration at such an address. No component port may name the
+  address.
+- Two instances in one document whose classes provide the same tool name or the
+  same `mcp_name` are refused, both sites cited — including two instances of one
+  providing class. An instance may not hold a `tool` statement naming a tool its
+  own class provides.
+
+A provider answers each request through the `provides` interface and may act
+for the calling user only on a request it is serving; its instance names no
+inbox and no user.
 
 ### Surfaces
 
@@ -1950,6 +2044,14 @@ Compilation is fail-closed and reports the whole document: a refusal is a
 positioned diagnostic, often with related sites in other files, and a document
 that does not compile is a boot panic rather than a degraded start.
 
+For provided tools, `config-check` sees every rule of the `provide` statement
+and the request inbox port, including the schema's shape, the summed
+concurrency ceiling, and a provided `mcp_name` equal to a core or repo virtual
+tool's name. It cannot see a collision with a native registry tool's name or
+with an integration's virtual tool name, nor an agent's `tool` statement naming
+a tool no class provides: those are registry and agent-list facts, refused when
+the server boots.
+
 A document that passes comes back with its identity:
 `<root>: ok document_sha256=<hash>`. The hash is over every file the compile
 read — the root, its tree modules, and the packaged modules it imported — each
@@ -2117,6 +2219,13 @@ not compile, or that declares a path which is not an installed mount, is a
 refusal on its own — nothing about the deployment document is read. The outcome
 body's `mounts` array names what the process is reading: the candidate's on
 `applied` and `unchanged`, the running one's on `refused`.
+
+Provided tools need a restart too: the tool registry is fixed for the life of
+the process. A reload that adds, removes or changes a `provide` statement, or
+adds or removes an instance whose class provides one, is refused naming the
+instance (`wasm_consumers[search].provides differs`); any other change to a
+providing instance — its bindings, its own `tool` statements — converges as for
+any instance.
 
 Everything else needs a restart, and says so. Remotes,
 PWA push, tool declarations, Claude profiles, and the

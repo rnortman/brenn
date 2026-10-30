@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use brenn_envelope::addressing::{PROVIDER_CONCURRENCY_CEILING, PROVIDER_CONCURRENCY_REFUSAL};
+use brenn_envelope::tool_schema::{INPUT_SCHEMA_SHAPE_REFUSAL, check_input_schema};
 use brenn_lib::messaging::config::{
     ActivationPacing, BACKEND_FATAL_NOISE_REFUSAL, DEFAULT_WASM_INPUT_AMPLIFICATION,
     DEFAULT_WASM_PUBLISH_CAPACITY, DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth,
@@ -145,9 +146,9 @@ pub(crate) fn resolve_wasm_consumers(
         }
 
         // 4d. `provides` granted iff the class provides a tool, each with a
-        //     concurrency of at least one and the sum within the ceiling — the
-        //     class rules the config language refuses, held again for a
-        //     hand-built config.
+        //     concurrency of at least one, a schema of the checked shape and
+        //     the sum within the ceiling — the class rules the config language
+        //     refuses, held again for a hand-built config.
         assert_eq!(
             grants.contains(&ComponentGrant::Provides),
             !consumer.provides.is_empty(),
@@ -162,6 +163,13 @@ pub(crate) fn resolve_wasm_consumers(
                  `max_concurrency` is a count of at least one",
                 tool.name,
             );
+            if let Err(error) = check_input_schema(&tool.input_schema) {
+                panic!(
+                    "[[wasm_consumer]] {slug:?}: provided tool {:?}: \
+                     {INPUT_SCHEMA_SHAPE_REFUSAL}: {error}",
+                    tool.name,
+                );
+            }
         }
         let provided_concurrency: u64 = consumer
             .provides

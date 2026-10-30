@@ -107,6 +107,12 @@ fn accepted_types(
 /// `Err` carries a message naming the offending key and what was allowed,
 /// written for the model that made the call. `tool` names the tool in the
 /// warning for a `type` keyword the validator does not model.
+///
+/// The schema has the shape `brenn_envelope::tool_schema::check_input_schema`
+/// admits — every schema offered to an agent is held to it before any call is
+/// validated — so a present `properties` that is not an object, or a present
+/// `required` that is not an array of strings, panics. An absent `properties`
+/// allows no arguments; an absent `required` requires none.
 pub fn validate_tool_input(tool: &str, schema: &Value, args: &Value) -> Result<(), String> {
     let Value::Object(args) = args else {
         return Err(format!(
@@ -115,23 +121,28 @@ pub fn validate_tool_input(tool: &str, schema: &Value, args: &Value) -> Result<(
         ));
     };
     let empty = serde_json::Map::new();
-    let properties = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .unwrap_or(&empty);
+    let properties = schema.get("properties").map_or(&empty, |props| {
+        props.as_object().unwrap_or_else(|| {
+            panic!("BUG: tool {tool}'s schema reached validation with a non-object `properties`")
+        })
+    });
     let mut allowed: Vec<&str> = properties.keys().map(String::as_str).collect();
     allowed.sort_unstable();
 
-    let missing: Vec<&str> = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|req| {
-            req.iter()
-                .filter_map(Value::as_str)
-                .filter(|k| !args.contains_key(*k))
-                .collect()
-        })
-        .unwrap_or_default();
+    let required: Vec<&str> = schema.get("required").map_or_else(Vec::new, |req| {
+        req.as_array()
+            .and_then(|names| names.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+            .unwrap_or_else(|| {
+                panic!(
+                    "BUG: tool {tool}'s schema reached validation with a `required` that is not \
+                     an array of strings"
+                )
+            })
+    });
+    let missing: Vec<&str> = required
+        .into_iter()
+        .filter(|k| !args.contains_key(*k))
+        .collect();
     if !missing.is_empty() {
         return Err(format!(
             "missing required argument(s): {missing:?} (allowed: {allowed:?})"
@@ -412,5 +423,44 @@ mod tests {
                 assert_eq!(result.is_ok(), expect_ok, "shape={shape} value={value}");
             }
         }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "BUG: tool Tool's schema reached validation with a non-object \
+                               `properties`"
+    )]
+    fn a_non_object_properties_panics() {
+        validate_tool_input(
+            "Tool",
+            &json!({"type": "object", "properties": ["q"]}),
+            &json!({}),
+        )
+        .unwrap_or_else(|err| panic!("refused instead of panicking: {err}"));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "BUG: tool Tool's schema reached validation with a `required` \
+                               that is not an array of strings"
+    )]
+    fn a_non_array_required_panics() {
+        validate_tool_input(
+            "Tool",
+            &json!({"type": "object", "properties": {"q": {}}, "required": "q"}),
+            &json!({"q": 1}),
+        )
+        .unwrap_or_else(|err| panic!("refused instead of panicking: {err}"));
+    }
+
+    #[test]
+    fn absent_properties_and_required_allow_nothing_and_require_nothing() {
+        let schema = json!({"type": "object"});
+        assert_eq!(validate_tool_input("Tool", &schema, &json!({})), Ok(()));
+        let err = validate_tool_input("Tool", &schema, &json!({"q": 1})).unwrap_err();
+        assert!(
+            err.starts_with("unknown argument(s): [\"q\"] (allowed: [])"),
+            "{err}"
+        );
     }
 }

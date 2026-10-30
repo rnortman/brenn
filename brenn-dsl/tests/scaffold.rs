@@ -581,7 +581,7 @@ fn every_item_naming_the_sdk_is_gated_to_wasm32() {
 fn provide(tool: &str) -> String {
     format!(
         "  provide {tool} {{\n    mcp_name = \"Tool\";\n    description = \"A tool.\";\n    \
-         input_schema = \"\"\"{{}}\"\"\";\n  }}\n"
+         input_schema = \"\"\"{{ \"type\": \"object\" }}\"\"\";\n  }}\n"
     )
 }
 

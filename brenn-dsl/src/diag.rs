@@ -106,6 +106,9 @@ impl Diagnostic {
     /// Multi-line and newline-free at both ends, so a caller decides whether it
     /// goes to stderr, into a panic message, or into a joined block.
     pub fn render(&self) -> String {
+        // TODO(dsl-diagnostic-untrusted-text): messages and notes are written
+        // out as built, so author text a site interpolates with `Display`
+        // reaches stderr and boot panics with its control characters intact.
         let mut out = self.to_string();
         for (note, span) in &self.related {
             out.push_str("\n  ");

@@ -151,6 +151,50 @@ pub const PROVIDER_CONCURRENCY_REFUSAL: &str = "one activation can be handed a f
      new requests and serves each with one nested call, and the ceiling is half an activation's \
      tool-call budget so the activation keeps calls for its other work";
 
+/// Every name the host's core and repo virtual tools can take, conditional
+/// ones included.
+///
+/// An agent's tool list is one bare namespace shared by these, the registry's
+/// tools and the integrations' tools, so a provided tool's `mcp_name` may not
+/// take one of them; the config language refuses it at compile time against
+/// this list. A literal list because the builders that emit these names need
+/// an app to run; a `brenn-lib` test holds it equal to what they emit.
+pub const CORE_VIRTUAL_TOOL_NAMES: &[&str] = &[
+    "DisplayFile",
+    "RequestCompaction",
+    "MessageChannelList",
+    "MessageSubscriptionList",
+    "MessageChannelGet",
+    "MessageSubscribe",
+    "MessageUnsubscribe",
+    "BrennPendingList",
+    "BrennMessageCancel",
+    "BrennMessageEdit",
+    "BrennSend",
+    "PwaPushSend",
+    "PwaPushChannelGet",
+    "DeviceList",
+    "DeviceGet",
+    "DeviceAssignSlug",
+    "SetUserTimezone",
+    "ExportUsage",
+    "AutoCreate",
+    "AutoList",
+    "AutoEdit",
+    "AutoDelete",
+    "MqttSend",
+    "GitRepoStatus",
+    "GitRepoCommitAndPush",
+    "GitListRepos",
+    "GitRepoRun",
+];
+
+/// What every refusal of a provided `mcp_name` in [`CORE_VIRTUAL_TOOL_NAMES`]
+/// says the name is, so the operator reads the same reason wherever it is
+/// refused. Callers name the declaration and the name ahead of it.
+pub const CORE_VIRTUAL_TOOL_NAME_REFUSAL: &str =
+    "the name of a core virtual tool every agent may be offered";
+
 /// Does `address` (a scheme-stripped `brenn:` channel name) fall in a reserved
 /// tool namespace? True for an exact segment match (`"tools"`) or a leading
 /// segment followed by a `.`/`/` boundary (`"tools/x"`, `"tools.x"`), so a

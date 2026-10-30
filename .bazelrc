@@ -57,6 +57,8 @@ build --@fltk//crates/fltk-serde-core:serde=//brenn-dsl:fltk_serde
 # ---------------------------------------------------------------------------
 # Stamping is release-only: an env-var input to a compile action is a cache
 # key, so a per-build id on the dev loop would bust the cache on every build.
+# TODO(release-overflow-checks): `opt` turns rustc's integer overflow checks
+# off, so release binaries wrap silently where dev and test builds panic.
 build:release --compilation_mode=opt
 build:release --stamp
 build:release --workspace_status_command=bazel/workspace_status.sh

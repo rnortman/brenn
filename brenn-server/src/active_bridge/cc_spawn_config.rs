@@ -322,7 +322,9 @@ fn registry_virtual_tools(
 /// server's declaration file and `brenn-tool`'s catalog are both this list.
 ///
 /// Panics if two sources offer the same name: lookup by name would pick one
-/// tool while dispatch runs another.
+/// tool while dispatch runs another. Panics if a tool's schema is not of the
+/// shape `brenn_envelope::tool_schema::check_input_schema` admits: every call
+/// is validated against it, and validation reads that shape.
 pub fn virtual_tools(
     app_config: &brenn_lib::config::AppConfig,
     registry: &brenn_tool_registry::ToolRegistry,
@@ -341,7 +343,20 @@ pub fn virtual_tools(
         )
         .collect();
     assert_unique_tool_names(&app_config.slug, &tools);
+    assert_checked_schemas(&app_config.slug, &tools);
     tools
+}
+
+fn assert_checked_schemas(app_slug: &str, tools: &[brenn_lib::integration::VirtualToolDef]) {
+    for def in tools {
+        if let Err(error) = brenn_envelope::tool_schema::check_input_schema(&def.input_schema) {
+            panic!(
+                "BUG: agent {app_slug:?} is offered virtual tool {:?} whose input_schema is not \
+                 of the checked shape: {error}",
+                def.name
+            );
+        }
+    }
 }
 
 fn assert_unique_tool_names(app_slug: &str, tools: &[brenn_lib::integration::VirtualToolDef]) {
@@ -1189,6 +1204,40 @@ mod tests {
         fn env_vars(&self, _app_config: &brenn_lib::config::AppConfig) -> Vec<(String, String)> {
             vec![(self.key.to_string(), self.value.to_string())]
         }
+    }
+
+    /// Test-only integration stub that contributes one virtual tool whose
+    /// schema has no root `type`.
+    struct UntypedSchemaIntegration;
+
+    impl brenn_lib::integration::Integration for UntypedSchemaIntegration {
+        fn name(&self) -> &str {
+            "untyped"
+        }
+
+        fn virtual_tools(&self) -> Vec<brenn_lib::integration::VirtualToolDef> {
+            vec![brenn_lib::integration::VirtualToolDef {
+                input_schema: serde_json::json!({"properties": {}}),
+                ..tool_def("Untyped")
+            }]
+        }
+    }
+
+    /// Every schema an agent is offered is held to the shape validation
+    /// reads, whichever source contributed it.
+    #[test]
+    #[should_panic(
+        expected = "BUG: agent \"test\" is offered virtual tool \"Untyped\" whose \
+                               input_schema is not of the checked shape: the root has no \
+                               `\"type\": \"object\"`"
+    )]
+    fn virtual_tools_panics_on_a_schema_of_the_wrong_shape() {
+        let mut app = minimal_test_app_config();
+        app.integrations.insert(
+            "untyped".to_string(),
+            std::sync::Arc::new(UntypedSchemaIntegration),
+        );
+        virtual_tools(&app, &brenn_tool_registry::ToolRegistry::new(vec![]));
     }
 
     /// An emitted key missing from `env_var_names` is one the resolve-time

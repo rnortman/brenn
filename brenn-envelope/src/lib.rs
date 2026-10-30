@@ -32,6 +32,7 @@ pub mod chat;
 pub mod grants;
 #[cfg(feature = "testutils")]
 pub mod testutils;
+pub mod tool_schema;
 
 // ---------------------------------------------------------------------------
 // Address scheme

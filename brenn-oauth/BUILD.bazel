@@ -35,7 +35,7 @@ rust_test(
     crate_features = ["testutils"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
-    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS + ["//brenn-envelope"],
 )
 
 rust_doc_test(

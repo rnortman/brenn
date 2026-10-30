@@ -49,6 +49,13 @@ All notable changes to Brenn are documented here.
   changing a declaration needs a restart. Channel names under
   `tool-requests` are now reserved, like `tools` and `tool-results`.
 
+- A provided tool's input schema is now checked against the shape Brenn
+  validates tool arguments with: a JSON object schema whose `properties` are
+  objects and whose `required` names only listed arguments. Its `mcp_name`
+  may not take the name of one of Brenn's built-in agent tools.
+  `config-check` reports both. The `provide` statement is documented in
+  `docs/config-dsl.md`.
+
 - Bumped wasmtime from 48.0.7 to 48.0.8, clearing RUSTSEC-2026-0422,
   RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
 

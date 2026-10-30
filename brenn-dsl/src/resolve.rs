@@ -17,10 +17,12 @@
 //! in one document are all reported.
 
 use brenn_envelope::addressing::{
-    PROVIDER_CONCURRENCY_CEILING, PROVIDER_CONCURRENCY_REFUSAL, TOOL_REQUEST_INPUT_PORT,
-    TOOL_RESULT_INPUT_PORT, is_unreserved_name,
+    CORE_VIRTUAL_TOOL_NAME_REFUSAL, CORE_VIRTUAL_TOOL_NAMES, PROVIDER_CONCURRENCY_CEILING,
+    PROVIDER_CONCURRENCY_REFUSAL, TOOL_REQUEST_INPUT_PORT, TOOL_RESULT_INPUT_PORT,
+    is_unreserved_name,
 };
 use brenn_envelope::grants::ComponentGrant;
+use brenn_envelope::tool_schema::{INPUT_SCHEMA_SHAPE_REFUSAL, check_input_schema};
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -4761,7 +4763,8 @@ fn is_tool_name(text: &str) -> bool {
 }
 
 /// A `provide` statement's `mcp_name`: the bare suffix an MCP client sees,
-/// `[A-Z][A-Za-z0-9]*`, kept as written.
+/// `[A-Z][A-Za-z0-9]*`, kept as written, and not the name of a core or repo
+/// virtual tool, which shares an agent's tool list with it.
 fn provided_mcp_name(value: &RVal, errors: &mut Vec<Diagnostic>) -> Option<Spanned<String>> {
     let text = match str_value(value, "an `mcp_name`") {
         Ok(text) => text,
@@ -4783,10 +4786,21 @@ fn provided_mcp_name(value: &RVal, errors: &mut Vec<Diagnostic>) -> Option<Spann
         ));
         return None;
     }
+    if CORE_VIRTUAL_TOOL_NAMES.contains(&text) {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{text}` is {CORE_VIRTUAL_TOOL_NAME_REFUSAL} (`CORE_VIRTUAL_TOOL_NAMES`); a \
+                 provided tool's `mcp_name` may not take it"
+            ),
+            value.span().clone(),
+        ));
+        return None;
+    }
     Some(Spanned::new(text.to_string(), value.span().clone()))
 }
 
-/// A `provide` statement's `input_schema`: JSON text that parses as an object.
+/// A `provide` statement's `input_schema`: JSON text that parses as an object
+/// of the shape a tool's arguments are checked against.
 fn provided_input_schema(value: &RVal, errors: &mut Vec<Diagnostic>) -> Option<serde_json::Value> {
     let text = match str_value(value, "an `input_schema`") {
         Ok(text) => text,
@@ -4796,7 +4810,16 @@ fn provided_input_schema(value: &RVal, errors: &mut Vec<Diagnostic>) -> Option<s
         }
     };
     match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(schema @ serde_json::Value::Object(_)) => Some(schema),
+        Ok(schema @ serde_json::Value::Object(_)) => match check_input_schema(&schema) {
+            Ok(()) => Some(schema),
+            Err(error) => {
+                errors.push(Diagnostic::at(
+                    format!("{INPUT_SCHEMA_SHAPE_REFUSAL}: {error}"),
+                    value.span().clone(),
+                ));
+                None
+            }
+        },
         Ok(_) => {
             errors.push(Diagnostic::at(
                 "`input_schema` is a JSON schema, which is a JSON object; this JSON is not one",

@@ -891,4 +891,19 @@ new myapp: Assistant();
             "non-pfin tool should return None, got {action:?}"
         );
     }
+
+    /// Every pfin schema has the shape a call is validated against.
+    #[test]
+    fn every_pfin_virtual_tool_schema_has_the_checked_shape() {
+        let defs = pfin_virtual_tools();
+        assert_eq!(defs.len(), 3);
+        for def in defs {
+            assert_eq!(
+                brenn_envelope::tool_schema::check_input_schema(&def.input_schema),
+                Ok(()),
+                "{}",
+                def.name
+            );
+        }
+    }
 }

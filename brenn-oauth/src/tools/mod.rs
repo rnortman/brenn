@@ -79,4 +79,25 @@ mod tests {
         assert_eq!(names(&registered(Some(&svc), keys())), all);
         assert!(registered(None, BTreeMap::new()).is_empty());
     }
+
+    /// Every descriptor's schema has the shape a call is validated against.
+    #[tokio::test]
+    async fn every_descriptor_schema_has_the_checked_shape() {
+        let base = "http://127.0.0.1:9";
+        let (svc, _dir) = service(vec![provider_config("google", base)]);
+        let tools = registered(
+            Some(&svc),
+            BTreeMap::from([key_provider_config("maps", base)]),
+        );
+        assert_eq!(tools.len(), 4);
+        for tool in &tools {
+            let d = tool.descriptor();
+            assert_eq!(
+                brenn_envelope::tool_schema::check_input_schema(&d.input_schema),
+                Ok(()),
+                "{}",
+                d.name
+            );
+        }
+    }
 }

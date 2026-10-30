@@ -267,6 +267,27 @@ sibling gap and the larger one: none of the three fit gates lowers, so no
 lowering-only refusal reaches any of them, whether or not a body was expanded.
 Closing this entry alone does not make the gates complete.
 
+## `dsl-diagnostic-untrusted-text`
+
+Author-controlled text from a document — a packaged `.brenn` is adversarial
+input (`docs/security-posture.md`) — reaches rendered DSL diagnostics and boot
+panics unescaped wherever a refusal interpolates it with `Display`: names,
+addresses, `mcp_name`s, schema text. Examples are the address refusal in
+`brenn-dsl/src/resolve.rs` (``address `{text}` names no scheme``) and echo sites
+in `brenn-dsl/src/derive.rs`. A newline or terminal escape in that text can
+forge a `file:line:col:` line, the `config-check` `ok document_sha256=` line, or
+a journal panic line. Some sites already quote with `Debug` (`input_schema`
+property keys, `mcp_name` shape refusals); the rest do not.
+
+The work is to choose one sanitising boundary for DSL diagnostics — at
+`Diagnostic` construction, in `Diagnostic::render` / `render_all`, or per site
+by convention with a check — decide how it treats the multi-line `related`
+notes `render` itself emits, decide whether the boot-panic paths that format
+diagnostics share it, and then apply it to every echo site.
+
+Code site (`TODO(dsl-diagnostic-untrusted-text)`): brenn-dsl/src/diag.rs,
+`Diagnostic::render`.
+
 ## `dsl-fmt-orphan-terminator`
 
 A document whose first item is a section (`tool alice;` at byte 0, no header
@@ -2315,10 +2336,13 @@ that explains itself.
 
 ## `dsl-doc-examples-ungated`
 
-`docs/config-dsl.md` carries ~26 fenced DSL blocks. Exactly one — the `Chrome`
-spec — is held against anything (`brenn-lib/src/config/tests/config_files.rs`,
-`the_dsl_doc_transcribes_the_chrome_spec_verbatim`, which compares the block to
-`config/specs/chrome.brenn` byte for byte). Every other snippet is prose: the
+`docs/config-dsl.md` carries ~26 fenced DSL blocks. Exactly two are held
+against anything, both in `brenn-lib/src/config/tests/config_files.rs`: the
+`Chrome` spec (`the_dsl_doc_transcribes_the_chrome_spec_verbatim`, which
+compares the block to `config/specs/chrome.brenn` byte for byte) and the
+`GmailTools` providing class (`the_dsl_doc_providing_class_compiles`, which
+compiles the block as a packaged module beside one instance of it). Every other
+snippet is prose: the
 `channel` declaration, the tuning form, the consumer and surface instances, the
 `agent` block with its `mount`/`mcp_server`/`subscribe` tails, the `assembly`
 block, and the `acl` matcher-tail example. Nothing parses them.
@@ -2351,7 +2375,7 @@ wrapping is machinery the doc's author cannot see.
 
 Code site (`TODO(dsl-doc-examples-ungated)`):
 brenn-lib/src/config/tests/config_files.rs, on the transcription test that
-gates the one block.
+gates the `Chrome` block.
 
 Done = every block in `docs/config-dsl.md` and `docs/claude-accounts.md` that is
 presented as compilable is compiled by `make check`, and the blocks that are not
@@ -3313,3 +3337,40 @@ Code sites (`TODO(guest-binary-body)`):
 
 Done = an out-of-tree guest can store a binary retained body without
 writing its own codec: its state type is a derive.
+
+## `release-overflow-checks`
+
+Release builds carry no integer overflow checks. Dev and test builds already
+panic on overflow: nothing in `.bazelrc` or the Makefile sets a compilation mode
+outside `build:release`, so `make check` runs the test graph at Bazel's default
+`fastbuild`, which rules_rust maps to `opt-level=0`
+(`rust/private/toolchain.bzl:802`), where rustc's default `-C overflow-checks`
+(which follows `-C debug-assertions`) is on. Only `--compilation_mode=opt`
+turns the checks off: release builds are `--compilation_mode=opt`, under which
+rules_rust passes rustc `opt-level=3` and nothing else (`rustc.bzl:1236-1238`),
+so integer overflow wraps silently in the release binaries and nowhere else.
+
+The project's posture — panic rather than tolerate a bug — wants it on, and it
+is one flag in the Release stanza:
+`build:release --@rules_rust//:extra_rustc_flag=-Coverflow-checks=on` (the
+alias exists in rules_rust 0.73, `BUILD.bazel:54`). The cost to decide is
+release-path throughput in the hot paths, plus any overflow that only an
+optimised build's code paths reach; there is no dev-build discovery cost, since
+the test graph already runs with the checks on.
+
+The DSL integer sums bounded site by site today are where the per-site bound
+could be re-examined once the global check holds: `rate_count`
+(`brenn-dsl/src/resolve.rs`, `u32::try_from` on a token-bucket count), the depth
+rule (`resolve_depth`, with lowering's non-negative check), and a `provide`
+statement's `max_concurrency` (`concurrency_count`, a `u32` lowering summed as a
+`u64`).
+
+Code site (`TODO(release-overflow-checks)`): `.bazelrc`, in the Release stanza
+above `build:release --compilation_mode=opt`.
+
+Done = the flag on in `build:release`, and the test graph green optimised with
+the checks on — `bazel test -c opt
+--@rules_rust//:extra_rustc_flag=-Coverflow-checks=on //...`. That command is
+the one lane that exercises the proposed configuration: tests do not build under
+`--config=release` because that config clears `testutils`, but `-c opt` alone
+does not clear it, so the test targets configure under it.

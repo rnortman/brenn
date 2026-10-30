@@ -40,6 +40,7 @@ bindgen!({
 pub use brenn::replay::store::StoreError;
 pub use brenn::replay::types::Header;
 
+use brenn_activation::WINDOW_DEPTH_CEILING;
 use brenn_activation::sync::CallDisposition;
 use brenn_common::sanitize_untrusted_str;
 use brenn_envelope::addressing::PROVIDER_CONCURRENCY_CEILING;
@@ -1054,16 +1055,17 @@ const _: () = assert!(
     "a provider's request window must fit a nested call per request in half of one \
      activation's publish budget"
 );
-/// Maximum `provides.complete` calls per activation (4 × the provider
-/// concurrency ceiling).
+/// Maximum `provides.complete` calls per activation (2 × the sum of the two
+/// reserved windows a provider can be handed in one activation).
 ///
-/// A provider's outstanding requests are bounded by its request window, which
-/// is never deeper than [`PROVIDER_CONCURRENCY_CEILING`]; one activation can
-/// name each live id, each stale id that window delivers after a restart, and
-/// retry once after a rejected outcome, all inside this cap. A call past it is
-/// a guest looping on `complete`, and traps the activation.
+/// A `complete` is called once per delivered request (`tool-requests`, a window
+/// never deeper than [`PROVIDER_CONCURRENCY_CEILING`]) or once per delivered
+/// result that carries `serving` (`tool-results`, a window the operator may
+/// deepen to [`WINDOW_DEPTH_CEILING`]); live or stale, each costs one call, and
+/// `invalid-outcome` allows one retry. A call past this is a guest looping on
+/// `complete`, and traps the activation.
 pub const PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION: usize =
-    4 * PROVIDER_CONCURRENCY_CEILING as usize;
+    2 * (PROVIDER_CONCURRENCY_CEILING + WINDOW_DEPTH_CEILING) as usize;
 /// Maximum bytes in a guest-supplied `provides.complete` `outcome-json`
 /// (512 KiB, the registry's async result cap).
 ///

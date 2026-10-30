@@ -350,6 +350,10 @@ mod tests {
     fn input_schema_matches_args_struct_fields() {
         let tool = GitRepoPullTool::new(clones_index(PathBuf::from("/x")), locks(), None);
         let schema = &tool.descriptor().input_schema;
+        assert_eq!(
+            brenn_envelope::tool_schema::check_input_schema(schema),
+            Ok(())
+        );
         let props = schema["properties"].as_object().expect("properties object");
         let names: HashSet<&str> = props.keys().map(String::as_str).collect();
         assert_eq!(names, HashSet::from(["repos"]), "schema property drift");

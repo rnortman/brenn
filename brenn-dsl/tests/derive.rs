@@ -1695,7 +1695,7 @@ fn provider_class(name: &str, tool: &str, mcp_name: &str) -> String {
     format!(
         "component {name} {{\n    abi = processor; requires = [provides];\n    \
          in tool-requests;\n    provide {tool} {{\n        mcp_name = \"{mcp_name}\";\n        \
-         description = \"Search.\";\n        input_schema = \"\"\"{{}}\"\"\";\n    }}\n}}\n"
+         description = \"Search.\";\n        input_schema = \"\"\"{{ \"type\": \"object\" }}\"\"\";\n    }}\n}}\n"
     )
 }
 
@@ -1786,7 +1786,8 @@ fn a_provider_granted_its_own_tool_is_refused() {
             "component Mail {\n    abi = processor; requires = [provides, tools];\n",
             "    in tool-requests;\n    in tool-results;\n",
             "    provide mail-search {\n        mcp_name = \"MailSearch\";\n",
-            "        description = \"Search.\";\n        input_schema = \"\"\"{}\"\"\";\n    }\n",
+            "        description = \"Search.\";\n",
+            "        input_schema = \"\"\"{ \"type\": \"object\" }\"\"\";\n    }\n",
             "}\n",
         ),
         packaged!(),

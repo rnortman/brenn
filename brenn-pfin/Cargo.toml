@@ -15,5 +15,6 @@ toml = "1.1.2"
 tracing = "0.1.44"
 
 [dev-dependencies]
+brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
 tempfile = "3.27.0"

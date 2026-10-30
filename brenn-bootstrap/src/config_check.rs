@@ -2550,4 +2550,103 @@ new git-sync-consumer: GitSyncConsumer {{
             vec!["git-repo-pull"],
         );
     }
+
+    // ── provided tools ───────────────────────────────────────────────────────
+
+    /// A providing class requiring `requires`, its `provide` statements
+    /// `provides`, and one instance of it granted `grants`.
+    fn provider_doc(requires: &str, provides: &str, grants: &str) -> String {
+        format!(
+            r#"{SURFACE_INDEX_DECL}
+// ── packaged ──
+component Search {{
+    {header}
+    in tool-requests;
+{provides}}}
+// ── packaged ──
+new search: Search {{
+    grants = [{grants}];
+}}
+"#,
+            header = processor_header(requires),
+        )
+    }
+
+    /// One `provide` statement with the given `mcp_name`, schema and
+    /// concurrency.
+    fn provide(tool: &str, mcp_name: &str, schema: &str, max_concurrency: u32) -> String {
+        format!(
+            "    provide {tool} {{\n        mcp_name = \"{mcp_name}\";\n        \
+             description = \"Search.\";\n        input_schema = \"\"\"{schema}\"\"\";\n        \
+             max_concurrency = {max_concurrency};\n    }}\n"
+        )
+    }
+
+    const OBJECT_SCHEMA: &str = r#"{ "type": "object" }"#;
+
+    #[test]
+    fn a_document_declaring_a_provider_passes_the_gate() {
+        let (ok, report) = check(
+            "main.brenn",
+            &provider_doc(
+                "provides",
+                &provide("doc-search", "DocSearch", OBJECT_SCHEMA, 4),
+                "provides",
+            ),
+        );
+        assert!(ok, "{report}");
+        assert_eq!(report, "");
+    }
+
+    /// Each class rule `config-check` sees, rendered through: the word with
+    /// the statement, the concurrency ceiling, the schema's shape and the core
+    /// virtual tool names.
+    #[test]
+    fn the_gate_refuses_what_the_provider_rules_refuse() {
+        let cases = [
+            (
+                provider_doc(
+                    "",
+                    &provide("doc-search", "DocSearch", OBJECT_SCHEMA, 1),
+                    "",
+                ),
+                "declares `provide doc-search` and does not require `provides`",
+            ),
+            (
+                provider_doc(
+                    "provides",
+                    &(provide("doc-search", "DocSearch", OBJECT_SCHEMA, 32)
+                        + &provide("doc-read", "DocRead", OBJECT_SCHEMA, 1)),
+                    "provides",
+                ),
+                "declares Σ max_concurrency = 33 across its provide statements",
+            ),
+            (
+                provider_doc(
+                    "provides",
+                    &provide(
+                        "doc-search",
+                        "DocSearch",
+                        r#"{ "type": "object", "properties": { "q": {} }, "required": ["r"] }"#,
+                        1,
+                    ),
+                    "provides",
+                ),
+                "`required` names \"r\", which is not a key of `properties`",
+            ),
+            (
+                provider_doc(
+                    "provides",
+                    &provide("doc-search", "GitRepoStatus", OBJECT_SCHEMA, 1),
+                    "provides",
+                ),
+                "`GitRepoStatus` is the name of a core virtual tool every agent may be offered",
+            ),
+        ];
+        for (document, refusal) in cases {
+            let (ok, report) = check("main.brenn", &document);
+            assert!(!ok, "{refusal}");
+            assert!(report.contains(refusal), "{report}");
+        }
+    }
 }
