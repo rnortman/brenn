@@ -69,6 +69,24 @@ const ALERT_ADVICE_MAX: usize = 5;
 /// How Google splits a forecast day, stated once in a daily answer.
 const DAY_PARTS: &str = "day 07:00–19:00, night 19:00–07:00 local";
 
+/// The Routes API's field mask for `Directions`: the route, its legs and their
+/// steps, no polyline, and `fallbackInfo`, which Google sets when it did not
+/// compute the route in the routing mode asked for.
+const DIRECTIONS_FIELD_MASK: &str = "routes.description,routes.warnings,routes.distanceMeters,\
+routes.duration,routes.staticDuration,routes.legs.distanceMeters,routes.legs.duration,\
+routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.travelMode,\
+routes.legs.steps.navigationInstruction,routes.legs.steps.transitDetails,fallbackInfo";
+/// The Routes API path a route is computed at.
+const COMPUTE_ROUTES_PATH: &str = "/directions/v2:computeRoutes";
+/// The most steps a `Directions` answer carries across its legs, and the
+/// default.
+const DIRECTIONS_MAX_STEPS: u64 = 200;
+const DIRECTIONS_DEFAULT_MAX_STEPS: u64 = 40;
+/// The most route warnings carried.
+const ROUTE_WARNINGS_MAX: usize = 10;
+/// The prefix that makes a waypoint text a Places place id.
+const PLACE_ID_PREFIX: &str = "place_id:";
+
 /// The unit system Google is asked to answer in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Units {
@@ -77,11 +95,28 @@ pub enum Units {
 }
 
 impl Units {
-    /// The Weather API's `unitsSystem` value.
+    /// Google's name for the system: the Weather API's `unitsSystem` and the
+    /// Routes API's `units`.
     fn google(self) -> &'static str {
         match self {
             Units::Metric => "METRIC",
             Units::Imperial => "IMPERIAL",
+        }
+    }
+
+    /// The unit a route's distances are stated in.
+    fn distance_label(self) -> &'static str {
+        match self {
+            Units::Metric => "km",
+            Units::Imperial => "mi",
+        }
+    }
+
+    /// Meters in one [`Units::distance_label`].
+    fn meters_per_distance_unit(self) -> f64 {
+        match self {
+            Units::Metric => 1000.0,
+            Units::Imperial => 1609.344,
         }
     }
 
@@ -483,6 +518,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                 },
             })
         }
+        Provided::Directions => {
+            let directions = DirectionsArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: directions_call(&directions, settings),
+            })
+        }
     }
 }
 
@@ -668,6 +710,201 @@ fn geocode_call(query: &Where, settings: &Settings) -> ApiCall {
     }
 }
 
+/// How a route is travelled: the tool's `mode` and the Routes API's
+/// `travelMode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TravelMode {
+    Drive,
+    Walk,
+    Bicycle,
+    Transit,
+}
+
+impl TravelMode {
+    fn parse(args: &Args) -> Result<TravelMode, String> {
+        match args.get("mode") {
+            None => Ok(TravelMode::Drive),
+            Some(Value::String(mode)) => match mode.as_str() {
+                "drive" => Ok(TravelMode::Drive),
+                "walk" => Ok(TravelMode::Walk),
+                "bicycle" => Ok(TravelMode::Bicycle),
+                "transit" => Ok(TravelMode::Transit),
+                _ => Err(MODE_CHOICES.to_string()),
+            },
+            Some(_) => Err(MODE_CHOICES.to_string()),
+        }
+    }
+
+    /// The tool's spelling, as the answer states it.
+    fn name(self) -> &'static str {
+        match self {
+            TravelMode::Drive => "drive",
+            TravelMode::Walk => "walk",
+            TravelMode::Bicycle => "bicycle",
+            TravelMode::Transit => "transit",
+        }
+    }
+
+    fn google(self) -> &'static str {
+        match self {
+            TravelMode::Drive => "DRIVE",
+            TravelMode::Walk => "WALK",
+            TravelMode::Bicycle => "BICYCLE",
+            TravelMode::Transit => "TRANSIT",
+        }
+    }
+}
+
+const MODE_CHOICES: &str = "`mode` must be one of `drive`, `walk`, `bicycle`, `transit`";
+
+/// One end of a route: coordinates, a Places place id, or an address Google
+/// resolves itself.
+#[derive(Clone, Debug, PartialEq)]
+enum Waypoint {
+    At(f64, f64),
+    PlaceId(String),
+    Address(String),
+}
+
+impl Waypoint {
+    /// The required text argument `key`: `<lat>,<lng>` is coordinates,
+    /// `place_id:<id>` a place id, anything else an address.
+    fn parse(args: &Args, key: &str) -> Result<Waypoint, String> {
+        let Some(text) = text(args, key)? else {
+            return Err(format!("`{key}` is required"));
+        };
+        if let Some((lat, lng)) = parse_lat_lng(text, key)? {
+            return Ok(Waypoint::At(lat, lng));
+        }
+        if let Some(id) = text.trim().strip_prefix(PLACE_ID_PREFIX) {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(format!("`{key}`: `{PLACE_ID_PREFIX}` names no place id"));
+            }
+            return Ok(Waypoint::PlaceId(id.to_string()));
+        }
+        Ok(Waypoint::Address(text.to_string()))
+    }
+
+    /// The Routes API `Waypoint`.
+    fn google(&self) -> Value {
+        match self {
+            Waypoint::At(lat, lng) => {
+                json!({ "location": { "latLng": { "latitude": lat, "longitude": lng } } })
+            }
+            Waypoint::PlaceId(id) => json!({ "placeId": id }),
+            Waypoint::Address(address) => json!({ "address": address }),
+        }
+    }
+}
+
+impl std::fmt::Display for Waypoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Waypoint::At(lat, lng) => write!(f, "{lat},{lng}"),
+            Waypoint::PlaceId(id) => write!(f, "{PLACE_ID_PREFIX}{id}"),
+            Waypoint::Address(address) => f.write_str(address),
+        }
+    }
+}
+
+/// When a route is wanted: leaving at, or arriving by, an RFC 3339 time.
+#[derive(Clone, Debug, PartialEq)]
+enum When {
+    DepartAt(String),
+    ArriveBy(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DirectionsArgs {
+    origin: Waypoint,
+    destination: Waypoint,
+    mode: TravelMode,
+    when: Option<When>,
+    max_steps: usize,
+}
+
+impl DirectionsArgs {
+    fn parse(args: &Value) -> Result<DirectionsArgs, String> {
+        let args = object(
+            args,
+            &[
+                "origin",
+                "destination",
+                "mode",
+                "depart_at",
+                "arrive_by",
+                "max_steps",
+            ],
+        )?;
+        let origin = Waypoint::parse(args, "origin")?;
+        let destination = Waypoint::parse(args, "destination")?;
+        let mode = TravelMode::parse(args)?;
+        // Google checks the times themselves and answers a malformed one with a 400.
+        let when = match (text(args, "depart_at")?, text(args, "arrive_by")?) {
+            (Some(_), Some(_)) => {
+                return Err("pass `depart_at` or `arrive_by`, not both".to_string());
+            }
+            (Some(time), None) => Some(When::DepartAt(time.to_string())),
+            (None, Some(_)) if mode != TravelMode::Transit => {
+                // Google ignores an arrival time on every other mode; a route
+                // that silently leaves now is not the route asked for.
+                return Err("`arrive_by` applies to `mode: transit` only".to_string());
+            }
+            (None, Some(time)) => Some(When::ArriveBy(time.to_string())),
+            (None, None) => None,
+        };
+        let max_steps = integer(args, "max_steps", 1, DIRECTIONS_MAX_STEPS)?
+            .unwrap_or(DIRECTIONS_DEFAULT_MAX_STEPS);
+        Ok(DirectionsArgs {
+            origin,
+            destination,
+            mode,
+            when,
+            max_steps: usize::try_from(max_steps).expect("max_steps is at most 200"),
+        })
+    }
+}
+
+/// A Routes `computeRoutes` call for `Directions`: one route, no alternatives,
+/// no polyline.
+fn directions_call(args: &DirectionsArgs, settings: &Settings) -> ApiCall {
+    let mut body = Args::new();
+    body.insert("origin".to_string(), args.origin.google());
+    body.insert("destination".to_string(), args.destination.google());
+    body.insert("travelMode".to_string(), json!(args.mode.google()));
+    // Google refuses a routing preference on any mode but driving.
+    if args.mode == TravelMode::Drive {
+        body.insert("routingPreference".to_string(), json!("TRAFFIC_AWARE"));
+    }
+    match &args.when {
+        Some(When::DepartAt(time)) => {
+            body.insert("departureTime".to_string(), json!(time));
+        }
+        Some(When::ArriveBy(time)) => {
+            body.insert("arrivalTime".to_string(), json!(time));
+        }
+        None => {}
+    }
+    body.insert("computeAlternativeRoutes".to_string(), json!(false));
+    body.insert("units".to_string(), json!(settings.units.google()));
+    if let Some(language) = &settings.language {
+        body.insert("languageCode".to_string(), json!(language));
+    }
+    ApiCall {
+        provider: settings.provider.clone(),
+        method: "POST".to_string(),
+        host: settings.routes_host.clone(),
+        path: COMPUTE_ROUTES_PATH.to_string(),
+        query: BTreeMap::new(),
+        headers: BTreeMap::from([(
+            "X-Goog-FieldMask".to_string(),
+            DIRECTIONS_FIELD_MASK.to_string(),
+        )]),
+        body: Some(Value::Object(body).to_string()),
+    }
+}
+
 /// A nested call's typed error, as the executor wrote it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NestedError {
@@ -814,6 +1051,9 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
         (Provided::Weather, WEATHER_LOOKUP_STEP) => stored(state, WeatherArgs::parse)
             .and_then(|args| compact_weather(&args, &state.derived, &body, settings.units))
             .map(Next::Complete),
+        (Provided::Directions, 1) => stored(state, DirectionsArgs::parse)
+            .and_then(|args| compact_directions(&args, &body, settings.units))
+            .map(Next::Complete),
         (tool, step) => Err(internal(format!(
             "in-flight row names step {step} of {}, which has no such step",
             tool.name()
@@ -866,12 +1106,7 @@ fn first_location(body: &Value, text: &str) -> Result<Located, Failure> {
     let Value::Object(body) = body else {
         return Err(shape("Geocoding"));
     };
-    let first = match body.get("results") {
-        None => None,
-        Some(Value::Array(results)) => results.first(),
-        Some(_) => return Err(shape("Geocoding")),
-    };
-    let Some(first) = first else {
+    let Some(first) = first_of(body, "results", "Geocoding")? else {
         return Err(Failure {
             kind: ErrorKind::InvalidArgs,
             detail: format!("no location found for {text}"),
@@ -985,6 +1220,23 @@ fn record<'a>(item: &'a Value, api: &str) -> Result<&'a Value, Failure> {
         Ok(item)
     } else {
         Err(shape(api))
+    }
+}
+
+fn string_item(item: &Value, api: &str) -> Result<Value, Failure> {
+    match item {
+        Value::String(_) => Ok(item.clone()),
+        _ => Err(shape(api)),
+    }
+}
+
+/// The first item of the Google list at `body[key]`: `None` when the list is
+/// absent or empty, a shape error when `body[key]` is not a list.
+fn first_of<'a>(body: &'a Args, key: &str, api: &str) -> Result<Option<&'a Value>, Failure> {
+    match body.get(key) {
+        None => Ok(None),
+        Some(Value::Array(items)) => Ok(items.first()),
+        Some(_) => Err(shape(api)),
     }
 }
 
@@ -1254,10 +1506,7 @@ fn compact_alert(alert: &Value) -> Result<Value, Failure> {
             lines,
             ALERT_ADVICE_MAX,
             "Weather",
-            |line| match line {
-                Value::String(_) => Ok(line.clone()),
-                _ => Err(shape("Weather")),
-            },
+            |line| string_item(line, "Weather"),
         )?;
     }
     if let Some(recommendations) = alert.get("safetyRecommendations") {
@@ -1341,6 +1590,206 @@ fn compact_geocode(body: &Value, max: usize) -> Result<Value, Failure> {
         },
     )?;
     Ok(Value::Object(answer))
+}
+
+/// A Routes answer as `Directions`' compact result: Google's one route, its
+/// legs, and at most `max_steps` steps across them, with `steps_omitted`
+/// counting the rest. No route is the caller's: none joins the two ends by
+/// that mode.
+fn compact_directions(args: &DirectionsArgs, body: &Value, units: Units) -> Result<Value, Failure> {
+    let Value::Object(body) = body else {
+        return Err(shape("Routes"));
+    };
+    let Some(route) = first_of(body, "routes", "Routes")? else {
+        return Err(Failure {
+            kind: ErrorKind::InvalidArgs,
+            detail: format!(
+                "no {} route found from {} to {}",
+                args.mode.name(),
+                args.origin,
+                args.destination
+            ),
+        });
+    };
+    let route = record(route, "Routes")?;
+    let none = Value::Array(Vec::new());
+    let mut out = Args::new();
+    out.insert("mode".to_string(), json!(args.mode.name()));
+    copy(&mut out, "summary", route.get("description"));
+    // Google requires its warnings shown (walking and cycling routes are in
+    // beta), so the list is always carried, empty when there are none.
+    first_items(
+        &mut out,
+        "warnings",
+        route.get("warnings").unwrap_or(&none),
+        ROUTE_WARNINGS_MAX,
+        "Routes",
+        |warning| string_item(warning, "Routes"),
+    )?;
+    distance(&mut out, "distance", route.get("distanceMeters"), units)?;
+    minutes(&mut out, "duration_minutes", route.get("duration"))?;
+    minutes(
+        &mut out,
+        "duration_without_traffic_minutes",
+        route.get("staticDuration"),
+    )?;
+    // Its presence is the signal, so it is carried even when none of the
+    // inner fields read here is set.
+    match body.get("fallbackInfo") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(info)) => {
+            let mut fallback = Args::new();
+            copy(&mut fallback, "routing_mode", info.get("routingMode"));
+            copy(&mut fallback, "reason", info.get("reason"));
+            out.insert("fallback".to_string(), Value::Object(fallback));
+        }
+        Some(_) => return Err(shape("Routes")),
+    }
+    let Value::Array(legs) = route.get("legs").unwrap_or(&none) else {
+        return Err(shape("Routes"));
+    };
+    let mut room = args.max_steps;
+    let mut omitted = 0;
+    let mut compact_legs = Vec::with_capacity(legs.len());
+    for leg in legs {
+        let leg = record(leg, "Routes")?;
+        let mut item = Args::new();
+        distance(&mut item, "distance", leg.get("distanceMeters"), units)?;
+        minutes(&mut item, "duration_minutes", leg.get("duration"))?;
+        let Value::Array(steps) = leg.get("steps").unwrap_or(&none) else {
+            return Err(shape("Routes"));
+        };
+        let kept = steps.len().min(room);
+        room -= kept;
+        omitted += steps.len() - kept;
+        let mut compact_steps = Vec::with_capacity(kept);
+        for step in &steps[..kept] {
+            let step = record(step, "Routes")?;
+            compact_steps.push(compact_step(step, units)?);
+        }
+        item.insert("steps".to_string(), Value::Array(compact_steps));
+        compact_legs.push(Value::Object(item));
+    }
+    out.insert("legs".to_string(), Value::Array(compact_legs));
+    if omitted > 0 {
+        out.insert("steps_omitted".to_string(), json!(omitted));
+    }
+    Ok(Value::Object(out))
+}
+
+/// One step of a route. A transit step carries the leg the rider takes: line,
+/// stops, and each boarding and alighting time as local text with its own
+/// zone and as Google's UTC instant.
+fn compact_step(step: &Value, units: Units) -> Result<Value, Failure> {
+    let mut item = Args::new();
+    copy(
+        &mut item,
+        "instruction",
+        at(step, &["navigationInstruction", "instructions"]),
+    );
+    copy(
+        &mut item,
+        "maneuver",
+        at(step, &["navigationInstruction", "maneuver"]),
+    );
+    distance(&mut item, "distance", step.get("distanceMeters"), units)?;
+    // A step has no traffic-aware duration; its static one is all Google sends.
+    minutes(&mut item, "duration_minutes", step.get("staticDuration"))?;
+    copy(&mut item, "mode", step.get("travelMode"));
+    if let Some(details) = step.get("transitDetails") {
+        let mut transit = Args::new();
+        copy(&mut transit, "line", at(details, &["transitLine", "name"]));
+        copy(
+            &mut transit,
+            "line_short",
+            at(details, &["transitLine", "nameShort"]),
+        );
+        copy(&mut transit, "headsign", details.get("headsign"));
+        copy(
+            &mut transit,
+            "vehicle",
+            at(details, &["transitLine", "vehicle", "type"]),
+        );
+        copy(
+            &mut transit,
+            "agency",
+            details.pointer("/transitLine/agencies/0/name"),
+        );
+        copy(
+            &mut transit,
+            "from",
+            at(details, &["stopDetails", "departureStop", "name"]),
+        );
+        transit_time(&mut transit, details, "departs", "departureTime");
+        copy(
+            &mut transit,
+            "to",
+            at(details, &["stopDetails", "arrivalStop", "name"]),
+        );
+        transit_time(&mut transit, details, "arrives", "arrivalTime");
+        copy(&mut transit, "stops", details.get("stopCount"));
+        nest(&mut item, "transit", transit);
+    }
+    Ok(Value::Object(item))
+}
+
+/// One end of a transit ride, Google's `field` (`departureTime` or
+/// `arrivalTime`), as `<name>` (local wall-clock text), `<name>_timezone` (the
+/// zone that text is in) and `<name>_at` (the RFC 3339 UTC instant).
+fn transit_time(to: &mut Args, details: &Value, name: &str, field: &str) {
+    copy(
+        to,
+        name,
+        at(details, &["localizedValues", field, "time", "text"]),
+    );
+    copy(
+        to,
+        &format!("{name}_timezone"),
+        at(details, &["localizedValues", field, "timeZone"]),
+    );
+    copy(
+        to,
+        &format!("{name}_at"),
+        at(details, &["stopDetails", field]),
+    );
+}
+
+/// Google's `distanceMeters` as `{ value, unit }` in `units`, to two decimals.
+/// Absent is omitted; anything but a number is a shape error.
+fn distance(
+    to: &mut Args,
+    name: &str,
+    meters: Option<&Value>,
+    units: Units,
+) -> Result<(), Failure> {
+    let Some(meters) = meters.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let meters = meters.as_f64().ok_or_else(|| shape("Routes"))?;
+    let value = (meters / units.meters_per_distance_unit() * 100.0).round() / 100.0;
+    to.insert(
+        name.to_string(),
+        json!({ "value": value, "unit": units.distance_label() }),
+    );
+    Ok(())
+}
+
+/// A Google `Duration` (`"1234s"`, `"3.5s"`) as whole minutes, rounded up.
+/// Absent is omitted; any other form is a shape error.
+fn minutes(to: &mut Args, name: &str, duration: Option<&Value>) -> Result<(), Failure> {
+    let Some(duration) = duration.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let seconds = duration
+        .as_str()
+        .and_then(|text| text.strip_suffix('s'))
+        .filter(|text| !text.starts_with(['+', '-']))
+        .and_then(decimal)
+        .ok_or_else(|| shape("Routes"))?;
+    // Whole minutes: a route's duration is days at most.
+    let whole = (seconds / 60.0).ceil() as u64;
+    to.insert(name.to_string(), json!(whole));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2705,5 +3154,613 @@ mod tests {
                 "{kind} {body}"
             );
         }
+    }
+
+    fn directions(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::Directions, &args, &settings()).map(|call| {
+            assert_eq!(call.step, 1);
+            call.api
+        })
+    }
+
+    /// The JSON body a call posts.
+    fn posted(call: &ApiCall) -> Value {
+        serde_json::from_str(call.body.as_deref().expect("a body")).expect("a JSON body")
+    }
+
+    #[test]
+    fn directions_posts_one_compute_routes_call() {
+        let call = directions(json!({
+            "origin": "37.422,-122.0841",
+            "destination": "Mountain View",
+        }))
+        .unwrap();
+        assert_eq!(call.provider, "maps");
+        assert_eq!(call.method, "POST");
+        assert_eq!(call.host, "routes.example.com");
+        assert_eq!(call.path, "/directions/v2:computeRoutes");
+        assert!(call.query.is_empty());
+        assert_eq!(
+            call.headers,
+            query(&[("X-Goog-FieldMask", DIRECTIONS_FIELD_MASK)])
+        );
+        assert!(!DIRECTIONS_FIELD_MASK.contains("polyline"));
+        assert_eq!(
+            posted(&call),
+            json!({
+                "origin": { "location": { "latLng": { "latitude": 37.422, "longitude": -122.0841 } } },
+                "destination": { "address": "Mountain View" },
+                "travelMode": "DRIVE",
+                "routingPreference": "TRAFFIC_AWARE",
+                "computeAlternativeRoutes": false,
+                "units": "METRIC",
+            })
+        );
+    }
+
+    #[test]
+    fn directions_reads_each_waypoint_form() {
+        let body = posted(
+            &directions(json!({
+                "origin": " place_id:ChIJ1 ",
+                "destination": "12 Main St, Springfield",
+            }))
+            .unwrap(),
+        );
+        assert_eq!(body["origin"], json!({ "placeId": "ChIJ1" }));
+        assert_eq!(
+            body["destination"],
+            json!({ "address": "12 Main St, Springfield" })
+        );
+        let err = directions(json!({ "origin": "place_id: ", "destination": "x" })).unwrap_err();
+        assert_eq!(err, "`origin`: `place_id:` names no place id");
+        let err = directions(json!({ "origin": "x", "destination": "0,181" })).unwrap_err();
+        assert!(
+            err.contains("`destination`") && err.contains("longitude 181"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn directions_maps_each_mode_and_prefers_traffic_only_driving() {
+        for (mode, google) in [
+            ("drive", "DRIVE"),
+            ("walk", "WALK"),
+            ("bicycle", "BICYCLE"),
+            ("transit", "TRANSIT"),
+        ] {
+            let body = posted(
+                &directions(json!({ "origin": "a", "destination": "b", "mode": mode })).unwrap(),
+            );
+            assert_eq!(body["travelMode"], google, "{mode}");
+            assert_eq!(
+                body.get("routingPreference").is_some(),
+                mode == "drive",
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn directions_pass_units_and_language() {
+        let s = Settings::from_lookup(lookup(&with(&[("units", "IMPERIAL"), ("language", "de")])))
+            .unwrap();
+        let call = plan(
+            Provided::Directions,
+            &json!({ "origin": "a", "destination": "b" }),
+            &s,
+        )
+        .unwrap();
+        let body = posted(&call.api);
+        assert_eq!(body["units"], "IMPERIAL");
+        assert_eq!(body["languageCode"], "de");
+    }
+
+    #[test]
+    fn directions_send_a_departure_or_a_transit_arrival() {
+        let body = posted(
+            &directions(json!({
+                "origin": "a", "destination": "b", "depart_at": "2026-10-30T17:00:00Z",
+            }))
+            .unwrap(),
+        );
+        assert_eq!(body["departureTime"], "2026-10-30T17:00:00Z");
+        assert!(body.get("arrivalTime").is_none());
+        let body = posted(
+            &directions(json!({
+                "origin": "a", "destination": "b", "mode": "transit",
+                "arrive_by": "2026-10-30T09:30:00.250-07:00",
+            }))
+            .unwrap(),
+        );
+        assert_eq!(body["arrivalTime"], "2026-10-30T09:30:00.250-07:00");
+        assert!(body.get("departureTime").is_none());
+    }
+
+    #[test]
+    fn directions_refuse_an_arrival_google_would_ignore() {
+        for mode in ["drive", "walk", "bicycle"] {
+            assert_eq!(
+                directions(json!({
+                    "origin": "a", "destination": "b", "mode": mode,
+                    "arrive_by": "2026-10-30T17:00:00Z",
+                }))
+                .unwrap_err(),
+                "`arrive_by` applies to `mode: transit` only",
+                "{mode}"
+            );
+        }
+        // Without a mode the route is driven.
+        assert!(
+            directions(
+                json!({ "origin": "a", "destination": "b", "arrive_by": "2026-10-30T17:00:00Z" })
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn directions_refuse_bad_arguments_by_name() {
+        let cases = [
+            (json!({ "destination": "b" }), "`origin` is required"),
+            (json!({ "origin": "a" }), "`destination` is required"),
+            (
+                json!({ "origin": 1, "destination": "b" }),
+                "`origin` must be a string",
+            ),
+            (
+                json!({ "origin": "a", "destination": " " }),
+                "`destination` is empty",
+            ),
+            (
+                json!({ "origin": "a", "destination": "b", "mode": "fly" }),
+                MODE_CHOICES,
+            ),
+            (
+                json!({ "origin": "a", "destination": "b", "mode": 1 }),
+                MODE_CHOICES,
+            ),
+            (
+                json!({
+                    "origin": "a", "destination": "b", "mode": "transit",
+                    "depart_at": "2026-10-30T17:00:00Z", "arrive_by": "2026-10-30T18:00:00Z",
+                }),
+                "pass `depart_at` or `arrive_by`, not both",
+            ),
+            (
+                json!({ "origin": "a", "destination": "b", "max_steps": 0 }),
+                "`max_steps` must be an integer from 1 to 200",
+            ),
+            (
+                json!({ "origin": "a", "destination": "b", "max_steps": 201 }),
+                "`max_steps` must be an integer from 1 to 200",
+            ),
+        ];
+        for (args, want) in cases {
+            assert_eq!(directions(args.clone()).unwrap_err(), want, "{args}");
+        }
+        let err = directions(json!({ "origin": "a", "destination": "b", "via": "c" })).unwrap_err();
+        assert!(err.starts_with("unknown argument `via`"), "{err}");
+    }
+
+    #[test]
+    fn directions_cap_both_ends_in_bytes() {
+        let at_cap = "é".repeat(TEXT_MAX_BYTES / 2);
+        assert!(directions(json!({ "origin": at_cap, "destination": at_cap })).is_ok());
+        let over = format!("{at_cap}a");
+        assert_eq!(
+            directions(json!({ "origin": over, "destination": "b" })).unwrap_err(),
+            "`origin` is longer than 1024 bytes"
+        );
+        assert_eq!(
+            directions(json!({ "origin": "a", "destination": over })).unwrap_err(),
+            "`destination` is longer than 1024 bytes"
+        );
+    }
+
+    fn directions_answer(args: Value, body: &str, settings: &Settings) -> Next {
+        let call = plan(Provided::Directions, &args, settings).unwrap();
+        let state = InFlight::new(
+            &"a".repeat(32),
+            Provided::Directions,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        );
+        advance(&state, http(200, body), settings)
+    }
+
+    fn drive_step(n: u64) -> Value {
+        json!({
+            "distanceMeters": 1000 * n,
+            "staticDuration": format!("{}s", 60 * n),
+            "travelMode": "DRIVE",
+            "navigationInstruction": { "maneuver": "TURN_LEFT", "instructions": format!("Turn left {n}") },
+        })
+    }
+
+    #[test]
+    fn directions_compact_a_driven_route() {
+        let body = json!({
+            "routes": [{
+                "description": "I-280 S",
+                "warnings": ["This route has tolls."],
+                "distanceMeters": 12345,
+                "duration": "1234s",
+                "staticDuration": "1100s",
+                "legs": [{
+                    "distanceMeters": 12345,
+                    "duration": "1234s",
+                    "steps": [
+                        drive_step(1),
+                        { "distanceMeters": 45, "staticDuration": "3.5s", "travelMode": "DRIVE",
+                          "navigationInstruction": { "instructions": "Arrive" } },
+                    ],
+                }],
+            }],
+        });
+        assert_eq!(
+            directions_answer(
+                json!({ "origin": "a", "destination": "b" }),
+                &body.to_string(),
+                &settings()
+            ),
+            Next::Complete(json!({
+                "mode": "drive",
+                "summary": "I-280 S",
+                "warnings": ["This route has tolls."],
+                "distance": { "value": 12.35, "unit": "km" },
+                "duration_minutes": 21,
+                "duration_without_traffic_minutes": 19,
+                "legs": [{
+                    "distance": { "value": 12.35, "unit": "km" },
+                    "duration_minutes": 21,
+                    "steps": [
+                        { "instruction": "Turn left 1", "maneuver": "TURN_LEFT",
+                          "distance": { "value": 1.0, "unit": "km" }, "duration_minutes": 1,
+                          "mode": "DRIVE" },
+                        { "instruction": "Arrive", "distance": { "value": 0.05, "unit": "km" },
+                          "duration_minutes": 1, "mode": "DRIVE" },
+                    ],
+                }],
+            }))
+        );
+    }
+
+    #[test]
+    fn directions_state_distances_in_the_instances_units() {
+        let s = Settings::from_lookup(lookup(&with(&[("units", "IMPERIAL")]))).unwrap();
+        let body = json!({ "routes": [{ "distanceMeters": 16093, "duration": "0s" }] });
+        let Next::Complete(answer) = directions_answer(
+            json!({ "origin": "a", "destination": "b", "mode": "walk" }),
+            &body.to_string(),
+            &s,
+        ) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["distance"], json!({ "value": 10.0, "unit": "mi" }));
+        assert_eq!(answer["duration_minutes"], 0);
+        assert_eq!(answer["mode"], "walk");
+        // No warnings from Google is an empty list, still carried; no legs is
+        // an empty list.
+        assert_eq!(answer["warnings"], json!([]));
+        assert_eq!(answer["legs"], json!([]));
+        assert!(answer.get("steps_omitted").is_none());
+        assert!(answer.get("timezone").is_none());
+    }
+
+    #[test]
+    fn directions_name_each_transit_ride() {
+        let body = json!({
+            "routes": [{
+                "distanceMeters": 9000,
+                "duration": "1500s",
+                "legs": [{
+                    "steps": [
+                        { "distanceMeters": 200, "staticDuration": "150s", "travelMode": "WALK",
+                          "navigationInstruction": { "instructions": "Walk to Aeroporto" } },
+                        { "distanceMeters": 8800, "staticDuration": "1200s", "travelMode": "TRANSIT",
+                          "transitDetails": {
+                              "stopDetails": {
+                                  "departureStop": { "name": "Aeroporto" },
+                                  "arrivalStop": { "name": "Saldanha" },
+                                  "departureTime": "2026-10-30T10:29:42Z",
+                                  "arrivalTime": "2026-10-30T10:49:42Z",
+                              },
+                              "localizedValues": {
+                                  "departureTime": { "time": { "text": "10:29" }, "timeZone": "Europe/Lisbon" },
+                                  "arrivalTime": { "time": { "text": "10:49" }, "timeZone": "Europe/Lisbon" },
+                              },
+                              "headsign": "São Sebastião",
+                              "headway": "420s",
+                              "transitLine": {
+                                  "agencies": [{ "name": "Metropolitano de Lisboa, E.P.E." }, { "name": "Other" }],
+                                  "name": "Linha Vermelha",
+                                  "nameShort": "V",
+                                  "vehicle": { "name": { "text": "Subway" }, "type": "SUBWAY" },
+                              },
+                              "stopCount": 7,
+                          } },
+                    ],
+                }],
+            }],
+        });
+        let Next::Complete(answer) = directions_answer(
+            json!({ "origin": "Aeroporto", "destination": "Saldanha", "mode": "transit" }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert!(answer.get("timezone").is_none());
+        let steps = &answer["legs"][0]["steps"];
+        assert_eq!(
+            steps[0],
+            json!({ "instruction": "Walk to Aeroporto", "distance": { "value": 0.2, "unit": "km" },
+                    "duration_minutes": 3, "mode": "WALK" })
+        );
+        assert_eq!(
+            steps[1],
+            json!({
+                "distance": { "value": 8.8, "unit": "km" },
+                "duration_minutes": 20,
+                "mode": "TRANSIT",
+                "transit": {
+                    "line": "Linha Vermelha", "line_short": "V", "headsign": "São Sebastião",
+                    "vehicle": "SUBWAY", "agency": "Metropolitano de Lisboa, E.P.E.",
+                    "from": "Aeroporto", "departs": "10:29", "departs_timezone": "Europe/Lisbon",
+                    "departs_at": "2026-10-30T10:29:42Z",
+                    "to": "Saldanha", "arrives": "10:49", "arrives_timezone": "Europe/Lisbon",
+                    "arrives_at": "2026-10-30T10:49:42Z",
+                    "stops": 7,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn directions_give_each_transit_time_its_own_zone() {
+        let ride = |from: &str, departs: Value, to: &str, arrives: Value, utc: [&str; 2]| {
+            json!({ "travelMode": "TRANSIT", "transitDetails": {
+                "stopDetails": {
+                    "departureStop": { "name": from }, "arrivalStop": { "name": to },
+                    "departureTime": utc[0], "arrivalTime": utc[1],
+                },
+                "localizedValues": { "departureTime": departs, "arrivalTime": arrives },
+            } })
+        };
+        let body = json!({
+            "routes": [{ "legs": [{ "steps": [
+                ride(
+                    "Lisboa Oriente",
+                    json!({ "time": { "text": "23:40" } }),
+                    "Badajoz",
+                    json!({ "time": { "text": "04:05" }, "timeZone": "Europe/Madrid" }),
+                    ["2026-10-30T23:40:00Z", "2026-10-31T03:05:00Z"],
+                ),
+                ride(
+                    "Badajoz",
+                    json!({ "time": { "text": "05:00" }, "timeZone": "Europe/Madrid" }),
+                    "Madrid Atocha",
+                    json!({ "time": { "text": "10:15" }, "timeZone": "Europe/Madrid" }),
+                    ["2026-10-31T04:00:00Z", "2026-10-31T09:15:00Z"],
+                ),
+            ] }] }],
+        });
+        let Next::Complete(answer) = directions_answer(
+            json!({ "origin": "Lisboa", "destination": "Madrid", "mode": "transit" }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert!(answer.get("timezone").is_none());
+        let transit = |n: usize| answer["legs"][0]["steps"][n]["transit"].clone();
+        assert_eq!(
+            transit(0),
+            json!({
+                "from": "Lisboa Oriente", "departs": "23:40", "departs_at": "2026-10-30T23:40:00Z",
+                "to": "Badajoz", "arrives": "04:05", "arrives_timezone": "Europe/Madrid",
+                "arrives_at": "2026-10-31T03:05:00Z",
+            })
+        );
+        assert_eq!(
+            transit(1),
+            json!({
+                "from": "Badajoz", "departs": "05:00", "departs_timezone": "Europe/Madrid",
+                "departs_at": "2026-10-31T04:00:00Z",
+                "to": "Madrid Atocha", "arrives": "10:15", "arrives_timezone": "Europe/Madrid",
+                "arrives_at": "2026-10-31T09:15:00Z",
+            })
+        );
+    }
+
+    fn fallback_answer(fallback: Value) -> Next {
+        let body = json!({
+            "routes": [{ "duration": "1800s", "staticDuration": "1800s" }],
+            "fallbackInfo": fallback,
+        });
+        directions_answer(
+            json!({ "origin": "a", "destination": "b" }),
+            &body.to_string(),
+            &settings(),
+        )
+    }
+
+    #[test]
+    fn directions_say_when_google_fell_back() {
+        let Next::Complete(answer) = fallback_answer(
+            json!({ "routingMode": "FALLBACK_TRAFFIC_UNAWARE", "reason": "LATENCY_EXCEEDED" }),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(
+            answer["fallback"],
+            json!({ "routing_mode": "FALLBACK_TRAFFIC_UNAWARE", "reason": "LATENCY_EXCEEDED" })
+        );
+        assert_eq!(answer["duration_minutes"], 30);
+        assert_eq!(answer["duration_without_traffic_minutes"], 30);
+    }
+
+    #[test]
+    fn directions_carry_a_fallback_whose_fields_they_cannot_read() {
+        for fallback in [json!({}), json!({ "mode": "OTHER" })] {
+            let Next::Complete(answer) = fallback_answer(fallback.clone()) else {
+                panic!("expected an answer for {fallback}");
+            };
+            assert_eq!(answer["fallback"], json!({}), "{fallback}");
+        }
+    }
+
+    #[test]
+    fn directions_refuse_a_fallback_that_is_not_an_object() {
+        for fallback in [json!("x"), json!([]), json!(1)] {
+            assert_eq!(
+                fallback_answer(fallback.clone()),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    "unexpected Routes API response shape"
+                )),
+                "{fallback}"
+            );
+        }
+    }
+
+    #[test]
+    fn directions_cap_steps_across_the_route() {
+        let body = json!({
+            "routes": [{
+                "legs": [
+                    { "steps": [drive_step(1), drive_step(2)] },
+                    { "steps": [drive_step(3), drive_step(4), drive_step(5)] },
+                ],
+            }],
+        });
+        let Next::Complete(answer) = directions_answer(
+            json!({ "origin": "a", "destination": "b", "max_steps": 3 }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        let instructions = |leg: usize| -> Vec<Value> {
+            answer["legs"][leg]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|step| step["instruction"].clone())
+                .collect()
+        };
+        assert_eq!(
+            instructions(0),
+            [json!("Turn left 1"), json!("Turn left 2")]
+        );
+        assert_eq!(instructions(1), [json!("Turn left 3")]);
+        assert_eq!(answer["steps_omitted"], 2);
+    }
+
+    #[test]
+    fn directions_cap_steps_at_forty_by_default() {
+        let steps: Vec<Value> = (1..=41).map(drive_step).collect();
+        let body = json!({ "routes": [{ "legs": [{ "steps": steps }] }] });
+        let Next::Complete(answer) = directions_answer(
+            json!({ "origin": "a", "destination": "b" }),
+            &body.to_string(),
+            &settings(),
+        ) else {
+            panic!("expected an answer");
+        };
+        let kept = answer["legs"][0]["steps"].as_array().unwrap();
+        assert_eq!(kept.len(), 40);
+        assert_eq!(kept[39]["instruction"], "Turn left 40");
+        assert_eq!(answer["steps_omitted"], 1);
+    }
+
+    #[test]
+    fn directions_with_no_route_is_the_callers() {
+        assert_eq!(
+            directions_answer(
+                json!({ "origin": "37.42,-122.08", "destination": "place_id:ChIJ1", "mode": "transit" }),
+                "{}",
+                &settings()
+            ),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "no transit route found from 37.42,-122.08 to place_id:ChIJ1"
+            ))
+        );
+        assert_eq!(
+            directions_answer(
+                json!({ "origin": "a", "destination": "b" }),
+                r#"{ "routes": [] }"#,
+                &settings()
+            ),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "no drive route found from a to b"
+            ))
+        );
+    }
+
+    #[test]
+    fn directions_refuse_an_unexpected_shape() {
+        for body in [
+            "[]",
+            r#"{ "routes": {} }"#,
+            r#"{ "routes": [1] }"#,
+            r#"{ "routes": [{ "warnings": "tolls" }] }"#,
+            r#"{ "routes": [{ "warnings": [1] }] }"#,
+            r#"{ "routes": [{ "distanceMeters": "12" }] }"#,
+            r#"{ "routes": [{ "duration": 12 }] }"#,
+            r#"{ "routes": [{ "duration": "12" }] }"#,
+            r#"{ "routes": [{ "duration": "-12s" }] }"#,
+            r#"{ "routes": [{ "duration": "1e3s" }] }"#,
+            r#"{ "routes": [{ "legs": {} }] }"#,
+            r#"{ "routes": [{ "legs": [1] }] }"#,
+            r#"{ "routes": [{ "legs": [{ "steps": {} }] }] }"#,
+            r#"{ "routes": [{ "legs": [{ "steps": [1] }] }] }"#,
+            r#"{ "routes": [{ "legs": [{ "steps": [{ "staticDuration": "x" }] }] }] }"#,
+        ] {
+            assert_eq!(
+                directions_answer(
+                    json!({ "origin": "a", "destination": "b" }),
+                    body,
+                    &settings()
+                ),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    "unexpected Routes API response shape"
+                )),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_userless_directions_call_is_denied_naming_the_post() {
+        let args = json!({ "origin": "a", "destination": "b" });
+        let call = plan(Provided::Directions, &args, &settings()).unwrap();
+        let state = InFlight::new(
+            &"a".repeat(32),
+            Provided::Directions,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        );
+        assert_eq!(
+            advance(
+                &state,
+                nested("denied", "a caller with no acting user may only read"),
+                &settings()
+            ),
+            Next::Fail(failure(
+                ErrorKind::Denied,
+                "api-request refused the nested POST to routes.example.com/directions/v2:computeRoutes: \
+                 a caller with no acting user may only read. A POST needs a request with a calling \
+                 user (an agent or `brenn-tool`)."
+            ))
+        );
     }
 }

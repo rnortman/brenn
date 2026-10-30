@@ -26,7 +26,11 @@ const ARTIFACT: &str = "brenn_google_maps_tools.wasm";
 
 /// The tools the class provides, by registry name and MCP name, in
 /// declaration order.
-const TOOLS: &[(&str, &str)] = &[("weather", "Weather"), ("geocode", "Geocode")];
+const TOOLS: &[(&str, &str)] = &[
+    ("weather", "Weather"),
+    ("geocode", "Geocode"),
+    ("directions", "Directions"),
+];
 
 /// The class's packaged specification.
 fn spec() -> String {

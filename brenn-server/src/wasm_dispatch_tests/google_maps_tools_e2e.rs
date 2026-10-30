@@ -18,12 +18,13 @@ use std::path::Path;
 use brenn_lib::config::{ApiKeyProviderConfig, PACKAGED, config_from_dsl};
 use brenn_lib::messaging::config::ProvidedToolDecl;
 use brenn_lib::tools::ResolvedToolGrant;
+use brenn_messaging::MountDebt;
 use brenn_oauth::testutil;
 use brenn_tool_registry::ToolError;
 use brenn_tool_registry::testutil::{clause, grant};
 use serde_json::{Value, json};
 
-use super::provider_rig::{ProviderRig, ProviderSetup};
+use super::provider_rig::{CallerSetup, ProviderRig, ProviderSetup};
 
 const MAPS_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -38,6 +39,8 @@ const MAPS_SPEC: &str = concat!(
 
 /// The providing instance.
 const PROVIDER: &str = "maps";
+/// The component that calls a provided tool on its own account.
+const CALLER: &str = "agenda";
 /// The key provider the instance's `config` names.
 const KEY_PROVIDER: &str = "maps";
 /// The store namespace the component keeps its in-flight rows in.
@@ -46,6 +49,7 @@ const INFLIGHT_NS: &str = "inflight";
 const GEOCODE_ADDRESS: &str = "/v4/geocode/address";
 const GEOCODE_LOCATION: &str = "/v4/geocode/location";
 const CURRENT_CONDITIONS: &str = "/v1/currentConditions:lookup";
+const COMPUTE_ROUTES: &str = "/directions/v2:computeRoutes";
 
 /// The instance's `api-request` clauses, as method and exact path, each on the
 /// stub's host: one per endpoint the component calls.
@@ -58,7 +62,7 @@ const CLAUSES: &[(&str, &str)] = &[
     ("GET", GEOCODE_LOCATION),
     ("POST", "/v1/places:searchText"),
     ("GET", "/v1/places/*"),
-    ("POST", "/directions/v2:computeRoutes"),
+    ("POST", COMPUTE_ROUTES),
 ];
 
 /// The component's `provide` statements, lowered from its packaged
@@ -120,6 +124,8 @@ fn current_body() -> String {
 struct Rig {
     base: ProviderRig,
     stub: testutil::Stub,
+    /// The stub's `host:port`, which every Google host in `config` is.
+    host: String,
     _dir: tempfile::TempDir,
     _vault: tempfile::TempDir,
 }
@@ -135,12 +141,17 @@ impl std::ops::Deref for Rig {
 /// The rig with every clause and the stub's key provider as
 /// `testutil::key_provider_config` builds it.
 async fn rig() -> Rig {
-    rig_with(CLAUSES, |_| {}).await
+    rig_with(CLAUSES, |_| {}, None).await
 }
 
-/// Stand up the rig: the provider's `api-request` grant holds `clauses`, and
-/// `key` adjusts the key provider before the registry is built.
-async fn rig_with(clauses: &[(&str, &str)], key: impl FnOnce(&mut ApiKeyProviderConfig)) -> Rig {
+/// Stand up the rig: the provider's `api-request` grant holds `clauses`,
+/// `key` adjusts the key provider before the registry is built, and `caller`
+/// is the calling component, if any.
+async fn rig_with(
+    clauses: &[(&str, &str)],
+    key: impl FnOnce(&mut ApiKeyProviderConfig),
+    caller: Option<CallerSetup<'_>>,
+) -> Rig {
     let (base, stub) = testutil::start_stub().await;
     let host = base
         .strip_prefix("http://")
@@ -196,7 +207,7 @@ async fn rig_with(clauses: &[(&str, &str)], key: impl FnOnce(&mut ApiKeyProvider
             .collect(),
             ..ProcessorLoadSpec::minimal(Path::new(MAPS_WASM), PROVIDER)
         },
-        caller: None,
+        caller,
     })
     .await;
     base.provider.component.open_store();
@@ -204,6 +215,7 @@ async fn rig_with(clauses: &[(&str, &str)], key: impl FnOnce(&mut ApiKeyProvider
     Rig {
         base,
         stub,
+        host,
         _dir: dir,
         _vault: vault,
     }
@@ -216,7 +228,7 @@ async fn rig_without_clause(path: &str) -> Rig {
         .copied()
         .filter(|(_, admitted)| *admitted != path)
         .collect();
-    rig_with(&clauses, |_| {}).await
+    rig_with(&clauses, |_| {}, None).await
 }
 
 /// Assert `answer` is the `internal` refusal of a nested call the grant does
@@ -466,7 +478,7 @@ async fn a_google_error_body_is_the_tools_error() {
 /// compacted: the request is answered `internal`, naming the cut.
 #[tokio::test]
 async fn a_truncated_answer_is_internal() {
-    let r = rig_with(CLAUSES, |key| key.raw.max_response_bytes = 64).await;
+    let r = rig_with(CLAUSES, |key| key.raw.max_response_bytes = 64, None).await;
     r.answer(GEOCODE_ADDRESS, geocode_body().to_string());
     let call = r.call_for_alice("Geocode", json!({ "address": "Mountain View" }));
     r.requested_id().await;
@@ -579,5 +591,172 @@ async fn a_clause_miss_at_the_second_step_is_internal_could_not_be_issued() {
         )]
     );
     assert!(r.inflight_keys().is_empty(), "neither step left a row");
+    assert!(r.runtime.serving(PROVIDER, &id).is_none());
+}
+
+/// The `Directions` field mask, as Google's Routes reference spells its
+/// fields.
+const DIRECTIONS_FIELD_MASK: &str = "routes.description,routes.warnings,routes.distanceMeters,\
+routes.duration,routes.staticDuration,routes.legs.distanceMeters,routes.legs.duration,\
+routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.travelMode,\
+routes.legs.steps.navigationInstruction,routes.legs.steps.transitDetails,fallbackInfo";
+
+/// A one-leg driving route as the Routes API answers it.
+fn route_body() -> String {
+    serde_json::to_string_pretty(&json!({
+        "routes": [{
+            "description": "Shoreline Blvd",
+            "distanceMeters": 3200,
+            "duration": "540s",
+            "staticDuration": "480s",
+            "legs": [{
+                "distanceMeters": 3200,
+                "duration": "540s",
+                "steps": [{
+                    "distanceMeters": 3200,
+                    "staticDuration": "480s",
+                    "travelMode": "DRIVE",
+                    "navigationInstruction": {
+                        "maneuver": "DEPART",
+                        "instructions": "Head north on Shoreline Blvd",
+                    },
+                }],
+            }],
+        }],
+    }))
+    .unwrap()
+}
+
+/// Directions for a conversation is one keyed `POST` to `computeRoutes`,
+/// stamped with the conversation's user, carrying the field mask and the
+/// route request, and answered with the route compacted.
+#[tokio::test]
+async fn directions_posts_compute_routes_for_a_user() {
+    let r = rig().await;
+    r.answer(COMPUTE_ROUTES, route_body());
+    let call = r.call_for_alice(
+        "Directions",
+        json!({
+            "origin": "37.422,-122.0841",
+            "destination": "place_id:ChIJiQHsW0m3j4ARm69rRkrUF3w",
+            "depart_at": "2026-10-30T17:00:00Z",
+        }),
+    );
+    let id = r.requested_id().await;
+    r.serve().await;
+    assert_eq!(r.inflight_keys(), [format!("{id}/1")]);
+    r.run_nested().await;
+    r.serve().await;
+
+    let answer = call.await.unwrap().expect("the component answered");
+    assert_eq!(
+        answer,
+        json!({
+            "mode": "drive",
+            "summary": "Shoreline Blvd",
+            "warnings": [],
+            "distance": { "value": 3.2, "unit": "km" },
+            "duration_minutes": 9,
+            "duration_without_traffic_minutes": 8,
+            "legs": [{
+                "distance": { "value": 3.2, "unit": "km" },
+                "duration_minutes": 9,
+                "steps": [{
+                    "instruction": "Head north on Shoreline Blvd",
+                    "maneuver": "DEPART",
+                    "distance": { "value": 3.2, "unit": "km" },
+                    "duration_minutes": 8,
+                    "mode": "DRIVE",
+                }],
+            }],
+        })
+    );
+
+    assert_eq!(
+        r.seen(),
+        [(
+            "POST".to_string(),
+            COMPUTE_ROUTES.to_string(),
+            BTreeMap::new()
+        )]
+    );
+    let stub = r.stub.lock().unwrap();
+    let request = &stub.api_seen[0];
+    assert_eq!(request.headers.get("x-api-key").unwrap(), testutil::KEY);
+    assert_eq!(
+        request.headers.get("x-goog-fieldmask").unwrap(),
+        DIRECTIONS_FIELD_MASK
+    );
+    let body: Value = serde_json::from_slice(&request.body).expect("a JSON body");
+    assert_eq!(
+        body,
+        json!({
+            "origin": { "location": { "latLng": { "latitude": 37.422, "longitude": -122.0841 } } },
+            "destination": { "placeId": "ChIJiQHsW0m3j4ARm69rRkrUF3w" },
+            "travelMode": "DRIVE",
+            "routingPreference": "TRAFFIC_AWARE",
+            "departureTime": "2026-10-30T17:00:00Z",
+            "computeAlternativeRoutes": false,
+            "units": "METRIC",
+        })
+    );
+    drop(stub);
+    assert!(
+        r.inflight_keys().is_empty(),
+        "the answered request left no row"
+    );
+    assert!(r.runtime.serving(PROVIDER, &id).is_none());
+}
+
+/// A component calling `directions` on its own account has no user, so the
+/// executor refuses the component's nested `POST`: the caller's result is
+/// `denied` naming the call and why, and nothing reaches the API.
+#[tokio::test]
+async fn a_userless_callers_directions_are_denied_with_the_reason() {
+    let r = rig_with(
+        CLAUSES,
+        |_| {},
+        Some(CallerSetup {
+            slug: CALLER,
+            tool: "directions",
+            args: json!({ "origin": "37.422,-122.0841", "destination": "Mountain View" }),
+        }),
+    )
+    .await;
+    let caller = r.caller();
+    testutils::insert_bus_message(&r.messenger, &caller.trigger, "go", ChannelScheme::Brenn).await;
+    drain_step(&caller.component, &caller.sub, MountDebt::Settled).await;
+
+    // The executor hands the call to the provider, which issues its `POST`.
+    r.executor.drain_step().await;
+    let id = r.requested_id().await;
+    r.serve().await;
+    let nested = r.owed(&r.executor_sub(), 1).await;
+    assert_eq!(nested[0]["serving"], id.as_str());
+
+    r.executor.drain_step().await;
+    assert!(r.seen().is_empty(), "a refused call reaches no API");
+    r.owed(&r.provider_sub, 1).await;
+    r.serve().await;
+
+    let results = r.owed(&caller.sub, 1).await;
+    assert_eq!(results[0]["tool"], "directions");
+    let error = &results[0]["outcome"]["err"];
+    assert_eq!(error["kind"], "denied", "{}", results[0]);
+    let detail = error["detail"].as_str().expect("a detail");
+    assert!(
+        detail.starts_with(&format!(
+            "api-request refused the nested POST to {}{COMPUTE_ROUTES}: ",
+            r.host
+        )) && detail.contains("a caller with no acting user may only read")
+            && detail.ends_with(
+                "A POST needs a request with a calling user (an agent or `brenn-tool`)."
+            ),
+        "{detail}"
+    );
+    assert!(
+        r.inflight_keys().is_empty(),
+        "the denied request left no row"
+    );
     assert!(r.runtime.serving(PROVIDER, &id).is_none());
 }

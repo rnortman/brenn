@@ -23,6 +23,16 @@ All notable changes to Brenn are documented here.
   that no alert is in force: Google gives the same answer when a provider's
   alert lacked a required field.
 
+- **`google-maps-tools` adds a `Directions` tool**: a route between two
+  places by car (with traffic), on foot, by bicycle or by public transit,
+  optionally for a given departure time or, for transit, arrival time. It
+  gives the distance, the travel time and the turn-by-turn steps; a transit
+  step names its line and stops and gives each departure and arrival time
+  with its own time zone. When Google could not take traffic into account,
+  the answer says so. Directions must be asked for on a user's behalf (from
+  a conversation, for instance); a component calling on its own account is
+  refused.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key
