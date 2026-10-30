@@ -985,6 +985,7 @@ impl ReloadDriver {
             alert_dispatcher: &self.env.alert_dispatcher,
             mqtt_service: self.env.mqtt_service.clone(),
             tool_registry: &self.env.tool_registry,
+            provider_runtime: &self.env.provider_runtime,
             max_payload_bytes: self.env.max_payload_bytes,
             sync_router: Some(self.env.router.clone()),
         };
@@ -2581,6 +2582,7 @@ channel scratch at "ephemeral:scratch" {{
                     alert_dispatcher: &alert_dispatcher,
                     mqtt_service: mqtt.0.clone(),
                     tool_registry: &tool_registry,
+                    provider_runtime: &provider_runtime,
                     max_payload_bytes: document.config.messaging.max_body_bytes,
                     sync_router: Some(router.clone()),
                 },

@@ -2116,7 +2116,7 @@ and `brenn-server/src/routes/remote.rs`, above each handler.
 
 Seventeen test targets now declare, by hand, which WASM component fixtures they
 stage: the twelve `WASM_TEST_SUITES` entries and `brenn-wasm_test` in
-`brenn-wasm/BUILD.bazel`, `brenn-server_test`'s six in
+`brenn-wasm/BUILD.bazel`, `brenn-server_test`'s seven in
 `brenn-server/BUILD.bazel`, `brenn-wasm-dispatch_test`'s four,
 `brenn-bootstrap_test`'s one and `//surface/server:server_test`'s one. Each list
 was derived by reading that target's sources for artifact stems, and nothing

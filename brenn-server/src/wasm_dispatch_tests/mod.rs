@@ -1,7 +1,7 @@
 //! Dispatch suites that need this crate's wiring.
 //!
 //! The dispatcher and the bulk of its suites live in `brenn-wasm-dispatch`,
-//! below this crate. The three families here drive the same dispatcher through
+//! below this crate. The families here drive the same dispatcher through
 //! the tool executor, the repo-sync fixtures and the webhook router — all of
 //! which live in this crate — so they run in this crate's test binary and build
 //! on the scaffolding the lower crate exposes behind `testutils`.
@@ -25,24 +25,20 @@ pub async fn attach_tool_executor(messenger: &Arc<brenn_messaging::Messenger>) {
     .await;
 }
 
-/// A consumer's result inbox entry carrying the consumer's own Wasm subscriber,
-/// plus the entry's resolved channel for the `inbox_input_port` call beside it.
-///
-/// The subscriber's depths and noise come from `inbox_subscription` so a tuned
-/// inbox cannot make a fixture's channel entry and its input port describe two
-/// different subscriptions.
-pub fn inbox_entry_with_own_subscriber(
+/// `entry` with the consumer `slug`'s own Wasm subscriber pushed onto it, its
+/// depths and noise read by `subscription` from the entry's own channel — so a
+/// tuned inbox cannot make a fixture's channel entry and its input port
+/// describe two different subscriptions.
+pub fn with_own_wasm_subscriber(
     slug: &str,
-    tuning: &brenn_lib::messaging::config::SystemChannelTuning,
-    defaults: &brenn_lib::messaging::config::MessagingGlobalConfig,
-) -> (
-    brenn_lib::messaging::ChannelEntry,
-    brenn_lib::messaging::config::ResolvedChannel,
-) {
-    let mut inbox = brenn_tool_registry::bus_wiring::result_inbox_entry(slug, tuning, defaults);
-    let channel = inbox.resolved_channel.clone();
-    let sub = brenn_tool_registry::bus_wiring::inbox_subscription(slug, &channel);
-    inbox
+    mut entry: brenn_lib::messaging::ChannelEntry,
+    subscription: fn(
+        &str,
+        &brenn_lib::messaging::config::ResolvedChannel,
+    ) -> brenn_lib::messaging::config::ResolvedSubscription,
+) -> brenn_lib::messaging::ChannelEntry {
+    let sub = subscription(slug, &entry.resolved_channel);
+    entry
         .subscribers
         .push(brenn_lib::messaging::SubscriberEntry {
             kind: brenn_lib::messaging::SubscriberEntryKind::Wasm(slug.to_string()),
@@ -51,9 +47,29 @@ pub fn inbox_entry_with_own_subscriber(
             noise: sub.noise,
             wake_min: None,
         });
+    entry
+}
+
+/// A consumer's result inbox entry carrying the consumer's own Wasm subscriber,
+/// plus the entry's resolved channel for the `inbox_input_port` call beside it.
+pub fn inbox_entry_with_own_subscriber(
+    slug: &str,
+    tuning: &brenn_lib::messaging::config::SystemChannelTuning,
+    defaults: &brenn_lib::messaging::config::MessagingGlobalConfig,
+) -> (
+    brenn_lib::messaging::ChannelEntry,
+    brenn_lib::messaging::config::ResolvedChannel,
+) {
+    let inbox = with_own_wasm_subscriber(
+        slug,
+        brenn_tool_registry::bus_wiring::result_inbox_entry(slug, tuning, defaults),
+        brenn_tool_registry::bus_wiring::inbox_subscription,
+    );
+    let channel = inbox.resolved_channel.clone();
     (inbox, channel)
 }
 
 mod git_pipeline_e2e;
 mod git_sync_consumer;
+mod provided_e2e;
 mod tool_e2e;

@@ -19,10 +19,10 @@ use brenn_lib::messaging::{ParticipantId, canonical_address};
 use brenn_lib::tools::ResolvedToolGrant;
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_wasm::{QueuedToolRequest, ToolCallError, ToolHost};
-use serde_json::json;
 
 use super::bus_wiring;
 use super::descriptor::ToolError;
+use super::executor::ToolRequest;
 use super::registry::ToolRegistry;
 use super::tool::{RegisteredTool, ToolCtx};
 
@@ -58,6 +58,11 @@ impl WasmToolHost {
             caller,
             alert,
         }
+    }
+
+    /// The consumer slug this host serves.
+    pub(crate) fn slug(&self) -> &str {
+        &self.slug
     }
 }
 
@@ -106,6 +111,22 @@ impl ToolHost for WasmToolHost {
         args_json: &str,
         call_id: &str,
     ) -> Result<QueuedToolRequest, ToolCallError> {
+        self.resolve_async(tool, args_json, call_id, None)
+    }
+}
+
+impl WasmToolHost {
+    /// Validate an async call and resolve it into its request envelope. A call
+    /// made on behalf of a pending provided-tool call carries that call's id as
+    /// `serving`; the executor reads the acting user from the pending record,
+    /// never from the body.
+    pub(crate) fn resolve_async(
+        &self,
+        tool: &str,
+        args_json: &str,
+        call_id: &str,
+        serving: Option<&str>,
+    ) -> Result<QueuedToolRequest, ToolCallError> {
         let grant = self
             .tool_grants
             .get(tool)
@@ -128,13 +149,14 @@ impl ToolHost for WasmToolHost {
         // Canonical name from the descriptor (the caller passed it, but the
         // descriptor is the source of truth for the channel name).
         let name = async_tool.descriptor().name;
-        let body = json!({
-            "v": 1,
-            "tool": name,
-            "call_id": call_id,
-            "caller": self.caller.as_str(),
-            "args": args,
-        });
+        let body = ToolRequest {
+            v: 1,
+            tool: name.to_string(),
+            call_id: call_id.to_string(),
+            caller: self.caller.as_str().to_string(),
+            args,
+            serving: serving.map(str::to_string),
+        };
         // Derive the request channel and reply inbox through the shared bus-wiring
         // helpers (+ `canonical_address`) that the bootstrap and executor policy
         // own, so the reserved namespace is spelled in exactly one place.
@@ -156,6 +178,7 @@ mod tests {
     use crate::tool::{AsyncTool, FastTool};
     use brenn_lib::tools::AclClause;
     use brenn_obs::alerting::noop_alert_dispatcher;
+    use serde_json::json;
 
     /// A fast tool that echoes its args back and rejects any repo not in the ACL.
     struct EchoFast;

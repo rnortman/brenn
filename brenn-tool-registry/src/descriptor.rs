@@ -186,6 +186,22 @@ impl ToolError {
             ToolError::NotGranted | ToolError::RateLimited | ToolError::WrongClass => String::new(),
         }
     }
+
+    /// The error a result envelope's `err.kind` / `err.detail` names: the
+    /// inverse of [`kind_str`](Self::kind_str) and [`detail`](Self::detail).
+    /// `None` for a kind that is not a tool error kind. A variant with no
+    /// payload drops `detail`.
+    pub fn from_wire(kind: &str, detail: String) -> Option<ToolError> {
+        Some(match kind {
+            "not_granted" => ToolError::NotGranted,
+            "denied" => ToolError::Denied(detail),
+            "invalid_args" => ToolError::InvalidArgs(detail),
+            "rate_limited" => ToolError::RateLimited,
+            "wrong_class" => ToolError::WrongClass,
+            "internal" => ToolError::Internal(detail),
+            _ => return None,
+        })
+    }
 }
 
 /// The `outcome` label for an invocation log line: `"ok"` on success, else the
@@ -200,5 +216,48 @@ pub fn outcome_label(result: &Result<serde_json::Value, ToolError>) -> &'static 
 impl From<AclDenied> for ToolError {
     fn from(d: AclDenied) -> Self {
         ToolError::Denied(d.resource)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One of each variant, with a detail where the variant carries one.
+    fn every_error() -> Vec<ToolError> {
+        let every = vec![
+            ToolError::NotGranted,
+            ToolError::Denied("repo r".to_string()),
+            ToolError::InvalidArgs("missing repo".to_string()),
+            ToolError::RateLimited,
+            ToolError::WrongClass,
+            ToolError::Internal("boom".to_string()),
+        ];
+        // Exhaustive, so a new variant stops this compiling until it is listed
+        // above.
+        for e in &every {
+            match e {
+                ToolError::NotGranted
+                | ToolError::Denied(_)
+                | ToolError::InvalidArgs(_)
+                | ToolError::RateLimited
+                | ToolError::WrongClass
+                | ToolError::Internal(_) => {}
+            }
+        }
+        every
+    }
+
+    #[test]
+    fn every_error_round_trips_through_its_wire_form() {
+        for e in every_error() {
+            assert_eq!(ToolError::from_wire(e.kind_str(), e.detail()), Some(e));
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_is_no_tool_error() {
+        assert_eq!(ToolError::from_wire("not-granted", String::new()), None);
+        assert_eq!(ToolError::from_wire("ok", String::new()), None);
     }
 }

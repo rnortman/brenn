@@ -38,7 +38,7 @@ use brenn_tool_registry::{
 };
 use git_fixture::scratch::scratch_remote_and_clone_behind_by_one;
 
-const TOOL_WASM: &str = concat!(
+pub(super) const TOOL_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../brenn-wasm/target/components/brenn_processor_tool_test.wasm"
 );

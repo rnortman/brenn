@@ -29,6 +29,15 @@ All notable changes to Brenn are documented here.
   mosquitto kept only for the tests; the `BRENN_MOSQUITTO_BIN` override is no
   longer forwarded from your shell into Bazel tests.
 
+- **WASM components can now serve tools to the assistant and to other
+  components.** A component instance granted `provides` that declares a tool
+  with a `provide` statement is now connected to Brenn when it loads, at
+  boot and on reload: Brenn hands it each call to that tool and returns its
+  answer to the caller. Tool calls the component makes while serving a call
+  act for the user who made that call and are allowed only by the
+  component's own tool grants. A configuration that declares a providing
+  instance now boots.
+
 - **WASM components can import a new `provides` interface** (granted by
   the new `provides` grant word), the first step toward components that
   serve tools to the assistant and to other components. It lets a
@@ -45,9 +54,8 @@ All notable changes to Brenn are documented here.
   `in tool-requests` port. `config-check` refuses a malformed declaration,
   two instances providing the same tool, and an instance granted a tool it
   provides itself; generated component scaffolding gains a `Provided` enum.
-  Brenn does not yet register or serve these tools. Adding, removing or
-  changing a declaration needs a restart. Channel names under
-  `tool-requests` are now reserved, like `tools` and `tool-results`.
+  Adding, removing or changing a declaration needs a restart. Channel names
+  under `tool-requests` are now reserved, like `tools` and `tool-results`.
 
 - A provided tool's input schema is now checked against the shape Brenn
   validates tool arguments with: a JSON object schema whose `properties` are
@@ -67,14 +75,13 @@ All notable changes to Brenn are documented here.
   `noise` can still be tuned. Groundwork for component-provided tools: Brenn
   now registers each declared provided tool and creates the providing
   instance's request inbox, `brenn:tool-requests/<slug>`, which accepts no
-  tuning blocks. A configuration that declares a provider does not boot yet.
+  tuning blocks.
 
-- Groundwork for component-provided tools, with no change yet for any
-  deployment: Brenn can now hand a call to a provided tool to the component
-  that serves it and wait up to four minutes for its answer, alerting once
-  if a provider runs out the clock. Tool calls a component makes while
-  serving such a call act for that call's user and end no later than it
-  does.
+- Groundwork for component-provided tools: Brenn can now hand a call to a
+  provided tool to the component that serves it and wait up to four minutes
+  for its answer, alerting once if a provider runs out the clock. Tool calls
+  a component makes while serving such a call act for that call's user and
+  end no later than it does.
 
 - Bumped wasmtime from 48.0.7 to 48.0.8, clearing RUSTSEC-2026-0422,
   RUSTSEC-2026-0423 and RUSTSEC-2026-0424.

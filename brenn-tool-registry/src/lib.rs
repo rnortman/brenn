@@ -8,8 +8,8 @@
 //! (`registry`), per-`(participant, tool)` throttling (`rate_limit`), the
 //! async execution loop over the message bus (`executor`, `bus_wiring`), the
 //! WASM caller path (`wasm_host`), tools a WASM instance provides
-//! (`provided`), and the one concrete tool that needs git
-//! (`git_repo_pull`).
+//! (`provided`) and the host a provider answers through (`provides_host`),
+//! and the one concrete tool that needs git (`git_repo_pull`).
 //!
 //! Config parsing/resolution and the ACL-matching primitive live in
 //! `brenn_lib::tools`; execution lives here because it needs the message
@@ -20,6 +20,7 @@ pub mod descriptor;
 pub mod executor;
 pub mod git_repo_pull;
 pub mod provided;
+pub mod provides_host;
 pub mod rate_limit;
 pub mod registry;
 pub mod tool;
@@ -39,6 +40,7 @@ pub use git_repo_pull::GitRepoPullTool;
 pub use provided::{
     CompleteError, PendingGuard, PendingId, ProvidedRequest, ProvidedTool, ProviderRuntime,
 };
+pub use provides_host::WasmProvidesHost;
 pub use rate_limit::RateLimiter;
 pub use registry::{GrantOwner, ToolRegistry};
 pub use tool::{ActingUser, AsyncTool, FastTool, RegisteredTool, ToolCtx};

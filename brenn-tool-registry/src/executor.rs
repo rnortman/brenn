@@ -70,7 +70,7 @@ use brenn_messaging::system::SystemInbox;
 use brenn_messaging::{Messenger, PublishResult};
 use brenn_messaging_store::store::MessageSeq;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -174,18 +174,22 @@ impl ToolCallerGrants {
     }
 }
 
-/// The v1 async tool-call request body published to `brenn:tools/<tool>`. Extra
-/// fields (`v`, `idempotency_key`) are ignored — only what the executor acts on
-/// is captured here. `serving` is present on a provider's nested call: the
-/// pending provided-tool call it acts for.
-#[derive(Debug, Deserialize)]
-struct ToolRequest {
-    tool: String,
-    call_id: String,
-    caller: String,
-    args: Value,
-    #[serde(default)]
-    serving: Option<String>,
+/// The v1 async tool-call request body published to `brenn:tools/<tool>`:
+/// written by [`WasmToolHost`](crate::WasmToolHost) and read here, so the two
+/// sides share one spelling. Unknown fields are ignored on read; `v` is
+/// required, and its value is not checked: the one writer stamps 1 and ships
+/// with this reader. `serving` is
+/// present on a provider's nested call: the pending provided-tool call it acts
+/// for.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ToolRequest {
+    pub(crate) v: u32,
+    pub(crate) tool: String,
+    pub(crate) call_id: String,
+    pub(crate) caller: String,
+    pub(crate) args: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) serving: Option<String>,
 }
 
 /// The handles every batch's tasks share: the bus, the tools, the grants, the
@@ -463,6 +467,7 @@ async fn admit_and_dispatch(
     };
 
     let ToolRequest {
+        v: _,
         tool,
         call_id,
         caller,
@@ -1292,6 +1297,33 @@ mod tests {
                 .any(|(t, _)| t.contains("malformed request")),
             "malformed-request alert should fire: {captured:?}",
         );
+    }
+
+    /// A body without `v` is malformed: the request is answered `invalid_args`
+    /// and never executed.
+    #[tokio::test]
+    async fn a_request_without_a_version_is_malformed() {
+        let h = harness().await;
+        let mut body: Value = serde_json::from_str(&request_body("c5", "brenn")).unwrap();
+        body.as_object_mut().unwrap().remove("v");
+        insert_request(&h, &body.to_string(), Some(h.results_uuid)).await;
+        let (alert, _hg) = noop_alert_dispatcher();
+        let tool = StubAsync::new(4, Duration::ZERO);
+        let seen = tool.seen_users.clone();
+        let exec = executor(
+            &h,
+            registry(tool),
+            caller_grants(vec![clause(&[("repo", "brenn")])]),
+            alert,
+        );
+
+        drain_and_join(&exec).await;
+
+        let result = read_result(&h).await;
+        assert_eq!(result["call_id"], "c5");
+        assert_eq!(result["outcome"]["err"]["kind"], "invalid_args");
+        assert_eq!(result["outcome"]["err"]["detail"], "malformed request body");
+        assert!(seen.lock().unwrap().is_empty(), "the tool must not run");
     }
 
     #[tokio::test]

@@ -864,6 +864,7 @@ pub async fn run_server(
             alert_dispatcher: &guard.alert_dispatcher,
             mqtt_service: mqtt_result.service.clone(),
             tool_registry: &tool_registry_core,
+            provider_runtime: &provider_runtime,
             max_payload_bytes: config.messaging.max_body_bytes,
             sync_router: messaging_result.router.clone(),
         };

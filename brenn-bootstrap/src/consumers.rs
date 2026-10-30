@@ -208,6 +208,10 @@ pub(crate) struct ConsumerLoadContext<'a> {
     /// interface.
     pub mqtt_service: Arc<brenn_mqtt::MqttService>,
     pub tool_registry: &'a Arc<brenn_tool_registry::ToolRegistry>,
+    /// The process's pending-call table. A consumer holding the `provides`
+    /// grant answers its requests and acts for their users through a host
+    /// over it.
+    pub provider_runtime: &'a Arc<brenn_tool_registry::ProviderRuntime>,
     /// `[messaging].max_body_bytes`, the ceiling on one published payload.
     pub max_payload_bytes: usize,
     /// The wake router, which is also how one consumer reaches another's
@@ -300,19 +304,29 @@ pub(crate) fn load_consumer(
     } else {
         None
     };
-    // Real tool host over the shared registry, built iff the consumer holds ≥1
-    // tool grant (so `tool_host.is_some()` tracks the `Tools` capability —
-    // `ProcessorComponent::load` re-asserts that invariant).
-    let tool_host: Option<brenn_wasm::ToolHostFn> = if consumer.policy.tool_grants.is_empty() {
-        None
-    } else {
-        Some(Arc::new(brenn_tool_registry::WasmToolHost::new(
-            ctx.tool_registry.clone(),
-            consumer.policy.tool_grants.clone(),
-            consumer.slug.clone(),
-            ctx.alert_dispatcher.clone(),
-        )))
-    };
+    // Real tool host over the shared registry. Linked as `tool_host` iff the
+    // consumer holds ≥1 tool grant (so `tool_host.is_some()` tracks the `Tools`
+    // capability — `ProcessorComponent::load` re-asserts that invariant). A
+    // provider's nested calls resolve through this same host, so they are
+    // admitted by the same grants; a provider with no tool grant gets one that
+    // answers every nested call `not-granted`.
+    let tools = Arc::new(brenn_tool_registry::WasmToolHost::new(
+        ctx.tool_registry.clone(),
+        consumer.policy.tool_grants.clone(),
+        consumer.slug.clone(),
+        ctx.alert_dispatcher.clone(),
+    ));
+    let tool_host: Option<brenn_wasm::ToolHostFn> =
+        (!consumer.policy.tool_grants.is_empty()).then(|| tools.clone() as brenn_wasm::ToolHostFn);
+    // Provider seam over the pending-call table, built iff the consumer is a
+    // provider — the `provides` interface is linked iff this is `Some`, and
+    // `ProcessorComponent::load` re-asserts that invariant.
+    let provides_host: Option<brenn_wasm::ProvidesHostFn> = is_provider(consumer).then(|| {
+        Arc::new(brenn_tool_registry::WasmProvidesHost::new(
+            ctx.provider_runtime.clone(),
+            tools.clone(),
+        )) as brenn_wasm::ProvidesHostFn
+    });
     // Peer-call seam. Built iff the consumer holds the `Calls` grant — the
     // `calls` interface is linked iff this is `Some`, and
     // `ProcessorComponent::load` re-asserts that invariant.
@@ -370,9 +384,7 @@ pub(crate) fn load_consumer(
             output_acl,
             mqtt_publish,
             tool_host,
-            // No provider seam is built here, so a consumer granted `provides`
-            // trips the seam-iff-grant assert in `ProcessorComponent::load`.
-            provides_host: None,
+            provides_host,
             declared_call_ports: consumer.call_ports.clone(),
             calls,
             sync_caller,
@@ -499,13 +511,22 @@ pub(crate) fn start_consumer(
     }
 }
 
+/// Whether the consumer provides tools: it holds the `provides` grant, which
+/// the boot plan admits iff it declares a provided tool. Both of a provider's seams —
+/// the provides host at load and the failure hook at start — follow this.
+fn is_provider(consumer: &ResolvedWasmConsumer) -> bool {
+    consumer
+        .grants
+        .contains(&brenn_lib::messaging::ComponentGrant::Provides)
+}
+
 /// The provider runtime a consumer's dispatcher answers failed activations
-/// through: the shared one for a consumer that provides tools, none otherwise.
+/// through: the shared one for a provider, none otherwise.
 fn consumer_provider(
     consumer: &ResolvedWasmConsumer,
     provider_runtime: &Arc<brenn_tool_registry::ProviderRuntime>,
 ) -> Option<Arc<brenn_tool_registry::ProviderRuntime>> {
-    (!consumer.provides.is_empty()).then(|| provider_runtime.clone())
+    is_provider(consumer).then(|| provider_runtime.clone())
 }
 
 /// A built component fixture's bytes, by artifact file name.
@@ -862,9 +883,10 @@ mod tests {
     async fn only_a_providing_consumer_gets_the_provider_runtime() {
         let (alert_dispatcher, _drainer) = brenn_obs::alerting::noop_alert_dispatcher();
         let runtime = brenn_tool_registry::ProviderRuntime::new(alert_dispatcher);
-        let mut consumer = tool_consumer(&[brenn_lib::messaging::ComponentGrant::Provides], &[]);
-        assert!(consumer_provider(&consumer, &runtime).is_none());
+        let plain = tool_consumer(&[brenn_lib::messaging::ComponentGrant::Ports], &[]);
+        assert!(consumer_provider(&plain, &runtime).is_none());
 
+        let mut consumer = tool_consumer(&[brenn_lib::messaging::ComponentGrant::Provides], &[]);
         consumer
             .provides
             .push(brenn_lib::messaging::config::ProvidedToolDecl {
@@ -908,6 +930,7 @@ mod tests {
             alert_dispatcher: &alert_dispatcher,
             mqtt_service: brenn_mqtt::MqttService::new(),
             tool_registry: &tool_registry,
+            provider_runtime: &brenn_tool_registry::ProviderRuntime::new(alert_dispatcher.clone()),
             max_payload_bytes: 1024,
             sync_router: None,
         };
