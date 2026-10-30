@@ -173,6 +173,9 @@ pub(crate) struct ReloadEnv {
     /// table do not exist then, and a fresh boot of the candidate would not
     /// build them either.
     pub tool_caller_grants: Option<Arc<brenn_tool_registry::ToolCallerGrants>>,
+    /// The process's pending provided-tool calls, handed to every providing
+    /// consumer a reload starts so its failed activations answer their callers.
+    pub provider_runtime: Arc<brenn_tool_registry::ProviderRuntime>,
     pub alert_dispatcher: AlertDispatcher,
 }
 
@@ -2474,6 +2477,7 @@ channel scratch at "ephemeral:scratch" {{
             brenn_server::active_bridge::write_virtual_tools_file(app, &tool_registry);
         }
         let (alert_dispatcher, captured, _drain) = make_capturing_alerter_with_severity();
+        let provider_runtime = brenn_tool_registry::ProviderRuntime::new(alert_dispatcher.clone());
 
         // One registry for the whole rig: the reload's session steps, the wake
         // router and a case that seats a session all read the same one.
@@ -2592,7 +2596,13 @@ channel scratch at "ephemeral:scratch" {{
             );
             registry.insert(
                 consumer.slug.clone(),
-                crate::consumers::start_consumer(one, consumer, &messenger, &alert_dispatcher),
+                crate::consumers::start_consumer(
+                    one,
+                    consumer,
+                    &messenger,
+                    &alert_dispatcher,
+                    &provider_runtime,
+                ),
             );
         }
 
@@ -2678,6 +2688,7 @@ channel scratch at "ephemeral:scratch" {{
                 messenger: messenger.clone(),
                 router: router.clone(),
                 tool_caller_grants: tool_caller_grants.clone(),
+                provider_runtime,
                 alert_dispatcher,
             },
             Baseline::of(document, loaded_mounts, &plan),

@@ -1193,8 +1193,12 @@ port is neither the class's option nor the instance's to wire:
   config gate runs the planner, so `check.sh` catches it without a tool
   registry). Its `push_depth` tunes the channel
   rung only, which that subscription does not read, so `1` is the honest value
-  to write. A component port may not name that address, or any
-  `brenn:tools/<tool>` address, directly.
+  to write. Its send rate is the host's, not `default_send_rate` and not the
+  block's — `send_rate` in a tool-results block is refused — because the tool
+  executor is the inbox's only publisher and publishes at most one result per
+  request it dequeues, refused or run; the rate that bounds an instance's own
+  calls is the one on its `brenn:tools/<tool>` channels. A component port may
+  not name that address, or any `brenn:tools/<tool>` address, directly.
 
 So a tool-using instance's body holds its `tool` statements and the bindings for
 its own ports, and says nothing at all about `tool-results`.
@@ -1215,16 +1219,21 @@ a reserved input port named `tool-requests`:
   that does not may not use the name. The port is never `optional`, and no
   instance binding names it.
 - The channel behind it is `brenn:tool-requests/<slug>`, minted by the
-  substrate and sized from the class's summed `max_concurrency`, so that no
-  request is pushed out of the window before the component sees it while the
-  component takes delivery of each within the provided-tool deadline (240 s). A
-  request whose caller the deadline has already answered `internal` frees its
-  slot, so a component paced or stalled past the deadline can have such a
-  request pushed out unseen; nothing is lost, as its caller is answered. Unlike
-  the result inbox it is not the operator's to tune: a `channel at
-  "brenn:tool-requests/…"` tuning block, exact or prefix, is refused, and so is
-  a channel declaration at such an address. No component port may name the
-  address.
+  substrate and sized to the class's summed `max_concurrency`: at most that many
+  requests are live at once, each holding a permit, and the window holds that
+  many rows. A request is pushed out before the component sees it only when a
+  permit is freed without the component running in between — a later request
+  expiring at the provided-tool deadline (240 s), or a caller abandoning its
+  call; a request already answered can always be pushed out, and that loses
+  nothing. A live request pushed out is answered `internal` at its deadline, as
+  a request the component did not answer would be; nothing runs for it. A drop
+  here raises no alert of its own: the per-tool ceiling alert is the signal
+  that a provider is not keeping up. Unlike the result inbox it is not the
+  operator's to tune: a `channel at "brenn:tool-requests/…"` tuning block, exact
+  or prefix, is refused, and so is a channel declaration at such an address. No
+  component port may name the address. Its send rate is the same host-owned
+  one as the result inbox's, for the same reason; a call the bus nonetheless
+  refuses is answered `rate_limited`.
 - Two instances in one document whose classes provide the same tool name or the
   same `mcp_name` are refused, both sites cited — including two instances of one
   providing class. An instance may not hold a `tool` statement naming a tool its

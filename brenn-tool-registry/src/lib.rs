@@ -36,7 +36,9 @@ pub use descriptor::{
 };
 pub use executor::{CallerGrantTable, TOOL_EXECUTOR_COMPONENT, ToolCallerGrants, ToolExecutor};
 pub use git_repo_pull::GitRepoPullTool;
-pub use provided::{CompleteError, PendingGuard, PendingId, ProvidedTool, ProviderRuntime};
+pub use provided::{
+    CompleteError, PendingGuard, PendingId, ProvidedRequest, ProvidedTool, ProviderRuntime,
+};
 pub use rate_limit::RateLimiter;
 pub use registry::{GrantOwner, ToolRegistry};
 pub use tool::{ActingUser, AsyncTool, FastTool, RegisteredTool, ToolCtx};

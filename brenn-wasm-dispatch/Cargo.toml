@@ -17,16 +17,20 @@ testutils = [
 ]
 
 # Depends on brenn-lib for the messaging store it drains and the pacing bucket,
-# on brenn-wasm for the guest host it invokes, and on brenn-obs for the
-# throttle alert. Nothing above the server reaches back: the server only wires
-# this task in, so a server edit leaves these tests cached.
+# on brenn-wasm for the guest host it invokes, on brenn-obs for the throttle
+# alert, and on brenn-tool-registry for the provider runtime a failed
+# activation answers its pending provided-tool calls through. Nothing above the
+# server reaches back: the server only wires this task in, so a server edit
+# leaves these tests cached.
 [dependencies]
 brenn-activation = { version = "0.1.0", path = "../brenn-activation" }
 brenn-common = { version = "0.1.0", path = "../brenn-common" }
+brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
 brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
 brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
+brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry" }
 brenn-wasm = { version = "0.1.0", path = "../brenn-wasm" }
 chrono = "0.4.44"
 tokio = { version = "1.50.0", features = ["sync", "time", "macros", "rt"] }

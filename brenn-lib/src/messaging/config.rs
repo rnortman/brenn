@@ -2466,6 +2466,7 @@ impl SystemChannelTuning {
 ///   `mqtt:<client>:<topic-filter>`
 /// - an `address_prefix` that is empty, names no system-minted family, or does
 ///   not end at a segment boundary
+/// - an exact address or prefix in the `brenn:tool-requests/` family
 /// - a duplicate exact address or a duplicate prefix
 /// - `sink = "archive"` (stated or inherited) with no `[messaging].archive_path`
 pub fn build_system_channel_tuning(
@@ -2533,6 +2534,21 @@ pub fn build_system_channel_tuning(
             }
         };
 
+        // A provider's request inbox is sized from its class's declarations,
+        // never from a block. Refused here, where the family is read off the
+        // address, so a plan with no tool registry refuses it too and no exact
+        // key in the family reaches the existence check.
+        assert!(
+            !matches!(
+                ChannelScheme::split(&entry_key),
+                Some((ChannelScheme::Brenn, name))
+                    if name.starts_with(brenn_envelope::addressing::TOOL_REQUESTS_NAMESPACE)
+            ),
+            "config: [[channel]] {label} tunes the provider request-inbox family, which no \
+             block tunes: an inbox holds every request that can be in flight at once, the \
+             sum of its class's max_concurrency, and that depth is the class's to state",
+        );
+
         assert!(
             ch.uuid.is_none(),
             "config: [[channel]] {label} tunes a system-minted channel and must not set \
@@ -2593,6 +2609,20 @@ pub fn build_system_channel_tuning(
              retains a window sized for the outage it must survive, and its system \
              participants subscribe at that window; zero leaves them with no position",
         );
+        let tool_result_inbox = matches!(
+            ChannelScheme::split(&entry_key),
+            Some((ChannelScheme::Brenn, name)) if name.starts_with(TOOL_RESULTS_NAMESPACE)
+        );
+        // A result inbox's send rate is the host's, set where the inbox entry is
+        // built; a block's rate would be silently overridden there. Refused here
+        // for the same no-registry reason as the noise refusal below.
+        assert!(
+            !(tool_result_inbox && entry.send_rate.is_some()),
+            "config: [[channel]] {label} tunes a tool-result inbox's `send_rate` — the \
+             inbox's send rate is the host's: the tool executor is its only publisher and \
+             publishes at most one result per request it dequeues, so the rate that bounds a \
+             component's calls is the one on its `brenn:tools/<tool>` channels",
+        );
         if let Some(rate) = entry.send_rate {
             rate.validate(&format!("[[channel]] {label}"));
         }
@@ -2602,9 +2632,7 @@ pub fn build_system_channel_tuning(
         // the address, so a config gate planning without a tool registry — which
         // never reaches the fold-in — still catches the rung that would panic the
         // service at its next boot.
-        if entry_key
-            .strip_prefix("brenn:")
-            .is_some_and(|name| name.starts_with(TOOL_RESULTS_NAMESPACE))
+        if tool_result_inbox
             && !entry
                 .noise
                 .unwrap_or(defaults.default_noise)
@@ -4177,6 +4205,71 @@ channel demo at "ephemeral:protobar-demo" {
         assert_eq!(
             resolve_system_channel("webhook:hook", &tuning, &global_defaults()).noise,
             NoiseLevel::Fatal,
+        );
+    }
+
+    /// A rate the operator could set on a tool-result inbox.
+    fn a_send_rate() -> SendRate {
+        SendRate {
+            burst: 7,
+            refill_interval_secs: 1,
+            refill: 3,
+        }
+    }
+
+    /// A result inbox's send rate is the host's, so an exact block stating one
+    /// is refused rather than silently overridden.
+    #[test]
+    #[should_panic(
+        expected = "tunes a tool-result inbox's `send_rate` — the inbox's send \
+                               rate is the host's"
+    )]
+    fn an_exact_inbox_tuning_block_with_a_send_rate_panics() {
+        let mut block = tuning_block("brenn:tool-results/x", 1, 4, 4);
+        block.send_rate = Some(a_send_rate());
+        tuning_of(&[block]);
+    }
+
+    /// A prefix block over the whole family is refused the same way.
+    #[test]
+    #[should_panic(
+        expected = "tunes a tool-result inbox's `send_rate` — the inbox's send \
+                               rate is the host's"
+    )]
+    fn a_prefix_inbox_tuning_block_with_a_send_rate_panics() {
+        let mut block = tuning_prefix("brenn:tool-results/", 1, 4, 4);
+        block.send_rate = Some(a_send_rate());
+        tuning_of(&[block]);
+    }
+
+    /// Without `send_rate` the same blocks build, and the operator's other
+    /// knobs on a result inbox stay the operator's.
+    #[test]
+    fn an_inbox_tuning_block_without_a_send_rate_builds() {
+        let mut exact = tuning_block("brenn:tool-results/x", 1, 4, 4);
+        exact.noise = Some(NoiseLevel::Alarm);
+        let tuning = tuning_of(&[exact, tuning_prefix("brenn:tool-results/", 1, 6, 6)]);
+        let defaults = global_defaults();
+        let x = resolve_system_channel("brenn:tool-results/x", &tuning, &defaults);
+        assert_eq!(x.retain_depth, Depth::Bounded(4));
+        assert_eq!(x.noise, NoiseLevel::Alarm);
+        assert_eq!(
+            resolve_system_channel("brenn:tool-results/y", &tuning, &defaults).retain_depth,
+            Depth::Bounded(6),
+        );
+    }
+
+    /// The refusal is scoped to the result-inbox family: a send rate on a
+    /// tool's request channel stays the operator's.
+    #[test]
+    fn a_send_rate_on_a_tool_request_channel_still_builds() {
+        let mut block = tuning_block("brenn:tools/git-repo-pull", 1, 4, 4);
+        block.send_rate = Some(a_send_rate());
+        let tuning = tuning_of(&[block]);
+        assert_eq!(
+            resolve_system_channel("brenn:tools/git-repo-pull", &tuning, &global_defaults())
+                .send_rate,
+            a_send_rate(),
         );
     }
 

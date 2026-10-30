@@ -15,6 +15,7 @@ use std::sync::Arc;
 use brenn_lib::config::{AppConfig, BrennConfig};
 use brenn_lib::messaging::config::{
     ResolvedSubscription, ResolvedSurface, ResolvedSurfaceSubscription, ResolvedWasmConsumer,
+    WasmInputPort,
 };
 use brenn_lib::messaging::remote::{RemoteFacts, resolve_remote_facts_all};
 use brenn_lib::messaging::{
@@ -150,6 +151,25 @@ impl MessagingPlan {
             .as_ref()
             .is_some_and(|planned| Arc::ptr_eq(planned, apps))
     }
+}
+
+/// Fold a consumer's own system-minted inbox into the plan: `port` joins the
+/// consumer's inputs, its subscription joins the consumer's directory
+/// registrations, and `entry` joins the channel entries.
+fn fold_own_inbox(
+    consumer: &mut ResolvedWasmConsumer,
+    wasm_consumers_for_dir: &mut [(String, Vec<ResolvedSubscription>)],
+    all_entries: &mut Vec<ChannelEntry>,
+    entry: ChannelEntry,
+    port: WasmInputPort,
+) {
+    let dir_entry = wasm_consumers_for_dir
+        .iter_mut()
+        .find(|(slug, _)| slug == &consumer.slug)
+        .expect("wasm_consumers_for_dir has an entry per resolved consumer");
+    dir_entry.1.push(port.sub.clone());
+    consumer.inputs.push(port);
+    all_entries.push(entry);
 }
 
 /// Lower a document into a [`MessagingPlan`], or `None` when it configures no
@@ -343,12 +363,14 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
             global_defaults,
         ));
     }
-    // TODO(tool-registry-unregistered-tool-sweep): once tools can be
-    // dynamically (de)registered, sweep `brenn:tools/*` pending rows here for
-    // tools no longer in the registry — alert and delete them at boot rather
-    // than executing a request against a removed tool. Unreachable today: the
-    // async tool set is fixed in code, so a pending row can only name a
-    // registered tool.
+    // TODO(tool-registry-unregistered-tool-sweep): a tool absent from the
+    // registry at this boot — a provided one whose class left the document —
+    // mints no `brenn:tools/<tool>` entry here, so its channel row and up to a
+    // window of request rows stay on disk unreaped (GC walks only the
+    // directory). Nothing executes them: the executor does not subscribe and
+    // their cursors are deleted at boot. A later tool of the same name re-runs
+    // at most a window under `Idempotency::Natural`. Needs a reaping policy for
+    // channels that left the directory.
     let mut tuned_inbox_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for consumer in resolved_wasm_consumers.iter_mut() {
         let async_tools = match tool_registry {
@@ -382,24 +404,53 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
             inbox_entry.address,
             brenn_lib::messaging::config::BACKEND_FATAL_NOISE_REFUSAL,
         );
-        let dir_entry = wasm_consumers_for_dir
-            .iter_mut()
-            .find(|(slug, _)| slug == &consumer.slug)
-            .expect("wasm_consumers_for_dir has an entry per resolved consumer");
-        dir_entry
-            .1
-            .push(brenn_tool_registry::bus_wiring::inbox_subscription(
-                &consumer.slug,
-                &inbox_entry.resolved_channel,
-            ));
-        consumer
-            .inputs
-            .push(brenn_tool_registry::bus_wiring::inbox_input_port(
-                &consumer.slug,
-                &inbox_entry.resolved_channel,
-            ));
-        all_entries.push(inbox_entry);
+        let port = brenn_tool_registry::bus_wiring::inbox_input_port(
+            &consumer.slug,
+            &inbox_entry.resolved_channel,
+        );
+        fold_own_inbox(
+            consumer,
+            &mut wasm_consumers_for_dir,
+            &mut all_entries,
+            inbox_entry,
+            port,
+        );
         tuned_inbox_slugs.insert(consumer.slug.clone());
+    }
+    // --- Provided tools: one `brenn:tool-requests/<slug>` inbox per provider ---
+    //
+    // Sized from the consumer's own declarations, so it needs no registry and a
+    // config check plans it too. Folded as the result inbox is, with a
+    // triggering `tool-requests` input port and the subscribe-only grant the
+    // delivery gate checks.
+    for consumer in resolved_wasm_consumers
+        .iter_mut()
+        .filter(|consumer| !consumer.provides.is_empty())
+    {
+        let depth = brenn_tool_registry::bus_wiring::request_inbox_depth(
+            &consumer.slug,
+            &consumer.provides,
+        );
+        brenn_tool_registry::bus_wiring::derive_provided_bus_grants(
+            &mut consumer.policy,
+            &consumer.slug,
+        );
+        let inbox_entry = brenn_tool_registry::bus_wiring::request_inbox_entry(
+            &consumer.slug,
+            depth,
+            global_defaults,
+        );
+        let port = brenn_tool_registry::bus_wiring::request_input_port(
+            &consumer.slug,
+            &inbox_entry.resolved_channel,
+        );
+        fold_own_inbox(
+            consumer,
+            &mut wasm_consumers_for_dir,
+            &mut all_entries,
+            inbox_entry,
+            port,
+        );
     }
     // Each consumer's tool grants against the registry: a wasm policy is not in
     // the `apps` map the registry scanned at its own construction, so this is
@@ -1133,6 +1184,129 @@ mod tests {
             replay_store_paths: &[],
         })
         .expect("a document declaring channels configures messaging");
+    }
+
+    /// A document with one consumer providing two tools at `concurrency`, which
+    /// also reads `brenn:work`, and `default_noise = alarm` in the globals.
+    fn providing_config(concurrency: [u32; 2]) -> BrennConfig {
+        use brenn_lib::messaging::ComponentGrant;
+        use brenn_lib::messaging::config::{NoiseLevel, ProvidedToolDecl, WasmConsumerConfigRaw};
+
+        let tool = |name: &str, max_concurrency: u32| ProvidedToolDecl {
+            name: name.to_string(),
+            mcp_name: "EchoForUser".to_string(),
+            description: "Echo.".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            max_concurrency,
+            auto_approve: true,
+        };
+        let mut provider =
+            WasmConsumerConfigRaw::minimal("prov", "processor-provider-test", &["brenn:work"]);
+        provider.subscribe_acl = vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
+            "work".to_string(),
+        )];
+        provider.grants = vec![ComponentGrant::Provides];
+        provider.provides = vec![
+            tool("echo-for-user", concurrency[0]),
+            tool("echo-twice", concurrency[1]),
+        ];
+
+        let mut config = BrennConfig::default();
+        config.messaging.default_noise = NoiseLevel::Alarm;
+        config
+            .channels
+            .push(durable_channel("brenn:surface.index", Depth::Unbounded));
+        config
+            .channels
+            .push(durable_channel("brenn:work", Depth::Bounded(4)));
+        config.wasm_consumers = vec![provider];
+        config
+    }
+
+    /// The provider's inbox is planned with no registry at all: depth and both
+    /// rungs at Σ `max_concurrency`, `metered` on the channel and on the folded
+    /// subscription though the globals say `alarm`, a triggering `tool-requests`
+    /// port, and a grant to receive there and publish nowhere new.
+    #[test]
+    fn a_provider_plans_its_request_inbox_from_its_declarations() {
+        use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
+        use brenn_lib::messaging::SubscriberEntryKind;
+        use brenn_lib::messaging::config::NoiseLevel;
+
+        let plan = plan_of(&providing_config([2, 3]));
+        let inbox = plan
+            .directory
+            .list()
+            .into_iter()
+            .find(|entry| entry.address == "brenn:tool-requests/prov")
+            .expect("the provider's request inbox is in the directory");
+        assert_eq!(inbox.resolved_channel.retain_depth, Depth::Bounded(5));
+        assert_eq!(
+            inbox.resolved_channel.standing_retain_depth,
+            Depth::Bounded(5)
+        );
+        assert_eq!(inbox.resolved_channel.noise, NoiseLevel::Metered);
+        assert_eq!(inbox.subscribers.len(), 1);
+        let sub = &inbox.subscribers[0];
+        assert!(matches!(&sub.kind, SubscriberEntryKind::Wasm(slug) if slug == "prov"));
+        assert_eq!(sub.push_depth, Depth::Bounded(5));
+        assert_eq!(sub.retain_depth, Depth::Bounded(5));
+        assert_eq!(sub.noise, NoiseLevel::Metered);
+
+        let consumer = &plan.wasm_consumers[0];
+        let port = consumer
+            .inputs
+            .iter()
+            .find(|input| input.port == TOOL_REQUEST_INPUT_PORT)
+            .expect("the inbox is a triggering input port");
+        assert_eq!(port.sub.channel_address, "brenn:tool-requests/prov");
+        assert_eq!(port.sub.push_depth, Depth::Bounded(5));
+        assert_eq!(port.sub.noise, NoiseLevel::Metered);
+        assert!(
+            consumer
+                .policy
+                .allows_channel_access("brenn:tool-requests/prov")
+        );
+        assert!(!consumer.policy.allows_brenn_publish("tool-requests/prov"));
+    }
+
+    /// A consumer that provides nothing gets no request inbox.
+    #[test]
+    fn a_consumer_providing_nothing_plans_no_request_inbox() {
+        let mut config = providing_config([1, 1]);
+        config.wasm_consumers[0].provides.clear();
+        config.wasm_consumers[0].grants.clear();
+        let plan = plan_of(&config);
+        assert!(
+            !plan
+                .directory
+                .list()
+                .into_iter()
+                .any(|entry| entry.address.starts_with("brenn:tool-requests/"))
+        );
+    }
+
+    /// A tuning block on the request-inbox family is refused at plan time, exact
+    /// or prefix, naming why the depth is not the operator's.
+    #[test]
+    #[should_panic(expected = "tunes the provider request-inbox family")]
+    fn an_exact_request_inbox_tuning_block_is_refused_by_the_planner() {
+        let mut config = providing_config([1, 1]);
+        let mut tuning = durable_channel("brenn:tool-requests/prov", Depth::Bounded(4));
+        tuning.uuid = None;
+        config.channels.push(tuning);
+        plan_of(&config);
+    }
+
+    #[test]
+    #[should_panic(expected = "tunes the provider request-inbox family")]
+    fn a_prefix_request_inbox_tuning_block_is_refused_by_the_planner() {
+        let mut config = providing_config([1, 1]);
+        let mut tuning = durable_channel("brenn:tool-requests/", Depth::Bounded(4));
+        tuning.uuid = None;
+        tuning.address_prefix = tuning.address.take();
+        config.channels.push(tuning);
+        plan_of(&config);
     }
 
     /// The mount is checked where the entry is minted. A block whose declared

@@ -812,17 +812,21 @@ Code site: `brenn-render/src/tools/mod.rs` (`build_tool_registry`),
 
 ## `tool-registry-unregistered-tool-sweep`
 
-At bootstrap, `brenn:tools/*` may hold durable pending request rows for a tool
-that is no longer registered (binary/config changed across restart). Executing
-a request against a removed tool is wrong-thing territory; the sweep should
-alert and delete those rows at boot. Not built this cycle: the async tool set
-is fixed in code (only `git-repo-pull`), so a pending row can only name a
-registered tool — the case is unreachable until tools become dynamically
-(de)registerable.
+When an async tool leaves the registry across a restart — today, a provided
+tool whose providing class left the document — its `brenn:tools/<tool>`
+channel row and up to one window of request rows stay on disk, unreaped: the
+bus GC (`brenn-bootstrap/src/shutdown.rs`, `bus_gc_loop`) walks only the
+directory, and the planner mints no directory entry for a tool the registry
+does not hold. Nothing executes those rows — the executor has no subscription
+to the channel and its cursor rows are deleted at boot — and a later tool
+registered under the same name re-runs at most one window, which
+`Idempotency::Natural` already covers. What is missing is a reaping policy for
+channels that left the directory. The question is general, not a tool one:
+declared channels removed from config are kept the same way
+(`brenn-messaging-store/src/db/bootstrap.rs`, `upsert_channels`).
 
-Code site: `brenn-messaging-boot/src/lib.rs` (async-tool request
-channel wiring in `build_messaging`),
-`TODO(tool-registry-unregistered-tool-sweep)`.
+Code site: `brenn-messaging-boot/src/plan.rs` (the async-tool request channel
+wiring in `plan_messaging`), `TODO(tool-registry-unregistered-tool-sweep)`.
 
 ---
 

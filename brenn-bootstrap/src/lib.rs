@@ -68,6 +68,71 @@ fn assert_build_id_valid(build_id: &str) {
     );
 }
 
+/// Who already holds a bare tool name an agent may be offered, for the
+/// provided-tool refusal in [`build_tool_registry`].
+enum ReservedBy {
+    Core,
+    Integration(String),
+}
+
+/// The process's tool registry: `native` first, then one provided tool per
+/// `provide` declaration of every consumer in `consumers`, each served through
+/// `runtime`.
+///
+/// # Panics
+///
+/// When a provided tool's `mcp_name` suffix is a name an agent can be offered
+/// outside the registry — a core or repo virtual tool, or a virtual tool of an
+/// integration of any app in `apps`, granted or not, since a reload can add the
+/// grant but not the integration. Then, from [`ToolRegistry::with_provided`],
+/// when a provided name or `mcp_name` is already registered.
+///
+/// [`ToolRegistry::with_provided`]: brenn_tool_registry::ToolRegistry::with_provided
+pub fn build_tool_registry(
+    native: Vec<brenn_tool_registry::RegisteredTool>,
+    consumers: &[brenn_lib::messaging::config::WasmConsumerConfigRaw],
+    apps: &indexmap::IndexMap<String, brenn_lib::config::AppConfig>,
+    runtime: &std::sync::Arc<brenn_tool_registry::ProviderRuntime>,
+) -> brenn_tool_registry::ToolRegistry {
+    use brenn_envelope::addressing::{CORE_VIRTUAL_TOOL_NAME_REFUSAL, CORE_VIRTUAL_TOOL_NAMES};
+
+    let mut reserved: std::collections::HashMap<String, ReservedBy> = CORE_VIRTUAL_TOOL_NAMES
+        .iter()
+        .map(|name| (name.to_string(), ReservedBy::Core))
+        .collect();
+    for integration in apps.values().flat_map(|app| app.integrations.values()) {
+        for tool in integration.virtual_tools() {
+            reserved
+                .entry(tool.name)
+                .or_insert_with(|| ReservedBy::Integration(integration.name().to_string()));
+        }
+    }
+
+    let mut provided = Vec::new();
+    for consumer in consumers {
+        for decl in &consumer.provides {
+            if let Some(holder) = reserved.get(&decl.mcp_name) {
+                let held = match holder {
+                    ReservedBy::Core => CORE_VIRTUAL_TOOL_NAME_REFUSAL.to_string(),
+                    ReservedBy::Integration(integration) => {
+                        format!("the name of integration `{integration}`'s virtual tool")
+                    }
+                };
+                panic!(
+                    "tool `{}` of `[[wasm_consumer]] {}` has mcp_name `{}`, {held}",
+                    decl.name, consumer.slug, decl.mcp_name,
+                );
+            }
+            provided.push(std::sync::Arc::new(brenn_tool_registry::ProvidedTool::new(
+                &consumer.slug,
+                decl,
+                runtime.clone(),
+            )));
+        }
+    }
+    brenn_tool_registry::ToolRegistry::with_provided(native, provided)
+}
+
 /// What a server refuses to start on, before any of it is used.
 ///
 /// The components roots are checked here rather than where a consumer resolves
@@ -570,7 +635,7 @@ pub async fn run_server(
             oauth_service.as_ref(),
             api_key_providers,
         ));
-        let registry = brenn_tool_registry::ToolRegistry::new(tools);
+        let registry = build_tool_registry(tools, &config.wasm_consumers, &apps, &provider_runtime);
         registry.validate_config(&apps);
         std::sync::Arc::new(registry)
     };
@@ -1126,7 +1191,13 @@ pub async fn run_server(
                 });
             consumer_registry.insert(
                 slug,
-                consumers::start_consumer(loaded, consumer, messenger, &state.alert_dispatcher),
+                consumers::start_consumer(
+                    loaded,
+                    consumer,
+                    messenger,
+                    &state.alert_dispatcher,
+                    &provider_runtime,
+                ),
             );
         }
 
@@ -1192,6 +1263,7 @@ pub async fn run_server(
                 messenger: messenger.clone(),
                 router: router.clone(),
                 tool_caller_grants: reload_tool_caller_grants,
+                provider_runtime: provider_runtime.clone(),
                 alert_dispatcher: guard.alert_dispatcher.clone(),
             };
             let baseline = reload::driver::Baseline::from_parts(
@@ -1821,6 +1893,100 @@ mod tests {
             ("demo", bundle.path().to_path_buf()),
         ]);
         preconditions(&roots);
+    }
+
+    /// A consumer providing one tool whose bare MCP name is `mcp_name`.
+    fn consumer_providing(mcp_name: &str) -> brenn_lib::messaging::config::WasmConsumerConfigRaw {
+        let mut consumer = brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
+            "gmail",
+            "processor-provider-test",
+            &[],
+        );
+        consumer.provides = vec![brenn_lib::messaging::config::ProvidedToolDecl {
+            name: "gmail-search".to_string(),
+            mcp_name: mcp_name.to_string(),
+            description: "Search.".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            max_concurrency: 1,
+            auto_approve: true,
+        }];
+        consumer
+    }
+
+    fn provider_runtime() -> std::sync::Arc<brenn_tool_registry::ProviderRuntime> {
+        let (alert, _drain) = brenn_obs::alerting::AlertDispatcher::noop();
+        brenn_tool_registry::ProviderRuntime::new(alert)
+    }
+
+    /// A declared tool is registered beside the natives, as a provided tool
+    /// under its prefixed MCP name.
+    #[tokio::test]
+    async fn the_registry_holds_each_provided_tool() {
+        let registry = super::build_tool_registry(
+            vec![],
+            &[consumer_providing("GmailSearch")],
+            &indexmap::IndexMap::new(),
+            &provider_runtime(),
+        );
+        assert!(registry.is_provided("gmail-search"));
+        let Some(brenn_tool_registry::RegisteredTool::Async(tool)) = registry.get("gmail-search")
+        else {
+            panic!("a provided tool is async");
+        };
+        assert_eq!(tool.descriptor().mcp_name, "mcp__brenn__GmailSearch");
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "tool `gmail-search` of `[[wasm_consumer]] gmail` has mcp_name `DisplayFile`, \
+                    the name of a core virtual tool every agent may be offered"
+    )]
+    async fn a_provided_tool_named_like_a_core_virtual_tool_is_refused() {
+        super::build_tool_registry(
+            vec![],
+            &[consumer_providing("DisplayFile")],
+            &indexmap::IndexMap::new(),
+            &provider_runtime(),
+        );
+    }
+
+    /// An integration contributing one virtual tool, `BatchAssign`.
+    struct AssigningIntegration;
+
+    impl brenn_lib::integration::Integration for AssigningIntegration {
+        fn name(&self) -> &str {
+            "assigner"
+        }
+
+        fn virtual_tools(&self) -> Vec<brenn_lib::integration::VirtualToolDef> {
+            vec![brenn_lib::integration::VirtualToolDef {
+                name: "BatchAssign".to_string(),
+                description: "Assign.".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                cli: brenn_lib::integration::CliAccess::Available,
+            }]
+        }
+    }
+
+    /// The integration's names are reserved whatever the app grants: the app
+    /// here grants no tool at all.
+    #[tokio::test]
+    #[should_panic(
+        expected = "tool `gmail-search` of `[[wasm_consumer]] gmail` has mcp_name `BatchAssign`, \
+                    the name of integration `assigner`'s virtual tool"
+    )]
+    async fn a_provided_tool_named_like_an_integrations_virtual_tool_is_refused() {
+        let mut app = brenn_lib::config::test_app_config("ledger");
+        app.integrations.insert(
+            "assigner".to_string(),
+            std::sync::Arc::new(AssigningIntegration),
+        );
+        super::build_tool_registry(
+            vec![],
+            &[consumer_providing("BatchAssign")],
+            &indexmap::IndexMap::from([("ledger".to_string(), app)]),
+            &provider_runtime(),
+        );
     }
 
     /// The wiring assert's two directions: clones of one table pass, and a

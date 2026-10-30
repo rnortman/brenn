@@ -222,6 +222,7 @@ async fn tool_harness(
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     ToolHarness {

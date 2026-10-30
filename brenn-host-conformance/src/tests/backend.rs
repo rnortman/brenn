@@ -392,6 +392,7 @@ impl Backend {
                     burst: u32::MAX,
                     min_period: std::time::Duration::from_millis(1),
                 },
+                provider: None,
             },
             subscriber,
             channels,

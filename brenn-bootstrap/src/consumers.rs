@@ -473,6 +473,7 @@ pub(crate) fn start_consumer(
     consumer: &ResolvedWasmConsumer,
     messenger: &Arc<Messenger>,
     alert_dispatcher: &AlertDispatcher,
+    provider_runtime: &Arc<brenn_tool_registry::ProviderRuntime>,
 ) -> RunningConsumer {
     loaded.component.open_store();
     let handle = brenn_wasm_dispatch::spawn_wasm_consumer_task(
@@ -486,6 +487,7 @@ pub(crate) fn start_consumer(
             outputs: consumer.outputs.clone(),
             sync_ports: consumer.sync_ports.clone(),
             activation_pacing: consumer.activation_pacing,
+            provider: consumer_provider(consumer, provider_runtime),
         },
         loaded.sync_rx,
     );
@@ -495,6 +497,15 @@ pub(crate) fn start_consumer(
         component: loaded.component,
         handle,
     }
+}
+
+/// The provider runtime a consumer's dispatcher answers failed activations
+/// through: the shared one for a consumer that provides tools, none otherwise.
+fn consumer_provider(
+    consumer: &ResolvedWasmConsumer,
+    provider_runtime: &Arc<brenn_tool_registry::ProviderRuntime>,
+) -> Option<Arc<brenn_tool_registry::ProviderRuntime>> {
+    (!consumer.provides.is_empty()).then(|| provider_runtime.clone())
 }
 
 /// A built component fixture's bytes, by artifact file name.
@@ -842,6 +853,30 @@ mod tests {
             &[brenn_lib::messaging::ComponentGrant::Ports],
             &["git-repo-pull"],
         ));
+    }
+
+    /// A consumer that provides a tool hands its dispatcher the shared provider
+    /// runtime, so a failed activation answers its callers at once; one that
+    /// provides nothing gets none.
+    #[tokio::test]
+    async fn only_a_providing_consumer_gets_the_provider_runtime() {
+        let (alert_dispatcher, _drainer) = brenn_obs::alerting::noop_alert_dispatcher();
+        let runtime = brenn_tool_registry::ProviderRuntime::new(alert_dispatcher);
+        let mut consumer = tool_consumer(&[brenn_lib::messaging::ComponentGrant::Provides], &[]);
+        assert!(consumer_provider(&consumer, &runtime).is_none());
+
+        consumer
+            .provides
+            .push(brenn_lib::messaging::config::ProvidedToolDecl {
+                name: "echo-for-user".to_string(),
+                mcp_name: "EchoForUser".to_string(),
+                description: "Echo, for a user.".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                max_concurrency: 1,
+                auto_approve: false,
+            });
+        let provider = consumer_provider(&consumer, &runtime).expect("a providing consumer");
+        assert!(Arc::ptr_eq(&provider, &runtime));
     }
 
     /// The host-side half of `store_path` resolution: an existing parent

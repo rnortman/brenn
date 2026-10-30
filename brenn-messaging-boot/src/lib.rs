@@ -1033,8 +1033,9 @@ pub(crate) fn validate_exact_tuning_blocks(
             )
         } else {
             // `mqtt:` — open-ended population, not boot-checkable. Nothing else
-            // reaches here: the table admits only system-minted families and
-            // holds their canonical spellings, so an unchecked address of any
+            // reaches here: the table admits only system-minted families, refuses
+            // the provider request-inbox family outright, and holds canonical
+            // spellings, so an unchecked address of any
             // other scheme would be a hole in exactly the check this function
             // is.
             assert_eq!(

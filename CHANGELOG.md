@@ -56,6 +56,19 @@ All notable changes to Brenn are documented here.
   `config-check` reports both. The `provide` statement is documented in
   `docs/config-dsl.md`.
 
+- **A component's tool-result inbox no longer crashes Brenn under a burst
+  of answers.** Each WASM component gets the answers to its async tool calls
+  on its own `brenn:tool-results/<slug>` channel. That channel used to take
+  the server-wide `[messaging].default_send_rate`. A component with several
+  tools could use up that rate, and Brenn then stopped. Brenn now sets this
+  channel's send rate itself, high enough that no real load reaches it. A
+  `channel` tuning block on `brenn:tool-results/…` that sets `send_rate` is
+  now refused at boot and by `config-check`: remove that line. Depths and
+  `noise` can still be tuned. Groundwork for component-provided tools: Brenn
+  now registers each declared provided tool and creates the providing
+  instance's request inbox, `brenn:tool-requests/<slug>`, which accepts no
+  tuning blocks. A configuration that declares a provider does not boot yet.
+
 - Groundwork for component-provided tools, with no change yet for any
   deployment: Brenn can now hand a call to a provided tool to the component
   that serves it and wait up to four minutes for its answer, alerting once

@@ -19,10 +19,12 @@ rust_library(
     deps = all_crate_deps(normal = True) + [
         "//brenn-activation",
         "//brenn-common",
+        "//brenn-envelope",
         "//brenn-lib",
         "//brenn-messaging",
         "//brenn-messaging-store",
         "//brenn-obs",
+        "//brenn-tool-registry",
         "//brenn-wasm",
     ],
 )
@@ -57,11 +59,13 @@ rust_test(
     deps = all_crate_deps(normal_dev = True) + [
         "//brenn-activation",
         "//brenn-common",
+        "//brenn-envelope",
         "//brenn-host-conformance",
         "//brenn-lib",
         "//brenn-messaging",
         "//brenn-messaging-store",
         "//brenn-obs",
+        "//brenn-tool-registry",
         "//brenn-wasm",
     ],
 )

@@ -246,6 +246,7 @@ pub fn build_cfg(
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
     (cfg, alert_handle, db)
 }
@@ -332,6 +333,7 @@ pub async fn build_multi_channel_setup(
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
     (
         messenger,
@@ -496,6 +498,7 @@ pub async fn build_multiport_setup_with_depths(
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     (
@@ -704,6 +707,7 @@ pub async fn build_two_channel_setup(
         }],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     (
@@ -732,6 +736,8 @@ mod mount;
 mod multiport;
 #[cfg(test)]
 mod pacing;
+#[cfg(test)]
+mod provider;
 #[cfg(test)]
 mod renotify;
 #[cfg(test)]

@@ -196,6 +196,7 @@ async fn build_parser_setup(
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     (

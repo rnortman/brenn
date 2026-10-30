@@ -43,6 +43,7 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     drain_step(&cfg2, &wasm_sub, MountDebt::Settled).await;
@@ -398,6 +399,7 @@ async fn a_denied_port_is_empty_and_unadvanced_beside_a_served_sibling() {
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
     drain_step(&denied_cfg, &wasm_sub, MountDebt::Settled).await;
 
@@ -661,6 +663,7 @@ async fn multiport_err_outcome_quarantines_both_channels() {
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     // in0: normal body; in1: __err__ sentinel → Err returned.
@@ -1165,6 +1168,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     // Insert one message on each input channel.

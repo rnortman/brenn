@@ -386,7 +386,9 @@ declare it; it *tunes* it. Synthesis still owns creation, identity and
 description, so `uuid` and `description` are rejected on a tuning block, and all
 three depths are required — a block that tunes states every number. `noise`,
 `wake_min`, `sink` and `send_rate` are optional and inherit the `[messaging]`
-globals, exactly as on a declaring block. An explicit `"unbounded"` is legal
+globals, exactly as on a declaring block — except `send_rate` on a
+`brenn:tool-results/` inbox, which is the host's and refused in the block. An
+explicit `"unbounded"` is legal
 here: unbounded is something an operator asks for in so many words, never
 something a default hands out.
 

@@ -237,6 +237,7 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;

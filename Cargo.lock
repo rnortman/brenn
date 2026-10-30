@@ -1421,11 +1421,13 @@ version = "0.1.0"
 dependencies = [
  "brenn-activation",
  "brenn-common",
+ "brenn-envelope",
  "brenn-host-conformance",
  "brenn-lib",
  "brenn-messaging",
  "brenn-messaging-store",
  "brenn-obs",
+ "brenn-tool-registry",
  "brenn-wasm",
  "chrono",
  "indexmap",

@@ -344,6 +344,7 @@ async fn build_pipeline() -> Pipeline {
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     // --- Consumer guest: push-events + tool-results inbox → outcomes output. ---
@@ -425,6 +426,7 @@ async fn build_pipeline() -> Pipeline {
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     // --- Tool executor over the same messenger + registry + consumer grant. ---

@@ -1840,7 +1840,13 @@ async fn start_consumers(
 
         registry.insert(
             slug.clone(),
-            start_consumer(one, consumer, &env.messenger, &env.alert_dispatcher),
+            start_consumer(
+                one,
+                consumer,
+                &env.messenger,
+                &env.alert_dispatcher,
+                &env.provider_runtime,
+            ),
         );
         info!(slug = %slug, "reload: consumer started");
     }

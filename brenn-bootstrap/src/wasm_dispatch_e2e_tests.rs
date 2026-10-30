@@ -257,6 +257,7 @@ async fn err_outcome_acks_push_row_at_activation_start() {
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
@@ -910,6 +911,7 @@ async fn build_ring_backed_consumer(
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     (messenger, entry, ring, wasm_sub, cfg, alert_handle)
@@ -1036,6 +1038,7 @@ async fn build_mixed_class_consumer(
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
+        provider: None,
     };
 
     (
@@ -1317,6 +1320,7 @@ async fn boot_dispatch_with(
                 outputs: consumer.outputs.clone(),
                 sync_ports: std::collections::BTreeSet::new(),
                 activation_pacing: unthrottled_pacing(),
+                provider: None,
             }
         })
         .collect();
@@ -2217,6 +2221,7 @@ mod peer_calls {
                 }],
                 sync_ports: [ANSWER.to_string()].into_iter().collect(),
                 activation_pacing: unthrottled_pacing(),
+                provider: None,
             };
             router.register_delivery_binding(
                 SubscriberEntryKind::Wasm((*slug).to_string()),

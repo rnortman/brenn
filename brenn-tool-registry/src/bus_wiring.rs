@@ -1,7 +1,8 @@
 //! Bootstrap-time derivations that connect the async tool substrate to the
-//! messaging bus: the programmatic `brenn:tools/<tool>` request channels and
-//! `brenn:tool-results/<slug>` inboxes, the `system:tool-executor` publish
-//! policy, and the per-consumer async bus grants derived from a tool grant.
+//! messaging bus: the programmatic `brenn:tools/<tool>` request channels,
+//! `brenn:tool-results/<slug>` inboxes and providers' `brenn:tool-requests/<slug>`
+//! inboxes, the `system:tool-executor` publish policy, and the per-consumer bus
+//! grants derived from a tool grant or a provided tool.
 //!
 //! These are pure functions over resolved config/policy types so the delicate
 //! `build_messaging` assembly can call them and they can be unit-tested in
@@ -10,14 +11,16 @@
 //! finalize/rebuild path every other channel and subscription flows through.
 
 use brenn_envelope::addressing::{
-    TOOL_REQUESTS_NAMESPACE, TOOL_RESULT_INPUT_PORT, TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE,
+    PROVIDER_CONCURRENCY_CEILING, TOOL_REQUEST_INPUT_PORT, TOOL_REQUESTS_NAMESPACE,
+    TOOL_RESULT_INPUT_PORT, TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE,
 };
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::acl::{AclSet, ChannelMatcher};
 use brenn_lib::access::{AppPolicy, GrantSet};
 use brenn_lib::messaging::config::{
-    MILLITOKENS_PER_PUBLISH, MessagingGlobalConfig, ResolvedChannel, ResolvedSubscription,
-    SystemChannelTuning, WasmInputPort, resolve_system_channel, resolve_wasm_window_depth,
+    Depth, MILLITOKENS_PER_PUBLISH, MessagingGlobalConfig, NoiseLevel, ProvidedToolDecl,
+    ResolvedChannel, ResolvedSubscription, SendRate, SystemChannelTuning, WINDOW_DEPTH_CEILING,
+    WasmInputPort, resolve_system_channel, resolve_wasm_window_depth,
 };
 use brenn_lib::messaging::{
     ChannelEntry, ChannelScheme, canonical_address, tool_channel_uuid_from_address,
@@ -41,6 +44,20 @@ pub fn request_inbox_name(slug: &str) -> String {
     format!("{TOOL_REQUESTS_NAMESPACE}{slug}")
 }
 
+/// A tool-substrate channel minted by the system: durable `brenn:`, its uuid
+/// derived from its address, with no description and no subscriber pre-set.
+fn system_entry(address: String, resolved_channel: ResolvedChannel) -> ChannelEntry {
+    ChannelEntry {
+        uuid: tool_channel_uuid_from_address(&address),
+        address,
+        description: None,
+        resolved_channel,
+        subscribers: vec![],
+        transport_type: ChannelScheme::Brenn,
+        mount: None,
+    }
+}
+
 /// The `brenn:tools/<tool>` request channel for one async tool. The
 /// `system:tool-executor` subscriber is not pre-set here: it is folded in from
 /// the executor's [`SystemParticipantSpec`] subscriptions
@@ -58,37 +75,44 @@ pub fn request_channel_entry(
 ) -> ChannelEntry {
     let address = canonical_address(&request_channel_name(tool));
     let resolved_channel = resolve_system_channel(&address, tuning, defaults);
-    ChannelEntry {
-        uuid: tool_channel_uuid_from_address(&address),
-        address,
-        description: None,
-        resolved_channel,
-        subscribers: vec![],
-        transport_type: ChannelScheme::Brenn,
-        mount: None,
-    }
+    system_entry(address, resolved_channel)
 }
+
+/// The send rate of the tool executor's publishes onto both tool inboxes,
+/// `brenn:tool-results/<slug>` and `brenn:tool-requests/<slug>`, in place of
+/// the operator's `default_send_rate`.
+///
+/// The executor is the only publisher on both families, and each publish is
+/// one per call already admitted upstream (the caller's send bucket, the
+/// per-grant limiter, the permits). A refusal here would lose an answer or
+/// refuse an admitted call, so this rate must exceed any admitted inflow; the
+/// ring's depth, not the rate, bounds memory.
+///
+/// A channel the substrate publishes on takes this rate; a channel a component
+/// publishes on never does.
+pub const TOOL_INBOX_SEND_RATE: SendRate = SendRate {
+    burst: 100_000,
+    refill_interval_secs: 1,
+    refill: 10_000,
+};
 
 /// The `brenn:tool-results/<slug>` inbox channel for one consumer, with no
 /// subscriber pre-set: the consumer's `Wasm(slug)` subscription is folded in
 /// through the normal wasm-subscription path (see [`inbox_subscription`]),
 /// exactly like a configured wasm subscription.
+///
+/// Depths, `noise`, `wake_min` and `sink` resolve from the operator's tuning
+/// and defaults; the send rate is [`TOOL_INBOX_SEND_RATE`], and a tuning block
+/// carrying `send_rate` on this family is refused when the table is built.
 pub fn result_inbox_entry(
     slug: &str,
     tuning: &SystemChannelTuning,
     defaults: &MessagingGlobalConfig,
 ) -> ChannelEntry {
     let address = canonical_address(&result_inbox_name(slug));
-    let resolved_channel = resolve_system_channel(&address, tuning, defaults);
-    ChannelEntry {
-        uuid: tool_channel_uuid_from_address(&address),
-        address,
-        description: None,
-        resolved_channel,
-        subscribers: vec![],
-        transport_type: ChannelScheme::Brenn,
-        mount: None,
-    }
+    let mut resolved_channel = resolve_system_channel(&address, tuning, defaults);
+    resolved_channel.send_rate = TOOL_INBOX_SEND_RATE;
+    system_entry(address, resolved_channel)
 }
 
 /// The synthetic `ResolvedSubscription` for a consumer's own result inbox, folded
@@ -132,6 +156,119 @@ pub fn inbox_input_port(slug: &str, ch: &ResolvedChannel) -> WasmInputPort {
         sub: inbox_subscription(slug, ch),
         amplification_mt: MILLITOKENS_PER_PUBLISH,
     }
+}
+
+// A request inbox's depth is at most the provider ceiling and takes no window
+// ceiling check of its own, so the ceiling must sit within the window a host
+// reads.
+const _: () = assert!(
+    PROVIDER_CONCURRENCY_CEILING <= WINDOW_DEPTH_CEILING,
+    "a provider's request inbox must fit the window one activation reads"
+);
+
+/// The depth N of a providing consumer's request inbox: the sum of its
+/// provided tools' `max_concurrency`, at least one.
+///
+/// # Panics
+///
+/// When the sum exceeds [`PROVIDER_CONCURRENCY_CEILING`]: the config language
+/// refuses such a class and `resolve_wasm_consumers` refuses such a hand-built
+/// consumer, so a sum above it here is a host bug.
+pub fn request_inbox_depth(slug: &str, provides: &[ProvidedToolDecl]) -> u64 {
+    let sum: u64 = provides
+        .iter()
+        .map(|tool| u64::from(tool.max_concurrency))
+        .sum();
+    assert!(
+        sum <= PROVIDER_CONCURRENCY_CEILING,
+        "BUG: [[wasm_consumer]] {slug:?} reached the request-inbox fold with \
+         Σ max_concurrency = {sum}, above PROVIDER_CONCURRENCY_CEILING = \
+         {PROVIDER_CONCURRENCY_CEILING}; resolution refuses that sum",
+    );
+    sum.max(1)
+}
+
+/// The `brenn:tool-requests/<slug>` request inbox of a consumer that provides
+/// tools: durable, `noise = metered`, send rate [`TOOL_INBOX_SEND_RATE`],
+/// and `depth` deep — retain depth, standing depth and the channel's push
+/// template all at `depth`
+/// ([`request_inbox_depth`]). No subscriber is pre-set: the consumer's own is
+/// folded in through [`request_inbox_subscription`].
+///
+/// No operator tuning applies: a tuning block on this family is refused, so the
+/// depth is the declaration's, and neither the noise nor the send rate is the
+/// operator's global default.
+///
+/// What the depth guarantees rests on three premises: every live request holds
+/// one of its tool's permits from the moment its pending record is minted until
+/// that record ends (completion, failure, expiry or a dropped waiter); only the
+/// tool executor publishes on this address; and the depth and both rungs of the
+/// consumer's subscription are N = max(Σ `max_concurrency`, 1). Under them, a
+/// live request is pushed out of the window before the consumer sees it only
+/// when a permit is freed with no consumer activation in between, which happens
+/// two ways: (a) a request published later reaches its deadline — possible
+/// seconds after its publish when it waited on its permit for most of its
+/// deadline, or when it is a nested provided call admitted with a served
+/// deadline nearer than its own batch's; (b) a waiter is dropped before its
+/// call completes. Otherwise every live request is served as new. A request
+/// already answered can always be pushed out, and that loses nothing. A live
+/// request pushed out is never served; its waiter answers `internal` at its
+/// deadline and nothing runs for it. That is a designed consequence of the
+/// ceiling, not a misconfiguration, so the drop is metered rather than alarmed:
+/// the per-tool ceiling alert is the signal that a provider is not keeping up.
+pub fn request_inbox_entry(
+    slug: &str,
+    depth: u64,
+    defaults: &MessagingGlobalConfig,
+) -> ChannelEntry {
+    let address = canonical_address(&request_inbox_name(slug));
+    let mut resolved_channel =
+        resolve_system_channel(&address, &SystemChannelTuning::default(), defaults);
+    resolved_channel.push_depth = Depth::Bounded(depth);
+    resolved_channel.retain_depth = Depth::Bounded(depth);
+    resolved_channel.standing_retain_depth = Depth::Bounded(depth);
+    resolved_channel.noise = NoiseLevel::Metered;
+    resolved_channel.send_rate = TOOL_INBOX_SEND_RATE;
+    system_entry(address, resolved_channel)
+}
+
+/// The providing consumer's subscription to its own request inbox: both rungs
+/// at the inbox's retain depth, so every unseen request still in the window is
+/// handed over as new and none as context. `noise` and `wake_min` are the
+/// channel's.
+pub fn request_inbox_subscription(slug: &str, ch: &ResolvedChannel) -> ResolvedSubscription {
+    let address = canonical_address(&request_inbox_name(slug));
+    ResolvedSubscription {
+        channel_uuid: tool_channel_uuid_from_address(&address),
+        channel_address: address,
+        push_depth: ch.retain_depth,
+        retain_depth: ch.retain_depth,
+        noise: ch.noise,
+        wake_min: ch.wake_min,
+    }
+}
+
+/// The providing consumer's request inbox as the triggering `tool-requests`
+/// input port, so a delivered request activates it. Shares its subscription
+/// with [`request_inbox_subscription`].
+pub fn request_input_port(slug: &str, ch: &ResolvedChannel) -> WasmInputPort {
+    WasmInputPort {
+        port: TOOL_REQUEST_INPUT_PORT.to_string(),
+        sub: request_inbox_subscription(slug, ch),
+        amplification_mt: MILLITOKENS_PER_PUBLISH,
+    }
+}
+
+/// Derive a providing consumer's bus grants: the `MessagingSubscribe`
+/// transport grant and an exact `brenn_subscribe` matcher on its own request
+/// inbox, so the delivery gate admits its requests. No publish authority: a
+/// provider answers through `provides.complete`, never on the bus.
+pub fn derive_provided_bus_grants(policy: &mut AppPolicy, slug: &str) {
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy
+        .acls
+        .brenn_subscribe
+        .push(ChannelMatcher::Exact(request_inbox_name(slug)));
 }
 
 /// The async-class tool names a consumer's resolved tool grants address. Fast
@@ -510,6 +647,118 @@ mod tests {
         for address in &spec.subscriptions {
             assert!(spec.policy.allows_channel_access(address));
         }
+    }
+
+    fn provided(max_concurrency: u32) -> ProvidedToolDecl {
+        ProvidedToolDecl {
+            name: "echo-for-user".to_string(),
+            mcp_name: "EchoForUser".to_string(),
+            description: "Echo.".to_string(),
+            input_schema: json!({ "type": "object" }),
+            max_concurrency,
+            auto_approve: true,
+        }
+    }
+
+    /// N is the summed concurrency of the provider's tools, at least one.
+    #[test]
+    fn the_request_inbox_depth_is_the_summed_concurrency() {
+        assert_eq!(
+            request_inbox_depth("prov", &[provided(2), provided(30)]),
+            32
+        );
+        assert_eq!(request_inbox_depth("prov", &[provided(3)]), 3);
+        assert_eq!(request_inbox_depth("prov", &[]), 1);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "BUG: [[wasm_consumer]] \"prov\" reached the request-inbox fold \
+                               with Σ max_concurrency = 33"
+    )]
+    fn a_request_inbox_sum_above_the_ceiling_is_a_bug() {
+        request_inbox_depth("prov", &[provided(32), provided(1)]);
+    }
+
+    /// Depth, standing depth and both subscription rungs are N, and the rung is
+    /// `metered` whatever the global default — here `alarm`.
+    #[test]
+    fn the_request_inbox_is_n_deep_and_metered() {
+        let defaults = MessagingGlobalConfig {
+            default_noise: NoiseLevel::Alarm,
+            default_send_rate: SendRate {
+                burst: 10,
+                refill_interval_secs: 60,
+                refill: 1,
+            },
+            ..MessagingGlobalConfig::default()
+        };
+        let inbox = request_inbox_entry("prov", 5, &defaults);
+        assert_eq!(inbox.address, "brenn:tool-requests/prov");
+        assert_eq!(
+            inbox.uuid,
+            tool_channel_uuid_from_address("brenn:tool-requests/prov")
+        );
+        assert_eq!(inbox.transport_type, ChannelScheme::Brenn);
+        assert!(inbox.subscribers.is_empty());
+        let ch = &inbox.resolved_channel;
+        assert_eq!(ch.push_depth, Depth::Bounded(5));
+        assert_eq!(ch.retain_depth, Depth::Bounded(5));
+        assert_eq!(ch.standing_retain_depth, Depth::Bounded(5));
+        assert_eq!(ch.noise, NoiseLevel::Metered);
+        assert_eq!(ch.send_rate, TOOL_INBOX_SEND_RATE);
+
+        let port = request_input_port("prov", ch);
+        assert_eq!(port.port, TOOL_REQUEST_INPUT_PORT);
+        assert_eq!(port.amplification_mt, MILLITOKENS_PER_PUBLISH);
+        assert_eq!(port.sub.channel_address, "brenn:tool-requests/prov");
+        assert_eq!(port.sub.channel_uuid, inbox.uuid);
+        assert_eq!(port.sub.push_depth, Depth::Bounded(5));
+        assert_eq!(port.sub.retain_depth, Depth::Bounded(5));
+        assert_eq!(port.sub.noise, NoiseLevel::Metered);
+        assert_eq!(port.sub.wake_min, defaults.default_wake_min);
+    }
+
+    /// The result inbox takes the host's send rate whatever the global default
+    /// — here a restrictive one — while everything else still resolves from
+    /// the defaults: depths as the system resolver gives them, and the global
+    /// `noise`.
+    #[test]
+    fn the_result_inbox_takes_the_host_send_rate() {
+        let restrictive = SendRate {
+            burst: 10,
+            refill_interval_secs: 60,
+            refill: 1,
+        };
+        let defaults = MessagingGlobalConfig {
+            default_noise: NoiseLevel::Alarm,
+            default_send_rate: restrictive,
+            ..MessagingGlobalConfig::default()
+        };
+        let empty = SystemChannelTuning::default();
+        let inbox = result_inbox_entry("sync", &empty, &defaults);
+        let ch = &inbox.resolved_channel;
+        assert_eq!(ch.send_rate, TOOL_INBOX_SEND_RATE);
+        assert_ne!(ch.send_rate, restrictive);
+        let resolved = resolve_system_channel("brenn:tool-results/sync", &empty, &defaults);
+        assert_eq!(ch.push_depth, resolved.push_depth);
+        assert_eq!(ch.retain_depth, resolved.retain_depth);
+        assert_eq!(ch.standing_retain_depth, resolved.standing_retain_depth);
+        assert_eq!(ch.noise, NoiseLevel::Alarm);
+        assert_eq!(ch.wake_min, defaults.default_wake_min);
+    }
+
+    /// A provider may receive on its own request inbox and on nothing else,
+    /// and gains no publish authority at all.
+    #[test]
+    fn provided_grants_subscribe_to_the_own_request_inbox_only() {
+        let mut policy = policy_with_grants(&[]);
+        derive_provided_bus_grants(&mut policy, "prov");
+        assert!(policy.allows_channel_access("brenn:tool-requests/prov"));
+        assert!(!policy.allows_channel_access("brenn:tool-requests/other"));
+        assert!(!policy.allows_channel_access("brenn:tool-results/prov"));
+        assert!(!policy.grants.has(AppCapability::MessagingPublish));
+        assert!(policy.acls.brenn_publish.is_empty());
     }
 
     #[test]

@@ -26,7 +26,8 @@ use brenn_lib::tools::AclClause;
 use brenn_messaging::{Messenger, PublishResult};
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use rand::RngExt;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tracing::{debug, info};
@@ -43,6 +44,28 @@ use super::tool::{ActingUser, AsyncTool, ToolCtx};
 /// result cap less the executor's envelope margin, so a completed value never
 /// trips the executor's over-cap substitution.
 pub const PROVIDED_RESULT_BUDGET: usize = MAX_ASYNC_RESULT_BYTES - ENVELOPE_MARGIN;
+
+/// The body of a request on a provider's `brenn:tool-requests/<slug>` inbox:
+/// the pending id the provider answers through, the tool and its arguments.
+/// It names no caller and no user. [`ProvidedTool::execute`] writes it; host
+/// readers parse it with [`ProvidedRequest::parse`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProvidedRequest {
+    pub v: u32,
+    pub id: String,
+    pub tool: String,
+    pub args: Value,
+}
+
+impl ProvidedRequest {
+    /// The only body version the host writes.
+    pub const VERSION: u32 = 1;
+
+    /// Parse a request body as the host wrote it.
+    pub fn parse(body: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(body)
+    }
+}
 
 /// A pending provided-tool call's id: 16 CSPRNG bytes as 32 lowercase hex
 /// characters. Host-minted and never derived from anything a caller chose.
@@ -216,9 +239,11 @@ impl ProviderRuntime {
     }
 
     /// Fail every listed id still pending for `instance` with
-    /// `Internal(reason)`. Ids already answered, or another instance's, are
-    /// left alone.
-    pub fn fail_delivered(&self, instance: &str, ids: &[String], reason: &str) {
+    /// `Internal("provider activation failed: {diag}")`: the activation that
+    /// was handed those requests as new failed with `diag`. Ids already
+    /// answered, or another instance's, are left alone.
+    pub fn fail_delivered(&self, instance: &str, ids: &[String], diag: &str) {
+        let reason = format!("provider activation failed: {diag}");
         let mut failed = Vec::new();
         {
             let mut pending = self.lock();
@@ -233,7 +258,7 @@ impl ProviderRuntime {
             }
         }
         for (id, record) in failed {
-            deliver(id, record, Err(ToolError::Internal(reason.to_string())));
+            deliver(id, record, Err(ToolError::Internal(reason.clone())));
         }
     }
 
@@ -378,8 +403,13 @@ impl AsyncTool for ProvidedTool {
         let mut guard = self.runtime.begin(&self.instance, name, ctx);
 
         let address = canonical_address(&request_inbox_name(&self.instance));
-        let body =
-            json!({ "v": 1, "id": guard.id().as_str(), "tool": name, "args": args }).to_string();
+        let body = serde_json::to_string(&ProvidedRequest {
+            v: ProvidedRequest::VERSION,
+            id: guard.id().as_str().to_string(),
+            tool: name.to_string(),
+            args,
+        })
+        .expect("a request of strings and a JSON value serializes");
         match self
             .runtime
             .messenger()
@@ -401,8 +431,6 @@ impl AsyncTool for ProvidedTool {
                      {max} bytes"
                 )));
             }
-            // The executor's send-rate bucket on this inbox is empty: a limit,
-            // answered as one.
             PublishResult::RateLimited => return Err(ToolError::RateLimited),
             other @ (PublishResult::UnknownChannel(_)
             | PublishResult::MalformedAddress(_)
@@ -470,6 +498,7 @@ pub(crate) mod tests {
     use brenn_messaging::testutils::test_channel_entry;
     use brenn_obs::alerting::{make_capturing_alerter, noop_alert_dispatcher};
     use indexmap::IndexMap;
+    use serde_json::json;
 
     use super::*;
 
@@ -755,7 +784,7 @@ pub(crate) mod tests {
                 foreign.id().as_str().to_string(),
                 "f".repeat(32),
             ],
-            "provider activation failed: trap",
+            "trap",
         );
 
         assert_eq!(

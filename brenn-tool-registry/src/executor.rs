@@ -669,6 +669,13 @@ async fn publish_result(messenger: &Messenger, reply_addr: &str, body: &str) {
                  (caller removed from config)"
             );
         }
+        PublishResult::RateLimited => panic!(
+            "BUG: tool executor: the send rate refused a result to {reply_addr:?} — the executor \
+             publishes at most one result per request it dequeues from a brenn:tools/<tool> \
+             channel, whose rate the caller's own send bucket there already bounded, and the \
+             inbox's send rate is the host's TOOL_INBOX_SEND_RATE, set past any such inflow; \
+             this is a host bug, not an operator setting"
+        ),
         other => panic!(
             "tool executor: publishing a result to {reply_addr:?} failed unexpectedly ({other:?}) \
              — host-wiring invariant violated: the {TOOL_EXECUTOR_COMPONENT} system policy must \
@@ -1306,6 +1313,46 @@ mod tests {
         )
         .await;
         assert!(rows.is_empty(), "no result row for a dropped reply target");
+    }
+
+    /// A result inbox's send rate is the host's and set past any inflow, so a
+    /// refusal is a host bug: a hand-built inbox with a one-token rate makes
+    /// the second result panic, naming the invariant rather than the policy.
+    #[tokio::test]
+    #[should_panic(expected = "BUG: tool executor: the send rate refused a result to \
+                               \"brenn:tool-results/sync\"")]
+    async fn a_rate_refused_result_is_a_host_bug() {
+        use brenn_lib::messaging::config::SendRate;
+
+        let db = brenn_messaging_store::db::init_db_memory();
+        let mut inbox = test_channel_entry("tool-results/sync", vec![]);
+        inbox.resolved_channel.send_rate = SendRate {
+            burst: 1,
+            refill_interval_secs: 3600,
+            refill: 1,
+        };
+        {
+            let conn = db.lock().await;
+            upsert_channels(&conn, std::slice::from_ref(&inbox));
+        }
+        let messenger = Messenger::new(
+            db,
+            Arc::new(MessagingDirectory::with_entries(vec![inbox])),
+            Arc::from("test"),
+            Arc::new(IndexMap::new()),
+            Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
+            MessagingGlobalConfig::default(),
+        )
+        .with_subscriber_registrations(brenn_messaging::testutils::system_registrations(
+            HashMap::from([(
+                TOOL_EXECUTOR_COMPONENT.to_string(),
+                crate::bus_wiring::tool_executor_system_policy(),
+            )]),
+        ));
+        let (alert, _hg) = noop_alert_dispatcher();
+        let body = build_result_body("apull", "r1", None, &Ok(json!({})), &alert);
+        publish_result(&messenger, "brenn:tool-results/sync", &body).await;
+        publish_result(&messenger, "brenn:tool-results/sync", &body).await;
     }
 
     #[tokio::test]

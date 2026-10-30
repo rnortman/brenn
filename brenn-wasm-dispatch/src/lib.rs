@@ -20,6 +20,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use brenn_activation::sync::{SyncAnswer, SyncRefusal, sync_request};
+use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
 use brenn_lib::messaging::config::{ActivationPacing, WasmInputPort, WasmOutputPort};
 use brenn_lib::messaging::{ParticipantId, Urgency};
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
@@ -27,6 +28,7 @@ use brenn_messaging::{Messenger, MountDebt, Wake, WasmBatchFailure, WasmPublish}
 use brenn_messaging_store::store::{DeferralOutcome, MessageSeq, instant_of, release_time_of};
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use brenn_obs::security::{SecurityEventType, log_component_security_event};
+use brenn_tool_registry::{ProvidedRequest, ProviderRuntime};
 use brenn_wasm::ProcessorDeferredOp;
 use brenn_wasm::{
     GuestAlertSeverity, PROCESSOR_MAX_DIAG_BYTES, ProcessorActivation, ProcessorAlerter,
@@ -172,6 +174,10 @@ pub struct WasmConsumerConfig {
     /// `ActivationPacer` (a `TokenBucket` over activations) from this and gates
     /// every drain step through it.
     pub activation_pacing: ActivationPacing,
+    /// The process's pending provided-tool calls, `Some` iff this consumer
+    /// provides tools. A failed activation answers at once every pending call
+    /// whose request it was handed as new.
+    pub provider: Option<Arc<ProviderRuntime>>,
 }
 
 /// Per-consumer activation pacing gate.
@@ -953,6 +959,7 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
             );
             record_activation_failure(cfg, subscriber, &snapshots, wake, carried_new, "err", &diag)
                 .await;
+            fail_delivered_requests(cfg, &snapshots, &diag);
             answer_sync(&cfg.slug, sync.take(), SyncAnswer::Err(diag));
         }
         ProcessorOutcome::Trap(msg) => {
@@ -984,6 +991,7 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
                 &diag,
             )
             .await;
+            fail_delivered_requests(cfg, &snapshots, &diag);
             answer_sync(&cfg.slug, sync.take(), SyncAnswer::Trap);
         }
     }
@@ -1059,6 +1067,46 @@ async fn record_activation_failure(
     cfg.messenger
         .record_wasm_activation_failure(&failures)
         .await;
+}
+
+/// Answer `internal` every provided-tool call whose request a failed activation
+/// was handed as new.
+///
+/// The provider will not answer those requests: their only delivery as new was
+/// to this activation. Ids already completed, expired or from before a restart
+/// are not pending and are left alone. A request handed only as context was
+/// delivered as new to an earlier activation, which may still answer it from a
+/// later one, so it is not failed here.
+///
+/// # Panics
+///
+/// If a new envelope on the request port is not a [`ProvidedRequest`]: the host
+/// builds every body on that channel, so one that does not parse is a host bug.
+fn fail_delivered_requests(
+    cfg: &WasmConsumerConfig,
+    snapshots: &[brenn_messaging::PortSnapshot],
+    diag: &str,
+) {
+    let Some(runtime) = &cfg.provider else {
+        return;
+    };
+    let ids: Vec<String> = snapshots
+        .iter()
+        .filter(|snap| snap.port == TOOL_REQUEST_INPUT_PORT)
+        .flat_map(|snap| snap.new_entries())
+        .map(|(_, env)| match ProvidedRequest::parse(&env.body) {
+            Ok(request) => request.id,
+            Err(err) => panic!(
+                "BUG: wasm_dispatch: request {} on {}'s {TOOL_REQUEST_INPUT_PORT:?} port is not \
+                 a provided-tool request ({err}) — the host builds every body on that channel",
+                env.message_id, cfg.slug
+            ),
+        })
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    runtime.fail_delivered(&cfg.slug, &ids, diag);
 }
 
 fn format_triggering_summary(snapshots: &[brenn_messaging::PortSnapshot]) -> Vec<String> {
