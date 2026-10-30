@@ -99,8 +99,11 @@ pub struct StubState {
     pub api_statuses: std::collections::VecDeque<u16>,
     /// Extra headers on every API response.
     pub api_headers: Vec<(String, String)>,
-    /// The body of every API response.
+    /// The body of every API response whose path has no entry in
+    /// `api_bodies`.
     pub api_body: Vec<u8>,
+    /// API response bodies by exact request path, query excluded.
+    pub api_bodies: BTreeMap<String, Vec<u8>>,
     /// Every API request, as received.
     pub api_seen: Vec<ApiSeen>,
 }
@@ -207,7 +210,8 @@ async fn api(
             value.parse().unwrap(),
         );
     }
-    (status, response_headers, s.api_body.clone())
+    let body = s.api_bodies.get(uri.path()).unwrap_or(&s.api_body).clone();
+    (status, response_headers, body)
 }
 
 /// The Brenn user the fixtures act for.

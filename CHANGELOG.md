@@ -112,6 +112,13 @@ All notable changes to Brenn are documented here.
   a component makes while serving such a call act for that call's user and
   end no later than it does.
 
+- `google-maps-tools` is now tested end to end: the compiled component
+  answers Geocode and Weather calls through a key provider against a
+  stand-in for Google, including Google's errors, oversized answers and
+  requests its grant does not cover, and the shipped class spec with an
+  operator's key provider and instance block is booted into an agent's
+  tool list.
+
 - Bumped wasmtime from 48.0.7 to 48.0.8, clearing RUSTSEC-2026-0422,
   RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
 

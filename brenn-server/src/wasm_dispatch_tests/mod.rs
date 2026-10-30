@@ -71,5 +71,7 @@ pub fn inbox_entry_with_own_subscriber(
 
 mod git_pipeline_e2e;
 mod git_sync_consumer;
+mod google_maps_tools_e2e;
 mod provided_e2e;
+mod provider_rig;
 mod tool_e2e;

@@ -61,6 +61,9 @@ pub(crate) mod webhook;
 mod oracle_tests;
 
 #[cfg(test)]
+mod google_maps_tools_boot_tests;
+
+#[cfg(test)]
 mod provided_tools_tests;
 
 /// Reload's MQTT convergence against a real broker. Filtered out of the
