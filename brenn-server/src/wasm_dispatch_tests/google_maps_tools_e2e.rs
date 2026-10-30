@@ -50,6 +50,7 @@ const GEOCODE_ADDRESS: &str = "/v4/geocode/address";
 const GEOCODE_LOCATION: &str = "/v4/geocode/location";
 const CURRENT_CONDITIONS: &str = "/v1/currentConditions:lookup";
 const COMPUTE_ROUTES: &str = "/directions/v2:computeRoutes";
+const SEARCH_TEXT: &str = "/v1/places:searchText";
 
 /// The instance's `api-request` clauses, as method and exact path, each on the
 /// stub's host: one per endpoint the component calls.
@@ -60,7 +61,7 @@ const CLAUSES: &[(&str, &str)] = &[
     ("GET", "/v1/publicAlerts:lookup"),
     ("GET", GEOCODE_ADDRESS),
     ("GET", GEOCODE_LOCATION),
-    ("POST", "/v1/places:searchText"),
+    ("POST", SEARCH_TEXT),
     ("GET", "/v1/places/*"),
     ("POST", COMPUTE_ROUTES),
 ];
@@ -757,6 +758,127 @@ async fn a_userless_callers_directions_are_denied_with_the_reason() {
     assert!(
         r.inflight_keys().is_empty(),
         "the denied request left no row"
+    );
+    assert!(r.runtime.serving(PROVIDER, &id).is_none());
+}
+
+/// The `PlacesSearch` field mask, as Google's Places reference spells its
+/// fields.
+const PLACES_SEARCH_FIELD_MASK: &str = "places.id,places.displayName,places.formattedAddress,\
+places.location,places.primaryTypeDisplayName,places.rating,places.userRatingCount,\
+places.priceLevel,places.currentOpeningHours.openNow,places.businessStatus,nextPageToken";
+
+/// One place as Places text search answers it, with a further page.
+fn places_body() -> String {
+    serde_json::to_string_pretty(&json!({
+        "places": [{
+            "id": "ChIJ1",
+            "displayName": { "text": "Blue Cup", "languageCode": "en" },
+            "formattedAddress": "1 Main St, Mountain View, CA, USA",
+            "location": { "latitude": 37.39, "longitude": -122.08 },
+            "primaryTypeDisplayName": { "text": "Coffee Shop", "languageCode": "en" },
+            "rating": 4.6,
+            "userRatingCount": 312,
+            "priceLevel": "PRICE_LEVEL_INEXPENSIVE",
+            "currentOpeningHours": { "openNow": true },
+            "businessStatus": "OPERATIONAL",
+        }],
+        "nextPageToken": "next",
+    }))
+    .unwrap()
+}
+
+/// PlacesSearch near a place geocodes the place with a keyed `GET`, then posts
+/// a text search biased toward the first result's location, stamped with the
+/// conversation's user, and answers with the places and the resolved place.
+#[tokio::test]
+async fn places_search_near_a_place_geocodes_then_posts() {
+    let r = rig().await;
+    r.answer(GEOCODE_ADDRESS, geocode_body().to_string());
+    r.answer(SEARCH_TEXT, places_body());
+    let call = r.call_for_alice(
+        "PlacesSearch",
+        json!({ "query": "coffee", "near": "Mountain View", "open_now": true, "max": 5 }),
+    );
+    let id = r.requested_id().await;
+
+    // Step 1: the geocode of `near`.
+    r.serve().await;
+    assert_eq!(r.inflight_keys(), [format!("{id}/1")]);
+    let result = r.run_nested().await;
+    assert_eq!(result["call_id"], format!("{id}/1"));
+
+    // Step 2: the search around the geocoded location.
+    r.serve().await;
+    assert_eq!(r.inflight_keys(), [format!("{id}/2")]);
+    let result = r.run_nested().await;
+    assert_eq!(result["call_id"], format!("{id}/2"));
+    r.serve().await;
+
+    let answer = call.await.unwrap().expect("the component answered");
+    assert_eq!(
+        answer,
+        json!({
+            "location": { "lat": 37.4220, "lng": -122.0841, "place": "Mountain View, CA, USA" },
+            "places": [{
+                "id": "ChIJ1",
+                "name": "Blue Cup",
+                "address": "1 Main St, Mountain View, CA, USA",
+                "lat": 37.39,
+                "lng": -122.08,
+                "type": "Coffee Shop",
+                "rating": 4.6,
+                "rating_count": 312,
+                "price_level": "PRICE_LEVEL_INEXPENSIVE",
+                "open_now": true,
+                "status": "OPERATIONAL",
+            }],
+            "more": true,
+        })
+    );
+
+    assert_eq!(
+        r.seen(),
+        [
+            (
+                "GET".to_string(),
+                GEOCODE_ADDRESS.to_string(),
+                pairs(&[("addressQuery", "Mountain View")]),
+            ),
+            ("POST".to_string(), SEARCH_TEXT.to_string(), BTreeMap::new()),
+        ]
+    );
+    let stub = r.stub.lock().unwrap();
+    for request in &stub.api_seen {
+        assert_eq!(
+            request.headers.get("x-api-key").unwrap(),
+            testutil::KEY,
+            "{}",
+            request.path_and_query
+        );
+    }
+    let search = &stub.api_seen[1];
+    assert_eq!(
+        search.headers.get("x-goog-fieldmask").unwrap(),
+        PLACES_SEARCH_FIELD_MASK
+    );
+    let body: Value = serde_json::from_slice(&search.body).expect("a JSON body");
+    assert_eq!(
+        body,
+        json!({
+            "textQuery": "coffee",
+            "pageSize": 5,
+            "openNow": true,
+            "locationBias": { "circle": {
+                "center": { "latitude": 37.4220, "longitude": -122.0841 },
+                "radius": 5000,
+            } },
+        })
+    );
+    drop(stub);
+    assert!(
+        r.inflight_keys().is_empty(),
+        "the answered request left no row"
     );
     assert!(r.runtime.serving(PROVIDER, &id).is_none());
 }

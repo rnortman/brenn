@@ -87,6 +87,26 @@ const ROUTE_WARNINGS_MAX: usize = 10;
 /// The prefix that makes a waypoint text a Places place id.
 const PLACE_ID_PREFIX: &str = "place_id:";
 
+/// Places text search's field mask: only what the compact result carries,
+/// plus `nextPageToken`, which says whether Google holds more.
+const PLACES_SEARCH_FIELD_MASK: &str = "places.id,places.displayName,places.formattedAddress,\
+places.location,places.primaryTypeDisplayName,places.rating,places.userRatingCount,\
+places.priceLevel,places.currentOpeningHours.openNow,places.businessStatus,nextPageToken";
+/// The Places API path a text search posts to.
+const SEARCH_TEXT_PATH: &str = "/v1/places:searchText";
+/// PlacesSearch's steps: the geocode of a `near` place, then the search. A
+/// request with no `near`, or `near` as coordinates, starts at the search.
+const PLACES_GEOCODE_STEP: u8 = 1;
+const PLACES_SEARCH_STEP: u8 = 2;
+/// The most places one search answers with (Google's page size range), and
+/// the default.
+const PLACES_MAX: u64 = 20;
+const PLACES_DEFAULT_MAX: u64 = 10;
+/// The bias circle's radius in meters: the tool's range, and the default when
+/// `near` is given without one.
+const RADIUS_MAX_METERS: u64 = 50_000;
+const RADIUS_DEFAULT_METERS: u64 = 5_000;
+
 /// The unit system Google is asked to answer in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Units {
@@ -525,6 +545,23 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                 api: directions_call(&directions, settings),
             })
         }
+        Provided::PlacesSearch => {
+            let search = PlacesSearchArgs::parse(args)?;
+            Ok(match &search.near {
+                Some(near @ Where::Text(_)) => Call {
+                    step: PLACES_GEOCODE_STEP,
+                    api: geocode_call(near, settings),
+                },
+                Some(Where::At(lat, lng)) => Call {
+                    step: PLACES_SEARCH_STEP,
+                    api: places_search_call(&search, Some((*lat, *lng)), settings),
+                },
+                None => Call {
+                    step: PLACES_SEARCH_STEP,
+                    api: places_search_call(&search, None, settings),
+                },
+            })
+        }
     }
 }
 
@@ -542,11 +579,17 @@ fn place_or_coordinates(args: &Args, key: &str) -> Result<Where, String> {
         (Some(_), Some(_)) => Err(format!("pass `{key}` or `lat` and `lng`, not both")),
         (None, None) => Err(format!("pass `{key}` or `lat` and `lng`")),
         (None, Some((lat, lng))) => Ok(Where::At(lat, lng)),
-        (Some(text), None) => Ok(match parse_lat_lng(text, key)? {
-            Some((lat, lng)) => Where::At(lat, lng),
-            None => Where::Text(text.to_string()),
-        }),
+        (Some(text), None) => place_text(text, key),
     }
+}
+
+/// The place text of argument `key`: coordinates when it has the form
+/// `<lat>,<lng>`, otherwise a text to geocode.
+fn place_text(text: &str, key: &str) -> Result<Where, String> {
+    Ok(match parse_lat_lng(text, key)? {
+        Some((lat, lng)) => Where::At(lat, lng),
+        None => Where::Text(text.to_string()),
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -905,6 +948,85 @@ fn directions_call(args: &DirectionsArgs, settings: &Settings) -> ApiCall {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PlacesSearchArgs {
+    query: String,
+    /// Where the search is biased toward: coordinates, or a place to geocode.
+    near: Option<Where>,
+    /// The bias circle's radius; read only with `near`.
+    radius: u64,
+    open_now: bool,
+    max: usize,
+}
+
+impl PlacesSearchArgs {
+    fn parse(args: &Value) -> Result<PlacesSearchArgs, String> {
+        let args = object(args, &["query", "near", "radius", "open_now", "max"])?;
+        let Some(query) = text(args, "query")? else {
+            return Err("`query` is required".to_string());
+        };
+        let near = text(args, "near")?
+            .map(|near| place_text(near, "near"))
+            .transpose()?;
+        let radius = integer(args, "radius", 1, RADIUS_MAX_METERS)?;
+        if radius.is_some() && near.is_none() {
+            return Err("`radius` applies with `near` only".to_string());
+        }
+        let open_now = match args.get("open_now") {
+            None => false,
+            Some(Value::Bool(open_now)) => *open_now,
+            Some(_) => return Err("`open_now` must be true or false".to_string()),
+        };
+        let max = integer(args, "max", 1, PLACES_MAX)?.unwrap_or(PLACES_DEFAULT_MAX);
+        Ok(PlacesSearchArgs {
+            query: query.to_string(),
+            near,
+            radius: radius.unwrap_or(RADIUS_DEFAULT_METERS),
+            open_now,
+            max: usize::try_from(max).expect("max is at most 20"),
+        })
+    }
+}
+
+/// A Places text search, biased toward a circle around `center` when there
+/// is one: one page of at most `max` places.
+fn places_search_call(
+    args: &PlacesSearchArgs,
+    center: Option<(f64, f64)>,
+    settings: &Settings,
+) -> ApiCall {
+    let mut body = Args::new();
+    body.insert("textQuery".to_string(), json!(args.query));
+    body.insert("pageSize".to_string(), json!(args.max));
+    if args.open_now {
+        body.insert("openNow".to_string(), json!(true));
+    }
+    if let Some((lat, lng)) = center {
+        body.insert(
+            "locationBias".to_string(),
+            json!({ "circle": {
+                "center": { "latitude": lat, "longitude": lng },
+                "radius": args.radius,
+            } }),
+        );
+    }
+    if let Some(language) = &settings.language {
+        body.insert("languageCode".to_string(), json!(language));
+    }
+    ApiCall {
+        provider: settings.provider.clone(),
+        method: "POST".to_string(),
+        host: settings.places_host.clone(),
+        path: SEARCH_TEXT_PATH.to_string(),
+        query: BTreeMap::new(),
+        headers: BTreeMap::from([(
+            "X-Goog-FieldMask".to_string(),
+            PLACES_SEARCH_FIELD_MASK.to_string(),
+        )]),
+        body: Some(Value::Object(body).to_string()),
+    }
+}
+
 /// A nested call's typed error, as the executor wrote it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NestedError {
@@ -1054,6 +1176,11 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
         (Provided::Directions, 1) => stored(state, DirectionsArgs::parse)
             .and_then(|args| compact_directions(&args, &body, settings.units))
             .map(Next::Complete),
+        (Provided::PlacesSearch, PLACES_GEOCODE_STEP) => stored(state, PlacesSearchArgs::parse)
+            .and_then(|args| places_after_geocode(&args, &body, settings)),
+        (Provided::PlacesSearch, PLACES_SEARCH_STEP) => stored(state, PlacesSearchArgs::parse)
+            .and_then(|args| compact_places_search(&args, &state.derived, &body))
+            .map(Next::Complete),
         (tool, step) => Err(internal(format!(
             "in-flight row names step {step} of {}, which has no such step",
             tool.name()
@@ -1143,20 +1270,31 @@ fn weather_after_geocode(
             "in-flight row names weather's geocode step for a request given coordinates",
         ));
     };
-    let located = first_location(body, place)?;
+    after_geocode(body, place, |lat, lng| Call {
+        step: WEATHER_LOOKUP_STEP,
+        api: weather_call(args, lat, lng, settings),
+    })
+}
+
+/// The call `next` builds at the first location the geocode of `text`
+/// answered with; the location rides in `derived` to the answer.
+fn after_geocode(
+    body: &Value,
+    text: &str,
+    next: impl FnOnce(f64, f64) -> Call,
+) -> Result<Next, Failure> {
+    let located = first_location(body, text)?;
     Ok(Next::Call {
-        call: Call {
-            step: WEATHER_LOOKUP_STEP,
-            api: weather_call(args, located.lat, located.lng, settings),
-        },
+        call: next(located.lat, located.lng),
         derived: located.to_map(),
     })
 }
 
-/// The compact `location` of a Weather answer: the caller's coordinates, or
-/// what the geocode step resolved the place to.
-fn weather_location(args: &WeatherArgs, derived: &Args) -> Result<Value, Failure> {
-    match &args.at {
+/// The compact `location` of an answer about `at`: the caller's coordinates,
+/// or what the geocode step resolved the text to, which `derived` carries.
+/// `step` names the step reading it, for the error when `derived` does not.
+fn resolved_location(at: &Where, derived: &Args, step: &str) -> Result<Value, Failure> {
+    match at {
         Where::At(lat, lng) => Ok(Value::Object(
             Located {
                 lat: *lat,
@@ -1167,13 +1305,93 @@ fn weather_location(args: &WeatherArgs, derived: &Args) -> Result<Value, Failure
         )),
         Where::Text(_) => {
             if !(derived.contains_key("lat") && derived.contains_key("lng")) {
-                return Err(internal(
-                    "in-flight row for weather's lookup carries no geocoded location",
-                ));
+                return Err(internal(format!(
+                    "in-flight row for {step} carries no geocoded location"
+                )));
             }
             Ok(Value::Object(derived.clone()))
         }
     }
+}
+
+/// PlacesSearch's search around where its `near` place geocoded to; the
+/// location rides in `derived` to the answer.
+fn places_after_geocode(
+    args: &PlacesSearchArgs,
+    body: &Value,
+    settings: &Settings,
+) -> Result<Next, Failure> {
+    let Some(Where::Text(near)) = &args.near else {
+        return Err(internal(
+            "in-flight row names places-search's geocode step for a request with no place to \
+             geocode",
+        ));
+    };
+    after_geocode(body, near, |lat, lng| Call {
+        step: PLACES_SEARCH_STEP,
+        api: places_search_call(args, Some((lat, lng)), settings),
+    })
+}
+
+/// A Places text search answer as PlacesSearch's compact result: `location`
+/// when the search was biased toward a place, then the places and `more`.
+fn compact_places_search(
+    args: &PlacesSearchArgs,
+    derived: &Args,
+    body: &Value,
+) -> Result<Value, Failure> {
+    let mut out = Args::new();
+    if let Some(near) = &args.near {
+        out.insert(
+            "location".to_string(),
+            resolved_location(near, derived, "places-search's search")?,
+        );
+    }
+    compact_places(&mut out, body, args.max)?;
+    Ok(Value::Object(out))
+}
+
+/// A Places text search answer's places, at most `max` with `places_omitted`
+/// counting the rest, and `more`: whether Google holds a further page. Google
+/// omits `places` when nothing matched, which is an empty list.
+fn compact_places(out: &mut Args, body: &Value, max: usize) -> Result<(), Failure> {
+    if !body.is_object() {
+        return Err(shape("Places"));
+    }
+    let none = Value::Array(Vec::new());
+    first_items(
+        out,
+        "places",
+        body.get("places").unwrap_or(&none),
+        max,
+        "Places",
+        |place| {
+            let place = record(place, "Places")?;
+            let mut item = Args::new();
+            copy(&mut item, "id", place.get("id"));
+            copy(&mut item, "name", at(place, &["displayName", "text"]));
+            copy(&mut item, "address", place.get("formattedAddress"));
+            copy(&mut item, "lat", at(place, &["location", "latitude"]));
+            copy(&mut item, "lng", at(place, &["location", "longitude"]));
+            copy(
+                &mut item,
+                "type",
+                at(place, &["primaryTypeDisplayName", "text"]),
+            );
+            copy(&mut item, "rating", place.get("rating"));
+            copy(&mut item, "rating_count", place.get("userRatingCount"));
+            copy(&mut item, "price_level", place.get("priceLevel"));
+            copy(
+                &mut item,
+                "open_now",
+                at(place, &["currentOpeningHours", "openNow"]),
+            );
+            copy(&mut item, "status", place.get("businessStatus"));
+            Ok(Value::Object(item))
+        },
+    )?;
+    out.insert("more".to_string(), json!(page_token(body).is_some()));
+    Ok(())
 }
 
 /// The value at `path` through nested objects.
@@ -1240,13 +1458,17 @@ fn first_of<'a>(body: &'a Args, key: &str, api: &str) -> Result<Option<&'a Value
     }
 }
 
-/// Google's `nextPageToken`, when it names a further page.
-fn next_page(to: &mut Args, body: &Value) {
-    if let Some(token) = body
-        .get("nextPageToken")
+/// Google's `nextPageToken`, when it names a further page: an empty token
+/// names none.
+fn page_token(body: &Value) -> Option<&str> {
+    body.get("nextPageToken")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
-    {
+}
+
+/// Google's `nextPageToken` as `next_page`, when it names a further page.
+fn next_page(to: &mut Args, body: &Value) {
+    if let Some(token) = page_token(body) {
         to.insert("next_page".to_string(), json!(token));
     }
 }
@@ -1258,7 +1480,7 @@ fn compact_weather(
     body: &Value,
     units: Units,
 ) -> Result<Value, Failure> {
-    let location = weather_location(args, derived)?;
+    let location = resolved_location(&args.at, derived, "weather's lookup")?;
     if !body.is_object() {
         return Err(shape("Weather"));
     }
@@ -3758,6 +3980,383 @@ mod tests {
             Next::Fail(failure(
                 ErrorKind::Denied,
                 "api-request refused the nested POST to routes.example.com/directions/v2:computeRoutes: \
+                 a caller with no acting user may only read. A POST needs a request with a calling \
+                 user (an agent or `brenn-tool`)."
+            ))
+        );
+    }
+
+    fn places_search(args: Value) -> Result<Call, String> {
+        plan(Provided::PlacesSearch, &args, &settings())
+    }
+
+    fn places_state(args: Value, call: &Call, derived: Args) -> InFlight {
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::PlacesSearch,
+            &args,
+            call,
+            derived,
+            1_000,
+        )
+    }
+
+    #[test]
+    fn places_search_without_near_posts_one_search() {
+        let call = places_search(json!({ "query": "coffee" })).unwrap();
+        assert_eq!(call.step, PLACES_SEARCH_STEP);
+        assert_eq!(call.api.provider, "maps");
+        assert_eq!(call.api.method, "POST");
+        assert_eq!(call.api.host, "places.example.com");
+        assert_eq!(call.api.path, "/v1/places:searchText");
+        assert!(call.api.query.is_empty());
+        assert_eq!(
+            call.api.headers,
+            query(&[("X-Goog-FieldMask", PLACES_SEARCH_FIELD_MASK)])
+        );
+        assert_eq!(
+            posted(&call.api),
+            json!({ "textQuery": "coffee", "pageSize": 10 })
+        );
+    }
+
+    #[test]
+    fn places_search_field_mask_requests_what_the_answer_carries() {
+        assert_eq!(
+            PLACES_SEARCH_FIELD_MASK.split(',').collect::<Vec<_>>(),
+            [
+                "places.id",
+                "places.displayName",
+                "places.formattedAddress",
+                "places.location",
+                "places.primaryTypeDisplayName",
+                "places.rating",
+                "places.userRatingCount",
+                "places.priceLevel",
+                "places.currentOpeningHours.openNow",
+                "places.businessStatus",
+                "nextPageToken",
+            ]
+        );
+    }
+
+    #[test]
+    fn places_search_near_coordinates_biases_without_geocoding() {
+        let call = places_search(json!({
+            "query": "coffee", "near": "37.422, -122.0841", "radius": 800,
+            "open_now": true, "max": 20,
+        }))
+        .unwrap();
+        assert_eq!(call.step, PLACES_SEARCH_STEP);
+        assert_eq!(
+            posted(&call.api),
+            json!({
+                "textQuery": "coffee",
+                "pageSize": 20,
+                "openNow": true,
+                "locationBias": { "circle": {
+                    "center": { "latitude": 37.422, "longitude": -122.0841 },
+                    "radius": 800,
+                } },
+            })
+        );
+        // `open_now: false` is Google's default and is not sent.
+        let call = places_search(json!({ "query": "coffee", "open_now": false })).unwrap();
+        assert!(posted(&call.api).get("openNow").is_none());
+    }
+
+    #[test]
+    fn places_search_passes_the_language() {
+        let s = Settings::from_lookup(lookup(&with(&[("language", "fr")]))).unwrap();
+        let call = plan(Provided::PlacesSearch, &json!({ "query": "café" }), &s).unwrap();
+        assert_eq!(posted(&call.api)["languageCode"], "fr");
+    }
+
+    #[test]
+    fn places_search_near_a_place_geocodes_first() {
+        let call = places_search(json!({ "query": "coffee", "near": "Mountain View" })).unwrap();
+        assert_eq!(call.step, PLACES_GEOCODE_STEP);
+        assert_eq!(call.api.host, "geocode.example.com");
+        assert_eq!(call.api.path, "/v4/geocode/address");
+        assert_eq!(call.api.query, query(&[("addressQuery", "Mountain View")]));
+        assert_eq!(
+            call.api.headers,
+            query(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
+        );
+    }
+
+    #[test]
+    fn places_search_near_a_place_searches_where_the_geocode_landed() {
+        let args = json!({ "query": "coffee", "near": "Mountain View" });
+        let step1 = places_search(args.clone()).unwrap();
+        let state = places_state(args.clone(), &step1, Map::new());
+        let Next::Call { call, derived } = advance(&state, http(200, MOUNTAIN_VIEW), &settings())
+        else {
+            panic!("expected the search step");
+        };
+        assert_eq!(call.step, PLACES_SEARCH_STEP);
+        assert_eq!(call.api.host, "places.example.com");
+        assert_eq!(call.api.path, "/v1/places:searchText");
+        // No radius given: the default circle.
+        assert_eq!(
+            posted(&call.api)["locationBias"],
+            json!({ "circle": {
+                "center": { "latitude": 37.39, "longitude": -122.08 },
+                "radius": 5000,
+            } })
+        );
+        let want = json!({ "lat": 37.39, "lng": -122.08, "place": "Mountain View, CA, USA" });
+        assert_eq!(Value::Object(derived.clone()), want);
+
+        // The search's row carries the location through the store to the answer.
+        let step2 = InFlight::decode(&state.next(&call, derived, 2_000).encode()).unwrap();
+        assert_eq!(step2.call_id(), format!("{}/2", "a".repeat(32)));
+        assert_eq!(step2.target, call.api.target());
+        let Next::Complete(answer) = advance(&step2, http(200, "{}"), &settings()) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(
+            answer,
+            json!({ "location": want, "places": [], "more": false })
+        );
+    }
+
+    #[test]
+    fn places_search_near_a_place_nothing_matches_is_the_callers() {
+        let args = json!({ "query": "coffee", "near": "Nowhere Special" });
+        let state = places_state(args.clone(), &places_search(args).unwrap(), Map::new());
+        assert_eq!(
+            advance(&state, http(200, "{}"), &settings()),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "no location found for Nowhere Special"
+            ))
+        );
+    }
+
+    #[test]
+    fn places_search_steps_without_their_state_are_internal() {
+        // A geocode step for a request with nothing to geocode.
+        let args = json!({ "query": "coffee", "near": "1,2" });
+        let call = Call {
+            step: PLACES_GEOCODE_STEP,
+            api: geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
+        };
+        assert_eq!(
+            advance(
+                &places_state(args, &call, Map::new()),
+                http(200, MOUNTAIN_VIEW),
+                &settings()
+            ),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row names places-search's geocode step for a request with no place \
+                 to geocode"
+            ))
+        );
+        // A search step for a place whose geocoded location was not carried.
+        let args = json!({ "query": "coffee", "near": "Mountain View" });
+        let search = PlacesSearchArgs::parse(&args).unwrap();
+        let call = Call {
+            step: PLACES_SEARCH_STEP,
+            api: places_search_call(&search, Some((1.0, 2.0)), &settings()),
+        };
+        assert_eq!(
+            advance(
+                &places_state(args, &call, Map::new()),
+                http(200, "{}"),
+                &settings()
+            ),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row for places-search's search carries no geocoded location"
+            ))
+        );
+    }
+
+    #[test]
+    fn places_search_refuses_bad_arguments_by_name() {
+        let cases = [
+            (json!({}), "`query` is required"),
+            (json!({ "query": 1 }), "`query` must be a string"),
+            (json!({ "query": " " }), "`query` is empty"),
+            (json!({ "query": "a", "near": "" }), "`near` is empty"),
+            (
+                json!({ "query": "a", "radius": 100 }),
+                "`radius` applies with `near` only",
+            ),
+            (
+                json!({ "query": "a", "near": "b", "radius": 0 }),
+                "`radius` must be an integer from 1 to 50000",
+            ),
+            (
+                json!({ "query": "a", "near": "b", "radius": 50_001 }),
+                "`radius` must be an integer from 1 to 50000",
+            ),
+            (
+                json!({ "query": "a", "near": "b", "radius": 1.5 }),
+                "`radius` must be an integer from 1 to 50000",
+            ),
+            (
+                json!({ "query": "a", "open_now": "yes" }),
+                "`open_now` must be true or false",
+            ),
+            (
+                json!({ "query": "a", "max": 0 }),
+                "`max` must be an integer from 1 to 20",
+            ),
+            (
+                json!({ "query": "a", "max": 21 }),
+                "`max` must be an integer from 1 to 20",
+            ),
+        ];
+        for (args, want) in cases {
+            assert_eq!(places_search(args.clone()).unwrap_err(), want, "{args}");
+        }
+        let err = places_search(json!({ "query": "a", "lat": 1 })).unwrap_err();
+        assert!(err.starts_with("unknown argument `lat`"), "{err}");
+        let err = places_search(json!({ "query": "a", "near": "1,200" })).unwrap_err();
+        assert!(
+            err.contains("`near`") && err.contains("longitude 200"),
+            "{err}"
+        );
+        // The radius bounds themselves are accepted.
+        for radius in [1, 50_000] {
+            let call = places_search(json!({ "query": "a", "near": "1,2", "radius": radius }));
+            assert_eq!(
+                posted(&call.unwrap().api)["locationBias"]["circle"]["radius"],
+                radius
+            );
+        }
+    }
+
+    #[test]
+    fn places_search_caps_query_and_near_in_bytes() {
+        let at_cap = "é".repeat(TEXT_MAX_BYTES / 2);
+        assert!(places_search(json!({ "query": at_cap, "near": at_cap })).is_ok());
+        let over = format!("{at_cap}a");
+        assert_eq!(
+            places_search(json!({ "query": over })).unwrap_err(),
+            "`query` is longer than 1024 bytes"
+        );
+        assert_eq!(
+            places_search(json!({ "query": "a", "near": over })).unwrap_err(),
+            "`near` is longer than 1024 bytes"
+        );
+    }
+
+    fn places_answer(args: Value, body: &Value) -> Next {
+        let call = plan(Provided::PlacesSearch, &args, &settings()).unwrap();
+        advance(
+            &places_state(args, &call, Map::new()),
+            http(200, &body.to_string()),
+            &settings(),
+        )
+    }
+
+    fn place(n: usize) -> Value {
+        json!({ "id": format!("ChIJ{n}"), "displayName": { "text": format!("Cafe {n}"), "languageCode": "en" } })
+    }
+
+    #[test]
+    fn places_search_compacts_googles_answer() {
+        let body = json!({
+            "places": [
+                {
+                    "id": "ChIJ1",
+                    "displayName": { "text": "Blue Cup", "languageCode": "en" },
+                    "formattedAddress": "1 Main St, Springfield",
+                    "location": { "latitude": 37.39, "longitude": -122.08 },
+                    "primaryTypeDisplayName": { "text": "Coffee Shop", "languageCode": "en" },
+                    "rating": 4.6,
+                    "userRatingCount": 312,
+                    "priceLevel": "PRICE_LEVEL_INEXPENSIVE",
+                    "currentOpeningHours": { "openNow": true },
+                    "businessStatus": "OPERATIONAL",
+                },
+                { "id": "ChIJ2", "displayName": { "text": "New Cafe" } },
+            ],
+            "nextPageToken": "tok",
+        });
+        let Next::Complete(answer) = places_answer(json!({ "query": "coffee" }), &body) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(
+            answer,
+            json!({
+                "places": [
+                    {
+                        "id": "ChIJ1", "name": "Blue Cup", "address": "1 Main St, Springfield",
+                        "lat": 37.39, "lng": -122.08, "type": "Coffee Shop",
+                        "rating": 4.6, "rating_count": 312, "price_level": "PRICE_LEVEL_INEXPENSIVE",
+                        "open_now": true, "status": "OPERATIONAL",
+                    },
+                    { "id": "ChIJ2", "name": "New Cafe" },
+                ],
+                "more": true,
+            })
+        );
+    }
+
+    #[test]
+    fn places_search_near_coordinates_states_them() {
+        let Next::Complete(answer) = places_answer(
+            json!({ "query": "coffee", "near": "1,2" }),
+            &json!({ "places": [place(1)], "nextPageToken": "" }),
+        ) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["location"], json!({ "lat": 1.0, "lng": 2.0 }));
+        // An empty token names no further page.
+        assert_eq!(answer["more"], false);
+    }
+
+    #[test]
+    fn places_search_beyond_max_is_counted() {
+        let body = json!({ "places": (1..=5).map(place).collect::<Vec<_>>() });
+        let Next::Complete(answer) = places_answer(json!({ "query": "coffee", "max": 3 }), &body)
+        else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["places"].as_array().unwrap().len(), 3);
+        assert_eq!(answer["places"][2]["id"], "ChIJ3");
+        assert_eq!(answer["places_omitted"], 2);
+        assert_eq!(answer["more"], false);
+        assert!(answer.get("location").is_none());
+    }
+
+    #[test]
+    fn places_search_refuses_an_unexpected_shape() {
+        for body in [
+            json!([]),
+            json!({ "places": {} }),
+            json!({ "places": null }),
+            json!({ "places": [1] }),
+        ] {
+            assert_eq!(
+                places_answer(json!({ "query": "coffee" }), &body),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    "unexpected Places API response shape"
+                )),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_userless_places_search_is_denied_naming_the_post() {
+        let args = json!({ "query": "coffee" });
+        let call = places_search(args.clone()).unwrap();
+        assert_eq!(
+            advance(
+                &places_state(args, &call, Map::new()),
+                nested("denied", "a caller with no acting user may only read"),
+                &settings()
+            ),
+            Next::Fail(failure(
+                ErrorKind::Denied,
+                "api-request refused the nested POST to places.example.com/v1/places:searchText: \
                  a caller with no acting user may only read. A POST needs a request with a calling \
                  user (an agent or `brenn-tool`)."
             ))

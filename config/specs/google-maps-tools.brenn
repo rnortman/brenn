@@ -47,4 +47,10 @@ component GoogleMapsTools {
     input_schema = """{ "type": "object", "properties": { "origin": { "type": "string" }, "destination": { "type": "string" }, "mode": { "type": "string", "enum": ["drive", "walk", "bicycle", "transit"] }, "depart_at": { "type": "string", "format": "date-time" }, "arrive_by": { "type": "string", "format": "date-time" }, "max_steps": { "type": "integer", "minimum": 1, "maximum": 200 } }, "required": ["origin", "destination"], "additionalProperties": false }""";
     max_concurrency = 4;
   }
+  provide places-search {
+    mcp_name = "PlacesSearch";
+    description = "Search for places (businesses, landmarks, addresses) by text with Google's Places API. `query` is what to look for (\"coffee\", \"hardware store in Springfield\"). `near` (\"<lat>,<lng>\" or a place, geocoded first) biases the search toward a circle of `radius` meters (1-50000, default 5000, only with `near`); results outside it can still appear. `open_now: true` keeps only places open now. `max` (1-20, default 10) caps the results. Each place has its Places `id` (as \"place_id:<id>\" in Directions), `name`, `address`, `lat`, `lng`, `type`, `rating`, `rating_count`, `price_level`, `open_now` and business `status`, each when Google gives it. `location` states where `near` was resolved to. `more` is true when Google has further results than this answer holds. Maps Platform endpoints this component does not wrap (air quality, time zone, weather history, nearby search, …) are listed with `api-request` examples in `docs/providers/google-maps.md`.";
+    input_schema = """{ "type": "object", "properties": { "query": { "type": "string" }, "near": { "type": "string" }, "radius": { "type": "integer", "minimum": 1, "maximum": 50000 }, "open_now": { "type": "boolean" }, "max": { "type": "integer", "minimum": 1, "maximum": 20 } }, "required": ["query"], "additionalProperties": false }""";
+    max_concurrency = 4;
+  }
 }

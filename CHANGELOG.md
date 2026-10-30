@@ -33,6 +33,13 @@ All notable changes to Brenn are documented here.
   a conversation, for instance); a component calling on its own account is
   refused.
 
+- **`google-maps-tools` adds a `PlacesSearch` tool**: find businesses,
+  landmarks or addresses by a text search such as "coffee", optionally
+  near a place or coordinates and optionally only those open now. Each
+  result gives the place's name, address, location, rating, price level
+  and whether it is open, plus an id that Directions accepts as a
+  destination. Like Directions, it must be asked for on a user's behalf.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key

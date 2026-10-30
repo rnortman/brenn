@@ -30,6 +30,7 @@ const TOOLS: &[(&str, &str)] = &[
     ("weather", "Weather"),
     ("geocode", "Geocode"),
     ("directions", "Directions"),
+    ("places-search", "PlacesSearch"),
 ];
 
 /// The class's packaged specification.
