@@ -3,10 +3,18 @@
 //! key for an `api_key_provider`.
 //!
 //! The caller names the request; the credential is never an argument. On an
-//! OAuth provider a conversation caller acts with its owner's credential, and
-//! a caller with no acting user (a WASM component) with the one user its own
-//! grant names. On a key provider every caller sends the same key. A caller
-//! with no acting user only reads, on either kind.
+//! OAuth provider a caller with an acting user acts with that user's
+//! credential: a conversation's owner, or the user of the provided-tool call
+//! a component's call serves, stamped by the executor. A caller with no acting
+//! user (a WASM component calling on its own account) borrows the one user its
+//! grant names. On a key provider every caller sends the same key.
+//!
+//! A caller with no acting user only reads, on either kind: its call can be
+//! re-run from its channel window. A stamped component call is its user's
+//! call, the method bounded by its clause like any other: a re-run of it
+//! cannot act, because the pending call it serves is gone once completed,
+//! expired or lost to a restart, and the executor refuses a serving id that is
+//! not pending.
 //!
 //! The ACL is matched here, not by [`AclClause::matches`]: `path` is a segment
 //! template (see [`crate::path_template`]) and every other key exact or `*`.
@@ -824,8 +832,9 @@ impl AsyncTool for ApiRequestTool {
             .map_err(|e| ToolError::InvalidArgs(format!("{NAME} args: {e}")))?;
         let provider = self.resolve(&args.provider)?;
         let request = prepare(&provider, args)?;
-        // A component's call can be replayed from its channel window, so it
-        // only reads, whatever the credential.
+        // A caller with no acting user can be replayed from its channel
+        // window, so it only reads, whatever the credential. A stamped
+        // component call is its user's and is bounded by its clause alone.
         if ctx.acting_user.is_none() && !READ_METHODS.contains(&request.method.as_str()) {
             return Err(ToolError::Denied(format!(
                 "{}: a caller with no acting user may only read ({READ_METHODS:?})",
@@ -1908,6 +1917,78 @@ mod tests {
             panic!("expected Denied, got {out:?}");
         };
         assert!(detail.contains("may only read"), "{detail}");
+        assert_eq!(f.seen().len(), 1);
+    }
+
+    /// A component's call the executor stamped with the user of the
+    /// provided-tool call it serves.
+    fn stamped_component_ctx(acl: Vec<AclClause>) -> ToolCtx {
+        ToolCtx {
+            caller: brenn_lib::messaging::ParticipantId::for_wasm("x"),
+            acting_conversation_id: None,
+            ..tool_ctx(Some(alice()), acl)
+        }
+    }
+
+    /// A stamped component call is its user's call: it writes within its
+    /// clause, with the key on a key provider and with that user's own
+    /// credential on OAuth, under a `user = "*"` clause that lends nobody.
+    #[tokio::test]
+    async fn a_stamped_component_call_writes_as_its_user() {
+        let key = key_fixture().await;
+        let mut post = key.args("POST", "/v1/things:search");
+        post["body"] = serde_json::json!("{}");
+        let out = key
+            .tool
+            .execute(
+                &stamped_component_ctx(vec![clause(&[("provider", "maps"), ("method", "POST")])]),
+                post,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["status"], 200);
+        let seen = key.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(seen[0].headers["x-api-key"], KEY);
+
+        let f = fixture().await;
+        let mut bobs = credential("google", "alice@example.com", "RT-b");
+        bobs.access_token = "bobs-access".to_string();
+        f.svc.vault().store("bob", &bobs).await;
+        let mut draft = f.args("POST", "/gmail/v1/users/me/drafts");
+        draft["body"] = serde_json::json!(r#"{"raw":"x"}"#);
+        let out = f
+            .tool
+            .execute(
+                &stamped_component_ctx(vec![clause(&[
+                    ("provider", "google"),
+                    ("user", "*"),
+                    ("method", "POST"),
+                ])]),
+                draft,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["status"], 200);
+        let seen = f.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(seen[0].headers["authorization"], "Bearer access");
+
+        // The clause still bounds the method.
+        let out = f
+            .tool
+            .execute(
+                &stamped_component_ctx(vec![clause(&[
+                    ("provider", "google"),
+                    ("user", "*"),
+                    ("method", "GET"),
+                ])]),
+                f.args("DELETE", "/gmail/v1/users/me/drafts/d"),
+            )
+            .await;
+        assert!(matches!(out, Err(ToolError::Denied(_))), "{out:?}");
         assert_eq!(f.seen().len(), 1);
     }
 

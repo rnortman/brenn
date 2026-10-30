@@ -27,14 +27,14 @@ use brenn_server::test_support::init_db_file;
 use super::driver::TriggerSource;
 use super::driver::tests::{
     BootFixture, Booted, CEILING, CONFIG_MOUNT, FRAGMENT_ADDRESS, FRAGMENT_CONSUMER, READER,
-    SPILL_ACL_BY_ADDRESS, Tree, async_tool_registry, bearer_endpoint, boot, boot_with,
-    conversation_of, document, document_covering_work, document_push_subscribing,
-    document_push_subscribing_acl, document_subscribing, document_with,
-    document_with_a_broker_only, document_with_a_consumer, document_with_an_mqtt_consumer,
-    document_with_clients, document_with_webhooks, fragment, insert_dynamic_row,
-    insert_push_dynamic_row, install_package, install_package_from, push_owner_covering_work,
-    restage, seat_a_conversation, seat_position, seat_user, spill_channel, staged_module,
-    subscriber_debug_lines, surface_document, surfaces_document, write_surface_kind,
+    SPILL_ACL_BY_ADDRESS, Tree, async_pull_tool, bearer_endpoint, boot, boot_with, conversation_of,
+    document, document_covering_work, document_push_subscribing, document_push_subscribing_acl,
+    document_subscribing, document_with, document_with_a_broker_only, document_with_a_consumer,
+    document_with_an_mqtt_consumer, document_with_clients, document_with_webhooks, fragment,
+    insert_dynamic_row, insert_push_dynamic_row, install_package, install_package_from,
+    push_owner_covering_work, restage, seat_a_conversation, seat_position, seat_user,
+    spill_channel, staged_module, subscriber_debug_lines, surface_document, surfaces_document,
+    write_surface_kind,
 };
 use brenn_messaging::config_reload::Outcome;
 
@@ -1051,7 +1051,7 @@ async fn the_reloaded_process_matches_a_fresh_boot() {
         |db| BootFixture {
             db: Some(db),
             components_roots: roots.clone(),
-            tool_registry: Some(async_tool_registry()),
+            native_tools: vec![async_pull_tool()],
             ..BootFixture::default()
         },
         async |booted| {
@@ -1428,7 +1428,7 @@ async fn every_consumer_registration_site_binds_the_consumer_shaped_arm() {
         &tree,
         BootFixture {
             components_roots: vec![components.path().to_path_buf()],
-            tool_registry: Some(async_tool_registry()),
+            native_tools: vec![async_pull_tool()],
             ..BootFixture::default()
         },
     )
@@ -1538,7 +1538,7 @@ async fn a_retune_takes_the_send_rate_buckets_with_it() {
         &tree,
         BootFixture {
             components_roots: vec![components.path().to_path_buf()],
-            tool_registry: Some(async_tool_registry()),
+            native_tools: vec![async_pull_tool()],
             ..BootFixture::default()
         },
     )

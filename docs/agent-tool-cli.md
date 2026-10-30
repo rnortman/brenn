@@ -37,7 +37,8 @@ brenn-tool describe BrennSend --pretty   # one tool, with its input schema
 
 `list` prints `[{"name", "description", "available", "reason"?}]`. `describe`
 adds `input_schema`, which is exactly the schema the tool call uses: a
-command takes the same input object as the tool.
+command takes the same input object as the tool. A tool a WASM component
+provides is listed and called like any other registry tool.
 
 Some tools are listed as not available, with a `reason`:
 

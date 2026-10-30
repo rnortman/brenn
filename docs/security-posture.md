@@ -849,6 +849,111 @@ Both substrate halves, and the residual each leaves:
 Cross-host calls do not exist: a call whose caller and callee are not placed
 together is refused at compile time.
 
+### 8.4 Component-provided tools (the `provides` grant)
+
+A component class may declare `provide <tool>` statements; each becomes a
+registry tool that agents, `brenn-tool` and other components call like any
+other (`docs/config-dsl.md`, "Tool grants"). The component serves a call as an
+ordinary activation on its reserved `tool-requests` port, and answers it
+through `provides.complete`. It may act for the caller's user through
+`provides.call-async-for`.
+
+**Trust decision: a provider decides nothing about its own authority.**
+Admission happens before the provider sees a request. That covers the grant,
+the ACL, the rate limit and the concurrency permit. A bus caller is admitted by
+the tool executor; an agent or `brenn-tool` by the LLM path. The host mints the
+pending id: 16 random bytes, never derived from the caller's call id. The host
+also records the call's acting user on the host-side pending record. The
+request body the provider receives carries the id, the tool and the arguments.
+It carries no caller, no user and no reply address. A provider names no inbox,
+no channel and no user. Its request inbox is minted by the host, subscribed by
+the provider alone and published by the executor alone. It acts for a user
+only through `call-async-for` on an id pending for it, and the executor stamps
+that nested call with the user it reads from the pending record, never from a
+body field.
+
+**Policies:**
+
+- **An id acts only while its caller waits.** A pending record lives exactly as
+  long as its caller's wait, and no longer: completion, failure, expiry and a
+  dropped waiter all remove it. `complete` and `call-async-for` on an id not
+  pending for this component are refused (`not-pending`, `denied`), and an id
+  pending for another component is indistinguishable from an unknown one.
+- **The acting user is read after admission.** The executor reads the user of a
+  nested call from the pending record once, after the nested call's permit is
+  acquired and immediately before it runs. A nested call whose record went away
+  while it waited is refused and never runs.
+- **The ceiling.** Every provided call is answered within 240 s of its
+  admission, which covers the rate-limit and permit wait as well as the
+  provider's work. A call parked behind busy permits past that deadline is
+  answered `internal` with nothing published. A provider that does not complete
+  in time is answered `internal`, and the first such expiry per tool raises an
+  alert.
+- **The result is bounded.** A completion's outcome text is capped at the WASM
+  boundary, and its value, `ok` or error, is held to the async result budget. An
+  error kind outside `denied`, `invalid_args` and `internal` is refused. A
+  refused completion leaves the call pending, so the provider may answer again.
+
+Limits, stated beside the guarantees:
+
+- A provider's result is the caller's tool result and lands wherever tool
+  results land: an agent's transcript and history, or a component's result
+  inbox.
+- The host cannot tell whether a provider acts for its caller's user, so every
+  provided tool is taken to. A grant of one is refused on a `multiuser` agent
+  and on an agent with no `container`, as `api-request`'s is, even for a
+  provider that touches no credential.
+- A request from a component calling on its own account carries no user. A
+  nested call made for it is unstamped: it borrows the lent user and only
+  reads, as the component's own calls do (§9f).
+- A request delivered after its record is gone (restart, expiry) is served to a
+  provider that then cannot act on it or complete it.
+- A live request can be pushed out of a provider's request inbox unseen, when a
+  later request expires or its caller abandons it before the provider runs. It
+  is answered `internal` at its deadline and nothing runs for it. A drop on the
+  inbox raises no alert of its own; the ceiling alert is the operator's signal.
+- The acting user is read from the record when the nested call is admitted, so
+  a nested *native* call already executing when the record goes away runs to
+  completion under its own tool's timeouts. A nested call to a provided tool
+  ends no later than the call it serves.
+- Authority lent through a pending record never outlives the root call that
+  lent it. A nested provided call, at any depth, is answered by the deadline of
+  the call it serves. So every provided call in a chain is answered by the root
+  call's deadline, including a chain through two components granted each
+  other's tools. A nested native call already inside its tool when its record
+  goes away runs to its own timeouts, as the item before says.
+- A dropped or cancelled waiter leaves nothing pending: the record's lifetime
+  is the waiter's.
+- The executor's publish authority on `tool-requests/*` is the trusted
+  substrate's wildcard.
+- The executor's publishes onto a component's result inbox and a provider's
+  request inbox run at a host-pinned rate, not the operator's
+  `default_send_rate`. Each is already bounded upstream. A result is at most
+  one per request the executor dequeues from a `brenn:tools/<tool>` channel,
+  refused or run, so the caller's own send bucket on that channel bounds it.
+  The per-grant limiter and the per-tool permits bound only what runs, and the
+  executor answers refusals before either. A request is one per admitted call,
+  which the caller's bucket, the limiter and the permit have all passed. The
+  operator's rate governs the component's own publishes on `brenn:tools/<tool>`,
+  which is where its call rate is decided. An executor publish the bus refuses
+  anyway is a host bug and panics (result) or is answered `rate_limited`
+  (request).
+
+Component A serving user U may call provided tool T of component B through
+`call-async-for`. The executor stamps U, B's call records U, and B's own nested
+`api-request` acts as U (§9f). A provider granted an owner-bound tool (connect,
+accounts, disconnect) is still refused at boot: stamping changes only the tools
+that take an acting user when one is present.
+
+**What the reviewer verifies:** admission happens before the provider sees a
+request, on both the executor and the LLM path; the host mints the id and
+stamps the user on the record; no request or result body names a user. Raise a
+finding for any of these: a provider addressing an inbox or naming a user; a
+nested call stamped from a body field rather than the pending record; a stamped
+write admitted after the record is gone; a nested call admitted with a deadline
+later than the call it serves; a substrate publish whose refusal drops a
+completed call's answer.
+
 
 ---
 
@@ -1335,7 +1440,10 @@ requests may be made. The backend picks the credential and attaches it. The
 user whose credential is used is the conversation's owner, stamped by the
 backend for the conversation. A caller never names it. A component has no
 owner, so its credential is lent by the operator's own grant, which names the
-user. Tokens live in a vault the backend alone reads. No tool result, log line
+user — unless the component is serving a provided-tool call whose caller had
+a user (§8.4), in which case the executor stamps that user from the host's
+pending record.
+Tokens live in a vault the backend alone reads. No tool result, log line
 or page carries a token.
 
 **A deployment key is the operator's, not a user's.** An `api_key_provider`
@@ -1385,13 +1493,21 @@ sent. Two limits stand beside that guarantee:
 - **No owner, no owner-bound tool.** A WASM component is never granted the tools
   that connect, list or disconnect an owner's accounts, because there is no
   owner to act for.
-- **Lent credentials are read-only.** A component's credentialed request is
-  admitted for reading methods only. A component's call can be re-run from its
-  channel window, and a re-run write (a second draft, a second event) is the
-  wrong thing. Until writes are deduplicated, a lent credential does not write.
-  The same holds for a component's call on a key provider: no user is lent,
-  but a re-run write is as wrong with the deployment's key, so only reading
-  methods are admitted.
+- **Unstamped component calls are read-only.** A component's credentialed
+  request that carries no acting user is admitted for reading methods only. Such
+  a call can be re-run from its channel window, and a re-run write (a second
+  draft, a second event) is the wrong thing. So a lent credential does not
+  write. The same holds for an unstamped call on a key provider: no user is
+  lent, but a re-run write is as wrong with the deployment's key, so only
+  reading methods are admitted.
+- **A stamped component call is its user's call.** A call the executor stamped
+  from a pending provided-tool call (§8.4) uses that user's credential, or the
+  key, and may write within its clause; the lent user is not consulted. Neither
+  kind of call is deduplicated. A re-run of a *stamped* request is harmless for
+  a different reason: the pending id it serves is gone once its call completes,
+  expires or is lost to a restart, so the re-run is refused before it reaches
+  this tool. Deduplicating writes in general is still open
+  (`tool-registry-idempotency-dedupe`).
 - **The caller cannot touch the credential or the transport.** `Authorization`,
   `Cookie`, `Host` and the framing headers are refused from the caller.
 - **Reserved injection name.** The key's header is Brenn's. A caller header of
@@ -1434,7 +1550,8 @@ sent. Two limits stand beside that guarantee:
 container-visible path; any route by which a caller names the user whose
 credential is used; a credential-bearing grant admitted on a bare or
 `multiuser` app, or an owner-bound one on a component; a write through a
-lent credential; a caller-supplied `Authorization` or transport header; a
+lent credential or by any unstamped component call; a stamped write admitted
+after its pending record is gone; a caller-supplied `Authorization` or transport header; a
 redirect followed with the credential; a destination matched by prefix,
 or a path sent other than the one matched; a vault location an agent can
 reach; a session-minting form post admitted from another site; an unknown

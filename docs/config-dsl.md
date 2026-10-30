@@ -438,6 +438,25 @@ user's credential is used. A lent credential is read-only: only `GET` and
 `HEAD` are admitted. `account` picks one of the user's accounts. When it is
 omitted and the user has more than one, the call is refused and lists them.
 
+The exception is a component serving a provided-tool call (*The request inbox
+port*) whose caller had a user: an agent, `brenn-tool`, or a component itself
+serving such a call. A nested call it makes for that request carries the
+calling user. It uses that user's credential and may use any method its clause
+admits; no user is lent. `allow { provider = "google"; user = "*"; method =
+"POST"; … }` on a provider's grant admits it for whichever user is calling. A
+request from a component calling on its own account carries no user. A nested
+call made for it is a lent call like the component's own calls: read-only, and
+under the lent-user rule above.
+
+A `user = "*"` clause leaves no single user to lend, so on an instance holding
+one, every call to that provider that carries no user is refused, reads
+included: the instance's own calls and nested calls for userless requests. An
+instance that serves any calling user through such a clause cannot also read
+on its own account from that provider. Split the roles: put the own-account
+reads in an instance of a class that provides nothing (two instances of one
+providing class are refused), or name the one user in every clause for the
+provider, which admits stamped calls for that user only.
+
 ```
 agent PersonalAssistant {
   container = "sandbox";
@@ -556,10 +575,13 @@ request rules are those of *The OAuth tools*. What differs:
   key by testing the deployment. Brenn does not inspect the answer: a provider
   that quotes request headers in its own error bodies would return the key to
   the caller.
-- **A WASM component only reads.** A caller with no acting user is admitted
-  with `GET` and `HEAD` only, as with a lent OAuth credential. A component's
-  call can be replayed from its channel window, and a replayed write is the
-  wrong thing whatever the credential. No `user` is named or lent.
+- **A WASM component only reads, on its own account.** A caller with no acting
+  user is admitted with `GET` and `HEAD` only, as with a lent OAuth credential.
+  A component's call can be replayed from its channel window, and a replayed
+  write is the wrong thing whatever the credential. No `user` is named or lent.
+  A nested call a provider makes for a request whose caller had a user
+  carries that user and may use any method its clause admits, as on OAuth;
+  one made for a userless request only reads (see *The OAuth tools*).
 - **Grants are admitted as for OAuth.** An `api-request` grant is still
   refused on a `multiuser` app and on an app with no `container`, even when it
   names only key providers. A bare agent that can read the host could read the
@@ -1241,7 +1263,16 @@ a reserved input port named `tool-requests`:
 
 A provider answers each request through the `provides` interface and may act
 for the calling user only on a request it is serving; its instance names no
-inbox and no user.
+inbox and no user. A nested `api-request` made for a request it serves is the
+calling user's call when that request's caller had a user (see *The OAuth
+tools*, which gives the rule and its limits). What the host guarantees about a
+provider, and the limits beside it, are in `docs/security-posture.md` §8.4.
+
+A `tool` statement naming a provided tool is admitted as an `api-request`
+grant is. It is refused at boot and on reload on a `multiuser` agent and on an
+agent with no `container`, and admitted on a component. The host cannot tell
+whether a provider acts for its caller's user, so every provided tool is taken
+to, including one that touches no credential.
 
 ### Surfaces
 
@@ -2057,9 +2088,10 @@ For provided tools, `config-check` sees every rule of the `provide` statement
 and the request inbox port, including the schema's shape, the summed
 concurrency ceiling, and a provided `mcp_name` equal to a core or repo virtual
 tool's name. It cannot see a collision with a native registry tool's name or
-with an integration's virtual tool name, nor an agent's `tool` statement naming
-a tool no class provides: those are registry and agent-list facts, refused when
-the server boots.
+with an integration's virtual tool name, an agent's `tool` statement naming a
+tool no class provides, nor a provided tool granted to a `multiuser` or
+container-less agent: those are registry and agent-list facts, refused when the
+server boots.
 
 A document that passes comes back with its identity:
 `<root>: ok document_sha256=<hash>`. The hash is over every file the compile

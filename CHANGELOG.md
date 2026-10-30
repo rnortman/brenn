@@ -38,6 +38,16 @@ All notable changes to Brenn are documented here.
   component's own tool grants. A configuration that declares a providing
   instance now boots.
 
+- Component-provided tools are now documented for operators. The security
+  posture (`docs/security-posture.md`) has a new section on the `provides`
+  grant, covering who admits a call, which user a component acts for, the
+  four-minute limit and the known limits. `docs/config-dsl.md` spells out
+  what this means for configuration. A grant of a provided tool is refused
+  on `multiuser` and container-less agents. When a component serving a
+  user's call calls `api-request`, it acts as that user and may write
+  within its grant. A component calling on its own account still only
+  reads.
+
 - **WASM components can import a new `provides` interface** (granted by
   the new `provides` grant word), the first step toward components that
   serve tools to the assistant and to other components. It lets a

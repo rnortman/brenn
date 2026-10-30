@@ -2394,9 +2394,12 @@ channel scratch at "ephemeral:scratch" {{
         /// consumer, whose roots are read only by the cross-root scan prepare
         /// re-runs.
         pub(crate) components_roots: Vec<PathBuf>,
-        /// The tool registry, for the documents whose consumers hold async tool
-        /// grants; absent mints an empty one.
-        pub(crate) tool_registry: Option<Arc<brenn_tool_registry::ToolRegistry>>,
+        /// The native tools of the registry, for the documents whose consumers
+        /// hold async tool grants. The registry is built over them, the
+        /// document's provided tools and the rig's one provider runtime, and
+        /// its grants validated against the resolved apps, as `run_server`
+        /// does.
+        pub(crate) native_tools: Vec<brenn_tool_registry::RegisteredTool>,
         /// A deployed surface asset tree to declare as one more mount, in the
         /// shape a release installs: the kernel pair at its root and one
         /// `processor/<kind>/` directory per kind it serves.
@@ -2443,7 +2446,7 @@ channel scratch at "ephemeral:scratch" {{
         let BootFixture {
             db,
             components_roots,
-            tool_registry,
+            native_tools,
             surface_assets,
             surface_bundle,
             mqtt_live,
@@ -2462,14 +2465,23 @@ channel scratch at "ephemeral:scratch" {{
         let loaded_mounts = mounts.load();
         let components_roots = loaded_mounts.roots.components_roots.clone();
         let db = db.unwrap_or_else(init_db_memory);
-        let tool_registry = tool_registry
-            .unwrap_or_else(|| Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])));
         let document = check_config(&deployment_inputs(&tree.root(), &loaded_mounts.roots))
             .expect("the fixture document must load");
         // Resolved by the same function boot and reload call, so the
         // document and the map cannot disagree.
         let runtime_dir = tree.runtime_dir();
         let apps = Arc::new(resolve_fixture_apps(&document.config, &runtime_dir));
+        let (alert_dispatcher, captured, _drain) = make_capturing_alerter_with_severity();
+        // One runtime serves the registry's provided tools and the providers'
+        // hosts, as at boot; its messenger is attached once messaging is up.
+        let provider_runtime = brenn_tool_registry::ProviderRuntime::new(alert_dispatcher.clone());
+        let tool_registry = Arc::new(crate::build_tool_registry(
+            native_tools,
+            &document.config.wasm_consumers,
+            &apps,
+            &provider_runtime,
+        ));
+        tool_registry.validate_config(&apps);
         // What boot writes for every agent, so the file the reload renames onto
         // has a predecessor and a fresh boot of the same rig produces its own.
         // Without it the oracle's virtual-tools field would compare a file the
@@ -2477,8 +2489,6 @@ channel scratch at "ephemeral:scratch" {{
         for app in apps.values() {
             brenn_server::active_bridge::write_virtual_tools_file(app, &tool_registry);
         }
-        let (alert_dispatcher, captured, _drain) = make_capturing_alerter_with_severity();
-        let provider_runtime = brenn_tool_registry::ProviderRuntime::new(alert_dispatcher.clone());
 
         // One registry for the whole rig: the reload's session steps, the wake
         // router and a case that seats a session all read the same one.
@@ -2495,6 +2505,7 @@ channel scratch at "ephemeral:scratch" {{
         .await
         .0;
         let messenger = result.messenger.clone().expect("messaging must be up");
+        provider_runtime.attach(messenger.clone());
         let router = result.router.clone().expect("the wake router must be up");
         // The delivery bindings boot registers for everything that is not a
         // consumer. Without them the cross-check commit runs at the end of its
@@ -5935,10 +5946,10 @@ channel extra at "brenn:extra" {
         assert_eq!(outcomes[1].outcome, Outcome::Unchanged);
     }
 
-    /// A registry holding one async tool `apull` (acl key `repo`), which is
-    /// what makes a consumer's `tool` grant resolvable and mints the executor
-    /// and its request channel.
-    pub(crate) fn async_tool_registry() -> Arc<brenn_tool_registry::ToolRegistry> {
+    /// The stub async tool `apull` (acl key `repo`), which is what makes a
+    /// consumer's `tool` grant resolvable and mints the executor and its
+    /// request channel.
+    pub(crate) fn async_pull_tool() -> brenn_tool_registry::RegisteredTool {
         use brenn_tool_registry::ToolError;
         use brenn_tool_registry::descriptor::{AclDenied, Idempotency, ToolClass, ToolDescriptor};
         use brenn_tool_registry::tool::{AsyncTool, RegisteredTool, ToolCtx};
@@ -5961,19 +5972,17 @@ channel extra at "brenn:extra" {
                 Ok(json!({}))
             }
         }
-        Arc::new(brenn_tool_registry::ToolRegistry::new(vec![
-            RegisteredTool::Async(Arc::new(APull(ToolDescriptor {
-                name: "apull",
-                mcp_name: "mcp__brenn__APull",
-                description: "stub async",
-                input_schema: json!({ "type": "object" }),
-                class: ToolClass::Async { max_concurrency: 4 },
-                acl_keys: &["repo"],
-                idempotency: Idempotency::Natural,
-                auto_approve: true,
-                user_binding: brenn_tool_registry::UserBinding::None,
-            }))),
-        ]))
+        RegisteredTool::Async(Arc::new(APull(ToolDescriptor {
+            name: "apull",
+            mcp_name: "mcp__brenn__APull",
+            description: "stub async",
+            input_schema: json!({ "type": "object" }),
+            class: ToolClass::Async { max_concurrency: 4 },
+            acl_keys: &["repo"],
+            idempotency: Idempotency::Natural,
+            auto_approve: true,
+            user_binding: brenn_tool_registry::UserBinding::None,
+        })))
     }
 
     /// A document whose `sifter` holds an async grant on that tool, narrowed to
@@ -6045,7 +6054,7 @@ new grinder: Demo {
             &tree,
             BootFixture {
                 components_roots: roots,
-                tool_registry: Some(async_tool_registry()),
+                native_tools: vec![async_pull_tool()],
                 ..BootFixture::default()
             },
         )

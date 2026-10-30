@@ -60,6 +60,9 @@ pub(crate) mod webhook;
 #[cfg(test)]
 mod oracle_tests;
 
+#[cfg(test)]
+mod provided_tools_tests;
+
 /// Reload's MQTT convergence against a real broker. Filtered out of the
 /// hermetic test target and run by one that spawns `mosquitto`.
 #[cfg(test)]

@@ -98,6 +98,9 @@ rust_test(
         # package name, which is what makes the record comparison the only
         # thing that can see the change.
         "//brenn-wasm:fixture_processor_dual",
+        # The provided-tool boot-path case installs the provider fixture as a
+        # providing class's package.
+        "//brenn-wasm:fixture_processor_provider_test",
         "//brenn-wasm:fixture_replay",
         # The bumped-replay-package case installs a second replay artifact
         # under one package name, which is what makes the release comparison
