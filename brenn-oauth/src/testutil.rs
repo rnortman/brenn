@@ -231,6 +231,7 @@ pub fn tool_ctx(
         },
         acting_conversation_id: Some(7),
         acting_user: user,
+        deadline: None,
     }
 }
 

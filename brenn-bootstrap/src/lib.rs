@@ -552,6 +552,11 @@ pub async fn run_server(
             guard.alert_dispatcher.clone(),
         ))
     });
+    // The process's pending provided-tool calls, shared by the registry's
+    // provided tools, their providers' hosts and the executor. Its messenger is
+    // attached once messaging is built.
+    let provider_runtime =
+        brenn_tool_registry::ProviderRuntime::new(guard.alert_dispatcher.clone());
     let tool_registry_core: std::sync::Arc<brenn_tool_registry::ToolRegistry> = {
         let git_repo_pull = brenn_tool_registry::GitRepoPullTool::new(
             repo_sync_result.clones.clone(),
@@ -693,6 +698,9 @@ pub async fn run_server(
         brenn_surface_server::log_surface_error_advisory(&advisory);
     }
     let messenger = messaging_result.messenger.as_ref();
+    if let Some(messenger) = messenger {
+        provider_runtime.attach(messenger.clone());
+    }
 
     // Unconditional: a broken install is refused independently of what today's
     // config touches, and the kind → root map it returns is what the router
@@ -1133,6 +1141,7 @@ pub async fn run_server(
                     messenger.clone(),
                     state.tools.clone(),
                     caller_grants,
+                    provider_runtime.clone(),
                     state.alert_dispatcher.clone(),
                     notify,
                 )

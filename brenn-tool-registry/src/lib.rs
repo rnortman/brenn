@@ -7,7 +7,8 @@
 //! (`descriptor`, `tool`), the built-once table plus config validation
 //! (`registry`), per-`(participant, tool)` throttling (`rate_limit`), the
 //! async execution loop over the message bus (`executor`, `bus_wiring`), the
-//! WASM caller path (`wasm_host`), and the one concrete tool that needs git
+//! WASM caller path (`wasm_host`), tools a WASM instance provides
+//! (`provided`), and the one concrete tool that needs git
 //! (`git_repo_pull`).
 //!
 //! Config parsing/resolution and the ACL-matching primitive live in
@@ -18,6 +19,7 @@ pub mod bus_wiring;
 pub mod descriptor;
 pub mod executor;
 pub mod git_repo_pull;
+pub mod provided;
 pub mod rate_limit;
 pub mod registry;
 pub mod tool;
@@ -30,10 +32,11 @@ pub mod testutil;
 pub use descriptor::{
     AclDenied, DEFAULT_FAST_BUDGET, ENVELOPE_MARGIN, Idempotency, MAX_ARGS_BYTES,
     MAX_ASYNC_RESULT_BYTES, MAX_FAST_BUDGET, MAX_FAST_CALLS_PER_ACTIVATION, MAX_FAST_RESULT_BYTES,
-    ToolClass, ToolDescriptor, ToolError, UserBinding,
+    PROVIDED_TOOL_CEILING, ToolClass, ToolDescriptor, ToolError, UserBinding,
 };
 pub use executor::{CallerGrantTable, TOOL_EXECUTOR_COMPONENT, ToolCallerGrants, ToolExecutor};
 pub use git_repo_pull::GitRepoPullTool;
+pub use provided::{CompleteError, PendingGuard, PendingId, ProvidedTool, ProviderRuntime};
 pub use rate_limit::RateLimiter;
 pub use registry::{GrantOwner, ToolRegistry};
 pub use tool::{ActingUser, AsyncTool, FastTool, RegisteredTool, ToolCtx};

@@ -23,9 +23,9 @@ pub struct ActingUser {
 }
 
 /// Per-invocation context handed to a tool's `execute`. Carries the caller
-/// principal, the resolved grant admitting the call, and — for conversation
-/// callers only — the acting conversation id (feeds `SyncTrigger::Push`
-/// self-notification suppression) and the acting user.
+/// principal, the resolved grant admitting the call, the acting conversation id
+/// (conversation callers only; feeds `SyncTrigger::Push` self-notification
+/// suppression), the acting user, and the call's deadline when it has one.
 pub struct ToolCtx {
     /// The principal invoking the tool (`wasm:<slug>`, `app:<slug>@<server>`,
     /// or the executor for bus-originated calls).
@@ -36,8 +36,14 @@ pub struct ToolCtx {
     /// calls, which pass no self-notification suppression.
     pub acting_conversation_id: Option<i64>,
     /// The human on whose behalf this call runs: the conversation's owner for
-    /// a conversation-originated call; `None` for a component or bus caller.
+    /// a conversation-originated call; for a provider's nested call, the user
+    /// of the pending call it serves; `None` for any other component or bus
+    /// caller.
     pub acting_user: Option<ActingUser>,
+    /// The instant by which a provided tool's call must be answered, set by
+    /// the call site that admitted it and covering admission as well as
+    /// execution. `None` for a native tool, which ignores it.
+    pub deadline: Option<tokio::time::Instant>,
 }
 
 impl ToolCtx {

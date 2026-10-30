@@ -2,11 +2,13 @@
 //! `AsyncTool` publishes, plus the shared caps and error type both projections
 //! (LLM adapter and WASM host) map onto.
 //!
-//! A descriptor is code, not config: the operator grants a tool by name in
-//! `[[*.tool_grant]]`, and the descriptor here is what the registry validates
-//! those grants against (canonical name, MCP name, ACL keys). The class field
-//! is the mechanical backbone of the fast/async split — a tool declares its
-//! class, the caller never chooses.
+//! A native tool's descriptor is code; a provided tool's is a component class's
+//! specification, read once at boot and fixed for the process. The registry
+//! treats both alike: the operator grants a tool by name in
+//! `[[*.tool_grant]]`, and the descriptor is what the registry validates those
+//! grants against (canonical name, MCP name, ACL keys). The class field is the
+//! mechanical backbone of the fast/async split — a tool declares its class, the
+//! caller never chooses.
 
 use std::time::Duration;
 
@@ -33,6 +35,13 @@ pub const MAX_ASYNC_RESULT_BYTES: usize = 512 * 1024;
 // An OAuth provider's response body limit is refused above this cap at boot;
 // the config layer holds its own copy because it cannot depend on this crate.
 const _: () = assert!(brenn_lib::config::MAX_RESPONSE_BYTES_CEILING == MAX_ASYNC_RESULT_BYTES);
+
+/// The most time a call to a provided tool may take, admission included: from
+/// the instant its call site admits it to its answer. Inside the 300 s
+/// PostToolUse hook and CLI windows with margin for the publish and the hook's
+/// own overhead, and above one worst-case `api-request` (refresh, call,
+/// refresh, resend).
+pub const PROVIDED_TOOL_CEILING: Duration = Duration::from_secs(240);
 
 /// Bytes reserved for the executor's result envelope (`v`, `tool`, `call_id`,
 /// `outcome.ok`) around a tool's serialized value. A tool that bounds its own

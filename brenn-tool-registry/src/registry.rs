@@ -7,7 +7,7 @@
 //! a grant naming an unknown tool/ACL key are all operator/wiring bugs that must
 //! stop startup, never degrade at runtime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,9 +19,16 @@ use indexmap::IndexMap;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
-use super::descriptor::{Idempotency, MAX_FAST_BUDGET, ToolClass, ToolError, UserBinding};
+use super::descriptor::{
+    Idempotency, MAX_FAST_BUDGET, PROVIDED_TOOL_CEILING, ToolClass, ToolError, UserBinding,
+};
+use super::provided::ProvidedTool;
 use super::rate_limit::RateLimiter;
-use super::tool::{ActingUser, RegisteredTool, ToolCtx};
+use super::tool::{ActingUser, AsyncTool, RegisteredTool, ToolCtx};
+
+/// The `internal` detail of a provided tool's call whose ceiling passed while
+/// it waited for admission ([`ToolRegistry::admit_async_by`]).
+pub const PROVIDED_ADMISSION_CEILING_DETAIL: &str = "provider ceiling reached before admission";
 
 /// The participant whose grants are being validated, carrying the facts the
 /// user-binding refusals depend on.
@@ -36,7 +43,8 @@ pub enum GrantOwner<'a> {
         /// The agent runs in a container rather than as Brenn's uid.
         has_container: bool,
     },
-    /// A WASM consumer. Its calls carry no acting user.
+    /// A WASM consumer. Its calls carry no acting user unless the executor
+    /// stamps one from a pending provided-tool call it serves.
     WasmConsumer { slug: &'a str },
 }
 
@@ -102,6 +110,9 @@ pub struct ToolRegistry {
     /// Per-async-tool global concurrency bound; `execute` acquires a permit on
     /// every path (executor and LLM).
     semaphores: HashMap<&'static str, Arc<Semaphore>>,
+    /// Canonical names of the tools a WASM instance provides. Their calls carry
+    /// a deadline from admission on.
+    provided: HashSet<&'static str>,
     /// Shared per-`(participant, tool)` rate limiter.
     rate_limiter: RateLimiter,
 }
@@ -118,6 +129,57 @@ impl ToolRegistry {
     /// tool whose declared budget exceeds `MAX_FAST_BUDGET`; or an async tool
     /// with `max_concurrency == 0`.
     pub fn new(tools: Vec<RegisteredTool>) -> Self {
+        Self::with_provided(tools, Vec::new())
+    }
+
+    /// Build the registry from native tools and the tools WASM instances
+    /// provide, natives first.
+    ///
+    /// # Panics
+    ///
+    /// As [`ToolRegistry::new`]; a provided tool whose name or MCP name is
+    /// already taken panics naming both sources.
+    pub fn with_provided(native: Vec<RegisteredTool>, provided: Vec<Arc<ProvidedTool>>) -> Self {
+        // Who holds each name and each MCP name so far, so a provided tool's
+        // collision names both sides. `None` is a native tool.
+        let mut names: HashMap<&'static str, Option<&str>> = HashMap::new();
+        let mut mcp_names: HashMap<&'static str, Option<&str>> = HashMap::new();
+        for tool in &native {
+            let desc = tool.descriptor();
+            names.insert(desc.name, None);
+            mcp_names.insert(desc.mcp_name, None);
+        }
+        let mut provided_names = HashSet::new();
+        for tool in &provided {
+            let desc = tool.descriptor();
+            let slug = tool.instance();
+            for (what, key, held) in [
+                ("tool", desc.name, &mut names),
+                ("tool mcp_name", desc.mcp_name, &mut mcp_names),
+            ] {
+                match held.insert(key, Some(slug)) {
+                    None => {}
+                    Some(None) => panic!(
+                        "{what} {key:?} is provided by [[wasm_consumer]] {slug:?} and registered \
+                         natively"
+                    ),
+                    Some(Some(other)) => panic!(
+                        "{what} {key:?} is provided by [[wasm_consumer]] {other:?} and by {slug:?}"
+                    ),
+                }
+            }
+            provided_names.insert(desc.name);
+        }
+
+        let tools = native
+            .into_iter()
+            .chain(provided.into_iter().map(|t| RegisteredTool::Async(t as _)));
+        let mut registry = Self::build(tools);
+        registry.provided = provided_names;
+        registry
+    }
+
+    fn build(tools: impl Iterator<Item = RegisteredTool>) -> Self {
         let mut map: HashMap<&'static str, RegisteredTool> = HashMap::new();
         let mut by_mcp_name: HashMap<&'static str, &'static str> = HashMap::new();
         let mut semaphores: HashMap<&'static str, Arc<Semaphore>> = HashMap::new();
@@ -178,8 +240,14 @@ impl ToolRegistry {
             tools: map,
             by_mcp_name,
             semaphores,
+            provided: HashSet::new(),
             rate_limiter: RateLimiter::default(),
         }
+    }
+
+    /// Whether `name` is a tool a WASM instance provides.
+    pub fn is_provided(&self, name: &str) -> bool {
+        self.provided.contains(name)
     }
 
     /// Look up a tool by its canonical name.
@@ -386,6 +454,36 @@ impl ToolRegistry {
             .expect("tool concurrency semaphore never closed")
     }
 
+    /// [`ToolRegistry::admit_async`] bounded by `deadline`, the admission rule
+    /// of a provided tool's call: when the deadline passes first it logs and
+    /// answers `Internal(`[`PROVIDED_ADMISSION_CEILING_DETAIL`]`)`, so the call
+    /// is never handed to its provider. A cancelled admission keeps its
+    /// rate-limit reservation (over-counting against the caller's own budget,
+    /// never under) and gives up its place in the semaphore queue.
+    pub async fn admit_async_by(
+        &self,
+        deadline: tokio::time::Instant,
+        caller: &str,
+        name: &str,
+        rate_limit: Option<ResolvedRateLimit>,
+        alert: &AlertDispatcher,
+    ) -> Result<OwnedSemaphorePermit, ToolError> {
+        match tokio::time::timeout_at(deadline, self.admit_async(caller, name, rate_limit, alert))
+            .await
+        {
+            Ok(permit) => Ok(permit),
+            Err(_elapsed) => {
+                warn!(
+                    tool = %name, %caller,
+                    "provided tool call reached its ceiling waiting for admission; answered internal",
+                );
+                Err(ToolError::Internal(
+                    PROVIDED_ADMISSION_CEILING_DETAIL.to_string(),
+                ))
+            }
+        }
+    }
+
     /// Invoke a tool directly for the LLM path (the PostToolUse adapter).
     ///
     /// This is the hook-driven request/response bridge: async tools are awaited
@@ -415,11 +513,12 @@ impl ToolRegistry {
             .clone();
         let name = tool.descriptor().name;
         let rate_limit = grant.rate_limit;
-        let ctx = ToolCtx {
+        let mut ctx = ToolCtx {
             caller,
             grant: grant.clone(),
             acting_conversation_id,
             acting_user,
+            deadline: None,
         };
 
         let invoke_started = Instant::now();
@@ -432,6 +531,20 @@ impl ToolRegistry {
             RegisteredTool::Async(t) => {
                 if let Err(denied) = t.check_acl(&args, &grant.acl) {
                     Err(denied.into())
+                } else if self.is_provided(name) {
+                    // A provided tool: one deadline from here bounds admission
+                    // and the provider's answer together, so a call parked
+                    // behind a busy permit is answered inside the ceiling and
+                    // never handed to its provider late.
+                    let deadline = tokio::time::Instant::now() + PROVIDED_TOOL_CEILING;
+                    ctx.deadline = Some(deadline);
+                    match self
+                        .admit_async_by(deadline, ctx.caller.as_str(), name, rate_limit, alert)
+                        .await
+                    {
+                        Ok(_permit) => t.execute(&ctx, args).await,
+                        Err(e) => Err(e),
+                    }
                 } else {
                     // Async class: delay-not-drop rate admission then the tool's
                     // global concurrency permit — the shared guard. The 300s
@@ -1153,5 +1266,229 @@ mod tests {
                 &alert,
             )
             .await;
+    }
+
+    // --- provided tools ---
+
+    use crate::provided::tests::{PROVIDER, decl, messenger, published_id, requests};
+    use crate::provided::{ProvidedTool, ProviderRuntime};
+
+    fn provided(
+        slug: &str,
+        decl: &brenn_lib::messaging::config::ProvidedToolDecl,
+    ) -> Arc<ProvidedTool> {
+        let (alert, _drain) = brenn_obs::alerting::noop_alert_dispatcher();
+        Arc::new(ProvidedTool::new(slug, decl, ProviderRuntime::new(alert)))
+    }
+
+    fn renamed(name: &str, mcp_name: &str) -> brenn_lib::messaging::config::ProvidedToolDecl {
+        brenn_lib::messaging::config::ProvidedToolDecl {
+            name: name.to_string(),
+            mcp_name: mcp_name.to_string(),
+            ..decl(1)
+        }
+    }
+
+    /// Provided tools sit beside the native ones, async-class with their
+    /// declared concurrency, and only they are marked provided.
+    #[tokio::test]
+    async fn provided_tools_register_beside_native_ones() {
+        let reg = ToolRegistry::with_provided(
+            vec![fast("stub", "mcp__brenn__Stub", &["repo"])],
+            vec![provided(PROVIDER, &decl(2))],
+        );
+        assert!(reg.is_provided("echo-for-user"));
+        assert!(!reg.is_provided("stub"));
+        assert!(!reg.is_provided("absent"));
+        assert!(matches!(
+            reg.get_by_mcp_name("mcp__brenn__EchoForUser"),
+            Some(RegisteredTool::Async(_))
+        ));
+        assert_eq!(
+            reg.concurrency("echo-for-user")
+                .unwrap()
+                .available_permits(),
+            2
+        );
+        assert_eq!(reg.async_tool_names(), vec!["echo-for-user"]);
+        assert!(!ToolRegistry::new(vec![]).is_provided("echo-for-user"));
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "tool \"stub\" is provided by [[wasm_consumer]] \"prov\" and registered natively"
+    )]
+    async fn a_provided_tool_taking_a_native_name_panics_naming_both() {
+        ToolRegistry::with_provided(
+            vec![fast("stub", "mcp__brenn__Stub", &[])],
+            vec![provided(PROVIDER, &renamed("stub", "Other"))],
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "tool mcp_name \"mcp__brenn__Stub\" is provided by [[wasm_consumer]] \"prov\" \
+                    and registered natively"
+    )]
+    async fn a_provided_tool_taking_a_native_mcp_name_panics_naming_both() {
+        ToolRegistry::with_provided(
+            vec![fast("stub", "mcp__brenn__Stub", &[])],
+            vec![provided(PROVIDER, &renamed("other", "Stub"))],
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "tool \"echo-for-user\" is provided by [[wasm_consumer]] \"gmail\" and by \
+                    \"calendar\""
+    )]
+    async fn two_providers_of_one_name_panic_naming_both() {
+        ToolRegistry::with_provided(
+            vec![],
+            vec![
+                provided("gmail", &decl(1)),
+                provided("calendar", &renamed("echo-for-user", "Other")),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "tool mcp_name \"mcp__brenn__EchoForUser\" is provided by [[wasm_consumer]] \
+                    \"gmail\" and by \"calendar\""
+    )]
+    async fn two_providers_of_one_mcp_name_panic_naming_both() {
+        ToolRegistry::with_provided(
+            vec![],
+            vec![
+                provided("gmail", &decl(1)),
+                provided("calendar", &renamed("other", "EchoForUser")),
+            ],
+        );
+    }
+
+    /// The LLM path stamps a provided call with a deadline, hands it to the
+    /// provider and returns the provider's answer, holding the tool's permit
+    /// for the whole wait.
+    #[tokio::test]
+    async fn invoke_for_llm_runs_a_provided_tool_to_its_answer() {
+        let (alert, _drain) = brenn_obs::alerting::noop_alert_dispatcher();
+        let runtime = ProviderRuntime::new(alert.clone());
+        let messenger = messenger().await;
+        runtime.attach(messenger.clone());
+        let reg = Arc::new(ToolRegistry::with_provided(
+            vec![],
+            vec![Arc::new(ProvidedTool::new(
+                PROVIDER,
+                &decl(1),
+                runtime.clone(),
+            ))],
+        ));
+
+        let call = tokio::spawn({
+            let reg = reg.clone();
+            let alert = alert.clone();
+            async move {
+                reg.invoke_for_llm(
+                    "mcp__brenn__EchoForUser",
+                    caller(),
+                    grant(vec![]),
+                    Some(3),
+                    None,
+                    json!({ "q": "x" }),
+                    &alert,
+                )
+                .await
+            }
+        });
+        let id = published_id(&messenger).await;
+        assert_eq!(
+            reg.concurrency("echo-for-user")
+                .unwrap()
+                .available_permits(),
+            0,
+            "the permit is held across the provider's wait"
+        );
+        runtime
+            .complete(PROVIDER, &id, Ok(json!({ "echoed": "x" })))
+            .unwrap();
+        assert_eq!(call.await.unwrap(), Ok(json!({ "echoed": "x" })));
+        assert_eq!(
+            reg.concurrency("echo-for-user")
+                .unwrap()
+                .available_permits(),
+            1
+        );
+    }
+
+    /// A call parked behind a busy permit is answered inside the ceiling and
+    /// never handed to its provider: admission and the provider's wait share
+    /// one deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_provided_call_parked_past_the_ceiling_is_answered_without_a_request() {
+        let (alert, _drain) = brenn_obs::alerting::noop_alert_dispatcher();
+        let runtime = ProviderRuntime::new(alert.clone());
+        let messenger = messenger().await;
+        runtime.attach(messenger.clone());
+        let reg = ToolRegistry::with_provided(
+            vec![],
+            vec![Arc::new(ProvidedTool::new(PROVIDER, &decl(1), runtime))],
+        );
+        let _held = reg
+            .concurrency("echo-for-user")
+            .unwrap()
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let out = reg
+            .invoke_for_llm(
+                "mcp__brenn__EchoForUser",
+                caller(),
+                grant(vec![]),
+                Some(3),
+                None,
+                json!({}),
+                &alert,
+            )
+            .await;
+        assert_eq!(
+            out,
+            Err(ToolError::Internal(
+                PROVIDED_ADMISSION_CEILING_DETAIL.to_string()
+            ))
+        );
+        assert_eq!(started.elapsed(), PROVIDED_TOOL_CEILING);
+        assert!(
+            requests(&messenger).await.is_empty(),
+            "nothing was published"
+        );
+    }
+
+    /// `admit_async_by` gives up at its deadline and admits before it.
+    #[tokio::test(start_paused = true)]
+    async fn admit_async_by_is_bounded_by_its_deadline() {
+        let (alert, _drain) = brenn_obs::alerting::noop_alert_dispatcher();
+        let reg = ToolRegistry::with_provided(vec![], vec![provided(PROVIDER, &decl(1))]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let first = reg
+            .admit_async_by(deadline, "c", "echo-for-user", None, &alert)
+            .await
+            .expect("a free permit admits");
+        assert!(matches!(
+            reg.admit_async_by(deadline, "c", "echo-for-user", None, &alert)
+                .await,
+            Err(ToolError::Internal(detail)) if detail == PROVIDED_ADMISSION_CEILING_DETAIL
+        ));
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        drop(first);
+        let later = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert!(
+            reg.admit_async_by(later, "c", "echo-for-user", None, &alert)
+                .await
+                .is_ok()
+        );
     }
 }

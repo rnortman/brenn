@@ -271,6 +271,7 @@ mod tests {
             },
             acting_conversation_id: acting,
             acting_user: None,
+            deadline: None,
         }
     }
 

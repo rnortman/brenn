@@ -193,6 +193,7 @@ mod tests {
             },
             acting_conversation_id: Some(7),
             acting_user: user,
+            deadline: None,
         }
     }
 

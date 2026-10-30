@@ -6,6 +6,11 @@
 //! — a crate that only needs a tool's *name* takes an edge to this leaf module
 //! rather than to the subsystem that implements it.
 
+/// MCP-server prefix CC prepends to every noop-server tool name. The
+/// virtual-tools file lists the short (unprefixed) names; a descriptor's
+/// `mcp_name` is the full `mcp__brenn__<Short>` form.
+pub const MCP_BRENN_PREFIX: &str = "mcp__brenn__";
+
 /// MCP tool name for the usage observability export tool.
 pub const MCP_EXPORT_USAGE_TOOL: &str = "mcp__brenn__ExportUsage";
 

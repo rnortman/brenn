@@ -92,6 +92,7 @@ impl ToolHost for WasmToolHost {
             grant,
             acting_conversation_id: None,
             acting_user: None,
+            deadline: None,
         };
         // `invoke_fast` emits the unified invocation log (tool, caller, class,
         // duration, outcome) on every path, so nothing is logged here.

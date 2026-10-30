@@ -27,7 +27,9 @@ brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
 brenn-wasm = { version = "0.1.0", path = "../brenn-wasm" }
 futures = "0.3.32"
+hex = "0.4.3"
 indexmap = "2"
+rand = "0.10"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.50.0", features = ["sync", "time", "macros", "rt"] }

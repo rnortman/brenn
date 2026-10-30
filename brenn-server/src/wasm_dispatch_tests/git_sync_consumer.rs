@@ -371,6 +371,7 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
         Arc::clone(&harness.messenger),
         registry,
         caller_grants,
+        brenn_tool_registry::ProviderRuntime::new(exec_alert.clone()),
         exec_alert,
         Arc::new(Notify::new()),
     );

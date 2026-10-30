@@ -9,7 +9,9 @@
 //! folds the returned `ChannelEntry`s and `ResolvedSubscription`s into the same
 //! finalize/rebuild path every other channel and subscription flows through.
 
-use brenn_envelope::addressing::{TOOL_RESULT_INPUT_PORT, TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE};
+use brenn_envelope::addressing::{
+    TOOL_REQUESTS_NAMESPACE, TOOL_RESULT_INPUT_PORT, TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE,
+};
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::acl::{AclSet, ChannelMatcher};
 use brenn_lib::access::{AppPolicy, GrantSet};
@@ -32,6 +34,11 @@ pub fn request_channel_name(tool: &str) -> String {
 /// Bare (prefix-less) channel name of a consumer's result inbox.
 pub fn result_inbox_name(slug: &str) -> String {
     format!("{TOOL_RESULTS_NAMESPACE}{slug}")
+}
+
+/// Bare (prefix-less) channel name of a providing consumer's request inbox.
+pub fn request_inbox_name(slug: &str) -> String {
+    format!("{TOOL_REQUESTS_NAMESPACE}{slug}")
 }
 
 /// The `brenn:tools/<tool>` request channel for one async tool. The
@@ -180,8 +187,9 @@ pub fn tool_executor_spec(
 }
 
 /// The bootstrap-built `system:tool-executor` policy: subscribe on every
-/// `brenn:tools/*` request channel (to receive requests) and publish on exactly
-/// `brenn:tool-results/*` (to deliver results) — nothing else. Built in code, not
+/// `brenn:tools/*` request channel (to receive requests), publish on
+/// `brenn:tool-results/*` (to deliver results) and on `brenn:tool-requests/*`
+/// (to hand a provided tool's call to its provider) — nothing else. Built in code, not
 /// config, because the executor is substrate, not an operator participant.
 pub fn tool_executor_system_policy() -> AppPolicy {
     let mut grants = GrantSet::default();
@@ -192,6 +200,8 @@ pub fn tool_executor_system_policy() -> AppPolicy {
         .push(ChannelMatcher::Prefix(TOOLS_NAMESPACE.to_string()));
     acls.brenn_publish
         .push(ChannelMatcher::Prefix(TOOL_RESULTS_NAMESPACE.to_string()));
+    acls.brenn_publish
+        .push(ChannelMatcher::Prefix(TOOL_REQUESTS_NAMESPACE.to_string()));
     AppPolicy {
         grants,
         acls,
@@ -322,14 +332,17 @@ mod tests {
     }
 
     #[test]
-    fn executor_policy_receives_requests_and_publishes_results_only() {
+    fn executor_policy_receives_requests_and_publishes_results_and_provider_requests_only() {
         let policy = tool_executor_system_policy();
         // Subscribe scope covers every request channel.
         assert!(policy.allows_channel_access("brenn:tools/apull"));
         assert!(policy.allows_channel_access("brenn:tools/git-repo-pull"));
-        // Publish scope is exactly the result inboxes.
+        // Publish scope is exactly the result inboxes and the providers'
+        // request inboxes.
         assert!(policy.allows_brenn_publish("tool-results/sync"));
+        assert!(policy.allows_brenn_publish("tool-requests/gmail"));
         assert!(!policy.allows_brenn_publish("tools/apull"));
+        assert!(!policy.allows_channel_access("brenn:tool-requests/gmail"));
     }
 
     #[test]

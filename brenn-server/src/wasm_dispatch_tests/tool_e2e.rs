@@ -336,6 +336,7 @@ async fn execute_and_read_result(
         Arc::clone(&harness.messenger),
         Arc::clone(registry),
         caller_grants,
+        brenn_tool_registry::ProviderRuntime::new(exec_alert.clone()),
         exec_alert,
         Arc::new(Notify::new()),
     );

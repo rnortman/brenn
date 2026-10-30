@@ -1,5 +1,5 @@
 {
-  "checksum": "464f5ab123d8a3da3d2e60795bba8229be048759f7746fe035ede930b52ebc44",
+  "checksum": "b6af398581ab703d82db11b555829acdab9c2ef1a49a9e2c8c6f5b13feb1741c",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -5862,8 +5862,16 @@
               "target": "futures"
             },
             {
+              "id": "hex 0.4.3",
+              "target": "hex"
+            },
+            {
               "id": "indexmap 2.14.0",
               "target": "indexmap"
+            },
+            {
+              "id": "rand 0.10.1",
+              "target": "rand"
             },
             {
               "id": "serde 1.0.228",

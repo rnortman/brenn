@@ -56,6 +56,13 @@ All notable changes to Brenn are documented here.
   `config-check` reports both. The `provide` statement is documented in
   `docs/config-dsl.md`.
 
+- Groundwork for component-provided tools, with no change yet for any
+  deployment: Brenn can now hand a call to a provided tool to the component
+  that serves it and wait up to four minutes for its answer, alerting once
+  if a provider runs out the clock. Tool calls a component makes while
+  serving such a call act for that call's user and end no later than it
+  does.
+
 - Bumped wasmtime from 48.0.7 to 48.0.8, clearing RUSTSEC-2026-0422,
   RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
 
