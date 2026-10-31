@@ -2117,7 +2117,7 @@ mod tests {
         let examples = provider_examples("docs/providers/google.md", "google", None);
         assert_eq!(
             examples.len(),
-            14,
+            11,
             "one example per endpoint the document covers"
         );
         for args in &examples {

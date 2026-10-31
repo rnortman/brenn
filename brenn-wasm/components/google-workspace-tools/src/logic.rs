@@ -2993,6 +2993,65 @@ mod tests {
         assert_eq!(s.calendar_host, "www.googleapis.com");
     }
 
+    /// The guide quotes, in its answer summary and in the assistant's
+    /// instructions, the two description sentences that say whose response
+    /// `self_response` and `organizer.self` carry; each quote must stay the
+    /// spec's words.
+    #[test]
+    fn the_google_workspace_guide_quotes_the_calendar_descriptions() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let read = |relative: &str| {
+            let path = root.join(relative);
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()))
+        };
+        let spec = read("config/specs/google-workspace-tools.brenn");
+        let description = |block: &str| -> String {
+            let opening = format!("provide {block} {{");
+            spec.lines()
+                .map(str::trim)
+                .skip_while(|line| *line != opening)
+                .find_map(|line| line.strip_prefix("description = \""))
+                .unwrap_or_else(|| panic!("the spec's {block} block has no description"))
+                .to_string()
+        };
+        // From the opening words to the delimiter, the delimiter kept when
+        // `keep` is set.
+        let quoted = |text: &str, opening: &str, delimiter: &str, keep: bool| -> String {
+            let start = text
+                .find(opening)
+                .unwrap_or_else(|| panic!("no {opening:?} in the description"));
+            let end = start
+                + text[start..]
+                    .find(delimiter)
+                    .unwrap_or_else(|| panic!("no {delimiter:?} after {opening:?}"));
+            let end = if keep { end + 1 } else { end };
+            text[start..end].to_string()
+        };
+        let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let guide = collapse(&read("docs/google-workspace.md"));
+        for sentence in [
+            quoted(
+                &description("calendar-events"),
+                "the answer to the invitation of the calendar read",
+                ")",
+                false,
+            ),
+            quoted(
+                &description("calendar-event"),
+                "The calendar read is the user on",
+                ". ",
+                true,
+            ),
+        ] {
+            assert_eq!(
+                guide.matches(&collapse(&sentence)).count(),
+                2,
+                "docs/google-workspace.md must quote {sentence:?} in section 5 and section 6"
+            );
+        }
+    }
+
     fn labels(args: Value) -> Result<ApiCall, String> {
         plan(Provided::GmailLabels, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);

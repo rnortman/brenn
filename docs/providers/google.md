@@ -2,9 +2,12 @@
 
 The `google-workspace-tools` component answers Gmail's labels, searches,
 messages and threads as the tools `GmailLabels`, `GmailSearch`, `GmailRead`
-and `GmailThread`. This document lists Gmail and Google Calendar endpoints
-those tools do not cover, each with one `api-request` call that reaches it
-through the `google` OAuth provider. The operator's setup is in
+and `GmailThread`, and Google Calendar's calendar list, events, single events
+and free/busy as `CalendarList`, `CalendarEvents`, `CalendarEvent` and
+`CalendarFreeBusy`. This document lists Gmail and Google Calendar endpoints
+those tools do not cover, and Calendar's events listing for a caller the
+tools do not serve, each with one `api-request` call that reaches it through
+the `google` OAuth provider. The operator's setup is in
 `docs/google-workspace.md`.
 
 Every example below is the argument object of one `api-request` call. Brenn
@@ -242,32 +245,21 @@ names a field the answer does not have is answered 400.
 
 Every Calendar call is on `www.googleapis.com`, under `/calendar/v3`. These
 need the account connected with a Calendar scope (`calendar_readonly` in the
-operator guide's block). A calendar id is `primary` for the user's own
-calendar, or an `id` from the calendar list; ids contain `@` and sometimes
-`#`, and go in the path as they are — Brenn encodes them.
+operator guide's block).
 
-### The calendar list
+### Calendars, events and free/busy
 
-The calendars the user has in their list: their own, shared and subscribed.
-Reference: `https://developers.google.com/workspace/calendar/api/v3/reference/calendarList/list`.
+The calendar list, a calendar's events in a window, one event and free/busy
+are answered by the component's tools — `CalendarList`, `CalendarEvents`,
+`CalendarEvent` and `CalendarFreeBusy` — which build the request, bound
+Google's answer and compact it. A conversation's assistant, or a component
+serving a conversation's request, uses them rather than `api-request` for
+those reads. The tools' descriptions state their arguments and answers, and
+`docs/google-workspace.md` section 5 summarises them. The tools serve only a
+caller with a user of its own; a component with a lent credential and no
+user behind the call reads events through `api-request`, below.
 
-```json
-{
-  "provider": "google",
-  "method": "GET",
-  "host": "www.googleapis.com",
-  "path": "/calendar/v3/users/me/calendarList",
-  "query": {
-    "fields": "items(id,summary,primary,accessRole,timeZone),nextPageToken",
-    "prettyPrint": "false"
-  }
-}
-```
-
-The answer is `{ items[], nextPageToken? }`; `accessRole` is `owner`,
-`writer`, `reader` or `freeBusyReader` (busy times only).
-
-### Events in a window
+### Events in a window, for a caller without a user
 
 A calendar's events between two times, recurring events expanded into their
 occurrences, in start order.
@@ -285,64 +277,19 @@ Reference: `https://developers.google.com/workspace/calendar/api/v3/reference/ev
     "singleEvents": "true",
     "orderBy": "startTime",
     "maxResults": "50",
-    "fields": "items(id,summary,start,end,location,status,attendees(email,responseStatus)),nextPageToken,timeZone",
+    "fields": "items(id,summary,start,end,location,status),nextPageToken,timeZone",
     "prettyPrint": "false"
   }
 }
 ```
 
-`timeMin` and `timeMax` are RFC 3339 times with an offset; an event is listed
-when it overlaps the window. `orderBy=startTime` needs `singleEvents=true`.
-`q` searches the events' text; `maxResults` is at most 2 500 (default 250).
-Each event's `start` and `end` are `{ dateTime, timeZone? }`, or
-`{ date }` for an all-day event.
-
-### One event
-
-One event by its `id` from a listing.
-Reference: `https://developers.google.com/workspace/calendar/api/v3/reference/events/get`.
-
-```json
-{
-  "provider": "google",
-  "method": "GET",
-  "host": "www.googleapis.com",
-  "path": "/calendar/v3/calendars/primary/events/<event id>",
-  "query": {
-    "prettyPrint": "false"
-  }
-}
-```
-
-The answer is the whole event: `summary`, `description`, `start`, `end`,
-`location`, `attendees`, `organizer`, `recurrence` (for a recurring event's
-master), `hangoutLink`, `conferenceData` and more. A `fields` mask keeps it
-small.
-
-### Free and busy
-
-The busy intervals of one or more calendars in a window, without the events.
-Reference: `https://developers.google.com/workspace/calendar/api/v3/reference/freebusy/query`.
-
-```json
-{
-  "provider": "google",
-  "method": "POST",
-  "host": "www.googleapis.com",
-  "path": "/calendar/v3/freeBusy",
-  "query": {
-    "prettyPrint": "false"
-  },
-  "body": "{\"timeMin\": \"2026-11-02T08:00:00Z\", \"timeMax\": \"2026-11-02T18:00:00Z\", \"items\": [{\"id\": \"primary\"}, {\"id\": \"alice@example.com\"}]}"
-}
-```
-
-This is a `POST` although it changes nothing, so it is admitted only for a
-call that carries a user — a conversation, or a component serving a
-conversation's request — and only by a clause naming `POST` and this path; a
-lent credential is read-only. The answer is
-`{ timeMin, timeMax, calendars: { <id>: { busy[]: { start, end }, errors? } } }`;
-a calendar the user cannot see answers `errors` instead of `busy`.
+A calendar id is `primary` for the lent user's own calendar, or an `id` from
+the calendar list; ids contain `@` and sometimes `#`, and go in the path as
+they are — Brenn encodes them. `timeMin` and `timeMax` are RFC 3339 times
+with an offset (`Z` is one); an event is listed when it overlaps the window.
+`orderBy=startTime` needs `singleEvents=true`. `q` searches the events'
+text; `maxResults` is at most 2 500 (default 250). Each event's `start` and
+`end` are `{ dateTime, timeZone? }`, or `{ date }` for an all-day event.
 
 ### Colors and settings
 

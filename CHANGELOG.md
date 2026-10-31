@@ -35,8 +35,9 @@ All notable changes to Brenn are documented here.
   The `google-workspace-tools` component gains `CalendarEvents`: the events
   on one calendar (`primary` unless named) between two RFC 3339 times,
   recurring events expanded, in start order, each with its id, title, start
-  and end as Google gives them, location, status, organizer and the user's
-  own response to the invitation; up to 50 to a page, with a text search. A
+  and end as Google gives them, location, status, organizer and the response
+  of the calendar read (the user's own on `primary`); up to 50 to a page,
+  with a text search. A
   window too large to read whole is refused, saying what to narrow.
   **Config change required:** the instance's `api-request` grant needs a
   `GET` clause for `/calendar/v3/calendars/*/events` on the Calendar host,
@@ -53,7 +54,10 @@ All notable changes to Brenn are documented here.
   `/calendar/v3/users/me/calendarList` on that host; the Google provider's
   `api_hosts` must include `https://www.googleapis.com`; and the assistant
   needs `tool calendar-list {}`. `docs/google-workspace.md` shows all four.
-  When Google refuses a Calendar call for a missing permission, the assistant
+  Each user's Google account must also be connected with the
+  `calendar_readonly` scope set: an account connected for Gmail alone is
+  refused by Google on every Calendar tool until it is reconnected. When
+  Google refuses a Calendar call for a missing permission, the assistant
   is now told to reconnect with the Calendar read scope rather than the Gmail
   one.
 
@@ -72,6 +76,14 @@ All notable changes to Brenn are documented here.
   passing fault on one of these reads, such as a dropped connection, is
   answered the same way and its reason names neither limit: asking again
   usually reads the message whole.
+
+- The Google Workspace operator guide (`docs/google-workspace.md`) now
+  covers the Calendar tools: connecting users with `calendar_readonly`, what
+  each answer holds, the assistant's instructions and Calendar setup and
+  troubleshooting steps. The raw `api-request` route is now documented for
+  writes, Gmail endpoints the tools do not cover, Calendar's colors and
+  settings, and automations that act without a user;
+  `docs/providers/google.md` drops the Calendar examples the tools replace.
 
 ## [0.30.1] — 2026-10-31
 

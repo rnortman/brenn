@@ -47,7 +47,10 @@ rust_test(
     ],
     compile_data = glob(["src/fixtures/*.json"]),
     crate_root = "src/logic.rs",
-    data = ["//docs:google-workspace.md"],
+    data = [
+        "//:config/specs/google-workspace-tools.brenn",
+        "//docs:google-workspace.md",
+    ],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": package_name()},
     proc_macro_deps = all_crate_deps(proc_macro = True),

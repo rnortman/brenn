@@ -36,7 +36,8 @@ decide whether `google_error` reads that reason — scope reasons `denied` with
 the hint, quota and service reasons `internal`, and which branch wins when the
 field is absent — or the mapping stays unconditional and the guide's "when a
 step fails" paragraph names the quota and "has not been used in project"
-messages as not scope problems.
+messages as not scope problems. Calendar answers 403 the same way for the
+Calendar API not enabled; the hint names the Calendar read scope.
 
 ## `errhandling-gmail-4xx-on-fixed-request-blamed-on-caller`
 
@@ -48,7 +49,9 @@ wrapper's or Google's fault, but reaches the model and the invocation log as
 caller error. Decide the rule across the Gmail tools — a per-step declaration
 of which statuses the caller's input can cause, or a coarser rule such as 404
 the caller's and 400 the wrapper's unless the step carries `q` or `page` — and
-apply it to every step.
+apply it to every step. Calendar's steps carry caller input in `from`, `to`,
+`q`, `page`, `calendar`, `id` and `calendars`; `CalendarList` carries only
+`page`.
 
 ## `provider-kit`
 
@@ -63,7 +66,13 @@ and `advance(state, outcome, settings)`), the argument helpers (`object`,
 `capped`, `integer`, `flag`), `NestedError`, `Failure`, `ErrorKind`, `cut`,
 `not_issued`, `result_summary`, `bounded`, `copy`, and the envelope-reading
 half of `read_api_result` (status, `truncated` with `bytes`, binary,
-redirect, non-JSON). Each further Gmail or Calendar tool adds to the copy, so
+redirect, non-JSON). The Workspace component's own step helpers stay with it
+when the core moves: `Unreadable` and `unreadable` (the rule for a cut or
+refused nested read), `Family` and its scope hint, `bounded`'s hint argument,
+`ApiCall::get` and `ApiCall::post_json`, and the Calendar bounds
+(`CALENDAR_ID_MAX_BYTES`, `EVENT_ID_MAX_BYTES`, `TIME_MAX_BYTES`,
+`LISTING_TEXT_MAX_BYTES`, `EVENT_TEXT_MAX_BYTES`, `SHORT_MAX_BYTES`). Each
+further Gmail or Calendar tool adds to the copy, so
 the extraction starts from a diff of the two components, not from this list.
 Both components decide some steps on the envelope itself before the step's
 logic runs: Maps pre-reads the raw outcome for a cut route answer
