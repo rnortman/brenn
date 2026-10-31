@@ -54,7 +54,9 @@ const GOOGLE_MESSAGE_MAX_BYTES: usize = 1000;
 /// date), the page's envelope at most 8 300 (a page token of
 /// `PAGE_MAX_BYTES` serializes to at most 8 206), and a page of 25 lines
 /// stays under `COMPACT_RESULT_CEILING` while each line's label names
-/// serialize to at most 1 715 bytes. A page past that answers `internal`.
+/// serialize to at most 1 715 bytes. A page past that answers `internal`. A
+/// listed message is a line or an `unavailable` entry, and an entry (an id and
+/// a reason cut to `GOOGLE_MESSAGE_MAX_BYTES`) serializes to at most 2 155.
 const HEADER_MAX_BYTES: usize = 1000;
 
 /// The most UTF-8 bytes of a recipient header's value (`To`, `Cc`, `Bcc`,
@@ -119,7 +121,7 @@ const MAX_CHARS_MIN: u64 = 200;
 const MAX_CHARS_MAX: u64 = 60_000;
 const MAX_CHARS_DEFAULT: u64 = 12_000;
 /// `GmailRead`'s second step: the message's structure, read when the full
-/// message was cut at the provider's read limit.
+/// message's read was cut at the provider's read limit or refused by the host.
 const STRUCTURE_STEP: u8 = 2;
 /// messages.get's structure mask: everything but `data`, the tree listed to
 /// the payload and three levels of parts below it.
@@ -140,6 +142,12 @@ const THREAD_SUBJECT: &str = "Subject";
 /// The headers a thread's messages carry, requested by repeating
 /// `metadataHeaders`.
 const THREAD_HEADERS: &[&str] = &["From", "To", "Cc", THREAD_SUBJECT, "Date"];
+/// `GmailThread`'s second step: the thread read again without `To` and `Cc`,
+/// when the first read was cut or refused.
+const THREAD_NARROW_STEP: u8 = 2;
+/// The headers the narrower thread read asks for: the recipient headers, which
+/// a wide thread is wide in, left out.
+const THREAD_NARROW_HEADERS: &[&str] = &["From", THREAD_SUBJECT, "Date"];
 /// `GmailThread`'s `max`: the range and the default.
 const THREAD_MAX_MIN: u64 = 1;
 const THREAD_MAX_MAX: u64 = 100;
@@ -629,7 +637,7 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
             let thread = ThreadArgs::parse(args)?;
             Ok(Call {
                 step: 1,
-                api: thread_call(&thread, settings),
+                api: thread_call(&thread, THREAD_HEADERS, settings),
             })
         }
         Provided::CalendarList => {
@@ -798,15 +806,15 @@ impl ThreadArgs {
     }
 }
 
-/// threads.get of one thread's messages' metadata: headers, labels and
+/// threads.get of one thread's messages' metadata: `headers`, labels and
 /// snippets, no bodies.
-fn thread_call(args: &ThreadArgs, settings: &Settings) -> ApiCall {
+fn thread_call(args: &ThreadArgs, headers: &[&str], settings: &Settings) -> ApiCall {
     ApiCall::get(
         settings,
         &settings.gmail_host,
         args.account.as_deref(),
         format!("{THREADS_PATH}/{}", args.id),
-        metadata_query(THREAD_FIELDS, THREAD_HEADERS),
+        metadata_query(THREAD_FIELDS, headers),
     )
 }
 
@@ -1060,16 +1068,20 @@ pub enum Answer {
     /// Google's answer was cut at the provider's read limit; the size as the
     /// messages state it (`<n> bytes`, or `of unstated length`).
     Truncated(String),
+    /// The host did not deliver the call's answer: the nested `internal`
+    /// error's detail — the bus cap's refusal, or `api-request`'s transport
+    /// or refresh failure, which the detail alone tells apart.
+    Refused(String),
     /// Google's whole 4xx/5xx answer: its HTTP status, for a step that
     /// treats one status as an outcome, and the failure every other step
     /// answers with.
     GoogleError { status: u64, failure: Failure },
 }
 
-/// `api-request`'s answer read: Google's JSON, the credential relay, a cut
-/// answer or Google's error for the caller to decide on, or the request's
-/// error answer. Only `error.status` and `error.message` are ever copied out
-/// of a non-2xx body.
+/// `api-request`'s answer read: Google's JSON, the credential relay, a cut or
+/// undelivered answer or Google's error for the caller to decide on, or the
+/// request's error answer. Only `error.status` and `error.message` are ever
+/// copied out of a non-2xx body.
 pub fn read_api_result(
     outcome: Result<Value, NestedError>,
     target: &Target,
@@ -1079,20 +1091,20 @@ pub fn read_api_result(
         Ok(value) => value,
         Err(error) => {
             let NestedError { kind, detail } = error;
-            return Err(match kind.as_str() {
-                "denied" => Failure {
+            return match kind.as_str() {
+                "denied" => Err(Failure {
                     kind: ErrorKind::Denied,
                     detail: format!(
                         "api-request refused the nested {} {}{}: {detail}",
                         target.method, target.host, target.path
                     ),
-                },
-                "invalid_args" => internal(format!(
+                }),
+                "invalid_args" => Err(internal(format!(
                     "api-request rejected the wrapper's request: {detail}"
-                )),
-                "internal" => internal(format!("api-request: {detail}")),
-                other => internal(format!("{other}: {detail}")),
-            });
+                ))),
+                "internal" => Ok(Answer::Refused(detail)),
+                other => Err(internal(format!("{other}: {detail}"))),
+            };
         }
     };
     if value.get("error").and_then(Value::as_str) == Some("credential_invalid") {
@@ -1144,11 +1156,80 @@ pub fn read_api_result(
     })
 }
 
-/// A cut answer where the step has no use for one.
-fn cut_answer(size: &str) -> Failure {
-    internal(format!(
-        "Google's answer ({size}) exceeded the provider's max_response_bytes and was cut"
-    ))
+/// The `derived` key carrying an [`Unreadable`] to a re-read step.
+const UNREADABLE_KEY: &str = "unreadable";
+
+/// Why a nested read's answer cannot be used whole: `api-request` cut it at
+/// the provider's read limit (the size as `Answer::Truncated` states it), or
+/// the host did not deliver it (the nested error's detail).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Unreadable {
+    Cut(String),
+    Refused(String),
+}
+
+impl Unreadable {
+    /// The one sentence that says why, with Google's `sizeEstimate` when the
+    /// step rendering it has one.
+    fn render(&self, estimate: Option<u64>) -> String {
+        let estimate = estimate
+            .map(|n| format!("; sizeEstimate {n}"))
+            .unwrap_or_default();
+        match self {
+            Unreadable::Cut(size) => format!(
+                "Google's answer ({size}{estimate}) exceeds api-request's read limit for this \
+                 provider (max_response_bytes)"
+            ),
+            Unreadable::Refused(detail) => {
+                format!("the host did not deliver api-request's answer: {detail}{estimate}")
+            }
+        }
+    }
+
+    /// [`Unreadable::render`] as copied into an answer: through `plain`, cut
+    /// to `GOOGLE_MESSAGE_MAX_BYTES`, since a refusal's detail is the host's
+    /// and unbounded.
+    fn quoted(&self, estimate: Option<u64>) -> String {
+        cut(&plain(&self.render(estimate)), GOOGLE_MESSAGE_MAX_BYTES).0
+    }
+
+    /// The request's failure: `internal` with the rendering, and `hint` — what
+    /// the caller can narrow — after it when the step has one.
+    fn failure(&self, hint: Option<&str>) -> Failure {
+        let why = self.render(None);
+        internal(match hint {
+            Some(hint) => format!("{why}; {hint}"),
+            None => why,
+        })
+    }
+
+    /// The `derived` a re-read step is issued with: `unreadable` as
+    /// `{"cut": size}` or `{"refused": detail}`.
+    fn to_derived(&self) -> Args {
+        let reason = match self {
+            Unreadable::Cut(size) => json!({ "cut": size }),
+            Unreadable::Refused(detail) => json!({ "refused": detail }),
+        };
+        Args::from_iter([(UNREADABLE_KEY.to_string(), reason)])
+    }
+
+    /// The reason [`Unreadable::to_derived`] wrote, read back at the re-read
+    /// step.
+    fn from_derived(derived: &Args) -> Result<Unreadable, Failure> {
+        let reason = match derived.get(UNREADABLE_KEY) {
+            Some(Value::Object(map)) if map.len() == 1 => map.iter().next(),
+            _ => None,
+        };
+        match reason {
+            Some((key, Value::String(text))) if key == "cut" => Ok(Unreadable::Cut(text.clone())),
+            Some((key, Value::String(text))) if key == "refused" => {
+                Ok(Unreadable::Refused(text.clone()))
+            }
+            _ => Err(internal(
+                "in-flight row at a re-read step carries no `unreadable` reason",
+            )),
+        }
+    }
 }
 
 /// A 4xx/5xx answer: Google's status and message when the body is Google's
@@ -1190,30 +1271,23 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
     let body = match read_api_result(outcome, &state.target, family(state.tool)) {
         Ok(Answer::Google(body)) => body,
         Ok(Answer::Relay(value)) => return Next::Complete(value),
-        // A message too large to read whole is read again without its body.
-        Ok(Answer::Truncated(size))
-            if matches!((state.tool, state.step), (Provided::GmailRead, 1)) =>
-        {
-            return settle(state.tool, read_cut(state, &size, settings));
+        Ok(Answer::Truncated(size)) => {
+            return unreadable(state, Unreadable::Cut(size), settings);
         }
-        // TODO(errhandling-cut-thread-read-has-no-fallback-and-max-cannot-help):
-        // a cut thread read fails whatever `max` is; it has no narrower re-read.
-        // TODO(errhandling-refused-search-message-read-fails-the-page): a
-        // search's per-message read cut at the read limit fails the page here.
-        Ok(Answer::Truncated(size)) => return Next::Fail(cut_answer(&size)),
-        // A message deleted between the listing and its read is skipped, not
-        // the search's failure.
+        Ok(Answer::Refused(detail)) => {
+            return unreadable(state, Unreadable::Refused(detail), settings);
+        }
+        // A message deleted between the listing and its read is listed
+        // unavailable, not the search's failure.
         Ok(Answer::GoogleError { status: 404, .. })
             if matches!(
                 (state.tool, state.step),
                 (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET)
             ) =>
         {
-            return settle(state.tool, search_message(state, None, settings));
+            return settle(state.tool, search_message(state, Read::Deleted, settings));
         }
         Ok(Answer::GoogleError { failure, .. }) => return Next::Fail(failure),
-        // TODO(errhandling-refused-search-message-read-fails-the-page): a
-        // search's per-message read refused on the bus cap fails the page here.
         Err(failure) => return Next::Fail(failure),
     };
     settle(
@@ -1227,19 +1301,61 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
                 .map(Next::Complete),
             (Provided::GmailSearch, 1) => search_listed(state, &body, settings),
             (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET) => {
-                search_message(state, Some(&body), settings)
+                search_message(state, Read::Body(&body), settings)
             }
             (Provided::GmailRead, 1) => read_full(state, &body, settings),
             (Provided::GmailRead, STRUCTURE_STEP) => read_structure(state, &body, settings),
-            (Provided::GmailThread, 1) => thread_read(state, &body, settings),
+            (Provided::GmailThread, 1 | THREAD_NARROW_STEP) => thread_read(state, &body, settings),
             (Provided::CalendarList, 1) => compact_calendar_list(&body).map(Next::Complete),
             (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 named(state, &body)
             }
-            (tool, step) => Err(internal(format!(
-                "in-flight row names step {step} of {}, which has no such step",
-                tool.name()
-            ))),
+            (tool, step) => Err(no_such_step(tool, step)),
+        },
+    )
+}
+
+fn no_such_step(tool: Provided, step: u8) -> Failure {
+    internal(format!(
+        "in-flight row names step {step} of {}, which has no such step",
+        tool.name()
+    ))
+}
+
+/// A nested read that was cut or refused, decided by the step's shape: a
+/// per-message read of a search page is listed unavailable and the page goes
+/// on; a message's or a thread's first read is asked for again narrower,
+/// carrying why; every other step fails with why.
+fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
+    settle(
+        state.tool,
+        match (state.tool, state.step) {
+            (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET) => {
+                search_message(state, Read::Unreadable(why), settings)
+            }
+            (Provided::GmailRead, 1) => stored(state, ReadArgs::parse).map(|args| Next::Call {
+                call: Call {
+                    step: STRUCTURE_STEP,
+                    api: read_call(&args, Some(STRUCTURE_FIELDS), settings),
+                },
+                derived: why.to_derived(),
+            }),
+            (Provided::GmailThread, 1) => stored(state, ThreadArgs::parse).map(|args| Next::Call {
+                call: Call {
+                    step: THREAD_NARROW_STEP,
+                    api: thread_call(&args, THREAD_NARROW_HEADERS, settings),
+                },
+                derived: why.to_derived(),
+            }),
+            (Provided::GmailLabels, 1)
+            | (Provided::GmailSearch, 1)
+            | (Provided::GmailRead, STRUCTURE_STEP)
+            | (Provided::GmailThread, THREAD_NARROW_STEP)
+            | (Provided::CalendarList, 1)
+            | (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
+                Err(why.failure(None))
+            }
+            (tool, step) => Err(no_such_step(tool, step)),
         },
     )
 }
@@ -1310,14 +1426,20 @@ fn search_listed(state: &InFlight, body: &Value, settings: &Settings) -> Result<
     Ok(Next::Call { call, derived })
 }
 
-/// One listed message's metadata read — or, for `None`, found deleted —
-/// recorded in `derived`; then the next listed message is read, or the
-/// search is finished.
-fn search_message(
-    state: &InFlight,
-    body: Option<&Value>,
-    settings: &Settings,
-) -> Result<Next, Failure> {
+/// What one listed message's read gave a search page.
+enum Read<'a> {
+    /// Google's metadata answer.
+    Body(&'a Value),
+    /// Google's 404: deleted between the listing and the read.
+    Deleted,
+    /// Cut or refused.
+    Unreadable(Unreadable),
+}
+
+/// One listed message's read recorded in `derived` — a line from its
+/// metadata, or an `unavailable` entry with its `id` and the `reason` — then
+/// the next listed message is read, or the search is finished.
+fn search_message(state: &InFlight, read: Read, settings: &Settings) -> Result<Next, Failure> {
     let args = stored(state, SearchArgs::parse)?;
     let mut derived = state.derived.clone();
     let index = usize::from(state.step - SEARCH_FIRST_GET);
@@ -1329,9 +1451,11 @@ fn search_message(
         )));
     };
     let next_id = ids.get(index + 1).cloned();
-    let (key, entry) = match body {
-        Some(body) => ("lines", search_line(body, id)?),
-        None => ("unavailable", json!(id)),
+    let unavailable = |reason: String| ("unavailable", json!({ "id": id, "reason": reason }));
+    let (key, entry) = match read {
+        Read::Body(body) => ("lines", search_line(body, id)?),
+        Read::Deleted => unavailable("deleted (Google 404)".to_string()),
+        Read::Unreadable(why) => unavailable(why.quoted(None)),
     };
     let mut list = derived_list(&derived, key)?;
     list.push(entry);
@@ -1401,37 +1525,17 @@ fn read_full(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next
     finish(Value::Object(out), args.account.as_deref(), settings)
 }
 
-/// messages.get (full) cut at the read limit: the message is read again
-/// through the structure mask, its size waiting in `derived`.
-fn read_cut(state: &InFlight, size: &str, settings: &Settings) -> Result<Next, Failure> {
-    let args = stored(state, ReadArgs::parse)?;
-    Ok(Next::Call {
-        call: Call {
-            step: STRUCTURE_STEP,
-            api: read_call(&args, Some(STRUCTURE_FIELDS), settings),
-        },
-        derived: Args::from_iter([("size".to_string(), json!(size))]),
-    })
-}
-
-/// messages.get (structure) read: the headers, labels, snippet and
-/// attachments, `text` null and `text_omitted` saying why; then the user
-/// labels named. A structure answer itself cut is the step's failure.
+/// messages.get (structure) read, after the full read was cut or refused:
+/// the headers, labels, snippet and attachments, `text` null and
+/// `text_omitted` saying why; then the user labels named.
 fn read_structure(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
     let args = stored(state, ReadArgs::parse)?;
     let api = "messages.get";
-    let Some(Value::String(size)) = state.derived.get("size") else {
-        return Err(internal(
-            "in-flight row at the structure step carries no size",
-        ));
-    };
+    let why = Unreadable::from_derived(&state.derived)?;
     let mut out = asked_message_fields(body, &args.id, READ_HEADERS, api)?;
     let estimate = match body.get("sizeEstimate") {
-        None => String::new(),
-        Some(estimate) => format!(
-            "; sizeEstimate {}",
-            estimate.as_u64().ok_or_else(|| shape(api))?
-        ),
+        None => None,
+        Some(estimate) => Some(estimate.as_u64().ok_or_else(|| shape(api))?),
     };
     if let Some(snippet) = snippet_value(body, api)? {
         out.insert("snippet".to_string(), json!(snippet));
@@ -1442,8 +1546,8 @@ fn read_structure(state: &InFlight, body: &Value, settings: &Settings) -> Result
     out.insert(
         "text_omitted".to_string(),
         json!(format!(
-            "Google's answer ({size}{estimate}) exceeds api-request's read limit for this \
-             provider (max_response_bytes); headers and attachments are listed, the body is not"
+            "{}; headers and attachments are listed, the body is not",
+            why.quoted(estimate)
         )),
     );
     out.insert("attachments".to_string(), attachments(&extracted));
@@ -1616,8 +1720,8 @@ fn derived_list(derived: &Args, key: &str) -> Result<Vec<Value>, Failure> {
 
 /// `GmailSearch`'s answer from what its steps gathered in `derived`:
 /// `messages` (empty when nothing matched), Google's `next_page` and
-/// `result_size_estimate` when it gave them, and `unavailable` when a listed
-/// message could not be read.
+/// `result_size_estimate` when it gave them, and `unavailable` — each `id`
+/// and `reason` — when a listed message could not be read.
 fn search_answer(derived: Args) -> Value {
     let mut out = Args::new();
     out.insert(
@@ -1653,10 +1757,17 @@ fn search_line(body: &Value, id: &str) -> Result<Value, Failure> {
 /// threads.get read: the newest `max` messages in thread order, the rest
 /// counted; the thread's subject is its first message's, and a message
 /// answers its own subject only when that differs, both compared as Google
-/// sent them. Then the user labels are named.
+/// sent them. Then the user labels are named. At the narrower step the
+/// messages carry no `to` or `cc`, and `recipients_omitted` says why.
 fn thread_read(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
     let args = stored(state, ThreadArgs::parse)?;
     let api = "threads.get";
+    let (headers, recipients_omitted) = if state.step == THREAD_NARROW_STEP {
+        let why = Unreadable::from_derived(&state.derived)?;
+        (THREAD_NARROW_HEADERS, Some(why.quoted(None)))
+    } else {
+        (THREAD_HEADERS, None)
+    };
     if body.get("id").and_then(Value::as_str) != Some(args.id.as_str()) {
         return Err(shape(api));
     }
@@ -1671,23 +1782,31 @@ fn thread_read(state: &InFlight, body: &Value, settings: &Settings) -> Result<Ne
     let omitted = messages.len().saturating_sub(args.max);
     let answered = messages[omitted..]
         .iter()
-        .map(|message| thread_message(message, subject, api))
+        .map(|message| thread_message(message, headers, subject, api))
         .collect::<Result<Vec<_>, _>>()?;
     out.insert("message_count".to_string(), json!(messages.len()));
     if omitted > 0 {
         out.insert("messages_omitted".to_string(), json!(omitted));
     }
+    if let Some(why) = recipients_omitted {
+        out.insert("recipients_omitted".to_string(), json!(why));
+    }
     out.insert("messages".to_string(), Value::Array(answered));
     finish(Value::Object(out), args.account.as_deref(), settings)
 }
 
-/// One message of a thread: `message_fields` with the `THREAD_HEADERS`,
+/// One message of a thread: `message_fields` with `headers`,
 /// `THREAD_SUBJECT` among them only when it differs from the thread's
 /// `subject`, and the snippet through `snippet_value`. `THREAD_FIELDS` asks
 /// for no `threadId`, so none is answered.
-fn thread_message(message: &Value, subject: Option<&str>, api: &str) -> Result<Value, Failure> {
+fn thread_message(
+    message: &Value,
+    headers: &[&str],
+    subject: Option<&str>,
+    api: &str,
+) -> Result<Value, Failure> {
     let differs = raw_header(message, THREAD_SUBJECT, api)? != subject;
-    let headers: Vec<&str> = THREAD_HEADERS
+    let headers: Vec<&str> = headers
         .iter()
         .copied()
         .filter(|&name| differs || name != THREAD_SUBJECT)
@@ -2322,22 +2441,25 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_internal_error_is_an_undelivered_answer() {
+        assert_eq!(
+            read(nested(
+                "internal",
+                "result exceeds [messaging] max_body_bytes"
+            )),
+            Ok(Answer::Refused(
+                "result exceeds [messaging] max_body_bytes".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn other_nested_errors_are_internal() {
         assert_eq!(
             read(nested("invalid_args", "bad query")),
             Err(failure(
                 ErrorKind::Internal,
                 "api-request rejected the wrapper's request: bad query"
-            ))
-        );
-        assert_eq!(
-            read(nested(
-                "internal",
-                "result exceeds [messaging] max_body_bytes"
-            )),
-            Err(failure(
-                ErrorKind::Internal,
-                "api-request: result exceeds [messaging] max_body_bytes"
             ))
         );
         assert_eq!(
@@ -2362,13 +2484,58 @@ mod tests {
             read(unstated),
             Ok(Answer::Truncated("of unstated length".to_string()))
         );
+    }
+
+    #[test]
+    fn an_unreadable_read_renders_one_sentence() {
+        let cut = Unreadable::Cut("300000 bytes".to_string());
+        let refused = Unreadable::Refused("result exceeds [messaging] max_body_bytes".to_string());
         assert_eq!(
-            cut_answer("of unstated length"),
+            cut.render(Some(4096)),
+            "Google's answer (300000 bytes; sizeEstimate 4096) exceeds api-request's read \
+             limit for this provider (max_response_bytes)"
+        );
+        assert_eq!(
+            refused.render(Some(4096)),
+            "the host did not deliver api-request's answer: result exceeds [messaging] \
+             max_body_bytes; sizeEstimate 4096"
+        );
+        assert_eq!(
+            cut.failure(None),
             failure(
                 ErrorKind::Internal,
-                "Google's answer (of unstated length) exceeded the provider's \
-                 max_response_bytes and was cut"
+                "Google's answer (300000 bytes) exceeds api-request's read limit for this \
+                 provider (max_response_bytes)"
             )
+        );
+        assert_eq!(
+            refused.failure(Some("ask for less")),
+            failure(
+                ErrorKind::Internal,
+                "the host did not deliver api-request's answer: result exceeds [messaging] \
+                 max_body_bytes; ask for less"
+            )
+        );
+        // Carried to a re-read step and back.
+        for why in [cut, refused] {
+            assert_eq!(Unreadable::from_derived(&why.to_derived()), Ok(why));
+        }
+        for carried in [
+            json!(null),
+            json!({}),
+            json!({ "cut": 7 }),
+            json!({ "lost": "x" }),
+            json!({ "cut": "x", "refused": "y" }),
+        ] {
+            let derived = Args::from_iter([(UNREADABLE_KEY.to_string(), carried.clone())]);
+            assert!(Unreadable::from_derived(&derived).is_err(), "{carried}");
+        }
+        assert!(Unreadable::from_derived(&Args::new()).is_err());
+        // A host detail copied into an answer is bounded.
+        let long = Unreadable::Refused("x".repeat(5000));
+        assert_eq!(
+            long.quoted(None).len(),
+            GOOGLE_MESSAGE_MAX_BYTES + "…".len()
         );
     }
 
@@ -2661,7 +2828,7 @@ mod tests {
         }));
         assert_eq!(
             answered(&labels_state(json!({})), outcome),
-            Next::Fail(cut_answer("of unstated length"))
+            Next::Fail(Unreadable::Cut("of unstated length".to_string()).failure(None))
         );
     }
 
@@ -3104,9 +3271,47 @@ mod tests {
             Next::Complete(json!({
                 "messages": [line("m2", json!([]))],
                 "result_size_estimate": 3,
-                "unavailable": ["m1", "m3"],
+                "unavailable": [deleted("m1"), deleted("m3")],
             }))
         );
+    }
+
+    fn deleted(id: &str) -> Value {
+        json!({ "id": id, "reason": "deleted (Google 404)" })
+    }
+
+    #[test]
+    fn a_message_cut_or_refused_mid_search_is_listed_unavailable() {
+        let cut = Ok(json!({
+            "status": 200, "headers": {}, "bytes": 900000, "truncated": true, "body": "{",
+        }));
+        let refused = nested("internal", "result exceeds [messaging] max_body_bytes");
+        for (outcome, reason) in [
+            (
+                cut,
+                "Google's answer (900000 bytes) exceeds api-request's read limit for this \
+                 provider (max_response_bytes)",
+            ),
+            (
+                refused,
+                "the host did not deliver api-request's answer: result exceeds [messaging] \
+                 max_body_bytes",
+            ),
+        ] {
+            let state = search_state(json!({ "q": "lunch" }));
+            let list = listing(&["m1", "m2"], json!({ "nextPageToken": "next-1" }));
+            let (state, _) = follow(&state, answered(&state, http(200, &list)));
+            let (state, call) = follow(&state, answered(&state, outcome));
+            assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m2");
+            assert_eq!(
+                answered(&state, http(200, &metadata("m2", &[]))),
+                Next::Complete(json!({
+                    "messages": [line("m2", json!([]))],
+                    "next_page": "next-1",
+                    "unavailable": [{ "id": "m1", "reason": reason }],
+                }))
+            );
+        }
     }
 
     #[test]
@@ -3121,7 +3326,7 @@ mod tests {
         let untold = Ok(json!({ "status": 404, "headers": {}, "bytes": 2, "body": "{}" }));
         assert_eq!(
             answered(&state, untold),
-            Next::Complete(json!({ "messages": [], "unavailable": ["m1"] }))
+            Next::Complete(json!({ "messages": [], "unavailable": [deleted("m1")] }))
         );
         let binary = Ok(json!({
             "status": 404, "headers": {}, "bytes": 3, "truncated": false, "body_base64": "AAEC",
@@ -3144,7 +3349,7 @@ mod tests {
         // The 25th message read, then found deleted, at step 26.
         for (last, read, unavailable) in [
             (http(200, &metadata("m25", &[])), 25, None),
-            (http(404, &gone), 24, Some(json!(["m25"]))),
+            (http(404, &gone), 24, Some(json!([deleted("m25")]))),
         ] {
             let state = search_state(json!({ "q": "lunch", "max": 25 }));
             let (mut state, mut call) = follow(&state, answered(&state, http(200, &list)));
@@ -3422,12 +3627,13 @@ mod tests {
                 "Google INTERNAL (HTTP 500): later"
             ))
         );
-        let cut = Ok(json!({
-            "status": 404, "headers": {}, "bytes": 900000, "truncated": true, "body": "{",
-        }));
         assert_eq!(
-            answered(&state, cut),
-            Next::Fail(cut_answer("900000 bytes"))
+            answered(&state, nested("denied", "no clause")),
+            Next::Fail(failure(
+                ErrorKind::Denied,
+                "api-request refused the nested GET gmail.example.com/gmail/v1/users/me/\
+                 messages/m1: no clause"
+            ))
         );
         let value = credential_invalid(json!("alice@example.com"));
         assert_eq!(answered(&state, Ok(value.clone())), Next::Complete(value));
@@ -4180,7 +4386,48 @@ mod tests {
         );
         assert_eq!(
             answered(&row, cut_read(json!(900000))),
-            Next::Fail(cut_answer("900000 bytes"))
+            Next::Fail(Unreadable::Cut("900000 bytes".to_string()).failure(None))
+        );
+    }
+
+    #[test]
+    fn a_refused_read_falls_back_to_the_structure() {
+        let state = read_state(json!({ "id": "m1" }));
+        let refusal = "result exceeds [messaging] max_body_bytes";
+        let (row, call) = follow(&state, answered(&state, nested("internal", refusal)));
+        assert_eq!(call.step, STRUCTURE_STEP);
+        assert_eq!(
+            call.api.query["fields"],
+            QueryValue::One(STRUCTURE_FIELDS.to_string())
+        );
+        let answer = completed(answered(&row, http(200, STRUCTURE)));
+        assert_eq!(answer["text"], Value::Null);
+        assert_eq!(
+            answer["text_omitted"],
+            json!(
+                "the host did not deliver api-request's answer: result exceeds [messaging] \
+                 max_body_bytes; sizeEstimate 4096; headers and attachments are listed, the \
+                 body is not"
+            )
+        );
+        // The narrower read refused too is the request's failure, no hint.
+        assert_eq!(
+            answered(&row, nested("internal", refusal)),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "the host did not deliver api-request's answer: result exceeds [messaging] \
+                 max_body_bytes"
+            ))
+        );
+        // A structure row that lost its reason is refused, not guessed at.
+        let mut lost = row;
+        lost.derived = Map::new();
+        assert_eq!(
+            answered(&lost, http(200, STRUCTURE)),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row at a re-read step carries no `unreadable` reason"
+            ))
         );
     }
 
@@ -4475,7 +4722,86 @@ mod tests {
     }
 
     #[test]
-    fn thread_refuses_an_unexpected_shape_or_a_cut_answer() {
+    fn a_thread_cut_or_refused_is_read_again_without_recipients() {
+        for (outcome, why) in [
+            (
+                cut_read(json!(300000)),
+                "Google's answer (300000 bytes) exceeds api-request's read limit for this \
+                 provider (max_response_bytes)",
+            ),
+            (
+                nested("internal", "result exceeds [messaging] max_body_bytes"),
+                "the host did not deliver api-request's answer: result exceeds [messaging] \
+                 max_body_bytes",
+            ),
+        ] {
+            let state =
+                thread_state(json!({ "id": "t1", "max": 3, "account": "alice@example.com" }));
+            let (row, call) = follow(&state, answered(&state, outcome));
+            assert_eq!(call.step, THREAD_NARROW_STEP);
+            assert_eq!(
+                serde_json::to_value(&call.api).unwrap(),
+                json!({
+                    "provider": "google",
+                    "account": "alice@example.com",
+                    "method": "GET",
+                    "host": "gmail.example.com",
+                    "path": "/gmail/v1/users/me/threads/t1",
+                    "query": {
+                        "format": "metadata",
+                        "metadataHeaders": ["From", "Subject", "Date"],
+                        "fields": "id,messages(id,labelIds,snippet,internalDate,payload/headers)",
+                        "prettyPrint": "false",
+                    },
+                })
+            );
+            // Google answers the narrower mask without `To` and `Cc`.
+            let narrow = thread_body(|messages| {
+                for message in messages.iter_mut() {
+                    let Value::Array(headers) = &mut message["payload"]["headers"] else {
+                        panic!("the message has headers");
+                    };
+                    headers.retain(|h| !matches!(h["name"].as_str(), Some("To" | "Cc")));
+                }
+            });
+            let (named_row, names_call) = follow(&row, answered(&row, http(200, &narrow)));
+            assert_eq!(names_call.step, LABELS_STEP);
+            assert_eq!(names_call.api.account.as_deref(), Some("alice@example.com"));
+            let names = r#"{ "labels": [{ "id": "Label_7", "name": "Projects" }] }"#;
+            let answer = completed(answered(&named_row, http(200, names)));
+            assert_eq!(answer["recipients_omitted"], json!(why));
+            assert_eq!(answer["subject"], json!("Planning"));
+            assert_eq!(answer["message_count"], json!(4));
+            assert_eq!(answer["messages_omitted"], json!(1));
+            let messages = answer["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 3);
+            for message in messages {
+                assert_eq!(message.get("to"), None, "{message}");
+                assert_eq!(message.get("cc"), None, "{message}");
+                assert!(message.get("from").is_some(), "{message}");
+            }
+            assert_eq!(messages[0]["labels"], json!(["INBOX", "Projects"]));
+            assert_eq!(messages[1]["subject"], json!("Re: Planning (room booked)"));
+
+            // Even if Google sent `To` and `Cc` under the narrower mask, they
+            // are not answered.
+            let Next::Call { derived, .. } = answered(&row, http(200, THREAD)) else {
+                panic!("the thread's label names are read next");
+            };
+            assert_eq!(derived["answer"]["messages"][0]["id"], json!("m2"));
+            assert_eq!(derived["answer"]["messages"][0].get("to"), None);
+            assert_eq!(derived["answer"]["messages"][0].get("cc"), None);
+
+            // The narrower read cut or refused again is the request's failure.
+            assert_eq!(
+                answered(&row, cut_read(json!(200000))),
+                Next::Fail(Unreadable::Cut("200000 bytes".to_string()).failure(None))
+            );
+        }
+    }
+
+    #[test]
+    fn thread_refuses_an_unexpected_shape() {
         let state = thread_state(json!({ "id": "t1" }));
         for body in [
             r#"{ "id": "t2", "messages": [{ "id": "m1" }] }"#.to_string(),
@@ -4496,10 +4822,6 @@ mod tests {
                 "{body}"
             );
         }
-        assert_eq!(
-            answered(&state, cut_read(json!(300000))),
-            Next::Fail(cut_answer("300000 bytes"))
-        );
     }
 
     #[test]
@@ -4820,5 +5142,124 @@ mod tests {
         let size = serialized_len(&answer);
         assert!(size < 140_000, "{size}");
         assert!(size < COMPACT_RESULT_CEILING);
+    }
+
+    #[test]
+    fn every_step_answers_an_unreadable_read_by_its_shape() {
+        let refusal = "result exceeds [messaging] max_body_bytes";
+        let outcomes = || {
+            [
+                (
+                    cut_read(json!(300000)),
+                    Unreadable::Cut("300000 bytes".to_string()),
+                ),
+                (
+                    nested("internal", refusal),
+                    Unreadable::Refused(refusal.to_string()),
+                ),
+            ]
+        };
+        let at = |mut state: InFlight, step: u8| {
+            state.step = step;
+            state
+        };
+        let name = |state: &InFlight| format!("{} step {}", state.tool.name(), state.step);
+
+        // Neither one of many nor with a narrower form: the rendering alone.
+        for state in [
+            labels_state(json!({})),
+            search_state(json!({ "q": "lunch" })),
+            at(read_state(json!({ "id": "m1" })), STRUCTURE_STEP),
+            at(thread_state(json!({ "id": "t1" })), THREAD_NARROW_STEP),
+            calendar_list_state(json!({})),
+            at(search_state(json!({ "q": "lunch" })), LABELS_STEP),
+            at(read_state(json!({ "id": "m1" })), LABELS_STEP),
+            at(thread_state(json!({ "id": "t1" })), LABELS_STEP),
+        ] {
+            for (outcome, why) in outcomes() {
+                assert_eq!(
+                    answered(&state, outcome),
+                    Next::Fail(why.failure(None)),
+                    "{}",
+                    name(&state)
+                );
+            }
+        }
+
+        // A narrower form: one re-read, carrying why.
+        for (state, step) in [
+            (read_state(json!({ "id": "m1" })), STRUCTURE_STEP),
+            (thread_state(json!({ "id": "t1" })), THREAD_NARROW_STEP),
+        ] {
+            for (outcome, why) in outcomes() {
+                let Next::Call { call, derived } = answered(&state, outcome) else {
+                    panic!("{} did not read again", name(&state));
+                };
+                assert_eq!(call.step, step, "{}", name(&state));
+                assert_eq!(derived, why.to_derived());
+            }
+        }
+
+        // One of many: every per-message step of a full page lists the
+        // message unavailable and goes on.
+        let ids: Vec<String> = (1..=25).map(|i| format!("m{i}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let state = search_state(json!({ "q": "lunch", "max": 25 }));
+        let (row, _) = follow(
+            &state,
+            answered(&state, http(200, &listing(&id_refs, json!({})))),
+        );
+        for step in SEARCH_FIRST_GET..=SEARCH_LAST_GET {
+            let index = usize::from(step - SEARCH_FIRST_GET);
+            for (outcome, why) in outcomes() {
+                let entry = json!([{ "id": ids[index], "reason": why.render(None) }]);
+                match answered(&at(row.clone(), step), outcome) {
+                    Next::Call { call, derived } => {
+                        assert!(step < SEARCH_LAST_GET, "{step}");
+                        assert_eq!(call.step, step + 1);
+                        assert_eq!(
+                            call.api.path,
+                            format!("/gmail/v1/users/me/messages/{}", ids[index + 1])
+                        );
+                        assert_eq!(derived["unavailable"], entry);
+                    }
+                    Next::Complete(answer) => {
+                        assert_eq!(step, SEARCH_LAST_GET);
+                        assert_eq!(answer, json!({ "messages": [], "unavailable": entry }));
+                    }
+                    other => panic!("step {step}: {other:?}"),
+                }
+            }
+        }
+
+        // A step the tool does not have is refused as such.
+        for (outcome, _) in outcomes() {
+            assert_eq!(
+                answered(&at(labels_state(json!({})), 2), outcome),
+                Next::Fail(no_such_step(Provided::GmailLabels, 2))
+            );
+        }
+    }
+
+    #[test]
+    fn every_tools_first_read_has_an_unreadable_answer() {
+        // `unreadable` runs only on a cut or refused read, so a tool missing
+        // its arm there would pass every other test and be answered as a
+        // step it does not have.
+        for tool in Provided::ALL {
+            let mut state = labels_state(json!({}));
+            state.tool = tool;
+            for outcome in [
+                cut_read(json!(300000)),
+                nested("internal", "result exceeds [messaging] max_body_bytes"),
+            ] {
+                assert_ne!(
+                    answered(&state, outcome),
+                    Next::Fail(no_such_step(tool, 1)),
+                    "{}",
+                    tool.name()
+                );
+            }
+        }
     }
 }

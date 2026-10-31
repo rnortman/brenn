@@ -1149,6 +1149,274 @@ async fn thread_reads_once_and_keeps_the_newest_messages() {
     r.assert_finished(&id);
 }
 
+/// How a nested read is made unreadable end to end.
+#[derive(Clone, Copy, Debug)]
+enum Unreadable {
+    /// `api-request` reads at most 4 096 bytes, so an [`OVERSIZED`] body is
+    /// cut at the read limit.
+    Cut,
+    /// The rig's bus cap is the 64 KiB default and the read limit the
+    /// 256 KiB default, so an [`OVERSIZED`] body is read whole and its result
+    /// refused by the executor on `max_body_bytes`.
+    Refused,
+}
+
+const BOTH_WAYS: [Unreadable; 2] = [Unreadable::Cut, Unreadable::Refused];
+
+/// A Google body size past both the cut rig's read limit and the default bus
+/// cap, and under the default read limit.
+const OVERSIZED: usize = 100 * 1024;
+
+/// The rig for `way`, with every clause and alice's one account connected.
+async fn unreadable_rig(way: Unreadable) -> StubRig {
+    match way {
+        Unreadable::Cut => rig_reading_at_most(4096).await,
+        Unreadable::Refused => rig().await,
+    }
+}
+
+/// `reason` is the wrapper's sentence for a read of a `len`-byte body made
+/// unreadable `way`.
+fn assert_unreadable(way: Unreadable, reason: &str, len: usize) {
+    match way {
+        Unreadable::Cut => assert_eq!(
+            reason,
+            format!(
+                "Google's answer ({len} bytes) exceeds api-request's read limit for this \
+                 provider (max_response_bytes)"
+            )
+        ),
+        Unreadable::Refused => {
+            let (size, cap) = reason
+                .strip_prefix("the host did not deliver api-request's answer: result of ")
+                .and_then(|rest| rest.split_once(" bytes exceeds [messaging] max_body_bytes ("))
+                .and_then(|(size, cap)| Some((size, cap.strip_suffix(')')?)))
+                .unwrap_or_else(|| panic!("{reason}"));
+            let size: usize = size.parse().unwrap_or_else(|_| panic!("{reason}"));
+            let cap: usize = cap.parse().unwrap_or_else(|_| panic!("{reason}"));
+            assert!(size >= len && size > cap, "{reason}");
+        }
+    }
+}
+
+/// A search page whose first listed message cannot be read whole answers its
+/// other message and its page token, and names the first in `unavailable`
+/// with the reason.
+#[tokio::test]
+async fn a_search_page_names_a_message_it_cannot_read_and_answers_the_rest() {
+    for way in BOTH_WAYS {
+        let r = unreadable_rig(way).await;
+        r.answer(
+            MESSAGES,
+            json!({
+                "messages": [
+                    { "id": "m1", "threadId": "t-m1" },
+                    { "id": "m2", "threadId": "t-m2" },
+                ],
+                "nextPageToken": "page-2",
+            })
+            .to_string(),
+        );
+        let wide = message_body(
+            "m1",
+            "Bob Example <bob@example.com>",
+            "Lunch?",
+            &["INBOX"],
+            &"a".repeat(OVERSIZED),
+        );
+        r.answer(&format!("{MESSAGES}/m1"), wide.clone());
+        r.answer(
+            &format!("{MESSAGES}/m2"),
+            message_body(
+                "m2",
+                "Bob Example <bob@example.com>",
+                "Lunch?",
+                &["INBOX", "UNREAD"],
+                "Are you free",
+            ),
+        );
+        let call = r.call_for_alice("GmailSearch", json!({ "q": "is:unread" }));
+        let id = r.requested_id().await;
+        r.run(3).await;
+
+        let answer = call.await.unwrap().expect("the component answered");
+        assert_eq!(
+            answer["messages"],
+            json!([{
+                "id": "m2",
+                "thread_id": "t-m2",
+                "from": "Bob Example <bob@example.com>",
+                "subject": "Lunch?",
+                "date": "Sat, 31 Oct 2026 14:05:09 +0000",
+                "internal_date": "2026-10-31T14:05:09Z",
+                "snippet": "Are you free",
+                "labels": ["INBOX", "UNREAD"],
+            }]),
+            "{way:?}"
+        );
+        assert_eq!(answer["next_page"], "page-2");
+        let unavailable = answer["unavailable"]
+            .as_array()
+            .expect("unavailable listed");
+        assert_eq!(unavailable.len(), 1, "{way:?}");
+        assert_eq!(unavailable[0]["id"], "m1");
+        assert_unreadable(way, unavailable[0]["reason"].as_str().unwrap(), wide.len());
+        assert_eq!(r.seen().len(), 3, "{way:?}");
+        r.owed(&r.executor_sub(), 0).await;
+        r.assert_finished(&id);
+    }
+}
+
+/// One message of a thread as threads.get answers the narrower mask: no `To`.
+fn narrow_thread_message_body(id: &str, from: &str, subject: &str) -> serde_json::Value {
+    let mut message = thread_message_body(id, from, subject, &["INBOX"]);
+    message["payload"]["headers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|header| header["name"] != "To");
+    message
+}
+
+/// A thread whose recipients make it too large to read whole is read again
+/// with only `From`, `Subject` and `Date`, and answered with
+/// `recipients_omitted` saying why.
+#[tokio::test]
+async fn a_thread_too_large_to_read_whole_is_read_again_without_recipients() {
+    for way in BOTH_WAYS {
+        let r = unreadable_rig(way).await;
+        let path = format!("{THREADS}/t1");
+        let mut wide_message = thread_message_body(
+            "m1",
+            "Alice Example <alice@example.com>",
+            "Planning",
+            &["INBOX"],
+        );
+        wide_message["payload"]["headers"][1]["value"] = json!("b".repeat(OVERSIZED));
+        let wide = json!({ "id": "t1", "messages": [wide_message] }).to_string();
+        r.answer(&path, wide.clone());
+        let call = r.call_for_alice("GmailThread", json!({ "id": "t1" }));
+        let id = r.requested_id().await;
+
+        r.serve().await;
+        r.run_nested().await;
+        // The stub answers by path alone; what Google answers under the
+        // narrower headers is the same thread without `To`.
+        r.answer(
+            &path,
+            json!({ "id": "t1", "messages": [narrow_thread_message_body(
+                "m1",
+                "Alice Example <alice@example.com>",
+                "Planning",
+            )] })
+            .to_string(),
+        );
+        r.serve().await;
+        assert_eq!(r.inflight_keys(), [format!("{id}/2")]);
+        r.run_nested().await;
+        r.serve().await;
+
+        let answer = call.await.unwrap().expect("the component answered");
+        assert_unreadable(
+            way,
+            answer["recipients_omitted"].as_str().unwrap(),
+            wide.len(),
+        );
+        assert_eq!(answer["subject"], "Planning");
+        assert_eq!(answer["message_count"], 1);
+        assert_eq!(
+            answer["messages"],
+            json!([{
+                "id": "m1",
+                "from": "Alice Example <alice@example.com>",
+                "date": "Sat, 31 Oct 2026 14:05:09 +0000",
+                "internal_date": "2026-10-31T14:05:09Z",
+                "snippet": "Planning & more",
+                "labels": ["INBOX"],
+            }]),
+            "{way:?}"
+        );
+        let seen = r.seen();
+        assert_eq!(seen.len(), 2, "{way:?}");
+        assert_eq!(
+            seen[1],
+            (
+                "GET".to_string(),
+                path,
+                google_query(&[
+                    ("format", "metadata"),
+                    (
+                        "fields",
+                        "id,messages(id,labelIds,snippet,internalDate,payload/headers)",
+                    ),
+                    ("metadataHeaders", "From"),
+                    ("metadataHeaders", "Subject"),
+                    ("metadataHeaders", "Date"),
+                ]),
+            )
+        );
+        r.assert_finished(&id);
+    }
+}
+
+/// A thread whose narrower read is unreadable too is `internal`, naming why.
+#[tokio::test]
+async fn a_thread_unreadable_twice_is_internal() {
+    for way in BOTH_WAYS {
+        let r = unreadable_rig(way).await;
+        let wide_message = thread_message_body(
+            "m1",
+            "Alice Example <alice@example.com>",
+            &"s".repeat(OVERSIZED),
+            &["INBOX"],
+        );
+        let wide = json!({ "id": "t1", "messages": [wide_message] }).to_string();
+        r.answer(&format!("{THREADS}/t1"), wide.clone());
+        let call = r.call_for_alice("GmailThread", json!({ "id": "t1" }));
+        let id = r.requested_id().await;
+        r.run(2).await;
+
+        let Err(ToolError::Internal(detail)) = call.await.unwrap() else {
+            panic!("{way:?}: the thread was not refused internal");
+        };
+        assert_unreadable(way, &detail, wide.len());
+        assert_eq!(r.seen().len(), 2, "{way:?}");
+        r.owed(&r.executor_sub(), 0).await;
+        r.assert_finished(&id);
+    }
+}
+
+/// A message read refused by the bus cap falls back to its structure as a
+/// cut one does, `text_omitted` quoting the host's refusal.
+#[tokio::test]
+async fn a_read_refused_by_the_bus_cap_falls_back_to_the_structure() {
+    let r = rig().await;
+    let path = format!("{MESSAGES}/m1");
+    let full = read_body(&["INBOX"], Some(&"QUFB".repeat(OVERSIZED / 4)));
+    let full_len = full.len();
+    r.answer(&path, full);
+    let call = r.call_for_alice("GmailRead", json!({ "id": "m1" }));
+    let id = r.requested_id().await;
+
+    r.serve().await;
+    r.run_nested().await;
+    r.answer(&path, read_body(&["INBOX"], None));
+    r.serve().await;
+    assert_eq!(r.inflight_keys(), [format!("{id}/2")]);
+    r.run_nested().await;
+    r.serve().await;
+
+    let answer = call.await.unwrap().expect("the component answered");
+    assert_eq!(answer["text"], serde_json::Value::Null);
+    assert_eq!(answer["snippet"], "Hi Bob, The numbers are in & attached");
+    let omitted = answer["text_omitted"].as_str().unwrap();
+    let why = omitted
+        .strip_suffix("; sizeEstimate 9000; headers and attachments are listed, the body is not")
+        .unwrap_or_else(|| panic!("{omitted}"));
+    assert_unreadable(Unreadable::Refused, why, full_len);
+    assert_eq!(r.seen().len(), 2);
+    r.assert_finished(&id);
+}
+
 /// calendarList.list's query as `CalendarList` sends it, with `extra`.
 fn calendar_list_query(extra: &[(&str, &str)]) -> Pairs {
     google_query(

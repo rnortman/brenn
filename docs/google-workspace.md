@@ -131,12 +131,14 @@ gives the full account of what raising the cap costs
 does not grow when escaped, so an ordinary message's body fits the pair
 with room to spare. A message whose sender has filled its headers with quotes or
 backslashes is different: those escape twice, once by Google and once by
-`api-request`, and such a message can be refused on the bus cap — `internal`
-naming `max_body_bytes` — by whichever of these tools reads it, and the
-request that read it fails, a search page that listed it included. No cap
-setting closes that, and that message is simply not readable through these
-tools; it is the sender's doing, not the operator's configuration, and mail
-is untrusted input.
+`api-request`, and such a message's read can be refused on the bus cap by
+whichever of these tools reads it. A search page that lists it is answered
+with its other messages and names that one in `unavailable`, with the reason;
+a thread that holds it is read again without `To` and `Cc`, which answers
+when those were the oversized headers; any other read of it is answered
+`internal` naming `max_body_bytes`. No cap setting closes that, and that
+message is simply not readable through these tools; it is the sender's
+doing, not the operator's configuration, and mail is untrusted input.
 
 Operators who already have the Maps guide's `messaging` block need nothing
 more: the cap is bus-wide, and the value is the same.
@@ -146,9 +148,10 @@ The alternative, for an operator who will not raise the cap: leave
 `oauth_provider` block, so every answer Brenn reads fits the default cap.
 For Gmail that costs most HTML mail: a message over 40 KiB is answered by
 `GmailRead` with its headers and attachments but no text (section 5). It
-also costs long threads: `GmailThread` refuses a thread whose messages'
-headers together pass the limit, and such a thread is read one message at a
-time (section 7, step 8).
+also costs long threads: a thread whose messages' headers together pass the
+limit is answered without `to` and `cc`, and one whose remaining headers
+still pass it is refused and read one message at a time (section 7,
+step 8).
 
 Changing these blocks, or replacing the client file, takes a restart. A
 reload that changes them is refused.
@@ -273,7 +276,9 @@ the reason. This is a property of serving any caller, not a defect.
 **The rate limit.** The `rate_limit` is one bucket for the instance across
 every user it serves. `GmailSearch` at its largest (`max = 25`) is 27 calls —
 the search, one per message, and one for label names — so a burst of 60
-admits two such searches without stalling. Callers over the limit are
+admits two such searches without stalling. `GmailRead` and `GmailThread` are
+at most three: the read, one narrower read when the first is too large, and
+label names. Callers over the limit are
 delayed, never refused. Google's own quota, 250 units per user per second
 with a list or a get costing 5, is the real bound on a user.
 
@@ -303,16 +308,20 @@ What the tools answer when that is not in place:
 
 **What an answer holds.** `GmailRead` answers the message's text, decoded,
 up to `max_chars` characters (12 000 by default, 200 to 60 000), and lists
-attachments without fetching them. A message larger than the read limit
-(`max_response_bytes`) is answered with its headers, its attachments and
+attachments without fetching them. A message too large to read whole —
+over the read limit (`max_response_bytes`), or refused on the bus cap
+(`max_body_bytes`) — is answered with its headers, its attachments and
 Gmail's preview, `text` null and `text_omitted` saying why. Header values,
 attachment names and MIME types are bounded in bytes and a cut header is
 flagged; a long text is cut to the wrapper's result ceiling and says so; a
 long thread is trimmed to its newest messages and `messages_omitted` says
-how many were left out; and a thread whose headers alone are too large to
-read is refused — the `internal` answer names the provider's read limit
-(`max_response_bytes`) or the bus cap (`max_body_bytes`) — and a smaller
-`max` does not help.
+how many were left out. A thread whose headers are too large to read whole
+is read again without `to` and `cc`, and `recipients_omitted` says why; a
+thread whose `from`, `subject` and `date` alone are too large is refused —
+the `internal` answer names the provider's read limit or the bus cap — and a
+smaller `max` does not help. A search page answers every message it could
+read; one it could not — deleted since the listing, or its read cut or
+refused — is named in `unavailable` with the reason.
 
 ## 6. Telling the assistant
 
@@ -388,19 +397,34 @@ sections 3 and 5 in place.
    - An `internal` error whose `detail` says "result of … bytes exceeds
      [messaging] max_body_bytes", on ordinary mail, is the bus cap at its
      default: the `messaging` block of section 3 was not applied, and it
-     takes a restart. Under the recommended pair, from any of these tools, it
-     is a message whose sender-written headers are oversized, and the request
-     that read it failed — a single read, a thread, or a search page that
-     listed it (a narrower query, one that lists no such message, gets the
-     listing back); that message is not readable through these tools, and
-     neither is a message that carries the same headers (a reply, whose
-     subject is copied from it); there is nothing to raise and nothing to
-     fix.
+     takes a restart. Under the recommended pair it is a message whose
+     sender-written headers are oversized; that message is not readable
+     through these tools, and neither is a message that carries the same
+     headers (a reply, whose subject is copied from it); there is nothing to
+     raise and nothing to fix. The same detail appears without failing the
+     request where the tools have somewhere to put it: a search page names
+     such a message in `unavailable` and answers the rest, a thread is read
+     again without `to` and `cc` (`recipients_omitted` quotes it), and a
+     `GmailRead` answer without its body quotes it in `text_omitted`.
+   - A reason that says "the host did not deliver api-request's answer" and
+     names neither `max_response_bytes` nor `max_body_bytes` — in
+     `unavailable`, `text_omitted`, `recipients_omitted` or a `GmailThread`
+     `internal` — is not about those limits: it quotes the error
+     `api-request` answered, most often that it could not reach Google or
+     could not refresh the access token. Those are transient; a retry reads
+     the message or thread whole, and there is nothing to raise. The
+     bullets below are about the two limits.
    - A `GmailRead` answer with `text_omitted` on an ordinary message means
-     `max_response_bytes` was lowered (section 3).
-   - A `GmailThread` answer `internal` saying Google's answer "exceeded the
-     provider's max_response_bytes and was cut" is a thread whose headers
-     alone are too large to read. A smaller `max` does not help. Two
+     `max_response_bytes` was lowered (section 3), or, when it quotes
+     `max_body_bytes`, that the `messaging` block was not applied.
+   - A `GmailThread` answer with `recipients_omitted` naming
+     `max_response_bytes` or `max_body_bytes` is a thread whose headers were
+     too large to read whole; it was read again without `to` and `cc`, and
+     needs nothing. A `GmailThread` answer `internal` saying Google's answer
+     "exceeds api-request's read limit for this provider
+     (max_response_bytes)", or that the host did not deliver it because it
+     exceeds `max_body_bytes`, is a thread whose `from`, `subject` and
+     `date` alone are too large to read. A smaller `max` does not help. Two
      remedies, in this order:
      1. **Read the messages one at a time.** The assistant finds the
         thread's messages with `GmailSearch`, whose lines carry `thread_id`,

@@ -18,6 +18,22 @@ All notable changes to Brenn are documented here.
   is now told to reconnect with the Calendar read scope rather than the Gmail
   one.
 
+- **Gmail tools answer around a message they cannot read whole instead of
+  failing.** A `GmailSearch` page whose listed message cannot be read — cut
+  at the provider's read limit, or refused by the bus's `max_body_bytes` —
+  now answers the page's other messages and its `next_page`, and names that
+  message in `unavailable` with the reason; `unavailable` entries are now
+  objects (`id`, `reason`), a message deleted since the listing included. A
+  `GmailThread` too large to read whole is read again without `to` and `cc`,
+  and `recipients_omitted` says why. A `GmailRead` refused by the bus cap
+  now falls back to the message's headers and attachments, as one over the
+  read limit already did. The `internal` error for a read that stays too
+  large now reads "Google's answer (…) exceeds api-request's read limit for
+  this provider (max_response_bytes)", or names the host's refusal. A
+  passing fault on one of these reads, such as a dropped connection, is
+  answered the same way and its reason names neither limit: asking again
+  usually reads the message whole.
+
 ## [0.30.1] — 2026-10-31
 
 - **Fix: an MQTT client with more than 64 subscriptions no longer hangs
