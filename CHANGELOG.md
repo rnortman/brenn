@@ -40,6 +40,15 @@ All notable changes to Brenn are documented here.
   and whether it is open, plus an id that Directions accepts as a
   destination. Like Directions, it must be asked for on a user's behalf.
 
+- **`google-maps-tools` adds `PlaceDetails` and `SearchAlongRoute`.**
+  PlaceDetails gives one place's details from its id: address, rating,
+  opening hours, phone, website and a Google Maps link, plus Google's
+  summary and a few reviews when asked for (they are billed at a higher
+  rate). SearchAlongRoute finds places along a route, such as "gas station"
+  between two cities, and gives the route's distance and travel time with
+  the results. A route too long to search along is refused. Like Directions,
+  SearchAlongRoute must be asked for on a user's behalf.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key

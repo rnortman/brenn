@@ -31,6 +31,8 @@ const TOOLS: &[(&str, &str)] = &[
     ("geocode", "Geocode"),
     ("directions", "Directions"),
     ("places-search", "PlacesSearch"),
+    ("place-details", "PlaceDetails"),
+    ("search-along-route", "SearchAlongRoute"),
 ];
 
 /// The class's packaged specification.

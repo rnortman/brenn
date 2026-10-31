@@ -882,3 +882,221 @@ async fn places_search_near_a_place_geocodes_then_posts() {
     );
     assert!(r.runtime.serving(PROVIDER, &id).is_none());
 }
+
+/// The path Place Details reads the test's place at.
+const PLACE_DETAILS: &str = "/v1/places/ChIJ1";
+
+/// The `PlaceDetails` field mask without reviews, as Google's Places reference
+/// spells its fields.
+const PLACE_DETAILS_FIELD_MASK: &str = "id,displayName,formattedAddress,location,\
+primaryTypeDisplayName,rating,userRatingCount,priceLevel,businessStatus,\
+currentOpeningHours.openNow,regularOpeningHours.weekdayDescriptions,nationalPhoneNumber,\
+internationalPhoneNumber,websiteUri,googleMapsUri";
+
+/// One place as Place Details answers it, reviews included: the stub answers
+/// whatever the mask asked for.
+fn place_details_body() -> String {
+    serde_json::to_string_pretty(&json!({
+        "id": "ChIJ1",
+        "displayName": { "text": "Blue Cup", "languageCode": "en" },
+        "formattedAddress": "1 Main St, Mountain View, CA, USA",
+        "location": { "latitude": 37.39, "longitude": -122.08 },
+        "websiteUri": "https://example.com/",
+        "editorialSummary": { "text": "A small cafe.", "languageCode": "en" },
+        "reviews": [{
+            "rating": 5,
+            "relativePublishTimeDescription": "a week ago",
+            "text": { "text": "Good coffee.", "languageCode": "en" },
+            "authorAttribution": { "displayName": "Alice" },
+        }],
+    }))
+    .unwrap()
+}
+
+/// PlaceDetails is one keyed `GET` on the place's path. Its field mask asks for
+/// reviews and the editorial summary only when the caller does, and the answer
+/// carries them only then.
+#[tokio::test]
+async fn place_details_omits_reviews_unless_asked() {
+    let r = rig().await;
+    r.answer(PLACE_DETAILS, place_details_body());
+    let place = json!({
+        "id": "ChIJ1",
+        "name": "Blue Cup",
+        "address": "1 Main St, Mountain View, CA, USA",
+        "lat": 37.39,
+        "lng": -122.08,
+        "website": "https://example.com/",
+    });
+
+    for (reviews, mask) in [
+        (false, PLACE_DETAILS_FIELD_MASK.to_string()),
+        (
+            true,
+            format!("{PLACE_DETAILS_FIELD_MASK},reviews,editorialSummary"),
+        ),
+    ] {
+        let call = r.call_for_alice("PlaceDetails", json!({ "id": "ChIJ1", "reviews": reviews }));
+        let id = r.requested_id().await;
+        r.serve().await;
+        assert_eq!(r.inflight_keys(), [format!("{id}/1")]);
+        r.run_nested().await;
+        r.serve().await;
+
+        let answer = call.await.unwrap().expect("the component answered");
+        let mut want = place.clone();
+        if reviews {
+            want["summary"] = json!("A small cafe.");
+            want["reviews"] = json!([{
+                "rating": 5, "when": "a week ago", "author": "Alice", "text": "Good coffee.",
+            }]);
+        }
+        assert_eq!(answer, want, "reviews: {reviews}");
+
+        let stub = r.stub.lock().unwrap();
+        let request = stub.api_seen.last().expect("a request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path_and_query, PLACE_DETAILS);
+        assert_eq!(request.headers.get("x-api-key").unwrap(), testutil::KEY);
+        assert_eq!(
+            request.headers.get("x-goog-fieldmask").unwrap(),
+            mask.as_str(),
+            "reviews: {reviews}"
+        );
+        drop(stub);
+        assert!(
+            r.inflight_keys().is_empty(),
+            "the answered request left no row"
+        );
+        assert!(r.runtime.serving(PROVIDER, &id).is_none());
+    }
+    assert_eq!(r.seen().len(), 2);
+}
+
+/// SearchAlongRoute's route field mask.
+const ALONG_ROUTE_FIELD_MASK: &str =
+    "routes.polyline.encodedPolyline,routes.distanceMeters,routes.duration,fallbackInfo";
+
+/// SearchAlongRoute computes the route with a keyed `POST` asking for an
+/// overview polyline, then posts a text search along that polyline, both
+/// stamped with the conversation's user, and answers with the route — Google's
+/// fallback included — and the places.
+#[tokio::test]
+async fn search_along_route_computes_then_searches() {
+    let r = rig().await;
+    r.answer(
+        COMPUTE_ROUTES,
+        serde_json::to_string_pretty(&json!({
+            "routes": [{
+                "polyline": { "encodedPolyline": "_p~iF~ps|U_ulLnnqC" },
+                "distanceMeters": 3200,
+                "duration": "540s",
+            }],
+            "fallbackInfo": { "routingMode": "FALLBACK_TRAFFIC_UNAWARE", "reason": "SERVER_ERROR" },
+        }))
+        .unwrap(),
+    );
+    r.answer(SEARCH_TEXT, places_body());
+    let call = r.call_for_alice(
+        "SearchAlongRoute",
+        json!({ "origin": "37.422,-122.0841", "destination": "Mountain View", "query": "coffee" }),
+    );
+    let id = r.requested_id().await;
+
+    // Step 1: the route.
+    r.serve().await;
+    assert_eq!(r.inflight_keys(), [format!("{id}/1")]);
+    let result = r.run_nested().await;
+    assert_eq!(result["call_id"], format!("{id}/1"));
+
+    // Step 2: the search along it.
+    r.serve().await;
+    assert_eq!(r.inflight_keys(), [format!("{id}/2")]);
+    let result = r.run_nested().await;
+    assert_eq!(result["call_id"], format!("{id}/2"));
+    r.serve().await;
+
+    let answer = call.await.unwrap().expect("the component answered");
+    assert_eq!(
+        answer,
+        json!({
+            "route": {
+                "distance": { "value": 3.2, "unit": "km" },
+                "duration_minutes": 9,
+                "fallback": { "routing_mode": "FALLBACK_TRAFFIC_UNAWARE", "reason": "SERVER_ERROR" },
+            },
+            "places": [{
+                "id": "ChIJ1",
+                "name": "Blue Cup",
+                "address": "1 Main St, Mountain View, CA, USA",
+                "lat": 37.39,
+                "lng": -122.08,
+                "type": "Coffee Shop",
+                "rating": 4.6,
+                "rating_count": 312,
+                "price_level": "PRICE_LEVEL_INEXPENSIVE",
+                "open_now": true,
+                "status": "OPERATIONAL",
+            }],
+            "more": true,
+        })
+    );
+
+    assert_eq!(
+        r.seen(),
+        [
+            (
+                "POST".to_string(),
+                COMPUTE_ROUTES.to_string(),
+                BTreeMap::new()
+            ),
+            ("POST".to_string(), SEARCH_TEXT.to_string(), BTreeMap::new()),
+        ]
+    );
+    let stub = r.stub.lock().unwrap();
+    for request in &stub.api_seen {
+        assert_eq!(
+            request.headers.get("x-api-key").unwrap(),
+            testutil::KEY,
+            "{}",
+            request.path_and_query
+        );
+    }
+    let (route, search) = (&stub.api_seen[0], &stub.api_seen[1]);
+    assert_eq!(
+        route.headers.get("x-goog-fieldmask").unwrap(),
+        ALONG_ROUTE_FIELD_MASK
+    );
+    let body: Value = serde_json::from_slice(&route.body).expect("a JSON body");
+    assert_eq!(
+        body,
+        json!({
+            "origin": { "location": { "latLng": { "latitude": 37.422, "longitude": -122.0841 } } },
+            "destination": { "address": "Mountain View" },
+            "travelMode": "DRIVE",
+            "routingPreference": "TRAFFIC_AWARE",
+            "computeAlternativeRoutes": false,
+            "polylineQuality": "OVERVIEW",
+            "units": "METRIC",
+        })
+    );
+    assert_eq!(
+        search.headers.get("x-goog-fieldmask").unwrap(),
+        PLACES_SEARCH_FIELD_MASK
+    );
+    let body: Value = serde_json::from_slice(&search.body).expect("a JSON body");
+    assert_eq!(
+        body,
+        json!({
+            "textQuery": "coffee",
+            "pageSize": 10,
+            "searchAlongRouteParameters": { "polyline": { "encodedPolyline": "_p~iF~ps|U_ulLnnqC" } },
+        })
+    );
+    drop(stub);
+    assert!(
+        r.inflight_keys().is_empty(),
+        "the answered request left no row"
+    );
+    assert!(r.runtime.serving(PROVIDER, &id).is_none());
+}

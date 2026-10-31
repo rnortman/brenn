@@ -107,6 +107,41 @@ const PLACES_DEFAULT_MAX: u64 = 10;
 const RADIUS_MAX_METERS: u64 = 50_000;
 const RADIUS_DEFAULT_METERS: u64 = 5_000;
 
+/// Place Details' field mask: what the compact result carries. Details masks
+/// carry no `places.` prefix.
+const PLACE_DETAILS_FIELD_MASK: &str = "id,displayName,formattedAddress,location,\
+primaryTypeDisplayName,rating,userRatingCount,priceLevel,businessStatus,\
+currentOpeningHours.openNow,regularOpeningHours.weekdayDescriptions,nationalPhoneNumber,\
+internationalPhoneNumber,websiteUri,googleMapsUri";
+/// What `reviews: true` adds to the mask: user-submitted content, billed at
+/// Google's Enterprise + Atmosphere tier and refused on a Demo Key.
+const PLACE_DETAILS_REVIEW_FIELDS: &str = "reviews,editorialSummary";
+/// The Places API path a place's details are read at, before its id.
+const PLACE_DETAILS_PATH: &str = "/v1/places/";
+/// The most reviews carried (Google returns at most five), and the most
+/// characters of each review's text.
+const REVIEWS_MAX: usize = 5;
+const REVIEW_TEXT_MAX_CHARS: usize = 600;
+/// The most opening-hours lines carried: one per weekday.
+const WEEKDAYS: usize = 7;
+
+/// SearchAlongRoute's route field mask: the polyline the search follows, the
+/// route's size, and `fallbackInfo`, which Google sets when it did not
+/// compute the route in the routing mode asked for.
+const ALONG_ROUTE_FIELD_MASK: &str =
+    "routes.polyline.encodedPolyline,routes.distanceMeters,routes.duration,fallbackInfo";
+/// SearchAlongRoute's steps: the route, then the search along it.
+const ALONG_ROUTE_ROUTE_STEP: u8 = 1;
+const ALONG_ROUTE_SEARCH_STEP: u8 = 2;
+/// The longest encoded polyline a search along a route is sent with. It is the
+/// one field of unbounded size the wrapper ever puts into a nested call's
+/// arguments; this leaves room under their 64 KiB cap for the rest of the
+/// search body, whose caller text is capped at [`TEXT_MAX_BYTES`], and for
+/// escaping the polyline's `\` twice at the one-in-64 rate Google's encoding
+/// alphabet gives it. A polyline denser in `\` than that can exceed the args
+/// cap, which the nested call refuses.
+pub const POLYLINE_MAX_BYTES: usize = 48 * 1024;
+
 /// The unit system Google is asked to answer in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Units {
@@ -459,6 +494,15 @@ fn integer(args: &Args, key: &str, min: u64, max: u64) -> Result<Option<u64>, St
     }
 }
 
+/// A boolean argument; absent is `false`.
+fn flag(args: &Args, key: &str) -> Result<bool, String> {
+    match args.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(format!("`{key}` must be true or false")),
+    }
+}
+
 /// A latitude and longitude in range.
 fn checked(lat: f64, lng: f64, what: &str) -> Result<(f64, f64), String> {
     if !(-90.0..=90.0).contains(&lat) {
@@ -542,7 +586,12 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
             let directions = DirectionsArgs::parse(args)?;
             Ok(Call {
                 step: 1,
-                api: directions_call(&directions, settings),
+                api: compute_routes_call(
+                    &directions.route,
+                    directions.when.as_ref(),
+                    RouteRequest::Directions,
+                    settings,
+                ),
             })
         }
         Provided::PlacesSearch => {
@@ -560,6 +609,20 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                     step: PLACES_SEARCH_STEP,
                     api: places_search_call(&search, None, settings),
                 },
+            })
+        }
+        Provided::PlaceDetails => {
+            let details = PlaceDetailsArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: place_details_call(&details, settings),
+            })
+        }
+        Provided::SearchAlongRoute => {
+            let along = AlongRouteArgs::parse(args)?;
+            Ok(Call {
+                step: ALONG_ROUTE_ROUTE_STEP,
+                api: compute_routes_call(&along.route, None, RouteRequest::Polyline, settings),
             })
         }
     }
@@ -858,11 +921,47 @@ enum When {
     ArriveBy(String),
 }
 
+/// The two ends of a route and how it is travelled.
 #[derive(Clone, Debug, PartialEq)]
-struct DirectionsArgs {
+struct RouteEnds {
     origin: Waypoint,
     destination: Waypoint,
     mode: TravelMode,
+}
+
+impl RouteEnds {
+    fn parse(args: &Args) -> Result<RouteEnds, String> {
+        Ok(RouteEnds {
+            origin: Waypoint::parse(args, "origin")?,
+            destination: Waypoint::parse(args, "destination")?,
+            mode: TravelMode::parse(args)?,
+        })
+    }
+
+    /// The first route of a Routes answer. No route is the caller's: none
+    /// joins the two ends by that mode.
+    fn first<'a>(&self, body: &'a Value) -> Result<&'a Value, Failure> {
+        let Value::Object(body) = body else {
+            return Err(shape("Routes"));
+        };
+        let Some(route) = first_of(body, "routes", "Routes")? else {
+            return Err(Failure {
+                kind: ErrorKind::InvalidArgs,
+                detail: format!(
+                    "no {} route found from {} to {}",
+                    self.mode.name(),
+                    self.origin,
+                    self.destination
+                ),
+            });
+        };
+        record(route, "Routes")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DirectionsArgs {
+    route: RouteEnds,
     when: Option<When>,
     max_steps: usize,
 }
@@ -880,16 +979,14 @@ impl DirectionsArgs {
                 "max_steps",
             ],
         )?;
-        let origin = Waypoint::parse(args, "origin")?;
-        let destination = Waypoint::parse(args, "destination")?;
-        let mode = TravelMode::parse(args)?;
+        let route = RouteEnds::parse(args)?;
         // Google checks the times themselves and answers a malformed one with a 400.
         let when = match (text(args, "depart_at")?, text(args, "arrive_by")?) {
             (Some(_), Some(_)) => {
                 return Err("pass `depart_at` or `arrive_by`, not both".to_string());
             }
             (Some(time), None) => Some(When::DepartAt(time.to_string())),
-            (None, Some(_)) if mode != TravelMode::Transit => {
+            (None, Some(_)) if route.mode != TravelMode::Transit => {
                 // Google ignores an arrival time on every other mode; a route
                 // that silently leaves now is not the route asked for.
                 return Err("`arrive_by` applies to `mode: transit` only".to_string());
@@ -900,27 +997,38 @@ impl DirectionsArgs {
         let max_steps = integer(args, "max_steps", 1, DIRECTIONS_MAX_STEPS)?
             .unwrap_or(DIRECTIONS_DEFAULT_MAX_STEPS);
         Ok(DirectionsArgs {
-            origin,
-            destination,
-            mode,
+            route,
             when,
             max_steps: usize::try_from(max_steps).expect("max_steps is at most 200"),
         })
     }
 }
 
-/// A Routes `computeRoutes` call for `Directions`: one route, no alternatives,
-/// no polyline.
-fn directions_call(args: &DirectionsArgs, settings: &Settings) -> ApiCall {
+/// What a `computeRoutes` call asks Google for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteRequest {
+    /// `Directions`: legs and steps, no polyline.
+    Directions,
+    /// SearchAlongRoute: an overview polyline and the route's size.
+    Polyline,
+}
+
+/// A Routes `computeRoutes` call: one route, no alternatives.
+fn compute_routes_call(
+    route: &RouteEnds,
+    when: Option<&When>,
+    request: RouteRequest,
+    settings: &Settings,
+) -> ApiCall {
     let mut body = Args::new();
-    body.insert("origin".to_string(), args.origin.google());
-    body.insert("destination".to_string(), args.destination.google());
-    body.insert("travelMode".to_string(), json!(args.mode.google()));
+    body.insert("origin".to_string(), route.origin.google());
+    body.insert("destination".to_string(), route.destination.google());
+    body.insert("travelMode".to_string(), json!(route.mode.google()));
     // Google refuses a routing preference on any mode but driving.
-    if args.mode == TravelMode::Drive {
+    if route.mode == TravelMode::Drive {
         body.insert("routingPreference".to_string(), json!("TRAFFIC_AWARE"));
     }
-    match &args.when {
+    match when {
         Some(When::DepartAt(time)) => {
             body.insert("departureTime".to_string(), json!(time));
         }
@@ -930,6 +1038,16 @@ fn directions_call(args: &DirectionsArgs, settings: &Settings) -> ApiCall {
         None => {}
     }
     body.insert("computeAlternativeRoutes".to_string(), json!(false));
+    let mask = match request {
+        RouteRequest::Directions => DIRECTIONS_FIELD_MASK,
+        RouteRequest::Polyline => {
+            // Pinned rather than left to Google's default: an overview line is
+            // what keeps the polyline under `POLYLINE_MAX_BYTES` on any
+            // ordinary route.
+            body.insert("polylineQuality".to_string(), json!("OVERVIEW"));
+            ALONG_ROUTE_FIELD_MASK
+        }
+    };
     body.insert("units".to_string(), json!(settings.units.google()));
     if let Some(language) = &settings.language {
         body.insert("languageCode".to_string(), json!(language));
@@ -940,75 +1058,128 @@ fn directions_call(args: &DirectionsArgs, settings: &Settings) -> ApiCall {
         host: settings.routes_host.clone(),
         path: COMPUTE_ROUTES_PATH.to_string(),
         query: BTreeMap::new(),
-        headers: BTreeMap::from([(
-            "X-Goog-FieldMask".to_string(),
-            DIRECTIONS_FIELD_MASK.to_string(),
-        )]),
+        headers: BTreeMap::from([("X-Goog-FieldMask".to_string(), mask.to_string())]),
         body: Some(Value::Object(body).to_string()),
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct PlacesSearchArgs {
+struct PlaceDetailsArgs {
+    id: String,
+    reviews: bool,
+}
+
+impl PlaceDetailsArgs {
+    fn parse(args: &Value) -> Result<PlaceDetailsArgs, String> {
+        let args = object(args, &["id", "reviews"])?;
+        let Some(id) = text(args, "id")? else {
+            return Err("`id` is required".to_string());
+        };
+        // The id becomes the last path segment; a Places id is URL-safe base64.
+        if !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(
+                "`id` must be a bare Places place id (letters, digits, `_` and `-`), as \
+                 PlacesSearch's `id` or Geocode's `place_id`"
+                    .to_string(),
+            );
+        }
+        Ok(PlaceDetailsArgs {
+            id: id.to_string(),
+            reviews: flag(args, "reviews")?,
+        })
+    }
+}
+
+/// A Place Details lookup. Reviews and the editorial summary are requested
+/// only when asked for: they are billed at a higher tier.
+fn place_details_call(args: &PlaceDetailsArgs, settings: &Settings) -> ApiCall {
+    let mask = if args.reviews {
+        format!("{PLACE_DETAILS_FIELD_MASK},{PLACE_DETAILS_REVIEW_FIELDS}")
+    } else {
+        PLACE_DETAILS_FIELD_MASK.to_string()
+    };
+    let mut params = BTreeMap::new();
+    if let Some(language) = &settings.language {
+        params.insert("languageCode".to_string(), language.clone());
+    }
+    ApiCall {
+        provider: settings.provider.clone(),
+        method: "GET".to_string(),
+        host: settings.places_host.clone(),
+        path: format!("{PLACE_DETAILS_PATH}{}", args.id),
+        query: params,
+        headers: BTreeMap::from([("X-Goog-FieldMask".to_string(), mask)]),
+        body: None,
+    }
+}
+
+/// A Places text search's terms: what to look for, and the most places one
+/// page answers with.
+#[derive(Clone, Debug, PartialEq)]
+struct SearchText {
     query: String,
-    /// Where the search is biased toward: coordinates, or a place to geocode.
-    near: Option<Where>,
-    /// The bias circle's radius; read only with `near`.
-    radius: u64,
-    open_now: bool,
     max: usize,
 }
 
-impl PlacesSearchArgs {
-    fn parse(args: &Value) -> Result<PlacesSearchArgs, String> {
-        let args = object(args, &["query", "near", "radius", "open_now", "max"])?;
+impl SearchText {
+    fn parse(args: &Args) -> Result<SearchText, String> {
         let Some(query) = text(args, "query")? else {
             return Err("`query` is required".to_string());
         };
-        let near = text(args, "near")?
-            .map(|near| place_text(near, "near"))
-            .transpose()?;
-        let radius = integer(args, "radius", 1, RADIUS_MAX_METERS)?;
-        if radius.is_some() && near.is_none() {
-            return Err("`radius` applies with `near` only".to_string());
-        }
-        let open_now = match args.get("open_now") {
-            None => false,
-            Some(Value::Bool(open_now)) => *open_now,
-            Some(_) => return Err("`open_now` must be true or false".to_string()),
-        };
         let max = integer(args, "max", 1, PLACES_MAX)?.unwrap_or(PLACES_DEFAULT_MAX);
-        Ok(PlacesSearchArgs {
+        Ok(SearchText {
             query: query.to_string(),
-            near,
-            radius: radius.unwrap_or(RADIUS_DEFAULT_METERS),
-            open_now,
             max: usize::try_from(max).expect("max is at most 20"),
         })
     }
 }
 
-/// A Places text search, biased toward a circle around `center` when there
-/// is one: one page of at most `max` places.
-fn places_search_call(
-    args: &PlacesSearchArgs,
-    center: Option<(f64, f64)>,
+/// What limits a Places text search to an area.
+enum SearchScope<'a> {
+    Anywhere,
+    /// Biased toward a circle of `radius` meters around a point.
+    Near {
+        lat: f64,
+        lng: f64,
+        radius: u64,
+    },
+    /// Along a route's encoded polyline.
+    Along(&'a str),
+}
+
+/// A Places text search: one page of at most `search.max` places.
+fn search_text_call(
+    search: &SearchText,
+    open_now: bool,
+    scope: SearchScope<'_>,
     settings: &Settings,
 ) -> ApiCall {
     let mut body = Args::new();
-    body.insert("textQuery".to_string(), json!(args.query));
-    body.insert("pageSize".to_string(), json!(args.max));
-    if args.open_now {
+    body.insert("textQuery".to_string(), json!(search.query));
+    body.insert("pageSize".to_string(), json!(search.max));
+    if open_now {
         body.insert("openNow".to_string(), json!(true));
     }
-    if let Some((lat, lng)) = center {
-        body.insert(
-            "locationBias".to_string(),
-            json!({ "circle": {
-                "center": { "latitude": lat, "longitude": lng },
-                "radius": args.radius,
-            } }),
-        );
+    match scope {
+        SearchScope::Anywhere => {}
+        SearchScope::Near { lat, lng, radius } => {
+            body.insert(
+                "locationBias".to_string(),
+                json!({ "circle": {
+                    "center": { "latitude": lat, "longitude": lng },
+                    "radius": radius,
+                } }),
+            );
+        }
+        SearchScope::Along(polyline) => {
+            body.insert(
+                "searchAlongRouteParameters".to_string(),
+                json!({ "polyline": { "encodedPolyline": polyline } }),
+            );
+        }
     }
     if let Some(language) = &settings.language {
         body.insert("languageCode".to_string(), json!(language));
@@ -1025,6 +1196,74 @@ fn places_search_call(
         )]),
         body: Some(Value::Object(body).to_string()),
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AlongRouteArgs {
+    route: RouteEnds,
+    search: SearchText,
+}
+
+impl AlongRouteArgs {
+    fn parse(args: &Value) -> Result<AlongRouteArgs, String> {
+        let args = object(args, &["origin", "destination", "query", "mode", "max"])?;
+        let route = RouteEnds::parse(args)?;
+        let search = SearchText::parse(args)?;
+        Ok(AlongRouteArgs { route, search })
+    }
+}
+
+/// A Places text search along a route's encoded polyline.
+fn along_route_search_call(args: &AlongRouteArgs, polyline: &str, settings: &Settings) -> ApiCall {
+    search_text_call(&args.search, false, SearchScope::Along(polyline), settings)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PlacesSearchArgs {
+    search: SearchText,
+    /// Where the search is biased toward: coordinates, or a place to geocode.
+    near: Option<Where>,
+    /// The bias circle's radius; read only with `near`.
+    radius: u64,
+    open_now: bool,
+}
+
+impl PlacesSearchArgs {
+    fn parse(args: &Value) -> Result<PlacesSearchArgs, String> {
+        let args = object(args, &["query", "near", "radius", "open_now", "max"])?;
+        let search = SearchText::parse(args)?;
+        let near = text(args, "near")?
+            .map(|near| place_text(near, "near"))
+            .transpose()?;
+        let radius = integer(args, "radius", 1, RADIUS_MAX_METERS)?;
+        if radius.is_some() && near.is_none() {
+            return Err("`radius` applies with `near` only".to_string());
+        }
+        Ok(PlacesSearchArgs {
+            search,
+            near,
+            radius: radius.unwrap_or(RADIUS_DEFAULT_METERS),
+            open_now: flag(args, "open_now")?,
+        })
+    }
+}
+
+/// A Places text search, biased toward a circle around `center` when there
+/// is one.
+fn places_search_call(
+    args: &PlacesSearchArgs,
+    center: Option<(f64, f64)>,
+    settings: &Settings,
+) -> ApiCall {
+    let scope = match center {
+        None => SearchScope::Anywhere,
+        Some((lat, lng)) => SearchScope::Near {
+            lat,
+            lng,
+            radius: args.radius,
+        },
+    };
+    search_text_call(&args.search, args.open_now, scope, settings)
 }
 
 /// A nested call's typed error, as the executor wrote it.
@@ -1160,6 +1399,11 @@ fn google_error(status: u64, body: &str) -> Failure {
 /// What the request does with its nested call's answer: complete, fail, or
 /// issue its next step.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
+    if (state.tool, state.step) == (Provided::SearchAlongRoute, ALONG_ROUTE_ROUTE_STEP)
+        && let Some(failure) = route_answer_cut(&outcome)
+    {
+        return Next::Fail(failure);
+    }
     let body = match read_api_result(outcome, &state.target) {
         Ok(body) => body,
         Err(failure) => return Next::Fail(failure),
@@ -1181,6 +1425,18 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
         (Provided::PlacesSearch, PLACES_SEARCH_STEP) => stored(state, PlacesSearchArgs::parse)
             .and_then(|args| compact_places_search(&args, &state.derived, &body))
             .map(Next::Complete),
+        (Provided::PlaceDetails, 1) => stored(state, PlaceDetailsArgs::parse)
+            .and_then(|args| compact_place_details(&args, &body))
+            .map(Next::Complete),
+        (Provided::SearchAlongRoute, ALONG_ROUTE_ROUTE_STEP) => {
+            stored(state, AlongRouteArgs::parse)
+                .and_then(|args| search_along(&args, &body, settings))
+        }
+        (Provided::SearchAlongRoute, ALONG_ROUTE_SEARCH_STEP) => {
+            stored(state, AlongRouteArgs::parse)
+                .and_then(|args| compact_along_route(&args, &state.derived, &body))
+                .map(Next::Complete)
+        }
         (tool, step) => Err(internal(format!(
             "in-flight row names step {step} of {}, which has no such step",
             tool.name()
@@ -1347,7 +1603,7 @@ fn compact_places_search(
             resolved_location(near, derived, "places-search's search")?,
         );
     }
-    compact_places(&mut out, body, args.max)?;
+    compact_places(&mut out, body, args.search.max)?;
     Ok(Value::Object(out))
 }
 
@@ -1365,33 +1621,181 @@ fn compact_places(out: &mut Args, body: &Value, max: usize) -> Result<(), Failur
         body.get("places").unwrap_or(&none),
         max,
         "Places",
-        |place| {
-            let place = record(place, "Places")?;
-            let mut item = Args::new();
-            copy(&mut item, "id", place.get("id"));
-            copy(&mut item, "name", at(place, &["displayName", "text"]));
-            copy(&mut item, "address", place.get("formattedAddress"));
-            copy(&mut item, "lat", at(place, &["location", "latitude"]));
-            copy(&mut item, "lng", at(place, &["location", "longitude"]));
-            copy(
-                &mut item,
-                "type",
-                at(place, &["primaryTypeDisplayName", "text"]),
-            );
-            copy(&mut item, "rating", place.get("rating"));
-            copy(&mut item, "rating_count", place.get("userRatingCount"));
-            copy(&mut item, "price_level", place.get("priceLevel"));
-            copy(
-                &mut item,
-                "open_now",
-                at(place, &["currentOpeningHours", "openNow"]),
-            );
-            copy(&mut item, "status", place.get("businessStatus"));
-            Ok(Value::Object(item))
-        },
+        |place| Ok(Value::Object(compact_place(record(place, "Places")?))),
     )?;
     out.insert("more".to_string(), json!(page_token(body).is_some()));
     Ok(())
+}
+
+/// A Google `Place` as the compact place PlacesSearch, SearchAlongRoute and
+/// PlaceDetails all answer with.
+fn compact_place(place: &Value) -> Args {
+    let mut out = Args::new();
+    copy(&mut out, "id", place.get("id"));
+    copy(&mut out, "name", at(place, &["displayName", "text"]));
+    copy(&mut out, "address", place.get("formattedAddress"));
+    copy(&mut out, "lat", at(place, &["location", "latitude"]));
+    copy(&mut out, "lng", at(place, &["location", "longitude"]));
+    copy(
+        &mut out,
+        "type",
+        at(place, &["primaryTypeDisplayName", "text"]),
+    );
+    copy(&mut out, "rating", place.get("rating"));
+    copy(&mut out, "rating_count", place.get("userRatingCount"));
+    copy(&mut out, "price_level", place.get("priceLevel"));
+    copy(
+        &mut out,
+        "open_now",
+        at(place, &["currentOpeningHours", "openNow"]),
+    );
+    copy(&mut out, "status", place.get("businessStatus"));
+    out
+}
+
+/// A Place Details answer as PlaceDetails' compact result. `summary` and
+/// `reviews` appear only when they were asked for and Google gave them.
+fn compact_place_details(args: &PlaceDetailsArgs, body: &Value) -> Result<Value, Failure> {
+    if body.get("id").is_none() {
+        return Err(shape("Places"));
+    }
+    let mut out = compact_place(body);
+    if let Some(hours) = at(body, &["regularOpeningHours", "weekdayDescriptions"]) {
+        first_items(&mut out, "hours", hours, WEEKDAYS, "Places", |line| {
+            string_item(line, "Places")
+        })?;
+    }
+    copy(&mut out, "phone", body.get("nationalPhoneNumber"));
+    copy(
+        &mut out,
+        "phone_international",
+        body.get("internationalPhoneNumber"),
+    );
+    copy(&mut out, "website", body.get("websiteUri"));
+    copy(&mut out, "maps_url", body.get("googleMapsUri"));
+    if args.reviews {
+        copy(&mut out, "summary", at(body, &["editorialSummary", "text"]));
+        if let Some(reviews) = body.get("reviews") {
+            first_items(
+                &mut out,
+                "reviews",
+                reviews,
+                REVIEWS_MAX,
+                "Places",
+                |review| {
+                    let review = record(review, "Places")?;
+                    let mut item = Args::new();
+                    copy(&mut item, "rating", review.get("rating"));
+                    copy(
+                        &mut item,
+                        "when",
+                        review.get("relativePublishTimeDescription"),
+                    );
+                    copy(
+                        &mut item,
+                        "author",
+                        at(review, &["authorAttribution", "displayName"]),
+                    );
+                    if let Some(text) = at(review, &["text", "text"]).and_then(Value::as_str) {
+                        item.insert("text".to_string(), json!(cut(text, REVIEW_TEXT_MAX_CHARS)));
+                    }
+                    Ok(Value::Object(item))
+                },
+            )?;
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// SearchAlongRoute's route step answered with a body `api-request` cut at the
+/// key provider's read limit. The step's field mask leaves nothing in the
+/// answer but the polyline, two scalars and `fallbackInfo`, so a cut answer is
+/// a route too long to search along: the caller's, unlike every other cut
+/// answer, which `read_api_result` answers `internal`.
+fn route_answer_cut(outcome: &Result<Value, NestedError>) -> Option<Failure> {
+    let value = outcome.as_ref().ok()?;
+    if value.get("truncated").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let answer = match value.get("bytes").and_then(Value::as_u64) {
+        Some(bytes) => format!("Google's {bytes}-byte answer exceeds"),
+        None => "Google's answer, of unstated length, arrived as a cut at".to_string(),
+    };
+    Some(Failure {
+        kind: ErrorKind::InvalidArgs,
+        detail: format!("route too long to search along ({answer} the key provider's read limit)"),
+    })
+}
+
+/// SearchAlongRoute's search along the route its first step computed. The
+/// route's compact summary rides in `derived` to the answer; the polyline goes
+/// into the search's body and is not stored.
+fn search_along(args: &AlongRouteArgs, body: &Value, settings: &Settings) -> Result<Next, Failure> {
+    let route = args.route.first(body)?;
+    let polyline = at(route, &["polyline", "encodedPolyline"])
+        .and_then(Value::as_str)
+        .filter(|polyline| !polyline.is_empty())
+        .ok_or_else(|| shape("Routes"))?;
+    if polyline.len() > POLYLINE_MAX_BYTES {
+        return Err(Failure {
+            kind: ErrorKind::InvalidArgs,
+            detail: format!(
+                "route too long to search along ({}-byte polyline)",
+                polyline.len()
+            ),
+        });
+    }
+    let mut summary = Args::new();
+    distance(
+        &mut summary,
+        "distance",
+        route.get("distanceMeters"),
+        settings.units,
+    )?;
+    minutes(&mut summary, "duration_minutes", route.get("duration"))?;
+    fallback(&mut summary, body)?;
+    Ok(Next::Call {
+        call: Call {
+            step: ALONG_ROUTE_SEARCH_STEP,
+            api: along_route_search_call(args, polyline, settings),
+        },
+        derived: Args::from_iter([("route".to_string(), Value::Object(summary))]),
+    })
+}
+
+/// A search along a route as SearchAlongRoute's compact result: the route the
+/// first step computed, then the places and `more`.
+fn compact_along_route(
+    args: &AlongRouteArgs,
+    derived: &Args,
+    body: &Value,
+) -> Result<Value, Failure> {
+    let Some(route @ Value::Object(_)) = derived.get("route") else {
+        return Err(internal(
+            "in-flight row for search-along-route's search carries no route",
+        ));
+    };
+    let mut out = Args::new();
+    out.insert("route".to_string(), route.clone());
+    compact_places(&mut out, body, args.search.max)?;
+    Ok(Value::Object(out))
+}
+
+/// Google's `fallbackInfo` on a Routes answer as `fallback`. Its presence is
+/// the signal that Google did not compute the route in the routing mode asked
+/// for, so it is carried even when none of the inner fields read here is set.
+fn fallback(to: &mut Args, body: &Value) -> Result<(), Failure> {
+    match body.get("fallbackInfo") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Object(info)) => {
+            let mut fallback = Args::new();
+            copy(&mut fallback, "routing_mode", info.get("routingMode"));
+            copy(&mut fallback, "reason", info.get("reason"));
+            to.insert("fallback".to_string(), Value::Object(fallback));
+            Ok(())
+        }
+        Some(_) => Err(shape("Routes")),
+    }
 }
 
 /// The value at `path` through nested objects.
@@ -1816,27 +2220,12 @@ fn compact_geocode(body: &Value, max: usize) -> Result<Value, Failure> {
 
 /// A Routes answer as `Directions`' compact result: Google's one route, its
 /// legs, and at most `max_steps` steps across them, with `steps_omitted`
-/// counting the rest. No route is the caller's: none joins the two ends by
-/// that mode.
+/// counting the rest.
 fn compact_directions(args: &DirectionsArgs, body: &Value, units: Units) -> Result<Value, Failure> {
-    let Value::Object(body) = body else {
-        return Err(shape("Routes"));
-    };
-    let Some(route) = first_of(body, "routes", "Routes")? else {
-        return Err(Failure {
-            kind: ErrorKind::InvalidArgs,
-            detail: format!(
-                "no {} route found from {} to {}",
-                args.mode.name(),
-                args.origin,
-                args.destination
-            ),
-        });
-    };
-    let route = record(route, "Routes")?;
+    let route = args.route.first(body)?;
     let none = Value::Array(Vec::new());
     let mut out = Args::new();
-    out.insert("mode".to_string(), json!(args.mode.name()));
+    out.insert("mode".to_string(), json!(args.route.mode.name()));
     copy(&mut out, "summary", route.get("description"));
     // Google requires its warnings shown (walking and cycling routes are in
     // beta), so the list is always carried, empty when there are none.
@@ -1855,18 +2244,7 @@ fn compact_directions(args: &DirectionsArgs, body: &Value, units: Units) -> Resu
         "duration_without_traffic_minutes",
         route.get("staticDuration"),
     )?;
-    // Its presence is the signal, so it is carried even when none of the
-    // inner fields read here is set.
-    match body.get("fallbackInfo") {
-        None | Some(Value::Null) => {}
-        Some(Value::Object(info)) => {
-            let mut fallback = Args::new();
-            copy(&mut fallback, "routing_mode", info.get("routingMode"));
-            copy(&mut fallback, "reason", info.get("reason"));
-            out.insert("fallback".to_string(), Value::Object(fallback));
-        }
-        Some(_) => return Err(shape("Routes")),
-    }
+    fallback(&mut out, body)?;
     let Value::Array(legs) = route.get("legs").unwrap_or(&none) else {
         return Err(shape("Routes"));
     };
@@ -4357,6 +4735,614 @@ mod tests {
             Next::Fail(failure(
                 ErrorKind::Denied,
                 "api-request refused the nested POST to places.example.com/v1/places:searchText: \
+                 a caller with no acting user may only read. A POST needs a request with a calling \
+                 user (an agent or `brenn-tool`)."
+            ))
+        );
+    }
+
+    fn place_details(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::PlaceDetails, &args, &settings()).map(|call| {
+            assert_eq!(call.step, 1);
+            call.api
+        })
+    }
+
+    #[test]
+    fn place_details_gets_one_place_without_reviews() {
+        let call = place_details(json!({ "id": "ChIJj61dQgK6j4AR4GeTYWZsKWw" })).unwrap();
+        assert_eq!(call.provider, "maps");
+        assert_eq!(call.method, "GET");
+        assert_eq!(call.host, "places.example.com");
+        assert_eq!(call.path, "/v1/places/ChIJj61dQgK6j4AR4GeTYWZsKWw");
+        assert!(call.query.is_empty());
+        assert_eq!(call.body, None);
+        assert_eq!(
+            call.headers["X-Goog-FieldMask"]
+                .split(',')
+                .collect::<Vec<_>>(),
+            [
+                "id",
+                "displayName",
+                "formattedAddress",
+                "location",
+                "primaryTypeDisplayName",
+                "rating",
+                "userRatingCount",
+                "priceLevel",
+                "businessStatus",
+                "currentOpeningHours.openNow",
+                "regularOpeningHours.weekdayDescriptions",
+                "nationalPhoneNumber",
+                "internationalPhoneNumber",
+                "websiteUri",
+                "googleMapsUri",
+            ]
+        );
+        let call = place_details(json!({ "id": "ChIJ1", "reviews": false })).unwrap();
+        assert_eq!(call.headers["X-Goog-FieldMask"], PLACE_DETAILS_FIELD_MASK);
+    }
+
+    #[test]
+    fn place_details_ask_for_reviews_only_on_request() {
+        let call = place_details(json!({ "id": "ChIJ1", "reviews": true })).unwrap();
+        assert_eq!(
+            call.headers["X-Goog-FieldMask"],
+            format!("{PLACE_DETAILS_FIELD_MASK},reviews,editorialSummary")
+        );
+    }
+
+    #[test]
+    fn place_details_pass_the_language() {
+        let s = Settings::from_lookup(lookup(&with(&[("language", "fr")]))).unwrap();
+        let call = plan(Provided::PlaceDetails, &json!({ "id": "ChIJ1" }), &s).unwrap();
+        assert_eq!(call.api.query, query(&[("languageCode", "fr")]));
+    }
+
+    #[test]
+    fn place_details_refuse_bad_arguments_by_name() {
+        const BARE: &str = "`id` must be a bare Places place id (letters, digits, `_` and `-`), \
+                            as PlacesSearch's `id` or Geocode's `place_id`";
+        let cases = [
+            (json!({}), "`id` is required"),
+            (json!({ "id": 1 }), "`id` must be a string"),
+            (json!({ "id": " " }), "`id` is empty"),
+            (json!({ "id": "place_id:ChIJ1" }), BARE),
+            (json!({ "id": "ChIJ1/reviews" }), BARE),
+            (json!({ "id": "ChIJ%2F1" }), BARE),
+            (json!({ "id": "ChIJ1?x=1" }), BARE),
+            (
+                json!({ "id": "ChIJ1", "reviews": "yes" }),
+                "`reviews` must be true or false",
+            ),
+        ];
+        for (args, want) in cases {
+            assert_eq!(place_details(args.clone()).unwrap_err(), want, "{args}");
+        }
+        let err = place_details(json!({ "id": "ChIJ1", "fields": "*" })).unwrap_err();
+        assert!(err.starts_with("unknown argument `fields`"), "{err}");
+        let at_cap = "a".repeat(TEXT_MAX_BYTES);
+        assert!(place_details(json!({ "id": at_cap })).is_ok());
+        assert_eq!(
+            place_details(json!({ "id": format!("{at_cap}a") })).unwrap_err(),
+            "`id` is longer than 1024 bytes"
+        );
+    }
+
+    fn details_answer(args: Value, body: &Value) -> Next {
+        let call = plan(Provided::PlaceDetails, &args, &settings()).unwrap();
+        let state = InFlight::new(
+            &"a".repeat(32),
+            Provided::PlaceDetails,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        );
+        advance(&state, http(200, &body.to_string()), &settings())
+    }
+
+    fn review(n: usize, text: &str) -> Value {
+        json!({
+            "rating": 5,
+            "relativePublishTimeDescription": format!("{n} weeks ago"),
+            "text": { "text": text, "languageCode": "en" },
+            "authorAttribution": { "displayName": format!("Reviewer {n}"), "uri": "https://example.com/r" },
+        })
+    }
+
+    fn details_body() -> Value {
+        json!({
+            "id": "ChIJ1",
+            "displayName": { "text": "Blue Cup", "languageCode": "en" },
+            "formattedAddress": "1 Main St, Springfield",
+            "location": { "latitude": 37.39, "longitude": -122.08 },
+            "primaryTypeDisplayName": { "text": "Coffee Shop", "languageCode": "en" },
+            "rating": 4.6,
+            "userRatingCount": 312,
+            "priceLevel": "PRICE_LEVEL_INEXPENSIVE",
+            "businessStatus": "OPERATIONAL",
+            "currentOpeningHours": { "openNow": true },
+            "regularOpeningHours": { "openNow": true, "weekdayDescriptions": ["Monday: 7:00 AM – 6:00 PM"] },
+            "nationalPhoneNumber": "(555) 010-0000",
+            "internationalPhoneNumber": "+1 555-010-0000",
+            "websiteUri": "https://example.com/",
+            "googleMapsUri": "https://maps.google.com/?cid=1",
+            "editorialSummary": { "text": "A small cafe.", "languageCode": "en" },
+            "reviews": [review(1, "Good.")],
+        })
+    }
+
+    #[test]
+    fn place_details_compact_googles_answer() {
+        let want = json!({
+            "id": "ChIJ1", "name": "Blue Cup", "address": "1 Main St, Springfield",
+            "lat": 37.39, "lng": -122.08, "type": "Coffee Shop",
+            "rating": 4.6, "rating_count": 312, "price_level": "PRICE_LEVEL_INEXPENSIVE",
+            "status": "OPERATIONAL", "open_now": true,
+            "hours": ["Monday: 7:00 AM – 6:00 PM"],
+            "phone": "(555) 010-0000", "phone_international": "+1 555-010-0000",
+            "website": "https://example.com/", "maps_url": "https://maps.google.com/?cid=1",
+        });
+        // Not asked for: a summary or reviews Google sent anyway are not carried.
+        assert_eq!(
+            details_answer(json!({ "id": "ChIJ1" }), &details_body()),
+            Next::Complete(want.clone())
+        );
+        let Next::Complete(answer) =
+            details_answer(json!({ "id": "ChIJ1", "reviews": true }), &details_body())
+        else {
+            panic!("expected an answer");
+        };
+        let mut with_reviews = want;
+        with_reviews["summary"] = json!("A small cafe.");
+        with_reviews["reviews"] = json!([{
+            "rating": 5, "when": "1 weeks ago", "author": "Reviewer 1", "text": "Good.",
+        }]);
+        assert_eq!(answer, with_reviews);
+        // Only what Google gave is stated.
+        assert_eq!(
+            details_answer(
+                json!({ "id": "ChIJ1", "reviews": true }),
+                &json!({ "id": "ChIJ1" })
+            ),
+            Next::Complete(json!({ "id": "ChIJ1" }))
+        );
+    }
+
+    #[test]
+    fn place_details_cut_review_text_and_count_reviews_beyond_the_cap() {
+        let long = "é".repeat(REVIEW_TEXT_MAX_CHARS + 1);
+        let mut body = details_body();
+        body["reviews"] = json!((1..=6).map(|n| review(n, &long)).collect::<Vec<_>>());
+        let Next::Complete(answer) =
+            details_answer(json!({ "id": "ChIJ1", "reviews": true }), &body)
+        else {
+            panic!("expected an answer");
+        };
+        let reviews = answer["reviews"].as_array().unwrap();
+        assert_eq!(reviews.len(), REVIEWS_MAX);
+        assert_eq!(answer["reviews_omitted"], 1);
+        assert_eq!(
+            reviews[0]["text"],
+            format!("{}…", "é".repeat(REVIEW_TEXT_MAX_CHARS))
+        );
+        let exact = "é".repeat(REVIEW_TEXT_MAX_CHARS);
+        body["reviews"] = json!([review(1, &exact)]);
+        let Next::Complete(answer) =
+            details_answer(json!({ "id": "ChIJ1", "reviews": true }), &body)
+        else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["reviews"][0]["text"], exact);
+    }
+
+    #[test]
+    fn place_details_refuse_an_unexpected_shape() {
+        for body in [
+            json!([]),
+            json!({}),
+            json!({ "id": "ChIJ1", "regularOpeningHours": { "weekdayDescriptions": "Mon" } }),
+            json!({ "id": "ChIJ1", "regularOpeningHours": { "weekdayDescriptions": [1] } }),
+            json!({ "id": "ChIJ1", "reviews": {} }),
+            json!({ "id": "ChIJ1", "reviews": [1] }),
+        ] {
+            assert_eq!(
+                details_answer(json!({ "id": "ChIJ1", "reviews": true }), &body),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    "unexpected Places API response shape"
+                )),
+                "{body}"
+            );
+        }
+    }
+
+    fn along_route(args: Value) -> Result<Call, String> {
+        plan(Provided::SearchAlongRoute, &args, &settings())
+    }
+
+    fn along_state(args: &Value, call: &Call, derived: Args) -> InFlight {
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::SearchAlongRoute,
+            args,
+            call,
+            derived,
+            1_000,
+        )
+    }
+
+    #[test]
+    fn search_along_route_computes_an_overview_route_first() {
+        let call = along_route(json!({
+            "origin": "37.422,-122.0841", "destination": "place_id:ChIJ2", "query": "gas",
+        }))
+        .unwrap();
+        assert_eq!(call.step, ALONG_ROUTE_ROUTE_STEP);
+        assert_eq!(call.api.method, "POST");
+        assert_eq!(call.api.host, "routes.example.com");
+        assert_eq!(call.api.path, "/directions/v2:computeRoutes");
+        assert!(call.api.query.is_empty());
+        assert_eq!(
+            call.api.headers,
+            query(&[(
+                "X-Goog-FieldMask",
+                "routes.polyline.encodedPolyline,routes.distanceMeters,routes.duration,fallbackInfo"
+            )])
+        );
+        assert_eq!(
+            posted(&call.api),
+            json!({
+                "origin": { "location": { "latLng": { "latitude": 37.422, "longitude": -122.0841 } } },
+                "destination": { "placeId": "ChIJ2" },
+                "travelMode": "DRIVE",
+                "routingPreference": "TRAFFIC_AWARE",
+                "computeAlternativeRoutes": false,
+                "polylineQuality": "OVERVIEW",
+                "units": "METRIC",
+            })
+        );
+        let walk = along_route(
+            json!({ "origin": "a", "destination": "b", "query": "gas", "mode": "walk" }),
+        )
+        .unwrap();
+        let body = posted(&walk.api);
+        assert_eq!(body["travelMode"], "WALK");
+        assert!(body.get("routingPreference").is_none());
+    }
+
+    #[test]
+    fn search_along_route_refuses_bad_arguments_by_name() {
+        let cases = [
+            (
+                json!({ "destination": "b", "query": "q" }),
+                "`origin` is required",
+            ),
+            (
+                json!({ "origin": "a", "query": "q" }),
+                "`destination` is required",
+            ),
+            (
+                json!({ "origin": "a", "destination": "b" }),
+                "`query` is required",
+            ),
+            (
+                json!({ "origin": "a", "destination": "b", "query": " " }),
+                "`query` is empty",
+            ),
+            (
+                json!({ "origin": "a", "destination": "b", "query": "q", "mode": "fly" }),
+                MODE_CHOICES,
+            ),
+            (
+                json!({ "origin": "a", "destination": "b", "query": "q", "max": 0 }),
+                "`max` must be an integer from 1 to 20",
+            ),
+            (
+                json!({ "origin": "a", "destination": "b", "query": "q", "max": 21 }),
+                "`max` must be an integer from 1 to 20",
+            ),
+        ];
+        for (args, want) in cases {
+            assert_eq!(along_route(args.clone()).unwrap_err(), want, "{args}");
+        }
+        // Directions' time argument and PlacesSearch's own arguments are not
+        // SearchAlongRoute's.
+        for (name, value) in [
+            ("depart_at", json!("2026-10-30T17:00:00Z")),
+            ("open_now", json!(true)),
+            ("near", json!("c")),
+            ("radius", json!(1000)),
+        ] {
+            let mut args = json!({ "origin": "a", "destination": "b", "query": "q" });
+            args[name] = value;
+            let err = along_route(args).unwrap_err();
+            assert!(
+                err.starts_with(&format!("unknown argument `{name}`")),
+                "{err}"
+            );
+        }
+        let over = "a".repeat(TEXT_MAX_BYTES + 1);
+        assert_eq!(
+            along_route(json!({ "origin": "a", "destination": "b", "query": over })).unwrap_err(),
+            "`query` is longer than 1024 bytes"
+        );
+    }
+
+    /// A route answer for SearchAlongRoute's first step.
+    fn polyline_route(polyline: &str, extra: Value) -> String {
+        let mut body = json!({
+            "routes": [{
+                "polyline": { "encodedPolyline": polyline },
+                "distanceMeters": 80467,
+                "duration": "3000s",
+            }],
+        });
+        if let Value::Object(extra) = extra {
+            body.as_object_mut().unwrap().extend(extra);
+        }
+        body.to_string()
+    }
+
+    #[test]
+    fn search_along_route_searches_along_the_polyline_and_keeps_the_route() {
+        let args = json!({ "origin": "a", "destination": "b", "query": "gas", "max": 3 });
+        let step1 = along_route(args.clone()).unwrap();
+        let state = along_state(&args, &step1, Map::new());
+        let body = polyline_route(
+            "_p~iF~ps|U_ulLnnqC",
+            json!({ "fallbackInfo": { "routingMode": "FALLBACK_TRAFFIC_UNAWARE", "reason": "SERVER_ERROR" } }),
+        );
+        let Next::Call { call, derived } = advance(&state, http(200, &body), &settings()) else {
+            panic!("expected the search step");
+        };
+        assert_eq!(call.step, ALONG_ROUTE_SEARCH_STEP);
+        assert_eq!(call.api.method, "POST");
+        assert_eq!(call.api.host, "places.example.com");
+        assert_eq!(call.api.path, "/v1/places:searchText");
+        assert_eq!(
+            call.api.headers,
+            query(&[("X-Goog-FieldMask", PLACES_SEARCH_FIELD_MASK)])
+        );
+        assert_eq!(
+            posted(&call.api),
+            json!({
+                "textQuery": "gas",
+                "pageSize": 3,
+                "searchAlongRouteParameters": { "polyline": { "encodedPolyline": "_p~iF~ps|U_ulLnnqC" } },
+            })
+        );
+        let route = json!({
+            "distance": { "value": 80.47, "unit": "km" },
+            "duration_minutes": 50,
+            "fallback": { "routing_mode": "FALLBACK_TRAFFIC_UNAWARE", "reason": "SERVER_ERROR" },
+        });
+        // The route's summary is what the search's row carries; the polyline is not.
+        assert_eq!(Value::Object(derived.clone()), json!({ "route": route }));
+
+        // Step 1's body reaches the answer only through the stored row.
+        let step2 = InFlight::decode(&state.next(&call, derived, 2_000).encode()).unwrap();
+        assert_eq!(step2.call_id(), format!("{}/2", "a".repeat(32)));
+        let places = json!({ "places": [place(1)], "nextPageToken": "more" });
+        assert_eq!(
+            advance(&step2, http(200, &places.to_string()), &settings()),
+            Next::Complete(json!({
+                "route": route,
+                "places": [{ "id": "ChIJ1", "name": "Cafe 1" }],
+                "more": true,
+            }))
+        );
+    }
+
+    #[test]
+    fn search_along_route_without_a_fallback_states_none() {
+        let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
+        let state = along_state(&args, &along_route(args.clone()).unwrap(), Map::new());
+        let Next::Call { derived, .. } = advance(
+            &state,
+            http(200, &polyline_route("abc", json!({}))),
+            &settings(),
+        ) else {
+            panic!("expected the search step");
+        };
+        assert_eq!(
+            derived["route"],
+            json!({ "distance": { "value": 80.47, "unit": "km" }, "duration_minutes": 50 })
+        );
+    }
+
+    #[test]
+    fn search_along_route_refuses_a_route_too_long_to_search_along() {
+        let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
+        let state = along_state(&args, &along_route(args.clone()).unwrap(), Map::new());
+        // An encoded polyline cycles through its 64-symbol alphabet, ASCII 63
+        // to 126, so one byte in 64 is `\`, which is escaped once in the body
+        // and again in the args.
+        let at_cap: String = (63u8..=126)
+            .cycle()
+            .take(POLYLINE_MAX_BYTES)
+            .map(char::from)
+            .collect();
+        let Next::Call { call, .. } = advance(
+            &state,
+            http(200, &polyline_route(&at_cap, json!({}))),
+            &settings(),
+        ) else {
+            panic!("a polyline at the cap is searched along");
+        };
+        // With that polyline and a query whose every byte escapes to the
+        // longest form, the search args stay under the nested call's 64 KiB
+        // args cap.
+        let mut longest = AlongRouteArgs::parse(&args).unwrap();
+        longest.search.query = "\u{1}".repeat(TEXT_MAX_BYTES);
+        let api = along_route_search_call(&longest, &at_cap, &settings());
+        assert!(serde_json::to_vec(&api).unwrap().len() < 64 * 1024);
+        assert!(
+            posted(&call.api)["searchAlongRouteParameters"]["polyline"]["encodedPolyline"]
+                == at_cap
+        );
+        let over = format!("{at_cap}a");
+        assert_eq!(
+            advance(
+                &state,
+                http(200, &polyline_route(&over, json!({}))),
+                &settings()
+            ),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                &format!(
+                    "route too long to search along ({}-byte polyline)",
+                    POLYLINE_MAX_BYTES + 1
+                )
+            ))
+        );
+    }
+
+    #[test]
+    fn search_along_route_refuses_a_route_whose_answer_was_cut() {
+        let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
+        let state = along_state(&args, &along_route(args.clone()).unwrap(), Map::new());
+        let cut = |bytes: Value| {
+            Ok(json!({
+                "status": 200, "headers": {}, "bytes": bytes, "truncated": true,
+                "body": "{\"routes\":[{\"polyline\":{\"encodedPolyline\":\"abc",
+            }))
+        };
+        assert_eq!(
+            advance(&state, cut(json!(300000)), &settings()),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "route too long to search along (Google's 300000-byte answer exceeds the key \
+                 provider's read limit)"
+            ))
+        );
+        let Next::Fail(unstated) = advance(&state, cut(Value::Null), &settings()) else {
+            panic!("a cut answer of unstated length is refused");
+        };
+        assert_eq!(unstated.kind, ErrorKind::InvalidArgs);
+        assert!(
+            unstated
+                .detail
+                .starts_with("route too long to search along (")
+        );
+        assert!(unstated.detail.contains("a cut"));
+
+        // Every other cut answer stays the wrapper's `internal`: Directions'
+        // route, and the search step of this same tool.
+        let cut_internal = Next::Fail(failure(
+            ErrorKind::Internal,
+            "Google's answer (300000 bytes) exceeded the key provider's max_response_bytes and \
+             was cut",
+        ));
+        let directions_args = json!({ "origin": "a", "destination": "b" });
+        let directions_call = plan(Provided::Directions, &directions_args, &settings()).unwrap();
+        let directions = InFlight::new(
+            &"a".repeat(32),
+            Provided::Directions,
+            &directions_args,
+            &directions_call,
+            Map::new(),
+            1_000,
+        );
+        assert_eq!(
+            advance(&directions, cut(json!(300000)), &settings()),
+            cut_internal
+        );
+        let search = Call {
+            step: ALONG_ROUTE_SEARCH_STEP,
+            api: along_route_search_call(
+                &AlongRouteArgs::parse(&args).unwrap(),
+                "abc",
+                &settings(),
+            ),
+        };
+        assert_eq!(
+            advance(
+                &along_state(&args, &search, Map::new()),
+                cut(json!(300000)),
+                &settings()
+            ),
+            cut_internal
+        );
+    }
+
+    #[test]
+    fn search_along_route_with_no_route_is_the_callers() {
+        let args = json!({ "origin": "a", "destination": "b", "query": "gas", "mode": "bicycle" });
+        let state = along_state(&args, &along_route(args.clone()).unwrap(), Map::new());
+        assert_eq!(
+            advance(&state, http(200, "{}"), &settings()),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "no bicycle route found from a to b"
+            ))
+        );
+    }
+
+    #[test]
+    fn search_along_route_refuses_an_unexpected_route_shape() {
+        let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
+        let state = along_state(&args, &along_route(args.clone()).unwrap(), Map::new());
+        for body in [
+            "[]".to_string(),
+            r#"{ "routes": [{ "distanceMeters": 1 }] }"#.to_string(),
+            r#"{ "routes": [{ "polyline": { "encodedPolyline": "" } }] }"#.to_string(),
+            r#"{ "routes": [{ "polyline": { "encodedPolyline": 1 } }] }"#.to_string(),
+            polyline_route("abc", json!({ "fallbackInfo": "x" })),
+            polyline_route(
+                "abc",
+                json!({ "routes": [{ "polyline": { "encodedPolyline": "abc" }, "duration": 5 }] }),
+            ),
+        ] {
+            assert_eq!(
+                advance(&state, http(200, &body), &settings()),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    "unexpected Routes API response shape"
+                )),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_along_route_search_without_its_route_is_internal() {
+        let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
+        let call = Call {
+            step: ALONG_ROUTE_SEARCH_STEP,
+            api: along_route_search_call(
+                &AlongRouteArgs::parse(&args).unwrap(),
+                "abc",
+                &settings(),
+            ),
+        };
+        assert_eq!(
+            advance(
+                &along_state(&args, &call, Map::new()),
+                http(200, "{}"),
+                &settings()
+            ),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row for search-along-route's search carries no route"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_userless_search_along_route_is_denied_naming_the_post() {
+        let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
+        let call = along_route(args.clone()).unwrap();
+        assert_eq!(
+            advance(
+                &along_state(&args, &call, Map::new()),
+                nested("denied", "a caller with no acting user may only read"),
+                &settings()
+            ),
+            Next::Fail(failure(
+                ErrorKind::Denied,
+                "api-request refused the nested POST to routes.example.com/directions/v2:computeRoutes: \
                  a caller with no acting user may only read. A POST needs a request with a calling \
                  user (an agent or `brenn-tool`)."
             ))
