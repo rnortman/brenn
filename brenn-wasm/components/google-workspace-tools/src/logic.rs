@@ -195,6 +195,31 @@ const EVENTS_MAX_DEFAULT: u64 = 50;
 /// What the caller can narrow when a window's events are unreadable.
 const EVENTS_HINT: &str = "ask for fewer events with `max`, or a shorter `from`/`to` window";
 
+/// events.get's mask: one event's own text, its times, organizer, attendees,
+/// recurrence and conference link.
+const EVENT_GET_FIELDS: &str = "id,status,summary,description,location,start,end,\
+                                organizer(email,displayName,self),\
+                                attendees(email,displayName,responseStatus,optional,self),\
+                                attendeesOmitted,recurrence,recurringEventId,hangoutLink,\
+                                conferenceData/entryPoints(entryPointType,uri)";
+/// events.get's `maxAttendees`: past it Google returns only the calendar
+/// read's own attendee entry and marks the event `attendeesOmitted`. It bounds the read
+/// and the answer alike.
+const ATTENDEES_MAX: usize = 50;
+/// The most UTF-8 bytes of one event's text field (`summary`, `location`, the
+/// organizer's name, a recurrence line, the conference link) copied into an
+/// answer.
+const EVENT_TEXT_MAX_BYTES: usize = 1000;
+/// The most recurrence lines an event answers; past it `recurrence_truncated`.
+const RECURRENCE_MAX: usize = 20;
+/// The attendee responses Google writes, and the names they are counted under.
+const RESPONSES: &[(&str, &str)] = &[
+    ("accepted", "accepted"),
+    ("declined", "declined"),
+    ("tentative", "tentative"),
+    ("needsAction", "needs_action"),
+];
+
 /// The most bytes a calendar id may hold, in an argument or an answer.
 const CALENDAR_ID_MAX_BYTES: usize = 320;
 /// The most bytes an event id may hold: Google's base32hex ids are at most
@@ -224,7 +249,9 @@ fn family(tool: Provided) -> Family {
         | Provided::GmailSearch
         | Provided::GmailRead
         | Provided::GmailThread => Family::Gmail,
-        Provided::CalendarList | Provided::CalendarEvents => Family::Calendar,
+        Provided::CalendarList | Provided::CalendarEvents | Provided::CalendarEvent => {
+            Family::Calendar
+        }
     }
 }
 
@@ -648,6 +675,13 @@ fn is_event_id(id: &str) -> bool {
     is_token(id, EVENT_ID_MAX_BYTES)
 }
 
+/// An event id argument: one path segment of letters, digits, `_` and `-`.
+fn event_id(args: &Args, key: &str) -> Result<Option<String>, String> {
+    id_arg(args, key, is_event_id, || {
+        format!("1 to {EVENT_ID_MAX_BYTES} letters, digits, `_` or `-`")
+    })
+}
+
 /// A time argument, passed to Google as given.
 fn time(args: &Args, key: &str) -> Result<Option<String>, String> {
     Ok(capped(args, key, TIME_MAX_BYTES)?.map(str::to_string))
@@ -662,6 +696,13 @@ fn integer(args: &Args, key: &str, min: u64, max: u64) -> Result<Option<u64>, St
             _ => Err(format!("`{key}` must be an integer from {min} to {max}")),
         },
     }
+}
+
+/// The `max_chars` argument: `MAX_CHARS_MIN` to `MAX_CHARS_MAX`, default
+/// `MAX_CHARS_DEFAULT`.
+fn max_chars(args: &Args) -> Result<usize, String> {
+    let n = integer(args, "max_chars", MAX_CHARS_MIN, MAX_CHARS_MAX)?.unwrap_or(MAX_CHARS_DEFAULT);
+    Ok(usize::try_from(n).expect("max_chars is at most MAX_CHARS_MAX"))
 }
 
 /// A boolean argument; absent is `false`.
@@ -717,6 +758,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
             Ok(Call {
                 step: 1,
                 api: events_list_call(&events, settings),
+            })
+        }
+        Provided::CalendarEvent => {
+            let event = EventArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: event_get_call(&event, settings),
             })
         }
     }
@@ -830,11 +878,9 @@ impl ReadArgs {
     // `input_schema` in the spec are stated separately.
     fn parse(args: &Value) -> Result<ReadArgs, String> {
         let map = object(args, &["id", "max_chars", "account"])?;
-        let max_chars =
-            integer(map, "max_chars", MAX_CHARS_MIN, MAX_CHARS_MAX)?.unwrap_or(MAX_CHARS_DEFAULT);
         Ok(ReadArgs {
             id: gmail_id(map, "id")?.ok_or("`id` is required")?,
-            max_chars: usize::try_from(max_chars).expect("max_chars is at most 60 000"),
+            max_chars: max_chars(map)?,
             account: account(map)?,
         })
     }
@@ -984,6 +1030,43 @@ fn events_list_call(args: &EventsArgs, settings: &Settings) -> ApiCall {
         args.account.as_deref(),
         format!("{CALENDARS_PATH}/{}/events", args.calendar),
         query,
+    )
+}
+
+/// `CalendarEvent`'s arguments.
+struct EventArgs {
+    id: String,
+    calendar: String,
+    max_chars: usize,
+    account: Option<String>,
+}
+
+impl EventArgs {
+    // TODO(provider-schema-parse-parity): these bounds and the `calendar-event`
+    // `input_schema` in the spec are stated separately.
+    fn parse(args: &Value) -> Result<EventArgs, String> {
+        let map = object(args, &["id", "calendar", "max_chars", "account"])?;
+        Ok(EventArgs {
+            id: event_id(map, "id")?.ok_or("`id` is required")?,
+            calendar: calendar_id(map, "calendar")?.unwrap_or_else(|| PRIMARY_CALENDAR.to_string()),
+            max_chars: max_chars(map)?,
+            account: account(map)?,
+        })
+    }
+}
+
+/// events.get of one event, at most `ATTENDEES_MAX` attendees listed. The
+/// calendar id goes into the path as it is; `api-request` percent-encodes it.
+fn event_get_call(args: &EventArgs, settings: &Settings) -> ApiCall {
+    ApiCall::get(
+        settings,
+        &settings.calendar_host,
+        args.account.as_deref(),
+        format!("{CALENDARS_PATH}/{}/events/{}", args.calendar, args.id),
+        query([
+            ("maxAttendees", ATTENDEES_MAX.to_string()),
+            ("fields", EVENT_GET_FIELDS.to_string()),
+        ]),
     )
 }
 
@@ -1151,6 +1234,14 @@ fn cut(text: &str, max_bytes: usize) -> (String, bool) {
     }
     let at = text.floor_char_boundary(max_bytes);
     (format!("{}…", &text[..at]), true)
+}
+
+/// `text`'s first `max_chars` characters, and whether any were left out.
+fn chars_prefix(text: &str, max_chars: usize) -> (&str, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => (&text[..end], true),
+        None => (text, false),
+    }
 }
 
 /// `text` with every C0 control character other than tab, newline and
@@ -1443,6 +1534,9 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             (Provided::CalendarEvents, 1) => stored(state, EventsArgs::parse)
                 .and_then(|args| compact_events(&body, args.max))
                 .map(Next::Complete),
+            (Provided::CalendarEvent, 1) => stored(state, EventArgs::parse)
+                .and_then(|args| compact_event(&body, &args))
+                .map(Next::Complete),
             (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 named(state, &body)
             }
@@ -1488,7 +1582,7 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
             | (Provided::GmailSearch, 1)
             | (Provided::GmailRead, STRUCTURE_STEP)
             | (Provided::GmailThread, THREAD_NARROW_STEP)
-            | (Provided::CalendarList, 1)
+            | (Provided::CalendarList | Provided::CalendarEvent, 1)
             | (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 Err(why.failure(None))
             }
@@ -1499,13 +1593,14 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
 }
 
 /// A step's decision as the request's next move, a completed answer held to
-/// the result ceiling — after `GmailRead`'s text is cut, or `GmailThread`'s
-/// oldest messages dropped, to fit it.
+/// the result ceiling — after `GmailRead`'s text or `CalendarEvent`'s
+/// description is cut, or `GmailThread`'s oldest messages dropped, to fit it.
 fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
     match decided {
         Ok(Next::Complete(value)) => {
             let value = match tool {
-                Provided::GmailRead => fit_text(value, COMPACT_RESULT_CEILING),
+                Provided::GmailRead => fit_text(value, "text", COMPACT_RESULT_CEILING),
+                Provided::CalendarEvent => fit_text(value, "description", COMPACT_RESULT_CEILING),
                 Provided::GmailThread => fit_thread(value, COMPACT_RESULT_CEILING),
                 Provided::GmailLabels
                 | Provided::GmailSearch
@@ -1630,7 +1725,6 @@ fn read_full(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let text = plain(&text);
     let sources = || extracted.text_parts.iter().map(|(_, source)| *source);
     let text_source = if extracted.text_parts.is_empty() {
         "none"
@@ -1641,14 +1735,6 @@ fn read_full(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next
     } else {
         "mixed"
     };
-    let text_chars = text.chars().count();
-    let text = match text.char_indices().nth(args.max_chars) {
-        Some((end, _)) => {
-            out.insert("text_truncated".to_string(), json!(true));
-            text[..end].to_string()
-        }
-        None => text,
-    };
     let mut notes = notes(&extracted, false);
     if text.is_empty() && extracted.text_by_reference {
         notes.push(
@@ -1656,9 +1742,8 @@ fn read_full(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next
                 .to_string(),
         );
     }
-    out.insert("text".to_string(), json!(text));
+    put_cut_text(&mut out, "text", &text, args.max_chars);
     out.insert("text_source".to_string(), json!(text_source));
-    out.insert("text_chars".to_string(), json!(text_chars));
     out.insert("attachments".to_string(), attachments(&extracted));
     if !notes.is_empty() {
         out.insert("decoding_notes".to_string(), json!(notes));
@@ -1784,19 +1869,32 @@ fn json_width(c: char) -> usize {
     }
 }
 
-/// `answer` with its `text` cut to the longest prefix with which the whole
-/// answer serializes within `ceiling`, and `text_truncated` set, when it does
-/// not fit as it is. An answer that fits, or has no text, is unchanged; one
-/// that does not fit with an empty text is left for the ceiling to refuse.
-fn fit_text(mut answer: Value, ceiling: usize) -> Value {
+/// `text`, `plain`ed and cut at `max_chars` characters, under `key`, with
+/// `{key}_chars` its whole length and `{key}_truncated` set when it was cut.
+fn put_cut_text(out: &mut Args, key: &str, text: &str, max_chars: usize) {
+    let text = plain(text);
+    let (cut, truncated) = chars_prefix(&text, max_chars);
+    if truncated {
+        out.insert(format!("{key}_truncated"), json!(true));
+    }
+    out.insert(key.to_string(), json!(cut));
+    out.insert(format!("{key}_chars"), json!(text.chars().count()));
+}
+
+/// `answer` with its text `key` cut to the longest prefix with which the
+/// whole answer serializes within `ceiling`, and `{key}_truncated` set, when
+/// it does not fit as it is. An answer that fits, or has no such text, is
+/// unchanged; one that does not fit with an empty text is left for the ceiling
+/// to refuse.
+fn fit_text(mut answer: Value, key: &str, ceiling: usize) -> Value {
     if serialized_len(&answer) <= ceiling {
         return answer;
     }
-    let Some(Value::String(text)) = answer.get_mut("text").map(std::mem::take) else {
+    let Some(Value::String(text)) = answer.get_mut(key).map(std::mem::take) else {
         return answer;
     };
-    answer["text"] = json!("");
-    answer["text_truncated"] = json!(true);
+    answer[key] = json!("");
+    answer[format!("{key}_truncated")] = json!(true);
     let budget = ceiling.saturating_sub(serialized_len(&answer));
     let mut used = 0;
     let mut end = 0;
@@ -1807,7 +1905,7 @@ fn fit_text(mut answer: Value, ceiling: usize) -> Value {
         }
         end = at + c.len_utf8();
     }
-    answer["text"] = json!(text[..end]);
+    answer[key] = json!(text[..end]);
     answer
 }
 
@@ -2363,6 +2461,151 @@ fn self_response<'a>(event: &Compact<'a>) -> Result<Option<&'a str>, Failure> {
         found = Some(attendee.string("responseStatus")?);
     }
     Ok(found.flatten())
+}
+
+/// events.get as one event: `id`, `summary`, `description` (cut at
+/// `max_chars` characters, `description_chars` its whole length), `start`,
+/// `end`, `location`, `status`, `organizer`, `self_response`, `attendees`
+/// with their counts or `attendees_omitted`, `recurrence`,
+/// `recurring_event_id` and `conference`. An event whose id is not the one
+/// asked for is Google's fault.
+fn compact_event(body: &Value, args: &EventArgs) -> Result<Value, Failure> {
+    let api = "events.get";
+    let mut event = Compact::of(body, api)?;
+    if event.string("id")? != Some(args.id.as_str()) {
+        return Err(shape(api));
+    }
+    event.id("id", "id", is_event_id)?;
+    event.text("summary", "summary", EVENT_TEXT_MAX_BYTES)?;
+    if let Some(description) = event.string("description")? {
+        put_cut_text(&mut event.out, "description", description, args.max_chars);
+    }
+    event.when("start")?;
+    event.when("end")?;
+    event.text("location", "location", EVENT_TEXT_MAX_BYTES)?;
+    event.short("status", "status")?;
+    if let Some(mut organizer) = event.object("organizer")? {
+        organizer.text("email", "email", ACCOUNT_MAX_BYTES)?;
+        organizer.text("displayName", "name", EVENT_TEXT_MAX_BYTES)?;
+        organizer.when_true("self", "self")?;
+        event.out.insert("organizer".to_string(), organizer.done());
+    }
+    if let Some(response) = self_response(&event)? {
+        event.put_short("self_response", response);
+    }
+    attendees(&mut event)?;
+    recurrence(&mut event)?;
+    if event.item.contains_key("recurringEventId") {
+        event.id("recurringEventId", "recurring_event_id", is_event_id)?;
+    }
+    if let Some(link) = conference(&event)? {
+        event.put_text("conference", link, EVENT_TEXT_MAX_BYTES);
+    }
+    Ok(event.done())
+}
+
+/// The event's `attendees` as Google sent them, each `email`, `name`,
+/// `response` and `optional` (only when true). With the whole list, its
+/// length as `attendees_total` and its responses counted in
+/// `attendee_responses`; when Google left attendees out, `attendees_omitted`
+/// instead. More than `ATTENDEES_MAX` entries, or a response outside Google's
+/// four in a list being counted, is Google's fault.
+fn attendees(event: &mut Compact<'_>) -> Result<(), Failure> {
+    let api = event.api;
+    let attendees = event.array("attendees")?;
+    if attendees.len() > ATTENDEES_MAX {
+        return Err(shape(api));
+    }
+    let omitted = event.flag("attendeesOmitted")?;
+    let mut counts = [0_usize; RESPONSES.len()];
+    let mut entries = Vec::with_capacity(attendees.len());
+    for attendee in attendees {
+        let mut entry = Compact::of(attendee, api)?;
+        entry.text("email", "email", ACCOUNT_MAX_BYTES)?;
+        entry.text("displayName", "name", LISTING_TEXT_MAX_BYTES)?;
+        let response = entry.string("responseStatus")?;
+        if let Some(response) = response {
+            entry.put_short("response", response);
+        }
+        entry.when_true("optional", "optional")?;
+        if !omitted {
+            let counted = RESPONSES
+                .iter()
+                .position(|(google, _)| Some(*google) == response)
+                .ok_or_else(|| shape(api))?;
+            counts[counted] += 1;
+        }
+        entries.push(entry.done());
+    }
+    if omitted {
+        event
+            .out
+            .insert("attendees_omitted".to_string(), json!(true));
+    } else {
+        event
+            .out
+            .insert("attendees_total".to_string(), json!(entries.len()));
+        let responses: Args = RESPONSES
+            .iter()
+            .zip(counts)
+            .map(|((_, name), count)| (name.to_string(), json!(count)))
+            .collect();
+        event
+            .out
+            .insert("attendee_responses".to_string(), Value::Object(responses));
+    }
+    event
+        .out
+        .insert("attendees".to_string(), Value::Array(entries));
+    Ok(())
+}
+
+/// The event's first `RECURRENCE_MAX` recurrence lines, each through `plain`
+/// and cut to `EVENT_TEXT_MAX_BYTES` (a cut lists `recurrence` in
+/// `fields_truncated`), and `recurrence_truncated` past them.
+fn recurrence(event: &mut Compact<'_>) -> Result<(), Failure> {
+    let lines = event.array("recurrence")?;
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let mut cut_any = false;
+    let mut kept = Vec::with_capacity(lines.len().min(RECURRENCE_MAX));
+    for line in lines.iter().take(RECURRENCE_MAX) {
+        let Value::String(line) = line else {
+            return Err(shape(event.api));
+        };
+        let (line, was_cut) = cut(&plain(line), EVENT_TEXT_MAX_BYTES);
+        cut_any |= was_cut;
+        kept.push(line);
+    }
+    if cut_any {
+        event.truncated.push("recurrence".to_string());
+    }
+    event.out.insert("recurrence".to_string(), json!(kept));
+    if lines.len() > RECURRENCE_MAX {
+        event
+            .out
+            .insert("recurrence_truncated".to_string(), json!(true));
+    }
+    Ok(())
+}
+
+/// The event's conference link: its `hangoutLink`, else the `uri` of the
+/// first `video` entry point of its `conferenceData`.
+fn conference<'a>(event: &Compact<'a>) -> Result<Option<&'a str>, Failure> {
+    if let Some(link) = event.string("hangoutLink")? {
+        return Ok(Some(link));
+    }
+    let Some(data) = event.object("conferenceData")? else {
+        return Ok(None);
+    };
+    for point in data.array("entryPoints")? {
+        let point = Compact::of(point, event.api)?;
+        if point.string("entryPointType")? == Some("video") {
+            return point.string("uri");
+        }
+    }
+    Ok(None)
 }
 
 /// `value` as the request's answer, unless it serializes larger than
@@ -4398,9 +4641,9 @@ mod tests {
             serialized_len(&answer)
         };
         let whole = serialized_len(&answer);
-        assert_eq!(fit_text(answer.clone(), whole), answer);
+        assert_eq!(fit_text(answer.clone(), "text", whole), answer);
         for ceiling in with_text("")..whole {
-            let fitted = fit_text(answer.clone(), ceiling);
+            let fitted = fit_text(answer.clone(), "text", ceiling);
             let cut = fitted["text"].as_str().unwrap();
             assert_eq!(fitted["text_truncated"], json!(true));
             assert!(serialized_len(&fitted) <= ceiling, "{ceiling}");
@@ -5749,6 +5992,441 @@ mod tests {
         assert!(size < COMPACT_RESULT_CEILING);
     }
 
+    fn event(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::CalendarEvent, &args, &settings()).map(|call| {
+            assert_eq!(call.step, 1);
+            call.api
+        })
+    }
+
+    fn event_query() -> Query {
+        query([
+            ("maxAttendees", "50".to_string()),
+            (
+                "fields",
+                "id,status,summary,description,location,start,end,\
+                 organizer(email,displayName,self),\
+                 attendees(email,displayName,responseStatus,optional,self),\
+                 attendeesOmitted,recurrence,recurringEventId,hangoutLink,\
+                 conferenceData/entryPoints(entryPointType,uri)"
+                    .to_string(),
+            ),
+            ("prettyPrint", "false".to_string()),
+        ])
+    }
+
+    #[test]
+    fn event_reads_one_event_of_primary_on_the_calendar_host() {
+        assert_eq!(
+            event(json!({ "id": "e1" })).unwrap(),
+            ApiCall {
+                provider: "google".to_string(),
+                account: None,
+                method: "GET".to_string(),
+                host: "calendar.example.com".to_string(),
+                path: "/calendar/v3/calendars/primary/events/e1".to_string(),
+                query: event_query(),
+            }
+        );
+        let call = event(json!({
+            "id": "weekly0123456789_20261104T140000Z",
+            "calendar": "en.usa#holiday@group.v.calendar.google.com",
+            "max_chars": 200,
+            "account": "alice@example.com",
+        }))
+        .unwrap();
+        assert_eq!(
+            call.path,
+            "/calendar/v3/calendars/en.usa#holiday@group.v.calendar.google.com/events/\
+             weekly0123456789_20261104T140000Z"
+        );
+        assert_eq!(call.account.as_deref(), Some("alice@example.com"));
+        assert_eq!(call.query, event_query());
+    }
+
+    #[test]
+    fn event_refuses_bad_arguments() {
+        let bad_id = "`id` must be 1 to 1024 letters, digits, `_` or `-`";
+        for (args, refusal) in [
+            (json!({}), "`id` is required"),
+            (json!({ "id": "" }), bad_id),
+            (json!({ "id": "e.1" }), bad_id),
+            (json!({ "id": "e/1" }), bad_id),
+            (json!({ "id": "e".repeat(EVENT_ID_MAX_BYTES + 1) }), bad_id),
+            (json!({ "id": 1 }), bad_id),
+            (
+                json!({ "id": "e1", "calendar": "a/b" }),
+                "`calendar` must be a calendar id of 1 to 320 bytes with no `/`, `\\`, `%`, \
+                 `\"`, space or control character",
+            ),
+            (
+                json!({ "id": "e1", "max_chars": 199 }),
+                "`max_chars` must be an integer from 200 to 60000",
+            ),
+            (
+                json!({ "id": "e1", "max_chars": 60_001 }),
+                "`max_chars` must be an integer from 200 to 60000",
+            ),
+            (
+                json!({ "id": "e1", "from": "x" }),
+                "unknown argument `from`; this tool takes `id`, `calendar`, `max_chars`, `account`",
+            ),
+        ] {
+            assert_eq!(event(args.clone()).unwrap_err(), refusal, "{args}");
+        }
+    }
+
+    const EVENT: &str = include_str!("fixtures/event.json");
+    const EVENT_ID: &str = "weekly0123456789_20261104T140000Z";
+
+    fn event_state(args: Value) -> InFlight {
+        let call = plan(Provided::CalendarEvent, &args, &settings()).unwrap();
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::CalendarEvent,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        )
+    }
+
+    fn read_event(body: &str) -> Next {
+        answered(&event_state(json!({ "id": EVENT_ID })), http(200, body))
+    }
+
+    /// The fixture with `changes` applied, top-level keys replaced or, when
+    /// null, removed.
+    fn event_with(changes: Value) -> String {
+        let mut body: Value = serde_json::from_str(EVENT).unwrap();
+        for (key, value) in changes.as_object().unwrap() {
+            if value.is_null() {
+                body.as_object_mut().unwrap().remove(key);
+            } else {
+                body[key] = value.clone();
+            }
+        }
+        body.to_string()
+    }
+
+    #[test]
+    fn event_compacts_with_its_attendees_and_their_responses() {
+        let description = "<p>Agenda:</p>\n<ul><li>roadmap</li><li>hiring &amp; budget</li></ul>";
+        assert_eq!(
+            read_event(EVENT),
+            Next::Complete(json!({
+                "id": EVENT_ID,
+                "summary": "Weekly sync",
+                "description": description,
+                "description_chars": description.chars().count(),
+                "start": {
+                    "date_time": "2026-11-04T09:00:00-05:00",
+                    "time_zone": "America/New_York",
+                },
+                "end": {
+                    "date_time": "2026-11-04T09:30:00-05:00",
+                    "time_zone": "America/New_York",
+                },
+                "location": "Room 4 \"north\"",
+                "status": "confirmed",
+                "organizer": { "email": "bob@example.com", "name": "Bob Example" },
+                "self_response": "tentative",
+                "attendees": [
+                    { "email": "bob@example.com", "name": "Bob Example", "response": "accepted" },
+                    { "email": "alice@example.com", "response": "tentative" },
+                    {
+                        "email": "carol@example.com",
+                        "name": "Carol",
+                        "response": "declined",
+                        "optional": true,
+                    },
+                    { "email": "dave@example.com", "response": "needsAction" },
+                ],
+                "attendees_total": 4,
+                "attendee_responses": {
+                    "accepted": 1,
+                    "declined": 1,
+                    "tentative": 1,
+                    "needs_action": 1,
+                },
+                "recurring_event_id": "weekly0123456789",
+                "conference": "https://meet.example.com/abc-defg-hij",
+            }))
+        );
+    }
+
+    #[test]
+    fn an_event_with_attendees_left_out_answers_the_users_own_entry_and_no_counts() {
+        let answer = completed(read_event(&event_with(json!({
+            "attendees": [{ "email": "alice@example.com", "self": true, "responseStatus": "accepted" }],
+            "attendeesOmitted": true,
+        }))));
+        assert_eq!(
+            answer["attendees"],
+            json!([{ "email": "alice@example.com", "response": "accepted" }])
+        );
+        assert_eq!(answer["self_response"], json!("accepted"));
+        assert_eq!(answer["attendees_omitted"], json!(true));
+        assert!(answer.get("attendees_total").is_none(), "{answer}");
+        assert!(answer.get("attendee_responses").is_none(), "{answer}");
+
+        // Left out with no entry of the user's: nothing listed, nothing counted.
+        let answer = completed(read_event(&event_with(
+            json!({ "attendees": null, "attendeesOmitted": true }),
+        )));
+        assert_eq!(answer["attendees"], json!([]));
+        assert_eq!(answer["attendees_omitted"], json!(true));
+        assert!(answer.get("self_response").is_none(), "{answer}");
+
+        // No guests at all: an empty list, counted.
+        let answer = completed(read_event(&event_with(json!({ "attendees": null }))));
+        assert_eq!(answer["attendees"], json!([]));
+        assert_eq!(answer["attendees_total"], json!(0));
+        assert_eq!(
+            answer["attendee_responses"],
+            json!({ "accepted": 0, "declined": 0, "tentative": 0, "needs_action": 0 })
+        );
+    }
+
+    #[test]
+    fn an_event_answers_its_recurrence_and_conference_and_all_day_times() {
+        let rules: Vec<String> = (0..=RECURRENCE_MAX)
+            .map(|i| format!("EXDATE:202611{i:02}"))
+            .collect();
+        let answer = completed(read_event(&event_with(json!({
+            "start": { "date": "2026-11-04" },
+            "end": { "date": "2026-11-05" },
+            "recurrence": rules,
+            "recurringEventId": null,
+            "hangoutLink": null,
+            "conferenceData": { "entryPoints": [
+                { "entryPointType": "phone", "uri": "tel:+1-555-0100" },
+                { "entryPointType": "video", "uri": "https://video.example.com/j/1" },
+                { "entryPointType": "video", "uri": "https://video.example.com/j/2" },
+            ] },
+        }))));
+        assert_eq!(answer["start"], json!({ "date": "2026-11-04" }));
+        assert_eq!(answer["end"], json!({ "date": "2026-11-05" }));
+        assert_eq!(answer["recurrence"], json!(rules[..RECURRENCE_MAX]));
+        assert_eq!(answer["recurrence_truncated"], json!(true));
+        assert!(answer.get("recurring_event_id").is_none(), "{answer}");
+        assert_eq!(answer["conference"], json!("https://video.example.com/j/1"));
+
+        let answer = completed(read_event(&event_with(json!({
+            "recurrence": ["RRULE:FREQ=WEEKLY"],
+            "hangoutLink": null,
+            "conferenceData": { "entryPoints": [{ "entryPointType": "phone", "uri": "tel:1" }] },
+        }))));
+        assert_eq!(answer["recurrence"], json!(["RRULE:FREQ=WEEKLY"]));
+        assert!(answer.get("recurrence_truncated").is_none(), "{answer}");
+        assert!(answer.get("conference").is_none(), "{answer}");
+
+        // A Meet link wins over a video entry point of the conference data.
+        let answer = completed(read_event(&event_with(json!({
+            "hangoutLink": "https://meet.example.com/abc",
+            "conferenceData": { "entryPoints": [
+                { "entryPointType": "video", "uri": "https://video.example.com/j/1" },
+            ] },
+        }))));
+        assert_eq!(answer["conference"], json!("https://meet.example.com/abc"));
+    }
+
+    #[test]
+    fn an_event_cuts_and_flags_its_text_and_emails() {
+        let long = format!("a\u{1}{}", "é".repeat(EVENT_TEXT_MAX_BYTES));
+        let email = format!("{}@example.com", "o".repeat(ACCOUNT_MAX_BYTES));
+        let answer = completed(read_event(&event_with(json!({
+            "summary": long,
+            "location": long,
+            "status": "s".repeat(SHORT_MAX_BYTES + 1),
+            "organizer": { "email": email, "displayName": long, "self": true },
+            "attendees": [{
+                "email": email,
+                "displayName": long,
+                "self": true,
+                "responseStatus": "accepted",
+            }],
+            "recurrence": [long, "RRULE:FREQ=DAILY"],
+            "hangoutLink": long,
+        }))));
+        let summary = answer["summary"].as_str().unwrap();
+        assert!(summary.starts_with("a é"), "{summary}");
+        assert!(summary.len() <= EVENT_TEXT_MAX_BYTES + '…'.len_utf8());
+        let location = answer["location"].as_str().unwrap();
+        assert!(location.ends_with('…'), "{location}");
+        assert!(location.len() <= EVENT_TEXT_MAX_BYTES + '…'.len_utf8());
+        assert!(location.len() > LISTING_TEXT_MAX_BYTES + '…'.len_utf8());
+        assert_eq!(
+            answer["fields_truncated"],
+            json!(["conference", "location", "recurrence", "summary"])
+        );
+        assert_eq!(answer["recurrence"][1], json!("RRULE:FREQ=DAILY"));
+        assert_eq!(
+            answer["status"],
+            json!(format!("{}…", "s".repeat(SHORT_MAX_BYTES)))
+        );
+        let organizer = &answer["organizer"];
+        assert_eq!(organizer["self"], json!(true));
+        assert_eq!(organizer["fields_truncated"], json!(["email", "name"]));
+        assert!(organizer["email"].as_str().unwrap().ends_with('…'));
+        let attendee = &answer["attendees"][0];
+        assert_eq!(attendee["fields_truncated"], json!(["email", "name"]));
+        let name = attendee["name"].as_str().unwrap();
+        assert!(name.len() <= LISTING_TEXT_MAX_BYTES + '…'.len_utf8());
+        assert!(attendee.get("self").is_none(), "{attendee}");
+    }
+
+    #[test]
+    fn an_event_description_is_cut_at_max_chars_and_not_decoded() {
+        let description = format!("a&amp;\u{1}{}", "é".repeat(300));
+        let body = event_with(json!({ "description": description }));
+        let state = event_state(json!({ "id": EVENT_ID, "max_chars": 200 }));
+        let answer = completed(answered(&state, http(200, &body)));
+        assert_eq!(
+            answer["description"],
+            json!(format!("a&amp; {}", "é".repeat(193)))
+        );
+        assert_eq!(answer["description_truncated"], json!(true));
+        assert_eq!(answer["description_chars"], json!(307));
+
+        let answer = completed(read_event(&event_with(json!({ "description": null }))));
+        assert!(answer.get("description").is_none(), "{answer}");
+        assert!(answer.get("description_chars").is_none(), "{answer}");
+    }
+
+    #[test]
+    fn an_event_refuses_an_unexpected_shape() {
+        let shape = || {
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "unexpected Google events.get response shape",
+            ))
+        };
+        let attendee = |n: usize| {
+            (0..n)
+                .map(|i| json!({ "email": format!("a{i}@example.com"), "responseStatus": "accepted" }))
+                .collect::<Vec<_>>()
+        };
+        for body in [
+            "[]".to_string(),
+            event_with(json!({ "id": "e1" })),
+            event_with(json!({ "id": null })),
+            event_with(json!({ "recurringEventId": "weekly.1" })),
+            event_with(json!({ "recurringEventId": "w".repeat(EVENT_ID_MAX_BYTES + 1) })),
+            event_with(json!({ "description": 1 })),
+            event_with(json!({ "start": { "timeZone": "UTC" } })),
+            event_with(json!({ "organizer": "bob@example.com" })),
+            event_with(json!({ "organizer": { "self": "yes" } })),
+            event_with(json!({ "attendees": attendee(ATTENDEES_MAX + 1) })),
+            event_with(
+                json!({ "attendees": [{ "email": "a@example.com", "responseStatus": "maybe" }] }),
+            ),
+            event_with(json!({ "attendees": [{ "email": "a@example.com" }] })),
+            event_with(json!({ "attendees": [{ "email": 1, "responseStatus": "accepted" }] })),
+            event_with(
+                json!({ "attendees": [{ "optional": "no", "responseStatus": "accepted" }] }),
+            ),
+            event_with(json!({ "attendeesOmitted": "true" })),
+            event_with(json!({ "recurrence": "RRULE:FREQ=DAILY" })),
+            event_with(json!({ "recurrence": [1] })),
+            event_with(json!({ "hangoutLink": 1 })),
+            event_with(json!({ "hangoutLink": null, "conferenceData": [] })),
+            event_with(
+                json!({ "hangoutLink": null, "conferenceData": { "entryPoints": [{ "entryPointType": "video", "uri": 1 }] } }),
+            ),
+        ] {
+            assert_eq!(read_event(&body), shape(), "{body}");
+        }
+        // Exactly the bound is Google's own list, and an unknown response is
+        // not counted against when the list is not being counted.
+        let answer = completed(read_event(&event_with(
+            json!({ "attendees": attendee(ATTENDEES_MAX) }),
+        )));
+        assert_eq!(answer["attendees_total"], json!(ATTENDEES_MAX));
+        let answer = completed(read_event(&event_with(json!({
+            "attendees": [{ "email": "a@example.com", "self": true, "responseStatus": "maybe" }],
+            "attendeesOmitted": true,
+        }))));
+        assert_eq!(answer["self_response"], json!("maybe"));
+    }
+
+    #[test]
+    fn event_relays_googles_errors_with_the_calendar_hint() {
+        let state = event_state(json!({ "id": "e1" }));
+        assert_eq!(
+            answered(&state, http(404, &google(404, "NOT_FOUND", "Not Found"))),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "Google NOT_FOUND (HTTP 404): Not Found"
+            ))
+        );
+        let Next::Fail(Failure { kind, detail }) = answered(
+            &state,
+            http(
+                403,
+                &google(403, "PERMISSION_DENIED", "Insufficient Permission"),
+            ),
+        ) else {
+            panic!("a 403 did not fail");
+        };
+        assert_eq!(kind, ErrorKind::Denied);
+        assert!(detail.ends_with(&scope_hint(Family::Calendar)), "{detail}");
+    }
+
+    #[test]
+    fn the_widest_event_fits_the_ceiling_with_its_description_fitted() {
+        // Every string at its bound and as wide as it serializes.
+        let quotes = |n: usize| "\"".repeat(n);
+        let id = "a".repeat(EVENT_ID_MAX_BYTES);
+        let when = || json!({ "dateTime": quotes(SHORT_MAX_BYTES + 1), "timeZone": quotes(SHORT_MAX_BYTES + 1) });
+        let attendees: Vec<Value> = (0..ATTENDEES_MAX)
+            .map(|_| {
+                json!({
+                    "email": quotes(ACCOUNT_MAX_BYTES + 1),
+                    "displayName": quotes(LISTING_TEXT_MAX_BYTES + 1),
+                    "responseStatus": "needsAction",
+                    "optional": true,
+                })
+            })
+            .collect();
+        let body = json!({
+            "id": id,
+            "summary": quotes(EVENT_TEXT_MAX_BYTES + 1),
+            // Four bytes a character, the widest a character serializes
+            // without escaping, so `max_chars` of them pass the ceiling.
+            "description": "😀".repeat(MAX_CHARS_MAX as usize + 1),
+            "location": quotes(EVENT_TEXT_MAX_BYTES + 1),
+            "status": quotes(SHORT_MAX_BYTES + 1),
+            "start": when(),
+            "end": when(),
+            "organizer": {
+                "email": quotes(ACCOUNT_MAX_BYTES + 1),
+                "displayName": quotes(EVENT_TEXT_MAX_BYTES + 1),
+                "self": true,
+            },
+            "attendees": attendees,
+            "recurrence": vec![quotes(EVENT_TEXT_MAX_BYTES + 1); RECURRENCE_MAX + 1],
+            "recurringEventId": id,
+            "hangoutLink": quotes(EVENT_TEXT_MAX_BYTES + 1),
+        });
+        let state = event_state(json!({ "id": id, "max_chars": MAX_CHARS_MAX }));
+        let answer = completed(answered(&state, http(200, &body.to_string())));
+        let mut without = answer.clone();
+        without.as_object_mut().unwrap().remove("description");
+        let rest = serialized_len(&without);
+        assert!(rest < 126_000, "{rest}");
+        // The description is fitted into what is left, never emptied.
+        let kept = answer["description"].as_str().unwrap().chars().count();
+        assert!(kept > 30_000 && kept < MAX_CHARS_MAX as usize, "{kept}");
+        assert_eq!(answer["description_truncated"], json!(true));
+        assert_eq!(answer["description_chars"], json!(MAX_CHARS_MAX + 1));
+        let size = serialized_len(&answer);
+        assert!(
+            size <= COMPACT_RESULT_CEILING && size > COMPACT_RESULT_CEILING - 4,
+            "{size}"
+        );
+    }
+
     #[test]
     fn every_step_answers_an_unreadable_read_by_its_shape() {
         let refusal = "result exceeds [messaging] max_body_bytes";
@@ -5777,6 +6455,7 @@ mod tests {
             at(read_state(json!({ "id": "m1" })), STRUCTURE_STEP),
             at(thread_state(json!({ "id": "t1" })), THREAD_NARROW_STEP),
             calendar_list_state(json!({})),
+            event_state(json!({ "id": "e1" })),
             at(search_state(json!({ "q": "lunch" })), LABELS_STEP),
             at(read_state(json!({ "id": "m1" })), LABELS_STEP),
             at(thread_state(json!({ "id": "t1" })), LABELS_STEP),

@@ -64,6 +64,7 @@ const CLAUSES: &[(&str, &str)] = &[
     ("GET", "/gmail/v1/users/me/threads/*"),
     ("GET", CALENDAR_LIST),
     ("GET", "/calendar/v3/calendars/*/events"),
+    ("GET", "/calendar/v3/calendars/*/events/*"),
 ];
 
 /// The component's `provide` statements, lowered from its packaged
@@ -1700,6 +1701,141 @@ async fn a_google_400_on_a_window_is_invalid_args() {
         call.await.unwrap(),
         Err(ToolError::InvalidArgs(
             "Google INVALID_ARGUMENT (HTTP 400): Bad Request".to_string()
+        ))
+    );
+    r.assert_finished(&id);
+}
+
+/// [`HOLIDAYS`]' one event's path as it goes on the wire.
+const HOLIDAY_EVENT: &str =
+    "/calendar/v3/calendars/en.usa%23holiday@group.v.calendar.google.com/events/veterans0123456789";
+
+/// events.get's query as `CalendarEvent` sends it.
+fn event_query() -> Pairs {
+    google_query(&[
+        ("maxAttendees", "50"),
+        (
+            "fields",
+            "id,status,summary,description,location,start,end,\
+             organizer(email,displayName,self),\
+             attendees(email,displayName,responseStatus,optional,self),\
+             attendeesOmitted,recurrence,recurringEventId,hangoutLink,\
+             conferenceData/entryPoints(entryPointType,uri)",
+        ),
+    ])
+}
+
+/// `CalendarEvent` reads one event of a calendar named by an id holding `#`,
+/// with alice's bearer, and answers it with its attendees and their responses
+/// counted.
+#[tokio::test]
+async fn calendar_event_reads_one_event_with_its_attendees() {
+    let r = rig().await;
+    r.answer(
+        HOLIDAY_EVENT,
+        serde_json::to_string_pretty(&json!({
+            "id": "veterans0123456789",
+            "status": "confirmed",
+            "summary": "Veterans Day parade",
+            "description": "<b>Bring</b> a chair",
+            "start": { "date": "2026-11-11" },
+            "end": { "date": "2026-11-12" },
+            "organizer": { "email": HOLIDAYS, "displayName": "Holidays" },
+            "attendees": [
+                { "email": ACCOUNT, "self": true, "responseStatus": "accepted" },
+                { "email": "bob@example.com", "responseStatus": "declined", "optional": true },
+            ],
+        }))
+        .unwrap(),
+    );
+    let call = r.call_for_alice(
+        "CalendarEvent",
+        json!({ "id": "veterans0123456789", "calendar": HOLIDAYS }),
+    );
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap().expect("the component answered"),
+        json!({
+            "id": "veterans0123456789",
+            "summary": "Veterans Day parade",
+            "description": "<b>Bring</b> a chair",
+            "description_chars": 20,
+            "start": { "date": "2026-11-11" },
+            "end": { "date": "2026-11-12" },
+            "status": "confirmed",
+            "organizer": { "email": HOLIDAYS, "name": "Holidays" },
+            "self_response": "accepted",
+            "attendees": [
+                { "email": ACCOUNT, "response": "accepted" },
+                { "email": "bob@example.com", "response": "declined", "optional": true },
+            ],
+            "attendees_total": 2,
+            "attendee_responses": {
+                "accepted": 1,
+                "declined": 1,
+                "tentative": 0,
+                "needs_action": 0,
+            },
+        })
+    );
+    assert_eq!(
+        r.seen(),
+        [("GET".to_string(), HOLIDAY_EVENT.to_string(), event_query())]
+    );
+    assert_eq!(r.bearers(), [format!("Bearer {BEARER}")]);
+    r.assert_finished(&id);
+}
+
+/// An event that cannot be read whole is `internal`, naming why and nothing
+/// to narrow; nothing is read again.
+#[tokio::test]
+async fn an_event_too_large_to_read_whole_is_refused_with_the_reason_alone() {
+    for way in BOTH_WAYS {
+        let r = unreadable_rig(way).await;
+        let wide = json!({
+            "id": "e1",
+            "description": "d".repeat(OVERSIZED),
+            "start": { "date": "2026-11-03" },
+            "end": { "date": "2026-11-04" },
+        })
+        .to_string();
+        r.answer("/calendar/v3/calendars/primary/events/e1", wide.clone());
+        let call = r.call_for_alice("CalendarEvent", json!({ "id": "e1" }));
+        let id = r.requested_id().await;
+        r.run(1).await;
+
+        let Err(ToolError::Internal(detail)) = call.await.unwrap() else {
+            panic!("{way:?}: the event was not refused internal");
+        };
+        assert_unreadable(way, &detail, wide.len());
+        assert_eq!(r.seen().len(), 1, "{way:?}");
+        r.owed(&r.executor_sub(), 0).await;
+        r.assert_finished(&id);
+    }
+}
+
+/// Google's 404 for an event not on the calendar asked is the caller's:
+/// `invalid_args` with Google's message.
+#[tokio::test]
+async fn a_google_404_on_an_event_is_invalid_args() {
+    let r = rig().await;
+    r.fail(
+        "/calendar/v3/calendars/primary/events/e1",
+        404,
+        json!({ "error": { "code": 404, "message": "Not Found", "status": "NOT_FOUND" } })
+            .to_string()
+            .into_bytes(),
+    );
+    let call = r.call_for_alice("CalendarEvent", json!({ "id": "e1" }));
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap(),
+        Err(ToolError::InvalidArgs(
+            "Google NOT_FOUND (HTTP 404): Not Found".to_string()
         ))
     );
     r.assert_finished(&id);

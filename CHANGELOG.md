@@ -4,6 +4,21 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **The Google Workspace assistant tools can now read one calendar event.**
+  The `google-workspace-tools` component gains `CalendarEvent`: one event by
+  id (on `primary` unless a calendar is named) with its title, description
+  (as the organizer wrote it, cut at `max_chars`), start and end as Google
+  gives them, location, status, organizer, the response of the calendar
+  read (the user's own on `primary`), recurrence rules, the recurring event
+  it belongs to and its video link; and its attendees with each one's
+  response, counted. An event with more than 50 attendees answers the
+  calendar's own entry alone and says the others were left out. An event
+  too large to read whole is refused, saying why.
+  **Config change required:** the instance's `api-request` grant needs a
+  `GET` clause for `/calendar/v3/calendars/*/events/*` on the Calendar host,
+  and the assistant needs `tool calendar-event {}`;
+  `docs/google-workspace.md` shows both.
+
 - **The Google Workspace assistant tools can now read a calendar's events.**
   The `google-workspace-tools` component gains `CalendarEvents`: the events
   on one calendar (`primary` unless named) between two RFC 3339 times,

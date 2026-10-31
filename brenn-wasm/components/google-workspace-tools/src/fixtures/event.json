@@ -1,0 +1,18 @@
+{
+  "id": "weekly0123456789_20261104T140000Z",
+  "status": "confirmed",
+  "summary": "Weekly sync",
+  "description": "<p>Agenda:</p>\n<ul><li>roadmap</li><li>hiring &amp; budget</li></ul>",
+  "location": "Room 4 \"north\"",
+  "start": { "dateTime": "2026-11-04T09:00:00-05:00", "timeZone": "America/New_York" },
+  "end": { "dateTime": "2026-11-04T09:30:00-05:00", "timeZone": "America/New_York" },
+  "organizer": { "email": "bob@example.com", "displayName": "Bob Example" },
+  "attendees": [
+    { "email": "bob@example.com", "displayName": "Bob Example", "responseStatus": "accepted" },
+    { "email": "alice@example.com", "self": true, "responseStatus": "tentative" },
+    { "email": "carol@example.com", "displayName": "Carol", "responseStatus": "declined", "optional": true },
+    { "email": "dave@example.com", "responseStatus": "needsAction" }
+  ],
+  "recurringEventId": "weekly0123456789",
+  "hangoutLink": "https://meet.example.com/abc-defg-hij"
+}
