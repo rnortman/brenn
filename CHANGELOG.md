@@ -66,6 +66,18 @@ All notable changes to Brenn are documented here.
   restart. See `docs/google-maps-platform.md` for a Google setup and
   `docs/config-dsl.md`, "API-key providers", for the reference.
 
+- **A tool result too large for the message bus no longer crashes Brenn.**
+  Answers to tool calls made by WASM components travel over the message bus.
+  Every message there is limited by `[messaging] max_body_bytes`, 64 KiB by
+  default. A bigger answer, such as a large `api-request` response from an
+  API-key provider, used to crash Brenn's tool executor, and the caller waited
+  minutes for a timeout. The caller now gets an `internal` error at once
+  that names the setting, and operators get a Warning alert once per process.
+  To carry larger answers, raise `max_body_bytes` in a `messaging` block
+  (restart required) or lower the provider's `max_response_bytes`. The
+  `messaging` section is now documented in `docs/config-dsl.md`, "Messaging
+  defaults".
+
 - **The MQTT integration tests no longer need mosquitto installed.** The
   test broker (mosquitto 2.0.22) is now built from source by Bazel and
   handed to the tests, so they run the same on every machine and in CI. This

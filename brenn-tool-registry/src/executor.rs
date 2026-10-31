@@ -8,7 +8,10 @@
 //! current config, admits through the per-tool
 //! rate limiter and concurrency semaphore, runs the tool, and publishes a v1
 //! result envelope back to the caller's inbox through the gated
-//! `publish_from_system` path — no ACL bypass.
+//! `publish_from_system` path — no ACL bypass. The envelope must fit the bus
+//! body cap, `[messaging] max_body_bytes`: a result that does not is replaced
+//! by an `internal` error naming the cap, with a once-per-process Warning
+//! alert, so the caller is answered at once.
 //!
 //! The drain loop is the shared [`SystemInbox`] park/wake shape: a startup
 //! sweep then a `Notify`-driven loop, **ack-at-dequeue** (each loaded row is
@@ -390,7 +393,14 @@ impl Reply {
         } = self;
         match addr {
             Some(addr) => {
-                let body = build_result_body(tool, call_id, serving.as_deref(), &result, alert);
+                let body = build_result_body(
+                    tool,
+                    call_id,
+                    serving.as_deref(),
+                    &result,
+                    messenger.max_body_bytes(),
+                    alert,
+                );
                 publish_result(messenger, addr, &body).await;
             }
             None => {
@@ -458,6 +468,7 @@ async fn admit_and_dispatch(
                     &call_id,
                     None,
                     &Err(ToolError::InvalidArgs("malformed request body".to_string())),
+                    messenger.max_body_bytes(),
                     alert,
                 );
                 publish_result(messenger, &addr, &body).await;
@@ -652,9 +663,12 @@ async fn admit_and_dispatch(
 
 /// Publish a result body to the caller's inbox through the gated system-publish
 /// path. An unresolved reply target (consumer removed from config between request
-/// and result) is the one deliberate no-alert drop; any other publish failure is
-/// a host-wiring bug and panics (the executor's system policy must permit
-/// `brenn:tool-results/*`).
+/// and result) is the one deliberate no-alert drop. Every other refusal panics:
+/// a body over `[messaging] max_body_bytes` is one [`build_result_body`] already
+/// fitted to that cap, so its refusal means the cap is below that result's
+/// `internal` error envelope, whose size varies with the `tool`, `call_id` and
+/// `serving` it echoes; anything else is a host-wiring bug (the executor's
+/// system policy must permit `brenn:tool-results/*`).
 async fn publish_result(messenger: &Messenger, reply_addr: &str, body: &str) {
     match messenger
         .publish_from_system(
@@ -681,6 +695,12 @@ async fn publish_result(messenger: &Messenger, reply_addr: &str, body: &str) {
              inbox's send rate is the host's TOOL_INBOX_SEND_RATE, set past any such inflow; \
              this is a host bug, not an operator setting"
         ),
+        PublishResult::BodyTooLarge { len, max } => panic!(
+            "BUG: tool executor: a result envelope fitted to [messaging] max_body_bytes was \
+             still refused ({len} > {max}) — max_body_bytes is below this result's internal \
+             error envelope, which echoes the request's tool, call_id and serving and so \
+             varies per call; raise it past {len}"
+        ),
         other => panic!(
             "tool executor: publishing a result to {reply_addr:?} failed unexpectedly ({other:?}) \
              — host-wiring invariant violated: the {TOOL_EXECUTOR_COMPONENT} system policy must \
@@ -689,13 +709,19 @@ async fn publish_result(messenger: &Messenger, reply_addr: &str, body: &str) {
     }
 }
 
-/// Serialize the v1 result envelope, capping the payload. An over-cap result is a
-/// tool bug: it alerts and the body is replaced with an `internal` error result.
+/// Serialize the v1 result envelope, fitted to the smaller of
+/// [`MAX_ASYNC_RESULT_BYTES`] and the bus body cap `max_body_bytes`. A result
+/// over `MAX_ASYNC_RESULT_BYTES` is a tool bug; one over the bus cap alone is
+/// data the operator's `[messaging] max_body_bytes` does not carry. Either
+/// alerts once per process and the body is replaced with an `internal` error
+/// result: `result exceeded size cap` for the first, a detail naming the
+/// result's size and `max_body_bytes` for the second.
 fn build_result_body(
     tool: &str,
     call_id: &str,
     serving: Option<&str>,
     result: &Result<Value, ToolError>,
+    max_body_bytes: usize,
     alert: &AlertDispatcher,
 ) -> String {
     let envelope = |outcome: Value| {
@@ -726,6 +752,24 @@ fn build_result_body(
         return envelope(
             json!({ "err": { "kind": "internal", "detail": "result exceeded size cap" } }),
         );
+    }
+    if s.len() > max_body_bytes {
+        let len = s.len();
+        warn!(%tool, len, cap = max_body_bytes, "tool executor: result over the bus body cap");
+        alert.alert_once_per_process(
+            AlertSeverity::Warning,
+            format!("Tool {tool:?} produced a result over the bus body cap"),
+            &format!("tool:{tool}:result-over-bus-cap"),
+            format!(
+                "Tool {tool:?} produced a {len} byte result against [messaging] max_body_bytes \
+                 = {max_body_bytes}. The caller was answered with an internal error. Raise \
+                 max_body_bytes, or bound the tool's answer (for api-request, the provider's \
+                 max_response_bytes)."
+            ),
+        );
+        return envelope(json!({ "err": { "kind": "internal", "detail": format!(
+            "result of {len} bytes exceeds [messaging] max_body_bytes ({max_body_bytes})"
+        ) } }));
     }
     s
 }
@@ -758,7 +802,9 @@ mod tests {
     use brenn_messaging::testutils::test_channel_entry;
     use brenn_messaging::{MountDebt, WakeRouter, config::Depth, config::NoiseLevel};
     use brenn_messaging_store::db::{insert_message, upsert_channels, utc_to_ns};
-    use brenn_obs::alerting::{make_capturing_alerter, noop_alert_dispatcher};
+    use brenn_obs::alerting::{
+        make_capturing_alerter, make_capturing_alerter_with_severity, noop_alert_dispatcher,
+    };
     use chrono::Utc;
     use indexmap::IndexMap;
 
@@ -920,6 +966,11 @@ mod tests {
     }
 
     async fn harness() -> Harness {
+        harness_with(MessagingGlobalConfig::default()).await
+    }
+
+    /// [`harness`] over a messenger built with `messaging`.
+    async fn harness_with(messaging: MessagingGlobalConfig) -> Harness {
         let db = brenn_messaging_store::db::init_db_memory();
 
         let tools_ch = test_channel_entry(
@@ -966,7 +1017,7 @@ mod tests {
             Arc::from("test"),
             Arc::new(IndexMap::new()),
             Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
-            MessagingGlobalConfig::default(),
+            messaging,
         );
         let mut wasm_policies = HashMap::new();
         wasm_policies.insert(CALLER_SLUG.to_string(), subscribe_policy("tool-results/"));
@@ -1335,7 +1386,14 @@ mod tests {
         publish_result(
             &h.messenger,
             "brenn:tool-results/ghost",
-            &build_result_body("apull", "c5", None, &Ok(json!({})), &alert),
+            &build_result_body(
+                "apull",
+                "c5",
+                None,
+                &Ok(json!({})),
+                h.messenger.max_body_bytes(),
+                &alert,
+            ),
         )
         .await;
         // Nothing landed on any inbox; the drop is silent-but-logged.
@@ -1382,7 +1440,14 @@ mod tests {
             )]),
         ));
         let (alert, _hg) = noop_alert_dispatcher();
-        let body = build_result_body("apull", "r1", None, &Ok(json!({})), &alert);
+        let body = build_result_body(
+            "apull",
+            "r1",
+            None,
+            &Ok(json!({})),
+            messenger.max_body_bytes(),
+            &alert,
+        );
         publish_result(&messenger, "brenn:tool-results/sync", &body).await;
         publish_result(&messenger, "brenn:tool-results/sync", &body).await;
     }
@@ -1485,7 +1550,15 @@ mod tests {
         // the cap alert fires.
         let (alert, captured, handle) = make_capturing_alerter();
         let big = "x".repeat(MAX_ASYNC_RESULT_BYTES + 1);
-        let body = build_result_body("apull", "c7", None, &Ok(json!({ "blob": big })), &alert);
+        // The bus cap is set above the result cap, so only the result cap applies.
+        let body = build_result_body(
+            "apull",
+            "c7",
+            None,
+            &Ok(json!({ "blob": big })),
+            2 * MAX_ASYNC_RESULT_BYTES,
+            &alert,
+        );
         let v: Value = serde_json::from_str(&body).expect("capped body is JSON");
         assert_eq!(v["call_id"], "c7");
         assert_eq!(v["outcome"]["err"]["kind"], "internal");
@@ -1505,6 +1578,146 @@ mod tests {
         );
     }
 
+    /// A result under `MAX_ASYNC_RESULT_BYTES` but over the bus body cap is
+    /// data the operator's cap does not carry: the body becomes an `internal`
+    /// error naming the cap, and one Warning alert names the setting, however
+    /// many results trip it.
+    #[tokio::test]
+    async fn build_result_body_over_the_bus_cap_answers_internal_naming_it() {
+        let (alert, captured, handle) = make_capturing_alerter_with_severity();
+        let value = json!({ "blob": "x".repeat(2048) });
+        let body = build_result_body("apull", "c8", Some("s1"), &Ok(value.clone()), 1024, &alert);
+        let v: Value = serde_json::from_str(&body).expect("fitted body is JSON");
+        assert_eq!(v["call_id"], "c8");
+        assert_eq!(v["serving"], "s1");
+        assert_eq!(v["outcome"]["err"]["kind"], "internal");
+        let detail = v["outcome"]["err"]["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with("result of ")
+                && detail.ends_with(" bytes exceeds [messaging] max_body_bytes (1024)"),
+            "{detail}"
+        );
+        assert!(body.len() <= 1024, "the substitute fits the cap");
+        // A second over-cap result is answered the same way without a second alert.
+        let second = build_result_body("apull", "c9", None, &Ok(value), 1024, &alert);
+        let v: Value = serde_json::from_str(&second).expect("fitted body is JSON");
+        assert_eq!(v["call_id"], "c9");
+        assert_eq!(v["outcome"]["err"]["kind"], "internal");
+        assert!(second.len() <= 1024, "the second substitute fits the cap");
+
+        alert.flush().await;
+        drop(alert);
+        handle.await.unwrap();
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "one alert per process: {captured:?}");
+        let (severity, title, alert_body) = &captured[0];
+        assert!(matches!(severity, AlertSeverity::Warning), "{severity:?}");
+        assert!(title.contains("over the bus body cap"), "{title}");
+        assert!(
+            alert_body.contains("max_body_bytes = 1024")
+                && alert_body.contains("[tool:apull:result-over-bus-cap]"),
+            "{alert_body}"
+        );
+    }
+
+    /// The executor end to end under a 1 KiB bus cap: a tool answering 2 KiB
+    /// reaches its caller as one `internal` result naming the cap, and the
+    /// executor does not panic.
+    #[tokio::test]
+    async fn a_result_over_the_bus_cap_reaches_the_caller_as_internal() {
+        let h = harness_with(MessagingGlobalConfig {
+            max_body_bytes: 1024,
+            ..Default::default()
+        })
+        .await;
+        let request = json!({
+            "v": 1,
+            "tool": "apull",
+            "call_id": "big",
+            "caller": CALLER,
+            "args": { "repo": "brenn", "pad": "x".repeat(2048) },
+        })
+        .to_string();
+        insert_request(&h, &request, Some(h.results_uuid)).await;
+        let (alert, _hg) = noop_alert_dispatcher();
+        let exec = executor(
+            &h,
+            registry(StubAsync::new(4, Duration::ZERO)),
+            caller_grants(vec![clause(&[("repo", "brenn")])]),
+            alert,
+        );
+
+        drain_and_join(&exec).await;
+
+        let result = read_result(&h).await;
+        assert_eq!(result["call_id"], "big");
+        assert_eq!(result["outcome"]["err"]["kind"], "internal");
+        let detail = result["outcome"]["err"]["detail"].as_str().unwrap();
+        assert!(
+            detail.ends_with("exceeds [messaging] max_body_bytes (1024)"),
+            "{detail}"
+        );
+    }
+
+    /// A body of exactly `max_body_bytes` is sent unchanged and the bus
+    /// accepts it; one byte less and it is the `internal` substitute. The
+    /// executor's fit and the messenger's refusal draw the line at the same byte.
+    #[tokio::test]
+    async fn a_result_of_exactly_the_bus_cap_passes_through_and_lands() {
+        let value = json!({ "blob": "x".repeat(256) });
+        let (probe, _hp) = noop_alert_dispatcher();
+        let unfitted =
+            build_result_body("apull", "c11", None, &Ok(value.clone()), usize::MAX, &probe);
+        let cap = unfitted.len();
+
+        let (alert, captured, handle) = make_capturing_alerter_with_severity();
+        let at_cap = build_result_body("apull", "c11", None, &Ok(value.clone()), cap, &alert);
+        assert_eq!(at_cap, unfitted, "a body at the cap is sent unchanged");
+        let under = build_result_body("apull", "c11", None, &Ok(value.clone()), cap - 1, &alert);
+        let v: Value = serde_json::from_str(&under).expect("fitted body is JSON");
+        assert_eq!(v["outcome"]["err"]["kind"], "internal");
+        alert.flush().await;
+        drop(alert);
+        handle.await.unwrap();
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "only the cap - 1 fit alerts"
+        );
+
+        let h = harness_with(MessagingGlobalConfig {
+            max_body_bytes: cap,
+            ..Default::default()
+        })
+        .await;
+        publish_result(&h.messenger, "brenn:tool-results/sync", &at_cap).await;
+        let result = read_result(&h).await;
+        assert_eq!(result["call_id"], "c11");
+        assert_eq!(result["outcome"]["ok"], value);
+    }
+
+    /// A cap below a result's error envelope cannot carry that result: the
+    /// refusal of a fitted body panics naming `max_body_bytes`.
+    #[tokio::test]
+    #[should_panic(expected = "max_body_bytes is below this result's internal error envelope")]
+    async fn a_bus_cap_below_the_error_envelope_panics_naming_it() {
+        let h = harness_with(MessagingGlobalConfig {
+            max_body_bytes: 8,
+            ..Default::default()
+        })
+        .await;
+        let (alert, _hg) = noop_alert_dispatcher();
+        let body = build_result_body(
+            "apull",
+            "c10",
+            None,
+            &Ok(json!({})),
+            h.messenger.max_body_bytes(),
+            &alert,
+        );
+        publish_result(&h.messenger, "brenn:tool-results/sync", &body).await;
+    }
+
     #[tokio::test]
     async fn envelope_around_a_result_at_the_tool_budget_is_under_the_cap() {
         // A tool bounding its serialized value to
@@ -1519,7 +1732,14 @@ mod tests {
         let (alert, captured, handle) = make_capturing_alerter();
         let call_id = "c".repeat(128);
         let tool = "a-tool-name-of-generous-length-for-the-envelope-test";
-        let body = build_result_body(tool, &call_id, None, &Ok(value.clone()), &alert);
+        let body = build_result_body(
+            tool,
+            &call_id,
+            None,
+            &Ok(value.clone()),
+            MAX_ASYNC_RESULT_BYTES,
+            &alert,
+        );
         assert!(
             body.len() <= MAX_ASYNC_RESULT_BYTES,
             "envelope {} over cap",
@@ -1683,6 +1903,7 @@ mod tests {
                 "r1",
                 None,
                 &Ok(json!({ "echoed": { "repo": "brenn" } })),
+                h.messenger.max_body_bytes(),
                 &alert,
             ),
         )

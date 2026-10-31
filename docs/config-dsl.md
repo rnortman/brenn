@@ -246,6 +246,37 @@ claude_profile main;
 The two spellings mean the same thing — `claude_profile main {}` states exactly
 as much — so a section with required keys is refused either way.
 
+#### Messaging defaults
+
+The `messaging` section sets the bus's global defaults; every key is optional:
+
+```
+messaging { max_body_bytes = 393216; }
+```
+
+- `default_send_budget` — a conversation's send budget when its app states
+  none. Default 100.
+- `max_body_bytes` — the largest body any publish carries, in bytes. Default
+  65 536 (64 KiB). It bounds every message on the bus, a tool result
+  included: a result over it is answered to its caller as an `internal` error
+  naming the cap, with a Warning alert once per process. Several caps are
+  derived from it — the attach client frame cap (`max_client_frame_bytes`,
+  which adds room for JSON escaping and batch overhead), the MQTT publish
+  payload cap, and a guest's publish and sync-reply caps — so raising it
+  raises them.
+- `default_noise` — a subscription's noise level when it states none. Default
+  `silent`.
+- `default_sink` — a channel's sink when it states none. Default `drop`.
+- `archive_path` — where `sink = archive` channels write. No default; required
+  when any channel archives.
+- `default_wake_min` — the urgency that wakes a conversation subscriber when
+  it states none. Default `normal`.
+- `default_send_rate` — the per-sender, per-channel send rate when a channel
+  states none, a `{ burst, refill_interval_secs, refill }` table. Default
+  `{ burst = 240, refill_interval_secs = 1, refill = 30 }`.
+
+`messaging` is a restart section (see [What reload converges](#what-reload-converges)).
+
 ### Claude accounts
 
 A `claude_profile` block binds a name to one Claude account. The account is a
@@ -384,6 +415,9 @@ appears in the callback URL and in the vault's directory names.
   There must be at least one.
 - `max_response_bytes` — the most response-body bytes a credentialed request
   reads. Defaults to 256 KiB; above 512 KiB (the tool result cap) is refused.
+  An answer must also fit `[messaging] max_body_bytes` after JSON escaping and
+  the tool-result envelope, or the answer is an `internal` error naming the
+  cap (see [Messaging defaults](#messaging-defaults)).
 
 Every URL a credential is sent to (`token_url`, `userinfo_url`, `revoke_url`
 and each `api_hosts` origin) must be `https`. Plain `http` is accepted only
@@ -537,8 +571,10 @@ is refused at the second block.
   carrying the key may go to, each written canonically. Each origin must be
   `https`; plain `http` is accepted only for `127.0.0.1`, `[::1]` or
   `localhost`.
-- `max_response_bytes` — as for `oauth_provider`: defaults to 256 KiB, and
-  values above 512 KiB are refused.
+- `max_response_bytes` — as for `oauth_provider`: defaults to 256 KiB,
+  values above 512 KiB are refused, and an answer must also fit
+  `[messaging] max_body_bytes` after JSON escaping and the tool-result
+  envelope, or the answer is an `internal` error naming the cap.
 
 A key provider needs no `server.vault_dir`. That key stays required exactly
 when an `oauth_provider` is declared. Changing a key provider takes a restart,

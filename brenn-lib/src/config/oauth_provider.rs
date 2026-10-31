@@ -18,6 +18,9 @@ use super::secret::{SecretString, load_secret_file_private};
 
 /// The body limit a provider gets when its block states no
 /// `max_response_bytes`.
+// TODO(api-request-read-limit-vs-bus-cap): this default is above the bus
+// default `[messaging] max_body_bytes` (64 KiB), so an answer between the two
+// reaches the caller only as the executor's `internal` over-cap error.
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// The largest `max_response_bytes` a provider may state: the async tool

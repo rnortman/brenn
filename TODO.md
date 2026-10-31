@@ -1,5 +1,18 @@
 # TODOs
 
+## `api-request-read-limit-vs-bus-cap`
+
+`api-request`'s default read limit (`DEFAULT_MAX_RESPONSE_BYTES`, 256 KiB) and
+the bus default (`[messaging] max_body_bytes`, 64 KiB) contradict each other:
+an answer between them is carried to the caller only as the executor's
+`internal` substitution. Decide whether config check refuses a
+`max_response_bytes` that cannot fit the bus cap after escaping and the
+envelope (which refuses every config at today's defaults), or the provider
+default drops to fit the bus default, or the limits are documented as
+independent; then make `MAX_RESPONSE_BYTES_CEILING`'s compile-time tie to
+`MAX_ASYNC_RESULT_BYTES` (`brenn-tool-registry/src/descriptor.rs`) say which
+cap it means.
+
 ## `security-host-paths-follow-agent-symlinks`
 
 Brenn's host process creates, writes and deletes under trees the agent's
