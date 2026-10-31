@@ -20,6 +20,7 @@ use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
 use brenn_mqtt::payload::InboundPayload;
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use brenn_mqtt::state::ConnectorHealthLabel;
+use brenn_mqtt::test_support::client::wait_for_filter_acked;
 use common::{
     AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, SpawnedClient, TcpRelay,
     await_puback, broker_auth, broker_tls13, certs, direct_publisher_acked, direct_subscriber,
@@ -971,6 +972,288 @@ async fn reconnect_reasserts_filters_and_fails_pending_publish() {
         "post-reconnect sentinel payload mismatch: {:?}",
         msg.payload
     );
+
+    handle.stop();
+}
+
+// ---------------------------------------------------------------------------
+// More filters than the session's request channel holds (64): the supervisor
+// sends the connect-time re-assert from inside its poll loop, so the overflow
+// goes out as the event loop frees room instead of wedging the session.
+// ---------------------------------------------------------------------------
+
+/// How many static filters the large-set cases spawn with: comfortably more
+/// than the 64 requests the session's request channel holds.
+const MANY_FILTERS: usize = 100;
+
+fn many_filters() -> Vec<(String, u8)> {
+    (0..MANY_FILTERS)
+        .map(|i| (format!("brenn/itest/many/{i}/#"), 1))
+        .collect()
+}
+
+/// Every one of a 100-filter set is granted at the broker, and delivery works on
+/// the last one. A supervisor that waited for room on its own request channel
+/// before polling would never send the 65th SUBSCRIBE, so the last filter's
+/// grant wait fails at its cap instead of the case hanging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_with_more_filters_than_the_request_channel_holds_asserts_all() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+    let filters = many_filters();
+
+    let SpawnedClient {
+        svc,
+        client_slug,
+        handle,
+        mut rx,
+    } = spawn_client("many", &harness, ca.clone(), filters.clone()).await;
+
+    let last = &filters[MANY_FILTERS - 1].0;
+    wait_for_filter_acked(
+        &svc,
+        &client_slug,
+        last,
+        10,
+        "the last of the static filters was never granted",
+    )
+    .await;
+    for (filter, _) in &filters {
+        assert_eq!(
+            svc.subscription_acked(&client_slug, filter).await,
+            Some(true),
+            "{filter} was not granted on the session",
+        );
+    }
+
+    let (pubc, mut ack_rx) = direct_publisher_acked(harness.port, ca).await;
+    let probe = format!("brenn/itest/many/{}/probe", MANY_FILTERS - 1);
+    pubc.publish(probe.clone(), QoS::AtLeastOnce, false, b"probe".to_vec())
+        .await
+        .expect("probe publish failed");
+    await_puback(&mut ack_rx, "probe").await;
+    let msg = recv_delivery(&mut rx, "probe on the last filter").await;
+    assert_eq!(msg.topic, probe);
+
+    handle.stop();
+}
+
+/// A live subscribe issued while the connect-time re-assert is still filling
+/// the request channel is asserted too. It finds either a free slot (sent
+/// directly) or a full channel (handed to the supervisor); either way it must
+/// reach the broker without the caller or the supervisor waiting on each other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_subscribe_during_a_large_reassert_is_asserted() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+    let filters = many_filters();
+
+    let SpawnedClient {
+        svc,
+        client_slug,
+        handle,
+        mut rx,
+    } = spawn_client("many-live", &harness, ca.clone(), filters.clone()).await;
+
+    let live = "brenn/itest/many/live/#";
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        svc.subscribe_filter(&client_slug, live.to_string(), 1),
+    )
+    .await
+    .expect("a live subscribe never waits on the request channel");
+    assert_eq!(outcome, Some(IngressSubscribeOutcome::SubscribedLive));
+
+    wait_for_filter_acked(
+        &svc,
+        &client_slug,
+        live,
+        10,
+        "the live filter was never granted",
+    )
+    .await;
+    wait_for_filter_acked(
+        &svc,
+        &client_slug,
+        &filters[MANY_FILTERS - 1].0,
+        10,
+        "the last of the static filters was never granted",
+    )
+    .await;
+
+    let (pubc, mut ack_rx) = direct_publisher_acked(harness.port, ca).await;
+    let probe = "brenn/itest/many/live/probe";
+    pubc.publish(
+        probe.to_string(),
+        QoS::AtLeastOnce,
+        false,
+        b"probe".to_vec(),
+    )
+    .await
+    .expect("probe publish failed");
+    await_puback(&mut ack_rx, "probe").await;
+    let msg = recv_delivery(&mut rx, "probe on the live filter").await;
+    assert_eq!(msg.topic, probe);
+
+    handle.stop();
+}
+
+/// A stop that lands while the connect-time re-assert may still have the
+/// request channel full queues its DISCONNECT without waiting for room, so
+/// `stop_and_join` returns within the drain cap and the session is left
+/// terminal. Whether the channel is full at the instant of the stop is down to
+/// timing; the case holds on correct code either way.
+///
+/// The broker log is not read: the stop can close the socket with SUBACKs for
+/// the just-sent SUBSCRIBEs still unread, which resets the connection and
+/// loses the DISCONNECT at the broker.
+// TODO(mqtt-disconnect-lost-to-reset): assert `log_records_disconnect` for
+// this session once the stop path no longer loses its DISCONNECT to a reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_right_after_a_large_connect_returns_within_the_drain_cap() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+
+    let SpawnedClient {
+        svc,
+        client_slug,
+        handle,
+        ..
+    } = spawn_client("many-stop", &harness, ca, many_filters()).await;
+
+    // The supervisor's DISCONNECT drain is capped at 5s; 2s of slack on top.
+    tokio::time::timeout(Duration::from_secs(7), handle.stop_and_join())
+        .await
+        .expect("the supervisor did not stop within its drain cap");
+
+    wait_for_health(
+        &svc,
+        &client_slug,
+        &[ConnectorHealthLabel::Disconnected],
+        1,
+        "a stopped session did not read Disconnected",
+    )
+    .await;
+}
+
+/// A subscribe handed to the supervisor through the deferral queue is sent by
+/// the supervisor at its next poll return. The case puts the entry on the queue
+/// itself, so the deferred path is taken on every run rather than when a live
+/// subscribe happens to meet a full request channel, and then wakes the
+/// session's poll with a delivery on its static filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deferred_subscribe_is_sent_at_the_next_poll() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+    let wake = "brenn/itest/deferred/wake/#";
+
+    let SpawnedClient {
+        svc,
+        client_slug,
+        handle,
+        mut rx,
+    } = spawn_client(
+        "deferred-drain",
+        &harness,
+        ca.clone(),
+        vec![(wake.to_string(), 1)],
+    )
+    .await;
+    wait_for_filter_acked(
+        &svc,
+        &client_slug,
+        wake,
+        10,
+        "the static filter was never granted",
+    )
+    .await;
+
+    // Registered first, as `subscribe_filter` does before it defers: the SUBACK
+    // arm records a grant only for a filter in the session's set.
+    let handed = "brenn/itest/deferred/handed/#";
+    let sub = handle.add_subscription(handed.to_string(), 1).await;
+    handle
+        .deferred_subscribes
+        .lock()
+        .expect("deferred_subscribes poisoned")
+        .push_back(sub);
+
+    let (pubc, mut ack_rx) = direct_publisher_acked(harness.port, ca).await;
+    let probe = "brenn/itest/deferred/wake/probe";
+    pubc.publish(probe.to_string(), QoS::AtLeastOnce, false, b"wake".to_vec())
+        .await
+        .expect("wake publish failed");
+    await_puback(&mut ack_rx, "wake").await;
+    let msg = recv_delivery(&mut rx, "wake on the static filter").await;
+    assert_eq!(msg.topic, probe);
+
+    // The keepalive is 30s, so a grant inside this cap came from the drain that
+    // follows the delivery's poll return.
+    wait_for_filter_acked(
+        &svc,
+        &client_slug,
+        handed,
+        10,
+        "the deferred filter was never sent",
+    )
+    .await;
+    assert!(
+        handle
+            .deferred_subscribes
+            .lock()
+            .expect("deferred_subscribes poisoned")
+            .is_empty()
+    );
+
+    handle.stop();
+}
+
+/// A static filter the re-assert cannot send is logged and passed over: every
+/// filter behind it is still asserted on the session. The bad filter sits at
+/// the front, where a re-assert that stopped on it would assert nothing.
+/// Config resolution never lets such a filter through; the harness does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsendable_static_filter_does_not_stall_the_reassert() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+    let valid: Vec<String> = (0..10)
+        .map(|i| format!("brenn/itest/badfront/{i}/#"))
+        .collect();
+    let mut filters = vec![("brenn/itest/#/bad".to_string(), 1)];
+    filters.extend(valid.iter().map(|f| (f.clone(), 1)));
+
+    let SpawnedClient {
+        svc,
+        client_slug,
+        handle,
+        ..
+    } = spawn_client("bad-front", &harness, ca, filters).await;
+
+    wait_for_filter_acked(
+        &svc,
+        &client_slug,
+        &valid[valid.len() - 1],
+        10,
+        "the last valid filter was never granted",
+    )
+    .await;
+    for filter in &valid {
+        assert_eq!(
+            svc.subscription_acked(&client_slug, filter).await,
+            Some(true),
+            "{filter} was not granted on the session",
+        );
+    }
 
     handle.stop();
 }

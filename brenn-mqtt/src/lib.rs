@@ -19,7 +19,7 @@
 //! - `egress`     — shared capability/ACL/budget enforcement + broker publish (`enforce_and_publish`).
 //! - `service`    — `MqttService`, `MqttEventRouter` trait.
 //! - `connection` — unified per-client supervisor (`spawn_client_supervisor`) plus
-//!   subscription helpers (`union_subscriptions`, `assert_ingress_subscription`).
+//!   subscription helpers (`union_subscriptions`, `try_assert_ingress_subscription`).
 //! - `test_support` — a `mosquitto` harness and its throwaway TLS material, for
 //!   this crate's integration suite and for the crates above that drive ingress
 //!   through a real broker. Behind the `testutils` feature.

@@ -13,11 +13,13 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::connection::{assert_ingress_subscription, assert_ingress_unsubscribe};
+use crate::connection::{
+    SubscribeSend, assert_ingress_unsubscribe, try_assert_ingress_subscription,
+};
 use crate::payload::InboundPayload;
 use crate::state::{
-    ConnectorHealthLabel, MqttClientHandle, PendingPublish, PubackOutcome, SubAckOutcome,
-    SupervisorState,
+    ConnectorHealthLabel, DEFERRED_SUBSCRIBES_POISONED, MqttClientHandle, PendingPublish,
+    PubackOutcome, SubAckOutcome, SupervisorState,
 };
 use brenn_lib::messaging::Urgency;
 use brenn_lib::mqtt::config::MqttClientConfig;
@@ -61,7 +63,9 @@ pub trait MqttEventRouter: Send + Sync + 'static {
 /// Outcome of a runtime ingress SUBSCRIBE ([`MqttService::subscribe_filter`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngressSubscribeOutcome {
-    /// The client was live and the SUBSCRIBE was sent now.
+    /// The client was live and the SUBSCRIBE is on the session's request
+    /// channel, or — when that channel was full — in the supervisor's hands for
+    /// this session, sent at its next free slot.
     SubscribedLive,
     /// The client is currently disconnected but its supervisor is still
     /// retrying; the filter is registered and the SUBSCRIBE is deferred to the
@@ -415,10 +419,25 @@ impl MqttService {
                 }
                 _ => IngressSubscribeOutcome::DeferredDisconnected,
             },
-            Some(client) => match assert_ingress_subscription(&handle, &client, &sub).await {
-                Ok(()) => IngressSubscribeOutcome::SubscribedLive,
-                Err(e) => IngressSubscribeOutcome::SendFailed(e),
-            },
+            Some(client) => {
+                // Held from before the send until the push, so a supervisor
+                // drain that starts after the send found the channel full waits
+                // for the push and takes it. The full channel guarantees such a
+                // drain: the supervisor's next poll takes a request off it and
+                // returns.
+                let mut deferred = handle
+                    .deferred_subscribes
+                    .lock()
+                    .expect(DEFERRED_SUBSCRIBES_POISONED);
+                match try_assert_ingress_subscription(&handle, &client, &sub) {
+                    Ok(SubscribeSend::Sent) => IngressSubscribeOutcome::SubscribedLive,
+                    Ok(SubscribeSend::ChannelFull) => {
+                        deferred.push_back(sub);
+                        IngressSubscribeOutcome::SubscribedLive
+                    }
+                    Err(e) => IngressSubscribeOutcome::SendFailed(e),
+                }
+            }
         };
         Some(outcome)
     }
@@ -609,6 +628,7 @@ impl Default for MqttService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::unpolled_client;
 
     fn make_handle(client: &str) -> Arc<MqttClientHandle> {
         let (tx, _rx) = tokio::sync::watch::channel(false);
@@ -619,9 +639,7 @@ mod tests {
     /// An `AsyncClient` whose eventloop has been dropped: every request send fails
     /// with a closed-channel `ClientError`. Never connects to anything.
     fn dead_live_client() -> rumqttc::AsyncClient {
-        use rumqttc::{AsyncClient, MqttOptions};
-        let opts = MqttOptions::new("test-dead", ("127.0.0.1", 1));
-        let (client, eventloop) = AsyncClient::builder(opts).capacity(1).build();
+        let (client, eventloop) = unpolled_client(1);
         drop(eventloop);
         client
     }
@@ -629,9 +647,7 @@ mod tests {
     /// A client whose eventloop is still alive: a request send lands in its
     /// channel, so the SUBSCRIBE is answered on the spot.
     fn live_client() -> (rumqttc::AsyncClient, rumqttc::EventLoop) {
-        use rumqttc::{AsyncClient, MqttOptions};
-        let opts = MqttOptions::new("test-live", ("127.0.0.1", 1));
-        AsyncClient::builder(opts).capacity(10).build()
+        unpolled_client(10)
     }
 
     /// The live arm: a client installed in the cell answers the SUBSCRIBE now
@@ -744,16 +760,17 @@ mod tests {
         );
     }
 
+    /// A filter rumqttc would refuse is a failed send, not a full channel: it is
+    /// reported, not deferred, and stays registered.
     #[tokio::test]
-    async fn subscribe_filter_send_failure_reports_sendfailed_and_registers() {
+    async fn subscribe_filter_rejected_filter_reports_sendfailed_and_registers() {
         let svc = MqttService::new();
         let handle = make_handle("home");
-        *handle.client.lock().await = Some(dead_live_client());
+        let (client, _eventloop) = live_client();
+        *handle.client.lock().await = Some(client);
         svc.add_client(handle.clone());
 
-        let outcome = svc
-            .subscribe_filter("home", "sensors/+/temp".to_string(), 1)
-            .await;
+        let outcome = svc.subscribe_filter("home", "a/#/b".to_string(), 1).await;
         match outcome {
             Some(IngressSubscribeOutcome::SendFailed(msg)) => assert!(!msg.is_empty()),
             other => panic!("expected SendFailed, got {other:?}"),
@@ -764,7 +781,105 @@ mod tests {
                 .read()
                 .await
                 .iter()
-                .any(|s| s.topic_filter == "sensors/+/temp"),
+                .any(|s| s.topic_filter == "a/#/b"),
+        );
+        assert!(
+            handle.pending_subscribes.lock().unwrap().is_empty(),
+            "a refused filter is never pushed for attribution",
+        );
+        assert!(
+            handle.deferred_subscribes.lock().unwrap().is_empty(),
+            "and never handed to the supervisor",
+        );
+    }
+
+    /// A client whose event loop is gone cannot be told apart from a full one at
+    /// the send, so the subscribe goes to the supervisor, which discards it with
+    /// the dead session; the filter stays registered for the next connect.
+    #[tokio::test]
+    async fn subscribe_filter_on_a_dead_client_defers_to_the_supervisor() {
+        let svc = MqttService::new();
+        let handle = make_handle("home");
+        *handle.client.lock().await = Some(dead_live_client());
+        svc.add_client(handle.clone());
+
+        let outcome = svc
+            .subscribe_filter("home", "sensors/+/temp".to_string(), 1)
+            .await;
+        assert_eq!(outcome, Some(IngressSubscribeOutcome::SubscribedLive));
+        assert!(handle.pending_subscribes.lock().unwrap().is_empty());
+        let deferred: Vec<String> = handle
+            .deferred_subscribes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.topic_filter.clone())
+            .collect();
+        assert_eq!(
+            deferred,
+            vec!["sensors/+/temp".to_string()],
+            "the subscribe was handed to the supervisor",
+        );
+    }
+
+    /// A caller that finds the request channel full neither waits for a slot
+    /// nor holds the attribution lock: it hands the subscribe to the supervisor
+    /// and returns. The event loop is never polled here, so a caller that waited
+    /// for room would hang the test.
+    #[tokio::test]
+    async fn subscribe_filter_defers_when_the_control_channel_is_full() {
+        let svc = MqttService::new();
+        let handle = make_handle("home");
+        let (client, _eventloop) = unpolled_client(1);
+        *handle.client.lock().await = Some(client);
+        svc.add_client(handle.clone());
+
+        let first = svc
+            .subscribe_filter("home", "sensors/a".to_string(), 1)
+            .await;
+        assert_eq!(first, Some(IngressSubscribeOutcome::SubscribedLive));
+        assert_eq!(
+            handle
+                .pending_subscribes
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["sensors/a".to_string()],
+        );
+        assert!(handle.deferred_subscribes.lock().unwrap().is_empty());
+
+        let second = svc
+            .subscribe_filter("home", "sensors/b".to_string(), 1)
+            .await;
+        assert_eq!(second, Some(IngressSubscribeOutcome::SubscribedLive));
+        assert_eq!(
+            handle.pending_subscribes.lock().unwrap().len(),
+            1,
+            "the full-channel send recorded nothing for attribution",
+        );
+        let deferred: Vec<String> = handle
+            .deferred_subscribes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.topic_filter.clone())
+            .collect();
+        assert_eq!(
+            deferred,
+            vec!["sensors/b".to_string()],
+            "the second subscribe was handed to the supervisor",
+        );
+        assert!(
+            handle
+                .subscriptions
+                .read()
+                .await
+                .iter()
+                .any(|s| s.topic_filter == "sensors/b"),
+            "a deferred filter is in the reconnect set, so a connection that ends \
+             before the supervisor sends it re-asserts it on the next connect",
         );
     }
 

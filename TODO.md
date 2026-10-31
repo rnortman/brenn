@@ -3203,6 +3203,37 @@ connect, observed the way the removal cases observe the live one (the broker's
 own `Received UNSUBSCRIBE` record), and the status body says which of the two
 things a deferral was.
 
+## `mqtt-disconnect-lost-to-reset`
+
+A stop that lands while broker-to-client bytes are unread — SUBACKs for
+SUBSCRIBEs just sent, a retained delivery, ordinary inbound traffic — can
+lose its DISCONNECT at the broker. The supervisor's stop path queues the
+graceful DISCONNECT, rumqttc writes it and returns `RequestsDone`, and the
+`EventLoop` is dropped, which closes the socket with data still in its
+receive buffer; the kernel then sends RST instead of FIN, and the broker
+discards what it had not yet read, the DISCONNECT among it, and records the
+session as ended abnormally (mosquitto 2.1.2 logs "disconnected due to out
+of memory"). Consequences: a configured Last Will is published on a graceful
+stop or reload; the reload handover is ordered by the reset rather than by
+the orderly DISCONNECT `register_and_spawn`'s doc describes. The SUBSCRIBE
+brenn sends is untracked, and rumqttc's disconnect barrier
+(`outbound_requests_drained`) waits only on requests it tracks, so the
+barrier does not wait for those SUBACKs; and nothing after `RequestsDone`
+lets the client read the socket to EOF before closing. Candidate fixes, each a design decision: read
+to EOF after DISCONNECT (a rumqttc change or fork — third-party); tracked
+subscribes so the barrier waits for SUBACKs (closes the SUBACK window only,
+and moves pkid attribution onto the notices); a pre-DISCONNECT poll until
+`pending_subscribes` and `inflight_subscribes` are empty (same partial
+coverage, and spends the drain cap before DISCONNECT is queued on a broker
+that stops answering). Done when
+`stop_right_after_a_large_connect_returns_within_the_drain_cap` asserts
+`log_records_disconnect` again with no SUBACK barrier before the stop, 10/10
+under the gate.
+
+Code sites (`TODO(mqtt-disconnect-lost-to-reset)`): `brenn-mqtt/src/connection.rs`
+(the stop arm, after the DISCONNECT drain), `brenn-mqtt/tests/mqtt_integration.rs`
+(the case).
+
 ## `retained-state-port-attribute`
 
 `RetainedState` (`brenn-wasm/components/guest/src/lib.rs`) works only against a

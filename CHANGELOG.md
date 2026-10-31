@@ -4,6 +4,26 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Fix: an MQTT client with more than 64 subscriptions no longer hangs
+  when it connects or reconnects.** After connecting to the broker, Brenn
+  subscribes again to every topic filter the client needs. With more
+  filters than the client's outgoing request queue holds (64), that step
+  waited for queue space that could only free up once it had finished, so
+  the connection stalled silently: nothing more was sent or received, the
+  broker dropped the session for missing keepalives, and Brenn never
+  reconnected. The log stopped after "connected to broker". Subscriptions
+  added while the client is running could hang behind it too. Now a
+  subscribe that finds the queue full is handed to the connection task to
+  send when the queue has room, and re-subscribing on connect never blocks.
+  If a topic filter cannot be subscribed during that step, the rest still
+  go through, and the summary log line becomes a warning giving the number
+  that failed.
+
+- Known issue, older than this release: if an MQTT client is stopped or
+  reloaded just after the broker has sent it data, the broker may treat the
+  disconnect as abnormal and publish the client's configured Last Will.
+  Tracked as `mqtt-disconnect-lost-to-reset` in `TODO.md`.
+
 ## [0.30.0] — 2026-10-31
 
 - **New `google-maps-tools` component: Google Maps Platform as assistant

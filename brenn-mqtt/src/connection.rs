@@ -20,7 +20,10 @@ use rustls_pki_types::pem::PemObject as _;
 
 use crate::payload::classify_inbound;
 use crate::service::{MqttEventRouter, MqttService};
-use crate::state::{IngressSubscription, MqttClientHandle, PubackOutcome, SupervisorState};
+use crate::state::{
+    DEFERRED_SUBSCRIBES_POISONED, IngressSubscription, MqttClientHandle,
+    PENDING_SUBSCRIBES_POISONED, PubackOutcome, SupervisorState,
+};
 use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel, TlsVersionMin};
 
 // Maximum time to wait for the DISCONNECT drain (flush DISCONNECT bytes to the
@@ -73,23 +76,11 @@ pub fn union_subscriptions(
     subs
 }
 
-/// Issue a single broker SUBSCRIBE for one ingress subscription on a live
-/// `AsyncClient`, using the `OnEverySubscribe` retain rule so the broker
-/// re-delivers the current retained message on every (re)subscribe.
-///
-/// Shared by the supervisor's reconnect re-assert loop and the runtime
-/// dynamic-`mqtt:`-subscribe path (`MqttService::subscribe_filter`), so the two
-/// never drift on subscribe semantics. The filter is pushed onto
-/// `handle.pending_subscribes` (under that lock, atomically with the send) so the
-/// `Outgoing::Subscribe` arm can bind pkid → filter for correct SubAck
-/// attribution.
-///
-/// Returns `Err(message)` on a failed SUBSCRIBE *send*; there is no SUBACK wait.
-pub async fn assert_ingress_subscription(
-    handle: &Arc<MqttClientHandle>,
-    client: &AsyncClient,
-    sub: &IngressSubscription,
-) -> Result<(), String> {
+/// The `Filter` and properties of the broker SUBSCRIBE for one ingress
+/// subscription: the `OnEverySubscribe` retain rule, so the broker re-delivers
+/// the current retained message on every (re)subscribe, and the subscription's
+/// MQTT 5 Subscription Identifier.
+fn subscribe_request(sub: &IngressSubscription) -> (Filter, SubscribeProperties) {
     let rumq_qos = match sub.qos {
         0 => QoS::AtMostOnce,
         1 => QoS::AtLeastOnce,
@@ -106,15 +97,62 @@ pub async fn assert_ingress_subscription(
         id: Some(sub.sub_id as usize),
         user_properties: vec![],
     };
-    // Hold pending_subscribes across the push + send so the push order equals the
-    // submit order equals the Outgoing::Subscribe order (FIFO attribution).
-    let mut pending = handle.pending_subscribes.lock().await;
+    (filter, props)
+}
+
+/// What [`try_assert_ingress_subscription`] did with a SUBSCRIBE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscribeSend {
+    /// The SUBSCRIBE is on the session's request channel.
+    Sent,
+    /// The request channel had no free slot (or its receiver is gone; the send
+    /// cannot tell the two apart). Nothing was queued or recorded.
+    ChannelFull,
+}
+
+/// Submit a single broker SUBSCRIBE for one ingress subscription onto a live
+/// `AsyncClient` without waiting for room on its request channel.
+///
+/// The request channel is drained only by the supervisor's `EventLoop::poll`.
+/// Two rules follow, and this function is how both are kept:
+///
+/// - The supervisor, while it is the task that polls, must never wait for a
+///   slot on its own client — nobody else can free it. On
+///   [`SubscribeSend::ChannelFull`] its push loop keeps the filter and polls.
+/// - No task holds `handle.pending_subscribes` across an await. The filter is
+///   pushed onto that FIFO and the SUBSCRIBE submitted under the lock in one
+///   synchronous section, so the FIFO order equals the order the event loop
+///   receives requests and the `Outgoing::Subscribe` arm binds pkid → filter
+///   correctly. `MqttService::subscribe_filter`, on
+///   [`SubscribeSend::ChannelFull`], hands the subscription to the supervisor
+///   through `handle.deferred_subscribes` instead of waiting.
+///
+/// A filter rumqttc would reject is refused up front, without touching the
+/// FIFO: rumqttc reports it with the same error as a full channel, and a
+/// retry loop must not mistake it for one.
+///
+/// Returns `Err(message)` for a send that failed for any other reason; there is
+/// no SUBACK wait.
+pub fn try_assert_ingress_subscription(
+    handle: &MqttClientHandle,
+    client: &AsyncClient,
+    sub: &IngressSubscription,
+) -> Result<SubscribeSend, String> {
+    if !rumqttc::mqttbytes::valid_filter(&sub.topic_filter) {
+        return Err(format!("invalid topic filter {:?}", sub.topic_filter));
+    }
+    let (filter, props) = subscribe_request(sub);
+    let mut pending = handle
+        .pending_subscribes
+        .lock()
+        .expect(PENDING_SUBSCRIBES_POISONED);
     pending.push_back(sub.topic_filter.clone());
-    match client
-        .subscribe_many_with_properties(std::iter::once(filter), props)
-        .await
-    {
-        Ok(()) => Ok(()),
+    match client.try_subscribe_many_with_properties(std::iter::once(filter), props) {
+        Ok(()) => Ok(SubscribeSend::Sent),
+        Err(rumqttc::ClientError::TryRequest(_)) => {
+            pending.pop_back();
+            Ok(SubscribeSend::ChannelFull)
+        }
         Err(e) => {
             pending.pop_back();
             Err(e.to_string())
@@ -123,8 +161,11 @@ pub async fn assert_ingress_subscription(
 }
 
 /// Issue a single broker UNSUBSCRIBE for one ingress topic filter on a live
-/// `AsyncClient`. The inverse of [`assert_ingress_subscription`]. There is no
-/// UNSUBACK wait.
+/// `AsyncClient`. The inverse of [`try_assert_ingress_subscription`]. There is
+/// no UNSUBACK wait.
+///
+/// This waits for room on the request channel, so it must never be called from
+/// the supervisor task, which is the only task that drains that channel.
 pub async fn assert_ingress_unsubscribe(
     client: &AsyncClient,
     topic_filter: &str,
@@ -133,6 +174,38 @@ pub async fn assert_ingress_unsubscribe(
         .unsubscribe(topic_filter.to_string())
         .await
         .map_err(|e| e.to_string())
+}
+
+/// How [`queue_disconnect`] ended.
+#[derive(Debug)]
+enum DisconnectQueued {
+    /// The graceful DISCONNECT is on the request channel.
+    Queued,
+    /// A poll made to free a slot failed: the connection is gone.
+    ConnectionGone,
+    /// The send failed for a reason other than a full request channel.
+    SendFailed(rumqttc::ClientError),
+}
+
+/// Queue the graceful DISCONNECT on the supervisor's own `client` without
+/// waiting for room on its request channel. The supervisor is the only task
+/// that frees a slot, so on a full channel this polls `eventloop` once — which
+/// takes a request off — and retries. Events those polls return are discarded.
+async fn queue_disconnect(
+    client: &AsyncClient,
+    eventloop: &mut rumqttc::EventLoop,
+) -> DisconnectQueued {
+    loop {
+        match client.try_disconnect() {
+            Ok(()) => return DisconnectQueued::Queued,
+            Err(rumqttc::ClientError::TryRequest(_)) => {
+                if eventloop.poll().await.is_err() {
+                    return DisconnectQueued::ConnectionGone;
+                }
+            }
+            Err(e) => return DisconnectQueued::SendFailed(e),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,10 +577,11 @@ async fn supervisor_body(
     'supervisor: loop {
         if stopping_now(&stop_rx) {
             tracing::info!(client = %client_slug, "supervisor stopping");
-            let client_opt = handle.client.lock().await.take();
-            if let Some(client) = client_opt {
-                let _ = client.disconnect().await;
-            }
+            // Every path back to the loop top within one body clears the client
+            // cell first. A body the watchdog respawned after a panic finds the
+            // dead body's client still there; its event loop died with that
+            // body, so there is no session to disconnect, only a handle to drop.
+            *handle.client.lock().await = None;
             // A publish waiting for its PUBACK is waiting on a session that is
             // over: nothing polls this eventloop again, so the ack can never be
             // attributed and the waiter would hang on its oneshot forever.
@@ -533,6 +607,13 @@ async fn supervisor_body(
         }
 
         let opts = build_mqtt_options(&broker, tls_transport.clone());
+        // This task is the only poller of `eventloop`, and only a poll frees a
+        // slot on the client's bounded request channels. So every request this
+        // task submits on `client` is a non-blocking `try_*` send interleaved
+        // with `poll` — `try_assert_ingress_subscription` in the main loop,
+        // `try_disconnect` on the stop path. The awaiting forms are for other
+        // tasks only. The bound is kept so a stalled broker turns into a prompt
+        // `NotConnected` on the publish path rather than unbounded growth.
         let (client, mut eventloop) = AsyncClient::builder(opts).capacity(64).build();
 
         // Poll until ConnAck or error. `None` = stop requested.
@@ -635,6 +716,14 @@ async fn supervisor_body(
         // the now-dead request channel after `clear_subscribe_tracking` ran). Left
         // uncleared it would shift pkid→filter attribution for this whole cycle.
         clear_subscribe_tracking(&handle).await;
+        // Deferred subscribes left from a previous connection are dropped: each
+        // was added to `handle.subscriptions` before it was enqueued, so the
+        // snapshot taken below covers it.
+        handle
+            .deferred_subscribes
+            .lock()
+            .expect(DEFERRED_SUBSCRIBES_POISONED)
+            .clear();
 
         // Connected — install client in handle.
         {
@@ -655,24 +744,69 @@ async fn supervisor_body(
         );
 
         // Re-assert all union subscriptions (static config union plus any
-        // runtime-added dynamic `mqtt:` subscriptions). Snapshot under a brief
-        // read-lock and drop the guard before the per-subscribe awaits.
-        let subscriptions_snapshot = handle.subscriptions.read().await.clone();
-        for sub in &subscriptions_snapshot {
-            if let Err(e) = assert_ingress_subscription(&handle, &client, sub).await {
-                tracing::error!(
-                    client = %client_slug,
-                    broker = %broker.identity.slug,
-                    topic = %sub.topic_filter,
-                    error = %e,
-                    "failed to send subscribe — filter not asserted; channel will receive \
-                     nothing until the next reconnect",
-                );
-            }
-        }
+        // runtime-added dynamic `mqtt:` subscriptions) from inside the main
+        // loop: as many SUBSCRIBEs as the request channel takes before each
+        // poll, the rest after the poll frees room. Snapshot under a brief
+        // read-lock.
+        let mut unasserted: std::collections::VecDeque<IngressSubscription> =
+            handle.subscriptions.read().await.clone().into();
+        let reassert_count = unasserted.len();
+        let mut reasserted_logged = reassert_count == 0;
+        let mut reassert_failed = 0usize;
 
-        // Main event loop.
         let disconnect_reason = loop {
+            // Live subscribes that found the request channel full since the
+            // last poll.
+            unasserted.extend(
+                handle
+                    .deferred_subscribes
+                    .lock()
+                    .expect(DEFERRED_SUBSCRIBES_POISONED)
+                    .drain(..),
+            );
+            // Push as many SUBSCRIBEs as the request channel will take now. A
+            // full channel is non-empty, so the poll below takes a request off
+            // it (or fails and ends the connection) and this loop resumes.
+            while let Some(sub) = unasserted.front() {
+                match try_assert_ingress_subscription(&handle, &client, sub) {
+                    Ok(SubscribeSend::Sent) => {
+                        unasserted.pop_front();
+                    }
+                    Ok(SubscribeSend::ChannelFull) => break,
+                    Err(e) => {
+                        tracing::error!(
+                            client = %client_slug,
+                            broker = %broker.identity.slug,
+                            topic = %sub.topic_filter,
+                            error = %e,
+                            "failed to send subscribe — filter not asserted; channel will \
+                             receive nothing until the next reconnect",
+                        );
+                        unasserted.pop_front();
+                        reassert_failed += 1;
+                    }
+                }
+            }
+            if !reasserted_logged && unasserted.is_empty() {
+                if reassert_failed == 0 {
+                    tracing::info!(
+                        client = %client_slug,
+                        broker = %broker.identity.slug,
+                        filters = reassert_count,
+                        "re-asserted all ingress filters",
+                    );
+                } else {
+                    tracing::warn!(
+                        client = %client_slug,
+                        broker = %broker.identity.slug,
+                        filters = reassert_count,
+                        failed = reassert_failed,
+                        "re-assert finished with ingress filters not asserted",
+                    );
+                }
+                reasserted_logged = true;
+            }
+
             tokio::select! {
                 biased;
                 _ = stop_requested(&mut stop_rx) => {
@@ -691,11 +825,31 @@ async fn supervisor_body(
                     }
                     let client_opt = handle.client.lock().await.take();
                     if let Some(c) = client_opt {
-                        let _ = c.disconnect().await;
-                        let drain_result = tokio::time::timeout(
-                            DISCONNECT_DRAIN_TIMEOUT,
-                            async { while eventloop.poll().await.is_ok() {} },
-                        )
+                        // Queue the graceful DISCONNECT barrier without waiting
+                        // for room — this task is the one that makes room — then
+                        // drain. Both are under the one timeout.
+                        let drain_result = tokio::time::timeout(DISCONNECT_DRAIN_TIMEOUT, async {
+                            match queue_disconnect(&c, &mut eventloop).await {
+                                DisconnectQueued::Queued => {}
+                                DisconnectQueued::ConnectionGone => return,
+                                DisconnectQueued::SendFailed(e) => {
+                                    tracing::warn!(
+                                        client = %client_slug,
+                                        broker = %broker.identity.slug,
+                                        error = %e,
+                                        "could not queue DISCONNECT",
+                                    );
+                                    return;
+                                }
+                            }
+                            while eventloop.poll().await.is_ok() {}
+                            // TODO(mqtt-disconnect-lost-to-reset): the
+                            // `EventLoop`'s drop below closes the socket with
+                            // whatever the broker sent after the last read still
+                            // unread; that close is an RST, and the broker may
+                            // discard the DISCONNECT with it. rumqttc offers no
+                            // read-to-EOF after `RequestsDone`.
+                        })
                         .await;
                         if drain_result.is_err() {
                             tracing::warn!(
@@ -774,6 +928,7 @@ async fn supervisor_body(
             client = %client_slug,
             broker = %broker.identity.slug,
             reason = %disconnect_reason,
+            unasserted = unasserted.len(),
             "broker connection lost; reconnecting",
         );
         {
@@ -826,7 +981,11 @@ async fn supervisor_body(
 /// it, and the next session's answers arrive when its own re-asserted
 /// SUBSCRIBEs are acked.
 async fn clear_subscribe_tracking(handle: &Arc<MqttClientHandle>) {
-    handle.pending_subscribes.lock().await.clear();
+    handle
+        .pending_subscribes
+        .lock()
+        .expect(PENDING_SUBSCRIBES_POISONED)
+        .clear();
     handle.inflight_subscribes.lock().await.clear();
     handle.clear_outcomes().await;
 }
@@ -940,7 +1099,11 @@ async fn handle_event(
 
         // --- Outgoing subscribe: bind pkid → pending filter (FIFO) ---
         Event::Outgoing(Outgoing::Subscribe(pkid)) => {
-            let filter = handle.pending_subscribes.lock().await.pop_front();
+            let filter = handle
+                .pending_subscribes
+                .lock()
+                .expect(PENDING_SUBSCRIBES_POISONED)
+                .pop_front();
             if let Some(filter) = filter {
                 handle.inflight_subscribes.lock().await.insert(pkid, filter);
             } else {
@@ -1162,6 +1325,15 @@ async fn handle_event(
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+/// A client that never connects, with room for `capacity` requests on each
+/// channel. Requests stay queued until the returned event loop is polled; with
+/// the event loop dropped, every send fails as on a closed channel.
+#[cfg(test)]
+pub(crate) fn unpolled_client(capacity: usize) -> (AsyncClient, rumqttc::EventLoop) {
+    let opts = MqttOptions::new("test-unpolled", ("127.0.0.1", 1));
+    AsyncClient::builder(opts).capacity(capacity).build()
+}
 
 #[cfg(test)]
 mod tests {
@@ -1462,6 +1634,180 @@ mod tests {
         successor.stop_and_join().await;
     }
 
+    fn sub(topic_filter: &str, sub_id: u32) -> IngressSubscription {
+        IngressSubscription {
+            topic_filter: topic_filter.to_string(),
+            qos: 1,
+            sub_id,
+        }
+    }
+
+    /// The supervisor's SUBSCRIBE send returns at once on a full request
+    /// channel rather than waiting for a poll only the supervisor can make, and
+    /// records nothing for attribution when it did not send.
+    #[test]
+    fn try_assert_does_not_block_on_a_full_channel() {
+        let handle = test_handle();
+        let (client, _eventloop) = unpolled_client(1);
+
+        assert_eq!(
+            try_assert_ingress_subscription(&handle, &client, &sub("home/a", 1)),
+            Ok(SubscribeSend::Sent),
+        );
+        assert_eq!(
+            handle
+                .pending_subscribes
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["home/a".to_string()],
+        );
+
+        assert_eq!(
+            try_assert_ingress_subscription(&handle, &client, &sub("home/b", 2)),
+            Ok(SubscribeSend::ChannelFull),
+        );
+        assert_eq!(
+            handle
+                .pending_subscribes
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["home/a".to_string()],
+            "the unsent SUBSCRIBE left no attribution entry behind",
+        );
+    }
+
+    /// A filter rumqttc refuses is an error, not a full channel, so a retry
+    /// loop cannot spin on it, and it is never pushed for attribution.
+    #[test]
+    fn try_assert_rejects_a_filter_rumqttc_would_reject() {
+        let handle = test_handle();
+        let (client, _eventloop) = unpolled_client(4);
+
+        let result = try_assert_ingress_subscription(&handle, &client, &sub("a/#/b", 1));
+        assert!(
+            matches!(result, Err(ref e) if e.contains("a/#/b")),
+            "{result:?}"
+        );
+        assert!(handle.pending_subscribes.lock().unwrap().is_empty());
+    }
+
+    /// A body the watchdog respawns after a panic while connected inherits the
+    /// dead body's client, whose event loop is gone. A stop requested before
+    /// the respawned body's first check still ends the supervisor promptly in a
+    /// terminal state, with the dead client dropped.
+    #[tokio::test]
+    async fn a_stop_after_a_panicked_connected_body_ends_the_supervisor() {
+        let handle = test_handle();
+        let (client, eventloop) = unpolled_client(1);
+        drop(eventloop);
+        *handle.client.lock().await = Some(client);
+        *handle.supervisor_state.write().await = SupervisorState::Connected;
+        let stop_rx = handle.stop_tx.subscribe();
+        handle.stop_tx.send(true).expect("stop_rx is alive");
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor_body(handle.clone(), Arc::new(NullRouter), stop_rx),
+        )
+        .await
+        .expect("the supervisor did not stop");
+
+        assert!(handle.client.lock().await.is_none());
+        assert!(matches!(
+            *handle.supervisor_state.read().await,
+            SupervisorState::Disconnected {
+                last_error: None,
+                ..
+            }
+        ));
+    }
+
+    /// The stop path's DISCONNECT goes out even when the request channel is
+    /// full at the stop: the supervisor polls once to make room rather than
+    /// waiting for a slot only its own poll can free, then queues it.
+    ///
+    /// The broker is a bare socket that answers CONNECT with a success CONNACK
+    /// and discards everything after.
+    #[tokio::test]
+    async fn queue_disconnect_polls_a_full_channel_then_queues() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let broker = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.expect("read CONNECT");
+            assert!(n > 0, "the client sent no CONNECT");
+            // CONNACK: no session present, reason Success, no properties.
+            sock.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
+                .await
+                .expect("write CONNACK");
+            while sock.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        });
+
+        let opts = MqttOptions::new("test-queue-disconnect", ("127.0.0.1", port));
+        let (client, mut eventloop) = AsyncClient::builder(opts).capacity(1).build();
+        let connected = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Event::Incoming(Incoming::ConnAck(_)) = eventloop
+                    .poll()
+                    .await
+                    .expect("connect to the stand-in broker")
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        connected.expect("no CONNACK");
+
+        let handle = test_handle();
+        assert_eq!(
+            try_assert_ingress_subscription(&handle, &client, &sub("home/a", 1)),
+            Ok(SubscribeSend::Sent),
+        );
+        assert!(
+            matches!(
+                client.try_disconnect(),
+                Err(rumqttc::ClientError::TryRequest(_))
+            ),
+            "the request channel is full before the stop",
+        );
+
+        let queued = tokio::time::timeout(
+            Duration::from_secs(5),
+            queue_disconnect(&client, &mut eventloop),
+        )
+        .await
+        .expect("queueing the DISCONNECT did not return");
+        assert!(matches!(queued, DisconnectQueued::Queued), "{queued:?}");
+
+        let wrote_disconnect = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match eventloop.poll().await {
+                    Ok(Event::Outgoing(Outgoing::Disconnect)) => break true,
+                    Ok(_) => continue,
+                    Err(_) => break false,
+                }
+            }
+        })
+        .await
+        .expect("the drain did not end");
+        assert!(wrote_disconnect, "the queued DISCONNECT was never written");
+
+        drop(eventloop);
+        broker.await.expect("stand-in broker");
+    }
+
     /// Two SUBSCRIBEs bound to distinct pkids resolve to their own filters at
     /// SubAck time — the second filter is not mis-attributed to the first (the
     /// positional-index bug the merge fixes).
@@ -1475,12 +1821,12 @@ mod tests {
         handle
             .pending_subscribes
             .lock()
-            .await
+            .unwrap()
             .push_back("home/+/state".to_string());
         handle
             .pending_subscribes
             .lock()
-            .await
+            .unwrap()
             .push_back("sensors/#".to_string());
 
         handle_event(Event::Outgoing(Outgoing::Subscribe(10)), &handle, &router).await;
@@ -1540,12 +1886,12 @@ mod tests {
         handle
             .pending_subscribes
             .lock()
-            .await
+            .unwrap()
             .push_back("home/+/state".to_string());
         handle
             .pending_subscribes
             .lock()
-            .await
+            .unwrap()
             .push_back("sensors/#".to_string());
         handle_event(Event::Outgoing(Outgoing::Subscribe(10)), &handle, &router).await;
         handle_event(Event::Outgoing(Outgoing::Subscribe(11)), &handle, &router).await;
@@ -1602,7 +1948,7 @@ mod tests {
         handle
             .pending_subscribes
             .lock()
-            .await
+            .unwrap()
             .push_back("home/+/state".to_string());
         handle_event(Event::Outgoing(Outgoing::Subscribe(10)), &handle, &router).await;
 
@@ -1630,7 +1976,7 @@ mod tests {
         handle
             .pending_subscribes
             .lock()
-            .await
+            .unwrap()
             .push_back("home/+/state".to_string());
         handle_event(Event::Outgoing(Outgoing::Subscribe(10)), &handle, &router).await;
 

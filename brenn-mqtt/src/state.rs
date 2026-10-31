@@ -23,6 +23,16 @@ use brenn_lib::mqtt::error::MqttError;
 /// enough that a reload's commit cannot sit here unnoticed.
 const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Poisoning message for [`MqttClientHandle::pending_subscribes`]. Its critical
+/// sections are synchronous and short, so poisoning means a holder panicked
+/// mid-section and the FIFO no longer matches the request channel.
+pub(crate) const PENDING_SUBSCRIBES_POISONED: &str =
+    "pending_subscribes lock poisoned: a holder panicked inside its critical section";
+
+/// Poisoning message for [`MqttClientHandle::deferred_subscribes`].
+pub(crate) const DEFERRED_SUBSCRIBES_POISONED: &str =
+    "deferred_subscribes lock poisoned: a holder panicked inside its critical section";
+
 // ---------------------------------------------------------------------------
 // Supervisor state (visible to the registry for health reporting)
 // ---------------------------------------------------------------------------
@@ -184,7 +194,38 @@ pub struct MqttClientHandle {
 
     /// Filters awaiting pkid binding (FIFO) — one entry per SUBSCRIBE packet,
     /// for SubAck attribution.
-    pub pending_subscribes: Mutex<std::collections::VecDeque<String>>,
+    ///
+    /// The lock exists only to make a push onto this FIFO atomic with the
+    /// non-blocking submit of the matching SUBSCRIBE onto the session's request
+    /// channel, so the FIFO's order is the order the event loop receives the
+    /// requests. Nothing may hold it across an await: the request channel is
+    /// drained only by the supervisor's poll, and a holder parked on that
+    /// channel would make every other acquirer — the supervisor included — wait
+    /// on a poll that cannot happen. It is a `std::sync::Mutex` so that holding
+    /// it across an await makes the future `!Send`, which `tokio::spawn`
+    /// rejects. A sender that finds the request channel full releases it and
+    /// either polls (the supervisor) or hands the subscribe to the supervisor
+    /// through [`Self::deferred_subscribes`] (everyone else).
+    pub pending_subscribes: std::sync::Mutex<std::collections::VecDeque<String>>,
+
+    /// Subscribes a caller could not submit because the request channel was
+    /// full, handed to the supervisor, which takes them in its own loop before
+    /// each poll and sends them at the next free slot. See
+    /// [`Self::pending_subscribes`] for why a caller never waits for a slot
+    /// itself.
+    ///
+    /// A plain queue, not a channel: nothing awaits it. Callers push and the
+    /// supervisor takes everything, both in short synchronous sections, so a
+    /// `std::sync::Mutex` suffices and cannot be held across an await. It
+    /// lives on the handle rather than in the supervisor task so a supervisor
+    /// respawned after a panic drains the same queue.
+    ///
+    /// A caller holds this lock across its send and the push that follows, so
+    /// a drain cannot slip in between and leave the push for a poll that only
+    /// traffic or keepalive would end. It therefore takes this lock before
+    /// [`Self::pending_subscribes`]; nothing takes the two in the other order,
+    /// and the supervisor never holds both.
+    pub deferred_subscribes: std::sync::Mutex<std::collections::VecDeque<IngressSubscription>>,
 
     /// Inflight subscribes (pkid → filter), resolved at SubAck by `ack.pkid`.
     pub inflight_subscribes: Mutex<HashMap<u16, String>>,
@@ -225,7 +266,8 @@ impl MqttClientHandle {
             client: Mutex::new(None),
             pending_publishes: Mutex::new(std::collections::VecDeque::new()),
             inflight_publishes: Mutex::new(HashMap::new()),
-            pending_subscribes: Mutex::new(std::collections::VecDeque::new()),
+            pending_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            deferred_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             inflight_subscribes: Mutex::new(HashMap::new()),
             subscribe_outcomes: Mutex::new(HashMap::new()),
             stop_tx,
