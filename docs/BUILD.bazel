@@ -11,4 +11,5 @@ exports_files([
     "google-maps-platform.md",
     "google-workspace.md",
     "providers/google-maps.md",
+    "providers/google.md",
 ])

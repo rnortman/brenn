@@ -33,7 +33,10 @@ rust_test(
     size = "small",
     crate = ":brenn-oauth",
     crate_features = ["testutils"],
-    data = ["//docs:providers/google-maps.md"],
+    data = [
+        "//docs:providers/google-maps.md",
+        "//docs:providers/google.md",
+    ],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": package_name()},
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),

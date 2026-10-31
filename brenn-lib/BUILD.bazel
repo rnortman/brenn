@@ -63,6 +63,7 @@ rust_test(
         "//:brenn_configs",
         "//docs:config-dsl.md",
         "//docs:google-maps-platform.md",
+        "//docs:google-workspace.md",
     ],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-lib"},

@@ -2039,12 +2039,15 @@ mod tests {
         ApiRequestTool::new(Some(svc), keys);
     }
 
-    /// Every `json` example in `docs/providers/google-maps.md` is an argument
-    /// object `api-request` accepts, and every `body` it carries is JSON.
-    #[test]
-    fn the_google_maps_provider_examples_are_api_request_arguments() {
+    /// The ` ```json ` blocks of the provider document at `relative` (from the
+    /// repository root), each parsed as `api-request`'s argument object for
+    /// `provider`, with every path one `api-request` decodes, no header Brenn
+    /// reserves for itself (`Authorization`, transport headers, and the API-key
+    /// provider's `key_header`, lowercase), and every `body` JSON.
+    fn provider_examples(relative: &str, provider: &str, key_header: Option<&str>) -> Vec<ApiArgs> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../docs/providers/google-maps.md");
+            .join("..")
+            .join(relative);
         let doc = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
         let mut examples = Vec::new();
@@ -2062,20 +2065,63 @@ mod tests {
             }
         }
         assert!(open.is_none(), "a `json` block is never closed");
+        examples
+            .iter()
+            .map(|example| {
+                let args: ApiArgs = serde_json::from_str(example).unwrap_or_else(|error| {
+                    panic!("not an api-request argument ({error}):\n{example}")
+                });
+                assert_eq!(args.provider, provider, "{example}");
+                if let Err(error) = decode_path(&args.path) {
+                    panic!("{error}:\n{example}");
+                }
+                for name in args.headers.keys() {
+                    let name = name.to_ascii_lowercase();
+                    assert!(
+                        name != "authorization"
+                            && !TRANSPORT_HEADERS.contains(&name.as_str())
+                            && key_header != Some(name.as_str()),
+                        "header {name:?} is Brenn's to set:\n{example}"
+                    );
+                }
+                if let Some(body) = &args.body {
+                    serde_json::from_str::<serde_json::Value>(body)
+                        .unwrap_or_else(|error| panic!("body is not JSON ({error}):\n{example}"));
+                }
+                args
+            })
+            .collect()
+    }
+
+    /// Every `json` example in `docs/providers/google-maps.md` is an argument
+    /// object `api-request` accepts, and every `body` it carries is JSON.
+    #[test]
+    fn the_google_maps_provider_examples_are_api_request_arguments() {
+        let examples = provider_examples(
+            "docs/providers/google-maps.md",
+            "google-maps",
+            Some("x-goog-api-key"),
+        );
         assert_eq!(
             examples.len(),
             7,
             "one example per endpoint the document covers"
         );
-        for example in &examples {
-            let args: ApiArgs = serde_json::from_str(example).unwrap_or_else(|error| {
-                panic!("not an api-request argument ({error}):\n{example}")
-            });
-            assert_eq!(args.provider, "google-maps", "{example}");
-            if let Some(body) = &args.body {
-                serde_json::from_str::<serde_json::Value>(body)
-                    .unwrap_or_else(|error| panic!("body is not JSON ({error}):\n{example}"));
-            }
+    }
+
+    /// Every `json` example in `docs/providers/google.md` is an argument
+    /// object `api-request` accepts for the `google` OAuth provider, and none
+    /// names `account` — Brenn uses the calling user's grant.
+    #[test]
+    fn the_google_provider_examples_are_api_request_arguments() {
+        let examples = provider_examples("docs/providers/google.md", "google", None);
+        assert_eq!(
+            examples.len(),
+            14,
+            "one example per endpoint the document covers"
+        );
+        for args in &examples {
+            assert!(args.account.is_none(), "{args:?}");
         }
     }
 }

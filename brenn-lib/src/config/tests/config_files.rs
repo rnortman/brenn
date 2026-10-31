@@ -297,52 +297,108 @@ fn the_dsl_doc_providing_class_compiles() {
     }
 }
 
-/// The Google Maps guide's configuration compiles as an operator pastes it.
-///
-/// The guide's three copy blocks, plus only the `sandbox` container the agent
-/// names, must pass `check_config` against the shipped module root with the
-/// guide's bus cap in force.
+/// The Google Maps guide's configuration compiles as an operator pastes it,
+/// with the guide's bus cap in force and its tuning reaching the `maps`
+/// result inbox at the depth and noise its prose defends.
 #[test]
 fn the_google_maps_guide_configuration_compiles() {
+    let config = compile_guide(
+        "docs/google-maps-platform.md",
+        &[
+            "use @google-maps-tools::*;",
+            "api_key_provider google-maps {",
+            "new maps: GoogleMapsTools {",
+        ],
+    );
+    assert_eq!(config.messaging.max_body_bytes, 393_216);
+    let inbox = guide_result_inbox(&config, "maps");
+    assert_eq!(
+        inbox.retain_depth,
+        crate::messaging::config::Depth::Bounded(64)
+    );
+    assert_eq!(inbox.noise, crate::messaging::config::NoiseLevel::Alarm);
+}
+
+/// The Google Workspace guide's configuration compiles as an operator pastes
+/// it — its `server` and `oauth_provider` block, its `messaging` block, the
+/// component's import, its tuning and instance block and the agent granted
+/// the component's tools — with the guide's bus cap in force, the `google`
+/// provider declared, and its tuning reaching the `workspace` result inbox
+/// at the depth and noise its prose defends.
+#[test]
+fn the_google_workspace_guide_configuration_compiles() {
+    let config = compile_guide(
+        "docs/google-workspace.md",
+        &[
+            "use @google-workspace-tools::*;",
+            "oauth_provider google {",
+            "messaging { max_body_bytes",
+            "new workspace: GoogleWorkspaceTools {",
+            "tool gmail-thread {}",
+        ],
+    );
+    assert_eq!(config.messaging.max_body_bytes, 393_216);
+    assert!(
+        config.oauth_providers.contains_key("google"),
+        "the guide declares no oauth_provider `google`"
+    );
+    let inbox = guide_result_inbox(&config, "workspace");
+    assert_eq!(
+        inbox.retain_depth,
+        crate::messaging::config::Depth::Bounded(64)
+    );
+    assert_eq!(inbox.noise, crate::messaging::config::NoiseLevel::Alarm);
+}
+
+/// The configuration a guide teaches, compiled as an operator pastes it.
+///
+/// `relative` is the guide's path from the repository root; each of `markers`
+/// picks the guide's first fenced block containing it, and the blocks are
+/// joined in the order given. Only the `sandbox` container the guides' agents
+/// name is added before `check_config` runs against the shipped module root.
+fn compile_guide(relative: &str, markers: &[&str]) -> BrennConfig {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let doc_path = root.join("docs/google-maps-platform.md");
+    let doc_path = root.join(relative);
     let doc = std::fs::read_to_string(&doc_path)
         .unwrap_or_else(|error| panic!("{} must be readable: {error}", doc_path.display()));
     let blocks = fenced_blocks(&doc);
-    let block_holding = |marker: &str| {
-        blocks
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let mut document = String::new();
+    for marker in markers {
+        let block = blocks
             .iter()
             .find(|block| block.contains(marker))
             .unwrap_or_else(|| {
                 panic!(
-                    "docs/google-maps-platform.md carries no fenced block containing `{marker}`; \
+                    "{relative} carries no fenced block containing `{marker}`; \
                      the configuration example is gone, not merely stale"
                 )
-            })
-            .clone()
-    };
-    let dir = tempfile::tempdir().expect("a tempdir");
-    let document = format!(
-        "{import}\n{providers}\n{component}\n\
-         container sandbox {{\n    image = \"example.com/cc:latest\";\n    \
+            });
+        document.push_str(block);
+        document.push('\n');
+    }
+    document.push_str(&format!(
+        "container sandbox {{\n    image = \"example.com/cc:latest\";\n    \
          home_dir = \"{home}\";\n}}\n",
         home = dir.path().display(),
-        import = block_holding("use @google-maps-tools::*;"),
-        providers = block_holding("api_key_provider google-maps {"),
-        component = block_holding("new maps: GoogleMapsTools {"),
-    );
+    ));
     let main = dir.path().join("main.brenn");
     std::fs::write(&main, &document).expect("write the document");
     let inputs = DocumentInputs::with_modules(main, root.join("config/specs"));
-    let loaded = check_config(&inputs).unwrap_or_else(|report| {
-        panic!("the configuration in docs/google-maps-platform.md must compile:\n{report}")
-    });
-    let config = &loaded.config;
-    assert_eq!(config.messaging.max_body_bytes, 393_216);
+    check_config(&inputs)
+        .unwrap_or_else(|report| panic!("the configuration in {relative} must compile:\n{report}"))
+        .config
+}
 
-    // The tuning block reaches the result inbox of the instance the guide
-    // declares, at the depth and noise its prose defends.
-    let instance = "maps";
+/// The result inbox of the component instance `instance` in a guide's
+/// configuration, resolved through the tuning the configuration declares.
+///
+/// Panics if the configuration declares no such instance or its tuning names
+/// no channel block for that inbox.
+fn guide_result_inbox(
+    config: &BrennConfig,
+    instance: &str,
+) -> crate::messaging::config::ResolvedChannel {
     assert!(
         config.wasm_consumers.iter().any(|c| c.slug == instance),
         "the guide declares no instance `{instance}`"
@@ -357,13 +413,7 @@ fn the_google_maps_guide_configuration_compiles() {
         tuning.exact_addresses().any(|address| address == inbox),
         "the guide's tuning block does not name {inbox}"
     );
-    let resolved =
-        crate::messaging::config::resolve_system_channel(&inbox, &tuning, &config.messaging);
-    assert_eq!(
-        resolved.retain_depth,
-        crate::messaging::config::Depth::Bounded(64)
-    );
-    assert_eq!(resolved.noise, crate::messaging::config::NoiseLevel::Alarm);
+    crate::messaging::config::resolve_system_channel(&inbox, &tuning, &config.messaging)
 }
 
 /// The contents of every fenced code block in a markdown document.

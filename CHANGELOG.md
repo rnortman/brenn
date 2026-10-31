@@ -120,6 +120,17 @@ All notable changes to Brenn are documented here.
   the assistant's grant line. All of the component's Gmail reads now ask
   Google for compact answers, which leaves more room under the size limits.
 
+- **The Google accounts guide, `docs/google-workspace.md`, now sets up the
+  `google-workspace-tools` component**: its configuration, instance and
+  agent grants, what to tell the assistant, and how to check it works. The
+  component needs a `messaging { max_body_bytes = 393216; }` block (restart
+  required; the same value as the Maps guide's), or a lower
+  `max_response_bytes` on the OAuth provider at the cost of large messages'
+  text. A message whose sender filled its headers with quotes or
+  backslashes can still be refused by these tools whatever the setting. For
+  Gmail and Calendar endpoints the component does not cover,
+  `docs/providers/google.md` gives ready-made `api-request` examples.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key
