@@ -172,6 +172,8 @@ new workspace: GoogleWorkspaceTools {
   tool api-request {
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/labels"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/labels/*"; }
+    allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages"; }
+    allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/*"; }
     rate_limit { burst = 60; sustained_per_minute = 120; }
   }
   config = {
@@ -179,6 +181,14 @@ new workspace: GoogleWorkspaceTools {
     gmail_host = "gmail.googleapis.com"
   };
 }
+```
+
+The assistant is granted the tools beside its `oauth-connect`,
+`oauth-accounts` and `oauth-disconnect` grants (section 4):
+
+```
+tool gmail-labels {}
+tool gmail-search {}
 ```
 
 ## 6. First connect: acceptance

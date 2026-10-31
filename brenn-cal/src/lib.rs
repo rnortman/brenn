@@ -1,16 +1,18 @@
 //! Pure-arithmetic Gregorian calendar helpers.
 //!
-//! No external dependencies. `#![no_std]`-compatible; `ms_to_sent_at` requires
-//! `alloc` for its `String` return type.
+//! No external dependencies. `#![no_std]`-compatible; `ms_to_sent_at` and
+//! `ms_to_rfc3339_seconds` require `alloc` for their `String` return type.
 //!
 //! # Domains
 //!
-//! - `days_from_epoch` / `days_to_ymd`: natural Hinnant domain over `u32` year
-//!   inputs. `days_to_ymd` requires `days >= 0`; no production caller passes
-//!   negative values.
+//! - `days_from_epoch`: natural Hinnant domain over `u32` year inputs.
+//! - `days_to_ymd`: `0 ..= days_from_epoch(u32::MAX, 12, 31)`, the days from
+//!   1970-01-01 to the last day whose year fits `u32`; it panics outside it.
 //! - `ms_to_sent_at`: `year < 10000` for fixed-width 24-char output. Years ≥
 //!   10000 render correctly but exceed the 24-char protocol invariant. No caller
 //!   produces such values.
+//! - `ms_to_rfc3339_seconds`: every `u64`; years ≥ 10000 render with more than
+//!   four digits.
 #![no_std]
 extern crate alloc;
 
@@ -57,48 +59,72 @@ pub fn days_from_epoch(year: u32, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Gregorian calendar: days since 1970-01-01 (non-negative) → `(year, month, day)`.
+/// Gregorian calendar: days since 1970-01-01 → `(year, month, day)`.
 ///
-/// Inverse of `days_from_epoch` for `days >= 0`. O(n) loop; acceptable for the
-/// test-only callers this serves.
-pub fn days_to_ymd(mut days: i64) -> (u32, u32, u32) {
-    let mut year = 1970u32;
-    loop {
-        let y_days = if is_leap_year(year) { 366 } else { 365 };
-        if days < y_days {
-            break;
-        }
-        days -= y_days;
-        year += 1;
-    }
-    let mut month = 1u32;
-    loop {
-        let m_days = days_in_month(year, month).unwrap() as i64;
-        if days < m_days {
-            break;
-        }
-        days -= m_days;
-        month += 1;
-    }
-    (year, month, days as u32 + 1)
+/// Inverse of `days_from_epoch` for `0 ..= days_from_epoch(u32::MAX, 12, 31)`;
+/// panics on a day count outside that range. Uses Howard Hinnant's O(1)
+/// `civil_from_days` closed-form formula: 400-year eras of 146 097 days counted
+/// from 0000-03-01, so that the leap day falls at the end of each counted year.
+/// Reference: <https://howardhinnant.github.io/date_algorithms.html#civil_from_days>
+pub fn days_to_ymd(days: i64) -> (u32, u32, u32) {
+    assert!(days >= 0, "days_to_ymd: {days} is before 1970-01-01");
+    let last = days_from_epoch(u32::MAX, 12, 31);
+    assert!(
+        days <= last,
+        "days_to_ymd: {days} is past {last}, the last day of year u32::MAX"
+    );
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 {
+        month_from_march + 3
+    } else {
+        month_from_march - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (
+        u32::try_from(year).expect("a day count up to the asserted last day has a u32 year"),
+        month as u32,
+        day as u32,
+    )
+}
+
+/// UTC milliseconds-since-epoch as `(year, month, day, hour, minute, second, millis)`.
+fn split_ms(ms: u64) -> (u32, u32, u32, u64, u64, u64, u64) {
+    let secs = ms / 1000;
+    let sec_of_day = secs % 86_400;
+    let (year, month, day) = days_to_ymd((secs / 86_400) as i64);
+    (
+        year,
+        month,
+        day,
+        sec_of_day / 3600,
+        sec_of_day % 3600 / 60,
+        sec_of_day % 60,
+        ms % 1000,
+    )
 }
 
 /// Renders UTC milliseconds-since-epoch as a fixed-width RFC3339 string.
 ///
 /// Output format: `YYYY-MM-DDTHH:MM:SS.mmmZ` (24 chars for years < 10000).
 pub fn ms_to_sent_at(ms: u64) -> String {
-    let secs = ms / 1000;
-    let millis = ms % 1000;
-    let sec_of_day = secs % 86_400;
-    let days = secs / 86_400;
-
-    let hour = sec_of_day / 3600;
-    let min = (sec_of_day % 3600) / 60;
-    let sec = sec_of_day % 60;
-
-    let (year, month, day) = days_to_ymd(days as i64);
-
+    let (year, month, day, hour, min, sec, millis) = split_ms(ms);
     alloc::format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+/// Renders UTC milliseconds-since-epoch as an RFC3339 string to the second,
+/// the milliseconds dropped.
+///
+/// Output format: `YYYY-MM-DDTHH:MM:SSZ` (20 chars for years < 10000).
+pub fn ms_to_rfc3339_seconds(ms: u64) -> String {
+    let (year, month, day, hour, min, sec, _) = split_ms(ms);
+    alloc::format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
 #[cfg(test)]
@@ -191,6 +217,72 @@ mod tests {
                 "roundtrip failed for {y}-{m:02}-{d:02}"
             );
         }
+    }
+
+    #[test]
+    fn days_to_ymd_is_the_inverse_of_days_from_epoch_over_every_day_to_2500() {
+        let last = days_from_epoch(2500, 12, 31);
+        let (mut y, mut m, mut d) = (1970u32, 1u32, 1u32);
+        for days in 0..=last {
+            assert_eq!(days_to_ymd(days), (y, m, d), "day {days}");
+            d += 1;
+            if d > days_in_month(y, m).unwrap() {
+                d = 1;
+                m += 1;
+                if m > 12 {
+                    m = 1;
+                    y += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn days_to_ymd_far_dates() {
+        assert_eq!(days_to_ymd(days_from_epoch(9999, 12, 31)), (9999, 12, 31));
+        // The last day `u64` epoch milliseconds reach.
+        assert_eq!(
+            days_to_ymd((u64::MAX / 86_400_000) as i64),
+            (584_556_019, 4, 3)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "before 1970-01-01")]
+    fn days_to_ymd_refuses_a_negative_day_count() {
+        days_to_ymd(-1);
+    }
+
+    #[test]
+    fn days_to_ymd_reaches_the_last_day_of_year_u32_max() {
+        let last = days_from_epoch(u32::MAX, 12, 31);
+        assert_eq!(days_to_ymd(last), (u32::MAX, 12, 31));
+    }
+
+    #[test]
+    #[should_panic(expected = "the last day of year u32::MAX")]
+    fn days_to_ymd_refuses_a_day_count_past_year_u32_max() {
+        days_to_ymd(days_from_epoch(u32::MAX, 12, 31) + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "the last day of year u32::MAX")]
+    fn days_to_ymd_refuses_the_largest_day_count() {
+        days_to_ymd(i64::MAX);
+    }
+
+    #[test]
+    fn ms_to_rfc3339_seconds_drops_the_milliseconds() {
+        assert_eq!(ms_to_rfc3339_seconds(0), "1970-01-01T00:00:00Z");
+        assert_eq!(ms_to_rfc3339_seconds(999), "1970-01-01T00:00:00Z");
+        // 2024-02-29T23:59:59.999Z, then the next instant.
+        let ms = (19_782 * 86_400 + 86_399) * 1000 + 999;
+        assert_eq!(ms_to_rfc3339_seconds(ms), "2024-02-29T23:59:59Z");
+        assert_eq!(ms_to_rfc3339_seconds(ms + 1), "2024-03-01T00:00:00Z");
+        assert_eq!(
+            ms_to_rfc3339_seconds(253_402_300_799_000),
+            "9999-12-31T23:59:59Z"
+        );
     }
 
     #[test]

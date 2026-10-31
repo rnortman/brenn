@@ -76,6 +76,17 @@ All notable changes to Brenn are documented here.
   keys and the result-inbox sizing it needs; `docs/google-workspace.md`
   gives its instance.
 
+- **`google-workspace-tools` adds a `GmailSearch` tool**: a Gmail search
+  (`q`, in Gmail's search-box syntax) answered with one compact line per
+  message — sender, subject, date, Gmail's preview and labels by name — up
+  to 25 per page, with a token for the next page. Messages deleted between
+  the listing and their reading are named as unavailable rather than
+  failing the search. A sender, subject or date over 1,000 characters is
+  cut, and the line says which were cut. Bodies are not included. The
+  guide's instance block in
+  `docs/google-workspace.md` gains the two `messages` clauses the tool needs
+  and the assistant's grant lines.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key

@@ -72,6 +72,7 @@ dependencies = [
 name = "brenn-google-workspace-tools"
 version = "0.1.0"
 dependencies = [
+ "brenn-cal",
  "brenn-guest",
  "serde",
  "serde_json",

@@ -13,6 +13,29 @@ independent; then make `MAX_RESPONSE_BYTES_CEILING`'s compile-time tie to
 `MAX_ASYNC_RESULT_BYTES` (`brenn-tool-registry/src/descriptor.rs`) say which
 cap it means.
 
+## `correctness-search-header-cap-counts-chars-not-bytes`
+
+`google-workspace-tools` cuts each header value to `HEADER_MAX_CHARS` (1000)
+characters, but holds a finished answer to `COMPACT_RESULT_CEILING` (256 KiB)
+of serialized bytes. A character serializes to up to 4 bytes (UTF-8) or 6
+(`\u00XX` for a C0 control), and one `GmailSearch` page reads up to 25
+messages, each with its own read limit. So about 22 lines whose `From`,
+`Subject` and `Date` sit at the bound in four-byte characters (or whose `From`
+and `Subject` are C0 controls, if Gmail passes them through) push the page
+past the ceiling. The search then fails `internal` every time it runs, and a
+sender can cause this with crafted mail matched by `in:spam`, `from:` or
+`is:unread`. Decide how the listing's bound fits the ceiling by construction:
+a byte budget on each header's serialized form beside the character bound, a
+lower listing bound, or cutting the page short with a flag. Then pin the
+choice with a 25-line worst-case search test, and record the arithmetic beside
+the constant. `GmailThread` (up to 100 messages from one read) is held by its
+single `max_response_bytes` read and needs no change unless that read limit
+changes.
+
+Code site (`TODO(correctness-search-header-cap-counts-chars-not-bytes)`):
+`HEADER_MAX_CHARS` in
+`brenn-wasm/components/google-workspace-tools/src/logic.rs`.
+
 ## `errhandling-gmail-403-always-denied-with-scope-hint`
 
 `google-workspace-tools` answers every Google HTTP 403 `denied` with a
@@ -44,20 +67,52 @@ apply it to every step.
 ## `provider-kit`
 
 `google-maps-tools` and `google-workspace-tools` each carry their own copy of
-the provider-component core: the in-flight row (`call_id`, `InFlight`,
-`INFLIGHT_TTL_MS`, `row_expired`, `claim`, `provided_name`), the argument
-helpers (`object`, `capped`), `NestedError`, `Failure`, `ErrorKind`, `cut`,
-`not_issued`, `result_summary`, `bounded`, `copy`, the envelope-reading half of
-`read_api_result` (status, `truncated` with `bytes`, binary, redirect,
-non-JSON), the `lib.rs` sweep/answer/issue glue, and the tests proving them.
-The copies already differ: Maps does not relay `credential_invalid`, keeps the
-POST sentence on a nested `denied`, and answers 403 `internal` where the
-Workspace copy answers `denied` with a scope hint. Decide
-the shared home — a host-testable `std` + `serde` crate in the components
-workspace, SDK helpers in `brenn-guest::provides` (an out-of-tree surface), or
-both — and what stays per provider (Google's error mapping, the credential
-relay), with the multi-step state of `GmailSearch` and the Calendar tools in
-view; then move both components onto it and delete the copied tests.
+the provider-component core. In kind: `lib.rs` whole (sweep, answer, issue,
+the `Next::Call` arm; the same file apart from names), the in-flight row and
+multi-step machinery, the argument helpers, the result plumbing, the reading
+of `api-request`'s answer envelope, and the tests proving them. By name: the
+row (`call_id`, `InFlight` with `next`, `INFLIGHT_TTL_MS`, `row_expired`,
+`claim`, `provided_name`, `stored`), the steps (`Next::Call { call, derived }`
+and `advance(state, outcome, settings)`), the argument helpers (`object`,
+`capped`, `integer`, `flag`), `NestedError`, `Failure`, `ErrorKind`, `cut`,
+`not_issued`, `result_summary`, `bounded`, `copy`, and the envelope-reading
+half of `read_api_result` (status, `truncated` with `bytes`, binary,
+redirect, non-JSON). Each further Gmail or Calendar tool adds to the copy, so
+the extraction starts from a diff of the two components, not from this list.
+Both components decide some steps on the envelope itself before the step's
+logic runs: Maps pre-reads the raw outcome for a cut route answer
+(`route_answer_cut`), Workspace takes Google's 404 on a per-message search
+step from `read_api_result`'s `Answer::GoogleError`; the shared reader has to
+hand status and truncation to step logic. The copies already differ: Maps
+does not relay `credential_invalid`, keeps the POST sentence on a nested
+`denied`, answers 403 `internal` where the Workspace copy answers `denied`
+with a scope hint, and reports Google's errors as a `Failure` where the
+Workspace copy reports `Answer::GoogleError`. Decide the shared home — a
+host-testable `std` + `serde` crate in the components workspace, SDK helpers
+in `brenn-guest::provides` (an out-of-tree surface), or both — and what stays
+per provider (Google's error mapping, the credential relay), with the
+multi-step state of `GmailSearch` and the Calendar tools in view; then move
+both components onto it and delete the copied tests.
+
+## `provider-schema-parse-parity`
+
+A provider component states each tool's argument bounds twice: in the
+`input_schema` of its `.brenn` spec, which the model is shown, and in its
+argument parser (`google-workspace-tools` `SearchArgs::parse` and
+`LabelsArgs::parse`: the property set, `q` 1–1024 bytes, `max` 1–25, `page`
+1–4096 bytes, `account` 1–320 bytes; `google-maps-tools` likewise, every
+`*Args::parse` reached from `plan`). Nothing ties the two, so a bound edited
+on one side alone promises the model arguments the wrapper refuses as
+`invalid_args`. Decide the mechanism for every component at once — the spec
+scaffold exposing each tool's schema to the component's host test, or one
+source generating the other — and apply it to both provider components and
+to every argument parser added to them. `tool-schema-derive` is the same drift
+on the host tool registry's side; one source generating the other there means
+a schema derive such as `schemars`, so decide the two mechanisms together.
+
+Code sites (`TODO(provider-schema-parse-parity)`): each `*Args::parse` in
+`brenn-wasm/components/google-workspace-tools/src/logic.rs`; `plan` in
+`brenn-wasm/components/google-maps-tools/src/logic.rs`.
 
 ## `security-host-paths-follow-agent-symlinks`
 

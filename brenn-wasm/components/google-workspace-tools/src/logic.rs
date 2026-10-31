@@ -10,10 +10,16 @@
 #[cfg(test)]
 mod spec;
 
+// The decoder is this module's child in the component and the host test
+// alike: the path resolves beside this file whether it is `crate::logic` or
+// the crate root.
+#[path = "decode.rs"]
+mod decode;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::spec::Provided;
 
@@ -37,6 +43,13 @@ const ID_MAX_BYTES: usize = 128;
 /// The most characters of a Google error message copied into a result.
 const GOOGLE_MESSAGE_MAX_CHARS: usize = 1000;
 
+/// The most characters of a message header's value copied into a result. A
+/// sender writes these, and nothing bounds their length.
+// TODO(correctness-search-header-cap-counts-chars-not-bytes): a character
+// serializes to up to 6 bytes, so 25 search lines of headers at this bound
+// can pass `COMPACT_RESULT_CEILING`.
+const HEADER_MAX_CHARS: usize = 1000;
+
 /// The path Gmail lists the user's labels at, and reads one label below.
 const LABELS_PATH: &str = "/gmail/v1/users/me/labels";
 /// labels.list's mask: what a listing carries.
@@ -51,6 +64,35 @@ const LABEL_COUNTS: &[(&str, &str)] = &[
     ("threadsTotal", "threads_total"),
     ("threadsUnread", "threads_unread"),
 ];
+
+/// The step that names a finished answer's user labels, whichever tool's.
+const LABELS_STEP: u8 = 100;
+/// The finishing step's mask: names only.
+const LABEL_NAMES_FIELDS: &str = "labels(id,name)";
+/// The prefix of Google's user-label ids; every system label's id is its name.
+const USER_LABEL_PREFIX: &str = "Label_";
+
+/// The path Gmail lists messages at, and reads one message below.
+const MESSAGES_PATH: &str = "/gmail/v1/users/me/messages";
+/// messages.list's mask: the ids, the page token, the estimate.
+const MESSAGES_LIST_FIELDS: &str = "messages(id,threadId),nextPageToken,resultSizeEstimate";
+/// messages.get's metadata mask: what one search line needs.
+const METADATA_FIELDS: &str =
+    "id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload/headers";
+/// The headers a search line carries, requested by repeating `metadataHeaders`.
+const SEARCH_HEADERS: &[&str] = &["From", "Subject", "Date"];
+
+/// The most bytes a search query may hold.
+const QUERY_MAX_BYTES: usize = 1024;
+/// The most bytes a page token may hold.
+const PAGE_MAX_BYTES: usize = 4096;
+/// `GmailSearch`'s `max`: the range and the default.
+const SEARCH_MAX_MIN: u64 = 1;
+const SEARCH_MAX_MAX: u64 = 25;
+const SEARCH_MAX_DEFAULT: u64 = 10;
+/// `GmailSearch`'s per-message steps: listed id `i` is read at step `2 + i`.
+const SEARCH_FIRST_GET: u8 = 2;
+const SEARCH_LAST_GET: u8 = SEARCH_FIRST_GET + SEARCH_MAX_MAX as u8 - 1;
 
 /// The sentence every Google 403 is answered with: Gmail answers an account
 /// connected without the read scope this way, and the component does not read
@@ -127,6 +169,25 @@ pub struct Target {
     pub path: String,
 }
 
+/// One query parameter: a single value, or several that `api-request` sends
+/// as the key repeated once per value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum QueryValue {
+    One(String),
+    Many(Vec<String>),
+}
+
+type Query = BTreeMap<String, QueryValue>;
+
+/// A query from `(key, value)` pairs, each sent once.
+fn query<const N: usize>(pairs: [(&str, String); N]) -> Query {
+    pairs
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), QueryValue::One(value)))
+        .collect()
+}
+
 /// One `api-request` call's arguments. `account`, when the caller named one,
 /// is passed on every call a request makes, so a request never mixes
 /// accounts.
@@ -139,7 +200,7 @@ pub struct ApiCall {
     pub host: String,
     pub path: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub query: BTreeMap<String, String>,
+    pub query: Query,
 }
 
 impl ApiCall {
@@ -148,7 +209,7 @@ impl ApiCall {
         settings: &Settings,
         account: Option<&str>,
         path: String,
-        query: BTreeMap<String, String>,
+        query: Query,
     ) -> ApiCall {
         ApiCall {
             provider: settings.provider.clone(),
@@ -176,9 +237,10 @@ pub struct Call {
     pub api: ApiCall,
 }
 
-// TODO(provider-kit): the in-flight row (`call_id`, `InFlight`, `row_expired`,
-// `claim`), the argument helpers, `NestedError` and the reading of
-// `api-request`'s answer envelope are copied from `google-maps-tools`.
+// TODO(provider-kit): the in-flight row and step machinery (`call_id`,
+// `InFlight` with `next`, `row_expired`, `claim`, `stored`, `Next::Call`), the
+// argument helpers, `NestedError`, the reading of `api-request`'s answer
+// envelope and `lib.rs` are copied from `google-maps-tools`.
 
 /// The correlation id of a request's nested call: `<pending id>/<step>`.
 pub fn call_id(id: &str, step: u8) -> String {
@@ -222,6 +284,12 @@ impl InFlight {
             target: call.api.target(),
             issued_at_ms: now_ms,
         }
+    }
+
+    /// The row for this request's next step, `call`, carrying what earlier
+    /// steps learned in `derived`.
+    pub fn next(&self, call: &Call, derived: Map<String, Value>, now_ms: u64) -> InFlight {
+        InFlight::new(&self.id, self.tool, &self.args, call, derived, now_ms)
     }
 
     pub fn call_id(&self) -> String {
@@ -290,11 +358,16 @@ mod provided_name {
     }
 }
 
-/// How a request ends after its nested call answered.
+/// What a request does next after its nested call answered.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Next {
     Complete(Value),
     Fail(Failure),
+    /// Issue the request's next step, carrying what this one learned.
+    Call {
+        call: Call,
+        derived: Map<String, Value>,
+    },
 }
 
 type Args = Map<String, Value>;
@@ -339,21 +412,42 @@ fn account(args: &Args) -> Result<Option<String>, String> {
     Ok(capped(args, "account", ACCOUNT_MAX_BYTES)?.map(str::to_string))
 }
 
+/// Whether `id` is one path segment of letters, digits, `_` and `-`.
+fn is_gmail_id(id: &str) -> bool {
+    (1..=ID_MAX_BYTES).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// A Gmail id argument: one path segment of letters, digits, `_` and `-`.
 fn gmail_id(args: &Args, key: &str) -> Result<Option<String>, String> {
     match args.get(key) {
         None => Ok(None),
-        Some(Value::String(id))
-            if (1..=ID_MAX_BYTES).contains(&id.len())
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
-        {
-            Ok(Some(id.clone()))
-        }
+        Some(Value::String(id)) if is_gmail_id(id) => Ok(Some(id.clone())),
         Some(_) => Err(format!(
             "`{key}` must be 1 to {ID_MAX_BYTES} letters, digits, `_` or `-`"
         )),
+    }
+}
+
+/// An integer argument in `min..=max`.
+fn integer(args: &Args, key: &str, min: u64, max: u64) -> Result<Option<u64>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
+            _ => Err(format!("`{key}` must be an integer from {min} to {max}")),
+        },
+    }
+}
+
+/// A boolean argument; absent is `false`.
+fn flag(args: &Args, key: &str) -> Result<bool, String> {
+    match args.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(format!("`{key}` must be true or false")),
     }
 }
 
@@ -368,6 +462,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                 api: labels_call(&labels, settings),
             })
         }
+        Provided::GmailSearch => {
+            let search = SearchArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: search_list_call(&search, settings),
+            })
+        }
     }
 }
 
@@ -378,6 +479,8 @@ struct LabelsArgs {
 }
 
 impl LabelsArgs {
+    // TODO(provider-schema-parse-parity): these bounds and the `gmail-labels`
+    // `input_schema` in the spec are stated separately.
     fn parse(args: &Value) -> Result<LabelsArgs, String> {
         let map = object(args, &["id", "account"])?;
         Ok(LabelsArgs {
@@ -397,8 +500,110 @@ fn labels_call(args: &LabelsArgs, settings: &Settings) -> ApiCall {
         settings,
         args.account.as_deref(),
         path,
-        BTreeMap::from([("fields".to_string(), fields.to_string())]),
+        query([("fields", fields.to_string())]),
     )
+}
+
+/// `GmailSearch`'s arguments.
+struct SearchArgs {
+    q: String,
+    max: u64,
+    page: Option<String>,
+    spam_trash: bool,
+    account: Option<String>,
+}
+
+impl SearchArgs {
+    // TODO(provider-schema-parse-parity): these bounds and the `gmail-search`
+    // `input_schema` in the spec are stated separately.
+    fn parse(args: &Value) -> Result<SearchArgs, String> {
+        let map = object(args, &["q", "max", "page", "spam_trash", "account"])?;
+        Ok(SearchArgs {
+            q: capped(map, "q", QUERY_MAX_BYTES)?
+                .ok_or("`q` is required")?
+                .to_string(),
+            max: integer(map, "max", SEARCH_MAX_MIN, SEARCH_MAX_MAX)?.unwrap_or(SEARCH_MAX_DEFAULT),
+            page: capped(map, "page", PAGE_MAX_BYTES)?.map(str::to_string),
+            spam_trash: flag(map, "spam_trash")?,
+            account: account(map)?,
+        })
+    }
+}
+
+/// messages.list for the query, one page of at most `max` ids.
+fn search_list_call(args: &SearchArgs, settings: &Settings) -> ApiCall {
+    let mut query = query([
+        ("q", args.q.clone()),
+        ("maxResults", args.max.to_string()),
+        ("fields", MESSAGES_LIST_FIELDS.to_string()),
+    ]);
+    if let Some(page) = &args.page {
+        query.insert("pageToken".to_string(), QueryValue::One(page.clone()));
+    }
+    if args.spam_trash {
+        query.insert(
+            "includeSpamTrash".to_string(),
+            QueryValue::One("true".to_string()),
+        );
+    }
+    ApiCall::gmail_get(
+        settings,
+        args.account.as_deref(),
+        MESSAGES_PATH.to_string(),
+        query,
+    )
+}
+
+/// messages.get of one message's metadata: the search line's headers, labels
+/// and snippet, no body.
+fn message_metadata_call(id: &str, account: Option<&str>, settings: &Settings) -> ApiCall {
+    let mut query = query([
+        ("format", "metadata".to_string()),
+        ("fields", METADATA_FIELDS.to_string()),
+    ]);
+    query.insert(
+        "metadataHeaders".to_string(),
+        QueryValue::Many(SEARCH_HEADERS.iter().map(|h| h.to_string()).collect()),
+    );
+    ApiCall::gmail_get(settings, account, format!("{MESSAGES_PATH}/{id}"), query)
+}
+
+/// labels.list for the names of the user labels an answer carries.
+fn label_names_call(account: Option<&str>, settings: &Settings) -> ApiCall {
+    ApiCall::gmail_get(
+        settings,
+        account,
+        LABELS_PATH.to_string(),
+        query([("fields", LABEL_NAMES_FIELDS.to_string())]),
+    )
+}
+
+/// A header value as answered, and whether it was cut to its bound.
+#[derive(Debug, PartialEq, Eq)]
+struct HeaderValue {
+    value: String,
+    cut: bool,
+}
+
+/// The value of the header `name` in `message`'s `payload.headers` list, cut
+/// to `HEADER_MAX_CHARS`. `None` when the message has no such header, or no
+/// `payload` or `headers` at all, as Google omits them when no header matches
+/// the mask. A `payload` that is not an object or a header list not of Gmail's
+/// shape is Google's fault, reported against `api`.
+fn header_value(message: &Value, name: &str, api: &str) -> Result<Option<HeaderValue>, Failure> {
+    let headers = match message.get("payload") {
+        None => return Ok(None),
+        Some(Value::Object(payload)) => match payload.get("headers") {
+            None => return Ok(None),
+            Some(headers) => headers,
+        },
+        Some(_) => return Err(shape(api)),
+    };
+    let found = decode::header(headers, name).map_err(|decode::MalformedHeaders| shape(api))?;
+    Ok(found.map(|value| {
+        let (value, cut) = cut(value, HEADER_MAX_CHARS);
+        HeaderValue { value, cut }
+    }))
 }
 
 /// A nested call's typed error, as the executor wrote it.
@@ -408,11 +613,12 @@ pub struct NestedError {
     pub detail: String,
 }
 
-/// `text` cut to `max` characters, ending in `…` when cut.
-fn cut(text: &str, max: usize) -> String {
+/// `text` cut to `max` characters, ending in `…` when cut, and whether it was
+/// cut.
+fn cut(text: &str, max: usize) -> (String, bool) {
     match text.char_indices().nth(max) {
-        None => text.to_string(),
-        Some((at, _)) => format!("{}…", &text[..at]),
+        None => (text.to_string(), false),
+        Some((at, _)) => (format!("{}…", &text[..at]), true),
     }
 }
 
@@ -451,11 +657,16 @@ pub enum Answer {
     /// Google's answer was cut at the provider's read limit; the size as the
     /// messages state it (`<n> bytes`, or `of unstated length`).
     Truncated(String),
+    /// Google's whole 4xx/5xx answer: its HTTP status, for a step that
+    /// treats one status as an outcome, and the failure every other step
+    /// answers with.
+    GoogleError { status: u64, failure: Failure },
 }
 
 /// `api-request`'s answer read: Google's JSON, the credential relay, a cut
-/// answer for the caller to decide on, or the request's error answer. Only
-/// `error.status` and `error.message` are ever copied out of a non-2xx body.
+/// answer or Google's error for the caller to decide on, or the request's
+/// error answer. Only `error.status` and `error.message` are ever copied out
+/// of a non-2xx body.
 pub fn read_api_result(
     outcome: Result<Value, NestedError>,
     target: &Target,
@@ -512,7 +723,10 @@ pub fn read_api_result(
         .and_then(Value::as_str)
         .ok_or_else(|| internal("api-request's answer carries no body"))?;
     if status >= 400 {
-        return Err(google_error(status, body));
+        return Ok(Answer::GoogleError {
+            status,
+            failure: google_error(status, body),
+        });
     }
     if !(200..300).contains(&status) {
         return Err(internal(format!(
@@ -554,7 +768,7 @@ fn google_error(status: u64, body: &str) -> Failure {
     let mut detail = match (field("status"), field("message")) {
         (Some(google_status), Some(message)) => format!(
             "Google {google_status} (HTTP {status}): {}",
-            cut(message, GOOGLE_MESSAGE_MAX_CHARS)
+            cut(message, GOOGLE_MESSAGE_MAX_CHARS).0
         ),
         _ => format!("Google HTTP {status}, body not in the standard error shape"),
     };
@@ -565,30 +779,331 @@ fn google_error(status: u64, body: &str) -> Failure {
     Failure { kind, detail }
 }
 
-/// What the request does with its nested call's answer: complete or fail.
-pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>) -> Next {
+/// What the request does with its nested call's answer: complete, fail, or
+/// issue its next step. Every answer completed here is held to the result
+/// ceiling; a relayed credential answer is `api-request`'s own and is not.
+pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
     let body = match read_api_result(outcome, &state.target) {
         Ok(Answer::Google(body)) => body,
         Ok(Answer::Relay(value)) => return Next::Complete(value),
         Ok(Answer::Truncated(size)) => return Next::Fail(cut_answer(&size)),
+        // A message deleted between the listing and its read is skipped, not
+        // the search's failure.
+        Ok(Answer::GoogleError { status: 404, .. })
+            if matches!(
+                (state.tool, state.step),
+                (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET)
+            ) =>
+        {
+            return settle(search_message(state, None, settings));
+        }
+        Ok(Answer::GoogleError { failure, .. }) => return Next::Fail(failure),
         Err(failure) => return Next::Fail(failure),
     };
-    let answer = match (state.tool, state.step) {
-        (Provided::GmailLabels, 1) => {
-            stored(state, LabelsArgs::parse).and_then(|args| match args.id {
+    settle(match (state.tool, state.step) {
+        (Provided::GmailLabels, 1) => stored(state, LabelsArgs::parse)
+            .and_then(|args| match args.id {
                 Some(_) => compact_label(&body),
                 None => compact_labels(&body),
             })
+            .map(Next::Complete),
+        (Provided::GmailSearch, 1) => search_listed(state, &body, settings),
+        (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET) => {
+            search_message(state, Some(&body), settings)
         }
+        (Provided::GmailSearch, LABELS_STEP) => named(state, &body),
         (tool, step) => Err(internal(format!(
             "in-flight row names step {step} of {}, which has no such step",
             tool.name()
         ))),
-    };
-    match answer {
-        Ok(value) => bounded(value, COMPACT_RESULT_CEILING),
+    })
+}
+
+/// A step's decision as the request's next move, a completed answer held to
+/// the result ceiling.
+fn settle(decided: Result<Next, Failure>) -> Next {
+    match decided {
+        Ok(Next::Complete(value)) => bounded(value, COMPACT_RESULT_CEILING),
+        Ok(next) => next,
         Err(failure) => Next::Fail(failure),
     }
+}
+
+/// messages.list read: an empty page completes at once; otherwise the first
+/// listed message is read next, the ids and the page's token and estimate
+/// riding in `derived`.
+fn search_listed(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
+    let args = stored(state, SearchArgs::parse)?;
+    let Value::Object(body) = body else {
+        return Err(shape("messages.list"));
+    };
+    let ids: Vec<Value> = match body.get("messages") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| match item.get("id") {
+                Some(Value::String(id)) if is_gmail_id(id) => Ok(json!(id)),
+                _ => Err(shape("messages.list")),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(shape("messages.list")),
+    };
+    if ids.len() as u64 > args.max {
+        return Err(internal(format!(
+            "Gmail messages.list answered {} messages for maxResults {}",
+            ids.len(),
+            args.max
+        )));
+    }
+    let mut derived = Args::new();
+    match body.get("nextPageToken") {
+        None => {}
+        Some(token @ Value::String(_)) => {
+            derived.insert("next_page".to_string(), token.clone());
+        }
+        Some(_) => return Err(shape("messages.list")),
+    }
+    match body.get("resultSizeEstimate") {
+        None => {}
+        Some(estimate @ Value::Number(_)) => {
+            derived.insert("result_size_estimate".to_string(), estimate.clone());
+        }
+        Some(_) => return Err(shape("messages.list")),
+    }
+    let Some(Value::String(first)) = ids.first() else {
+        return Ok(Next::Complete(search_answer(derived)));
+    };
+    let call = Call {
+        step: SEARCH_FIRST_GET,
+        api: message_metadata_call(first, args.account.as_deref(), settings),
+    };
+    derived.insert("ids".to_string(), Value::Array(ids));
+    derived.insert("lines".to_string(), Value::Array(Vec::new()));
+    derived.insert("unavailable".to_string(), Value::Array(Vec::new()));
+    Ok(Next::Call { call, derived })
+}
+
+/// One listed message's metadata read — or, for `None`, found deleted —
+/// recorded in `derived`; then the next listed message is read, or the
+/// search is finished.
+fn search_message(
+    state: &InFlight,
+    body: Option<&Value>,
+    settings: &Settings,
+) -> Result<Next, Failure> {
+    let args = stored(state, SearchArgs::parse)?;
+    let mut derived = state.derived.clone();
+    let index = usize::from(state.step - SEARCH_FIRST_GET);
+    let ids = derived_list(&derived, "ids")?;
+    let Some(Value::String(id)) = ids.get(index) else {
+        return Err(internal(format!(
+            "in-flight row at gmail-search step {} lists no message id for it",
+            state.step
+        )));
+    };
+    let next_id = ids.get(index + 1).cloned();
+    let (key, entry) = match body {
+        Some(body) => ("lines", search_line(body, id)?),
+        None => ("unavailable", json!(id)),
+    };
+    let mut list = derived_list(&derived, key)?;
+    list.push(entry);
+    derived.insert(key.to_string(), Value::Array(list));
+    match next_id {
+        Some(Value::String(next)) => Ok(Next::Call {
+            call: Call {
+                step: state.step + 1,
+                api: message_metadata_call(&next, args.account.as_deref(), settings),
+            },
+            derived,
+        }),
+        Some(_) => Err(internal(
+            "in-flight row lists a message id that is not a string",
+        )),
+        None => finish(search_answer(derived), args.account.as_deref(), settings),
+    }
+}
+
+/// The array `derived[key]` that an earlier step of this request wrote.
+fn derived_list(derived: &Args, key: &str) -> Result<Vec<Value>, Failure> {
+    match derived.get(key) {
+        Some(Value::Array(items)) => Ok(items.clone()),
+        _ => Err(internal(format!("in-flight row carries no `{key}` list"))),
+    }
+}
+
+/// `GmailSearch`'s answer from what its steps gathered in `derived`:
+/// `messages` (empty when nothing matched), Google's `next_page` and
+/// `result_size_estimate` when it gave them, and `unavailable` when a listed
+/// message could not be read.
+fn search_answer(derived: Args) -> Value {
+    let mut out = Args::new();
+    out.insert(
+        "messages".to_string(),
+        derived.get("lines").cloned().unwrap_or_else(|| json!([])),
+    );
+    copy(&mut out, "next_page", derived.get("next_page"));
+    copy(
+        &mut out,
+        "result_size_estimate",
+        derived.get("result_size_estimate"),
+    );
+    if let Some(Value::Array(gone)) = derived.get("unavailable")
+        && !gone.is_empty()
+    {
+        out.insert("unavailable".to_string(), Value::Array(gone.clone()));
+    }
+    Value::Object(out)
+}
+
+/// One message's metadata as a search line: `id`, `thread_id`, the `from`,
+/// `subject` and `date` header values when present, each cut to
+/// `HEADER_MAX_CHARS` with the cut fields named, sorted, in
+/// `headers_truncated`, `internal_date` as RFC 3339, `snippet` with its
+/// character references decoded, and the label ids as `labels`. A body for
+/// another message than `id` is Google's fault.
+fn search_line(body: &Value, id: &str) -> Result<Value, Failure> {
+    let api = "messages.get";
+    if body.get("id").and_then(Value::as_str) != Some(id) {
+        return Err(shape(api));
+    }
+    let mut out = Args::new();
+    out.insert("id".to_string(), json!(id));
+    copy(&mut out, "thread_id", body.get("threadId"));
+    let mut truncated = Vec::new();
+    for name in SEARCH_HEADERS {
+        if let Some(header) = header_value(body, name, api)? {
+            let field = name.to_ascii_lowercase();
+            if header.cut {
+                truncated.push(field.clone());
+            }
+            out.insert(field, json!(header.value));
+        }
+    }
+    if !truncated.is_empty() {
+        truncated.sort();
+        out.insert("headers_truncated".to_string(), json!(truncated));
+    }
+    match body.get("internalDate") {
+        None => {}
+        Some(Value::String(ms)) => {
+            let date = decode::internal_date(ms).ok_or_else(|| shape(api))?;
+            out.insert("internal_date".to_string(), json!(date));
+        }
+        Some(_) => return Err(shape(api)),
+    }
+    match body.get("snippet") {
+        None => {}
+        Some(Value::String(snippet)) => {
+            out.insert(
+                "snippet".to_string(),
+                json!(decode::decode_entities(snippet)),
+            );
+        }
+        Some(_) => return Err(shape(api)),
+    }
+    out.insert("labels".to_string(), label_ids(body, api)?);
+    Ok(Value::Object(out))
+}
+
+/// A message's `labelIds` as an array of strings; absent is none.
+fn label_ids(message: &Value, api: &str) -> Result<Value, Failure> {
+    match message.get("labelIds") {
+        None => Ok(json!([])),
+        Some(Value::Array(ids)) if ids.iter().all(Value::is_string) => {
+            Ok(Value::Array(ids.clone()))
+        }
+        Some(_) => Err(shape(api)),
+    }
+}
+
+/// A finished answer completes, unless one of its `labels` arrays carries a
+/// user-label id: then labels.list is issued to name it, the answer waiting
+/// in `derived`.
+fn finish(answer: Value, account: Option<&str>, settings: &Settings) -> Result<Next, Failure> {
+    if !needs_label_names(&answer) {
+        return Ok(Next::Complete(answer));
+    }
+    Ok(Next::Call {
+        call: Call {
+            step: LABELS_STEP,
+            api: label_names_call(account, settings),
+        },
+        derived: Args::from_iter([("answer".to_string(), answer)]),
+    })
+}
+
+/// Whether any `labels` array of strings in `answer` holds a user-label id.
+fn needs_label_names(answer: &Value) -> bool {
+    match answer {
+        Value::Object(map) => map.iter().any(|(key, value)| match value {
+            Value::Array(items) if key == "labels" => items.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|id| id.starts_with(USER_LABEL_PREFIX))
+            }),
+            other => needs_label_names(other),
+        }),
+        Value::Array(items) => items.iter().any(needs_label_names),
+        _ => false,
+    }
+}
+
+/// Every label id in every `labels` array of strings in `answer` replaced by
+/// its name; an id `names` lacks stays an id.
+fn name_labels(answer: &mut Value, names: &BTreeMap<String, String>) {
+    match answer {
+        Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                match value {
+                    Value::Array(items) if key == "labels" => {
+                        for item in items {
+                            if let Some(name) = item.as_str().and_then(|id| names.get(id)) {
+                                *item = json!(name);
+                            }
+                        }
+                    }
+                    other => name_labels(other, names),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                name_labels(item, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The finishing step: labels.list's names applied to the answer that waited
+/// for them.
+fn named(state: &InFlight, body: &Value) -> Result<Next, Failure> {
+    let Some(answer) = state.derived.get("answer") else {
+        return Err(internal(
+            "in-flight row at the label-names step carries no answer",
+        ));
+    };
+    let Value::Object(body) = body else {
+        return Err(shape("labels.list"));
+    };
+    let mut names = BTreeMap::new();
+    match body.get("labels") {
+        None => {}
+        Some(Value::Array(items)) => {
+            for item in items {
+                let Some(id) = item.get("id").and_then(Value::as_str) else {
+                    return Err(shape("labels.list"));
+                };
+                if let Some(name) = item.get("name").and_then(Value::as_str) {
+                    names.insert(id.to_string(), name.to_string());
+                }
+            }
+        }
+        Some(_) => return Err(shape("labels.list")),
+    }
+    let mut answer = answer.clone();
+    name_labels(&mut answer, &names);
+    Ok(Next::Complete(answer))
 }
 
 /// A row's stored arguments, parsed again. They were validated when the
@@ -787,8 +1302,13 @@ mod tests {
         })
     }
 
-    fn fields(mask: &str) -> BTreeMap<String, String> {
-        BTreeMap::from([("fields".to_string(), mask.to_string())])
+    fn fields(mask: &str) -> Query {
+        query([("fields", mask.to_string())])
+    }
+
+    /// `advance` under the test settings.
+    fn answered(state: &InFlight, outcome: Result<Value, NestedError>) -> Next {
+        advance(state, outcome, &settings())
     }
 
     #[test]
@@ -915,6 +1435,13 @@ mod tests {
         }
     }
 
+    fn refused(status: u64, kind: ErrorKind, detail: &str) -> Result<Answer, Failure> {
+        Ok(Answer::GoogleError {
+            status,
+            failure: failure(kind, detail),
+        })
+    }
+
     fn credential_invalid(account: Value) -> Value {
         json!({
             "error": "credential_invalid",
@@ -1031,20 +1558,22 @@ mod tests {
                 400,
                 &google(400, "INVALID_ARGUMENT", "Invalid pageToken")
             )),
-            Err(failure(
+            refused(
+                400,
                 ErrorKind::InvalidArgs,
                 "Google INVALID_ARGUMENT (HTTP 400): Invalid pageToken"
-            ))
+            )
         );
         assert_eq!(
             read(http(
                 404,
                 &google(404, "NOT_FOUND", "Requested entity was not found.")
             )),
-            Err(failure(
+            refused(
+                404,
                 ErrorKind::InvalidArgs,
                 "Google NOT_FOUND (HTTP 404): Requested entity was not found."
-            ))
+            )
         );
         for (code, status) in [
             (401, "UNAUTHENTICATED"),
@@ -1054,10 +1583,11 @@ mod tests {
         ] {
             assert_eq!(
                 read(http(code, &google(code, status, "later"))),
-                Err(failure(
+                refused(
+                    code,
                     ErrorKind::Internal,
                     &format!("Google {status} (HTTP {code}): later")
-                ))
+                )
             );
         }
     }
@@ -1073,29 +1603,34 @@ mod tests {
                     "Request had insufficient authentication scopes."
                 )
             )),
-            Err(failure(
+            refused(
+                403,
                 ErrorKind::Denied,
                 "Google PERMISSION_DENIED (HTTP 403): Request had insufficient authentication \
                  scopes. If Google names insufficient authentication scopes, the account was \
                  connected without the Gmail read scope: run oauth-connect with that scope set \
                  and relay its steps."
-            ))
+            )
         );
         assert_eq!(
             read(http(403, "<html>SECRET</html>")),
-            Err(failure(
+            refused(
+                403,
                 ErrorKind::Denied,
                 &format!("Google HTTP 403, body not in the standard error shape. {SCOPE_HINT}")
-            ))
+            )
         );
     }
 
     #[test]
     fn a_long_google_message_is_cut() {
         let message = "x".repeat(GOOGLE_MESSAGE_MAX_CHARS + 50);
-        let detail = read(http(500, &google(500, "INTERNAL", &message)))
-            .unwrap_err()
-            .detail;
+        let Ok(Answer::GoogleError { failure, .. }) =
+            read(http(500, &google(500, "INTERNAL", &message)))
+        else {
+            panic!("a 500 is Google's error");
+        };
+        let detail = failure.detail;
         assert_eq!(
             detail,
             format!(
@@ -1109,10 +1644,11 @@ mod tests {
     fn an_error_body_not_in_googles_shape_is_not_copied() {
         assert_eq!(
             read(http(400, "{\"error\": \"SECRET\"}")),
-            Err(failure(
+            refused(
+                400,
                 ErrorKind::InvalidArgs,
                 "Google HTTP 400, body not in the standard error shape"
-            ))
+            )
         );
     }
 
@@ -1193,7 +1729,7 @@ mod tests {
     fn labels_list_compacts_in_googles_order() {
         let state = labels_state(json!({}));
         assert_eq!(
-            advance(&state, http(200, LABELS_BODY)),
+            answered(&state, http(200, LABELS_BODY)),
             Next::Complete(json!({
                 "labels": [
                     { "id": "INBOX", "name": "INBOX", "type": "system" },
@@ -1204,7 +1740,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            advance(&state, http(200, "{}")),
+            answered(&state, http(200, "{}")),
             Next::Complete(json!({ "labels": [] }))
         );
     }
@@ -1215,7 +1751,7 @@ mod tests {
         let body = r#"{ "id": "Label_7", "name": "Receipts", "type": "user",
             "messagesTotal": 120, "messagesUnread": 3, "threadsTotal": 98, "threadsUnread": 2 }"#;
         assert_eq!(
-            advance(&state, http(200, body)),
+            answered(&state, http(200, body)),
             Next::Complete(json!({
                 "id": "Label_7", "name": "Receipts", "type": "user",
                 "messages_total": 120, "messages_unread": 3,
@@ -1224,7 +1760,7 @@ mod tests {
         );
         let sparse = r#"{ "id": "INBOX", "name": "INBOX", "type": "system", "messagesUnread": 0 }"#;
         assert_eq!(
-            advance(&labels_state(json!({ "id": "INBOX" })), http(200, sparse)),
+            answered(&labels_state(json!({ "id": "INBOX" })), http(200, sparse)),
             Next::Complete(json!({
                 "id": "INBOX", "name": "INBOX", "type": "system", "messages_unread": 0,
             }))
@@ -1241,7 +1777,7 @@ mod tests {
             "{\"labels\": [{}]}",
         ] {
             assert_eq!(
-                advance(&list, http(200, body)),
+                answered(&list, http(200, body)),
                 Next::Fail(failure(
                     ErrorKind::Internal,
                     "unexpected Gmail labels.list response shape"
@@ -1251,7 +1787,7 @@ mod tests {
         }
         let one = labels_state(json!({ "id": "INBOX" }));
         assert_eq!(
-            advance(&one, http(200, "{\"name\": \"INBOX\"}")),
+            answered(&one, http(200, "{\"name\": \"INBOX\"}")),
             Next::Fail(failure(
                 ErrorKind::Internal,
                 "unexpected Gmail labels.get response shape"
@@ -1263,7 +1799,7 @@ mod tests {
     fn advance_relays_a_missing_credential_unchanged() {
         let value = credential_invalid(Value::Null);
         assert_eq!(
-            advance(&labels_state(json!({})), Ok(value.clone())),
+            answered(&labels_state(json!({})), Ok(value.clone())),
             Next::Complete(value)
         );
     }
@@ -1274,7 +1810,7 @@ mod tests {
             "status": 200, "headers": {}, "bytes": null, "truncated": true, "body": "{",
         }));
         assert_eq!(
-            advance(&labels_state(json!({})), outcome),
+            answered(&labels_state(json!({})), outcome),
             Next::Fail(cut_answer("of unstated length"))
         );
     }
@@ -1282,7 +1818,7 @@ mod tests {
     #[test]
     fn advance_passes_a_failed_call_through() {
         assert_eq!(
-            advance(
+            answered(
                 &labels_state(json!({ "id": "Label_404" })),
                 http(404, &google(404, "NOT_FOUND", "Invalid label: Label_404"))
             ),
@@ -1298,7 +1834,7 @@ mod tests {
         let mut state = labels_state(json!({}));
         state.step = 2;
         assert_eq!(
-            advance(&state, http(200, "{}")),
+            answered(&state, http(200, "{}")),
             Next::Fail(failure(
                 ErrorKind::Internal,
                 "in-flight row names step 2 of gmail-labels, which has no such step"
@@ -1311,7 +1847,7 @@ mod tests {
         let mut state = labels_state(json!({}));
         state.args = json!({ "id": "a/b" });
         assert_eq!(
-            advance(&state, http(200, LABELS_BODY)),
+            answered(&state, http(200, LABELS_BODY)),
             Next::Fail(failure(
                 ErrorKind::Internal,
                 "stored gmail-labels arguments no longer parse: `id` must be 1 to 128 letters, \
@@ -1433,6 +1969,692 @@ mod tests {
         assert!(
             error.contains("no provided tool is named `GmailLabels`"),
             "{error}"
+        );
+    }
+
+    fn search(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::GmailSearch, &args, &settings()).map(|call| {
+            assert_eq!(call.step, 1);
+            call.api
+        })
+    }
+
+    #[test]
+    fn search_lists_one_page_of_the_query() {
+        let call = search(json!({ "q": "from:alice@example.com is:unread" })).unwrap();
+        assert_eq!(
+            serde_json::to_value(&call).unwrap(),
+            json!({
+                "provider": "google",
+                "method": "GET",
+                "host": "gmail.example.com",
+                "path": "/gmail/v1/users/me/messages",
+                "query": {
+                    "q": "from:alice@example.com is:unread",
+                    "maxResults": "10",
+                    "fields": "messages(id,threadId),nextPageToken,resultSizeEstimate",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn search_passes_page_spam_trash_max_and_account() {
+        let call = search(json!({
+            "q": "invoice", "max": 25, "page": "token-2", "spam_trash": true,
+            "account": "alice@example.com",
+        }))
+        .unwrap();
+        assert_eq!(call.account.as_deref(), Some("alice@example.com"));
+        assert_eq!(call.query["maxResults"], QueryValue::One("25".to_string()));
+        assert_eq!(
+            call.query["pageToken"],
+            QueryValue::One("token-2".to_string())
+        );
+        assert_eq!(
+            call.query["includeSpamTrash"],
+            QueryValue::One("true".to_string())
+        );
+        let call = search(json!({ "q": "invoice", "max": 1, "spam_trash": false })).unwrap();
+        assert_eq!(call.query["maxResults"], QueryValue::One("1".to_string()));
+        assert!(!call.query.contains_key("includeSpamTrash"));
+        assert!(!call.query.contains_key("pageToken"));
+    }
+
+    #[test]
+    fn search_refuses_bad_arguments() {
+        for (args, error) in [
+            (json!({}), "`q` is required"),
+            (json!({ "q": " " }), "`q` is empty"),
+            (json!({ "q": 1 }), "`q` must be a string"),
+            (
+                json!({ "q": "x".repeat(1025) }),
+                "`q` is longer than 1024 bytes",
+            ),
+            (
+                json!({ "q": "x", "max": 0 }),
+                "`max` must be an integer from 1 to 25",
+            ),
+            (
+                json!({ "q": "x", "max": 26 }),
+                "`max` must be an integer from 1 to 25",
+            ),
+            (
+                json!({ "q": "x", "max": "5" }),
+                "`max` must be an integer from 1 to 25",
+            ),
+            (
+                json!({ "q": "x", "page": "p".repeat(4097) }),
+                "`page` is longer than 4096 bytes",
+            ),
+            (
+                json!({ "q": "x", "spam_trash": "yes" }),
+                "`spam_trash` must be true or false",
+            ),
+            (
+                json!({ "q": "x", "limit": 5 }),
+                "unknown argument `limit`; this tool takes `q`, `max`, `page`, `spam_trash`, \
+                 `account`",
+            ),
+        ] {
+            assert_eq!(search(args.clone()).unwrap_err(), error, "{args}");
+        }
+        assert!(search(json!({ "q": "x".repeat(1024) })).is_ok());
+    }
+
+    #[test]
+    fn a_repeated_query_key_is_sent_as_an_array() {
+        let call = message_metadata_call("m1", None, &settings());
+        assert_eq!(
+            serde_json::to_value(&call).unwrap(),
+            json!({
+                "provider": "google",
+                "method": "GET",
+                "host": "gmail.example.com",
+                "path": "/gmail/v1/users/me/messages/m1",
+                "query": {
+                    "format": "metadata",
+                    "metadataHeaders": ["From", "Subject", "Date"],
+                    "fields": "id,threadId,labelIds,snippet,internalDate,sizeEstimate,\
+                               payload/headers",
+                },
+            })
+        );
+    }
+
+    fn search_state(args: Value) -> InFlight {
+        let call = plan(Provided::GmailSearch, &args, &settings()).unwrap();
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::GmailSearch,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        )
+    }
+
+    /// The row the next step is stored under, read back as the next
+    /// activation reads it, and the call it issues.
+    fn follow(state: &InFlight, next: Next) -> (InFlight, Call) {
+        let Next::Call { call, derived } = next else {
+            panic!("expected a next step, got {next:?}");
+        };
+        let row = InFlight::decode(&state.next(&call, derived, 2_000).encode()).unwrap();
+        assert_eq!(row.step, call.step);
+        assert_eq!(row.target, call.api.target());
+        assert_eq!(row.issued_at_ms, 2_000);
+        (row, call)
+    }
+
+    fn listing(ids: &[&str], extra: Value) -> String {
+        let mut body = json!({
+            "messages": ids.iter().map(|id| json!({ "id": id, "threadId": "t1" })).collect::<Vec<_>>(),
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body.to_string()
+    }
+
+    fn metadata(id: &str, labels: &[&str]) -> String {
+        json!({
+            "id": id,
+            "threadId": format!("t-{id}"),
+            "labelIds": labels,
+            "snippet": "It&#39;s at noon &amp; on &quot;us&quot;",
+            "internalDate": "1793455509123",
+            "sizeEstimate": 2048,
+            "payload": { "headers": [
+                { "name": "From", "value": "Alice <alice@example.com>" },
+                { "name": "subject", "value": "Lunch" },
+                { "name": "Date", "value": "Sat, 31 Oct 2026 14:05:09 +0000" },
+            ] },
+        })
+        .to_string()
+    }
+
+    fn line(id: &str, labels: Value) -> Value {
+        json!({
+            "id": id,
+            "thread_id": format!("t-{id}"),
+            "from": "Alice <alice@example.com>",
+            "subject": "Lunch",
+            "date": "Sat, 31 Oct 2026 14:05:09 +0000",
+            "internal_date": "2026-10-31T14:05:09Z",
+            "snippet": "It's at noon & on \"us\"",
+            "labels": labels,
+        })
+    }
+
+    #[test]
+    fn search_reads_each_listed_message_then_names_user_labels() {
+        let args = json!({ "q": "lunch", "max": 3, "account": "alice@example.com" });
+        let state = search_state(args);
+        let list = listing(
+            &["m1", "m2", "m3"],
+            json!({ "nextPageToken": "next-1", "resultSizeEstimate": 40 }),
+        );
+        let (state, call) = follow(&state, answered(&state, http(200, &list)));
+        assert_eq!(call.step, 2);
+        assert_eq!(
+            call.api,
+            message_metadata_call("m1", Some("alice@example.com"), &settings())
+        );
+        let (state, call) = follow(
+            &state,
+            answered(&state, http(200, &metadata("m1", &["INBOX", "UNREAD"]))),
+        );
+        assert_eq!(
+            (call.step, call.api.path.as_str()),
+            (3, "/gmail/v1/users/me/messages/m2")
+        );
+        let (state, call) = follow(
+            &state,
+            answered(&state, http(200, &metadata("m2", &["Label_7", "INBOX"]))),
+        );
+        assert_eq!(
+            (call.step, call.api.path.as_str()),
+            (4, "/gmail/v1/users/me/messages/m3")
+        );
+        let (state, call) = follow(&state, answered(&state, http(200, &metadata("m3", &[]))));
+        assert_eq!(call.step, 100);
+        assert_eq!(
+            call.api,
+            ApiCall {
+                provider: "google".to_string(),
+                account: Some("alice@example.com".to_string()),
+                method: "GET".to_string(),
+                host: "gmail.example.com".to_string(),
+                path: "/gmail/v1/users/me/labels".to_string(),
+                query: fields("labels(id,name)"),
+            }
+        );
+        let names = r#"{ "labels": [
+            { "id": "INBOX", "name": "INBOX" },
+            { "id": "Label_7", "name": "Receipts" }
+        ] }"#;
+        assert_eq!(
+            answered(&state, http(200, names)),
+            Next::Complete(json!({
+                "messages": [
+                    line("m1", json!(["INBOX", "UNREAD"])),
+                    line("m2", json!(["Receipts", "INBOX"])),
+                    line("m3", json!([])),
+                ],
+                "next_page": "next-1",
+                "result_size_estimate": 40,
+            }))
+        );
+    }
+
+    #[test]
+    fn a_search_with_system_labels_only_completes_without_naming_them() {
+        let state = search_state(json!({ "q": "lunch" }));
+        let list = listing(&["m1"], json!({ "resultSizeEstimate": 1 }));
+        let (state, _) = follow(&state, answered(&state, http(200, &list)));
+        assert_eq!(
+            answered(
+                &state,
+                http(200, &metadata("m1", &["INBOX", "CATEGORY_UPDATES"]))
+            ),
+            Next::Complete(json!({
+                "messages": [line("m1", json!(["INBOX", "CATEGORY_UPDATES"]))],
+                "result_size_estimate": 1,
+            }))
+        );
+    }
+
+    #[test]
+    fn an_empty_search_completes_after_one_call() {
+        let state = search_state(json!({ "q": "nothing" }));
+        assert_eq!(
+            answered(&state, http(200, r#"{ "resultSizeEstimate": 0 }"#)),
+            Next::Complete(json!({ "messages": [], "result_size_estimate": 0 }))
+        );
+        assert_eq!(
+            answered(&state, http(200, r#"{ "messages": [] }"#)),
+            Next::Complete(json!({ "messages": [] }))
+        );
+    }
+
+    #[test]
+    fn a_message_deleted_mid_search_is_listed_unavailable() {
+        let state = search_state(json!({ "q": "lunch" }));
+        let list = listing(&["m1", "m2", "m3"], json!({ "resultSizeEstimate": 3 }));
+        let (state, _) = follow(&state, answered(&state, http(200, &list)));
+        let gone = google(404, "NOT_FOUND", "Requested entity was not found.");
+        let (state, call) = follow(&state, answered(&state, http(404, &gone)));
+        assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m2");
+        let (state, _) = follow(&state, answered(&state, http(200, &metadata("m2", &[]))));
+        assert_eq!(
+            answered(&state, http(404, &gone)),
+            Next::Complete(json!({
+                "messages": [line("m2", json!([]))],
+                "result_size_estimate": 3,
+                "unavailable": ["m1", "m3"],
+            }))
+        );
+    }
+
+    #[test]
+    fn a_404_mid_search_is_read_by_the_one_envelope_reader() {
+        let state = search_state(json!({ "q": "lunch" }));
+        let (state, _) = follow(
+            &state,
+            answered(&state, http(200, &listing(&["m1"], json!({})))),
+        );
+        // An envelope without `truncated` is read as whole, as every step
+        // reads it.
+        let untold = Ok(json!({ "status": 404, "headers": {}, "bytes": 2, "body": "{}" }));
+        assert_eq!(
+            answered(&state, untold),
+            Next::Complete(json!({ "messages": [], "unavailable": ["m1"] }))
+        );
+        let binary = Ok(json!({
+            "status": 404, "headers": {}, "bytes": 3, "truncated": false, "body_base64": "AAEC",
+        }));
+        assert_eq!(
+            answered(&state, binary),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "Google returned a non-text body (404)"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_search_reads_all_25_messages_max_allows() {
+        let ids: Vec<String> = (1..=25).map(|i| format!("m{i}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let list = listing(&id_refs, json!({}));
+        let gone = google(404, "NOT_FOUND", "Requested entity was not found.");
+        // The 25th message read, then found deleted, at step 26.
+        for (last, read, unavailable) in [
+            (http(200, &metadata("m25", &[])), 25, None),
+            (http(404, &gone), 24, Some(json!(["m25"]))),
+        ] {
+            let state = search_state(json!({ "q": "lunch", "max": 25 }));
+            let (mut state, mut call) = follow(&state, answered(&state, http(200, &list)));
+            for (i, id) in ids[..24].iter().enumerate() {
+                assert_eq!(
+                    (call.step, call.api.path.as_str()),
+                    (
+                        2 + i as u8,
+                        format!("/gmail/v1/users/me/messages/{id}").as_str()
+                    )
+                );
+                (state, call) = follow(&state, answered(&state, http(200, &metadata(id, &[]))));
+            }
+            assert_eq!(
+                (call.step, call.api.path.as_str()),
+                (26, "/gmail/v1/users/me/messages/m25")
+            );
+            let Next::Complete(answer) = answered(&state, last) else {
+                panic!("the search did not complete at its 25th message");
+            };
+            assert_eq!(answer["messages"].as_array().unwrap().len(), read);
+            assert_eq!(answer.get("unavailable").cloned(), unavailable);
+        }
+    }
+
+    #[test]
+    fn a_long_header_value_is_cut() {
+        let with_subject = |id: &str, subject: String| {
+            let mut body: Value = serde_json::from_str(&metadata(id, &[])).unwrap();
+            body["payload"]["headers"][1]["value"] = json!(subject);
+            http(200, &body.to_string())
+        };
+        // A sender's own trailing `…` at exactly the bound is not a cut.
+        let at_bound = format!("{}…", "é".repeat(HEADER_MAX_CHARS - 1));
+        let state = search_state(json!({ "q": "lunch" }));
+        let (state, _) = follow(
+            &state,
+            answered(&state, http(200, &listing(&["m1", "m2", "m3"], json!({})))),
+        );
+        let (state, _) = follow(
+            &state,
+            answered(&state, with_subject("m1", "é".repeat(HEADER_MAX_CHARS + 1))),
+        );
+        let (state, _) = follow(
+            &state,
+            answered(&state, with_subject("m2", at_bound.clone())),
+        );
+        let Next::Complete(answer) = answered(&state, http(200, &metadata("m3", &[]))) else {
+            panic!("the search did not complete");
+        };
+        let lines = answer["messages"].as_array().unwrap();
+        assert_eq!(
+            lines[0]["subject"],
+            json!(format!("{}…", "é".repeat(HEADER_MAX_CHARS)))
+        );
+        assert_eq!(lines[0]["from"], json!("Alice <alice@example.com>"));
+        assert_eq!(lines[0]["headers_truncated"], json!(["subject"]));
+        assert_eq!(lines[1]["subject"], json!(at_bound));
+        assert_eq!(lines[1].get("headers_truncated"), None);
+        assert_eq!(lines[2].get("headers_truncated"), None);
+    }
+
+    #[test]
+    fn every_cut_header_on_a_line_is_flagged_in_sorted_order() {
+        let state = search_state(json!({ "q": "lunch" }));
+        let (state, _) = follow(
+            &state,
+            answered(&state, http(200, &listing(&["m1"], json!({})))),
+        );
+        let mut body: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
+        for header in 0..3 {
+            body["payload"]["headers"][header]["value"] = json!("x".repeat(HEADER_MAX_CHARS + 1));
+        }
+        let Next::Complete(answer) = answered(&state, http(200, &body.to_string())) else {
+            panic!("the search did not complete");
+        };
+        assert_eq!(
+            answer["messages"][0]["headers_truncated"],
+            json!(["date", "from", "subject"])
+        );
+    }
+
+    #[test]
+    fn header_value_reports_a_cut_only_past_the_bound() {
+        let message = |value: String| json!({ "payload": { "headers": [{ "name": "Subject", "value": value }] } });
+        let at = message("a".repeat(HEADER_MAX_CHARS));
+        assert_eq!(
+            header_value(&at, "subject", "messages.get"),
+            Ok(Some(HeaderValue {
+                value: "a".repeat(HEADER_MAX_CHARS),
+                cut: false
+            }))
+        );
+        let past = message("a".repeat(HEADER_MAX_CHARS + 1));
+        assert_eq!(
+            header_value(&past, "Subject", "messages.get"),
+            Ok(Some(HeaderValue {
+                value: format!("{}…", "a".repeat(HEADER_MAX_CHARS)),
+                cut: true
+            }))
+        );
+        assert_eq!(header_value(&past, "From", "messages.get"), Ok(None));
+    }
+
+    #[test]
+    fn a_message_without_payload_or_headers_has_no_header() {
+        for message in [json!({}), json!({ "payload": {} })] {
+            assert_eq!(header_value(&message, "Subject", "messages.get"), Ok(None));
+        }
+    }
+
+    #[test]
+    fn malformed_headers_fail_the_search() {
+        for payload in [
+            json!("headers"),
+            json!({ "headers": { "Subject": "Lunch" } }),
+            json!({ "headers": [{ "name": "Subject", "value": 7 }] }),
+            json!({ "headers": [{ "value": "nameless" }] }),
+        ] {
+            let state = search_state(json!({ "q": "lunch" }));
+            let (state, _) = follow(
+                &state,
+                answered(&state, http(200, &listing(&["m1"], json!({})))),
+            );
+            let mut body: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
+            body["payload"] = payload.clone();
+            let Next::Fail(failure) = answered(&state, http(200, &body.to_string())) else {
+                panic!("a payload of {payload} did not fail the search");
+            };
+            assert_eq!(failure.kind, ErrorKind::Internal);
+            assert_eq!(
+                failure.detail,
+                "unexpected Gmail messages.get response shape"
+            );
+        }
+    }
+
+    #[test]
+    fn a_404_on_the_listing_is_the_callers() {
+        let state = search_state(json!({ "q": "lunch", "page": "stale" }));
+        assert_eq!(
+            answered(&state, http(404, &google(404, "NOT_FOUND", "gone"))),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "Google NOT_FOUND (HTTP 404): gone"
+            ))
+        );
+    }
+
+    #[test]
+    fn any_other_failure_mid_search_fails_the_search() {
+        let state = search_state(json!({ "q": "lunch" }));
+        let (state, _) = follow(
+            &state,
+            answered(&state, http(200, &listing(&["m1", "m2"], json!({})))),
+        );
+        assert_eq!(
+            answered(&state, http(500, &google(500, "INTERNAL", "later"))),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "Google INTERNAL (HTTP 500): later"
+            ))
+        );
+        let cut = Ok(json!({
+            "status": 404, "headers": {}, "bytes": 900000, "truncated": true, "body": "{",
+        }));
+        assert_eq!(
+            answered(&state, cut),
+            Next::Fail(cut_answer("900000 bytes"))
+        );
+        let value = credential_invalid(json!("alice@example.com"));
+        assert_eq!(answered(&state, Ok(value.clone())), Next::Complete(value));
+    }
+
+    #[test]
+    fn search_refuses_an_unexpected_listing() {
+        let state = search_state(json!({ "q": "lunch", "max": 2 }));
+        let shape_error = Next::Fail(failure(
+            ErrorKind::Internal,
+            "unexpected Gmail messages.list response shape",
+        ));
+        for body in [
+            "[]".to_string(),
+            r#"{ "messages": {} }"#.to_string(),
+            r#"{ "messages": [{ "threadId": "t1" }] }"#.to_string(),
+            listing(&["m/1"], json!({})),
+            listing(&["m1"], json!({ "nextPageToken": 7 })),
+            listing(&["m1"], json!({ "resultSizeEstimate": "many" })),
+        ] {
+            assert_eq!(answered(&state, http(200, &body)), shape_error, "{body}");
+        }
+        assert_eq!(
+            answered(&state, http(200, &listing(&["m1", "m2", "m3"], json!({})))),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "Gmail messages.list answered 3 messages for maxResults 2"
+            ))
+        );
+    }
+
+    #[test]
+    fn search_refuses_an_unexpected_message() {
+        let state = search_state(json!({ "q": "lunch" }));
+        let (state, _) = follow(
+            &state,
+            answered(&state, http(200, &listing(&["m1"], json!({})))),
+        );
+        let shape_error = Next::Fail(failure(
+            ErrorKind::Internal,
+            "unexpected Gmail messages.get response shape",
+        ));
+        let mut wrong_date: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
+        wrong_date["internalDate"] = json!("yesterday");
+        let mut wrong_labels: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
+        wrong_labels["labelIds"] = json!([1]);
+        let mut wrong_snippet: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
+        wrong_snippet["snippet"] = json!(null);
+        for body in [
+            metadata("m2", &[]),
+            "{}".to_string(),
+            wrong_date.to_string(),
+            wrong_labels.to_string(),
+            wrong_snippet.to_string(),
+        ] {
+            assert_eq!(answered(&state, http(200, &body)), shape_error, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_sparse_message_answers_what_google_gave() {
+        let state = search_state(json!({ "q": "lunch" }));
+        let (state, _) = follow(
+            &state,
+            answered(&state, http(200, &listing(&["m1"], json!({})))),
+        );
+        assert_eq!(
+            answered(&state, http(200, r#"{ "id": "m1" }"#)),
+            Next::Complete(json!({ "messages": [{ "id": "m1", "labels": [] }] }))
+        );
+    }
+
+    #[test]
+    fn a_search_row_missing_what_earlier_steps_wrote_is_internal() {
+        let state = search_state(json!({ "q": "lunch" }));
+        let (mut state, _) = follow(
+            &state,
+            answered(&state, http(200, &listing(&["m1"], json!({})))),
+        );
+        state.derived.remove("lines");
+        assert_eq!(
+            answered(&state, http(200, &metadata("m1", &[]))),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row carries no `lines` list"
+            ))
+        );
+        state.step = 3;
+        assert_eq!(
+            answered(&state, http(200, &metadata("m1", &[]))),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row at gmail-search step 3 lists no message id for it"
+            ))
+        );
+        state.step = 27;
+        assert_eq!(
+            answered(&state, http(200, "{}")),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row names step 27 of gmail-search, which has no such step"
+            ))
+        );
+    }
+
+    #[test]
+    fn label_names_are_needed_only_for_user_labels() {
+        assert!(!needs_label_names(
+            &json!({ "labels": ["INBOX", "UNREAD"] })
+        ));
+        assert!(needs_label_names(
+            &json!({ "labels": ["INBOX", "Label_3"] })
+        ));
+        assert!(needs_label_names(
+            &json!({ "messages": [{ "labels": [] }, { "labels": ["Label_3"] }] })
+        ));
+        // Only a `labels` array names labels.
+        assert!(!needs_label_names(
+            &json!({ "subject": "Label_3", "ids": ["Label_3"] })
+        ));
+    }
+
+    #[test]
+    fn naming_rewrites_every_labels_array_and_keeps_unknown_ids() {
+        let mut answer = json!({
+            "labels": ["Label_1", "INBOX"],
+            "messages": [{ "labels": ["Label_2", "Label_9"], "subject": "Label_1" }],
+        });
+        let names = BTreeMap::from([
+            ("Label_1".to_string(), "Receipts".to_string()),
+            ("Label_2".to_string(), "Travel/2026".to_string()),
+        ]);
+        name_labels(&mut answer, &names);
+        assert_eq!(
+            answer,
+            json!({
+                "labels": ["Receipts", "INBOX"],
+                "messages": [{ "labels": ["Travel/2026", "Label_9"], "subject": "Label_1" }],
+            })
+        );
+    }
+
+    fn naming_state(derived: Args) -> InFlight {
+        let state = search_state(json!({ "q": "lunch" }));
+        let call = Call {
+            step: LABELS_STEP,
+            api: label_names_call(None, &settings()),
+        };
+        state.next(&call, derived, 2_000)
+    }
+
+    #[test]
+    fn the_naming_step_reads_labels_list() {
+        let waiting = json!({ "messages": [{ "id": "m1", "labels": ["Label_7", "Label_8"] }] });
+        let state = naming_state(Args::from_iter([("answer".to_string(), waiting)]));
+        assert_eq!(
+            answered(
+                &state,
+                http(
+                    200,
+                    r#"{ "labels": [{ "id": "Label_7", "name": "Receipts" }, { "id": "Label_8" }] }"#
+                )
+            ),
+            Next::Complete(
+                json!({ "messages": [{ "id": "m1", "labels": ["Receipts", "Label_8"] }] })
+            )
+        );
+        assert_eq!(
+            answered(&state, http(200, "{}")),
+            Next::Complete(
+                json!({ "messages": [{ "id": "m1", "labels": ["Label_7", "Label_8"] }] })
+            )
+        );
+        for body in [
+            "[]",
+            r#"{ "labels": {} }"#,
+            r#"{ "labels": [{ "name": "x" }] }"#,
+        ] {
+            assert_eq!(
+                answered(&state, http(200, body)),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    "unexpected Gmail labels.list response shape"
+                )),
+                "{body}"
+            );
+        }
+        assert_eq!(
+            answered(&naming_state(Args::new()), http(200, "{}")),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row at the label-names step carries no answer"
+            ))
         );
     }
 }

@@ -9,8 +9,9 @@
 //! Serving a request validates its arguments and issues its first nested
 //! `api-request` for the caller's user through `call_async_for`, recording the
 //! request's state in the store under the call's id. Answering a result reads
-//! that state back, deletes it, and completes the request from `api-request`'s
-//! answer, so a request has at most one nested call outstanding. A request's own problem —
+//! that state back, deletes it, and either completes the request from
+//! `api-request`'s answer or issues its next step from the same activation, so
+//! a request has at most one nested call outstanding. A request's own problem —
 //! bad arguments, Brenn's refusal, Google's error — is answered with
 //! `complete_err`, and a missing credential is relayed as `api-request`
 //! answered it; only a structural fault (a bad `config`, a store failure, a
@@ -49,7 +50,7 @@ impl Processor for GoogleWorkspaceTools {
             serve(&tx, &settings, now_ms, &request)?;
         }
         for result in activation.tool_results()? {
-            answer(&tx, result)?;
+            answer(&tx, &settings, now_ms, result)?;
         }
         tx.commit()?;
         Ok(None)
@@ -126,7 +127,12 @@ fn issue(
     }
 }
 
-fn answer(tx: &store::Transaction, result: ToolResult) -> Result<(), Error> {
+fn answer(
+    tx: &store::Transaction,
+    settings: &Settings,
+    now_ms: u64,
+    result: ToolResult,
+) -> Result<(), Error> {
     // Every call this component makes serves a request.
     let Some(id) = result.serving else {
         log::debug(format!(
@@ -156,13 +162,14 @@ fn answer(tx: &store::Transaction, result: ToolResult) -> Result<(), Error> {
         state.step,
         logic::result_summary(&outcome)
     ));
-    match logic::advance(&state, outcome) {
+    match logic::advance(&state, outcome, settings) {
         Next::Complete(value) => drop_not_pending(provides::complete(&id, &value)),
         Next::Fail(failure) => drop_not_pending(provides::complete_err(
             &id,
             outcome_kind(failure.kind),
             &failure.detail,
         )),
+        Next::Call { call, derived } => issue(tx, &id, &call, &state.next(&call, derived, now_ms)),
     }
 }
 

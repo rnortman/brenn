@@ -564,6 +564,8 @@ pub fn parse_lat_lng(text: &str, key: &str) -> Result<Option<(f64, f64)>, String
 
 /// Validate a request's arguments and build its first nested call. An error is
 /// the request's `invalid_args` detail, naming the argument.
+// TODO(provider-schema-parse-parity): each tool's `*Args::parse` bounds and its
+// `input_schema` in the spec are stated separately.
 pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, String> {
     match tool {
         Provided::Geocode => {
