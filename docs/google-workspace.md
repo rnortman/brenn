@@ -157,7 +157,8 @@ Then the inbox tuning and the instance:
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered. 64 holds the 32 ceiling on Σ twice over, so tools joining the
+// re-delivered. The four Gmail tools declare Σ = 12, which needs 24, rounded
+// up to 32. 64 holds the 32 ceiling on Σ twice over, so tools joining the
 // class change nothing here.
 channel at "brenn:tool-results/workspace" {
   push_depth = 1;
@@ -174,6 +175,7 @@ new workspace: GoogleWorkspaceTools {
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/labels/*"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/*"; }
+    allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/threads/*"; }
     rate_limit { burst = 60; sustained_per_minute = 120; }
   }
   config = {
@@ -190,6 +192,7 @@ The assistant is granted the tools beside its `oauth-connect`,
 tool gmail-labels {}
 tool gmail-search {}
 tool gmail-read {}
+tool gmail-thread {}
 ```
 
 ## 6. First connect: acceptance

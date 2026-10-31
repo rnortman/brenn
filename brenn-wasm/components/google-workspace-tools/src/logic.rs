@@ -128,6 +128,22 @@ const STRUCTURE_FIELDS: &str = "id,threadId,labelIds,snippet,internalDate,sizeEs
                                 parts(mimeType,filename,headers,body(size,attachmentId),\
                                 parts(mimeType,filename,headers,body(size,attachmentId)))))";
 
+/// The path Gmail reads one thread below.
+const THREADS_PATH: &str = "/gmail/v1/users/me/threads";
+/// threads.get's metadata mask: each message's id, labels, snippet, receipt
+/// time and the requested headers.
+const THREAD_FIELDS: &str = "id,messages(id,labelIds,snippet,internalDate,payload/headers)";
+/// The header a thread answers once, from its first message; a message of
+/// the thread answers it only where it differs.
+const THREAD_SUBJECT: &str = "Subject";
+/// The headers a thread's messages carry, requested by repeating
+/// `metadataHeaders`.
+const THREAD_HEADERS: &[&str] = &["From", "To", "Cc", THREAD_SUBJECT, "Date"];
+/// `GmailThread`'s `max`: the range and the default.
+const THREAD_MAX_MIN: u64 = 1;
+const THREAD_MAX_MAX: u64 = 100;
+const THREAD_MAX_DEFAULT: u64 = 30;
+
 /// The most bytes a search query may hold.
 const QUERY_MAX_BYTES: usize = 1024;
 /// The most bytes a page token may hold.
@@ -234,6 +250,20 @@ fn query<const N: usize>(pairs: [(&str, String); N]) -> Query {
         .collect()
 }
 
+/// A `format=metadata` read's query: the `fields` mask, and `headers`
+/// requested by repeating `metadataHeaders`.
+fn metadata_query(fields: &str, headers: &[&str]) -> Query {
+    let mut query = query([
+        ("format", "metadata".to_string()),
+        ("fields", fields.to_string()),
+    ]);
+    query.insert(
+        "metadataHeaders".to_string(),
+        QueryValue::Many(headers.iter().map(|h| h.to_string()).collect()),
+    );
+    query
+}
+
 /// One `api-request` call's arguments. `account`, when the caller named one,
 /// is passed on every call a request makes, so a request never mixes
 /// accounts.
@@ -250,13 +280,19 @@ pub struct ApiCall {
 }
 
 impl ApiCall {
-    /// A GET on the Gmail host for `account`.
+    /// A GET on the Gmail host for `account`. Every Gmail read adds
+    /// `prettyPrint=false` to `query`: Google's indentation would count
+    /// against the read limit and the bus cap like any other byte.
     fn gmail_get(
         settings: &Settings,
         account: Option<&str>,
         path: String,
-        query: Query,
+        mut query: Query,
     ) -> ApiCall {
+        query.insert(
+            "prettyPrint".to_string(),
+            QueryValue::One("false".to_string()),
+        );
         ApiCall {
             provider: settings.provider.clone(),
             account: account.map(str::to_string),
@@ -522,6 +558,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                 api: read_call(&read, None, settings),
             })
         }
+        Provided::GmailThread => {
+            let thread = ThreadArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: thread_call(&thread, settings),
+            })
+        }
     }
 }
 
@@ -610,15 +653,12 @@ fn search_list_call(args: &SearchArgs, settings: &Settings) -> ApiCall {
 /// messages.get of one message's metadata: the search line's headers, labels
 /// and snippet, no body.
 fn message_metadata_call(id: &str, account: Option<&str>, settings: &Settings) -> ApiCall {
-    let mut query = query([
-        ("format", "metadata".to_string()),
-        ("fields", METADATA_FIELDS.to_string()),
-    ]);
-    query.insert(
-        "metadataHeaders".to_string(),
-        QueryValue::Many(SEARCH_HEADERS.iter().map(|h| h.to_string()).collect()),
-    );
-    ApiCall::gmail_get(settings, account, format!("{MESSAGES_PATH}/{id}"), query)
+    ApiCall::gmail_get(
+        settings,
+        account,
+        format!("{MESSAGES_PATH}/{id}"),
+        metadata_query(METADATA_FIELDS, SEARCH_HEADERS),
+    )
 }
 
 /// `GmailRead`'s arguments.
@@ -658,6 +698,39 @@ fn read_call(args: &ReadArgs, fields: Option<&str>, settings: &Settings) -> ApiC
     )
 }
 
+/// `GmailThread`'s arguments.
+struct ThreadArgs {
+    id: String,
+    max: usize,
+    account: Option<String>,
+}
+
+impl ThreadArgs {
+    // TODO(provider-schema-parse-parity): these bounds and the `gmail-thread`
+    // `input_schema` in the spec are stated separately.
+    fn parse(args: &Value) -> Result<ThreadArgs, String> {
+        let map = object(args, &["id", "max", "account"])?;
+        let max =
+            integer(map, "max", THREAD_MAX_MIN, THREAD_MAX_MAX)?.unwrap_or(THREAD_MAX_DEFAULT);
+        Ok(ThreadArgs {
+            id: gmail_id(map, "id")?.ok_or("`id` is required")?,
+            max: usize::try_from(max).expect("max is at most 100"),
+            account: account(map)?,
+        })
+    }
+}
+
+/// threads.get of one thread's messages' metadata: headers, labels and
+/// snippets, no bodies.
+fn thread_call(args: &ThreadArgs, settings: &Settings) -> ApiCall {
+    ApiCall::gmail_get(
+        settings,
+        args.account.as_deref(),
+        format!("{THREADS_PATH}/{}", args.id),
+        metadata_query(THREAD_FIELDS, THREAD_HEADERS),
+    )
+}
+
 /// labels.list for the names of the user labels an answer carries.
 fn label_names_call(account: Option<&str>, settings: &Settings) -> ApiCall {
     ApiCall::gmail_get(
@@ -683,15 +756,7 @@ struct HeaderValue {
 /// object or a header list not of Gmail's shape is Google's fault, reported
 /// against `api`.
 fn header_value(message: &Value, name: &str, api: &str) -> Result<Option<HeaderValue>, Failure> {
-    let headers = match message.get("payload") {
-        None => return Ok(None),
-        Some(Value::Object(payload)) => match payload.get("headers") {
-            None => return Ok(None),
-            Some(headers) => headers,
-        },
-        Some(_) => return Err(shape(api)),
-    };
-    let found = decode::header(headers, name).map_err(|decode::MalformedHeaders| shape(api))?;
+    let found = raw_header(message, name, api)?;
     let bound = if RECIPIENT_HEADERS
         .iter()
         .any(|recipient| recipient.eq_ignore_ascii_case(name))
@@ -704,6 +769,21 @@ fn header_value(message: &Value, name: &str, api: &str) -> Result<Option<HeaderV
         let (value, cut) = cut(&plain(value), bound);
         HeaderValue { value, cut }
     }))
+}
+
+/// The value of the header `name` in `message`'s `payload.headers` list as
+/// Google sent it, for comparison only: never copied into an answer. Absent
+/// and malformed as `header_value` reads them.
+fn raw_header<'a>(message: &'a Value, name: &str, api: &str) -> Result<Option<&'a str>, Failure> {
+    let headers = match message.get("payload") {
+        None => return Ok(None),
+        Some(Value::Object(payload)) => match payload.get("headers") {
+            None => return Ok(None),
+            Some(headers) => headers,
+        },
+        Some(_) => return Err(shape(api)),
+    };
+    decode::header(headers, name).map_err(|decode::MalformedHeaders| shape(api))
 }
 
 /// `message`'s `names` headers into `out`, each present one under its
@@ -732,14 +812,29 @@ fn answer_headers(
     Ok(())
 }
 
-/// What every message-bearing answer carries of one message: `id` (which
-/// must be the id asked for), `thread_id`, the `headers` through
-/// `answer_headers`, `internal_date` as RFC 3339 and `labels` as label ids.
-/// An id, thread id or label id that is not a Gmail id is Google's fault.
-fn message_fields(body: &Value, id: &str, headers: &[&str], api: &str) -> Result<Args, Failure> {
+/// `message_fields` of the message asked for by `id`; a message whose id is
+/// another is Google's fault.
+fn asked_message_fields(
+    body: &Value,
+    id: &str,
+    headers: &[&str],
+    api: &str,
+) -> Result<Args, Failure> {
     if body.get("id").and_then(Value::as_str) != Some(id) {
         return Err(shape(api));
     }
+    message_fields(body, headers, api)
+}
+
+/// What every message-bearing answer carries of one message: `id`,
+/// `thread_id` when Google gave it, the `headers` through `answer_headers`,
+/// `internal_date` as RFC 3339 and `labels` as label ids. An id, thread id
+/// or label id that is not a Gmail id is Google's fault.
+fn message_fields(body: &Value, headers: &[&str], api: &str) -> Result<Args, Failure> {
+    let id = match body.get("id") {
+        Some(Value::String(id)) if is_gmail_id(id) => id,
+        _ => return Err(shape(api)),
+    };
     let mut out = Args::new();
     out.insert("id".to_string(), json!(id));
     match body.get("threadId") {
@@ -750,7 +845,15 @@ fn message_fields(body: &Value, id: &str, headers: &[&str], api: &str) -> Result
         Some(_) => return Err(shape(api)),
     }
     answer_headers(&mut out, body, headers, api)?;
-    match body.get("internalDate") {
+    received(&mut out, body, api)?;
+    out.insert("labels".to_string(), label_ids(body, api)?);
+    Ok(out)
+}
+
+/// `message`'s `internalDate` into `out` as `internal_date`, RFC 3339, when
+/// Google gave it; one that is not epoch milliseconds is Google's fault.
+fn received(out: &mut Args, message: &Value, api: &str) -> Result<(), Failure> {
+    match message.get("internalDate") {
         None => {}
         Some(Value::String(ms)) => {
             let date = decode::internal_date(ms).ok_or_else(|| shape(api))?;
@@ -758,8 +861,7 @@ fn message_fields(body: &Value, id: &str, headers: &[&str], api: &str) -> Result
         }
         Some(_) => return Err(shape(api)),
     }
-    out.insert("labels".to_string(), label_ids(body, api)?);
-    Ok(out)
+    Ok(())
 }
 
 /// A message's snippet as answered: character references decoded, passed
@@ -977,6 +1079,10 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
         {
             return settle(state.tool, read_cut(state, &size, settings));
         }
+        // TODO(errhandling-cut-thread-read-has-no-fallback-and-max-cannot-help):
+        // a cut thread read fails whatever `max` is; it has no narrower re-read.
+        // TODO(errhandling-refused-search-message-read-fails-the-page): a
+        // search's per-message read cut at the read limit fails the page here.
         Ok(Answer::Truncated(size)) => return Next::Fail(cut_answer(&size)),
         // A message deleted between the listing and its read is skipped, not
         // the search's failure.
@@ -989,6 +1095,8 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             return settle(state.tool, search_message(state, None, settings));
         }
         Ok(Answer::GoogleError { failure, .. }) => return Next::Fail(failure),
+        // TODO(errhandling-refused-search-message-read-fails-the-page): a
+        // search's per-message read refused on the bus cap fails the page here.
         Err(failure) => return Next::Fail(failure),
     };
     settle(
@@ -1006,7 +1114,10 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             }
             (Provided::GmailRead, 1) => read_full(state, &body, settings),
             (Provided::GmailRead, STRUCTURE_STEP) => read_structure(state, &body, settings),
-            (Provided::GmailSearch | Provided::GmailRead, LABELS_STEP) => named(state, &body),
+            (Provided::GmailThread, 1) => thread_read(state, &body, settings),
+            (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
+                named(state, &body)
+            }
             (tool, step) => Err(internal(format!(
                 "in-flight row names step {step} of {}, which has no such step",
                 tool.name()
@@ -1016,12 +1127,14 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
 }
 
 /// A step's decision as the request's next move, a completed answer held to
-/// the result ceiling — after `GmailRead`'s text is cut to fit it.
+/// the result ceiling — after `GmailRead`'s text is cut, or `GmailThread`'s
+/// oldest messages dropped, to fit it.
 fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
     match decided {
         Ok(Next::Complete(value)) => {
             let value = match tool {
                 Provided::GmailRead => fit_text(value, COMPACT_RESULT_CEILING),
+                Provided::GmailThread => fit_thread(value, COMPACT_RESULT_CEILING),
                 Provided::GmailLabels | Provided::GmailSearch => value,
             };
             bounded(value, COMPACT_RESULT_CEILING)
@@ -1131,7 +1244,7 @@ fn search_message(
 fn read_full(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
     let args = stored(state, ReadArgs::parse)?;
     let api = "messages.get";
-    let mut out = message_fields(body, &args.id, READ_HEADERS, api)?;
+    let mut out = asked_message_fields(body, &args.id, READ_HEADERS, api)?;
     let extracted = extract(body, api)?;
     let text = extracted
         .text_parts
@@ -1200,7 +1313,7 @@ fn read_structure(state: &InFlight, body: &Value, settings: &Settings) -> Result
             "in-flight row at the structure step carries no size",
         ));
     };
-    let mut out = message_fields(body, &args.id, READ_HEADERS, api)?;
+    let mut out = asked_message_fields(body, &args.id, READ_HEADERS, api)?;
     let estimate = match body.get("sizeEstimate") {
         None => String::new(),
         Some(estimate) => format!(
@@ -1341,6 +1454,40 @@ fn fit_text(mut answer: Value, ceiling: usize) -> Value {
     answer
 }
 
+/// `answer` with its oldest messages dropped, each counted in
+/// `messages_omitted`, until it serializes within `ceiling`. An answer that
+/// fits is unchanged.
+fn fit_thread(mut answer: Value, ceiling: usize) -> Value {
+    loop {
+        let len = serialized_len(&answer);
+        if len <= ceiling {
+            return answer;
+        }
+        let Some(Value::Array(messages)) = answer.get_mut("messages") else {
+            return answer;
+        };
+        if messages.is_empty() {
+            return answer;
+        }
+        // Each dropped message takes its serialization and a comma with it;
+        // the fewest that cover the excess are dropped, and the loop measures
+        // again, since `messages_omitted` may have grown.
+        let excess = len - ceiling;
+        let mut removed = 0;
+        let mut dropped = 0;
+        while dropped < messages.len() && removed < excess {
+            removed += serialized_len(&messages[dropped]) + 1;
+            dropped += 1;
+        }
+        messages.drain(..dropped);
+        let omitted = answer
+            .get("messages_omitted")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        answer["messages_omitted"] = json!(omitted + dropped as u64);
+    }
+}
+
 fn serialized_len(value: &Value) -> usize {
     serde_json::to_vec(value)
         .expect("a JSON value serializes")
@@ -1379,13 +1526,62 @@ fn search_answer(derived: Args) -> Value {
     Value::Object(out)
 }
 
-/// One message's metadata as a search line: `message_fields` with the
+/// One message's metadata as a search line: `asked_message_fields` with the
 /// `from`, `subject` and `date` headers, and the snippet through
 /// `snippet_value`.
 fn search_line(body: &Value, id: &str) -> Result<Value, Failure> {
     let api = "messages.get";
-    let mut out = message_fields(body, id, SEARCH_HEADERS, api)?;
+    let mut out = asked_message_fields(body, id, SEARCH_HEADERS, api)?;
     if let Some(snippet) = snippet_value(body, api)? {
+        out.insert("snippet".to_string(), json!(snippet));
+    }
+    Ok(Value::Object(out))
+}
+
+/// threads.get read: the newest `max` messages in thread order, the rest
+/// counted; the thread's subject is its first message's, and a message
+/// answers its own subject only when that differs, both compared as Google
+/// sent them. Then the user labels are named.
+fn thread_read(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
+    let args = stored(state, ThreadArgs::parse)?;
+    let api = "threads.get";
+    if body.get("id").and_then(Value::as_str) != Some(args.id.as_str()) {
+        return Err(shape(api));
+    }
+    let messages = match body.get("messages") {
+        Some(Value::Array(messages)) if !messages.is_empty() => messages,
+        _ => return Err(shape(api)),
+    };
+    let mut out = Args::new();
+    out.insert("id".to_string(), json!(args.id));
+    answer_headers(&mut out, &messages[0], &[THREAD_SUBJECT], api)?;
+    let subject = raw_header(&messages[0], THREAD_SUBJECT, api)?;
+    let omitted = messages.len().saturating_sub(args.max);
+    let answered = messages[omitted..]
+        .iter()
+        .map(|message| thread_message(message, subject, api))
+        .collect::<Result<Vec<_>, _>>()?;
+    out.insert("message_count".to_string(), json!(messages.len()));
+    if omitted > 0 {
+        out.insert("messages_omitted".to_string(), json!(omitted));
+    }
+    out.insert("messages".to_string(), Value::Array(answered));
+    finish(Value::Object(out), args.account.as_deref(), settings)
+}
+
+/// One message of a thread: `message_fields` with the `THREAD_HEADERS`,
+/// `THREAD_SUBJECT` among them only when it differs from the thread's
+/// `subject`, and the snippet through `snippet_value`. `THREAD_FIELDS` asks
+/// for no `threadId`, so none is answered.
+fn thread_message(message: &Value, subject: Option<&str>, api: &str) -> Result<Value, Failure> {
+    let differs = raw_header(message, THREAD_SUBJECT, api)? != subject;
+    let headers: Vec<&str> = THREAD_HEADERS
+        .iter()
+        .copied()
+        .filter(|&name| differs || name != THREAD_SUBJECT)
+        .collect();
+    let mut out = message_fields(message, &headers, api)?;
+    if let Some(snippet) = snippet_value(message, api)? {
         out.insert("snippet".to_string(), json!(snippet));
     }
     Ok(Value::Object(out))
@@ -1685,8 +1881,12 @@ mod tests {
         })
     }
 
+    /// A Gmail call's query that names only the `fields` mask.
     fn fields(mask: &str) -> Query {
-        query([("fields", mask.to_string())])
+        query([
+            ("fields", mask.to_string()),
+            ("prettyPrint", "false".to_string()),
+        ])
     }
 
     /// `advance` under the test settings.
@@ -1717,7 +1917,7 @@ mod tests {
                 "method": "GET",
                 "host": "gmail.example.com",
                 "path": "/gmail/v1/users/me/labels",
-                "query": { "fields": "labels(id,name,type)" },
+                "query": { "fields": "labels(id,name,type)", "prettyPrint": "false" },
             })
         );
     }
@@ -2376,6 +2576,7 @@ mod tests {
                     "q": "from:alice@example.com is:unread",
                     "maxResults": "10",
                     "fields": "messages(id,threadId),nextPageToken,resultSizeEstimate",
+                    "prettyPrint": "false",
                 },
             })
         );
@@ -2460,6 +2661,7 @@ mod tests {
                     "metadataHeaders": ["From", "Subject", "Date"],
                     "fields": "id,threadId,labelIds,snippet,internalDate,sizeEstimate,\
                                payload/headers",
+                    "prettyPrint": "false",
                 },
             })
         );
@@ -3245,7 +3447,7 @@ mod tests {
                 "method": "GET",
                 "host": "gmail.example.com",
                 "path": "/gmail/v1/users/me/messages/m1",
-                "query": { "format": "full" },
+                "query": { "format": "full", "prettyPrint": "false" },
             })
         );
         for (args, error) in [
@@ -3730,5 +3932,314 @@ mod tests {
                  not list; attachments below it are not listed"
             ])
         );
+    }
+
+    const THREAD: &str = include_str!("fixtures/thread.json");
+
+    fn thread_state(args: Value) -> InFlight {
+        let call = plan(Provided::GmailThread, &args, &settings()).unwrap();
+        InFlight::new(
+            &"t".repeat(32),
+            Provided::GmailThread,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        )
+    }
+
+    /// The thread fixture with `edit` applied to its messages.
+    fn thread_body(edit: impl FnOnce(&mut Vec<Value>)) -> String {
+        let mut body: Value = serde_json::from_str(THREAD).unwrap();
+        let Value::Array(messages) = &mut body["messages"] else {
+            panic!("the fixture lists messages");
+        };
+        edit(messages);
+        body.to_string()
+    }
+
+    /// `message`'s header `name` set to `value`, replacing any of that name.
+    fn set_header(message: &mut Value, name: &str, value: String) {
+        let Value::Array(headers) = &mut message["payload"]["headers"] else {
+            panic!("the message has headers");
+        };
+        headers.retain(|h| !h["name"].as_str().unwrap().eq_ignore_ascii_case(name));
+        headers.push(json!({ "name": name, "value": value }));
+    }
+
+    #[test]
+    fn thread_plans_one_metadata_read() {
+        let call = plan(
+            Provided::GmailThread,
+            &json!({ "id": "t1", "max": 5, "account": "alice@example.com" }),
+            &settings(),
+        )
+        .unwrap();
+        assert_eq!(call.step, 1);
+        assert_eq!(
+            serde_json::to_value(&call.api).unwrap(),
+            json!({
+                "provider": "google",
+                "account": "alice@example.com",
+                "method": "GET",
+                "host": "gmail.example.com",
+                "path": "/gmail/v1/users/me/threads/t1",
+                "query": {
+                    "format": "metadata",
+                    "metadataHeaders": ["From", "To", "Cc", "Subject", "Date"],
+                    "fields": "id,messages(id,labelIds,snippet,internalDate,payload/headers)",
+                    "prettyPrint": "false",
+                },
+            })
+        );
+        for (args, error) in [
+            (json!({}), "`id` is required"),
+            (
+                json!({ "id": "t/1" }),
+                "`id` must be 1 to 128 letters, digits, `_` or `-`",
+            ),
+            (
+                json!({ "id": "t1", "max": 0 }),
+                "`max` must be an integer from 1 to 100",
+            ),
+            (
+                json!({ "id": "t1", "max": 101 }),
+                "`max` must be an integer from 1 to 100",
+            ),
+            (
+                json!({ "id": "t1", "bodies": true }),
+                "unknown argument `bodies`; this tool takes `id`, `max`, `account`",
+            ),
+        ] {
+            assert_eq!(
+                plan(Provided::GmailThread, &args, &settings()).unwrap_err(),
+                error,
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_thread_answers_its_messages_in_order_and_names_their_labels() {
+        let state = thread_state(json!({ "id": "t1", "account": "alice@example.com" }));
+        let (row, call) = follow(&state, answered(&state, http(200, THREAD)));
+        assert_eq!(call.step, LABELS_STEP);
+        assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
+        let names = r#"{ "labels": [{ "id": "Label_7", "name": "Projects" }] }"#;
+        assert_eq!(
+            completed(answered(&row, http(200, names))),
+            json!({
+                "id": "t1",
+                "subject": "Planning",
+                "message_count": 4,
+                "messages": [
+                    { "id": "m1", "from": "Alice Example <alice@example.com>",
+                      "to": "Bob Example <bob@example.com>",
+                      "date": "Sat, 31 Oct 2026 14:05:09 +0000",
+                      "internal_date": "2026-10-31T14:05:09Z",
+                      "snippet": "Can we meet Tuesday?", "labels": ["SENT"] },
+                    { "id": "m2", "from": "Bob Example <bob@example.com>",
+                      "to": "Alice Example <alice@example.com>",
+                      "cc": "Carol Example <carol@example.com>",
+                      "date": "Sat, 31 Oct 2026 15:05:09 +0000",
+                      "internal_date": "2026-10-31T15:05:09Z",
+                      "snippet": "Tuesday works & I'll book a room",
+                      "labels": ["INBOX", "Projects"] },
+                    { "id": "m3", "from": "Carol Example <carol@example.com>",
+                      "to": "Alice Example <alice@example.com>, Bob Example <bob@example.com>",
+                      "subject": "Re: Planning (room booked)",
+                      "date": "Sat, 31 Oct 2026 16:05:09 +0000",
+                      "internal_date": "2026-10-31T16:05:09Z",
+                      "snippet": "Room 4 is booked",
+                      "labels": ["INBOX", "UNREAD", "Projects"] },
+                    { "id": "m4", "from": "Bob Example <bob@example.com>",
+                      "to": "Carol Example <carol@example.com>",
+                      "date": "Sat, 31 Oct 2026 17:05:09 +0000",
+                      "internal_date": "2026-10-31T17:05:09Z",
+                      "snippet": "See you there", "labels": ["INBOX", "UNREAD"] },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn a_thread_longer_than_max_keeps_the_newest() {
+        let state = thread_state(json!({ "id": "t1", "max": 2 }));
+        let (row, _) = follow(&state, answered(&state, http(200, THREAD)));
+        let answer = completed(answered(&row, http(200, "{}")));
+        assert_eq!(answer["subject"], json!("Planning"));
+        assert_eq!(answer["message_count"], json!(4));
+        assert_eq!(answer["messages_omitted"], json!(2));
+        let ids: Vec<&str> = answer["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["m3", "m4"]);
+        assert_eq!(answer["messages"][1].get("subject"), None);
+
+        let whole = thread_state(json!({ "id": "t1", "max": 4 }));
+        let (row, _) = follow(&whole, answered(&whole, http(200, THREAD)));
+        let answer = completed(answered(&row, http(200, "{}")));
+        assert_eq!(answer.get("messages_omitted"), None);
+        assert_eq!(answer["messages"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn thread_headers_are_bounded_and_flagged_per_object() {
+        let body = thread_body(|messages| {
+            set_header(&mut messages[0], "Subject", "s".repeat(1001));
+            set_header(&mut messages[1], "Subject", "s".repeat(1001));
+            set_header(&mut messages[1], "Cc", "c".repeat(4001));
+            set_header(&mut messages[2], "Subject", "s".repeat(1000) + "t");
+            set_header(&mut messages[3], "To", "t".repeat(4000));
+            for message in messages.iter_mut() {
+                message["labelIds"] = json!(["INBOX"]);
+            }
+        });
+        let answer = completed(answered(
+            &thread_state(json!({ "id": "t1" })),
+            http(200, &body),
+        ));
+        let cut = |c: &str, n: usize| format!("{}…", c.repeat(n));
+        assert_eq!(answer["subject"], json!(cut("s", 1000)));
+        assert_eq!(answer["headers_truncated"], json!(["subject"]));
+        let messages = answer["messages"].as_array().unwrap();
+        assert_eq!(messages[0].get("subject"), None);
+        assert_eq!(messages[0].get("headers_truncated"), None);
+        assert_eq!(messages[1].get("subject"), None);
+        assert_eq!(messages[1]["cc"], json!(cut("c", 4000)));
+        assert_eq!(messages[1]["headers_truncated"], json!(["cc"]));
+        assert_eq!(messages[2]["subject"], json!(cut("s", 1000)));
+        assert_eq!(messages[2]["headers_truncated"], json!(["subject"]));
+        assert_eq!(messages[3]["subject"], json!("Planning"));
+        assert_eq!(messages[3]["to"], json!("t".repeat(4000)));
+        assert_eq!(messages[3].get("headers_truncated"), None);
+    }
+
+    /// A thread of `count` messages, each with `To` and `Cc` at their bound in
+    /// `"` (the widest serialization) and labelled `labels`.
+    fn wide_thread(count: usize, labels: &[&str]) -> String {
+        let messages: Vec<Value> = (0..count)
+            .map(|i| {
+                json!({
+                    "id": format!("m{i}"),
+                    "labelIds": labels,
+                    "snippet": "Hello",
+                    "internalDate": "1793455509000",
+                    "payload": { "headers": [
+                        { "name": "From", "value": "Alice Example <alice@example.com>" },
+                        { "name": "To", "value": "\"".repeat(4000) },
+                        { "name": "Cc", "value": "\"".repeat(4000) },
+                        { "name": "Subject", "value": if i == 0 { "Planning" } else { "Re: Planning" } },
+                    ] },
+                })
+            })
+            .collect();
+        json!({ "id": "t1", "messages": messages }).to_string()
+    }
+
+    /// The ids `answer` kept, which must be the newest of a `count`-message
+    /// thread, with every other message counted as omitted.
+    fn kept_newest(answer: &Value, count: usize) -> usize {
+        let messages = answer["messages"].as_array().unwrap();
+        let kept = messages.len();
+        assert!(kept > 0 && kept < count, "{kept}");
+        assert_eq!(answer["messages_omitted"], json!(count - kept));
+        assert_eq!(answer["message_count"], json!(count));
+        for (i, message) in messages.iter().enumerate() {
+            assert_eq!(message["id"], json!(format!("m{}", count - kept + i)));
+        }
+        assert_eq!(answer["subject"], json!("Planning"));
+        assert!(serialized_len(answer) <= COMPACT_RESULT_CEILING);
+        kept
+    }
+
+    #[test]
+    fn a_thread_past_the_ceiling_keeps_fewer_of_the_newest() {
+        let state = thread_state(json!({ "id": "t1", "max": 100 }));
+        let answer = completed(answered(&state, http(200, &wide_thread(100, &["INBOX"]))));
+        let unlabelled = kept_newest(&answer, 100);
+        // Dropped no more than it had to: one more message would not fit.
+        let mut one_more = answer.clone();
+        let Value::Array(messages) = &mut one_more["messages"] else {
+            unreachable!()
+        };
+        messages.insert(0, messages[0].clone());
+        one_more["messages_omitted"] = json!(100 - unlabelled - 1);
+        assert!(serialized_len(&one_more) > COMPACT_RESULT_CEILING);
+
+        // `max` leaves 40 out before the ceiling drops more; the count covers
+        // both, and the same newest messages are kept.
+        let capped = thread_state(json!({ "id": "t1", "max": 60 }));
+        let answer = completed(answered(&capped, http(200, &wide_thread(100, &["INBOX"]))));
+        assert_eq!(kept_newest(&answer, 100), unlabelled);
+        assert!(unlabelled < 60);
+
+        let (row, call) = follow(
+            &state,
+            answered(&state, http(200, &wide_thread(100, &["INBOX", "Label_12"]))),
+        );
+        assert_eq!(call.step, LABELS_STEP);
+        let long_name = "n".repeat(225);
+        let names = json!({ "labels": [{ "id": "Label_12", "name": long_name }] }).to_string();
+        let named = completed(answered(&row, http(200, &names)));
+        assert_eq!(named["messages"][0]["labels"], json!(["INBOX", long_name]));
+        assert!(kept_newest(&named, 100) < unlabelled);
+    }
+
+    #[test]
+    fn fit_thread_leaves_an_answer_that_fits() {
+        let answer = json!({ "id": "t1", "message_count": 1, "messages": [{ "id": "m1" }] });
+        assert_eq!(fit_thread(answer.clone(), COMPACT_RESULT_CEILING), answer);
+        let fitted = fit_thread(answer.clone(), serialized_len(&answer) - 1);
+        assert_eq!(fitted["messages"], json!([]));
+        assert_eq!(fitted["messages_omitted"], json!(1));
+
+        // A count `max` already started is added to, not replaced.
+        let mut capped = answer;
+        capped["messages_omitted"] = json!(2);
+        let fitted = fit_thread(capped.clone(), serialized_len(&capped) - 1);
+        assert_eq!(fitted["messages"], json!([]));
+        assert_eq!(fitted["messages_omitted"], json!(3));
+    }
+
+    #[test]
+    fn thread_refuses_an_unexpected_shape_or_a_cut_answer() {
+        let state = thread_state(json!({ "id": "t1" }));
+        for body in [
+            r#"{ "id": "t2", "messages": [{ "id": "m1" }] }"#.to_string(),
+            r#"{ "id": "t1" }"#.to_string(),
+            r#"{ "id": "t1", "messages": [] }"#.to_string(),
+            r#"{ "id": "t1", "messages": {} }"#.to_string(),
+            r#"{ "id": "t1", "messages": [{ "id": "m/1" }] }"#.to_string(),
+            r#"{ "id": "t1", "messages": [{ "id": 7 }] }"#.to_string(),
+            r#"{ "id": "t1", "messages": [{ "id": "m1", "labelIds": ["a b"] }] }"#.to_string(),
+            r#"{ "id": "t1", "messages": [{ "id": "m1", "internalDate": 7 }] }"#.to_string(),
+            r#"{ "id": "t1", "messages": [{ "id": "m1", "payload": { "headers": {} } }] }"#
+                .to_string(),
+            thread_body(|messages| messages[3]["id"] = json!("m 4")),
+        ] {
+            assert_eq!(
+                answered(&state, http(200, &body)),
+                Next::Fail(shape("threads.get")),
+                "{body}"
+            );
+        }
+        assert_eq!(
+            answered(&state, cut_read(json!(300000))),
+            Next::Fail(cut_answer("300000 bytes"))
+        );
+    }
+
+    #[test]
+    fn a_message_of_a_thread_past_max_is_not_read() {
+        // The oldest message is malformed, but `max` leaves it out.
+        let body = thread_body(|messages| messages[0]["labelIds"] = json!(["a b"]));
+        let state = thread_state(json!({ "id": "t1", "max": 3 }));
+        let (row, _) = follow(&state, answered(&state, http(200, &body)));
+        let answer = completed(answered(&row, http(200, "{}")));
+        assert_eq!(answer["messages_omitted"], json!(1));
     }
 }

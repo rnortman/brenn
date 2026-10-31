@@ -35,6 +35,7 @@ const TOOLS: &[(&str, &str)] = &[
     ("gmail-labels", "GmailLabels"),
     ("gmail-search", "GmailSearch"),
     ("gmail-read", "GmailRead"),
+    ("gmail-thread", "GmailThread"),
 ];
 
 /// The paths the instance's clauses admit, one per endpoint the tools call.
@@ -43,6 +44,7 @@ const PATHS: &[&str] = &[
     "/gmail/v1/users/me/labels/*",
     "/gmail/v1/users/me/messages",
     "/gmail/v1/users/me/messages/*",
+    "/gmail/v1/users/me/threads/*",
 ];
 
 /// The class's packaged specification.

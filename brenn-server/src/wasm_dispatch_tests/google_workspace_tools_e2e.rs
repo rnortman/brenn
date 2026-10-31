@@ -51,6 +51,7 @@ const WORK_BEARER: &str = "AT-alice-work";
 
 const LABELS: &str = "/gmail/v1/users/me/labels";
 const MESSAGES: &str = "/gmail/v1/users/me/messages";
+const THREADS: &str = "/gmail/v1/users/me/threads";
 
 /// The instance's `api-request` clauses, as exact path, each a `GET` on the
 /// stub's host for any user: one per endpoint the tools built so far call.
@@ -59,6 +60,7 @@ const CLAUSES: &[&str] = &[
     "/gmail/v1/users/me/labels/*",
     MESSAGES,
     "/gmail/v1/users/me/messages/*",
+    "/gmail/v1/users/me/threads/*",
 ];
 
 /// The component's `provide` statements, lowered from its packaged
@@ -158,15 +160,21 @@ async fn rig_configured(
     .await
 }
 
+/// The query pairs a Gmail call sends: `expected` plus the `prettyPrint=false`
+/// every Gmail call carries.
+fn gmail_query(expected: &[(&str, &str)]) -> Pairs {
+    pairs(&[expected, &[("prettyPrint", "false")]].concat())
+}
+
 /// labels.list's query as the `GmailLabels` listing sends it.
 fn labels_list_query() -> Pairs {
-    pairs(&[("fields", "labels(id,name,type)")])
+    gmail_query(&[("fields", "labels(id,name,type)")])
 }
 
 /// messages.get's metadata query for one search line: the three
 /// `metadataHeaders`, each its own query key.
 fn metadata_query() -> Pairs {
-    pairs(&[
+    gmail_query(&[
         ("format", "metadata"),
         (
             "fields",
@@ -216,7 +224,7 @@ fn scope_denied() -> Result<serde_json::Value, ToolError> {
 
 /// messages.list's query for `q` at the default page size.
 fn search_list_query(q: &str) -> Pairs {
-    pairs(&[
+    gmail_query(&[
         ("q", q),
         ("maxResults", "10"),
         (
@@ -328,7 +336,7 @@ async fn labels_with_an_id_reads_its_counts() {
         [(
             "GET".to_string(),
             "/gmail/v1/users/me/labels/Label_7".to_string(),
-            pairs(&[(
+            gmail_query(&[(
                 "fields",
                 "id,name,type,messagesTotal,messagesUnread,threadsTotal,threadsUnread"
             )]),
@@ -442,7 +450,7 @@ async fn search_lists_reads_each_message_then_names_labels() {
             (
                 "GET".to_string(),
                 MESSAGES.to_string(),
-                pairs(&[
+                gmail_query(&[
                     ("q", "from:example.com newer_than:7d"),
                     ("maxResults", "2"),
                     (
@@ -456,7 +464,7 @@ async fn search_lists_reads_each_message_then_names_labels() {
             (
                 "GET".to_string(),
                 LABELS.to_string(),
-                pairs(&[("fields", "labels(id,name)")]),
+                gmail_query(&[("fields", "labels(id,name)")]),
             ),
         ]
     );
@@ -484,7 +492,7 @@ async fn search_sends_the_page_token_and_an_empty_page_completes() {
         [(
             "GET".to_string(),
             MESSAGES.to_string(),
-            pairs(&[
+            gmail_query(&[
                 ("q", "is:starred"),
                 ("maxResults", "10"),
                 ("pageToken", "page-2"),
@@ -734,7 +742,7 @@ async fn a_clause_miss_is_internal_could_not_be_issued() {
 }
 
 fn full_read_query() -> Pairs {
-    pairs(&[("format", "full")])
+    gmail_query(&[("format", "full")])
 }
 
 /// One message as messages.get (full) answers it: a `multipart/mixed` of a
@@ -856,7 +864,7 @@ async fn read_decodes_the_full_message_and_names_its_labels() {
             (
                 "GET".to_string(),
                 LABELS.to_string(),
-                pairs(&[("fields", "labels(id,name)")]),
+                gmail_query(&[("fields", "labels(id,name)")]),
             ),
         ]
     );
@@ -984,7 +992,7 @@ async fn a_read_past_the_limit_falls_back_to_the_structure() {
             (
                 "GET".to_string(),
                 path,
-                pairs(&[
+                gmail_query(&[
                     ("format", "full"),
                     (
                         "fields",
@@ -998,5 +1006,117 @@ async fn a_read_past_the_limit_falls_back_to_the_structure() {
             ),
         ]
     );
+    r.assert_finished(&id);
+}
+
+/// One message of a thread as threads.get (metadata) answers it.
+fn thread_message_body(id: &str, from: &str, subject: &str, labels: &[&str]) -> serde_json::Value {
+    json!({
+        "id": id,
+        "labelIds": labels,
+        "snippet": format!("{subject} &amp; more"),
+        "internalDate": "1793455509000",
+        "payload": { "headers": [
+            { "name": "From", "value": from },
+            { "name": "To", "value": "Bob Example <bob@example.com>" },
+            { "name": "Subject", "value": subject },
+            { "name": "Date", "value": "Sat, 31 Oct 2026 14:05:09 +0000" },
+        ] },
+    })
+}
+
+/// `GmailThread` reads the thread in one metadata call with the five
+/// `metadataHeaders`, keeps the newest `max` messages and counts the rest,
+/// answers the thread's subject as its first message's even though that
+/// message is left out, and names the user label a kept message carries.
+#[tokio::test]
+async fn thread_reads_once_and_keeps_the_newest_messages() {
+    let r = rig().await;
+    let path = format!("{THREADS}/t1");
+    r.answer(
+        &path,
+        serde_json::to_string_pretty(&json!({
+            "id": "t1",
+            "messages": [
+                thread_message_body("m1", "Alice Example <alice@example.com>", "Planning", &["SENT"]),
+                thread_message_body("m2", "Bob Example <bob@example.com>", "Planning", &["INBOX"]),
+                thread_message_body(
+                    "m3",
+                    "Carol Example <carol@example.com>",
+                    "Re: Planning",
+                    &["INBOX", "Label_7"],
+                ),
+            ],
+        }))
+        .unwrap(),
+    );
+    r.answer(LABELS, labels_body());
+    let call = r.call_for_alice("GmailThread", json!({ "id": "t1", "max": 2 }));
+    let id = r.requested_id().await;
+
+    r.serve().await;
+    for step in [1, 100] {
+        assert_eq!(r.inflight_keys(), [format!("{id}/{step}")]);
+        r.run_nested().await;
+        r.serve().await;
+    }
+
+    let answer = call.await.unwrap().expect("the component answered");
+    let kept = |id: &str, from: &str, labels: &[&str]| {
+        json!({
+            "id": id,
+            "from": from,
+            "to": "Bob Example <bob@example.com>",
+            "date": "Sat, 31 Oct 2026 14:05:09 +0000",
+            "internal_date": "2026-10-31T14:05:09Z",
+            "labels": labels,
+        })
+    };
+    let mut m2 = kept("m2", "Bob Example <bob@example.com>", &["INBOX"]);
+    m2["snippet"] = json!("Planning & more");
+    let mut m3 = kept(
+        "m3",
+        "Carol Example <carol@example.com>",
+        &["INBOX", "Receipts"],
+    );
+    m3["snippet"] = json!("Re: Planning & more");
+    m3["subject"] = json!("Re: Planning");
+    assert_eq!(
+        answer,
+        json!({
+            "id": "t1",
+            "subject": "Planning",
+            "message_count": 3,
+            "messages_omitted": 1,
+            "messages": [m2, m3],
+        })
+    );
+    assert_eq!(
+        r.seen(),
+        [
+            (
+                "GET".to_string(),
+                path,
+                gmail_query(&[
+                    ("format", "metadata"),
+                    (
+                        "fields",
+                        "id,messages(id,labelIds,snippet,internalDate,payload/headers)",
+                    ),
+                    ("metadataHeaders", "From"),
+                    ("metadataHeaders", "To"),
+                    ("metadataHeaders", "Cc"),
+                    ("metadataHeaders", "Subject"),
+                    ("metadataHeaders", "Date"),
+                ]),
+            ),
+            (
+                "GET".to_string(),
+                LABELS.to_string(),
+                gmail_query(&[("fields", "labels(id,name)")]),
+            ),
+        ]
+    );
+    assert_eq!(r.bearers(), vec![format!("Bearer {BEARER}"); 2]);
     r.assert_finished(&id);
 }

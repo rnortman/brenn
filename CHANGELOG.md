@@ -108,6 +108,18 @@ All notable changes to Brenn are documented here.
   included. When a message has both versions the plain one is still read,
   unless it is blank.
 
+- **`google-workspace-tools` adds a `GmailThread` tool**: one email
+  conversation's messages in order, oldest first, without their bodies —
+  each with its sender, recipients, date, Gmail's preview and labels by
+  name, and its subject only where it changes. The newest 30 are given by
+  default (up to 100), and the answer says how many were left out,
+  including any dropped to keep it within the component's result size
+  limit. A thread whose headers together are too large to read is refused,
+  whatever the number asked for. The guide's instance block in
+  `docs/google-workspace.md` gains the `threads` clause the tool needs and
+  the assistant's grant line. All of the component's Gmail reads now ask
+  Google for compact answers, which leaves more room under the size limits.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key

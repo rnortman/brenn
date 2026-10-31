@@ -11,7 +11,47 @@ envelope (which refuses every config at today's defaults), or the provider
 default drops to fit the bus default, or the limits are documented as
 independent; then make `MAX_RESPONSE_BYTES_CEILING`'s compile-time tie to
 `MAX_ASYNC_RESULT_BYTES` (`brenn-tool-registry/src/descriptor.rs`) say which
-cap it means.
+cap it means. Escaping is not a fixed half-again: a JSON answer whose text is
+dense in `"` or `\` (sender-written mail headers, for one) serializes to about
+twice its length, so at a `max_body_bytes` of half again the read limit such a
+read is refused on the bus cap at about three quarters of the read limit.
+That refusal is not a cut, so a tool's fallback for a cut read does not run:
+a `GmailRead` message whose headers carry enough quotes or backslashes is
+answered `internal` naming `max_body_bytes`, not without its body as its
+description says of a message over the read limit.
+
+## `errhandling-cut-thread-read-has-no-fallback-and-max-cannot-help`
+
+`google-workspace-tools`' `GmailThread` reads a thread in one `threads.get`
+call that carries every message's metadata, and applies `max` afterwards, so a
+thread whose headers together are too large to read is answered `internal` on
+every attempt — cut by `api-request` at the provider's `max_response_bytes`
+(`advance`, the `Answer::Truncated` arm), or, when sender-written headers
+dense in quotes or backslashes escape to about twice their size, refused by
+the executor on `[messaging] max_body_bytes` at about three quarters of the
+read limit under the guide's pair — and cannot be read through the tool at
+all; a smaller `max` does not help, and the tool's description says so. A
+handful of reply-all messages each sent to a couple of thousand visible
+recipients reaches the read limit at its 256 KiB default, and a participant
+can provoke either refusal with the headers they write. `GmailRead` re-reads a
+cut message without its body; `GmailThread` has no narrower re-read. The fix
+shape is a narrower re-read when the first read is cut, answered with a marker
+saying what was left out, plus the description clause and tests; a re-read
+keeping `From`, `Subject`, `Date` closes the wide-recipient case. It does not
+close a sender who fills headers: `From` and `Subject` are as sender-written
+and unbounded in the read as `To`/`Cc`, and replies copy the subject into
+every message, so a re-read that keeps them does not close it. That sender's
+message is not readable through these tools, and neither is a reply that
+copies a filled header: every reply copies the subject, and a reply-all copies
+the sender's `From` into `To`, which `GmailRead` reads with every other
+header. A search that lists a message with a filled `From` or `Subject` fails
+(`errhandling-refused-search-message-read-fails-the-page`). The Calendar-cycle
+design picks, once, together with the Calendar tools' one-call event listings,
+which meet the same one-call-then-narrower-read question, so that both take
+one rule. Until then the assistant's remedy for an honest wide thread is
+`GmailSearch` plus `GmailRead`, and the operator's is the operator guide's
+thread item, which raises `max_response_bytes` and
+`[messaging] max_body_bytes` together.
 
 ## `errhandling-gmail-403-always-denied-with-scope-hint`
 
@@ -40,6 +80,34 @@ caller error. Decide the rule across the Gmail tools — a per-step declaration
 of which statuses the caller's input can cause, or a coarser rule such as 404
 the caller's and 400 the wrapper's unless the step carries `q` or `page` — and
 apply it to every step.
+
+## `errhandling-refused-search-message-read-fails-the-page`
+
+`GmailSearch` reads `From`, `Subject` and `Date` of every message its page
+lists (`message_metadata_call`). A message whose sender filled those headers
+with quotes or backslashes can be refused on the bus cap
+(`[messaging] max_body_bytes`) below the read limit under the operator guide's
+limit pair (the ratio is `api-request-read-limit-vs-bus-cap`'s). The refusal
+reaches `advance` as an `Err` and fails the whole request: the page's other
+messages and its `next_page` token are lost with it, and only a narrower query
+that lists no message carrying the filled headers gets the listing back. A
+read cut at the read limit fails the page the same way, through the
+`Truncated` arm. The one
+per-message outcome skipped today is Google's 404
+(`search_message(state, None, …)`, which lists the id in the answer's
+`unavailable`). Done: the page is answered, and the message whose read was
+refused or cut is named in it by id as unreadable, so the assistant can say so
+and exclude it; `unavailable`, a sibling list beside it, or a marked line in
+`messages` is the shape to pick with the rule. Open question for the rule: the
+bus-cap refusal reaches the component as the same nested `internal` as an
+`api-request` transport failure or a wrapper bug, told apart only by the
+executor's detail text, so either the skip covers any failed per-message read
+or the refusal needs a typed kind on the nested-call error vocabulary, which
+out-of-tree components see. The rule for every nested read that is refused or
+cut — this search skip, the thread fallback
+(`errhandling-cut-thread-read-has-no-fallback-and-max-cannot-help`), and the
+Calendar listings that meet the same question — is designed once, in the
+Calendar tools' cycle, so that all take one rule.
 
 ## `provider-kit`
 
