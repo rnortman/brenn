@@ -85,6 +85,12 @@ All notable changes to Brenn are documented here.
   settings, and automations that act without a user;
   `docs/providers/google.md` drops the Calendar examples the tools replace.
 
+- Internal: a new in-tree crate, `brenn-provider-kit`, holds the core the
+  two Google tool components share (the record a request keeps while it
+  waits on `api-request`, argument and setting readers, and the reading of
+  Google's answers), with its own tests. Nothing uses it yet; nothing an
+  operator or the assistant sees changes.
+
 ## [0.30.1] — 2026-10-31
 
 - **Fix: an MQTT client with more than 64 subscriptions no longer hangs

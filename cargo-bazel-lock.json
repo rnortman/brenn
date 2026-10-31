@@ -1,5 +1,5 @@
 {
-  "checksum": "b6af398581ab703d82db11b555829acdab9c2ef1a49a9e2c8c6f5b13feb1741c",
+  "checksum": "61b65d90df4c90383bb9d57b44f9231d3386a7eba31fbcaadc549ba7cde975a2",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -4843,6 +4843,50 @@
               "id": "pulldown-cmark 0.13.5",
               "target": "pulldown_cmark"
             },
+            {
+              "id": "serde 1.0.228",
+              "target": "serde"
+            },
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-provider-kit 0.1.0": {
+      "name": "brenn-provider-kit",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_provider_kit",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_provider_kit",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
             {
               "id": "serde 1.0.228",
               "target": "serde"
@@ -37159,6 +37203,7 @@
     "brenn-page-harness 0.1.0": "surface/page-harness",
     "brenn-pfin 0.1.0": "brenn-pfin",
     "brenn-protobar 0.1.0": "surface/components/protobar",
+    "brenn-provider-kit 0.1.0": "brenn-provider-kit",
     "brenn-pwa-push 0.1.0": "brenn-pwa-push",
     "brenn-queue 0.1.0": "brenn-queue",
     "brenn-remote-server 0.1.0": "brenn-remote-server",

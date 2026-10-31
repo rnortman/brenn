@@ -1,0 +1,35 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# The host graph's build. Nothing in the host binaries links it; it exists for
+# the crate's own tests. `testutils` carries the `schema` parity checker and
+# the `testutil` fixtures; the release configs clear the flag.
+rust_library(
+    name = "brenn-provider-kit",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "brenn-provider-kit_test",
+    crate = ":brenn-provider-kit",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "brenn-provider-kit_doc_test",
+    crate = ":brenn-provider-kit",
+)

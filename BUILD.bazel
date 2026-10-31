@@ -155,6 +155,7 @@ filegroup(
         "//brenn-oauth:policy_srcs",
         "//brenn-obs:policy_srcs",
         "//brenn-pfin:policy_srcs",
+        "//brenn-provider-kit:policy_srcs",
         "//brenn-pwa-push:policy_srcs",
         "//brenn-queue:policy_srcs",
         "//brenn-remote-server:policy_srcs",
