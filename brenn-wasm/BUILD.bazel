@@ -15,6 +15,7 @@ COMPONENT_NAMES = [
     "git-forge-parser",
     "git-sync-consumer",
     "google-maps-tools",
+    "google-workspace-tools",
     "processor-call-test",
     "processor-config",
     "processor-demo",
@@ -48,6 +49,7 @@ COMPONENT_PACKAGES = {
     "git-forge-parser": ("brenn:processor", "//:config/specs/git-forge-parser.brenn"),
     "git-sync-consumer": ("brenn:processor", "//:config/specs/git-sync-consumer.brenn"),
     "google-maps-tools": ("brenn:processor", "//:config/specs/google-maps-tools.brenn"),
+    "google-workspace-tools": ("brenn:processor", "//:config/specs/google-workspace-tools.brenn"),
     "processor-demo": ("brenn:processor", "//:config/specs/processor-demo.brenn"),
     # Replay components have no component class, no ports and no grants, so
     # their packages are artifact plus record and nothing else.

@@ -69,6 +69,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-google-workspace-tools"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "brenn-guest"
 version = "0.1.0"
 dependencies = [

@@ -13,6 +13,52 @@ independent; then make `MAX_RESPONSE_BYTES_CEILING`'s compile-time tie to
 `MAX_ASYNC_RESULT_BYTES` (`brenn-tool-registry/src/descriptor.rs`) say which
 cap it means.
 
+## `errhandling-gmail-403-always-denied-with-scope-hint`
+
+`google-workspace-tools` answers every Google HTTP 403 `denied` with a
+sentence pointing at `oauth-connect` (`google_error`). Gmail also answers 403
+for usage limits (`userRateLimitExceeded`, `rateLimitExceeded`,
+`dailyLimitExceeded` — transient, like 429, which is answered `internal`) and
+for an API not enabled in the operator's Cloud project (`SERVICE_DISABLED` /
+`accessNotConfigured` — an operator setup fault). Google names the case in
+`error.errors[].reason` and in an `ErrorInfo` entry of `error.details[]`. Once
+live 403 bodies have been captured (the guide's acceptance walk-through),
+decide whether `google_error` reads that reason — scope reasons `denied` with
+the hint, quota and service reasons `internal`, and which branch wins when the
+field is absent — or the mapping stays unconditional and the guide's "when a
+step fails" paragraph names the quota and "has not been used in project"
+messages as not scope problems.
+
+## `errhandling-gmail-4xx-on-fixed-request-blamed-on-caller`
+
+`google-workspace-tools` answers every Google 400 and 404 `invalid_args`
+(`google_error`), including on requests whose path and `fields` mask are
+constants and carry nothing from the caller: `GmailLabels` without `id`, and
+the mask on `labels.get`. A refused mask or a moved path there is the
+wrapper's or Google's fault, but reaches the model and the invocation log as
+caller error. Decide the rule across the Gmail tools — a per-step declaration
+of which statuses the caller's input can cause, or a coarser rule such as 404
+the caller's and 400 the wrapper's unless the step carries `q` or `page` — and
+apply it to every step.
+
+## `provider-kit`
+
+`google-maps-tools` and `google-workspace-tools` each carry their own copy of
+the provider-component core: the in-flight row (`call_id`, `InFlight`,
+`INFLIGHT_TTL_MS`, `row_expired`, `claim`, `provided_name`), the argument
+helpers (`object`, `capped`), `NestedError`, `Failure`, `ErrorKind`, `cut`,
+`not_issued`, `result_summary`, `bounded`, `copy`, the envelope-reading half of
+`read_api_result` (status, `truncated` with `bytes`, binary, redirect,
+non-JSON), the `lib.rs` sweep/answer/issue glue, and the tests proving them.
+The copies already differ: Maps does not relay `credential_invalid`, keeps the
+POST sentence on a nested `denied`, and answers 403 `internal` where the
+Workspace copy answers `denied` with a scope hint. Decide
+the shared home — a host-testable `std` + `serde` crate in the components
+workspace, SDK helpers in `brenn-guest::provides` (an out-of-tree surface), or
+both — and what stays per provider (Google's error mapping, the credential
+relay), with the multi-step state of `GmailSearch` and the Calendar tools in
+view; then move both components onto it and delete the copied tests.
+
 ## `security-host-paths-follow-agent-symlinks`
 
 Brenn's host process creates, writes and deletes under trees the agent's

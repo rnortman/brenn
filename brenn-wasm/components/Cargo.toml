@@ -26,6 +26,7 @@ members = [
     "git-forge-parser",
     "git-sync-consumer",
     "google-maps-tools",
+    "google-workspace-tools",
     "processor-call-test",
     "processor-config",
     "processor-demo",

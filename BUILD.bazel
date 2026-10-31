@@ -172,6 +172,7 @@ filegroup(
         "//brenn-wasm/components/git-forge-parser:policy_srcs",
         "//brenn-wasm/components/git-sync-consumer:policy_srcs",
         "//brenn-wasm/components/google-maps-tools:policy_srcs",
+        "//brenn-wasm/components/google-workspace-tools:policy_srcs",
         "//brenn-wasm/components/guest:policy_srcs",
         "//brenn-wasm/components/processor-call-test:policy_srcs",
         "//brenn-wasm/components/processor-config:policy_srcs",

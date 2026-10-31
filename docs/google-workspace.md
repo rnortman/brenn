@@ -42,7 +42,7 @@ Gmail's read and modify scopes are *restricted*. An unverified app shows users
 an "unverified app" warning before consent. Google may also refuse restricted
 scopes to an unverified app entirely. If so, the consent attempt ends with
 "nothing was connected", and calendar scopes, which are only *sensitive*,
-still connect on their own. The first acceptance step (section 5) finds out
+still connect on their own. The first acceptance step (section 6) finds out
 which applies to your project.
 
 ## 2. The vault
@@ -141,7 +141,47 @@ new agenda_sync: AgendaSync {
 
 The rate limit applies per app, or per component, across all its users.
 
-## 5. First connect: acceptance
+## 5. The component
+
+The `google-workspace-tools` component answers the assistant's Gmail tools
+with stamped `api-request` calls for whichever user is calling. Its class,
+`GoogleWorkspaceTools`, is imported from the release's module root, at the top
+of the document with any other `use` lines:
+
+```
+use @google-workspace-tools::*;
+```
+
+Then the inbox tuning and the instance:
+
+```
+// Each live request has one nested call outstanding: Σ max_concurrency
+// results can arrive between two activations, twice over if one is
+// re-delivered. 64 holds the 32 ceiling on Σ twice over, so tools joining the
+// class change nothing here.
+channel at "brenn:tool-results/workspace" {
+  push_depth = 1;
+  retain_depth = 64;
+  standing_retain_depth = 64;
+  noise = alarm;
+}
+
+new workspace: GoogleWorkspaceTools {
+  grants = [log, store, config, tools, provides];
+  store_path = "/var/lib/brenn/google-workspace-tools.db";
+  tool api-request {
+    allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/labels"; }
+    allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/labels/*"; }
+    rate_limit { burst = 60; sustained_per_minute = 120; }
+  }
+  config = {
+    provider = "google",
+    gmail_host = "gmail.googleapis.com"
+  };
+}
+```
+
+## 6. First connect: acceptance
 
 Do this once per deployment, in order.
 
@@ -170,7 +210,7 @@ Do this once per deployment, in order.
    that Brenn no longer appears at `myaccount.google.com/permissions` for that
    account, and that its file is gone from the vault.
 
-## 6. Rotating and removing by hand
+## 7. Rotating and removing by hand
 
 - **A user's credential.** Delete
   `<vault_dir>/google/<username>/<account>.json`. The next request for it

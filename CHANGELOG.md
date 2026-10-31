@@ -63,6 +63,19 @@ All notable changes to Brenn are documented here.
   comma. For Google endpoints the component does not cover,
   `docs/providers/google-maps.md` gives ready-made `api-request` examples.
 
+- **New `google-workspace-tools` component: a user's Gmail as assistant
+  tools.** Instead of composing raw `api-request` calls, the assistant gets
+  native tools that call Gmail with the calling user's connected Google
+  account (Brenn attaches the token; the component never sees it) and
+  return compact answers. This first release has `GmailLabels`: the user's
+  labels, or one label with its message and thread counts. A user who has
+  not connected an account gets the same `credential_invalid` answer
+  `api-request` gives, so the assistant offers to connect; a user with
+  several accounts names one as `account`. The component's class spec,
+  `config/specs/google-workspace-tools.brenn`, documents its configuration
+  keys and the result-inbox sizing it needs; `docs/google-workspace.md`
+  gives its instance.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key

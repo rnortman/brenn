@@ -312,6 +312,10 @@ pub struct Call {
     pub api: ApiCall,
 }
 
+// TODO(provider-kit): the in-flight row (`call_id`, `InFlight`, `row_expired`,
+// `claim`), the argument helpers, `NestedError` and the reading of
+// `api-request`'s answer envelope are copied in `google-workspace-tools`.
+
 /// The correlation id of a request's nested call: `<pending id>/<step>`.
 pub fn call_id(id: &str, step: u8) -> String {
     format!("{id}/{step}")

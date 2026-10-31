@@ -1,0 +1,53 @@
+/// A user's Google Workspace for an assistant, as native tools, each answered
+/// by `api-request` calls against the `oauth_provider` the instance names,
+/// stamped with the calling conversation's owner and compacted to what a model
+/// needs. The user's token never reaches this component; `api-request`
+/// attaches it host-side. Every call is nested under a request: an instance
+/// whose clauses say `user = "*"` cannot call on its own account, so a caller
+/// with no user of its own is answered `denied`.
+///
+/// Every capability is load-bearing: `config` names the provider and its
+/// hosts, without which no call can be addressed; `store` carries each
+/// request's state between the activation that issues its nested call and the
+/// one that receives the answer; `tools` is the authority to call
+/// `api-request`; `provides` is what makes the tools exist; `log` records each
+/// step's tool, status and size — never a body, a header or a query.
+///
+/// The instance's `config = { ... };` map is flat: `provider` is the
+/// `oauth_provider` name; `gmail_host` is the `host[:port]` Gmail is called on,
+/// which `api-request` matches against that provider's `api_hosts` and the
+/// instance's clauses must admit. A missing or malformed key fails every
+/// activation, naming the key.
+///
+/// Size the instance's result inbox with a `channel at
+/// "brenn:tool-results/<slug>"` block: each live request has at most one
+/// nested call outstanding, so the window must hold Σ max_concurrency results,
+/// twice over for a re-delivered result — `retain_depth ≥ 2 × Σ`, rounded up to
+/// a power of two. 64 is the documented value: it holds any Σ max_concurrency
+/// up to the 32 ceiling twice over, so tools joining this class change nothing
+/// a deployed inbox needs, and the family default of 16 is too small for a full
+/// window.
+///
+/// Every nested answer crosses the bus as a tool result, so Google's body — a
+/// JSON string inside `api-request`'s value, inside the result envelope — must
+/// fit `[messaging] max_body_bytes` (64 KiB default). Either raise that cap to
+/// carry the OAuth provider's `max_response_bytes` (256 KiB default) with a
+/// margin for escaping, `messaging { max_body_bytes = 393216; }`, or lower
+/// `max_response_bytes` to fit the default cap, at the cost of most HTML mail.
+/// Half again covers message bodies, which are base64url and do not grow when
+/// escaped; sender-written headers dense in quotes or backslashes escape to
+/// about twice their size, so such a read can pass the cap below the read
+/// limit.
+/// An answer over the bus cap never reaches this component as Google's answer.
+component GoogleWorkspaceTools {
+  abi = processor;
+  requires = [log, store, config, tools, provides];
+  in tool-results;
+  in tool-requests;
+  provide gmail-labels {
+    mcp_name = "GmailLabels";
+    description = "The user's Gmail labels. Without `id`, every label with its `id`, `name` and `type` (`system` or `user`), in Google's order; Google gives no counts in a listing. With `id` (a label's `id`, such as `INBOX` or `Label_12`), that one label with its `messages_total`, `messages_unread`, `threads_total` and `threads_unread`, each when Google gives it. `account` is needed only when the user has several Google accounts connected: the refusal lists them. An answer `{\"error\": \"credential_invalid\", …}` means this user has no usable Google credential: run `oauth-connect` for the provider with the Gmail read scope set the operator named and relay its steps, then `oauth-accounts` confirms. Gmail and Calendar endpoints these tools do not cover (attachments, profile, history, Calendar) are listed with `api-request` examples in `docs/providers/google.md`.";
+    input_schema = """{ "type": "object", "properties": { "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" }, "account": { "type": "string", "minLength": 1, "maxLength": 320 } }, "additionalProperties": false }""";
+    max_concurrency = 2;
+  }
+}
