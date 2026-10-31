@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-10-31
+
 - **New `google-maps-tools` component: Google Maps Platform as assistant
   tools.** Instead of composing raw `api-request` calls, the assistant gets
   native tools that call Google through an `api_key_provider` (the key stays
