@@ -1,5 +1,5 @@
 {
-  "checksum": "aa959cf5beeaaac0a02a008ed5a5b96cb08bd655c0d09ceabab8247b4078f727",
+  "checksum": "cb4caa22a46dc4bb310a42c10bdf4858ee413faf6be5ec0444628ea03305b9f6",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -330,10 +330,6 @@
         ],
         "deps": {
           "common": [
-            {
-              "id": "serde 1.0.229",
-              "target": "serde"
-            },
             {
               "id": "serde_json 1.0.151",
               "target": "serde_json"

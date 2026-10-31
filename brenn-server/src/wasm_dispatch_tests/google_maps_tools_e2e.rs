@@ -356,7 +356,9 @@ async fn a_truncated_answer_is_internal() {
     };
     assert!(
         detail.starts_with("Google's answer (")
-            && detail.ends_with("exceeded the key provider's max_response_bytes and was cut"),
+            && detail.ends_with(
+                "exceeds api-request's read limit for this provider (max_response_bytes)"
+            ),
         "{detail}"
     );
 }
@@ -597,12 +599,9 @@ async fn a_userless_callers_directions_are_denied_with_the_reason() {
     let detail = error["detail"].as_str().expect("a detail");
     assert!(
         detail.starts_with(&format!(
-            "api-request refused the nested POST to {}{COMPUTE_ROUTES}: ",
+            "api-request refused the nested POST {}{COMPUTE_ROUTES}: ",
             r.host
-        )) && detail.contains("a caller with no acting user may only read")
-            && detail.ends_with(
-                "A POST needs a request with a calling user (an agent or `brenn-tool`)."
-            ),
+        )) && detail.contains("a caller with no acting user may only read"),
         "{detail}"
     );
     assert!(

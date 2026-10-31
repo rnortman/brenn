@@ -64,7 +64,7 @@ name = "brenn-google-maps-tools"
 version = "0.1.0"
 dependencies = [
  "brenn-guest",
- "serde",
+ "brenn-provider-kit",
  "serde_json",
 ]
 

@@ -74,46 +74,6 @@ apply it to every step. Calendar's steps carry caller input in `from`, `to`,
 `q`, `page`, `calendar`, `id` and `calendars`; `CalendarList` carries only
 `page`.
 
-## `provider-kit`
-
-`google-maps-tools` and `google-workspace-tools` each carry their own copy of
-the provider-component core. In kind: `lib.rs` whole (sweep, answer, issue,
-the `Next::Call` arm; the same file apart from names), the in-flight row and
-multi-step machinery, the argument helpers, the result plumbing, the reading
-of `api-request`'s answer envelope, and the tests proving them. By name: the
-row (`call_id`, `InFlight` with `next`, `INFLIGHT_TTL_MS`, `row_expired`,
-`claim`, `provided_name`, `stored`), the steps (`Next::Call { call, derived }`
-and `advance(state, outcome, settings)`), the argument helpers (`object`,
-`capped`, `integer`, `flag`), `NestedError`, `Failure`, `ErrorKind`, `cut`,
-`not_issued`, `result_summary`, `bounded`, `copy`, and the envelope-reading
-half of `read_api_result` (status, `truncated` with `bytes`, binary,
-redirect, non-JSON). The Workspace component's own step helpers stay with it
-when the core moves: `Unreadable` and `unreadable` (the rule for a cut or
-refused nested read), `Family` and its scope hint, `bounded`'s hint argument,
-`ApiCall::get` and `ApiCall::post_json`, and the Calendar bounds
-(`CALENDAR_ID_MAX_BYTES`, `EVENT_ID_MAX_BYTES`, `TIME_MAX_BYTES`,
-`LISTING_TEXT_MAX_BYTES`, `EVENT_TEXT_MAX_BYTES`, `SHORT_MAX_BYTES`). Each
-further Gmail or Calendar tool adds to the copy, so
-the extraction starts from a diff of the two components, not from this list.
-Both components decide some steps on the envelope itself before the step's
-logic runs: Maps pre-reads the raw outcome for a cut route answer
-(`route_answer_cut`), Workspace takes Google's 404 on a per-message search
-step from `read_api_result`'s `Answer::GoogleError`; the shared reader has to
-hand status and truncation to step logic. The copies already differ: Maps
-does not relay `credential_invalid`, keeps the POST sentence on a nested
-`denied`, answers 403 `internal` where the Workspace copy answers `denied`
-with a scope hint, and reports Google's errors as a `Failure` where the
-Workspace copy reports `Answer::GoogleError`. The Workspace `cut` bounds UTF-8
-bytes and returns whether it cut, because the copied strings it bounds are
-sized against `COMPACT_RESULT_CEILING`, which counts bytes; the Maps `cut`
-bounds characters, so its `GOOGLE_MESSAGE_MAX_CHARS` and the Workspace
-`GOOGLE_MESSAGE_MAX_BYTES` (both 1000) are different limits. Decide the shared home — a
-host-testable `std` + `serde` crate in the components workspace, SDK helpers
-in `brenn-guest::provides` (an out-of-tree surface), or both — and what stays
-per provider (Google's error mapping, the credential relay), with the
-multi-step state of `GmailSearch` and the Calendar tools in view; then move
-both components onto it and delete the copied tests.
-
 ## `provider-schema-parse-parity`
 
 A provider component states each tool's argument bounds twice: in the

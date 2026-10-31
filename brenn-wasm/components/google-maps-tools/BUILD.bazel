@@ -22,6 +22,7 @@ wasm_guest_cdylib(
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
+        "//brenn-provider-kit:brenn-provider-kit_guest",
         "//brenn-wasm/components/guest:brenn-guest",
     ],
 )
@@ -33,10 +34,10 @@ wasm_component(
 )
 
 # Argument validation, request assembly, result reading and compaction are
-# std + serde only, so they run on the host; the glue in lib.rs needs the
-# guest SDK and builds for wasm32 alone. The generated `spec` module compiles
-# here too, since its SDK-facing items are wasm32-only: the tools the planner
-# matches on are the specification's own `Provided`.
+# std, serde_json and brenn-provider-kit only, so they run on the host; the
+# glue in lib.rs needs the guest SDK and builds for wasm32 alone. The generated
+# `spec` module compiles here too, since its SDK-facing items are wasm32-only:
+# the tools the planner matches on are the specification's own `Provided`.
 rust_test(
     name = "logic_test",
     srcs = [
@@ -49,5 +50,7 @@ rust_test(
     rustc_env = {"CARGO_MANIFEST_DIR": package_name()},
     proc_macro_deps = all_crate_deps(proc_macro = True),
     target_compatible_with = HOST_ONLY,
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-provider-kit:brenn-provider-kit_guest",
+    ],
 )

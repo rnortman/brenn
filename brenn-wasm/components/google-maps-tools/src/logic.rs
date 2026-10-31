@@ -1,9 +1,10 @@
-//! The wrapper's decisions, in `std` plus `serde`/`serde_json`: reading the
-//! instance's `config`, validating a tool's arguments, building each Google
-//! call as `api-request` arguments, reading `api-request`'s answer, and
-//! compacting Google's JSON into the tool's result. Nothing here names the
-//! guest SDK, so the whole module runs on the host under test. Tools are the
-//! generated `Provided` enum, whose SDK-facing parts are wasm32-only.
+//! The wrapper's decisions, in `std`, `serde_json` and `brenn-provider-kit`:
+//! reading the instance's `config`, validating a tool's arguments, building
+//! each Google call as `api-request` arguments, reading `api-request`'s
+//! answer, and compacting Google's JSON into the tool's result. Nothing here
+//! names the guest SDK, so the whole module runs on the host under test.
+//! Tools are the generated `Provided` enum, whose SDK-facing parts are
+//! wasm32-only.
 
 // The host test's crate root is this file, so it declares the generated
 // module itself; in the component, `lib.rs` does.
@@ -12,30 +13,33 @@ mod spec;
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use brenn_provider_kit::{
+    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, NestedError, Next,
+    Query, QueryValue, Tool, Unreadable, bounded, capped, copy, cut, flag, google_error_detail,
+    host, integer, internal, no_such_step, object, query, read_api_result, required, stored,
+};
+use serde_json::{Value, json};
 
 use crate::spec::Provided;
 
-/// An in-flight row older than this is garbage: longer than the host's
-/// 240 s provided-tool ceiling plus `api-request`'s 60 s HTTP timeout, so no
-/// row whose result can still arrive is ever swept.
-pub const INFLIGHT_TTL_MS: u64 = 300_000;
+/// The most characters a free-text argument may hold. Every body and query
+/// string the wrapper builds from caller text therefore has a known upper size.
+pub const TEXT_MAX_CHARS: usize = 1024;
 
-/// The most bytes a free-text argument may hold. Every body and query string
-/// the wrapper builds from caller text therefore has a known upper size.
-pub const TEXT_MAX_BYTES: usize = 1024;
+/// The most characters a `page` token may hold. Google's tokens are opaque and
+/// run to a few hundred characters.
+pub const PAGE_TOKEN_MAX_CHARS: usize = 4096;
 
-/// The most bytes a `page` token may hold. Google's tokens are opaque and run
-/// to a few hundred characters.
-pub const PAGE_TOKEN_MAX_BYTES: usize = 4096;
+/// The most characters a `place-details` `id` may hold.
+pub const PLACE_ID_MAX_CHARS: usize = 1024;
 
-/// A compact result larger than this is a bug in a size bound, answered
-/// `internal` rather than sent.
-pub const COMPACT_RESULT_CEILING: usize = 256 * 1024;
-
-/// The most characters of a Google error message copied into a result.
-const GOOGLE_MESSAGE_MAX_CHARS: usize = 1000;
+/// What to narrow when a step's answer cannot be read whole: the route
+/// SearchAlongRoute searches along, the places a search answers with, a place's
+/// reviews, or the days of a daily forecast.
+const ROUTE_HINT: &str = "search along a shorter route";
+const PLACES_HINT: &str = "ask for fewer places with `max`";
+const REVIEWS_HINT: &str = "ask without `reviews`";
+const DAYS_HINT: &str = "ask for fewer `days`";
 
 /// Geocoding v4's field mask: only what the compact result carries.
 const GEOCODE_FIELD_MASK: &str =
@@ -59,10 +63,11 @@ const HOURS_DEFAULT: u64 = 24;
 const DAYS_MAX: u64 = 10;
 const DAYS_DEFAULT: u64 = 5;
 
-/// The most alerts one answer carries, and the most characters of an alert's
-/// description.
+/// The most alerts one answer carries, and the most UTF-8 bytes of an alert's
+/// description, which sizes the answer against the byte-counted result
+/// ceiling.
 const ALERTS_MAX: usize = 20;
-const ALERT_DESCRIPTION_MAX_CHARS: usize = 1000;
+const ALERT_DESCRIPTION_MAX_BYTES: usize = 1000;
 /// The most instructions and safety recommendations carried per alert.
 const ALERT_ADVICE_MAX: usize = 5;
 
@@ -118,10 +123,11 @@ internationalPhoneNumber,websiteUri,googleMapsUri";
 const PLACE_DETAILS_REVIEW_FIELDS: &str = "reviews,editorialSummary";
 /// The Places API path a place's details are read at, before its id.
 const PLACE_DETAILS_PATH: &str = "/v1/places/";
-/// The most reviews carried (Google returns at most five), and the most
-/// characters of each review's text.
+/// The most reviews carried (Google returns at most five), and the most UTF-8
+/// bytes of each review's text, which sizes the answer against the
+/// byte-counted result ceiling.
 const REVIEWS_MAX: usize = 5;
-const REVIEW_TEXT_MAX_CHARS: usize = 600;
+const REVIEW_TEXT_MAX_BYTES: usize = 600;
 /// The most opening-hours lines carried: one per weekday.
 const WEEKDAYS: usize = 7;
 
@@ -136,7 +142,7 @@ const ALONG_ROUTE_SEARCH_STEP: u8 = 2;
 /// The longest encoded polyline a search along a route is sent with. It is the
 /// one field of unbounded size the wrapper ever puts into a nested call's
 /// arguments; this leaves room under their 64 KiB cap for the rest of the
-/// search body, whose caller text is capped at [`TEXT_MAX_BYTES`], and for
+/// search body, whose caller text is capped at [`TEXT_MAX_CHARS`], and for
 /// escaping the polyline's `\` twice at the one-in-64 rate Google's encoding
 /// alphabet gives it. A polyline denser in `\` than that can exceed the args
 /// cap, which the nested call refuses.
@@ -208,22 +214,6 @@ impl Settings {
     /// error naming the key: nothing a misconfigured instance answered would
     /// be right.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Settings, String> {
-        let required = |key: &str| -> Result<String, String> {
-            match get(key) {
-                None => Err(format!("config {key} is required")),
-                Some(value) if value.is_empty() => Err(format!("config {key} is empty")),
-                Some(value) => Ok(value),
-            }
-        };
-        let host = |key: &str| -> Result<String, String> {
-            let value = required(key)?;
-            if value.contains('/') {
-                return Err(format!(
-                    "config {key}: {value:?} is not a host[:port]; it contains `/`"
-                ));
-            }
-            Ok(value)
-        };
         let units = match get("units").as_deref() {
             None | Some("METRIC") => Units::Metric,
             Some("IMPERIAL") => Units::Imperial,
@@ -238,273 +228,34 @@ impl Settings {
             other => other,
         };
         Ok(Settings {
-            provider: required("provider")?,
-            weather_host: host("weather_host")?,
-            geocoding_host: host("geocoding_host")?,
-            places_host: host("places_host")?,
-            routes_host: host("routes_host")?,
+            provider: required(&get, "provider")?,
+            weather_host: host(&get, "weather_host")?,
+            geocoding_host: host(&get, "geocoding_host")?,
+            places_host: host(&get, "places_host")?,
+            routes_host: host(&get, "routes_host")?,
             units,
             language,
         })
     }
 }
 
-/// The error kinds a request is answered with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ErrorKind {
-    Denied,
-    InvalidArgs,
-    Internal,
-}
+impl Tool for Provided {
+    fn name(self) -> &'static str {
+        Provided::name(self)
+    }
 
-/// A request's error answer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Failure {
-    pub kind: ErrorKind,
-    pub detail: String,
-}
-
-fn internal(detail: impl Into<String>) -> Failure {
-    Failure {
-        kind: ErrorKind::Internal,
-        detail: detail.into(),
+    fn from_name(name: &str) -> Option<Provided> {
+        Provided::from_name(name)
     }
 }
 
-/// The method, host and path of a nested call, for the messages that name it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Target {
-    pub method: String,
-    pub host: String,
-    pub path: String,
-}
+/// A request's in-flight row, naming one of this component's tools.
+pub type InFlight = brenn_provider_kit::InFlight<Provided>;
 
-/// One `api-request` call's arguments.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct ApiCall {
-    pub provider: String,
-    pub method: String,
-    pub host: String,
-    pub path: String,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub query: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub body: Option<String>,
-}
-
-impl ApiCall {
-    pub fn target(&self) -> Target {
-        Target {
-            method: self.method.clone(),
-            host: self.host.clone(),
-            path: self.path.clone(),
-        }
-    }
-}
-
-/// A nested call to issue: the request's step it is, and its arguments.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Call {
-    pub step: u8,
-    pub api: ApiCall,
-}
-
-// TODO(provider-kit): the in-flight row (`call_id`, `InFlight`, `row_expired`,
-// `claim`), the argument helpers, `NestedError` and the reading of
-// `api-request`'s answer envelope are copied in `google-workspace-tools`.
-
-/// The correlation id of a request's nested call: `<pending id>/<step>`.
-pub fn call_id(id: &str, step: u8) -> String {
-    format!("{id}/{step}")
-}
-
-/// What the store holds for a request between the activation that issues its
-/// nested call and the one that receives the answer, keyed by the call id.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InFlight {
-    /// The pending id as the host spells it.
-    pub id: String,
-    #[serde(with = "provided_name")]
-    pub tool: Provided,
-    pub step: u8,
-    /// The caller's arguments, already validated once.
-    pub args: Value,
-    /// What earlier steps learned that later steps need.
-    pub derived: Map<String, Value>,
-    /// The nested call outstanding.
-    pub target: Target,
-    pub issued_at_ms: u64,
-}
-
-impl InFlight {
-    pub fn new(
-        id: &str,
-        tool: Provided,
-        args: &Value,
-        call: &Call,
-        derived: Map<String, Value>,
-        now_ms: u64,
-    ) -> InFlight {
-        InFlight {
-            id: id.to_string(),
-            tool,
-            step: call.step,
-            args: args.clone(),
-            derived,
-            target: call.api.target(),
-            issued_at_ms: now_ms,
-        }
-    }
-
-    /// The same request's row for its next call, carrying what this step
-    /// learned in `derived`.
-    pub fn next(&self, call: &Call, derived: Map<String, Value>, now_ms: u64) -> InFlight {
-        InFlight::new(&self.id, self.tool, &self.args, call, derived, now_ms)
-    }
-
-    pub fn call_id(&self) -> String {
-        call_id(&self.id, self.step)
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("an InFlight row serializes")
-    }
-
-    /// A row this module did not write is a corrupt store.
-    pub fn decode(bytes: &[u8]) -> Result<InFlight, String> {
-        serde_json::from_slice(bytes).map_err(|e| format!("in-flight row does not parse: {e}"))
-    }
-}
-
-/// Whether a stored in-flight row has outlived any result that could still
-/// arrive. Only the row's issue time is read: a row that old is garbage
-/// whatever else it holds, including a row a different build wrote in a shape
-/// this one does not parse. A row with no readable issue time is a corrupt
-/// store.
-pub fn row_expired(bytes: &[u8], now_ms: u64) -> Result<bool, String> {
-    #[derive(Deserialize)]
-    struct Issued {
-        issued_at_ms: u64,
-    }
-    let row: Issued = serde_json::from_slice(bytes)
-        .map_err(|e| format!("in-flight row has no readable issue time: {e}"))?;
-    Ok(row.issued_at_ms.saturating_add(INFLIGHT_TTL_MS) < now_ms)
-}
-
-/// The in-flight state a result for request `id`, correlated by `call_id`,
-/// answers; `row` is what the store holds under `call_id`. No row means the
-/// result is a duplicate or arrived after its row was swept, and is ignored.
-/// A row belonging to another request is a host fault.
-pub fn claim(id: &str, call_id: &str, row: Option<&[u8]>) -> Result<Option<InFlight>, String> {
-    let Some(bytes) = row else {
-        return Ok(None);
-    };
-    let state = InFlight::decode(bytes)?;
-    if state.id != id {
-        return Err(format!(
-            "result {call_id} serves {id}, but its in-flight row is {}'s",
-            state.id
-        ));
-    }
-    Ok(Some(state))
-}
-
-/// A stored row names its tool by the registry name the specification gives
-/// it; a name the specification no longer declares does not parse.
-mod provided_name {
-    use serde::de::Error as _;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    use crate::spec::Provided;
-
-    pub fn serialize<S: Serializer>(tool: &Provided, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(tool.name())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Provided, D::Error> {
-        let name = String::deserialize(deserializer)?;
-        Provided::from_name(&name)
-            .ok_or_else(|| D::Error::custom(format!("no provided tool is named `{name}`")))
-    }
-}
-
-/// What a request does next after its nested call answered.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Next {
-    Complete(Value),
-    Fail(Failure),
-    /// Issue the request's next step, carrying what this one learned.
-    Call {
-        call: Call,
-        derived: Map<String, Value>,
-    },
-}
-
-type Args = Map<String, Value>;
-
-fn object<'a>(args: &'a Value, allowed: &[&str]) -> Result<&'a Args, String> {
-    let Value::Object(map) = args else {
-        return Err("the arguments must be a JSON object".to_string());
-    };
-    if let Some(unknown) = map.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!(
-            "unknown argument `{unknown}`; this tool takes {}",
-            allowed
-                .iter()
-                .map(|key| format!("`{key}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    Ok(map)
-}
-
-/// A free-text argument, capped at [`TEXT_MAX_BYTES`] before anything else is
+/// A free-text argument, capped at [`TEXT_MAX_CHARS`] before anything else is
 /// done with it.
 fn text<'a>(args: &'a Args, key: &str) -> Result<Option<&'a str>, String> {
-    capped(args, key, TEXT_MAX_BYTES)
-}
-
-/// A string argument of at most `cap` bytes, checked before anything else is
-/// done with it.
-fn capped<'a>(args: &'a Args, key: &str, cap: usize) -> Result<Option<&'a str>, String> {
-    match args.get(key) {
-        None => Ok(None),
-        Some(Value::String(value)) => {
-            if value.len() > cap {
-                return Err(format!("`{key}` is longer than {cap} bytes"));
-            }
-            if value.trim().is_empty() {
-                return Err(format!("`{key}` is empty"));
-            }
-            Ok(Some(value))
-        }
-        Some(_) => Err(format!("`{key}` must be a string")),
-    }
-}
-
-/// An integer argument in `min..=max`.
-fn integer(args: &Args, key: &str, min: u64, max: u64) -> Result<Option<u64>, String> {
-    match args.get(key) {
-        None => Ok(None),
-        Some(value) => match value.as_u64() {
-            Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
-            _ => Err(format!("`{key}` must be an integer from {min} to {max}")),
-        },
-    }
-}
-
-/// A boolean argument; absent is `false`.
-fn flag(args: &Args, key: &str) -> Result<bool, String> {
-    match args.get(key) {
-        None => Ok(false),
-        Some(Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(format!("`{key}` must be true or false")),
-    }
+    capped(args, key, TEXT_MAX_CHARS)
 }
 
 /// A latitude and longitude in range.
@@ -697,7 +448,7 @@ impl WeatherArgs {
             },
             Some(_) => return Err(KIND_CHOICES.to_string()),
         };
-        let page = capped(args, "page", PAGE_TOKEN_MAX_BYTES)?;
+        let page = capped(args, "page", PAGE_TOKEN_MAX_CHARS)?;
         let at = place_or_coordinates(args, "place")?;
         let hours = integer(args, "hours", 1, HOURS_MAX)?;
         let days = integer(args, "days", 1, DAYS_MAX)?;
@@ -724,11 +475,11 @@ const KIND_CHOICES: &str = "`kind` must be one of `current`, `hourly`, `daily`, 
 
 /// A Weather API lookup at a location: one page, never followed.
 fn weather_call(args: &WeatherArgs, lat: f64, lng: f64, settings: &Settings) -> ApiCall {
-    let mut params = BTreeMap::from([
-        ("location.latitude".to_string(), lat.to_string()),
-        ("location.longitude".to_string(), lng.to_string()),
+    let mut params = query([
+        ("location.latitude", lat.to_string()),
+        ("location.longitude", lng.to_string()),
     ]);
-    let mut set = |key: &str, value: String| params.insert(key.to_string(), value);
+    let mut set = |key: &str, value: String| params.insert(key.to_string(), QueryValue::One(value));
     let units = settings.units.google().to_string();
     let path = match args.kind {
         WeatherKind::Current => {
@@ -762,6 +513,7 @@ fn weather_call(args: &WeatherArgs, lat: f64, lng: f64, settings: &Settings) -> 
     }
     ApiCall {
         provider: settings.provider.clone(),
+        account: None,
         method: "GET".to_string(),
         host: settings.weather_host.clone(),
         path: path.to_string(),
@@ -792,24 +544,29 @@ impl GeocodeArgs {
 /// A Geocoding v4 lookup: forward by `addressQuery`, reverse by location,
 /// both as query parameters so the path is fixed and no caller text becomes a
 /// path segment.
-fn geocode_call(query: &Where, settings: &Settings) -> ApiCall {
-    let mut params = BTreeMap::new();
-    let path = match query {
-        Where::Text(address) => {
-            params.insert("addressQuery".to_string(), address.clone());
-            "/v4/geocode/address"
-        }
-        Where::At(lat, lng) => {
-            params.insert("location.latitude".to_string(), lat.to_string());
-            params.insert("location.longitude".to_string(), lng.to_string());
-            "/v4/geocode/location"
-        }
+fn geocode_call(place: &Where, settings: &Settings) -> ApiCall {
+    let (path, mut params) = match place {
+        Where::Text(address) => (
+            "/v4/geocode/address",
+            query([("addressQuery", address.clone())]),
+        ),
+        Where::At(lat, lng) => (
+            "/v4/geocode/location",
+            query([
+                ("location.latitude", lat.to_string()),
+                ("location.longitude", lng.to_string()),
+            ]),
+        ),
     };
     if let Some(language) = &settings.language {
-        params.insert("languageCode".to_string(), language.clone());
+        params.insert(
+            "languageCode".to_string(),
+            QueryValue::One(language.clone()),
+        );
     }
     ApiCall {
         provider: settings.provider.clone(),
+        account: None,
         method: "GET".to_string(),
         host: settings.geocoding_host.clone(),
         path: path.to_string(),
@@ -1060,10 +817,11 @@ fn compute_routes_call(
     }
     ApiCall {
         provider: settings.provider.clone(),
+        account: None,
         method: "POST".to_string(),
         host: settings.routes_host.clone(),
         path: COMPUTE_ROUTES_PATH.to_string(),
-        query: BTreeMap::new(),
+        query: Query::new(),
         headers: BTreeMap::from([("X-Goog-FieldMask".to_string(), mask.to_string())]),
         body: Some(Value::Object(body).to_string()),
     }
@@ -1078,7 +836,7 @@ struct PlaceDetailsArgs {
 impl PlaceDetailsArgs {
     fn parse(args: &Value) -> Result<PlaceDetailsArgs, String> {
         let args = object(args, &["id", "reviews"])?;
-        let Some(id) = text(args, "id")? else {
+        let Some(id) = capped(args, "id", PLACE_ID_MAX_CHARS)? else {
             return Err("`id` is required".to_string());
         };
         // The id becomes the last path segment; a Places id is URL-safe base64.
@@ -1107,12 +865,16 @@ fn place_details_call(args: &PlaceDetailsArgs, settings: &Settings) -> ApiCall {
     } else {
         PLACE_DETAILS_FIELD_MASK.to_string()
     };
-    let mut params = BTreeMap::new();
+    let mut params = Query::new();
     if let Some(language) = &settings.language {
-        params.insert("languageCode".to_string(), language.clone());
+        params.insert(
+            "languageCode".to_string(),
+            QueryValue::One(language.clone()),
+        );
     }
     ApiCall {
         provider: settings.provider.clone(),
+        account: None,
         method: "GET".to_string(),
         host: settings.places_host.clone(),
         path: format!("{PLACE_DETAILS_PATH}{}", args.id),
@@ -1192,10 +954,11 @@ fn search_text_call(
     }
     ApiCall {
         provider: settings.provider.clone(),
+        account: None,
         method: "POST".to_string(),
         host: settings.places_host.clone(),
         path: SEARCH_TEXT_PATH.to_string(),
-        query: BTreeMap::new(),
+        query: Query::new(),
         headers: BTreeMap::from([(
             "X-Goog-FieldMask".to_string(),
             PLACES_SEARCH_FIELD_MASK.to_string(),
@@ -1272,146 +1035,29 @@ fn places_search_call(
     search_text_call(&args.search, args.open_now, scope, settings)
 }
 
-/// A nested call's typed error, as the executor wrote it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NestedError {
-    pub kind: String,
-    pub detail: String,
-}
-
-/// `text` cut to `max` characters, ending in `…` when cut.
-fn cut(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        None => text.to_string(),
-        Some((at, _)) => format!("{}…", &text[..at]),
-    }
-}
-
-/// The detail of a nested call that issued but could not be queued: Brenn's
-/// refusal text plus the one sentence of operator guidance.
-pub fn not_issued(refusal: &str) -> String {
-    format!(
-        "api-request could not be issued: {refusal}. If this names the clause, the instance's \
-         `tool api-request` grant must admit the method, host and path."
-    )
-}
-
-/// One line for the log: status, size and truncation, or the error kind.
-/// Never a body or a header.
-pub fn result_summary(outcome: &Result<Value, NestedError>) -> String {
-    match outcome {
-        Ok(value) => format!(
-            "status {} bytes {} truncated {}",
-            value.get("status").unwrap_or(&Value::Null),
-            value.get("bytes").unwrap_or(&Value::Null),
-            value.get("truncated").unwrap_or(&Value::Null),
-        ),
-        Err(error) => format!("error {}", error.kind),
-    }
-}
-
-/// Google's JSON answer from an `api-request` result, or the request's error
-/// answer. Only `error.status` and `error.message` are ever copied out of a
-/// non-2xx body.
-pub fn read_api_result(
-    outcome: Result<Value, NestedError>,
-    target: &Target,
-) -> Result<Value, Failure> {
-    let value = match outcome {
-        Ok(value) => value,
-        Err(error) => {
-            let NestedError { kind, detail } = error;
-            return Err(match kind.as_str() {
-                "denied" => Failure {
-                    kind: ErrorKind::Denied,
-                    detail: format!(
-                        "api-request refused the nested {} to {}{}: {detail}. A POST needs a \
-                         request with a calling user (an agent or `brenn-tool`).",
-                        target.method, target.host, target.path
-                    ),
-                },
-                "invalid_args" => internal(format!(
-                    "api-request rejected the wrapper's request: {detail}"
-                )),
-                "internal" => internal(format!("api-request: {detail}")),
-                other => internal(format!("{other}: {detail}")),
-            });
-        }
-    };
-    let status = value
-        .get("status")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| internal("api-request's answer carries no status"))?;
-    if value.get("truncated").and_then(Value::as_bool) == Some(true) {
-        let size = match value.get("bytes").and_then(Value::as_u64) {
-            Some(bytes) => format!("{bytes} bytes"),
-            None => "of unstated length".to_string(),
-        };
-        return Err(internal(format!(
-            "Google's answer ({size}) exceeded the key provider's max_response_bytes and was cut"
-        )));
-    }
-    if value.get("body_base64").is_some() {
-        return Err(internal(format!(
-            "Google returned a non-text body ({status})"
-        )));
-    }
-    if (300..400).contains(&status) {
-        return Err(internal(format!(
-            "Google answered {status} with a redirect, which Brenn does not follow"
-        )));
-    }
-    let body = value
-        .get("body")
-        .and_then(Value::as_str)
-        .ok_or_else(|| internal("api-request's answer carries no body"))?;
-    if status >= 400 {
-        return Err(google_error(status, body));
-    }
-    if !(200..300).contains(&status) {
-        return Err(internal(format!(
-            "Google answered HTTP {status}, which is neither a success nor an error"
-        )));
-    }
-    serde_json::from_str(body).map_err(|_| {
-        internal(format!(
-            "Google returned HTTP {status} with a body that is not JSON"
-        ))
-    })
-}
-
-/// A 4xx/5xx answer: Google's status and message when the body is Google's
-/// standard error shape, nothing of it otherwise. 400 and 404 are the caller's
-/// arguments; every other status is the wrapper's or Google's.
+/// A Google 4xx/5xx answer as the request's failure. 400 and 404 are the
+/// caller's arguments; every other status is the operator's or Google's,
+/// 403 included: a restricted key, a disabled API or billing.
 fn google_error(status: u64, body: &str) -> Failure {
     let kind = if status == 400 || status == 404 {
         ErrorKind::InvalidArgs
     } else {
         ErrorKind::Internal
     };
-    let parsed: Option<Value> = serde_json::from_str(body).ok();
-    let error = parsed.as_ref().and_then(|body| body.get("error"));
-    let field = |name: &str| error.and_then(|e| e.get(name)).and_then(Value::as_str);
-    let detail = match (field("status"), field("message")) {
-        (Some(google_status), Some(message)) => format!(
-            "Google {google_status} (HTTP {status}): {}",
-            cut(message, GOOGLE_MESSAGE_MAX_CHARS)
-        ),
-        _ => format!("Google HTTP {status}, body not in the standard error shape"),
-    };
-    Failure { kind, detail }
+    Failure {
+        kind,
+        detail: google_error_detail(status, body),
+    }
 }
 
 /// What the request does with its nested call's answer: complete, fail, or
 /// issue its next step.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
-    if (state.tool, state.step) == (Provided::SearchAlongRoute, ALONG_ROUTE_ROUTE_STEP)
-        && let Some(failure) = route_answer_cut(&outcome)
-    {
-        return Next::Fail(failure);
-    }
     let body = match read_api_result(outcome, &state.target) {
-        Ok(body) => body,
+        Ok(Answer::Body(body)) => body,
+        Ok(Answer::Relay(value)) => return Next::Complete(value),
+        Ok(Answer::Unreadable(why)) => return Next::Fail(unreadable(state, &why)),
+        Ok(Answer::Error { status, body }) => return Next::Fail(google_error(status, &body)),
         Err(failure) => return Next::Fail(failure),
     };
     let next = match (state.tool, state.step) {
@@ -1443,29 +1089,46 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
                 .and_then(|args| compact_along_route(&args, &state.derived, &body))
                 .map(Next::Complete)
         }
-        (tool, step) => Err(internal(format!(
-            "in-flight row names step {step} of {}, which has no such step",
-            tool.name()
-        ))),
+        (tool, step) => Err(no_such_step(tool, step)),
     };
     match next {
-        Ok(Next::Complete(value)) => bounded(value, COMPACT_RESULT_CEILING),
+        Ok(Next::Complete(value)) => bounded(value, COMPACT_RESULT_CEILING, None),
         Ok(next) => next,
         Err(failure) => Next::Fail(failure),
     }
 }
 
-/// A row's stored arguments, parsed again. They were validated when the
-/// request was served, so a failure here is the wrapper's.
-fn stored<T>(state: &InFlight, parse: fn(&Value) -> Result<T, String>) -> Result<T, Failure> {
-    parse(&state.args).map_err(|reason| {
-        internal(format!(
-            "stored {} arguments no longer parse: {reason}",
-            state.tool.name()
-        ))
-    })
+/// A step's answer that cannot be read whole, cut at the read limit or not
+/// delivered, as the request's failure. SearchAlongRoute's route step holds
+/// nothing but the polyline, two scalars and `fallbackInfo`, so a cut there
+/// is a route too long to search along: the caller's. Every other answer is
+/// `internal`, naming what to narrow where an argument narrows it.
+fn unreadable(state: &InFlight, why: &Unreadable) -> Failure {
+    match (state.tool, state.step) {
+        (Provided::SearchAlongRoute, ALONG_ROUTE_ROUTE_STEP) => match why {
+            Unreadable::Cut(_) => Failure {
+                kind: ErrorKind::InvalidArgs,
+                detail: format!("route too long to search along: {}", why.render(None)),
+            },
+            Unreadable::Refused(_) => why.failure(Some(ROUTE_HINT)),
+        },
+        (Provided::PlacesSearch, PLACES_SEARCH_STEP)
+        | (Provided::SearchAlongRoute, ALONG_ROUTE_SEARCH_STEP) => why.failure(Some(PLACES_HINT)),
+        (Provided::PlaceDetails, 1) => stored(state, PlaceDetailsArgs::parse).map_or_else(
+            |failure| failure,
+            |args| why.failure(args.reviews.then_some(REVIEWS_HINT)),
+        ),
+        (Provided::Weather, WEATHER_LOOKUP_STEP) => stored(state, WeatherArgs::parse).map_or_else(
+            |failure| failure,
+            |args| why.failure((args.kind == WeatherKind::Daily).then_some(DAYS_HINT)),
+        ),
+        (Provided::Geocode, 1)
+        | (Provided::Weather, WEATHER_GEOCODE_STEP)
+        | (Provided::PlacesSearch, PLACES_GEOCODE_STEP)
+        | (Provided::Directions, 1) => why.failure(None),
+        (tool, step) => no_such_step(tool, step),
+    }
 }
-
 /// A geocoded place: the first result's location and the address Google
 /// resolved the text to.
 #[derive(Clone, Debug, PartialEq)]
@@ -1703,7 +1366,10 @@ fn compact_place_details(args: &PlaceDetailsArgs, body: &Value) -> Result<Value,
                         at(review, &["authorAttribution", "displayName"]),
                     );
                     if let Some(text) = at(review, &["text", "text"]).and_then(Value::as_str) {
-                        item.insert("text".to_string(), json!(cut(text, REVIEW_TEXT_MAX_CHARS)));
+                        item.insert(
+                            "text".to_string(),
+                            json!(cut(text, REVIEW_TEXT_MAX_BYTES).0),
+                        );
                     }
                     Ok(Value::Object(item))
                 },
@@ -1711,26 +1377,6 @@ fn compact_place_details(args: &PlaceDetailsArgs, body: &Value) -> Result<Value,
         }
     }
     Ok(Value::Object(out))
-}
-
-/// SearchAlongRoute's route step answered with a body `api-request` cut at the
-/// key provider's read limit. The step's field mask leaves nothing in the
-/// answer but the polyline, two scalars and `fallbackInfo`, so a cut answer is
-/// a route too long to search along: the caller's, unlike every other cut
-/// answer, which `read_api_result` answers `internal`.
-fn route_answer_cut(outcome: &Result<Value, NestedError>) -> Option<Failure> {
-    let value = outcome.as_ref().ok()?;
-    if value.get("truncated").and_then(Value::as_bool) != Some(true) {
-        return None;
-    }
-    let answer = match value.get("bytes").and_then(Value::as_u64) {
-        Some(bytes) => format!("Google's {bytes}-byte answer exceeds"),
-        None => "Google's answer, of unstated length, arrived as a cut at".to_string(),
-    };
-    Some(Failure {
-        kind: ErrorKind::InvalidArgs,
-        detail: format!("route too long to search along ({answer} the key provider's read limit)"),
-    })
 }
 
 /// SearchAlongRoute's search along the route its first step computed. The
@@ -2128,7 +1774,7 @@ fn compact_alert(alert: &Value) -> Result<Value, Failure> {
     if let Some(description) = alert.get("description").and_then(Value::as_str) {
         item.insert(
             "description".to_string(),
-            json!(cut(description, ALERT_DESCRIPTION_MAX_CHARS)),
+            json!(cut(description, ALERT_DESCRIPTION_MAX_BYTES).0),
         );
     }
     if let Some(lines) = alert.get("instruction") {
@@ -2168,30 +1814,8 @@ fn compact_alert(alert: &Value) -> Result<Value, Failure> {
     Ok(Value::Object(item))
 }
 
-/// `value` as the request's answer, unless it serializes larger than
-/// `ceiling` — a bound that was wrong, reported rather than sent.
-pub fn bounded(value: Value, ceiling: usize) -> Next {
-    let size = serde_json::to_vec(&value)
-        .expect("a JSON value serializes")
-        .len();
-    if size > ceiling {
-        return Next::Fail(internal(format!(
-            "compact result of {size} bytes exceeds the wrapper's ceiling"
-        )));
-    }
-    Next::Complete(value)
-}
-
 fn shape(api: &str) -> Failure {
     internal(format!("unexpected {api} API response shape"))
-}
-
-/// Copy `from[key]` into `to[name]` when present and not null; absent fields
-/// are omitted, never invented.
-fn copy(to: &mut Args, name: &str, from: Option<&Value>) {
-    if let Some(value) = from.filter(|value| !value.is_null()) {
-        to.insert(name.to_string(), value.clone());
-    }
 }
 
 /// A Geocoding v4 answer as at most `max` results. Google omits `results`
@@ -2400,6 +2024,8 @@ fn minutes(to: &mut Args, name: &str, duration: Option<&Value>) -> Result<(), Fa
 
 #[cfg(test)]
 mod tests {
+    use brenn_provider_kit::testutil::{failure, google, http, nested, truncated};
+
     use super::*;
 
     fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -2538,11 +2164,20 @@ mod tests {
         })
     }
 
-    fn query(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    fn pairs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// Query parameters each sent once.
+    fn params(pairs: &[(&str, &str)]) -> Query {
+        pairs.iter().map(|(k, v)| (k.to_string(), one(v))).collect()
+    }
+
+    fn one(value: &str) -> QueryValue {
+        QueryValue::One(value.to_string())
     }
 
     #[test]
@@ -2554,11 +2189,11 @@ mod tests {
         assert_eq!(call.path, "/v4/geocode/address");
         assert_eq!(
             call.query,
-            query(&[("addressQuery", "1600 Amphitheatre Pkwy, Mountain View")])
+            params(&[("addressQuery", "1600 Amphitheatre Pkwy, Mountain View")])
         );
         assert_eq!(
             call.headers,
-            query(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
+            pairs(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
         );
         assert_eq!(call.body, None);
     }
@@ -2569,14 +2204,14 @@ mod tests {
         assert_eq!(call.path, "/v4/geocode/location");
         assert_eq!(
             call.query,
-            query(&[
+            params(&[
                 ("location.latitude", "37.422"),
                 ("location.longitude", "-122.0841")
             ])
         );
         assert_eq!(
             call.headers,
-            query(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
+            pairs(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
         );
     }
 
@@ -2584,8 +2219,8 @@ mod tests {
     fn geocode_reads_a_coordinate_address_as_a_location() {
         let call = geocode(json!({ "address": " 37.422 , -122.0841" })).unwrap();
         assert_eq!(call.path, "/v4/geocode/location");
-        assert_eq!(call.query["location.latitude"], "37.422");
-        assert_eq!(call.query["location.longitude"], "-122.0841");
+        assert_eq!(call.query["location.latitude"], one("37.422"));
+        assert_eq!(call.query["location.longitude"], one("-122.0841"));
         // Not the coordinate form: geocoded as text.
         for address in ["1e5,3", "inf,0", "12,Main St", "37.4.2,1"] {
             let call = geocode(json!({ "address": address })).unwrap();
@@ -2599,7 +2234,7 @@ mod tests {
     fn geocode_passes_the_language() {
         let s = Settings::from_lookup(lookup(&with(&[("language", "fr")]))).unwrap();
         let call = plan(Provided::Geocode, &json!({ "address": "Paris" }), &s).unwrap();
-        assert_eq!(call.api.query["languageCode"], "fr");
+        assert_eq!(call.api.query["languageCode"], one("fr"));
     }
 
     #[test]
@@ -2657,255 +2292,43 @@ mod tests {
     }
 
     #[test]
-    fn geocode_caps_the_address_in_bytes() {
-        // Multi-byte characters: the cap is UTF-8 bytes, not characters.
-        let at_cap = "é".repeat(TEXT_MAX_BYTES / 2);
-        assert_eq!(at_cap.len(), TEXT_MAX_BYTES);
+    fn geocode_caps_the_address_in_characters() {
+        // Two-byte characters: the cap counts characters, as the schema's
+        // `maxLength` does, not UTF-8 bytes.
+        let at_cap = "é".repeat(TEXT_MAX_CHARS);
+        assert_eq!(at_cap.len(), 2 * TEXT_MAX_CHARS);
         assert!(geocode(json!({ "address": at_cap })).is_ok());
         let over = format!("{at_cap}a");
         assert_eq!(
             geocode(json!({ "address": over })).unwrap_err(),
-            "`address` is longer than 1024 bytes"
+            "`address` is longer than 1024 characters"
         );
     }
 
-    fn target() -> Target {
-        Target {
-            method: "POST".to_string(),
-            host: "places.example.com".to_string(),
-            path: "/v1/places:searchText".to_string(),
+    #[test]
+    fn a_google_error_maps_its_status_to_a_kind() {
+        let cases = [
+            (400, "INVALID_ARGUMENT", ErrorKind::InvalidArgs),
+            (404, "NOT_FOUND", ErrorKind::InvalidArgs),
+            // A restricted key, a disabled API or billing: the operator's.
+            (403, "PERMISSION_DENIED", ErrorKind::Internal),
+            (429, "RESOURCE_EXHAUSTED", ErrorKind::Internal),
+            (503, "UNAVAILABLE", ErrorKind::Internal),
+        ];
+        for (code, status, kind) in cases {
+            assert_eq!(
+                google_error(code, &google(code, status, "no")),
+                failure(kind, &format!("Google {status} (HTTP {code}): no")),
+                "{code}"
+            );
         }
-    }
-
-    fn nested(kind: &str, detail: &str) -> Result<Value, NestedError> {
-        Err(NestedError {
-            kind: kind.to_string(),
-            detail: detail.to_string(),
-        })
-    }
-
-    fn http(status: u64, body: &str) -> Result<Value, NestedError> {
-        Ok(json!({
-            "status": status,
-            "headers": { "content-type": "application/json" },
-            "bytes": body.len(),
-            "truncated": false,
-            "body": body,
-        }))
-    }
-
-    fn read(outcome: Result<Value, NestedError>) -> Result<Value, Failure> {
-        read_api_result(outcome, &target())
-    }
-
-    fn failure(kind: ErrorKind, detail: &str) -> Failure {
-        Failure {
-            kind,
-            detail: detail.to_string(),
-        }
-    }
-
-    #[test]
-    fn a_denied_nested_call_is_denied_naming_it() {
         assert_eq!(
-            read(nested("denied", "a component may only GET or HEAD")),
-            Err(failure(
-                ErrorKind::Denied,
-                "api-request refused the nested POST to places.example.com/v1/places:searchText: \
-                 a component may only GET or HEAD. A POST needs a request with a calling user \
-                 (an agent or `brenn-tool`)."
-            ))
-        );
-    }
-
-    #[test]
-    fn other_nested_errors_are_internal() {
-        assert_eq!(
-            read(nested("invalid_args", "bad query")),
-            Err(failure(
-                ErrorKind::Internal,
-                "api-request rejected the wrapper's request: bad query"
-            ))
-        );
-        assert_eq!(
-            read(nested("internal", "timed out")),
-            Err(failure(ErrorKind::Internal, "api-request: timed out"))
-        );
-        assert_eq!(
-            read(nested("rate_limited", "slow down")),
-            Err(failure(ErrorKind::Internal, "rate_limited: slow down"))
-        );
-    }
-
-    #[test]
-    fn a_truncated_answer_is_internal() {
-        let outcome = Ok(json!({
-            "status": 200, "headers": {}, "bytes": 300000, "truncated": true, "body": "{\"res",
-        }));
-        assert_eq!(
-            read(outcome),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google's answer (300000 bytes) exceeded the key provider's max_response_bytes \
-                 and was cut"
-            ))
-        );
-        let unstated = Ok(json!({
-            "status": 200, "headers": {}, "bytes": null, "truncated": true, "body": "",
-        }));
-        assert!(
-            read(unstated)
-                .unwrap_err()
-                .detail
-                .contains("(of unstated length)")
-        );
-    }
-
-    #[test]
-    fn a_binary_body_is_internal() {
-        let outcome = Ok(json!({
-            "status": 200, "headers": {}, "bytes": 3, "truncated": false, "body_base64": "AAEC",
-        }));
-        assert_eq!(
-            read(outcome),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google returned a non-text body (200)"
-            ))
-        );
-    }
-
-    #[test]
-    fn a_redirect_is_internal() {
-        assert_eq!(
-            read(http(302, "")),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google answered 302 with a redirect, which Brenn does not follow"
-            ))
-        );
-    }
-
-    fn google(code: u64, status: &str, message: &str) -> String {
-        json!({ "error": { "code": code, "status": status, "message": message, "details": [{ "secret": "x" }] } })
-            .to_string()
-    }
-
-    #[test]
-    fn a_google_error_carries_its_status_and_message_only() {
-        assert_eq!(
-            read(http(400, &google(400, "INVALID_ARGUMENT", "bad location"))),
-            Err(failure(
-                ErrorKind::InvalidArgs,
-                "Google INVALID_ARGUMENT (HTTP 400): bad location"
-            ))
-        );
-        assert_eq!(
-            read(http(404, &google(404, "NOT_FOUND", "no such place"))),
-            Err(failure(
-                ErrorKind::InvalidArgs,
-                "Google NOT_FOUND (HTTP 404): no such place"
-            ))
-        );
-        assert_eq!(
-            read(http(
-                403,
-                &google(403, "PERMISSION_DENIED", "API not enabled")
-            )),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google PERMISSION_DENIED (HTTP 403): API not enabled"
-            ))
-        );
-        assert_eq!(
-            read(http(503, &google(503, "UNAVAILABLE", "later"))),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google UNAVAILABLE (HTTP 503): later"
-            ))
-        );
-    }
-
-    #[test]
-    fn a_long_google_message_is_cut() {
-        let message = "x".repeat(GOOGLE_MESSAGE_MAX_CHARS + 50);
-        let detail = read(http(500, &google(500, "INTERNAL", &message)))
-            .unwrap_err()
-            .detail;
-        assert_eq!(
-            detail,
-            format!(
-                "Google INTERNAL (HTTP 500): {}…",
-                "x".repeat(GOOGLE_MESSAGE_MAX_CHARS)
-            )
-        );
-    }
-
-    #[test]
-    fn an_error_body_not_in_googles_shape_is_not_copied() {
-        assert_eq!(
-            read(http(403, "<html>key=SECRET</html>")),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google HTTP 403, body not in the standard error shape"
-            ))
-        );
-        assert_eq!(
-            read(http(400, "{\"error\": \"SECRET\"}")),
-            Err(failure(
+            google_error(400, "<html>key=SECRET</html>"),
+            failure(
                 ErrorKind::InvalidArgs,
                 "Google HTTP 400, body not in the standard error shape"
-            ))
+            )
         );
-    }
-
-    #[test]
-    fn a_success_body_must_be_json() {
-        assert_eq!(
-            read(http(200, "not json")),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google returned HTTP 200 with a body that is not JSON"
-            ))
-        );
-        assert_eq!(read(http(200, "{\"a\": 1}")), Ok(json!({ "a": 1 })));
-    }
-
-    #[test]
-    fn an_answer_without_status_or_body_is_internal() {
-        assert_eq!(
-            read(Ok(json!({ "truncated": false }))),
-            Err(failure(
-                ErrorKind::Internal,
-                "api-request's answer carries no status"
-            ))
-        );
-        assert_eq!(
-            read(Ok(json!({ "status": 200, "truncated": false }))),
-            Err(failure(
-                ErrorKind::Internal,
-                "api-request's answer carries no body"
-            ))
-        );
-        assert!(read(http(101, "")).unwrap_err().detail.contains("HTTP 101"));
-    }
-
-    #[test]
-    fn the_summary_names_status_size_and_truncation_only() {
-        assert_eq!(
-            result_summary(&http(200, "{\"secret\": 1}")),
-            "status 200 bytes 13 truncated false"
-        );
-        assert_eq!(result_summary(&nested("denied", "secret")), "error denied");
-    }
-
-    #[test]
-    fn not_issued_carries_brenns_text_and_the_guidance() {
-        let detail = not_issued("call-async api-request: denied: no clause admits GET");
-        assert!(detail.starts_with(
-            "api-request could not be issued: call-async api-request: denied: no clause admits GET."
-        ));
-        assert!(detail.ends_with("must admit the method, host and path."));
     }
 
     fn geocode_state(args: Value) -> InFlight {
@@ -2915,7 +2338,7 @@ mod tests {
             Provided::Geocode,
             &args,
             &call,
-            Map::new(),
+            Args::new(),
             1_000,
         )
     }
@@ -2990,7 +2413,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_passes_a_failed_call_through() {
+    fn advance_answers_a_google_error_through_the_status_mapping() {
         let state = geocode_state(json!({ "address": "Paris" }));
         assert_eq!(
             advance(
@@ -3006,135 +2429,141 @@ mod tests {
     }
 
     #[test]
-    fn advance_refuses_a_step_the_tool_does_not_have() {
-        let mut state = geocode_state(json!({ "address": "Paris" }));
-        state.step = 2;
+    fn advance_relays_a_missing_credential_unchanged() {
+        let value = json!({
+            "error": "credential_invalid",
+            "provider": "maps",
+            "account": null,
+            "detail": "no account is connected for this provider",
+        });
         assert_eq!(
-            advance(&state, http(200, "{}"), &settings()),
+            advance(
+                &geocode_state(json!({ "address": "Paris" })),
+                Ok(value.clone()),
+                &settings()
+            ),
+            Next::Complete(value)
+        );
+    }
+
+    /// Request `args` of `tool`, its row moved to `step`.
+    fn at_step(tool: Provided, args: Value, step: u8) -> InFlight {
+        let call = plan(tool, &args, &settings()).unwrap();
+        let mut state = InFlight::new(&"a".repeat(32), tool, &args, &call, Args::new(), 1_000);
+        state.step = step;
+        state
+    }
+
+    #[test]
+    fn an_unreadable_answer_names_what_to_narrow_per_step() {
+        let route = json!({ "origin": "Paris", "destination": "Lyon", "query": "tea" });
+        let cases = [
+            (Provided::Geocode, json!({ "address": "Paris" }), 1, None),
+            (
+                Provided::Weather,
+                json!({ "kind": "current", "place": "Paris" }),
+                WEATHER_GEOCODE_STEP,
+                None,
+            ),
+            (
+                Provided::Weather,
+                json!({ "kind": "hourly", "lat": 1, "lng": 2 }),
+                WEATHER_LOOKUP_STEP,
+                None,
+            ),
+            (
+                Provided::Weather,
+                json!({ "kind": "daily", "lat": 1, "lng": 2 }),
+                WEATHER_LOOKUP_STEP,
+                Some("ask for fewer `days`"),
+            ),
+            (
+                Provided::Directions,
+                json!({ "origin": "Paris", "destination": "Lyon" }),
+                1,
+                None,
+            ),
+            (
+                Provided::PlacesSearch,
+                json!({ "query": "tea", "near": "Paris" }),
+                PLACES_GEOCODE_STEP,
+                None,
+            ),
+            (
+                Provided::PlacesSearch,
+                json!({ "query": "tea" }),
+                PLACES_SEARCH_STEP,
+                Some("ask for fewer places with `max`"),
+            ),
+            (Provided::PlaceDetails, json!({ "id": "ChIJ1" }), 1, None),
+            (
+                Provided::PlaceDetails,
+                json!({ "id": "ChIJ1", "reviews": true }),
+                1,
+                Some("ask without `reviews`"),
+            ),
+            (
+                Provided::SearchAlongRoute,
+                route.clone(),
+                ALONG_ROUTE_SEARCH_STEP,
+                Some("ask for fewer places with `max`"),
+            ),
+        ];
+        let hinted = |why: &str, hint: Option<&str>| match hint {
+            Some(hint) => format!("{why}; {hint}"),
+            None => why.to_string(),
+        };
+        for (tool, args, step, hint) in cases {
+            let state = at_step(tool, args, step);
+            let what = format!("{} step {step}", tool.name());
+            assert_eq!(
+                advance(&state, truncated(200, json!(300000), "{\"res"), &settings()),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    &hinted(
+                        "Google's answer (300000 bytes) exceeds api-request's read limit for \
+                         this provider (max_response_bytes)",
+                        hint
+                    )
+                )),
+                "{what}"
+            );
+            assert_eq!(
+                advance(
+                    &state,
+                    nested("internal", "exceeds max_body_bytes"),
+                    &settings()
+                ),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    &hinted(
+                        "the host did not deliver api-request's answer: exceeds max_body_bytes",
+                        hint
+                    )
+                )),
+                "{what}"
+            );
+        }
+        // A refused route answer may be a transport fault: not the caller's.
+        let state = at_step(Provided::SearchAlongRoute, route, ALONG_ROUTE_ROUTE_STEP);
+        assert_eq!(
+            advance(&state, nested("internal", "connection reset"), &settings()),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "the host did not deliver api-request's answer: connection reset; search along \
+                 a shorter route"
+            ))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_answer_at_a_step_the_tool_does_not_have_is_internal() {
+        let state = at_step(Provided::Geocode, json!({ "address": "Paris" }), 2);
+        assert_eq!(
+            advance(&state, truncated(200, json!(300000), "{\"res"), &settings()),
             Next::Fail(failure(
                 ErrorKind::Internal,
                 "in-flight row names step 2 of geocode, which has no such step"
-            ))
-        );
-    }
-
-    #[test]
-    fn the_result_ceiling_reports_rather_than_sends() {
-        let value = json!({ "text": "x".repeat(100) });
-        assert_eq!(bounded(value.clone(), 1_000), Next::Complete(value.clone()));
-        let size = serde_json::to_vec(&value).unwrap().len();
-        assert_eq!(
-            bounded(value, 50),
-            Next::Fail(failure(
-                ErrorKind::Internal,
-                &format!("compact result of {size} bytes exceeds the wrapper's ceiling")
-            ))
-        );
-    }
-
-    #[test]
-    fn in_flight_round_trips_with_a_string_id() {
-        let state = geocode_state(json!({ "address": "Paris", "max": 1 }));
-        assert_eq!(state.call_id(), format!("{}/1", "a".repeat(32)));
-        assert!(state.call_id().len() <= 128);
-        assert_eq!(
-            state.target,
-            Target {
-                method: "GET".to_string(),
-                host: "geocode.example.com".to_string(),
-                path: "/v4/geocode/address".to_string(),
-            }
-        );
-        let bytes = state.encode();
-        let wire: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(wire["id"], json!("a".repeat(32)));
-        assert_eq!(wire["tool"], json!("geocode"));
-        assert_eq!(InFlight::decode(&bytes).unwrap(), state);
-        assert!(InFlight::decode(b"{}").is_err());
-    }
-
-    #[test]
-    fn a_row_expires_only_after_the_ttl() {
-        let row = geocode_state(json!({ "address": "Paris" })).encode();
-        assert_eq!(row_expired(&row, 1_000), Ok(false));
-        assert_eq!(row_expired(&row, 1_000 + INFLIGHT_TTL_MS), Ok(false));
-        assert_eq!(row_expired(&row, 1_000 + INFLIGHT_TTL_MS + 1), Ok(true));
-    }
-
-    #[test]
-    fn a_row_another_build_wrote_still_expires() {
-        let state = geocode_state(json!({ "address": "Paris" }));
-        let mut wire: Value = serde_json::from_slice(&state.encode()).unwrap();
-        wire["tool"] = json!("no-such-tool");
-        wire["added_later"] = json!(1);
-        wire.as_object_mut().unwrap().remove("target");
-        let row = serde_json::to_vec(&wire).unwrap();
-        assert!(InFlight::decode(&row).is_err());
-        assert_eq!(row_expired(&row, 1_000 + INFLIGHT_TTL_MS), Ok(false));
-        assert_eq!(row_expired(&row, 1_000 + INFLIGHT_TTL_MS + 1), Ok(true));
-    }
-
-    #[test]
-    fn a_row_with_no_issue_time_is_a_corrupt_store() {
-        for row in [&b"{}"[..], b"not json", br#"{"issued_at_ms":"soon"}"#] {
-            let error = row_expired(row, 0).unwrap_err();
-            assert!(
-                error.starts_with("in-flight row has no readable issue time: "),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_result_claims_its_requests_row() {
-        let state = geocode_state(json!({ "address": "Paris" }));
-        let call_id = state.call_id();
-        assert_eq!(
-            claim(&state.id, &call_id, Some(&state.encode())),
-            Ok(Some(state.clone()))
-        );
-    }
-
-    #[test]
-    fn a_result_with_no_row_is_ignored() {
-        assert_eq!(
-            claim(&"a".repeat(32), &format!("{}/1", "a".repeat(32)), None),
-            Ok(None)
-        );
-    }
-
-    #[test]
-    fn a_result_for_another_requests_row_is_a_host_fault() {
-        let state = geocode_state(json!({ "address": "Paris" }));
-        let other = "b".repeat(32);
-        assert_eq!(
-            claim(&other, &state.call_id(), Some(&state.encode())),
-            Err(format!(
-                "result {}/1 serves {other}, but its in-flight row is {}'s",
-                "a".repeat(32),
-                "a".repeat(32)
-            ))
-        );
-    }
-
-    #[test]
-    fn a_result_whose_row_does_not_parse_is_a_corrupt_store() {
-        let error = claim(&"a".repeat(32), "x/1", Some(b"{}")).unwrap_err();
-        assert!(
-            error.starts_with("in-flight row does not parse: "),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn advance_refuses_stored_arguments_that_no_longer_parse() {
-        let mut state = geocode_state(json!({ "address": "Paris" }));
-        state.args = json!({ "address": "Paris", "max": 9 });
-        assert_eq!(
-            advance(&state, http(200, GEOCODE_BODY), &settings()),
-            Next::Fail(failure(
-                ErrorKind::Internal,
-                "stored geocode arguments no longer parse: `max` must be an integer from 1 to 5"
             ))
         );
     }
@@ -3151,18 +2580,6 @@ mod tests {
             assert_eq!(wire["tool"], json!(tool.name()));
             assert_eq!(InFlight::decode(&row.encode()).unwrap().tool, tool);
         }
-    }
-
-    #[test]
-    fn a_row_naming_an_undeclared_tool_does_not_parse() {
-        let state = geocode_state(json!({ "address": "Paris" }));
-        let mut wire: Value = serde_json::from_slice(&state.encode()).unwrap();
-        wire["tool"] = json!("Geocode");
-        let error = InFlight::decode(&serde_json::to_vec(&wire).unwrap()).unwrap_err();
-        assert!(
-            error.contains("no provided tool is named `Geocode`"),
-            "{error}"
-        );
     }
 
     fn weather(args: Value) -> Result<Call, String> {
@@ -3190,7 +2607,7 @@ mod tests {
         assert_eq!(call.api.path, "/v1/currentConditions:lookup");
         assert_eq!(
             call.api.query,
-            query(&[
+            params(&[
                 ("location.latitude", "37.422"),
                 ("location.longitude", "-122.0841"),
                 ("unitsSystem", "METRIC"),
@@ -3201,7 +2618,7 @@ mod tests {
         // A coordinate place is not geocoded.
         let call = weather(json!({ "kind": "current", "place": "37.422,-122.0841" })).unwrap();
         assert_eq!(call.step, WEATHER_LOOKUP_STEP);
-        assert_eq!(call.api.query["location.latitude"], "37.422");
+        assert_eq!(call.api.query["location.latitude"], one("37.422"));
     }
 
     #[test]
@@ -3210,7 +2627,7 @@ mod tests {
         assert_eq!(call.api.path, "/v1/forecast/hours:lookup");
         assert_eq!(
             call.api.query,
-            query(&[
+            params(&[
                 ("location.latitude", "1"),
                 ("location.longitude", "2"),
                 ("unitsSystem", "METRIC"),
@@ -3226,22 +2643,22 @@ mod tests {
             &s,
         )
         .unwrap();
-        assert_eq!(call.api.query["hours"], "240");
-        assert_eq!(call.api.query["pageSize"], "24");
-        assert_eq!(call.api.query["pageToken"], "tok");
-        assert_eq!(call.api.query["unitsSystem"], "IMPERIAL");
-        assert_eq!(call.api.query["languageCode"], "de");
+        assert_eq!(call.api.query["hours"], one("240"));
+        assert_eq!(call.api.query["pageSize"], one("24"));
+        assert_eq!(call.api.query["pageToken"], one("tok"));
+        assert_eq!(call.api.query["unitsSystem"], one("IMPERIAL"));
+        assert_eq!(call.api.query["languageCode"], one("de"));
     }
 
     #[test]
     fn weather_daily_is_one_page_of_days() {
         let call = weather(json!({ "kind": "daily", "lat": 1, "lng": 2 })).unwrap();
         assert_eq!(call.api.path, "/v1/forecast/days:lookup");
-        assert_eq!(call.api.query["days"], "5");
-        assert_eq!(call.api.query["pageSize"], "5");
+        assert_eq!(call.api.query["days"], one("5"));
+        assert_eq!(call.api.query["pageSize"], one("5"));
         let call = weather(json!({ "kind": "daily", "lat": 1, "lng": 2, "days": 10 })).unwrap();
-        assert_eq!(call.api.query["days"], "10");
-        assert_eq!(call.api.query["pageSize"], "10");
+        assert_eq!(call.api.query["days"], one("10"));
+        assert_eq!(call.api.query["pageSize"], one("10"));
         assert!(!call.api.query.contains_key("pageToken"));
     }
 
@@ -3251,7 +2668,7 @@ mod tests {
         assert_eq!(call.api.path, "/v1/publicAlerts:lookup");
         assert_eq!(
             call.api.query,
-            query(&[
+            params(&[
                 ("location.latitude", "1"),
                 ("location.longitude", "2"),
                 ("pageSize", "20"),
@@ -3267,10 +2684,10 @@ mod tests {
         assert_eq!(call.step, WEATHER_GEOCODE_STEP);
         assert_eq!(call.api.host, "geocode.example.com");
         assert_eq!(call.api.path, "/v4/geocode/address");
-        assert_eq!(call.api.query, query(&[("addressQuery", "Mountain View")]));
+        assert_eq!(call.api.query, params(&[("addressQuery", "Mountain View")]));
         assert_eq!(
             call.api.headers,
-            query(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
+            pairs(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
         );
     }
 
@@ -3334,20 +2751,20 @@ mod tests {
     }
 
     #[test]
-    fn weather_caps_place_and_page_in_bytes() {
-        let place = "a".repeat(TEXT_MAX_BYTES);
+    fn weather_caps_place_and_page_in_characters() {
+        let place = "é".repeat(TEXT_MAX_CHARS);
         assert!(weather(json!({ "kind": "current", "place": place })).is_ok());
         assert_eq!(
             weather(json!({ "kind": "current", "place": format!("{place}a") })).unwrap_err(),
-            "`place` is longer than 1024 bytes"
+            "`place` is longer than 1024 characters"
         );
-        let page = "t".repeat(PAGE_TOKEN_MAX_BYTES);
+        let page = "ü".repeat(PAGE_TOKEN_MAX_CHARS);
         let ok = json!({ "kind": "hourly", "lat": 1, "lng": 2, "page": page });
-        assert_eq!(weather(ok).unwrap().api.query["pageToken"], page);
+        assert_eq!(weather(ok).unwrap().api.query["pageToken"], one(&page));
         let over = json!({ "kind": "hourly", "lat": 1, "lng": 2, "page": format!("{page}t") });
         assert_eq!(
             weather(over).unwrap_err(),
-            "`page` is longer than 4096 bytes"
+            "`page` is longer than 4096 characters"
         );
     }
 
@@ -3378,7 +2795,7 @@ mod tests {
     fn weather_for_a_place_looks_up_where_the_geocode_landed() {
         let args = json!({ "kind": "current", "place": "Mountain View" });
         let step1 = weather(args.clone()).unwrap();
-        let state = weather_state(args.clone(), &step1, Map::new());
+        let state = weather_state(args.clone(), &step1, Args::new());
         let Next::Call { call, derived } = advance(&state, http(200, MOUNTAIN_VIEW), &settings())
         else {
             panic!("expected the lookup step");
@@ -3386,8 +2803,8 @@ mod tests {
         assert_eq!(call.step, WEATHER_LOOKUP_STEP);
         assert_eq!(call.api.host, "weather.example.com");
         assert_eq!(call.api.path, "/v1/currentConditions:lookup");
-        assert_eq!(call.api.query["location.latitude"], "37.39");
-        assert_eq!(call.api.query["location.longitude"], "-122.08");
+        assert_eq!(call.api.query["location.latitude"], one("37.39"));
+        assert_eq!(call.api.query["location.longitude"], one("-122.08"));
         let want = json!({ "lat": 37.39, "lng": -122.08, "place": "Mountain View, CA, USA" });
         assert_eq!(Value::Object(derived.clone()), want);
 
@@ -3410,7 +2827,7 @@ mod tests {
     #[test]
     fn weather_for_a_place_nothing_matches_is_the_callers() {
         let args = json!({ "kind": "daily", "place": "Nowhere Special" });
-        let state = weather_state(args.clone(), &weather(args).unwrap(), Map::new());
+        let state = weather_state(args.clone(), &weather(args).unwrap(), Args::new());
         for body in ["{}", "{\"results\": []}"] {
             assert_eq!(
                 advance(&state, http(200, body), &settings()),
@@ -3444,7 +2861,7 @@ mod tests {
             step: WEATHER_GEOCODE_STEP,
             api: geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
         };
-        let state = weather_state(args, &call, Map::new());
+        let state = weather_state(args, &call, Args::new());
         assert_eq!(
             advance(&state, http(200, MOUNTAIN_VIEW), &settings()),
             Next::Fail(failure(
@@ -3461,7 +2878,7 @@ mod tests {
             step: WEATHER_LOOKUP_STEP,
             api: weather_call(&WeatherArgs::parse(&args).unwrap(), 1.0, 2.0, &settings()),
         };
-        let state = weather_state(args, &call, Map::new());
+        let state = weather_state(args, &call, Args::new());
         assert_eq!(
             advance(&state, http(200, CURRENT_BODY), &settings()),
             Next::Fail(failure(
@@ -3475,7 +2892,7 @@ mod tests {
     fn weather_answer(args: Value, body: &str, settings: &Settings) -> Next {
         let call = plan(Provided::Weather, &args, settings).unwrap();
         advance(
-            &weather_state(args, &call, Map::new()),
+            &weather_state(args, &call, Args::new()),
             http(200, body),
             settings,
         )
@@ -3673,7 +3090,7 @@ mod tests {
             "alertId": format!("urn:{n}"),
             "alertTitle": { "text": "Flash Flood Warning", "languageCode": "en" },
             "eventType": "FLASH_FLOOD", "areaName": "Wake, NC",
-            "description": "d".repeat(ALERT_DESCRIPTION_MAX_CHARS + 1),
+            "description": "d".repeat(ALERT_DESCRIPTION_MAX_BYTES + 1),
             "severity": "SEVERE", "certainty": "LIKELY", "urgency": "IMMEDIATE",
             "instruction": ["one", "two", "three", "four", "five", "six"],
             "safetyRecommendations": [{ "directive": "Move to higher ground", "subtext": "now" }],
@@ -3704,7 +3121,7 @@ mod tests {
                     "title": "Flash Flood Warning", "event": "FLASH_FLOOD", "severity": "SEVERE",
                     "certainty": "LIKELY", "urgency": "IMMEDIATE", "area": "Wake, NC",
                     "starts": "2025-08-06T18:24:00Z", "ends": "2025-08-06T21:30:00Z",
-                    "description": format!("{}…", "d".repeat(ALERT_DESCRIPTION_MAX_CHARS)),
+                    "description": format!("{}…", "d".repeat(ALERT_DESCRIPTION_MAX_BYTES)),
                     "instructions": ["one", "two", "three", "four", "five"],
                     "instructions_omitted": 1,
                     "recommendations": [{ "directive": "Move to higher ground", "subtext": "now" }],
@@ -3712,6 +3129,16 @@ mod tests {
                 }],
                 "next_page": "p2",
             })
+        );
+    }
+
+    #[test]
+    fn weather_alert_description_is_cut_in_bytes() {
+        let mut long = alert(1);
+        long["description"] = json!("é".repeat(ALERT_DESCRIPTION_MAX_BYTES));
+        assert_eq!(
+            compact_alert(&long).unwrap()["description"],
+            format!("{}…", "é".repeat(ALERT_DESCRIPTION_MAX_BYTES / 2))
         );
     }
 
@@ -3834,7 +3261,7 @@ mod tests {
         assert!(call.query.is_empty());
         assert_eq!(
             call.headers,
-            query(&[("X-Goog-FieldMask", DIRECTIONS_FIELD_MASK)])
+            pairs(&[("X-Goog-FieldMask", DIRECTIONS_FIELD_MASK)])
         );
         assert!(!DIRECTIONS_FIELD_MASK.contains("polyline"));
         assert_eq!(
@@ -3996,17 +3423,17 @@ mod tests {
     }
 
     #[test]
-    fn directions_cap_both_ends_in_bytes() {
-        let at_cap = "é".repeat(TEXT_MAX_BYTES / 2);
+    fn directions_cap_both_ends_in_characters() {
+        let at_cap = "é".repeat(TEXT_MAX_CHARS);
         assert!(directions(json!({ "origin": at_cap, "destination": at_cap })).is_ok());
         let over = format!("{at_cap}a");
         assert_eq!(
             directions(json!({ "origin": over, "destination": "b" })).unwrap_err(),
-            "`origin` is longer than 1024 bytes"
+            "`origin` is longer than 1024 characters"
         );
         assert_eq!(
             directions(json!({ "origin": "a", "destination": over })).unwrap_err(),
-            "`destination` is longer than 1024 bytes"
+            "`destination` is longer than 1024 characters"
         );
     }
 
@@ -4017,7 +3444,7 @@ mod tests {
             Provided::Directions,
             &args,
             &call,
-            Map::new(),
+            Args::new(),
             1_000,
         );
         advance(&state, http(200, body), settings)
@@ -4398,7 +3825,7 @@ mod tests {
             Provided::Directions,
             &args,
             &call,
-            Map::new(),
+            Args::new(),
             1_000,
         );
         assert_eq!(
@@ -4409,9 +3836,8 @@ mod tests {
             ),
             Next::Fail(failure(
                 ErrorKind::Denied,
-                "api-request refused the nested POST to routes.example.com/directions/v2:computeRoutes: \
-                 a caller with no acting user may only read. A POST needs a request with a calling \
-                 user (an agent or `brenn-tool`)."
+                "api-request refused the nested POST routes.example.com/directions/v2:computeRoutes: \
+                 a caller with no acting user may only read"
             ))
         );
     }
@@ -4442,7 +3868,7 @@ mod tests {
         assert!(call.api.query.is_empty());
         assert_eq!(
             call.api.headers,
-            query(&[("X-Goog-FieldMask", PLACES_SEARCH_FIELD_MASK)])
+            pairs(&[("X-Goog-FieldMask", PLACES_SEARCH_FIELD_MASK)])
         );
         assert_eq!(
             posted(&call.api),
@@ -4508,10 +3934,10 @@ mod tests {
         assert_eq!(call.step, PLACES_GEOCODE_STEP);
         assert_eq!(call.api.host, "geocode.example.com");
         assert_eq!(call.api.path, "/v4/geocode/address");
-        assert_eq!(call.api.query, query(&[("addressQuery", "Mountain View")]));
+        assert_eq!(call.api.query, params(&[("addressQuery", "Mountain View")]));
         assert_eq!(
             call.api.headers,
-            query(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
+            pairs(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
         );
     }
 
@@ -4519,7 +3945,7 @@ mod tests {
     fn places_search_near_a_place_searches_where_the_geocode_landed() {
         let args = json!({ "query": "coffee", "near": "Mountain View" });
         let step1 = places_search(args.clone()).unwrap();
-        let state = places_state(args.clone(), &step1, Map::new());
+        let state = places_state(args.clone(), &step1, Args::new());
         let Next::Call { call, derived } = advance(&state, http(200, MOUNTAIN_VIEW), &settings())
         else {
             panic!("expected the search step");
@@ -4554,7 +3980,7 @@ mod tests {
     #[test]
     fn places_search_near_a_place_nothing_matches_is_the_callers() {
         let args = json!({ "query": "coffee", "near": "Nowhere Special" });
-        let state = places_state(args.clone(), &places_search(args).unwrap(), Map::new());
+        let state = places_state(args.clone(), &places_search(args).unwrap(), Args::new());
         assert_eq!(
             advance(&state, http(200, "{}"), &settings()),
             Next::Fail(failure(
@@ -4574,7 +4000,7 @@ mod tests {
         };
         assert_eq!(
             advance(
-                &places_state(args, &call, Map::new()),
+                &places_state(args, &call, Args::new()),
                 http(200, MOUNTAIN_VIEW),
                 &settings()
             ),
@@ -4593,7 +4019,7 @@ mod tests {
         };
         assert_eq!(
             advance(
-                &places_state(args, &call, Map::new()),
+                &places_state(args, &call, Args::new()),
                 http(200, "{}"),
                 &settings()
             ),
@@ -4661,24 +4087,24 @@ mod tests {
     }
 
     #[test]
-    fn places_search_caps_query_and_near_in_bytes() {
-        let at_cap = "é".repeat(TEXT_MAX_BYTES / 2);
+    fn places_search_caps_query_and_near_in_characters() {
+        let at_cap = "é".repeat(TEXT_MAX_CHARS);
         assert!(places_search(json!({ "query": at_cap, "near": at_cap })).is_ok());
         let over = format!("{at_cap}a");
         assert_eq!(
             places_search(json!({ "query": over })).unwrap_err(),
-            "`query` is longer than 1024 bytes"
+            "`query` is longer than 1024 characters"
         );
         assert_eq!(
             places_search(json!({ "query": "a", "near": over })).unwrap_err(),
-            "`near` is longer than 1024 bytes"
+            "`near` is longer than 1024 characters"
         );
     }
 
     fn places_answer(args: Value, body: &Value) -> Next {
         let call = plan(Provided::PlacesSearch, &args, &settings()).unwrap();
         advance(
-            &places_state(args, &call, Map::new()),
+            &places_state(args, &call, Args::new()),
             http(200, &body.to_string()),
             &settings(),
         )
@@ -4780,15 +4206,14 @@ mod tests {
         let call = places_search(args.clone()).unwrap();
         assert_eq!(
             advance(
-                &places_state(args, &call, Map::new()),
+                &places_state(args, &call, Args::new()),
                 nested("denied", "a caller with no acting user may only read"),
                 &settings()
             ),
             Next::Fail(failure(
                 ErrorKind::Denied,
-                "api-request refused the nested POST to places.example.com/v1/places:searchText: \
-                 a caller with no acting user may only read. A POST needs a request with a calling \
-                 user (an agent or `brenn-tool`)."
+                "api-request refused the nested POST places.example.com/v1/places:searchText: \
+                 a caller with no acting user may only read"
             ))
         );
     }
@@ -4848,7 +4273,7 @@ mod tests {
     fn place_details_pass_the_language() {
         let s = Settings::from_lookup(lookup(&with(&[("language", "fr")]))).unwrap();
         let call = plan(Provided::PlaceDetails, &json!({ "id": "ChIJ1" }), &s).unwrap();
-        assert_eq!(call.api.query, query(&[("languageCode", "fr")]));
+        assert_eq!(call.api.query, params(&[("languageCode", "fr")]));
     }
 
     #[test]
@@ -4873,11 +4298,11 @@ mod tests {
         }
         let err = place_details(json!({ "id": "ChIJ1", "fields": "*" })).unwrap_err();
         assert!(err.starts_with("unknown argument `fields`"), "{err}");
-        let at_cap = "a".repeat(TEXT_MAX_BYTES);
+        let at_cap = "a".repeat(PLACE_ID_MAX_CHARS);
         assert!(place_details(json!({ "id": at_cap })).is_ok());
         assert_eq!(
             place_details(json!({ "id": format!("{at_cap}a") })).unwrap_err(),
-            "`id` is longer than 1024 bytes"
+            "`id` is longer than 1024 characters"
         );
     }
 
@@ -4888,7 +4313,7 @@ mod tests {
             Provided::PlaceDetails,
             &args,
             &call,
-            Map::new(),
+            Args::new(),
             1_000,
         );
         advance(&state, http(200, &body.to_string()), &settings())
@@ -4963,8 +4388,9 @@ mod tests {
     }
 
     #[test]
-    fn place_details_cut_review_text_and_count_reviews_beyond_the_cap() {
-        let long = "é".repeat(REVIEW_TEXT_MAX_CHARS + 1);
+    fn place_details_cut_review_text_in_bytes_and_count_reviews_beyond_the_cap() {
+        // Two-byte characters: the cut counts UTF-8 bytes.
+        let long = "é".repeat(REVIEW_TEXT_MAX_BYTES / 2 + 1);
         let mut body = details_body();
         body["reviews"] = json!((1..=6).map(|n| review(n, &long)).collect::<Vec<_>>());
         let Next::Complete(answer) =
@@ -4977,9 +4403,21 @@ mod tests {
         assert_eq!(answer["reviews_omitted"], 1);
         assert_eq!(
             reviews[0]["text"],
-            format!("{}…", "é".repeat(REVIEW_TEXT_MAX_CHARS))
+            format!("{}…", "é".repeat(REVIEW_TEXT_MAX_BYTES / 2))
         );
-        let exact = "é".repeat(REVIEW_TEXT_MAX_CHARS);
+        // A character straddling the bound is dropped whole.
+        let straddling = format!("a{long}");
+        body["reviews"] = json!([review(1, &straddling)]);
+        let Next::Complete(answer) =
+            details_answer(json!({ "id": "ChIJ1", "reviews": true }), &body)
+        else {
+            panic!("expected an answer");
+        };
+        assert_eq!(
+            answer["reviews"][0]["text"],
+            format!("a{}…", "é".repeat(REVIEW_TEXT_MAX_BYTES / 2 - 1))
+        );
+        let exact = "é".repeat(REVIEW_TEXT_MAX_BYTES / 2);
         body["reviews"] = json!([review(1, &exact)]);
         let Next::Complete(answer) =
             details_answer(json!({ "id": "ChIJ1", "reviews": true }), &body)
@@ -5038,7 +4476,7 @@ mod tests {
         assert!(call.api.query.is_empty());
         assert_eq!(
             call.api.headers,
-            query(&[(
+            pairs(&[(
                 "X-Goog-FieldMask",
                 "routes.polyline.encodedPolyline,routes.distanceMeters,routes.duration,fallbackInfo"
             )])
@@ -5115,10 +4553,10 @@ mod tests {
                 "{err}"
             );
         }
-        let over = "a".repeat(TEXT_MAX_BYTES + 1);
+        let over = "a".repeat(TEXT_MAX_CHARS + 1);
         assert_eq!(
             along_route(json!({ "origin": "a", "destination": "b", "query": over })).unwrap_err(),
-            "`query` is longer than 1024 bytes"
+            "`query` is longer than 1024 characters"
         );
     }
 
@@ -5141,7 +4579,7 @@ mod tests {
     fn search_along_route_searches_along_the_polyline_and_keeps_the_route() {
         let args = json!({ "origin": "a", "destination": "b", "query": "gas", "max": 3 });
         let step1 = along_route(args.clone()).unwrap();
-        let state = along_state(&args, &step1, Map::new());
+        let state = along_state(&args, &step1, Args::new());
         let body = polyline_route(
             "_p~iF~ps|U_ulLnnqC",
             json!({ "fallbackInfo": { "routingMode": "FALLBACK_TRAFFIC_UNAWARE", "reason": "SERVER_ERROR" } }),
@@ -5155,7 +4593,7 @@ mod tests {
         assert_eq!(call.api.path, "/v1/places:searchText");
         assert_eq!(
             call.api.headers,
-            query(&[("X-Goog-FieldMask", PLACES_SEARCH_FIELD_MASK)])
+            pairs(&[("X-Goog-FieldMask", PLACES_SEARCH_FIELD_MASK)])
         );
         assert_eq!(
             posted(&call.api),
@@ -5190,7 +4628,7 @@ mod tests {
     #[test]
     fn search_along_route_without_a_fallback_states_none() {
         let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
-        let state = along_state(&args, &along_route(args.clone()).unwrap(), Map::new());
+        let state = along_state(&args, &along_route(args.clone()).unwrap(), Args::new());
         let Next::Call { derived, .. } = advance(
             &state,
             http(200, &polyline_route("abc", json!({}))),
@@ -5207,7 +4645,7 @@ mod tests {
     #[test]
     fn search_along_route_refuses_a_route_too_long_to_search_along() {
         let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
-        let state = along_state(&args, &along_route(args.clone()).unwrap(), Map::new());
+        let state = along_state(&args, &along_route(args.clone()).unwrap(), Args::new());
         // An encoded polyline cycles through its 64-symbol alphabet, ASCII 63
         // to 126, so one byte in 64 is `\`, which is escaped once in the body
         // and again in the args.
@@ -5227,7 +4665,7 @@ mod tests {
         // longest form, the search args stay under the nested call's 64 KiB
         // args cap.
         let mut longest = AlongRouteArgs::parse(&args).unwrap();
-        longest.search.query = "\u{1}".repeat(TEXT_MAX_BYTES);
+        longest.search.query = "\u{1}".repeat(TEXT_MAX_CHARS);
         let api = along_route_search_call(&longest, &at_cap, &settings());
         assert!(serde_json::to_vec(&api).unwrap().len() < 64 * 1024);
         assert!(
@@ -5254,75 +4692,36 @@ mod tests {
     #[test]
     fn search_along_route_refuses_a_route_whose_answer_was_cut() {
         let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
-        let state = along_state(&args, &along_route(args.clone()).unwrap(), Map::new());
+        let state = along_state(&args, &along_route(args.clone()).unwrap(), Args::new());
         let cut = |bytes: Value| {
-            Ok(json!({
-                "status": 200, "headers": {}, "bytes": bytes, "truncated": true,
-                "body": "{\"routes\":[{\"polyline\":{\"encodedPolyline\":\"abc",
-            }))
+            truncated(
+                200,
+                bytes,
+                "{\"routes\":[{\"polyline\":{\"encodedPolyline\":\"abc",
+            )
         };
         assert_eq!(
             advance(&state, cut(json!(300000)), &settings()),
             Next::Fail(failure(
                 ErrorKind::InvalidArgs,
-                "route too long to search along (Google's 300000-byte answer exceeds the key \
-                 provider's read limit)"
+                "route too long to search along: Google's answer (300000 bytes) exceeds \
+                 api-request's read limit for this provider (max_response_bytes)"
             ))
         );
-        let Next::Fail(unstated) = advance(&state, cut(Value::Null), &settings()) else {
-            panic!("a cut answer of unstated length is refused");
-        };
-        assert_eq!(unstated.kind, ErrorKind::InvalidArgs);
-        assert!(
-            unstated
-                .detail
-                .starts_with("route too long to search along (")
-        );
-        assert!(unstated.detail.contains("a cut"));
-
-        // Every other cut answer stays the wrapper's `internal`: Directions'
-        // route, and the search step of this same tool.
-        let cut_internal = Next::Fail(failure(
-            ErrorKind::Internal,
-            "Google's answer (300000 bytes) exceeded the key provider's max_response_bytes and \
-             was cut",
-        ));
-        let directions_args = json!({ "origin": "a", "destination": "b" });
-        let directions_call = plan(Provided::Directions, &directions_args, &settings()).unwrap();
-        let directions = InFlight::new(
-            &"a".repeat(32),
-            Provided::Directions,
-            &directions_args,
-            &directions_call,
-            Map::new(),
-            1_000,
-        );
         assert_eq!(
-            advance(&directions, cut(json!(300000)), &settings()),
-            cut_internal
-        );
-        let search = Call {
-            step: ALONG_ROUTE_SEARCH_STEP,
-            api: along_route_search_call(
-                &AlongRouteArgs::parse(&args).unwrap(),
-                "abc",
-                &settings(),
-            ),
-        };
-        assert_eq!(
-            advance(
-                &along_state(&args, &search, Map::new()),
-                cut(json!(300000)),
-                &settings()
-            ),
-            cut_internal
+            advance(&state, cut(Value::Null), &settings()),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "route too long to search along: Google's answer (of unstated length) exceeds \
+                 api-request's read limit for this provider (max_response_bytes)"
+            ))
         );
     }
 
     #[test]
     fn search_along_route_with_no_route_is_the_callers() {
         let args = json!({ "origin": "a", "destination": "b", "query": "gas", "mode": "bicycle" });
-        let state = along_state(&args, &along_route(args.clone()).unwrap(), Map::new());
+        let state = along_state(&args, &along_route(args.clone()).unwrap(), Args::new());
         assert_eq!(
             advance(&state, http(200, "{}"), &settings()),
             Next::Fail(failure(
@@ -5335,7 +4734,7 @@ mod tests {
     #[test]
     fn search_along_route_refuses_an_unexpected_route_shape() {
         let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
-        let state = along_state(&args, &along_route(args.clone()).unwrap(), Map::new());
+        let state = along_state(&args, &along_route(args.clone()).unwrap(), Args::new());
         for body in [
             "[]".to_string(),
             r#"{ "routes": [{ "distanceMeters": 1 }] }"#.to_string(),
@@ -5371,7 +4770,7 @@ mod tests {
         };
         assert_eq!(
             advance(
-                &along_state(&args, &call, Map::new()),
+                &along_state(&args, &call, Args::new()),
                 http(200, "{}"),
                 &settings()
             ),
@@ -5388,15 +4787,14 @@ mod tests {
         let call = along_route(args.clone()).unwrap();
         assert_eq!(
             advance(
-                &along_state(&args, &call, Map::new()),
+                &along_state(&args, &call, Args::new()),
                 nested("denied", "a caller with no acting user may only read"),
                 &settings()
             ),
             Next::Fail(failure(
                 ErrorKind::Denied,
-                "api-request refused the nested POST to routes.example.com/directions/v2:computeRoutes: \
-                 a caller with no acting user may only read. A POST needs a request with a calling \
-                 user (an agent or `brenn-tool`)."
+                "api-request refused the nested POST routes.example.com/directions/v2:computeRoutes: \
+                 a caller with no acting user may only read"
             ))
         );
     }

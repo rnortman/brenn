@@ -89,6 +89,25 @@ All notable changes to Brenn are documented here.
   very long non-ASCII calendar ids can exceed the host's size limit for a
   nested call and is then answered as an internal error. No config changes.
 
+- **Google Maps tool arguments are now limited in characters, and its
+  errors read like the Workspace tools'.** The length caps on the
+  `google-maps-tools` arguments (`address`, `place`, `page`, `origin`,
+  `destination`, `depart_at`, `arrive_by`, `query`, `near` and the place
+  `id`) now count characters, so a non-ASCII value of up to the stated
+  length is accepted and a refusal reads "… longer than N characters". A
+  Google answer too large to read now reads "Google's answer (…) exceeds
+  api-request's read limit for this provider (max_response_bytes)" and, where
+  an argument would shrink it, says what to ask for instead (fewer places,
+  no `reviews`, fewer `days`, a shorter route); one the host did not deliver
+  reads "the host did not deliver api-request's answer: …". A refused write
+  reads "api-request refused the nested POST …" without the old closing
+  sentence, and a provider whose credential is missing or expired is
+  answered with `api-request`'s own message. Review text and weather alert
+  descriptions are now cut at 600 and 1000 bytes rather than characters, so
+  non-Latin text is cut sooner. As for Workspace, a whole-number argument
+  written as a float is accepted and a Google error with an unusual status
+  code is reported as "not in the standard error shape". No config changes.
+
 - The Google Workspace operator guide (`docs/google-workspace.md`) now
   covers the Calendar tools: connecting users with `calendar_readonly`, what
   each answer holds, the assistant's instructions and Calendar setup and
@@ -100,8 +119,8 @@ All notable changes to Brenn are documented here.
 - Internal: a new in-tree crate, `brenn-provider-kit`, holds the core the
   two Google tool components share (the record a request keeps while it
   waits on `api-request`, argument and setting readers, and the reading of
-  Google's answers), with its own tests. The Google Workspace tool
-  component now builds on it.
+  Google's answers), with its own tests. Both the Google Workspace and the
+  Google Maps tool components now build on it.
 
 ## [0.30.1] — 2026-10-31
 
