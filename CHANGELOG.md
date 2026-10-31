@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.30.1] — 2026-10-31
+
 - **Fix: an MQTT client with more than 64 subscriptions no longer hangs
   when it connects or reconnects.** After connecting to the broker, Brenn
   subscribes again to every topic filter the client needs. With more
