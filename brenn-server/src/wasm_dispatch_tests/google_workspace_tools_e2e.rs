@@ -864,6 +864,46 @@ async fn read_decodes_the_full_message_and_names_its_labels() {
     r.assert_finished(&id);
 }
 
+/// `GmailRead` on a message whose only body is HTML answers its text:
+/// the style dropped, paragraphs as blank lines, the link's text without its
+/// address, the entity decoded.
+#[tokio::test]
+async fn an_html_only_read_answers_its_text() {
+    let r = rig().await;
+    let path = format!("{MESSAGES}/m1");
+    // `<html><head><style>p{color:red}</style></head><body><p>Hi Bob,</p><p>The
+    // numbers are <a href="https://example.com/q3">in</a> &amp;
+    // attached.</p></body></html>`, base64url without padding.
+    let html = "PGh0bWw-PGhlYWQ-PHN0eWxlPnB7Y29sb3I6cmVkfTwvc3R5bGU-PC9oZWFkPjxib2R5PjxwPkhpIEJvYiw8\
+                L3A-PHA-VGhlIG51bWJlcnMgYXJlIDxhIGhyZWY9Imh0dHBzOi8vZXhhbXBsZS5jb20vcTMiPmluPC9hPiAm\
+                YW1wOyBhdHRhY2hlZC48L3A-PC9ib2R5PjwvaHRtbD4";
+    let mut body: serde_json::Value = serde_json::from_str(&read_body(&["INBOX"], None)).unwrap();
+    body["payload"] = json!({
+        "mimeType": "text/html",
+        "filename": "",
+        "headers": body["payload"]["headers"],
+        "body": { "size": 158, "data": html },
+    });
+    r.answer(&path, body.to_string());
+    let call = r.call_for_alice("GmailRead", json!({ "id": "m1" }));
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    let text = "Hi Bob,\n\nThe numbers are in & attached.";
+    let mut expected = read_answer(
+        &["INBOX"],
+        json!({
+            "text": text,
+            "text_source": "text/html",
+            "text_chars": text.chars().count(),
+        }),
+    );
+    expected["attachments"] = json!([]);
+    assert_eq!(call.await.unwrap(), Ok(expected));
+    assert_eq!(r.seen(), [("GET".to_string(), path, full_read_query())]);
+    r.assert_finished(&id);
+}
+
 /// Google's 404 on a read (an id that names no message) is the caller's
 /// `invalid_args` with Google's message.
 #[tokio::test]

@@ -98,10 +98,15 @@ All notable changes to Brenn are documented here.
   the whole answer would pass the component's result size limit, and the
   answer says so. A message larger than the provider's read limit is
   answered with its attachments and Gmail's preview instead of its body.
-  HTML-only mail is not rendered yet: it reads as empty text with a note.
   Recipient headers are cut over 4,000 bytes and the others over 1,000,
   and the answer names those cut. Generated component scaffolding no longer
   fails clippy when several of a spec's tools share a name prefix.
+
+- **`GmailRead` reads HTML-only mail as text.** Tags, styles and scripts
+  are dropped. Links keep their text but not their address. Paragraphs,
+  list items and table cells stay apart. Text that the HTML hides is still
+  included. When a message has both versions the plain one is still read,
+  unless it is blank.
 
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new

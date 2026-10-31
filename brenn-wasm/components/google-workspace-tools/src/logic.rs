@@ -1274,7 +1274,6 @@ fn notes(extracted: &decode::Extracted, structure: bool) -> Vec<String> {
                  it is shown",
                 bounded_quote(mime_type)
             ),
-            decode::Note::HtmlNotRendered => "HTML body not rendered in this build".to_string(),
         })
         .collect()
 }
@@ -3180,6 +3179,8 @@ mod tests {
     const UNKNOWN_CHARSET: &str = include_str!("fixtures/unknown-charset.json");
     const STRUCTURE: &str = include_str!("fixtures/structure.json");
     const STRUCTURE_DEEP: &str = include_str!("fixtures/structure-deep.json");
+    const HTML_ONLY: &str = include_str!("fixtures/html-only.json");
+    const ALTERNATIVE_HTML_RICHER: &str = include_str!("fixtures/alternative-html-richer.json");
 
     fn read_state(args: Value) -> InFlight {
         let call = plan(Provided::GmailRead, &args, &settings()).unwrap();
@@ -3356,18 +3357,56 @@ mod tests {
     }
 
     #[test]
-    fn an_html_only_message_answers_an_empty_html_text_with_a_note() {
+    fn an_html_only_message_reads_as_text() {
+        let text = "October\u{a0}news\n\n\
+                    Hello Bob,\n\n\
+                    Prices are up 5\u{a0}&percnt; \u{2014} see the report.\n\n\
+                    Plan\tPrice\n\n\
+                    Basic\t€10\n\n\
+                    Pro\t€25\n\n\
+                    Faster sync\n\
+                    Café mode\n\n\
+                    © 2026 Example Corp · Unsubscribe";
+        assert_eq!(
+            completed(read_m1(HTML_ONLY)),
+            json!({
+                "id": "m1",
+                "thread_id": "t1",
+                "labels": ["INBOX", "CATEGORY_UPDATES"],
+                "from": "Example Corp <news@example.com>",
+                "to": "Bob Example <bob@example.com>",
+                "subject": "October news",
+                "date": "Sat, 31 Oct 2026 14:05:09 +0000",
+                "message_id": "<m1@example.com>",
+                "internal_date": "2026-10-31T14:05:09Z",
+                "text": text,
+                "text_source": "text/html",
+                "text_chars": text.chars().count(),
+                "attachments": [],
+            })
+        );
+    }
+
+    #[test]
+    fn an_alternative_reads_its_plain_part_even_when_the_html_says_more() {
+        let answer = completed(read_m1(ALTERNATIVE_HTML_RICHER));
+        assert_eq!(answer["text"], json!("Hello Bob,\r\nSee the report.\r\n"));
+        assert_eq!(answer["text_source"], json!("text/plain"));
+        assert_eq!(answer.get("decoding_notes"), None);
+    }
+
+    #[test]
+    fn an_html_message_with_no_text_answers_empty_html_text() {
+        // "<img src=\"cid:logo\">"
         let body = one_part(
-            json!({ "mimeType": "text/html", "body": { "size": 9, "data": "PHA-aGk8L3A-" } }),
+            json!({ "mimeType": "text/html", "body": { "size": 20, "data": "PGltZyBzcmM9ImNpZDpsb2dvIj4" } }),
             json!([]),
         );
         let answer = completed(read_m1(&body));
         assert_eq!(answer["text"], json!(""));
         assert_eq!(answer["text_source"], json!("text/html"));
-        assert_eq!(
-            answer["decoding_notes"],
-            json!(["HTML body not rendered in this build"])
-        );
+        assert_eq!(answer["text_chars"], json!(0));
+        assert_eq!(answer.get("decoding_notes"), None);
     }
 
     #[test]
@@ -3399,12 +3438,9 @@ mod tests {
         assert_eq!(answer["text"], json!("a\n\nb"));
         assert_eq!(answer["text_source"], json!("text/plain"));
         let answer = completed(read_m1(&mixed(json!([leaf("YQ"), html, leaf("Yg")]))));
-        assert_eq!(answer["text"], json!("a\n\nb"));
+        assert_eq!(answer["text"], json!("a\n\nhi\n\nb"));
         assert_eq!(answer["text_source"], json!("mixed"));
-        assert_eq!(
-            answer["decoding_notes"],
-            json!(["HTML body not rendered in this build"])
-        );
+        assert_eq!(answer.get("decoding_notes"), None);
     }
 
     #[test]

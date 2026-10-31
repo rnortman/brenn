@@ -1,0 +1,16 @@
+{
+  "id": "m1",
+  "threadId": "t1",
+  "labelIds": ["INBOX", "CATEGORY_UPDATES"],
+  "snippet": "Hello Bob, Prices are up",
+  "sizeEstimate": 8192,
+  "internalDate": "1793455509123",
+  "payload": {
+    "partId": "",
+    "mimeType": "text/html",
+    "filename": "",
+    "headers": [{"name": "From", "value": "Example Corp <news@example.com>"}, {"name": "To", "value": "Bob Example <bob@example.com>"}, {"name": "Subject", "value": "October news"}, {"name": "Date", "value": "Sat, 31 Oct 2026 14:05:09 +0000"}, {"name": "Message-ID", "value": "<m1@example.com>"}, {"name": "Content-Type", "value": "text/html; charset=\"utf-8\""}],
+    "body": {"size": 750, "data": "PCFET0NUWVBFIGh0bWw-CjxodG1sPgo8aGVhZD4KPG1ldGEgY2hhcnNldD0idXRmLTgiPgo8dGl0bGU-T2N0b2JlciBuZXdzPC90aXRsZT4KPHN0eWxlIHR5cGU9InRleHQvY3NzIj4KICBib2R5IHsgZm9udC1mYW1pbHk6IEFyaWFsOyB9IC5idG4geyBjb2xvcjogI2ZmZjsgfQo8L3N0eWxlPgo8L2hlYWQ-Cjxib2R5Pgo8IS0tIHByZWhlYWRlciAtLT4KPHRhYmxlIHdpZHRoPSI2MDAiIGNlbGxwYWRkaW5nPSIwIj48dHI-PHRkPgo8aDE-T2N0b2JlciZuYnNwO25ld3M8L2gxPgo8cD5IZWxsbyBCb2IsPC9wPgo8cD5QcmljZXMgYXJlIHVwIDUmbmJzcDsmcGVyY250OyAmbWRhc2g7IHNlZSA8YSBocmVmPSJodHRwczovL2V4YW1wbGUuY29tL3Q_dT0xJmFtcDtjPTIiPnRoZSByZXBvcnQ8L2E-LjwvcD4KPHRhYmxlPgo8dHI-PHRoPlBsYW48L3RoPjx0aD5QcmljZTwvdGg-PC90cj4KPHRyPjx0ZD5CYXNpYzwvdGQ-PHRkPiZldXJvOzEwPC90ZD48L3RyPgo8dHI-PHRkPlBybzwvdGQ-PHRkPiZldXJvOzI1PC90ZD48L3RyPgo8L3RhYmxlPgo8dWw-PGxpPkZhc3RlciBzeW5jPC9saT48bGk-Q2FmJmVhY3V0ZTsgbW9kZTwvbGk-PC91bD4KPHA-JmNvcHk7IDIwMjYgRXhhbXBsZSBDb3JwICZtaWRkb3Q7IDxhIGhyZWY9Imh0dHBzOi8vZXhhbXBsZS5jb20vdW5zdWIiPlVuc3Vic2NyaWJlPC9hPjwvcD4KPC90ZD48L3RyPjwvdGFibGU-CjxzY3JpcHQ-dHJhY2tPcGVuKCJtMSIpOzwvc2NyaXB0Pgo8L2JvZHk-CjwvaHRtbD4K"}
+  },
+  "historyId": "9001"
+}

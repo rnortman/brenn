@@ -1,0 +1,20 @@
+{
+  "id": "m1",
+  "threadId": "t1",
+  "labelIds": ["INBOX"],
+  "snippet": "Hello Bob, Prices are up",
+  "sizeEstimate": 8192,
+  "internalDate": "1793455509123",
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/alternative",
+    "filename": "",
+    "headers": [{"name": "From", "value": "Example Corp <news@example.com>"}, {"name": "To", "value": "Bob Example <bob@example.com>"}, {"name": "Subject", "value": "October news"}, {"name": "Date", "value": "Sat, 31 Oct 2026 14:05:09 +0000"}, {"name": "Message-ID", "value": "<m1@example.com>"}, {"name": "Content-Type", "value": "multipart/alternative; boundary=\"b\""}],
+    "body": {"size": 0},
+    "parts": [
+      {"partId": "0", "mimeType": "text/plain", "filename": "", "headers": [{"name": "Content-Type", "value": "text/plain; charset=\"utf-8\""}], "body": {"size": 29, "data": "SGVsbG8gQm9iLA0KU2VlIHRoZSByZXBvcnQuDQo"}},
+      {"partId": "1", "mimeType": "text/html", "filename": "", "headers": [{"name": "Content-Type", "value": "text/html; charset=\"utf-8\""}], "body": {"size": 130, "data": "PHA-SGVsbG8gQm9iLDwvcD48cD5TZWUgPGEgaHJlZj0iaHR0cHM6Ly9leGFtcGxlLmNvbS9yIj50aGUgcmVwb3J0PC9hPi48L3A-PHRhYmxlPjx0cj48dGQ-QmFzaWM8L3RkPjx0ZD4mZXVybzsxMDwvdGQ-PC90cj48L3RhYmxlPg"}}
+    ]
+  },
+  "historyId": "9001"
+}

@@ -1,8 +1,8 @@
 //! Turning Gmail's encodings into text a model reads: a header's value from
 //! `payload.headers`, HTML character references in `snippet`, `internalDate`
 //! as an RFC 3339 instant, and a `format=full` message's MIME tree as its text
-//! parts, attachments and decoding notes — base64url and three charsets
-//! decoded here. Pure functions with no crate behind them beyond
+//! parts, attachments and decoding notes — base64url, three charsets and HTML
+//! read as text here. Pure functions with no crate behind them beyond
 //! `serde_json`'s value type.
 
 use serde_json::Value;
@@ -31,9 +31,11 @@ pub fn header<'a>(headers: &'a Value, name: &str) -> Result<Option<&'a str>, Mal
     Ok(found)
 }
 
-/// Named references decoded, each to its text. An empty text drops the
-/// reference: a soft hyphen or a zero-width joiner carries nothing a reader
-/// needs.
+/// Named references decoded, each to its text: the XML five, spaces, dashes
+/// and quotes, symbols and currency, and the accented letters mail most
+/// often spells this way. Names are case-sensitive, as HTML's are. An empty
+/// text drops the reference: a soft hyphen or a zero-width joiner carries
+/// nothing a reader needs.
 const NAMED: &[(&str, &str)] = &[
     ("amp", "&"),
     ("lt", "<"),
@@ -41,9 +43,73 @@ const NAMED: &[(&str, &str)] = &[
     ("quot", "\""),
     ("apos", "'"),
     ("nbsp", "\u{a0}"),
+    ("ensp", "\u{2002}"),
+    ("emsp", "\u{2003}"),
+    ("thinsp", "\u{2009}"),
     ("shy", ""),
     ("zwj", ""),
     ("zwnj", ""),
+    ("ndash", "\u{2013}"),
+    ("mdash", "\u{2014}"),
+    ("lsquo", "\u{2018}"),
+    ("rsquo", "\u{2019}"),
+    ("sbquo", "\u{201a}"),
+    ("ldquo", "\u{201c}"),
+    ("rdquo", "\u{201d}"),
+    ("bdquo", "\u{201e}"),
+    ("laquo", "\u{ab}"),
+    ("raquo", "\u{bb}"),
+    ("lsaquo", "\u{2039}"),
+    ("rsaquo", "\u{203a}"),
+    ("hellip", "\u{2026}"),
+    ("bull", "\u{2022}"),
+    ("middot", "\u{b7}"),
+    ("dagger", "\u{2020}"),
+    ("Dagger", "\u{2021}"),
+    ("permil", "\u{2030}"),
+    ("prime", "\u{2032}"),
+    ("sect", "\u{a7}"),
+    ("para", "\u{b6}"),
+    ("copy", "\u{a9}"),
+    ("reg", "\u{ae}"),
+    ("trade", "\u{2122}"),
+    ("deg", "\u{b0}"),
+    ("plusmn", "\u{b1}"),
+    ("times", "\u{d7}"),
+    ("divide", "\u{f7}"),
+    ("frac14", "\u{bc}"),
+    ("frac12", "\u{bd}"),
+    ("frac34", "\u{be}"),
+    ("micro", "\u{b5}"),
+    ("iexcl", "\u{a1}"),
+    ("iquest", "\u{bf}"),
+    ("larr", "\u{2190}"),
+    ("rarr", "\u{2192}"),
+    ("uarr", "\u{2191}"),
+    ("darr", "\u{2193}"),
+    ("euro", "\u{20ac}"),
+    ("pound", "\u{a3}"),
+    ("yen", "\u{a5}"),
+    ("cent", "\u{a2}"),
+    ("curren", "\u{a4}"),
+    ("aacute", "\u{e1}"),
+    ("agrave", "\u{e0}"),
+    ("auml", "\u{e4}"),
+    ("ccedil", "\u{e7}"),
+    ("eacute", "\u{e9}"),
+    ("egrave", "\u{e8}"),
+    ("ecirc", "\u{ea}"),
+    ("iacute", "\u{ed}"),
+    ("ntilde", "\u{f1}"),
+    ("oacute", "\u{f3}"),
+    ("ouml", "\u{f6}"),
+    ("uacute", "\u{fa}"),
+    ("uuml", "\u{fc}"),
+    ("szlig", "\u{df}"),
+    ("Eacute", "\u{c9}"),
+    ("Auml", "\u{c4}"),
+    ("Ouml", "\u{d6}"),
+    ("Uuml", "\u{dc}"),
 ];
 
 /// The longest reference body read between `&` and `;`: `#x10FFFF` and every
@@ -115,6 +181,219 @@ fn parse_digits(digits: &str, radix: u32) -> Option<u64> {
                 .saturating_add(u64::from(digit)),
         )
     })
+}
+
+/// What a tag does to the text around it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Break {
+    /// Removed, its content kept.
+    None,
+    /// `<br>`, `<li>`: the text after it starts a new line.
+    Line,
+    /// A block element or its close: the text after it starts a new
+    /// paragraph.
+    Paragraph,
+    /// `<td>`, `<th>`: a tab before the cell's text.
+    Tab,
+}
+
+/// The break a tag named `name` (lowercase) makes; `close` for `</name>`.
+///
+/// The paragraph elements are those the HTML Standard's default style sheet
+/// (Rendering, "Flow content", "Sections and headings", "Lists", "Tables",
+/// "The fieldset and legend elements", "The details and summary elements")
+/// displays as a block, a table, a table caption or a table row. `<li>`,
+/// `<dt>` and `<dd>` start a line instead, so a list or a term and its
+/// definition read one per line.
+fn tag_break(name: &str, close: bool) -> Break {
+    match name {
+        "br" | "li" | "dt" | "dd" if !close => Break::Line,
+        "address" | "article" | "aside" | "blockquote" | "caption" | "center" | "details"
+        | "dialog" | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer"
+        | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hgroup" | "hr"
+        | "legend" | "listing" | "main" | "menu" | "nav" | "ol" | "p" | "plaintext" | "pre"
+        | "search" | "section" | "summary" | "table" | "tr" | "ul" | "xmp" => Break::Paragraph,
+        "td" | "th" if !close => Break::Tab,
+        _ => Break::None,
+    }
+}
+
+/// Elements dropped with everything they hold. The head's other elements
+/// (`<meta>`, `<link>`, `<base>`) hold nothing, so its content is dropped
+/// without treating `<head>` itself as a span.
+const DROPPED: &[&str] = &["script", "style", "title"];
+
+/// HTML as text, for a model to read: comments, `<script>`, `<style>` and
+/// `<title>` dropped with their content, and so the head's content; `<br>`,
+/// `<li>`, `<dt>` and `<dd>` start a line; block elements ([`tag_break`])
+/// and their closes start a paragraph; `<td>` and `<th>` put a tab before the
+/// cell; every other tag is removed and its content kept — a link keeps its
+/// text, not its target. Content that styles or attributes hide is kept.
+/// Character references are decoded; whitespace runs in the source are one
+/// space; each line is trimmed; blank lines between text are at most one.
+/// `<pre>` is not special: its text reads the same with its whitespace
+/// collapsed.
+///
+/// A `<` not followed by a letter, `/`, `!` or `?` is text. A quote in a tag
+/// opens a quoted value only right after `=`; elsewhere it is an ordinary
+/// character, as in `alt=Bob's`. A comment ends as HTML ends one
+/// ([`comment_end`]). A tag, comment or dropped element left open runs to
+/// the end of the input, as a browser reads it.
+pub fn html_to_text(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = TextOut::default();
+    let mut text_from = 0;
+    let mut at = 0;
+    while let Some(found) = html[at..].find('<') {
+        let open = at + found;
+        let next = html[open + 1..].chars().next();
+        if !next.is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?')) {
+            at = open + 1;
+            continue;
+        }
+        out.text(&html[text_from..open]);
+        let end = if lower[open..].starts_with("<!--") {
+            comment_end(html, open + 4)
+        } else {
+            tag_end(html, open).and_then(|end| {
+                let (name, close) = tag_name(&lower[open + 1..end]);
+                if !close && DROPPED.contains(&name) {
+                    dropped_end(&lower, name, end)
+                } else {
+                    out.tag(tag_break(name, close));
+                    Some(end)
+                }
+            })
+        };
+        let Some(end) = end else {
+            text_from = html.len();
+            break;
+        };
+        text_from = end;
+        at = end;
+    }
+    out.text(&html[text_from..]);
+    out.finish()
+}
+
+/// The byte after the end of the comment whose `<!--` ends at `body`; `None`
+/// when it is never closed. As HTML's tokenizer reads it: `<!-->` and
+/// `<!--->` are whole empty comments, and otherwise the first `-->` or
+/// `--!>` ends the comment.
+fn comment_end(html: &str, body: usize) -> Option<usize> {
+    let rest = &html[body..];
+    if rest.starts_with('>') {
+        return Some(body + 1);
+    }
+    if rest.starts_with("->") {
+        return Some(body + 2);
+    }
+    let close = rest.find("-->").map(|at| at + 3);
+    let bang = rest.find("--!>").map(|at| at + 4);
+    let len = match (close, bang) {
+        (Some(close), Some(bang)) => close.min(bang),
+        (close, bang) => close.or(bang)?,
+    };
+    Some(body + len)
+}
+
+/// The byte after the `>` closing the tag that opens at `open`, quoted
+/// attribute values skipped; `None` when the tag is never closed. A quote
+/// opens a value only when the last non-whitespace character before it is
+/// `=`.
+fn tag_end(html: &str, open: usize) -> Option<usize> {
+    let mut quote = None;
+    let mut after_equals = false;
+    for (i, c) in html[open + 1..].char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') if after_equals => quote = Some(c),
+            (None, '>') => return Some(open + 1 + i + 1),
+            (None, _) => {}
+        }
+        if quote.is_none() && !c.is_ascii_whitespace() {
+            after_equals = c == '=';
+        }
+    }
+    None
+}
+
+/// A tag's name and whether it closes, from its lowercase source between
+/// `<` and `>`. `<!…>` and `<?…>` have an empty name.
+fn tag_name(inner: &str) -> (&str, bool) {
+    let (inner, close) = match inner.strip_prefix('/') {
+        Some(rest) => (rest, true),
+        None => (inner, false),
+    };
+    let len = inner
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(inner.len());
+    (&inner[..len], close)
+}
+
+/// The byte after the close of the dropped element `name` whose open tag
+/// ends at `from`; `None` when it is never closed.
+fn dropped_end(lower: &str, name: &str, from: usize) -> Option<usize> {
+    let close = format!("</{name}");
+    lower[from..]
+        .find(&close)
+        .and_then(|at| tag_end(lower, from + at))
+}
+
+/// The text being assembled by [`html_to_text`].
+#[derive(Default)]
+struct TextOut {
+    text: String,
+    /// Source whitespace was seen since the last character written.
+    space: bool,
+}
+
+impl TextOut {
+    /// A run of source text between tags.
+    fn text(&mut self, raw: &str) {
+        for c in decode_entities(raw).chars() {
+            if c.is_ascii_whitespace() {
+                self.space = true;
+            } else {
+                if self.space && !self.text.is_empty() && !self.text.ends_with(['\n', '\t']) {
+                    self.text.push(' ');
+                }
+                self.space = false;
+                self.text.push(c);
+            }
+        }
+    }
+
+    fn tag(&mut self, kind: Break) {
+        let mark = match kind {
+            Break::None => return,
+            Break::Line => "\n",
+            Break::Paragraph => "\n\n",
+            Break::Tab => "\t",
+        };
+        self.text.push_str(mark);
+        self.space = false;
+    }
+
+    /// Lines trimmed, at most one blank line between text, none at either
+    /// end.
+    fn finish(self) -> String {
+        let mut out = String::with_capacity(self.text.len());
+        let mut blank = false;
+        for line in self.text.split('\n').map(str::trim) {
+            if line.is_empty() {
+                blank = !out.is_empty();
+                continue;
+            }
+            if !out.is_empty() {
+                out.push_str(if blank { "\n\n" } else { "\n" });
+            }
+            blank = false;
+            out.push_str(line);
+        }
+        out
+    }
 }
 
 /// Gmail's `internalDate` — milliseconds since the Unix epoch, as a decimal
@@ -208,8 +487,6 @@ pub enum Note {
     /// A `multipart/*` or `message/rfc822` part at `depth` (the payload is 0)
     /// came without its children.
     UnlistedChildren { mime_type: String, depth: usize },
-    /// An HTML part was chosen as text, and this build does not render HTML.
-    HtmlNotRendered,
 }
 
 /// Which kind of part a text came from.
@@ -264,8 +541,8 @@ pub enum WalkError {
 /// yielding any text, and lists every child's attachments. Every other
 /// `multipart/*` and `message/rfc822` yields its children's in order; one
 /// with no `parts` yields nothing and a note. A `text/plain` leaf is decoded
-/// in its charset; a `text/html` leaf yields an empty HTML text and a note. A
-/// text leaf with no `data` is empty and yields nothing; any other leaf is an
+/// in its charset; a `text/html` leaf is decoded in its charset and read by
+/// [`html_to_text`]. A text leaf with no `data` is empty and yields nothing; any other leaf is an
 /// attachment.
 pub fn extract(payload: &Value) -> Result<Extracted, WalkError> {
     let mut out = Extracted::default();
@@ -341,11 +618,15 @@ fn walk(part: &Value, depth: usize, out: &mut Extracted) -> Result<(), WalkError
             walk(child, depth + 1, &mut one)?;
             read.push(one);
         }
+        // A child yields a source's text when a part of that source holds
+        // more than whitespace; a blank plain part does not hide its HTML
+        // sibling. With no such child, the first child with any text part.
         let yields = |source: Option<Source>| {
             read.iter().position(|one| {
-                one.text_parts
-                    .iter()
-                    .any(|(_, s)| source.is_none_or(|source| *s == source))
+                one.text_parts.iter().any(|(text, s)| match source {
+                    Some(source) => *s == source && !text.trim().is_empty(),
+                    None => true,
+                })
             })
         };
         let chosen = yields(Some(Source::Plain))
@@ -381,14 +662,13 @@ fn walk(part: &Value, depth: usize, out: &mut Extracted) -> Result<(), WalkError
             _ => mime_type.clone(),
         })
     })?;
-    if mime_type == "text/html" {
-        out.text_parts.push((String::new(), Source::Html));
-        out.notes.push(Note::HtmlNotRendered);
-        return Ok(());
-    }
     let content_type = header("Content-Type")?;
     let text = decode_charset(&bytes, content_type.and_then(charset), &mut out.notes);
-    out.text_parts.push((text, Source::Plain));
+    out.text_parts.push(if mime_type == "text/html" {
+        (html_to_text(&text), Source::Html)
+    } else {
+        (text, Source::Plain)
+    });
     Ok(())
 }
 
@@ -690,8 +970,8 @@ mod tests {
     fn an_alternative_without_plain_takes_html_and_lists_the_rest() {
         let image = json!({ "mimeType": "image/png", "body": { "size": 4 } });
         let read = extract(&alternative(json!([image, html_part()]))).unwrap();
-        assert_eq!(read.text_parts, [(String::new(), Source::Html)]);
-        assert_eq!(read.notes, [Note::HtmlNotRendered]);
+        assert_eq!(read.text_parts, [("hi".to_string(), Source::Html)]);
+        assert_eq!(read.notes, []);
         assert_eq!(
             read.attachments,
             [Attachment {
@@ -701,6 +981,27 @@ mod tests {
                 inline: false,
             }]
         );
+    }
+
+    #[test]
+    fn a_blank_plain_alternative_gives_way_to_html() {
+        // "\r\n" and " \t"
+        for blank in ["DQo", "IAk"] {
+            let read = extract(&alternative(json!([
+                plain_part(blank, "utf-8"),
+                html_part()
+            ])))
+            .unwrap();
+            assert_eq!(read.text_parts, [("hi".to_string(), Source::Html)]);
+        }
+        // "<p> </p>": nothing yields text, so the first child is read.
+        let blank_html = json!({ "mimeType": "text/html", "body": { "data": "PHA-IDwvcD4" } });
+        let read = extract(&alternative(json!([
+            plain_part("DQo", "utf-8"),
+            blank_html
+        ])))
+        .unwrap();
+        assert_eq!(read.text_parts, [("\r\n".to_string(), Source::Plain)]);
     }
 
     #[test]
@@ -738,5 +1039,220 @@ mod tests {
         .unwrap();
         let inline: Vec<bool> = read.attachments.iter().map(|a| a.inline).collect();
         assert_eq!(inline, [true, true, false, false]);
+    }
+
+    #[test]
+    fn an_html_part_is_decoded_in_its_charset_then_read_as_text() {
+        // "<p>caf\xe9 \x93hi\x94</p>" in Windows-1252.
+        let part = json!({ "mimeType": "text/html", "body": { "data": "PHA-Y2Fm6SCTaGmUPC9wPg" },
+                           "headers": [{ "name": "Content-Type",
+                                         "value": "text/html; charset=windows-1252" }] });
+        let read = extract(&part).unwrap();
+        assert_eq!(
+            read.text_parts,
+            [("café \u{201c}hi\u{201d}".to_string(), Source::Html)]
+        );
+        assert_eq!(read.notes, []);
+    }
+
+    #[test]
+    fn an_html_part_with_no_text_yields_an_empty_html_text() {
+        // "<img src=\"cid:a\">"
+        let part =
+            json!({ "mimeType": "text/html", "body": { "data": "PGltZyBzcmM9ImNpZDphIj4" } });
+        let read = extract(&part).unwrap();
+        assert_eq!(read.text_parts, [(String::new(), Source::Html)]);
+    }
+
+    #[test]
+    fn tags_are_removed_and_links_keep_their_text() {
+        assert_eq!(
+            html_to_text(
+                "<span class=\"x\">Hello <b>there</b>, <a href=\"https://example.com/t?u=1&amp;v=2\">read more</a>.</span>"
+            ),
+            "Hello there, read more."
+        );
+        assert_eq!(html_to_text("<IMG SRC=\"a.png\" ALT=\"logo\">Text"), "Text");
+        assert_eq!(
+            html_to_text("<a title=\"a > b\" href='x>y'>link</a> after"),
+            "link after"
+        );
+        assert_eq!(html_to_text("<!DOCTYPE html><?xml version=\"1.0\"?>x"), "x");
+    }
+
+    #[test]
+    fn a_lone_angle_bracket_is_text() {
+        assert_eq!(html_to_text("a < b and c<5 <3"), "a < b and c<5 <3");
+        assert_eq!(html_to_text("x<"), "x<");
+    }
+
+    #[test]
+    fn line_and_paragraph_tags_break_the_text() {
+        assert_eq!(html_to_text("one<br>two<BR/>three"), "one\ntwo\nthree");
+        assert_eq!(
+            html_to_text("<ul><li>a</li><li>b</li></ul>after"),
+            "a\nb\n\nafter"
+        );
+        for tag in [
+            "address",
+            "article",
+            "aside",
+            "blockquote",
+            "caption",
+            "center",
+            "details",
+            "dialog",
+            "dir",
+            "div",
+            "dl",
+            "fieldset",
+            "figcaption",
+            "figure",
+            "footer",
+            "form",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "header",
+            "hgroup",
+            "legend",
+            "listing",
+            "main",
+            "menu",
+            "nav",
+            "ol",
+            "p",
+            "plaintext",
+            "pre",
+            "search",
+            "section",
+            "summary",
+            "table",
+            "tr",
+            "ul",
+            "xmp",
+        ] {
+            assert_eq!(
+                html_to_text(&format!("a<{tag}>b</{tag}>c")),
+                "a\n\nb\n\nc",
+                "{tag}"
+            );
+        }
+        assert_eq!(html_to_text("a<hr>b"), "a\n\nb");
+        assert_eq!(html_to_text("a<span>b</span>c<em>d</em>"), "abcd");
+        assert_eq!(
+            html_to_text("<dl><dt>Name</dt><dd>Bob</dd><dt>Total</dt><dd>$40.00</dd></dl>after"),
+            "Name\nBob\nTotal\n$40.00\n\nafter"
+        );
+    }
+
+    #[test]
+    fn table_cells_are_tab_separated() {
+        assert_eq!(
+            html_to_text(
+                "<table><tr><th>Item</th><th>Price</th></tr>\n<tr><td> Tea </td><td>&euro;3</td></tr></table>"
+            ),
+            "Item\tPrice\n\nTea\t€3"
+        );
+    }
+
+    #[test]
+    fn comments_scripts_styles_and_the_heads_content_are_dropped() {
+        assert_eq!(
+            html_to_text(
+                "<html><HEAD><title>T</title><style>p{color:red}</style></head>\
+                 <body><!-- hidden <p>x</p> -->Shown<script type=\"x\">if (a<b) {}</SCRIPT>\
+                 <style>.a{}</style> text</body></html>"
+            ),
+            "Shown text"
+        );
+        // `</head>` omitted, with and without `<body>`.
+        assert_eq!(
+            html_to_text("<head><title>T</title><body>Shown</body>"),
+            "Shown"
+        );
+        assert_eq!(
+            html_to_text("<head><meta charset=utf-8><link rel=x href=y><p>Hello"),
+            "Hello"
+        );
+    }
+
+    #[test]
+    fn a_quote_opens_a_value_only_after_equals() {
+        assert_eq!(
+            html_to_text("<img alt=Bob's src=x.png>Hello there"),
+            "Hello there"
+        );
+        assert_eq!(
+            html_to_text("<p class=a'b>Hi</p> Don't stop <b>here</b>."),
+            "Hi\n\nDon't stop here."
+        );
+        assert_eq!(html_to_text("<a title = 'x > y'>t</a>"), "t");
+        assert_eq!(html_to_text("<a data-x\"y>t</a>"), "t");
+    }
+
+    #[test]
+    fn comments_end_where_html_ends_them() {
+        assert_eq!(
+            html_to_text("<!-->shown after empty comment"),
+            "shown after empty comment"
+        );
+        assert_eq!(html_to_text("<p>a</p><!--->b"), "a\n\nb");
+        assert_eq!(html_to_text("a<!---->b"), "ab");
+        assert_eq!(html_to_text("x<!-- c --!>y"), "xy");
+        assert_eq!(html_to_text("x<!-- c --!>y<!-- d -->z"), "xyz");
+        assert_eq!(html_to_text("x<!-- c -->y --!>z"), "xy --!>z");
+        assert_eq!(html_to_text("x<!-- a - b -- c --->y"), "xy");
+    }
+
+    #[test]
+    fn what_is_left_open_runs_to_the_end() {
+        assert_eq!(html_to_text("a<!-- never closed <p>b"), "a");
+        assert_eq!(html_to_text("a<script>b"), "a");
+        assert_eq!(html_to_text("a<b class=\"x"), "a");
+        assert_eq!(html_to_text("a<head><title>t"), "a");
+    }
+
+    #[test]
+    fn entities_decode_after_tags_are_removed() {
+        assert_eq!(
+            html_to_text("&lt;b&gt;not bold&lt;/b&gt; &amp; Caf&eacute; &mdash; &copy;&nbsp;2026"),
+            "<b>not bold</b> & Café \u{2014} ©\u{a0}2026"
+        );
+    }
+
+    #[test]
+    fn whitespace_collapses_lines_trim_and_blank_lines_are_at_most_one() {
+        assert_eq!(
+            html_to_text(
+                "  <p>\n  Hello\t\r\n   world  </p>\n\n<p></p><p></p><div>  next </div>  "
+            ),
+            "Hello world\n\nnext"
+        );
+        assert_eq!(html_to_text("a&#32;&#32;&#10;b"), "a b");
+        assert_eq!(html_to_text("<pre>  keep\n   this </pre>"), "keep this");
+        assert_eq!(html_to_text(""), "");
+        assert_eq!(html_to_text("<p> </p>"), "");
+    }
+
+    #[test]
+    fn the_named_table_decodes_common_entities_case_sensitively() {
+        assert_eq!(
+            decode_entities(
+                "&ndash;&mdash;&lsquo;&rsquo;&ldquo;&rdquo;&hellip;&euro;&pound;&yen;&cent;\
+                 &copy;&reg;&trade;&middot;&bull;&deg;&laquo;&raquo;&times;&frac12;"
+            ),
+            "\u{2013}\u{2014}\u{2018}\u{2019}\u{201c}\u{201d}\u{2026}€£¥¢©®™·•°«»×½"
+        );
+        assert_eq!(decode_entities("&dagger;&Dagger;"), "\u{2020}\u{2021}");
+        assert_eq!(decode_entities("&eacute;&Eacute;"), "éÉ");
+        assert_eq!(decode_entities("&EURO;&Copy;"), "&EURO;&Copy;");
+        for (name, text) in NAMED {
+            assert!(name.len() <= REFERENCE_MAX_CHARS, "{name}");
+            assert_eq!(decode_entities(&format!("&{name};")), *text, "{name}");
+        }
     }
 }
