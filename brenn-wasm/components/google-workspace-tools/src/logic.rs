@@ -30,7 +30,9 @@ use crate::spec::Provided;
 pub const INFLIGHT_TTL_MS: u64 = 300_000;
 
 /// A compact result larger than this is a bug in a size bound, answered
-/// `internal` rather than sent.
+/// `internal` rather than sent. `CalendarFreeBusy` alone reaches it by design
+/// — its answer mirrors Google's, which is bounded by the read limit, not by
+/// the wrapper — and `settle` refuses it there with a hint.
 pub const COMPACT_RESULT_CEILING: usize = 256 * 1024;
 
 /// The most bytes an `account` argument may hold: a mailbox address's limit.
@@ -220,6 +222,17 @@ const RESPONSES: &[(&str, &str)] = &[
     ("needsAction", "needs_action"),
 ];
 
+/// The path Calendar answers free/busy queries at.
+const FREEBUSY_PATH: &str = "/calendar/v3/freeBusy";
+/// The most calendars one free/busy query may name: Google's limit.
+const FREEBUSY_CALENDARS_MAX: usize = 50;
+/// What the caller can narrow when a free/busy answer is unreadable or past
+/// the result ceiling.
+const FREEBUSY_HINT: &str = "ask for a shorter `from`/`to` window, or fewer `calendars`";
+/// The most calendar ids a free/busy refusal quotes from each side of a
+/// mismatch between the calendars asked and those Google answered.
+const QUOTED_IDS_MAX: usize = 5;
+
 /// The most bytes a calendar id may hold, in an argument or an answer.
 const CALENDAR_ID_MAX_BYTES: usize = 320;
 /// The most bytes an event id may hold: Google's base32hex ids are at most
@@ -249,9 +262,10 @@ fn family(tool: Provided) -> Family {
         | Provided::GmailSearch
         | Provided::GmailRead
         | Provided::GmailThread => Family::Gmail,
-        Provided::CalendarList | Provided::CalendarEvents | Provided::CalendarEvent => {
-            Family::Calendar
-        }
+        Provided::CalendarList
+        | Provided::CalendarEvents
+        | Provided::CalendarEvent
+        | Provided::CalendarFreeBusy => Family::Calendar,
     }
 }
 
@@ -393,18 +407,48 @@ pub struct ApiCall {
     pub path: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub query: Query,
+    /// The request body as text; `api-request` sends it as
+    /// `application/json` when no `Content-Type` is given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 impl ApiCall {
-    /// A GET on `host` for `account`. Every Google read adds
-    /// `prettyPrint=false` to `query`: Google's indentation would count
-    /// against the read limit and the bus cap like any other byte.
+    /// A GET on `host` for `account`.
     fn get(
         settings: &Settings,
         host: &str,
         account: Option<&str>,
         path: String,
+        query: Query,
+    ) -> ApiCall {
+        ApiCall::new(settings, "GET", host, account, path, query, None)
+    }
+
+    /// A POST on `host` for `account` carrying `body` as JSON text.
+    fn post_json(
+        settings: &Settings,
+        host: &str,
+        account: Option<&str>,
+        path: String,
+        query: Query,
+        body: Value,
+    ) -> ApiCall {
+        let body = serde_json::to_string(&body).expect("a JSON value serializes");
+        ApiCall::new(settings, "POST", host, account, path, query, Some(body))
+    }
+
+    /// Every Google call adds `prettyPrint=false` to `query`: Google's
+    /// indentation would count against the read limit and the bus cap like
+    /// any other byte.
+    fn new(
+        settings: &Settings,
+        method: &str,
+        host: &str,
+        account: Option<&str>,
+        path: String,
         mut query: Query,
+        body: Option<String>,
     ) -> ApiCall {
         query.insert(
             "prettyPrint".to_string(),
@@ -413,10 +457,11 @@ impl ApiCall {
         ApiCall {
             provider: settings.provider.clone(),
             account: account.map(str::to_string),
-            method: "GET".to_string(),
+            method: method.to_string(),
             host: host.to_string(),
             path,
             query,
+            body,
         }
     }
 
@@ -658,15 +703,18 @@ fn is_calendar_id(id: &str) -> bool {
             .any(|c| matches!(c, '/' | '\\' | '%' | '"') || c.is_control() || c.is_whitespace())
 }
 
+/// What `is_calendar_id` admits, as a refusal states it.
+fn calendar_id_rule() -> String {
+    format!(
+        "a calendar id of 1 to {CALENDAR_ID_MAX_BYTES} bytes with no `/`, `\\`, `%`, `\"`, \
+         space or control character"
+    )
+}
+
 /// A calendar id argument, refused here rather than by `api-request` so a bad
 /// id is the caller's to fix.
 fn calendar_id(args: &Args, key: &str) -> Result<Option<String>, String> {
-    id_arg(args, key, is_calendar_id, || {
-        format!(
-            "a calendar id of 1 to {CALENDAR_ID_MAX_BYTES} bytes with no `/`, `\\`, `%`, `\"`, \
-             space or control character"
-        )
-    })
+    id_arg(args, key, is_calendar_id, calendar_id_rule)
 }
 
 /// Whether `id` is an event id as Google writes them: 1 to
@@ -685,6 +733,41 @@ fn event_id(args: &Args, key: &str) -> Result<Option<String>, String> {
 /// A time argument, passed to Google as given.
 fn time(args: &Args, key: &str) -> Result<Option<String>, String> {
     Ok(capped(args, key, TIME_MAX_BYTES)?.map(str::to_string))
+}
+
+/// The `calendars` argument: 1 to `FREEBUSY_CALENDARS_MAX` distinct calendar
+/// ids, each as `calendar_id` bounds it; absent is `primary` alone. Google
+/// answers one entry per distinct id, so a repeated id is refused.
+fn calendars(args: &Args) -> Result<Vec<String>, String> {
+    let Some(value) = args.get("calendars") else {
+        return Ok(vec![PRIMARY_CALENDAR.to_string()]);
+    };
+    let ids = match value {
+        Value::Array(ids) if (1..=FREEBUSY_CALENDARS_MAX).contains(&ids.len()) => ids,
+        _ => {
+            return Err(format!(
+                "`calendars` must be an array of 1 to {FREEBUSY_CALENDARS_MAX} calendar ids"
+            ));
+        }
+    };
+    let mut out: Vec<String> = Vec::with_capacity(ids.len());
+    for id in ids {
+        match id {
+            Value::String(id) if is_calendar_id(id) => {
+                if out.contains(id) {
+                    return Err(format!("`calendars` names {id:?} twice"));
+                }
+                out.push(id.clone());
+            }
+            _ => {
+                return Err(format!(
+                    "each of `calendars` must be {}",
+                    calendar_id_rule()
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// An integer argument in `min..=max`.
@@ -765,6 +848,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
             Ok(Call {
                 step: 1,
                 api: event_get_call(&event, settings),
+            })
+        }
+        Provided::CalendarFreeBusy => {
+            let free_busy = FreeBusyArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: free_busy_call(&free_busy, settings),
             })
         }
     }
@@ -1067,6 +1157,51 @@ fn event_get_call(args: &EventArgs, settings: &Settings) -> ApiCall {
             ("maxAttendees", ATTENDEES_MAX.to_string()),
             ("fields", EVENT_GET_FIELDS.to_string()),
         ]),
+    )
+}
+
+/// `CalendarFreeBusy`'s arguments.
+struct FreeBusyArgs {
+    from: String,
+    to: String,
+    calendars: Vec<String>,
+    account: Option<String>,
+}
+
+impl FreeBusyArgs {
+    // TODO(provider-schema-parse-parity): these bounds and the
+    // `calendar-free-busy` `input_schema` in the spec are stated separately.
+    fn parse(args: &Value) -> Result<FreeBusyArgs, String> {
+        let map = object(args, &["from", "to", "calendars", "account"])?;
+        Ok(FreeBusyArgs {
+            from: time(map, "from")?.ok_or("`from` is required")?,
+            to: time(map, "to")?.ok_or("`to` is required")?,
+            calendars: calendars(map)?,
+            account: account(map)?,
+        })
+    }
+}
+
+/// freebusy.query for the window `from`..`to` over `calendars`. The POST
+/// changes nothing; `api-request` admits it only for a stamped call.
+fn free_busy_call(args: &FreeBusyArgs, settings: &Settings) -> ApiCall {
+    let items: Vec<Value> = args
+        .calendars
+        .iter()
+        .map(|id| json!({ "id": id }))
+        .collect();
+    ApiCall::post_json(
+        settings,
+        &settings.calendar_host,
+        args.account.as_deref(),
+        FREEBUSY_PATH.to_string(),
+        Query::new(),
+        json!({
+            "timeMin": args.from,
+            "timeMax": args.to,
+            "items": items,
+            "calendarExpansionMax": args.calendars.len(),
+        }),
     )
 }
 
@@ -1537,6 +1672,9 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             (Provided::CalendarEvent, 1) => stored(state, EventArgs::parse)
                 .and_then(|args| compact_event(&body, &args))
                 .map(Next::Complete),
+            (Provided::CalendarFreeBusy, 1) => stored(state, FreeBusyArgs::parse)
+                .and_then(|args| compact_free_busy(&body, &args))
+                .map(Next::Complete),
             (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 named(state, &body)
             }
@@ -1555,8 +1693,8 @@ fn no_such_step(tool: Provided, step: u8) -> Failure {
 /// A nested read that was cut or refused, decided by the step's shape: a
 /// per-message read of a search page is listed unavailable and the page goes
 /// on; a message's or a thread's first read is asked for again narrower,
-/// carrying why; a window's events fail with why and what to narrow; every
-/// other step fails with why.
+/// carrying why; a window's events or free/busy fail with why and what to
+/// narrow; every other step fails with why.
 fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
     settle(
         state.tool,
@@ -1587,6 +1725,7 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
                 Err(why.failure(None))
             }
             (Provided::CalendarEvents, 1) => Err(why.failure(Some(EVENTS_HINT))),
+            (Provided::CalendarFreeBusy, 1) => Err(why.failure(Some(FREEBUSY_HINT))),
             (tool, step) => Err(no_such_step(tool, step)),
         },
     )
@@ -1594,20 +1733,24 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
 
 /// A step's decision as the request's next move, a completed answer held to
 /// the result ceiling — after `GmailRead`'s text or `CalendarEvent`'s
-/// description is cut, or `GmailThread`'s oldest messages dropped, to fit it.
+/// description is cut, or `GmailThread`'s oldest messages dropped, to fit it;
+/// a `CalendarFreeBusy` answer past it is refused with what to narrow.
 fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
     match decided {
         Ok(Next::Complete(value)) => {
-            let value = match tool {
-                Provided::GmailRead => fit_text(value, "text", COMPACT_RESULT_CEILING),
-                Provided::CalendarEvent => fit_text(value, "description", COMPACT_RESULT_CEILING),
-                Provided::GmailThread => fit_thread(value, COMPACT_RESULT_CEILING),
+            let (value, hint) = match tool {
+                Provided::GmailRead => (fit_text(value, "text", COMPACT_RESULT_CEILING), None),
+                Provided::CalendarEvent => {
+                    (fit_text(value, "description", COMPACT_RESULT_CEILING), None)
+                }
+                Provided::GmailThread => (fit_thread(value, COMPACT_RESULT_CEILING), None),
+                Provided::CalendarFreeBusy => (value, Some(FREEBUSY_HINT)),
                 Provided::GmailLabels
                 | Provided::GmailSearch
                 | Provided::CalendarList
-                | Provided::CalendarEvents => value,
+                | Provided::CalendarEvents => (value, None),
             };
-            bounded(value, COMPACT_RESULT_CEILING)
+            bounded(value, COMPACT_RESULT_CEILING, hint)
         }
         Ok(next) => next,
         Err(failure) => Next::Fail(failure),
@@ -2608,14 +2751,114 @@ fn conference<'a>(event: &Compact<'a>) -> Result<Option<&'a str>, Failure> {
     Ok(None)
 }
 
+/// freebusy.query as `{ "from"?, "to"?, "calendars": { <id>: { "busy"?,
+/// "errors"? } } }`: Google's echo of the window, and per calendar asked its
+/// busy intervals (`start`, `end`, as Google gave them) or the reasons Google
+/// could not answer for it. The empty `busy` Google sends beside reasons is
+/// left out, since it would read as free time. The calendars must be exactly
+/// those asked, and the refusal otherwise names the ids on each side of the
+/// difference; one with neither `busy` nor reasons is Google's fault.
+fn compact_free_busy(body: &Value, args: &FreeBusyArgs) -> Result<Value, Failure> {
+    let api = "freebusy.query";
+    let mut answer = Compact::of(body, api)?;
+    answer.short("timeMin", "from")?;
+    answer.short("timeMax", "to")?;
+    let Some(Value::Object(google)) = answer.item.get("calendars") else {
+        return Err(shape(api));
+    };
+    let unasked: Vec<&String> = google
+        .keys()
+        .filter(|id| !args.calendars.contains(*id))
+        .collect();
+    let unanswered: Vec<&String> = args
+        .calendars
+        .iter()
+        .filter(|id| !google.contains_key(*id))
+        .collect();
+    if !(unasked.is_empty() && unanswered.is_empty()) {
+        return Err(internal(format!(
+            "unexpected Google {api} response shape: calendars answered but not asked: {}; \
+             calendars asked but not answered: {}",
+            quoted_ids(&unasked),
+            quoted_ids(&unanswered)
+        )));
+    }
+    let mut calendars = Args::new();
+    for (id, calendar) in google {
+        let calendar = Compact::of(calendar, api)?;
+        let busy = calendar
+            .array("busy")?
+            .iter()
+            .map(|interval| busy_interval(interval, api))
+            .collect::<Result<Vec<_>, _>>()?;
+        let errors = calendar
+            .array("errors")?
+            .iter()
+            .map(|error| match Compact::of(error, api)?.string("reason")? {
+                Some(reason) => Ok(json!(cut(&plain(reason), SHORT_MAX_BYTES).0)),
+                None => Err(shape(api)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Args::new();
+        if errors.is_empty() {
+            if !calendar.item.contains_key("busy") {
+                return Err(shape(api));
+            }
+            out.insert("busy".to_string(), Value::Array(busy));
+        } else {
+            if !busy.is_empty() {
+                out.insert("busy".to_string(), Value::Array(busy));
+            }
+            out.insert("errors".to_string(), Value::Array(errors));
+        }
+        calendars.insert(id.clone(), Value::Object(out));
+    }
+    answer
+        .out
+        .insert("calendars".to_string(), Value::Object(calendars));
+    Ok(answer.done())
+}
+
+/// Calendar ids for a refusal's detail: the first `QUOTED_IDS_MAX`, each
+/// through `bounded_quote`, then how many more; `none` when empty.
+fn quoted_ids(ids: &[&String]) -> String {
+    if ids.is_empty() {
+        return "none".to_string();
+    }
+    let mut out = ids
+        .iter()
+        .take(QUOTED_IDS_MAX)
+        .map(|id| format!("\"{}\"", bounded_quote(id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ids.len() > QUOTED_IDS_MAX {
+        out.push_str(&format!(" and {} more", ids.len() - QUOTED_IDS_MAX));
+    }
+    out
+}
+
+/// One busy interval: Google's `start` and `end`, both required.
+fn busy_interval(interval: &Value, api: &str) -> Result<Value, Failure> {
+    let mut out = Compact::of(interval, api)?;
+    out.short("start", "start")?;
+    out.short("end", "end")?;
+    if !(out.out.contains_key("start") && out.out.contains_key("end")) {
+        return Err(shape(api));
+    }
+    Ok(out.done())
+}
+
 /// `value` as the request's answer, unless it serializes larger than
-/// `ceiling` — a bound that was wrong, reported rather than sent.
-pub fn bounded(value: Value, ceiling: usize) -> Next {
+/// `ceiling`: then an internal failure, ending with `hint` (what the caller
+/// should narrow) when one is given. Nothing is dropped to fit.
+pub fn bounded(value: Value, ceiling: usize, hint: Option<&str>) -> Next {
     let size = serialized_len(&value);
     if size > ceiling {
-        return Next::Fail(internal(format!(
-            "compact result of {size} bytes exceeds the wrapper's ceiling"
-        )));
+        let detail = format!("compact result of {size} bytes exceeds the wrapper's ceiling");
+        return Next::Fail(internal(match hint {
+            Some(hint) => format!("{detail}; {hint}"),
+            None => detail,
+        }));
     }
     Next::Complete(value)
 }
@@ -2782,6 +3025,7 @@ mod tests {
                 host: "gmail.example.com".to_string(),
                 path: "/gmail/v1/users/me/labels".to_string(),
                 query: fields("labels(id,name,type)"),
+                body: None,
             }
         );
         // `api-request` refuses an argument it does not know, so an absent
@@ -3369,13 +3613,25 @@ mod tests {
     #[test]
     fn the_result_ceiling_reports_rather_than_sends() {
         let value = json!({ "text": "x".repeat(100) });
-        assert_eq!(bounded(value.clone(), 1_000), Next::Complete(value.clone()));
+        assert_eq!(
+            bounded(value.clone(), 1_000, None),
+            Next::Complete(value.clone())
+        );
         let size = serde_json::to_vec(&value).unwrap().len();
         assert_eq!(
-            bounded(value, 50),
+            bounded(value.clone(), 50, None),
             Next::Fail(failure(
                 ErrorKind::Internal,
                 &format!("compact result of {size} bytes exceeds the wrapper's ceiling")
+            ))
+        );
+        assert_eq!(
+            bounded(value, 50, Some("ask for less")),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                &format!(
+                    "compact result of {size} bytes exceeds the wrapper's ceiling; ask for less"
+                )
             ))
         );
     }
@@ -3700,6 +3956,7 @@ mod tests {
                 host: "gmail.example.com".to_string(),
                 path: "/gmail/v1/users/me/labels".to_string(),
                 query: fields("labels(id,name)"),
+                body: None,
             }
         );
         let names = r#"{ "labels": [
@@ -5434,6 +5691,7 @@ mod tests {
                 host: "calendar.example.com".to_string(),
                 path: "/calendar/v3/users/me/calendarList".to_string(),
                 query: calendar_list_query(&[]),
+                body: None,
             }
         );
         let call =
@@ -5714,6 +5972,7 @@ mod tests {
                 host: "calendar.example.com".to_string(),
                 path: "/calendar/v3/calendars/primary/events".to_string(),
                 query: events_query("50", &[]),
+                body: None,
             }
         );
         let call = events(json!({
@@ -6026,6 +6285,7 @@ mod tests {
                 host: "calendar.example.com".to_string(),
                 path: "/calendar/v3/calendars/primary/events/e1".to_string(),
                 query: event_query(),
+                body: None,
             }
         );
         let call = event(json!({
@@ -6427,6 +6687,389 @@ mod tests {
         );
     }
 
+    fn free_busy(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::CalendarFreeBusy, &args, &settings()).map(|call| {
+            assert_eq!(call.step, 1);
+            call.api
+        })
+    }
+
+    /// The JSON body a free/busy call carries.
+    fn free_busy_body(call: &ApiCall) -> Value {
+        serde_json::from_str(call.body.as_deref().expect("a POST carries a body")).unwrap()
+    }
+
+    #[test]
+    fn free_busy_posts_one_query_for_primary_on_the_calendar_host() {
+        let call = free_busy(json!({ "from": FROM, "to": TO })).unwrap();
+        assert_eq!(
+            call,
+            ApiCall {
+                provider: "google".to_string(),
+                account: None,
+                method: "POST".to_string(),
+                host: "calendar.example.com".to_string(),
+                path: "/calendar/v3/freeBusy".to_string(),
+                query: query([("prettyPrint", "false".to_string())]),
+                body: call.body.clone(),
+            }
+        );
+        assert_eq!(
+            free_busy_body(&call),
+            json!({
+                "timeMin": FROM,
+                "timeMax": TO,
+                "items": [{ "id": "primary" }],
+                "calendarExpansionMax": 1,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&call).unwrap()["body"],
+            json!(call.body.as_deref().unwrap())
+        );
+
+        let holidays = "en.usa#holiday@group.v.calendar.google.com";
+        let call = free_busy(json!({
+            "from": FROM,
+            "to": TO,
+            "calendars": ["primary", holidays],
+            "account": "alice@example.com",
+        }))
+        .unwrap();
+        assert_eq!(call.account.as_deref(), Some("alice@example.com"));
+        assert_eq!(
+            free_busy_body(&call),
+            json!({
+                "timeMin": FROM,
+                "timeMax": TO,
+                "items": [{ "id": "primary" }, { "id": holidays }],
+                "calendarExpansionMax": 2,
+            })
+        );
+        // A GET carries no body, and `api-request` is not sent one.
+        let get = event(json!({ "id": "e1" })).unwrap();
+        assert!(serde_json::to_value(&get).unwrap().get("body").is_none());
+    }
+
+    #[test]
+    fn free_busy_refuses_bad_arguments() {
+        let window = |extra: Value| {
+            let mut args = json!({ "from": FROM, "to": TO });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            args
+        };
+        let count = "`calendars` must be an array of 1 to 50 calendar ids";
+        let bad_id = "each of `calendars` must be a calendar id of 1 to 320 bytes with no `/`, \
+                      `\\`, `%`, `\"`, space or control character";
+        for (args, refusal) in [
+            (json!({ "to": TO }), "`from` is required".to_string()),
+            (json!({ "from": FROM }), "`to` is required".to_string()),
+            (
+                json!({ "from": " ", "to": TO }),
+                "`from` is empty".to_string(),
+            ),
+            (
+                json!({ "from": FROM, "to": "t".repeat(TIME_MAX_BYTES + 1) }),
+                "`to` is longer than 64 bytes".to_string(),
+            ),
+            (window(json!({ "calendars": [] })), count.to_string()),
+            (
+                window(json!({ "calendars": vec!["c"; FREEBUSY_CALENDARS_MAX + 1] })),
+                count.to_string(),
+            ),
+            (window(json!({ "calendars": "primary" })), count.to_string()),
+            (window(json!({ "calendars": ["a/b"] })), bad_id.to_string()),
+            (window(json!({ "calendars": ["a b"] })), bad_id.to_string()),
+            (
+                window(json!({ "calendars": ["c".repeat(CALENDAR_ID_MAX_BYTES + 1)] })),
+                bad_id.to_string(),
+            ),
+            (window(json!({ "calendars": [1] })), bad_id.to_string()),
+            (
+                window(json!({ "calendars": ["primary", "bob@example.com", "primary"] })),
+                "`calendars` names \"primary\" twice".to_string(),
+            ),
+            (
+                window(json!({ "max": 5 })),
+                "unknown argument `max`; this tool takes `from`, `to`, `calendars`, `account`"
+                    .to_string(),
+            ),
+        ] {
+            assert_eq!(free_busy(args.clone()).unwrap_err(), refusal, "{args}");
+        }
+        let fifty: Vec<String> = (0..FREEBUSY_CALENDARS_MAX)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let call = free_busy(window(json!({ "calendars": fifty }))).unwrap();
+        assert_eq!(free_busy_body(&call)["calendarExpansionMax"], json!(50));
+    }
+
+    const FREE_BUSY: &str = include_str!("fixtures/free-busy.json");
+    const FREE_BUSY_CALENDARS: [&str; 3] = [
+        "primary",
+        "en.usa#holiday@group.v.calendar.google.com",
+        "bob@example.com",
+    ];
+
+    fn free_busy_state(args: Value) -> InFlight {
+        let call = plan(Provided::CalendarFreeBusy, &args, &settings()).unwrap();
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::CalendarFreeBusy,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        )
+    }
+
+    /// The fixture's three calendars asked, answered `body`.
+    fn read_free_busy(body: &str) -> Next {
+        let state = free_busy_state(json!({
+            "from": FROM,
+            "to": TO,
+            "calendars": FREE_BUSY_CALENDARS,
+        }));
+        answered(&state, http(200, body))
+    }
+
+    /// The fixture with its `calendars` entry `id` replaced by `entry`, or
+    /// removed when `entry` is null.
+    fn free_busy_with(id: &str, entry: Value) -> String {
+        let mut body: Value = serde_json::from_str(FREE_BUSY).unwrap();
+        let calendars = body["calendars"].as_object_mut().unwrap();
+        if entry.is_null() {
+            calendars.remove(id);
+        } else {
+            calendars.insert(id.to_string(), entry);
+        }
+        body.to_string()
+    }
+
+    #[test]
+    fn free_busy_answers_each_calendar_asked() {
+        assert_eq!(
+            completed(read_free_busy(FREE_BUSY)),
+            json!({
+                "from": "2026-11-03T05:00:00.000Z",
+                "to": "2026-11-04T05:00:00.000Z",
+                "calendars": {
+                    "primary": { "busy": [
+                        { "start": "2026-11-03T14:00:00Z", "end": "2026-11-03T15:00:00Z" },
+                        { "start": "2026-11-03T18:30:00Z", "end": "2026-11-03T19:00:00Z" },
+                    ] },
+                    // Free all window: an empty list, not an absent one.
+                    "en.usa#holiday@group.v.calendar.google.com": { "busy": [] },
+                    // Unknown, not free: Google's empty `busy` is left out.
+                    "bob@example.com": { "errors": ["notFound"] },
+                },
+            })
+        );
+        // Busy intervals beside an error are kept.
+        let partial = free_busy_with(
+            "bob@example.com",
+            json!({
+                "errors": [{ "domain": "global", "reason": "tooManyCalendarsRequested" }],
+                "busy": [{ "start": "2026-11-03T16:00:00Z", "end": "2026-11-03T17:00:00Z" }],
+            }),
+        );
+        assert_eq!(
+            completed(read_free_busy(&partial))["calendars"]["bob@example.com"],
+            json!({
+                "busy": [{ "start": "2026-11-03T16:00:00Z", "end": "2026-11-03T17:00:00Z" }],
+                "errors": ["tooManyCalendarsRequested"],
+            })
+        );
+    }
+
+    #[test]
+    fn free_busy_vocabulary_is_plain_and_cut_unflagged() {
+        let long = format!("2026-11-03T14:00:00Z\u{7}{}", "9".repeat(SHORT_MAX_BYTES));
+        let body = free_busy_with(
+            "primary",
+            json!({ "busy": [{ "start": long, "end": "2026-11-03T15:00:00Z" }] }),
+        );
+        let answer = completed(read_free_busy(&body));
+        let start = answer["calendars"]["primary"]["busy"][0]["start"]
+            .as_str()
+            .unwrap();
+        // Cut at the bound, `…` after it.
+        assert_eq!(start.len(), SHORT_MAX_BYTES + '…'.len_utf8());
+        assert!(
+            start.starts_with("2026-11-03T14:00:00Z ") && start.ends_with('…'),
+            "{start}"
+        );
+        assert!(
+            answer["calendars"]["primary"]["busy"][0]
+                .get("fields_truncated")
+                .is_none()
+        );
+        let body = free_busy_with(
+            "bob@example.com",
+            json!({ "errors": [{ "domain": "global", "reason": "r".repeat(SHORT_MAX_BYTES + 1) }] }),
+        );
+        let answer = completed(read_free_busy(&body));
+        assert_eq!(
+            answer["calendars"]["bob@example.com"]["errors"][0]
+                .as_str()
+                .unwrap()
+                .len(),
+            SHORT_MAX_BYTES + '…'.len_utf8()
+        );
+    }
+
+    #[test]
+    fn free_busy_refuses_an_unexpected_shape() {
+        let mut no_calendars: Value = serde_json::from_str(FREE_BUSY).unwrap();
+        no_calendars.as_object_mut().unwrap().remove("calendars");
+        for body in [
+            "[]".to_string(),
+            no_calendars.to_string(),
+            json!({ "calendars": [] }).to_string(),
+            // A calendar that says nothing, or is not of Google's shape.
+            free_busy_with("primary", json!({})),
+            free_busy_with("primary", json!([])),
+            free_busy_with("primary", json!({ "busy": {} })),
+            free_busy_with(
+                "primary",
+                json!({ "busy": [{ "start": "2026-11-03T14:00:00Z" }] }),
+            ),
+            free_busy_with("primary", json!({ "busy": [{ "start": 1, "end": 2 }] })),
+            free_busy_with("primary", json!({ "busy": ["2026-11-03T14:00:00Z"] })),
+            free_busy_with("primary", json!({ "errors": [{ "domain": "global" }] })),
+            free_busy_with("primary", json!({ "errors": "notFound" })),
+            free_busy_with("primary", json!({ "errors": [], "busy": "x" })),
+            json!({ "timeMin": 1, "calendars": {} }).to_string(),
+        ] {
+            assert_eq!(
+                read_free_busy(&body),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    "unexpected Google freebusy.query response shape"
+                )),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn free_busy_names_the_calendars_asked_and_answered_apart() {
+        let shape = "unexpected Google freebusy.query response shape";
+        let mut stranger: Value = serde_json::from_str(FREE_BUSY).unwrap();
+        stranger["calendars"]["carol@example.com"] = json!({ "busy": [] });
+        let mut members: Value = serde_json::from_str(FREE_BUSY).unwrap();
+        let calendars = members["calendars"].as_object_mut().unwrap();
+        calendars.remove("bob@example.com");
+        for n in 0..7 {
+            calendars.insert(format!("member{n}@example.com"), json!({ "busy": [] }));
+        }
+        for (body, detail) in [
+            (
+                free_busy_with("primary", Value::Null),
+                format!(
+                    "{shape}: calendars answered but not asked: none; calendars asked but not \
+                     answered: \"primary\""
+                ),
+            ),
+            (
+                stranger.to_string(),
+                format!(
+                    "{shape}: calendars answered but not asked: \"carol@example.com\"; calendars \
+                     asked but not answered: none"
+                ),
+            ),
+            (
+                members.to_string(),
+                format!(
+                    "{shape}: calendars answered but not asked: \"member0@example.com\", \
+                     \"member1@example.com\", \"member2@example.com\", \"member3@example.com\", \
+                     \"member4@example.com\" and 2 more; calendars asked but not answered: \
+                     \"bob@example.com\""
+                ),
+            ),
+        ] {
+            assert_eq!(
+                read_free_busy(&body),
+                Next::Fail(failure(ErrorKind::Internal, &detail)),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn free_busy_relays_googles_errors_with_the_calendar_hint() {
+        let state = free_busy_state(json!({ "from": "monday", "to": TO }));
+        assert_eq!(
+            answered(
+                &state,
+                http(400, &google(400, "INVALID_ARGUMENT", "Bad Request"))
+            ),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "Google INVALID_ARGUMENT (HTTP 400): Bad Request"
+            ))
+        );
+        let Next::Fail(Failure { kind, detail }) = answered(
+            &state,
+            http(
+                403,
+                &google(403, "PERMISSION_DENIED", "Insufficient Permission"),
+            ),
+        ) else {
+            panic!("a 403 did not fail");
+        };
+        assert_eq!(kind, ErrorKind::Denied);
+        assert!(detail.ends_with(&scope_hint(Family::Calendar)), "{detail}");
+    }
+
+    /// A free/busy body whose answer, once compacted, serializes to exactly
+    /// `size` bytes: `primary` busy with as many intervals as fit, the first
+    /// ones' `end` padded (within `SHORT_MAX_BYTES`) to land on it.
+    fn free_busy_answering(size: usize) -> String {
+        let interval = || json!({ "start": "2026-11-03T14:00:00Z", "end": "2026-11-03T15:00:00Z" });
+        let body = |busy: &[Value]| json!({ "timeMin": "f", "timeMax": "t", "calendars": { "primary": { "busy": busy } } });
+        let compacted = |busy: &[Value]| {
+            serialized_len(
+                &json!({ "from": "f", "to": "t", "calendars": { "primary": { "busy": busy } } }),
+            )
+        };
+        let mut busy = vec![interval()];
+        while compacted(&busy) + serialized_len(&interval()) < size {
+            busy.push(interval());
+        }
+        let mut deficit = size - compacted(&busy);
+        for item in &mut busy {
+            let end = item["end"].as_str().unwrap().to_string();
+            let pad = deficit.min(SHORT_MAX_BYTES - end.len());
+            item["end"] = json!(format!("{end}{}", "0".repeat(pad)));
+            deficit -= pad;
+        }
+        assert_eq!(deficit, 0);
+        body(&busy).to_string()
+    }
+
+    #[test]
+    fn free_busy_past_the_ceiling_is_refused_with_what_to_narrow() {
+        let state = free_busy_state(json!({ "from": FROM, "to": TO }));
+        for size in [COMPACT_RESULT_CEILING - 1, COMPACT_RESULT_CEILING] {
+            let answer = completed(answered(&state, http(200, &free_busy_answering(size))));
+            assert_eq!(serialized_len(&answer), size);
+        }
+        let over = COMPACT_RESULT_CEILING + 1;
+        assert_eq!(
+            answered(&state, http(200, &free_busy_answering(over))),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                &format!(
+                    "compact result of {over} bytes exceeds the wrapper's ceiling; ask for \
+                     a shorter `from`/`to` window, or fewer `calendars`"
+                )
+            ))
+        );
+    }
+
     #[test]
     fn every_step_answers_an_unreadable_read_by_its_shape() {
         let refusal = "result exceeds [messaging] max_body_bytes";
@@ -6471,24 +7114,31 @@ mod tests {
         }
 
         // A window the caller can narrow: the rendering and what to narrow.
-        let state = events_state(json!({ "from": FROM, "to": TO }));
-        for (outcome, why) in outcomes() {
-            let answer = answered(&state, outcome);
-            assert_eq!(
-                answer,
-                Next::Fail(why.failure(Some(EVENTS_HINT))),
-                "{}",
-                name(&state)
-            );
-            let Next::Fail(Failure { detail, .. }) = answer else {
-                panic!("{answer:?}");
-            };
-            assert!(
-                detail.ends_with(
-                    "; ask for fewer events with `max`, or a shorter `from`/`to` window"
-                ),
-                "{detail}"
-            );
+        for (state, hint, wording) in [
+            (
+                events_state(json!({ "from": FROM, "to": TO })),
+                EVENTS_HINT,
+                "; ask for fewer events with `max`, or a shorter `from`/`to` window",
+            ),
+            (
+                free_busy_state(json!({ "from": FROM, "to": TO })),
+                FREEBUSY_HINT,
+                "; ask for a shorter `from`/`to` window, or fewer `calendars`",
+            ),
+        ] {
+            for (outcome, why) in outcomes() {
+                let answer = answered(&state, outcome);
+                assert_eq!(
+                    answer,
+                    Next::Fail(why.failure(Some(hint))),
+                    "{}",
+                    name(&state)
+                );
+                let Next::Fail(Failure { detail, .. }) = answer else {
+                    panic!("{answer:?}");
+                };
+                assert!(detail.ends_with(wording), "{detail}");
+            }
         }
 
         // A narrower form: one re-read, carrying why.

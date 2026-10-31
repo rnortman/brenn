@@ -4,6 +4,18 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **The Google Workspace assistant tools can now tell when the user is
+  busy.** The `google-workspace-tools` component gains `CalendarFreeBusy`:
+  for a window between two RFC 3339 times and up to 50 calendars (`primary`
+  unless named), each calendar's busy intervals as Google gives them, or
+  Google's reasons it could not answer for that calendar, which are not
+  reported as free time. A window too large to read or answer whole is
+  refused, saying what to narrow. **Config change required:** the instance's
+  `api-request` grant needs a `POST` clause for `/calendar/v3/freeBusy` on
+  the Calendar host (the query changes nothing, and is admitted only for a
+  call made for a user), and the assistant needs
+  `tool calendar-free-busy {}`; `docs/google-workspace.md` shows both.
+
 - **The Google Workspace assistant tools can now read one calendar event.**
   The `google-workspace-tools` component gains `CalendarEvent`: one event by
   id (on `primary` unless a calendar is named) with its title, description

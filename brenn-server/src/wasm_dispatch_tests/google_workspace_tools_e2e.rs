@@ -53,6 +53,7 @@ const LABELS: &str = "/gmail/v1/users/me/labels";
 const MESSAGES: &str = "/gmail/v1/users/me/messages";
 const THREADS: &str = "/gmail/v1/users/me/threads";
 const CALENDAR_LIST: &str = "/calendar/v3/users/me/calendarList";
+const FREE_BUSY: &str = "/calendar/v3/freeBusy";
 
 /// The instance's `api-request` clauses, as method and exact path, each on
 /// the stub's host for any user: one per endpoint the tools call.
@@ -65,6 +66,7 @@ const CLAUSES: &[(&str, &str)] = &[
     ("GET", CALENDAR_LIST),
     ("GET", "/calendar/v3/calendars/*/events"),
     ("GET", "/calendar/v3/calendars/*/events/*"),
+    ("POST", FREE_BUSY),
 ];
 
 /// The component's `provide` statements, lowered from its packaged
@@ -599,28 +601,63 @@ async fn a_google_403_mid_search_fails_the_search() {
     r.assert_finished(&id);
 }
 
-/// A tool of each Google API whose first call is a bare `GET`: its name, its
-/// slug, the path that call issues, and a body that answers it. The credential
-/// cases run on each, so each host's route resolves the caller's account.
-fn first_reads() -> [(&'static str, &'static str, &'static str, String); 2] {
+/// A tool's first call: the tool's name and slug, the arguments it is called
+/// with, the method and path the call issues, and a body that answers it.
+struct FirstRead {
+    tool: &'static str,
+    slug: &'static str,
+    args: serde_json::Value,
+    method: &'static str,
+    path: &'static str,
+    body: String,
+}
+
+/// A tool of each Google API whose first call is a bare `GET`, and the one
+/// whose first call is a `POST`. The credential cases run on each, so each
+/// host's route and each method resolves the caller's account.
+fn first_reads() -> [FirstRead; 3] {
     [
-        ("GmailLabels", "gmail-labels", LABELS, labels_body()),
-        (
-            "CalendarList",
-            "calendar-list",
-            CALENDAR_LIST,
-            json!({ "items": [] }).to_string(),
-        ),
+        FirstRead {
+            tool: "GmailLabels",
+            slug: "gmail-labels",
+            args: json!({}),
+            method: "GET",
+            path: LABELS,
+            body: labels_body(),
+        },
+        FirstRead {
+            tool: "CalendarList",
+            slug: "calendar-list",
+            args: json!({}),
+            method: "GET",
+            path: CALENDAR_LIST,
+            body: json!({ "items": [] }).to_string(),
+        },
+        FirstRead {
+            tool: "CalendarFreeBusy",
+            slug: "calendar-free-busy",
+            args: json!({ "from": FROM, "to": TO }),
+            method: "POST",
+            path: FREE_BUSY,
+            body: json!({ "calendars": { "primary": { "busy": [] } } }).to_string(),
+        },
     ]
+}
+
+/// `args` with `account` set to `account`.
+fn naming(args: &serde_json::Value, account: &str) -> serde_json::Value {
+    let mut args = args.clone();
+    args["account"] = json!(account);
+    args
 }
 
 /// With no account connected, `api-request`'s `credential_invalid` value is
 /// the tool's answer unchanged, and the component makes no further call.
 #[tokio::test]
 async fn no_connected_account_is_relayed_as_credential_invalid() {
-    for (tool, _, _, _) in first_reads() {
+    for FirstRead { tool, args, .. } in first_reads() {
         let r = rig_with(CLAUSES, &[], None).await;
-        let call = r.call_for_alice(tool, json!({}));
+        let call = r.call_for_alice(tool, args);
         let id = r.requested_id().await;
         r.run(1).await;
 
@@ -648,7 +685,15 @@ async fn no_connected_account_is_relayed_as_credential_invalid() {
 /// bearer.
 #[tokio::test]
 async fn several_accounts_need_one_named() {
-    for (tool, _, path, body) in first_reads() {
+    for FirstRead {
+        tool,
+        args,
+        method,
+        path,
+        body,
+        ..
+    } in first_reads()
+    {
         let r = rig_with(
             CLAUSES,
             &[(ACCOUNT, BEARER), (WORK_ACCOUNT, WORK_BEARER)],
@@ -657,7 +702,7 @@ async fn several_accounts_need_one_named() {
         .await;
         r.answer(path, body);
 
-        let call = r.call_for_alice(tool, json!({}));
+        let call = r.call_for_alice(tool, args.clone());
         let id = r.requested_id().await;
         r.run(1).await;
         let answer = call.await.unwrap();
@@ -666,8 +711,8 @@ async fn several_accounts_need_one_named() {
         };
         assert!(
             detail.starts_with(&format!(
-                "api-request refused the nested GET {}{path}: several \"google\" accounts are \
-                 connected; name one as `account`: ",
+                "api-request refused the nested {method} {}{path}: several \"google\" accounts \
+                 are connected; name one as `account`: ",
                 r.host
             )) && detail.contains(ACCOUNT)
                 && detail.contains(WORK_ACCOUNT),
@@ -676,7 +721,7 @@ async fn several_accounts_need_one_named() {
         assert!(r.seen().is_empty(), "{tool}: a refused call reaches no API");
         r.assert_finished(&id);
 
-        let call = r.call_for_alice(tool, json!({ "account": WORK_ACCOUNT }));
+        let call = r.call_for_alice(tool, naming(&args, WORK_ACCOUNT));
         let id = r.requested_id().await;
         r.run(1).await;
         call.await
@@ -692,14 +737,21 @@ async fn several_accounts_need_one_named() {
 /// `denied` carrying `api-request`'s explanation, and nothing reaches the API.
 #[tokio::test]
 async fn a_userless_caller_is_denied_with_the_reason() {
-    for (_, slug, path, _) in first_reads() {
+    for FirstRead {
+        slug,
+        args,
+        method,
+        path,
+        ..
+    } in first_reads()
+    {
         let r = rig_with(
             CLAUSES,
             &[(ACCOUNT, BEARER)],
             Some(CallerSetup {
                 slug: CALLER,
                 tool: slug,
-                args: json!({}),
+                args,
             }),
         )
         .await;
@@ -708,7 +760,8 @@ async fn a_userless_caller_is_denied_with_the_reason() {
             .await;
         drain_step(&caller.component, &caller.sub, MountDebt::Settled).await;
 
-        // The executor hands the call to the provider, which issues its `GET`.
+        // The executor hands the call to the provider, which issues its
+        // first call.
         r.executor.drain_step().await;
         let id = r.requested_id().await;
         r.serve().await;
@@ -725,11 +778,17 @@ async fn a_userless_caller_is_denied_with_the_reason() {
         let error = &results[0]["outcome"]["err"];
         assert_eq!(error["kind"], "denied", "{}", results[0]);
         let detail = error["detail"].as_str().expect("a detail");
+        // A userless read has no user to borrow; a userless `POST` is refused
+        // first, as not a read.
+        let reason = match method {
+            "GET" => "a caller with no acting user borrows the one user",
+            _ => "a caller with no acting user may only read",
+        };
         assert!(
             detail.starts_with(&format!(
-                "api-request refused the nested GET {}{path}: ",
+                "api-request refused the nested {method} {}{path}: ",
                 r.host
-            )) && detail.contains("a caller with no acting user borrows the one user"),
+            )) && detail.contains(reason),
             "{slug}: {detail}"
         );
         r.assert_finished(&id);
@@ -1838,5 +1897,138 @@ async fn a_google_404_on_an_event_is_invalid_args() {
             "Google NOT_FOUND (HTTP 404): Not Found".to_string()
         ))
     );
+    r.assert_finished(&id);
+}
+
+/// `CalendarFreeBusy` asks for two calendars, one named by an id holding `#`,
+/// in one `POST` carrying alice's bearer and the window as a JSON body, and
+/// answers each calendar's busy intervals or Google's reasons.
+#[tokio::test]
+async fn calendar_free_busy_posts_one_query_and_answers_each_calendar() {
+    let r = rig().await;
+    r.answer(
+        FREE_BUSY,
+        serde_json::to_string_pretty(&json!({
+            "kind": "calendar#freeBusy",
+            "timeMin": "2026-11-02T05:00:00.000Z",
+            "timeMax": "2026-11-09T05:00:00.000Z",
+            "calendars": {
+                "primary": { "busy": [
+                    { "start": "2026-11-03T14:00:00Z", "end": "2026-11-03T15:00:00Z" },
+                ] },
+                HOLIDAYS: {
+                    "errors": [{ "domain": "global", "reason": "notFound" }],
+                    "busy": [],
+                },
+            },
+        }))
+        .unwrap(),
+    );
+    let call = r.call_for_alice(
+        "CalendarFreeBusy",
+        json!({ "from": FROM, "to": TO, "calendars": ["primary", HOLIDAYS] }),
+    );
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap().expect("the component answered"),
+        json!({
+            "from": "2026-11-02T05:00:00.000Z",
+            "to": "2026-11-09T05:00:00.000Z",
+            "calendars": {
+                "primary": { "busy": [
+                    { "start": "2026-11-03T14:00:00Z", "end": "2026-11-03T15:00:00Z" },
+                ] },
+                HOLIDAYS: { "errors": ["notFound"] },
+            },
+        })
+    );
+    assert_eq!(
+        r.seen(),
+        [("POST".to_string(), FREE_BUSY.to_string(), google_query(&[]))]
+    );
+    let bodies = r.bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bodies[0]).unwrap(),
+        json!({
+            "timeMin": FROM,
+            "timeMax": TO,
+            "items": [{ "id": "primary" }, { "id": HOLIDAYS }],
+            "calendarExpansionMax": 2,
+        })
+    );
+    assert_eq!(r.bearers(), [format!("Bearer {BEARER}")]);
+    r.assert_finished(&id);
+}
+
+/// Without `calendars`, the query asks for `primary` alone.
+#[tokio::test]
+async fn calendar_free_busy_asks_for_primary_by_default() {
+    let r = rig().await;
+    r.answer(
+        FREE_BUSY,
+        json!({ "calendars": { "primary": { "busy": [] } } }).to_string(),
+    );
+    let call = r.call_for_alice("CalendarFreeBusy", json!({ "from": FROM, "to": TO }));
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap(),
+        Ok(json!({ "calendars": { "primary": { "busy": [] } } }))
+    );
+    let body: serde_json::Value = serde_json::from_slice(&r.bodies()[0]).unwrap();
+    assert_eq!(body["items"], json!([{ "id": "primary" }]));
+    r.assert_finished(&id);
+}
+
+/// A free/busy answer that cannot be read whole is `internal`, naming why and
+/// what to narrow; nothing is asked again.
+#[tokio::test]
+async fn a_free_busy_window_too_large_to_read_whole_is_refused_with_what_to_narrow() {
+    for way in BOTH_WAYS {
+        let r = unreadable_rig(way).await;
+        let interval = json!({ "start": "2026-11-03T14:00:00Z", "end": "2026-11-03T15:00:00Z" });
+        let busy = vec![interval; OVERSIZED / 60];
+        let wide = json!({ "calendars": { "primary": { "busy": busy } } }).to_string();
+        assert!(wide.len() > OVERSIZED - 1024, "{}", wide.len());
+        r.answer(FREE_BUSY, wide.clone());
+        let call = r.call_for_alice("CalendarFreeBusy", json!({ "from": FROM, "to": TO }));
+        let id = r.requested_id().await;
+        r.run(1).await;
+
+        let Err(ToolError::Internal(detail)) = call.await.unwrap() else {
+            panic!("{way:?}: the window was not refused internal");
+        };
+        let why = detail
+            .strip_suffix("; ask for a shorter `from`/`to` window, or fewer `calendars`")
+            .unwrap_or_else(|| panic!("{detail}"));
+        assert_unreadable(way, why, wide.len());
+        assert_eq!(r.seen().len(), 1, "{way:?}");
+        r.owed(&r.executor_sub(), 0).await;
+        r.assert_finished(&id);
+    }
+}
+
+/// A `POST` the instance's grant does not admit is refused when it is
+/// queued, even though every `GET` clause stands: the request is answered
+/// `internal` with Brenn's text and the clause guidance.
+#[tokio::test]
+async fn a_free_busy_post_without_its_clause_could_not_be_issued() {
+    let clauses: Vec<(&str, &str)> = CLAUSES
+        .iter()
+        .copied()
+        .filter(|&(method, _)| method != "POST")
+        .collect();
+    let r = rig_with(&clauses, &[(ACCOUNT, BEARER)], None).await;
+    let call = r.call_for_alice("CalendarFreeBusy", json!({ "from": FROM, "to": TO }));
+    let id = r.requested_id().await;
+    r.serve().await;
+
+    assert_could_not_be_issued(call.await.unwrap());
+    r.owed(&r.executor_sub(), 0).await;
+    assert!(r.seen().is_empty(), "a refused call reaches no API");
     r.assert_finished(&id);
 }

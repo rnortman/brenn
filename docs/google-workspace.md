@@ -196,7 +196,7 @@ Then the inbox tuning and the instance:
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered. The seven tools declare Σ = 22, which needs 44, rounded up
+// re-delivered. The eight tools declare Σ = 24, which needs 48, rounded up
 // to 64. 64 holds the 32 ceiling on Σ twice over, so tools joining the
 // class change nothing here.
 channel at "brenn:tool-results/workspace" {
@@ -218,6 +218,7 @@ new workspace: GoogleWorkspaceTools {
     allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/users/me/calendarList"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
+    allow { provider = "google"; user = "*"; method = "POST"; host = "www.googleapis.com"; path = "/calendar/v3/freeBusy"; }
     rate_limit { burst = 60; sustained_per_minute = 120; }
   }
   config = {
@@ -245,6 +246,7 @@ agent PersonalAssistant {
   tool calendar-list {}
   tool calendar-events {}
   tool calendar-event {}
+  tool calendar-free-busy {}
 }
 ```
 
@@ -254,19 +256,20 @@ need one.
 **The result inbox.** The `channel at "brenn:tool-results/workspace"` block
 sizes the inbox the instance's nested answers arrive on (the slug after the
 `/` is the instance's name). Each request the component serves has at most
-one Google call outstanding, so at most Σ `max_concurrency` = 22 answers are
-outstanding at once, and an answer may be delivered twice: 22 × 2 = 44,
+one Google call outstanding, so at most Σ `max_concurrency` = 24 answers are
+outstanding at once, and an answer may be delivered twice: 24 × 2 = 48,
 rounded up to 64. The block sets 64, which covers the 32 ceiling on Σ
 `max_concurrency` twice over, so the Calendar tools joining this class later
-change nothing deployed. The default window of 16 is below 44 and would lose
+change nothing deployed. The default window of 16 is below 48 and would lose
 answers under load, each lost answer leaving its request to be answered
 `internal` after the 240-second ceiling. `push_depth = 1` is the inert
 channel rung, and `noise = alarm` makes a drop here an alert.
 
-**The clauses.** The instance holds eight clauses, one per endpoint the tools
+**The clauses.** The instance holds nine clauses, one per endpoint the tools
 call — Gmail's label list, one label, the message search, one message, one
-thread, and Calendar's calendar list, one calendar's events and one event —
-every one a `GET`, and nothing wider. The `*` segments take a label, message,
+thread, and Calendar's calendar list, one calendar's events, one event and
+free/busy — every one a `GET` but free/busy's `POST`, which changes nothing
+and is admitted only for a stamped call, and nothing wider. The `*` segments take a label, message,
 thread, calendar or event id. A clause that does not admit a call's method, host and
 path is refused before anything is sent (section 7).
 
@@ -414,7 +417,7 @@ sections 3 and 5 in place.
    - A reason that says "the host did not deliver api-request's answer" and
      names neither `max_response_bytes` nor `max_body_bytes` — in
      `unavailable`, `text_omitted`, `recipients_omitted`, or a `GmailThread`,
-     `CalendarEvents` or `CalendarEvent` `internal` — is not about those limits: it quotes
+     `CalendarEvents`, `CalendarEvent` or `CalendarFreeBusy` `internal` — is not about those limits: it quotes
      the error `api-request` answered, most often that it could not reach
      Google or could not refresh the access token. Those are transient; a
      retry with the same arguments reads the message, thread, window or

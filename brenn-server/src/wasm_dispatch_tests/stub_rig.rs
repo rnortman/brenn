@@ -231,6 +231,19 @@ impl StubRig {
             .collect()
     }
 
+    /// The body of every API request the stub saw that carried one, in the
+    /// order received.
+    pub fn bodies(&self) -> Vec<Vec<u8>> {
+        self.stub
+            .lock()
+            .unwrap()
+            .api_seen
+            .iter()
+            .filter(|seen| !seen.body.is_empty())
+            .map(|seen| seen.body.clone())
+            .collect()
+    }
+
     /// The `Authorization` header of every API request the stub saw.
     pub fn bearers(&self) -> Vec<String> {
         self.stub

@@ -39,6 +39,7 @@ const TOOLS: &[(&str, &str)] = &[
     ("calendar-list", "CalendarList"),
     ("calendar-events", "CalendarEvents"),
     ("calendar-event", "CalendarEvent"),
+    ("calendar-free-busy", "CalendarFreeBusy"),
 ];
 
 /// The hosts the instance's `config` names for Gmail and Calendar.
@@ -56,6 +57,7 @@ const CLAUSES: &[(&str, &str, &str)] = &[
     ("GET", CALENDAR_HOST, "/calendar/v3/users/me/calendarList"),
     ("GET", CALENDAR_HOST, "/calendar/v3/calendars/*/events"),
     ("GET", CALENDAR_HOST, "/calendar/v3/calendars/*/events/*"),
+    ("POST", CALENDAR_HOST, "/calendar/v3/freeBusy"),
 ];
 
 /// The class's packaged specification.
