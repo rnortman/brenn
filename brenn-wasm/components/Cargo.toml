@@ -11,11 +11,11 @@
 # discovers crates by globbing this directory.
 #
 # `host-crates/` holds symlinks to the first-party crates this workspace shares
-# with the host tree (`brenn-envelope`, `brenn-cal`), and members reach them
-# through it rather than by `../../../`. The reason is not cosmetic: a path
-# dependency that escapes the workspace root cannot be resolved when the
-# workspace is reconstructed elsewhere on disk, which is exactly what generating
-# the Bazel crate hub does. Through the symlinks every path a member names stays
+# with the host tree (`brenn-envelope`, `brenn-cal`, `brenn-provider-kit`), and
+# members reach them through it rather than by `../../../`. The reason is not
+# cosmetic: a path dependency that escapes the workspace root cannot be
+# resolved when the workspace is reconstructed elsewhere on disk, which is
+# exactly what generating the Bazel crate hub does. Through the symlinks every path a member names stays
 # inside this directory. The crates on the far side belong to the root
 # workspace; they are dependencies here, never members.
 [workspace]

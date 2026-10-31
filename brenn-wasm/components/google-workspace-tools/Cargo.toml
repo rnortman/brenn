@@ -10,5 +10,5 @@ crate-type = ["cdylib"]
 [dependencies]
 brenn-cal = { version = "0.1.0", path = "../host-crates/brenn-cal" }
 brenn-guest = { path = "../guest" }
-serde = { version = "1", features = ["derive"] }
+brenn-provider-kit = { version = "0.1.0", path = "../host-crates/brenn-provider-kit" }
 serde_json = "1"

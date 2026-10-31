@@ -27,8 +27,11 @@ use brenn_guest::provides::{OutcomeErrorKind, PendingId, ToolRequest, drop_not_p
 use brenn_guest::serde_json::Map;
 use brenn_guest::tools::ToolResult;
 use brenn_guest::{Activation, Error, Processor};
+use brenn_provider_kit::{
+    Call, ErrorKind, NestedError, Next, claim, not_issued, result_summary, row_expired,
+};
 
-use crate::logic::{Call, ErrorKind, InFlight, NestedError, Next, Settings};
+use crate::logic::{InFlight, Settings};
 use crate::spec::{Provided, config, log, provides, store};
 
 /// The store namespace of in-flight rows, keyed by call id.
@@ -63,7 +66,7 @@ impl Processor for GoogleWorkspaceTools {
 /// still expires.
 fn sweep(tx: &store::Transaction, now_ms: u64) -> Result<(), Error> {
     for (key, bytes) in tx.scan(INFLIGHT_NS, b"", None, 0)? {
-        if logic::row_expired(&bytes, now_ms).map_err(Error::failed)? {
+        if row_expired(&bytes, now_ms).map_err(Error::failed)? {
             log::debug(format!("swept in-flight {}", String::from_utf8_lossy(&key)));
             tx.delete(INFLIGHT_NS, &key)?;
         }
@@ -122,7 +125,7 @@ fn issue(
         Err(refused) => drop_not_pending(provides::complete_err(
             id,
             OutcomeErrorKind::Internal,
-            &logic::not_issued(&refused.to_string()),
+            &not_issued(&refused.to_string()),
         )),
     }
 }
@@ -143,7 +146,7 @@ fn answer(
     };
     let row = tx.get(INFLIGHT_NS, result.call_id.as_bytes())?;
     let Some(state) =
-        logic::claim(id.as_str(), &result.call_id, row.as_deref()).map_err(Error::failed)?
+        claim::<Provided>(id.as_str(), &result.call_id, row.as_deref()).map_err(Error::failed)?
     else {
         log::debug(format!(
             "result for {} with no in-flight state: duplicate or stale",
@@ -160,7 +163,7 @@ fn answer(
         "{} step {} result {}",
         state.tool.name(),
         state.step,
-        logic::result_summary(&outcome)
+        result_summary(&outcome)
     ));
     match logic::advance(&state, outcome, settings) {
         Next::Complete(value) => drop_not_pending(provides::complete(&id, &value)),

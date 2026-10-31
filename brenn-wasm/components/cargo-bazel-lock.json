@@ -1,5 +1,5 @@
 {
-  "checksum": "c854219a29178dfbf1c1587320a3584fb6f2b942373e17fbfc8ca004d460479d",
+  "checksum": "aa959cf5beeaaac0a02a008ed5a5b96cb08bd655c0d09ceabab8247b4078f727",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -362,10 +362,6 @@
         "deps": {
           "common": [
             {
-              "id": "serde 1.0.229",
-              "target": "serde"
-            },
-            {
               "id": "serde_json 1.0.151",
               "target": "serde_json"
             }
@@ -726,6 +722,50 @@
       "repository": null,
       "targets": [],
       "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            },
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-provider-kit 0.1.0": {
+      "name": "brenn-provider-kit",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_provider_kit",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_provider_kit",
       "common_attrs": {
         "compile_data_glob": [
           "**"
@@ -4088,6 +4128,7 @@
     "brenn-processor-store-rt 0.1.0": "brenn-wasm/components/processor-store-rt",
     "brenn-processor-tool-test 0.1.0": "brenn-wasm/components/processor-tool-test",
     "brenn-processor-transplant 0.1.0": "brenn-wasm/components/processor-transplant",
+    "brenn-provider-kit 0.1.0": "brenn-wasm/components/host-crates/brenn-provider-kit",
     "brenn-replay 0.1.0": "brenn-wasm/components/replay",
     "brenn-replay-fault-test 0.1.0": "brenn-wasm/components/replay-fault-test",
     "brenn-replay-generic 0.1.0": "brenn-wasm/components/replay-generic"

@@ -77,6 +77,18 @@ All notable changes to Brenn are documented here.
   answered the same way and its reason names neither limit: asking again
   usually reads the message whole.
 
+- **Google Workspace tool arguments are now limited in characters, not
+  bytes.** The length caps on the `google-workspace-tools` arguments (`q`,
+  `page`, `account`, `from`/`to`, `calendar` and `calendars`) now count
+  characters, as the tools' argument schemas do, so a non-ASCII value of up
+  to the stated length is accepted and a refusal reads "… longer than N
+  characters" or "a calendar id of 1 to 320 characters". A whole-number
+  argument written as a float (`5.0`) is now accepted. A Google error whose
+  status is not a short upper-case code is reported as "not in the standard
+  error shape" rather than quoted. Known limit: a free/busy query over many
+  very long non-ASCII calendar ids can exceed the host's size limit for a
+  nested call and is then answered as an internal error. No config changes.
+
 - The Google Workspace operator guide (`docs/google-workspace.md`) now
   covers the Calendar tools: connecting users with `calendar_readonly`, what
   each answer holds, the assistant's instructions and Calendar setup and
@@ -88,8 +100,8 @@ All notable changes to Brenn are documented here.
 - Internal: a new in-tree crate, `brenn-provider-kit`, holds the core the
   two Google tool components share (the record a request keeps while it
   waits on `api-request`, argument and setting readers, and the reading of
-  Google's answers), with its own tests. Nothing uses it yet; nothing an
-  operator or the assistant sees changes.
+  Google's answers), with its own tests. The Google Workspace tool
+  component now builds on it.
 
 ## [0.30.1] — 2026-10-31
 

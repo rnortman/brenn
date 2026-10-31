@@ -74,7 +74,7 @@ version = "0.1.0"
 dependencies = [
  "brenn-cal",
  "brenn-guest",
- "serde",
+ "brenn-provider-kit",
  "serde_json",
 ]
 
@@ -182,6 +182,14 @@ name = "brenn-processor-transplant"
 version = "0.1.0"
 dependencies = [
  "brenn-guest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "brenn-provider-kit"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
 ]

@@ -1,4 +1,4 @@
-//! The wrapper's decisions, in `std` plus `serde`/`serde_json`: reading the
+//! The wrapper's decisions, in `std` plus `serde_json`: reading the
 //! instance's `config`, validating a tool's arguments, building each Gmail
 //! and Calendar call as `api-request` arguments, reading `api-request`'s
 //! answer, and compacting Google's JSON into the tool's result. Nothing here
@@ -19,32 +19,30 @@ mod decode;
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use brenn_provider_kit::{
+    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure,
+    GOOGLE_MESSAGE_MAX_BYTES, NestedError, Next, Query, QueryValue, Tool, Unreadable, bounded,
+    capped, copy, cut, flag, google_error_detail, host, integer, internal, no_such_step, object,
+    query, read_api_result, required, serialized_len, stored,
+};
+use serde_json::{Value, json};
 
 use crate::spec::Provided;
 
-/// An in-flight row older than this is garbage: longer than the host's
-/// 240 s provided-tool ceiling plus `api-request`'s 60 s HTTP timeout, so no
-/// row whose result can still arrive is ever swept.
-pub const INFLIGHT_TTL_MS: u64 = 300_000;
-
-/// A compact result larger than this is a bug in a size bound, answered
-/// `internal` rather than sent. `CalendarFreeBusy` alone reaches it by design
-/// — its answer mirrors Google's, which is bounded by the read limit, not by
-/// the wrapper — and `settle` refuses it there with a hint.
-pub const COMPACT_RESULT_CEILING: usize = 256 * 1024;
-
-/// The most bytes an `account` argument may hold: a mailbox address's limit.
+/// The most characters an `account` argument may hold: a mailbox address's
+/// limit.
+const ACCOUNT_MAX_CHARS: usize = 320;
+/// The most UTF-8 bytes of an email address copied into an event answer (the
+/// organizer's and each attendee's). The same number as `ACCOUNT_MAX_CHARS`,
+/// counted in bytes because it sizes the answer against the byte-counted
+/// result ceiling.
 const ACCOUNT_MAX_BYTES: usize = 320;
 
-/// The most bytes a Gmail id (message, thread or label) may hold. Ids are one
-/// path segment of letters, digits, `_` and `-`, which `api-request` neither
-/// decodes nor refuses.
-const ID_MAX_BYTES: usize = 128;
-
-/// The most UTF-8 bytes of a Google error message copied into a result.
-const GOOGLE_MESSAGE_MAX_BYTES: usize = 1000;
+/// The most characters a Gmail id (message, thread or label) may hold. Ids
+/// are one path segment of letters, digits, `_` and `-`, which `api-request`
+/// neither decodes nor refuses; being ASCII, an id's characters are its bytes,
+/// so the bound holds for ids Google answers too.
+const ID_MAX_CHARS: usize = 128;
 
 /// The most UTF-8 bytes of a message header's value copied into a result. A
 /// sender writes these, and nothing bounds their length.
@@ -155,10 +153,15 @@ const THREAD_MAX_MIN: u64 = 1;
 const THREAD_MAX_MAX: u64 = 100;
 const THREAD_MAX_DEFAULT: u64 = 30;
 
-/// The most bytes a search query may hold.
-const QUERY_MAX_BYTES: usize = 1024;
-/// The most bytes a page token may hold.
+/// The most characters a search query may hold.
+const QUERY_MAX_CHARS: usize = 1024;
+/// The most characters a `page` argument may hold.
+const PAGE_MAX_CHARS: usize = 4096;
+/// The most bytes of a page token Google answers as `nextPageToken`. Counted
+/// in bytes because it sizes the answer; no more than `PAGE_MAX_CHARS`, as
+/// asserted below, so a token Google gave is one `page` admits back.
 const PAGE_MAX_BYTES: usize = 4096;
+const _: () = assert!(PAGE_MAX_BYTES <= PAGE_MAX_CHARS);
 /// `GmailSearch`'s `max`: the range and the default.
 const SEARCH_MAX_MIN: u64 = 1;
 const SEARCH_MAX_MAX: u64 = 25;
@@ -233,14 +236,21 @@ const FREEBUSY_HINT: &str = "ask for a shorter `from`/`to` window, or fewer `cal
 /// mismatch between the calendars asked and those Google answered.
 const QUOTED_IDS_MAX: usize = 5;
 
-/// The most bytes a calendar id may hold, in an argument or an answer.
+/// The most characters a calendar id argument may hold.
+const CALENDAR_ID_MAX_CHARS: usize = 320;
+/// The most bytes of a calendar id Google answers in `calendarList.list`.
+/// Counted in bytes because it sizes the listing against the result ceiling;
+/// no more than `CALENDAR_ID_MAX_CHARS`, as asserted below, so a listed id is
+/// one `calendar` admits back.
 const CALENDAR_ID_MAX_BYTES: usize = 320;
-/// The most bytes an event id may hold: Google's base32hex ids are at most
-/// 1 024 characters, an instance's suffix included.
-const EVENT_ID_MAX_BYTES: usize = 1024;
-/// The most bytes a time argument may hold. Times are passed to Google as
-/// given; Google refuses one that is not RFC 3339 with an offset.
-const TIME_MAX_BYTES: usize = 64;
+const _: () = assert!(CALENDAR_ID_MAX_BYTES <= CALENDAR_ID_MAX_CHARS);
+/// The most characters an event id may hold: Google's base32hex ids are at
+/// most 1 024 characters, an instance's suffix included. Being ASCII, an id's
+/// characters are its bytes.
+const EVENT_ID_MAX_CHARS: usize = 1024;
+/// The most characters a time argument may hold. Times are passed to Google
+/// as given; Google refuses one that is not RFC 3339 with an offset.
+const TIME_MAX_CHARS: usize = 64;
 /// The most UTF-8 bytes of text copied into one line of a listing.
 const LISTING_TEXT_MAX_BYTES: usize = 300;
 /// The most UTF-8 bytes of a value from Google's own vocabulary (a role, a
@@ -306,78 +316,12 @@ impl Settings {
     /// containing `/` is an error naming the key: nothing a misconfigured
     /// instance answered would be right.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Settings, String> {
-        let required = |key: &str| -> Result<String, String> {
-            match get(key) {
-                None => Err(format!("config {key} is required")),
-                Some(value) if value.is_empty() => Err(format!("config {key} is empty")),
-                Some(value) => Ok(value),
-            }
-        };
-        let host = |key: &str| -> Result<String, String> {
-            let value = required(key)?;
-            if value.contains('/') {
-                return Err(format!(
-                    "config {key}: {value:?} is not a host[:port]; it contains `/`"
-                ));
-            }
-            Ok(value)
-        };
         Ok(Settings {
-            provider: required("provider")?,
-            gmail_host: host("gmail_host")?,
-            calendar_host: host("calendar_host")?,
+            provider: required(&get, "provider")?,
+            gmail_host: host(&get, "gmail_host")?,
+            calendar_host: host(&get, "calendar_host")?,
         })
     }
-}
-
-/// The error kinds a request is answered with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ErrorKind {
-    Denied,
-    InvalidArgs,
-    Internal,
-}
-
-/// A request's error answer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Failure {
-    pub kind: ErrorKind,
-    pub detail: String,
-}
-
-fn internal(detail: impl Into<String>) -> Failure {
-    Failure {
-        kind: ErrorKind::Internal,
-        detail: detail.into(),
-    }
-}
-
-/// The method, host and path of a nested call, for the messages that name it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Target {
-    pub method: String,
-    pub host: String,
-    pub path: String,
-}
-
-/// One query parameter: a single value, or several that `api-request` sends
-/// as the key repeated once per value.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-pub enum QueryValue {
-    One(String),
-    Many(Vec<String>),
-}
-
-type Query = BTreeMap<String, QueryValue>;
-
-/// A query from `(key, value)` pairs, each sent once.
-fn query<const N: usize>(pairs: [(&str, String); N]) -> Query {
-    pairs
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), QueryValue::One(value)))
-        .collect()
 }
 
 /// A `format=metadata` read's query: the `fields` mask, and `headers`
@@ -394,266 +338,77 @@ fn metadata_query(fields: &str, headers: &[&str]) -> Query {
     query
 }
 
+/// A GET on `host` for `account`.
+fn get_call(
+    settings: &Settings,
+    host: &str,
+    account: Option<&str>,
+    path: String,
+    query: Query,
+) -> ApiCall {
+    new_call(settings, "GET", host, account, path, query, None)
+}
+
+/// A POST on `host` for `account` carrying `body` as JSON text, which
+/// `api-request` sends as `application/json` when no `Content-Type` is given.
+fn post_json_call(
+    settings: &Settings,
+    host: &str,
+    account: Option<&str>,
+    path: String,
+    query: Query,
+    body: Value,
+) -> ApiCall {
+    let body = serde_json::to_string(&body).expect("a JSON value serializes");
+    new_call(settings, "POST", host, account, path, query, Some(body))
+}
+
 /// One `api-request` call's arguments. `account`, when the caller named one,
 /// is passed on every call a request makes, so a request never mixes
-/// accounts.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct ApiCall {
-    pub provider: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub account: Option<String>,
-    pub method: String,
-    pub host: String,
-    pub path: String,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub query: Query,
-    /// The request body as text; `api-request` sends it as
-    /// `application/json` when no `Content-Type` is given.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub body: Option<String>,
-}
-
-impl ApiCall {
-    /// A GET on `host` for `account`.
-    fn get(
-        settings: &Settings,
-        host: &str,
-        account: Option<&str>,
-        path: String,
-        query: Query,
-    ) -> ApiCall {
-        ApiCall::new(settings, "GET", host, account, path, query, None)
-    }
-
-    /// A POST on `host` for `account` carrying `body` as JSON text.
-    fn post_json(
-        settings: &Settings,
-        host: &str,
-        account: Option<&str>,
-        path: String,
-        query: Query,
-        body: Value,
-    ) -> ApiCall {
-        let body = serde_json::to_string(&body).expect("a JSON value serializes");
-        ApiCall::new(settings, "POST", host, account, path, query, Some(body))
-    }
-
-    /// Every Google call adds `prettyPrint=false` to `query`: Google's
-    /// indentation would count against the read limit and the bus cap like
-    /// any other byte.
-    fn new(
-        settings: &Settings,
-        method: &str,
-        host: &str,
-        account: Option<&str>,
-        path: String,
-        mut query: Query,
-        body: Option<String>,
-    ) -> ApiCall {
-        query.insert(
-            "prettyPrint".to_string(),
-            QueryValue::One("false".to_string()),
-        );
-        ApiCall {
-            provider: settings.provider.clone(),
-            account: account.map(str::to_string),
-            method: method.to_string(),
-            host: host.to_string(),
-            path,
-            query,
-            body,
-        }
-    }
-
-    pub fn target(&self) -> Target {
-        Target {
-            method: self.method.clone(),
-            host: self.host.clone(),
-            path: self.path.clone(),
-        }
+/// accounts. Every Google call adds `prettyPrint=false` to `query`: Google's
+/// indentation would count against the read limit and the bus cap like any
+/// other byte.
+fn new_call(
+    settings: &Settings,
+    method: &str,
+    host: &str,
+    account: Option<&str>,
+    path: String,
+    mut query: Query,
+    body: Option<String>,
+) -> ApiCall {
+    query.insert(
+        "prettyPrint".to_string(),
+        QueryValue::One("false".to_string()),
+    );
+    ApiCall {
+        provider: settings.provider.clone(),
+        account: account.map(str::to_string),
+        method: method.to_string(),
+        host: host.to_string(),
+        path,
+        query,
+        headers: BTreeMap::new(),
+        body,
     }
 }
 
-/// A nested call to issue: the request's step it is, and its arguments.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Call {
-    pub step: u8,
-    pub api: ApiCall,
-}
-
-// TODO(provider-kit): the in-flight row and step machinery (`call_id`,
-// `InFlight` with `next`, `row_expired`, `claim`, `stored`, `Next::Call`), the
-// argument helpers, `NestedError`, the reading of `api-request`'s answer
-// envelope and `lib.rs` are copied from `google-maps-tools`.
-
-/// The correlation id of a request's nested call: `<pending id>/<step>`.
-pub fn call_id(id: &str, step: u8) -> String {
-    format!("{id}/{step}")
-}
-
-/// What the store holds for a request between the activation that issues its
-/// nested call and the one that receives the answer, keyed by the call id.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InFlight {
-    /// The pending id as the host spells it.
-    pub id: String,
-    #[serde(with = "provided_name")]
-    pub tool: Provided,
-    pub step: u8,
-    /// The caller's arguments, already validated once.
-    pub args: Value,
-    /// What earlier steps learned that later steps need.
-    pub derived: Map<String, Value>,
-    /// The nested call outstanding.
-    pub target: Target,
-    pub issued_at_ms: u64,
-}
-
-impl InFlight {
-    pub fn new(
-        id: &str,
-        tool: Provided,
-        args: &Value,
-        call: &Call,
-        derived: Map<String, Value>,
-        now_ms: u64,
-    ) -> InFlight {
-        InFlight {
-            id: id.to_string(),
-            tool,
-            step: call.step,
-            args: args.clone(),
-            derived,
-            target: call.api.target(),
-            issued_at_ms: now_ms,
-        }
+impl Tool for Provided {
+    fn name(self) -> &'static str {
+        Provided::name(self)
     }
 
-    /// The row for this request's next step, `call`, carrying what earlier
-    /// steps learned in `derived`.
-    pub fn next(&self, call: &Call, derived: Map<String, Value>, now_ms: u64) -> InFlight {
-        InFlight::new(&self.id, self.tool, &self.args, call, derived, now_ms)
-    }
-
-    pub fn call_id(&self) -> String {
-        call_id(&self.id, self.step)
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("an InFlight row serializes")
-    }
-
-    /// A row this module did not write is a corrupt store.
-    pub fn decode(bytes: &[u8]) -> Result<InFlight, String> {
-        serde_json::from_slice(bytes).map_err(|e| format!("in-flight row does not parse: {e}"))
+    fn from_name(name: &str) -> Option<Provided> {
+        Provided::from_name(name)
     }
 }
 
-/// Whether a stored in-flight row has outlived any result that could still
-/// arrive. Only the row's issue time is read: a row that old is garbage
-/// whatever else it holds, including a row a different build wrote in a shape
-/// this one does not parse. A row with no readable issue time is a corrupt
-/// store.
-pub fn row_expired(bytes: &[u8], now_ms: u64) -> Result<bool, String> {
-    #[derive(Deserialize)]
-    struct Issued {
-        issued_at_ms: u64,
-    }
-    let row: Issued = serde_json::from_slice(bytes)
-        .map_err(|e| format!("in-flight row has no readable issue time: {e}"))?;
-    Ok(row.issued_at_ms.saturating_add(INFLIGHT_TTL_MS) < now_ms)
-}
-
-/// The in-flight state a result for request `id`, correlated by `call_id`,
-/// answers; `row` is what the store holds under `call_id`. No row means the
-/// result is a duplicate or arrived after its row was swept, and is ignored.
-/// A row belonging to another request is a host fault.
-pub fn claim(id: &str, call_id: &str, row: Option<&[u8]>) -> Result<Option<InFlight>, String> {
-    let Some(bytes) = row else {
-        return Ok(None);
-    };
-    let state = InFlight::decode(bytes)?;
-    if state.id != id {
-        return Err(format!(
-            "result {call_id} serves {id}, but its in-flight row is {}'s",
-            state.id
-        ));
-    }
-    Ok(Some(state))
-}
-
-/// A stored row names its tool by the registry name the specification gives
-/// it; a name the specification no longer declares does not parse.
-mod provided_name {
-    use serde::de::Error as _;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    use crate::spec::Provided;
-
-    pub fn serialize<S: Serializer>(tool: &Provided, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(tool.name())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Provided, D::Error> {
-        let name = String::deserialize(deserializer)?;
-        Provided::from_name(&name)
-            .ok_or_else(|| D::Error::custom(format!("no provided tool is named `{name}`")))
-    }
-}
-
-/// What a request does next after its nested call answered.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Next {
-    Complete(Value),
-    Fail(Failure),
-    /// Issue the request's next step, carrying what this one learned.
-    Call {
-        call: Call,
-        derived: Map<String, Value>,
-    },
-}
-
-type Args = Map<String, Value>;
-
-fn object<'a>(args: &'a Value, allowed: &[&str]) -> Result<&'a Args, String> {
-    let Value::Object(map) = args else {
-        return Err("the arguments must be a JSON object".to_string());
-    };
-    if let Some(unknown) = map.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!(
-            "unknown argument `{unknown}`; this tool takes {}",
-            allowed
-                .iter()
-                .map(|key| format!("`{key}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    Ok(map)
-}
-
-/// A string argument of at most `cap` bytes, checked before anything else is
-/// done with it.
-fn capped<'a>(args: &'a Args, key: &str, cap: usize) -> Result<Option<&'a str>, String> {
-    match args.get(key) {
-        None => Ok(None),
-        Some(Value::String(value)) => {
-            if value.len() > cap {
-                return Err(format!("`{key}` is longer than {cap} bytes"));
-            }
-            if value.trim().is_empty() {
-                return Err(format!("`{key}` is empty"));
-            }
-            Ok(Some(value))
-        }
-        Some(_) => Err(format!("`{key}` must be a string")),
-    }
-}
+/// A request's in-flight row, naming one of this component's tools.
+pub type InFlight = brenn_provider_kit::InFlight<Provided>;
 
 /// The Google account to act on, when the caller named one.
 fn account(args: &Args) -> Result<Option<String>, String> {
-    Ok(capped(args, "account", ACCOUNT_MAX_BYTES)?.map(str::to_string))
+    Ok(capped(args, "account", ACCOUNT_MAX_CHARS)?.map(str::to_string))
 }
 
 /// Whether `id` is 1 to `max` letters, digits, `_` and `-`: one path segment
@@ -667,7 +422,7 @@ fn is_token(id: &str, max: usize) -> bool {
 
 /// Whether `id` is a Gmail message, thread or label id.
 fn is_gmail_id(id: &str) -> bool {
-    is_token(id, ID_MAX_BYTES)
+    is_token(id, ID_MAX_CHARS)
 }
 
 /// An id argument held to `valid`; a refusal says "`key` must be" `what`.
@@ -687,27 +442,42 @@ fn id_arg(
 /// A Gmail id argument: one path segment of letters, digits, `_` and `-`.
 fn gmail_id(args: &Args, key: &str) -> Result<Option<String>, String> {
     id_arg(args, key, is_gmail_id, || {
-        format!("1 to {ID_MAX_BYTES} letters, digits, `_` or `-`")
+        format!("1 to {ID_MAX_CHARS} letters, digits, `_` or `-`")
     })
 }
 
-/// Whether `id` is a calendar id `api-request` takes as one path segment:
-/// 1 to `CALENDAR_ID_MAX_BYTES` bytes with no `/`, `\`, `%` or `"`, and no
-/// control or whitespace character. `#`, `@`, `?`, `.` and `+` are content.
-fn is_calendar_id(id: &str) -> bool {
-    (1..=CALENDAR_ID_MAX_BYTES).contains(&id.len())
-        && id != "."
+/// Whether `id` has a calendar id's shape, whatever its length: one path
+/// segment `api-request` takes, so not `.` or `..`, with no `/`, `\`, `%` or
+/// `"`, and no control or whitespace character. `#`, `@`, `?`, `.` and `+` are
+/// content.
+fn calendar_id_shape(id: &str) -> bool {
+    id != "."
         && id != ".."
         && !id
             .chars()
             .any(|c| matches!(c, '/' | '\\' | '%' | '"') || c.is_control() || c.is_whitespace())
 }
 
+/// Whether `id` is a calendar id argument: 1 to `CALENDAR_ID_MAX_CHARS`
+/// characters of a calendar id's shape. Arguments are counted in characters,
+/// as the tool's `input_schema` states them; an answer's ids are held to
+/// `is_listed_calendar_id`.
+fn is_calendar_id(id: &str) -> bool {
+    (1..=CALENDAR_ID_MAX_CHARS).contains(&id.chars().count()) && calendar_id_shape(id)
+}
+
+/// Whether `id` is a calendar id Google may answer in `calendarList.list`: 1
+/// to `CALENDAR_ID_MAX_BYTES` bytes of a calendar id's shape. Counted in bytes
+/// so a listing's size stays bounded against the result ceiling.
+fn is_listed_calendar_id(id: &str) -> bool {
+    (1..=CALENDAR_ID_MAX_BYTES).contains(&id.len()) && calendar_id_shape(id)
+}
+
 /// What `is_calendar_id` admits, as a refusal states it.
 fn calendar_id_rule() -> String {
     format!(
-        "a calendar id of 1 to {CALENDAR_ID_MAX_BYTES} bytes with no `/`, `\\`, `%`, `\"`, \
-         space or control character"
+        "a calendar id of 1 to {CALENDAR_ID_MAX_CHARS} characters with no `/`, `\\`, `%`, \
+         `\"`, space or control character"
     )
 }
 
@@ -718,21 +488,21 @@ fn calendar_id(args: &Args, key: &str) -> Result<Option<String>, String> {
 }
 
 /// Whether `id` is an event id as Google writes them: 1 to
-/// `EVENT_ID_MAX_BYTES` letters, digits, `_` and `-`.
+/// `EVENT_ID_MAX_CHARS` letters, digits, `_` and `-`.
 fn is_event_id(id: &str) -> bool {
-    is_token(id, EVENT_ID_MAX_BYTES)
+    is_token(id, EVENT_ID_MAX_CHARS)
 }
 
 /// An event id argument: one path segment of letters, digits, `_` and `-`.
 fn event_id(args: &Args, key: &str) -> Result<Option<String>, String> {
     id_arg(args, key, is_event_id, || {
-        format!("1 to {EVENT_ID_MAX_BYTES} letters, digits, `_` or `-`")
+        format!("1 to {EVENT_ID_MAX_CHARS} letters, digits, `_` or `-`")
     })
 }
 
 /// A time argument, passed to Google as given.
 fn time(args: &Args, key: &str) -> Result<Option<String>, String> {
-    Ok(capped(args, key, TIME_MAX_BYTES)?.map(str::to_string))
+    Ok(capped(args, key, TIME_MAX_CHARS)?.map(str::to_string))
 }
 
 /// The `calendars` argument: 1 to `FREEBUSY_CALENDARS_MAX` distinct calendar
@@ -770,31 +540,11 @@ fn calendars(args: &Args) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// An integer argument in `min..=max`.
-fn integer(args: &Args, key: &str, min: u64, max: u64) -> Result<Option<u64>, String> {
-    match args.get(key) {
-        None => Ok(None),
-        Some(value) => match value.as_u64() {
-            Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
-            _ => Err(format!("`{key}` must be an integer from {min} to {max}")),
-        },
-    }
-}
-
 /// The `max_chars` argument: `MAX_CHARS_MIN` to `MAX_CHARS_MAX`, default
 /// `MAX_CHARS_DEFAULT`.
 fn max_chars(args: &Args) -> Result<usize, String> {
     let n = integer(args, "max_chars", MAX_CHARS_MIN, MAX_CHARS_MAX)?.unwrap_or(MAX_CHARS_DEFAULT);
     Ok(usize::try_from(n).expect("max_chars is at most MAX_CHARS_MAX"))
-}
-
-/// A boolean argument; absent is `false`.
-fn flag(args: &Args, key: &str) -> Result<bool, String> {
-    match args.get(key) {
-        None => Ok(false),
-        Some(Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(format!("`{key}` must be true or false")),
-    }
 }
 
 /// Validate a request's arguments and build its first nested call. An error is
@@ -884,7 +634,7 @@ fn labels_call(args: &LabelsArgs, settings: &Settings) -> ApiCall {
         Some(id) => (format!("{LABELS_PATH}/{id}"), LABEL_GET_FIELDS),
         None => (LABELS_PATH.to_string(), LABELS_LIST_FIELDS),
     };
-    ApiCall::get(
+    get_call(
         settings,
         &settings.gmail_host,
         args.account.as_deref(),
@@ -908,11 +658,11 @@ impl SearchArgs {
     fn parse(args: &Value) -> Result<SearchArgs, String> {
         let map = object(args, &["q", "max", "page", "spam_trash", "account"])?;
         Ok(SearchArgs {
-            q: capped(map, "q", QUERY_MAX_BYTES)?
+            q: capped(map, "q", QUERY_MAX_CHARS)?
                 .ok_or("`q` is required")?
                 .to_string(),
             max: integer(map, "max", SEARCH_MAX_MIN, SEARCH_MAX_MAX)?.unwrap_or(SEARCH_MAX_DEFAULT),
-            page: capped(map, "page", PAGE_MAX_BYTES)?.map(str::to_string),
+            page: capped(map, "page", PAGE_MAX_CHARS)?.map(str::to_string),
             spam_trash: flag(map, "spam_trash")?,
             account: account(map)?,
         })
@@ -935,7 +685,7 @@ fn search_list_call(args: &SearchArgs, settings: &Settings) -> ApiCall {
             QueryValue::One("true".to_string()),
         );
     }
-    ApiCall::get(
+    get_call(
         settings,
         &settings.gmail_host,
         args.account.as_deref(),
@@ -947,7 +697,7 @@ fn search_list_call(args: &SearchArgs, settings: &Settings) -> ApiCall {
 /// messages.get of one message's metadata: the search line's headers, labels
 /// and snippet, no body.
 fn message_metadata_call(id: &str, account: Option<&str>, settings: &Settings) -> ApiCall {
-    ApiCall::get(
+    get_call(
         settings,
         &settings.gmail_host,
         account,
@@ -983,7 +733,7 @@ fn read_call(args: &ReadArgs, fields: Option<&str>, settings: &Settings) -> ApiC
     if let Some(fields) = fields {
         query.insert("fields".to_string(), QueryValue::One(fields.to_string()));
     }
-    ApiCall::get(
+    get_call(
         settings,
         &settings.gmail_host,
         args.account.as_deref(),
@@ -1017,7 +767,7 @@ impl ThreadArgs {
 /// threads.get of one thread's messages' metadata: `headers`, labels and
 /// snippets, no bodies.
 fn thread_call(args: &ThreadArgs, headers: &[&str], settings: &Settings) -> ApiCall {
-    ApiCall::get(
+    get_call(
         settings,
         &settings.gmail_host,
         args.account.as_deref(),
@@ -1038,7 +788,7 @@ impl CalendarListArgs {
     fn parse(args: &Value) -> Result<CalendarListArgs, String> {
         let map = object(args, &["page", "account"])?;
         Ok(CalendarListArgs {
-            page: capped(map, "page", PAGE_MAX_BYTES)?.map(str::to_string),
+            page: capped(map, "page", PAGE_MAX_CHARS)?.map(str::to_string),
             account: account(map)?,
         })
     }
@@ -1053,7 +803,7 @@ fn calendar_list_call(args: &CalendarListArgs, settings: &Settings) -> ApiCall {
     if let Some(page) = &args.page {
         query.insert("pageToken".to_string(), QueryValue::One(page.clone()));
     }
-    ApiCall::get(
+    get_call(
         settings,
         &settings.calendar_host,
         args.account.as_deref(),
@@ -1087,9 +837,9 @@ impl EventsArgs {
             calendar: calendar_id(map, "calendar")?.unwrap_or_else(|| PRIMARY_CALENDAR.to_string()),
             from: time(map, "from")?.ok_or("`from` is required")?,
             to: time(map, "to")?.ok_or("`to` is required")?,
-            q: capped(map, "q", QUERY_MAX_BYTES)?.map(str::to_string),
+            q: capped(map, "q", QUERY_MAX_CHARS)?.map(str::to_string),
             max: usize::try_from(max).expect("max is at most 50"),
-            page: capped(map, "page", PAGE_MAX_BYTES)?.map(str::to_string),
+            page: capped(map, "page", PAGE_MAX_CHARS)?.map(str::to_string),
             account: account(map)?,
         })
     }
@@ -1114,7 +864,7 @@ fn events_list_call(args: &EventsArgs, settings: &Settings) -> ApiCall {
     if let Some(page) = &args.page {
         query.insert("pageToken".to_string(), QueryValue::One(page.clone()));
     }
-    ApiCall::get(
+    get_call(
         settings,
         &settings.calendar_host,
         args.account.as_deref(),
@@ -1148,7 +898,7 @@ impl EventArgs {
 /// events.get of one event, at most `ATTENDEES_MAX` attendees listed. The
 /// calendar id goes into the path as it is; `api-request` percent-encodes it.
 fn event_get_call(args: &EventArgs, settings: &Settings) -> ApiCall {
-    ApiCall::get(
+    get_call(
         settings,
         &settings.calendar_host,
         args.account.as_deref(),
@@ -1184,13 +934,18 @@ impl FreeBusyArgs {
 
 /// freebusy.query for the window `from`..`to` over `calendars`. The POST
 /// changes nothing; `api-request` admits it only for a stamped call.
+// TODO(correctness-free-busy-nested-call-can-exceed-the-args-cap): the body
+// carries every id uncut and is escaped again inside the nested call's args,
+// so fifty maximal ids of four-byte characters can exceed the host's 64 KiB
+// args cap. Such an admitted `calendars` is answered `internal`, not
+// `invalid_args` naming `calendars`.
 fn free_busy_call(args: &FreeBusyArgs, settings: &Settings) -> ApiCall {
     let items: Vec<Value> = args
         .calendars
         .iter()
         .map(|id| json!({ "id": id }))
         .collect();
-    ApiCall::post_json(
+    post_json_call(
         settings,
         &settings.calendar_host,
         args.account.as_deref(),
@@ -1207,7 +962,7 @@ fn free_busy_call(args: &FreeBusyArgs, settings: &Settings) -> ApiCall {
 
 /// labels.list for the names of the user labels an answer carries.
 fn label_names_call(account: Option<&str>, settings: &Settings) -> ApiCall {
-    ApiCall::get(
+    get_call(
         settings,
         &settings.gmail_host,
         account,
@@ -1353,24 +1108,6 @@ fn snippet_value(message: &Value, api: &str) -> Result<Option<String>, Failure> 
     }
 }
 
-/// A nested call's typed error, as the executor wrote it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NestedError {
-    pub kind: String,
-    pub detail: String,
-}
-
-/// `text` cut to the longest prefix of at most `max_bytes` UTF-8 bytes that
-/// ends on a char boundary, ending in `…` when cut, and whether it was cut. A
-/// character straddling the bound is dropped whole.
-fn cut(text: &str, max_bytes: usize) -> (String, bool) {
-    if text.len() <= max_bytes {
-        return (text.to_string(), false);
-    }
-    let at = text.floor_char_boundary(max_bytes);
-    (format!("{}…", &text[..at]), true)
-}
-
 /// `text`'s first `max_chars` characters, and whether any were left out.
 fn chars_prefix(text: &str, max_chars: usize) -> (&str, bool) {
     match text.char_indices().nth(max_chars) {
@@ -1392,210 +1129,17 @@ fn plain(text: &str) -> String {
         .collect()
 }
 
-/// The detail of a nested call that issued but could not be queued: Brenn's
-/// refusal text plus the one sentence of operator guidance.
-pub fn not_issued(refusal: &str) -> String {
-    format!(
-        "api-request could not be issued: {refusal}. If this names the clause, the instance's \
-         `tool api-request` grant must admit the method, host and path."
-    )
+/// `why`'s rendering as copied into an answer: through `plain`, cut to
+/// `GOOGLE_MESSAGE_MAX_BYTES`, since a refusal's detail is the host's and
+/// unbounded.
+fn quoted(why: &Unreadable, estimate: Option<u64>) -> String {
+    cut(&plain(&why.render(estimate)), GOOGLE_MESSAGE_MAX_BYTES).0
 }
 
-/// One line for the log: status, size and truncation, or the error kind.
-/// Never a body or a header.
-pub fn result_summary(outcome: &Result<Value, NestedError>) -> String {
-    match outcome {
-        Ok(value) => format!(
-            "status {} bytes {} truncated {}",
-            value.get("status").unwrap_or(&Value::Null),
-            value.get("bytes").unwrap_or(&Value::Null),
-            value.get("truncated").unwrap_or(&Value::Null),
-        ),
-        Err(error) => format!("error {}", error.kind),
-    }
-}
-
-/// What a nested `api-request` call answered, read.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Answer {
-    /// Google's 2xx JSON body.
-    Google(Value),
-    /// `api-request`'s `credential_invalid` value: the user has no usable
-    /// credential, and the request is answered with this value unchanged so
-    /// the caller runs `oauth-connect`.
-    Relay(Value),
-    /// Google's answer was cut at the provider's read limit; the size as the
-    /// messages state it (`<n> bytes`, or `of unstated length`).
-    Truncated(String),
-    /// The host did not deliver the call's answer: the nested `internal`
-    /// error's detail — the bus cap's refusal, or `api-request`'s transport
-    /// or refresh failure, which the detail alone tells apart.
-    Refused(String),
-    /// Google's whole 4xx/5xx answer: its HTTP status, for a step that
-    /// treats one status as an outcome, and the failure every other step
-    /// answers with.
-    GoogleError { status: u64, failure: Failure },
-}
-
-/// `api-request`'s answer read: Google's JSON, the credential relay, a cut or
-/// undelivered answer or Google's error for the caller to decide on, or the
-/// request's error answer. Only `error.status` and `error.message` are ever
-/// copied out of a non-2xx body.
-pub fn read_api_result(
-    outcome: Result<Value, NestedError>,
-    target: &Target,
-    family: Family,
-) -> Result<Answer, Failure> {
-    let value = match outcome {
-        Ok(value) => value,
-        Err(error) => {
-            let NestedError { kind, detail } = error;
-            return match kind.as_str() {
-                "denied" => Err(Failure {
-                    kind: ErrorKind::Denied,
-                    detail: format!(
-                        "api-request refused the nested {} {}{}: {detail}",
-                        target.method, target.host, target.path
-                    ),
-                }),
-                "invalid_args" => Err(internal(format!(
-                    "api-request rejected the wrapper's request: {detail}"
-                ))),
-                "internal" => Ok(Answer::Refused(detail)),
-                other => Err(internal(format!("{other}: {detail}"))),
-            };
-        }
-    };
-    if value.get("error").and_then(Value::as_str) == Some("credential_invalid") {
-        return Ok(Answer::Relay(value));
-    }
-    let status = value
-        .get("status")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| internal("api-request's answer carries no status"))?;
-    if value.get("truncated").and_then(Value::as_bool) == Some(true) {
-        // On a cut answer `bytes` is the response's Content-Length, not a
-        // count of what was read; null when Google sent none.
-        return Ok(Answer::Truncated(
-            match value.get("bytes").and_then(Value::as_u64) {
-                Some(bytes) => format!("{bytes} bytes"),
-                None => "of unstated length".to_string(),
-            },
-        ));
-    }
-    if value.get("body_base64").is_some() {
-        return Err(internal(format!(
-            "Google returned a non-text body ({status})"
-        )));
-    }
-    if (300..400).contains(&status) {
-        return Err(internal(format!(
-            "Google answered {status} with a redirect, which Brenn does not follow"
-        )));
-    }
-    let body = value
-        .get("body")
-        .and_then(Value::as_str)
-        .ok_or_else(|| internal("api-request's answer carries no body"))?;
-    if status >= 400 {
-        return Ok(Answer::GoogleError {
-            status,
-            failure: google_error(status, body, family),
-        });
-    }
-    if !(200..300).contains(&status) {
-        return Err(internal(format!(
-            "Google answered HTTP {status}, which is neither a success nor an error"
-        )));
-    }
-    serde_json::from_str(body).map(Answer::Google).map_err(|_| {
-        internal(format!(
-            "Google returned HTTP {status} with a body that is not JSON"
-        ))
-    })
-}
-
-/// The `derived` key carrying an [`Unreadable`] to a re-read step.
-const UNREADABLE_KEY: &str = "unreadable";
-
-/// Why a nested read's answer cannot be used whole: `api-request` cut it at
-/// the provider's read limit (the size as `Answer::Truncated` states it), or
-/// the host did not deliver it (the nested error's detail).
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Unreadable {
-    Cut(String),
-    Refused(String),
-}
-
-impl Unreadable {
-    /// The one sentence that says why, with Google's `sizeEstimate` when the
-    /// step rendering it has one.
-    fn render(&self, estimate: Option<u64>) -> String {
-        let estimate = estimate
-            .map(|n| format!("; sizeEstimate {n}"))
-            .unwrap_or_default();
-        match self {
-            Unreadable::Cut(size) => format!(
-                "Google's answer ({size}{estimate}) exceeds api-request's read limit for this \
-                 provider (max_response_bytes)"
-            ),
-            Unreadable::Refused(detail) => {
-                format!("the host did not deliver api-request's answer: {detail}{estimate}")
-            }
-        }
-    }
-
-    /// [`Unreadable::render`] as copied into an answer: through `plain`, cut
-    /// to `GOOGLE_MESSAGE_MAX_BYTES`, since a refusal's detail is the host's
-    /// and unbounded.
-    fn quoted(&self, estimate: Option<u64>) -> String {
-        cut(&plain(&self.render(estimate)), GOOGLE_MESSAGE_MAX_BYTES).0
-    }
-
-    /// The request's failure: `internal` with the rendering, and `hint` — what
-    /// the caller can narrow — after it when the step has one.
-    fn failure(&self, hint: Option<&str>) -> Failure {
-        let why = self.render(None);
-        internal(match hint {
-            Some(hint) => format!("{why}; {hint}"),
-            None => why,
-        })
-    }
-
-    /// The `derived` a re-read step is issued with: `unreadable` as
-    /// `{"cut": size}` or `{"refused": detail}`.
-    fn to_derived(&self) -> Args {
-        let reason = match self {
-            Unreadable::Cut(size) => json!({ "cut": size }),
-            Unreadable::Refused(detail) => json!({ "refused": detail }),
-        };
-        Args::from_iter([(UNREADABLE_KEY.to_string(), reason)])
-    }
-
-    /// The reason [`Unreadable::to_derived`] wrote, read back at the re-read
-    /// step.
-    fn from_derived(derived: &Args) -> Result<Unreadable, Failure> {
-        let reason = match derived.get(UNREADABLE_KEY) {
-            Some(Value::Object(map)) if map.len() == 1 => map.iter().next(),
-            _ => None,
-        };
-        match reason {
-            Some((key, Value::String(text))) if key == "cut" => Ok(Unreadable::Cut(text.clone())),
-            Some((key, Value::String(text))) if key == "refused" => {
-                Ok(Unreadable::Refused(text.clone()))
-            }
-            _ => Err(internal(
-                "in-flight row at a re-read step carries no `unreadable` reason",
-            )),
-        }
-    }
-}
-
-/// A 4xx/5xx answer: Google's status and message when the body is Google's
-/// standard error shape, nothing of it otherwise. 400 and 404 are the caller's
-/// arguments; 403 is Google's refusal, answered with the family's scope hint; every
-/// other status (401 after `api-request`'s retry, 429, 5xx) is the wrapper's
-/// or Google's.
+/// A 4xx/5xx answer, its detail as `google_error_detail` writes it. 400 and
+/// 404 are the caller's arguments; 403 is Google's refusal, answered with the
+/// family's scope hint; every other status (401 after `api-request`'s retry,
+/// 429, 5xx) is the wrapper's or Google's.
 // TODO(errhandling-gmail-403-always-denied-with-scope-hint): a quota or
 // API-not-enabled 403 is answered `denied` with the scope hint.
 // TODO(errhandling-gmail-4xx-on-fixed-request-blamed-on-caller): a 400/404 on
@@ -1606,16 +1150,7 @@ fn google_error(status: u64, body: &str, family: Family) -> Failure {
         403 => ErrorKind::Denied,
         _ => ErrorKind::Internal,
     };
-    let parsed: Option<Value> = serde_json::from_str(body).ok();
-    let error = parsed.as_ref().and_then(|body| body.get("error"));
-    let field = |name: &str| error.and_then(|e| e.get(name)).and_then(Value::as_str);
-    let mut detail = match (field("status"), field("message")) {
-        (Some(google_status), Some(message)) => format!(
-            "Google {google_status} (HTTP {status}): {}",
-            cut(message, GOOGLE_MESSAGE_MAX_BYTES).0
-        ),
-        _ => format!("Google HTTP {status}, body not in the standard error shape"),
-    };
+    let mut detail = google_error_detail(status, body);
     if kind == ErrorKind::Denied {
         let stop = if detail.ends_with('.') { "" } else { "." };
         detail = format!("{detail}{stop} {}", scope_hint(family));
@@ -1627,18 +1162,13 @@ fn google_error(status: u64, body: &str, family: Family) -> Failure {
 /// issue its next step. Every answer completed here is held to the result
 /// ceiling; a relayed credential answer is `api-request`'s own and is not.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
-    let body = match read_api_result(outcome, &state.target, family(state.tool)) {
-        Ok(Answer::Google(body)) => body,
+    let body = match read_api_result(outcome, &state.target) {
+        Ok(Answer::Body(body)) => body,
         Ok(Answer::Relay(value)) => return Next::Complete(value),
-        Ok(Answer::Truncated(size)) => {
-            return unreadable(state, Unreadable::Cut(size), settings);
-        }
-        Ok(Answer::Refused(detail)) => {
-            return unreadable(state, Unreadable::Refused(detail), settings);
-        }
+        Ok(Answer::Unreadable(why)) => return unreadable(state, why, settings),
         // A message deleted between the listing and its read is listed
         // unavailable, not the search's failure.
-        Ok(Answer::GoogleError { status: 404, .. })
+        Ok(Answer::Error { status: 404, .. })
             if matches!(
                 (state.tool, state.step),
                 (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET)
@@ -1646,7 +1176,9 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
         {
             return settle(state.tool, search_message(state, Read::Deleted, settings));
         }
-        Ok(Answer::GoogleError { failure, .. }) => return Next::Fail(failure),
+        Ok(Answer::Error { status, body }) => {
+            return Next::Fail(google_error(status, &body, family(state.tool)));
+        }
         Err(failure) => return Next::Fail(failure),
     };
     settle(
@@ -1681,13 +1213,6 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             (tool, step) => Err(no_such_step(tool, step)),
         },
     )
-}
-
-fn no_such_step(tool: Provided, step: u8) -> Failure {
-    internal(format!(
-        "in-flight row names step {step} of {}, which has no such step",
-        tool.name()
-    ))
 }
 
 /// A nested read that was cut or refused, decided by the step's shape: a
@@ -1834,7 +1359,7 @@ fn search_message(state: &InFlight, read: Read, settings: &Settings) -> Result<N
     let (key, entry) = match read {
         Read::Body(body) => ("lines", search_line(body, id)?),
         Read::Deleted => unavailable("deleted (Google 404)".to_string()),
-        Read::Unreadable(why) => unavailable(why.quoted(None)),
+        Read::Unreadable(why) => unavailable(quoted(&why, None)),
     };
     let mut list = derived_list(&derived, key)?;
     list.push(entry);
@@ -1916,7 +1441,7 @@ fn read_structure(state: &InFlight, body: &Value, settings: &Settings) -> Result
         "text_omitted".to_string(),
         json!(format!(
             "{}; headers and attachments are listed, the body is not",
-            why.quoted(estimate)
+            quoted(&why, estimate)
         )),
     );
     out.insert("attachments".to_string(), attachments(&extracted));
@@ -2086,12 +1611,6 @@ fn fit_thread(mut answer: Value, ceiling: usize) -> Value {
     }
 }
 
-fn serialized_len(value: &Value) -> usize {
-    serde_json::to_vec(value)
-        .expect("a JSON value serializes")
-        .len()
-}
-
 /// The array `derived[key]` that an earlier step of this request wrote.
 fn derived_list(derived: &Args, key: &str) -> Result<Vec<Value>, Failure> {
     match derived.get(key) {
@@ -2146,7 +1665,7 @@ fn thread_read(state: &InFlight, body: &Value, settings: &Settings) -> Result<Ne
     let api = "threads.get";
     let (headers, recipients_omitted) = if state.step == THREAD_NARROW_STEP {
         let why = Unreadable::from_derived(&state.derived)?;
-        (THREAD_NARROW_HEADERS, Some(why.quoted(None)))
+        (THREAD_NARROW_HEADERS, Some(quoted(&why, None)))
     } else {
         (THREAD_HEADERS, None)
     };
@@ -2298,17 +1817,6 @@ fn named(state: &InFlight, body: &Value) -> Result<Next, Failure> {
     let mut answer = answer.clone();
     name_labels(&mut answer, &names);
     Ok(Next::Complete(answer))
-}
-
-/// A row's stored arguments, parsed again. They were validated when the
-/// request was served, so a failure here is the wrapper's.
-fn stored<T>(state: &InFlight, parse: fn(&Value) -> Result<T, String>) -> Result<T, Failure> {
-    parse(&state.args).map_err(|reason| {
-        internal(format!(
-            "stored {} arguments no longer parse: {reason}",
-            state.tool.name()
-        ))
-    })
 }
 
 /// labels.list as `{ "labels": [{ "id", "name", "type" }] }` in Google's
@@ -2535,7 +2043,7 @@ fn compact_calendar_list(body: &Value) -> Result<Value, Failure> {
 /// One calendar of the user's list.
 fn calendar_entry(item: &Value, api: &str) -> Result<Value, Failure> {
     let mut entry = Compact::of(item, api)?;
-    entry.id("id", "id", is_calendar_id)?;
+    entry.id("id", "id", is_listed_calendar_id)?;
     entry.text("summary", "summary", LISTING_TEXT_MAX_BYTES)?;
     entry.when_true("primary", "primary")?;
     entry.short("accessRole", "access_role")?;
@@ -2757,7 +2265,10 @@ fn conference<'a>(event: &Compact<'a>) -> Result<Option<&'a str>, Failure> {
 /// could not answer for it. The empty `busy` Google sends beside reasons is
 /// left out, since it would read as free time. The calendars must be exactly
 /// those asked, and the refusal otherwise names the ids on each side of the
-/// difference; one with neither `busy` nor reasons is Google's fault.
+/// difference; one with neither `busy` nor reasons is Google's fault. The
+/// calendars are keyed by the ids as asked, uncut: fifty ids of
+/// `CALENDAR_ID_MAX_CHARS` characters are at most 64 000 bytes of keys, and
+/// the result ceiling's refusal in `settle` is what bounds the whole answer.
 fn compact_free_busy(body: &Value, args: &FreeBusyArgs) -> Result<Value, Failure> {
     let api = "freebusy.query";
     let mut answer = Compact::of(body, api)?;
@@ -2848,36 +2359,14 @@ fn busy_interval(interval: &Value, api: &str) -> Result<Value, Failure> {
     Ok(out.done())
 }
 
-/// `value` as the request's answer, unless it serializes larger than
-/// `ceiling`: then an internal failure, ending with `hint` (what the caller
-/// should narrow) when one is given. Nothing is dropped to fit.
-pub fn bounded(value: Value, ceiling: usize, hint: Option<&str>) -> Next {
-    let size = serialized_len(&value);
-    if size > ceiling {
-        let detail = format!("compact result of {size} bytes exceeds the wrapper's ceiling");
-        return Next::Fail(internal(match hint {
-            Some(hint) => format!("{detail}; {hint}"),
-            None => detail,
-        }));
-    }
-    Next::Complete(value)
-}
-
 fn shape(api: &str) -> Failure {
     internal(format!("unexpected Google {api} response shape"))
 }
 
-/// Copy `from` into `to[name]` when present and not null; absent fields are
-/// omitted, never invented.
-fn copy(to: &mut Args, name: &str, from: Option<&Value>) {
-    if let Some(value) = from.filter(|value| !value.is_null()) {
-        to.insert(name.to_string(), value.clone());
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use brenn_provider_kit::testutil::{failure, google, http, nested, truncated};
+    use serde_json::{Map, json};
 
     use super::*;
 
@@ -3084,6 +2573,7 @@ mod tests {
                 host: "gmail.example.com".to_string(),
                 path: "/gmail/v1/users/me/labels".to_string(),
                 query: fields("labels(id,name,type)"),
+                headers: BTreeMap::new(),
                 body: None,
             }
         );
@@ -3157,51 +2647,8 @@ mod tests {
         let long = format!("{}@example.com", "a".repeat(320));
         assert_eq!(
             labels(json!({ "account": long })).unwrap_err(),
-            "`account` is longer than 320 bytes"
+            "`account` is longer than 320 characters"
         );
-    }
-
-    fn target() -> Target {
-        Target {
-            method: "GET".to_string(),
-            host: "gmail.example.com".to_string(),
-            path: "/gmail/v1/users/me/labels".to_string(),
-        }
-    }
-
-    fn nested(kind: &str, detail: &str) -> Result<Value, NestedError> {
-        Err(NestedError {
-            kind: kind.to_string(),
-            detail: detail.to_string(),
-        })
-    }
-
-    fn http(status: u64, body: &str) -> Result<Value, NestedError> {
-        Ok(json!({
-            "status": status,
-            "headers": { "content-type": "application/json" },
-            "bytes": body.len(),
-            "truncated": false,
-            "body": body,
-        }))
-    }
-
-    fn read(outcome: Result<Value, NestedError>) -> Result<Answer, Failure> {
-        read_api_result(outcome, &target(), Family::Gmail)
-    }
-
-    fn failure(kind: ErrorKind, detail: &str) -> Failure {
-        Failure {
-            kind,
-            detail: detail.to_string(),
-        }
-    }
-
-    fn refused(status: u64, kind: ErrorKind, detail: &str) -> Result<Answer, Failure> {
-        Ok(Answer::GoogleError {
-            status,
-            failure: failure(kind, detail),
-        })
     }
 
     fn credential_invalid(account: Value) -> Value {
@@ -3214,190 +2661,35 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_credential_is_relayed_unchanged() {
-        for account in [Value::Null, json!("alice@example.com")] {
-            let value = credential_invalid(account);
-            assert_eq!(read(Ok(value.clone())), Ok(Answer::Relay(value)));
-        }
-    }
-
-    #[test]
-    fn a_denied_nested_call_is_denied_naming_it() {
+    fn a_quoted_unreadable_is_plain_and_bounded() {
+        let refused = Unreadable::Refused("result\u{1}exceeds max_body_bytes".to_string());
         assert_eq!(
-            read(nested(
-                "denied",
-                "several google accounts are connected; name one as `account`"
-            )),
-            Err(failure(
-                ErrorKind::Denied,
-                "api-request refused the nested GET gmail.example.com/gmail/v1/users/me/labels: \
-                 several google accounts are connected; name one as `account`"
-            ))
+            quoted(&refused, Some(4096)),
+            "the host did not deliver api-request's answer: result exceeds max_body_bytes; \
+             sizeEstimate 4096"
         );
-    }
-
-    #[test]
-    fn a_nested_internal_error_is_an_undelivered_answer() {
-        assert_eq!(
-            read(nested(
-                "internal",
-                "result exceeds [messaging] max_body_bytes"
-            )),
-            Ok(Answer::Refused(
-                "result exceeds [messaging] max_body_bytes".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn other_nested_errors_are_internal() {
-        assert_eq!(
-            read(nested("invalid_args", "bad query")),
-            Err(failure(
-                ErrorKind::Internal,
-                "api-request rejected the wrapper's request: bad query"
-            ))
-        );
-        assert_eq!(
-            read(nested("rate_limited", "slow down")),
-            Err(failure(ErrorKind::Internal, "rate_limited: slow down"))
-        );
-    }
-
-    #[test]
-    fn a_truncated_answer_states_its_size() {
-        let outcome = Ok(json!({
-            "status": 200, "headers": {}, "bytes": 300000, "truncated": true, "body": "{\"lab",
-        }));
-        assert_eq!(
-            read(outcome),
-            Ok(Answer::Truncated("300000 bytes".to_string()))
-        );
-        let unstated = Ok(json!({
-            "status": 200, "headers": {}, "bytes": null, "truncated": true, "body": "",
-        }));
-        assert_eq!(
-            read(unstated),
-            Ok(Answer::Truncated("of unstated length".to_string()))
-        );
-    }
-
-    #[test]
-    fn an_unreadable_read_renders_one_sentence() {
-        let cut = Unreadable::Cut("300000 bytes".to_string());
-        let refused = Unreadable::Refused("result exceeds [messaging] max_body_bytes".to_string());
-        assert_eq!(
-            cut.render(Some(4096)),
-            "Google's answer (300000 bytes; sizeEstimate 4096) exceeds api-request's read \
-             limit for this provider (max_response_bytes)"
-        );
-        assert_eq!(
-            refused.render(Some(4096)),
-            "the host did not deliver api-request's answer: result exceeds [messaging] \
-             max_body_bytes; sizeEstimate 4096"
-        );
-        assert_eq!(
-            cut.failure(None),
-            failure(
-                ErrorKind::Internal,
-                "Google's answer (300000 bytes) exceeds api-request's read limit for this \
-                 provider (max_response_bytes)"
-            )
-        );
-        assert_eq!(
-            refused.failure(Some("ask for less")),
-            failure(
-                ErrorKind::Internal,
-                "the host did not deliver api-request's answer: result exceeds [messaging] \
-                 max_body_bytes; ask for less"
-            )
-        );
-        // Carried to a re-read step and back.
-        for why in [cut, refused] {
-            assert_eq!(Unreadable::from_derived(&why.to_derived()), Ok(why));
-        }
-        for carried in [
-            json!(null),
-            json!({}),
-            json!({ "cut": 7 }),
-            json!({ "lost": "x" }),
-            json!({ "cut": "x", "refused": "y" }),
-        ] {
-            let derived = Args::from_iter([(UNREADABLE_KEY.to_string(), carried.clone())]);
-            assert!(Unreadable::from_derived(&derived).is_err(), "{carried}");
-        }
-        assert!(Unreadable::from_derived(&Args::new()).is_err());
         // A host detail copied into an answer is bounded.
         let long = Unreadable::Refused("x".repeat(5000));
         assert_eq!(
-            long.quoted(None).len(),
+            quoted(&long, None).len(),
             GOOGLE_MESSAGE_MAX_BYTES + "…".len()
         );
     }
 
     #[test]
-    fn a_binary_body_or_a_redirect_is_internal() {
-        let outcome = Ok(json!({
-            "status": 200, "headers": {}, "bytes": 3, "truncated": false, "body_base64": "AAEC",
-        }));
-        assert_eq!(
-            read(outcome),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google returned a non-text body (200)"
-            ))
-        );
-        assert_eq!(
-            read(http(302, "")),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google answered 302 with a redirect, which Brenn does not follow"
-            ))
-        );
-    }
-
-    fn google(code: u64, status: &str, message: &str) -> String {
-        json!({ "error": { "code": code, "status": status, "message": message, "details": [{ "secret": "x" }] } })
-            .to_string()
-    }
-
-    #[test]
-    fn a_google_error_carries_its_status_and_message_only() {
-        assert_eq!(
-            read(http(
-                400,
-                &google(400, "INVALID_ARGUMENT", "Invalid pageToken")
-            )),
-            refused(
-                400,
-                ErrorKind::InvalidArgs,
-                "Google INVALID_ARGUMENT (HTTP 400): Invalid pageToken"
-            )
-        );
-        assert_eq!(
-            read(http(
-                404,
-                &google(404, "NOT_FOUND", "Requested entity was not found.")
-            )),
-            refused(
-                404,
-                ErrorKind::InvalidArgs,
-                "Google NOT_FOUND (HTTP 404): Requested entity was not found."
-            )
-        );
-        for (code, status) in [
-            (401, "UNAUTHENTICATED"),
-            (429, "RESOURCE_EXHAUSTED"),
-            (500, "INTERNAL"),
-            (503, "UNAVAILABLE"),
+    fn a_google_error_maps_its_status_to_a_kind() {
+        for (code, status, kind) in [
+            (400, "INVALID_ARGUMENT", ErrorKind::InvalidArgs),
+            (404, "NOT_FOUND", ErrorKind::InvalidArgs),
+            (401, "UNAUTHENTICATED", ErrorKind::Internal),
+            (429, "RESOURCE_EXHAUSTED", ErrorKind::Internal),
+            (500, "INTERNAL", ErrorKind::Internal),
+            (503, "UNAVAILABLE", ErrorKind::Internal),
         ] {
             assert_eq!(
-                read(http(code, &google(code, status, "later"))),
-                refused(
-                    code,
-                    ErrorKind::Internal,
-                    &format!("Google {status} (HTTP {code}): later")
-                )
+                google_error(code, &google(code, status, "later"), Family::Gmail),
+                failure(kind, &format!("Google {status} (HTTP {code}): later")),
+                "{code}"
             );
         }
     }
@@ -3405,16 +2697,16 @@ mod tests {
     #[test]
     fn a_google_403_is_denied_with_the_scope_hint() {
         assert_eq!(
-            read(http(
+            google_error(
                 403,
                 &google(
                     403,
                     "PERMISSION_DENIED",
                     "Request had insufficient authentication scopes."
-                )
-            )),
-            refused(
-                403,
+                ),
+                Family::Gmail
+            ),
+            failure(
                 ErrorKind::Denied,
                 "Google PERMISSION_DENIED (HTTP 403): Request had insufficient authentication \
                  scopes. If Google names insufficient authentication scopes, the account was \
@@ -3423,9 +2715,8 @@ mod tests {
             )
         );
         assert_eq!(
-            read(http(403, "<html>SECRET</html>")),
-            refused(
-                403,
+            google_error(403, "<html>SECRET</html>", Family::Gmail),
+            failure(
                 ErrorKind::Denied,
                 &format!(
                     "Google HTTP 403, body not in the standard error shape. {}",
@@ -3436,85 +2727,17 @@ mod tests {
     }
 
     #[test]
-    fn a_long_google_message_is_cut() {
-        let message = "x".repeat(GOOGLE_MESSAGE_MAX_BYTES + 50);
-        let Ok(Answer::GoogleError { failure, .. }) =
-            read(http(500, &google(500, "INTERNAL", &message)))
-        else {
-            panic!("a 500 is Google's error");
-        };
-        let detail = failure.detail;
+    fn advance_answers_a_google_error_through_the_family_mapping() {
         assert_eq!(
-            detail,
-            format!(
-                "Google INTERNAL (HTTP 500): {}…",
-                "x".repeat(GOOGLE_MESSAGE_MAX_BYTES)
-            )
-        );
-    }
-
-    #[test]
-    fn an_error_body_not_in_googles_shape_is_not_copied() {
-        assert_eq!(
-            read(http(400, "{\"error\": \"SECRET\"}")),
-            refused(
-                400,
+            answered(
+                &labels_state(json!({ "id": "Label_404" })),
+                http(404, &google(404, "NOT_FOUND", "Invalid label: Label_404"))
+            ),
+            Next::Fail(failure(
                 ErrorKind::InvalidArgs,
-                "Google HTTP 400, body not in the standard error shape"
-            )
-        );
-    }
-
-    #[test]
-    fn a_success_body_must_be_json() {
-        assert_eq!(
-            read(http(200, "not json")),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google returned HTTP 200 with a body that is not JSON"
+                "Google NOT_FOUND (HTTP 404): Invalid label: Label_404"
             ))
         );
-        assert_eq!(
-            read(http(200, "{\"a\": 1}")),
-            Ok(Answer::Google(json!({ "a": 1 })))
-        );
-    }
-
-    #[test]
-    fn an_answer_without_status_or_body_is_internal() {
-        assert_eq!(
-            read(Ok(json!({ "truncated": false }))),
-            Err(failure(
-                ErrorKind::Internal,
-                "api-request's answer carries no status"
-            ))
-        );
-        assert_eq!(
-            read(Ok(json!({ "status": 200, "truncated": false }))),
-            Err(failure(
-                ErrorKind::Internal,
-                "api-request's answer carries no body"
-            ))
-        );
-        assert!(read(http(101, "")).unwrap_err().detail.contains("HTTP 101"));
-    }
-
-    #[test]
-    fn the_summary_names_status_size_and_truncation_only() {
-        assert_eq!(
-            result_summary(&http(200, "{\"secret\": 1}")),
-            "status 200 bytes 13 truncated false"
-        );
-        assert_eq!(result_summary(&nested("denied", "secret")), "error denied");
-    }
-
-    #[test]
-    fn not_issued_carries_brenns_text_and_the_guidance() {
-        let detail = not_issued("call-async api-request: denied: no clause admits GET");
-        assert!(detail.starts_with(
-            "api-request could not be issued: call-async api-request: denied: no clause admits GET."
-        ));
-        assert!(detail.ends_with("must admit the method, host and path."));
     }
 
     fn labels_state(args: Value) -> InFlight {
@@ -3619,160 +2842,9 @@ mod tests {
 
     #[test]
     fn advance_answers_a_cut_listing_internal() {
-        let outcome = Ok(json!({
-            "status": 200, "headers": {}, "bytes": null, "truncated": true, "body": "{",
-        }));
         assert_eq!(
-            answered(&labels_state(json!({})), outcome),
+            answered(&labels_state(json!({})), truncated(200, Value::Null, "{")),
             Next::Fail(Unreadable::Cut("of unstated length".to_string()).failure(None))
-        );
-    }
-
-    #[test]
-    fn advance_passes_a_failed_call_through() {
-        assert_eq!(
-            answered(
-                &labels_state(json!({ "id": "Label_404" })),
-                http(404, &google(404, "NOT_FOUND", "Invalid label: Label_404"))
-            ),
-            Next::Fail(failure(
-                ErrorKind::InvalidArgs,
-                "Google NOT_FOUND (HTTP 404): Invalid label: Label_404"
-            ))
-        );
-    }
-
-    #[test]
-    fn advance_refuses_a_step_the_tool_does_not_have() {
-        let mut state = labels_state(json!({}));
-        state.step = 2;
-        assert_eq!(
-            answered(&state, http(200, "{}")),
-            Next::Fail(failure(
-                ErrorKind::Internal,
-                "in-flight row names step 2 of gmail-labels, which has no such step"
-            ))
-        );
-    }
-
-    #[test]
-    fn advance_refuses_stored_arguments_that_no_longer_parse() {
-        let mut state = labels_state(json!({}));
-        state.args = json!({ "id": "a/b" });
-        assert_eq!(
-            answered(&state, http(200, LABELS_BODY)),
-            Next::Fail(failure(
-                ErrorKind::Internal,
-                "stored gmail-labels arguments no longer parse: `id` must be 1 to 128 letters, \
-                 digits, `_` or `-`"
-            ))
-        );
-    }
-
-    #[test]
-    fn the_result_ceiling_reports_rather_than_sends() {
-        let value = json!({ "text": "x".repeat(100) });
-        assert_eq!(
-            bounded(value.clone(), 1_000, None),
-            Next::Complete(value.clone())
-        );
-        let size = serde_json::to_vec(&value).unwrap().len();
-        assert_eq!(
-            bounded(value.clone(), 50, None),
-            Next::Fail(failure(
-                ErrorKind::Internal,
-                &format!("compact result of {size} bytes exceeds the wrapper's ceiling")
-            ))
-        );
-        assert_eq!(
-            bounded(value, 50, Some("ask for less")),
-            Next::Fail(failure(
-                ErrorKind::Internal,
-                &format!(
-                    "compact result of {size} bytes exceeds the wrapper's ceiling; ask for less"
-                )
-            ))
-        );
-    }
-
-    #[test]
-    fn in_flight_round_trips_with_a_string_id() {
-        let state = labels_state(json!({ "id": "INBOX", "account": "alice@example.com" }));
-        assert_eq!(state.call_id(), format!("{}/1", "a".repeat(32)));
-        assert_eq!(
-            state.target,
-            Target {
-                method: "GET".to_string(),
-                host: "gmail.example.com".to_string(),
-                path: "/gmail/v1/users/me/labels/INBOX".to_string(),
-            }
-        );
-        let bytes = state.encode();
-        let wire: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(wire["id"], json!("a".repeat(32)));
-        assert_eq!(wire["tool"], json!("gmail-labels"));
-        assert_eq!(InFlight::decode(&bytes).unwrap(), state);
-        assert!(InFlight::decode(b"{}").is_err());
-    }
-
-    #[test]
-    fn a_row_expires_only_after_the_ttl() {
-        let row = labels_state(json!({})).encode();
-        assert_eq!(row_expired(&row, 1_000), Ok(false));
-        assert_eq!(row_expired(&row, 1_000 + INFLIGHT_TTL_MS), Ok(false));
-        assert_eq!(row_expired(&row, 1_000 + INFLIGHT_TTL_MS + 1), Ok(true));
-    }
-
-    #[test]
-    fn a_row_another_build_wrote_still_expires() {
-        let mut wire: Value = serde_json::from_slice(&labels_state(json!({})).encode()).unwrap();
-        wire["tool"] = json!("no-such-tool");
-        wire["added_later"] = json!(1);
-        wire.as_object_mut().unwrap().remove("target");
-        let row = serde_json::to_vec(&wire).unwrap();
-        assert!(InFlight::decode(&row).is_err());
-        assert_eq!(row_expired(&row, 1_000 + INFLIGHT_TTL_MS), Ok(false));
-        assert_eq!(row_expired(&row, 1_000 + INFLIGHT_TTL_MS + 1), Ok(true));
-    }
-
-    #[test]
-    fn a_row_with_no_issue_time_is_a_corrupt_store() {
-        for row in [&b"{}"[..], b"not json", br#"{"issued_at_ms":"soon"}"#] {
-            let error = row_expired(row, 0).unwrap_err();
-            assert!(
-                error.starts_with("in-flight row has no readable issue time: "),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_result_claims_its_requests_row_or_ignores_a_missing_one() {
-        let state = labels_state(json!({}));
-        let call_id = state.call_id();
-        assert_eq!(
-            claim(&state.id, &call_id, Some(&state.encode())),
-            Ok(Some(state.clone()))
-        );
-        assert_eq!(claim(&state.id, &call_id, None), Ok(None));
-    }
-
-    #[test]
-    fn a_result_for_another_requests_row_is_a_host_fault() {
-        let state = labels_state(json!({}));
-        let other = "b".repeat(32);
-        assert_eq!(
-            claim(&other, &state.call_id(), Some(&state.encode())),
-            Err(format!(
-                "result {}/1 serves {other}, but its in-flight row is {}'s",
-                "a".repeat(32),
-                "a".repeat(32)
-            ))
-        );
-        let error = claim(&other, "x/1", Some(b"{}")).unwrap_err();
-        assert!(
-            error.starts_with("in-flight row does not parse: "),
-            "{error}"
         );
     }
 
@@ -3855,7 +2927,7 @@ mod tests {
             (json!({ "q": 1 }), "`q` must be a string"),
             (
                 json!({ "q": "x".repeat(1025) }),
-                "`q` is longer than 1024 bytes",
+                "`q` is longer than 1024 characters",
             ),
             (
                 json!({ "q": "x", "max": 0 }),
@@ -3871,7 +2943,7 @@ mod tests {
             ),
             (
                 json!({ "q": "x", "page": "p".repeat(4097) }),
-                "`page` is longer than 4096 bytes",
+                "`page` is longer than 4096 characters",
             ),
             (
                 json!({ "q": "x", "spam_trash": "yes" }),
@@ -4015,6 +3087,7 @@ mod tests {
                 host: "gmail.example.com".to_string(),
                 path: "/gmail/v1/users/me/labels".to_string(),
                 query: fields("labels(id,name)"),
+                headers: BTreeMap::new(),
                 body: None,
             }
         );
@@ -4091,9 +3164,7 @@ mod tests {
 
     #[test]
     fn a_message_cut_or_refused_mid_search_is_listed_unavailable() {
-        let cut = Ok(json!({
-            "status": 200, "headers": {}, "bytes": 900000, "truncated": true, "body": "{",
-        }));
+        let cut = truncated(200, json!(900000), "{");
         let refused = nested("internal", "result exceeds [messaging] max_body_bytes");
         for (outcome, reason) in [
             (
@@ -4502,7 +3573,7 @@ mod tests {
         let mut thread_not_an_id: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
         thread_not_an_id["threadId"] = json!("t/1");
         let mut thread_too_long: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
-        thread_too_long["threadId"] = json!("t".repeat(ID_MAX_BYTES + 1));
+        thread_too_long["threadId"] = json!("t".repeat(ID_MAX_CHARS + 1));
         let mut thread_not_a_string: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
         thread_not_a_string["threadId"] = json!(7);
         for body in [
@@ -5142,9 +4213,7 @@ mod tests {
     }
 
     fn cut_read(bytes: Value) -> Result<Value, NestedError> {
-        Ok(json!({
-            "status": 200, "headers": {}, "bytes": bytes, "truncated": true, "body": "{\"id",
-        }))
+        truncated(200, bytes, "{\"id")
     }
 
     #[test]
@@ -5651,9 +4720,8 @@ mod tests {
             "Request had insufficient authentication scopes.",
         );
         assert_eq!(
-            read_api_result(http(403, &body), &target(), Family::Calendar),
-            refused(
-                403,
+            google_error(403, &body, Family::Calendar),
+            failure(
                 ErrorKind::Denied,
                 "Google PERMISSION_DENIED (HTTP 403): Request had insufficient authentication \
                  scopes. If Google names insufficient authentication scopes, the account was \
@@ -5695,7 +4763,7 @@ mod tests {
             "alice@example.com",
             "en.usa#holiday@group.v.calendar.google.com",
             "c_0123?x+y@group.calendar.google.com",
-            &"a".repeat(CALENDAR_ID_MAX_BYTES),
+            &"a".repeat(CALENDAR_ID_MAX_CHARS),
         ] {
             assert!(is_calendar_id(ok), "{ok:?}");
         }
@@ -5711,7 +4779,7 @@ mod tests {
             "a\tb",
             "a\u{0}b",
             "a\u{a0}b",
-            &"a".repeat(CALENDAR_ID_MAX_BYTES + 1),
+            &"a".repeat(CALENDAR_ID_MAX_CHARS + 1),
         ] {
             assert!(!is_calendar_id(bad), "{bad:?}");
         }
@@ -5750,6 +4818,7 @@ mod tests {
                 host: "calendar.example.com".to_string(),
                 path: "/calendar/v3/users/me/calendarList".to_string(),
                 query: calendar_list_query(&[]),
+                headers: BTreeMap::new(),
                 body: None,
             }
         );
@@ -5770,8 +4839,8 @@ mod tests {
             "`page` is empty"
         );
         assert_eq!(
-            calendar_list(json!({ "page": "x".repeat(PAGE_MAX_BYTES + 1) })).unwrap_err(),
-            "`page` is longer than 4096 bytes"
+            calendar_list(json!({ "page": "x".repeat(PAGE_MAX_CHARS + 1) })).unwrap_err(),
+            "`page` is longer than 4096 characters"
         );
         assert_eq!(
             calendar_list(json!({ "page": 2 })).unwrap_err(),
@@ -5779,7 +4848,7 @@ mod tests {
         );
         assert_eq!(
             calendar_list(json!({ "account": "x".repeat(321) })).unwrap_err(),
-            "`account` is longer than 320 bytes"
+            "`account` is longer than 320 characters"
         );
     }
 
@@ -5956,14 +5025,14 @@ mod tests {
 
     #[test]
     fn a_calendar_id_argument_is_refused_before_any_call() {
-        let refusal = "`calendar` must be a calendar id of 1 to 320 bytes with no `/`, `\\`, `%`, \
+        let refusal = "`calendar` must be a calendar id of 1 to 320 characters with no `/`, `\\`, `%`, \
                        `\"`, space or control character";
         for bad in [
             json!("a/b"),
             json!("a%40b"),
             json!("a b"),
             json!(""),
-            json!("x".repeat(CALENDAR_ID_MAX_BYTES + 1)),
+            json!("x".repeat(CALENDAR_ID_MAX_CHARS + 1)),
             json!(7),
         ] {
             assert_eq!(
@@ -5979,11 +5048,11 @@ mod tests {
         for ok in [
             "0a1b2c3d4e5f",
             "weekly0123456789_20261104T140000Z",
-            &"a".repeat(EVENT_ID_MAX_BYTES),
+            &"a".repeat(EVENT_ID_MAX_CHARS),
         ] {
             assert!(is_event_id(ok), "{ok:?}");
         }
-        for bad in ["", "a b", "a/b", "a.b", &"a".repeat(EVENT_ID_MAX_BYTES + 1)] {
+        for bad in ["", "a b", "a/b", "a.b", &"a".repeat(EVENT_ID_MAX_CHARS + 1)] {
             assert!(!is_event_id(bad), "{bad:?}");
         }
     }
@@ -6031,6 +5100,7 @@ mod tests {
                 host: "calendar.example.com".to_string(),
                 path: "/calendar/v3/calendars/primary/events".to_string(),
                 query: events_query("50", &[]),
+                headers: BTreeMap::new(),
                 body: None,
             }
         );
@@ -6062,8 +5132,8 @@ mod tests {
             (json!({ "from": FROM }), "`to` is required"),
             (json!({ "from": " ", "to": TO }), "`from` is empty"),
             (
-                json!({ "from": FROM, "to": "x".repeat(TIME_MAX_BYTES + 1) }),
-                "`to` is longer than 64 bytes",
+                json!({ "from": FROM, "to": "x".repeat(TIME_MAX_CHARS + 1) }),
+                "`to` is longer than 64 characters",
             ),
             (
                 json!({ "from": FROM, "to": TO, "max": 0 }),
@@ -6075,8 +5145,8 @@ mod tests {
             ),
             (json!({ "from": FROM, "to": TO, "q": "" }), "`q` is empty"),
             (
-                json!({ "from": FROM, "to": TO, "page": "x".repeat(PAGE_MAX_BYTES + 1) }),
-                "`page` is longer than 4096 bytes",
+                json!({ "from": FROM, "to": TO, "page": "x".repeat(PAGE_MAX_CHARS + 1) }),
+                "`page` is longer than 4096 characters",
             ),
             (
                 json!({ "from": FROM, "to": TO, "id": "e1" }),
@@ -6203,6 +5273,88 @@ mod tests {
     }
 
     #[test]
+    fn an_events_lines_organizer_is_cut_in_bytes() {
+        // 160 two-byte characters and a 4-byte domain: 164 characters, 324
+        // bytes. Under the argument's 320-character bound, over the answer's
+        // 320-byte one.
+        let organizer = format!("{}@x.y", "é".repeat(160));
+        assert!(organizer.chars().count() <= ACCOUNT_MAX_CHARS);
+        let body = json!({ "items": [{ "id": "e1", "organizer": { "email": organizer } }] });
+        let answer = completed(list_events(&body.to_string()));
+        let line = &answer["events"][0];
+        let cut_email = line["organizer"].as_str().unwrap();
+        assert_eq!(cut_email, format!("{}…", "é".repeat(ACCOUNT_MAX_BYTES / 2)));
+        assert_eq!(line["fields_truncated"], json!(["organizer"]));
+    }
+
+    /// A string of `n` characters, each two bytes in UTF-8.
+    fn wide(n: usize) -> String {
+        "é".repeat(n)
+    }
+
+    /// A `key` of `max` characters is admitted and one of `max + 1` refused,
+    /// both in characters of two UTF-8 bytes, beside the arguments `base`.
+    fn admits_characters(
+        plan_with: fn(Value) -> Result<ApiCall, String>,
+        base: Value,
+        key: &str,
+        max: usize,
+    ) {
+        let with = |value: String| {
+            let mut args = base.clone();
+            args[key] = json!(value);
+            plan_with(args)
+        };
+        assert!(with(wide(max)).is_ok(), "{key} at {max} characters");
+        assert_eq!(
+            with(wide(max + 1)).unwrap_err(),
+            format!("`{key}` is longer than {max} characters"),
+        );
+    }
+
+    #[test]
+    fn argument_caps_count_characters_not_bytes() {
+        admits_characters(search, json!({}), "q", QUERY_MAX_CHARS);
+        admits_characters(search, json!({ "q": "x" }), "page", PAGE_MAX_CHARS);
+        admits_characters(labels, json!({}), "account", ACCOUNT_MAX_CHARS);
+        admits_characters(calendar_list, json!({}), "page", PAGE_MAX_CHARS);
+        admits_characters(events, json!({ "to": TO }), "from", TIME_MAX_CHARS);
+        admits_characters(free_busy, json!({ "from": FROM }), "to", TIME_MAX_CHARS);
+        admits_characters(
+            events,
+            json!({ "from": FROM, "to": TO }),
+            "q",
+            QUERY_MAX_CHARS,
+        );
+        let calendar = |id: String| events(json!({ "calendar": id, "from": FROM, "to": TO }));
+        assert!(calendar(wide(CALENDAR_ID_MAX_CHARS)).is_ok());
+        assert!(calendar(wide(CALENDAR_ID_MAX_CHARS + 1)).is_err());
+        let calendars =
+            |id: String| free_busy(json!({ "from": FROM, "to": TO, "calendars": [id] }));
+        assert!(calendars(wide(CALENDAR_ID_MAX_CHARS)).is_ok());
+        assert!(calendars(wide(CALENDAR_ID_MAX_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn a_listed_calendar_id_is_bounded_in_bytes() {
+        let id = wide(CALENDAR_ID_MAX_BYTES / 2 + 1);
+        assert!(is_calendar_id(&id), "an argument of 161 characters");
+        assert!(!is_listed_calendar_id(&id), "an answer of 322 bytes");
+        assert!(is_listed_calendar_id(&wide(CALENDAR_ID_MAX_BYTES / 2)));
+        for bad in ["", ".", "..", "a/b", "a b"] {
+            assert!(!is_listed_calendar_id(bad), "{bad:?}");
+        }
+        let body = json!({ "items": [{ "id": id }] });
+        assert_eq!(
+            list_calendars(&body.to_string()),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "unexpected Google calendarList.list response shape"
+            ))
+        );
+    }
+
+    #[test]
     fn events_refuse_an_unexpected_shape() {
         let shape = || {
             Next::Fail(failure(
@@ -6223,7 +5375,7 @@ mod tests {
             json!({ "items": [1] }),
             json!({ "items": [{}] }),
             json!({ "items": [{ "id": "e.1" }] }),
-            json!({ "items": [{ "id": "e".repeat(EVENT_ID_MAX_BYTES + 1) }] }),
+            json!({ "items": [{ "id": "e".repeat(EVENT_ID_MAX_CHARS + 1) }] }),
             event(json!({ "summary": 1 })),
             event(json!({ "start": "2026-11-02" })),
             event(json!({ "start": {} })),
@@ -6280,7 +5432,7 @@ mod tests {
         let items: Vec<Value> = (0..EVENTS_MAX_MAX)
             .map(|i| {
                 json!({
-                    "id": format!("{i:02}{}", "a".repeat(EVENT_ID_MAX_BYTES - 2)),
+                    "id": format!("{i:02}{}", "a".repeat(EVENT_ID_MAX_CHARS - 2)),
                     "summary": quotes(LISTING_TEXT_MAX_BYTES + 1),
                     "location": quotes(LISTING_TEXT_MAX_BYTES + 1),
                     "status": quotes(SHORT_MAX_BYTES + 1),
@@ -6344,6 +5496,7 @@ mod tests {
                 host: "calendar.example.com".to_string(),
                 path: "/calendar/v3/calendars/primary/events/e1".to_string(),
                 query: event_query(),
+                headers: BTreeMap::new(),
                 body: None,
             }
         );
@@ -6371,11 +5524,11 @@ mod tests {
             (json!({ "id": "" }), bad_id),
             (json!({ "id": "e.1" }), bad_id),
             (json!({ "id": "e/1" }), bad_id),
-            (json!({ "id": "e".repeat(EVENT_ID_MAX_BYTES + 1) }), bad_id),
+            (json!({ "id": "e".repeat(EVENT_ID_MAX_CHARS + 1) }), bad_id),
             (json!({ "id": 1 }), bad_id),
             (
                 json!({ "id": "e1", "calendar": "a/b" }),
-                "`calendar` must be a calendar id of 1 to 320 bytes with no `/`, `\\`, `%`, \
+                "`calendar` must be a calendar id of 1 to 320 characters with no `/`, `\\`, `%`, \
                  `\"`, space or control character",
             ),
             (
@@ -6631,7 +5784,7 @@ mod tests {
             event_with(json!({ "id": "e1" })),
             event_with(json!({ "id": null })),
             event_with(json!({ "recurringEventId": "weekly.1" })),
-            event_with(json!({ "recurringEventId": "w".repeat(EVENT_ID_MAX_BYTES + 1) })),
+            event_with(json!({ "recurringEventId": "w".repeat(EVENT_ID_MAX_CHARS + 1) })),
             event_with(json!({ "description": 1 })),
             event_with(json!({ "start": { "timeZone": "UTC" } })),
             event_with(json!({ "organizer": "bob@example.com" })),
@@ -6696,7 +5849,7 @@ mod tests {
     fn the_widest_event_fits_the_ceiling_with_its_description_fitted() {
         // Every string at its bound and as wide as it serializes.
         let quotes = |n: usize| "\"".repeat(n);
-        let id = "a".repeat(EVENT_ID_MAX_BYTES);
+        let id = "a".repeat(EVENT_ID_MAX_CHARS);
         let when = || json!({ "dateTime": quotes(SHORT_MAX_BYTES + 1), "timeZone": quotes(SHORT_MAX_BYTES + 1) });
         let attendees: Vec<Value> = (0..ATTENDEES_MAX)
             .map(|_| {
@@ -6770,6 +5923,7 @@ mod tests {
                 host: "calendar.example.com".to_string(),
                 path: "/calendar/v3/freeBusy".to_string(),
                 query: query([("prettyPrint", "false".to_string())]),
+                headers: BTreeMap::new(),
                 body: call.body.clone(),
             }
         );
@@ -6820,7 +5974,7 @@ mod tests {
             args
         };
         let count = "`calendars` must be an array of 1 to 50 calendar ids";
-        let bad_id = "each of `calendars` must be a calendar id of 1 to 320 bytes with no `/`, \
+        let bad_id = "each of `calendars` must be a calendar id of 1 to 320 characters with no `/`, \
                       `\\`, `%`, `\"`, space or control character";
         for (args, refusal) in [
             (json!({ "to": TO }), "`from` is required".to_string()),
@@ -6830,8 +5984,8 @@ mod tests {
                 "`from` is empty".to_string(),
             ),
             (
-                json!({ "from": FROM, "to": "t".repeat(TIME_MAX_BYTES + 1) }),
-                "`to` is longer than 64 bytes".to_string(),
+                json!({ "from": FROM, "to": "t".repeat(TIME_MAX_CHARS + 1) }),
+                "`to` is longer than 64 characters".to_string(),
             ),
             (window(json!({ "calendars": [] })), count.to_string()),
             (
@@ -6842,7 +5996,7 @@ mod tests {
             (window(json!({ "calendars": ["a/b"] })), bad_id.to_string()),
             (window(json!({ "calendars": ["a b"] })), bad_id.to_string()),
             (
-                window(json!({ "calendars": ["c".repeat(CALENDAR_ID_MAX_BYTES + 1)] })),
+                window(json!({ "calendars": ["c".repeat(CALENDAR_ID_MAX_CHARS + 1)] })),
                 bad_id.to_string(),
             ),
             (window(json!({ "calendars": [1] })), bad_id.to_string()),

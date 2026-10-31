@@ -23,6 +23,7 @@ wasm_guest_cdylib(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
         "//brenn-cal",
+        "//brenn-provider-kit:brenn-provider-kit_guest",
         "//brenn-wasm/components/guest:brenn-guest",
     ],
 )
@@ -33,11 +34,12 @@ wasm_component(
     visibility = ["//visibility:public"],
 )
 
-# Argument validation, request assembly and result reading are std, serde
-# and brenn-cal only, so they run on the host; the glue in lib.rs needs the
-# guest SDK and builds for wasm32 alone. The generated `spec` module compiles here too,
-# since its SDK-facing items are wasm32-only: the tools the planner matches
-# on are the specification's own `Provided`.
+# Argument validation, request assembly and result reading are std,
+# serde_json, brenn-cal and brenn-provider-kit only, so they run on the host;
+# the glue in lib.rs needs the guest SDK and builds for wasm32 alone. The
+# generated `spec` module compiles here too, since its SDK-facing items are
+# wasm32-only: the tools the planner matches on are the specification's own
+# `Provided`.
 rust_test(
     name = "logic_test",
     srcs = [
@@ -55,5 +57,8 @@ rust_test(
     rustc_env = {"CARGO_MANIFEST_DIR": package_name()},
     proc_macro_deps = all_crate_deps(proc_macro = True),
     target_compatible_with = HOST_ONLY,
-    deps = all_crate_deps(normal = True) + ["//brenn-cal"],
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-cal",
+        "//brenn-provider-kit:brenn-provider-kit_guest",
+    ],
 )

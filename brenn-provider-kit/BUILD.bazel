@@ -2,10 +2,15 @@ load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+load("@wasm_crates//:defs.bzl", wasm_crate_deps = "all_crate_deps")
 
 policy_srcs()
 
 exports_files(["Cargo.toml"])
+
+# Where the guest cargo workspace reaches these sources from. Its hub keys this
+# crate's dependency entry under that path.
+GUEST_WORKSPACE_PATH = "brenn-wasm/components/host-crates/brenn-provider-kit"
 
 # The host graph's build. Nothing in the host binaries links it; it exists for
 # the crate's own tests. `testutils` carries the `schema` parity checker and
@@ -32,4 +37,26 @@ rust_test(
 rust_doc_test(
     name = "brenn-provider-kit_doc_test",
     crate = ":brenn-provider-kit",
+)
+
+# The guest graph's build of the same sources, against the guest hub's serde.
+# It carries no platform constraint: the component cdylibs link it under
+# wasm32, and the components' host `logic_test`s link it on the host, where
+# their serde is the guest hub's too. `testutils` gives those tests `schema`
+# and `testutil`.
+rust_library(
+    name = "brenn-provider-kit_guest",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    crate_name = "brenn_provider_kit",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = wasm_crate_deps(
+        package_name = GUEST_WORKSPACE_PATH,
+        proc_macro = True,
+    ),
+    deps = wasm_crate_deps(
+        normal = True,
+        package_name = GUEST_WORKSPACE_PATH,
+    ),
 )

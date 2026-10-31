@@ -22,6 +22,27 @@ stays open here is the configuration question above; a sender who fills
 `From` or `Subject` is unreadable through the tools under any pair, which the
 operator guide states.
 
+## `correctness-free-busy-nested-call-can-exceed-the-args-cap`
+
+`google-workspace-tools`' `calendar-free-busy` admits up to 50 calendar ids
+of up to 320 characters each (`is_calendar_id`, `calendars`), and
+`free_busy_call` puts them all in a POST body that is escaped again inside the
+nested `api-request` args. With four-byte characters, an admitted input's
+nested args can pass the host's 64 KiB `args-json` cap
+(`PROCESSOR_MAX_TOOL_ARGS_BYTES`). The host refuses the call and `issue`
+answers `internal` with `not_issued`'s text, which points the operator at the
+`api-request` grant. The caller's own argument size is the cause: the answer
+should be `invalid_args` and tell the caller to ask for fewer `calendars`.
+Any fix is a refusal or a bound that the schema's per-item `maxLength` cannot
+state, so it needs a ruling on where the bound lives: a byte budget on
+`calendars` in the parser and the schema description, a pre-issue size check
+against a guest-visible copy of the host cap (which would also cover
+`post_json_call`'s later callers that put attendee lists into POST bodies), or
+the host's size refusal reaching the guest as a typed error it can map. The
+fix should come with `the_widest_free_busy_call_fits_the_args_cap`, built from
+50 ids of 320 four-byte characters with `from`, `to` and `account` at their
+caps, asserting that the call fits or that parsing refuses it.
+
 ## `errhandling-gmail-403-always-denied-with-scope-hint`
 
 `google-workspace-tools` answers every Google HTTP 403 `denied` with a
