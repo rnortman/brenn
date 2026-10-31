@@ -297,6 +297,75 @@ fn the_dsl_doc_providing_class_compiles() {
     }
 }
 
+/// The Google Maps guide's configuration compiles as an operator pastes it.
+///
+/// The guide's three copy blocks, plus only the `sandbox` container the agent
+/// names, must pass `check_config` against the shipped module root with the
+/// guide's bus cap in force.
+#[test]
+fn the_google_maps_guide_configuration_compiles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let doc_path = root.join("docs/google-maps-platform.md");
+    let doc = std::fs::read_to_string(&doc_path)
+        .unwrap_or_else(|error| panic!("{} must be readable: {error}", doc_path.display()));
+    let blocks = fenced_blocks(&doc);
+    let block_holding = |marker: &str| {
+        blocks
+            .iter()
+            .find(|block| block.contains(marker))
+            .unwrap_or_else(|| {
+                panic!(
+                    "docs/google-maps-platform.md carries no fenced block containing `{marker}`; \
+                     the configuration example is gone, not merely stale"
+                )
+            })
+            .clone()
+    };
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let document = format!(
+        "{import}\n{providers}\n{component}\n\
+         container sandbox {{\n    image = \"example.com/cc:latest\";\n    \
+         home_dir = \"{home}\";\n}}\n",
+        home = dir.path().display(),
+        import = block_holding("use @google-maps-tools::*;"),
+        providers = block_holding("api_key_provider google-maps {"),
+        component = block_holding("new maps: GoogleMapsTools {"),
+    );
+    let main = dir.path().join("main.brenn");
+    std::fs::write(&main, &document).expect("write the document");
+    let inputs = DocumentInputs::with_modules(main, root.join("config/specs"));
+    let loaded = check_config(&inputs).unwrap_or_else(|report| {
+        panic!("the configuration in docs/google-maps-platform.md must compile:\n{report}")
+    });
+    let config = &loaded.config;
+    assert_eq!(config.messaging.max_body_bytes, 393_216);
+
+    // The tuning block reaches the result inbox of the instance the guide
+    // declares, at the depth and noise its prose defends.
+    let instance = "maps";
+    assert!(
+        config.wasm_consumers.iter().any(|c| c.slug == instance),
+        "the guide declares no instance `{instance}`"
+    );
+    let inbox = format!(
+        "brenn:{}{instance}",
+        brenn_envelope::addressing::TOOL_RESULTS_NAMESPACE
+    );
+    let tuning =
+        crate::messaging::config::build_system_channel_tuning(&config.channels, &config.messaging);
+    assert!(
+        tuning.exact_addresses().any(|address| address == inbox),
+        "the guide's tuning block does not name {inbox}"
+    );
+    let resolved =
+        crate::messaging::config::resolve_system_channel(&inbox, &tuning, &config.messaging);
+    assert_eq!(
+        resolved.retain_depth,
+        crate::messaging::config::Depth::Bounded(64)
+    );
+    assert_eq!(resolved.noise, crate::messaging::config::NoiseLevel::Alarm);
+}
+
 /// The contents of every fenced code block in a markdown document.
 ///
 /// A fence is a line whose first non-space characters are three backticks; an

@@ -2466,6 +2466,52 @@ mod tests {
         }
     }
 
+    /// The `config` map in `docs/google-maps-platform.md`'s instance example is
+    /// one this parser accepts, with the values the guide states.
+    #[test]
+    fn the_google_maps_guide_config_map_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../docs/google-maps-platform.md");
+        let doc = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+        let mut lines = doc
+            .lines()
+            .map(str::trim)
+            .skip_while(|line| *line != "config = {");
+        assert_eq!(
+            lines.next(),
+            Some("config = {"),
+            "docs/google-maps-platform.md carries no `config = {{` line"
+        );
+        let pairs: Vec<(String, String)> = lines
+            .take_while(|line| *line != "};")
+            .map(|line| {
+                let (key, value) = line
+                    .trim_end_matches(',')
+                    .split_once(" = ")
+                    .unwrap_or_else(|| panic!("{line:?} is not `key = \"value\"`"));
+                let value = value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .unwrap_or_else(|| panic!("{line:?} has no quoted value"));
+                (key.to_string(), value.to_string())
+            })
+            .collect();
+        let pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let s = Settings::from_lookup(lookup(&pairs)).unwrap_or_else(|error| {
+            panic!("the guide's config map fails every activation: {error}")
+        });
+        assert_eq!(s.provider, "google-maps");
+        assert_eq!(s.weather_host, "weather.googleapis.com");
+        assert_eq!(s.geocoding_host, "geocode.googleapis.com");
+        assert_eq!(s.places_host, "places.googleapis.com");
+        assert_eq!(s.routes_host, "routes.googleapis.com");
+        assert_eq!(s.units, Units::Imperial);
+    }
+
     #[test]
     fn settings_refuse_bad_values() {
         let err = Settings::from_lookup(lookup(&with(&[("places_host", "")]))).unwrap_err();

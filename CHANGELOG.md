@@ -49,6 +49,20 @@ All notable changes to Brenn are documented here.
   the results. A route too long to search along is refused. Like Directions,
   SearchAlongRoute must be asked for on a user's behalf.
 
+- **The Google Maps guide, `docs/google-maps-platform.md`, now sets up the
+  `google-maps-tools` component**: the key, the configuration, the
+  component's instance and agent grants, what to tell the assistant, and how
+  to check it works. Its configuration needs a
+  `messaging { max_body_bytes = 393216; }` block (restart required), because
+  Google's answers reach the component over the message bus and the 64 KiB
+  default is too small for a long transit route or a day's forecast. The
+  guide also explains the alternative, which is a lower
+  `max_response_bytes` on the key provider. Corrected: a component serving a
+  user's tool call may use any method its grant allows, not just
+  `GET`/`HEAD`, and the `api_hosts` examples no longer end with a trailing
+  comma. For Google endpoints the component does not cover,
+  `docs/providers/google-maps.md` gives ready-made `api-request` examples.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key

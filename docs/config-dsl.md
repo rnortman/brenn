@@ -545,7 +545,7 @@ api_key_provider google-maps {
   api_hosts = [
     "https://weather.googleapis.com",
     "https://places.googleapis.com",
-    "https://routes.googleapis.com",
+    "https://routes.googleapis.com"
   ];
 }
 ```

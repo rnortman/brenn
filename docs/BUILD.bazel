@@ -8,4 +8,6 @@ exports_files([
     "chat-protocol.md",
     "claude-accounts.md",
     "config-dsl.md",
+    "google-maps-platform.md",
+    "providers/google-maps.md",
 ])

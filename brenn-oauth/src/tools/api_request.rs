@@ -2038,4 +2038,44 @@ mod tests {
         let keys = BTreeMap::from([key_provider_config("maps", base)]);
         ApiRequestTool::new(Some(svc), keys);
     }
+
+    /// Every `json` example in `docs/providers/google-maps.md` is an argument
+    /// object `api-request` accepts, and every `body` it carries is JSON.
+    #[test]
+    fn the_google_maps_provider_examples_are_api_request_arguments() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../docs/providers/google-maps.md");
+        let doc = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+        let mut examples = Vec::new();
+        let mut open: Option<String> = None;
+        for line in doc.lines() {
+            match (line.trim_start().starts_with("```"), open.take()) {
+                (true, None) if line.trim_start() == "```json" => open = Some(String::new()),
+                (true, Some(block)) => examples.push(block),
+                (false, Some(mut block)) => {
+                    block.push_str(line);
+                    block.push('\n');
+                    open = Some(block);
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_none(), "a `json` block is never closed");
+        assert_eq!(
+            examples.len(),
+            7,
+            "one example per endpoint the document covers"
+        );
+        for example in &examples {
+            let args: ApiArgs = serde_json::from_str(example).unwrap_or_else(|error| {
+                panic!("not an api-request argument ({error}):\n{example}")
+            });
+            assert_eq!(args.provider, "google-maps", "{example}");
+            if let Some(body) = &args.body {
+                serde_json::from_str::<serde_json::Value>(body)
+                    .unwrap_or_else(|error| panic!("body is not JSON ({error}):\n{example}"));
+            }
+        }
+    }
 }
