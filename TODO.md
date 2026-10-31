@@ -22,27 +22,6 @@ stays open here is the configuration question above; a sender who fills
 `From` or `Subject` is unreadable through the tools under any pair, which the
 operator guide states.
 
-## `correctness-free-busy-nested-call-can-exceed-the-args-cap`
-
-`google-workspace-tools`' `calendar-free-busy` admits up to 50 calendar ids
-of up to 320 characters each (`is_calendar_id`, `calendars`), and
-`free_busy_call` puts them all in a POST body that is escaped again inside the
-nested `api-request` args. With four-byte characters, an admitted input's
-nested args can pass the host's 64 KiB `args-json` cap
-(`PROCESSOR_MAX_TOOL_ARGS_BYTES`). The host refuses the call and `issue`
-answers `internal` with `not_issued`'s text, which points the operator at the
-`api-request` grant. The caller's own argument size is the cause: the answer
-should be `invalid_args` and tell the caller to ask for fewer `calendars`.
-Any fix is a refusal or a bound that the schema's per-item `maxLength` cannot
-state, so it needs a ruling on where the bound lives: a byte budget on
-`calendars` in the parser and the schema description, a pre-issue size check
-against a guest-visible copy of the host cap (which would also cover
-`post_json_call`'s later callers that put attendee lists into POST bodies), or
-the host's size refusal reaching the guest as a typed error it can map. The
-fix should come with `the_widest_free_busy_call_fits_the_args_cap`, built from
-50 ids of 320 four-byte characters with `from`, `to` and `account` at their
-caps, asserting that the call fits or that parsing refuses it.
-
 ## `errhandling-gmail-403-always-denied-with-scope-hint`
 
 `google-workspace-tools` answers every Google HTTP 403 `denied` with a
@@ -73,6 +52,21 @@ the caller's and 400 the wrapper's unless the step carries `q` or `page` — and
 apply it to every step. Calendar's steps carry caller input in `from`, `to`,
 `q`, `page`, `calendar`, `id` and `calendars`; `CalendarList` carries only
 `page`.
+
+## `reuse-host-args-cap-copied-per-component-test`
+
+The provider components' tests each copy the host's nested-args cap
+(`brenn_wasm::PROCESSOR_MAX_TOOL_ARGS_BYTES`, 64 KiB) to prove their widest
+call fits: `google-workspace-tools` as `HOST_ARGS_CAP_BYTES` in its
+`logic.rs` tests, `google-maps-tools` as a literal `< 64 * 1024` in its
+`logic.rs` tests (strict, where the host refuses only `>`). Nothing ties
+either copy to the host's constant, so a changed cap leaves every widest-call
+test passing against the old number. Decide where the one copy lives (the
+kit's `testutil` is the natural home, serializing the `ApiCall` as
+`call_async_for` does and asserting `<=`) and what pins it to the host's
+constant, as `brenn-tool-registry/src/descriptor.rs` const-asserts its own
+copy; no host crate depends on `brenn-provider-kit` today, so the pin needs a
+new dependency edge or another tie. Then replace both components' copies.
 
 ## `security-host-paths-follow-agent-symlinks`
 

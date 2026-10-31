@@ -229,6 +229,16 @@ const RESPONSES: &[(&str, &str)] = &[
 const FREEBUSY_PATH: &str = "/calendar/v3/freeBusy";
 /// The most calendars one free/busy query may name: Google's limit.
 const FREEBUSY_CALENDARS_MAX: usize = 50;
+/// The most UTF-8 bytes the `calendars` ids may hold together. The query's
+/// body carries every id uncut and travels as one JSON string inside the
+/// nested call's args, which the host caps at 64 KiB; with this budget, the
+/// window, `account` at its cap and the call's envelope, the widest admitted
+/// call serializes to about 52 000 bytes. An id can hold no character JSON
+/// escapes (`calendar_id_shape` refuses `"`, `\` and controls), so its bytes
+/// are what it adds; the window and `account` can, so they count at their
+/// escaped width: 7 bytes a character for the window, escaped in the body
+/// and again in the args, and 6 for `account`, escaped once.
+const FREEBUSY_IDS_MAX_BYTES: usize = 48_000;
 /// What the caller can narrow when a free/busy answer is unreadable or past
 /// the result ceiling.
 const FREEBUSY_HINT: &str = "ask for a shorter `from`/`to` window, or fewer `calendars`";
@@ -258,45 +268,53 @@ const LISTING_TEXT_MAX_BYTES: usize = 300;
 /// it; it exists so an answer's size is bounded, and a cut is not flagged.
 const SHORT_MAX_BYTES: usize = 64;
 
-/// The Google API a tool reads, where a message to the caller differs by it.
+/// The Google scope a step's call needs, named in a 403's hint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Family {
-    Gmail,
-    Calendar,
+pub enum Scope {
+    GmailRead,
+    CalendarRead,
 }
 
-/// The API `tool` reads.
-fn family(tool: Provided) -> Family {
-    match tool {
-        Provided::GmailLabels
-        | Provided::GmailSearch
-        | Provided::GmailRead
-        | Provided::GmailThread => Family::Gmail,
-        Provided::CalendarList
-        | Provided::CalendarEvents
-        | Provided::CalendarEvent
-        | Provided::CalendarFreeBusy => Family::Calendar,
-    }
-}
-
-impl Family {
-    /// The API's name as the user knows it.
+impl Scope {
+    /// How the hint names the scope: the API and the scope set's own word,
+    /// as the operator guide names the scope sets.
     fn name(self) -> &'static str {
         match self {
-            Family::Gmail => "Gmail",
-            Family::Calendar => "Calendar",
+            Scope::GmailRead => "Gmail read",
+            Scope::CalendarRead => "Calendar read",
         }
     }
 }
 
+/// The scope `tool`'s step `step` needs. A step the tool does not have is
+/// never asked for: `advance` maps an error only for a step it issued.
+fn scope(tool: Provided, step: u8) -> Scope {
+    match (tool, step) {
+        (
+            Provided::GmailLabels
+            | Provided::GmailSearch
+            | Provided::GmailRead
+            | Provided::GmailThread,
+            _,
+        ) => Scope::GmailRead,
+        (
+            Provided::CalendarList
+            | Provided::CalendarEvents
+            | Provided::CalendarEvent
+            | Provided::CalendarFreeBusy,
+            _,
+        ) => Scope::CalendarRead,
+    }
+}
+
 /// The sentence every Google 403 is answered with: Google answers an account
-/// connected without the family's read scope this way, and the component does
-/// not read Google's reason codes to tell that refusal from another.
-fn scope_hint(family: Family) -> String {
+/// connected without the step's scope this way, and the component does not
+/// read Google's reason codes to tell that refusal from another.
+fn scope_hint(scope: Scope) -> String {
     format!(
         "If Google names insufficient authentication scopes, the account was connected without \
-         the {} read scope: run oauth-connect with that scope set and relay its steps.",
-        family.name()
+         the {} scope: run oauth-connect with that scope set and relay its steps.",
+        scope.name()
     )
 }
 
@@ -520,8 +538,9 @@ fn time(args: &Args, key: &str) -> Result<Option<String>, String> {
 }
 
 /// The `calendars` argument: 1 to `FREEBUSY_CALENDARS_MAX` distinct calendar
-/// ids, each as `calendar_id` bounds it; absent is `primary` alone. Google
-/// answers one entry per distinct id, so a repeated id is refused.
+/// ids, each as `calendar_id` bounds it, together at most
+/// `FREEBUSY_IDS_MAX_BYTES`; absent is `primary` alone. Google answers one
+/// entry per distinct id, so a repeated id is refused.
 fn calendars(args: &Args) -> Result<Vec<String>, String> {
     let Some(value) = args.get("calendars") else {
         return Ok(vec![PRIMARY_CALENDAR.to_string()]);
@@ -550,6 +569,11 @@ fn calendars(args: &Args) -> Result<Vec<String>, String> {
                 ));
             }
         }
+    }
+    if out.iter().map(String::len).sum::<usize>() > FREEBUSY_IDS_MAX_BYTES {
+        return Err(format!(
+            "`calendars` together exceed {FREEBUSY_IDS_MAX_BYTES} bytes (UTF-8); ask for fewer"
+        ));
     }
     Ok(out)
 }
@@ -953,11 +977,6 @@ impl FreeBusyArgs {
 
 /// freebusy.query for the window `from`..`to` over `calendars`. The POST
 /// changes nothing; `api-request` admits it only for a stamped call.
-// TODO(correctness-free-busy-nested-call-can-exceed-the-args-cap): the body
-// carries every id uncut and is escaped again inside the nested call's args,
-// so fifty maximal ids of four-byte characters can exceed the host's 64 KiB
-// args cap. Such an admitted `calendars` is answered `internal`, not
-// `invalid_args` naming `calendars`.
 fn free_busy_call(args: &FreeBusyArgs, settings: &Settings) -> ApiCall {
     let items: Vec<Value> = args
         .calendars
@@ -1157,13 +1176,13 @@ fn quoted(why: &Unreadable, estimate: Option<u64>) -> String {
 
 /// A 4xx/5xx answer, its detail as `google_error_detail` writes it. 400 and
 /// 404 are the caller's arguments; 403 is Google's refusal, answered with the
-/// family's scope hint; every other status (401 after `api-request`'s retry,
-/// 429, 5xx) is the wrapper's or Google's.
+/// hint naming the step's scope; every other status (401 after
+/// `api-request`'s retry, 429, 5xx) is the wrapper's or Google's.
 // TODO(errhandling-gmail-403-always-denied-with-scope-hint): a quota or
 // API-not-enabled 403 is answered `denied` with the scope hint.
 // TODO(errhandling-gmail-4xx-on-fixed-request-blamed-on-caller): a 400/404 on
 // a request built from constants alone is answered `invalid_args`.
-fn google_error(status: u64, body: &str, family: Family) -> Failure {
+fn google_error(status: u64, body: &str, scope: Scope) -> Failure {
     let kind = match status {
         400 | 404 => ErrorKind::InvalidArgs,
         403 => ErrorKind::Denied,
@@ -1172,7 +1191,7 @@ fn google_error(status: u64, body: &str, family: Family) -> Failure {
     let mut detail = google_error_detail(status, body);
     if kind == ErrorKind::Denied {
         let stop = if detail.ends_with('.') { "" } else { "." };
-        detail = format!("{detail}{stop} {}", scope_hint(family));
+        detail = format!("{detail}{stop} {}", scope_hint(scope));
     }
     Failure { kind, detail }
 }
@@ -1202,7 +1221,7 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             return settle(state.tool, search_message(state, Read::Deleted, settings));
         }
         Ok(Answer::Error { status, body }) => {
-            return Next::Fail(google_error(status, &body, family(state.tool)));
+            return Next::Fail(google_error(status, &body, scope(state.tool, state.step)));
         }
         Err(failure) => return Next::Fail(failure),
     };
@@ -2291,9 +2310,9 @@ fn conference<'a>(event: &Compact<'a>) -> Result<Option<&'a str>, Failure> {
 /// left out, since it would read as free time. The calendars must be exactly
 /// those asked, and the refusal otherwise names the ids on each side of the
 /// difference; one with neither `busy` nor reasons is Google's fault. The
-/// calendars are keyed by the ids as asked, uncut: fifty ids of
-/// `CALENDAR_ID_MAX_CHARS` characters are at most 64 000 bytes of keys, and
-/// the result ceiling's refusal in `settle` is what bounds the whole answer.
+/// calendars are keyed by the ids as asked, uncut: the keys are at most
+/// `FREEBUSY_IDS_MAX_BYTES` bytes together, and the result ceiling's refusal
+/// in `settle` is what bounds the whole answer.
 fn compact_free_busy(body: &Value, args: &FreeBusyArgs) -> Result<Value, Failure> {
     let api = "freebusy.query";
     let mut answer = Compact::of(body, api)?;
@@ -2523,15 +2542,6 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()))
         };
         let spec = read("config/specs/google-workspace-tools.brenn");
-        let description = |block: &str| -> String {
-            let opening = format!("provide {block} {{");
-            spec.lines()
-                .map(str::trim)
-                .skip_while(|line| *line != opening)
-                .find_map(|line| line.strip_prefix("description = \""))
-                .unwrap_or_else(|| panic!("the spec's {block} block has no description"))
-                .to_string()
-        };
         // From the opening words to the delimiter, the delimiter kept when
         // `keep` is set.
         let quoted = |text: &str, opening: &str, delimiter: &str, keep: bool| -> String {
@@ -2549,13 +2559,13 @@ mod tests {
         let guide = collapse(&read("docs/google-workspace.md"));
         for sentence in [
             quoted(
-                &description("calendar-events"),
+                &description(&spec, "calendar-events"),
                 "the answer to the invitation of the calendar read",
                 ")",
                 false,
             ),
             quoted(
-                &description("calendar-event"),
+                &description(&spec, "calendar-event"),
                 "The calendar read is the user on",
                 ". ",
                 true,
@@ -2715,7 +2725,7 @@ mod tests {
             (503, "UNAVAILABLE", ErrorKind::Internal),
         ] {
             assert_eq!(
-                google_error(code, &google(code, status, "later"), Family::Gmail),
+                google_error(code, &google(code, status, "later"), Scope::GmailRead),
                 failure(kind, &format!("Google {status} (HTTP {code}): later")),
                 "{code}"
             );
@@ -2732,7 +2742,7 @@ mod tests {
                     "PERMISSION_DENIED",
                     "Request had insufficient authentication scopes."
                 ),
-                Family::Gmail
+                Scope::GmailRead
             ),
             failure(
                 ErrorKind::Denied,
@@ -2743,19 +2753,19 @@ mod tests {
             )
         );
         assert_eq!(
-            google_error(403, "<html>SECRET</html>", Family::Gmail),
+            google_error(403, "<html>SECRET</html>", Scope::GmailRead),
             failure(
                 ErrorKind::Denied,
                 &format!(
                     "Google HTTP 403, body not in the standard error shape. {}",
-                    scope_hint(Family::Gmail)
+                    scope_hint(Scope::GmailRead)
                 )
             )
         );
     }
 
     #[test]
-    fn advance_answers_a_google_error_through_the_family_mapping() {
+    fn advance_answers_a_google_error_through_the_status_mapping() {
         assert_eq!(
             answered(
                 &labels_state(json!({ "id": "Label_404" })),
@@ -4748,7 +4758,7 @@ mod tests {
             "Request had insufficient authentication scopes.",
         );
         assert_eq!(
-            google_error(403, &body, Family::Calendar),
+            google_error(403, &body, Scope::CalendarRead),
             failure(
                 ErrorKind::Denied,
                 "Google PERMISSION_DENIED (HTTP 403): Request had insufficient authentication \
@@ -4765,22 +4775,41 @@ mod tests {
                 &format!(
                     "Google PERMISSION_DENIED (HTTP 403): Request had insufficient \
                      authentication scopes. {}",
-                    scope_hint(Family::Calendar)
+                    scope_hint(Scope::CalendarRead)
                 )
             ))
         );
     }
 
+    /// Every step `tool` issues a call at.
+    fn steps(tool: Provided) -> Vec<u8> {
+        match tool {
+            Provided::GmailLabels => vec![1],
+            Provided::GmailSearch => [1, LABELS_STEP]
+                .into_iter()
+                .chain(SEARCH_FIRST_GET..=SEARCH_LAST_GET)
+                .collect(),
+            Provided::GmailRead => vec![1, STRUCTURE_STEP, LABELS_STEP],
+            Provided::GmailThread => vec![1, THREAD_NARROW_STEP, LABELS_STEP],
+            Provided::CalendarList
+            | Provided::CalendarEvents
+            | Provided::CalendarEvent
+            | Provided::CalendarFreeBusy => vec![1],
+        }
+    }
+
     #[test]
-    fn every_tool_names_its_family() {
+    fn every_step_names_its_scope() {
         for tool in Provided::ALL {
             let expected = if tool.name().starts_with("gmail-") {
-                Family::Gmail
+                Scope::GmailRead
             } else {
                 assert!(tool.name().starts_with("calendar-"), "{}", tool.name());
-                Family::Calendar
+                Scope::CalendarRead
             };
-            assert_eq!(family(tool), expected, "{}", tool.name());
+            for step in steps(tool) {
+                assert_eq!(scope(tool, step), expected, "{} step {step}", tool.name());
+            }
         }
     }
 
@@ -5366,7 +5395,10 @@ mod tests {
     /// Every argument `tool` takes, with the bound its parser holds it to,
     /// and the arguments it requires: the parser's own constants and key
     /// lists, as `every_tools_schema_states_what_its_parser_enforces` holds
-    /// the spec to them.
+    /// the spec to them. One parser rule is outside what a schema states,
+    /// leaving the schema wider than the parser: `calendars`' ids together
+    /// hold at most `FREEBUSY_IDS_MAX_BYTES`, which the description states, as
+    /// `every_description_states_its_parsers_budgets` holds it to.
     fn bounds(tool: Provided) -> ToolBounds<'static> {
         let (keys, required): (&'static [&'static str], &'static [&'static str]) = match tool {
             Provided::GmailLabels => (LabelsArgs::KEYS, &[]),
@@ -5479,6 +5511,12 @@ mod tests {
                     json!(["a/b"]),
                     json!([1]),
                     json!("primary"),
+                    // The byte budget the schema cannot state.
+                    json!(
+                        (0..FREEBUSY_CALENDARS_MAX)
+                            .map(|i| four_byte(i, CALENDAR_ID_MAX_CHARS))
+                            .collect::<Vec<_>>()
+                    ),
                 ],
             },
             other => panic!("`{other}` has no probes"),
@@ -5511,6 +5549,36 @@ mod tests {
                 hold_probes(name, key, &probes, &base, plan_with);
             }
         }
+    }
+
+    /// The `description` of the spec's `provide <block>` block, as the spec
+    /// writes it (escapes unexpanded).
+    fn description(spec: &str, block: &str) -> String {
+        let opening = format!("provide {block} {{");
+        spec.lines()
+            .map(str::trim)
+            .skip_while(|line| *line != opening)
+            .find_map(|line| line.strip_prefix("description = \""))
+            .unwrap_or_else(|| panic!("the spec's {block} block has no description"))
+            .to_string()
+    }
+
+    /// The parser budgets no schema can state: each tool's description gives
+    /// the number its parser's constant holds.
+    #[test]
+    fn every_description_states_its_parsers_budgets() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../config/specs/google-workspace-tools.brenn");
+        let spec = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+        let tool = Provided::CalendarFreeBusy;
+        let budget =
+            format!("the ids together may hold at most {FREEBUSY_IDS_MAX_BYTES} bytes of UTF-8");
+        assert!(
+            description(&spec, tool.name()).contains(&budget),
+            "`{}`'s description must say {budget:?}",
+            tool.name()
+        );
     }
 
     #[test]
@@ -6020,7 +6088,10 @@ mod tests {
             panic!("a 403 did not fail");
         };
         assert_eq!(kind, ErrorKind::Denied);
-        assert!(detail.ends_with(&scope_hint(Family::Calendar)), "{detail}");
+        assert!(
+            detail.ends_with(&scope_hint(Scope::CalendarRead)),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -6195,6 +6266,71 @@ mod tests {
             .collect();
         let call = free_busy(window(json!({ "calendars": fifty }))).unwrap();
         assert_eq!(free_busy_body(&call)["calendarExpansionMax"], json!(50));
+    }
+
+    /// The host's cap on a nested call's serialized args: a copy of
+    /// `PROCESSOR_MAX_TOOL_ARGS_BYTES`, which the component cannot see.
+    // TODO(reuse-host-args-cap-copied-per-component-test): one copy, pinned
+    // to the host's constant, for every provider component's tests.
+    const HOST_ARGS_CAP_BYTES: usize = 64 * 1024;
+
+    /// `n` characters of four UTF-8 bytes, the first naming `i` so that ids
+    /// built for different `i` differ.
+    fn four_byte(i: usize, n: usize) -> String {
+        let first = char::from_u32(0x1_0000 + u32::try_from(i).unwrap()).unwrap();
+        std::iter::once(first)
+            .chain(std::iter::repeat_n('\u{1d11e}', n - 1))
+            .collect()
+    }
+
+    /// `n` characters of the widest serialized width an argument parsed by
+    /// `capped` alone can take: `capped` admits controls, and U+0001 has no
+    /// short escape, so each is `\u0001`, 6 bytes, when serialized once
+    /// (`account`) and `\\u0001`, 7 bytes, inside a POST body serialized
+    /// again as the args. Four-byte characters are the widest only for an
+    /// argument whose parser refuses every character JSON escapes.
+    fn escaped_widest(n: usize) -> String {
+        "\u{1}".repeat(n)
+    }
+
+    #[test]
+    fn the_widest_free_busy_call_fits_the_args_cap() {
+        let with = |calendars: Vec<String>| {
+            free_busy(json!({
+                "from": escaped_widest(TIME_MAX_CHARS),
+                "to": escaped_widest(TIME_MAX_CHARS),
+                "calendars": calendars,
+                "account": escaped_widest(ACCOUNT_MAX_CHARS),
+            }))
+        };
+        let ids = |chars: usize| -> Vec<String> {
+            (0..FREEBUSY_CALENDARS_MAX)
+                .map(|i| four_byte(i, chars))
+                .collect()
+        };
+        let refusal = "`calendars` together exceed 48000 bytes (UTF-8); ask for fewer";
+        assert_eq!(
+            with(ids(CALENDAR_ID_MAX_CHARS)).unwrap_err(),
+            refusal,
+            "fifty maximal ids of four-byte characters"
+        );
+
+        let at_budget = ids(FREEBUSY_IDS_MAX_BYTES / FREEBUSY_CALENDARS_MAX / 4);
+        assert_eq!(
+            at_budget.iter().map(String::len).sum::<usize>(),
+            FREEBUSY_IDS_MAX_BYTES
+        );
+        let call = with(at_budget.clone()).unwrap();
+        let args = serde_json::to_vec(&call).unwrap();
+        assert!(
+            args.len() <= HOST_ARGS_CAP_BYTES,
+            "{} bytes of args",
+            args.len()
+        );
+
+        let mut over = at_budget;
+        over[0].push('x');
+        assert_eq!(with(over).unwrap_err(), refusal, "one byte over");
     }
 
     const FREE_BUSY: &str = include_str!("fixtures/free-busy.json");
@@ -6412,7 +6548,10 @@ mod tests {
             panic!("a 403 did not fail");
         };
         assert_eq!(kind, ErrorKind::Denied);
-        assert!(detail.ends_with(&scope_hint(Family::Calendar)), "{detail}");
+        assert!(
+            detail.ends_with(&scope_hint(Scope::CalendarRead)),
+            "{detail}"
+        );
     }
 
     /// A free/busy body whose answer, once compacted, serializes to exactly
@@ -6590,14 +6729,7 @@ mod tests {
     #[test]
     fn an_empty_answer_is_internal_at_every_step() {
         for tool in Provided::ALL {
-            for step in [
-                1,
-                STRUCTURE_STEP,
-                THREAD_NARROW_STEP,
-                LABELS_STEP,
-                SEARCH_FIRST_GET,
-                SEARCH_LAST_GET,
-            ] {
+            for step in steps(tool) {
                 let mut state = labels_state(json!({}));
                 state.tool = tool;
                 state.step = step;

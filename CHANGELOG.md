@@ -85,9 +85,13 @@ All notable changes to Brenn are documented here.
   characters" or "a calendar id of 1 to 320 characters". A whole-number
   argument written as a float (`5.0`) is now accepted. A Google error whose
   status is not a short upper-case code is reported as "not in the standard
-  error shape" rather than quoted. Known limit: a free/busy query over many
-  very long non-ASCII calendar ids can exceed the host's size limit for a
-  nested call and is then answered as an internal error. No config changes.
+  error shape" rather than quoted. No config changes.
+
+- `CalendarFreeBusy` now refuses a `calendars` list whose ids together
+  exceed 48 000 bytes of UTF-8, before any call to Google, with an error
+  naming `calendars` and asking for fewer. Such a list could exceed the
+  host's size limit for the call to `api-request` and was answered as an
+  internal error. No config changes.
 
 - **Google Maps tool arguments are now limited in characters, and its
   errors read like the Workspace tools'.** The length caps on the
