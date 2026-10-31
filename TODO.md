@@ -74,26 +74,6 @@ apply it to every step. Calendar's steps carry caller input in `from`, `to`,
 `q`, `page`, `calendar`, `id` and `calendars`; `CalendarList` carries only
 `page`.
 
-## `provider-schema-parse-parity`
-
-A provider component states each tool's argument bounds twice: in the
-`input_schema` of its `.brenn` spec, which the model is shown, and in its
-argument parser (`google-workspace-tools` `SearchArgs::parse` and
-`LabelsArgs::parse`: the property set, `q` 1–1024 bytes, `max` 1–25, `page`
-1–4096 bytes, `account` 1–320 bytes; `google-maps-tools` likewise, every
-`*Args::parse` reached from `plan`). Nothing ties the two, so a bound edited
-on one side alone promises the model arguments the wrapper refuses as
-`invalid_args`. Decide the mechanism for every component at once — the spec
-scaffold exposing each tool's schema to the component's host test, or one
-source generating the other — and apply it to both provider components and
-to every argument parser added to them. `tool-schema-derive` is the same drift
-on the host tool registry's side; one source generating the other there means
-a schema derive such as `schemars`, so decide the two mechanisms together.
-
-Code sites (`TODO(provider-schema-parse-parity)`): each `*Args::parse` in
-`brenn-wasm/components/google-workspace-tools/src/logic.rs`; `plan` in
-`brenn-wasm/components/google-maps-tools/src/logic.rs`.
-
 ## `security-host-paths-follow-agent-symlinks`
 
 Brenn's host process creates, writes and deletes under trees the agent's

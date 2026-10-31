@@ -108,6 +108,15 @@ All notable changes to Brenn are documented here.
   written as a float is accepted and a Google error with an unusual status
   code is reported as "not in the standard error shape". No config changes.
 
+- **The Google tools' argument schemas now state every limit their checks
+  enforce.** The schemas the assistant reads for the `google-maps-tools`
+  arguments now give each text argument's length (1024 characters, 4096 for
+  `page`) and the place `id`'s allowed characters; the free-text arguments of
+  both Google components now say a value must not be blank; and the
+  Workspace `calendar` and `calendars` arguments state the calendar-id rule
+  as a pattern instead of a bare length. A test now fails the build when a
+  tool's schema and its argument check disagree. No config changes.
+
 - The Google Workspace operator guide (`docs/google-workspace.md`) now
   covers the Calendar tools: connecting users with `calendar_readonly`, what
   each answer holds, the assistant's instructions and Calendar setup and

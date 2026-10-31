@@ -45,7 +45,10 @@ rust_test(
         ":spec",
     ],
     crate_root = "src/logic.rs",
-    data = ["//docs:google-maps-platform.md"],
+    data = [
+        "//:config/specs/google-maps-tools.brenn",
+        "//docs:google-maps-platform.md",
+    ],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": package_name()},
     proc_macro_deps = all_crate_deps(proc_macro = True),

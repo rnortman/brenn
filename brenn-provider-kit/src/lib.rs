@@ -15,8 +15,9 @@
 //! - [`settings`]: reading an instance's `config` values.
 //! - `schema` (behind the `testutils` feature): a host test's check that each
 //!   tool's `input_schema` states exactly the bounds its argument parser
-//!   enforces. Its reader panics by design: it serves host tests, never a
-//!   component step.
+//!   enforces, the argument values that probe the parser against each
+//!   bound, and the assertions that hold the parser to them. It panics by
+//!   design: it serves host tests, never a component step.
 //! - `testutil` (behind the `testutils` feature): fixtures for a step's tests
 //!   — `api-request` answers, nested-call errors, Google error bodies and
 //!   error answers.
@@ -52,7 +53,10 @@ pub use call::{
 };
 pub use row::{INFLIGHT_TTL_MS, InFlight, Tool, call_id, claim, no_such_step, row_expired, stored};
 #[cfg(feature = "testutils")]
-pub use schema::{Bound, NON_BLANK, ToolBounds, check, input_schema, token_pattern};
+pub use schema::{
+    Bound, NON_BLANK, Probes, ToolBounds, check, hold_probes, hold_required, input_schema, probes,
+    token_pattern,
+};
 pub use settings::{host, required};
 
 /// A two-tool enum standing in for a component's generated `Provided`.

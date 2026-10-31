@@ -258,13 +258,28 @@ fn text<'a>(args: &'a Args, key: &str) -> Result<Option<&'a str>, String> {
     capped(args, key, TEXT_MAX_CHARS)
 }
 
+/// The largest latitude either side of the equator, in degrees.
+const LAT_MAX: f64 = 90.0;
+/// The largest longitude either side of the prime meridian, in degrees.
+const LNG_MAX: f64 = 180.0;
+
+/// The refusal of a `key` that is not one of `names`, listing them in order.
+fn one_of(key: &str, names: impl IntoIterator<Item = &'static str>) -> String {
+    let names: Vec<String> = names.into_iter().map(|name| format!("`{name}`")).collect();
+    format!("`{key}` must be one of {}", names.join(", "))
+}
+
 /// A latitude and longitude in range.
 fn checked(lat: f64, lng: f64, what: &str) -> Result<(f64, f64), String> {
-    if !(-90.0..=90.0).contains(&lat) {
-        return Err(format!("{what}: latitude {lat} is outside -90 to 90"));
+    if !(-LAT_MAX..=LAT_MAX).contains(&lat) {
+        return Err(format!(
+            "{what}: latitude {lat} is outside -{LAT_MAX} to {LAT_MAX}"
+        ));
     }
-    if !(-180.0..=180.0).contains(&lng) {
-        return Err(format!("{what}: longitude {lng} is outside -180 to 180"));
+    if !(-LNG_MAX..=LNG_MAX).contains(&lng) {
+        return Err(format!(
+            "{what}: longitude {lng} is outside -{LNG_MAX} to {LNG_MAX}"
+        ));
     }
     Ok((lat, lng))
 }
@@ -315,8 +330,6 @@ pub fn parse_lat_lng(text: &str, key: &str) -> Result<Option<(f64, f64)>, String
 
 /// Validate a request's arguments and build its first nested call. An error is
 /// the request's `invalid_args` detail, naming the argument.
-// TODO(provider-schema-parse-parity): each tool's `*Args::parse` bounds and its
-// `input_schema` in the spec are stated separately.
 pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, String> {
     match tool {
         Provided::Geocode => {
@@ -420,6 +433,31 @@ enum WeatherKind {
     Alerts,
 }
 
+impl WeatherKind {
+    /// Every kind, in the order the tool's `input_schema` lists them.
+    const ALL: [WeatherKind; 4] = [
+        WeatherKind::Current,
+        WeatherKind::Hourly,
+        WeatherKind::Daily,
+        WeatherKind::Alerts,
+    ];
+
+    /// The tool's spelling.
+    fn name(self) -> &'static str {
+        match self {
+            WeatherKind::Current => "current",
+            WeatherKind::Hourly => "hourly",
+            WeatherKind::Daily => "daily",
+            WeatherKind::Alerts => "alerts",
+        }
+    }
+
+    /// The refusal of a `kind` that is not one of these.
+    fn choices() -> String {
+        one_of("kind", WeatherKind::ALL.map(WeatherKind::name))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct WeatherArgs {
     kind: WeatherKind,
@@ -432,21 +470,18 @@ struct WeatherArgs {
 }
 
 impl WeatherArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["kind", "lat", "lng", "place", "hours", "days", "page"];
+
     fn parse(args: &Value) -> Result<WeatherArgs, String> {
-        let args = object(
-            args,
-            &["kind", "lat", "lng", "place", "hours", "days", "page"],
-        )?;
+        let args = object(args, Self::KEYS)?;
         let kind = match args.get("kind") {
             None => return Err("`kind` is required".to_string()),
-            Some(Value::String(kind)) => match kind.as_str() {
-                "current" => WeatherKind::Current,
-                "hourly" => WeatherKind::Hourly,
-                "daily" => WeatherKind::Daily,
-                "alerts" => WeatherKind::Alerts,
-                _ => return Err(KIND_CHOICES.to_string()),
-            },
-            Some(_) => return Err(KIND_CHOICES.to_string()),
+            Some(Value::String(kind)) => WeatherKind::ALL
+                .into_iter()
+                .find(|known| known.name() == kind)
+                .ok_or_else(WeatherKind::choices)?,
+            Some(_) => return Err(WeatherKind::choices()),
         };
         let page = capped(args, "page", PAGE_TOKEN_MAX_CHARS)?;
         let at = place_or_coordinates(args, "place")?;
@@ -470,8 +505,6 @@ impl WeatherArgs {
         })
     }
 }
-
-const KIND_CHOICES: &str = "`kind` must be one of `current`, `hourly`, `daily`, `alerts`";
 
 /// A Weather API lookup at a location: one page, never followed.
 fn weather_call(args: &WeatherArgs, lat: f64, lng: f64, settings: &Settings) -> ApiCall {
@@ -530,8 +563,11 @@ struct GeocodeArgs {
 }
 
 impl GeocodeArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["address", "lat", "lng", "max"];
+
     fn parse(args: &Value) -> Result<GeocodeArgs, String> {
-        let args = object(args, &["address", "lat", "lng", "max"])?;
+        let args = object(args, Self::KEYS)?;
         let query = place_or_coordinates(args, "address")?;
         let max = integer(args, "max", 1, GEOCODE_MAX)?.unwrap_or(GEOCODE_DEFAULT_MAX);
         Ok(GeocodeArgs {
@@ -590,17 +626,22 @@ enum TravelMode {
 }
 
 impl TravelMode {
+    /// Every mode, in the order the tools' `input_schema`s list them.
+    const ALL: [TravelMode; 4] = [
+        TravelMode::Drive,
+        TravelMode::Walk,
+        TravelMode::Bicycle,
+        TravelMode::Transit,
+    ];
+
     fn parse(args: &Args) -> Result<TravelMode, String> {
         match args.get("mode") {
             None => Ok(TravelMode::Drive),
-            Some(Value::String(mode)) => match mode.as_str() {
-                "drive" => Ok(TravelMode::Drive),
-                "walk" => Ok(TravelMode::Walk),
-                "bicycle" => Ok(TravelMode::Bicycle),
-                "transit" => Ok(TravelMode::Transit),
-                _ => Err(MODE_CHOICES.to_string()),
-            },
-            Some(_) => Err(MODE_CHOICES.to_string()),
+            Some(Value::String(mode)) => TravelMode::ALL
+                .into_iter()
+                .find(|known| known.name() == mode)
+                .ok_or_else(TravelMode::choices),
+            Some(_) => Err(TravelMode::choices()),
         }
     }
 
@@ -614,6 +655,11 @@ impl TravelMode {
         }
     }
 
+    /// The refusal of a `mode` that is not one of these.
+    fn choices() -> String {
+        one_of("mode", TravelMode::ALL.map(TravelMode::name))
+    }
+
     fn google(self) -> &'static str {
         match self {
             TravelMode::Drive => "DRIVE",
@@ -623,8 +669,6 @@ impl TravelMode {
         }
     }
 }
-
-const MODE_CHOICES: &str = "`mode` must be one of `drive`, `walk`, `bicycle`, `transit`";
 
 /// One end of a route: coordinates, a Places place id, or an address Google
 /// resolves itself.
@@ -730,18 +774,18 @@ struct DirectionsArgs {
 }
 
 impl DirectionsArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &[
+        "origin",
+        "destination",
+        "mode",
+        "depart_at",
+        "arrive_by",
+        "max_steps",
+    ];
+
     fn parse(args: &Value) -> Result<DirectionsArgs, String> {
-        let args = object(
-            args,
-            &[
-                "origin",
-                "destination",
-                "mode",
-                "depart_at",
-                "arrive_by",
-                "max_steps",
-            ],
-        )?;
+        let args = object(args, Self::KEYS)?;
         let route = RouteEnds::parse(args)?;
         // Google checks the times themselves and answers a malformed one with a 400.
         let when = match (text(args, "depart_at")?, text(args, "arrive_by")?) {
@@ -834,8 +878,11 @@ struct PlaceDetailsArgs {
 }
 
 impl PlaceDetailsArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["id", "reviews"];
+
     fn parse(args: &Value) -> Result<PlaceDetailsArgs, String> {
-        let args = object(args, &["id", "reviews"])?;
+        let args = object(args, Self::KEYS)?;
         let Some(id) = capped(args, "id", PLACE_ID_MAX_CHARS)? else {
             return Err("`id` is required".to_string());
         };
@@ -974,8 +1021,11 @@ struct AlongRouteArgs {
 }
 
 impl AlongRouteArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["origin", "destination", "query", "mode", "max"];
+
     fn parse(args: &Value) -> Result<AlongRouteArgs, String> {
-        let args = object(args, &["origin", "destination", "query", "mode", "max"])?;
+        let args = object(args, Self::KEYS)?;
         let route = RouteEnds::parse(args)?;
         let search = SearchText::parse(args)?;
         Ok(AlongRouteArgs { route, search })
@@ -998,8 +1048,11 @@ struct PlacesSearchArgs {
 }
 
 impl PlacesSearchArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["query", "near", "radius", "open_now", "max"];
+
     fn parse(args: &Value) -> Result<PlacesSearchArgs, String> {
-        let args = object(args, &["query", "near", "radius", "open_now", "max"])?;
+        let args = object(args, Self::KEYS)?;
         let search = SearchText::parse(args)?;
         let near = text(args, "near")?
             .map(|near| place_text(near, "near"))
@@ -2025,8 +2078,16 @@ fn minutes(to: &mut Args, name: &str, duration: Option<&Value>) -> Result<(), Fa
 #[cfg(test)]
 mod tests {
     use brenn_provider_kit::testutil::{failure, google, http, nested, truncated};
+    use brenn_provider_kit::{
+        Bound, ToolBounds, check, hold_probes, hold_required, input_schema, probes,
+    };
 
     use super::*;
+
+    /// The refusals of a `kind` and a `mode` the tools do not take, as the
+    /// model reads them.
+    const KIND_CHOICES: &str = "`kind` must be one of `current`, `hourly`, `daily`, `alerts`";
+    const MODE_CHOICES: &str = "`mode` must be one of `drive`, `walk`, `bicycle`, `transit`";
 
     fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: BTreeMap<String, String> = pairs
@@ -4797,5 +4858,144 @@ mod tests {
                  a caller with no acting user may only read"
             ))
         );
+    }
+
+    /// Every argument `tool` takes, with the bound its parser holds it to,
+    /// and the arguments it requires: the parser's own constants and key
+    /// lists, as `every_tools_schema_states_what_its_parser_enforces` holds
+    /// the spec to them. Some rules the parser holds are in no bound here,
+    /// and the schema leaves them to the descriptions: every rule across
+    /// arguments, and two on one text value. A place text of the form
+    /// `<lat>,<lng>` is refused when out of range, and a waypoint of
+    /// `place_id:` with no id is refused; the schema admits both.
+    fn bounds(tool: Provided) -> ToolBounds<'static> {
+        let (keys, required): (&'static [&'static str], &'static [&'static str]) = match tool {
+            Provided::Weather => (WeatherArgs::KEYS, &["kind"]),
+            Provided::Geocode => (GeocodeArgs::KEYS, &[]),
+            Provided::Directions => (DirectionsArgs::KEYS, &["origin", "destination"]),
+            Provided::PlacesSearch => (PlacesSearchArgs::KEYS, &["query"]),
+            Provided::PlaceDetails => (PlaceDetailsArgs::KEYS, &["id"]),
+            Provided::SearchAlongRoute => {
+                (AlongRouteArgs::KEYS, &["origin", "destination", "query"])
+            }
+        };
+        let text = Bound::Text {
+            max_chars: TEXT_MAX_CHARS,
+            format: None,
+        };
+        let integer = |max| Bound::Integer { min: 1, max };
+        let property = |key: &'static str| {
+            let bound = match (tool, key) {
+                (Provided::Weather, "kind") => {
+                    Bound::Enum(WeatherKind::ALL.map(WeatherKind::name).to_vec())
+                }
+                (Provided::Weather, "page") => Bound::Text {
+                    max_chars: PAGE_TOKEN_MAX_CHARS,
+                    format: None,
+                },
+                (Provided::Weather, "hours") => integer(HOURS_MAX),
+                (Provided::Weather, "days") => integer(DAYS_MAX),
+                (Provided::Weather | Provided::Geocode, "lat") => Bound::Number {
+                    min: -LAT_MAX,
+                    max: LAT_MAX,
+                },
+                (Provided::Weather | Provided::Geocode, "lng") => Bound::Number {
+                    min: -LNG_MAX,
+                    max: LNG_MAX,
+                },
+                (_, "place" | "address" | "origin" | "destination" | "query" | "near") => {
+                    text.clone()
+                }
+                (Provided::Geocode, "max") => integer(GEOCODE_MAX),
+                (Provided::Directions | Provided::SearchAlongRoute, "mode") => {
+                    Bound::Enum(TravelMode::ALL.map(TravelMode::name).to_vec())
+                }
+                (Provided::Directions, "depart_at" | "arrive_by") => Bound::Text {
+                    max_chars: TEXT_MAX_CHARS,
+                    format: Some("date-time"),
+                },
+                (Provided::Directions, "max_steps") => integer(DIRECTIONS_MAX_STEPS),
+                (Provided::PlacesSearch | Provided::SearchAlongRoute, "max") => integer(PLACES_MAX),
+                (Provided::PlacesSearch, "radius") => integer(RADIUS_MAX_METERS),
+                (Provided::PlacesSearch, "open_now") | (Provided::PlaceDetails, "reviews") => {
+                    Bound::Bool
+                }
+                (Provided::PlaceDetails, "id") => Bound::Token {
+                    max_chars: PLACE_ID_MAX_CHARS,
+                },
+                _ => panic!("{tool:?} takes `{key}`, which no bound here states"),
+            };
+            (key, bound)
+        };
+        ToolBounds {
+            properties: keys.iter().copied().map(property).collect(),
+            required,
+        }
+    }
+
+    /// Arguments `tool` admits into which a probe of `key` is set: the
+    /// required ones, a location by coordinates where the tool needs one,
+    /// and an optional argument only where a probe of `key` is refused
+    /// without it. The location is `key` itself when `key` is the location's
+    /// text, which the coordinates would contradict. Every other optional
+    /// argument is absent, so the parser admitting these arguments shows it
+    /// does not require it.
+    fn admitted_args(tool: Provided, key: &str) -> Value {
+        let mut args = match tool {
+            Provided::Weather => {
+                json!({ "kind": if key == "days" { "daily" } else { "hourly" }, "lat": 0, "lng": 0 })
+            }
+            Provided::Geocode => json!({ "lat": 0, "lng": 0 }),
+            Provided::Directions => json!({ "origin": "a", "destination": "b" }),
+            Provided::PlacesSearch => json!({ "query": "coffee" }),
+            Provided::PlaceDetails => json!({ "id": "abc" }),
+            Provided::SearchAlongRoute => {
+                json!({ "origin": "a", "destination": "b", "query": "coffee" })
+            }
+        };
+        let map = args.as_object_mut().unwrap();
+        match (tool, key) {
+            (_, "place" | "address") => {
+                map.remove("lat");
+                map.remove("lng");
+                map.insert(key.to_string(), json!("Springfield"));
+            }
+            (Provided::PlacesSearch, "radius") => {
+                map.insert("near".to_string(), json!("Springfield"));
+            }
+            (Provided::Directions, "arrive_by") => {
+                map.insert("mode".to_string(), json!("transit"));
+            }
+            _ => {}
+        }
+        args
+    }
+
+    /// Each tool's `input_schema` states exactly the bounds its parser
+    /// enforces, and the parser admits and refuses every bound's probes,
+    /// naming the argument it refuses: the schema and the parser are held to
+    /// the same table from both sides.
+    #[test]
+    fn every_tools_schema_states_what_its_parser_enforces() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../config/specs/google-maps-tools.brenn");
+        let spec = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+        for tool in Provided::ALL {
+            let name = tool.name();
+            let bounds = bounds(tool);
+            if let Err(error) = check(&input_schema(&spec, name), &bounds) {
+                panic!("`{name}`'s input_schema: {error}");
+            }
+            let plan_with = |args: &Value| plan(tool, args, &settings()).map(drop);
+            for key in bounds.required {
+                hold_required(name, key, &admitted_args(tool, key), plan_with);
+            }
+            for (key, bound) in &bounds.properties {
+                let probes = probes(bound)
+                    .unwrap_or_else(|| panic!("`{name}`'s `{key}` has no probes: {bound:?}"));
+                hold_probes(name, key, &probes, &admitted_args(tool, key), plan_with);
+            }
+        }
     }
 }

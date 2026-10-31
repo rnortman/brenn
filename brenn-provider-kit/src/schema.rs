@@ -57,7 +57,9 @@ pub enum Bound<'a> {
         max_chars: usize,
         format: Option<&'a str>,
     },
-    /// `{type: string, pattern: P}`.
+    /// `{type: string, pattern: token_pattern(max_chars)}`: an ASCII token id.
+    Token { max_chars: usize },
+    /// `{type: string, pattern: P}`, for a pattern that is its component's.
     Pattern(String),
     /// `{type: integer, minimum, maximum}`. The parser admits a whole number
     /// written as a float (`5.0`), as the schema's `integer` does.
@@ -65,7 +67,7 @@ pub enum Bound<'a> {
     /// `{type: number, minimum, maximum}`.
     Number { min: f64, max: f64 },
     /// `{type: string, enum: [..]}`, in order.
-    Enum(&'a [&'a str]),
+    Enum(Vec<&'a str>),
     /// `{type: boolean}`.
     Bool,
     /// `{type: array, minItems, maxItems[, uniqueItems: true], items}`.
@@ -88,6 +90,9 @@ impl Bound<'_> {
                     text["format"] = json!(format);
                 }
                 text
+            }
+            Bound::Token { max_chars } => {
+                json!({ "type": "string", "pattern": token_pattern(*max_chars) })
             }
             Bound::Pattern(pattern) => json!({ "type": "string", "pattern": pattern }),
             Bound::Integer { min, max } => {
@@ -253,6 +258,149 @@ fn same(want: &Value, have: &Value) -> bool {
     }
 }
 
+/// Argument values that hold a parser to a bound: the parser must admit each
+/// of `admitted`, and refuse each of `refused` naming the argument.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Probes {
+    pub admitted: Vec<Value>,
+    pub refused: Vec<Value>,
+}
+
+/// The characters the longest token probe cycles through: one of each class
+/// [`token_pattern`] admits.
+const TOKEN_PROBE: &str = "Az09_-";
+
+/// The probes of `bound`, or `None` for a bound whose probes are its
+/// component's: a `Pattern` and an `Array`. A `Text` bound's longest admitted
+/// value is two-byte characters, so only a parser counting characters, as
+/// `maxLength` does, admits it; its blank
+/// probe holds U+0085, whitespace to the parser and not to ECMA's `\s`. A
+/// token's refused values are one too long, empty, and one per character
+/// class the pattern excludes.
+pub fn probes(bound: &Bound) -> Option<Probes> {
+    let probes = match bound {
+        Bound::Text { max_chars, .. } => Probes {
+            admitted: vec![json!("é".repeat(*max_chars))],
+            refused: vec![
+                json!("é".repeat(max_chars + 1)),
+                json!(""),
+                json!(" \t\n\u{85}\u{3000}"),
+                json!(1),
+            ],
+        },
+        Bound::Token { max_chars: max } => {
+            let max = *max;
+            let token = |n: usize| -> String { TOKEN_PROBE.chars().cycle().take(n).collect() };
+            Probes {
+                admitted: vec![json!(token(max)), json!(token(1))],
+                refused: [
+                    token(max + 1).as_str(),
+                    "",
+                    "a b",
+                    "a/b",
+                    "a.b",
+                    "a%b",
+                    "a\u{1}b",
+                    "é",
+                ]
+                .into_iter()
+                .map(|text| json!(text))
+                .chain([json!(1)])
+                .collect(),
+            }
+        }
+        Bound::Integer { min, max } => {
+            let mut refused = vec![
+                json!(max + 1),
+                json!(*min as f64 + 0.5),
+                json!(min.to_string()),
+            ];
+            if *min > 0 {
+                refused.push(json!(min - 1));
+            }
+            Probes {
+                admitted: vec![json!(min), json!(max), json!(*max as f64)],
+                refused,
+            }
+        }
+        Bound::Number { min, max } => Probes {
+            admitted: vec![json!(min), json!(max)],
+            refused: vec![json!(min - 1.0), json!(max + 1.0), json!(min.to_string())],
+        },
+        Bound::Enum(values) => Probes {
+            admitted: values.iter().map(|value| json!(value)).collect(),
+            refused: vec![json!(format!("{}-", values.concat())), json!(1)],
+        },
+        Bound::Bool => Probes {
+            admitted: vec![json!(true), json!(false)],
+            refused: vec![json!("true"), json!(1)],
+        },
+        Bound::Pattern(_) | Bound::Array { .. } => return None,
+    };
+    Some(probes)
+}
+
+/// Holds `tool`'s parser to its required argument `key`: `plan` admits
+/// `base`, and refuses `base` without `key` with an error naming `key`.
+/// Panics naming the tool otherwise.
+pub fn hold_required(
+    tool: &str,
+    key: &str,
+    base: &Value,
+    plan: impl Fn(&Value) -> Result<(), String>,
+) {
+    admits(tool, base, &plan);
+    let mut args = base.clone();
+    let Some(map) = args.as_object_mut() else {
+        panic!("`{tool}`'s base arguments {base} are not an object");
+    };
+    map.remove(key);
+    refuses(tool, key, &args, &plan);
+}
+
+/// Holds `tool`'s parser to one argument's probes: `plan` admits `base`,
+/// admits `base` with `key` set to each of `probes.admitted`, and refuses
+/// `base` with `key` set to each of `probes.refused` with an error naming
+/// `key`. Panics naming the tool and the value otherwise.
+pub fn hold_probes(
+    tool: &str,
+    key: &str,
+    probes: &Probes,
+    base: &Value,
+    plan: impl Fn(&Value) -> Result<(), String>,
+) {
+    admits(tool, base, &plan);
+    let with = |value: &Value| {
+        let mut args = base.clone();
+        args[key] = value.clone();
+        args
+    };
+    for value in &probes.admitted {
+        admits(tool, &with(value), &plan);
+    }
+    for value in &probes.refused {
+        refuses(tool, key, &with(value), &plan);
+    }
+}
+
+/// Panics unless `plan` admits `args`.
+fn admits(tool: &str, args: &Value, plan: &impl Fn(&Value) -> Result<(), String>) {
+    if let Err(error) = plan(args) {
+        panic!("`{tool}` refuses {args}: {error}");
+    }
+}
+
+/// Panics unless `plan` refuses `args` with an error naming `key`.
+fn refuses(tool: &str, key: &str, args: &Value, plan: &impl Fn(&Value) -> Result<(), String>) {
+    match plan(args) {
+        Ok(()) => panic!("`{tool}` admits {args}"),
+        Err(error) => assert!(
+            error.contains(&format!("`{key}`")),
+            "`{tool}` refuses {args} without naming `{key}`: {error}"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,7 +470,7 @@ spec fixture {
                         format: Some("date-time"),
                     },
                 ),
-                ("id", Bound::Pattern(token_pattern(128))),
+                ("id", Bound::Token { max_chars: 128 }),
                 ("max", Bound::Integer { min: 1, max: 25 }),
                 (
                     "lat",
@@ -331,7 +479,7 @@ spec fixture {
                         max: 90.0,
                     },
                 ),
-                ("kind", Bound::Enum(KINDS)),
+                ("kind", Bound::Enum(KINDS.to_vec())),
                 ("all", Bound::Bool),
                 (
                     "ids",
@@ -537,6 +685,175 @@ spec fixture {
         assert_eq!(
             refusal(|schema| schema["required"] = json!(["q", "kind", 7])),
             "the schema's `required` holds 7, not a name"
+        );
+    }
+
+    /// A fixture tool's parser: the kit's own parser for `bound` reading
+    /// `key`, which is required when `required` is set.
+    fn parser(bound: &Bound, required: bool) -> impl Fn(&Value) -> Result<(), String> {
+        move |args: &Value| {
+            let args = crate::object(args, &["key"])?;
+            match bound {
+                Bound::Text { max_chars, .. } => {
+                    crate::capped(args, "key", *max_chars).map(drop)?
+                }
+                Bound::Integer { min, max } => crate::integer(args, "key", *min, *max).map(drop)?,
+                Bound::Bool => crate::flag(args, "key").map(drop)?,
+                other => panic!("the kit has no parser for {other:?}"),
+            }
+            if required && !args.contains_key("key") {
+                return Err("`key` is required".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_kits_parsers_hold_to_their_bounds_probes() {
+        for bound in [
+            Bound::Text {
+                max_chars: 16,
+                format: None,
+            },
+            Bound::Integer { min: 1, max: 25 },
+            Bound::Integer { min: 0, max: 3 },
+            Bound::Bool,
+        ] {
+            let probes = probes(&bound).unwrap();
+            hold_probes(
+                "fixture-lookup",
+                "key",
+                &probes,
+                &json!({}),
+                parser(&bound, false),
+            );
+        }
+    }
+
+    #[test]
+    fn a_required_argument_holds_when_its_absence_is_refused_naming_it() {
+        let bound = Bound::Bool;
+        hold_required(
+            "fixture-lookup",
+            "key",
+            &json!({ "key": true }),
+            parser(&bound, true),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "`fixture-lookup` admits {}")]
+    fn an_optional_argument_does_not_hold_as_required() {
+        let bound = Bound::Bool;
+        hold_required(
+            "fixture-lookup",
+            "key",
+            &json!({ "key": true }),
+            parser(&bound, false),
+        );
+    }
+
+    #[test]
+    // The first refused probe is one two-byte character past the bound.
+    #[should_panic(expected = r#"`fixture-lookup` admits {"key":"éé"#)]
+    fn a_parser_wider_than_its_bound_does_not_hold() {
+        let probes = probes(&Bound::Text {
+            max_chars: 16,
+            format: None,
+        })
+        .unwrap();
+        let wider = Bound::Text {
+            max_chars: 17,
+            format: None,
+        };
+        hold_probes(
+            "fixture-lookup",
+            "key",
+            &probes,
+            &json!({}),
+            parser(&wider, false),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "without naming `key`: refused")]
+    fn a_refusal_that_does_not_name_the_argument_does_not_hold() {
+        let probes = probes(&Bound::Bool).unwrap();
+        let unnamed = |args: &Value| match args.get("key") {
+            None | Some(Value::Bool(_)) => Ok(()),
+            Some(_) => Err("refused".to_string()),
+        };
+        hold_probes("fixture-lookup", "key", &probes, &json!({}), unnamed);
+    }
+
+    #[test]
+    #[should_panic(expected = "`fixture-lookup` refuses {}: `key` is required")]
+    fn a_base_the_parser_refuses_does_not_hold() {
+        let bound = Bound::Bool;
+        let probes = probes(&bound).unwrap();
+        hold_probes(
+            "fixture-lookup",
+            "key",
+            &probes,
+            &json!({}),
+            parser(&bound, true),
+        );
+    }
+
+    #[test]
+    fn a_text_probe_is_wider_in_bytes_than_in_characters() {
+        let probes = probes(&Bound::Text {
+            max_chars: 4,
+            format: None,
+        })
+        .unwrap();
+        assert_eq!(probes.admitted, [json!("éééé")]);
+        assert_eq!(probes.refused[0], json!("ééééé"));
+    }
+
+    #[test]
+    fn token_probes_hold_the_length_and_every_excluded_class() {
+        let probes = probes(&Bound::Token { max_chars: 8 }).unwrap();
+        assert_eq!(probes.admitted, [json!("Az09_-Az"), json!("A")]);
+        let is_token = |value: &Value| {
+            value.as_str().is_some_and(|text| {
+                (1..=8).contains(&text.len())
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            })
+        };
+        assert!(probes.admitted.iter().all(is_token));
+        assert!(!probes.refused.iter().any(is_token));
+        assert!(probes.refused.contains(&json!("Az09_-Az0")));
+    }
+
+    #[test]
+    fn number_and_enum_probes_sit_on_and_past_the_bound() {
+        let number = probes(&Bound::Number {
+            min: -90.0,
+            max: 90.0,
+        })
+        .unwrap();
+        assert_eq!(number.admitted, [json!(-90.0), json!(90.0)]);
+        assert_eq!(number.refused, [json!(-91.0), json!(91.0), json!("-90")]);
+        let choices = probes(&Bound::Enum(vec!["daily", "hourly"])).unwrap();
+        assert_eq!(choices.admitted, [json!("daily"), json!("hourly")]);
+        assert_eq!(choices.refused, [json!("dailyhourly-"), json!(1)]);
+    }
+
+    #[test]
+    fn a_components_own_pattern_or_array_has_no_kit_probes() {
+        assert_eq!(probes(&Bound::Pattern("^[a-z]{1,8}$".to_string())), None);
+        assert_eq!(probes(&Bound::Pattern(token_pattern(8))), None);
+        assert_eq!(
+            probes(&Bound::Array {
+                min: 1,
+                max: 2,
+                unique: true,
+                item: Box::new(Bound::Bool),
+            }),
+            None
         );
     }
 

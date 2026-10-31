@@ -481,6 +481,20 @@ fn calendar_id_rule() -> String {
     )
 }
 
+/// What `is_calendar_id` admits, as the `pattern` an `input_schema` states it.
+/// `\x00-\x1f` with `\x7f-\x9f` is `char::is_control`, and ECMA-262's `\s`
+/// is Unicode whitespace less U+0085 (a control character, refused anyway)
+/// plus U+FEFF. Two differences remain, both leaving the schema narrower than
+/// the parser: an id holding U+FEFF is refused, and, the quantifier counting
+/// UTF-16 units without the `u` flag, an id of characters outside the Basic
+/// Multilingual Plane is admitted only up to half the length. Tests compare
+/// this text with the spec's and never run it as a regex, so these claims
+/// about what it matches are checked by reading, not by a test.
+#[cfg(test)]
+fn calendar_id_pattern() -> String {
+    format!(r#"^(?!\.\.?$)[^\s/\\%"\x00-\x1f\x7f-\x9f]{{1,{CALENDAR_ID_MAX_CHARS}}}$"#)
+}
+
 /// A calendar id argument, refused here rather than by `api-request` so a bad
 /// id is the caller's to fix.
 fn calendar_id(args: &Args, key: &str) -> Result<Option<String>, String> {
@@ -617,10 +631,11 @@ struct LabelsArgs {
 }
 
 impl LabelsArgs {
-    // TODO(provider-schema-parse-parity): these bounds and the `gmail-labels`
-    // `input_schema` in the spec are stated separately.
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["id", "account"];
+
     fn parse(args: &Value) -> Result<LabelsArgs, String> {
-        let map = object(args, &["id", "account"])?;
+        let map = object(args, Self::KEYS)?;
         Ok(LabelsArgs {
             id: gmail_id(map, "id")?,
             account: account(map)?,
@@ -653,10 +668,11 @@ struct SearchArgs {
 }
 
 impl SearchArgs {
-    // TODO(provider-schema-parse-parity): these bounds and the `gmail-search`
-    // `input_schema` in the spec are stated separately.
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["q", "max", "page", "spam_trash", "account"];
+
     fn parse(args: &Value) -> Result<SearchArgs, String> {
-        let map = object(args, &["q", "max", "page", "spam_trash", "account"])?;
+        let map = object(args, Self::KEYS)?;
         Ok(SearchArgs {
             q: capped(map, "q", QUERY_MAX_CHARS)?
                 .ok_or("`q` is required")?
@@ -714,10 +730,11 @@ struct ReadArgs {
 }
 
 impl ReadArgs {
-    // TODO(provider-schema-parse-parity): these bounds and the `gmail-read`
-    // `input_schema` in the spec are stated separately.
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["id", "max_chars", "account"];
+
     fn parse(args: &Value) -> Result<ReadArgs, String> {
-        let map = object(args, &["id", "max_chars", "account"])?;
+        let map = object(args, Self::KEYS)?;
         Ok(ReadArgs {
             id: gmail_id(map, "id")?.ok_or("`id` is required")?,
             max_chars: max_chars(map)?,
@@ -750,10 +767,11 @@ struct ThreadArgs {
 }
 
 impl ThreadArgs {
-    // TODO(provider-schema-parse-parity): these bounds and the `gmail-thread`
-    // `input_schema` in the spec are stated separately.
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["id", "max", "account"];
+
     fn parse(args: &Value) -> Result<ThreadArgs, String> {
-        let map = object(args, &["id", "max", "account"])?;
+        let map = object(args, Self::KEYS)?;
         let max =
             integer(map, "max", THREAD_MAX_MIN, THREAD_MAX_MAX)?.unwrap_or(THREAD_MAX_DEFAULT);
         Ok(ThreadArgs {
@@ -783,10 +801,11 @@ struct CalendarListArgs {
 }
 
 impl CalendarListArgs {
-    // TODO(provider-schema-parse-parity): these bounds and the `calendar-list`
-    // `input_schema` in the spec are stated separately.
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["page", "account"];
+
     fn parse(args: &Value) -> Result<CalendarListArgs, String> {
-        let map = object(args, &["page", "account"])?;
+        let map = object(args, Self::KEYS)?;
         Ok(CalendarListArgs {
             page: capped(map, "page", PAGE_MAX_CHARS)?.map(str::to_string),
             account: account(map)?,
@@ -824,13 +843,11 @@ struct EventsArgs {
 }
 
 impl EventsArgs {
-    // TODO(provider-schema-parse-parity): these bounds and the `calendar-events`
-    // `input_schema` in the spec are stated separately.
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["calendar", "from", "to", "q", "max", "page", "account"];
+
     fn parse(args: &Value) -> Result<EventsArgs, String> {
-        let map = object(
-            args,
-            &["calendar", "from", "to", "q", "max", "page", "account"],
-        )?;
+        let map = object(args, Self::KEYS)?;
         let max =
             integer(map, "max", EVENTS_MAX_MIN, EVENTS_MAX_MAX)?.unwrap_or(EVENTS_MAX_DEFAULT);
         Ok(EventsArgs {
@@ -882,10 +899,11 @@ struct EventArgs {
 }
 
 impl EventArgs {
-    // TODO(provider-schema-parse-parity): these bounds and the `calendar-event`
-    // `input_schema` in the spec are stated separately.
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["id", "calendar", "max_chars", "account"];
+
     fn parse(args: &Value) -> Result<EventArgs, String> {
-        let map = object(args, &["id", "calendar", "max_chars", "account"])?;
+        let map = object(args, Self::KEYS)?;
         Ok(EventArgs {
             id: event_id(map, "id")?.ok_or("`id` is required")?,
             calendar: calendar_id(map, "calendar")?.unwrap_or_else(|| PRIMARY_CALENDAR.to_string()),
@@ -919,10 +937,11 @@ struct FreeBusyArgs {
 }
 
 impl FreeBusyArgs {
-    // TODO(provider-schema-parse-parity): these bounds and the
-    // `calendar-free-busy` `input_schema` in the spec are stated separately.
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["from", "to", "calendars", "account"];
+
     fn parse(args: &Value) -> Result<FreeBusyArgs, String> {
-        let map = object(args, &["from", "to", "calendars", "account"])?;
+        let map = object(args, Self::KEYS)?;
         Ok(FreeBusyArgs {
             from: time(map, "from")?.ok_or("`from` is required")?,
             to: time(map, "to")?.ok_or("`to` is required")?,
@@ -2366,6 +2385,9 @@ fn shape(api: &str) -> Failure {
 #[cfg(test)]
 mod tests {
     use brenn_provider_kit::testutil::{failure, google, http, nested, truncated};
+    use brenn_provider_kit::{
+        Bound, Probes, ToolBounds, check, hold_probes, hold_required, input_schema, probes,
+    };
     use serde_json::{Map, json};
 
     use super::*;
@@ -5333,6 +5355,156 @@ mod tests {
             |id: String| free_busy(json!({ "from": FROM, "to": TO, "calendars": [id] }));
         assert!(calendars(wide(CALENDAR_ID_MAX_CHARS)).is_ok());
         assert!(calendars(wide(CALENDAR_ID_MAX_CHARS + 1)).is_err());
+    }
+
+    /// Every argument `tool` takes, with the bound its parser holds it to,
+    /// and the arguments it requires: the parser's own constants and key
+    /// lists, as `every_tools_schema_states_what_its_parser_enforces` holds
+    /// the spec to them.
+    fn bounds(tool: Provided) -> ToolBounds<'static> {
+        let (keys, required): (&'static [&'static str], &'static [&'static str]) = match tool {
+            Provided::GmailLabels => (LabelsArgs::KEYS, &[]),
+            Provided::GmailSearch => (SearchArgs::KEYS, &["q"]),
+            Provided::GmailRead => (ReadArgs::KEYS, &["id"]),
+            Provided::GmailThread => (ThreadArgs::KEYS, &["id"]),
+            Provided::CalendarList => (CalendarListArgs::KEYS, &[]),
+            Provided::CalendarEvents => (EventsArgs::KEYS, &["from", "to"]),
+            Provided::CalendarEvent => (EventArgs::KEYS, &["id"]),
+            Provided::CalendarFreeBusy => (FreeBusyArgs::KEYS, &["from", "to"]),
+        };
+        let text = |max_chars| Bound::Text {
+            max_chars,
+            format: None,
+        };
+        let integer = |min, max| Bound::Integer { min, max };
+        let property = |key: &'static str| {
+            let bound = match (tool, key) {
+                (_, "account") => text(ACCOUNT_MAX_CHARS),
+                (_, "q") => text(QUERY_MAX_CHARS),
+                (_, "page") => text(PAGE_MAX_CHARS),
+                (_, "from" | "to") => text(TIME_MAX_CHARS),
+                (_, "calendar") => Bound::Pattern(calendar_id_pattern()),
+                (_, "calendars") => Bound::Array {
+                    min: 1,
+                    max: FREEBUSY_CALENDARS_MAX,
+                    unique: true,
+                    item: Box::new(Bound::Pattern(calendar_id_pattern())),
+                },
+                (_, "max_chars") => integer(MAX_CHARS_MIN, MAX_CHARS_MAX),
+                (_, "spam_trash") => Bound::Bool,
+                (Provided::GmailLabels | Provided::GmailRead | Provided::GmailThread, "id") => {
+                    Bound::Token {
+                        max_chars: ID_MAX_CHARS,
+                    }
+                }
+                (Provided::CalendarEvent, "id") => Bound::Token {
+                    max_chars: EVENT_ID_MAX_CHARS,
+                },
+                (Provided::GmailSearch, "max") => integer(SEARCH_MAX_MIN, SEARCH_MAX_MAX),
+                (Provided::GmailThread, "max") => integer(THREAD_MAX_MIN, THREAD_MAX_MAX),
+                (Provided::CalendarEvents, "max") => integer(EVENTS_MAX_MIN, EVENTS_MAX_MAX),
+                _ => panic!("{tool:?} takes `{key}`, which no bound here states"),
+            };
+            (key, bound)
+        };
+        ToolBounds {
+            properties: keys.iter().copied().map(property).collect(),
+            required,
+        }
+    }
+
+    /// Arguments `tool` admits, every required one present, into which a
+    /// probe of one argument is set.
+    fn admitted_args(tool: Provided) -> Value {
+        match tool {
+            Provided::GmailLabels | Provided::CalendarList => json!({}),
+            Provided::GmailSearch => json!({ "q": "from:alice" }),
+            Provided::GmailRead | Provided::GmailThread => json!({ "id": "m1" }),
+            Provided::CalendarEvent => json!({ "id": "e1" }),
+            Provided::CalendarEvents | Provided::CalendarFreeBusy => {
+                json!({ "from": FROM, "to": TO })
+            }
+        }
+    }
+
+    /// The probes of the arguments whose bounds are this component's: the
+    /// calendar id, alone as `calendar` and as `calendars`' items.
+    fn calendar_probes(key: &str) -> Probes {
+        let ids = |n: usize| json!((0..n).map(|i| format!("c{i}")).collect::<Vec<_>>());
+        match key {
+            "calendar" => Probes {
+                admitted: [
+                    wide(CALENDAR_ID_MAX_CHARS),
+                    "team@group.calendar.example.com".to_string(),
+                    "#x?+".to_string(),
+                    "...".to_string(),
+                    ".a".to_string(),
+                ]
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+                refused: [
+                    wide(CALENDAR_ID_MAX_CHARS + 1).as_str(),
+                    "",
+                    ".",
+                    "..",
+                    "a/b",
+                    "a\\b",
+                    "a%b",
+                    "a\"b",
+                    "a\u{1}b",
+                    "a\u{85}b",
+                    "a\u{9f}b",
+                    "a b",
+                    "a\u{3000}b",
+                ]
+                .into_iter()
+                .map(|id| json!(id))
+                .chain([json!(1)])
+                .collect(),
+            },
+            "calendars" => Probes {
+                admitted: vec![ids(1), ids(FREEBUSY_CALENDARS_MAX)],
+                refused: vec![
+                    ids(0),
+                    ids(FREEBUSY_CALENDARS_MAX + 1),
+                    json!(["c0", "c0"]),
+                    json!([""]),
+                    json!(["a/b"]),
+                    json!([1]),
+                    json!("primary"),
+                ],
+            },
+            other => panic!("`{other}` has no probes"),
+        }
+    }
+
+    /// Each tool's `input_schema` states exactly the bounds its parser
+    /// enforces, and the parser admits and refuses every bound's probes,
+    /// naming the argument it refuses: the schema and the parser are held to
+    /// the same table from both sides.
+    #[test]
+    fn every_tools_schema_states_what_its_parser_enforces() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../config/specs/google-workspace-tools.brenn");
+        let spec = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+        for tool in Provided::ALL {
+            let name = tool.name();
+            let bounds = bounds(tool);
+            if let Err(error) = check(&input_schema(&spec, name), &bounds) {
+                panic!("`{name}`'s input_schema: {error}");
+            }
+            let plan_with = |args: &Value| plan(tool, args, &settings()).map(drop);
+            let base = admitted_args(tool);
+            for key in bounds.required {
+                hold_required(name, key, &base, plan_with);
+            }
+            for (key, bound) in &bounds.properties {
+                let probes = probes(bound).unwrap_or_else(|| calendar_probes(key));
+                hold_probes(name, key, &probes, &base, plan_with);
+            }
+        }
     }
 
     #[test]
