@@ -9,11 +9,10 @@
 //! built over the document's key providers as `run_server` builds it.
 
 use brenn_lib::config::PACKAGED;
-use brenn_lib::messaging::SubscriberEntryKind;
-use brenn_lib::messaging::config::Depth;
 use std::os::unix::fs::PermissionsExt;
 
-use super::driver::tests::{BootFixture, Tree, boot_with, install_package_from, staged_module};
+use super::driver::tests::Tree;
+use super::provider_class_boot::{ProviderClassBoot, assert_provider_class_boots};
 
 /// The instance's slug.
 const MAPS: &str = "maps";
@@ -115,12 +114,12 @@ new {ASSISTANT}: Assistant();
     ))
 }
 
-/// The packaged class boots: each tool is a provided tool in the registry and
-/// on the agent's written list, the request inbox is as deep as the class's
-/// summed concurrency, and the result inbox takes the tuning block's depth.
+/// The packaged class boots over the document's key providers: each tool is a
+/// provided tool in the registry and on the agent's written list, the request
+/// inbox is as deep as the class's summed concurrency, and the result inbox
+/// takes the tuning block's depth.
 #[tokio::test(flavor = "multi_thread")]
 async fn google_maps_tools_boots_into_an_agents_tool_list() {
-    let components = tempfile::tempdir().expect("a components root");
     let home = tempfile::tempdir().expect("a container home");
     let host = tempfile::tempdir().expect("a host directory");
     let key_file = host.path().join("maps-api-key");
@@ -129,79 +128,22 @@ async fn google_maps_tools_boots_into_an_agents_tool_list() {
         .expect("the key file is private");
     let store = host.path().join("google-maps-tools.db");
     let tree = Tree::holding(&document(home.path(), &key_file, &store));
-    install_package_from(components.path(), &staged_module(&tree), ARTIFACT);
 
-    let config = tree.load().config;
-    let provides = &config
-        .wasm_consumers
-        .iter()
-        .find(|consumer| consumer.slug == MAPS)
-        .expect("the instance lowers")
-        .provides;
-    let declared: Vec<(&str, &str)> = provides
-        .iter()
-        .map(|decl| (decl.name.as_str(), decl.mcp_name.as_str()))
-        .collect();
-    assert_eq!(declared, TOOLS, "the class provides exactly these tools");
-    // Σ `max_concurrency` over the class's `provide` statements.
-    let request_inbox_depth: u64 = provides
-        .iter()
-        .map(|decl| u64::from(decl.max_concurrency))
-        .sum();
-
-    let key_providers = brenn_lib::config::resolve_api_key_providers(&config);
-    let booted = boot_with(
-        &tree,
-        BootFixture {
-            components_roots: vec![components.path().to_path_buf()],
-            native_tools: brenn_oauth::tools::registered(None, key_providers),
-            ..BootFixture::default()
+    assert_provider_class_boots(
+        ProviderClassBoot {
+            tree: &tree,
+            artifact: ARTIFACT,
+            slug: MAPS,
+            agent: ASSISTANT,
+            tools: TOOLS,
+            result_depth: 64,
+        },
+        |config| {
+            brenn_oauth::tools::registered(
+                None,
+                brenn_lib::config::resolve_api_key_providers(config),
+            )
         },
     )
     .await;
-
-    let registry = booted.driver.env().tool_registry.clone();
-    for (name, mcp_name) in TOOLS {
-        assert!(registry.is_provided(name), "{name}");
-        let descriptor = registry
-            .get(name)
-            .expect("the provided tool is registered")
-            .descriptor();
-        assert_eq!(descriptor.mcp_name, format!("mcp__brenn__{mcp_name}"));
-    }
-
-    let apps = booted.messenger.app_table().load();
-    let assistant = &apps[ASSISTANT];
-    let written: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(assistant.virtual_tools_path()).expect("boot wrote the list"),
-    )
-    .expect("the list is JSON");
-    let names: Vec<&str> = written
-        .as_array()
-        .expect("the list is an array")
-        .iter()
-        .filter_map(|tool| tool["name"].as_str())
-        .collect();
-    for (_, mcp_name) in TOOLS {
-        assert!(names.contains(mcp_name), "{mcp_name} not in {names:?}");
-    }
-
-    let directory = booted.messenger.directory();
-    let requests = directory
-        .resolve(&format!("brenn:tool-requests/{MAPS}"))
-        .expect("the request inbox is minted");
-    assert_eq!(
-        requests.resolved_channel.retain_depth,
-        Depth::Bounded(request_inbox_depth)
-    );
-    let results = directory
-        .resolve(&format!("brenn:tool-results/{MAPS}"))
-        .expect("the result inbox is minted");
-    assert_eq!(results.resolved_channel.retain_depth, Depth::Bounded(64));
-    let result_subscribers: Vec<&SubscriberEntryKind> =
-        results.subscribers.iter().map(|s| &s.kind).collect();
-    assert_eq!(
-        result_subscribers,
-        [&SubscriberEntryKind::Wasm(MAPS.to_string())]
-    );
 }

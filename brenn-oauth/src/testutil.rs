@@ -94,9 +94,12 @@ pub struct StubState {
     pub revoke_body: Option<serde_json::Value>,
     /// Every form posted to `/revoke`, decoded.
     pub revoke_forms: Vec<BTreeMap<String, String>>,
-    /// Statuses for successive API requests (any other path); 200 once
-    /// exhausted.
+    /// Statuses for successive API requests (any other path) that
+    /// `api_failures` does not answer; 200 once exhausted.
     pub api_statuses: std::collections::VecDeque<u16>,
+    /// Status and body for every API request to an exact path, query
+    /// excluded; ahead of `api_statuses` and `api_bodies`.
+    pub api_failures: BTreeMap<String, (u16, Vec<u8>)>,
     /// Extra headers on every API response.
     pub api_headers: Vec<(String, String)>,
     /// The body of every API response whose path has no entry in
@@ -202,7 +205,12 @@ async fn api(
         headers,
         body: body.to_vec(),
     });
-    let status = StatusCode::from_u16(s.api_statuses.pop_front().unwrap_or(200)).unwrap();
+    let failure = s.api_failures.get(uri.path()).cloned();
+    let status = match &failure {
+        Some((status, _)) => *status,
+        None => s.api_statuses.pop_front().unwrap_or(200),
+    };
+    let status = StatusCode::from_u16(status).unwrap();
     let mut response_headers = HeaderMap::new();
     for (name, value) in &s.api_headers {
         response_headers.append(
@@ -210,7 +218,10 @@ async fn api(
             value.parse().unwrap(),
         );
     }
-    let body = s.api_bodies.get(uri.path()).unwrap_or(&s.api_body).clone();
+    let body = match failure {
+        Some((_, body)) => body,
+        None => s.api_bodies.get(uri.path()).unwrap_or(&s.api_body).clone(),
+    };
     (status, response_headers, body)
 }
 

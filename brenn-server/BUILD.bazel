@@ -69,19 +69,20 @@ rust_library(
 # what Bazel schedules the action's local resources against, so the repo's
 # biggest test binary declaring itself large is the truthful answer twice over.
 #
-# `data` is the eight components this crate's tests actually open, one fixture
+# `data` is the nine components this crate's tests actually open, one fixture
 # target each — not the whole set. Runfiles are inputs to the test action, so
 # every component named here is an edge from a guest crate to all ~1,350 tests;
-# the others cost nothing when they change. The one specification listed is
-# the `google-maps-tools` class, whose `provide` statements the e2e rig lowers;
-# its component's fixture already depends on it.
+# the others cost nothing when they change. The two specifications listed are
+# the `google-maps-tools` and `google-workspace-tools` classes, whose `provide`
+# statements the e2e rigs lower; each component's fixture already depends on
+# its own.
 #
-# TODO(bazel-fixture-list-guard): which eight those are was derived by reading
+# TODO(bazel-fixture-list-guard): which nine those are was derived by reading
 # this crate's artifact-stem call sites, and nothing holds the list to them. A
 # component dropped from the tests keeps its edge here silently; one added
 # without its fixture fails loudly on a missing runfile.
 #
-# TODO(crate-split): those eight still couple every component edit to the whole
+# TODO(crate-split): those nine still couple every component edit to the whole
 # binary, because the fixture-reading tests share this target with ~1,310 that
 # read none — and any source edit re-runs all of them regardless. The cure is
 # finer crates: the dispatch families that read only a guest left with
@@ -94,9 +95,11 @@ rust_test(
     crate_features = ["testutils"],
     data = [
         "//:config/specs/google-maps-tools.brenn",
+        "//:config/specs/google-workspace-tools.brenn",
         "//brenn-wasm:fixture_git_forge_parser",
         "//brenn-wasm:fixture_git_sync_consumer",
         "//brenn-wasm:fixture_google_maps_tools",
+        "//brenn-wasm:fixture_google_workspace_tools",
         "//brenn-wasm:fixture_processor_provider_test",
         "//brenn-wasm:fixture_processor_tool_test",
         "//brenn-wasm:fixture_replay",

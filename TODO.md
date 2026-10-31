@@ -2209,13 +2209,12 @@ and `brenn-server/src/routes/remote.rs`, above each handler.
 
 ## `bazel-fixture-list-guard`
 
-Seventeen test targets now declare, by hand, which WASM component fixtures they
-stage: the twelve `WASM_TEST_SUITES` entries and `brenn-wasm_test` in
-`brenn-wasm/BUILD.bazel`, `brenn-server_test`'s seven in
-`brenn-server/BUILD.bazel`, `brenn-wasm-dispatch_test`'s four,
-`brenn-bootstrap_test`'s one and `//surface/server:server_test`'s one. Each list
-was derived by reading that target's sources for artifact stems, and nothing
-mechanizes the derivation.
+Test targets declare, by hand, which WASM component fixtures they stage, each in
+its own `data` list in its `BUILD.bazel`: the `WASM_TEST_SUITES` entries and
+`brenn-wasm_test` in `brenn-wasm/BUILD.bazel`, `brenn-server_test`,
+`brenn-wasm-dispatch_test`, `brenn-bootstrap_test` and
+`//surface/server:server_test`. Each list was derived by reading that target's
+sources for artifact stems, and nothing mechanizes the derivation.
 
 Under-declaration is loud: a test that opens a component its target does not
 stage panics on a missing runfile the first time it runs. Over-declaration is

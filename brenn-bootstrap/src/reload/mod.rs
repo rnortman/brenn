@@ -60,8 +60,15 @@ pub(crate) mod webhook;
 #[cfg(test)]
 mod oracle_tests;
 
+/// The boot-path contract the packaged provider classes' boot tests share.
+#[cfg(test)]
+mod provider_class_boot;
+
 #[cfg(test)]
 mod google_maps_tools_boot_tests;
+
+#[cfg(test)]
+mod google_workspace_tools_boot_tests;
 
 #[cfg(test)]
 mod provided_tools_tests;

@@ -13,18 +13,16 @@
 use super::*;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 
 use brenn_lib::config::{ApiKeyProviderConfig, PACKAGED, config_from_dsl};
 use brenn_lib::messaging::config::ProvidedToolDecl;
-use brenn_lib::tools::ResolvedToolGrant;
 use brenn_messaging::MountDebt;
 use brenn_oauth::testutil;
 use brenn_tool_registry::ToolError;
-use brenn_tool_registry::testutil::{clause, grant};
 use serde_json::{Value, json};
 
-use super::provider_rig::{CallerSetup, ProviderRig, ProviderSetup};
+use super::provider_rig::CallerSetup;
+use super::stub_rig::{self, StubProvider, StubRig, assert_could_not_be_issued, pairs};
 
 const MAPS_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -43,8 +41,6 @@ const PROVIDER: &str = "maps";
 const CALLER: &str = "agenda";
 /// The key provider the instance's `config` names.
 const KEY_PROVIDER: &str = "maps";
-/// The store namespace the component keeps its in-flight rows in.
-const INFLIGHT_NS: &str = "inflight";
 
 const GEOCODE_ADDRESS: &str = "/v4/geocode/address";
 const GEOCODE_LOCATION: &str = "/v4/geocode/location";
@@ -120,28 +116,9 @@ fn current_body() -> String {
     .unwrap()
 }
 
-/// The provider rig, with the store the component keeps and the stub its
-/// nested calls reach.
-struct Rig {
-    base: ProviderRig,
-    stub: testutil::Stub,
-    /// The stub's `host:port`, which every Google host in `config` is.
-    host: String,
-    _dir: tempfile::TempDir,
-    _vault: tempfile::TempDir,
-}
-
-impl std::ops::Deref for Rig {
-    type Target = ProviderRig;
-
-    fn deref(&self) -> &ProviderRig {
-        &self.base
-    }
-}
-
 /// The rig with every clause and the stub's key provider as
 /// `testutil::key_provider_config` builds it.
-async fn rig() -> Rig {
+async fn rig() -> StubRig {
     rig_with(CLAUSES, |_| {}, None).await
 }
 
@@ -152,165 +129,54 @@ async fn rig_with(
     clauses: &[(&str, &str)],
     key: impl FnOnce(&mut ApiKeyProviderConfig),
     caller: Option<CallerSetup<'_>>,
-) -> Rig {
-    let (base, stub) = testutil::start_stub().await;
-    let host = base
-        .strip_prefix("http://")
-        .expect("the stub is plain http")
-        .to_string();
+) -> StubRig {
+    let started = stub_rig::start().await;
+    let host = started.host.clone();
     let (service, vault) = testutil::service(vec![]);
-    let (key_name, mut key_config) = testutil::key_provider_config(KEY_PROVIDER, &base);
+    let (key_name, mut key_config) = testutil::key_provider_config(KEY_PROVIDER, &started.base);
     key(&mut key_config);
-
-    let grants: BTreeMap<String, ResolvedToolGrant> = BTreeMap::from([(
-        "api-request".to_string(),
-        grant(
-            clauses
+    StubRig::build(
+        started,
+        StubProvider {
+            slug: PROVIDER,
+            wasm: MAPS_WASM,
+            decls: provided(),
+            native: brenn_oauth::tools::registered(
+                Some(&service),
+                BTreeMap::from([(key_name, key_config)]),
+            ),
+            clauses: clauses
                 .iter()
-                .map(|(method, path)| {
-                    clause(&[
+                .map(|&(method, path)| {
+                    vec![
                         ("provider", KEY_PROVIDER),
                         ("method", method),
-                        ("host", &host),
                         ("path", path),
-                    ])
+                    ]
                 })
                 .collect(),
-        ),
-    )]);
-    let dir = tempfile::tempdir().expect("a store directory");
-    let store_path = dir.path().join("google-maps-tools.db");
-    let base = ProviderRig::build(ProviderSetup {
-        slug: PROVIDER,
-        decls: provided(),
-        native: brenn_oauth::tools::registered(
-            Some(&service),
-            BTreeMap::from([(key_name, key_config)]),
-        ),
-        grants,
-        component: ProcessorLoadSpec {
             config: HashMap::from([
                 ("provider".to_string(), KEY_PROVIDER.to_string()),
                 ("weather_host".to_string(), host.clone()),
                 ("geocoding_host".to_string(), host.clone()),
                 ("places_host".to_string(), host.clone()),
-                ("routes_host".to_string(), host.clone()),
+                ("routes_host".to_string(), host),
             ]),
-            store_path: Some(&store_path),
-            grants: [
-                ComponentGrant::Log,
-                ComponentGrant::Store,
-                ComponentGrant::Config,
-                ComponentGrant::Tools,
-                ComponentGrant::Provides,
-            ]
-            .into_iter()
-            .collect(),
-            ..ProcessorLoadSpec::minimal(Path::new(MAPS_WASM), PROVIDER)
+            caller,
+            vault,
         },
-        caller,
-    })
-    .await;
-    base.provider.component.open_store();
-
-    Rig {
-        base,
-        stub,
-        host,
-        _dir: dir,
-        _vault: vault,
-    }
+    )
+    .await
 }
 
 /// A rig whose `api-request` grant admits every clause but `path`'s.
-async fn rig_without_clause(path: &str) -> Rig {
+async fn rig_without_clause(path: &str) -> StubRig {
     let clauses: Vec<(&str, &str)> = CLAUSES
         .iter()
         .copied()
         .filter(|(_, admitted)| *admitted != path)
         .collect();
     rig_with(&clauses, |_| {}, None).await
-}
-
-/// Assert `answer` is the `internal` refusal of a nested call the grant does
-/// not admit: Brenn's text and the clause guidance.
-fn assert_could_not_be_issued(answer: Result<Value, ToolError>) {
-    let Err(ToolError::Internal(detail)) = answer else {
-        panic!("expected an internal answer, got {answer:?}");
-    };
-    assert!(
-        detail.starts_with("api-request could not be issued: ")
-            && detail.ends_with(
-                "If this names the clause, the instance's `tool api-request` grant must admit \
-                 the method, host and path."
-            ),
-        "{detail}"
-    );
-}
-
-/// A request path and its query, decoded.
-fn split(path_and_query: &str) -> (String, BTreeMap<String, String>) {
-    let (path, query) = path_and_query
-        .split_once('?')
-        .unwrap_or((path_and_query, ""));
-    (
-        path.to_string(),
-        url::form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect(),
-    )
-}
-
-/// The query pairs a test expects, as owned strings.
-fn pairs(expected: &[(&str, &str)]) -> BTreeMap<String, String> {
-    expected
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
-
-impl Rig {
-    /// Run the one nested call the provider issued, and wait for its result
-    /// on the provider's inbox; returns that result.
-    async fn run_nested(&self) -> Value {
-        self.owed(&self.executor_sub(), 1).await;
-        self.executor.drain_step().await;
-        self.owed(&self.provider_sub, 1).await.remove(0)
-    }
-
-    /// The stub's answer to a request for `path`.
-    fn answer(&self, path: &str, body: impl Into<Vec<u8>>) {
-        self.stub
-            .lock()
-            .unwrap()
-            .api_bodies
-            .insert(path.to_string(), body.into());
-    }
-
-    /// Every API request the stub saw, as method, path and decoded query.
-    fn seen(&self) -> Vec<(String, String, BTreeMap<String, String>)> {
-        self.stub
-            .lock()
-            .unwrap()
-            .api_seen
-            .iter()
-            .map(|seen| {
-                let (path, query) = split(&seen.path_and_query);
-                (seen.method.clone(), path, query)
-            })
-            .collect()
-    }
-
-    /// The keys of the component's in-flight rows, read from its store.
-    fn inflight_keys(&self) -> Vec<String> {
-        self.provider
-            .component
-            .kv_store_for_testing()
-            .scan_for_testing(INFLIGHT_NS)
-            .into_iter()
-            .map(|(key, _)| String::from_utf8(key).expect("a UTF-8 key"))
-            .collect()
-    }
 }
 
 /// Weather for a place geocodes the place, then looks up the weather at the
@@ -394,11 +260,7 @@ async fn weather_for_a_place_geocodes_then_looks_up() {
         "results.placeId,results.location,results.formattedAddress,results.granularity,results.types"
     );
     drop(stub);
-    assert!(
-        r.inflight_keys().is_empty(),
-        "the answered request left no row"
-    );
-    assert!(r.runtime.serving(PROVIDER, &id).is_none());
+    r.assert_finished(&id);
 }
 
 /// Geocode by coordinates is one reverse lookup, answered with Google's
@@ -445,10 +307,10 @@ async fn geocode_reverse_answers_compactly() {
 #[tokio::test]
 async fn a_google_error_body_is_the_tools_error() {
     let r = rig().await;
-    {
-        let mut stub = r.stub.lock().unwrap();
-        stub.api_statuses.push_back(403);
-        stub.api_body = json!({
+    r.fail(
+        GEOCODE_ADDRESS,
+        403,
+        json!({
             "error": {
                 "code": 403,
                 "message": "Geocoding API has not been used in project 1234 before or it is disabled.",
@@ -457,8 +319,8 @@ async fn a_google_error_body_is_the_tools_error() {
             },
         })
         .to_string()
-        .into_bytes();
-    }
+        .into_bytes(),
+    );
     let call = r.call_for_alice("Geocode", json!({ "address": "Mountain View" }));
     r.requested_id().await;
     r.serve().await;
@@ -508,11 +370,7 @@ async fn a_stale_result_is_ignored_and_a_swept_row_is_gone() {
     r.answer(GEOCODE_ADDRESS, geocode_body().to_string());
     // A row a request lost to a restart left behind, issued long ago.
     const ABANDONED: &str = "00000000000000000000000000000000/1";
-    r.provider.component.kv_store_for_testing().put_for_testing(
-        INFLIGHT_NS,
-        ABANDONED.as_bytes(),
-        br#"{"issued_at_ms":0}"#,
-    );
+    r.plant_inflight(ABANDONED, br#"{"issued_at_ms":0}"#);
     assert_eq!(r.inflight_keys(), [ABANDONED]);
 
     // The first activation sweeps the abandoned row and records its own.
@@ -675,11 +533,7 @@ async fn directions_posts_compute_routes_for_a_user() {
 
     assert_eq!(
         r.seen(),
-        [(
-            "POST".to_string(),
-            COMPUTE_ROUTES.to_string(),
-            BTreeMap::new()
-        )]
+        [("POST".to_string(), COMPUTE_ROUTES.to_string(), Vec::new())]
     );
     let stub = r.stub.lock().unwrap();
     let request = &stub.api_seen[0];
@@ -702,11 +556,7 @@ async fn directions_posts_compute_routes_for_a_user() {
         })
     );
     drop(stub);
-    assert!(
-        r.inflight_keys().is_empty(),
-        "the answered request left no row"
-    );
-    assert!(r.runtime.serving(PROVIDER, &id).is_none());
+    r.assert_finished(&id);
 }
 
 /// A component calling `directions` on its own account has no user, so the
@@ -845,7 +695,7 @@ async fn places_search_near_a_place_geocodes_then_posts() {
                 GEOCODE_ADDRESS.to_string(),
                 pairs(&[("addressQuery", "Mountain View")]),
             ),
-            ("POST".to_string(), SEARCH_TEXT.to_string(), BTreeMap::new()),
+            ("POST".to_string(), SEARCH_TEXT.to_string(), Vec::new()),
         ]
     );
     let stub = r.stub.lock().unwrap();
@@ -876,11 +726,7 @@ async fn places_search_near_a_place_geocodes_then_posts() {
         })
     );
     drop(stub);
-    assert!(
-        r.inflight_keys().is_empty(),
-        "the answered request left no row"
-    );
-    assert!(r.runtime.serving(PROVIDER, &id).is_none());
+    r.assert_finished(&id);
 }
 
 /// The path Place Details reads the test's place at.
@@ -964,11 +810,7 @@ async fn place_details_omits_reviews_unless_asked() {
             "reviews: {reviews}"
         );
         drop(stub);
-        assert!(
-            r.inflight_keys().is_empty(),
-            "the answered request left no row"
-        );
-        assert!(r.runtime.serving(PROVIDER, &id).is_none());
+        r.assert_finished(&id);
     }
     assert_eq!(r.seen().len(), 2);
 }
@@ -1045,12 +887,8 @@ async fn search_along_route_computes_then_searches() {
     assert_eq!(
         r.seen(),
         [
-            (
-                "POST".to_string(),
-                COMPUTE_ROUTES.to_string(),
-                BTreeMap::new()
-            ),
-            ("POST".to_string(), SEARCH_TEXT.to_string(), BTreeMap::new()),
+            ("POST".to_string(), COMPUTE_ROUTES.to_string(), Vec::new()),
+            ("POST".to_string(), SEARCH_TEXT.to_string(), Vec::new()),
         ]
     );
     let stub = r.stub.lock().unwrap();
@@ -1094,9 +932,5 @@ async fn search_along_route_computes_then_searches() {
         })
     );
     drop(stub);
-    assert!(
-        r.inflight_keys().is_empty(),
-        "the answered request left no row"
-    );
-    assert!(r.runtime.serving(PROVIDER, &id).is_none());
+    r.assert_finished(&id);
 }

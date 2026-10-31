@@ -196,6 +196,14 @@ All notable changes to Brenn are documented here.
   operator's key provider and instance block is booted into an agent's
   tool list.
 
+- `google-workspace-tools` is now tested end to end: the compiled component
+  answers `GmailLabels` and `GmailSearch` calls through an OAuth provider
+  against a stand-in for Gmail, sending the right user's token, including a
+  missing or ambiguous connected account, a caller with no user, Google's
+  refusals and requests its grant does not cover; and the shipped class spec
+  with an operator's `oauth_provider` block and instance block is booted into
+  an agent's tool list.
+
 - Bumped wasmtime from 48.0.7 to 48.0.8, clearing RUSTSEC-2026-0422,
   RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
 
