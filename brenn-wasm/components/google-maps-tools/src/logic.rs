@@ -1108,6 +1108,12 @@ fn google_error(status: u64, body: &str) -> Failure {
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
     let body = match read_api_result(outcome, &state.target) {
         Ok(Answer::Body(body)) => body,
+        // Every step reads a JSON answer; none accepts an empty one.
+        Ok(Answer::NoBody { status }) => {
+            return Next::Fail(internal(format!(
+                "Google answered HTTP {status} with no body"
+            )));
+        }
         Ok(Answer::Relay(value)) => return Next::Complete(value),
         Ok(Answer::Unreadable(why)) => return Next::Fail(unreadable(state, &why)),
         Ok(Answer::Error { status, body }) => return Next::Fail(google_error(status, &body)),
@@ -2615,6 +2621,23 @@ mod tests {
                  a shorter route"
             ))
         );
+    }
+
+    /// The empty-answer arm runs before `advance` dispatches on the step, so
+    /// one step stands for all of them.
+    #[test]
+    fn an_empty_answer_is_internal() {
+        let state = at_step(Provided::Geocode, json!({ "address": "Paris" }), 1);
+        for status in [200, 204] {
+            assert_eq!(
+                advance(&state, http(status, ""), &settings()),
+                Next::Fail(failure(
+                    ErrorKind::Internal,
+                    &format!("Google answered HTTP {status} with no body")
+                )),
+                "HTTP {status}"
+            );
+        }
     }
 
     #[test]

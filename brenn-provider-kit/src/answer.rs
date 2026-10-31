@@ -136,6 +136,9 @@ impl Unreadable {
 pub enum Answer {
     /// The API's 2xx JSON body.
     Body(Value),
+    /// A 2xx with no body: the API accepted the call and answers nothing (a
+    /// 204, or an endpoint that answers an empty 200). Only `status` is known.
+    NoBody { status: u64 },
     /// `api-request`'s `credential_invalid` value: the user has no usable
     /// credential, and the request is answered with this value unchanged so
     /// the caller runs `oauth-connect`.
@@ -147,9 +150,10 @@ pub enum Answer {
     Error { status: u64, body: String },
 }
 
-/// `api-request`'s answer read: the API's JSON, the credential relay, a cut or
-/// undelivered answer or the API's error for the component to decide on, or
-/// the request's error answer.
+/// `api-request`'s answer read: the API's JSON or its empty 2xx, the
+/// credential relay, a cut or undelivered answer or the API's error for the
+/// component to decide on, or the request's error answer. A 2xx body of zero
+/// bytes is [`Answer::NoBody`]; any other 2xx body must be JSON.
 pub fn read_api_result(
     outcome: Result<Value, NestedError>,
     target: &Target,
@@ -215,6 +219,9 @@ pub fn read_api_result(
         return Err(internal(format!(
             "Google answered HTTP {status}, which is neither a success nor an error"
         )));
+    }
+    if body.is_empty() {
+        return Ok(Answer::NoBody { status });
     }
     serde_json::from_str(body).map(Answer::Body).map_err(|_| {
         internal(format!(
@@ -549,6 +556,25 @@ mod tests {
         );
         assert_eq!(
             read(http(200, "{\"a\": 1}")),
+            Ok(Answer::Body(json!({ "a": 1 })))
+        );
+    }
+
+    #[test]
+    fn an_empty_2xx_answer_is_accepted_with_nothing_to_read() {
+        for status in [200, 204] {
+            assert_eq!(read(http(status, "")), Ok(Answer::NoBody { status }));
+        }
+        // Whitespace is a body, and not JSON.
+        assert_eq!(
+            read(http(200, " ")),
+            Err(failure(
+                ErrorKind::Internal,
+                "Google returned HTTP 200 with a body that is not JSON"
+            ))
+        );
+        assert_eq!(
+            read(http(204, "{\"a\": 1}")),
             Ok(Answer::Body(json!({ "a": 1 })))
         );
     }

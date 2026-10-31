@@ -131,6 +131,11 @@ All notable changes to Brenn are documented here.
   Google's answers), with its own tests. Both the Google Workspace and the
   Google Maps tool components now build on it.
 
+- Internal: `brenn-provider-kit` now accepts a successful Google answer with
+  an empty body (as some write endpoints give) instead of failing it as "not
+  JSON". The Google tools have no such call yet and still fail one, now
+  reading "Google answered HTTP … with no body". No config changes.
+
 ## [0.30.1] — 2026-10-31
 
 - **Fix: an MQTT client with more than 64 subscriptions no longer hangs

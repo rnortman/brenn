@@ -1183,6 +1183,12 @@ fn google_error(status: u64, body: &str, family: Family) -> Failure {
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
     let body = match read_api_result(outcome, &state.target) {
         Ok(Answer::Body(body)) => body,
+        // Every step reads a JSON answer; none accepts an empty one.
+        Ok(Answer::NoBody { status }) => {
+            return Next::Fail(internal(format!(
+                "Google answered HTTP {status} with no body"
+            )));
+        }
         Ok(Answer::Relay(value)) => return Next::Complete(value),
         Ok(Answer::Unreadable(why)) => return unreadable(state, why, settings),
         // A message deleted between the listing and its read is listed
@@ -6578,6 +6584,35 @@ mod tests {
                 answered(&at(labels_state(json!({})), 2), outcome),
                 Next::Fail(no_such_step(Provided::GmailLabels, 2))
             );
+        }
+    }
+
+    #[test]
+    fn an_empty_answer_is_internal_at_every_step() {
+        for tool in Provided::ALL {
+            for step in [
+                1,
+                STRUCTURE_STEP,
+                THREAD_NARROW_STEP,
+                LABELS_STEP,
+                SEARCH_FIRST_GET,
+                SEARCH_LAST_GET,
+            ] {
+                let mut state = labels_state(json!({}));
+                state.tool = tool;
+                state.step = step;
+                for status in [200, 204] {
+                    assert_eq!(
+                        answered(&state, http(status, "")),
+                        Next::Fail(failure(
+                            ErrorKind::Internal,
+                            &format!("Google answered HTTP {status} with no body")
+                        )),
+                        "{} step {step}",
+                        tool.name()
+                    );
+                }
+            }
         }
     }
 
