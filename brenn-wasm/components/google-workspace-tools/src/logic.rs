@@ -1,9 +1,10 @@
 //! The wrapper's decisions, in `std` plus `serde`/`serde_json`: reading the
 //! instance's `config`, validating a tool's arguments, building each Gmail
-//! call as `api-request` arguments, reading `api-request`'s answer, and
-//! compacting Google's JSON into the tool's result. Nothing here names the
-//! guest SDK, so the whole module runs on the host under test. Tools are the
-//! generated `Provided` enum, whose SDK-facing parts are wasm32-only.
+//! and Calendar call as `api-request` arguments, reading `api-request`'s
+//! answer, and compacting Google's JSON into the tool's result. Nothing here
+//! names the guest SDK, so the whole module runs on the host under test.
+//! Tools are the generated `Provided` enum, whose SDK-facing parts are
+//! wasm32-only.
 
 // The host test's crate root is this file, so it declares the generated
 // module itself; in the component, `lib.rs` does.
@@ -156,12 +157,62 @@ const SEARCH_MAX_DEFAULT: u64 = 10;
 const SEARCH_FIRST_GET: u8 = 2;
 const SEARCH_LAST_GET: u8 = SEARCH_FIRST_GET + SEARCH_MAX_MAX as u8 - 1;
 
-/// The sentence every Google 403 is answered with: Gmail answers an account
-/// connected without the read scope this way, and the component does not read
-/// Google's reason codes to tell that refusal from another.
-const SCOPE_HINT: &str = "If Google names insufficient authentication scopes, the account was \
-                          connected without the Gmail read scope: run oauth-connect with that \
-                          scope set and relay its steps.";
+/// The path Calendar lists the user's calendars at.
+const CALENDAR_LIST_PATH: &str = "/calendar/v3/users/me/calendarList";
+/// calendarList.list's mask: what a listing line carries, and the page token.
+const CALENDAR_LIST_FIELDS: &str = "items(id,summary,primary,accessRole,timeZone),nextPageToken";
+/// calendarList.list's page size: the most entries whose worst-case answer
+/// stays under `COMPACT_RESULT_CEILING` (an entry serializes to at most
+/// 1 297 bytes; 100 of them and a page token to about 138 000).
+const CALENDAR_LIST_PAGE: usize = 100;
+
+/// The most bytes a calendar id may hold, in an argument or an answer.
+const CALENDAR_ID_MAX_BYTES: usize = 320;
+/// The most UTF-8 bytes of text copied into one line of a listing.
+const LISTING_TEXT_MAX_BYTES: usize = 300;
+/// The most UTF-8 bytes of a value from Google's own vocabulary (a role, a
+/// time zone, a timestamp) copied into an answer. No honest value reaches
+/// it; it exists so an answer's size is bounded, and a cut is not flagged.
+const SHORT_MAX_BYTES: usize = 64;
+
+/// The Google API a tool reads, where a message to the caller differs by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family {
+    Gmail,
+    Calendar,
+}
+
+/// The API `tool` reads.
+fn family(tool: Provided) -> Family {
+    match tool {
+        Provided::GmailLabels
+        | Provided::GmailSearch
+        | Provided::GmailRead
+        | Provided::GmailThread => Family::Gmail,
+        Provided::CalendarList => Family::Calendar,
+    }
+}
+
+impl Family {
+    /// The API's name as the user knows it.
+    fn name(self) -> &'static str {
+        match self {
+            Family::Gmail => "Gmail",
+            Family::Calendar => "Calendar",
+        }
+    }
+}
+
+/// The sentence every Google 403 is answered with: Google answers an account
+/// connected without the family's read scope this way, and the component does
+/// not read Google's reason codes to tell that refusal from another.
+fn scope_hint(family: Family) -> String {
+    format!(
+        "If Google names insufficient authentication scopes, the account was connected without \
+         the {} read scope: run oauth-connect with that scope set and relay its steps.",
+        family.name()
+    )
+}
 
 /// The instance's `config` map, validated.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,6 +221,8 @@ pub struct Settings {
     pub provider: String,
     /// The `host[:port]` Gmail is called on.
     pub gmail_host: String,
+    /// The `host[:port]` Calendar is called on.
+    pub calendar_host: String,
 }
 
 impl Settings {
@@ -196,6 +249,7 @@ impl Settings {
         Ok(Settings {
             provider: required("provider")?,
             gmail_host: host("gmail_host")?,
+            calendar_host: host("calendar_host")?,
         })
     }
 }
@@ -280,11 +334,12 @@ pub struct ApiCall {
 }
 
 impl ApiCall {
-    /// A GET on the Gmail host for `account`. Every Gmail read adds
+    /// A GET on `host` for `account`. Every Google read adds
     /// `prettyPrint=false` to `query`: Google's indentation would count
     /// against the read limit and the bus cap like any other byte.
-    fn gmail_get(
+    fn get(
         settings: &Settings,
+        host: &str,
         account: Option<&str>,
         path: String,
         mut query: Query,
@@ -297,7 +352,7 @@ impl ApiCall {
             provider: settings.provider.clone(),
             account: account.map(str::to_string),
             method: "GET".to_string(),
-            host: settings.gmail_host.clone(),
+            host: host.to_string(),
             path,
             query,
         }
@@ -513,6 +568,18 @@ fn gmail_id(args: &Args, key: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// Whether `id` is a calendar id `api-request` takes as one path segment:
+/// 1 to `CALENDAR_ID_MAX_BYTES` bytes with no `/`, `\`, `%` or `"`, and no
+/// control or whitespace character. `#`, `@`, `?`, `.` and `+` are content.
+fn is_calendar_id(id: &str) -> bool {
+    (1..=CALENDAR_ID_MAX_BYTES).contains(&id.len())
+        && id != "."
+        && id != ".."
+        && !id
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | '%' | '"') || c.is_control() || c.is_whitespace())
+}
+
 /// An integer argument in `min..=max`.
 fn integer(args: &Args, key: &str, min: u64, max: u64) -> Result<Option<u64>, String> {
     match args.get(key) {
@@ -565,6 +632,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                 api: thread_call(&thread, settings),
             })
         }
+        Provided::CalendarList => {
+            let list = CalendarListArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: calendar_list_call(&list, settings),
+            })
+        }
     }
 }
 
@@ -592,8 +666,9 @@ fn labels_call(args: &LabelsArgs, settings: &Settings) -> ApiCall {
         Some(id) => (format!("{LABELS_PATH}/{id}"), LABEL_GET_FIELDS),
         None => (LABELS_PATH.to_string(), LABELS_LIST_FIELDS),
     };
-    ApiCall::gmail_get(
+    ApiCall::get(
         settings,
+        &settings.gmail_host,
         args.account.as_deref(),
         path,
         query([("fields", fields.to_string())]),
@@ -642,8 +717,9 @@ fn search_list_call(args: &SearchArgs, settings: &Settings) -> ApiCall {
             QueryValue::One("true".to_string()),
         );
     }
-    ApiCall::gmail_get(
+    ApiCall::get(
         settings,
+        &settings.gmail_host,
         args.account.as_deref(),
         MESSAGES_PATH.to_string(),
         query,
@@ -653,8 +729,9 @@ fn search_list_call(args: &SearchArgs, settings: &Settings) -> ApiCall {
 /// messages.get of one message's metadata: the search line's headers, labels
 /// and snippet, no body.
 fn message_metadata_call(id: &str, account: Option<&str>, settings: &Settings) -> ApiCall {
-    ApiCall::gmail_get(
+    ApiCall::get(
         settings,
+        &settings.gmail_host,
         account,
         format!("{MESSAGES_PATH}/{id}"),
         metadata_query(METADATA_FIELDS, SEARCH_HEADERS),
@@ -690,8 +767,9 @@ fn read_call(args: &ReadArgs, fields: Option<&str>, settings: &Settings) -> ApiC
     if let Some(fields) = fields {
         query.insert("fields".to_string(), QueryValue::One(fields.to_string()));
     }
-    ApiCall::gmail_get(
+    ApiCall::get(
         settings,
+        &settings.gmail_host,
         args.account.as_deref(),
         format!("{MESSAGES_PATH}/{}", args.id),
         query,
@@ -723,18 +801,56 @@ impl ThreadArgs {
 /// threads.get of one thread's messages' metadata: headers, labels and
 /// snippets, no bodies.
 fn thread_call(args: &ThreadArgs, settings: &Settings) -> ApiCall {
-    ApiCall::gmail_get(
+    ApiCall::get(
         settings,
+        &settings.gmail_host,
         args.account.as_deref(),
         format!("{THREADS_PATH}/{}", args.id),
         metadata_query(THREAD_FIELDS, THREAD_HEADERS),
     )
 }
 
+/// `CalendarList`'s arguments.
+struct CalendarListArgs {
+    page: Option<String>,
+    account: Option<String>,
+}
+
+impl CalendarListArgs {
+    // TODO(provider-schema-parse-parity): these bounds and the `calendar-list`
+    // `input_schema` in the spec are stated separately.
+    fn parse(args: &Value) -> Result<CalendarListArgs, String> {
+        let map = object(args, &["page", "account"])?;
+        Ok(CalendarListArgs {
+            page: capped(map, "page", PAGE_MAX_BYTES)?.map(str::to_string),
+            account: account(map)?,
+        })
+    }
+}
+
+/// calendarList.list, one page of at most `CALENDAR_LIST_PAGE` entries.
+fn calendar_list_call(args: &CalendarListArgs, settings: &Settings) -> ApiCall {
+    let mut query = query([
+        ("maxResults", CALENDAR_LIST_PAGE.to_string()),
+        ("fields", CALENDAR_LIST_FIELDS.to_string()),
+    ]);
+    if let Some(page) = &args.page {
+        query.insert("pageToken".to_string(), QueryValue::One(page.clone()));
+    }
+    ApiCall::get(
+        settings,
+        &settings.calendar_host,
+        args.account.as_deref(),
+        CALENDAR_LIST_PATH.to_string(),
+        query,
+    )
+}
+
 /// labels.list for the names of the user labels an answer carries.
 fn label_names_call(account: Option<&str>, settings: &Settings) -> ApiCall {
-    ApiCall::gmail_get(
+    ApiCall::get(
         settings,
+        &settings.gmail_host,
         account,
         LABELS_PATH.to_string(),
         query([("fields", LABEL_NAMES_FIELDS.to_string())]),
@@ -957,6 +1073,7 @@ pub enum Answer {
 pub fn read_api_result(
     outcome: Result<Value, NestedError>,
     target: &Target,
+    family: Family,
 ) -> Result<Answer, Failure> {
     let value = match outcome {
         Ok(value) => value,
@@ -1012,7 +1129,7 @@ pub fn read_api_result(
     if status >= 400 {
         return Ok(Answer::GoogleError {
             status,
-            failure: google_error(status, body),
+            failure: google_error(status, body, family),
         });
     }
     if !(200..300).contains(&status) {
@@ -1036,14 +1153,14 @@ fn cut_answer(size: &str) -> Failure {
 
 /// A 4xx/5xx answer: Google's status and message when the body is Google's
 /// standard error shape, nothing of it otherwise. 400 and 404 are the caller's
-/// arguments; 403 is Google's refusal, answered with the scope hint; every
+/// arguments; 403 is Google's refusal, answered with the family's scope hint; every
 /// other status (401 after `api-request`'s retry, 429, 5xx) is the wrapper's
 /// or Google's.
 // TODO(errhandling-gmail-403-always-denied-with-scope-hint): a quota or
 // API-not-enabled 403 is answered `denied` with the scope hint.
 // TODO(errhandling-gmail-4xx-on-fixed-request-blamed-on-caller): a 400/404 on
 // a request built from constants alone is answered `invalid_args`.
-fn google_error(status: u64, body: &str) -> Failure {
+fn google_error(status: u64, body: &str, family: Family) -> Failure {
     let kind = match status {
         400 | 404 => ErrorKind::InvalidArgs,
         403 => ErrorKind::Denied,
@@ -1061,7 +1178,7 @@ fn google_error(status: u64, body: &str) -> Failure {
     };
     if kind == ErrorKind::Denied {
         let stop = if detail.ends_with('.') { "" } else { "." };
-        detail = format!("{detail}{stop} {SCOPE_HINT}");
+        detail = format!("{detail}{stop} {}", scope_hint(family));
     }
     Failure { kind, detail }
 }
@@ -1070,7 +1187,7 @@ fn google_error(status: u64, body: &str) -> Failure {
 /// issue its next step. Every answer completed here is held to the result
 /// ceiling; a relayed credential answer is `api-request`'s own and is not.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
-    let body = match read_api_result(outcome, &state.target) {
+    let body = match read_api_result(outcome, &state.target, family(state.tool)) {
         Ok(Answer::Google(body)) => body,
         Ok(Answer::Relay(value)) => return Next::Complete(value),
         // A message too large to read whole is read again without its body.
@@ -1115,6 +1232,7 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             (Provided::GmailRead, 1) => read_full(state, &body, settings),
             (Provided::GmailRead, STRUCTURE_STEP) => read_structure(state, &body, settings),
             (Provided::GmailThread, 1) => thread_read(state, &body, settings),
+            (Provided::CalendarList, 1) => compact_calendar_list(&body).map(Next::Complete),
             (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 named(state, &body)
             }
@@ -1135,7 +1253,7 @@ fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
             let value = match tool {
                 Provided::GmailRead => fit_text(value, COMPACT_RESULT_CEILING),
                 Provided::GmailThread => fit_thread(value, COMPACT_RESULT_CEILING),
-                Provided::GmailLabels | Provided::GmailSearch => value,
+                Provided::GmailLabels | Provided::GmailSearch | Provided::CalendarList => value,
             };
             bounded(value, COMPACT_RESULT_CEILING)
         }
@@ -1171,13 +1289,7 @@ fn search_listed(state: &InFlight, body: &Value, settings: &Settings) -> Result<
         )));
     }
     let mut derived = Args::new();
-    match body.get("nextPageToken") {
-        None => {}
-        Some(Value::String(token)) if token.len() <= PAGE_MAX_BYTES => {
-            derived.insert("next_page".to_string(), json!(token));
-        }
-        Some(_) => return Err(shape("messages.list")),
-    }
+    next_page(&mut derived, body, "messages.list")?;
     match body.get("resultSizeEstimate") {
         None => {}
         Some(estimate @ Value::Number(_)) => {
@@ -1738,6 +1850,152 @@ fn label(item: &Value, api: &str, extra: &[(&str, &str)]) -> Result<Value, Failu
     Ok(Value::Object(out))
 }
 
+/// One compacted object of a Calendar answer: the fields copied so far, and
+/// the names of those cut at a bound that is flagged.
+struct Compact<'a> {
+    item: &'a Value,
+    api: &'a str,
+    out: Args,
+    truncated: Vec<String>,
+}
+
+impl<'a> Compact<'a> {
+    fn of(item: &'a Value, api: &'a str) -> Result<Compact<'a>, Failure> {
+        if !item.is_object() {
+            return Err(shape(api));
+        }
+        Ok(Compact {
+            item,
+            api,
+            out: Args::new(),
+            truncated: Vec::new(),
+        })
+    }
+
+    /// Google's string `key`, when present; any other value is Google's
+    /// fault.
+    fn string(&self, key: &str) -> Result<Option<&'a str>, Failure> {
+        match self.item.get(key) {
+            None => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value)),
+            Some(_) => Err(shape(self.api)),
+        }
+    }
+
+    /// Google's id `key` under `name`, required and held to `valid`: an id is
+    /// a handle the caller passes back, so it is never cut.
+    fn id(&mut self, key: &str, name: &str, valid: fn(&str) -> bool) -> Result<(), Failure> {
+        match self.string(key)? {
+            Some(id) if valid(id) => {
+                self.out.insert(name.to_string(), json!(id));
+                Ok(())
+            }
+            _ => Err(shape(self.api)),
+        }
+    }
+
+    /// Google's text `key` under `name`, through `plain` and cut to `bound`
+    /// UTF-8 bytes; a cut is listed in `fields_truncated`.
+    fn text(&mut self, key: &str, name: &str, bound: usize) -> Result<(), Failure> {
+        if let Some(value) = self.string(key)? {
+            let (value, cut) = cut(&plain(value), bound);
+            if cut {
+                self.truncated.push(name.to_string());
+            }
+            self.out.insert(name.to_string(), json!(value));
+        }
+        Ok(())
+    }
+
+    /// Google's vocabulary `key` under `name`, through `plain` and cut to
+    /// `SHORT_MAX_BYTES` unflagged.
+    fn short(&mut self, key: &str, name: &str) -> Result<(), Failure> {
+        if let Some(value) = self.string(key)? {
+            let value = cut(&plain(value), SHORT_MAX_BYTES).0;
+            self.out.insert(name.to_string(), json!(value));
+        }
+        Ok(())
+    }
+
+    /// Google's flag `key` under `name`, only when it is `true`.
+    fn when_true(&mut self, key: &str, name: &str) -> Result<(), Failure> {
+        match self.item.get(key) {
+            None | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => {
+                self.out.insert(name.to_string(), json!(true));
+            }
+            Some(_) => return Err(shape(self.api)),
+        }
+        Ok(())
+    }
+
+    /// The object, with `fields_truncated` sorted when a field was cut.
+    fn done(mut self) -> Value {
+        if !self.truncated.is_empty() {
+            self.truncated.sort();
+            self.out
+                .insert("fields_truncated".to_string(), json!(self.truncated));
+        }
+        Value::Object(self.out)
+    }
+}
+
+/// Google's `nextPageToken` into `out` as `next_page`, when Google gave one;
+/// one that `page` would refuse back — not a string, blank, or longer than
+/// `PAGE_MAX_BYTES` — is Google's fault.
+fn next_page(out: &mut Args, body: &Args, api: &str) -> Result<(), Failure> {
+    match body.get("nextPageToken") {
+        None => {}
+        Some(Value::String(token)) if token.len() <= PAGE_MAX_BYTES && !token.trim().is_empty() => {
+            out.insert("next_page".to_string(), json!(token));
+        }
+        Some(_) => return Err(shape(api)),
+    }
+    Ok(())
+}
+
+/// calendarList.list as `{ "calendars": [...], "next_page"? }` in Google's
+/// order: each entry's `id`, `summary`, `primary` (only when true),
+/// `access_role` and `time_zone`. Google omits `items` when there are none,
+/// which is an empty list; more entries than the page size asked for is
+/// Google's fault.
+fn compact_calendar_list(body: &Value) -> Result<Value, Failure> {
+    let api = "calendarList.list";
+    let Value::Object(body) = body else {
+        return Err(shape(api));
+    };
+    let items: &[Value] = match body.get("items") {
+        None => &[],
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(shape(api)),
+    };
+    if items.len() > CALENDAR_LIST_PAGE {
+        return Err(internal(format!(
+            "Google {api} answered {} items for maxResults {CALENDAR_LIST_PAGE}",
+            items.len()
+        )));
+    }
+    let calendars = items
+        .iter()
+        .map(|item| calendar_entry(item, api))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut out = Args::new();
+    out.insert("calendars".to_string(), Value::Array(calendars));
+    next_page(&mut out, body, api)?;
+    Ok(Value::Object(out))
+}
+
+/// One calendar of the user's list.
+fn calendar_entry(item: &Value, api: &str) -> Result<Value, Failure> {
+    let mut entry = Compact::of(item, api)?;
+    entry.id("id", "id", is_calendar_id)?;
+    entry.text("summary", "summary", LISTING_TEXT_MAX_BYTES)?;
+    entry.when_true("primary", "primary")?;
+    entry.short("accessRole", "access_role")?;
+    entry.short("timeZone", "time_zone")?;
+    Ok(entry.done())
+}
+
 /// `value` as the request's answer, unless it serializes larger than
 /// `ceiling` — a bound that was wrong, reported rather than sent.
 pub fn bounded(value: Value, ceiling: usize) -> Next {
@@ -1751,7 +2009,7 @@ pub fn bounded(value: Value, ceiling: usize) -> Next {
 }
 
 fn shape(api: &str) -> Failure {
-    internal(format!("unexpected Gmail {api} response shape"))
+    internal(format!("unexpected Google {api} response shape"))
 }
 
 /// Copy `from` into `to[name]` when present and not null; absent fields are
@@ -1776,7 +2034,11 @@ mod tests {
         move |key| map.get(key).cloned()
     }
 
-    const BASE: &[(&str, &str)] = &[("provider", "google"), ("gmail_host", "gmail.example.com")];
+    const BASE: &[(&str, &str)] = &[
+        ("provider", "google"),
+        ("gmail_host", "gmail.example.com"),
+        ("calendar_host", "calendar.example.com"),
+    ];
 
     fn settings() -> Settings {
         Settings::from_lookup(lookup(BASE)).unwrap()
@@ -1795,6 +2057,7 @@ mod tests {
             Settings {
                 provider: "google".to_string(),
                 gmail_host: "gmail.example.com".to_string(),
+                calendar_host: "calendar.example.com".to_string(),
             }
         );
         let s = Settings::from_lookup(lookup(&with("gmail_host", "127.0.0.1:8080"))).unwrap();
@@ -1803,7 +2066,7 @@ mod tests {
 
     #[test]
     fn settings_refuse_a_missing_key_by_name() {
-        for key in ["provider", "gmail_host"] {
+        for key in ["provider", "gmail_host", "calendar_host"] {
             let pairs: Vec<_> = BASE.iter().filter(|(k, _)| *k != key).copied().collect();
             let err = Settings::from_lookup(lookup(&pairs)).unwrap_err();
             assert_eq!(err, format!("config {key} is required"));
@@ -1812,7 +2075,7 @@ mod tests {
 
     #[test]
     fn settings_refuse_bad_values() {
-        for key in ["provider", "gmail_host"] {
+        for key in ["provider", "gmail_host", "calendar_host"] {
             let err = Settings::from_lookup(lookup(&with(key, ""))).unwrap_err();
             assert_eq!(err, format!("config {key} is empty"));
         }
@@ -1872,6 +2135,7 @@ mod tests {
         });
         assert_eq!(s.provider, "google");
         assert_eq!(s.gmail_host, "gmail.googleapis.com");
+        assert_eq!(s.calendar_host, "www.googleapis.com");
     }
 
     fn labels(args: Value) -> Result<ApiCall, String> {
@@ -2008,7 +2272,7 @@ mod tests {
     }
 
     fn read(outcome: Result<Value, NestedError>) -> Result<Answer, Failure> {
-        read_api_result(outcome, &target())
+        read_api_result(outcome, &target(), Family::Gmail)
     }
 
     fn failure(kind: ErrorKind, detail: &str) -> Failure {
@@ -2200,7 +2464,10 @@ mod tests {
             refused(
                 403,
                 ErrorKind::Denied,
-                &format!("Google HTTP 403, body not in the standard error shape. {SCOPE_HINT}")
+                &format!(
+                    "Google HTTP 403, body not in the standard error shape. {}",
+                    scope_hint(Family::Gmail)
+                )
             )
         );
     }
@@ -2363,7 +2630,7 @@ mod tests {
                 answered(&list, http(200, body)),
                 Next::Fail(failure(
                     ErrorKind::Internal,
-                    "unexpected Gmail labels.list response shape"
+                    "unexpected Google labels.list response shape"
                 )),
                 "{body}"
             );
@@ -2373,7 +2640,7 @@ mod tests {
             answered(&one, http(200, "{\"name\": \"INBOX\"}")),
             Next::Fail(failure(
                 ErrorKind::Internal,
-                "unexpected Gmail labels.get response shape"
+                "unexpected Google labels.get response shape"
             ))
         );
     }
@@ -3124,7 +3391,7 @@ mod tests {
             assert_eq!(failure.kind, ErrorKind::Internal);
             assert_eq!(
                 failure.detail,
-                "unexpected Gmail messages.get response shape"
+                "unexpected Google messages.get response shape"
             );
         }
     }
@@ -3171,7 +3438,7 @@ mod tests {
         let state = search_state(json!({ "q": "lunch", "max": 2 }));
         let shape_error = Next::Fail(failure(
             ErrorKind::Internal,
-            "unexpected Gmail messages.list response shape",
+            "unexpected Google messages.list response shape",
         ));
         for body in [
             "[]".to_string(),
@@ -3179,6 +3446,8 @@ mod tests {
             r#"{ "messages": [{ "threadId": "t1" }] }"#.to_string(),
             listing(&["m/1"], json!({})),
             listing(&["m1"], json!({ "nextPageToken": 7 })),
+            listing(&["m1"], json!({ "nextPageToken": "" })),
+            listing(&["m1"], json!({ "nextPageToken": " \t" })),
             listing(&["m1"], json!({ "resultSizeEstimate": "many" })),
             listing(
                 &["m1"],
@@ -3205,7 +3474,7 @@ mod tests {
         );
         let shape_error = Next::Fail(failure(
             ErrorKind::Internal,
-            "unexpected Gmail messages.get response shape",
+            "unexpected Google messages.get response shape",
         ));
         let mut wrong_date: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
         wrong_date["internalDate"] = json!("yesterday");
@@ -3359,7 +3628,7 @@ mod tests {
                 answered(&state, http(200, body)),
                 Next::Fail(failure(
                     ErrorKind::Internal,
-                    "unexpected Gmail labels.list response shape"
+                    "unexpected Google labels.list response shape"
                 )),
                 "{body}"
             );
@@ -4241,5 +4510,315 @@ mod tests {
         let (row, _) = follow(&state, answered(&state, http(200, &body)));
         let answer = completed(answered(&row, http(200, "{}")));
         assert_eq!(answer["messages_omitted"], json!(1));
+    }
+
+    #[test]
+    fn a_google_403_on_a_calendar_tool_names_the_calendar_scope() {
+        let body = google(
+            403,
+            "PERMISSION_DENIED",
+            "Request had insufficient authentication scopes.",
+        );
+        assert_eq!(
+            read_api_result(http(403, &body), &target(), Family::Calendar),
+            refused(
+                403,
+                ErrorKind::Denied,
+                "Google PERMISSION_DENIED (HTTP 403): Request had insufficient authentication \
+                 scopes. If Google names insufficient authentication scopes, the account was \
+                 connected without the Calendar read scope: run oauth-connect with that scope \
+                 set and relay its steps."
+            )
+        );
+        let state = calendar_list_state(json!({}));
+        assert_eq!(
+            answered(&state, http(403, &body)),
+            Next::Fail(failure(
+                ErrorKind::Denied,
+                &format!(
+                    "Google PERMISSION_DENIED (HTTP 403): Request had insufficient \
+                     authentication scopes. {}",
+                    scope_hint(Family::Calendar)
+                )
+            ))
+        );
+    }
+
+    #[test]
+    fn every_tool_names_its_family() {
+        for tool in Provided::ALL {
+            let expected = if tool.name().starts_with("gmail-") {
+                Family::Gmail
+            } else {
+                assert!(tool.name().starts_with("calendar-"), "{}", tool.name());
+                Family::Calendar
+            };
+            assert_eq!(family(tool), expected, "{}", tool.name());
+        }
+    }
+
+    #[test]
+    fn a_calendar_id_is_one_segment_api_request_admits() {
+        for ok in [
+            "primary",
+            "alice@example.com",
+            "en.usa#holiday@group.v.calendar.google.com",
+            "c_0123?x+y@group.calendar.google.com",
+            &"a".repeat(CALENDAR_ID_MAX_BYTES),
+        ] {
+            assert!(is_calendar_id(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a%40b",
+            "a\"b",
+            "a b",
+            "a\tb",
+            "a\u{0}b",
+            "a\u{a0}b",
+            &"a".repeat(CALENDAR_ID_MAX_BYTES + 1),
+        ] {
+            assert!(!is_calendar_id(bad), "{bad:?}");
+        }
+    }
+
+    fn calendar_list(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::CalendarList, &args, &settings()).map(|call| {
+            assert_eq!(call.step, 1);
+            call.api
+        })
+    }
+
+    fn calendar_list_query(extra: &[(&str, &str)]) -> Query {
+        let mut query = query([
+            ("maxResults", "100".to_string()),
+            (
+                "fields",
+                "items(id,summary,primary,accessRole,timeZone),nextPageToken".to_string(),
+            ),
+            ("prettyPrint", "false".to_string()),
+        ]);
+        for (key, value) in extra {
+            query.insert(key.to_string(), QueryValue::One(value.to_string()));
+        }
+        query
+    }
+
+    #[test]
+    fn calendar_list_reads_one_page_on_the_calendar_host() {
+        assert_eq!(
+            calendar_list(json!({})).unwrap(),
+            ApiCall {
+                provider: "google".to_string(),
+                account: None,
+                method: "GET".to_string(),
+                host: "calendar.example.com".to_string(),
+                path: "/calendar/v3/users/me/calendarList".to_string(),
+                query: calendar_list_query(&[]),
+            }
+        );
+        let call =
+            calendar_list(json!({ "page": "page-2", "account": "alice@example.com" })).unwrap();
+        assert_eq!(call.account.as_deref(), Some("alice@example.com"));
+        assert_eq!(call.query, calendar_list_query(&[("pageToken", "page-2")]));
+    }
+
+    #[test]
+    fn calendar_list_refuses_bad_arguments() {
+        assert_eq!(
+            calendar_list(json!({ "calendar": "primary" })).unwrap_err(),
+            "unknown argument `calendar`; this tool takes `page`, `account`"
+        );
+        assert_eq!(
+            calendar_list(json!({ "page": "" })).unwrap_err(),
+            "`page` is empty"
+        );
+        assert_eq!(
+            calendar_list(json!({ "page": "x".repeat(PAGE_MAX_BYTES + 1) })).unwrap_err(),
+            "`page` is longer than 4096 bytes"
+        );
+        assert_eq!(
+            calendar_list(json!({ "page": 2 })).unwrap_err(),
+            "`page` must be a string"
+        );
+        assert_eq!(
+            calendar_list(json!({ "account": "x".repeat(321) })).unwrap_err(),
+            "`account` is longer than 320 bytes"
+        );
+    }
+
+    const CALENDAR_LIST: &str = include_str!("fixtures/calendar-list.json");
+
+    fn calendar_list_state(args: Value) -> InFlight {
+        let call = plan(Provided::CalendarList, &args, &settings()).unwrap();
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::CalendarList,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        )
+    }
+
+    fn list_calendars(body: &str) -> Next {
+        answered(&calendar_list_state(json!({})), http(200, body))
+    }
+
+    #[test]
+    fn calendar_list_compacts_in_googles_order() {
+        assert_eq!(
+            list_calendars(CALENDAR_LIST),
+            Next::Complete(json!({
+                "calendars": [
+                    {
+                        "id": "alice@example.com",
+                        "summary": "alice@example.com",
+                        "primary": true,
+                        "access_role": "owner",
+                        "time_zone": "America/New_York",
+                    },
+                    {
+                        "id": "c_0123456789abcdef@group.calendar.google.com",
+                        "summary": "Family \"shared\"",
+                        "access_role": "writer",
+                        "time_zone": "America/Chicago",
+                    },
+                    {
+                        "id": "en.usa#holiday@group.v.calendar.google.com",
+                        "summary": "Holidays in United States",
+                        "access_role": "reader",
+                        "time_zone": "America/New_York",
+                    },
+                    {
+                        "id": "bob@example.com",
+                        "access_role": "freeBusyReader",
+                        "time_zone": "Europe/London",
+                    },
+                ],
+                "next_page": "page-2",
+            }))
+        );
+        assert_eq!(
+            list_calendars("{}"),
+            Next::Complete(json!({ "calendars": [] }))
+        );
+        assert_eq!(
+            list_calendars(r#"{ "items": [{ "id": "primary", "primary": false }] }"#),
+            Next::Complete(json!({ "calendars": [{ "id": "primary" }] }))
+        );
+    }
+
+    #[test]
+    fn a_calendar_summary_is_plain_and_cut_flagged_and_vocabulary_cut_unflagged() {
+        let body = json!({ "items": [{
+            "id": "alice@example.com",
+            "summary": format!("a\u{1}{}", "é".repeat(200)),
+            "accessRole": "r".repeat(SHORT_MAX_BYTES + 10),
+            "timeZone": "America/New_York",
+        }] });
+        let answer = completed(list_calendars(&body.to_string()));
+        let entry = &answer["calendars"][0];
+        let summary = entry["summary"].as_str().unwrap();
+        assert!(summary.starts_with("a é"), "{summary}");
+        assert!(summary.ends_with('…'), "{summary}");
+        assert!(summary.len() <= LISTING_TEXT_MAX_BYTES + '…'.len_utf8());
+        assert_eq!(entry["fields_truncated"], json!(["summary"]));
+        assert_eq!(
+            entry["access_role"],
+            json!(format!("{}…", "r".repeat(SHORT_MAX_BYTES)))
+        );
+    }
+
+    #[test]
+    fn calendar_list_refuses_an_unexpected_shape() {
+        let shape = || {
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "unexpected Google calendarList.list response shape",
+            ))
+        };
+        for body in [
+            json!([]),
+            json!({ "items": {} }),
+            json!({ "items": [1] }),
+            json!({ "items": [{}] }),
+            json!({ "items": [{ "id": 7 }] }),
+            json!({ "items": [{ "id": "a/b" }] }),
+            json!({ "items": [{ "id": "x".repeat(CALENDAR_ID_MAX_BYTES + 1) }] }),
+            json!({ "items": [{ "id": "primary", "summary": 1 }] }),
+            json!({ "items": [{ "id": "primary", "primary": "yes" }] }),
+            json!({ "items": [{ "id": "primary", "timeZone": null }] }),
+            json!({ "items": [], "nextPageToken": 3 }),
+            json!({ "items": [], "nextPageToken": "" }),
+            json!({ "items": [], "nextPageToken": " " }),
+            json!({ "items": [], "nextPageToken": "x".repeat(PAGE_MAX_BYTES + 1) }),
+        ] {
+            assert_eq!(list_calendars(&body.to_string()), shape(), "{body}");
+        }
+    }
+
+    #[test]
+    fn calendar_list_refuses_more_entries_than_it_asked_for() {
+        let items: Vec<Value> = (0..=CALENDAR_LIST_PAGE)
+            .map(|i| json!({ "id": format!("c{i}@example.com") }))
+            .collect();
+        assert_eq!(
+            list_calendars(&json!({ "items": items }).to_string()),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "Google calendarList.list answered 101 items for maxResults 100"
+            ))
+        );
+    }
+
+    #[test]
+    fn calendar_list_relays_googles_errors() {
+        let state = calendar_list_state(json!({ "page": "stale" }));
+        assert_eq!(
+            answered(
+                &state,
+                http(400, &google(400, "INVALID_ARGUMENT", "Invalid page token"))
+            ),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "Google INVALID_ARGUMENT (HTTP 400): Invalid page token"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_widest_calendar_list_page_fits_the_ceiling() {
+        // Every string at its bound and as wide as it serializes: a summary
+        // of quotes past its cut, a full-length id, vocabulary past its cut.
+        let items: Vec<Value> = (0..CALENDAR_LIST_PAGE)
+            .map(|i| {
+                let id = format!("{i:03}{}", "a".repeat(CALENDAR_ID_MAX_BYTES - 3));
+                json!({
+                    "id": id,
+                    "summary": "\"".repeat(LISTING_TEXT_MAX_BYTES + 1),
+                    "primary": true,
+                    "accessRole": "\"".repeat(SHORT_MAX_BYTES + 1),
+                    "timeZone": "\"".repeat(SHORT_MAX_BYTES + 1),
+                })
+            })
+            .collect();
+        let body = json!({ "items": items, "nextPageToken": "\"".repeat(PAGE_MAX_BYTES) });
+        let answer = completed(list_calendars(&body.to_string()));
+        assert_eq!(
+            answer["calendars"].as_array().unwrap().len(),
+            CALENDAR_LIST_PAGE
+        );
+        assert_eq!(
+            answer["calendars"][0]["fields_truncated"],
+            json!(["summary"])
+        );
+        let size = serialized_len(&answer);
+        assert!(size < 140_000, "{size}");
+        assert!(size < COMPACT_RESULT_CEILING);
     }
 }

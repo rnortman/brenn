@@ -36,15 +36,22 @@ const TOOLS: &[(&str, &str)] = &[
     ("gmail-search", "GmailSearch"),
     ("gmail-read", "GmailRead"),
     ("gmail-thread", "GmailThread"),
+    ("calendar-list", "CalendarList"),
 ];
 
-/// The paths the instance's clauses admit, one per endpoint the tools call.
-const PATHS: &[&str] = &[
-    "/gmail/v1/users/me/labels",
-    "/gmail/v1/users/me/labels/*",
-    "/gmail/v1/users/me/messages",
-    "/gmail/v1/users/me/messages/*",
-    "/gmail/v1/users/me/threads/*",
+/// The hosts the instance's `config` names for Gmail and Calendar.
+const GMAIL_HOST: &str = "gmail.googleapis.com";
+const CALENDAR_HOST: &str = "www.googleapis.com";
+
+/// The method, host and path each of the instance's clauses admits, one per
+/// endpoint the tools call.
+const CLAUSES: &[(&str, &str, &str)] = &[
+    ("GET", GMAIL_HOST, "/gmail/v1/users/me/labels"),
+    ("GET", GMAIL_HOST, "/gmail/v1/users/me/labels/*"),
+    ("GET", GMAIL_HOST, "/gmail/v1/users/me/messages"),
+    ("GET", GMAIL_HOST, "/gmail/v1/users/me/messages/*"),
+    ("GET", GMAIL_HOST, "/gmail/v1/users/me/threads/*"),
+    ("GET", CALENDAR_HOST, "/calendar/v3/users/me/calendarList"),
 ];
 
 /// The class's packaged specification.
@@ -67,12 +74,12 @@ fn document(
         .iter()
         .map(|(name, _)| format!("    tool {name} {{}}\n"))
         .collect();
-    let clauses: String = PATHS
+    let clauses: String = CLAUSES
         .iter()
-        .map(|path| {
+        .map(|(method, host, path)| {
             format!(
-                "        allow {{ provider = \"{PROVIDER}\"; user = \"*\"; method = \"GET\"; \
-                 host = \"gmail.googleapis.com\"; path = \"{path}\"; }}\n"
+                "        allow {{ provider = \"{PROVIDER}\"; user = \"*\"; method = \"{method}\"; \
+                 host = \"{host}\"; path = \"{path}\"; }}\n"
             )
         })
         .collect();
@@ -98,9 +105,10 @@ oauth_provider {PROVIDER} {{
     account_field = "email";
     base_scopes = ["openid", "https://www.googleapis.com/auth/userinfo.email"];
     scope_sets = {{
-        gmail_readonly = ["https://www.googleapis.com/auth/gmail.readonly"]
+        gmail_readonly = ["https://www.googleapis.com/auth/gmail.readonly"],
+        calendar_readonly = ["https://www.googleapis.com/auth/calendar.readonly"]
     }};
-    api_hosts = ["https://gmail.googleapis.com"];
+    api_hosts = ["https://{GMAIL_HOST}", "https://{CALENDAR_HOST}"];
 }}
 
 channel at "brenn:tool-results/{WORKSPACE}" {{
@@ -118,7 +126,8 @@ new {WORKSPACE}: GoogleWorkspaceTools {{
     }}
     config = {{
         provider = "{PROVIDER}",
-        gmail_host = "gmail.googleapis.com"
+        gmail_host = "{GMAIL_HOST}",
+        calendar_host = "{CALENDAR_HOST}"
     }};
 }}
 

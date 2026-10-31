@@ -229,4 +229,47 @@ mod tests {
         assert_eq!(url.as_str(), "http://127.0.0.1:8080/x%3F/a%20b/c:d");
         assert_eq!(display_path(&segs("/x%3F/a b")), "/x%3F/a%20b");
     }
+
+    /// A raw `#` or `?` in a path segment is content, not a fragment or a
+    /// query: it decodes as itself, matches one `*`, and goes on the wire
+    /// encoded.
+    #[test]
+    fn a_raw_hash_or_question_mark_is_segment_content() {
+        let holiday =
+            segs("/calendar/v3/calendars/en.usa#holiday@group.v.calendar.google.com/events");
+        assert_eq!(holiday.len(), 5);
+        assert_eq!(holiday[3], "en.usa#holiday@group.v.calendar.google.com");
+        assert!(template_admits("/calendar/v3/calendars/*/events", &holiday));
+        let url = build_url(
+            &Url::parse("https://www.googleapis.com").unwrap(),
+            &holiday,
+            &[],
+        );
+        assert_eq!(
+            url.as_str(),
+            "https://www.googleapis.com/calendar/v3/calendars/en.usa%23holiday@group.v.calendar.google.com/events"
+        );
+        assert_eq!(url.fragment(), None);
+
+        let question = segs("/calendar/v3/calendars/a?b/events/e1");
+        assert_eq!(question[3], "a?b");
+        assert!(template_admits(
+            "/calendar/v3/calendars/*/events/*",
+            &question
+        ));
+        assert_eq!(
+            display_path(&question),
+            "/calendar/v3/calendars/a%3Fb/events/e1"
+        );
+        let url = build_url(
+            &Url::parse("https://www.googleapis.com").unwrap(),
+            &question,
+            &[],
+        );
+        assert_eq!(url.query(), None);
+        assert_eq!(
+            url.as_str(),
+            "https://www.googleapis.com/calendar/v3/calendars/a%3Fb/events/e1"
+        );
+    }
 }

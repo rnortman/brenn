@@ -6,8 +6,8 @@
 //! nested `api-request`s through a real `WasmProvidesHost`, the executor runs
 //! each against the OAuth test stub with the credential alice connected, and
 //! the result comes back on the component's `brenn:tool-results/<slug>` inbox.
-//! The Gmail host the component's `config` names is the stub, which answers by
-//! request path. The component and the executor are stepped by hand; the
+//! The Gmail and Calendar hosts the component's `config` names are both the
+//! stub, which answers by request path. The component and the executor are stepped by hand; the
 //! conversation's call runs on a spawned task.
 
 use super::*;
@@ -52,15 +52,17 @@ const WORK_BEARER: &str = "AT-alice-work";
 const LABELS: &str = "/gmail/v1/users/me/labels";
 const MESSAGES: &str = "/gmail/v1/users/me/messages";
 const THREADS: &str = "/gmail/v1/users/me/threads";
+const CALENDAR_LIST: &str = "/calendar/v3/users/me/calendarList";
 
-/// The instance's `api-request` clauses, as exact path, each a `GET` on the
-/// stub's host for any user: one per endpoint the tools built so far call.
-const CLAUSES: &[&str] = &[
-    LABELS,
-    "/gmail/v1/users/me/labels/*",
-    MESSAGES,
-    "/gmail/v1/users/me/messages/*",
-    "/gmail/v1/users/me/threads/*",
+/// The instance's `api-request` clauses, as method and exact path, each on
+/// the stub's host for any user: one per endpoint the tools call.
+const CLAUSES: &[(&str, &str)] = &[
+    ("GET", LABELS),
+    ("GET", "/gmail/v1/users/me/labels/*"),
+    ("GET", MESSAGES),
+    ("GET", "/gmail/v1/users/me/messages/*"),
+    ("GET", "/gmail/v1/users/me/threads/*"),
+    ("GET", CALENDAR_LIST),
 ];
 
 /// The component's `provide` statements, lowered from its packaged
@@ -97,7 +99,7 @@ async fn rig() -> StubRig {
 /// alice has connected `connected`, and `caller` is the calling component, if
 /// any.
 async fn rig_with(
-    clauses: &[&str],
+    clauses: &[(&str, &str)],
     connected: Connected<'_>,
     caller: Option<CallerSetup<'_>>,
 ) -> StubRig {
@@ -116,7 +118,7 @@ async fn rig_reading_at_most(max_response_bytes: usize) -> StubRig {
 /// [`rig_with`], with `configure` applied to the OAuth provider's
 /// configuration before the service is built.
 async fn rig_configured(
-    clauses: &[&str],
+    clauses: &[(&str, &str)],
     connected: Connected<'_>,
     caller: Option<CallerSetup<'_>>,
     configure: impl FnOnce(&mut brenn_lib::config::OAuthProviderConfig),
@@ -140,18 +142,19 @@ async fn rig_configured(
             native: brenn_oauth::tools::registered(Some(&service), BTreeMap::new()),
             clauses: clauses
                 .iter()
-                .map(|&path| {
+                .map(|&(method, path)| {
                     vec![
                         ("provider", OAUTH_PROVIDER),
                         ("user", "*"),
-                        ("method", "GET"),
+                        ("method", method),
                         ("path", path),
                     ]
                 })
                 .collect(),
             config: HashMap::from([
                 ("provider".to_string(), OAUTH_PROVIDER.to_string()),
-                ("gmail_host".to_string(), host),
+                ("gmail_host".to_string(), host.clone()),
+                ("calendar_host".to_string(), host),
             ]),
             caller,
             vault,
@@ -160,21 +163,21 @@ async fn rig_configured(
     .await
 }
 
-/// The query pairs a Gmail call sends: `expected` plus the `prettyPrint=false`
-/// every Gmail call carries.
-fn gmail_query(expected: &[(&str, &str)]) -> Pairs {
+/// The query pairs a Google call sends: `expected` plus the
+/// `prettyPrint=false` every call carries.
+fn google_query(expected: &[(&str, &str)]) -> Pairs {
     pairs(&[expected, &[("prettyPrint", "false")]].concat())
 }
 
 /// labels.list's query as the `GmailLabels` listing sends it.
 fn labels_list_query() -> Pairs {
-    gmail_query(&[("fields", "labels(id,name,type)")])
+    google_query(&[("fields", "labels(id,name,type)")])
 }
 
 /// messages.get's metadata query for one search line: the three
 /// `metadataHeaders`, each its own query key.
 fn metadata_query() -> Pairs {
-    gmail_query(&[
+    google_query(&[
         ("format", "metadata"),
         (
             "fields",
@@ -224,7 +227,7 @@ fn scope_denied() -> Result<serde_json::Value, ToolError> {
 
 /// messages.list's query for `q` at the default page size.
 fn search_list_query(q: &str) -> Pairs {
-    gmail_query(&[
+    google_query(&[
         ("q", q),
         ("maxResults", "10"),
         (
@@ -336,7 +339,7 @@ async fn labels_with_an_id_reads_its_counts() {
         [(
             "GET".to_string(),
             "/gmail/v1/users/me/labels/Label_7".to_string(),
-            gmail_query(&[(
+            google_query(&[(
                 "fields",
                 "id,name,type,messagesTotal,messagesUnread,threadsTotal,threadsUnread"
             )]),
@@ -450,7 +453,7 @@ async fn search_lists_reads_each_message_then_names_labels() {
             (
                 "GET".to_string(),
                 MESSAGES.to_string(),
-                gmail_query(&[
+                google_query(&[
                     ("q", "from:example.com newer_than:7d"),
                     ("maxResults", "2"),
                     (
@@ -464,7 +467,7 @@ async fn search_lists_reads_each_message_then_names_labels() {
             (
                 "GET".to_string(),
                 LABELS.to_string(),
-                gmail_query(&[("fields", "labels(id,name)")]),
+                google_query(&[("fields", "labels(id,name)")]),
             ),
         ]
     );
@@ -492,7 +495,7 @@ async fn search_sends_the_page_token_and_an_empty_page_completes() {
         [(
             "GET".to_string(),
             MESSAGES.to_string(),
-            gmail_query(&[
+            google_query(&[
                 ("q", "is:starred"),
                 ("maxResults", "10"),
                 ("pageToken", "page-2"),
@@ -594,30 +597,48 @@ async fn a_google_403_mid_search_fails_the_search() {
     r.assert_finished(&id);
 }
 
+/// A tool of each Google API whose first call is a bare `GET`: its name, its
+/// slug, the path that call issues, and a body that answers it. The credential
+/// cases run on each, so each host's route resolves the caller's account.
+fn first_reads() -> [(&'static str, &'static str, &'static str, String); 2] {
+    [
+        ("GmailLabels", "gmail-labels", LABELS, labels_body()),
+        (
+            "CalendarList",
+            "calendar-list",
+            CALENDAR_LIST,
+            json!({ "items": [] }).to_string(),
+        ),
+    ]
+}
+
 /// With no account connected, `api-request`'s `credential_invalid` value is
 /// the tool's answer unchanged, and the component makes no further call.
 #[tokio::test]
 async fn no_connected_account_is_relayed_as_credential_invalid() {
-    let r = rig_with(CLAUSES, &[], None).await;
-    let call = r.call_for_alice("GmailSearch", json!({ "q": "is:unread" }));
-    let id = r.requested_id().await;
-    r.run(1).await;
+    for (tool, _, _, _) in first_reads() {
+        let r = rig_with(CLAUSES, &[], None).await;
+        let call = r.call_for_alice(tool, json!({}));
+        let id = r.requested_id().await;
+        r.run(1).await;
 
-    assert_eq!(
-        call.await.unwrap(),
-        Ok(json!({
-            "error": "credential_invalid",
-            "provider": OAUTH_PROVIDER,
-            "account": null,
-            "detail": "no account is connected for this provider",
-        }))
-    );
-    r.owed(&r.executor_sub(), 0).await;
-    assert!(
-        r.seen().is_empty(),
-        "no API was called without a credential"
-    );
-    r.assert_finished(&id);
+        assert_eq!(
+            call.await.unwrap(),
+            Ok(json!({
+                "error": "credential_invalid",
+                "provider": OAUTH_PROVIDER,
+                "account": null,
+                "detail": "no account is connected for this provider",
+            })),
+            "{tool}"
+        );
+        r.owed(&r.executor_sub(), 0).await;
+        assert!(
+            r.seen().is_empty(),
+            "{tool}: no API was called without a credential"
+        );
+        r.assert_finished(&id);
+    }
 }
 
 /// With two accounts connected, a call naming none is `denied` with
@@ -625,85 +646,92 @@ async fn no_connected_account_is_relayed_as_credential_invalid() {
 /// bearer.
 #[tokio::test]
 async fn several_accounts_need_one_named() {
-    let r = rig_with(
-        CLAUSES,
-        &[(ACCOUNT, BEARER), (WORK_ACCOUNT, WORK_BEARER)],
-        None,
-    )
-    .await;
-    r.answer(LABELS, labels_body());
+    for (tool, _, path, body) in first_reads() {
+        let r = rig_with(
+            CLAUSES,
+            &[(ACCOUNT, BEARER), (WORK_ACCOUNT, WORK_BEARER)],
+            None,
+        )
+        .await;
+        r.answer(path, body);
 
-    let call = r.call_for_alice("GmailLabels", json!({}));
-    let id = r.requested_id().await;
-    r.run(1).await;
-    let answer = call.await.unwrap();
-    let Err(ToolError::Denied(detail)) = answer else {
-        panic!("expected a denied answer, got {answer:?}");
-    };
-    assert!(
-        detail.starts_with(&format!(
-            "api-request refused the nested GET {}{LABELS}: several \"google\" accounts are \
-             connected; name one as `account`: ",
-            r.host
-        )) && detail.contains(ACCOUNT)
-            && detail.contains(WORK_ACCOUNT),
-        "{detail}"
-    );
-    assert!(r.seen().is_empty(), "a refused call reaches no API");
-    r.assert_finished(&id);
+        let call = r.call_for_alice(tool, json!({}));
+        let id = r.requested_id().await;
+        r.run(1).await;
+        let answer = call.await.unwrap();
+        let Err(ToolError::Denied(detail)) = answer else {
+            panic!("{tool}: expected a denied answer, got {answer:?}");
+        };
+        assert!(
+            detail.starts_with(&format!(
+                "api-request refused the nested GET {}{path}: several \"google\" accounts are \
+                 connected; name one as `account`: ",
+                r.host
+            )) && detail.contains(ACCOUNT)
+                && detail.contains(WORK_ACCOUNT),
+            "{tool}: {detail}"
+        );
+        assert!(r.seen().is_empty(), "{tool}: a refused call reaches no API");
+        r.assert_finished(&id);
 
-    let call = r.call_for_alice("GmailLabels", json!({ "account": WORK_ACCOUNT }));
-    let id = r.requested_id().await;
-    r.run(1).await;
-    call.await.unwrap().expect("the named account answered");
-    assert_eq!(r.bearers(), [format!("Bearer {WORK_BEARER}")]);
-    r.assert_finished(&id);
+        let call = r.call_for_alice(tool, json!({ "account": WORK_ACCOUNT }));
+        let id = r.requested_id().await;
+        r.run(1).await;
+        call.await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{tool}: the named account answered: {e:?}"));
+        assert_eq!(r.bearers(), [format!("Bearer {WORK_BEARER}")], "{tool}");
+        r.assert_finished(&id);
+    }
 }
 
-/// A component calling `gmail-labels` on its own account has no user, and an
+/// A component calling a tool on its own account has no user, and an
 /// instance whose clauses say `user = "*"` lends none: the caller's result is
 /// `denied` carrying `api-request`'s explanation, and nothing reaches the API.
 #[tokio::test]
 async fn a_userless_caller_is_denied_with_the_reason() {
-    let r = rig_with(
-        CLAUSES,
-        &[(ACCOUNT, BEARER)],
-        Some(CallerSetup {
-            slug: CALLER,
-            tool: "gmail-labels",
-            args: json!({}),
-        }),
-    )
-    .await;
-    let caller = r.caller();
-    testutils::insert_bus_message(&r.messenger, &caller.trigger, "go", ChannelScheme::Brenn).await;
-    drain_step(&caller.component, &caller.sub, MountDebt::Settled).await;
+    for (_, slug, path, _) in first_reads() {
+        let r = rig_with(
+            CLAUSES,
+            &[(ACCOUNT, BEARER)],
+            Some(CallerSetup {
+                slug: CALLER,
+                tool: slug,
+                args: json!({}),
+            }),
+        )
+        .await;
+        let caller = r.caller();
+        testutils::insert_bus_message(&r.messenger, &caller.trigger, "go", ChannelScheme::Brenn)
+            .await;
+        drain_step(&caller.component, &caller.sub, MountDebt::Settled).await;
 
-    // The executor hands the call to the provider, which issues its `GET`.
-    r.executor.drain_step().await;
-    let id = r.requested_id().await;
-    r.serve().await;
-    let nested = r.owed(&r.executor_sub(), 1).await;
-    assert_eq!(nested[0]["serving"], id.as_str());
+        // The executor hands the call to the provider, which issues its `GET`.
+        r.executor.drain_step().await;
+        let id = r.requested_id().await;
+        r.serve().await;
+        let nested = r.owed(&r.executor_sub(), 1).await;
+        assert_eq!(nested[0]["serving"], id.as_str(), "{slug}");
 
-    r.executor.drain_step().await;
-    assert!(r.seen().is_empty(), "a refused call reaches no API");
-    r.owed(&r.provider_sub, 1).await;
-    r.serve().await;
+        r.executor.drain_step().await;
+        assert!(r.seen().is_empty(), "{slug}: a refused call reaches no API");
+        r.owed(&r.provider_sub, 1).await;
+        r.serve().await;
 
-    let results = r.owed(&caller.sub, 1).await;
-    assert_eq!(results[0]["tool"], "gmail-labels");
-    let error = &results[0]["outcome"]["err"];
-    assert_eq!(error["kind"], "denied", "{}", results[0]);
-    let detail = error["detail"].as_str().expect("a detail");
-    assert!(
-        detail.starts_with(&format!(
-            "api-request refused the nested GET {}{LABELS}: ",
-            r.host
-        )) && detail.contains("a caller with no acting user borrows the one user"),
-        "{detail}"
-    );
-    r.assert_finished(&id);
+        let results = r.owed(&caller.sub, 1).await;
+        assert_eq!(results[0]["tool"], slug);
+        let error = &results[0]["outcome"]["err"];
+        assert_eq!(error["kind"], "denied", "{}", results[0]);
+        let detail = error["detail"].as_str().expect("a detail");
+        assert!(
+            detail.starts_with(&format!(
+                "api-request refused the nested GET {}{path}: ",
+                r.host
+            )) && detail.contains("a caller with no acting user borrows the one user"),
+            "{slug}: {detail}"
+        );
+        r.assert_finished(&id);
+    }
 }
 
 /// Google's 403 is the tool's `denied`: Google's status and message, and the
@@ -725,10 +753,10 @@ async fn a_google_403_is_denied_with_the_scope_hint() {
 /// guidance, and nothing reaches the API.
 #[tokio::test]
 async fn a_clause_miss_is_internal_could_not_be_issued() {
-    let clauses: Vec<&str> = CLAUSES
+    let clauses: Vec<(&str, &str)> = CLAUSES
         .iter()
         .copied()
-        .filter(|path| *path != LABELS)
+        .filter(|&(_, path)| path != LABELS)
         .collect();
     let r = rig_with(&clauses, &[(ACCOUNT, BEARER)], None).await;
     let call = r.call_for_alice("GmailLabels", json!({}));
@@ -742,7 +770,7 @@ async fn a_clause_miss_is_internal_could_not_be_issued() {
 }
 
 fn full_read_query() -> Pairs {
-    gmail_query(&[("format", "full")])
+    google_query(&[("format", "full")])
 }
 
 /// One message as messages.get (full) answers it: a `multipart/mixed` of a
@@ -864,7 +892,7 @@ async fn read_decodes_the_full_message_and_names_its_labels() {
             (
                 "GET".to_string(),
                 LABELS.to_string(),
-                gmail_query(&[("fields", "labels(id,name)")]),
+                google_query(&[("fields", "labels(id,name)")]),
             ),
         ]
     );
@@ -992,7 +1020,7 @@ async fn a_read_past_the_limit_falls_back_to_the_structure() {
             (
                 "GET".to_string(),
                 path,
-                gmail_query(&[
+                google_query(&[
                     ("format", "full"),
                     (
                         "fields",
@@ -1097,7 +1125,7 @@ async fn thread_reads_once_and_keeps_the_newest_messages() {
             (
                 "GET".to_string(),
                 path,
-                gmail_query(&[
+                google_query(&[
                     ("format", "metadata"),
                     (
                         "fields",
@@ -1113,10 +1141,128 @@ async fn thread_reads_once_and_keeps_the_newest_messages() {
             (
                 "GET".to_string(),
                 LABELS.to_string(),
-                gmail_query(&[("fields", "labels(id,name)")]),
+                google_query(&[("fields", "labels(id,name)")]),
             ),
         ]
     );
     assert_eq!(r.bearers(), vec![format!("Bearer {BEARER}"); 2]);
+    r.assert_finished(&id);
+}
+
+/// calendarList.list's query as `CalendarList` sends it, with `extra`.
+fn calendar_list_query(extra: &[(&str, &str)]) -> Pairs {
+    google_query(
+        &[
+            &[
+                ("maxResults", "100"),
+                (
+                    "fields",
+                    "items(id,summary,primary,accessRole,timeZone),nextPageToken",
+                ),
+            ],
+            extra,
+        ]
+        .concat(),
+    )
+}
+
+/// `CalendarList` reads one page of alice's calendar list on the Calendar
+/// host with her bearer, and answers it compactly in Google's order with the
+/// page token relayed; a second call passes the token back.
+#[tokio::test]
+async fn calendar_list_reads_the_users_calendars() {
+    let r = rig().await;
+    r.answer(
+        CALENDAR_LIST,
+        serde_json::to_string_pretty(&json!({
+            "items": [
+                {
+                    "id": ACCOUNT,
+                    "summary": ACCOUNT,
+                    "timeZone": "America/New_York",
+                    "accessRole": "owner",
+                    "primary": true,
+                },
+                {
+                    "id": "en.usa#holiday@group.v.calendar.google.com",
+                    "summary": "Holidays in United States",
+                    "timeZone": "America/New_York",
+                    "accessRole": "reader",
+                },
+            ],
+            "nextPageToken": "page-2",
+        }))
+        .unwrap(),
+    );
+    let call = r.call_for_alice("CalendarList", json!({}));
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap().expect("the component answered"),
+        json!({
+            "calendars": [
+                {
+                    "id": ACCOUNT,
+                    "summary": ACCOUNT,
+                    "primary": true,
+                    "access_role": "owner",
+                    "time_zone": "America/New_York",
+                },
+                {
+                    "id": "en.usa#holiday@group.v.calendar.google.com",
+                    "summary": "Holidays in United States",
+                    "access_role": "reader",
+                    "time_zone": "America/New_York",
+                },
+            ],
+            "next_page": "page-2",
+        })
+    );
+    assert_eq!(r.bearers(), [format!("Bearer {BEARER}")]);
+    r.assert_finished(&id);
+
+    let call = r.call_for_alice("CalendarList", json!({ "page": "page-2" }));
+    let id = r.requested_id().await;
+    r.run(1).await;
+    call.await.unwrap().expect("the component answered");
+    assert_eq!(
+        r.seen(),
+        [
+            (
+                "GET".to_string(),
+                CALENDAR_LIST.to_string(),
+                calendar_list_query(&[]),
+            ),
+            (
+                "GET".to_string(),
+                CALENDAR_LIST.to_string(),
+                calendar_list_query(&[("pageToken", "page-2")]),
+            ),
+        ]
+    );
+    r.assert_finished(&id);
+}
+
+/// Google's 403 on a Calendar tool is `denied` with the sentence naming the
+/// Calendar read scope, not Gmail's.
+#[tokio::test]
+async fn a_calendar_403_is_denied_with_the_calendar_scope_hint() {
+    let r = rig().await;
+    r.fail(CALENDAR_LIST, 403, insufficient_scope_body());
+    let call = r.call_for_alice("CalendarList", json!({}));
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap(),
+        Err(ToolError::Denied(
+            "Google PERMISSION_DENIED (HTTP 403): Request had insufficient authentication \
+             scopes. If Google names insufficient authentication scopes, the account was \
+             connected without the Calendar read scope: run oauth-connect with that scope set \
+             and relay its steps."
+                .to_string(),
+        ))
+    );
     r.assert_finished(&id);
 }

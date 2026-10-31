@@ -4,6 +4,20 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **The Google Workspace assistant tools can now list the user's
+  calendars.** The `google-workspace-tools` component gains `CalendarList`:
+  each calendar in the user's Google Calendar list with its id, name, whether
+  it is the user's own, the user's access to it and its time zone, 100 to a
+  page. **Config change required:** the instance's `config` map needs a new
+  key, `calendar_host = "www.googleapis.com"` (without it every call fails,
+  naming the key); its `api-request` grant needs a `GET` clause for
+  `/calendar/v3/users/me/calendarList` on that host; the Google provider's
+  `api_hosts` must include `https://www.googleapis.com`; and the assistant
+  needs `tool calendar-list {}`. `docs/google-workspace.md` shows all four.
+  When Google refuses a Calendar call for a missing permission, the assistant
+  is now told to reconnect with the Calendar read scope rather than the Gmail
+  one.
+
 ## [0.30.1] — 2026-10-31
 
 - **Fix: an MQTT client with more than 64 subscriptions no longer hangs

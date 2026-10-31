@@ -193,8 +193,8 @@ Then the inbox tuning and the instance:
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered. The four Gmail tools declare Σ = 12, which needs 24, rounded
-// up to 32. 64 holds the 32 ceiling on Σ twice over, so tools joining the
+// re-delivered. The five tools declare Σ = 14, which needs 28, rounded up
+// to 32. 64 holds the 32 ceiling on Σ twice over, so tools joining the
 // class change nothing here.
 channel at "brenn:tool-results/workspace" {
   push_depth = 1;
@@ -212,16 +212,19 @@ new workspace: GoogleWorkspaceTools {
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/*"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/threads/*"; }
+    allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/users/me/calendarList"; }
     rate_limit { burst = 60; sustained_per_minute = 120; }
   }
   config = {
     provider = "google",
-    gmail_host = "gmail.googleapis.com"
+    gmail_host = "gmail.googleapis.com",
+    calendar_host = "www.googleapis.com"
   };
 }
 ```
 
-The assistant, granted the four tools beside its account tools (section 4):
+The assistant, granted every tool the instance provides beside its account tools
+(section 4):
 
 ```
 agent PersonalAssistant {
@@ -234,6 +237,7 @@ agent PersonalAssistant {
   tool gmail-search {}
   tool gmail-read {}
   tool gmail-thread {}
+  tool calendar-list {}
 }
 ```
 
@@ -243,18 +247,18 @@ need one.
 **The result inbox.** The `channel at "brenn:tool-results/workspace"` block
 sizes the inbox the instance's nested answers arrive on (the slug after the
 `/` is the instance's name). Each request the component serves has at most
-one Google call outstanding, so at most Σ `max_concurrency` = 12 answers are
-outstanding at once, and an answer may be delivered twice: 12 × 2 = 24,
+one Google call outstanding, so at most Σ `max_concurrency` = 14 answers are
+outstanding at once, and an answer may be delivered twice: 14 × 2 = 28,
 rounded up to 32. The block sets 64, which covers the 32 ceiling on Σ
 `max_concurrency` twice over, so the Calendar tools joining this class later
-change nothing deployed. The default window of 16 is below 24 and would lose
+change nothing deployed. The default window of 16 is below 28 and would lose
 answers under load, each lost answer leaving its request to be answered
 `internal` after the 240-second ceiling. `push_depth = 1` is the inert
 channel rung, and `noise = alarm` makes a drop here an alert.
 
-**The clauses.** The instance holds five clauses, one per Gmail endpoint the
-tools call — the label list, one label, the message search, one message, one
-thread — every one a `GET`, and nothing wider. The `*` segments take a label,
+**The clauses.** The instance holds six clauses, one per endpoint the tools
+call — Gmail's label list, one label, the message search, one message, one
+thread, and Calendar's calendar list — every one a `GET`, and nothing wider. The `*` segments take a label,
 message or thread id. A clause that does not admit a call's method, host and
 path is refused before anything is sent (section 7).
 
@@ -278,6 +282,8 @@ with a list or a get costing 5, is the real bound on a user.
 - `provider` — the `oauth_provider` name.
 - `gmail_host` — the `host[:port]` Gmail is called on. It must be one of the
   provider's `api_hosts` and admitted by the clauses.
+- `calendar_host` — the `host[:port]` Calendar is called on, under the same
+  two conditions.
 
 A missing key, an empty one, or a host containing `/` fails every activation
 with the key named.

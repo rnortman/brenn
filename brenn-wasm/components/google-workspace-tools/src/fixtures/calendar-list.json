@@ -1,0 +1,29 @@
+{
+  "nextPageToken": "page-2",
+  "items": [
+    {
+      "id": "alice@example.com",
+      "summary": "alice@example.com",
+      "timeZone": "America/New_York",
+      "accessRole": "owner",
+      "primary": true
+    },
+    {
+      "id": "c_0123456789abcdef@group.calendar.google.com",
+      "summary": "Family \"shared\"",
+      "timeZone": "America/Chicago",
+      "accessRole": "writer"
+    },
+    {
+      "id": "en.usa#holiday@group.v.calendar.google.com",
+      "summary": "Holidays in United States",
+      "timeZone": "America/New_York",
+      "accessRole": "reader"
+    },
+    {
+      "id": "bob@example.com",
+      "timeZone": "Europe/London",
+      "accessRole": "freeBusyReader"
+    }
+  ]
+}
