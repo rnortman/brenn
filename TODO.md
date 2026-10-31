@@ -13,29 +13,6 @@ independent; then make `MAX_RESPONSE_BYTES_CEILING`'s compile-time tie to
 `MAX_ASYNC_RESULT_BYTES` (`brenn-tool-registry/src/descriptor.rs`) say which
 cap it means.
 
-## `correctness-search-header-cap-counts-chars-not-bytes`
-
-`google-workspace-tools` cuts each header value to `HEADER_MAX_CHARS` (1000)
-characters, but holds a finished answer to `COMPACT_RESULT_CEILING` (256 KiB)
-of serialized bytes. A character serializes to up to 4 bytes (UTF-8) or 6
-(`\u00XX` for a C0 control), and one `GmailSearch` page reads up to 25
-messages, each with its own read limit. So about 22 lines whose `From`,
-`Subject` and `Date` sit at the bound in four-byte characters (or whose `From`
-and `Subject` are C0 controls, if Gmail passes them through) push the page
-past the ceiling. The search then fails `internal` every time it runs, and a
-sender can cause this with crafted mail matched by `in:spam`, `from:` or
-`is:unread`. Decide how the listing's bound fits the ceiling by construction:
-a byte budget on each header's serialized form beside the character bound, a
-lower listing bound, or cutting the page short with a flag. Then pin the
-choice with a 25-line worst-case search test, and record the arithmetic beside
-the constant. `GmailThread` (up to 100 messages from one read) is held by its
-single `max_response_bytes` read and needs no change unless that read limit
-changes.
-
-Code site (`TODO(correctness-search-header-cap-counts-chars-not-bytes)`):
-`HEADER_MAX_CHARS` in
-`brenn-wasm/components/google-workspace-tools/src/logic.rs`.
-
 ## `errhandling-gmail-403-always-denied-with-scope-hint`
 
 `google-workspace-tools` answers every Google HTTP 403 `denied` with a
@@ -87,7 +64,11 @@ hand status and truncation to step logic. The copies already differ: Maps
 does not relay `credential_invalid`, keeps the POST sentence on a nested
 `denied`, answers 403 `internal` where the Workspace copy answers `denied`
 with a scope hint, and reports Google's errors as a `Failure` where the
-Workspace copy reports `Answer::GoogleError`. Decide the shared home — a
+Workspace copy reports `Answer::GoogleError`. The Workspace `cut` bounds UTF-8
+bytes and returns whether it cut, because the copied strings it bounds are
+sized against `COMPACT_RESULT_CEILING`, which counts bytes; the Maps `cut`
+bounds characters, so its `GOOGLE_MESSAGE_MAX_CHARS` and the Workspace
+`GOOGLE_MESSAGE_MAX_BYTES` (both 1000) are different limits. Decide the shared home — a
 host-testable `std` + `serde` crate in the components workspace, SDK helpers
 in `brenn-guest::provides` (an out-of-tree surface), or both — and what stays
 per provider (Google's error mapping, the credential relay), with the

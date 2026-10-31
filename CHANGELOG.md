@@ -81,8 +81,9 @@ All notable changes to Brenn are documented here.
   message — sender, subject, date, Gmail's preview and labels by name — up
   to 25 per page, with a token for the next page. Messages deleted between
   the listing and their reading are named as unavailable rather than
-  failing the search. A sender, subject or date over 1,000 characters is
-  cut, and the line says which were cut. Bodies are not included. The
+  failing the search. A sender, subject or date over 1,000 bytes (UTF-8)
+  is cut, and the line says which were cut; control characters in them and
+  in the preview are shown as spaces. Bodies are not included. The
   guide's instance block in
   `docs/google-workspace.md` gains the two `messages` clauses the tool needs
   and the assistant's grant lines.

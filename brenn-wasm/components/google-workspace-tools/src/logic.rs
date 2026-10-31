@@ -40,15 +40,26 @@ const ACCOUNT_MAX_BYTES: usize = 320;
 /// decodes nor refuses.
 const ID_MAX_BYTES: usize = 128;
 
-/// The most characters of a Google error message copied into a result.
-const GOOGLE_MESSAGE_MAX_CHARS: usize = 1000;
+/// The most UTF-8 bytes of a Google error message copied into a result.
+const GOOGLE_MESSAGE_MAX_BYTES: usize = 1000;
 
-/// The most characters of a message header's value copied into a result. A
+/// The most UTF-8 bytes of a message header's value copied into a result. A
 /// sender writes these, and nothing bounds their length.
-// TODO(correctness-search-header-cap-counts-chars-not-bytes): a character
-// serializes to up to 6 bytes, so 25 search lines of headers at this bound
-// can pass `COMPACT_RESULT_CEILING`.
-const HEADER_MAX_CHARS: usize = 1000;
+///
+/// After `plain`, a string serializes to at most two bytes per UTF-8 byte, so
+/// a value cut here serializes to at most 2 003 bytes (`…` is three). A
+/// search line is then at most 8 438 serialized bytes plus its label names
+/// (three headers and a snippet at 2 003 each, two 128-byte ids, keys and
+/// date), the page's envelope at most 8 300 (a page token of
+/// `PAGE_MAX_BYTES` serializes to at most 8 206), and a page of 25 lines
+/// stays under `COMPACT_RESULT_CEILING` while each line's label names
+/// serialize to at most 1 715 bytes. A page past that answers `internal`.
+const HEADER_MAX_BYTES: usize = 1000;
+
+/// The most UTF-8 bytes of a message's snippet copied into a result. Google's
+/// snippet is itself a short preview; the bound only closes the page's size
+/// arithmetic, so a cut is not flagged.
+const SNIPPET_MAX_BYTES: usize = 1000;
 
 /// The path Gmail lists the user's labels at, and reads one label below.
 const LABELS_PATH: &str = "/gmail/v1/users/me/labels";
@@ -585,11 +596,12 @@ struct HeaderValue {
     cut: bool,
 }
 
-/// The value of the header `name` in `message`'s `payload.headers` list, cut
-/// to `HEADER_MAX_CHARS`. `None` when the message has no such header, or no
-/// `payload` or `headers` at all, as Google omits them when no header matches
-/// the mask. A `payload` that is not an object or a header list not of Gmail's
-/// shape is Google's fault, reported against `api`.
+/// The value of the header `name` in `message`'s `payload.headers` list,
+/// passed through `plain` and cut to `HEADER_MAX_BYTES`. `None` when the
+/// message has no such header, or no `payload` or `headers` at all, as Google
+/// omits them when no header matches the mask. A `payload` that is not an
+/// object or a header list not of Gmail's shape is Google's fault, reported
+/// against `api`.
 fn header_value(message: &Value, name: &str, api: &str) -> Result<Option<HeaderValue>, Failure> {
     let headers = match message.get("payload") {
         None => return Ok(None),
@@ -601,9 +613,23 @@ fn header_value(message: &Value, name: &str, api: &str) -> Result<Option<HeaderV
     };
     let found = decode::header(headers, name).map_err(|decode::MalformedHeaders| shape(api))?;
     Ok(found.map(|value| {
-        let (value, cut) = cut(value, HEADER_MAX_CHARS);
+        let (value, cut) = cut(&plain(value), HEADER_MAX_BYTES);
         HeaderValue { value, cut }
     }))
+}
+
+/// A message's snippet as answered: character references decoded, passed
+/// through `plain` and cut to `SNIPPET_MAX_BYTES`. `None` when Google gave
+/// none; a snippet that is not a string is Google's fault.
+fn snippet_value(message: &Value, api: &str) -> Result<Option<String>, Failure> {
+    match message.get("snippet") {
+        None => Ok(None),
+        Some(Value::String(snippet)) => {
+            let decoded = plain(&decode::decode_entities(snippet));
+            Ok(Some(cut(&decoded, SNIPPET_MAX_BYTES).0))
+        }
+        Some(_) => Err(shape(api)),
+    }
 }
 
 /// A nested call's typed error, as the executor wrote it.
@@ -613,13 +639,28 @@ pub struct NestedError {
     pub detail: String,
 }
 
-/// `text` cut to `max` characters, ending in `…` when cut, and whether it was
-/// cut.
-fn cut(text: &str, max: usize) -> (String, bool) {
-    match text.char_indices().nth(max) {
-        None => (text.to_string(), false),
-        Some((at, _)) => (format!("{}…", &text[..at]), true),
+/// `text` cut to the longest prefix of at most `max_bytes` UTF-8 bytes that
+/// ends on a char boundary, ending in `…` when cut, and whether it was cut. A
+/// character straddling the bound is dropped whole.
+fn cut(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
     }
+    let at = text.floor_char_boundary(max_bytes);
+    (format!("{}…", &text[..at]), true)
+}
+
+/// `text` with every C0 control character other than tab, newline and
+/// carriage return replaced by a space. Each of those would serialize as six
+/// bytes (`\u00XX`) and has no use in a header, a snippet or a body.
+fn plain(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\t' | '\n' | '\r' => c,
+            '\u{0}'..='\u{1f}' => ' ',
+            _ => c,
+        })
+        .collect()
 }
 
 /// The detail of a nested call that issued but could not be queued: Brenn's
@@ -768,7 +809,7 @@ fn google_error(status: u64, body: &str) -> Failure {
     let mut detail = match (field("status"), field("message")) {
         (Some(google_status), Some(message)) => format!(
             "Google {google_status} (HTTP {status}): {}",
-            cut(message, GOOGLE_MESSAGE_MAX_CHARS).0
+            cut(message, GOOGLE_MESSAGE_MAX_BYTES).0
         ),
         _ => format!("Google HTTP {status}, body not in the standard error shape"),
     };
@@ -858,8 +899,8 @@ fn search_listed(state: &InFlight, body: &Value, settings: &Settings) -> Result<
     let mut derived = Args::new();
     match body.get("nextPageToken") {
         None => {}
-        Some(token @ Value::String(_)) => {
-            derived.insert("next_page".to_string(), token.clone());
+        Some(Value::String(token)) if token.len() <= PAGE_MAX_BYTES => {
+            derived.insert("next_page".to_string(), json!(token));
         }
         Some(_) => return Err(shape("messages.list")),
     }
@@ -957,11 +998,11 @@ fn search_answer(derived: Args) -> Value {
 }
 
 /// One message's metadata as a search line: `id`, `thread_id`, the `from`,
-/// `subject` and `date` header values when present, each cut to
-/// `HEADER_MAX_CHARS` with the cut fields named, sorted, in
-/// `headers_truncated`, `internal_date` as RFC 3339, `snippet` with its
-/// character references decoded, and the label ids as `labels`. A body for
-/// another message than `id` is Google's fault.
+/// `subject` and `date` header values when present, each through
+/// `header_value` with the cut fields named, sorted, in `headers_truncated`,
+/// `internal_date` as RFC 3339, the snippet through `snippet_value`, and the
+/// label ids as `labels`. A body for another message than `id`, or a thread
+/// id that is not a Gmail id, is Google's fault.
 fn search_line(body: &Value, id: &str) -> Result<Value, Failure> {
     let api = "messages.get";
     if body.get("id").and_then(Value::as_str) != Some(id) {
@@ -969,7 +1010,13 @@ fn search_line(body: &Value, id: &str) -> Result<Value, Failure> {
     }
     let mut out = Args::new();
     out.insert("id".to_string(), json!(id));
-    copy(&mut out, "thread_id", body.get("threadId"));
+    match body.get("threadId") {
+        None => {}
+        Some(Value::String(thread)) if is_gmail_id(thread) => {
+            out.insert("thread_id".to_string(), json!(thread));
+        }
+        Some(_) => return Err(shape(api)),
+    }
     let mut truncated = Vec::new();
     for name in SEARCH_HEADERS {
         if let Some(header) = header_value(body, name, api)? {
@@ -992,25 +1039,18 @@ fn search_line(body: &Value, id: &str) -> Result<Value, Failure> {
         }
         Some(_) => return Err(shape(api)),
     }
-    match body.get("snippet") {
-        None => {}
-        Some(Value::String(snippet)) => {
-            out.insert(
-                "snippet".to_string(),
-                json!(decode::decode_entities(snippet)),
-            );
-        }
-        Some(_) => return Err(shape(api)),
+    if let Some(snippet) = snippet_value(body, api)? {
+        out.insert("snippet".to_string(), json!(snippet));
     }
     out.insert("labels".to_string(), label_ids(body, api)?);
     Ok(Value::Object(out))
 }
 
-/// A message's `labelIds` as an array of strings; absent is none.
+/// A message's `labelIds` as an array of Gmail ids; absent is none.
 fn label_ids(message: &Value, api: &str) -> Result<Value, Failure> {
     match message.get("labelIds") {
         None => Ok(json!([])),
-        Some(Value::Array(ids)) if ids.iter().all(Value::is_string) => {
+        Some(Value::Array(ids)) if ids.iter().all(|id| id.as_str().is_some_and(is_gmail_id)) => {
             Ok(Value::Array(ids.clone()))
         }
         Some(_) => Err(shape(api)),
@@ -1624,7 +1664,7 @@ mod tests {
 
     #[test]
     fn a_long_google_message_is_cut() {
-        let message = "x".repeat(GOOGLE_MESSAGE_MAX_CHARS + 50);
+        let message = "x".repeat(GOOGLE_MESSAGE_MAX_BYTES + 50);
         let Ok(Answer::GoogleError { failure, .. }) =
             read(http(500, &google(500, "INTERNAL", &message)))
         else {
@@ -1635,7 +1675,7 @@ mod tests {
             detail,
             format!(
                 "Google INTERNAL (HTTP 500): {}…",
-                "x".repeat(GOOGLE_MESSAGE_MAX_CHARS)
+                "x".repeat(GOOGLE_MESSAGE_MAX_BYTES)
             )
         );
     }
@@ -2325,8 +2365,10 @@ mod tests {
             body["payload"]["headers"][1]["value"] = json!(subject);
             http(200, &body.to_string())
         };
-        // A sender's own trailing `…` at exactly the bound is not a cut.
-        let at_bound = format!("{}…", "é".repeat(HEADER_MAX_CHARS - 1));
+        // A sender's own trailing `…` at exactly the bound is not a cut: one
+        // byte, 498 two-byte `é` and the three-byte `…` are 1 000 bytes.
+        let at_bound = format!("a{}…", "é".repeat(498));
+        assert_eq!(at_bound.len(), HEADER_MAX_BYTES);
         let state = search_state(json!({ "q": "lunch" }));
         let (state, _) = follow(
             &state,
@@ -2334,7 +2376,10 @@ mod tests {
         );
         let (state, _) = follow(
             &state,
-            answered(&state, with_subject("m1", "é".repeat(HEADER_MAX_CHARS + 1))),
+            answered(
+                &state,
+                with_subject("m1", "é".repeat(HEADER_MAX_BYTES / 2 + 1)),
+            ),
         );
         let (state, _) = follow(
             &state,
@@ -2346,7 +2391,7 @@ mod tests {
         let lines = answer["messages"].as_array().unwrap();
         assert_eq!(
             lines[0]["subject"],
-            json!(format!("{}…", "é".repeat(HEADER_MAX_CHARS)))
+            json!(format!("{}…", "é".repeat(HEADER_MAX_BYTES / 2)))
         );
         assert_eq!(lines[0]["from"], json!("Alice <alice@example.com>"));
         assert_eq!(lines[0]["headers_truncated"], json!(["subject"]));
@@ -2364,7 +2409,7 @@ mod tests {
         );
         let mut body: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
         for header in 0..3 {
-            body["payload"]["headers"][header]["value"] = json!("x".repeat(HEADER_MAX_CHARS + 1));
+            body["payload"]["headers"][header]["value"] = json!("x".repeat(HEADER_MAX_BYTES + 1));
         }
         let Next::Complete(answer) = answered(&state, http(200, &body.to_string())) else {
             panic!("the search did not complete");
@@ -2378,23 +2423,132 @@ mod tests {
     #[test]
     fn header_value_reports_a_cut_only_past_the_bound() {
         let message = |value: String| json!({ "payload": { "headers": [{ "name": "Subject", "value": value }] } });
-        let at = message("a".repeat(HEADER_MAX_CHARS));
+        let at = message("a".repeat(HEADER_MAX_BYTES));
         assert_eq!(
             header_value(&at, "subject", "messages.get"),
             Ok(Some(HeaderValue {
-                value: "a".repeat(HEADER_MAX_CHARS),
+                value: "a".repeat(HEADER_MAX_BYTES),
                 cut: false
             }))
         );
-        let past = message("a".repeat(HEADER_MAX_CHARS + 1));
+        let past = message("a".repeat(HEADER_MAX_BYTES + 1));
         assert_eq!(
             header_value(&past, "Subject", "messages.get"),
             Ok(Some(HeaderValue {
-                value: format!("{}…", "a".repeat(HEADER_MAX_CHARS)),
+                value: format!("{}…", "a".repeat(HEADER_MAX_BYTES)),
                 cut: true
             }))
         );
         assert_eq!(header_value(&past, "From", "messages.get"), Ok(None));
+    }
+
+    #[test]
+    fn plain_replaces_c0_controls_other_than_tab_newline_and_return() {
+        assert_eq!(plain("a\u{0}b\u{1b}c\u{1f}d"), "a b c d");
+        assert_eq!(plain("a\tb\nc\rd"), "a\tb\nc\rd");
+        assert_eq!(plain("a\u{7f}é😀"), "a\u{7f}é😀");
+    }
+
+    #[test]
+    fn cut_bounds_utf8_bytes_on_a_char_boundary() {
+        assert_eq!(cut(&"a".repeat(1000), 1000), ("a".repeat(1000), false));
+        assert_eq!(
+            cut(&"a".repeat(1001), 1000),
+            (format!("{}…", "a".repeat(1000)), true)
+        );
+        assert_eq!(cut(&"é".repeat(500), 1000), ("é".repeat(500), false));
+        // A four-byte character straddling the bound is dropped whole.
+        let straddling = format!("{}😀", "a".repeat(998));
+        assert_eq!(
+            cut(&straddling, 1000),
+            (format!("{}…", "a".repeat(998)), true)
+        );
+        assert_eq!(cut("", 0), (String::new(), false));
+    }
+
+    #[test]
+    fn a_header_of_control_characters_answers_spaces_unflagged() {
+        let message = json!({ "payload": { "headers": [
+            { "name": "Subject", "value": "\u{1}".repeat(HEADER_MAX_BYTES) }
+        ] } });
+        assert_eq!(
+            header_value(&message, "Subject", "messages.get"),
+            Ok(Some(HeaderValue {
+                value: " ".repeat(HEADER_MAX_BYTES),
+                cut: false
+            }))
+        );
+    }
+
+    #[test]
+    fn a_long_snippet_is_cut_unflagged() {
+        let at = json!({ "snippet": "a".repeat(SNIPPET_MAX_BYTES) });
+        assert_eq!(
+            snippet_value(&at, "messages.get"),
+            Ok(Some("a".repeat(SNIPPET_MAX_BYTES)))
+        );
+        // Measured after the references are decoded and controls replaced.
+        let past = json!({ "snippet": format!("{}&amp;\u{2}", "a".repeat(SNIPPET_MAX_BYTES - 1)) });
+        assert_eq!(
+            snippet_value(&past, "messages.get"),
+            Ok(Some(format!("{}&…", "a".repeat(SNIPPET_MAX_BYTES - 1))))
+        );
+        assert_eq!(snippet_value(&json!({}), "messages.get"), Ok(None));
+    }
+
+    #[test]
+    fn the_widest_search_page_fits_the_ceiling() {
+        // 128-byte ids, the longest a Gmail id may be.
+        let id = |prefix: char, i: usize| format!("{prefix}{i:0>127}");
+        let ids: Vec<String> = (0..25).map(|i| id('m', i)).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let list = listing(
+            &id_refs,
+            json!({ "nextPageToken": "\"".repeat(PAGE_MAX_BYTES), "resultSizeEstimate": u64::MAX }),
+        );
+        // Eight user labels per message, named so that each line's `labels`
+        // serializes to 1 715 bytes, the most the page's size arithmetic allows.
+        let label_ids: Vec<String> = (0..8).map(|i| format!("Label_{i}")).collect();
+        let names: Vec<Value> = (0..8)
+            .map(|i| json!({ "id": label_ids[i], "name": "n".repeat(if i < 2 { 212 } else { 211 }) }))
+            .collect();
+        // `"` and `\` serialize to two bytes each, the widest after `plain`.
+        let widest = |i: usize| {
+            json!({
+                "id": ids[i],
+                "threadId": id('t', i),
+                "labelIds": label_ids,
+                "snippet": "\\".repeat(SNIPPET_MAX_BYTES + 1),
+                "internalDate": "1793455509123",
+                "payload": { "headers": [
+                    { "name": "From", "value": "\"".repeat(HEADER_MAX_BYTES + 1) },
+                    { "name": "Subject", "value": "\"".repeat(HEADER_MAX_BYTES + 1) },
+                    { "name": "Date", "value": "\"".repeat(HEADER_MAX_BYTES + 1) },
+                ] },
+            })
+            .to_string()
+        };
+        let state = search_state(json!({ "q": "lunch", "max": 25 }));
+        let (mut state, _) = follow(&state, answered(&state, http(200, &list)));
+        for i in 0..24 {
+            (state, _) = follow(&state, answered(&state, http(200, &widest(i))));
+        }
+        let (state, call) = follow(&state, answered(&state, http(200, &widest(24))));
+        assert_eq!(call.step, LABELS_STEP);
+        let listing = json!({ "labels": names }).to_string();
+        let Next::Complete(answer) = answered(&state, http(200, &listing)) else {
+            panic!("the widest page did not complete");
+        };
+        let lines = answer["messages"].as_array().unwrap();
+        assert_eq!(lines.len(), 25);
+        assert_eq!(
+            lines[24]["headers_truncated"],
+            json!(["date", "from", "subject"])
+        );
+        for line in lines {
+            assert_eq!(serde_json::to_vec(&line["labels"]).unwrap().len(), 1715);
+        }
+        assert!(serde_json::to_vec(&answer).unwrap().len() <= COMPACT_RESULT_CEILING);
     }
 
     #[test]
@@ -2481,6 +2635,10 @@ mod tests {
             listing(&["m/1"], json!({})),
             listing(&["m1"], json!({ "nextPageToken": 7 })),
             listing(&["m1"], json!({ "resultSizeEstimate": "many" })),
+            listing(
+                &["m1"],
+                json!({ "nextPageToken": "p".repeat(PAGE_MAX_BYTES + 1) }),
+            ),
         ] {
             assert_eq!(answered(&state, http(200, &body)), shape_error, "{body}");
         }
@@ -2510,12 +2668,24 @@ mod tests {
         wrong_labels["labelIds"] = json!([1]);
         let mut wrong_snippet: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
         wrong_snippet["snippet"] = json!(null);
+        let mut label_not_an_id: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
+        label_not_an_id["labelIds"] = json!(["INBOX", "Label 7"]);
+        let mut thread_not_an_id: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
+        thread_not_an_id["threadId"] = json!("t/1");
+        let mut thread_too_long: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
+        thread_too_long["threadId"] = json!("t".repeat(ID_MAX_BYTES + 1));
+        let mut thread_not_a_string: Value = serde_json::from_str(&metadata("m1", &[])).unwrap();
+        thread_not_a_string["threadId"] = json!(7);
         for body in [
             metadata("m2", &[]),
             "{}".to_string(),
             wrong_date.to_string(),
             wrong_labels.to_string(),
             wrong_snippet.to_string(),
+            label_not_an_id.to_string(),
+            thread_not_an_id.to_string(),
+            thread_too_long.to_string(),
+            thread_not_a_string.to_string(),
         ] {
             assert_eq!(answered(&state, http(200, &body)), shape_error, "{body}");
         }
