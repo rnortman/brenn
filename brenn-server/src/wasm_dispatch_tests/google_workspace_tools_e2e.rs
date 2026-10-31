@@ -54,6 +54,7 @@ const MESSAGES: &str = "/gmail/v1/users/me/messages";
 const THREADS: &str = "/gmail/v1/users/me/threads";
 const CALENDAR_LIST: &str = "/calendar/v3/users/me/calendarList";
 const FREE_BUSY: &str = "/calendar/v3/freeBusy";
+const DRAFTS: &str = "/gmail/v1/users/me/drafts";
 
 /// The instance's `api-request` clauses, as method and exact path, each on
 /// the stub's host for any user: one per endpoint the tools call.
@@ -67,6 +68,7 @@ const CLAUSES: &[(&str, &str)] = &[
     ("GET", "/calendar/v3/calendars/*/events"),
     ("GET", "/calendar/v3/calendars/*/events/*"),
     ("POST", FREE_BUSY),
+    ("POST", DRAFTS),
 ];
 
 /// The component's `provide` statements, lowered from its packaged
@@ -612,10 +614,10 @@ struct FirstRead {
     body: String,
 }
 
-/// A tool of each Google API whose first call is a bare `GET`, and the one
-/// whose first call is a `POST`. The credential cases run on each, so each
-/// host's route and each method resolves the caller's account.
-fn first_reads() -> [FirstRead; 3] {
+/// A tool of each Google API whose first call is a bare `GET`, and one of
+/// each whose first call is a `POST`. The credential cases run on each, so
+/// each host's route and each method resolves the caller's account.
+fn first_reads() -> [FirstRead; 4] {
     [
         FirstRead {
             tool: "GmailLabels",
@@ -640,6 +642,14 @@ fn first_reads() -> [FirstRead; 3] {
             method: "POST",
             path: FREE_BUSY,
             body: json!({ "calendars": { "primary": { "busy": [] } } }).to_string(),
+        },
+        FirstRead {
+            tool: "GmailDraft",
+            slug: "gmail-draft",
+            args: json!({ "to": "bob@example.com", "subject": "Lunch", "body": "Friday?" }),
+            method: "POST",
+            path: DRAFTS,
+            body: draft_body(),
         },
     ]
 }
@@ -2024,6 +2034,256 @@ async fn a_free_busy_post_without_its_clause_could_not_be_issued() {
         .collect();
     let r = rig_with(&clauses, &[(ACCOUNT, BEARER)], None).await;
     let call = r.call_for_alice("CalendarFreeBusy", json!({ "from": FROM, "to": TO }));
+    let id = r.requested_id().await;
+    r.serve().await;
+
+    assert_could_not_be_issued(call.await.unwrap());
+    r.owed(&r.executor_sub(), 0).await;
+    assert!(r.seen().is_empty(), "a refused call reaches no API");
+    r.assert_finished(&id);
+}
+
+/// Google's draft resource for a new draft, as drafts.create answers it.
+fn draft_body() -> String {
+    serde_json::to_string_pretty(&json!({
+        "id": "r-5521",
+        "message": { "id": "m9", "threadId": "t9", "labelIds": ["DRAFT"] },
+    }))
+    .unwrap()
+}
+
+/// The tool's answer to [`draft_body`].
+fn draft_answer() -> serde_json::Value {
+    json!({ "draft_id": "r-5521", "message_id": "m9", "thread_id": "t9" })
+}
+
+/// A draft's message as the one `POST` carried it: the request body is
+/// `{"message": {"raw": …}}` and nothing else, `raw` is base64url, and the
+/// message is its headers, unfolded and in order, and its body, base64
+/// decoded.
+fn posted_message(bodies: &[Vec<u8>]) -> (Vec<(String, String)>, String) {
+    use base64ct::{Base64, Base64UrlUnpadded, Encoding as _};
+
+    assert_eq!(bodies.len(), 1, "exactly one POST carried a body");
+    let request: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+    let raw = request["message"]["raw"].as_str().expect("a raw message");
+    assert_eq!(
+        request,
+        json!({ "message": { "raw": raw } }),
+        "a fresh draft names no thread"
+    );
+    let message = String::from_utf8(Base64UrlUnpadded::decode_vec(raw).unwrap()).unwrap();
+    let (head, body) = message.split_once("\r\n\r\n").expect("a header block");
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in head.split("\r\n") {
+        assert!(line.len() <= 76, "a header line over 76: {line:?}");
+        match line.strip_prefix(' ') {
+            Some(continued) => {
+                let (_, value) = headers.last_mut().expect("a folded line continues one");
+                value.push(' ');
+                value.push_str(continued);
+            }
+            None => {
+                let (name, value) = line.split_once(": ").expect("a header line");
+                headers.push((name.to_string(), value.to_string()));
+            }
+        }
+    }
+    for line in body.split_terminator("\r\n") {
+        assert!(line.len() <= 76, "a body line over 76: {line:?}");
+    }
+    let body = Base64::decode_vec(&body.replace("\r\n", "")).unwrap();
+    (headers, String::from_utf8(body).unwrap())
+}
+
+/// The text of a header written as RFC 2047 `B` encoded-words in UTF-8.
+fn decoded_words(value: &str) -> String {
+    use base64ct::{Base64, Encoding as _};
+
+    let mut bytes = Vec::new();
+    for word in value.split(' ') {
+        let encoded = word
+            .strip_prefix("=?utf-8?B?")
+            .and_then(|word| word.strip_suffix("?="))
+            .unwrap_or_else(|| panic!("not an encoded-word: {word:?}"));
+        bytes.extend(Base64::decode_vec(encoded).unwrap());
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+/// The headers every draft carries after its addressing and subject.
+fn mime_headers() -> [(String, String); 3] {
+    [
+        ("MIME-Version", "1.0"),
+        ("Content-Type", "text/plain; charset=utf-8"),
+        ("Content-Transfer-Encoding", "base64"),
+    ]
+    .map(|(name, value)| (name.to_string(), value.to_string()))
+}
+
+/// `GmailDraft` creates a draft with one `POST` to drafts.create carrying
+/// alice's bearer and the message as `raw`: the given recipients and
+/// subject, no `From` or `Date`, and the body with CRLF line breaks. The
+/// answer names the draft, its message and its thread.
+#[tokio::test]
+async fn gmail_draft_posts_one_raw_message_with_the_users_bearer() {
+    let r = rig().await;
+    r.answer(DRAFTS, draft_body());
+    let call = r.call_for_alice(
+        "GmailDraft",
+        json!({
+            "to": "Bob Example <bob@example.com>, carol@example.com",
+            "cc": "dave@example.com",
+            "subject": "Lunch on Friday",
+            "body": "Hi Bob,\nNoon at the usual place?\n",
+        }),
+    );
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(call.await.unwrap(), Ok(draft_answer()));
+    assert_eq!(
+        r.seen(),
+        [("POST".to_string(), DRAFTS.to_string(), google_query(&[]))]
+    );
+    assert_eq!(r.bearers(), [format!("Bearer {BEARER}")]);
+    let (headers, body) = posted_message(&r.bodies());
+    let expected: Vec<(String, String)> = [
+        ("To", "Bob Example <bob@example.com>, carol@example.com"),
+        ("Cc", "dave@example.com"),
+        ("Subject", "Lunch on Friday"),
+    ]
+    .map(|(name, value)| (name.to_string(), value.to_string()))
+    .into_iter()
+    .chain(mime_headers())
+    .collect();
+    assert_eq!(headers, expected);
+    assert_eq!(body, "Hi Bob,\r\nNoon at the usual place?\r\n");
+    r.assert_finished(&id);
+}
+
+/// A subject outside ASCII is written as encoded-words that decode back to
+/// it, and a body outside ASCII travels as base64 of its UTF-8.
+#[tokio::test]
+async fn gmail_draft_encodes_a_non_ascii_subject_and_body() {
+    let subject = "Grüße aus Köln — 東京の会議について、来週の予定を確認させてください";
+    let r = rig().await;
+    r.answer(DRAFTS, draft_body());
+    let call = r.call_for_alice(
+        "GmailDraft",
+        json!({
+            "to": "bob@example.com",
+            "subject": subject,
+            "body": "Ça va ?\r\n日本語の本文。\n",
+        }),
+    );
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(call.await.unwrap(), Ok(draft_answer()));
+    let (headers, body) = posted_message(&r.bodies());
+    assert_eq!(headers.len(), 5, "{headers:?}");
+    assert_eq!(
+        headers[0],
+        ("To".to_string(), "bob@example.com".to_string())
+    );
+    let (name, value) = &headers[1];
+    assert_eq!(name, "Subject");
+    assert!(value.contains(' '), "a long subject spans words: {value}");
+    assert_eq!(decoded_words(value), subject);
+    assert_eq!(headers[2..], mime_headers());
+    assert_eq!(body, "Ça va ?\r\n日本語の本文。\r\n");
+    r.assert_finished(&id);
+}
+
+/// A line break in `to`, `cc` or `subject` is refused `invalid_args` naming
+/// the argument, before any call is issued.
+#[tokio::test]
+async fn gmail_draft_refuses_a_header_with_a_line_break_before_any_call() {
+    let ascii = "must be 1 to 980 printable ASCII characters (a display name in another script \
+                 is left out or written in ASCII)";
+    let cases = [
+        (
+            "to",
+            "bob@example.com\r\nBcc: eve@example.com",
+            format!("`to` {ascii}"),
+        ),
+        (
+            "cc",
+            "carol@example.com\nBcc: eve@example.com",
+            format!("`cc` {ascii}"),
+        ),
+        (
+            "subject",
+            "Lunch\r\nBcc: eve@example.com",
+            "`subject` holds a control character".to_string(),
+        ),
+        (
+            "subject",
+            "Lunch\rBcc: eve@example.com",
+            "`subject` holds a control character".to_string(),
+        ),
+    ];
+    for (key, value, refusal) in cases {
+        let r = rig().await;
+        let mut args = json!({ "to": "bob@example.com", "subject": "Lunch", "body": "Friday?" });
+        args[key] = json!(value);
+        let call = r.call_for_alice("GmailDraft", args);
+        let id = r.requested_id().await;
+        r.serve().await;
+
+        assert_eq!(
+            call.await.unwrap(),
+            Err(ToolError::InvalidArgs(refusal)),
+            "{key}: {value:?}"
+        );
+        r.owed(&r.executor_sub(), 0).await;
+        assert!(r.seen().is_empty(), "{key}: a refused draft reaches no API");
+        r.assert_finished(&id);
+    }
+}
+
+/// Google's 403 on the draft's `POST` is `denied`, telling the assistant to
+/// reconnect with the Gmail compose scope.
+#[tokio::test]
+async fn a_draft_403_names_the_compose_scope() {
+    let r = rig().await;
+    r.fail(DRAFTS, 403, insufficient_scope_body());
+    let call = r.call_for_alice(
+        "GmailDraft",
+        json!({ "to": "bob@example.com", "subject": "Lunch", "body": "Friday?" }),
+    );
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap(),
+        Err(ToolError::Denied(
+            "Google PERMISSION_DENIED (HTTP 403): Request had insufficient authentication \
+             scopes. If Google names insufficient authentication scopes, the account was \
+             connected without the Gmail compose scope: run oauth-connect with that scope set \
+             and relay its steps."
+                .to_string(),
+        ))
+    );
+    r.assert_finished(&id);
+}
+
+/// Without the drafts clause the draft's `POST` is refused when it is
+/// queued, even though free/busy's `POST` clause stands: the request is
+/// answered `internal` with Brenn's text and the clause guidance.
+#[tokio::test]
+async fn a_draft_post_without_its_clause_could_not_be_issued() {
+    let clauses: Vec<(&str, &str)> = CLAUSES
+        .iter()
+        .copied()
+        .filter(|&(_, path)| path != DRAFTS)
+        .collect();
+    let r = rig_with(&clauses, &[(ACCOUNT, BEARER)], None).await;
+    let call = r.call_for_alice(
+        "GmailDraft",
+        json!({ "to": "bob@example.com", "subject": "Lunch", "body": "Friday?" }),
+    );
     let id = r.requested_id().await;
     r.serve().await;
 

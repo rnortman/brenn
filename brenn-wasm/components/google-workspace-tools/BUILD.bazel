@@ -43,6 +43,7 @@ wasm_component(
 rust_test(
     name = "logic_test",
     srcs = [
+        "src/compose.rs",
         "src/decode.rs",
         "src/logic.rs",
         ":spec",

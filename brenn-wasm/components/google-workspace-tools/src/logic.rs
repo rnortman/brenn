@@ -11,9 +11,11 @@
 #[cfg(test)]
 mod spec;
 
-// The decoder is this module's child in the component and the host test
-// alike: the path resolves beside this file whether it is `crate::logic` or
-// the crate root.
+// The decoder and the draft builder are this module's children in the
+// component and the host test alike: the path resolves beside this file
+// whether it is `crate::logic` or the crate root.
+#[path = "compose.rs"]
+mod compose;
 #[path = "decode.rs"]
 mod decode;
 
@@ -268,10 +270,38 @@ const LISTING_TEXT_MAX_BYTES: usize = 300;
 /// it; it exists so an answer's size is bounded, and a cut is not flagged.
 const SHORT_MAX_BYTES: usize = 64;
 
+/// The path Gmail creates drafts at. Nothing below it is ever called: a
+/// draft is sent only by the user, from Gmail.
+const DRAFTS_PATH: &str = "/gmail/v1/users/me/drafts";
+/// `GmailDraft`'s one step: the draft's `POST`.
+const DRAFT_CREATE_STEP: u8 = 1;
+/// The most bytes of a header value a draft carries: RFC 5322 holds a line to
+/// 998 characters, and the longest header name written before a bounded value
+/// is `In-Reply-To: ` (13), so a value this long fits its line unfolded.
+const HEADER_VALUE_MAX_BYTES: usize = 980;
+/// The most characters a draft's `subject` may hold.
+const SUBJECT_MAX_CHARS: usize = 500;
+/// The most characters a draft's `body` may hold, as its schema states it.
+const BODY_MAX_CHARS: usize = 20_000;
+/// The most bytes a draft's body may hold in its CRLF form, a lone line break
+/// counting as the two bytes it becomes. The body travels as base64 of that
+/// form inside `raw`, itself base64url of the message, inside the nested
+/// call's args, which the host caps at 64 KiB: with `to` and `cc` at
+/// `HEADER_VALUE_MAX_BYTES`, `subject` at its cap as encoded-words and
+/// `account` at its escaped width, the widest admitted call serializes to
+/// about 49 000 bytes.
+const BODY_MAX_BYTES: usize = 20_000;
+/// What the caller is told when a draft's `POST` may have been acted on and
+/// its answer was lost or unreadable.
+const DRAFT_UNKNOWN_HINT: &str = "the draft may have been created before its answer was lost: \
+                                  look for it with GmailSearch (`q: in:drafts`) before asking \
+                                  again, or the user has two";
+
 /// The Google scope a step's call needs, named in a 403's hint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     GmailRead,
+    GmailCompose,
     CalendarRead,
 }
 
@@ -281,6 +311,7 @@ impl Scope {
     fn name(self) -> &'static str {
         match self {
             Scope::GmailRead => "Gmail read",
+            Scope::GmailCompose => "Gmail compose",
             Scope::CalendarRead => "Calendar read",
         }
     }
@@ -297,6 +328,7 @@ fn scope(tool: Provided, step: u8) -> Scope {
             | Provided::GmailThread,
             _,
         ) => Scope::GmailRead,
+        (Provided::GmailDraft, _) => Scope::GmailCompose,
         (
             Provided::CalendarList
             | Provided::CalendarEvents
@@ -643,6 +675,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
             Ok(Call {
                 step: 1,
                 api: free_busy_call(&free_busy, settings),
+            })
+        }
+        Provided::GmailDraft => {
+            let draft = DraftArgs::parse(args)?;
+            Ok(Call {
+                step: DRAFT_CREATE_STEP,
+                api: draft_create_call(&draft, settings),
             })
         }
     }
@@ -998,6 +1037,132 @@ fn free_busy_call(args: &FreeBusyArgs, settings: &Settings) -> ApiCall {
     )
 }
 
+/// `GmailDraft`'s arguments, each header value held to what the message
+/// builder writes without encoding or stripping.
+struct DraftArgs {
+    to: String,
+    cc: Option<String>,
+    subject: String,
+    body: compose::Body,
+    account: Option<String>,
+}
+
+impl DraftArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["to", "cc", "subject", "body", "account"];
+
+    fn parse(args: &Value) -> Result<DraftArgs, String> {
+        let map = object(args, Self::KEYS)?;
+        Ok(DraftArgs {
+            to: header_ascii(map, "to")?.ok_or("`to` is required")?,
+            cc: header_ascii(map, "cc")?,
+            subject: subject(map)?.ok_or("`subject` is required")?,
+            body: body(map)?.ok_or("`body` is required")?,
+            account: account(map)?,
+        })
+    }
+}
+
+/// A recipient header argument: 1 to `HEADER_VALUE_MAX_BYTES` printable
+/// ASCII characters, so it is written folded and never encoded. A display
+/// name in another script would need the address list parsed to encode it.
+fn header_ascii(args: &Args, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) if is_header_ascii(value) => Ok(Some(value.clone())),
+        Some(_) => Err(format!(
+            "`{key}` must be 1 to {HEADER_VALUE_MAX_BYTES} printable ASCII characters (a \
+             display name in another script is left out or written in ASCII)"
+        )),
+    }
+}
+
+/// Whether `value` is 1 to `HEADER_VALUE_MAX_BYTES` bytes of 0x20 to 0x7E.
+fn is_header_ascii(value: &str) -> bool {
+    (1..=HEADER_VALUE_MAX_BYTES).contains(&value.len())
+        && value.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// What `is_header_ascii` admits, as the `pattern` an `input_schema` states
+/// it.
+#[cfg(test)]
+fn header_ascii_pattern() -> String {
+    format!(r"^[\x20-\x7e]{{1,{HEADER_VALUE_MAX_BYTES}}}$")
+}
+
+/// A draft's `subject`: at most `SUBJECT_MAX_CHARS` characters, no control
+/// character (a line break included).
+fn subject(args: &Args) -> Result<Option<String>, String> {
+    let Some(subject) = capped(args, "subject", SUBJECT_MAX_CHARS)? else {
+        return Ok(None);
+    };
+    if subject.chars().any(char::is_control) {
+        return Err("`subject` holds a control character".to_string());
+    }
+    Ok(Some(subject.to_string()))
+}
+
+/// A draft's `body` in its CRLF form: at most `BODY_MAX_CHARS` characters as
+/// given and `BODY_MAX_BYTES` bytes as sent; any character.
+fn body(args: &Args) -> Result<Option<compose::Body>, String> {
+    let Some(body) = capped(args, "body", BODY_MAX_CHARS)? else {
+        return Ok(None);
+    };
+    let body = compose::canonical(body);
+    if body.as_str().len() > BODY_MAX_BYTES {
+        return Err(format!(
+            "`body` is longer than {BODY_MAX_BYTES} bytes (UTF-8, a line break counting as two)"
+        ));
+    }
+    Ok(Some(body))
+}
+
+/// drafts.create of the message the arguments describe, as `raw`. The `POST`
+/// creates a draft and sends nothing.
+fn draft_create_call(args: &DraftArgs, settings: &Settings) -> ApiCall {
+    let message = compose::message(&compose::Message {
+        to: &args.to,
+        cc: args.cc.as_deref(),
+        subject: &args.subject,
+        in_reply_to: None,
+        references: None,
+        body: &args.body,
+    });
+    post_json_call(
+        settings,
+        &settings.gmail_host,
+        args.account.as_deref(),
+        DRAFTS_PATH.to_string(),
+        Query::new(),
+        json!({ "message": { "raw": compose::base64url(&message) } }),
+    )
+}
+
+/// drafts.create's answer, Google's draft resource, as the draft's ids:
+/// `draft_id`, `message_id`, and `thread_id` when Google gave it. Nothing of
+/// the message is echoed; the caller wrote it.
+fn compact_draft(body: &Value) -> Result<Value, Failure> {
+    let api = "drafts.create";
+    let gmail_id = |value: Option<&Value>| match value {
+        Some(Value::String(id)) if is_gmail_id(id) => Ok(id.clone()),
+        _ => Err(shape(api)),
+    };
+    let draft = gmail_id(body.get("id"))?;
+    let Some(Value::Object(message)) = body.get("message") else {
+        return Err(shape(api));
+    };
+    let mut out = Args::new();
+    out.insert("draft_id".to_string(), json!(draft));
+    out.insert(
+        "message_id".to_string(),
+        json!(gmail_id(message.get("id"))?),
+    );
+    if let Some(thread) = message.get("threadId") {
+        out.insert("thread_id".to_string(), json!(gmail_id(Some(thread))?));
+    }
+    Ok(Value::Object(out))
+}
+
 /// labels.list for the names of the user labels an answer carries.
 fn label_names_call(account: Option<&str>, settings: &Settings) -> ApiCall {
     get_call(
@@ -1202,11 +1367,8 @@ fn google_error(status: u64, body: &str, scope: Scope) -> Failure {
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
     let body = match read_api_result(outcome, &state.target) {
         Ok(Answer::Body(body)) => body,
-        // Every step reads a JSON answer; none accepts an empty one.
         Ok(Answer::NoBody { status }) => {
-            return Next::Fail(internal(format!(
-                "Google answered HTTP {status} with no body"
-            )));
+            return Next::Fail(at_write(state, no_body(state, status)));
         }
         Ok(Answer::Relay(value)) => return Next::Complete(value),
         Ok(Answer::Unreadable(why)) => return unreadable(state, why, settings),
@@ -1221,13 +1383,19 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             return settle(state.tool, search_message(state, Read::Deleted, settings));
         }
         Ok(Answer::Error { status, body }) => {
-            return Next::Fail(google_error(status, &body, scope(state.tool, state.step)));
+            return Next::Fail(at_write(
+                state,
+                google_error(status, &body, scope(state.tool, state.step)),
+            ));
         }
-        Err(failure) => return Next::Fail(failure),
+        Err(failure) => return Next::Fail(at_write(state, failure)),
     };
     settle(
         state.tool,
         match (state.tool, state.step) {
+            (Provided::GmailDraft, DRAFT_CREATE_STEP) => compact_draft(&body)
+                .map(Next::Complete)
+                .map_err(|failure| at_write(state, failure)),
             (Provided::GmailLabels, 1) => stored(state, LabelsArgs::parse)
                 .and_then(|args| match args.id {
                     Some(_) => compact_label(&body),
@@ -1260,11 +1428,15 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
 }
 
 /// A nested read that was cut or refused, decided by the step's shape: a
-/// per-message read of a search page is listed unavailable and the page goes
-/// on; a message's or a thread's first read is asked for again narrower,
-/// carrying why; a window's events or free/busy fail with why and what to
-/// narrow; every other step fails with why.
+/// write step fails with why and its hint; a per-message read of a search
+/// page is listed unavailable and the page goes on; a message's or a
+/// thread's first read is asked for again narrower, carrying why; a window's
+/// events or free/busy fail with why and what to narrow; every other step
+/// fails with why.
 fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
+    if let Some(hint) = write_hint(state.tool, state.step) {
+        return settle(state.tool, Err(why.failure(Some(hint))));
+    }
     settle(
         state.tool,
         match (state.tool, state.step) {
@@ -1300,6 +1472,59 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
     )
 }
 
+/// The hint a write step's failure carries when Google may have acted: what
+/// the caller can look for, or that asking again is safe. `None` for a read.
+/// Every write step has its row here and nowhere else.
+fn write_hint(tool: Provided, step: u8) -> Option<&'static str> {
+    match (tool, step) {
+        (Provided::GmailDraft, DRAFT_CREATE_STEP) => Some(DRAFT_UNKNOWN_HINT),
+        _ => None,
+    }
+}
+
+/// `failure` as the request answers it: at a write step, an `internal`
+/// failure — a 2xx answer this component cannot read, a nested error the kit
+/// does not map, or a Google error the status mapping answers `internal` (a
+/// 5xx, a 429) — carries the step's hint, since Google may have acted before
+/// answering. A `denied` failure or Google's `invalid_args` refusal carries
+/// none.
+fn at_write(state: &InFlight, failure: Failure) -> Failure {
+    match write_hint(state.tool, state.step) {
+        Some(hint) if failure.kind == ErrorKind::Internal => {
+            internal(format!("{}; {hint}", failure.detail))
+        }
+        _ => failure,
+    }
+}
+
+/// A 2xx with no body, which no step accepts: each names the API whose
+/// answer it expected, as that step's `shape` failure names it.
+fn no_body(state: &InFlight, status: u64) -> Failure {
+    let (api, answers) = match (state.tool, state.step) {
+        (Provided::GmailDraft, DRAFT_CREATE_STEP) => ("drafts.create", "the draft"),
+        (Provided::GmailLabels, 1) => match stored(state, LabelsArgs::parse) {
+            Ok(LabelsArgs { id: Some(_), .. }) => ("labels.get", "JSON"),
+            Ok(LabelsArgs { id: None, .. }) => ("labels.list", "JSON"),
+            Err(failure) => return failure,
+        },
+        (Provided::GmailSearch, 1) => ("messages.list", "JSON"),
+        (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET)
+        | (Provided::GmailRead, 1 | STRUCTURE_STEP) => ("messages.get", "JSON"),
+        (Provided::GmailThread, 1 | THREAD_NARROW_STEP) => ("threads.get", "JSON"),
+        (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
+            ("labels.list", "JSON")
+        }
+        (Provided::CalendarList, 1) => ("calendarList.list", "JSON"),
+        (Provided::CalendarEvents, 1) => ("events.list", "JSON"),
+        (Provided::CalendarEvent, 1) => ("events.get", "JSON"),
+        (Provided::CalendarFreeBusy, 1) => ("freebusy.query", "JSON"),
+        (tool, step) => return no_such_step(tool, step),
+    };
+    internal(format!(
+        "Google answered HTTP {status} with no body where {api} answers {answers}"
+    ))
+}
+
 /// A step's decision as the request's next move, a completed answer held to
 /// the result ceiling — after `GmailRead`'s text or `CalendarEvent`'s
 /// description is cut, or `GmailThread`'s oldest messages dropped, to fit it;
@@ -1317,7 +1542,8 @@ fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
                 Provided::GmailLabels
                 | Provided::GmailSearch
                 | Provided::CalendarList
-                | Provided::CalendarEvents => (value, None),
+                | Provided::CalendarEvents
+                | Provided::GmailDraft => (value, None),
             };
             bounded(value, COMPACT_RESULT_CEILING, hint)
         }
@@ -4795,19 +5021,22 @@ mod tests {
             | Provided::CalendarEvents
             | Provided::CalendarEvent
             | Provided::CalendarFreeBusy => vec![1],
+            Provided::GmailDraft => vec![DRAFT_CREATE_STEP],
         }
     }
 
     #[test]
     fn every_step_names_its_scope() {
         for tool in Provided::ALL {
-            let expected = if tool.name().starts_with("gmail-") {
-                Scope::GmailRead
-            } else {
-                assert!(tool.name().starts_with("calendar-"), "{}", tool.name());
-                Scope::CalendarRead
-            };
             for step in steps(tool) {
+                let expected = match (tool, step) {
+                    (Provided::GmailDraft, DRAFT_CREATE_STEP) => Scope::GmailCompose,
+                    _ if tool.name().starts_with("gmail-") => Scope::GmailRead,
+                    _ => {
+                        assert!(tool.name().starts_with("calendar-"), "{}", tool.name());
+                        Scope::CalendarRead
+                    }
+                };
                 assert_eq!(scope(tool, step), expected, "{} step {step}", tool.name());
             }
         }
@@ -5390,15 +5619,34 @@ mod tests {
             |id: String| free_busy(json!({ "from": FROM, "to": TO, "calendars": [id] }));
         assert!(calendars(wide(CALENDAR_ID_MAX_CHARS)).is_ok());
         assert!(calendars(wide(CALENDAR_ID_MAX_CHARS + 1)).is_err());
+        admits_characters(draft, draft_args(json!({})), "subject", SUBJECT_MAX_CHARS);
+        // `body`'s character cap holds for ASCII; for wider text its byte
+        // budget is the narrower rule.
+        let body = |text: String| draft(draft_args(json!({ "body": text })));
+        assert!(body("x".repeat(BODY_MAX_CHARS)).is_ok());
+        assert_eq!(
+            body("x".repeat(BODY_MAX_CHARS + 1)).unwrap_err(),
+            "`body` is longer than 20000 characters"
+        );
+        let over_bytes = "`body` is longer than 20000 bytes (UTF-8, a line break counting as two)";
+        assert!(body(wide(BODY_MAX_BYTES / 2)).is_ok());
+        assert_eq!(body(wide(BODY_MAX_BYTES / 2 + 1)).unwrap_err(), over_bytes);
+        assert_eq!(
+            body(format!("x{}", "\n".repeat(BODY_MAX_CHARS - 1))).unwrap_err(),
+            over_bytes
+        );
     }
 
     /// Every argument `tool` takes, with the bound its parser holds it to,
     /// and the arguments it requires: the parser's own constants and key
     /// lists, as `every_tools_schema_states_what_its_parser_enforces` holds
-    /// the spec to them. One parser rule is outside what a schema states,
-    /// leaving the schema wider than the parser: `calendars`' ids together
-    /// hold at most `FREEBUSY_IDS_MAX_BYTES`, which the description states, as
-    /// `every_description_states_its_parsers_budgets` holds it to.
+    /// the spec to them. Three parser rules are outside what a schema states,
+    /// each leaving the schema wider than the parser and each in the
+    /// description: `calendars`' ids together hold at most
+    /// `FREEBUSY_IDS_MAX_BYTES`, and a draft's `body` at most `BODY_MAX_BYTES`
+    /// in its CRLF form, as `every_description_states_its_parsers_budgets`
+    /// holds them; a draft's `subject` holds no control character. Their
+    /// probes are this component's, in `workspace_probes`.
     fn bounds(tool: Provided) -> ToolBounds<'static> {
         let (keys, required): (&'static [&'static str], &'static [&'static str]) = match tool {
             Provided::GmailLabels => (LabelsArgs::KEYS, &[]),
@@ -5409,6 +5657,7 @@ mod tests {
             Provided::CalendarEvents => (EventsArgs::KEYS, &["from", "to"]),
             Provided::CalendarEvent => (EventArgs::KEYS, &["id"]),
             Provided::CalendarFreeBusy => (FreeBusyArgs::KEYS, &["from", "to"]),
+            Provided::GmailDraft => (DraftArgs::KEYS, &["to", "subject", "body"]),
         };
         let text = |max_chars| Bound::Text {
             max_chars,
@@ -5418,6 +5667,9 @@ mod tests {
         let property = |key: &'static str| {
             let bound = match (tool, key) {
                 (_, "account") => text(ACCOUNT_MAX_CHARS),
+                (Provided::GmailDraft, "to" | "cc") => Bound::Pattern(header_ascii_pattern()),
+                (Provided::GmailDraft, "subject") => text(SUBJECT_MAX_CHARS),
+                (Provided::GmailDraft, "body") => text(BODY_MAX_CHARS),
                 (_, "q") => text(QUERY_MAX_CHARS),
                 (_, "page") => text(PAGE_MAX_CHARS),
                 (_, "from" | "to") => text(TIME_MAX_CHARS),
@@ -5462,15 +5714,66 @@ mod tests {
             Provided::CalendarEvents | Provided::CalendarFreeBusy => {
                 json!({ "from": FROM, "to": TO })
             }
+            Provided::GmailDraft => draft_args(json!({})),
         }
     }
 
-    /// The probes of the arguments whose bounds are this component's: the
-    /// calendar id, alone as `calendar` and as `calendars`' items.
-    fn calendar_probes(key: &str) -> Probes {
+    /// The probes of the arguments whose bounds are this component's, or
+    /// whose parser holds a rule past the kit's bound: the calendar id, alone
+    /// as `calendar` and as `calendars`' items, and a draft's header values
+    /// and body. `None` where the kit's probes for the bound hold.
+    fn workspace_probes(tool: Provided, key: &str, bound: &Bound) -> Option<Probes> {
         let ids = |n: usize| json!((0..n).map(|i| format!("c{i}")).collect::<Vec<_>>());
-        match key {
-            "calendar" => Probes {
+        let strings = |values: &[&str]| values.iter().map(|v| json!(v)).collect::<Vec<_>>();
+        Some(match (tool, key) {
+            (Provided::GmailDraft, "to" | "cc") => Probes {
+                admitted: strings(&[
+                    &"x".repeat(HEADER_VALUE_MAX_BYTES),
+                    "Alice Example <alice@example.com>, bob@example.com",
+                    "~",
+                ]),
+                refused: [
+                    strings(&[
+                        &"x".repeat(HEADER_VALUE_MAX_BYTES + 1),
+                        "",
+                        "é",
+                        "a\rb",
+                        "a\nb",
+                        "a\tb",
+                        "a\u{7f}b",
+                    ]),
+                    vec![json!(1)],
+                ]
+                .concat(),
+            },
+            (Provided::GmailDraft, "subject") => {
+                let mut probes = probes(bound).expect("a text bound has probes");
+                probes
+                    .refused
+                    .extend(strings(&["a\u{1}b", "a\r\nb", "a\tb", "a\u{85}b"]));
+                probes
+            }
+            (Provided::GmailDraft, "body") => Probes {
+                admitted: strings(&[
+                    &"x".repeat(BODY_MAX_CHARS),
+                    &wide(BODY_MAX_BYTES / 2),
+                    &format!("x{}", "\n".repeat(BODY_MAX_BYTES / 2 - 1)),
+                    "a\u{1}\r\n\tb",
+                ]),
+                refused: [
+                    strings(&[
+                        &"x".repeat(BODY_MAX_CHARS + 1),
+                        // The byte budget the schema cannot state.
+                        &wide(BODY_MAX_BYTES / 2 + 1),
+                        &format!("x{}", "\n".repeat(BODY_MAX_CHARS - 1)),
+                        "",
+                        " \t\n\u{85}\u{3000}",
+                    ]),
+                    vec![json!(1)],
+                ]
+                .concat(),
+            },
+            (_, "calendar") => Probes {
                 admitted: [
                     wide(CALENDAR_ID_MAX_CHARS),
                     "team@group.calendar.example.com".to_string(),
@@ -5501,7 +5804,7 @@ mod tests {
                 .chain([json!(1)])
                 .collect(),
             },
-            "calendars" => Probes {
+            (_, "calendars") => Probes {
                 admitted: vec![ids(1), ids(FREEBUSY_CALENDARS_MAX)],
                 refused: vec![
                     ids(0),
@@ -5519,8 +5822,8 @@ mod tests {
                     ),
                 ],
             },
-            other => panic!("`{other}` has no probes"),
-        }
+            _ => return None,
+        })
     }
 
     /// Each tool's `input_schema` states exactly the bounds its parser
@@ -5545,7 +5848,9 @@ mod tests {
                 hold_required(name, key, &base, plan_with);
             }
             for (key, bound) in &bounds.properties {
-                let probes = probes(bound).unwrap_or_else(|| calendar_probes(key));
+                let probes = workspace_probes(tool, key, bound)
+                    .or_else(|| probes(bound))
+                    .unwrap_or_else(|| panic!("`{name}`'s `{key}` has no probes"));
                 hold_probes(name, key, &probes, &base, plan_with);
             }
         }
@@ -5571,14 +5876,31 @@ mod tests {
             .join("../../../config/specs/google-workspace-tools.brenn");
         let spec = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
-        let tool = Provided::CalendarFreeBusy;
-        let budget =
-            format!("the ids together may hold at most {FREEBUSY_IDS_MAX_BYTES} bytes of UTF-8");
-        assert!(
-            description(&spec, tool.name()).contains(&budget),
-            "`{}`'s description must say {budget:?}",
-            tool.name()
-        );
+        for (tool, budget) in [
+            (
+                Provided::CalendarFreeBusy,
+                format!(
+                    "the ids together may hold at most {FREEBUSY_IDS_MAX_BYTES} bytes of UTF-8"
+                ),
+            ),
+            (
+                Provided::GmailDraft,
+                format!(
+                    "at most {BODY_MAX_CHARS} characters and about {BODY_MAX_BYTES} bytes of \
+                     UTF-8 text, where a line break counts as two"
+                ),
+            ),
+            (
+                Provided::GmailDraft,
+                format!("each 1 to {HEADER_VALUE_MAX_BYTES} printable ASCII characters"),
+            ),
+        ] {
+            assert!(
+                description(&spec, tool.name()).contains(&budget),
+                "`{}`'s description must say {budget:?}",
+                tool.name()
+            );
+        }
     }
 
     #[test]
@@ -6600,6 +6922,360 @@ mod tests {
         );
     }
 
+    /// A draft's arguments: `alice@example.com`, `Lunch`, `Noon?`, with
+    /// `extra` set over them.
+    fn draft_args(extra: Value) -> Value {
+        let mut args = json!({ "to": "alice@example.com", "subject": "Lunch", "body": "Noon?" });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        args
+    }
+
+    fn draft(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::GmailDraft, &args, &settings()).map(|call| {
+            assert_eq!(call.step, DRAFT_CREATE_STEP);
+            call.api
+        })
+    }
+
+    fn draft_state(args: Value) -> InFlight {
+        let call = plan(Provided::GmailDraft, &args, &settings()).unwrap();
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::GmailDraft,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        )
+    }
+
+    /// The message a draft call carries in `raw`, decoded.
+    fn raw_message(call: &ApiCall) -> String {
+        let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+        let raw = body["message"]["raw"].as_str().unwrap();
+        assert!(
+            raw.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "unpadded base64url"
+        );
+        String::from_utf8(decode::base64url(raw).unwrap()).unwrap()
+    }
+
+    /// A message's body, its base64 lines decoded.
+    fn message_body(message: &str) -> String {
+        let (_, body) = message.split_once("\r\n\r\n").unwrap();
+        String::from_utf8(decode::base64url(body).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_draft_posts_one_raw_message_on_the_gmail_host() {
+        let call = draft(draft_args(json!({
+            "cc": "Bob Example <bob@example.com>",
+            "account": "alice@example.com",
+        })))
+        .unwrap();
+        assert_eq!(
+            call,
+            ApiCall {
+                provider: "google".to_string(),
+                account: Some("alice@example.com".to_string()),
+                method: "POST".to_string(),
+                host: "gmail.example.com".to_string(),
+                path: "/gmail/v1/users/me/drafts".to_string(),
+                query: query([("prettyPrint", "false".to_string())]),
+                headers: BTreeMap::new(),
+                body: call.body.clone(),
+            }
+        );
+        let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["message"]
+        );
+        assert_eq!(
+            body["message"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["raw"],
+            "a fresh draft names no thread"
+        );
+        assert_eq!(
+            raw_message(&call),
+            "To: alice@example.com\r\n\
+             Cc: Bob Example <bob@example.com>\r\n\
+             Subject: Lunch\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             \r\n\
+             Tm9vbj8=\r\n"
+        );
+    }
+
+    #[test]
+    fn a_non_ascii_subject_and_body_are_encoded() {
+        let call = draft(draft_args(json!({
+            "subject": "Grüße aus Köln",
+            "body": "Привет,\nмир\r\n🎵",
+        })))
+        .unwrap();
+        let message = raw_message(&call);
+        assert!(message.is_ascii(), "{message}");
+        assert!(
+            message.contains("\r\nSubject: =?utf-8?B?R3LDvMOfZSBhdXMgS8O2bG4=?=\r\n"),
+            "{message}"
+        );
+        assert_eq!(message_body(&message), "Привет,\r\nмир\r\n🎵");
+    }
+
+    #[test]
+    fn a_draft_refuses_bad_arguments() {
+        let header = |key: &str| {
+            format!(
+                "`{key}` must be 1 to 980 printable ASCII characters (a display \
+                                 name in another script is left out or written in ASCII)"
+            )
+        };
+        let without = |key: &str| {
+            let mut args = draft_args(json!({}));
+            args.as_object_mut().unwrap().remove(key);
+            args
+        };
+        for (args, refusal) in [
+            (without("to"), "`to` is required".to_string()),
+            (without("subject"), "`subject` is required".to_string()),
+            (without("body"), "`body` is required".to_string()),
+            (draft_args(json!({ "to": "" })), header("to")),
+            (
+                draft_args(json!({ "to": "Zoë <zoe@example.com>" })),
+                header("to"),
+            ),
+            (
+                draft_args(json!({ "to": "a@example.com\r\nBcc: b@example.com" })),
+                header("to"),
+            ),
+            (draft_args(json!({ "cc": "x".repeat(981) })), header("cc")),
+            (
+                draft_args(json!({ "cc": ["bob@example.com"] })),
+                header("cc"),
+            ),
+            (
+                draft_args(json!({ "subject": "Lunch\r\nBcc: bob@example.com" })),
+                "`subject` holds a control character".to_string(),
+            ),
+            (
+                draft_args(json!({ "subject": "Lunch\u{85}" })),
+                "`subject` holds a control character".to_string(),
+            ),
+            (
+                draft_args(json!({ "subject": "x".repeat(SUBJECT_MAX_CHARS + 1) })),
+                "`subject` is longer than 500 characters".to_string(),
+            ),
+            (
+                draft_args(json!({ "body": " \n" })),
+                "`body` is empty".to_string(),
+            ),
+            (
+                draft_args(json!({ "bcc": "bob@example.com" })),
+                "unknown argument `bcc`; this tool takes `to`, `cc`, `subject`, `body`, `account`"
+                    .to_string(),
+            ),
+        ] {
+            assert_eq!(draft(args.clone()).unwrap_err(), refusal, "{args}");
+        }
+        // A body may hold any character.
+        let call = draft(draft_args(json!({ "body": "a\u{1}\tb\r" }))).unwrap();
+        assert_eq!(message_body(&raw_message(&call)), "a\u{1}\tb\r\n");
+    }
+
+    #[test]
+    fn a_draft_answers_its_ids() {
+        let state = draft_state(draft_args(json!({})));
+        let resource = json!({
+            "id": "r-123",
+            "message": { "id": "m1", "threadId": "t1", "labelIds": ["DRAFT"] },
+        });
+        assert_eq!(
+            answered(&state, http(200, &resource.to_string())),
+            Next::Complete(json!({ "draft_id": "r-123", "message_id": "m1", "thread_id": "t1" }))
+        );
+        let resource = json!({ "id": "r-123", "message": { "id": "m1" } });
+        assert_eq!(
+            answered(&state, http(200, &resource.to_string())),
+            Next::Complete(json!({ "draft_id": "r-123", "message_id": "m1" }))
+        );
+    }
+
+    #[test]
+    fn a_draft_answer_of_another_shape_is_internal_with_the_hint() {
+        let state = draft_state(draft_args(json!({})));
+        let refusal =
+            format!("unexpected Google drafts.create response shape; {DRAFT_UNKNOWN_HINT}");
+        for resource in [
+            json!([]),
+            json!({ "message": { "id": "m1" } }),
+            json!({ "id": "r/1", "message": { "id": "m1" } }),
+            json!({ "id": "r1" }),
+            json!({ "id": "r1", "message": "m1" }),
+            json!({ "id": "r1", "message": { "id": 1 } }),
+            json!({ "id": "r1", "message": { "id": "m1", "threadId": "t 1" } }),
+        ] {
+            assert_eq!(
+                answered(&state, http(200, &resource.to_string())),
+                Next::Fail(internal(refusal.clone())),
+                "{resource}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_steps_internal_failure_carries_its_hint_and_a_denied_one_does_not() {
+        let state = draft_state(draft_args(json!({})));
+        let hinted = |detail: &str| Next::Fail(internal(format!("{detail}; {DRAFT_UNKNOWN_HINT}")));
+        assert_eq!(
+            answered(&state, nested("invalid_args", "bad wrapper")),
+            hinted("api-request rejected the wrapper's request: bad wrapper")
+        );
+        assert_eq!(
+            answered(&state, nested("rate_limited", "slow down")),
+            hinted("rate_limited: slow down")
+        );
+        assert_eq!(
+            answered(&state, http(200, "<html>")),
+            hinted("Google returned HTTP 200 with a body that is not JSON")
+        );
+        assert_eq!(
+            answered(&state, http(302, "")),
+            hinted("Google answered 302 with a redirect, which Brenn does not follow")
+        );
+        let Next::Fail(denied) = answered(&state, nested("denied", "no clause admits it")) else {
+            panic!("a refused call fails");
+        };
+        assert_eq!(denied.kind, ErrorKind::Denied);
+        assert!(
+            !denied.detail.contains(DRAFT_UNKNOWN_HINT),
+            "{}",
+            denied.detail
+        );
+        // A Google error mapped `internal` may follow a saved draft; a 400,
+        // 403 or 404 is Google's refusal and carries no hint.
+        for status in [500, 503] {
+            let Next::Fail(failed) = answered(&state, http(status, "{}")) else {
+                panic!("a {status} fails");
+            };
+            assert_eq!(failed.kind, ErrorKind::Internal);
+            assert!(
+                failed.detail.ends_with(&format!("; {DRAFT_UNKNOWN_HINT}")),
+                "{}",
+                failed.detail
+            );
+        }
+        for status in [400, 403, 404] {
+            let Next::Fail(refused) = answered(&state, http(status, "{}")) else {
+                panic!("a {status} fails");
+            };
+            assert_ne!(refused.kind, ErrorKind::Internal);
+            assert!(
+                !refused.detail.contains(DRAFT_UNKNOWN_HINT),
+                "{}",
+                refused.detail
+            );
+        }
+        // A read step's failure carries no hint.
+        assert_eq!(
+            answered(
+                &labels_state(json!({})),
+                nested("invalid_args", "bad wrapper")
+            ),
+            Next::Fail(internal(
+                "api-request rejected the wrapper's request: bad wrapper"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_draft_403_names_the_compose_scope() {
+        let body = google(
+            403,
+            "PERMISSION_DENIED",
+            "Request had insufficient authentication scopes.",
+        );
+        assert_eq!(
+            answered(&draft_state(draft_args(json!({}))), http(403, &body)),
+            Next::Fail(failure(
+                ErrorKind::Denied,
+                "Google PERMISSION_DENIED (HTTP 403): Request had insufficient authentication \
+                 scopes. If Google names insufficient authentication scopes, the account was \
+                 connected without the Gmail compose scope: run oauth-connect with that scope \
+                 set and relay its steps."
+            ))
+        );
+    }
+
+    #[test]
+    fn a_draft_never_calls_a_send_path() {
+        for args in [
+            draft_args(json!({})),
+            draft_args(json!({ "cc": "bob@example.com", "account": "alice@example.com" })),
+        ] {
+            let call = draft(args).unwrap();
+            assert_eq!(call.method, "POST");
+            assert_eq!(call.path, DRAFTS_PATH);
+            assert!(!call.path.contains("send"));
+            assert!(call.query.keys().all(|key| key == "prettyPrint"));
+        }
+        // Every answer to the one step completes or fails; none issues a call.
+        let state = draft_state(draft_args(json!({})));
+        for outcome in [
+            http(200, r#"{"id":"r1","message":{"id":"m1"}}"#),
+            http(204, ""),
+            http(500, "{}"),
+            cut_read(json!(300000)),
+        ] {
+            assert!(
+                !matches!(answered(&state, outcome), Next::Call { .. }),
+                "a draft issues one call"
+            );
+        }
+    }
+
+    #[test]
+    fn the_widest_draft_fits_the_args_cap() {
+        let with = |body: String| {
+            draft(json!({
+                "to": "x".repeat(HEADER_VALUE_MAX_BYTES),
+                "cc": "y".repeat(HEADER_VALUE_MAX_BYTES),
+                "subject": four_byte(0, SUBJECT_MAX_CHARS),
+                "body": body,
+                "account": escaped_widest(ACCOUNT_MAX_CHARS),
+            }))
+        };
+        let four_byte_body = four_byte(1, BODY_MAX_BYTES / 4);
+        assert_eq!(four_byte_body.len(), BODY_MAX_BYTES);
+        let newline_dense = format!("x{}", "\n".repeat(BODY_MAX_BYTES / 2 - 1));
+        assert_eq!(
+            compose::canonical(&newline_dense).as_str().len(),
+            BODY_MAX_BYTES - 1
+        );
+        for body in [four_byte_body, newline_dense] {
+            let call = with(body).unwrap();
+            let args = serde_json::to_vec(&call).unwrap();
+            assert!(
+                args.len() <= HOST_ARGS_CAP_BYTES,
+                "{} bytes of args",
+                args.len()
+            );
+        }
+        assert_eq!(
+            with(format!("x{}", "\n".repeat(BODY_MAX_CHARS - 1))).unwrap_err(),
+            "`body` is longer than 20000 bytes (UTF-8, a line break counting as two)"
+        );
+    }
+
     #[test]
     fn every_step_answers_an_unreadable_read_by_its_shape() {
         let refusal = "result exceeds [messaging] max_body_bytes";
@@ -6654,6 +7330,12 @@ mod tests {
                 free_busy_state(json!({ "from": FROM, "to": TO })),
                 FREEBUSY_HINT,
                 "; ask for a shorter `from`/`to` window, or fewer `calendars`",
+            ),
+            (
+                draft_state(draft_args(json!({}))),
+                DRAFT_UNKNOWN_HINT,
+                "; the draft may have been created before its answer was lost: look for it \
+                 with GmailSearch (`q: in:drafts`) before asking again, or the user has two",
             ),
         ] {
             for (outcome, why) in outcomes() {
@@ -6734,16 +7416,82 @@ mod tests {
                 state.tool = tool;
                 state.step = step;
                 for status in [200, 204] {
-                    assert_eq!(
-                        answered(&state, http(status, "")),
-                        Next::Fail(failure(
-                            ErrorKind::Internal,
-                            &format!("Google answered HTTP {status} with no body")
-                        )),
-                        "{} step {step}",
-                        tool.name()
-                    );
+                    let Next::Fail(Failure { kind, detail }) = answered(&state, http(status, ""))
+                    else {
+                        panic!("{} step {step} accepted no body", tool.name());
+                    };
+                    assert_eq!(kind, ErrorKind::Internal);
+                    let prefix = format!("Google answered HTTP {status} with no body where ");
+                    assert!(detail.starts_with(&prefix), "{detail}");
+                    let expected_end = match write_hint(tool, step) {
+                        Some(hint) => format!(" answers the draft; {hint}"),
+                        None => " answers JSON".to_string(),
+                    };
+                    assert!(detail.ends_with(&expected_end), "{detail}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_step_names_one_api_for_no_body_and_for_a_bad_shape() {
+        // Every step of every tool, both of `GmailLabels`' calls, and each
+        // search per-message read on a row that lists its ids.
+        let ids: Vec<String> = (1..=25).map(|i| format!("m{i}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let search = search_state(json!({ "q": "lunch", "max": 25 }));
+        let (listed, _) = follow(
+            &search,
+            answered(&search, http(200, &listing(&id_refs, json!({})))),
+        );
+        let bases = [
+            labels_state(json!({})),
+            labels_state(json!({ "id": "INBOX" })),
+            listed,
+            read_state(json!({ "id": "m1" })),
+            thread_state(json!({ "id": "t1" })),
+            calendar_list_state(json!({})),
+            events_state(json!({ "from": FROM, "to": TO })),
+            event_state(json!({ "id": "e1" })),
+            free_busy_state(json!({ "from": FROM, "to": TO })),
+            draft_state(draft_args(json!({}))),
+        ];
+        for tool in Provided::ALL {
+            assert!(
+                bases.iter().any(|state| state.tool == tool),
+                "{} has no state here",
+                tool.name()
+            );
+        }
+        let detail = |next: Next| match next {
+            Next::Fail(Failure { detail, .. }) => detail,
+            other => panic!("{other:?}"),
+        };
+        for base in &bases {
+            for step in steps(base.tool) {
+                let mut state = base.clone();
+                state.step = step;
+                // The label-names step reads after an answer it carries, and
+                // a narrower re-read after the reason it was asked for.
+                state
+                    .derived
+                    .entry("answer".to_string())
+                    .or_insert_with(|| json!({}));
+                for (key, value) in Unreadable::Cut("300000 bytes".to_string()).to_derived() {
+                    state.derived.entry(key).or_insert(value);
+                }
+                let name = format!("{} step {step}", state.tool.name());
+                let empty = detail(answered(&state, http(204, "")));
+                let api = empty
+                    .strip_prefix("Google answered HTTP 204 with no body where ")
+                    .and_then(|rest| rest.split_once(" answers "))
+                    .map(|(api, _)| api)
+                    .unwrap_or_else(|| panic!("{name}: {empty}"));
+                let bad = detail(answered(&state, http(200, "42")));
+                assert!(
+                    bad.starts_with(&format!("unexpected Google {api} response shape")),
+                    "{name}: {bad}"
+                );
             }
         }
     }

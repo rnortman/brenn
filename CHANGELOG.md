@@ -4,6 +4,22 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **The Google Workspace assistant tools can now write a Gmail draft.** The
+  `google-workspace-tools` component gains `GmailDraft`: a new draft, with
+  `to`, optional `cc`, `subject` and a plain-text `body`, saved in the user's
+  Gmail Drafts for the user to review and send from Gmail. No tool sends
+  mail: the component only ever creates drafts. Recipients are printable
+  ASCII (a display name in another script is left out or written in ASCII);
+  the subject and body may be any text, up to 500 characters and about
+  20 000 bytes. If Google's answer to the write is lost, the assistant is
+  told the draft may already exist and to look in Drafts before asking
+  again. **Config change required:** the instance's `api-request` grant
+  needs a `POST` clause for `/gmail/v1/users/me/drafts` on the Gmail host;
+  the Google provider needs a `gmail_compose` scope set
+  (`https://www.googleapis.com/auth/gmail.compose`); the assistant needs
+  `tool gmail-draft {}`; and each user reconnects their Google account with
+  `gmail_compose` before the tool can write.
+
 - **The Google Workspace assistant tools can now tell when the user is
   busy.** The `google-workspace-tools` component gains `CalendarFreeBusy`:
   for a window between two RFC 3339 times and up to 50 calendars (`primary`
