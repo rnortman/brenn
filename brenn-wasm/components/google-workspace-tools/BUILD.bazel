@@ -45,6 +45,7 @@ rust_test(
         "src/logic.rs",
         ":spec",
     ],
+    compile_data = glob(["src/fixtures/*.json"]),
     crate_root = "src/logic.rs",
     data = ["//docs:google-workspace.md"],
     edition = "2024",

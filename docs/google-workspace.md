@@ -189,6 +189,7 @@ The assistant is granted the tools beside its `oauth-connect`,
 ```
 tool gmail-labels {}
 tool gmail-search {}
+tool gmail-read {}
 ```
 
 ## 6. First connect: acceptance

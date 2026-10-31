@@ -1,0 +1,10 @@
+{
+  "id": "m1",
+  "threadId": "t1",
+  "labelIds": ["INBOX", "UNREAD"],
+  "snippet": "The numbers are in &amp; attached",
+  "sizeEstimate": 4096,
+  "internalDate": "1793455509123",
+  "payload": {"partId": "", "mimeType": "text/plain", "filename": "", "headers": [{"name": "From", "value": "Alice Example <alice@example.com>"}, {"name": "To", "value": "Bob Example <bob@example.com>"}, {"name": "Subject", "value": "Quarterly numbers"}, {"name": "Date", "value": "Sat, 31 Oct 2026 14:05:09 +0000"}, {"name": "Message-ID", "value": "<m1@example.com>"}, {"name": "Content-Type", "value": "text/plain; charset=\"KOI8-R\""}], "body": {"size": 21, "data": "UGxhaW4gQVNDSUksIHRoZW4gwcIK"}},
+  "historyId": "9001"
+}

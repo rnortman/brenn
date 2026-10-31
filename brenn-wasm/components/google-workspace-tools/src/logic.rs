@@ -56,6 +56,14 @@ const GOOGLE_MESSAGE_MAX_BYTES: usize = 1000;
 /// serialize to at most 1 715 bytes. A page past that answers `internal`.
 const HEADER_MAX_BYTES: usize = 1000;
 
+/// The most UTF-8 bytes of a recipient header's value (`To`, `Cc`, `Bcc`,
+/// `Reply-To`) copied into a result: about 110 recipients written as
+/// `Alice Example <alice@example.com>, `.
+const RECIPIENT_HEADER_MAX_BYTES: usize = 4000;
+/// The headers bounded at `RECIPIENT_HEADER_MAX_BYTES`, matched
+/// case-insensitively; every other header is bounded at `HEADER_MAX_BYTES`.
+const RECIPIENT_HEADERS: &[&str] = &["To", "Cc", "Bcc", "Reply-To"];
+
 /// The most UTF-8 bytes of a message's snippet copied into a result. Google's
 /// snippet is itself a short preview; the bound only closes the page's size
 /// arithmetic, so a cut is not flagged.
@@ -92,6 +100,33 @@ const METADATA_FIELDS: &str =
     "id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload/headers";
 /// The headers a search line carries, requested by repeating `metadataHeaders`.
 const SEARCH_HEADERS: &[&str] = &["From", "Subject", "Date"];
+
+/// The headers `GmailRead` answers, each under its snake-case name.
+const READ_HEADERS: &[&str] = &[
+    "From",
+    "To",
+    "Cc",
+    "Bcc",
+    "Reply-To",
+    "Subject",
+    "Date",
+    "Message-ID",
+    "In-Reply-To",
+];
+/// `GmailRead`'s `max_chars`: the range and the default.
+const MAX_CHARS_MIN: u64 = 200;
+const MAX_CHARS_MAX: u64 = 60_000;
+const MAX_CHARS_DEFAULT: u64 = 12_000;
+/// `GmailRead`'s second step: the message's structure, read when the full
+/// message was cut at the provider's read limit.
+const STRUCTURE_STEP: u8 = 2;
+/// messages.get's structure mask: everything but `data`, the tree listed to
+/// the payload and three levels of parts below it.
+const STRUCTURE_FIELDS: &str = "id,threadId,labelIds,snippet,internalDate,sizeEstimate,\
+                                payload(mimeType,filename,headers,body(size,attachmentId),\
+                                parts(mimeType,filename,headers,body(size,attachmentId),\
+                                parts(mimeType,filename,headers,body(size,attachmentId),\
+                                parts(mimeType,filename,headers,body(size,attachmentId)))))";
 
 /// The most bytes a search query may hold.
 const QUERY_MAX_BYTES: usize = 1024;
@@ -480,6 +515,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                 api: search_list_call(&search, settings),
             })
         }
+        Provided::GmailRead => {
+            let read = ReadArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: read_call(&read, None, settings),
+            })
+        }
     }
 }
 
@@ -579,6 +621,43 @@ fn message_metadata_call(id: &str, account: Option<&str>, settings: &Settings) -
     ApiCall::gmail_get(settings, account, format!("{MESSAGES_PATH}/{id}"), query)
 }
 
+/// `GmailRead`'s arguments.
+struct ReadArgs {
+    id: String,
+    max_chars: usize,
+    account: Option<String>,
+}
+
+impl ReadArgs {
+    // TODO(provider-schema-parse-parity): these bounds and the `gmail-read`
+    // `input_schema` in the spec are stated separately.
+    fn parse(args: &Value) -> Result<ReadArgs, String> {
+        let map = object(args, &["id", "max_chars", "account"])?;
+        let max_chars =
+            integer(map, "max_chars", MAX_CHARS_MIN, MAX_CHARS_MAX)?.unwrap_or(MAX_CHARS_DEFAULT);
+        Ok(ReadArgs {
+            id: gmail_id(map, "id")?.ok_or("`id` is required")?,
+            max_chars: usize::try_from(max_chars).expect("max_chars is at most 60 000"),
+            account: account(map)?,
+        })
+    }
+}
+
+/// messages.get of the whole message, or, with `fields`, of the parts of it
+/// that mask names.
+fn read_call(args: &ReadArgs, fields: Option<&str>, settings: &Settings) -> ApiCall {
+    let mut query = query([("format", "full".to_string())]);
+    if let Some(fields) = fields {
+        query.insert("fields".to_string(), QueryValue::One(fields.to_string()));
+    }
+    ApiCall::gmail_get(
+        settings,
+        args.account.as_deref(),
+        format!("{MESSAGES_PATH}/{}", args.id),
+        query,
+    )
+}
+
 /// labels.list for the names of the user labels an answer carries.
 fn label_names_call(account: Option<&str>, settings: &Settings) -> ApiCall {
     ApiCall::gmail_get(
@@ -597,7 +676,8 @@ struct HeaderValue {
 }
 
 /// The value of the header `name` in `message`'s `payload.headers` list,
-/// passed through `plain` and cut to `HEADER_MAX_BYTES`. `None` when the
+/// passed through `plain` and cut to its bound: `RECIPIENT_HEADER_MAX_BYTES`
+/// for a recipient header, `HEADER_MAX_BYTES` for any other. `None` when the
 /// message has no such header, or no `payload` or `headers` at all, as Google
 /// omits them when no header matches the mask. A `payload` that is not an
 /// object or a header list not of Gmail's shape is Google's fault, reported
@@ -612,10 +692,74 @@ fn header_value(message: &Value, name: &str, api: &str) -> Result<Option<HeaderV
         Some(_) => return Err(shape(api)),
     };
     let found = decode::header(headers, name).map_err(|decode::MalformedHeaders| shape(api))?;
+    let bound = if RECIPIENT_HEADERS
+        .iter()
+        .any(|recipient| recipient.eq_ignore_ascii_case(name))
+    {
+        RECIPIENT_HEADER_MAX_BYTES
+    } else {
+        HEADER_MAX_BYTES
+    };
     Ok(found.map(|value| {
-        let (value, cut) = cut(&plain(value), HEADER_MAX_BYTES);
+        let (value, cut) = cut(&plain(value), bound);
         HeaderValue { value, cut }
     }))
+}
+
+/// `message`'s `names` headers into `out`, each present one under its
+/// snake-case name (`Reply-To` as `reply_to`) through `header_value`, and the
+/// fields cut, sorted, under `headers_truncated` when any was.
+fn answer_headers(
+    out: &mut Args,
+    message: &Value,
+    names: &[&str],
+    api: &str,
+) -> Result<(), Failure> {
+    let mut truncated = Vec::new();
+    for name in names {
+        if let Some(header) = header_value(message, name, api)? {
+            let field = name.to_ascii_lowercase().replace('-', "_");
+            if header.cut {
+                truncated.push(field.clone());
+            }
+            out.insert(field, json!(header.value));
+        }
+    }
+    if !truncated.is_empty() {
+        truncated.sort();
+        out.insert("headers_truncated".to_string(), json!(truncated));
+    }
+    Ok(())
+}
+
+/// What every message-bearing answer carries of one message: `id` (which
+/// must be the id asked for), `thread_id`, the `headers` through
+/// `answer_headers`, `internal_date` as RFC 3339 and `labels` as label ids.
+/// An id, thread id or label id that is not a Gmail id is Google's fault.
+fn message_fields(body: &Value, id: &str, headers: &[&str], api: &str) -> Result<Args, Failure> {
+    if body.get("id").and_then(Value::as_str) != Some(id) {
+        return Err(shape(api));
+    }
+    let mut out = Args::new();
+    out.insert("id".to_string(), json!(id));
+    match body.get("threadId") {
+        None => {}
+        Some(Value::String(thread)) if is_gmail_id(thread) => {
+            out.insert("thread_id".to_string(), json!(thread));
+        }
+        Some(_) => return Err(shape(api)),
+    }
+    answer_headers(&mut out, body, headers, api)?;
+    match body.get("internalDate") {
+        None => {}
+        Some(Value::String(ms)) => {
+            let date = decode::internal_date(ms).ok_or_else(|| shape(api))?;
+            out.insert("internal_date".to_string(), json!(date));
+        }
+        Some(_) => return Err(shape(api)),
+    }
+    out.insert("labels".to_string(), label_ids(body, api)?);
+    Ok(out)
 }
 
 /// A message's snippet as answered: character references decoded, passed
@@ -827,6 +971,12 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
     let body = match read_api_result(outcome, &state.target) {
         Ok(Answer::Google(body)) => body,
         Ok(Answer::Relay(value)) => return Next::Complete(value),
+        // A message too large to read whole is read again without its body.
+        Ok(Answer::Truncated(size))
+            if matches!((state.tool, state.step), (Provided::GmailRead, 1)) =>
+        {
+            return settle(state.tool, read_cut(state, &size, settings));
+        }
         Ok(Answer::Truncated(size)) => return Next::Fail(cut_answer(&size)),
         // A message deleted between the listing and its read is skipped, not
         // the search's failure.
@@ -836,35 +986,46 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
                 (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET)
             ) =>
         {
-            return settle(search_message(state, None, settings));
+            return settle(state.tool, search_message(state, None, settings));
         }
         Ok(Answer::GoogleError { failure, .. }) => return Next::Fail(failure),
         Err(failure) => return Next::Fail(failure),
     };
-    settle(match (state.tool, state.step) {
-        (Provided::GmailLabels, 1) => stored(state, LabelsArgs::parse)
-            .and_then(|args| match args.id {
-                Some(_) => compact_label(&body),
-                None => compact_labels(&body),
-            })
-            .map(Next::Complete),
-        (Provided::GmailSearch, 1) => search_listed(state, &body, settings),
-        (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET) => {
-            search_message(state, Some(&body), settings)
-        }
-        (Provided::GmailSearch, LABELS_STEP) => named(state, &body),
-        (tool, step) => Err(internal(format!(
-            "in-flight row names step {step} of {}, which has no such step",
-            tool.name()
-        ))),
-    })
+    settle(
+        state.tool,
+        match (state.tool, state.step) {
+            (Provided::GmailLabels, 1) => stored(state, LabelsArgs::parse)
+                .and_then(|args| match args.id {
+                    Some(_) => compact_label(&body),
+                    None => compact_labels(&body),
+                })
+                .map(Next::Complete),
+            (Provided::GmailSearch, 1) => search_listed(state, &body, settings),
+            (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET) => {
+                search_message(state, Some(&body), settings)
+            }
+            (Provided::GmailRead, 1) => read_full(state, &body, settings),
+            (Provided::GmailRead, STRUCTURE_STEP) => read_structure(state, &body, settings),
+            (Provided::GmailSearch | Provided::GmailRead, LABELS_STEP) => named(state, &body),
+            (tool, step) => Err(internal(format!(
+                "in-flight row names step {step} of {}, which has no such step",
+                tool.name()
+            ))),
+        },
+    )
 }
 
 /// A step's decision as the request's next move, a completed answer held to
-/// the result ceiling.
-fn settle(decided: Result<Next, Failure>) -> Next {
+/// the result ceiling — after `GmailRead`'s text is cut to fit it.
+fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
     match decided {
-        Ok(Next::Complete(value)) => bounded(value, COMPACT_RESULT_CEILING),
+        Ok(Next::Complete(value)) => {
+            let value = match tool {
+                Provided::GmailRead => fit_text(value, COMPACT_RESULT_CEILING),
+                Provided::GmailLabels | Provided::GmailSearch => value,
+            };
+            bounded(value, COMPACT_RESULT_CEILING)
+        }
         Ok(next) => next,
         Err(failure) => Next::Fail(failure),
     }
@@ -965,6 +1126,228 @@ fn search_message(
     }
 }
 
+/// messages.get (full) read: the message's headers, labels, text and
+/// attachments, then its user labels named.
+fn read_full(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
+    let args = stored(state, ReadArgs::parse)?;
+    let api = "messages.get";
+    let mut out = message_fields(body, &args.id, READ_HEADERS, api)?;
+    let extracted = extract(body, api)?;
+    let text = extracted
+        .text_parts
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let text = plain(&text);
+    let sources = || extracted.text_parts.iter().map(|(_, source)| *source);
+    let text_source = if extracted.text_parts.is_empty() {
+        "none"
+    } else if sources().all(|s| s == decode::Source::Plain) {
+        "text/plain"
+    } else if sources().all(|s| s == decode::Source::Html) {
+        "text/html"
+    } else {
+        "mixed"
+    };
+    let text_chars = text.chars().count();
+    let text = match text.char_indices().nth(args.max_chars) {
+        Some((end, _)) => {
+            out.insert("text_truncated".to_string(), json!(true));
+            text[..end].to_string()
+        }
+        None => text,
+    };
+    let mut notes = notes(&extracted, false);
+    if text.is_empty() && extracted.text_by_reference {
+        notes.push(
+            "the body is an attachment reference, not fetched; it is listed under attachments"
+                .to_string(),
+        );
+    }
+    out.insert("text".to_string(), json!(text));
+    out.insert("text_source".to_string(), json!(text_source));
+    out.insert("text_chars".to_string(), json!(text_chars));
+    out.insert("attachments".to_string(), attachments(&extracted));
+    if !notes.is_empty() {
+        out.insert("decoding_notes".to_string(), json!(notes));
+    }
+    finish(Value::Object(out), args.account.as_deref(), settings)
+}
+
+/// messages.get (full) cut at the read limit: the message is read again
+/// through the structure mask, its size waiting in `derived`.
+fn read_cut(state: &InFlight, size: &str, settings: &Settings) -> Result<Next, Failure> {
+    let args = stored(state, ReadArgs::parse)?;
+    Ok(Next::Call {
+        call: Call {
+            step: STRUCTURE_STEP,
+            api: read_call(&args, Some(STRUCTURE_FIELDS), settings),
+        },
+        derived: Args::from_iter([("size".to_string(), json!(size))]),
+    })
+}
+
+/// messages.get (structure) read: the headers, labels, snippet and
+/// attachments, `text` null and `text_omitted` saying why; then the user
+/// labels named. A structure answer itself cut is the step's failure.
+fn read_structure(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
+    let args = stored(state, ReadArgs::parse)?;
+    let api = "messages.get";
+    let Some(Value::String(size)) = state.derived.get("size") else {
+        return Err(internal(
+            "in-flight row at the structure step carries no size",
+        ));
+    };
+    let mut out = message_fields(body, &args.id, READ_HEADERS, api)?;
+    let estimate = match body.get("sizeEstimate") {
+        None => String::new(),
+        Some(estimate) => format!(
+            "; sizeEstimate {}",
+            estimate.as_u64().ok_or_else(|| shape(api))?
+        ),
+    };
+    if let Some(snippet) = snippet_value(body, api)? {
+        out.insert("snippet".to_string(), json!(snippet));
+    }
+    let extracted = extract(body, api)?;
+    let notes = notes(&extracted, true);
+    out.insert("text".to_string(), Value::Null);
+    out.insert(
+        "text_omitted".to_string(),
+        json!(format!(
+            "Google's answer ({size}{estimate}) exceeds api-request's read limit for this \
+             provider (max_response_bytes); headers and attachments are listed, the body is not"
+        )),
+    );
+    out.insert("attachments".to_string(), attachments(&extracted));
+    if !notes.is_empty() {
+        out.insert("decoding_notes".to_string(), json!(notes));
+    }
+    finish(Value::Object(out), args.account.as_deref(), settings)
+}
+
+/// A message's `payload` read by `decode::extract`. A message without one, a
+/// tree not of Gmail's shape, or a part whose data is not base64url is
+/// Google's fault.
+fn extract(body: &Value, api: &str) -> Result<decode::Extracted, Failure> {
+    let payload = body.get("payload").ok_or_else(|| shape(api))?;
+    decode::extract(payload).map_err(|error| match error {
+        decode::WalkError::Shape => shape(api),
+        decode::WalkError::Base64(part) => internal(format!(
+            "Gmail {api} part {} carries body data that is not base64url",
+            bounded_quote(&part)
+        )),
+    })
+}
+
+/// A sender-written string quoted in a fixed sentence: through `plain`, cut
+/// to `HEADER_MAX_BYTES`.
+fn bounded_quote(text: &str) -> String {
+    cut(&plain(text), HEADER_MAX_BYTES).0
+}
+
+/// The decoding notes as answered. `structure` says the tree came through
+/// the structure mask, whose depth is why a part's children go unlisted.
+fn notes(extracted: &decode::Extracted, structure: bool) -> Vec<String> {
+    extracted
+        .notes
+        .iter()
+        .map(|note| match note {
+            decode::Note::UnknownCharset(name) => format!(
+                "charset \"{}\" is not supported; decoded as UTF-8, non-ASCII characters may \
+                 be wrong",
+                bounded_quote(name)
+            ),
+            decode::Note::InvalidUtf8 => {
+                "a text part is not valid UTF-8; its invalid bytes are shown as \u{fffd}"
+                    .to_string()
+            }
+            decode::Note::UnlistedChildren { mime_type, depth } if structure => format!(
+                "a {} part at depth {depth} has children the structure mask does not list; \
+                 attachments below it are not listed",
+                bounded_quote(mime_type)
+            ),
+            decode::Note::UnlistedChildren { mime_type, depth } => format!(
+                "a {} part at depth {depth} has no children in Google's answer; nothing below \
+                 it is shown",
+                bounded_quote(mime_type)
+            ),
+            decode::Note::HtmlNotRendered => "HTML body not rendered in this build".to_string(),
+        })
+        .collect()
+}
+
+/// The attachments as answered: `filename` and `mime_type` through `plain`
+/// and cut to `HEADER_MAX_BYTES`, `size` when Google gave it, `inline`.
+fn attachments(extracted: &decode::Extracted) -> Value {
+    Value::Array(
+        extracted
+            .attachments
+            .iter()
+            .map(|attachment| {
+                let mut entry = Args::new();
+                entry.insert(
+                    "filename".to_string(),
+                    json!(bounded_quote(&attachment.filename)),
+                );
+                entry.insert(
+                    "mime_type".to_string(),
+                    json!(bounded_quote(&attachment.mime_type)),
+                );
+                if let Some(size) = attachment.size {
+                    entry.insert("size".to_string(), json!(size));
+                }
+                entry.insert("inline".to_string(), json!(attachment.inline));
+                Value::Object(entry)
+            })
+            .collect(),
+    )
+}
+
+/// The serialized width of `c` in a JSON string, as `serde_json` writes it.
+fn json_width(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        '\u{0}'..='\u{1f}' => 6,
+        _ => c.len_utf8(),
+    }
+}
+
+/// `answer` with its `text` cut to the longest prefix with which the whole
+/// answer serializes within `ceiling`, and `text_truncated` set, when it does
+/// not fit as it is. An answer that fits, or has no text, is unchanged; one
+/// that does not fit with an empty text is left for the ceiling to refuse.
+fn fit_text(mut answer: Value, ceiling: usize) -> Value {
+    if serialized_len(&answer) <= ceiling {
+        return answer;
+    }
+    let Some(Value::String(text)) = answer.get_mut("text").map(std::mem::take) else {
+        return answer;
+    };
+    answer["text"] = json!("");
+    answer["text_truncated"] = json!(true);
+    let budget = ceiling.saturating_sub(serialized_len(&answer));
+    let mut used = 0;
+    let mut end = 0;
+    for (at, c) in text.char_indices() {
+        used += json_width(c);
+        if used > budget {
+            break;
+        }
+        end = at + c.len_utf8();
+    }
+    answer["text"] = json!(text[..end]);
+    answer
+}
+
+fn serialized_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .expect("a JSON value serializes")
+        .len()
+}
+
 /// The array `derived[key]` that an earlier step of this request wrote.
 fn derived_list(derived: &Args, key: &str) -> Result<Vec<Value>, Failure> {
     match derived.get(key) {
@@ -997,52 +1380,15 @@ fn search_answer(derived: Args) -> Value {
     Value::Object(out)
 }
 
-/// One message's metadata as a search line: `id`, `thread_id`, the `from`,
-/// `subject` and `date` header values when present, each through
-/// `header_value` with the cut fields named, sorted, in `headers_truncated`,
-/// `internal_date` as RFC 3339, the snippet through `snippet_value`, and the
-/// label ids as `labels`. A body for another message than `id`, or a thread
-/// id that is not a Gmail id, is Google's fault.
+/// One message's metadata as a search line: `message_fields` with the
+/// `from`, `subject` and `date` headers, and the snippet through
+/// `snippet_value`.
 fn search_line(body: &Value, id: &str) -> Result<Value, Failure> {
     let api = "messages.get";
-    if body.get("id").and_then(Value::as_str) != Some(id) {
-        return Err(shape(api));
-    }
-    let mut out = Args::new();
-    out.insert("id".to_string(), json!(id));
-    match body.get("threadId") {
-        None => {}
-        Some(Value::String(thread)) if is_gmail_id(thread) => {
-            out.insert("thread_id".to_string(), json!(thread));
-        }
-        Some(_) => return Err(shape(api)),
-    }
-    let mut truncated = Vec::new();
-    for name in SEARCH_HEADERS {
-        if let Some(header) = header_value(body, name, api)? {
-            let field = name.to_ascii_lowercase();
-            if header.cut {
-                truncated.push(field.clone());
-            }
-            out.insert(field, json!(header.value));
-        }
-    }
-    if !truncated.is_empty() {
-        truncated.sort();
-        out.insert("headers_truncated".to_string(), json!(truncated));
-    }
-    match body.get("internalDate") {
-        None => {}
-        Some(Value::String(ms)) => {
-            let date = decode::internal_date(ms).ok_or_else(|| shape(api))?;
-            out.insert("internal_date".to_string(), json!(date));
-        }
-        Some(_) => return Err(shape(api)),
-    }
+    let mut out = message_fields(body, id, SEARCH_HEADERS, api)?;
     if let Some(snippet) = snippet_value(body, api)? {
         out.insert("snippet".to_string(), json!(snippet));
     }
-    out.insert("labels".to_string(), label_ids(body, api)?);
     Ok(Value::Object(out))
 }
 
@@ -1200,9 +1546,7 @@ fn label(item: &Value, api: &str, extra: &[(&str, &str)]) -> Result<Value, Failu
 /// `value` as the request's answer, unless it serializes larger than
 /// `ceiling` — a bound that was wrong, reported rather than sent.
 pub fn bounded(value: Value, ceiling: usize) -> Next {
-    let size = serde_json::to_vec(&value)
-        .expect("a JSON value serializes")
-        .len();
+    let size = serialized_len(&value);
     if size > ceiling {
         return Next::Fail(internal(format!(
             "compact result of {size} bytes exceeds the wrapper's ceiling"
@@ -2825,6 +3169,530 @@ mod tests {
                 ErrorKind::Internal,
                 "in-flight row at the label-names step carries no answer"
             ))
+        );
+    }
+
+    const PLAIN: &str = include_str!("fixtures/plain.json");
+    const ALTERNATIVE: &str = include_str!("fixtures/alternative.json");
+    const NESTED: &str = include_str!("fixtures/nested.json");
+    const LATIN1: &str = include_str!("fixtures/latin1.json");
+    const CP1252: &str = include_str!("fixtures/cp1252.json");
+    const UNKNOWN_CHARSET: &str = include_str!("fixtures/unknown-charset.json");
+    const STRUCTURE: &str = include_str!("fixtures/structure.json");
+    const STRUCTURE_DEEP: &str = include_str!("fixtures/structure-deep.json");
+
+    fn read_state(args: Value) -> InFlight {
+        let call = plan(Provided::GmailRead, &args, &settings()).unwrap();
+        InFlight::new(
+            &"r".repeat(32),
+            Provided::GmailRead,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        )
+    }
+
+    /// `GmailRead { id: "m1" }` answered with `body` at its first step.
+    fn read_m1(body: &str) -> Next {
+        answered(&read_state(json!({ "id": "m1" })), http(200, body))
+    }
+
+    fn completed(next: Next) -> Value {
+        let Next::Complete(value) = next else {
+            panic!("expected a completed answer, got {next:?}");
+        };
+        value
+    }
+
+    /// The fields every fixture's top-level headers and metadata answer.
+    fn read_fields(labels: Value) -> Value {
+        json!({
+            "id": "m1",
+            "thread_id": "t1",
+            "labels": labels,
+            "from": "Alice Example <alice@example.com>",
+            "to": "Bob Example <bob@example.com>",
+            "subject": "Quarterly numbers",
+            "date": "Sat, 31 Oct 2026 14:05:09 +0000",
+            "message_id": "<m1@example.com>",
+            "internal_date": "2026-10-31T14:05:09Z",
+        })
+    }
+
+    fn with_fields(mut base: Value, extra: Value) -> Value {
+        for (key, value) in extra.as_object().unwrap() {
+            base[key] = value.clone();
+        }
+        base
+    }
+
+    #[test]
+    fn read_plans_one_full_read() {
+        let call = plan(
+            Provided::GmailRead,
+            &json!({ "id": "m1", "account": "alice@example.com" }),
+            &settings(),
+        )
+        .unwrap();
+        assert_eq!(call.step, 1);
+        assert_eq!(
+            serde_json::to_value(&call.api).unwrap(),
+            json!({
+                "provider": "google",
+                "account": "alice@example.com",
+                "method": "GET",
+                "host": "gmail.example.com",
+                "path": "/gmail/v1/users/me/messages/m1",
+                "query": { "format": "full" },
+            })
+        );
+        for (args, error) in [
+            (json!({}), "`id` is required"),
+            (
+                json!({ "id": "m/1" }),
+                "`id` must be 1 to 128 letters, digits, `_` or `-`",
+            ),
+            (
+                json!({ "id": "m1", "max_chars": 199 }),
+                "`max_chars` must be an integer from 200 to 60000",
+            ),
+            (
+                json!({ "id": "m1", "max_chars": 60001 }),
+                "`max_chars` must be an integer from 200 to 60000",
+            ),
+            (
+                json!({ "id": "m1", "format": "raw" }),
+                "unknown argument `format`; this tool takes `id`, `max_chars`, `account`",
+            ),
+        ] {
+            assert_eq!(
+                plan(Provided::GmailRead, &args, &settings()).unwrap_err(),
+                error,
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_message_reads_whole() {
+        let text = "Hi Bob,\n\nThe numbers are in. Café at noon? 😀\n\n— Alice\n";
+        assert_eq!(
+            completed(read_m1(PLAIN)),
+            with_fields(
+                read_fields(json!(["INBOX", "UNREAD"])),
+                json!({
+                    "text": text,
+                    "text_source": "text/plain",
+                    "text_chars": text.chars().count(),
+                    "attachments": [],
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn an_alternative_reads_its_plain_part() {
+        let answer = completed(read_m1(ALTERNATIVE));
+        assert_eq!(answer["text"], json!("The numbers are in.\r\n"));
+        assert_eq!(answer["text_source"], json!("text/plain"));
+        assert_eq!(answer.get("decoding_notes"), None);
+    }
+
+    #[test]
+    fn a_nested_message_lists_its_attachments_and_names_its_labels() {
+        let state = read_state(json!({ "id": "m1" }));
+        let (row, call) = follow(&state, answered(&state, http(200, NESTED)));
+        assert_eq!(call.step, LABELS_STEP);
+        let names = r#"{ "labels": [{ "id": "Label_7", "name": "Receipts" }] }"#;
+        assert_eq!(
+            completed(answered(&row, http(200, names))),
+            with_fields(
+                read_fields(json!(["INBOX", "Receipts"])),
+                json!({
+                    "text": "See the report.\n",
+                    "text_source": "text/plain",
+                    "text_chars": 16,
+                    "attachments": [
+                        { "filename": "Q3 report.pdf", "mime_type": "application/pdf",
+                          "size": 48213, "inline": false },
+                        { "filename": "logo.png", "mime_type": "image/png",
+                          "size": 1024, "inline": true },
+                    ],
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn three_charsets_decode_and_any_other_is_noted() {
+        assert_eq!(
+            completed(read_m1(LATIN1))["text"],
+            json!("Café crème, 5 °C\n")
+        );
+        assert_eq!(
+            completed(read_m1(CP1252))["text"],
+            json!("\u{201c}Quoted\u{201d} \u{2013} €10 \u{2026} \u{fffd}\n")
+        );
+        let answer = completed(read_m1(UNKNOWN_CHARSET));
+        assert_eq!(
+            answer["text"],
+            json!("Plain ASCII, then \u{fffd}\u{fffd}\n")
+        );
+        assert_eq!(
+            answer["decoding_notes"],
+            json!([
+                "charset \"KOI8-R\" is not supported; decoded as UTF-8, non-ASCII characters \
+                 may be wrong"
+            ])
+        );
+    }
+
+    /// A one-part message: `part` as its payload, with `headers` of its own.
+    fn one_part(part: Value, headers: Value) -> String {
+        let mut payload = part;
+        payload["headers"] = headers;
+        json!({ "id": "m1", "threadId": "t1", "payload": payload }).to_string()
+    }
+
+    #[test]
+    fn an_html_only_message_answers_an_empty_html_text_with_a_note() {
+        let body = one_part(
+            json!({ "mimeType": "text/html", "body": { "size": 9, "data": "PHA-aGk8L3A-" } }),
+            json!([]),
+        );
+        let answer = completed(read_m1(&body));
+        assert_eq!(answer["text"], json!(""));
+        assert_eq!(answer["text_source"], json!("text/html"));
+        assert_eq!(
+            answer["decoding_notes"],
+            json!(["HTML body not rendered in this build"])
+        );
+    }
+
+    #[test]
+    fn read_text_keeps_tab_newline_and_return_and_spaces_other_controls() {
+        // "a\tb\r\nc\x01d", base64url.
+        let body = one_part(
+            json!({ "mimeType": "text/plain", "body": { "size": 7, "data": "YQliDQpjAWQ" } }),
+            json!([]),
+        );
+        let answer = completed(read_m1(&body));
+        assert_eq!(answer["text"], json!("a\tb\r\nc d"));
+        assert_eq!(answer["text_chars"], json!(8));
+    }
+
+    /// A `multipart/mixed` message of `parts`.
+    fn mixed(parts: Value) -> String {
+        one_part(
+            json!({ "mimeType": "multipart/mixed", "parts": parts }),
+            json!([]),
+        )
+    }
+
+    #[test]
+    fn text_parts_join_with_a_blank_line_and_mixed_sources_say_so() {
+        let leaf = |data: &str| json!({ "mimeType": "text/plain", "body": { "data": data } });
+        let html = json!({ "mimeType": "text/html", "body": { "data": "PHA-aGk8L3A-" } });
+        // "a", "b"
+        let answer = completed(read_m1(&mixed(json!([leaf("YQ"), leaf("Yg")]))));
+        assert_eq!(answer["text"], json!("a\n\nb"));
+        assert_eq!(answer["text_source"], json!("text/plain"));
+        let answer = completed(read_m1(&mixed(json!([leaf("YQ"), html, leaf("Yg")]))));
+        assert_eq!(answer["text"], json!("a\n\nb"));
+        assert_eq!(answer["text_source"], json!("mixed"));
+        assert_eq!(
+            answer["decoding_notes"],
+            json!(["HTML body not rendered in this build"])
+        );
+    }
+
+    #[test]
+    fn a_full_read_says_what_it_could_not_show() {
+        let answer = completed(read_m1(&mixed(json!([
+            { "mimeType": "text/plain", "body": { "data": "Yf9i" } },
+            { "mimeType": "message/rfc822" },
+        ]))));
+        assert_eq!(answer["text"], json!("a\u{fffd}b"));
+        assert_eq!(
+            answer["decoding_notes"],
+            json!([
+                "a text part is not valid UTF-8; its invalid bytes are shown as \u{fffd}",
+                "a message/rfc822 part at depth 1 has no children in Google's answer; nothing \
+                 below it is shown",
+            ])
+        );
+    }
+
+    #[test]
+    fn fit_text_cuts_to_the_longest_text_that_fits() {
+        let text = "a\"\\\n\r\t\u{8}\u{c}\u{1}é😀".repeat(20);
+        let answer = json!({ "id": "m1", "text": text });
+        let with_text = |text: &str| {
+            let mut answer = answer.clone();
+            answer["text"] = json!(text);
+            answer["text_truncated"] = json!(true);
+            serialized_len(&answer)
+        };
+        let whole = serialized_len(&answer);
+        assert_eq!(fit_text(answer.clone(), whole), answer);
+        for ceiling in with_text("")..whole {
+            let fitted = fit_text(answer.clone(), ceiling);
+            let cut = fitted["text"].as_str().unwrap();
+            assert_eq!(fitted["text_truncated"], json!(true));
+            assert!(serialized_len(&fitted) <= ceiling, "{ceiling}");
+            let next = text[cut.len()..].chars().next().unwrap();
+            assert!(
+                with_text(&text[..cut.len() + next.len_utf8()]) > ceiling,
+                "{ceiling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_by_reference_is_listed_and_said() {
+        let body = one_part(
+            json!({ "mimeType": "text/plain", "body": { "size": 9, "attachmentId": "ATT-1" } }),
+            json!([]),
+        );
+        let answer = completed(read_m1(&body));
+        assert_eq!(answer["text"], json!(""));
+        assert_eq!(answer["text_source"], json!("none"));
+        assert_eq!(
+            answer["attachments"],
+            json!([{ "filename": "", "mime_type": "text/plain", "size": 9, "inline": false }])
+        );
+        assert_eq!(
+            answer["decoding_notes"],
+            json!([
+                "the body is an attachment reference, not fetched; it is listed under attachments"
+            ])
+        );
+    }
+
+    #[test]
+    fn data_that_is_not_base64url_is_internal_naming_the_part() {
+        let body = one_part(
+            json!({ "partId": "0.1", "mimeType": "text/plain", "body": { "data": "a*b" } }),
+            json!([]),
+        );
+        assert_eq!(
+            read_m1(&body),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "Gmail messages.get part 0.1 carries body data that is not base64url"
+            ))
+        );
+        for payload in [
+            json!({ "body": {} }),
+            json!({ "mimeType": "multipart/mixed", "parts": {} }),
+            json!({ "mimeType": "text/plain", "body": { "data": 7 } }),
+        ] {
+            assert_eq!(
+                read_m1(&json!({ "id": "m1", "payload": payload }).to_string()),
+                Next::Fail(shape("messages.get")),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn sender_strings_in_attachments_and_notes_are_plain_and_bounded() {
+        let body = one_part(
+            json!({ "mimeType": "multipart/mixed", "parts": [
+                { "mimeType": "text/plain", "body": { "data": "aGk" },
+                  "headers": [{ "name": "Content-Type",
+                                "value": format!("text/plain; charset={}", "x".repeat(1001)) }] },
+                { "mimeType": "y".repeat(1001), "filename": "a\u{1}b\u{7f}", "body": {} },
+                { "mimeType": "image/png", "filename": "z".repeat(1001), "body": {} },
+            ] }),
+            json!([]),
+        );
+        let answer = completed(read_m1(&body));
+        let cut = |c: &str| format!("{}…", c.repeat(1000));
+        assert_eq!(
+            answer["attachments"],
+            json!([
+                { "filename": "a b\u{7f}", "mime_type": cut("y"), "inline": false },
+                { "filename": cut("z"), "mime_type": "image/png", "inline": false },
+            ])
+        );
+        assert_eq!(
+            answer["decoding_notes"],
+            json!([format!(
+                "charset \"{}\" is not supported; decoded as UTF-8, non-ASCII characters may be \
+                 wrong",
+                cut("x")
+            )])
+        );
+    }
+
+    #[test]
+    fn recipient_headers_are_bounded_at_4000_bytes_and_flagged() {
+        let headers = |to: usize, subject: usize| {
+            json!([
+                { "name": "TO", "value": "t".repeat(to) },
+                { "name": "Subject", "value": "s".repeat(subject) },
+            ])
+        };
+        let leaf = json!({ "mimeType": "text/plain", "body": { "data": "aGk" } });
+        let answer = completed(read_m1(&one_part(leaf.clone(), headers(4000, 1000))));
+        assert_eq!(answer["to"], json!("t".repeat(4000)));
+        assert_eq!(answer.get("headers_truncated"), None);
+        let answer = completed(read_m1(&one_part(leaf.clone(), headers(4001, 1000))));
+        assert_eq!(answer["to"], json!(format!("{}…", "t".repeat(4000))));
+        assert_eq!(answer["headers_truncated"], json!(["to"]));
+        let answer = completed(read_m1(&one_part(leaf, headers(4001, 1001))));
+        assert_eq!(answer["subject"], json!(format!("{}…", "s".repeat(1000))));
+        assert_eq!(answer["headers_truncated"], json!(["subject", "to"]));
+    }
+
+    #[test]
+    fn text_is_cut_at_max_chars_on_a_char_boundary() {
+        let text = "é".repeat(150) + &"😀".repeat(100);
+        let data = base64_of(text.as_bytes());
+        let body = one_part(
+            json!({ "mimeType": "text/plain", "body": { "data": data } }),
+            json!([]),
+        );
+        let state = read_state(json!({ "id": "m1", "max_chars": 200 }));
+        let answer = completed(answered(&state, http(200, &body)));
+        assert_eq!(answer["text"], json!("é".repeat(150) + &"😀".repeat(50)));
+        assert_eq!(answer["text_chars"], json!(250));
+        assert_eq!(answer["text_truncated"], json!(true));
+    }
+
+    /// `bytes` in base64url without padding, for building bodies in tests.
+    fn base64_of(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+            for i in 0..=chunk.len() {
+                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_text_past_the_ceiling_is_cut_to_fit_after_naming() {
+        let text = "😀".repeat(60_000);
+        let headers: Vec<Value> = READ_HEADERS
+            .iter()
+            .map(|name| json!({ "name": name, "value": "\"".repeat(5000) }))
+            .collect();
+        let body = |labels: Value| {
+            json!({ "id": "m1", "labelIds": labels, "payload": {
+                "mimeType": "text/plain", "headers": headers,
+                "body": { "data": base64_of(text.as_bytes()) },
+            } })
+            .to_string()
+        };
+        let state = read_state(json!({ "id": "m1", "max_chars": 60_000 }));
+        let fitted = completed(answered(&state, http(200, &body(json!(["INBOX"])))));
+        let plain_len = fitted["text"].as_str().unwrap().len();
+        assert!(plain_len < text.len(), "{plain_len}");
+        assert_eq!(fitted["text_chars"], json!(60_000));
+        assert_eq!(fitted["text_truncated"], json!(true));
+        // Each char of the text is 4 bytes, so the most that fits is within 4
+        // bytes of the ceiling.
+        let fills = |answer: &Value| {
+            let len = serialized_len(answer);
+            len <= COMPACT_RESULT_CEILING && len > COMPACT_RESULT_CEILING - 4
+        };
+        assert!(fills(&fitted));
+
+        let (row, call) = follow(
+            &state,
+            answered(&state, http(200, &body(json!(["Label_12"])))),
+        );
+        assert_eq!(call.step, LABELS_STEP);
+        let long_name = "n".repeat(225);
+        let names = json!({ "labels": [{ "id": "Label_12", "name": long_name }] }).to_string();
+        let named = completed(answered(&row, http(200, &names)));
+        assert_eq!(named["labels"], json!([long_name]));
+        assert!(named["text"].as_str().unwrap().len() < plain_len);
+        assert!(fills(&named));
+    }
+
+    fn cut_read(bytes: Value) -> Result<Value, NestedError> {
+        Ok(json!({
+            "status": 200, "headers": {}, "bytes": bytes, "truncated": true, "body": "{\"id",
+        }))
+    }
+
+    #[test]
+    fn a_cut_read_falls_back_to_the_structure() {
+        let state = read_state(json!({ "id": "m1" }));
+        let (row, call) = follow(&state, answered(&state, cut_read(json!(300000))));
+        assert_eq!(call.step, STRUCTURE_STEP);
+        assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m1");
+        assert_eq!(
+            call.api.query["format"],
+            QueryValue::One("full".to_string())
+        );
+        assert_eq!(
+            call.api.query["fields"],
+            QueryValue::One(
+                "id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload(mimeType,\
+                 filename,headers,body(size,attachmentId),parts(mimeType,filename,headers,\
+                 body(size,attachmentId),parts(mimeType,filename,headers,body(size,\
+                 attachmentId),parts(mimeType,filename,headers,body(size,attachmentId)))))"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            completed(answered(&row, http(200, STRUCTURE))),
+            with_fields(
+                read_fields(json!(["INBOX", "UNREAD"])),
+                json!({
+                    "snippet": "The numbers are in & attached",
+                    "text": null,
+                    "text_omitted": "Google's answer (300000 bytes; sizeEstimate 4096) exceeds \
+                                     api-request's read limit for this provider \
+                                     (max_response_bytes); headers and attachments are listed, \
+                                     the body is not",
+                    "attachments": [{ "filename": "Q3 report.pdf",
+                                      "mime_type": "application/pdf", "size": 48213,
+                                      "inline": false }],
+                })
+            )
+        );
+        let (row, _) = follow(&state, answered(&state, cut_read(Value::Null)));
+        let answer = completed(answered(&row, http(200, STRUCTURE)));
+        assert!(
+            answer["text_omitted"]
+                .as_str()
+                .unwrap()
+                .starts_with("Google's answer (of unstated length; sizeEstimate 4096) exceeds"),
+            "{answer}"
+        );
+        assert_eq!(
+            answered(&row, cut_read(json!(900000))),
+            Next::Fail(cut_answer("900000 bytes"))
+        );
+    }
+
+    #[test]
+    fn a_structure_too_deep_to_list_says_so() {
+        let state = read_state(json!({ "id": "m1" }));
+        let (row, _) = follow(&state, answered(&state, cut_read(json!(300000))));
+        let answer = completed(answered(&row, http(200, STRUCTURE_DEEP)));
+        assert_eq!(
+            answer["attachments"],
+            json!([{ "filename": "inner.pdf", "mime_type": "application/pdf", "size": 2048,
+                     "inline": false }])
+        );
+        assert_eq!(
+            answer["decoding_notes"],
+            json!([
+                "a multipart/alternative part at depth 3 has children the structure mask does \
+                 not list; attachments below it are not listed"
+            ])
         );
     }
 }

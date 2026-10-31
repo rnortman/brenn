@@ -99,12 +99,31 @@ async fn rig_with(
     connected: Connected<'_>,
     caller: Option<CallerSetup<'_>>,
 ) -> StubRig {
+    rig_configured(clauses, connected, caller, |_| {}).await
+}
+
+/// The rig with every clause and alice's one account connected, `api-request`
+/// reading at most `max_response_bytes` of each of Google's answers.
+async fn rig_reading_at_most(max_response_bytes: usize) -> StubRig {
+    rig_configured(CLAUSES, &[(ACCOUNT, BEARER)], None, |provider| {
+        provider.raw.max_response_bytes = max_response_bytes;
+    })
+    .await
+}
+
+/// [`rig_with`], with `configure` applied to the OAuth provider's
+/// configuration before the service is built.
+async fn rig_configured(
+    clauses: &[&str],
+    connected: Connected<'_>,
+    caller: Option<CallerSetup<'_>>,
+    configure: impl FnOnce(&mut brenn_lib::config::OAuthProviderConfig),
+) -> StubRig {
     let started = stub_rig::start().await;
     let host = started.host.clone();
-    let (service, vault) = testutil::service(vec![testutil::provider_config(
-        OAUTH_PROVIDER,
-        &started.base,
-    )]);
+    let (name, mut provider) = testutil::provider_config(OAUTH_PROVIDER, &started.base);
+    configure(&mut provider);
+    let (service, vault) = testutil::service(vec![(name, provider)]);
     for (account, bearer) in connected {
         let mut credential = testutil::credential(OAUTH_PROVIDER, account, "RT-alice");
         credential.access_token = bearer.to_string();
@@ -711,5 +730,233 @@ async fn a_clause_miss_is_internal_could_not_be_issued() {
     assert_could_not_be_issued(call.await.unwrap());
     r.owed(&r.executor_sub(), 0).await;
     assert!(r.seen().is_empty(), "a refused call reaches no API");
+    r.assert_finished(&id);
+}
+
+fn full_read_query() -> Pairs {
+    pairs(&[("format", "full")])
+}
+
+/// One message as messages.get (full) answers it: a `multipart/mixed` of a
+/// `text/plain` part whose body is `text_data` (base64url) and a PDF
+/// attachment, labelled `labels`. `text_data` of `None` is the structure
+/// mask's answer, which carries no `data`.
+fn read_body(labels: &[&str], text_data: Option<&str>) -> String {
+    let mut text_body = json!({ "size": 30 });
+    if let Some(data) = text_data {
+        text_body["data"] = json!(data);
+    }
+    serde_json::to_string_pretty(&json!({
+        "id": "m1",
+        "threadId": "t-m1",
+        "labelIds": labels,
+        "snippet": "Hi Bob, The numbers are in &amp; attached",
+        "sizeEstimate": 9000,
+        "internalDate": "1793455509000",
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "filename": "",
+            "headers": [
+                { "name": "From", "value": "Alice Example <alice@example.com>" },
+                { "name": "To", "value": "Bob Example <bob@example.com>" },
+                { "name": "Subject", "value": "Quarterly numbers" },
+                { "name": "Date", "value": "Sat, 31 Oct 2026 14:05:09 +0000" },
+                { "name": "Message-ID", "value": "<m1@example.com>" },
+            ],
+            "body": { "size": 0 },
+            "parts": [
+                {
+                    "mimeType": "text/plain",
+                    "filename": "",
+                    "headers": [
+                        { "name": "Content-Type", "value": "text/plain; charset=\"UTF-8\"" },
+                    ],
+                    "body": text_body,
+                },
+                {
+                    "mimeType": "application/pdf",
+                    "filename": "Q3 report.pdf",
+                    "headers": [
+                        { "name": "Content-Type", "value": "application/pdf" },
+                        { "name": "Content-Disposition",
+                          "value": "attachment; filename=\"Q3 report.pdf\"" },
+                    ],
+                    "body": { "size": 48213, "attachmentId": "ATT-pdf" },
+                },
+            ],
+        },
+    }))
+    .unwrap()
+}
+
+/// The headers and metadata `GmailRead` answers for [`read_body`]'s message,
+/// with `labels` as answered and `rest` added.
+fn read_answer(labels: &[&str], rest: serde_json::Value) -> serde_json::Value {
+    let mut answer = json!({
+        "id": "m1",
+        "thread_id": "t-m1",
+        "labels": labels,
+        "from": "Alice Example <alice@example.com>",
+        "to": "Bob Example <bob@example.com>",
+        "subject": "Quarterly numbers",
+        "date": "Sat, 31 Oct 2026 14:05:09 +0000",
+        "message_id": "<m1@example.com>",
+        "internal_date": "2026-10-31T14:05:09Z",
+        "attachments": [{ "filename": "Q3 report.pdf", "mime_type": "application/pdf",
+                          "size": 48213, "inline": false }],
+    });
+    for (key, value) in rest.as_object().unwrap() {
+        answer[key] = value.clone();
+    }
+    answer
+}
+
+/// `GmailRead` reads the message with `format=full`, decodes its plain part,
+/// lists its attachment, then lists the labels because the message carries a
+/// user label, and answers the label named.
+#[tokio::test]
+async fn read_decodes_the_full_message_and_names_its_labels() {
+    let r = rig().await;
+    let path = format!("{MESSAGES}/m1");
+    // "Hi Bob,\n\nThe numbers are in.\n", base64url without padding.
+    r.answer(
+        &path,
+        read_body(
+            &["INBOX", "Label_7"],
+            Some("SGkgQm9iLAoKVGhlIG51bWJlcnMgYXJlIGluLgo"),
+        ),
+    );
+    r.answer(LABELS, labels_body());
+    let call = r.call_for_alice("GmailRead", json!({ "id": "m1" }));
+    let id = r.requested_id().await;
+
+    r.serve().await;
+    for step in [1, 100] {
+        assert_eq!(r.inflight_keys(), [format!("{id}/{step}")]);
+        r.run_nested().await;
+        r.serve().await;
+    }
+
+    let answer = call.await.unwrap().expect("the component answered");
+    assert_eq!(
+        answer,
+        read_answer(
+            &["INBOX", "Receipts"],
+            json!({
+                "text": "Hi Bob,\n\nThe numbers are in.\n",
+                "text_source": "text/plain",
+                "text_chars": 29,
+            })
+        )
+    );
+    assert_eq!(
+        r.seen(),
+        [
+            ("GET".to_string(), path, full_read_query()),
+            (
+                "GET".to_string(),
+                LABELS.to_string(),
+                pairs(&[("fields", "labels(id,name)")]),
+            ),
+        ]
+    );
+    assert_eq!(r.bearers(), vec![format!("Bearer {BEARER}"); 2]);
+    r.assert_finished(&id);
+}
+
+/// Google's 404 on a read (an id that names no message) is the caller's
+/// `invalid_args` with Google's message.
+#[tokio::test]
+async fn a_google_404_on_a_read_is_invalid_args() {
+    let r = rig().await;
+    r.fail(
+        &format!("{MESSAGES}/m404"),
+        404,
+        json!({ "error": {
+            "code": 404,
+            "message": "Requested entity was not found.",
+            "status": "NOT_FOUND",
+        } })
+        .to_string()
+        .into_bytes(),
+    );
+    let call = r.call_for_alice("GmailRead", json!({ "id": "m404" }));
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap(),
+        Err(ToolError::InvalidArgs(
+            "Google NOT_FOUND (HTTP 404): Requested entity was not found.".to_string()
+        ))
+    );
+    r.owed(&r.executor_sub(), 0).await;
+    r.assert_finished(&id);
+}
+
+/// A message larger than the provider's read limit comes back `truncated`:
+/// `GmailRead` reads it again through the structure mask and answers its
+/// headers, snippet and attachments with `text` null and `text_omitted`
+/// giving Google's stated size.
+#[tokio::test]
+async fn a_read_past_the_limit_falls_back_to_the_structure() {
+    let r = rig_reading_at_most(4096).await;
+    let path = format!("{MESSAGES}/m1");
+    // 6 000 bytes of text, 8 000 of base64url: past the 4 096-byte limit.
+    let full = read_body(&["INBOX"], Some(&"QUFB".repeat(2000)));
+    r.answer(&path, full.clone());
+    let call = r.call_for_alice("GmailRead", json!({ "id": "m1" }));
+    let id = r.requested_id().await;
+
+    r.serve().await;
+    r.run_nested().await;
+    // The stub answers by path alone; what Google answers under the
+    // structure mask is the same message without its `data`.
+    let structure = read_body(&["INBOX"], None);
+    assert!(structure.len() < 4096, "{}", structure.len());
+    r.answer(&path, structure);
+    r.serve().await;
+    assert_eq!(r.inflight_keys(), [format!("{id}/2")]);
+    r.run_nested().await;
+    r.serve().await;
+
+    let answer = call.await.unwrap().expect("the component answered");
+    assert_eq!(
+        answer,
+        read_answer(
+            &["INBOX"],
+            json!({
+                "snippet": "Hi Bob, The numbers are in & attached",
+                "text": null,
+                "text_omitted": format!(
+                    "Google's answer ({} bytes; sizeEstimate 9000) exceeds api-request's read \
+                     limit for this provider (max_response_bytes); headers and attachments are \
+                     listed, the body is not",
+                    full.len()
+                ),
+            })
+        )
+    );
+    assert_eq!(
+        r.seen(),
+        [
+            ("GET".to_string(), path.clone(), full_read_query()),
+            (
+                "GET".to_string(),
+                path,
+                pairs(&[
+                    ("format", "full"),
+                    (
+                        "fields",
+                        "id,threadId,labelIds,snippet,internalDate,sizeEstimate,\
+                         payload(mimeType,filename,headers,body(size,attachmentId),\
+                         parts(mimeType,filename,headers,body(size,attachmentId),\
+                         parts(mimeType,filename,headers,body(size,attachmentId),\
+                         parts(mimeType,filename,headers,body(size,attachmentId)))))",
+                    ),
+                ]),
+            ),
+        ]
+    );
     r.assert_finished(&id);
 }

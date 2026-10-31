@@ -88,6 +88,21 @@ All notable changes to Brenn are documented here.
   `docs/google-workspace.md` gains the two `messages` clauses the tool needs
   and the assistant's grant lines.
 
+- **`google-workspace-tools` adds a `GmailRead` tool**: one message by id,
+  answered with its headers, labels by name, its body as plain text and a
+  list of its attachments (name, type, size; their contents are not
+  fetched). Of a plain and an HTML version the plain one is read; UTF-8,
+  ISO-8859-1 and Windows-1252 text is decoded, and anything that could not
+  be decoded exactly is noted in the answer rather than shown garbled. The
+  text is cut at `max_chars` (12,000 characters by default), or shorter if
+  the whole answer would pass the component's result size limit, and the
+  answer says so. A message larger than the provider's read limit is
+  answered with its attachments and Gmail's preview instead of its body.
+  HTML-only mail is not rendered yet: it reads as empty text with a note.
+  Recipient headers are cut over 4,000 bytes and the others over 1,000,
+  and the answer names those cut. Generated component scaffolding no longer
+  fails clippy when several of a spec's tools share a name prefix.
+
 - **`api-request` can call services that use one operator-held API key**,
   such as Google Maps Platform. Declare the service in a new
   `api_key_provider` config section and name it as the `provider`. The key

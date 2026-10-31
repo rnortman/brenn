@@ -34,6 +34,7 @@ const PROVIDER: &str = "google";
 const TOOLS: &[(&str, &str)] = &[
     ("gmail-labels", "GmailLabels"),
     ("gmail-search", "GmailSearch"),
+    ("gmail-read", "GmailRead"),
 ];
 
 /// The paths the instance's clauses admit, one per endpoint the tools call.

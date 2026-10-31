@@ -12,7 +12,7 @@
 //! The whole port surface the specification states; a guest uses the part of it
 //! that it needs.
 
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_imports, clippy::enum_variant_names)]
 
 #[cfg(target_arch = "wasm32")]
 use brenn_guest::serde;

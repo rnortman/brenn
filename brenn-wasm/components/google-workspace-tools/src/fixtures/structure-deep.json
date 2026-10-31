@@ -1,0 +1,35 @@
+{
+  "id": "m1",
+  "threadId": "t1",
+  "labelIds": ["INBOX", "UNREAD"],
+  "snippet": "The numbers are in &amp; attached",
+  "sizeEstimate": 4096,
+  "internalDate": "1793455509123",
+  "payload": {
+    "mimeType": "multipart/mixed",
+    "filename": "",
+    "headers": [{"name": "From", "value": "Alice Example <alice@example.com>"}, {"name": "To", "value": "Bob Example <bob@example.com>"}, {"name": "Subject", "value": "Quarterly numbers"}, {"name": "Date", "value": "Sat, 31 Oct 2026 14:05:09 +0000"}, {"name": "Message-ID", "value": "<m1@example.com>"}, {"name": "Content-Type", "value": "multipart/mixed"}],
+    "body": {"size": 0},
+    "parts": [
+      {"mimeType": "text/plain", "filename": "", "headers": [{"name": "Content-Type", "value": "text/plain"}], "body": {"size": 120}},
+      {
+        "mimeType": "message/rfc822",
+        "filename": "",
+        "headers": [{"name": "Content-Type", "value": "message/rfc822"}],
+        "body": {"size": 0},
+        "parts": [
+          {
+            "mimeType": "multipart/mixed",
+            "filename": "",
+            "headers": [{"name": "Content-Type", "value": "multipart/mixed"}],
+            "body": {"size": 0},
+            "parts": [
+              {"mimeType": "multipart/alternative", "filename": "", "headers": [{"name": "Content-Type", "value": "multipart/alternative"}], "body": {"size": 0}},
+              {"mimeType": "application/pdf", "filename": "inner.pdf", "headers": [{"name": "Content-Type", "value": "application/pdf"}], "body": {"size": 2048, "attachmentId": "ATT-inner"}}
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

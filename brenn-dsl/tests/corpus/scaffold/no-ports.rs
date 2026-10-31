@@ -6,7 +6,7 @@
 //! The whole port surface the specification states; a guest uses the part of it
 //! that it needs.
 
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_imports, clippy::enum_variant_names)]
 
 /// The ports the specification declares as inbound — `in` and `io`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

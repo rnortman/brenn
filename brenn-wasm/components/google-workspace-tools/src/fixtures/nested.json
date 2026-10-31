@@ -1,0 +1,31 @@
+{
+  "id": "m1",
+  "threadId": "t1",
+  "labelIds": ["INBOX", "Label_7"],
+  "snippet": "The numbers are in &amp; attached",
+  "sizeEstimate": 4096,
+  "internalDate": "1793455509123",
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/mixed",
+    "filename": "",
+    "headers": [{"name": "From", "value": "Alice Example <alice@example.com>"}, {"name": "To", "value": "Bob Example <bob@example.com>"}, {"name": "Subject", "value": "Quarterly numbers"}, {"name": "Date", "value": "Sat, 31 Oct 2026 14:05:09 +0000"}, {"name": "Message-ID", "value": "<m1@example.com>"}, {"name": "Content-Type", "value": "multipart/mixed; boundary=\"b\""}],
+    "body": {"size": 0},
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "multipart/alternative",
+        "filename": "",
+        "headers": [{"name": "Content-Type", "value": "multipart/alternative; boundary=\"b\""}],
+        "body": {"size": 0},
+        "parts": [
+          {"partId": "0.0", "mimeType": "text/plain", "filename": "", "headers": [{"name": "Content-Type", "value": "text/plain; charset=\"us-ascii\""}], "body": {"size": 16, "data": "U2VlIHRoZSByZXBvcnQuCg"}},
+          {"partId": "0.1", "mimeType": "text/html", "filename": "", "headers": [{"name": "Content-Type", "value": "text/html; charset=\"us-ascii\""}], "body": {"size": 22, "data": "PHA-U2VlIHRoZSByZXBvcnQuPC9wPg"}}
+        ]
+      },
+      {"partId": "1", "mimeType": "application/pdf", "filename": "Q3 report.pdf", "headers": [{"name": "Content-Type", "value": "application/pdf; name=\"Q3 report.pdf\""}, {"name": "Content-Disposition", "value": "attachment; filename=\"Q3 report.pdf\""}], "body": {"size": 48213, "attachmentId": "ATT-pdf"}},
+      {"partId": "2", "mimeType": "image/png", "filename": "logo.png", "headers": [{"name": "Content-Type", "value": "image/png"}, {"name": "Content-Disposition", "value": "inline; filename=\"logo.png\""}, {"name": "Content-ID", "value": "<logo@example.com>"}], "body": {"size": 1024, "attachmentId": "ATT-png"}}
+    ]
+  },
+  "historyId": "9001"
+}

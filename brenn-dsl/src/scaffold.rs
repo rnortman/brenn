@@ -777,11 +777,13 @@ fn write_header(out: &mut String, spec_basename: &str, doc: Option<&DocComment>)
         }
         out.push_str("//!\n");
     }
+    // The enums' variant names are the specification's names, so a family of
+    // tools sharing a prefix is not the generated code's to rename.
     out.push_str(
         "//! The whole port surface the specification states; a guest uses the part of it\n\
          //! that it needs.\n\
          \n\
-         #![allow(dead_code, unused_imports)]\n",
+         #![allow(dead_code, unused_imports, clippy::enum_variant_names)]\n",
     );
 }
 
