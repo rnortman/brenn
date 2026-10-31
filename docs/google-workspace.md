@@ -196,8 +196,8 @@ Then the inbox tuning and the instance:
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered. The five tools declare Σ = 14, which needs 28, rounded up
-// to 32. 64 holds the 32 ceiling on Σ twice over, so tools joining the
+// re-delivered. The six tools declare Σ = 18, which needs 36, rounded up
+// to 64. 64 holds the 32 ceiling on Σ twice over, so tools joining the
 // class change nothing here.
 channel at "brenn:tool-results/workspace" {
   push_depth = 1;
@@ -216,6 +216,7 @@ new workspace: GoogleWorkspaceTools {
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/*"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/threads/*"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/users/me/calendarList"; }
+    allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events"; }
     rate_limit { burst = 60; sustained_per_minute = 120; }
   }
   config = {
@@ -241,6 +242,7 @@ agent PersonalAssistant {
   tool gmail-read {}
   tool gmail-thread {}
   tool calendar-list {}
+  tool calendar-events {}
 }
 ```
 
@@ -250,19 +252,20 @@ need one.
 **The result inbox.** The `channel at "brenn:tool-results/workspace"` block
 sizes the inbox the instance's nested answers arrive on (the slug after the
 `/` is the instance's name). Each request the component serves has at most
-one Google call outstanding, so at most Σ `max_concurrency` = 14 answers are
-outstanding at once, and an answer may be delivered twice: 14 × 2 = 28,
-rounded up to 32. The block sets 64, which covers the 32 ceiling on Σ
+one Google call outstanding, so at most Σ `max_concurrency` = 18 answers are
+outstanding at once, and an answer may be delivered twice: 18 × 2 = 36,
+rounded up to 64. The block sets 64, which covers the 32 ceiling on Σ
 `max_concurrency` twice over, so the Calendar tools joining this class later
-change nothing deployed. The default window of 16 is below 28 and would lose
+change nothing deployed. The default window of 16 is below 36 and would lose
 answers under load, each lost answer leaving its request to be answered
 `internal` after the 240-second ceiling. `push_depth = 1` is the inert
 channel rung, and `noise = alarm` makes a drop here an alert.
 
-**The clauses.** The instance holds six clauses, one per endpoint the tools
+**The clauses.** The instance holds seven clauses, one per endpoint the tools
 call — Gmail's label list, one label, the message search, one message, one
-thread, and Calendar's calendar list — every one a `GET`, and nothing wider. The `*` segments take a label,
-message or thread id. A clause that does not admit a call's method, host and
+thread, and Calendar's calendar list and one calendar's events — every one a
+`GET`, and nothing wider. The `*` segments take a label, message, thread or
+calendar id. A clause that does not admit a call's method, host and
 path is refused before anything is sent (section 7).
 
 **Acting for the caller.** `user = "*"` admits a call for whichever user is
@@ -408,11 +411,12 @@ sections 3 and 5 in place.
      `GmailRead` answer without its body quotes it in `text_omitted`.
    - A reason that says "the host did not deliver api-request's answer" and
      names neither `max_response_bytes` nor `max_body_bytes` — in
-     `unavailable`, `text_omitted`, `recipients_omitted` or a `GmailThread`
-     `internal` — is not about those limits: it quotes the error
-     `api-request` answered, most often that it could not reach Google or
-     could not refresh the access token. Those are transient; a retry reads
-     the message or thread whole, and there is nothing to raise. The
+     `unavailable`, `text_omitted`, `recipients_omitted`, or a `GmailThread`
+     or `CalendarEvents` `internal` — is not about those limits: it quotes
+     the error `api-request` answered, most often that it could not reach
+     Google or could not refresh the access token. Those are transient; a
+     retry with the same arguments reads the message, thread or window
+     whole, and there is nothing to raise. The
      bullets below are about the two limits.
    - A `GmailRead` answer with `text_omitted` on an ordinary message means
      `max_response_bytes` was lowered (section 3), or, when it quotes

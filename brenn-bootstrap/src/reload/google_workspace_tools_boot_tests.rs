@@ -37,6 +37,7 @@ const TOOLS: &[(&str, &str)] = &[
     ("gmail-read", "GmailRead"),
     ("gmail-thread", "GmailThread"),
     ("calendar-list", "CalendarList"),
+    ("calendar-events", "CalendarEvents"),
 ];
 
 /// The hosts the instance's `config` names for Gmail and Calendar.
@@ -52,6 +53,7 @@ const CLAUSES: &[(&str, &str, &str)] = &[
     ("GET", GMAIL_HOST, "/gmail/v1/users/me/messages/*"),
     ("GET", GMAIL_HOST, "/gmail/v1/users/me/threads/*"),
     ("GET", CALENDAR_HOST, "/calendar/v3/users/me/calendarList"),
+    ("GET", CALENDAR_HOST, "/calendar/v3/calendars/*/events"),
 ];
 
 /// The class's packaged specification.

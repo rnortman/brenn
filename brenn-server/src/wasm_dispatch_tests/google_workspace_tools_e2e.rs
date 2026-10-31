@@ -63,6 +63,7 @@ const CLAUSES: &[(&str, &str)] = &[
     ("GET", "/gmail/v1/users/me/messages/*"),
     ("GET", "/gmail/v1/users/me/threads/*"),
     ("GET", CALENDAR_LIST),
+    ("GET", "/calendar/v3/calendars/*/events"),
 ];
 
 /// The component's `provide` statements, lowered from its packaged
@@ -1530,6 +1531,175 @@ async fn a_calendar_403_is_denied_with_the_calendar_scope_hint() {
              connected without the Calendar read scope: run oauth-connect with that scope set \
              and relay its steps."
                 .to_string(),
+        ))
+    );
+    r.assert_finished(&id);
+}
+
+/// A calendar id with `#` and `@`, as Google's holiday calendars have.
+const HOLIDAYS: &str = "en.usa#holiday@group.v.calendar.google.com";
+/// [`HOLIDAYS`]' events path as it goes on the wire: `#` percent-encoded,
+/// `@` as is.
+const HOLIDAY_EVENTS: &str =
+    "/calendar/v3/calendars/en.usa%23holiday@group.v.calendar.google.com/events";
+
+/// The window every `CalendarEvents` call here asks for.
+const FROM: &str = "2026-11-02T00:00:00-05:00";
+const TO: &str = "2026-11-09T00:00:00-05:00";
+
+/// events.list's query as `CalendarEvents` sends it for [`FROM`]..[`TO`],
+/// with `extra`.
+fn events_query(extra: &[(&str, &str)]) -> Pairs {
+    google_query(
+        &[
+            &[
+                ("timeMin", FROM),
+                ("timeMax", TO),
+                ("singleEvents", "true"),
+                ("orderBy", "startTime"),
+                ("maxResults", "50"),
+                ("maxAttendees", "1"),
+                (
+                    "fields",
+                    "items(id,summary,start,end,location,status,organizer/email,\
+                     attendees(self,responseStatus)),nextPageToken,timeZone",
+                ),
+            ],
+            extra,
+        ]
+        .concat(),
+    )
+}
+
+/// `CalendarEvents` reads one window of a calendar named by an id holding `#`,
+/// which goes on the wire percent-encoded, with alice's bearer, and answers
+/// each event compactly with her own response.
+#[tokio::test]
+async fn calendar_events_reads_a_window_of_a_calendar_by_id() {
+    let r = rig().await;
+    r.answer(
+        HOLIDAY_EVENTS,
+        serde_json::to_string_pretty(&json!({
+            "timeZone": "America/New_York",
+            "nextPageToken": "page-2",
+            "items": [
+                {
+                    "id": "allday0123456789",
+                    "status": "confirmed",
+                    "summary": "Veterans Day",
+                    "organizer": { "email": HOLIDAYS },
+                    "start": { "date": "2026-11-11" },
+                    "end": { "date": "2026-11-12" },
+                },
+                {
+                    "id": "weekly0123456789_20261104T140000Z",
+                    "status": "confirmed",
+                    "summary": "Weekly sync",
+                    "organizer": { "email": "bob@example.com" },
+                    "start": { "dateTime": "2026-11-04T14:00:00Z" },
+                    "end": { "dateTime": "2026-11-04T14:30:00Z" },
+                    "attendees": [{ "self": true, "responseStatus": "declined" }],
+                },
+            ],
+        }))
+        .unwrap(),
+    );
+    let call = r.call_for_alice(
+        "CalendarEvents",
+        json!({ "calendar": HOLIDAYS, "from": FROM, "to": TO, "q": "sync" }),
+    );
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap().expect("the component answered"),
+        json!({
+            "events": [
+                {
+                    "id": "allday0123456789",
+                    "summary": "Veterans Day",
+                    "start": { "date": "2026-11-11" },
+                    "end": { "date": "2026-11-12" },
+                    "status": "confirmed",
+                    "organizer": HOLIDAYS,
+                },
+                {
+                    "id": "weekly0123456789_20261104T140000Z",
+                    "summary": "Weekly sync",
+                    "start": { "date_time": "2026-11-04T14:00:00Z" },
+                    "end": { "date_time": "2026-11-04T14:30:00Z" },
+                    "status": "confirmed",
+                    "organizer": "bob@example.com",
+                    "self_response": "declined",
+                },
+            ],
+            "time_zone": "America/New_York",
+            "next_page": "page-2",
+        })
+    );
+    assert_eq!(
+        r.seen(),
+        [(
+            "GET".to_string(),
+            HOLIDAY_EVENTS.to_string(),
+            events_query(&[("q", "sync")]),
+        )]
+    );
+    assert_eq!(r.bearers(), [format!("Bearer {BEARER}")]);
+    r.assert_finished(&id);
+}
+
+/// A window whose events cannot be read whole is `internal`, naming why and
+/// what to narrow; nothing is read again.
+#[tokio::test]
+async fn a_window_too_large_to_read_whole_is_refused_with_what_to_narrow() {
+    for way in BOTH_WAYS {
+        let r = unreadable_rig(way).await;
+        let wide = json!({ "items": [{
+            "id": "e1",
+            "summary": "s".repeat(OVERSIZED),
+            "start": { "date": "2026-11-03" },
+            "end": { "date": "2026-11-04" },
+        }] })
+        .to_string();
+        r.answer("/calendar/v3/calendars/primary/events", wide.clone());
+        let call = r.call_for_alice("CalendarEvents", json!({ "from": FROM, "to": TO }));
+        let id = r.requested_id().await;
+        r.run(1).await;
+
+        let Err(ToolError::Internal(detail)) = call.await.unwrap() else {
+            panic!("{way:?}: the window was not refused internal");
+        };
+        let why = detail
+            .strip_suffix("; ask for fewer events with `max`, or a shorter `from`/`to` window")
+            .unwrap_or_else(|| panic!("{detail}"));
+        assert_unreadable(way, why, wide.len());
+        assert_eq!(r.seen().len(), 1, "{way:?}");
+        r.owed(&r.executor_sub(), 0).await;
+        r.assert_finished(&id);
+    }
+}
+
+/// Google's 400 for a time it cannot read is the caller's: `invalid_args`
+/// with Google's message.
+#[tokio::test]
+async fn a_google_400_on_a_window_is_invalid_args() {
+    let r = rig().await;
+    r.fail(
+        "/calendar/v3/calendars/primary/events",
+        400,
+        json!({ "error": { "code": 400, "message": "Bad Request", "status": "INVALID_ARGUMENT" } })
+            .to_string()
+            .into_bytes(),
+    );
+    let call = r.call_for_alice("CalendarEvents", json!({ "from": "monday", "to": TO }));
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap(),
+        Err(ToolError::InvalidArgs(
+            "Google INVALID_ARGUMENT (HTTP 400): Bad Request".to_string()
         ))
     );
     r.assert_finished(&id);

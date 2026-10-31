@@ -174,8 +174,35 @@ const CALENDAR_LIST_FIELDS: &str = "items(id,summary,primary,accessRole,timeZone
 /// 1 297 bytes; 100 of them and a page token to about 138 000).
 const CALENDAR_LIST_PAGE: usize = 100;
 
+/// The path Calendar lists a calendar's events below: `{CALENDARS_PATH}/{id}/events`.
+const CALENDARS_PATH: &str = "/calendar/v3/calendars";
+/// The calendar a tool reads when the caller names none.
+const PRIMARY_CALENDAR: &str = "primary";
+/// events.list's mask: what an events line carries, the page token and the
+/// calendar's time zone. Of the attendees only the entry Google marks `self`
+/// is read: the calendar read's own, the user's on `primary`.
+const EVENTS_LIST_FIELDS: &str = "items(id,summary,start,end,location,status,organizer/email,\
+                                  attendees(self,responseStatus)),nextPageToken,timeZone";
+/// events.list's `maxAttendees`: past it Google returns only the calendar
+/// read's own attendee entry, which is the one an events line answers.
+const EVENTS_LIST_ATTENDEES: &str = "1";
+/// `CalendarEvents`' `max`: the range and the default. A line serializes to
+/// at most about 3 900 bytes, so 50 lines and the page's envelope stay under
+/// `COMPACT_RESULT_CEILING` (about 203 000); 70 would not.
+const EVENTS_MAX_MIN: u64 = 1;
+const EVENTS_MAX_MAX: u64 = 50;
+const EVENTS_MAX_DEFAULT: u64 = 50;
+/// What the caller can narrow when a window's events are unreadable.
+const EVENTS_HINT: &str = "ask for fewer events with `max`, or a shorter `from`/`to` window";
+
 /// The most bytes a calendar id may hold, in an argument or an answer.
 const CALENDAR_ID_MAX_BYTES: usize = 320;
+/// The most bytes an event id may hold: Google's base32hex ids are at most
+/// 1 024 characters, an instance's suffix included.
+const EVENT_ID_MAX_BYTES: usize = 1024;
+/// The most bytes a time argument may hold. Times are passed to Google as
+/// given; Google refuses one that is not RFC 3339 with an offset.
+const TIME_MAX_BYTES: usize = 64;
 /// The most UTF-8 bytes of text copied into one line of a listing.
 const LISTING_TEXT_MAX_BYTES: usize = 300;
 /// The most UTF-8 bytes of a value from Google's own vocabulary (a role, a
@@ -197,7 +224,7 @@ fn family(tool: Provided) -> Family {
         | Provided::GmailSearch
         | Provided::GmailRead
         | Provided::GmailThread => Family::Gmail,
-        Provided::CalendarList => Family::Calendar,
+        Provided::CalendarList | Provided::CalendarEvents => Family::Calendar,
     }
 }
 
@@ -557,23 +584,39 @@ fn account(args: &Args) -> Result<Option<String>, String> {
     Ok(capped(args, "account", ACCOUNT_MAX_BYTES)?.map(str::to_string))
 }
 
-/// Whether `id` is one path segment of letters, digits, `_` and `-`.
-fn is_gmail_id(id: &str) -> bool {
-    (1..=ID_MAX_BYTES).contains(&id.len())
+/// Whether `id` is 1 to `max` letters, digits, `_` and `-`: one path segment
+/// as Google writes its token ids.
+fn is_token(id: &str, max: usize) -> bool {
+    (1..=max).contains(&id.len())
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// A Gmail id argument: one path segment of letters, digits, `_` and `-`.
-fn gmail_id(args: &Args, key: &str) -> Result<Option<String>, String> {
+/// Whether `id` is a Gmail message, thread or label id.
+fn is_gmail_id(id: &str) -> bool {
+    is_token(id, ID_MAX_BYTES)
+}
+
+/// An id argument held to `valid`; a refusal says "`key` must be" `what`.
+fn id_arg(
+    args: &Args,
+    key: &str,
+    valid: fn(&str) -> bool,
+    what: impl FnOnce() -> String,
+) -> Result<Option<String>, String> {
     match args.get(key) {
         None => Ok(None),
-        Some(Value::String(id)) if is_gmail_id(id) => Ok(Some(id.clone())),
-        Some(_) => Err(format!(
-            "`{key}` must be 1 to {ID_MAX_BYTES} letters, digits, `_` or `-`"
-        )),
+        Some(Value::String(id)) if valid(id) => Ok(Some(id.clone())),
+        Some(_) => Err(format!("`{key}` must be {}", what())),
     }
+}
+
+/// A Gmail id argument: one path segment of letters, digits, `_` and `-`.
+fn gmail_id(args: &Args, key: &str) -> Result<Option<String>, String> {
+    id_arg(args, key, is_gmail_id, || {
+        format!("1 to {ID_MAX_BYTES} letters, digits, `_` or `-`")
+    })
 }
 
 /// Whether `id` is a calendar id `api-request` takes as one path segment:
@@ -586,6 +629,28 @@ fn is_calendar_id(id: &str) -> bool {
         && !id
             .chars()
             .any(|c| matches!(c, '/' | '\\' | '%' | '"') || c.is_control() || c.is_whitespace())
+}
+
+/// A calendar id argument, refused here rather than by `api-request` so a bad
+/// id is the caller's to fix.
+fn calendar_id(args: &Args, key: &str) -> Result<Option<String>, String> {
+    id_arg(args, key, is_calendar_id, || {
+        format!(
+            "a calendar id of 1 to {CALENDAR_ID_MAX_BYTES} bytes with no `/`, `\\`, `%`, `\"`, \
+             space or control character"
+        )
+    })
+}
+
+/// Whether `id` is an event id as Google writes them: 1 to
+/// `EVENT_ID_MAX_BYTES` letters, digits, `_` and `-`.
+fn is_event_id(id: &str) -> bool {
+    is_token(id, EVENT_ID_MAX_BYTES)
+}
+
+/// A time argument, passed to Google as given.
+fn time(args: &Args, key: &str) -> Result<Option<String>, String> {
+    Ok(capped(args, key, TIME_MAX_BYTES)?.map(str::to_string))
 }
 
 /// An integer argument in `min..=max`.
@@ -645,6 +710,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
             Ok(Call {
                 step: 1,
                 api: calendar_list_call(&list, settings),
+            })
+        }
+        Provided::CalendarEvents => {
+            let events = EventsArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: events_list_call(&events, settings),
             })
         }
     }
@@ -850,6 +922,67 @@ fn calendar_list_call(args: &CalendarListArgs, settings: &Settings) -> ApiCall {
         &settings.calendar_host,
         args.account.as_deref(),
         CALENDAR_LIST_PATH.to_string(),
+        query,
+    )
+}
+
+/// `CalendarEvents`' arguments.
+struct EventsArgs {
+    calendar: String,
+    from: String,
+    to: String,
+    q: Option<String>,
+    max: usize,
+    page: Option<String>,
+    account: Option<String>,
+}
+
+impl EventsArgs {
+    // TODO(provider-schema-parse-parity): these bounds and the `calendar-events`
+    // `input_schema` in the spec are stated separately.
+    fn parse(args: &Value) -> Result<EventsArgs, String> {
+        let map = object(
+            args,
+            &["calendar", "from", "to", "q", "max", "page", "account"],
+        )?;
+        let max =
+            integer(map, "max", EVENTS_MAX_MIN, EVENTS_MAX_MAX)?.unwrap_or(EVENTS_MAX_DEFAULT);
+        Ok(EventsArgs {
+            calendar: calendar_id(map, "calendar")?.unwrap_or_else(|| PRIMARY_CALENDAR.to_string()),
+            from: time(map, "from")?.ok_or("`from` is required")?,
+            to: time(map, "to")?.ok_or("`to` is required")?,
+            q: capped(map, "q", QUERY_MAX_BYTES)?.map(str::to_string),
+            max: usize::try_from(max).expect("max is at most 50"),
+            page: capped(map, "page", PAGE_MAX_BYTES)?.map(str::to_string),
+            account: account(map)?,
+        })
+    }
+}
+
+/// events.list of the window `from`..`to`, recurring events expanded into
+/// their instances in start order, one page of at most `max`. The calendar id
+/// goes into the path as it is; `api-request` percent-encodes it.
+fn events_list_call(args: &EventsArgs, settings: &Settings) -> ApiCall {
+    let mut query = query([
+        ("timeMin", args.from.clone()),
+        ("timeMax", args.to.clone()),
+        ("singleEvents", "true".to_string()),
+        ("orderBy", "startTime".to_string()),
+        ("maxResults", args.max.to_string()),
+        ("maxAttendees", EVENTS_LIST_ATTENDEES.to_string()),
+        ("fields", EVENTS_LIST_FIELDS.to_string()),
+    ]);
+    if let Some(q) = &args.q {
+        query.insert("q".to_string(), QueryValue::One(q.clone()));
+    }
+    if let Some(page) = &args.page {
+        query.insert("pageToken".to_string(), QueryValue::One(page.clone()));
+    }
+    ApiCall::get(
+        settings,
+        &settings.calendar_host,
+        args.account.as_deref(),
+        format!("{CALENDARS_PATH}/{}/events", args.calendar),
         query,
     )
 }
@@ -1307,6 +1440,9 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             (Provided::GmailRead, STRUCTURE_STEP) => read_structure(state, &body, settings),
             (Provided::GmailThread, 1 | THREAD_NARROW_STEP) => thread_read(state, &body, settings),
             (Provided::CalendarList, 1) => compact_calendar_list(&body).map(Next::Complete),
+            (Provided::CalendarEvents, 1) => stored(state, EventsArgs::parse)
+                .and_then(|args| compact_events(&body, args.max))
+                .map(Next::Complete),
             (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 named(state, &body)
             }
@@ -1325,7 +1461,8 @@ fn no_such_step(tool: Provided, step: u8) -> Failure {
 /// A nested read that was cut or refused, decided by the step's shape: a
 /// per-message read of a search page is listed unavailable and the page goes
 /// on; a message's or a thread's first read is asked for again narrower,
-/// carrying why; every other step fails with why.
+/// carrying why; a window's events fail with why and what to narrow; every
+/// other step fails with why.
 fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
     settle(
         state.tool,
@@ -1355,6 +1492,7 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
             | (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 Err(why.failure(None))
             }
+            (Provided::CalendarEvents, 1) => Err(why.failure(Some(EVENTS_HINT))),
             (tool, step) => Err(no_such_step(tool, step)),
         },
     )
@@ -1369,7 +1507,10 @@ fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
             let value = match tool {
                 Provided::GmailRead => fit_text(value, COMPACT_RESULT_CEILING),
                 Provided::GmailThread => fit_thread(value, COMPACT_RESULT_CEILING),
-                Provided::GmailLabels | Provided::GmailSearch | Provided::CalendarList => value,
+                Provided::GmailLabels
+                | Provided::GmailSearch
+                | Provided::CalendarList
+                | Provided::CalendarEvents => value,
             };
             bounded(value, COMPACT_RESULT_CEILING)
         }
@@ -1972,7 +2113,7 @@ fn label(item: &Value, api: &str, extra: &[(&str, &str)]) -> Result<Value, Failu
 /// One compacted object of a Calendar answer: the fields copied so far, and
 /// the names of those cut at a bound that is flagged.
 struct Compact<'a> {
-    item: &'a Value,
+    item: &'a Args,
     api: &'a str,
     out: Args,
     truncated: Vec<String>,
@@ -1980,9 +2121,9 @@ struct Compact<'a> {
 
 impl<'a> Compact<'a> {
     fn of(item: &'a Value, api: &'a str) -> Result<Compact<'a>, Failure> {
-        if !item.is_object() {
+        let Value::Object(item) = item else {
             return Err(shape(api));
-        }
+        };
         Ok(Compact {
             item,
             api,
@@ -2017,34 +2158,86 @@ impl<'a> Compact<'a> {
     /// UTF-8 bytes; a cut is listed in `fields_truncated`.
     fn text(&mut self, key: &str, name: &str, bound: usize) -> Result<(), Failure> {
         if let Some(value) = self.string(key)? {
-            let (value, cut) = cut(&plain(value), bound);
-            if cut {
-                self.truncated.push(name.to_string());
-            }
-            self.out.insert(name.to_string(), json!(value));
+            self.put_text(name, value, bound);
         }
         Ok(())
     }
 
-    /// Google's vocabulary `key` under `name`, through `plain` and cut to
-    /// `SHORT_MAX_BYTES` unflagged.
+    /// `value` under `name`, through `plain` and cut to `bound` UTF-8 bytes;
+    /// a cut is listed in `fields_truncated`.
+    fn put_text(&mut self, name: &str, value: &str, bound: usize) {
+        let (value, cut) = cut(&plain(value), bound);
+        if cut {
+            self.truncated.push(name.to_string());
+        }
+        self.out.insert(name.to_string(), json!(value));
+    }
+
+    /// Google's object `key`, when present; any other value is Google's
+    /// fault.
+    fn object(&self, key: &str) -> Result<Option<Compact<'a>>, Failure> {
+        match self.item.get(key) {
+            None => Ok(None),
+            Some(value) => Compact::of(value, self.api).map(Some),
+        }
+    }
+
+    /// Google's list `key`; Google omits a list with nothing in it, so
+    /// absent is empty. Any other value is Google's fault.
+    fn array(&self, key: &str) -> Result<&'a [Value], Failure> {
+        match self.item.get(key) {
+            None => Ok(&[]),
+            Some(Value::Array(items)) => Ok(items),
+            Some(_) => Err(shape(self.api)),
+        }
+    }
+
+    /// Google's vocabulary `key` under `name`; see `put_short`.
     fn short(&mut self, key: &str, name: &str) -> Result<(), Failure> {
         if let Some(value) = self.string(key)? {
-            let value = cut(&plain(value), SHORT_MAX_BYTES).0;
-            self.out.insert(name.to_string(), json!(value));
+            self.put_short(name, value);
         }
         Ok(())
+    }
+
+    /// Vocabulary `value` under `name`, through `plain` and cut to
+    /// `SHORT_MAX_BYTES` unflagged.
+    fn put_short(&mut self, name: &str, value: &str) {
+        let value = cut(&plain(value), SHORT_MAX_BYTES).0;
+        self.out.insert(name.to_string(), json!(value));
+    }
+
+    /// Google's flag `key`: absent is `false`; a non-bool is Google's fault.
+    fn flag(&self, key: &str) -> Result<bool, Failure> {
+        match self.item.get(key) {
+            None => Ok(false),
+            Some(Value::Bool(flag)) => Ok(*flag),
+            Some(_) => Err(shape(self.api)),
+        }
     }
 
     /// Google's flag `key` under `name`, only when it is `true`.
     fn when_true(&mut self, key: &str, name: &str) -> Result<(), Failure> {
-        match self.item.get(key) {
-            None | Some(Value::Bool(false)) => {}
-            Some(Value::Bool(true)) => {
-                self.out.insert(name.to_string(), json!(true));
-            }
-            Some(_) => return Err(shape(self.api)),
+        if self.flag(key)? {
+            self.out.insert(name.to_string(), json!(true));
         }
+        Ok(())
+    }
+
+    /// Google's event time `key` under the same name, as Google gave it:
+    /// `{ "date_time", "time_zone"? }` for a timed event, `{ "date" }` for an
+    /// all-day one. One with both or neither is Google's fault.
+    fn when(&mut self, key: &str) -> Result<(), Failure> {
+        let Some(mut time) = self.object(key)? else {
+            return Ok(());
+        };
+        time.short("dateTime", "date_time")?;
+        time.short("timeZone", "time_zone")?;
+        time.short("date", "date")?;
+        if time.out.contains_key("date_time") == time.out.contains_key("date") {
+            return Err(shape(self.api));
+        }
+        self.out.insert(key.to_string(), time.done());
         Ok(())
     }
 
@@ -2080,14 +2273,8 @@ fn next_page(out: &mut Args, body: &Args, api: &str) -> Result<(), Failure> {
 /// Google's fault.
 fn compact_calendar_list(body: &Value) -> Result<Value, Failure> {
     let api = "calendarList.list";
-    let Value::Object(body) = body else {
-        return Err(shape(api));
-    };
-    let items: &[Value] = match body.get("items") {
-        None => &[],
-        Some(Value::Array(items)) => items,
-        Some(_) => return Err(shape(api)),
-    };
+    let mut page = Compact::of(body, api)?;
+    let items = page.array("items")?;
     if items.len() > CALENDAR_LIST_PAGE {
         return Err(internal(format!(
             "Google {api} answered {} items for maxResults {CALENDAR_LIST_PAGE}",
@@ -2098,10 +2285,10 @@ fn compact_calendar_list(body: &Value) -> Result<Value, Failure> {
         .iter()
         .map(|item| calendar_entry(item, api))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut out = Args::new();
-    out.insert("calendars".to_string(), Value::Array(calendars));
-    next_page(&mut out, body, api)?;
-    Ok(Value::Object(out))
+    page.out
+        .insert("calendars".to_string(), Value::Array(calendars));
+    next_page(&mut page.out, page.item, api)?;
+    Ok(page.done())
 }
 
 /// One calendar of the user's list.
@@ -2113,6 +2300,69 @@ fn calendar_entry(item: &Value, api: &str) -> Result<Value, Failure> {
     entry.short("accessRole", "access_role")?;
     entry.short("timeZone", "time_zone")?;
     Ok(entry.done())
+}
+
+/// events.list as `{ "events": [...], "time_zone"?, "next_page"? }` in
+/// Google's order (start time). Google omits `items` when there are none,
+/// which is an empty list; more events than `max` is Google's fault.
+fn compact_events(body: &Value, max: usize) -> Result<Value, Failure> {
+    let api = "events.list";
+    let mut page = Compact::of(body, api)?;
+    let items = page.array("items")?;
+    if items.len() > max {
+        return Err(internal(format!(
+            "Google {api} answered {} events for maxResults {max}",
+            items.len()
+        )));
+    }
+    let events = items
+        .iter()
+        .map(|item| event_line(item, api))
+        .collect::<Result<Vec<_>, _>>()?;
+    page.out.insert("events".to_string(), Value::Array(events));
+    page.short("timeZone", "time_zone")?;
+    next_page(&mut page.out, page.item, api)?;
+    Ok(page.done())
+}
+
+/// One event of a window: `id`, `summary`, `start`, `end`, `location`,
+/// `status`, `organizer` (the organizer's email) and `self_response` (the
+/// calendar read's own `responseStatus`, when that calendar is an attendee).
+fn event_line(item: &Value, api: &str) -> Result<Value, Failure> {
+    let mut line = Compact::of(item, api)?;
+    line.id("id", "id", is_event_id)?;
+    line.text("summary", "summary", LISTING_TEXT_MAX_BYTES)?;
+    line.when("start")?;
+    line.when("end")?;
+    line.text("location", "location", LISTING_TEXT_MAX_BYTES)?;
+    line.short("status", "status")?;
+    if let Some(organizer) = line.object("organizer")?
+        && let Some(email) = organizer.string("email")?
+    {
+        line.put_text("organizer", email, ACCOUNT_MAX_BYTES);
+    }
+    if let Some(response) = self_response(&line)? {
+        line.put_short("self_response", response);
+    }
+    Ok(line.done())
+}
+
+/// The `responseStatus` of the attendee entry marked `self`, when Google
+/// returned one; every other entry is ignored. Two `self` entries are
+/// Google's fault.
+fn self_response<'a>(event: &Compact<'a>) -> Result<Option<&'a str>, Failure> {
+    let mut found = None;
+    for attendee in event.array("attendees")? {
+        let attendee = Compact::of(attendee, event.api)?;
+        if !attendee.flag("self")? {
+            continue;
+        }
+        if found.is_some() {
+            return Err(shape(event.api));
+        }
+        found = Some(attendee.string("responseStatus")?);
+    }
+    Ok(found.flatten())
 }
 
 /// `value` as the request's answer, unless it serializes larger than
@@ -5145,6 +5395,361 @@ mod tests {
     }
 
     #[test]
+    fn a_calendar_id_argument_is_refused_before_any_call() {
+        let refusal = "`calendar` must be a calendar id of 1 to 320 bytes with no `/`, `\\`, `%`, \
+                       `\"`, space or control character";
+        for bad in [
+            json!("a/b"),
+            json!("a%40b"),
+            json!("a b"),
+            json!(""),
+            json!("x".repeat(CALENDAR_ID_MAX_BYTES + 1)),
+            json!(7),
+        ] {
+            assert_eq!(
+                events(json!({ "calendar": bad, "from": FROM, "to": TO })).unwrap_err(),
+                refusal,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_id_is_googles_base32hex_with_an_instance_suffix() {
+        for ok in [
+            "0a1b2c3d4e5f",
+            "weekly0123456789_20261104T140000Z",
+            &"a".repeat(EVENT_ID_MAX_BYTES),
+        ] {
+            assert!(is_event_id(ok), "{ok:?}");
+        }
+        for bad in ["", "a b", "a/b", "a.b", &"a".repeat(EVENT_ID_MAX_BYTES + 1)] {
+            assert!(!is_event_id(bad), "{bad:?}");
+        }
+    }
+
+    const FROM: &str = "2026-11-02T00:00:00-05:00";
+    const TO: &str = "2026-11-09T00:00:00-05:00";
+
+    fn events(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::CalendarEvents, &args, &settings()).map(|call| {
+            assert_eq!(call.step, 1);
+            call.api
+        })
+    }
+
+    fn events_query(max: &str, extra: &[(&str, &str)]) -> Query {
+        let mut query = query([
+            ("timeMin", FROM.to_string()),
+            ("timeMax", TO.to_string()),
+            ("singleEvents", "true".to_string()),
+            ("orderBy", "startTime".to_string()),
+            ("maxResults", max.to_string()),
+            ("maxAttendees", "1".to_string()),
+            (
+                "fields",
+                "items(id,summary,start,end,location,status,organizer/email,\
+                 attendees(self,responseStatus)),nextPageToken,timeZone"
+                    .to_string(),
+            ),
+            ("prettyPrint", "false".to_string()),
+        ]);
+        for (key, value) in extra {
+            query.insert(key.to_string(), QueryValue::One(value.to_string()));
+        }
+        query
+    }
+
+    #[test]
+    fn events_reads_one_window_of_primary_on_the_calendar_host() {
+        assert_eq!(
+            events(json!({ "from": FROM, "to": TO })).unwrap(),
+            ApiCall {
+                provider: "google".to_string(),
+                account: None,
+                method: "GET".to_string(),
+                host: "calendar.example.com".to_string(),
+                path: "/calendar/v3/calendars/primary/events".to_string(),
+                query: events_query("50", &[]),
+            }
+        );
+        let call = events(json!({
+            "calendar": "en.usa#holiday@group.v.calendar.google.com",
+            "from": FROM,
+            "to": TO,
+            "q": "lunch & co",
+            "max": 7,
+            "page": "page-2",
+            "account": "alice@example.com",
+        }))
+        .unwrap();
+        assert_eq!(
+            call.path,
+            "/calendar/v3/calendars/en.usa#holiday@group.v.calendar.google.com/events"
+        );
+        assert_eq!(call.account.as_deref(), Some("alice@example.com"));
+        assert_eq!(
+            call.query,
+            events_query("7", &[("q", "lunch & co"), ("pageToken", "page-2")])
+        );
+    }
+
+    #[test]
+    fn events_refuse_bad_arguments() {
+        for (args, refusal) in [
+            (json!({ "to": TO }), "`from` is required"),
+            (json!({ "from": FROM }), "`to` is required"),
+            (json!({ "from": " ", "to": TO }), "`from` is empty"),
+            (
+                json!({ "from": FROM, "to": "x".repeat(TIME_MAX_BYTES + 1) }),
+                "`to` is longer than 64 bytes",
+            ),
+            (
+                json!({ "from": FROM, "to": TO, "max": 0 }),
+                "`max` must be an integer from 1 to 50",
+            ),
+            (
+                json!({ "from": FROM, "to": TO, "max": 51 }),
+                "`max` must be an integer from 1 to 50",
+            ),
+            (json!({ "from": FROM, "to": TO, "q": "" }), "`q` is empty"),
+            (
+                json!({ "from": FROM, "to": TO, "page": "x".repeat(PAGE_MAX_BYTES + 1) }),
+                "`page` is longer than 4096 bytes",
+            ),
+            (
+                json!({ "from": FROM, "to": TO, "id": "e1" }),
+                "unknown argument `id`; this tool takes `calendar`, `from`, `to`, `q`, `max`, \
+                 `page`, `account`",
+            ),
+        ] {
+            assert_eq!(events(args.clone()).unwrap_err(), refusal, "{args}");
+        }
+    }
+
+    const EVENTS_LIST: &str = include_str!("fixtures/events-list.json");
+
+    fn events_state(args: Value) -> InFlight {
+        let call = plan(Provided::CalendarEvents, &args, &settings()).unwrap();
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::CalendarEvents,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        )
+    }
+
+    fn list_events(body: &str) -> Next {
+        answered(
+            &events_state(json!({ "from": FROM, "to": TO })),
+            http(200, body),
+        )
+    }
+
+    #[test]
+    fn events_compact_in_googles_order_with_the_users_own_response() {
+        assert_eq!(
+            list_events(EVENTS_LIST),
+            Next::Complete(json!({
+                "events": [
+                    {
+                        "id": "0a1b2c3d4e5f6g7h8i9j",
+                        "summary": "Planning",
+                        "start": {
+                            "date_time": "2026-11-02T09:00:00-05:00",
+                            "time_zone": "America/New_York",
+                        },
+                        "end": {
+                            "date_time": "2026-11-02T10:00:00-05:00",
+                            "time_zone": "America/New_York",
+                        },
+                        "location": "Room 4 \"north\"",
+                        "status": "confirmed",
+                        "organizer": "alice@example.com",
+                        "self_response": "accepted",
+                    },
+                    {
+                        "id": "allday0123456789",
+                        "summary": "Holiday",
+                        "start": { "date": "2026-11-03" },
+                        "end": { "date": "2026-11-04" },
+                        "status": "confirmed",
+                        "organizer": "en.usa#holiday@group.v.calendar.google.com",
+                    },
+                    {
+                        "id": "weekly0123456789_20261104T140000Z",
+                        "summary": "Weekly sync",
+                        "start": { "date_time": "2026-11-04T14:00:00Z" },
+                        "end": { "date_time": "2026-11-04T14:30:00Z" },
+                        "status": "confirmed",
+                        "organizer": "bob@example.com",
+                        "self_response": "declined",
+                    },
+                    {
+                        "id": "offsite0123456789",
+                        "summary": "Offsite",
+                        "start": {
+                            "date_time": "2026-11-05T09:00:00-08:00",
+                            "time_zone": "America/Los_Angeles",
+                        },
+                        "end": {
+                            "date_time": "2026-11-05T17:00:00-08:00",
+                            "time_zone": "America/Los_Angeles",
+                        },
+                        "status": "tentative",
+                        "organizer": "bob@example.com",
+                    },
+                ],
+                "time_zone": "America/New_York",
+                "next_page": "page-2",
+            }))
+        );
+        assert_eq!(list_events("{}"), Next::Complete(json!({ "events": [] })));
+        assert_eq!(
+            list_events(r#"{ "items": [{ "id": "e1", "attendees": [{ "self": true }] }] }"#),
+            Next::Complete(json!({ "events": [{ "id": "e1" }] }))
+        );
+    }
+
+    #[test]
+    fn an_events_line_cuts_and_flags_its_text_and_organizer() {
+        let organizer = format!("{}@example.com", "o".repeat(ACCOUNT_MAX_BYTES));
+        let body = json!({ "items": [{
+            "id": "e1",
+            "summary": format!("a\u{1}{}", "é".repeat(200)),
+            "location": "Room 4",
+            "status": "s".repeat(SHORT_MAX_BYTES + 10),
+            "organizer": { "email": organizer },
+            "attendees": [{ "self": true, "responseStatus": "r".repeat(SHORT_MAX_BYTES + 1) }],
+        }] });
+        let answer = completed(list_events(&body.to_string()));
+        let line = &answer["events"][0];
+        let summary = line["summary"].as_str().unwrap();
+        assert!(summary.starts_with("a é"), "{summary}");
+        assert!(summary.len() <= LISTING_TEXT_MAX_BYTES + '…'.len_utf8());
+        assert!(line["organizer"].as_str().unwrap().ends_with('…'));
+        assert_eq!(line["fields_truncated"], json!(["organizer", "summary"]));
+        assert_eq!(
+            line["status"],
+            json!(format!("{}…", "s".repeat(SHORT_MAX_BYTES)))
+        );
+        assert_eq!(
+            line["self_response"],
+            json!(format!("{}…", "r".repeat(SHORT_MAX_BYTES)))
+        );
+    }
+
+    #[test]
+    fn events_refuse_an_unexpected_shape() {
+        let shape = || {
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "unexpected Google events.list response shape",
+            ))
+        };
+        let event = |extra: Value| {
+            let mut item = json!({ "id": "e1" });
+            item.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            json!({ "items": [item] })
+        };
+        for body in [
+            json!([]),
+            json!({ "items": {} }),
+            json!({ "items": [1] }),
+            json!({ "items": [{}] }),
+            json!({ "items": [{ "id": "e.1" }] }),
+            json!({ "items": [{ "id": "e".repeat(EVENT_ID_MAX_BYTES + 1) }] }),
+            event(json!({ "summary": 1 })),
+            event(json!({ "start": "2026-11-02" })),
+            event(json!({ "start": {} })),
+            event(json!({ "start": { "timeZone": "UTC" } })),
+            event(json!({ "start": { "date": "2026-11-02", "dateTime": "2026-11-02T00:00:00Z" } })),
+            event(json!({ "end": { "date": 20261102 } })),
+            event(json!({ "organizer": "bob@example.com" })),
+            event(json!({ "organizer": { "email": 1 } })),
+            event(json!({ "attendees": {} })),
+            event(json!({ "attendees": ["alice@example.com"] })),
+            event(json!({ "attendees": [{ "self": "yes" }] })),
+            event(json!({ "attendees": [{ "self": true, "responseStatus": 1 }] })),
+            event(json!({ "attendees": [{ "self": true }, { "self": true }] })),
+            json!({ "items": [], "timeZone": 5 }),
+            json!({ "items": [], "nextPageToken": "" }),
+        ] {
+            assert_eq!(list_events(&body.to_string()), shape(), "{body}");
+        }
+    }
+
+    #[test]
+    fn events_refuse_more_events_than_they_asked_for() {
+        let items: Vec<Value> = (0..=7).map(|i| json!({ "id": format!("e{i}") })).collect();
+        let state = events_state(json!({ "from": FROM, "to": TO, "max": 7 }));
+        assert_eq!(
+            answered(&state, http(200, &json!({ "items": items }).to_string())),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "Google events.list answered 8 events for maxResults 7"
+            ))
+        );
+    }
+
+    #[test]
+    fn events_relay_googles_errors() {
+        let state = events_state(json!({ "from": "monday", "to": TO }));
+        assert_eq!(
+            answered(
+                &state,
+                http(400, &google(400, "INVALID_ARGUMENT", "Bad Request"))
+            ),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "Google INVALID_ARGUMENT (HTTP 400): Bad Request"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_widest_events_page_fits_the_ceiling() {
+        // Every string at its bound and as wide as it serializes.
+        let quotes = |n: usize| "\"".repeat(n);
+        let when = || json!({ "dateTime": quotes(SHORT_MAX_BYTES + 1), "timeZone": quotes(SHORT_MAX_BYTES + 1) });
+        let items: Vec<Value> = (0..EVENTS_MAX_MAX)
+            .map(|i| {
+                json!({
+                    "id": format!("{i:02}{}", "a".repeat(EVENT_ID_MAX_BYTES - 2)),
+                    "summary": quotes(LISTING_TEXT_MAX_BYTES + 1),
+                    "location": quotes(LISTING_TEXT_MAX_BYTES + 1),
+                    "status": quotes(SHORT_MAX_BYTES + 1),
+                    "start": when(),
+                    "end": when(),
+                    "organizer": { "email": quotes(ACCOUNT_MAX_BYTES + 1) },
+                    "attendees": [{ "self": true, "responseStatus": quotes(SHORT_MAX_BYTES + 1) }],
+                })
+            })
+            .collect();
+        let body = json!({
+            "items": items,
+            "timeZone": quotes(SHORT_MAX_BYTES + 1),
+            "nextPageToken": quotes(PAGE_MAX_BYTES),
+        });
+        let answer = completed(list_events(&body.to_string()));
+        assert_eq!(
+            answer["events"].as_array().unwrap().len(),
+            usize::try_from(EVENTS_MAX_MAX).unwrap()
+        );
+        assert_eq!(
+            answer["events"][0]["fields_truncated"],
+            json!(["location", "organizer", "summary"])
+        );
+        let size = serialized_len(&answer);
+        assert!(size < 210_000, "{size}");
+        assert!(size < COMPACT_RESULT_CEILING);
+    }
+
+    #[test]
     fn every_step_answers_an_unreadable_read_by_its_shape() {
         let refusal = "result exceeds [messaging] max_body_bytes";
         let outcomes = || {
@@ -5184,6 +5789,27 @@ mod tests {
                     name(&state)
                 );
             }
+        }
+
+        // A window the caller can narrow: the rendering and what to narrow.
+        let state = events_state(json!({ "from": FROM, "to": TO }));
+        for (outcome, why) in outcomes() {
+            let answer = answered(&state, outcome);
+            assert_eq!(
+                answer,
+                Next::Fail(why.failure(Some(EVENTS_HINT))),
+                "{}",
+                name(&state)
+            );
+            let Next::Fail(Failure { detail, .. }) = answer else {
+                panic!("{answer:?}");
+            };
+            assert!(
+                detail.ends_with(
+                    "; ask for fewer events with `max`, or a shorter `from`/`to` window"
+                ),
+                "{detail}"
+            );
         }
 
         // A narrower form: one re-read, carrying why.

@@ -1,0 +1,42 @@
+{
+  "nextPageToken": "page-2",
+  "timeZone": "America/New_York",
+  "items": [
+    {
+      "id": "0a1b2c3d4e5f6g7h8i9j",
+      "status": "confirmed",
+      "summary": "Planning",
+      "location": "Room 4 \"north\"",
+      "organizer": { "email": "alice@example.com" },
+      "start": { "dateTime": "2026-11-02T09:00:00-05:00", "timeZone": "America/New_York" },
+      "end": { "dateTime": "2026-11-02T10:00:00-05:00", "timeZone": "America/New_York" },
+      "attendees": [{ "self": true, "responseStatus": "accepted" }]
+    },
+    {
+      "id": "allday0123456789",
+      "status": "confirmed",
+      "summary": "Holiday",
+      "organizer": { "email": "en.usa#holiday@group.v.calendar.google.com" },
+      "start": { "date": "2026-11-03" },
+      "end": { "date": "2026-11-04" }
+    },
+    {
+      "id": "weekly0123456789_20261104T140000Z",
+      "status": "confirmed",
+      "summary": "Weekly sync",
+      "organizer": { "email": "bob@example.com" },
+      "start": { "dateTime": "2026-11-04T14:00:00Z" },
+      "end": { "dateTime": "2026-11-04T14:30:00Z" },
+      "attendees": [{ "self": true, "responseStatus": "declined" }]
+    },
+    {
+      "id": "offsite0123456789",
+      "status": "tentative",
+      "summary": "Offsite",
+      "organizer": { "email": "bob@example.com" },
+      "start": { "dateTime": "2026-11-05T09:00:00-08:00", "timeZone": "America/Los_Angeles" },
+      "end": { "dateTime": "2026-11-05T17:00:00-08:00", "timeZone": "America/Los_Angeles" },
+      "attendees": [{ "responseStatus": "accepted" }]
+    }
+  ]
+}
