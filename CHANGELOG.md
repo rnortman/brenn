@@ -20,6 +20,15 @@ All notable changes to Brenn are documented here.
   `tool gmail-draft {}`; and each user reconnects their Google account with
   `gmail_compose` before the tool can write.
 
+- **A Gmail draft can now be a reply.** `GmailDraft` takes an optional
+  `reply_to_id`, a message id from `GmailSearch` or `GmailRead`: the draft is
+  then filed in that message's conversation with the headers a reply
+  carries, and `subject` may be left out, in which case it is the
+  original's with `Re: ` in front. If Gmail files the draft as a new
+  conversation instead, the assistant is told so. Reading the original needs
+  the user's Gmail read access as well as `gmail_compose`. No config changes
+  beyond those `GmailDraft` already needs.
+
 - **The Google Workspace assistant tools can now tell when the user is
   busy.** The `google-workspace-tools` component gains `CalendarFreeBusy`:
   for a window between two RFC 3339 times and up to 50 calendars (`primary`

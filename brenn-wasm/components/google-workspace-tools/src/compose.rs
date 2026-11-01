@@ -183,6 +183,23 @@ fn fold_ascii(name: &str, value: &str) -> String {
     out + "\r\n"
 }
 
+/// The text an unfolded header value of encoded-words carries, decoded:
+/// every space-separated word one `utf-8` `B` encoded-word of whole
+/// characters.
+#[cfg(test)]
+pub(super) fn decoded_words(value: &str) -> String {
+    let mut text = Vec::new();
+    for word in value.split(' ') {
+        let encoded = word
+            .strip_prefix("=?utf-8?B?")
+            .and_then(|rest| rest.strip_suffix("?="))
+            .unwrap_or_else(|| panic!("{word:?} is not one encoded-word"));
+        let bytes = super::decode::base64url(encoded).unwrap();
+        text.push(String::from_utf8(bytes).expect("a word is cut on a character boundary"));
+    }
+    text.concat()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::decode;
@@ -230,22 +247,6 @@ mod tests {
         assert_eq!(canonical("é\u{2028}").as_str(), "é\u{2028}");
     }
 
-    /// The text the encoded-words of a `Subject` line carry, decoded.
-    fn decoded_words(line: &str) -> String {
-        let words = line.strip_prefix("Subject: ").unwrap();
-        let mut text = Vec::new();
-        for word in words.trim_end_matches("\r\n").split("\r\n ") {
-            let encoded = word
-                .strip_prefix("=?utf-8?B?")
-                .and_then(|rest| rest.strip_suffix("?="))
-                .unwrap_or_else(|| panic!("{word:?} is not one encoded-word"));
-            let bytes = decode::base64url(encoded).unwrap();
-            // Each word carries whole characters.
-            text.push(String::from_utf8(bytes).expect("a word is cut on a character boundary"));
-        }
-        text.concat()
-    }
-
     #[test]
     fn a_subject_is_plain_when_it_fits_and_encoded_words_otherwise() {
         assert_eq!(
@@ -268,7 +269,11 @@ mod tests {
                 let word = physical.trim_start_matches("Subject: ").trim_start();
                 assert!(word.len() <= 75, "{word:?}");
             }
-            assert_eq!(decoded_words(&line), text);
+            let value = line.strip_prefix("Subject: ").unwrap();
+            assert_eq!(
+                decoded_words(&value.trim_end_matches("\r\n").replace("\r\n ", " ")),
+                text
+            );
         }
     }
 

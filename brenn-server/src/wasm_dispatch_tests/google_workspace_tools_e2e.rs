@@ -2058,19 +2058,22 @@ fn draft_answer() -> serde_json::Value {
 }
 
 /// A draft's message as the one `POST` carried it: the request body is
-/// `{"message": {"raw": …}}` and nothing else, `raw` is base64url, and the
-/// message is its headers, unfolded and in order, and its body, base64
-/// decoded.
-fn posted_message(bodies: &[Vec<u8>]) -> (Vec<(String, String)>, String) {
+/// `{"message": {"raw": …}}`, with `threadId` for a reply in `thread` and
+/// nothing else, `raw` is base64url, and the message is its headers,
+/// unfolded and in order, and its body, base64 decoded.
+fn posted_message(bodies: &[Vec<u8>], thread: Option<&str>) -> (Vec<(String, String)>, String) {
     use base64ct::{Base64, Base64UrlUnpadded, Encoding as _};
 
     assert_eq!(bodies.len(), 1, "exactly one POST carried a body");
     let request: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
     let raw = request["message"]["raw"].as_str().expect("a raw message");
+    let expected = match thread {
+        Some(thread) => json!({ "message": { "raw": raw, "threadId": thread } }),
+        None => json!({ "message": { "raw": raw } }),
+    };
     assert_eq!(
-        request,
-        json!({ "message": { "raw": raw } }),
-        "a fresh draft names no thread"
+        request, expected,
+        "a draft names its thread only as a reply"
     );
     let message = String::from_utf8(Base64UrlUnpadded::decode_vec(raw).unwrap()).unwrap();
     let (head, body) = message.split_once("\r\n\r\n").expect("a header block");
@@ -2147,7 +2150,7 @@ async fn gmail_draft_posts_one_raw_message_with_the_users_bearer() {
         [("POST".to_string(), DRAFTS.to_string(), google_query(&[]))]
     );
     assert_eq!(r.bearers(), [format!("Bearer {BEARER}")]);
-    let (headers, body) = posted_message(&r.bodies());
+    let (headers, body) = posted_message(&r.bodies(), None);
     let expected: Vec<(String, String)> = [
         ("To", "Bob Example <bob@example.com>, carol@example.com"),
         ("Cc", "dave@example.com"),
@@ -2181,7 +2184,7 @@ async fn gmail_draft_encodes_a_non_ascii_subject_and_body() {
     r.run(1).await;
 
     assert_eq!(call.await.unwrap(), Ok(draft_answer()));
-    let (headers, body) = posted_message(&r.bodies());
+    let (headers, body) = posted_message(&r.bodies(), None);
     assert_eq!(headers.len(), 5, "{headers:?}");
     assert_eq!(
         headers[0],
@@ -2290,5 +2293,154 @@ async fn a_draft_post_without_its_clause_could_not_be_issued() {
     assert_could_not_be_issued(call.await.unwrap());
     r.owed(&r.executor_sub(), 0).await;
     assert!(r.seen().is_empty(), "a refused call reaches no API");
+    r.assert_finished(&id);
+}
+
+/// messages.get's metadata query for a reply's original: its thread and the
+/// headers the reply derives its own from.
+fn original_query() -> Pairs {
+    google_query(&[
+        ("format", "metadata"),
+        ("fields", "id,threadId,payload/headers"),
+        ("metadataHeaders", "Subject"),
+        ("metadataHeaders", "Message-ID"),
+        ("metadataHeaders", "References"),
+    ])
+}
+
+/// Google's metadata answer for the original `m1` in thread `t9`, the
+/// thread `draft_body` files the draft in, carrying `headers` as name and
+/// value pairs.
+fn original_body(headers: &[(&str, &str)]) -> String {
+    let headers: Vec<serde_json::Value> = headers
+        .iter()
+        .map(|(name, value)| json!({ "name": name, "value": value }))
+        .collect();
+    serde_json::to_string_pretty(&json!({
+        "id": "m1",
+        "threadId": "t9",
+        "payload": { "headers": headers },
+    }))
+    .unwrap()
+}
+
+/// A reply with no `subject` reads its original's metadata, then posts one
+/// draft in the original's thread carrying `In-Reply-To`, `References` (the
+/// original's followed by its `Message-ID`) and the original's subject after
+/// `Re: `. The answer names the `Message-ID` answered and the derived
+/// subject.
+#[tokio::test]
+async fn gmail_draft_replies_in_the_originals_thread() {
+    let r = rig().await;
+    r.answer(
+        &format!("{MESSAGES}/m1"),
+        original_body(&[
+            ("Subject", "Lunch on Friday"),
+            ("Message-ID", "<c@mail.example.com>"),
+            ("References", "<a@mail.example.com> <b@mail.example.com>"),
+        ]),
+    );
+    r.answer(DRAFTS, draft_body());
+    let call = r.call_for_alice(
+        "GmailDraft",
+        json!({ "to": "bob@example.com", "body": "Noon works.", "reply_to_id": "m1" }),
+    );
+    let id = r.requested_id().await;
+    r.run(2).await;
+
+    let mut answer = draft_answer();
+    answer["in_reply_to"] = json!("<c@mail.example.com>");
+    answer["subject"] = json!("Re: Lunch on Friday");
+    assert_eq!(call.await.unwrap(), Ok(answer));
+    assert_eq!(
+        r.seen(),
+        [
+            (
+                "GET".to_string(),
+                format!("{MESSAGES}/m1"),
+                original_query()
+            ),
+            ("POST".to_string(), DRAFTS.to_string(), google_query(&[])),
+        ]
+    );
+    assert_eq!(
+        r.bearers(),
+        [format!("Bearer {BEARER}"), format!("Bearer {BEARER}")]
+    );
+    let (headers, body) = posted_message(&r.bodies(), Some("t9"));
+    let expected: Vec<(String, String)> = [
+        ("To", "bob@example.com"),
+        ("Subject", "Re: Lunch on Friday"),
+        ("In-Reply-To", "<c@mail.example.com>"),
+        (
+            "References",
+            "<a@mail.example.com> <b@mail.example.com> <c@mail.example.com>",
+        ),
+    ]
+    .map(|(name, value)| (name.to_string(), value.to_string()))
+    .into_iter()
+    .chain(mime_headers())
+    .collect();
+    assert_eq!(headers, expected);
+    assert_eq!(body, "Noon works.");
+    r.assert_finished(&id);
+}
+
+/// A reply to an original without a `Message-ID` posts the original's
+/// `threadId` with no `In-Reply-To` or `References`; the answer names no
+/// `in_reply_to`, and a caller's `subject` is used as given.
+#[tokio::test]
+async fn gmail_draft_replies_to_an_original_without_a_message_id() {
+    let r = rig().await;
+    r.answer(
+        &format!("{MESSAGES}/m1"),
+        original_body(&[("Subject", "Lunch on Friday")]),
+    );
+    r.answer(DRAFTS, draft_body());
+    let call = r.call_for_alice(
+        "GmailDraft",
+        json!({
+            "to": "bob@example.com",
+            "subject": "Re: Lunch",
+            "body": "Noon works.",
+            "reply_to_id": "m1",
+        }),
+    );
+    let id = r.requested_id().await;
+    r.run(2).await;
+
+    assert_eq!(call.await.unwrap(), Ok(draft_answer()));
+    let (headers, _) = posted_message(&r.bodies(), Some("t9"));
+    let expected: Vec<(String, String)> = [("To", "bob@example.com"), ("Subject", "Re: Lunch")]
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .into_iter()
+        .chain(mime_headers())
+        .collect();
+    assert_eq!(headers, expected);
+    r.assert_finished(&id);
+}
+
+/// Google's 403 on a reply's read of its original is `denied` naming the
+/// Gmail read scope, which that read needs, and no draft is posted.
+#[tokio::test]
+async fn a_reply_read_403_names_the_read_scope() {
+    let r = rig().await;
+    r.fail(&format!("{MESSAGES}/m1"), 403, insufficient_scope_body());
+    let call = r.call_for_alice(
+        "GmailDraft",
+        json!({ "to": "bob@example.com", "body": "Noon works.", "reply_to_id": "m1" }),
+    );
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(call.await.unwrap(), scope_denied());
+    assert_eq!(
+        r.seen(),
+        [(
+            "GET".to_string(),
+            format!("{MESSAGES}/m1"),
+            original_query()
+        )]
+    );
     r.assert_finished(&id);
 }

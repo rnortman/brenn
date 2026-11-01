@@ -273,8 +273,16 @@ const SHORT_MAX_BYTES: usize = 64;
 /// The path Gmail creates drafts at. Nothing below it is ever called: a
 /// draft is sent only by the user, from Gmail.
 const DRAFTS_PATH: &str = "/gmail/v1/users/me/drafts";
-/// `GmailDraft`'s one step: the draft's `POST`.
-const DRAFT_CREATE_STEP: u8 = 1;
+/// `GmailDraft`'s read of the message a reply answers.
+const DRAFT_ORIGINAL_STEP: u8 = 1;
+/// `GmailDraft`'s `POST`: a fresh draft's first step, a reply's second.
+const DRAFT_CREATE_STEP: u8 = 2;
+/// The fields a reply reads of its original.
+const DRAFT_ORIGINAL_FIELDS: &str = "id,threadId,payload/headers";
+/// The headers a reply derives its own from.
+const DRAFT_ORIGINAL_HEADERS: &[&str] = &["Subject", "Message-ID", "References"];
+/// The most bytes of an original's subject a reply derives its own from.
+const DERIVED_SUBJECT_MAX_BYTES: usize = HEADER_MAX_BYTES;
 /// The most bytes of a header value a draft carries: RFC 5322 holds a line to
 /// 998 characters, and the longest header name written before a bounded value
 /// is `In-Reply-To: ` (13), so a value this long fits its line unfolded.
@@ -286,10 +294,10 @@ const BODY_MAX_CHARS: usize = 20_000;
 /// The most bytes a draft's body may hold in its CRLF form, a lone line break
 /// counting as the two bytes it becomes. The body travels as base64 of that
 /// form inside `raw`, itself base64url of the message, inside the nested
-/// call's args, which the host caps at 64 KiB: with `to` and `cc` at
-/// `HEADER_VALUE_MAX_BYTES`, `subject` at its cap as encoded-words and
-/// `account` at its escaped width, the widest admitted call serializes to
-/// about 49 000 bytes.
+/// call's args, which the host caps at 64 KiB: with `to`, `cc` and a reply's
+/// `In-Reply-To` and `References` at `HEADER_VALUE_MAX_BYTES`, `subject` at
+/// its cap as encoded-words, the longest thread id and `account` at its
+/// escaped width, the widest admitted call serializes to about 49 000 bytes.
 const BODY_MAX_BYTES: usize = 20_000;
 /// What the caller is told when a draft's `POST` may have been acted on and
 /// its answer was lost or unreadable.
@@ -328,6 +336,7 @@ fn scope(tool: Provided, step: u8) -> Scope {
             | Provided::GmailThread,
             _,
         ) => Scope::GmailRead,
+        (Provided::GmailDraft, DRAFT_ORIGINAL_STEP) => Scope::GmailRead,
         (Provided::GmailDraft, _) => Scope::GmailCompose,
         (
             Provided::CalendarList
@@ -679,9 +688,18 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
         }
         Provided::GmailDraft => {
             let draft = DraftArgs::parse(args)?;
-            Ok(Call {
-                step: DRAFT_CREATE_STEP,
-                api: draft_create_call(&draft, settings),
+            Ok(match (&draft.reply_to_id, &draft.subject) {
+                (Some(id), _) => Call {
+                    step: DRAFT_ORIGINAL_STEP,
+                    api: draft_original_call(id, draft.account.as_deref(), settings),
+                },
+                (None, Some(subject)) => Call {
+                    step: DRAFT_CREATE_STEP,
+                    api: draft_create_call(&draft, subject, None, settings),
+                },
+                (None, None) => {
+                    unreachable!("a draft's parse refuses one without `subject` or `reply_to_id`")
+                }
             })
         }
     }
@@ -1042,25 +1060,55 @@ fn free_busy_call(args: &FreeBusyArgs, settings: &Settings) -> ApiCall {
 struct DraftArgs {
     to: String,
     cc: Option<String>,
-    subject: String,
+    /// `None` only for a reply, which derives its subject from the original.
+    subject: Option<String>,
     body: compose::Body,
+    reply_to_id: Option<String>,
     account: Option<String>,
 }
 
 impl DraftArgs {
     /// Every argument the tool takes.
-    const KEYS: &[&str] = &["to", "cc", "subject", "body", "account"];
+    const KEYS: &[&str] = &["to", "cc", "subject", "body", "reply_to_id", "account"];
 
     fn parse(args: &Value) -> Result<DraftArgs, String> {
         let map = object(args, Self::KEYS)?;
+        let to = header_ascii(map, "to")?.ok_or("`to` is required")?;
+        let cc = header_ascii(map, "cc")?;
+        let reply_to_id = gmail_id(map, "reply_to_id")?;
+        let subject = subject(map)?;
+        if subject.is_none() && reply_to_id.is_none() {
+            return Err("`subject` is required unless `reply_to_id` is given".to_string());
+        }
         Ok(DraftArgs {
-            to: header_ascii(map, "to")?.ok_or("`to` is required")?,
-            cc: header_ascii(map, "cc")?,
-            subject: subject(map)?.ok_or("`subject` is required")?,
+            to,
+            cc,
+            subject,
             body: body(map)?.ok_or("`body` is required")?,
+            reply_to_id,
             account: account(map)?,
         })
     }
+}
+
+/// What a reply takes from its original, each value held to what the message
+/// builder writes as is.
+struct Reply {
+    /// The original's thread, which the draft is filed in.
+    thread_id: String,
+    /// The threading headers, when the original's `Message-ID` is one
+    /// printable ASCII token of at most `HEADER_VALUE_MAX_BYTES`.
+    threading: Option<Threading>,
+}
+
+/// A reply's `In-Reply-To` and `References`.
+struct Threading {
+    /// The original's `Message-ID`.
+    in_reply_to: String,
+    /// The original's `References` and `Message-ID` joined, or the
+    /// `Message-ID` alone when the original's `References` is absent, not
+    /// printable ASCII, or too long to join.
+    references: String,
 }
 
 /// A recipient header argument: 1 to `HEADER_VALUE_MAX_BYTES` printable
@@ -1117,31 +1165,150 @@ fn body(args: &Args) -> Result<Option<compose::Body>, String> {
     Ok(Some(body))
 }
 
-/// drafts.create of the message the arguments describe, as `raw`. The `POST`
-/// creates a draft and sends nothing.
-fn draft_create_call(args: &DraftArgs, settings: &Settings) -> ApiCall {
+/// messages.get of a reply's original: its thread and the headers the reply
+/// derives its own from, no body.
+fn draft_original_call(id: &str, account: Option<&str>, settings: &Settings) -> ApiCall {
+    get_call(
+        settings,
+        &settings.gmail_host,
+        account,
+        format!("{MESSAGES_PATH}/{id}"),
+        metadata_query(DRAFT_ORIGINAL_FIELDS, DRAFT_ORIGINAL_HEADERS),
+    )
+}
+
+/// drafts.create of the message the arguments describe under `subject`, as
+/// `raw`, filed in the original's thread for a reply. The `POST` creates a
+/// draft and sends nothing.
+fn draft_create_call(
+    args: &DraftArgs,
+    subject: &str,
+    reply: Option<&Reply>,
+    settings: &Settings,
+) -> ApiCall {
+    let threading = reply.and_then(|reply| reply.threading.as_ref());
     let message = compose::message(&compose::Message {
         to: &args.to,
         cc: args.cc.as_deref(),
-        subject: &args.subject,
-        in_reply_to: None,
-        references: None,
+        subject,
+        in_reply_to: threading.map(|threading| threading.in_reply_to.as_str()),
+        references: threading.map(|threading| threading.references.as_str()),
         body: &args.body,
     });
+    let mut message = json!({ "raw": compose::base64url(&message) });
+    if let Some(reply) = reply {
+        message["threadId"] = json!(reply.thread_id);
+    }
     post_json_call(
         settings,
         &settings.gmail_host,
         args.account.as_deref(),
         DRAFTS_PATH.to_string(),
         Query::new(),
-        json!({ "message": { "raw": compose::base64url(&message) } }),
+        json!({ "message": message }),
     )
 }
 
+/// A reply's original read: the draft's `POST` next, filed in the original's
+/// thread with the headers derived from the original's, carrying in
+/// `derived` the original's `thread_id`, which the answer is checked
+/// against, and the `in_reply_to` and derived `subject` it names. An
+/// original whose id is not the one asked for is Google's fault.
+fn draft_reply(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
+    let api = "messages.get";
+    let args = stored(state, DraftArgs::parse)?;
+    let asked = args
+        .reply_to_id
+        .as_deref()
+        .expect("a draft reads an original only for `reply_to_id`");
+    if body.get("id").and_then(Value::as_str) != Some(asked) {
+        return Err(shape(api));
+    }
+    let thread_id = match body.get("threadId") {
+        Some(Value::String(id)) if is_gmail_id(id) => id.clone(),
+        _ => return Err(shape(api)),
+    };
+    let message_id =
+        raw_header(body, "Message-ID", api)?.filter(|id| is_header_ascii(id) && !id.contains(' '));
+    let original_references = raw_header(body, "References", api)?;
+    let original_subject = raw_header(body, "Subject", api)?;
+    let threading = message_id.map(|id| Threading {
+        in_reply_to: id.to_string(),
+        references: match original_references {
+            Some(references)
+                if is_header_ascii(references)
+                    && references.len() + 1 + id.len() <= HEADER_VALUE_MAX_BYTES =>
+            {
+                format!("{references} {id}")
+            }
+            _ => id.to_string(),
+        },
+    });
+    let mut derived = Args::new();
+    derived.insert("thread_id".to_string(), json!(thread_id));
+    if let Some(threading) = &threading {
+        derived.insert("in_reply_to".to_string(), json!(threading.in_reply_to));
+    }
+    let subject = match &args.subject {
+        Some(subject) => subject.clone(),
+        None => {
+            let subject = derived_subject(original_subject)?;
+            derived.insert("subject".to_string(), json!(subject));
+            subject
+        }
+    };
+    let reply = Reply {
+        thread_id,
+        threading,
+    };
+    Ok(Next::Call {
+        call: Call {
+            step: DRAFT_CREATE_STEP,
+            api: draft_create_call(&args, &subject, Some(&reply), settings),
+        },
+        derived,
+    })
+}
+
+/// A reply's subject from its original's: every control character a space,
+/// so no line break reaches the header, then `Re: ` before it unless it
+/// already starts with `re:` in any case after leading whitespace. An absent
+/// or blank original derives `Re:` alone; one over
+/// `DERIVED_SUBJECT_MAX_BYTES` is refused, the caller to give `subject`.
+fn derived_subject(original: Option<&str>) -> Result<String, Failure> {
+    let original: String = original
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if original.len() > DERIVED_SUBJECT_MAX_BYTES {
+        return Err(Failure {
+            kind: ErrorKind::InvalidArgs,
+            detail: format!(
+                "the original's subject is longer than {DERIVED_SUBJECT_MAX_BYTES} bytes; give \
+                 `subject`"
+            ),
+        });
+    }
+    let start = original.trim_start();
+    if start.is_empty() {
+        return Ok("Re:".to_string());
+    }
+    if start
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("re:"))
+    {
+        return Ok(original);
+    }
+    Ok(format!("Re: {original}"))
+}
+
 /// drafts.create's answer, Google's draft resource, as the draft's ids:
-/// `draft_id`, `message_id`, and `thread_id` when Google gave it. Nothing of
-/// the message is echoed; the caller wrote it.
-fn compact_draft(body: &Value) -> Result<Value, Failure> {
+/// `draft_id`, `message_id`, and `thread_id` when Google gave it; for a
+/// reply, also the `in_reply_to` and derived `subject` the draft carries,
+/// from `derived`, and `in_thread: false` when Google filed the draft in a
+/// thread other than the original's. Nothing the caller wrote is echoed.
+fn compact_draft(body: &Value, derived: &Args) -> Result<Value, Failure> {
     let api = "drafts.create";
     let gmail_id = |value: Option<&Value>| match value {
         Some(Value::String(id)) if is_gmail_id(id) => Ok(id.clone()),
@@ -1158,8 +1325,17 @@ fn compact_draft(body: &Value) -> Result<Value, Failure> {
         json!(gmail_id(message.get("id"))?),
     );
     if let Some(thread) = message.get("threadId") {
-        out.insert("thread_id".to_string(), json!(gmail_id(Some(thread))?));
+        let thread = gmail_id(Some(thread))?;
+        if derived
+            .get("thread_id")
+            .is_some_and(|original| original != thread.as_str())
+        {
+            out.insert("in_thread".to_string(), json!(false));
+        }
+        out.insert("thread_id".to_string(), json!(thread));
     }
+    copy(&mut out, "in_reply_to", derived.get("in_reply_to"));
+    copy(&mut out, "subject", derived.get("subject"));
     Ok(Value::Object(out))
 }
 
@@ -1205,8 +1381,9 @@ fn header_value(message: &Value, name: &str, api: &str) -> Result<Option<HeaderV
 }
 
 /// The value of the header `name` in `message`'s `payload.headers` list as
-/// Google sent it, for comparison only: never copied into an answer. Absent
-/// and malformed as `header_value` reads them.
+/// Google sent it, uncut and unfiltered: compared, or held to a rule of the
+/// caller's before it is written anywhere. Absent and malformed as
+/// `header_value` reads them.
 fn raw_header<'a>(message: &'a Value, name: &str, api: &str) -> Result<Option<&'a str>, Failure> {
     let headers = match message.get("payload") {
         None => return Ok(None),
@@ -1393,7 +1570,8 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
     settle(
         state.tool,
         match (state.tool, state.step) {
-            (Provided::GmailDraft, DRAFT_CREATE_STEP) => compact_draft(&body)
+            (Provided::GmailDraft, DRAFT_ORIGINAL_STEP) => draft_reply(state, &body, settings),
+            (Provided::GmailDraft, DRAFT_CREATE_STEP) => compact_draft(&body, &state.derived)
                 .map(Next::Complete)
                 .map_err(|failure| at_write(state, failure)),
             (Provided::GmailLabels, 1) => stored(state, LabelsArgs::parse)
@@ -1462,6 +1640,7 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
             | (Provided::GmailRead, STRUCTURE_STEP)
             | (Provided::GmailThread, THREAD_NARROW_STEP)
             | (Provided::CalendarList | Provided::CalendarEvent, 1)
+            | (Provided::GmailDraft, DRAFT_ORIGINAL_STEP)
             | (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 Err(why.failure(None))
             }
@@ -1509,7 +1688,8 @@ fn no_body(state: &InFlight, status: u64) -> Failure {
         },
         (Provided::GmailSearch, 1) => ("messages.list", "JSON"),
         (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET)
-        | (Provided::GmailRead, 1 | STRUCTURE_STEP) => ("messages.get", "JSON"),
+        | (Provided::GmailRead, 1 | STRUCTURE_STEP)
+        | (Provided::GmailDraft, DRAFT_ORIGINAL_STEP) => ("messages.get", "JSON"),
         (Provided::GmailThread, 1 | THREAD_NARROW_STEP) => ("threads.get", "JSON"),
         (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
             ("labels.list", "JSON")
@@ -5021,7 +5201,7 @@ mod tests {
             | Provided::CalendarEvents
             | Provided::CalendarEvent
             | Provided::CalendarFreeBusy => vec![1],
-            Provided::GmailDraft => vec![DRAFT_CREATE_STEP],
+            Provided::GmailDraft => vec![DRAFT_ORIGINAL_STEP, DRAFT_CREATE_STEP],
         }
     }
 
@@ -5640,12 +5820,14 @@ mod tests {
     /// Every argument `tool` takes, with the bound its parser holds it to,
     /// and the arguments it requires: the parser's own constants and key
     /// lists, as `every_tools_schema_states_what_its_parser_enforces` holds
-    /// the spec to them. Three parser rules are outside what a schema states,
+    /// the spec to them. Four parser rules are outside what a schema states,
     /// each leaving the schema wider than the parser and each in the
     /// description: `calendars`' ids together hold at most
     /// `FREEBUSY_IDS_MAX_BYTES`, and a draft's `body` at most `BODY_MAX_BYTES`
     /// in its CRLF form, as `every_description_states_its_parsers_budgets`
-    /// holds them; a draft's `subject` holds no control character. Their
+    /// holds them; a draft's `subject` holds no control character; and a
+    /// draft without `reply_to_id` requires `subject`, a cross-field rule
+    /// `draft_requires_a_subject_unless_it_replies` holds. The per-value
     /// probes are this component's, in `workspace_probes`.
     fn bounds(tool: Provided) -> ToolBounds<'static> {
         let (keys, required): (&'static [&'static str], &'static [&'static str]) = match tool {
@@ -5657,7 +5839,7 @@ mod tests {
             Provided::CalendarEvents => (EventsArgs::KEYS, &["from", "to"]),
             Provided::CalendarEvent => (EventArgs::KEYS, &["id"]),
             Provided::CalendarFreeBusy => (FreeBusyArgs::KEYS, &["from", "to"]),
-            Provided::GmailDraft => (DraftArgs::KEYS, &["to", "subject", "body"]),
+            Provided::GmailDraft => (DraftArgs::KEYS, &["to", "body"]),
         };
         let text = |max_chars| Bound::Text {
             max_chars,
@@ -5682,11 +5864,10 @@ mod tests {
                 },
                 (_, "max_chars") => integer(MAX_CHARS_MIN, MAX_CHARS_MAX),
                 (_, "spam_trash") => Bound::Bool,
-                (Provided::GmailLabels | Provided::GmailRead | Provided::GmailThread, "id") => {
-                    Bound::Token {
-                        max_chars: ID_MAX_CHARS,
-                    }
-                }
+                (Provided::GmailLabels | Provided::GmailRead | Provided::GmailThread, "id")
+                | (Provided::GmailDraft, "reply_to_id") => Bound::Token {
+                    max_chars: ID_MAX_CHARS,
+                },
                 (Provided::CalendarEvent, "id") => Bound::Token {
                     max_chars: EVENT_ID_MAX_CHARS,
                 },
@@ -5893,6 +6074,13 @@ mod tests {
             (
                 Provided::GmailDraft,
                 format!("each 1 to {HEADER_VALUE_MAX_BYTES} printable ASCII characters"),
+            ),
+            (
+                Provided::GmailDraft,
+                format!(
+                    "an original whose subject is over {DERIVED_SUBJECT_MAX_BYTES} bytes is \
+                     refused"
+                ),
             ),
         ] {
             assert!(
@@ -6951,6 +7139,65 @@ mod tests {
         )
     }
 
+    /// A reply's state at its original's read: `draft_args` without
+    /// `subject`, replying to `m0`, with `extra` set over them.
+    fn reply_state(extra: Value) -> InFlight {
+        let mut args = draft_args(json!({ "reply_to_id": "m0" }));
+        args.as_object_mut().unwrap().remove("subject");
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let state = draft_state(args);
+        assert_eq!(state.step, DRAFT_ORIGINAL_STEP);
+        state
+    }
+
+    /// A reply's original as messages.get answers its metadata: thread `t1`,
+    /// with `headers` as name and value pairs.
+    fn original(headers: &[(&str, &str)]) -> Result<Value, NestedError> {
+        let headers: Vec<Value> = headers
+            .iter()
+            .map(|(name, value)| json!({ "name": name, "value": value }))
+            .collect();
+        http(
+            200,
+            &json!({ "id": "m0", "threadId": "t1", "payload": { "headers": headers } }).to_string(),
+        )
+    }
+
+    /// What a reply posts after reading `headers` of its original: the
+    /// draft's call, decoded `raw`, and the `derived` its answer reads.
+    fn replied(state: &InFlight, headers: &[(&str, &str)]) -> (ApiCall, String, Args) {
+        let Next::Call { call, derived } = answered(state, original(headers)) else {
+            panic!("a reply posts after its read");
+        };
+        assert_eq!(call.step, DRAFT_CREATE_STEP);
+        let message = raw_message(&call.api);
+        (call.api, message, derived)
+    }
+
+    /// A message's header lines before the empty line, unfolded: each
+    /// CRLF before a continuation's space removed.
+    fn message_headers(message: &str) -> Vec<String> {
+        let (head, _) = message.split_once("\r\n\r\n").unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        for line in head.split("\r\n") {
+            if line.starts_with(' ') {
+                lines.last_mut().unwrap().push_str(line);
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+        lines
+    }
+
+    /// The value of `message`'s header `name`, unfolded.
+    fn message_header(message: &str, name: &str) -> Option<String> {
+        message_headers(message)
+            .into_iter()
+            .find_map(|line| line.strip_prefix(&format!("{name}: ")).map(str::to_string))
+    }
+
     /// The message a draft call carries in `raw`, decoded.
     fn raw_message(call: &ApiCall) -> String {
         let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
@@ -7047,7 +7294,14 @@ mod tests {
         };
         for (args, refusal) in [
             (without("to"), "`to` is required".to_string()),
-            (without("subject"), "`subject` is required".to_string()),
+            (
+                without("subject"),
+                "`subject` is required unless `reply_to_id` is given".to_string(),
+            ),
+            (
+                draft_args(json!({ "reply_to_id": "m/1" })),
+                "`reply_to_id` must be 1 to 128 letters, digits, `_` or `-`".to_string(),
+            ),
             (without("body"), "`body` is required".to_string()),
             (draft_args(json!({ "to": "" })), header("to")),
             (
@@ -7081,7 +7335,8 @@ mod tests {
             ),
             (
                 draft_args(json!({ "bcc": "bob@example.com" })),
-                "unknown argument `bcc`; this tool takes `to`, `cc`, `subject`, `body`, `account`"
+                "unknown argument `bcc`; this tool takes `to`, `cc`, `subject`, `body`, \
+                 `reply_to_id`, `account`"
                     .to_string(),
             ),
         ] {
@@ -7090,6 +7345,311 @@ mod tests {
         // A body may hold any character.
         let call = draft(draft_args(json!({ "body": "a\u{1}\tb\r" }))).unwrap();
         assert_eq!(message_body(&raw_message(&call)), "a\u{1}\tb\r\n");
+    }
+
+    #[test]
+    fn draft_requires_a_subject_unless_it_replies() {
+        let mut args = draft_args(json!({}));
+        args.as_object_mut().unwrap().remove("subject");
+        assert_eq!(
+            draft(args.clone()).unwrap_err(),
+            "`subject` is required unless `reply_to_id` is given"
+        );
+        args["reply_to_id"] = json!("m0");
+        assert!(plan(Provided::GmailDraft, &args, &settings()).is_ok());
+    }
+
+    #[test]
+    fn a_reply_reads_its_original_then_posts_in_its_thread() {
+        let state = reply_state(json!({ "account": "alice@example.com" }));
+        let read = plan(Provided::GmailDraft, &state.args, &settings()).unwrap();
+        let mut expected_query = metadata_query(DRAFT_ORIGINAL_FIELDS, DRAFT_ORIGINAL_HEADERS);
+        expected_query.insert(
+            "prettyPrint".to_string(),
+            QueryValue::One("false".to_string()),
+        );
+        assert_eq!(
+            read.api,
+            ApiCall {
+                provider: "google".to_string(),
+                account: Some("alice@example.com".to_string()),
+                method: "GET".to_string(),
+                host: "gmail.example.com".to_string(),
+                path: "/gmail/v1/users/me/messages/m0".to_string(),
+                query: expected_query,
+                headers: BTreeMap::new(),
+                body: None,
+            }
+        );
+        let headers = [
+            ("Subject", "Lunch"),
+            ("Message-ID", "<b@example.com>"),
+            ("References", "<a@example.com>"),
+        ];
+        let Next::Call { call, derived } = answered(&state, original(&headers)) else {
+            panic!("a reply posts after its read");
+        };
+        assert_eq!(call.step, DRAFT_CREATE_STEP);
+        assert_eq!(call.api.method, "POST");
+        assert_eq!(call.api.path, DRAFTS_PATH);
+        assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
+        let body: Value = serde_json::from_str(call.api.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["message"]["threadId"], json!("t1"));
+        assert_eq!(
+            raw_message(&call.api),
+            "To: alice@example.com\r\n\
+             Subject: Re: Lunch\r\n\
+             In-Reply-To: <b@example.com>\r\n\
+             References: <a@example.com> <b@example.com>\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             \r\n\
+             Tm9vbj8=\r\n"
+        );
+        let (row, _) = follow(&state, Next::Call { call, derived });
+        let resource = json!({ "id": "r1", "message": { "id": "m9", "threadId": "t1" } });
+        assert_eq!(
+            answered(&row, http(200, &resource.to_string())),
+            Next::Complete(json!({
+                "draft_id": "r1",
+                "message_id": "m9",
+                "thread_id": "t1",
+                "in_reply_to": "<b@example.com>",
+                "subject": "Re: Lunch",
+            }))
+        );
+    }
+
+    #[test]
+    fn a_reply_filed_outside_the_originals_thread_says_so() {
+        let state = reply_state(json!({}));
+        let Next::Call { call, derived } = answered(&state, original(&[("Subject", "Lunch")]))
+        else {
+            panic!("a reply posts after its read");
+        };
+        assert_eq!(derived.get("thread_id"), Some(&json!("t1")));
+        let (row, _) = follow(&state, Next::Call { call, derived });
+        for (message, expected) in [
+            (
+                json!({ "id": "m9", "threadId": "t1" }),
+                json!({ "draft_id": "r1", "message_id": "m9", "thread_id": "t1", "subject": "Re: Lunch" }),
+            ),
+            (
+                json!({ "id": "m9", "threadId": "t2" }),
+                json!({
+                    "draft_id": "r1",
+                    "message_id": "m9",
+                    "thread_id": "t2",
+                    "in_thread": false,
+                    "subject": "Re: Lunch",
+                }),
+            ),
+            (
+                json!({ "id": "m9" }),
+                json!({ "draft_id": "r1", "message_id": "m9", "subject": "Re: Lunch" }),
+            ),
+        ] {
+            let resource = json!({ "id": "r1", "message": message });
+            assert_eq!(
+                answered(&row, http(200, &resource.to_string())),
+                Next::Complete(expected),
+                "{resource}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_derives_its_headers_from_the_original() {
+        let state = reply_state(json!({}));
+        let id = "<b@example.com>";
+        let long_id = format!("<{}>", "i".repeat(HEADER_VALUE_MAX_BYTES - 2));
+        let joinable = "r".repeat(HEADER_VALUE_MAX_BYTES - id.len() - 1);
+        let too_long = format!("{joinable}r");
+        // `Message-ID` and `References` as the original carries them, and the
+        // draft's `In-Reply-To` and `References`.
+        for (headers, in_reply_to, references) in [
+            (vec![("Message-ID", id)], Some(id), Some(id.to_string())),
+            (
+                vec![("Message-ID", id), ("References", "<a@x> <z@x>")],
+                Some(id),
+                Some(format!("<a@x> <z@x> {id}")),
+            ),
+            (
+                vec![("Message-ID", id), ("References", &joinable)],
+                Some(id),
+                Some(format!("{joinable} {id}")),
+            ),
+            (
+                vec![("Message-ID", id), ("References", &too_long)],
+                Some(id),
+                Some(id.to_string()),
+            ),
+            (
+                vec![("Message-ID", id), ("References", "<a@x>\t<z@x>")],
+                Some(id),
+                Some(id.to_string()),
+            ),
+            (
+                vec![("Message-ID", id), ("References", "<ä@x>")],
+                Some(id),
+                Some(id.to_string()),
+            ),
+            (
+                vec![("Message-ID", id), ("References", "")],
+                Some(id),
+                Some(id.to_string()),
+            ),
+            (
+                vec![("Message-ID", &long_id)],
+                Some(long_id.as_str()),
+                Some(long_id.clone()),
+            ),
+            (vec![], None, None),
+            (vec![("References", "<a@x>")], None, None),
+            (vec![("Message-ID", "<b @x>")], None, None),
+            (vec![("Message-ID", "<b\r\n@x>")], None, None),
+            (vec![("Message-ID", "<bé@x>")], None, None),
+            (vec![("Message-ID", "")], None, None),
+            (vec![("Message-ID", &format!("{long_id}x"))], None, None),
+        ] {
+            let (call, message, derived) = replied(&state, &headers);
+            assert_eq!(
+                message_header(&message, "In-Reply-To").as_deref(),
+                in_reply_to,
+                "{headers:?}"
+            );
+            assert_eq!(
+                message_header(&message, "References"),
+                references,
+                "{headers:?}"
+            );
+            assert_eq!(
+                derived.get("in_reply_to"),
+                in_reply_to.map(|id| json!(id)).as_ref(),
+                "{headers:?}"
+            );
+            // The thread is the original's whether or not its headers were
+            // usable.
+            let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+            assert_eq!(body["message"]["threadId"], json!("t1"));
+        }
+    }
+
+    #[test]
+    fn a_reply_derives_its_subject_from_the_original() {
+        let state = reply_state(json!({}));
+        let long = "s".repeat(DERIVED_SUBJECT_MAX_BYTES);
+        let long_mapped = format!("{}\u{85}", "s".repeat(DERIVED_SUBJECT_MAX_BYTES - 1));
+        let long_spaced = format!("{} ", "s".repeat(DERIVED_SUBJECT_MAX_BYTES - 1));
+        for (original, derived) in [
+            (Some("Lunch"), "Re: Lunch".to_string()),
+            (Some("Re: Lunch"), "Re: Lunch".to_string()),
+            (Some("  RE:Lunch"), "  RE:Lunch".to_string()),
+            (Some("re:"), "re:".to_string()),
+            (Some("Rex"), "Re: Rex".to_string()),
+            (
+                Some("Lunch\r\n\tplans\u{85}"),
+                "Re: Lunch   plans ".to_string(),
+            ),
+            (Some("Grüße"), "Re: Grüße".to_string()),
+            (Some(""), "Re:".to_string()),
+            (Some(" \t"), "Re:".to_string()),
+            (None, "Re:".to_string()),
+            (Some(&long), format!("Re: {long}")),
+            // Bounded after the mapping: 1001 bytes as sent, 1000 as derived.
+            (Some(&long_mapped), format!("Re: {long_spaced}")),
+        ] {
+            let headers: Vec<(&str, &str)> = original.map(|s| ("Subject", s)).into_iter().collect();
+            let (_, message, answer) = replied(&state, &headers);
+            assert_eq!(answer.get("subject"), Some(&json!(derived)), "{original:?}");
+            let subject = message_header(&message, "Subject").unwrap();
+            let written = if subject.starts_with("=?") {
+                compose::decoded_words(&subject)
+            } else {
+                subject
+            };
+            assert_eq!(written, derived, "{original:?}");
+        }
+        // Over the bound, the caller is to give `subject`; nothing is posted.
+        let over = "s".repeat(DERIVED_SUBJECT_MAX_BYTES + 1);
+        assert_eq!(
+            answered(&state, original(&[("Subject", &over)])),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "the original's subject is longer than 1000 bytes; give `subject`"
+            ))
+        );
+        // A caller's subject is used as given, and the answer names none.
+        let given = reply_state(json!({ "subject": "Lunch plans" }));
+        let (_, message, answer) = replied(&given, &[("Subject", &over)]);
+        assert!(
+            message.contains("\r\nSubject: Lunch plans\r\n"),
+            "{message}"
+        );
+        assert_eq!(answer.get("subject"), None);
+    }
+
+    #[test]
+    fn a_reply_reads_an_original_of_another_shape_as_internal() {
+        let state = reply_state(json!({}));
+        for body in [
+            json!([]),
+            json!({ "id": "m0" }),
+            json!({ "threadId": "t1" }),
+            json!({ "id": "other", "threadId": "t1" }),
+            json!({ "id": "m0", "threadId": "t 1" }),
+            json!({ "id": "m0", "threadId": 1 }),
+            json!({ "id": "m0", "threadId": "t1", "payload": [] }),
+            json!({ "id": "m0", "threadId": "t1", "payload": { "headers": {} } }),
+        ] {
+            assert_eq!(
+                answered(&state, http(200, &body.to_string())),
+                Next::Fail(internal("unexpected Google messages.get response shape")),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_read_403_names_the_read_scope_and_a_404_is_the_callers() {
+        let state = reply_state(json!({}));
+        let body = google(
+            403,
+            "PERMISSION_DENIED",
+            "Request had insufficient authentication scopes.",
+        );
+        let Next::Fail(denied) = answered(&state, http(403, &body)) else {
+            panic!("a 403 fails");
+        };
+        assert_eq!(denied.kind, ErrorKind::Denied);
+        assert!(
+            denied
+                .detail
+                .contains("connected without the Gmail read scope"),
+            "{}",
+            denied.detail
+        );
+        let Next::Fail(missing) = answered(
+            &state,
+            http(
+                404,
+                &google(404, "NOT_FOUND", "Requested entity was not found."),
+            ),
+        ) else {
+            panic!("a 404 fails");
+        };
+        assert_eq!(missing.kind, ErrorKind::InvalidArgs);
+        assert!(
+            !missing.detail.contains(DRAFT_UNKNOWN_HINT),
+            "{}",
+            missing.detail
+        );
+        // A read failure is not a write's: no hint.
+        assert_eq!(
+            answered(&state, http(500, "{}")),
+            answered(&labels_state(json!({})), http(500, "{}"))
+        );
     }
 
     #[test]
@@ -7228,31 +7788,63 @@ mod tests {
             assert!(!call.path.contains("send"));
             assert!(call.query.keys().all(|key| key == "prettyPrint"));
         }
-        // Every answer to the one step completes or fails; none issues a call.
-        let state = draft_state(draft_args(json!({})));
-        for outcome in [
-            http(200, r#"{"id":"r1","message":{"id":"m1"}}"#),
-            http(204, ""),
-            http(500, "{}"),
-            cut_read(json!(300000)),
-        ] {
-            assert!(
-                !matches!(answered(&state, outcome), Next::Call { .. }),
-                "a draft issues one call"
-            );
+        // A reply reads its original and then posts the draft.
+        let state = reply_state(json!({}));
+        assert_eq!(state.target.method, "GET");
+        assert_eq!(state.target.path, format!("{MESSAGES_PATH}/m0"));
+        let (row, call) = follow(&state, answered(&state, original(&[])));
+        assert_eq!(call.api.method, "POST");
+        assert_eq!(call.api.path, DRAFTS_PATH);
+        // Every answer to the `POST` completes or fails; none issues a call.
+        for state in [draft_state(draft_args(json!({}))), row] {
+            for outcome in [
+                http(200, r#"{"id":"r1","message":{"id":"m1"}}"#),
+                http(204, ""),
+                http(500, "{}"),
+                cut_read(json!(300000)),
+            ] {
+                assert!(
+                    !matches!(answered(&state, outcome), Next::Call { .. }),
+                    "a draft posts once"
+                );
+            }
         }
     }
 
     #[test]
     fn the_widest_draft_fits_the_args_cap() {
+        // A reply whose original carries `In-Reply-To` and `References` at
+        // their bounds and the longest thread id; the caller's subject is
+        // wider than any derived one (2 000 bytes against 1 004).
         let with = |body: String| {
-            draft(json!({
+            let args = json!({
                 "to": "x".repeat(HEADER_VALUE_MAX_BYTES),
                 "cc": "y".repeat(HEADER_VALUE_MAX_BYTES),
                 "subject": four_byte(0, SUBJECT_MAX_CHARS),
                 "body": body,
+                "reply_to_id": "m".repeat(ID_MAX_CHARS),
                 "account": escaped_widest(ACCOUNT_MAX_CHARS),
-            }))
+            });
+            let call = plan(Provided::GmailDraft, &args, &settings())?;
+            let state = InFlight::new("a", Provided::GmailDraft, &args, &call, Map::new(), 1_000);
+            let message_id = format!("<{}>", "i".repeat(HEADER_VALUE_MAX_BYTES - 2));
+            let original = json!({
+                "id": "m".repeat(ID_MAX_CHARS),
+                "threadId": "t".repeat(ID_MAX_CHARS),
+                "payload": { "headers": [
+                    { "name": "Message-ID", "value": message_id },
+                    { "name": "References", "value": "<r@example.com>" },
+                ] },
+            });
+            let Next::Call { call, .. } = answered(&state, http(200, &original.to_string())) else {
+                panic!("a reply posts after its read");
+            };
+            let message = raw_message(&call.api);
+            // Both at the bound: a `Message-ID` that leaves no room to join
+            // the original's `References` is the draft's `References` alone.
+            assert!(message.contains(&format!("\r\nIn-Reply-To: {message_id}\r\n")));
+            assert!(message.contains(&format!("\r\nReferences: {message_id}\r\n")));
+            Ok::<ApiCall, String>(call.api)
         };
         let four_byte_body = four_byte(1, BODY_MAX_BYTES / 4);
         assert_eq!(four_byte_body.len(), BODY_MAX_BYTES);
@@ -7308,6 +7900,7 @@ mod tests {
             at(search_state(json!({ "q": "lunch" })), LABELS_STEP),
             at(read_state(json!({ "id": "m1" })), LABELS_STEP),
             at(thread_state(json!({ "id": "t1" })), LABELS_STEP),
+            reply_state(json!({})),
         ] {
             for (outcome, why) in outcomes() {
                 assert_eq!(
@@ -7454,7 +8047,7 @@ mod tests {
             events_state(json!({ "from": FROM, "to": TO })),
             event_state(json!({ "id": "e1" })),
             free_busy_state(json!({ "from": FROM, "to": TO })),
-            draft_state(draft_args(json!({}))),
+            reply_state(json!({})),
         ];
         for tool in Provided::ALL {
             assert!(
