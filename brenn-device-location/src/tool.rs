@@ -11,11 +11,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::db::{StoredFix, list_fixes_for_user};
-use crate::{NAME, STALE_AFTER_SECONDS};
-
-/// What the answer tells the assistant when no device shares location.
-const HOW_TO_ENABLE: &str = "No device shares location. The user can turn it on from the user \
-                             menu in the app: \"Share location from this device\".";
+use crate::{HOW_TO_ENABLE, NAME, STALE_AFTER_SECONDS};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,9 +38,11 @@ impl DeviceLocationTool {
                               old it is (the browser may have served a fix up to five minutes \
                               older than that), the device's time zone and the current local \
                               time there. A fix is `stale` when older than 15 minutes; tell the \
-                              user its age rather than treating it as current. Pass the \
-                              coordinates to `Weather` as `lat`/`lng` and the zone to the \
-                              Calendar tools. Empty `devices` means no device shares location: \
+                              user its age rather than treating it as current. `Weather` \
+                              without a location uses the most recent fix itself; to ask about \
+                              another device, pass its latitude and longitude to `Weather` as \
+                              `lat`/`lng`. Pass a device's `time_zone` to the Calendar tools. \
+                              Empty `devices` means no device shares location: \
                               the user turns it on from the user menu in the app (\"Share \
                               location from this device\").",
                 input_schema: serde_json::json!({
@@ -63,7 +61,7 @@ impl DeviceLocationTool {
                 acl_keys: &[],
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
-                user_binding: UserBinding::ActingUser,
+                user_binding: UserBinding::ActingOrServedUser,
             },
             db,
         }
@@ -116,7 +114,7 @@ impl AsyncTool for DeviceLocationTool {
         ctx: &ToolCtx,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
-        let user = ctx.require_acting_user(NAME).clone();
+        let user = ctx.require_acting_user(NAME)?.clone();
         let args: DeviceLocationArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("{NAME} args: {e}")))?;
         let (mut fixes, named) = {
@@ -397,11 +395,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "requires an acting user")]
-    async fn no_acting_user_panics() {
-        let _ = DeviceLocationTool::new(seeded_db())
+    async fn no_acting_user_is_denied() {
+        let err = DeviceLocationTool::new(seeded_db())
             .execute(&tool_ctx(None), serde_json::json!({}))
             .await;
+        assert!(
+            matches!(&err, Err(ToolError::Denied(d)) if d.starts_with("device-location: acts as the acting user")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -411,7 +412,7 @@ mod tests {
         assert_eq!(NAME, "device-location");
         assert_eq!(d.name, NAME);
         assert_eq!(d.mcp_name, "mcp__brenn__DeviceLocation");
-        assert_eq!(d.user_binding, UserBinding::ActingUser);
+        assert_eq!(d.user_binding, UserBinding::ActingOrServedUser);
         assert!(d.acl_keys.is_empty());
         assert_eq!(d.class, ToolClass::Async { max_concurrency: 4 });
         assert_eq!(d.idempotency, Idempotency::Natural);

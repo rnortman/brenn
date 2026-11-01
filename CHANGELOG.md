@@ -4,6 +4,28 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **"What's the weather?" now means "here".** The `Weather` tool, called
+  without a place or coordinates, uses the user's most recent shared device
+  location (from `DeviceLocation`) and says which device it used, how old the
+  position is, and whether it is stale. If no device is sharing location, the
+  call is refused with instructions for turning sharing on. To page through a
+  "here" forecast, pass the coordinates the first answer reported.
+  **Config change required:** add `tool device-location {}` to the
+  `google-maps-tools` instance, next to its `api-request` grant. Without it,
+  `Weather` with no location is refused, naming the missing grant; calls that
+  give a location work as before. The app still needs its own
+  `device-location` grant to show the sharing menu item.
+  **Privacy note:** each "here" call stores the user's sharing devices'
+  positions in that instance's durable `brenn:tool-results` inbox. They stay
+  there until newer results push them out (64 results in the documented
+  configuration), even if the user stops sharing.
+
+- **WASM components that provide tools may now be granted tools that act as
+  the user**, such as `device-location`. Such a call is allowed only when it
+  serves a request made on behalf of a user. Any other call is refused with
+  `denied` instead of crashing the server. The OAuth account tools are still
+  refused to all components.
+
 - **The assistant can now ask where the user is.** The PWA's user menu gains
   "Share location from this device": with the browser's permission, the
   device reports its position on connect, when the app comes to the

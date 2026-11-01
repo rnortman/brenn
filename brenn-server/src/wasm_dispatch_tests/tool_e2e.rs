@@ -167,7 +167,13 @@ async fn tool_harness(
     let mut tool_grants = BTreeMap::new();
     tool_grants.insert(call.tool.to_string(), call.grant.clone());
     // The plan build's check on a consumer's grants, run on the same map.
-    registry.validate_grants(GrantOwner::WasmConsumer { slug }, &tool_grants);
+    registry.validate_grants(
+        GrantOwner::WasmConsumer {
+            slug,
+            provides: false,
+        },
+        &tool_grants,
+    );
     let tool_host: brenn_wasm::ToolHostFn = Arc::new(WasmToolHost::new(
         Arc::clone(&registry),
         tool_grants.clone(),

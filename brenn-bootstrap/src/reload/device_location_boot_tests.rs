@@ -2,7 +2,11 @@
 //! device-location {}` grant validated against the registry `run_server`
 //! builds, and the app gate the WebSocket location messages read.
 
-use super::driver::tests::{Tree, resolve_fixture_apps};
+use brenn_lib::config::PACKAGED;
+
+use super::driver::tests::{
+    BootFixture, Tree, boot_with, install_package, resolve_fixture_apps, staged_module,
+};
 
 /// The agent holding the grant.
 const ASSISTANT: &str = "assistant";
@@ -82,4 +86,60 @@ async fn a_multiuser_agent_is_refused_the_grant() {
         ),
     ));
     validate(&tree);
+}
+
+/// A component that provides no tool never serves a call that carries a user,
+/// so boot refuses it the grant. (A providing component holding it boots:
+/// `google_maps_tools_boot_tests`.)
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(
+    expected = "tool_grant for \"device-location\" is refused: the tool acts as the acting user, \
+                and a component that provides no tool never serves a call that carries one"
+)]
+async fn a_component_that_provides_nothing_is_refused_the_grant() {
+    let home = tempfile::tempdir().expect("a container home");
+    let tree = Tree::holding(&super::driver::tests::document(&format!(
+        r#"
+container sandbox {{
+    image = "example.com/cc:latest";
+    home_dir = "{home}";
+}}
+
+channel sink at "brenn:sink" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
+
+{PACKAGED}component Demo {{
+    abi = processor;
+    requires = [ports, tools];
+    in inbound;
+    in tool-results;
+    out digest;
+}}
+{PACKAGED}
+new locator: Demo {{
+    grants = [ports, tools];
+    in inbound <- work {{ push_depth = 4; }}
+    out digest -> sink;
+    tool {name} {{}}
+}}
+"#,
+        home = home.path().display(),
+        name = brenn_device_location::NAME,
+    )));
+    let components = tempfile::tempdir().expect("a components root");
+    install_package(components.path(), &staged_module(&tree));
+    boot_with(
+        &tree,
+        BootFixture {
+            components_roots: vec![components.path().to_path_buf()],
+            native_tools: brenn_device_location::registered(brenn_db::into_db(
+                brenn_db::open_connection_memory(),
+            )),
+            ..BootFixture::default()
+        },
+    )
+    .await;
 }

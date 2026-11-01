@@ -53,18 +53,6 @@ apply it to every step. Calendar's steps carry caller input in `from`, `to`,
 `q`, `page`, `calendar`, `id` and `calendars`; `CalendarList` carries only
 `page`.
 
-## `reuse-choice-refusal-duplicates-maps-one-of`
-
-The kit states an enum argument's schema (`Bound::Enum` in
-`brenn-provider-kit/src/schema.rs`) but has no parser for it, so each provider
-component writes its own: `google-workspace-tools` has `choice` and
-`choice_refusal` in its `logic.rs`, `google-maps-tools` has `one_of` and a
-hand-rolled match per enum (`WeatherKind`, `TravelMode`) in its `logic.rs`,
-both refusing with "`key` must be one of `a`, `b`". Move one `choice` parser
-and its refusal into `brenn-provider-kit/src/args.rs` beside `flag` and
-`integer`, and have both components' enum arguments use it, so every
-component's enum refusal is the kit's wording.
-
 ## `reuse-host-args-cap-copied-per-component-test`
 
 The provider components' tests each copy the host's nested-args cap
@@ -153,6 +141,31 @@ and message generalised beyond `server.vault_dir`.
 
 Done = every file kind the posture covers is refused at boot and on reload when
 it lies inside an agent-visible root, with a test per kind.
+
+## `security-nested-location-answer-retained-in-durable-result-window`
+
+A provider's nested `device-location` call (`brenn-provider-kit/src/call.rs`,
+`Nested::DeviceLocation`; `google-maps-tools`'s `Weather` with no location) is
+answered with every sharing device of the user — latitude, longitude,
+accuracy, zone, local time — and the executor publishes that answer whole to
+the provider's durable `brenn:tool-results/<slug>` inbox
+(`brenn-tool-registry/src/bus_wiring.rs`). It stays there until newer results
+push it out of the window, and stopping sharing or unenrolling a device does
+not delete it, so the inbox holds a short position history the
+`device_locations` row was meant to be the only copy of. The component reads
+only the most recent device. `docs/security-posture.md` (users' device
+positions) states the retention as it stands.
+
+Deciding it is a posture question: whether the retention is accepted; whether
+the nested call narrows to the one fix it uses (a `device-location` argument
+or answer shape that the model-facing tool also exposes), which reduces the
+breadth but not the history; or whether a result inbox carrying such answers
+stops being durable or forgets them once delivered, which is a tool-substrate
+change touching every nested answer (mail bodies included).
+
+Done = the chosen reduction is in place with a test that the bus record of a
+"here" request holds no more than the decision allows, and the posture
+paragraph says what is kept and for how long.
 
 ## `quality-virtual-tools-final-symlink-left-open-though-local-fix-exists`
 

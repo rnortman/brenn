@@ -47,21 +47,64 @@ pub struct ToolCtx {
 }
 
 impl ToolCtx {
-    /// The acting user of a call to a tool bound to one.
-    ///
-    /// # Panics
-    ///
-    /// Panics naming `tool` when `acting_user` is `None`: grant validation
-    /// refuses an `ActingUser` tool to every caller kind that has no acting
-    /// user, so reaching here without one is a bypassed validation.
-    pub fn require_acting_user(&self, tool: &str) -> &ActingUser {
-        self.acting_user.as_ref().unwrap_or_else(|| {
-            panic!(
-                "BUG: tool {tool:?} requires an acting user but caller {} has none \
-                 (grant validation bypassed)",
+    /// The acting user of a call to a tool bound to one, or the refusal of a
+    /// call that carries none. A conversation's call always carries its owner;
+    /// a provider's nested call carries the user of the call it serves, which
+    /// is `None` when that call came from the bus or from a component's own
+    /// `call-async`; a component's own call never carries one. The grant admits
+    /// the tool to the participant; this is what admits the call.
+    pub fn require_acting_user(&self, tool: &str) -> Result<&ActingUser, ToolError> {
+        self.acting_user.as_ref().ok_or_else(|| {
+            ToolError::Denied(format!(
+                "{tool}: acts as the acting user, and this call carries none (caller {})",
                 self.caller.as_str()
-            )
+            ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(acting_user: Option<ActingUser>) -> ToolCtx {
+        ToolCtx {
+            caller: ParticipantId::for_wasm("maps"),
+            grant: ResolvedToolGrant {
+                acl: vec![],
+                rate_limit: None,
+            },
+            acting_conversation_id: None,
+            acting_user,
+            deadline: None,
+        }
+    }
+
+    #[test]
+    fn require_acting_user_returns_the_stamped_user() {
+        let user = ActingUser {
+            id: 1,
+            username: "alice".into(),
+        };
+        assert_eq!(
+            ctx(Some(user.clone())).require_acting_user("t").unwrap(),
+            &user
+        );
+    }
+
+    #[test]
+    fn require_acting_user_without_one_is_denied_naming_tool_and_caller() {
+        let err = ctx(None)
+            .require_acting_user("device-location")
+            .unwrap_err();
+        let ToolError::Denied(detail) = err else {
+            panic!("expected Denied, got {err:?}");
+        };
+        assert_eq!(
+            detail,
+            "device-location: acts as the acting user, and this call carries none \
+             (caller wasm:maps)"
+        );
     }
 }
 

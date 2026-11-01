@@ -4,6 +4,7 @@
 //! The document declares the component's class as its packaged specification
 //! states it, word for word, installed with the component's own artifact; one
 //! instance of it with the key provider, the `api-request` clauses, the
+//! `device-location` grant that answers `Weather` with no location, the
 //! `config` map and the result-inbox tuning block an operator writes; and a
 //! containerized agent granted every tool the class provides. The registry is
 //! built over the document's key providers as `run_server` builds it.
@@ -42,8 +43,8 @@ fn spec() -> String {
 }
 
 /// The operator's document: the class, the key provider, the tuning block,
-/// one instance with its nine clauses and `config`, and an agent granted
-/// every tool.
+/// one instance with its nine clauses, its `device-location` grant and
+/// `config`, and an agent granted every tool.
 fn document(home: &std::path::Path, key_file: &std::path::Path, store: &std::path::Path) -> String {
     let grants: String = TOOLS
         .iter()
@@ -89,6 +90,7 @@ new {MAPS}: GoogleMapsTools {{
         allow {{ provider = "google-maps"; method = "POST"; host = "routes.googleapis.com";  path = "/directions/v2:computeRoutes"; }}
         rate_limit {{ burst = 20; sustained_per_minute = 60; }}
     }}
+    tool device-location {{}}
     config = {{
         provider = "google-maps",
         weather_host = "weather.googleapis.com",
@@ -117,7 +119,8 @@ new {ASSISTANT}: Assistant();
 /// The packaged class boots over the document's key providers: each tool is a
 /// provided tool in the registry and on the agent's written list, the request
 /// inbox is as deep as the class's summed concurrency, and the result inbox
-/// takes the tuning block's depth.
+/// takes the tuning block's depth. The instance's `device-location` grant
+/// validates: the component provides tools.
 #[tokio::test(flavor = "multi_thread")]
 async fn google_maps_tools_boots_into_an_agents_tool_list() {
     let home = tempfile::tempdir().expect("a container home");
@@ -139,10 +142,14 @@ async fn google_maps_tools_boots_into_an_agents_tool_list() {
             result_depth: 64,
         },
         |config| {
-            brenn_oauth::tools::registered(
+            let mut native = brenn_oauth::tools::registered(
                 None,
                 brenn_lib::config::resolve_api_key_providers(config),
-            )
+            );
+            native.extend(brenn_device_location::registered(brenn_db::into_db(
+                brenn_db::open_connection_memory(),
+            )));
+            native
         },
     )
     .await;

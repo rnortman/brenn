@@ -7,7 +7,7 @@
 //! committed state.
 //!
 //! Serving a request validates its arguments and issues its first nested
-//! `api-request` for the caller's user through `call_async_for`, recording the
+//! registry-tool call for the caller's user through `call_async_for`, recording the
 //! request's state in the store under the call's id. Answering a result reads
 //! that state back, deletes it, and either completes the request from
 //! `api-request`'s answer or issues its next step from the same activation, so
@@ -36,8 +36,6 @@ use crate::spec::{Provided, config, log, provides, store};
 
 /// The store namespace of in-flight rows, keyed by call id.
 const INFLIGHT_NS: &str = "inflight";
-/// The tool every nested call reaches.
-const NESTED_TOOL: &str = "api-request";
 
 struct GoogleWorkspaceTools;
 
@@ -110,23 +108,24 @@ fn issue(
     state: &InFlight,
 ) -> Result<(), Error> {
     let call_id = state.call_id();
-    match provides::call_async_for(id, NESTED_TOOL, &call.api, &call_id) {
+    match provides::call_async_for(id, call.nested.tool(), &call.nested.args(), &call_id) {
         Ok(()) => {
             log::info(format!(
-                "{} step {} {} {}{}",
+                "{} step {} {}",
                 state.tool.name(),
                 call.step,
-                call.api.method,
-                call.api.host,
-                call.api.path
+                state.target
             ));
             tx.put(INFLIGHT_NS, call_id.as_bytes(), &state.encode())
         }
-        Err(refused) => drop_not_pending(provides::complete_err(
-            id,
-            OutcomeErrorKind::Internal,
-            &not_issued(&refused.to_string()),
-        )),
+        Err(refused) => {
+            let failure = not_issued(&state.target, &refused.to_string());
+            drop_not_pending(provides::complete_err(
+                id,
+                outcome_kind(failure.kind),
+                &failure.detail,
+            ))
+        }
     }
 }
 
@@ -163,7 +162,7 @@ fn answer(
         "{} step {} result {}",
         state.tool.name(),
         state.step,
-        result_summary(&outcome)
+        result_summary(&outcome, &state.target)
     ));
     match logic::advance(&state, outcome, settings) {
         Next::Complete(value) => drop_not_pending(provides::complete(&id, &value)),

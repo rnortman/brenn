@@ -288,7 +288,7 @@ mod tests {
             ctx: &ToolCtx,
             _args: serde_json::Value,
         ) -> Result<serde_json::Value, ToolError> {
-            let user = ctx.require_acting_user(self.descriptor.name);
+            let user = ctx.require_acting_user(self.descriptor.name)?;
             Ok(serde_json::json!({ "id": user.id, "username": user.username }))
         }
     }

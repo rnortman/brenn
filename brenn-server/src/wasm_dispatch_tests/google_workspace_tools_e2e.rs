@@ -163,6 +163,7 @@ async fn rig_configured(
                     ]
                 })
                 .collect(),
+            tools: &[],
             config: HashMap::from([
                 ("provider".to_string(), OAUTH_PROVIDER.to_string()),
                 ("gmail_host".to_string(), host.clone()),

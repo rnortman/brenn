@@ -113,7 +113,7 @@ impl AsyncTool for OAuthConnectTool {
         ctx: &ToolCtx,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
-        let user = ctx.require_acting_user(NAME).clone();
+        let user = ctx.require_acting_user(NAME)?.clone();
         let args: ConnectArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("{NAME} args: {e}")))?;
         let provider = self.service.require_provider(&args.provider)?;
@@ -260,15 +260,18 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "requires an acting user")]
-    async fn no_acting_user_panics() {
+    async fn no_acting_user_is_denied() {
         let (tool, _svc, _dir) = tool();
-        let _ = tool
+        let err = tool
             .execute(
                 &ctx(None),
                 serde_json::json!({"provider": "google", "scope_sets": ["mail"]}),
             )
             .await;
+        assert!(
+            matches!(&err, Err(ToolError::Denied(d)) if d.starts_with("oauth-connect: acts as the acting user")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

@@ -17,8 +17,9 @@ pub trait Tool: Copy + fmt::Debug + PartialEq {
 }
 
 /// An in-flight row older than this is garbage: longer than the host's
-/// 240 s provided-tool ceiling plus `api-request`'s 60 s HTTP timeout, so no
-/// row whose result can still arrive is ever swept.
+/// 240 s provided-tool ceiling plus the longest nested call's own timeout —
+/// `api-request`'s 60 s HTTP timeout; a `device-location` call is a local read
+/// and has none — so no row whose result can still arrive is ever swept.
 pub const INFLIGHT_TTL_MS: u64 = 300_000;
 
 /// The correlation id of a request's nested call: `<pending id>/<step>`.
@@ -40,7 +41,7 @@ pub struct InFlight<T: Tool> {
     pub args: Value,
     /// What earlier steps learned that later steps need.
     pub derived: Map<String, Value>,
-    /// The nested call outstanding.
+    /// What the outstanding nested call addressed.
     pub target: Target,
     pub issued_at_ms: u64,
 }
@@ -60,7 +61,7 @@ impl<T: Tool> InFlight<T> {
             step: call.step,
             args: args.clone(),
             derived,
-            target: call.api.target(),
+            target: call.nested.target(),
             issued_at_ms: now_ms,
         }
     }
@@ -175,9 +176,9 @@ mod tests {
     use crate::testutil::failure;
 
     fn call(step: u8, path: &str) -> Call {
-        Call {
+        Call::api(
             step,
-            api: ApiCall {
+            ApiCall {
                 provider: "google".to_string(),
                 account: None,
                 method: "GET".to_string(),
@@ -187,7 +188,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 body: None,
             },
-        }
+        )
     }
 
     fn state(args: Value) -> InFlight<Fixture> {
@@ -207,7 +208,7 @@ mod tests {
         assert_eq!(state.call_id(), format!("{}/1", "a".repeat(32)));
         assert_eq!(
             state.target,
-            Target {
+            Target::ApiRequest {
                 method: "GET".to_string(),
                 host: "api.example.com".to_string(),
                 path: "/v1/items/one".to_string(),
@@ -228,8 +229,8 @@ mod tests {
             String::from_utf8(state.encode()).unwrap(),
             format!(
                 "{{\"id\":\"{}\",\"tool\":\"fixture-lookup\",\"step\":1,\"args\":{{\"q\":\"x\"}},\
-                 \"derived\":{{}},\"target\":{{\"method\":\"GET\",\"host\":\"api.example.com\",\
-                 \"path\":\"/v1/items/one\"}},\"issued_at_ms\":1000}}",
+                 \"derived\":{{}},\"target\":{{\"tool\":\"api-request\",\"method\":\"GET\",\
+                 \"host\":\"api.example.com\",\"path\":\"/v1/items/one\"}},\"issued_at_ms\":1000}}",
                 "a".repeat(32)
             )
         );
@@ -245,11 +246,21 @@ mod tests {
             InFlight {
                 step: 2,
                 derived,
-                target: call(2, "/v1/items/two").api.target(),
+                target: call(2, "/v1/items/two").nested.target(),
                 issued_at_ms: 2_000,
                 ..first
             }
         );
+    }
+
+    #[test]
+    fn a_row_at_a_location_step_records_the_tool_alone() {
+        let first = state(json!({}));
+        let next = first.next(&Call::device_location(3), Map::new(), 2_000);
+        assert_eq!(next.target, Target::DeviceLocation);
+        let wire: Value = serde_json::from_slice(&next.encode()).unwrap();
+        assert_eq!(wire["target"], json!({ "tool": "device-location" }));
+        assert_eq!(InFlight::decode(&next.encode()), Ok(next));
     }
 
     #[test]

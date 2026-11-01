@@ -64,6 +64,33 @@ fn integral(n: f64) -> Option<u64> {
     (n.fract() == 0.0 && (0.0..PAST_U64).contains(&n)).then_some(n as u64)
 }
 
+/// The argument `key` as the one of `values` that `name` spells as given;
+/// absent is `None`. The refusal is "`key` must be one of `a`, `b`", the
+/// spellings in `values`' order.
+pub fn choice<T: Copy>(
+    args: &Args,
+    key: &str,
+    values: &[T],
+    name: impl Fn(T) -> &'static str,
+) -> Result<Option<T>, String> {
+    let refusal = || {
+        let names: Vec<String> = values
+            .iter()
+            .map(|value| format!("`{}`", name(*value)))
+            .collect();
+        format!("`{key}` must be one of {}", names.join(", "))
+    };
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::String(given)) => values
+            .iter()
+            .find(|value| name(**value) == given)
+            .map(|value| Some(*value))
+            .ok_or_else(refusal),
+        Some(_) => Err(refusal()),
+    }
+}
+
 /// A boolean argument; absent is `false`.
 pub fn flag(args: &Args, key: &str) -> Result<bool, String> {
     match args.get(key) {
@@ -164,6 +191,47 @@ mod tests {
         assert_eq!(
             integer(&args(json!({ "n": 2f64.powi(64) })), "n", 0, u64::MAX),
             Err(format!("`n` must be an integer from 0 to {}", u64::MAX))
+        );
+    }
+
+    #[test]
+    fn a_choice_is_one_of_its_values_and_absent_is_none() {
+        const VALUES: [&str; 3] = ["drive", "walk", "transit"];
+        let spelled = |value: &'static str| value;
+        for value in VALUES {
+            assert_eq!(
+                choice(&args(json!({ "mode": value })), "mode", &VALUES, spelled),
+                Ok(Some(value))
+            );
+        }
+        assert_eq!(choice(&args(json!({})), "mode", &VALUES, spelled), Ok(None));
+        for refused in [
+            json!("fly"),
+            json!("Drive"),
+            json!(""),
+            json!(1),
+            json!(null),
+        ] {
+            assert_eq!(
+                choice(&args(json!({ "mode": refused })), "mode", &VALUES, spelled),
+                Err("`mode` must be one of `drive`, `walk`, `transit`".to_string()),
+                "{refused}"
+            );
+        }
+    }
+
+    /// The value answered is the one whose spelling matched, not the
+    /// spelling itself.
+    #[test]
+    fn a_choice_answers_the_value_its_name_spells() {
+        let numbered = |n: u8| ["one", "two"][usize::from(n)];
+        assert_eq!(
+            choice(&args(json!({ "n": "two" })), "n", &[0u8, 1], numbered),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            choice(&args(json!({ "n": "three" })), "n", &[0u8, 1], numbered),
+            Err("`n` must be one of `one`, `two`".to_string())
         );
     }
 

@@ -1,5 +1,5 @@
 //! A provider component's core: the parts a WASM component that serves
-//! `provide`d tools by issuing nested `api-request` calls needs. The row, the
+//! `provide`d tools by issuing nested registry-tool calls needs. The row, the
 //! call, the argument helpers and the settings readers are provider-neutral;
 //! the answer reading is shaped to Google APIs' answers and names Google in
 //! the text the model sees.
@@ -7,11 +7,13 @@
 //! - [`row`]: the in-flight row a request keeps in the component's store
 //!   between the activation that issues a nested call and the one that
 //!   receives its answer, generic over the component's [`Tool`] enum.
-//! - [`call`]: the request's error answer, the nested call's arguments and
-//!   what a step decides next.
+//! - [`call`]: the request's error answer, the registry tool a nested call
+//!   reaches with its arguments, and what a step decides next.
 //! - [`args`]: reading a tool's JSON arguments.
-//! - [`answer`]: reading `api-request`'s answer envelope from a Google API,
-//!   bounding what is copied out of it, and the result ceiling.
+//! - [`answer`]: a nested call that could not be issued, its answer's log
+//!   line, reading `api-request`'s answer envelope from a Google API, bounding
+//!   what is copied out of it, and the result ceiling.
+//! - [`location`]: reading `device-location`'s answer.
 //! - [`settings`]: reading an instance's `config` values.
 //! - `schema` (behind the `testutils` feature): a host test's check that each
 //!   tool's `input_schema` states exactly the bounds its argument parser
@@ -19,8 +21,8 @@
 //!   bound, and the assertions that hold the parser to them. It panics by
 //!   design: it serves host tests, never a component step.
 //! - `testutil` (behind the `testutils` feature): fixtures for a step's tests
-//!   — `api-request` answers, nested-call errors, Google error bodies and
-//!   error answers.
+//!   — `api-request` and `device-location` answers, nested-call errors,
+//!   Google error bodies, error answers and a step's `api-request` arguments.
 //!
 //! The crate is `std` plus `serde`/`serde_json` and names no guest SDK, so all
 //! of it runs on the host under test. Each component keeps its own activation
@@ -35,6 +37,7 @@
 pub mod answer;
 pub mod args;
 pub mod call;
+pub mod location;
 pub mod row;
 #[cfg(feature = "testutils")]
 pub mod schema;
@@ -47,10 +50,12 @@ pub use answer::{
     UNREADABLE_KEY, Unreadable, bounded, copy, cut, google_error_detail, not_issued,
     read_api_result, result_summary, serialized_len,
 };
-pub use args::{Args, capped, flag, integer, object};
+pub use args::{Args, capped, choice, flag, integer, object};
 pub use call::{
-    ApiCall, Call, ErrorKind, Failure, Next, Query, QueryValue, Target, internal, query,
+    ApiCall, Call, ErrorKind, Failure, Nested, NestedArgs, Next, Query, QueryValue, Target,
+    internal, query,
 };
+pub use location::{DeviceFix, DeviceLocationAnswer, read_device_location_result};
 pub use row::{INFLIGHT_TTL_MS, InFlight, Tool, call_id, claim, no_such_step, row_expired, stored};
 #[cfg(feature = "testutils")]
 pub use schema::{

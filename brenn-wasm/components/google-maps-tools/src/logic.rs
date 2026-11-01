@@ -1,7 +1,8 @@
 //! The wrapper's decisions, in `std`, `serde_json` and `brenn-provider-kit`:
 //! reading the instance's `config`, validating a tool's arguments, building
 //! each Google call as `api-request` arguments, reading `api-request`'s
-//! answer, and compacting Google's JSON into the tool's result. Nothing here
+//! answer and, for `Weather` with no location, `device-location`'s, and
+//! compacting Google's JSON into the tool's result. Nothing here
 //! names the guest SDK, so the whole module runs on the host under test.
 //! Tools are the generated `Provided` enum, whose SDK-facing parts are
 //! wasm32-only.
@@ -14,9 +15,10 @@ mod spec;
 use std::collections::BTreeMap;
 
 use brenn_provider_kit::{
-    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, NestedError, Next,
-    Query, QueryValue, Tool, Unreadable, bounded, capped, copy, cut, flag, google_error_detail,
-    host, integer, internal, no_such_step, object, query, read_api_result, required, stored,
+    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, DeviceLocationAnswer, ErrorKind, Failure,
+    NestedError, Next, Query, QueryValue, Target, Tool, Unreadable, bounded, capped, choice, copy,
+    cut, flag, google_error_detail, host, integer, internal, no_such_step, object, query,
+    read_api_result, read_device_location_result, required, stored,
 };
 use serde_json::{Value, json};
 
@@ -49,10 +51,13 @@ const GEOCODE_FIELD_MASK: &str =
 const GEOCODE_MAX: u64 = 5;
 const GEOCODE_DEFAULT_MAX: u64 = 3;
 
-/// Weather's steps: the geocode of a `place`, then the Weather lookup. A
-/// request given coordinates starts at the lookup.
+/// Weather's steps: the geocode of a `place`, or the user's device location
+/// when no location is given, then the Weather lookup. A request given
+/// coordinates starts at the lookup. Numbers are fixed by meaning, not by
+/// order: a "here" request runs 3 then 2.
 const WEATHER_GEOCODE_STEP: u8 = 1;
 const WEATHER_LOOKUP_STEP: u8 = 2;
+const WEATHER_LOCATION_STEP: u8 = 3;
 
 /// Google's hourly page size, which is also its maximum.
 const HOURLY_PAGE_SIZE: u64 = 24;
@@ -263,12 +268,6 @@ const LAT_MAX: f64 = 90.0;
 /// The largest longitude either side of the prime meridian, in degrees.
 const LNG_MAX: f64 = 180.0;
 
-/// The refusal of a `key` that is not one of `names`, listing them in order.
-fn one_of(key: &str, names: impl IntoIterator<Item = &'static str>) -> String {
-    let names: Vec<String> = names.into_iter().map(|name| format!("`{name}`")).collect();
-    format!("`{key}` must be one of {}", names.join(", "))
-}
-
 /// A latitude and longitude in range.
 fn checked(lat: f64, lng: f64, what: &str) -> Result<(f64, f64), String> {
     if !(-LAT_MAX..=LAT_MAX).contains(&lat) {
@@ -334,66 +333,59 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
     match tool {
         Provided::Geocode => {
             let geocode = GeocodeArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: geocode_call(&geocode.query, settings),
-            })
+            Ok(Call::api(1, geocode_call(&geocode.query, settings)))
         }
         Provided::Weather => {
             let weather = WeatherArgs::parse(args)?;
             Ok(match &weather.at {
-                Where::Text(_) => Call {
-                    step: WEATHER_GEOCODE_STEP,
-                    api: geocode_call(&weather.at, settings),
-                },
-                Where::At(lat, lng) => Call {
-                    step: WEATHER_LOOKUP_STEP,
-                    api: weather_call(&weather, *lat, *lng, settings),
-                },
+                Some(place @ Where::Text(_)) => {
+                    Call::api(WEATHER_GEOCODE_STEP, geocode_call(place, settings))
+                }
+                Some(Where::At(lat, lng)) => Call::api(
+                    WEATHER_LOOKUP_STEP,
+                    weather_call(&weather, *lat, *lng, settings),
+                ),
+                None => Call::device_location(WEATHER_LOCATION_STEP),
             })
         }
         Provided::Directions => {
             let directions = DirectionsArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: compute_routes_call(
+            Ok(Call::api(
+                1,
+                compute_routes_call(
                     &directions.route,
                     directions.when.as_ref(),
                     RouteRequest::Directions,
                     settings,
                 ),
-            })
+            ))
         }
         Provided::PlacesSearch => {
             let search = PlacesSearchArgs::parse(args)?;
             Ok(match &search.near {
-                Some(near @ Where::Text(_)) => Call {
-                    step: PLACES_GEOCODE_STEP,
-                    api: geocode_call(near, settings),
-                },
-                Some(Where::At(lat, lng)) => Call {
-                    step: PLACES_SEARCH_STEP,
-                    api: places_search_call(&search, Some((*lat, *lng)), settings),
-                },
-                None => Call {
-                    step: PLACES_SEARCH_STEP,
-                    api: places_search_call(&search, None, settings),
-                },
+                Some(near @ Where::Text(_)) => {
+                    Call::api(PLACES_GEOCODE_STEP, geocode_call(near, settings))
+                }
+                Some(Where::At(lat, lng)) => Call::api(
+                    PLACES_SEARCH_STEP,
+                    places_search_call(&search, Some((*lat, *lng)), settings),
+                ),
+                None => Call::api(
+                    PLACES_SEARCH_STEP,
+                    places_search_call(&search, None, settings),
+                ),
             })
         }
         Provided::PlaceDetails => {
             let details = PlaceDetailsArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: place_details_call(&details, settings),
-            })
+            Ok(Call::api(1, place_details_call(&details, settings)))
         }
         Provided::SearchAlongRoute => {
             let along = AlongRouteArgs::parse(args)?;
-            Ok(Call {
-                step: ALONG_ROUTE_ROUTE_STEP,
-                api: compute_routes_call(&along.route, None, RouteRequest::Polyline, settings),
-            })
+            Ok(Call::api(
+                ALONG_ROUTE_ROUTE_STEP,
+                compute_routes_call(&along.route, None, RouteRequest::Polyline, settings),
+            ))
         }
     }
 }
@@ -405,14 +397,14 @@ enum Where {
     Text(String),
 }
 
-/// The text argument `key` or `lat` and `lng`, exactly one. A text of the
-/// form `<lat>,<lng>` is coordinates.
-fn place_or_coordinates(args: &Args, key: &str) -> Result<Where, String> {
+/// The text argument `key` or `lat` and `lng`, at most one; `None` when
+/// neither is given. A text of the form `<lat>,<lng>` is coordinates.
+fn place_or_coordinates(args: &Args, key: &str) -> Result<Option<Where>, String> {
     match (text(args, key)?, coordinates(args)?) {
         (Some(_), Some(_)) => Err(format!("pass `{key}` or `lat` and `lng`, not both")),
-        (None, None) => Err(format!("pass `{key}` or `lat` and `lng`")),
-        (None, Some((lat, lng))) => Ok(Where::At(lat, lng)),
-        (Some(text), None) => place_text(text, key),
+        (None, None) => Ok(None),
+        (None, Some((lat, lng))) => Ok(Some(Where::At(lat, lng))),
+        (Some(text), None) => place_text(text, key).map(Some),
     }
 }
 
@@ -451,17 +443,14 @@ impl WeatherKind {
             WeatherKind::Alerts => "alerts",
         }
     }
-
-    /// The refusal of a `kind` that is not one of these.
-    fn choices() -> String {
-        one_of("kind", WeatherKind::ALL.map(WeatherKind::name))
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct WeatherArgs {
     kind: WeatherKind,
-    at: Where,
+    /// Where the caller asked about, or `None` when the call named no
+    /// location: the weather is then at the user's most recent device fix.
+    at: Option<Where>,
     /// The hourly horizon; read for `hourly` only.
     hours: u64,
     /// The daily horizon; read for `daily` only.
@@ -475,13 +464,8 @@ impl WeatherArgs {
 
     fn parse(args: &Value) -> Result<WeatherArgs, String> {
         let args = object(args, Self::KEYS)?;
-        let kind = match args.get("kind") {
-            None => return Err("`kind` is required".to_string()),
-            Some(Value::String(kind)) => WeatherKind::ALL
-                .into_iter()
-                .find(|known| known.name() == kind)
-                .ok_or_else(WeatherKind::choices)?,
-            Some(_) => return Err(WeatherKind::choices()),
+        let Some(kind) = choice(args, "kind", &WeatherKind::ALL, WeatherKind::name)? else {
+            return Err("`kind` is required".to_string());
         };
         let page = capped(args, "page", PAGE_TOKEN_MAX_CHARS)?;
         let at = place_or_coordinates(args, "place")?;
@@ -495,6 +479,15 @@ impl WeatherArgs {
         }
         if page.is_some() && !matches!(kind, WeatherKind::Hourly | WeatherKind::Alerts) {
             return Err("`page` applies to `kind: hourly` and `kind: alerts` only".to_string());
+        }
+        // Google's page token holds only for the location it was issued at,
+        // and the device location can move between pages.
+        if page.is_some() && at.is_none() {
+            return Err(
+                "`page` needs the location of the answer it continues: pass that answer's \
+                 `location.lat` and `location.lng` as `lat` and `lng`"
+                    .to_string(),
+            );
         }
         Ok(WeatherArgs {
             kind,
@@ -568,7 +561,9 @@ impl GeocodeArgs {
 
     fn parse(args: &Value) -> Result<GeocodeArgs, String> {
         let args = object(args, Self::KEYS)?;
-        let query = place_or_coordinates(args, "address")?;
+        let Some(query) = place_or_coordinates(args, "address")? else {
+            return Err("pass `address` or `lat` and `lng`".to_string());
+        };
         let max = integer(args, "max", 1, GEOCODE_MAX)?.unwrap_or(GEOCODE_DEFAULT_MAX);
         Ok(GeocodeArgs {
             query,
@@ -635,14 +630,7 @@ impl TravelMode {
     ];
 
     fn parse(args: &Args) -> Result<TravelMode, String> {
-        match args.get("mode") {
-            None => Ok(TravelMode::Drive),
-            Some(Value::String(mode)) => TravelMode::ALL
-                .into_iter()
-                .find(|known| known.name() == mode)
-                .ok_or_else(TravelMode::choices),
-            Some(_) => Err(TravelMode::choices()),
-        }
+        Ok(choice(args, "mode", &TravelMode::ALL, TravelMode::name)?.unwrap_or(TravelMode::Drive))
     }
 
     /// The tool's spelling, as the answer states it.
@@ -653,11 +641,6 @@ impl TravelMode {
             TravelMode::Bicycle => "bicycle",
             TravelMode::Transit => "transit",
         }
-    }
-
-    /// The refusal of a `mode` that is not one of these.
-    fn choices() -> String {
-        one_of("mode", TravelMode::ALL.map(TravelMode::name))
     }
 
     fn google(self) -> &'static str {
@@ -1104,8 +1087,22 @@ fn google_error(status: u64, body: &str) -> Failure {
 }
 
 /// What the request does with its nested call's answer: complete, fail, or
-/// issue its next step.
+/// issue its next step. The row's target picks the reader; the tool and
+/// step pick what follows.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
+    if state.target == Target::DeviceLocation {
+        let next = read_device_location_result(outcome).and_then(|answer| {
+            match (state.tool, state.step) {
+                (Provided::Weather, WEATHER_LOCATION_STEP) => stored(state, WeatherArgs::parse)
+                    .and_then(|args| weather_after_location(&args, answer, settings)),
+                (tool, step) => Err(internal(format!(
+                    "in-flight row names step {step} of {}, which reads no device-location answer",
+                    tool.name()
+                ))),
+            }
+        });
+        return next.unwrap_or_else(Next::Fail);
+    }
     let body = match read_api_result(outcome, &state.target) {
         Ok(Answer::Body(body)) => body,
         // Every step reads a JSON answer; none accepts an empty one.
@@ -1249,15 +1246,66 @@ fn weather_after_geocode(
     body: &Value,
     settings: &Settings,
 ) -> Result<Next, Failure> {
-    let Where::Text(place) = &args.at else {
+    let Some(Where::Text(place)) = &args.at else {
         return Err(internal(
-            "in-flight row names weather's geocode step for a request given coordinates",
+            "in-flight row names weather's geocode step for a request with no place to geocode",
         ));
     };
-    after_geocode(body, place, |lat, lng| Call {
-        step: WEATHER_LOOKUP_STEP,
-        api: weather_call(args, lat, lng, settings),
+    after_geocode(body, place, |lat, lng| {
+        Call::api(WEATHER_LOOKUP_STEP, weather_call(args, lat, lng, settings))
     })
+}
+
+/// Weather's lookup at the user's most recent device fix; the fix rides in
+/// `derived` to the answer. A stale fix is used and reported, never refused.
+/// No sharing device is the caller's: the refusal carries the tool's own
+/// text on turning sharing on, and says what to pass instead.
+fn weather_after_location(
+    args: &WeatherArgs,
+    answer: DeviceLocationAnswer,
+    settings: &Settings,
+) -> Result<Next, Failure> {
+    if args.at.is_some() {
+        return Err(internal(
+            "in-flight row names weather's location step for a request given a location",
+        ));
+    }
+    let fix = match answer {
+        DeviceLocationAnswer::Sharing { most_recent, .. } => most_recent,
+        DeviceLocationAnswer::NoneSharing { how_to_enable } => {
+            return Err(Failure {
+                kind: ErrorKind::InvalidArgs,
+                detail: format!("{how_to_enable} Pass `place` or `lat` and `lng` instead."),
+            });
+        }
+    };
+    let mut derived = Args::new();
+    derived.insert("lat".to_string(), json!(fix.latitude));
+    derived.insert("lng".to_string(), json!(fix.longitude));
+    derived.insert("device".to_string(), json!(fix.device));
+    derived.insert("age_seconds".to_string(), json!(fix.age_seconds));
+    derived.insert("stale".to_string(), json!(fix.stale));
+    Ok(Next::Call {
+        call: Call::api(
+            WEATHER_LOOKUP_STEP,
+            weather_call(args, fix.latitude, fix.longitude, settings),
+        ),
+        derived,
+    })
+}
+
+/// The compact `location` of a "here" answer: the device fix the location
+/// step found, which `derived` carries whole.
+fn here_location(derived: &Args) -> Result<Value, Failure> {
+    if !["lat", "lng", "device"]
+        .iter()
+        .all(|key| derived.contains_key(*key))
+    {
+        return Err(internal(
+            "in-flight row for weather's lookup carries no device location",
+        ));
+    }
+    Ok(Value::Object(derived.clone()))
 }
 
 /// The call `next` builds at the first location the geocode of `text`
@@ -1311,9 +1359,11 @@ fn places_after_geocode(
              geocode",
         ));
     };
-    after_geocode(body, near, |lat, lng| Call {
-        step: PLACES_SEARCH_STEP,
-        api: places_search_call(args, Some((lat, lng)), settings),
+    after_geocode(body, near, |lat, lng| {
+        Call::api(
+            PLACES_SEARCH_STEP,
+            places_search_call(args, Some((lat, lng)), settings),
+        )
     })
 }
 
@@ -1466,10 +1516,10 @@ fn search_along(args: &AlongRouteArgs, body: &Value, settings: &Settings) -> Res
     minutes(&mut summary, "duration_minutes", route.get("duration"))?;
     fallback(&mut summary, body)?;
     Ok(Next::Call {
-        call: Call {
-            step: ALONG_ROUTE_SEARCH_STEP,
-            api: along_route_search_call(args, polyline, settings),
-        },
+        call: Call::api(
+            ALONG_ROUTE_SEARCH_STEP,
+            along_route_search_call(args, polyline, settings),
+        ),
         derived: Args::from_iter([("route".to_string(), Value::Object(summary))]),
     })
 }
@@ -1595,7 +1645,10 @@ fn compact_weather(
     body: &Value,
     units: Units,
 ) -> Result<Value, Failure> {
-    let location = resolved_location(&args.at, derived, "weather's lookup")?;
+    let location = match &args.at {
+        Some(at) => resolved_location(at, derived, "weather's lookup")?,
+        None => here_location(derived)?,
+    };
     if !body.is_object() {
         return Err(shape("Weather"));
     }
@@ -2083,7 +2136,11 @@ fn minutes(to: &mut Args, name: &str, duration: Option<&Value>) -> Result<(), Fa
 
 #[cfg(test)]
 mod tests {
-    use brenn_provider_kit::testutil::{failure, google, http, nested, truncated};
+    use brenn_provider_kit::Nested;
+    use brenn_provider_kit::testutil::{
+        HOW_TO_ENABLE, api, device_location_answer, failure, google, http, nested, no_devices,
+        truncated,
+    };
     use brenn_provider_kit::{
         Bound, ToolBounds, check, hold_probes, hold_required, input_schema, probes,
     };
@@ -2227,7 +2284,7 @@ mod tests {
     fn geocode(args: Value) -> Result<ApiCall, String> {
         plan(Provided::Geocode, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api(&call).clone()
         })
     }
 
@@ -2301,7 +2358,7 @@ mod tests {
     fn geocode_passes_the_language() {
         let s = Settings::from_lookup(lookup(&with(&[("language", "fr")]))).unwrap();
         let call = plan(Provided::Geocode, &json!({ "address": "Paris" }), &s).unwrap();
-        assert_eq!(call.api.query["languageCode"], one("fr"));
+        assert_eq!(api(&call).query["languageCode"], one("fr"));
     }
 
     #[test]
@@ -2685,32 +2742,32 @@ mod tests {
     fn weather_at_coordinates_is_one_lookup() {
         let call = weather(json!({ "kind": "current", "lat": 37.422, "lng": -122.0841 })).unwrap();
         assert_eq!(call.step, WEATHER_LOOKUP_STEP);
-        assert_eq!(call.api.provider, "maps");
-        assert_eq!(call.api.method, "GET");
-        assert_eq!(call.api.host, "weather.example.com");
-        assert_eq!(call.api.path, "/v1/currentConditions:lookup");
+        assert_eq!(api(&call).provider, "maps");
+        assert_eq!(api(&call).method, "GET");
+        assert_eq!(api(&call).host, "weather.example.com");
+        assert_eq!(api(&call).path, "/v1/currentConditions:lookup");
         assert_eq!(
-            call.api.query,
+            api(&call).query,
             params(&[
                 ("location.latitude", "37.422"),
                 ("location.longitude", "-122.0841"),
                 ("unitsSystem", "METRIC"),
             ])
         );
-        assert!(call.api.headers.is_empty());
-        assert_eq!(call.api.body, None);
+        assert!(api(&call).headers.is_empty());
+        assert_eq!(api(&call).body, None);
         // A coordinate place is not geocoded.
         let call = weather(json!({ "kind": "current", "place": "37.422,-122.0841" })).unwrap();
         assert_eq!(call.step, WEATHER_LOOKUP_STEP);
-        assert_eq!(call.api.query["location.latitude"], one("37.422"));
+        assert_eq!(api(&call).query["location.latitude"], one("37.422"));
     }
 
     #[test]
     fn weather_hourly_asks_for_one_page_of_the_horizon() {
         let call = weather(json!({ "kind": "hourly", "lat": 1, "lng": 2 })).unwrap();
-        assert_eq!(call.api.path, "/v1/forecast/hours:lookup");
+        assert_eq!(api(&call).path, "/v1/forecast/hours:lookup");
         assert_eq!(
-            call.api.query,
+            api(&call).query,
             params(&[
                 ("location.latitude", "1"),
                 ("location.longitude", "2"),
@@ -2727,31 +2784,31 @@ mod tests {
             &s,
         )
         .unwrap();
-        assert_eq!(call.api.query["hours"], one("240"));
-        assert_eq!(call.api.query["pageSize"], one("24"));
-        assert_eq!(call.api.query["pageToken"], one("tok"));
-        assert_eq!(call.api.query["unitsSystem"], one("IMPERIAL"));
-        assert_eq!(call.api.query["languageCode"], one("de"));
+        assert_eq!(api(&call).query["hours"], one("240"));
+        assert_eq!(api(&call).query["pageSize"], one("24"));
+        assert_eq!(api(&call).query["pageToken"], one("tok"));
+        assert_eq!(api(&call).query["unitsSystem"], one("IMPERIAL"));
+        assert_eq!(api(&call).query["languageCode"], one("de"));
     }
 
     #[test]
     fn weather_daily_is_one_page_of_days() {
         let call = weather(json!({ "kind": "daily", "lat": 1, "lng": 2 })).unwrap();
-        assert_eq!(call.api.path, "/v1/forecast/days:lookup");
-        assert_eq!(call.api.query["days"], one("5"));
-        assert_eq!(call.api.query["pageSize"], one("5"));
+        assert_eq!(api(&call).path, "/v1/forecast/days:lookup");
+        assert_eq!(api(&call).query["days"], one("5"));
+        assert_eq!(api(&call).query["pageSize"], one("5"));
         let call = weather(json!({ "kind": "daily", "lat": 1, "lng": 2, "days": 10 })).unwrap();
-        assert_eq!(call.api.query["days"], one("10"));
-        assert_eq!(call.api.query["pageSize"], one("10"));
-        assert!(!call.api.query.contains_key("pageToken"));
+        assert_eq!(api(&call).query["days"], one("10"));
+        assert_eq!(api(&call).query["pageSize"], one("10"));
+        assert!(!api(&call).query.contains_key("pageToken"));
     }
 
     #[test]
     fn weather_alerts_take_no_unit_system_and_page_at_the_cap() {
         let call = weather(json!({ "kind": "alerts", "lat": 1, "lng": 2, "page": "tok" })).unwrap();
-        assert_eq!(call.api.path, "/v1/publicAlerts:lookup");
+        assert_eq!(api(&call).path, "/v1/publicAlerts:lookup");
         assert_eq!(
-            call.api.query,
+            api(&call).query,
             params(&[
                 ("location.latitude", "1"),
                 ("location.longitude", "2"),
@@ -2766,11 +2823,14 @@ mod tests {
     fn weather_for_a_place_geocodes_first() {
         let call = weather(json!({ "kind": "current", "place": "Mountain View" })).unwrap();
         assert_eq!(call.step, WEATHER_GEOCODE_STEP);
-        assert_eq!(call.api.host, "geocode.example.com");
-        assert_eq!(call.api.path, "/v4/geocode/address");
-        assert_eq!(call.api.query, params(&[("addressQuery", "Mountain View")]));
+        assert_eq!(api(&call).host, "geocode.example.com");
+        assert_eq!(api(&call).path, "/v4/geocode/address");
         assert_eq!(
-            call.api.headers,
+            api(&call).query,
+            params(&[("addressQuery", "Mountain View")])
+        );
+        assert_eq!(
+            api(&call).headers,
             pairs(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
         );
     }
@@ -2784,10 +2844,6 @@ mod tests {
                 KIND_CHOICES,
             ),
             (json!({ "kind": 1, "lat": 1, "lng": 2 }), KIND_CHOICES),
-            (
-                json!({ "kind": "current" }),
-                "pass `place` or `lat` and `lng`",
-            ),
             (
                 json!({ "kind": "current", "place": "Paris", "lat": 1, "lng": 2 }),
                 "pass `place` or `lat` and `lng`, not both",
@@ -2824,6 +2880,33 @@ mod tests {
                 json!({ "kind": "hourly", "lat": 1, "lng": 2, "page": "" }),
                 "`page` is empty",
             ),
+            // Only a wholly absent location is "here".
+            (
+                json!({ "kind": "current", "lat": 1 }),
+                "`lat` and `lng` go together; pass both or neither",
+            ),
+            (
+                json!({ "kind": "current", "lng": 2 }),
+                "`lat` and `lng` go together; pass both or neither",
+            ),
+            (
+                json!({ "kind": "current", "place": "  " }),
+                "`place` is empty",
+            ),
+            (
+                json!({ "kind": "current", "place": "" }),
+                "`place` is empty",
+            ),
+            (
+                json!({ "kind": "hourly", "page": "tok" }),
+                "`page` needs the location of the answer it continues: pass that answer's \
+                 `location.lat` and `location.lng` as `lat` and `lng`",
+            ),
+            (
+                json!({ "kind": "alerts", "page": "tok" }),
+                "`page` needs the location of the answer it continues: pass that answer's \
+                 `location.lat` and `location.lng` as `lat` and `lng`",
+            ),
         ];
         for (args, want) in cases {
             assert_eq!(weather(args.clone()).unwrap_err(), want, "{args}");
@@ -2844,7 +2927,7 @@ mod tests {
         );
         let page = "ü".repeat(PAGE_TOKEN_MAX_CHARS);
         let ok = json!({ "kind": "hourly", "lat": 1, "lng": 2, "page": page });
-        assert_eq!(weather(ok).unwrap().api.query["pageToken"], one(&page));
+        assert_eq!(api(&weather(ok).unwrap()).query["pageToken"], one(&page));
         let over = json!({ "kind": "hourly", "lat": 1, "lng": 2, "page": format!("{page}t") });
         assert_eq!(
             weather(over).unwrap_err(),
@@ -2885,10 +2968,10 @@ mod tests {
             panic!("expected the lookup step");
         };
         assert_eq!(call.step, WEATHER_LOOKUP_STEP);
-        assert_eq!(call.api.host, "weather.example.com");
-        assert_eq!(call.api.path, "/v1/currentConditions:lookup");
-        assert_eq!(call.api.query["location.latitude"], one("37.39"));
-        assert_eq!(call.api.query["location.longitude"], one("-122.08"));
+        assert_eq!(api(&call).host, "weather.example.com");
+        assert_eq!(api(&call).path, "/v1/currentConditions:lookup");
+        assert_eq!(api(&call).query["location.latitude"], one("37.39"));
+        assert_eq!(api(&call).query["location.longitude"], one("-122.08"));
         let want = json!({ "lat": 37.39, "lng": -122.08, "place": "Mountain View, CA, USA" });
         assert_eq!(Value::Object(derived.clone()), want);
 
@@ -2900,7 +2983,7 @@ mod tests {
             (step2.tool, &step2.args, step2.step, step2.issued_at_ms),
             (Provided::Weather, &args, WEATHER_LOOKUP_STEP, 2_000)
         );
-        assert_eq!(step2.target, call.api.target());
+        assert_eq!(step2.target, api(&call).target());
         let step2 = InFlight::decode(&step2.encode()).unwrap();
         let Next::Complete(answer) = advance(&step2, http(200, CURRENT_BODY), &settings()) else {
             panic!("expected an answer");
@@ -2941,16 +3024,16 @@ mod tests {
     #[test]
     fn weather_geocode_step_for_coordinates_is_internal() {
         let args = json!({ "kind": "current", "lat": 1, "lng": 2 });
-        let call = Call {
-            step: WEATHER_GEOCODE_STEP,
-            api: geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
-        };
+        let call = Call::api(
+            WEATHER_GEOCODE_STEP,
+            geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
+        );
         let state = weather_state(args, &call, Args::new());
         assert_eq!(
             advance(&state, http(200, MOUNTAIN_VIEW), &settings()),
             Next::Fail(failure(
                 ErrorKind::Internal,
-                "in-flight row names weather's geocode step for a request given coordinates"
+                "in-flight row names weather's geocode step for a request with no place to geocode"
             ))
         );
     }
@@ -2958,10 +3041,10 @@ mod tests {
     #[test]
     fn weather_lookup_without_its_geocoded_location_is_internal() {
         let args = json!({ "kind": "current", "place": "Mountain View" });
-        let call = Call {
-            step: WEATHER_LOOKUP_STEP,
-            api: weather_call(&WeatherArgs::parse(&args).unwrap(), 1.0, 2.0, &settings()),
-        };
+        let call = Call::api(
+            WEATHER_LOOKUP_STEP,
+            weather_call(&WeatherArgs::parse(&args).unwrap(), 1.0, 2.0, &settings()),
+        );
         let state = weather_state(args, &call, Args::new());
         assert_eq!(
             advance(&state, http(200, CURRENT_BODY), &settings()),
@@ -2970,6 +3053,209 @@ mod tests {
                 "in-flight row for weather's lookup carries no geocoded location"
             ))
         );
+    }
+
+    #[test]
+    fn weather_with_no_location_reads_the_device_location_first() {
+        for kind in ["current", "hourly", "daily", "alerts"] {
+            let call = weather(json!({ "kind": kind })).unwrap();
+            assert_eq!(call, Call::device_location(WEATHER_LOCATION_STEP), "{kind}");
+            assert_eq!(call.nested, Nested::DeviceLocation);
+            assert_eq!(call.nested.target(), Target::DeviceLocation);
+        }
+        // `lat` alone is still half a pair, not "here".
+        assert_eq!(
+            weather(json!({ "kind": "current", "lat": 1 })).unwrap_err(),
+            "`lat` and `lng` go together; pass both or neither"
+        );
+    }
+
+    /// A "here" request's row at its location step.
+    fn here_state(args: &Value) -> InFlight {
+        weather_state(args.clone(), &weather(args.clone()).unwrap(), Args::new())
+    }
+
+    #[test]
+    fn weather_here_looks_up_at_the_most_recent_device() {
+        let args = json!({ "kind": "hourly", "hours": 6 });
+        let state = here_state(&args);
+        assert_eq!(state.step, WEATHER_LOCATION_STEP);
+        assert_eq!(state.target, Target::DeviceLocation);
+        let answer = device_location_answer(&[
+            ("phone", 51.5, -0.12, 30, false),
+            ("laptop", 48.85, 2.35, 4_000, true),
+        ]);
+        let Next::Call { call, derived } = advance(&state, answer, &settings()) else {
+            panic!("expected the lookup step");
+        };
+        assert_eq!(call.step, WEATHER_LOOKUP_STEP);
+        let want = weather_call(
+            &WeatherArgs::parse(&args).unwrap(),
+            51.5,
+            -0.12,
+            &settings(),
+        );
+        assert_eq!(api(&call), &want);
+        assert_eq!(api(&call).query["hours"], one("6"));
+        let location = json!({
+            "lat": 51.5, "lng": -0.12, "device": "phone", "age_seconds": 30, "stale": false,
+        });
+        assert_eq!(Value::Object(derived.clone()), location);
+
+        // The lookup's row carries the fix through the store to the answer.
+        let step2 = InFlight::decode(&state.next(&call, derived, 2_000).encode()).unwrap();
+        assert_eq!(step2.call_id(), format!("{}/2", "a".repeat(32)));
+        let Next::Complete(answer) = advance(&step2, http(200, CURRENT_HOURLY), &settings()) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["location"], location);
+    }
+
+    /// An hourly answer with no hours, enough to complete a request.
+    const CURRENT_HOURLY: &str = r#"{ "forecastHours": [] }"#;
+
+    #[test]
+    fn weather_here_uses_and_reports_a_stale_fix() {
+        let state = here_state(&json!({ "kind": "current" }));
+        let answer = device_location_answer(&[("tablet", -33.87, 151.21, 7_200, true)]);
+        let Next::Call { call, derived } = advance(&state, answer, &settings()) else {
+            panic!("a stale fix is used, not refused");
+        };
+        assert_eq!(api(&call).query["location.latitude"], one("-33.87"));
+        assert_eq!(api(&call).query["location.longitude"], one("151.21"));
+        assert_eq!(
+            Value::Object(derived.clone()),
+            json!({ "lat": -33.87, "lng": 151.21, "device": "tablet", "age_seconds": 7_200, "stale": true })
+        );
+        let step2 = state.next(&call, derived, 2_000);
+        let Next::Complete(answer) = advance(&step2, http(200, CURRENT_BODY), &settings()) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(answer["location"]["stale"], json!(true));
+        assert_eq!(answer["location"]["age_seconds"], json!(7_200));
+        assert_eq!(answer["temperature"], json!(16));
+    }
+
+    #[test]
+    fn weather_here_with_no_sharing_device_is_the_callers() {
+        let state = here_state(&json!({ "kind": "current" }));
+        assert_eq!(
+            advance(&state, no_devices(), &settings()),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                &format!("{HOW_TO_ENABLE} Pass `place` or `lat` and `lng` instead.")
+            ))
+        );
+    }
+
+    #[test]
+    fn weather_here_maps_each_nested_error() {
+        let state = here_state(&json!({ "kind": "current" }));
+        let cases = [
+            (
+                nested("denied", "device-location: acts as the acting user"),
+                failure(
+                    ErrorKind::Denied,
+                    "device-location refused the nested call: device-location: acts as the \
+                     acting user",
+                ),
+            ),
+            (
+                nested("not_granted", "caller no longer granted"),
+                read_device_location_result(nested("not_granted", "caller no longer granted"))
+                    .unwrap_err(),
+            ),
+            (
+                nested("invalid_args", "unknown device"),
+                failure(
+                    ErrorKind::Internal,
+                    "device-location rejected the wrapper's request: unknown device",
+                ),
+            ),
+            (
+                nested("internal", "result lost"),
+                failure(
+                    ErrorKind::Internal,
+                    "the host did not deliver device-location's answer: result lost",
+                ),
+            ),
+        ];
+        for (outcome, want) in cases {
+            assert_eq!(advance(&state, outcome, &settings()), Next::Fail(want));
+        }
+        let Next::Fail(not_granted) = advance(&state, nested("not_granted", "x"), &settings())
+        else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(not_granted.kind, ErrorKind::Denied);
+        assert!(
+            not_granted.detail.contains("`tool device-location {}`"),
+            "{}",
+            not_granted.detail
+        );
+        // An api-request envelope at the location step is not the tool's shape.
+        let Next::Fail(wrong) = advance(&state, http(200, "{}"), &settings()) else {
+            panic!("expected a failure");
+        };
+        assert_eq!(wrong.kind, ErrorKind::Internal);
+        assert!(
+            wrong
+                .detail
+                .starts_with("device-location's answer is not the tool's shape")
+        );
+    }
+
+    #[test]
+    fn weather_location_step_for_a_request_given_a_location_is_internal() {
+        let want = Next::Fail(failure(
+            ErrorKind::Internal,
+            "in-flight row names weather's location step for a request given a location",
+        ));
+        for args in [
+            json!({ "kind": "current", "lat": 1, "lng": 2 }),
+            json!({ "kind": "current", "place": "Paris" }),
+        ] {
+            let call = Call::device_location(WEATHER_LOCATION_STEP);
+            let state = weather_state(args, &call, Args::new());
+            let answer = device_location_answer(&[("phone", 1.0, 2.0, 0, false)]);
+            assert_eq!(advance(&state, answer, &settings()), want);
+        }
+    }
+
+    /// A location answer is read by the location reader whatever the step;
+    /// a step that takes no location answer is the component's fault.
+    #[test]
+    fn a_location_answer_at_a_step_that_reads_none_is_internal() {
+        let call = Call::device_location(WEATHER_LOOKUP_STEP);
+        let state = weather_state(json!({ "kind": "current" }), &call, Args::new());
+        let answer = device_location_answer(&[("phone", 1.0, 2.0, 0, false)]);
+        assert_eq!(
+            advance(&state, answer, &settings()),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "in-flight row names step 2 of weather, which reads no device-location answer",
+            ))
+        );
+    }
+
+    #[test]
+    fn weather_here_lookup_without_its_device_location_is_internal() {
+        let args = json!({ "kind": "current" });
+        let call = Call::api(
+            WEATHER_LOOKUP_STEP,
+            weather_call(&WeatherArgs::parse(&args).unwrap(), 1.0, 2.0, &settings()),
+        );
+        let want = Next::Fail(failure(
+            ErrorKind::Internal,
+            "in-flight row for weather's lookup carries no device location",
+        ));
+        let mut geocoded = Args::new();
+        geocoded.insert("lat".to_string(), json!(1.0));
+        geocoded.insert("lng".to_string(), json!(2.0));
+        for derived in [Args::new(), geocoded] {
+            let state = weather_state(args.clone(), &call, derived);
+            assert_eq!(advance(&state, http(200, CURRENT_BODY), &settings()), want);
+        }
     }
 
     /// The answer to a Weather lookup made at coordinates.
@@ -3322,7 +3608,7 @@ mod tests {
     fn directions(args: Value) -> Result<ApiCall, String> {
         plan(Provided::Directions, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api(&call).clone()
         })
     }
 
@@ -3414,7 +3700,7 @@ mod tests {
             &s,
         )
         .unwrap();
-        let body = posted(&call.api);
+        let body = posted(api(&call));
         assert_eq!(body["units"], "IMPERIAL");
         assert_eq!(body["languageCode"], "de");
     }
@@ -3945,17 +4231,17 @@ mod tests {
     fn places_search_without_near_posts_one_search() {
         let call = places_search(json!({ "query": "coffee" })).unwrap();
         assert_eq!(call.step, PLACES_SEARCH_STEP);
-        assert_eq!(call.api.provider, "maps");
-        assert_eq!(call.api.method, "POST");
-        assert_eq!(call.api.host, "places.example.com");
-        assert_eq!(call.api.path, "/v1/places:searchText");
-        assert!(call.api.query.is_empty());
+        assert_eq!(api(&call).provider, "maps");
+        assert_eq!(api(&call).method, "POST");
+        assert_eq!(api(&call).host, "places.example.com");
+        assert_eq!(api(&call).path, "/v1/places:searchText");
+        assert!(api(&call).query.is_empty());
         assert_eq!(
-            call.api.headers,
+            api(&call).headers,
             pairs(&[("X-Goog-FieldMask", PLACES_SEARCH_FIELD_MASK)])
         );
         assert_eq!(
-            posted(&call.api),
+            posted(api(&call)),
             json!({ "textQuery": "coffee", "pageSize": 10 })
         );
     }
@@ -3989,7 +4275,7 @@ mod tests {
         .unwrap();
         assert_eq!(call.step, PLACES_SEARCH_STEP);
         assert_eq!(
-            posted(&call.api),
+            posted(api(&call)),
             json!({
                 "textQuery": "coffee",
                 "pageSize": 20,
@@ -4002,25 +4288,28 @@ mod tests {
         );
         // `open_now: false` is Google's default and is not sent.
         let call = places_search(json!({ "query": "coffee", "open_now": false })).unwrap();
-        assert!(posted(&call.api).get("openNow").is_none());
+        assert!(posted(api(&call)).get("openNow").is_none());
     }
 
     #[test]
     fn places_search_passes_the_language() {
         let s = Settings::from_lookup(lookup(&with(&[("language", "fr")]))).unwrap();
         let call = plan(Provided::PlacesSearch, &json!({ "query": "café" }), &s).unwrap();
-        assert_eq!(posted(&call.api)["languageCode"], "fr");
+        assert_eq!(posted(api(&call))["languageCode"], "fr");
     }
 
     #[test]
     fn places_search_near_a_place_geocodes_first() {
         let call = places_search(json!({ "query": "coffee", "near": "Mountain View" })).unwrap();
         assert_eq!(call.step, PLACES_GEOCODE_STEP);
-        assert_eq!(call.api.host, "geocode.example.com");
-        assert_eq!(call.api.path, "/v4/geocode/address");
-        assert_eq!(call.api.query, params(&[("addressQuery", "Mountain View")]));
+        assert_eq!(api(&call).host, "geocode.example.com");
+        assert_eq!(api(&call).path, "/v4/geocode/address");
         assert_eq!(
-            call.api.headers,
+            api(&call).query,
+            params(&[("addressQuery", "Mountain View")])
+        );
+        assert_eq!(
+            api(&call).headers,
             pairs(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
         );
     }
@@ -4035,11 +4324,11 @@ mod tests {
             panic!("expected the search step");
         };
         assert_eq!(call.step, PLACES_SEARCH_STEP);
-        assert_eq!(call.api.host, "places.example.com");
-        assert_eq!(call.api.path, "/v1/places:searchText");
+        assert_eq!(api(&call).host, "places.example.com");
+        assert_eq!(api(&call).path, "/v1/places:searchText");
         // No radius given: the default circle.
         assert_eq!(
-            posted(&call.api)["locationBias"],
+            posted(api(&call))["locationBias"],
             json!({ "circle": {
                 "center": { "latitude": 37.39, "longitude": -122.08 },
                 "radius": 5000,
@@ -4051,7 +4340,7 @@ mod tests {
         // The search's row carries the location through the store to the answer.
         let step2 = InFlight::decode(&state.next(&call, derived, 2_000).encode()).unwrap();
         assert_eq!(step2.call_id(), format!("{}/2", "a".repeat(32)));
-        assert_eq!(step2.target, call.api.target());
+        assert_eq!(step2.target, api(&call).target());
         let Next::Complete(answer) = advance(&step2, http(200, "{}"), &settings()) else {
             panic!("expected an answer");
         };
@@ -4078,10 +4367,10 @@ mod tests {
     fn places_search_steps_without_their_state_are_internal() {
         // A geocode step for a request with nothing to geocode.
         let args = json!({ "query": "coffee", "near": "1,2" });
-        let call = Call {
-            step: PLACES_GEOCODE_STEP,
-            api: geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
-        };
+        let call = Call::api(
+            PLACES_GEOCODE_STEP,
+            geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
+        );
         assert_eq!(
             advance(
                 &places_state(args, &call, Args::new()),
@@ -4097,10 +4386,10 @@ mod tests {
         // A search step for a place whose geocoded location was not carried.
         let args = json!({ "query": "coffee", "near": "Mountain View" });
         let search = PlacesSearchArgs::parse(&args).unwrap();
-        let call = Call {
-            step: PLACES_SEARCH_STEP,
-            api: places_search_call(&search, Some((1.0, 2.0)), &settings()),
-        };
+        let call = Call::api(
+            PLACES_SEARCH_STEP,
+            places_search_call(&search, Some((1.0, 2.0)), &settings()),
+        );
         assert_eq!(
             advance(
                 &places_state(args, &call, Args::new()),
@@ -4164,7 +4453,7 @@ mod tests {
         for radius in [1, 50_000] {
             let call = places_search(json!({ "query": "a", "near": "1,2", "radius": radius }));
             assert_eq!(
-                posted(&call.unwrap().api)["locationBias"]["circle"]["radius"],
+                posted(api(&call.unwrap()))["locationBias"]["circle"]["radius"],
                 radius
             );
         }
@@ -4305,7 +4594,7 @@ mod tests {
     fn place_details(args: Value) -> Result<ApiCall, String> {
         plan(Provided::PlaceDetails, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api(&call).clone()
         })
     }
 
@@ -4357,7 +4646,7 @@ mod tests {
     fn place_details_pass_the_language() {
         let s = Settings::from_lookup(lookup(&with(&[("language", "fr")]))).unwrap();
         let call = plan(Provided::PlaceDetails, &json!({ "id": "ChIJ1" }), &s).unwrap();
-        assert_eq!(call.api.query, params(&[("languageCode", "fr")]));
+        assert_eq!(api(&call).query, params(&[("languageCode", "fr")]));
     }
 
     #[test]
@@ -4554,19 +4843,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(call.step, ALONG_ROUTE_ROUTE_STEP);
-        assert_eq!(call.api.method, "POST");
-        assert_eq!(call.api.host, "routes.example.com");
-        assert_eq!(call.api.path, "/directions/v2:computeRoutes");
-        assert!(call.api.query.is_empty());
+        assert_eq!(api(&call).method, "POST");
+        assert_eq!(api(&call).host, "routes.example.com");
+        assert_eq!(api(&call).path, "/directions/v2:computeRoutes");
+        assert!(api(&call).query.is_empty());
         assert_eq!(
-            call.api.headers,
+            api(&call).headers,
             pairs(&[(
                 "X-Goog-FieldMask",
                 "routes.polyline.encodedPolyline,routes.distanceMeters,routes.duration,fallbackInfo"
             )])
         );
         assert_eq!(
-            posted(&call.api),
+            posted(api(&call)),
             json!({
                 "origin": { "location": { "latLng": { "latitude": 37.422, "longitude": -122.0841 } } },
                 "destination": { "placeId": "ChIJ2" },
@@ -4581,7 +4870,7 @@ mod tests {
             json!({ "origin": "a", "destination": "b", "query": "gas", "mode": "walk" }),
         )
         .unwrap();
-        let body = posted(&walk.api);
+        let body = posted(api(&walk));
         assert_eq!(body["travelMode"], "WALK");
         assert!(body.get("routingPreference").is_none());
     }
@@ -4672,15 +4961,15 @@ mod tests {
             panic!("expected the search step");
         };
         assert_eq!(call.step, ALONG_ROUTE_SEARCH_STEP);
-        assert_eq!(call.api.method, "POST");
-        assert_eq!(call.api.host, "places.example.com");
-        assert_eq!(call.api.path, "/v1/places:searchText");
+        assert_eq!(api(&call).method, "POST");
+        assert_eq!(api(&call).host, "places.example.com");
+        assert_eq!(api(&call).path, "/v1/places:searchText");
         assert_eq!(
-            call.api.headers,
+            api(&call).headers,
             pairs(&[("X-Goog-FieldMask", PLACES_SEARCH_FIELD_MASK)])
         );
         assert_eq!(
-            posted(&call.api),
+            posted(api(&call)),
             json!({
                 "textQuery": "gas",
                 "pageSize": 3,
@@ -4750,10 +5039,10 @@ mod tests {
         // args cap.
         let mut longest = AlongRouteArgs::parse(&args).unwrap();
         longest.search.query = "\u{1}".repeat(TEXT_MAX_CHARS);
-        let api = along_route_search_call(&longest, &at_cap, &settings());
-        assert!(serde_json::to_vec(&api).unwrap().len() < 64 * 1024);
+        let search = along_route_search_call(&longest, &at_cap, &settings());
+        assert!(serde_json::to_vec(&search).unwrap().len() < 64 * 1024);
         assert!(
-            posted(&call.api)["searchAlongRouteParameters"]["polyline"]["encodedPolyline"]
+            posted(api(&call))["searchAlongRouteParameters"]["polyline"]["encodedPolyline"]
                 == at_cap
         );
         let over = format!("{at_cap}a");
@@ -4844,14 +5133,10 @@ mod tests {
     #[test]
     fn search_along_route_search_without_its_route_is_internal() {
         let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
-        let call = Call {
-            step: ALONG_ROUTE_SEARCH_STEP,
-            api: along_route_search_call(
-                &AlongRouteArgs::parse(&args).unwrap(),
-                "abc",
-                &settings(),
-            ),
-        };
+        let call = Call::api(
+            ALONG_ROUTE_SEARCH_STEP,
+            along_route_search_call(&AlongRouteArgs::parse(&args).unwrap(), "abc", &settings()),
+        );
         assert_eq!(
             advance(
                 &along_state(&args, &call, Args::new()),

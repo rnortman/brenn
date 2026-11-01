@@ -43,9 +43,10 @@ pub enum GrantOwner<'a> {
         /// The agent runs in a container rather than as Brenn's uid.
         has_container: bool,
     },
-    /// A WASM consumer. Its calls carry no acting user unless the executor
-    /// stamps one from a pending provided-tool call it serves.
-    WasmConsumer { slug: &'a str },
+    /// A WASM consumer. Its own calls carry no acting user; a consumer that
+    /// provides a tool serves calls, and a nested call it makes for one carries
+    /// that call's user, which the executor stamps from the pending record.
+    WasmConsumer { slug: &'a str, provides: bool },
 }
 
 impl<'a> GrantOwner<'a> {
@@ -63,7 +64,7 @@ impl std::fmt::Display for GrantOwner<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GrantOwner::App { slug, .. } => write!(f, "app {slug:?}"),
-            GrantOwner::WasmConsumer { slug } => write!(f, "wasm consumer {slug:?}"),
+            GrantOwner::WasmConsumer { slug, .. } => write!(f, "wasm consumer {slug:?}"),
         }
     }
 }
@@ -74,7 +75,9 @@ fn user_binding_refusal(owner: &GrantOwner<'_>, binding: UserBinding) -> Option<
     match (binding, owner) {
         (UserBinding::None, _) => None,
         (
-            UserBinding::ActingUser | UserBinding::ActingOrLentUser,
+            UserBinding::ActingUser
+            | UserBinding::ActingOrServedUser
+            | UserBinding::ActingOrLentUser,
             GrantOwner::App {
                 multiuser: true, ..
             },
@@ -83,7 +86,9 @@ fn user_binding_refusal(owner: &GrantOwner<'_>, binding: UserBinding) -> Option<
              typist need not be its owner)",
         ),
         (
-            UserBinding::ActingUser | UserBinding::ActingOrLentUser,
+            UserBinding::ActingUser
+            | UserBinding::ActingOrServedUser
+            | UserBinding::ActingOrLentUser,
             GrantOwner::App {
                 has_container: false,
                 ..
@@ -92,10 +97,25 @@ fn user_binding_refusal(owner: &GrantOwner<'_>, binding: UserBinding) -> Option<
             "the tool acts as a user and the app has no container (a bare agent runs as \
              Brenn's uid and could read the user's credentials)",
         ),
-        (UserBinding::ActingUser | UserBinding::ActingOrLentUser, GrantOwner::App { .. }) => None,
+        (
+            UserBinding::ActingUser
+            | UserBinding::ActingOrServedUser
+            | UserBinding::ActingOrLentUser,
+            GrantOwner::App { .. },
+        ) => None,
         (UserBinding::ActingUser, GrantOwner::WasmConsumer { .. }) => {
-            Some("the tool acts as the acting user and a wasm consumer's calls carry none")
+            Some("the tool acts as the acting user and only the user's own app may hold it")
         }
+        (
+            UserBinding::ActingOrServedUser,
+            GrantOwner::WasmConsumer {
+                provides: false, ..
+            },
+        ) => Some(
+            "the tool acts as the acting user, and a component that provides no tool never \
+             serves a call that carries one",
+        ),
+        (UserBinding::ActingOrServedUser, GrantOwner::WasmConsumer { provides: true, .. }) => None,
         (UserBinding::ActingOrLentUser, GrantOwner::WasmConsumer { .. }) => None,
     }
 }
@@ -646,7 +666,7 @@ mod tests {
         }))
     }
 
-    use crate::testutil::{clause, grant};
+    use crate::testutil::{bound, clause, grant};
 
     #[test]
     fn lookup_by_name_and_mcp_name() {
@@ -1041,53 +1061,6 @@ mod tests {
         }
     }
 
-    /// An async tool with a configurable user binding that refuses any clause
-    /// whose `path` is `"bad"`, and returns the acting user it was handed.
-    struct BoundTool {
-        descriptor: ToolDescriptor,
-    }
-
-    #[async_trait::async_trait]
-    impl AsyncTool for BoundTool {
-        fn descriptor(&self) -> &ToolDescriptor {
-            &self.descriptor
-        }
-        fn check_acl(
-            &self,
-            _args: &serde_json::Value,
-            _acl: &[AclClause],
-        ) -> Result<(), AclDenied> {
-            Ok(())
-        }
-        fn validate_clause(&self, clause: &AclClause) -> Result<(), String> {
-            match clause.iter().find(|(k, _)| *k == "path") {
-                Some((_, "bad")) => Err("path \"bad\" is not a template".to_string()),
-                _ => Ok(()),
-            }
-        }
-        async fn execute(
-            &self,
-            ctx: &ToolCtx,
-            _args: serde_json::Value,
-        ) -> Result<serde_json::Value, ToolError> {
-            let user = ctx.require_acting_user(self.descriptor.name);
-            Ok(json!({ "id": user.id, "username": user.username }))
-        }
-    }
-
-    fn bound(name: &'static str, binding: UserBinding) -> RegisteredTool {
-        let mcp_name: &'static str = Box::leak(format!("mcp__brenn__{name}").into_boxed_str());
-        let mut d = descriptor(
-            name,
-            mcp_name,
-            ToolClass::Async { max_concurrency: 2 },
-            &["provider", "path"],
-            Idempotency::Natural,
-        );
-        d.user_binding = binding;
-        RegisteredTool::Async(Arc::new(BoundTool { descriptor: d }))
-    }
-
     fn one_grant(tool: &str, pairs: &[(&str, &str)]) -> BTreeMap<String, ResolvedToolGrant> {
         BTreeMap::from([(tool.to_string(), grant(vec![clause(pairs)]))])
     }
@@ -1095,6 +1068,7 @@ mod tests {
     fn bound_registry() -> ToolRegistry {
         ToolRegistry::new(vec![
             bound("acting", UserBinding::ActingUser),
+            bound("served", UserBinding::ActingOrServedUser),
             bound("lent", UserBinding::ActingOrLentUser),
             fast("unbound", "mcp__brenn__Unbound", &["provider"]),
         ])
@@ -1103,7 +1077,7 @@ mod tests {
     #[test]
     fn user_bound_tools_admitted_on_a_single_user_container_app() {
         let reg = bound_registry();
-        for tool in ["acting", "lent", "unbound"] {
+        for tool in ["acting", "served", "lent", "unbound"] {
             reg.validate_grants(app_owner(), &one_grant(tool, &[("provider", "google")]));
         }
     }
@@ -1159,21 +1133,94 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "wasm consumer \"sync\": tool_grant for \"acting\" is refused: the tool acts as the acting user and a wasm consumer's calls carry none"
+        expected = "tool_grant for \"served\" is refused: the tool acts as a user and the app is multiuser"
+    )]
+    fn served_user_tool_refused_on_multiuser_app() {
+        let owner = GrantOwner::App {
+            slug: "pfin",
+            multiuser: true,
+            has_container: true,
+        };
+        bound_registry().validate_grants(owner, &one_grant("served", &[("provider", "google")]));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "tool_grant for \"served\" is refused: the tool acts as a user and the app has no container"
+    )]
+    fn served_user_tool_refused_on_bare_app() {
+        let owner = GrantOwner::App {
+            slug: "pfin",
+            multiuser: false,
+            has_container: false,
+        };
+        bound_registry().validate_grants(owner, &one_grant("served", &[("provider", "google")]));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "wasm consumer \"sync\": tool_grant for \"acting\" is refused: the tool acts as the acting user and only the user's own app may hold it"
     )]
     fn acting_user_tool_refused_on_wasm_consumer() {
         bound_registry().validate_grants(
-            GrantOwner::WasmConsumer { slug: "sync" },
+            GrantOwner::WasmConsumer {
+                slug: "sync",
+                provides: false,
+            },
             &one_grant("acting", &[("provider", "google")]),
         );
     }
 
     #[test]
-    fn lent_user_tool_admitted_on_wasm_consumer() {
+    #[should_panic(
+        expected = "wasm consumer \"maps\": tool_grant for \"acting\" is refused: the tool acts as the acting user and only the user's own app may hold it"
+    )]
+    fn acting_user_tool_refused_on_a_providing_wasm_consumer() {
         bound_registry().validate_grants(
-            GrantOwner::WasmConsumer { slug: "sync" },
-            &one_grant("lent", &[("provider", "google")]),
+            GrantOwner::WasmConsumer {
+                slug: "maps",
+                provides: true,
+            },
+            &one_grant("acting", &[("provider", "google")]),
         );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "wasm consumer \"sync\": tool_grant for \"served\" is refused: the tool acts as the acting user, and a component that provides no tool never serves a call that carries one"
+    )]
+    fn served_user_tool_refused_on_a_consumer_that_provides_nothing() {
+        bound_registry().validate_grants(
+            GrantOwner::WasmConsumer {
+                slug: "sync",
+                provides: false,
+            },
+            &one_grant("served", &[("provider", "google")]),
+        );
+    }
+
+    #[test]
+    fn served_user_tool_admitted_on_a_providing_consumer() {
+        bound_registry().validate_grants(
+            GrantOwner::WasmConsumer {
+                slug: "maps",
+                provides: true,
+            },
+            &one_grant("served", &[("provider", "google")]),
+        );
+    }
+
+    #[test]
+    fn lent_user_tool_admitted_on_wasm_consumer() {
+        for provides in [false, true] {
+            bound_registry().validate_grants(
+                GrantOwner::WasmConsumer {
+                    slug: "sync",
+                    provides,
+                },
+                &one_grant("lent", &[("provider", "google")]),
+            );
+        }
     }
 
     #[test]
@@ -1251,11 +1298,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "BUG: tool \"acting\" requires an acting user")]
-    async fn acting_user_tool_without_acting_user_panics() {
+    async fn acting_user_tool_without_acting_user_is_denied() {
         let reg = bound_registry();
         let (alert, _h) = brenn_obs::alerting::noop_alert_dispatcher();
-        let _ = reg
+        let err = reg
             .invoke_for_llm(
                 "mcp__brenn__acting",
                 caller(),
@@ -1265,7 +1311,12 @@ mod tests {
                 json!({}),
                 &alert,
             )
-            .await;
+            .await
+            .expect_err("a userless call is refused");
+        assert!(
+            matches!(&err, ToolError::Denied(d) if d.starts_with("acting: acts as the acting user")),
+            "{err:?}"
+        );
     }
 
     // --- provided tools ---

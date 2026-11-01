@@ -3,8 +3,9 @@
 //! The compiled component serves its provided tools through the one registry:
 //! an app conversation acting for alice calls a tool, the request lands on the
 //! component's `brenn:tool-requests/<slug>` inbox, the component issues its
-//! nested `api-request`s through a real `WasmProvidesHost`, the executor runs
-//! each against the OAuth test stub through a key provider, and the result
+//! nested calls through a real `WasmProvidesHost`, the executor runs each
+//! `api-request` against the OAuth test stub through a key provider and each
+//! `device-location` against an in-memory database, and the result
 //! comes back on the component's `brenn:tool-results/<slug>` inbox. Every
 //! Google host the component's `config` names is the stub, which answers by
 //! request path. The component and the executor are stepped by hand; the
@@ -21,7 +22,7 @@ use brenn_oauth::testutil;
 use brenn_tool_registry::ToolError;
 use serde_json::{Value, json};
 
-use super::provider_rig::CallerSetup;
+use super::provider_rig::{CallerSetup, alice};
 use super::stub_rig::{self, StubProvider, StubRig, assert_could_not_be_issued, pairs};
 
 const MAPS_WASM: &str = concat!(
@@ -73,6 +74,7 @@ new {PROVIDER}: GoogleMapsTools {{
     grants = [log, store, config, tools, provides];
     store_path = "/var/lib/brenn/maps.db";
     tool api-request {{}}
+    tool device-location {{}}
 }}
 "#
     ));
@@ -116,6 +118,43 @@ fn current_body() -> String {
     .unwrap()
 }
 
+/// The device alice shares her location from, and where it is.
+const DEVICE: &str = "phone";
+const FIX: (f64, f64) = (51.5007, -0.1246);
+
+/// What the rig's `device-location` tool answers, and whether the instance
+/// holds its grant.
+struct Here {
+    granted: bool,
+    /// Alice's `phone` shares [`FIX`].
+    sharing: bool,
+}
+
+/// The instance holds the grant and no device shares: the rig every
+/// location-given case runs on.
+const NOT_SHARING: Here = Here {
+    granted: true,
+    sharing: false,
+};
+
+/// A database holding alice and her `phone`, which shares [`FIX`] when
+/// `sharing`.
+fn location_db(sharing: bool) -> brenn_db::Db {
+    let conn = brenn_db::open_connection_memory();
+    brenn_db::run_migrations(&conn);
+    let user = brenn_db::auth::user::create_user(&conn, "alice", "hash");
+    assert_eq!(user, alice().id, "the conversation acts for this row");
+    let device = brenn_db::auth::device::resolve_or_create_device(&conn, None, user, "e2e");
+    brenn_db::auth::device::assign_device_slug(&conn, device.id, DEVICE, user);
+    if sharing {
+        let fix = brenn_device_location::validate::validate_fix(FIX.0, FIX.1, 12.0)
+            .expect("the fix is in bounds");
+        let now = chrono::Utc::now().timestamp_millis();
+        brenn_device_location::db::upsert_fix(&conn, device.id, user, &fix, now);
+    }
+    brenn_db::into_db(conn)
+}
+
 /// The rig with every clause and the stub's key provider as
 /// `testutil::key_provider_config` builds it.
 async fn rig() -> StubRig {
@@ -124,27 +163,39 @@ async fn rig() -> StubRig {
 
 /// Stand up the rig: the provider's `api-request` grant holds `clauses`,
 /// `key` adjusts the key provider before the registry is built, and `caller`
-/// is the calling component, if any.
+/// is the calling component, if any. The instance holds `device-location`
+/// and no device shares.
 async fn rig_with(
     clauses: &[(&str, &str)],
     key: impl FnOnce(&mut ApiKeyProviderConfig),
     caller: Option<CallerSetup<'_>>,
+) -> StubRig {
+    rig_here(clauses, key, caller, NOT_SHARING).await
+}
+
+/// [`rig_with`], with `here` saying whether the instance holds
+/// `device-location` and whether alice's `phone` shares its location.
+async fn rig_here(
+    clauses: &[(&str, &str)],
+    key: impl FnOnce(&mut ApiKeyProviderConfig),
+    caller: Option<CallerSetup<'_>>,
+    here: Here,
 ) -> StubRig {
     let started = stub_rig::start().await;
     let host = started.host.clone();
     let (service, vault) = testutil::service(vec![]);
     let (key_name, mut key_config) = testutil::key_provider_config(KEY_PROVIDER, &started.base);
     key(&mut key_config);
+    let mut native =
+        brenn_oauth::tools::registered(Some(&service), BTreeMap::from([(key_name, key_config)]));
+    native.extend(brenn_device_location::registered(location_db(here.sharing)));
     StubRig::build(
         started,
         StubProvider {
             slug: PROVIDER,
             wasm: MAPS_WASM,
             decls: provided(),
-            native: brenn_oauth::tools::registered(
-                Some(&service),
-                BTreeMap::from([(key_name, key_config)]),
-            ),
+            native,
             clauses: clauses
                 .iter()
                 .map(|&(method, path)| {
@@ -155,6 +206,11 @@ async fn rig_with(
                     ]
                 })
                 .collect(),
+            tools: if here.granted {
+                &[brenn_device_location::NAME]
+            } else {
+                &[]
+            },
             config: HashMap::from([
                 ("provider".to_string(), KEY_PROVIDER.to_string()),
                 ("weather_host".to_string(), host.clone()),
@@ -260,6 +316,183 @@ async fn weather_for_a_place_geocodes_then_looks_up() {
         "results.placeId,results.location,results.formattedAddress,results.granularity,results.types"
     );
     drop(stub);
+    r.assert_finished(&id);
+}
+
+/// Weather with no location reads alice's device location through a nested
+/// `device-location` call serving the request, then looks the weather up at
+/// her phone's fix: one API request, and an answer whose `location` names
+/// the device, the fix's age and that it is fresh.
+#[tokio::test]
+async fn weather_here_reads_the_device_location_then_looks_up() {
+    let r = rig_here(
+        CLAUSES,
+        |_| {},
+        None,
+        Here {
+            granted: true,
+            sharing: true,
+        },
+    )
+    .await;
+    r.answer(CURRENT_CONDITIONS, current_body());
+    let call = r.call_for_alice("Weather", json!({ "kind": "current" }));
+    let id = r.requested_id().await;
+
+    // Step 3: the device location, issued serving the request.
+    r.serve().await;
+    let nested = r.owed(&r.executor_sub(), 1).await;
+    assert_eq!(nested[0]["tool"], "device-location");
+    assert_eq!(nested[0]["serving"], id.as_str());
+    assert_eq!(nested[0]["call_id"], format!("{id}/3"));
+    assert_eq!(nested[0]["args"], json!({}));
+    r.executor.drain_step().await;
+    r.owed(&r.provider_sub, 1).await;
+    assert!(r.seen().is_empty(), "the location step reaches no API");
+
+    // Step 2: the weather lookup at the fix.
+    r.serve().await;
+    assert_eq!(r.inflight_keys(), [format!("{id}/2")]);
+    r.run_nested().await;
+    r.serve().await;
+
+    let mut answer = call.await.unwrap().expect("the component answered");
+    let age = answer["location"]
+        .as_object_mut()
+        .expect("a location")
+        .remove("age_seconds")
+        .expect("the fix's age");
+    assert!(age.as_u64().is_some_and(|age| age < 60), "{age}");
+    assert_eq!(
+        answer,
+        json!({
+            "location": { "lat": FIX.0, "lng": FIX.1, "device": DEVICE, "stale": false },
+            "time": "2026-10-30T17:00:00Z",
+            "timezone": "America/Los_Angeles",
+            "units": { "temperature": "°C", "speed": "km/h", "distance": "km", "precipitation": "mm" },
+            "condition": "Sunny",
+            "humidity_percent": 40,
+            "temperature": 18.5,
+            "feels_like": 18.0,
+            "is_daytime": true,
+        })
+    );
+    assert_eq!(
+        r.seen(),
+        [(
+            "GET".to_string(),
+            CURRENT_CONDITIONS.to_string(),
+            pairs(&[
+                ("location.latitude", "51.5007"),
+                ("location.longitude", "-0.1246"),
+                ("unitsSystem", "METRIC"),
+            ]),
+        )]
+    );
+    r.assert_finished(&id);
+}
+
+/// With no device sharing, Weather with no location is the caller's
+/// `invalid_args`, carrying the tool's text on turning sharing on; the
+/// lookup is never issued.
+#[tokio::test]
+async fn weather_here_with_no_sharing_device_is_invalid_args() {
+    let r = rig().await;
+    let call = r.call_for_alice("Weather", json!({ "kind": "current" }));
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    let Err(ToolError::InvalidArgs(detail)) = call.await.unwrap() else {
+        panic!("expected invalid_args");
+    };
+    assert_eq!(
+        detail,
+        format!(
+            "{} Pass `place` or `lat` and `lng` instead.",
+            brenn_device_location::HOW_TO_ENABLE
+        )
+    );
+    assert!(r.seen().is_empty(), "no lookup was issued");
+    r.assert_finished(&id);
+}
+
+/// An instance without the `device-location` grant cannot issue the location
+/// step: the request is `denied` naming the grant, nothing is queued, and no
+/// row is left.
+#[tokio::test]
+async fn weather_here_on_an_ungranted_instance_is_denied_naming_the_grant() {
+    let r = rig_here(
+        CLAUSES,
+        |_| {},
+        None,
+        Here {
+            granted: false,
+            sharing: true,
+        },
+    )
+    .await;
+    let call = r.call_for_alice("Weather", json!({ "kind": "current" }));
+    let id = r.requested_id().await;
+    r.serve().await;
+
+    let Err(ToolError::Denied(detail)) = call.await.unwrap() else {
+        panic!("expected denied");
+    };
+    assert!(
+        detail.starts_with("device-location could not be issued: ")
+            && detail.contains("`tool device-location {}`"),
+        "{detail}"
+    );
+    r.owed(&r.executor_sub(), 0).await;
+    assert!(r.seen().is_empty(), "a refused call reaches no API");
+    r.assert_finished(&id);
+}
+
+/// A component calling `weather` on its own account carries no user, so the
+/// provider's nested `device-location` call is refused by the tool: the
+/// caller's result is `denied` with the location wording, and nothing reaches
+/// the API.
+#[tokio::test]
+async fn a_userless_callers_weather_here_is_denied() {
+    let r = rig_here(
+        CLAUSES,
+        |_| {},
+        Some(CallerSetup {
+            slug: CALLER,
+            tool: "weather",
+            args: json!({ "kind": "current" }),
+        }),
+        Here {
+            granted: true,
+            sharing: true,
+        },
+    )
+    .await;
+    let caller = r.caller();
+    testutils::insert_bus_message(&r.messenger, &caller.trigger, "go", ChannelScheme::Brenn).await;
+    drain_step(&caller.component, &caller.sub, MountDebt::Settled).await;
+
+    r.executor.drain_step().await;
+    let id = r.requested_id().await;
+    r.serve().await;
+    let nested = r.owed(&r.executor_sub(), 1).await;
+    assert_eq!(nested[0]["tool"], "device-location");
+    assert_eq!(nested[0]["serving"], id.as_str());
+    r.executor.drain_step().await;
+    r.owed(&r.provider_sub, 1).await;
+    r.serve().await;
+
+    let results = r.owed(&caller.sub, 1).await;
+    assert_eq!(results[0]["tool"], "weather");
+    let error = &results[0]["outcome"]["err"];
+    assert_eq!(error["kind"], "denied", "{}", results[0]);
+    let detail = error["detail"].as_str().expect("a detail");
+    assert!(
+        detail.starts_with("device-location refused the nested call: ")
+            && detail.contains("this call carries none"),
+        "{detail}"
+    );
+    assert!(r.seen().is_empty(), "a refused call reaches no API");
     r.assert_finished(&id);
 }
 
