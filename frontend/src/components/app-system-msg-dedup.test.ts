@@ -78,6 +78,7 @@ async function primeApp(
     default_model: "sonnet",
     attachment_targets: [],
     pwa_push_enabled: false,
+    device_location_enabled: false,
   });
   ws.deliver({ type: "SetLayout", layout: { type: "SinglePane" } });
   await app.updateComplete;

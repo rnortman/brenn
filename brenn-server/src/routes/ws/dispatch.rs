@@ -318,9 +318,25 @@ pub(super) async fn handle_client_message(
             conn.handle_steal_app().await;
         }
         WsClientMessage::SetTimezone { timezone } => match timezone.parse::<chrono_tz::Tz>() {
-            Ok(tz) => conn.timezone = tz,
+            Ok(tz) => {
+                conn.timezone = tz;
+                // The parsed zone's own name, never the raw string: the
+                // column holds only names chrono-tz parses.
+                let db = conn.state.db.lock().await;
+                brenn_db::auth::device::set_browser_tz(
+                    &db,
+                    conn.device_id,
+                    conn.user_id,
+                    Some(tz.name()),
+                );
+            }
             Err(_) => {
+                // Not a security event: a real browser can report a zone
+                // chrono-tz does not know. The stored zone is cleared so an
+                // earlier one is not answered beside newer fixes.
                 warn!(timezone = %timezone, "invalid IANA timezone from client, keeping UTC");
+                let db = conn.state.db.lock().await;
+                brenn_db::auth::device::set_browser_tz(&db, conn.device_id, conn.user_id, None);
             }
         },
         WsClientMessage::SetDeviceInfo {
@@ -558,6 +574,52 @@ pub(super) async fn handle_client_message(
                 "PushUnsubscribe: subscription deleted"
             );
         }
+        // Device location. A gate miss is answered `{ enabled: false }` and
+        // is not a security event: the message touches only the sender's own
+        // row, and an unmodified PWA that was sharing sends a fix after a
+        // config reload removes the grant under its open connection.
+        WsClientMessage::DeviceLocationShare {
+            latitude,
+            longitude,
+            accuracy_m,
+        } => {
+            handle_device_location_fix(
+                conn,
+                client_ip,
+                FixKind::Share,
+                latitude,
+                longitude,
+                accuracy_m,
+            )
+            .await;
+        }
+        WsClientMessage::DeviceLocationFix {
+            latitude,
+            longitude,
+            accuracy_m,
+        } => {
+            handle_device_location_fix(
+                conn,
+                client_ip,
+                FixKind::Update,
+                latitude,
+                longitude,
+                accuracy_m,
+            )
+            .await;
+        }
+        WsClientMessage::DeviceLocationClear => {
+            // No gate: withdrawing consent is honoured whatever the app's
+            // grants are, and it deletes only the sender's own row.
+            let db = conn.state.db.lock().await;
+            brenn_device_location::db::delete_fix(&db, conn.device_id, conn.user_id);
+            drop(db);
+            let _ = conn.send_ws(WsServerMessage::DeviceLocationSharing { enabled: false });
+            debug!(
+                device_id = conn.device_id,
+                "DeviceLocationClear: fix deleted"
+            );
+        }
         WsClientMessage::DebugViewportSnapshot { snapshot } => {
             // Diagnostic, not usage-billable — no `record_usage`/`EventType`
             // on purpose (the design explicitly excludes usage accounting for
@@ -565,6 +627,99 @@ pub(super) async fn handle_client_message(
             conn.handle_debug_viewport_snapshot(snapshot).await;
         }
     }
+}
+
+/// Which location message a fix arrived in.
+#[derive(Debug, Clone, Copy)]
+enum FixKind {
+    /// `DeviceLocationShare`: creates or replaces the stored fix.
+    Share,
+    /// `DeviceLocationFix`: replaces the stored fix only if one exists.
+    Update,
+}
+
+impl FixKind {
+    fn variant(self) -> &'static str {
+        match self {
+            FixKind::Share => "DeviceLocationShare",
+            FixKind::Update => "DeviceLocationFix",
+        }
+    }
+}
+
+/// `DeviceLocationShare` and `DeviceLocationFix`: gate, validate, store, and
+/// answer `DeviceLocationSharing` with the pair's resulting state. No log line
+/// carries a coordinate, an accuracy or a timestamp.
+async fn handle_device_location_fix(
+    conn: &mut WsConnection,
+    client_ip: std::net::IpAddr,
+    kind: FixKind,
+    latitude: f64,
+    longitude: f64,
+    accuracy_m: f64,
+) {
+    let variant = kind.variant();
+    if !conn.app_config().device_location_enabled() {
+        warn!(
+            user = %conn.username,
+            device_id = conn.device_id,
+            app = ?conn.app_slug,
+            "{variant} from an app without the device-location grant"
+        );
+        let _ = conn.send_ws(WsServerMessage::DeviceLocationSharing { enabled: false });
+        return;
+    }
+    let fix = match brenn_device_location::validate::validate_fix(latitude, longitude, accuracy_m) {
+        Ok(fix) => fix,
+        Err(rejection) => {
+            // `FixRejection` names the field and its bound, never the value.
+            log_and_alert_security_event(
+                &conn.state.alert_dispatcher,
+                SecurityEventType::MalformedMessage,
+                client_ip,
+                &format!(
+                    "{variant} rejected: {rejection} (user {}, device {})",
+                    conn.user_id, conn.device_id
+                ),
+            );
+            let enabled = {
+                let db = conn.state.db.lock().await;
+                brenn_device_location::db::fix_exists(&db, conn.device_id, conn.user_id)
+            };
+            let _ = conn.send_ws(WsServerMessage::DeviceLocationSharing { enabled });
+            return;
+        }
+    };
+    let reported_at_ms = chrono::Utc::now().timestamp_millis();
+    let enabled = {
+        let db = conn.state.db.lock().await;
+        match kind {
+            FixKind::Share => {
+                brenn_device_location::db::upsert_fix(
+                    &db,
+                    conn.device_id,
+                    conn.user_id,
+                    &fix,
+                    reported_at_ms,
+                );
+                true
+            }
+            FixKind::Update => brenn_device_location::db::update_fix(
+                &db,
+                conn.device_id,
+                conn.user_id,
+                &fix,
+                reported_at_ms,
+            ),
+        }
+    };
+    let _ = conn.send_ws(WsServerMessage::DeviceLocationSharing { enabled });
+    debug!(
+        user = %conn.username,
+        device_id = conn.device_id,
+        stored = enabled,
+        "{variant}: handled"
+    );
 }
 
 #[cfg(test)]
@@ -1177,23 +1332,27 @@ mod tests {
     //
     // -----------------------------------------------------------------------
     //
-    /// Build a WsConnection whose AppState uses a capturing alert dispatcher.
-    /// Returns `(conn, ws_rx, captured_alerts, alert_handle)`.
+    /// Build a WsConnection whose AppState, built over `apps`, uses a
+    /// capturing alert dispatcher.
+    /// Returns `(conn, ws_rx, db, captured_alerts, alert_handle)`.
     ///
     /// The broadcast receiver is intentionally dropped (consistent with
     /// test_ws_conn_with_resume_conv_and_apps). These tests never reach a
     /// broadcast-send path; the dropped receiver is safe.
-    async fn ws_conn_with_capturing_alerter() -> (
+    async fn ws_conn_with_capturing_alerter(
+        apps: Option<Arc<indexmap::IndexMap<String, brenn_lib::config::AppConfig>>>,
+    ) -> (
         WsConnection,
         mpsc::Receiver<WsServerMessage>,
-        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        brenn_db::Db,
+        Arc<std::sync::Mutex<Vec<(String, String)>>>,
         tokio::task::JoinHandle<()>,
     ) {
         use brenn_obs::alerting::make_capturing_alerter;
 
         let db = crate::test_support::init_db_memory();
         let (alert_dispatcher, captured, alert_handle) = make_capturing_alerter();
-        let mut state = AppState::for_test(db.clone(), None);
+        let mut state = AppState::for_test(db.clone(), apps);
         state.alert_dispatcher = alert_dispatcher;
 
         let (ws_tx, ws_rx) = mpsc::channel(256);
@@ -1230,7 +1389,19 @@ mod tests {
         }
         .build();
 
-        (conn, ws_rx, captured, alert_handle)
+        (conn, ws_rx, db, captured, alert_handle)
+    }
+
+    /// Drop the connection (and with it the dispatcher), drain the alerter and
+    /// return every captured `(title, body)`.
+    async fn drain_alerts(
+        conn: WsConnection,
+        captured: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        alert_handle: tokio::task::JoinHandle<()>,
+    ) -> Vec<(String, String)> {
+        drop(conn);
+        alert_handle.await.expect("alert handle must not panic");
+        captured.lock().unwrap().clone()
     }
 
     /// Sanity check: the drift payload used by the schema-drift tests must
@@ -1252,7 +1423,8 @@ mod tests {
     /// standard Error response.
     #[tokio::test]
     async fn malformed_push_click_trace_does_not_trigger_security_event() {
-        let (mut conn, mut ws_rx, captured, alert_handle) = ws_conn_with_capturing_alerter().await;
+        let (mut conn, mut ws_rx, _db, captured, alert_handle) =
+            ws_conn_with_capturing_alerter(None).await;
 
         // T1Chosen missing client_id, target_path, focus_rejected — valid outer
         // shape (type + event object with type string), invalid inner fields.
@@ -1273,9 +1445,7 @@ mod tests {
         );
 
         // Drain the alerter and assert no alert was dispatched.
-        drop(conn); // drop the dispatcher clone held by AppState
-        alert_handle.await.expect("alert handle must not panic");
-        let alerts = captured.lock().unwrap();
+        let alerts = drain_alerts(conn, captured, alert_handle).await;
         assert!(
             alerts.is_empty(),
             "schema-drift PushClickTrace must not dispatch a security alert; got {alerts:?}"
@@ -1286,7 +1456,8 @@ mod tests {
     /// drift shape) must also be classified as schema drift, not a security event.
     #[tokio::test]
     async fn push_click_trace_missing_event_field_is_schema_drift() {
-        let (mut conn, mut ws_rx, captured, alert_handle) = ws_conn_with_capturing_alerter().await;
+        let (mut conn, mut ws_rx, _db, captured, alert_handle) =
+            ws_conn_with_capturing_alerter(None).await;
 
         // Older SW that omitted the `event` key entirely.
         handle_client_message(
@@ -1299,9 +1470,7 @@ mod tests {
         // This payload lacks the inner event-object shape required by the
         // discriminant check, so it falls through to the security path.
         // Verify that behavior is intentional and locked in.
-        drop(conn);
-        alert_handle.await.expect("alert handle must not panic");
-        let alerts = captured.lock().unwrap();
+        let alerts = drain_alerts(conn, captured, alert_handle).await;
         // A payload missing the event key entirely does NOT satisfy the inner-shape
         // check (requires event.type string), so it is treated as a security event.
         // This is the conservative behavior: if a stale SW omits `event` entirely
@@ -1322,7 +1491,8 @@ mod tests {
     /// the security path — this is a potential attacker probe, not genuine drift.
     #[tokio::test]
     async fn push_click_trace_event_scalar_triggers_security_event() {
-        let (mut conn, _ws_rx, captured, alert_handle) = ws_conn_with_capturing_alerter().await;
+        let (mut conn, _ws_rx, _db, captured, alert_handle) =
+            ws_conn_with_capturing_alerter(None).await;
 
         // Attacker probing with scalar `event`.
         handle_client_message(
@@ -1332,9 +1502,7 @@ mod tests {
         )
         .await;
 
-        drop(conn);
-        alert_handle.await.expect("alert handle must not panic");
-        let alerts = captured.lock().unwrap();
+        let alerts = drain_alerts(conn, captured, alert_handle).await;
         assert!(
             !alerts.is_empty(),
             "PushClickTrace with scalar event must dispatch a security alert; got {alerts:?}"
@@ -1349,13 +1517,12 @@ mod tests {
     /// An unknown message type (not PushClickTrace) must still trigger a security event.
     #[tokio::test]
     async fn unknown_message_type_still_triggers_security_event() {
-        let (mut conn, _ws_rx, captured, alert_handle) = ws_conn_with_capturing_alerter().await;
+        let (mut conn, _ws_rx, _db, captured, alert_handle) =
+            ws_conn_with_capturing_alerter(None).await;
 
         handle_client_message(r#"{"type":"TotallyBogus"}"#, &mut conn, TEST_CLIENT_IP).await;
 
-        drop(conn);
-        alert_handle.await.expect("alert handle must not panic");
-        let alerts = captured.lock().unwrap();
+        let alerts = drain_alerts(conn, captured, alert_handle).await;
         assert!(
             !alerts.is_empty(),
             "unknown message type must dispatch a security alert"
@@ -1370,13 +1537,12 @@ mod tests {
     /// Unparseable (non-JSON) input must still trigger a security event.
     #[tokio::test]
     async fn unparseable_json_still_triggers_security_event() {
-        let (mut conn, _ws_rx, captured, alert_handle) = ws_conn_with_capturing_alerter().await;
+        let (mut conn, _ws_rx, _db, captured, alert_handle) =
+            ws_conn_with_capturing_alerter(None).await;
 
         handle_client_message("not json at all", &mut conn, TEST_CLIENT_IP).await;
 
-        drop(conn);
-        alert_handle.await.expect("alert handle must not panic");
-        let alerts = captured.lock().unwrap();
+        let alerts = drain_alerts(conn, captured, alert_handle).await;
         assert!(
             !alerts.is_empty(),
             "unparseable input must dispatch a security alert"
@@ -1560,8 +1726,8 @@ mod tests {
     // A minimal valid JSON payload for DebugViewportSnapshot: all required
     // (non-Option) fields set; all Option fields set to null. Tests verify:
     //   (a) does not touch the idle-hook timer (not a UI action);
-    //   (b) does not dispatch a security event (AC8);
-    //   (c) emits the INFO log with `debug_viewport_snapshot=true` (AC4).
+    //   (b) does not dispatch a security event;
+    //   (c) emits the INFO log with `debug_viewport_snapshot=true`.
     // -----------------------------------------------------------------------
 
     /// Minimal well-formed DebugViewportSnapshot payload as a JSON string.
@@ -1586,19 +1752,18 @@ mod tests {
     }
 
     /// A well-formed `DebugViewportSnapshot` must NOT dispatch a security
-    /// alert — it is a legitimate expected message, not attacker traffic (AC8).
+    /// alert — it is a legitimate expected message, not attacker traffic.
     #[tokio::test]
     async fn debug_viewport_snapshot_does_not_trigger_security_event() {
-        let (mut conn, _ws_rx, captured, alert_handle) = ws_conn_with_capturing_alerter().await;
+        let (mut conn, _ws_rx, _db, captured, alert_handle) =
+            ws_conn_with_capturing_alerter(None).await;
 
         handle_client_message(&minimal_debug_snapshot_json(), &mut conn, TEST_CLIENT_IP).await;
 
-        drop(conn);
-        alert_handle.await.expect("alert handle must not panic");
-        let alerts = captured.lock().unwrap();
+        let alerts = drain_alerts(conn, captured, alert_handle).await;
         // A well-formed snapshot does intentionally dispatch one Info diagnostic
-        // alert ("Debug viewport snapshot") — that is the email destination. What
-        // AC8 forbids is a *security* alert, whose title is `Security: {event}`.
+        // alert ("Debug viewport snapshot") — that is the email destination. Only a
+        // *security* alert, titled `Security: {event}`, is forbidden.
         let security_alerts: Vec<_> = alerts
             .iter()
             .filter(|(title, _)| title.starts_with("Security:"))
@@ -1627,5 +1792,278 @@ mod tests {
             "DebugViewportSnapshot handler must emit an INFO log with the \
              'debug_viewport_snapshot' tag (AC4), even with no active bridge"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Device location
+    // -----------------------------------------------------------------------
+
+    /// The "test" app, holding the `device-location` tool grant when `granted`.
+    fn apps_with_device_location(
+        granted: bool,
+    ) -> Arc<indexmap::IndexMap<String, brenn_lib::config::AppConfig>> {
+        let mut cfg =
+            crate::test_support::app_config::default_test_app_config(TEST_APP_SLUG, "Test App");
+        if granted {
+            cfg.policy_mut().tool_grants.insert(
+                brenn_device_location::NAME.to_string(),
+                brenn_lib::tools::ResolvedToolGrant {
+                    acl: vec![],
+                    rate_limit: None,
+                },
+            );
+        }
+        let mut apps = indexmap::IndexMap::new();
+        apps.insert(TEST_APP_SLUG.to_string(), cfg);
+        Arc::new(apps)
+    }
+
+    /// A capturing-alerter connection on the "test" app, holding the
+    /// `device-location` grant when `granted`.
+    async fn location_conn(
+        granted: bool,
+    ) -> (
+        WsConnection,
+        mpsc::Receiver<WsServerMessage>,
+        brenn_db::Db,
+        Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        ws_conn_with_capturing_alerter(Some(apps_with_device_location(granted))).await
+    }
+
+    fn stored_fix(db_conn: &rusqlite::Connection, user_id: i64) -> Option<(f64, f64, f64)> {
+        let fixes = brenn_device_location::db::list_fixes_for_user(db_conn, user_id);
+        assert!(
+            fixes.len() <= 1,
+            "one device in these tests: {}",
+            fixes.len()
+        );
+        fixes
+            .first()
+            .map(|f| (f.latitude, f.longitude, f.accuracy_m))
+    }
+
+    fn expect_sharing(ws_rx: &mut mpsc::Receiver<WsServerMessage>, expected: bool) {
+        let msg = ws_rx
+            .try_recv()
+            .expect("DeviceLocationSharing must be sent");
+        match msg {
+            WsServerMessage::DeviceLocationSharing { enabled } => {
+                assert_eq!(enabled, expected, "DeviceLocationSharing.enabled")
+            }
+            other => panic!("expected DeviceLocationSharing, got {other:?}"),
+        }
+        assert!(ws_rx.try_recv().is_err(), "exactly one reply");
+    }
+
+    const SHARE: &str =
+        r#"{"type":"DeviceLocationShare","latitude":51.5,"longitude":-0.25,"accuracy_m":35}"#;
+    const FIX: &str =
+        r#"{"type":"DeviceLocationFix","latitude":48.75,"longitude":2.25,"accuracy_m":12.5}"#;
+    const CLEAR: &str = r#"{"type":"DeviceLocationClear"}"#;
+
+    #[tokio::test]
+    async fn device_location_share_on_gated_app_stores_and_confirms() {
+        let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+        handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, true);
+        assert_eq!(
+            stored_fix(&*db.lock().await, conn.user_id),
+            Some((51.5, -0.25, 35.0))
+        );
+        assert!(drain_alerts(conn, captured, h).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_location_fix_after_share_replaces_the_row() {
+        let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+        handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, true);
+        handle_client_message(FIX, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, true);
+        assert_eq!(
+            stored_fix(&*db.lock().await, conn.user_id),
+            Some((48.75, 2.25, 12.5))
+        );
+        assert!(drain_alerts(conn, captured, h).await.is_empty());
+    }
+
+    /// A fix with no stored row is a tab whose sharing was turned off
+    /// elsewhere: nothing stored, no security event, `{ enabled: false }`.
+    #[tokio::test]
+    async fn device_location_fix_without_row_stores_nothing() {
+        let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+        handle_client_message(FIX, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, false);
+        assert_eq!(stored_fix(&*db.lock().await, conn.user_id), None);
+        assert!(drain_alerts(conn, captured, h).await.is_empty());
+    }
+
+    /// An out-of-range latitude on either message stores nothing, raises a
+    /// `MalformedMessage` event whose text carries no coordinate, and answers
+    /// with the stored state.
+    #[tokio::test]
+    async fn device_location_out_of_range_is_malformed_and_carries_no_coordinate() {
+        for (msg, prior_share, expect_enabled) in [
+            (
+                r#"{"type":"DeviceLocationShare","latitude":91.125,"longitude":-0.375,"accuracy_m":35}"#,
+                false,
+                false,
+            ),
+            (
+                r#"{"type":"DeviceLocationFix","latitude":91.125,"longitude":-0.375,"accuracy_m":35}"#,
+                true,
+                true,
+            ),
+        ] {
+            let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+            if prior_share {
+                handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
+                expect_sharing(&mut ws_rx, true);
+            }
+            handle_client_message(msg, &mut conn, TEST_CLIENT_IP).await;
+            expect_sharing(&mut ws_rx, expect_enabled);
+            let stored = stored_fix(&*db.lock().await, conn.user_id);
+            if prior_share {
+                assert_eq!(stored, Some((51.5, -0.25, 35.0)), "prior fix kept");
+            } else {
+                assert_eq!(stored, None);
+            }
+            let alerts = drain_alerts(conn, captured, h).await;
+            assert_eq!(alerts.len(), 1, "one security event: {alerts:?}");
+            let (title, body) = &alerts[0];
+            assert!(title.contains("malformed_message"), "title: {title}");
+            for text in [title, body] {
+                assert!(!text.contains("91.125"), "latitude leaked: {text}");
+                assert!(!text.contains("0.375"), "longitude leaked: {text}");
+            }
+            assert!(body.contains("latitude"), "names the field: {body}");
+        }
+    }
+
+    /// Share and fix from an app without the grant — the reload-revokes-grant
+    /// case: the connection opened on a gated app, then the app map loses the
+    /// grant. Nothing stored, no security event, `{ enabled: false }`.
+    #[tokio::test]
+    async fn device_location_from_app_without_grant_is_refused_quietly() {
+        let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+        handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, true);
+
+        conn.state.apps.store(apps_with_device_location(false));
+
+        handle_client_message(FIX, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, false);
+        handle_client_message(
+            r#"{"type":"DeviceLocationShare","latitude":10.5,"longitude":20.5,"accuracy_m":5}"#,
+            &mut conn,
+            TEST_CLIENT_IP,
+        )
+        .await;
+        expect_sharing(&mut ws_rx, false);
+        assert_eq!(
+            stored_fix(&*db.lock().await, conn.user_id),
+            Some((51.5, -0.25, 35.0)),
+            "the row written before the reload is untouched"
+        );
+        assert!(
+            drain_alerts(conn, captured, h).await.is_empty(),
+            "a gate miss is not a security event"
+        );
+    }
+
+    /// The row survives a grant removal as the user's consent: once the
+    /// grant is back, the next connect reports sharing on and the stored fix
+    /// is the one the share wrote.
+    #[tokio::test]
+    async fn device_location_grant_restored_resumes_on_connect() {
+        use super::super::event_loop::send_device_location_sharing_on_connect;
+
+        let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+        handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, true);
+
+        conn.state.apps.store(apps_with_device_location(false));
+        handle_client_message(FIX, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, false);
+
+        conn.state.apps.store(apps_with_device_location(true));
+        send_device_location_sharing_on_connect(&conn).await;
+        expect_sharing(&mut ws_rx, true);
+        assert_eq!(
+            stored_fix(&*db.lock().await, conn.user_id),
+            Some((51.5, -0.25, 35.0)),
+            "the share's row, not the refused fix"
+        );
+        assert!(drain_alerts(conn, captured, h).await.is_empty());
+    }
+
+    /// Clear is honoured whatever the app's grants are.
+    #[tokio::test]
+    async fn device_location_clear_deletes_row_with_and_without_grant() {
+        for revoke in [false, true] {
+            let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+            handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
+            expect_sharing(&mut ws_rx, true);
+            if revoke {
+                conn.state.apps.store(apps_with_device_location(false));
+            }
+            handle_client_message(CLEAR, &mut conn, TEST_CLIENT_IP).await;
+            expect_sharing(&mut ws_rx, false);
+            assert_eq!(stored_fix(&*db.lock().await, conn.user_id), None);
+            assert!(drain_alerts(conn, captured, h).await.is_empty());
+        }
+    }
+
+    /// On connect, `DeviceLocationSharing` is sent only for a gated app, with
+    /// `enabled` reflecting the stored row.
+    #[tokio::test]
+    async fn device_location_sharing_on_connect_follows_grant_and_row() {
+        use super::super::event_loop::send_device_location_sharing_on_connect;
+
+        let (conn, mut ws_rx, _db, _captured, _h) = location_conn(false).await;
+        send_device_location_sharing_on_connect(&conn).await;
+        assert!(ws_rx.try_recv().is_err(), "nothing sent without the grant");
+
+        let (mut conn, mut ws_rx, _db, _captured, _h) = location_conn(true).await;
+        send_device_location_sharing_on_connect(&conn).await;
+        expect_sharing(&mut ws_rx, false);
+        handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, true);
+        send_device_location_sharing_on_connect(&conn).await;
+        expect_sharing(&mut ws_rx, true);
+    }
+
+    /// An unparseable zone from the browser is not a security event and
+    /// clears the stored zone, including one a valid report stored earlier.
+    #[tokio::test]
+    async fn set_timezone_invalid_is_not_a_security_event() {
+        let (mut conn, _ws_rx, db, captured, h) = location_conn(true).await;
+        handle_client_message(
+            r#"{"type":"SetTimezone","timezone":"Europe/Berlin"}"#,
+            &mut conn,
+            TEST_CLIENT_IP,
+        )
+        .await;
+        let du = brenn_db::auth::device::load_device_user(
+            &*db.lock().await,
+            conn.device_id,
+            conn.user_id,
+        );
+        assert_eq!(du.browser_tz.as_deref(), Some("Europe/Berlin"));
+        handle_client_message(
+            r#"{"type":"SetTimezone","timezone":"Not/A/Zone"}"#,
+            &mut conn,
+            TEST_CLIENT_IP,
+        )
+        .await;
+        let du = brenn_db::auth::device::load_device_user(
+            &*db.lock().await,
+            conn.device_id,
+            conn.user_id,
+        );
+        assert_eq!(du.browser_tz, None);
+        assert!(drain_alerts(conn, captured, h).await.is_empty());
     }
 }

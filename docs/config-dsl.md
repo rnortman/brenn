@@ -521,6 +521,39 @@ matches exactly one segment. There is no prefix matching:
 template with an empty segment, or a `.`, `..` or `%` segment, is refused at
 boot.
 
+#### The device-location tool
+
+`device-location` (MCP `mcp__brenn__DeviceLocation`) is always registered;
+it needs no provider. It answers where the acting user is, from the devices
+on which that user shares location: for each device its name, latitude,
+longitude, accuracy, when Brenn received the fix, the fix's age, whether it
+is stale (older than 15 minutes), the device's time zone and the local time
+there. Its optional `device` argument narrows the answer to one device by
+the name `DeviceList` shows.
+
+It takes no ACL keys, so the grant has no `allow` clause:
+
+```
+agent PersonalAssistant {
+  container = "sandbox";
+  tool device-location {}
+}
+```
+
+It acts as a Brenn user, so it is refused at boot and on reload, as the
+OAuth tools are, on a `multiuser` app, on an app with no `container`, and on
+a WASM component.
+
+Granting it to an app also shows that app's users the "Share location from
+this device" item in the PWA's user menu; without the grant the item does
+not appear and the PWA reports nothing. Sharing is per device and per user,
+not per app: a user who shares from a device while connected to one app is
+answered by the tool in any other app that holds the grant, and the menu
+item shows the same state in both. Removing the grant from an app stops that
+app's reporting; it does not end the pair's sharing. The user ends it with
+"Stop sharing location from this device" in any app that holds the grant, and
+an app whose grant is restored resumes reporting on its next connect.
+
 The request path is checked after each segment is percent-decoded once. A
 decoded segment that is empty (including from a trailing `/`), that is `.` or
 `..`, or that contains `/`, `\` or `%` is refused before matching. So `%2F`

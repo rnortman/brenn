@@ -243,6 +243,62 @@ fn push_unsubscribe_deserializes_frontend_wire_shape() {
 }
 
 #[test]
+fn device_location_share_deserializes_frontend_wire_shape() {
+    // SYNC: frontend send site app.ts `_handleEnableLocation`
+    // `ws.send({ type: "DeviceLocationShare", ...fix })`.
+    let json =
+        r#"{"type":"DeviceLocationShare","latitude":51.5,"longitude":-0.25,"accuracy_m":35}"#;
+    match serde_json::from_str::<WsClientMessage>(json).unwrap() {
+        WsClientMessage::DeviceLocationShare {
+            latitude,
+            longitude,
+            accuracy_m,
+        } => {
+            assert_eq!(latitude, 51.5);
+            assert_eq!(longitude, -0.25);
+            assert_eq!(accuracy_m, 35.0);
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn device_location_fix_deserializes_frontend_wire_shape() {
+    // SYNC: frontend send site app.ts LocationReporter `send`
+    // `ws.send({ type: "DeviceLocationFix", ...fix })`.
+    let json =
+        r#"{"type":"DeviceLocationFix","latitude":-33.875,"longitude":151.25,"accuracy_m":12.5}"#;
+    match serde_json::from_str::<WsClientMessage>(json).unwrap() {
+        WsClientMessage::DeviceLocationFix {
+            latitude,
+            longitude,
+            accuracy_m,
+        } => {
+            assert_eq!(latitude, -33.875);
+            assert_eq!(longitude, 151.25);
+            assert_eq!(accuracy_m, 12.5);
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn device_location_clear_deserializes_frontend_wire_shape() {
+    // SYNC: frontend send sites app.ts `ws.send({ type: "DeviceLocationClear" })`.
+    let json = r#"{"type":"DeviceLocationClear"}"#;
+    assert!(matches!(
+        serde_json::from_str::<WsClientMessage>(json).unwrap(),
+        WsClientMessage::DeviceLocationClear
+    ));
+}
+
+#[test]
+fn device_location_fix_refuses_non_numeric_coordinate() {
+    let json = r#"{"type":"DeviceLocationFix","latitude":"51.5","longitude":0,"accuracy_m":1}"#;
+    assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
+}
+
+#[test]
 fn push_vapid_key_request_deserializes_frontend_wire_shape() {
     // SYNC: frontend send site push.ts `ws.send({ type: "PushVapidKeyRequest" })`.
     let json = r#"{"type":"PushVapidKeyRequest"}"#;

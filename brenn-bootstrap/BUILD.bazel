@@ -18,6 +18,7 @@ rust_library(
         "//brenn-automation",
         "//brenn-common",
         "//brenn-db",
+        "//brenn-device-location",
         "//brenn-git",
         "//brenn-graf",
         "//brenn-hooks",
@@ -121,6 +122,7 @@ rust_test(
         "//brenn-automation",
         "//brenn-common",
         "//brenn-db",
+        "//brenn-device-location",
         # Test-only: fixture-text macros.
         "//brenn-dsl",
         "//brenn-git",
@@ -201,6 +203,7 @@ rust_test(
         "//brenn-automation",
         "//brenn-common",
         "//brenn-db",
+        "//brenn-device-location",
         "//brenn-dsl",
         "//brenn-git",
         "//brenn-graf",

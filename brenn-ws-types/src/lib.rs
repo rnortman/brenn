@@ -190,6 +190,30 @@ pub enum WsClientMessage {
     /// Delete the push subscription for this `(device, user)` pair.
     PushUnsubscribe,
 
+    // ── Device location ────────────────────────────────────────────────────
+    /// Start sharing location from this device: the user's menu action, with
+    /// the first fix from the browser's Geolocation API. Creates or replaces
+    /// the stored fix for this `(device, user)` pair. No browser timestamp:
+    /// the server stamps receipt time, and the fix's age counts from that.
+    DeviceLocationShare {
+        latitude: f64,
+        longitude: f64,
+        /// 68 % confidence radius in metres, as the browser reports it.
+        accuracy_m: f64,
+    },
+
+    /// A newer fix for a device that already shares. Same fields as
+    /// `DeviceLocationShare`; replaces the stored fix only if one exists, so a
+    /// tab that was turned off from another tab cannot re-enable sharing.
+    DeviceLocationFix {
+        latitude: f64,
+        longitude: f64,
+        accuracy_m: f64,
+    },
+
+    /// Stop sharing location from this device: delete the stored fix.
+    DeviceLocationClear,
+
     /// User-initiated viewport/layout geometry snapshot for diagnosing the
     /// intermittent Chrome-Android-PWA off-screen-input bug. Delivered via
     /// the system-message dual-delivery path (persisted + broadcast as a
@@ -732,6 +756,11 @@ pub enum WsServerMessage {
         /// this to decide whether to render the "Enable push" affordance.
         #[serde(default)]
         pwa_push_enabled: bool,
+        /// Whether the active app holds a `device-location` tool grant.
+        /// Frontend uses this to decide whether to render the
+        /// "Share location from this device" affordance.
+        #[serde(default)]
+        device_location_enabled: bool,
     },
     /// Pushes the available model list to all connected clients.
     /// Sent after the first CC subprocess spawns and reports its models.
@@ -937,6 +966,16 @@ pub enum WsServerMessage {
     /// Sent after `PushSubscribe`, `PushUnsubscribe`, and on WS connect when
     /// a subscription record exists.
     PushEnabled { enabled: bool },
+
+    // ── Device location ────────────────────────────────────────────────────
+    /// Whether this connection shares location: the app holds the
+    /// `device-location` grant and a stored fix exists for this `(device, user)`
+    /// pair. Sent on WS connect when the app may use location, and after every
+    /// `DeviceLocationShare`, `DeviceLocationFix` and `DeviceLocationClear`,
+    /// accepted or refused. `false` from an app without the grant does not mean
+    /// the pair's fix is gone: the row is the user's consent and survives grant
+    /// changes; only `DeviceLocationClear` and unenrolment delete it.
+    DeviceLocationSharing { enabled: bool },
 }
 
 impl WsServerMessage {

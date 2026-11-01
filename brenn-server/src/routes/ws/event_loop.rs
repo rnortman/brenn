@@ -150,6 +150,7 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
         default_model,
         attachment_targets,
         pwa_push_enabled: app_config.pwa_push_enabled(),
+        device_location_enabled: app_config.device_location_enabled(),
     });
 
     // Emit current subscription state so the frontend initializes correctly
@@ -161,6 +162,7 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
         };
         let _ = conn.send_ws(WsServerMessage::PushEnabled { enabled });
     }
+    send_device_location_sharing_on_connect(&conn).await;
 
     // SetLayout must precede ConversationSwitched and any history frames:
     // the frontend gates rendering on this message.
@@ -550,6 +552,20 @@ impl super::connection::WsConnection {
     }
 }
 
+/// On connect, tell the PWA whether this connection shares location: the app
+/// may use location and the pair has a stored fix. Sent only when the app may
+/// use location; `true` starts the PWA's reporter.
+pub(super) async fn send_device_location_sharing_on_connect(conn: &WsConnection) {
+    if !conn.app_config().device_location_enabled() {
+        return;
+    }
+    let enabled = {
+        let db = conn.state.db.lock().await;
+        brenn_device_location::db::fix_exists(&db, conn.device_id, conn.user_id)
+    };
+    let _ = conn.send_ws(WsServerMessage::DeviceLocationSharing { enabled });
+}
+
 #[cfg(test)]
 mod tests {
     use brenn_db::conversation;
@@ -760,6 +776,7 @@ mod tests {
             default_model: "claude-sonnet-4-5".to_string(),
             attachment_targets: vec![],
             pwa_push_enabled: true,
+            device_location_enabled: false,
         });
 
         // No subscription yet — PushEnabled should be false.

@@ -167,7 +167,13 @@ attachment_targets?: Array<TargetInfo>,
  * Whether the active app has `pwa_push.enabled = true`. Frontend uses
  * this to decide whether to render the "Enable push" affordance.
  */
-pwa_push_enabled: boolean, } | { "type": "ModelsAvailable", available_models: Array<ModelInfo>, } | { "type": "PresenceUpdate", conversation_id: number, users: Array<PresenceUser>, } | { "type": "SetLayout", layout: PaneLayout, } | { "type": "ApprovalRuleError", request_id: string, error: string, } | { "type": "PrivacyChanged", conversation_id: number, shared: boolean, } | { "type": "TargetResult", 
+pwa_push_enabled: boolean, 
+/**
+ * Whether the active app holds a `device-location` tool grant.
+ * Frontend uses this to decide whether to render the
+ * "Share location from this device" affordance.
+ */
+device_location_enabled: boolean, } | { "type": "ModelsAvailable", available_models: Array<ModelInfo>, } | { "type": "PresenceUpdate", conversation_id: number, users: Array<PresenceUser>, } | { "type": "SetLayout", layout: PaneLayout, } | { "type": "ApprovalRuleError", request_id: string, error: string, } | { "type": "PrivacyChanged", conversation_id: number, shared: boolean, } | { "type": "TargetResult", 
 /**
  * Target name (e.g. "import").
  */
@@ -324,4 +330,4 @@ since_last_compaction_usd: number,
  * Process-wide sum of `last_turn_usd` samples across every conversation
  * served by this brenn instance in the last 24 wall-clock hours.
  */
-last_24h_usd: number, } | { "type": "PushVapidKey", public_key_b64url: string, } | { "type": "PushEnabled", enabled: boolean, };
+last_24h_usd: number, } | { "type": "PushVapidKey", public_key_b64url: string, } | { "type": "PushEnabled", enabled: boolean, } | { "type": "DeviceLocationSharing", enabled: boolean, };

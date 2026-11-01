@@ -1442,7 +1442,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_timezone_updates_connection() {
-        let (mut conn, _ws_rx, _db, _user_id) = test_ws_conn_for_app(test_apps()).await;
+        let (mut conn, _ws_rx, db, _user_id) = test_ws_conn_for_app(test_apps()).await;
 
         // Default is UTC.
         assert_eq!(conn.timezone, chrono_tz::Tz::UTC);
@@ -1456,11 +1456,17 @@ mod tests {
         .await;
 
         assert_eq!(conn.timezone, chrono_tz::Asia::Tokyo);
+        // The parsed zone is also stored for the (device, user) pair.
+        let du = {
+            let db_conn = db.lock().await;
+            brenn_db::auth::device::load_device_user(&db_conn, conn.device_id, conn.user_id)
+        };
+        assert_eq!(du.browser_tz.as_deref(), Some("Asia/Tokyo"));
     }
 
     #[tokio::test]
     async fn set_timezone_invalid_keeps_current() {
-        let (mut conn, _ws_rx, _db, _user_id) = test_ws_conn_for_app(test_apps()).await;
+        let (mut conn, _ws_rx, db, _user_id) = test_ws_conn_for_app(test_apps()).await;
 
         handle_client_message(
             r#"{"type":"SetTimezone","timezone":"Not/A/Zone"}"#,
@@ -1471,6 +1477,12 @@ mod tests {
 
         // Should still be UTC (invalid timezone rejected).
         assert_eq!(conn.timezone, chrono_tz::Tz::UTC);
+        // Nothing is stored for an unparseable zone.
+        let du = {
+            let db_conn = db.lock().await;
+            brenn_db::auth::device::load_device_user(&db_conn, conn.device_id, conn.user_id)
+        };
+        assert_eq!(du.browser_tz, None);
     }
 
     #[tokio::test]

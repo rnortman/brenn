@@ -65,6 +65,9 @@ mod oracle_tests;
 mod provider_class_boot;
 
 #[cfg(test)]
+mod device_location_boot_tests;
+
+#[cfg(test)]
 mod google_maps_tools_boot_tests;
 
 #[cfg(test)]

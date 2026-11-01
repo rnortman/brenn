@@ -115,6 +115,7 @@ describe("BrennApp — stale model preference repair", () => {
             default_model: "opus[1m]",
             attachment_targets: [],
             pwa_push_enabled: false,
+            device_location_enabled: false,
         });
         await app.updateComplete;
 

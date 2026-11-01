@@ -176,6 +176,7 @@ fn server_message_variants_serialize() {
             default_model: "sonnet".into(),
             attachment_targets: vec![],
             pwa_push_enabled: false,
+            device_location_enabled: true,
         },
         WsServerMessage::ModelsAvailable {
             available_models: vec![ModelInfo {
@@ -319,6 +320,7 @@ fn server_message_variants_serialize() {
             public_key_b64url: "BEl1example".into(),
         },
         WsServerMessage::PushEnabled { enabled: true },
+        WsServerMessage::DeviceLocationSharing { enabled: true },
     ];
 
     for msg in &messages {
@@ -605,4 +607,53 @@ fn push_enabled_wire_format() {
         &WsServerMessage::PushEnabled { enabled: false },
         r#"{"type":"PushEnabled","enabled":false}"#,
     );
+}
+
+#[test]
+fn device_location_sharing_wire_format() {
+    assert_wire(
+        &WsServerMessage::DeviceLocationSharing { enabled: true },
+        r#"{"type":"DeviceLocationSharing","enabled":true}"#,
+    );
+    assert_wire(
+        &WsServerMessage::DeviceLocationSharing { enabled: false },
+        r#"{"type":"DeviceLocationSharing","enabled":false}"#,
+    );
+}
+
+#[test]
+fn welcome_device_location_enabled_round_trips_and_defaults_false() {
+    let msg = WsServerMessage::Welcome {
+        username: "alice".into(),
+        user_id: 1,
+        multiuser: false,
+        singleton: true,
+        available_models: vec![],
+        default_model: "sonnet".into(),
+        attachment_targets: vec![],
+        pwa_push_enabled: false,
+        device_location_enabled: true,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        json.contains(r#""device_location_enabled":true"#),
+        "Welcome must carry device_location_enabled: {json}"
+    );
+    match serde_json::from_str::<WsServerMessage>(&json).unwrap() {
+        WsServerMessage::Welcome {
+            device_location_enabled,
+            ..
+        } => assert!(device_location_enabled),
+        other => panic!("wrong variant: {other:?}"),
+    }
+
+    // An absent field reads as false.
+    let without = r#"{"type":"Welcome","username":"alice","user_id":1,"multiuser":false,"singleton":true,"default_model":"sonnet"}"#;
+    match serde_json::from_str::<WsServerMessage>(without).unwrap() {
+        WsServerMessage::Welcome {
+            device_location_enabled,
+            ..
+        } => assert!(!device_location_enabled),
+        other => panic!("wrong variant: {other:?}"),
+    }
 }

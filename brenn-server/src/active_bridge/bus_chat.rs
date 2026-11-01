@@ -1236,7 +1236,8 @@ fn translate(msg: WsServerMessage, turns: &mut TurnIds) -> Vec<Outbound> {
         | WsServerMessage::AppBusy { .. }
         | WsServerMessage::PermissionMode { .. }
         // App panels beside the chat thread: artifacts, todo lists, upload
-        // targets, push subscription. Not conversation content.
+        // targets, push subscription, location sharing. Not conversation
+        // content.
         | WsServerMessage::ArtifactContent { .. }
         | WsServerMessage::ArtifactIndex { .. }
         | WsServerMessage::TargetResult { .. }
@@ -1244,7 +1245,8 @@ fn translate(msg: WsServerMessage, turns: &mut TurnIds) -> Vec<Outbound> {
         | WsServerMessage::TodoDoneResult { .. }
         | WsServerMessage::TodoMutationResult { .. }
         | WsServerMessage::PushVapidKey { .. }
-        | WsServerMessage::PushEnabled { .. } => Vec::new(),
+        | WsServerMessage::PushEnabled { .. }
+        | WsServerMessage::DeviceLocationSharing { .. } => Vec::new(),
     }
 }
 
@@ -1558,6 +1560,7 @@ mod tests {
             },
             WsServerMessage::ArtifactIndex { files: vec![] },
             WsServerMessage::PushEnabled { enabled: true },
+            WsServerMessage::DeviceLocationSharing { enabled: true },
             WsServerMessage::SetLayout {
                 layout: ws::PaneLayout::SinglePane,
             },

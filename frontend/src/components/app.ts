@@ -50,6 +50,7 @@ import type { ShareData } from "../share-db.js";
 import { UserSettings } from "../settings.js";
 import { addSignedInUserId, removeSignedInUserId } from "../push-db.js";
 import { enablePush, disablePush } from "../push.js";
+import { LocationReporter, requestFix } from "../location.js";
 import {
   CHAT_AND_FILE,
   CHAT_ONLY,
@@ -213,6 +214,21 @@ export class BrennApp extends LitElement {
   @state() private pushPending = false;
   /** Timer for deferred IDB set cleanup on WS close (5s grace period). */
   private pushCleanupTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Whether the active app may use device location (from Welcome). */
+  private deviceLocationEnabled = false;
+  /**
+   * Whether this connection shares location (from DeviceLocationSharing): the
+   * app holds the grant and the (device, user) pair has a stored fix.
+   */
+  @state() private locationSharing = false;
+  /** Whether a location enable is in progress. */
+  @state() private locationPending = false;
+  /** Whether a DeviceLocationShare has been sent and its DeviceLocationSharing reply has not arrived. */
+  private locationShareOutstanding = false;
+  /** The reporter, present only while sharing is on and the WS is connected. */
+  private locationReporter: LocationReporter | null = null;
+  /** The zone last sent in SetTimezone on this connection; null before the first. */
+  private lastSentTimezone: string | null = null;
   /** Whether the user dropdown menu is open. */
   @state() private userMenuOpen = false;
   /** The effective model: user preference or app default. */
@@ -607,6 +623,7 @@ export class BrennApp extends LitElement {
       clearTimeout(this.pushCleanupTimer);
       this.pushCleanupTimer = null;
     }
+    this._stopLocationReporter();
     // Cancel any in-flight per-row debounce / error-badge / watchdog /
     // idle timers so they can't fire against a detached host (tests
     // mount/unmount between cases; production hosts live for the page
@@ -1274,6 +1291,7 @@ export class BrennApp extends LitElement {
         this.resolveCurrentModel();
         this.currentUserId = msg.user_id;
         this.pwaPushEnabled = msg.pwa_push_enabled;
+        this.deviceLocationEnabled = msg.device_location_enabled;
         // Maintain the signed_in_user_ids IDB set.
         // Cancel any pending cleanup timer from a prior WS close.
         if (this.pushCleanupTimer !== null) {
@@ -1384,6 +1402,22 @@ export class BrennApp extends LitElement {
       case "PushEnabled":
         this.pushSubscribed = msg.enabled;
         break;
+      case "DeviceLocationSharing": {
+        // Every accepted Share is answered true, so false after a Share is a
+        // refusal: the app no longer holds the grant.
+        const refusedShare = this.locationShareOutstanding && !msg.enabled;
+        this.locationShareOutstanding = false;
+        this.locationSharing = msg.enabled;
+        if (msg.enabled) {
+          this._startLocationReporter();
+        } else {
+          this._stopLocationReporter();
+        }
+        if (refusedShare) {
+          this.messageList?.appendError("Location sharing is not available in this app right now.");
+        }
+        break;
+      }
       default: {
         const _exhaustive: never = msg;
         this.messageList.appendError(
@@ -1500,6 +1534,11 @@ export class BrennApp extends LitElement {
 
   private handleConnectionStatus(connected: boolean): void {
     this.connected = connected;
+    if (!connected) {
+      // Nothing is sent on a closed socket; the server's DeviceLocationSharing
+      // on the next connect starts a fresh reporter.
+      this._stopLocationReporter();
+    }
     if (!connected && this.currentUserId !== 0) {
       // WS closed — schedule deferred IDB set cleanup (5s grace period).
       // The grace period lets an in-flight push arrive before the set shrinks,
@@ -1521,11 +1560,16 @@ export class BrennApp extends LitElement {
       // viewportMqlHandler. On open, the viewport is already in the WS
       // URL and the server emits SetLayout before any history frame.
 
-      // Report browser timezone for message attribution.
-      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      if (tz) {
-        this.ws.send({ type: "SetTimezone", timezone: tz });
-      }
+      // Report the browser's zone: message attribution and the stored zone
+      // the location tool answers. Re-sent before a location fix whenever
+      // the zone has changed since.
+      this.lastSentTimezone = null;
+      this._reportTimezoneIfChanged();
+
+      // A Share sent before this socket opened was dropped, not answered:
+      // the reply this flag waits for can only come on the socket it was
+      // sent on. Cleared before any message on the new socket arrives.
+      this.locationShareOutstanding = false;
 
       // Report device info (UA, platform, screen dimensions) for device identity.
       const platform: string =
@@ -3820,7 +3864,84 @@ export class BrennApp extends LitElement {
     return meta?.content ?? "";
   }
 
-  /** Render the user dropdown menu (username trigger + push toggle + logout). */
+  /**
+   * Send SetTimezone when the browser's zone differs from the one last sent
+   * on this connection, so the stored zone is never older than a fix sent
+   * after it.
+   */
+  private _reportTimezoneIfChanged(): void {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (!tz || tz === this.lastSentTimezone) return;
+    this.lastSentTimezone = tz;
+    this.ws.send({ type: "SetTimezone", timezone: tz });
+  }
+
+  /** Start the location reporter if it is not already running. */
+  private _startLocationReporter(): void {
+    if (this.locationReporter !== null) return;
+    this.locationReporter = new LocationReporter(
+      (fix) => {
+        this._reportTimezoneIfChanged();
+        // SYNC: brenn-ws-types/src/tests/client.rs device_location_fix_deserializes_frontend_wire_shape
+        this.ws.send({ type: "DeviceLocationFix", ...fix });
+      },
+      () => {
+        this.locationReporter = null;
+        // SYNC: brenn-ws-types/src/tests/client.rs device_location_clear_deserializes_frontend_wire_shape
+        this.ws.send({ type: "DeviceLocationClear" });
+        this.messageList?.appendError(
+          "Location permission was denied in the browser; sharing from this device is off. Allow location for this site in browser settings to share again.",
+        );
+      },
+    );
+    this.locationReporter.start();
+  }
+
+  /** Stop and drop the location reporter, if any. */
+  private _stopLocationReporter(): void {
+    if (this.locationReporter === null) return;
+    this.locationReporter.stop();
+    this.locationReporter = null;
+  }
+
+  /** User clicked "Share location from this device". */
+  private async _handleEnableLocation(): Promise<void> {
+    if (this.locationPending) return;
+    this.locationPending = true;
+    try {
+      // A fresh fix on enable; this call carries the user's gesture, so the
+      // browser may show its permission prompt.
+      const result = await requestFix(0);
+      if (result.ok) {
+        this._reportTimezoneIfChanged();
+        this.locationShareOutstanding = true;
+        // SYNC: brenn-ws-types/src/tests/client.rs device_location_share_deserializes_frontend_wire_shape
+        this.ws.send({ type: "DeviceLocationShare", ...result.fix });
+        // locationSharing and the reporter follow the server's DeviceLocationSharing.
+      } else if (result.reason === "permission_denied") {
+        this.messageList?.appendError(
+          "Location permission was denied. Allow location for this site in browser settings to share it.",
+        );
+      } else if (result.reason === "not_supported") {
+        this.messageList?.appendError("Location is not available in this browser.");
+      } else {
+        this.messageList?.appendError(
+          `Could not get a location fix: ${result.reason}. Try again.`,
+        );
+      }
+    } finally {
+      this.locationPending = false;
+    }
+  }
+
+  /** User clicked "Stop sharing location from this device". */
+  private _handleDisableLocation(): void {
+    // SYNC: brenn-ws-types/src/tests/client.rs device_location_clear_deserializes_frontend_wire_shape
+    this.ws.send({ type: "DeviceLocationClear" });
+    // locationSharing and the reporter follow the server's DeviceLocationSharing.
+  }
+
+  /** Render the user dropdown menu (username trigger + push and location toggles + logout). */
   private _renderUserMenu() {
     if (!this.currentUsername) return nothing;
     const csrfToken = this._getCsrfToken();
@@ -3837,6 +3958,19 @@ export class BrennApp extends LitElement {
               @click=${() => { this.userMenuOpen = false; void this._handleEnablePush(); }}
             >Enable push on this device</button>`
       : nothing;
+    const locationItem = this.deviceLocationEnabled
+      ? this.locationPending
+        ? html`<button class="user-menu-item" disabled>Location…</button>`
+        : this.locationSharing
+          ? html`<button
+              class="user-menu-item"
+              @click=${() => { this.userMenuOpen = false; this._handleDisableLocation(); }}
+            >Stop sharing location from this device</button>`
+          : html`<button
+              class="user-menu-item"
+              @click=${() => { this.userMenuOpen = false; void this._handleEnableLocation(); }}
+            >Share location from this device</button>`
+      : nothing;
     return html`
       <div class="user-menu-wrapper">
         <button
@@ -3848,6 +3982,7 @@ export class BrennApp extends LitElement {
         ${this.userMenuOpen ? html`
           <div class="user-menu-dropdown">
             ${pushItem}
+            ${locationItem}
             <button class="user-menu-item"
               @click=${() => { this.userMenuOpen = false; this._captureDebugSnapshot(); }}
             >Debug UI</button>

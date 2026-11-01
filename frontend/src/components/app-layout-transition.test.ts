@@ -195,6 +195,7 @@ describe("initial-connect startup flow (integration)", () => {
         default_model: "sonnet",
         attachment_targets: [],
         pwa_push_enabled: false,
+        device_location_enabled: false,
       });
 
       // Before SetLayout, renderable frames are queued — feed a probe
@@ -316,6 +317,7 @@ describe("initial-connect startup flow (integration)", () => {
       default_model: "sonnet",
       attachment_targets: [],
       pwa_push_enabled: false,
+      device_location_enabled: false,
     });
     ws.deliver({ type: "SetLayout", layout: { type: opts.initial } });
     await app.updateComplete;
@@ -693,6 +695,7 @@ describe("side-batch dispatch during replay", () => {
       default_model: "sonnet",
       attachment_targets: [],
       pwa_push_enabled: false,
+      device_location_enabled: false,
     });
     ws.deliver({ type: "SetLayout", layout: { type: "SinglePane" } });
     await app.updateComplete;
@@ -759,6 +762,7 @@ describe("side-batch dispatch during replay", () => {
       default_model: "sonnet",
       attachment_targets: [],
       pwa_push_enabled: false,
+      device_location_enabled: false,
     });
     ws.deliver({ type: "SetLayout", layout: { type: "SinglePane" } });
     await app.updateComplete;
@@ -801,6 +805,7 @@ describe("side-batch dispatch during replay", () => {
       default_model: "sonnet",
       attachment_targets: [],
       pwa_push_enabled: false,
+      device_location_enabled: false,
     });
     ws.deliver({ type: "SetLayout", layout: { type: "SinglePane" } });
     await app.updateComplete;

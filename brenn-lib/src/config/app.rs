@@ -675,6 +675,15 @@ impl AppConfig {
             .has_grant(brenn_envelope::grants::AppCapability::PwaPush)
     }
 
+    /// Whether this app may use device location: it holds a grant for the
+    /// `device-location` registry tool (`brenn_device_location::NAME`, a crate
+    /// above this one). The tool is the only reader of a stored fix, so an app
+    /// that cannot call it has no use for one. Gates the PWA's location menu
+    /// item and the WS location messages.
+    pub fn device_location_enabled(&self) -> bool {
+        self.policy.tool_grant("device-location").is_some()
+    }
+
     /// Resolved messaging send budget for this app: the agent's own
     /// `send_budget` → the `messaging` section's `default_send_budget` → 100.
     ///

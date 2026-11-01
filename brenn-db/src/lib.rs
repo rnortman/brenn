@@ -2,10 +2,11 @@
 //! the tables that schema creates.
 //!
 //! The crate owns exactly the tables its own production code touches: the base
-//! tables ([`run_base_migrations`]) and `pwa_push_subscriptions`
-//! ([`push_subscriptions`], written here because `unenroll_device` deletes its
-//! rows inside the unenroll transaction). [`run_migrations`] runs both, so any
-//! caller that has run it can call any function in this crate.
+//! tables ([`run_base_migrations`]), `pwa_push_subscriptions`
+//! ([`push_subscriptions`]) and `device_locations` ([`device_locations`]) — the
+//! last two written here because `unenroll_device` deletes their rows inside
+//! the unenroll transaction. [`run_migrations`] runs all three, so any caller
+//! that has run it can call any function in this crate.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use tokio::sync::Mutex;
 pub mod auth;
 pub mod conversation;
 pub mod cost_samples;
+pub mod device_locations;
 pub mod push_subscriptions;
 
 /// App-wide database handle. Single mutex-guarded connection.
@@ -97,13 +99,14 @@ pub fn into_db(conn: Connection) -> Db {
     Arc::new(Mutex::new(conn))
 }
 
-/// Run every migration this crate owns: the base tables and the
-/// push-subscription table. Idempotent.
+/// Run every migration this crate owns: the base tables, the
+/// push-subscription table and the device-location table. Idempotent.
 ///
 /// This is the whole set a caller needs before calling anything in this crate.
 pub fn run_migrations(conn: &Connection) {
     run_base_migrations(conn);
     push_subscriptions::run_push_subscription_migrations(conn);
+    device_locations::run_device_location_migrations(conn);
 }
 
 /// Open an in-memory database carrying this crate's tables only.
@@ -354,6 +357,10 @@ pub fn run_base_migrations(conn: &Connection) {
     // Both default NULL — no backfill needed; existing rows have no override.
     add_column_if_missing(conn, "device_users", "tz_override", "TEXT");
     add_column_if_missing(conn, "device_users", "tz_override_expires_at", "INTEGER");
+    // `browser_tz` is the IANA zone the browser last reported for this pair,
+    // written only from a zone name chrono-tz parsed. NULL until the first
+    // report; no backfill.
+    add_column_if_missing(conn, "device_users", "browser_tz", "TEXT");
 
     // Add the epoch column to conversations if not present: the conversation
     // epoch a singleton successor was minted under. NULL for every row created

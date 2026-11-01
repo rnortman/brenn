@@ -532,6 +532,7 @@ dependencies = [
  "brenn-common",
  "brenn-conversation-epoch",
  "brenn-db",
+ "brenn-device-location",
  "brenn-dsl",
  "brenn-envelope",
  "brenn-git",
@@ -675,6 +676,23 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "brenn-device-location"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "brenn-db",
+ "brenn-lib",
+ "brenn-tool-registry",
+ "chrono",
+ "chrono-tz",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1166,6 +1184,7 @@ dependencies = [
  "brenn-common",
  "brenn-conversation-epoch",
  "brenn-db",
+ "brenn-device-location",
  "brenn-envelope",
  "brenn-git",
  "brenn-graf",

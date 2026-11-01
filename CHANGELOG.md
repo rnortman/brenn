@@ -4,6 +4,20 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **The assistant can now ask where the user is.** The PWA's user menu gains
+  "Share location from this device": with the browser's permission, the
+  device reports its position on connect, when the app comes to the
+  foreground, and every five minutes while it is visible; "Stop sharing
+  location from this device" deletes the stored position. The new
+  `DeviceLocation` tool answers, for the acting user only, each sharing
+  device's name, coordinates, accuracy, when Brenn received the fix and its
+  age, the device's time zone and its local time; a fix older than 15 minutes
+  is marked `stale`. Brenn also stores each device's browser time zone per
+  user, so the tool knows it off-connection. Coordinates are never logged.
+  **Config change required:** the assistant needs `tool device-location {}`;
+  without it the menu item does not appear and the tool is not callable. The
+  grant is refused on `multiuser` apps and apps with no `container`.
+
 - **The Google Workspace assistant can now create, change and delete
   Calendar events.** The `google-workspace-tools` component gains three
   tools. `CalendarCreate` adds one event (summary, start and end as RFC 3339

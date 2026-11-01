@@ -63,4 +63,8 @@ after?: TodoAnchor | null,
 /**
  * Place before this neighbor.
  */
-before?: TodoAnchor | null, } | { "type": "LoadMoreHistory", before_seq: number, } | { "type": "PushVapidKeyRequest" } | { "type": "PushSubscribe", endpoint: string, p256dh: string, auth: string, } | { "type": "PushUnsubscribe" } | { "type": "DebugViewportSnapshot", snapshot: DebugViewportSnapshotData, };
+before?: TodoAnchor | null, } | { "type": "LoadMoreHistory", before_seq: number, } | { "type": "PushVapidKeyRequest" } | { "type": "PushSubscribe", endpoint: string, p256dh: string, auth: string, } | { "type": "PushUnsubscribe" } | { "type": "DeviceLocationShare", latitude: number, longitude: number, 
+/**
+ * 68 % confidence radius in metres, as the browser reports it.
+ */
+accuracy_m: number, } | { "type": "DeviceLocationFix", latitude: number, longitude: number, accuracy_m: number, } | { "type": "DeviceLocationClear" } | { "type": "DebugViewportSnapshot", snapshot: DebugViewportSnapshotData, };

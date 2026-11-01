@@ -190,6 +190,13 @@ tools send invitations only when asked (`notify`). Gmail endpoints the tools do 
 cover, and Calendar's colors and settings, are granted as `api-request`
 clauses (section 8).
 
+`device-location` is held under the same restrictions. It gives the
+assistant the user's position and time zone from the devices on which the
+user shares location, which `Weather` and the Calendar tools take as
+arguments; granting it also shows the "Share location from this device"
+item in the PWA's user menu (see `docs/config-dsl.md`, *The device-location
+tool*).
+
 ## 5. The component
 
 The `google-workspace-tools` component answers the assistant's Gmail and
@@ -268,6 +275,7 @@ agent PersonalAssistant {
   tool calendar-create {}
   tool calendar-update {}
   tool calendar-delete {}
+  tool device-location {}
 }
 ```
 
@@ -510,6 +518,9 @@ CalendarFreeBusy, CalendarCreate, CalendarUpdate and CalendarDelete.
   with CalendarEvent first.
 - CalendarDelete deletes a recurring series only with `series: true`; ask
   the user before passing it.
+- For "here" or "now", call DeviceLocation first: pass its latitude and
+  longitude to Weather as `lat`/`lng`, and its `time_zone` to the Calendar
+  tools. Tell the user a fix's age when it is `stale`.
 - In CalendarEvents, `self_response` is "the answer to the invitation of the
   calendar read — `needsAction`, `declined`, `tentative` or `accepted` — when
   that calendar is an attendee: on `primary` the user's own, on another

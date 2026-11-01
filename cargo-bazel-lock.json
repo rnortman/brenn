@@ -1,5 +1,5 @@
 {
-  "checksum": "61b65d90df4c90383bb9d57b44f9231d3386a7eba31fbcaadc549ba7cde975a2",
+  "checksum": "75f9995ed80a6ca591e9ff10688358f05b5f0f4edd2a5922bb91cbd949bace99",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -3384,6 +3384,79 @@
           "selects": {}
         },
         "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-device-location 0.1.0": {
+      "name": "brenn-device-location",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_device_location",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_device_location",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "chrono 0.4.45",
+              "target": "chrono"
+            },
+            {
+              "id": "chrono-tz 0.10.4",
+              "target": "chrono_tz"
+            },
+            {
+              "id": "rusqlite 0.39.0",
+              "target": "rusqlite"
+            },
+            {
+              "id": "serde 1.0.228",
+              "target": "serde"
+            },
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
+            },
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "proc_macro_deps": {
+          "common": [
+            {
+              "id": "async-trait 0.1.89",
+              "target": "async_trait"
+            }
+          ],
+          "selects": {}
+        },
         "version": "0.1.0"
       },
       "license": null,
@@ -37184,6 +37257,7 @@
     "brenn-common 0.1.0": "brenn-common",
     "brenn-conversation-epoch 0.1.0": "brenn-conversation-epoch",
     "brenn-db 0.1.0": "brenn-db",
+    "brenn-device-location 0.1.0": "brenn-device-location",
     "brenn-dsl 0.1.0": "brenn-dsl",
     "brenn-echo-stub 0.1.0": "surface/components/echo-stub",
     "brenn-envelope 0.1.0": "brenn-envelope",

@@ -92,6 +92,17 @@ In rough order of severity if compromised:
   tokens a user granted Brenn at a provider (their mailbox, their calendar).
   Compromise means acting as that user at the provider, outside Brenn, for as
   long as the token lives.
+- **Users' device positions.** The latest location fix per (device, user) in
+  `device_locations`: latitude, longitude, accuracy, and the server's receipt
+  time (no client timestamp is taken). The PWA reports a fix only after the
+  user turns on sharing for that device from the user menu and the browser
+  grants its own location permission. One tool reads it, `device-location`,
+  bound to the acting user and refused at boot to `multiuser` apps, to apps
+  with no `container`, and to WASM consumers. The row is deleted when the
+  user stops sharing and when the device is unenrolled. Coordinates are never
+  logged; log lines carry user and device ids and counts only. A position
+  appears in a conversation's transcript only where the assistant called the
+  tool, as any tool result does.
 - **Cross-user and cross-app isolation.** Conversation history, per-app data,
   per-app filesystem scope, per-component WASM storage. One user or one app must
   not reach another's data.
@@ -296,6 +307,28 @@ as `security-host-paths-follow-agent-symlinks` in `TODO.md`. A bare agent runs
 as Brenn's own uid with no filesystem restriction (§9d), and neither placement
 claim bounds it. On a home the agent has not rewritten, the placement above is
 exact: the file is in no git tree and no Brenn git operation touches it.
+
+**Device location.** `DeviceLocationShare` (the user's menu action, which
+creates the stored fix) and `DeviceLocationFix` (the PWA's periodic report,
+which only replaces a fix that already exists) carry a latitude, a longitude
+and an accuracy in metres, bounded at intake: latitude finite and in
+−90..=90, longitude finite and in −180..=180, accuracy finite and in
+0..=20 000 000. A value outside a bound is refused and raised as a
+`MalformedMessage` security event with the client IP; no browser's
+Geolocation API produces such a value, so a refusal means a modified client.
+The event names the field and the bound and never the value. The device and
+user come from the connection, never the message, and no timestamp is taken
+from the browser: the server stamps receipt time, so a phone's clock can
+neither trigger a refusal nor change a stored age. A share or fix from an app
+without the `device-location` grant stores nothing, is answered
+`DeviceLocationSharing { enabled: false }` and logged at `warn` without the
+IP — it is not a security event, because the message can touch only the
+sender's own row and an unmodified PWA sends one when a reload removes the
+grant under a connection that is sharing. The pair's row survives that reply:
+it is the user's consent, deleted only by `DeviceLocationClear` and
+unenrolment, and an app that regains the grant resumes reporting it on
+connect. `DeviceLocationClear` is honoured
+whatever the app's grants: it deletes the sender's own row.
 
 **What the reviewer verifies:** authority comes from the session everywhere; the
 inbound schema is closed and rejects+signals unknowns; every security-relevant

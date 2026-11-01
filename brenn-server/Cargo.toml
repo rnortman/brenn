@@ -35,6 +35,7 @@ brenn-graf = { version = "0.1.0", path = "../brenn-graf" }
 brenn-hooks = { version = "0.1.0", path = "../brenn-hooks" }
 brenn-automation = { version = "0.1.0", path = "../brenn-automation" }
 brenn-db = { version = "0.1.0", path = "../brenn-db" }
+brenn-device-location = { version = "0.1.0", path = "../brenn-device-location" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
 brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
 brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }

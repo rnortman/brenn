@@ -141,3 +141,44 @@ describe("documentClickHandler fires exactly once after mount→disconnect→rem
         expect(callCount).toBe(0);
     });
 });
+
+describe("location reporter is torn down on disconnect", () => {
+    it("no DeviceLocationFix is sent by the interval or visibilitychange after removeChild", async () => {
+        vi.useFakeTimers();
+        Object.defineProperty(navigator, "geolocation", {
+            value: {
+                getCurrentPosition(success: (p: GeolocationPosition) => void): void {
+                    success({
+                        coords: { latitude: 1, longitude: 2, accuracy: 3 },
+                        timestamp: 0,
+                    } as unknown as GeolocationPosition);
+                },
+            },
+            configurable: true,
+        });
+        try {
+            const { app } = await mountApp();
+            const ws = MockWebSocket.instances[0]!;
+            const fixes = (): number =>
+                ws.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "DeviceLocationFix")
+                    .length;
+
+            ws.deliver({ type: "DeviceLocationSharing", enabled: true });
+            for (let i = 0; i < 5; i++) await Promise.resolve();
+            expect(fixes()).toBe(1);
+            const internals = app as unknown as { locationReporter: unknown };
+            expect(internals.locationReporter).not.toBeNull();
+
+            document.body.removeChild(app);
+            expect(internals.locationReporter).toBeNull();
+
+            await vi.advanceTimersByTimeAsync(3 * 5 * 60_000);
+            document.dispatchEvent(new Event("visibilitychange"));
+            for (let i = 0; i < 5; i++) await Promise.resolve();
+            expect(fixes()).toBe(1);
+        } finally {
+            delete (navigator as unknown as { geolocation?: unknown }).geolocation;
+            vi.useRealTimers();
+        }
+    });
+});

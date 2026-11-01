@@ -635,6 +635,7 @@ pub async fn run_server(
             oauth_service.as_ref(),
             api_key_providers,
         ));
+        tools.extend(brenn_device_location::registered(db.clone()));
         let registry = build_tool_registry(tools, &config.wasm_consumers, &apps, &provider_runtime);
         registry.validate_config(&apps);
         std::sync::Arc::new(registry)

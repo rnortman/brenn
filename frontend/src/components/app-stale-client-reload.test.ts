@@ -188,6 +188,7 @@ describe("stale-client close → location.reload (3-strike loop guard)", () => {
                         default_model: "sonnet",
                         attachment_targets: [],
                         pwa_push_enabled: false,
+                        device_location_enabled: false,
                     } satisfies WsServerMessage),
                 }),
             );

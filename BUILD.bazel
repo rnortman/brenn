@@ -141,6 +141,7 @@ filegroup(
         "//brenn-common:policy_srcs",
         "//brenn-conversation-epoch:policy_srcs",
         "//brenn-db:policy_srcs",
+        "//brenn-device-location:policy_srcs",
         "//brenn-dsl:policy_srcs",
         "//brenn-envelope:policy_srcs",
         "//brenn-git:policy_srcs",

@@ -139,6 +139,7 @@ pub(super) fn msg_type_name(msg: &WsServerMessage) -> &'static str {
         WsServerMessage::CostUsage { .. } => "CostUsage",
         WsServerMessage::PushVapidKey { .. } => "PushVapidKey",
         WsServerMessage::PushEnabled { .. } => "PushEnabled",
+        WsServerMessage::DeviceLocationSharing { .. } => "DeviceLocationSharing",
     }
 }
 
