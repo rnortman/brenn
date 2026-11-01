@@ -2,9 +2,11 @@
 
 The `google-workspace-tools` component answers Gmail's labels, searches,
 messages and threads as the tools `GmailLabels`, `GmailSearch`, `GmailRead`
-and `GmailThread`, and Google Calendar's calendar list, events, single events
-and free/busy as `CalendarList`, `CalendarEvents`, `CalendarEvent` and
-`CalendarFreeBusy`. This document lists Gmail and Google Calendar endpoints
+and `GmailThread`, creates drafts as `GmailDraft` and changes labels as
+`GmailModifyLabels`, and answers Google Calendar's calendar list, events,
+single events and free/busy as `CalendarList`, `CalendarEvents`,
+`CalendarEvent` and `CalendarFreeBusy`. This document lists Gmail and Google
+Calendar endpoints
 those tools do not cover, and Calendar's events listing for a caller the
 tools do not serve, each with one `api-request` call that reaches it through
 the `google` OAuth provider. The operator's setup is in
@@ -182,7 +184,11 @@ The answer is `{ threads[], nextPageToken?, resultSizeEstimate }`, each thread
 ### Drafts
 
 The user's drafts, then one of them. Reading drafts needs only the Gmail read
-scope; creating or sending one is a write and needs its own scope and clause.
+scope. Creating one is `GmailDraft`, which can also draft a reply to a
+message (Gmail decides whether the reply joins the original's conversation;
+the answer says `in_thread: false` when it does not; see
+`docs/google-workspace.md` section 5); listing and reading them is still through
+`api-request`. No tool sends a draft.
 Reference: `https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.drafts/list`.
 
 ```json

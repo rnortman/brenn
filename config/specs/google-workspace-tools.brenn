@@ -24,11 +24,14 @@
 /// "brenn:tool-results/<slug>"` block: each live request has at most one
 /// nested call outstanding, so the window must hold Σ max_concurrency results,
 /// twice over for a re-delivered result — `retain_depth ≥ 2 × Σ`, rounded up to
-/// a power of two. The eight tools here declare Σ = 24, which needs 48, rounded
+/// a power of two. The ten tools here declare Σ = 28, which needs 56, rounded
 /// up to 64. 64 is the documented value: it holds any Σ max_concurrency
 /// up to the 32 ceiling twice over, so tools joining this class change nothing
 /// a deployed inbox needs, and the family default of 16 is too small for a full
 /// window.
+/// TODO(quality-sigma-count-restated-in-three-hand-kept-places): the tool count
+/// and Σ here and in `docs/google-workspace.md` section 5 (twice), and that section's
+/// clause count, are kept by hand.
 ///
 /// Every nested answer crosses the bus as a tool result, so Google's body — a
 /// JSON string inside `api-request`'s value, inside the result envelope — must

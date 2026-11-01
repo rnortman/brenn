@@ -44,6 +44,16 @@ All notable changes to Brenn are documented here.
   `tool gmail-modify-labels {}`; and each user reconnects their Google
   account with `gmail_organize` before the tool can change labels.
 
+- **The Google Workspace guide now tells operators to keep the assistant's
+  own Gmail access read-only.** `docs/google-workspace.md` documents
+  `GmailDraft` and `GmailModifyLabels` and drops its earlier example that
+  gave the assistant raw `POST` grants for Gmail drafts and labels through
+  `api-request`. A raw write grant on the Gmail host lets the assistant do
+  anything the user's Google connection allows, including sending or
+  trashing mail, which the tools themselves never do. If you followed that
+  example, remove those two clauses from the assistant's `api-request` tool;
+  the tools cover both writes. No other config changes.
+
 - **The Google Workspace assistant tools can now tell when the user is
   busy.** The `google-workspace-tools` component gains `CalendarFreeBusy`:
   for a window between two RFC 3339 times and up to 50 calendars (`primary`

@@ -142,6 +142,19 @@ and message generalised beyond `server.vault_dir`.
 Done = every file kind the posture covers is refused at boot and on reload when
 it lies inside an agent-visible root, with a test per kind.
 
+## `quality-sigma-count-restated-in-three-hand-kept-places`
+
+`google-workspace-tools`' tool count and Σ `max_concurrency` (ten, 28, 56) are
+written by hand in the spec header (`config/specs/google-workspace-tools.brenn`)
+and twice in `docs/google-workspace.md` section 5, beside text saying tools
+joining the class change nothing there; the same section's "The clauses"
+paragraph counts the instance's clauses (eleven) by hand. Each new tool must
+edit all four and nothing fails when one is missed. Decide whether to drop the figures and state
+only the rule, the 32 ceiling and 64 (as `config/specs/google-maps-tools.brenn`
+does), or keep a worked figure checked by a test that sums the spec's
+`max_concurrency` values and asserts `2 × Σ ≤ 64`; no test sees those values
+today. `docs/google-maps-platform.md` restates Maps' Σ the same way.
+
 ## `quality-virtual-tools-final-symlink-left-open-though-local-fix-exists`
 
 `write_virtual_tools_file` writes `<state_dir>/virtual-tools.json` with
