@@ -42,6 +42,9 @@ const TOOLS: &[(&str, &str)] = &[
     ("calendar-free-busy", "CalendarFreeBusy"),
     ("gmail-draft", "GmailDraft"),
     ("gmail-modify-labels", "GmailModifyLabels"),
+    ("calendar-create", "CalendarCreate"),
+    ("calendar-update", "CalendarUpdate"),
+    ("calendar-delete", "CalendarDelete"),
 ];
 
 /// The hosts the instance's `config` names for Gmail and Calendar.
@@ -66,6 +69,9 @@ const CLAUSES: &[(&str, &str, &str)] = &[
         GMAIL_HOST,
         "/gmail/v1/users/me/messages/batchModify",
     ),
+    ("POST", CALENDAR_HOST, "/calendar/v3/calendars/*/events"),
+    ("PATCH", CALENDAR_HOST, "/calendar/v3/calendars/*/events/*"),
+    ("DELETE", CALENDAR_HOST, "/calendar/v3/calendars/*/events/*"),
 ];
 
 /// The class's packaged specification.
@@ -122,7 +128,8 @@ oauth_provider {PROVIDER} {{
         gmail_readonly = ["https://www.googleapis.com/auth/gmail.readonly"],
         gmail_compose = ["https://www.googleapis.com/auth/gmail.compose"],
         gmail_organize = ["https://www.googleapis.com/auth/gmail.labels", "https://www.googleapis.com/auth/gmail.modify"],
-        calendar_readonly = ["https://www.googleapis.com/auth/calendar.readonly"]
+        calendar_readonly = ["https://www.googleapis.com/auth/calendar.readonly"],
+        calendar_events = ["https://www.googleapis.com/auth/calendar.events"]
     }};
     api_hosts = ["https://{GMAIL_HOST}", "https://{CALENDAR_HOST}"];
 }}

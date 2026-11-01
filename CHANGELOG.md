@@ -4,6 +4,26 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **The Google Workspace assistant can now create, change and delete
+  Calendar events.** The `google-workspace-tools` component gains three
+  tools. `CalendarCreate` adds one event (summary, start and end as RFC 3339
+  times or all-day dates, plus optional description, location, attendees,
+  time zone and recurrence). `CalendarUpdate` changes only the fields it is
+  given; `attendees` replaces the whole list. `CalendarDelete` removes one
+  event, deletes a recurring series only when explicitly asked to, and
+  refuses an event that is already cancelled. None of them emails attendees
+  unless the assistant asks it to (`notify`). If Google's answer to a create
+  is lost, the assistant is told the event may already exist and to check
+  before trying again. **Config change required:** the instance's
+  `api-request` grant on `www.googleapis.com` needs `POST
+  /calendar/v3/calendars/*/events`, `PATCH /calendar/v3/calendars/*/events/*`
+  and `DELETE /calendar/v3/calendars/*/events/*`; the Google provider needs a
+  `calendar_events` scope set
+  (`https://www.googleapis.com/auth/calendar.events`); the assistant needs
+  `tool calendar-create {}`, `tool calendar-update {}` and
+  `tool calendar-delete {}`; and each user reconnects their Google account
+  with `calendar_events` before the tools can work.
+
 - **The Google Workspace assistant tools can now write a Gmail draft.** The
   `google-workspace-tools` component gains `GmailDraft`: a new draft, with
   `to`, optional `cc`, `subject` and a plain-text `body`, saved in the user's

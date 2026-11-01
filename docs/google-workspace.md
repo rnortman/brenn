@@ -11,10 +11,14 @@ The assistant reaches Google in one of two ways:
   native tools — `GmailLabels`, `GmailSearch`, `GmailRead` and `GmailThread`
   for reading mail, `GmailDraft` and `GmailModifyLabels` for drafting replies
   and filing mail, `CalendarList`, `CalendarEvents`, `CalendarEvent` and
-  `CalendarFreeBusy` for the calendar — that build Google's requests for
-  whichever user is calling and answer with compact JSON, the message text
-  decoded. This is the route to use for reading mail and calendars, creating
-  drafts and changing labels. No tool sends, deletes or trashes mail.
+  `CalendarFreeBusy` for reading the calendar, and `CalendarCreate`,
+  `CalendarUpdate` and `CalendarDelete` for changing it — that build
+  Google's requests for whichever user is calling and answer with compact
+  JSON, the message text decoded. This is the route to use for reading mail
+  and calendars, creating drafts, changing labels and creating, changing and
+  deleting events. No tool sends, deletes or trashes mail; the Calendar
+  write tools create, change and delete events and send invitations only
+  when asked (`notify`).
 - **The raw `api-request` route** (section 8) lets it call any Gmail or
   Calendar endpoint directly, assembling the request and reading Google's
   answer itself. It is the route for the endpoints the component does not
@@ -154,7 +158,7 @@ For Gmail that costs most HTML mail: a message over 40 KiB is answered by
 also costs long threads: a thread whose messages' headers together pass the
 limit is answered without `to` and `cc`, and one whose remaining headers
 still pass it is refused and read one message at a time (section 7,
-step 14). For Calendar it costs wide windows: `CalendarEvents` and
+step 18). For Calendar it costs wide windows: `CalendarEvents` and
 `CalendarFreeBusy` refuse a window whose answer passes the limit and say
 what to narrow.
 
@@ -179,8 +183,10 @@ agent PersonalAssistant {
 }
 ```
 
-Reading mail and calendars, creating drafts and changing labels are granted
-through the component's tools (section 5). Gmail endpoints the tools do not
+Reading mail and calendars, creating drafts, changing labels and creating,
+changing and deleting events are granted through the component's tools
+(section 5); no tool sends, deletes or trashes mail, and the Calendar write
+tools send invitations only when asked (`notify`). Gmail endpoints the tools do not
 cover, and Calendar's colors and settings, are granted as `api-request`
 clauses (section 8).
 
@@ -202,9 +208,8 @@ Then the inbox tuning and the instance:
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered. The ten tools declare Σ = 28, which needs 56, rounded up
-// to 64. 64 holds the 32 ceiling on Σ twice over, so tools joining the
-// class change nothing here.
+// re-delivered. The config check holds Σ to at most 32, and 64 holds that
+// twice over, so tools joining the class change nothing here.
 channel at "brenn:tool-results/workspace" {
   push_depth = 1;
   retain_depth = 64;
@@ -227,6 +232,9 @@ new workspace: GoogleWorkspaceTools {
     allow { provider = "google"; user = "*"; method = "POST"; host = "www.googleapis.com"; path = "/calendar/v3/freeBusy"; }
     allow { provider = "google"; user = "*"; method = "POST"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/drafts"; }
     allow { provider = "google"; user = "*"; method = "POST"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/batchModify"; }
+    allow { provider = "google"; user = "*"; method = "POST"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events"; }
+    allow { provider = "google"; user = "*"; method = "PATCH"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
+    allow { provider = "google"; user = "*"; method = "DELETE"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
     rate_limit { burst = 60; sustained_per_minute = 120; }
   }
   config = {
@@ -257,6 +265,9 @@ agent PersonalAssistant {
   tool calendar-events {}
   tool calendar-event {}
   tool calendar-free-busy {}
+  tool calendar-create {}
+  tool calendar-update {}
+  tool calendar-delete {}
 }
 ```
 
@@ -266,25 +277,34 @@ need one.
 **The result inbox.** The `channel at "brenn:tool-results/workspace"` block
 sizes the inbox the instance's nested answers arrive on (the slug after the
 `/` is the instance's name). Each request the component serves has at most
-one Google call outstanding, so at most Σ `max_concurrency` = 28 answers are
-outstanding at once, and an answer may be delivered twice: 28 × 2 = 56,
-rounded up to 64. The block sets 64, which covers the 32 ceiling on Σ
-`max_concurrency` twice over, so tools joining this class later change
-nothing deployed. The default window of 16 is below 56 and would lose
-answers under load, each lost answer leaving its request to be answered
-`internal` after the 240-second ceiling. `push_depth = 1` is the inert
+one Google call outstanding, so at most Σ `max_concurrency` answers are
+outstanding at once, and an answer may be delivered twice: the window must
+hold 2 × Σ. The config check holds Σ to at most 32
+(`PROVIDER_CONCURRENCY_CEILING`), and the block sets 64, which holds that
+twice over, so tools joining this class later change nothing deployed. The
+default window of 16 is too small for a full window and would lose answers
+under load, each lost answer leaving its request to be answered `internal`
+after the 240-second ceiling. `push_depth = 1` is the inert
 channel rung, and `noise = alarm` makes a drop here an alert.
 
-**The clauses.** The instance holds eleven clauses, one per endpoint the
-tools call — Gmail's label list, one label, the message search, one message,
-one thread, draft creation and the batch label change, and Calendar's
-calendar list, one calendar's events, one event and free/busy — and nothing
-wider. Eight are `GET`s. Three are `POST`s, each admitted only for a stamped
-call: free/busy, which changes nothing; `drafts`, which creates a draft in
-the user's Drafts and sends nothing; and `messages/batchModify`, which adds
-and removes labels on the messages named. Each `POST` path is exact: a
-clause's path matches segment by segment with no prefix match, so `drafts`
-does not admit `drafts/send`. The `*` segments take a label, message,
+**The clauses.** The instance holds one clause per endpoint the tools call
+— Gmail's label list, one label, the message search, one message, one
+thread, draft creation and the batch label change, and Calendar's calendar
+list, one calendar's events, one event, free/busy, and creating, changing
+and deleting one event — and nothing wider. The reads are `GET`s. Every
+other method is admitted only for a stamped call: the `POST` for free/busy,
+which changes nothing; the `POST` for `drafts`, which creates a draft in the
+user's Drafts and sends nothing; the `POST` for `messages/batchModify`,
+which adds and removes labels on the messages named; and on Calendar the
+`POST` for `calendars/*/events`, which creates an event, the `PATCH` for
+`calendars/*/events/*`, which changes one, and the `DELETE` for the same
+path, which deletes one. Each write path is exact: a clause's path matches
+only a path with the same number of segments and every literal segment
+equal, with no prefix match. So `drafts` does not admit `drafts/send`;
+`calendars/*/events/*` admits neither `…/move` nor `…/instances`, which
+have one segment more; and `calendars/*/events` does not admit
+`calendars/*/clear`, which has the same number of segments but whose
+literal `clear` is not `events`. The `*` segments take a label, message,
 thread, calendar or event id. A clause that does not admit a call's method,
 host and path is refused before anything is sent (section 7).
 
@@ -303,7 +323,9 @@ admits two such searches without stalling. `GmailRead` and `GmailThread` are
 at most three: the read, one narrower read when the first is too large, and
 label names. `GmailDraft` is one call, two for a reply (the original's
 headers, then the draft); `GmailModifyLabels` is one call whatever the
-number of messages. Each Calendar tool is one call. Callers over the limit are
+number of messages. Each Calendar read is one call; `CalendarCreate` and
+`CalendarUpdate` are one, `CalendarDelete` two (the read, then the delete).
+Callers over the limit are
 delayed, never refused. Google's own quota, 250 units per user per second
 with a list or a get costing 5, is the real bound on a user.
 
@@ -319,18 +341,20 @@ A missing key, an empty one, or a host containing `/` fails every activation
 with the key named.
 
 **The user's connection.** Each user connects their account with the
-`gmail_readonly`, `gmail_compose`, `gmail_organize` and `calendar_readonly`
-scope sets (section 7, step 1). Each tool needs one:
+`gmail_readonly`, `gmail_compose`, `gmail_organize`, `calendar_readonly` and
+`calendar_events` scope sets (section 7, step 1). Each tool needs one:
 
 - `gmail_readonly` — `GmailLabels`, `GmailSearch`, `GmailRead` and
   `GmailThread`, and the read of the original that a reply draft makes
   first.
 - `gmail_compose` — `GmailDraft`.
 - `gmail_organize` — `GmailModifyLabels`.
-- `calendar_readonly` — the four Calendar tools.
+- `calendar_readonly` — the four Calendar read tools.
+- `calendar_events` — `CalendarCreate`, `CalendarUpdate` and
+  `CalendarDelete`, including the read `CalendarDelete` makes first.
 
-The tools write drafts and labels and nothing else: no send, no delete, no
-trash. Neither the scopes nor the clauses alone make that true:
+On Gmail the tools write drafts and labels and nothing else: no send, no
+delete, no trash. Neither the scopes nor the clauses alone make that true:
 
 - **Sending.** `gmail.modify` and `gmail.compose` can send at the API level.
   What keeps mail from being sent is the component's exact clauses: the
@@ -342,6 +366,17 @@ trash. Neither the scopes nor the clauses alone make that true:
   days. What keeps mail from being trashed is the tool itself:
   `GmailModifyLabels` refuses `TRASH` and `SPAM` in `add` before any call.
   It may remove them, which restores mail.
+
+On Calendar the tools create, change and delete events, and can email
+guests: an invitation, an update or a cancellation is sent only when the
+assistant passes `notify` as `all` or `externalOnly`; by default nobody is
+mailed. `calendar.events` can do more at the API level, and the
+`PATCH` and `DELETE` clauses admit any body or query. What keeps the tools
+from more: the exact clauses — no clause admits `events/*/move`,
+`calendars/*/clear` or `events/*/instances` — and the tools themselves:
+`CalendarDelete` refuses a recurring series unless told `series: true`,
+`CalendarUpdate` changes only the fields named and clears none, and no tool
+creates or deletes a calendar.
 
 What the tools answer when the connection is not in place:
 
@@ -355,8 +390,10 @@ What the tools answer when the connection is not in place:
   scope the failing call needs and saying to reconnect with that scope set.
   The sentence names it by the set's word: "Gmail read" is `gmail_readonly`,
   "Gmail compose" is `gmail_compose`, "Gmail organize" is `gmail_organize`,
-  "Calendar read" is `calendar_readonly`. A reply draft's read of the
-  original names the Gmail read scope, its draft the Gmail compose scope. A
+  "Calendar read" is `calendar_readonly`, "Calendar events" is
+  `calendar_events`. A reply draft's read of the original names the Gmail
+  read scope, its draft the Gmail compose scope; `CalendarDelete`'s read of
+  the event names the Calendar events scope, as its delete does. A
   Calendar tool is answered the same way when the Google Calendar API is not
   enabled in the project (section 1).
 
@@ -417,6 +454,24 @@ happened: the draft may exist (look in Drafts before asking again), or the
 labels may already be changed (asking again is safe). The component never
 retries a write.
 
+The three Calendar writes answer what Google holds. `CalendarCreate` answers
+the new event as `CalendarEvent` does, with its new `id`; `CalendarUpdate`
+answers the event as Google holds it after the change, the same way. Times
+are written as given: two `YYYY-MM-DD` dates make an all-day event (`end`
+the day after the last day), two RFC 3339 times with an offset a timed one;
+nothing is converted. An update changes only the fields named, `attendees`
+replaces the whole list, and a given `start` and `end` replace the event's
+time, which may move it between all-day and timed. `CalendarDelete` reads
+the event first and answers `deleted: true` with its `id`, its `summary` and
+`start` as read, and `series: true` when it was a recurring series; it
+refuses a series without `series: true`, and an event already cancelled.
+When a write's answer is lost, the tool is answered `internal` saying the
+write may have happened: the event may have been created (look for it with
+`CalendarEvents` in its window before asking again, or the user has two),
+the change may already be applied (asking again with the same arguments is
+safe), or the event may already be deleted (asking again is safe: a deleted
+event is refused as cancelled). The component never retries a write.
+
 ## 6. Telling the assistant
 
 The tools appear in the assistant's tool list with their descriptions, which
@@ -426,14 +481,14 @@ instructions (its system prompt or the `CLAUDE.md` it reads):
 ```
 You have Gmail tools: GmailLabels, GmailSearch, GmailRead, GmailThread,
 GmailDraft and GmailModifyLabels.
-You have Google Calendar tools: CalendarList, CalendarEvents, CalendarEvent
-and CalendarFreeBusy.
+You have Google Calendar tools: CalendarList, CalendarEvents, CalendarEvent,
+CalendarFreeBusy, CalendarCreate, CalendarUpdate and CalendarDelete.
 - Pass `account` only when the user has several Google accounts connected;
   the refusal names them.
 - An answer {"error": "credential_invalid", ...} means the user has no usable
   Google connection: run oauth-connect for provider "google" with the
-  gmail_readonly, gmail_compose, gmail_organize and calendar_readonly scope
-  sets and relay its steps to the user.
+  gmail_readonly, gmail_compose, gmail_organize, calendar_readonly and
+  calendar_events scope sets and relay its steps to the user.
 - GmailThread lists a thread's messages without their text; read a message's
   text with GmailRead.
 - GmailDraft creates a draft the user sends from Gmail and never sends; a
@@ -446,6 +501,15 @@ and CalendarFreeBusy.
 - Calendar times (`from`, `to`) are RFC 3339 with an offset, in the user's
   time zone: 2026-11-02T09:00:00-05:00. All-day events come back with
   `date`, timed ones with `date_time`; nothing is converted.
+- CalendarCreate and CalendarUpdate take `start` and `end` by the same rule:
+  both RFC 3339 with an offset, or both YYYY-MM-DD for an all-day event
+  (`end` the day after the last day).
+- `notify` on the Calendar writes defaults to nobody; pass `all` only when
+  the user wants the guests emailed.
+- `attendees` on CalendarUpdate is the whole new list; read the current one
+  with CalendarEvent first.
+- CalendarDelete deletes a recurring series only with `series: true`; ask
+  the user before passing it.
 - In CalendarEvents, `self_response` is "the answer to the invitation of the
   calendar read — `needsAction`, `declined`, `tentative` or `accepted` — when
   that calendar is an attendee: on `primary` the user's own, on another
@@ -476,13 +540,15 @@ sections 3 and 5 in place.
    you use for Brenn. Choose the account, go through the "unverified app"
    warning (*Advanced* → *Go to Brenn*), and tick every box. The page should say
    **Connected `<account>` to Brenn for Brenn user `<you>`**. Ask the assistant to list connected
-   accounts. Confirm that the Gmail scopes appear among the granted scopes:
-   `gmail.readonly`, `gmail.compose`, `gmail.labels` and `gmail.modify`. If
+   accounts. Confirm that the Gmail and Calendar scopes appear among the
+   granted scopes: `gmail.readonly`, `gmail.compose`, `gmail.labels`,
+   `gmail.modify`, `calendar.readonly` and `calendar.events`. If
    they are missing, or the page said nothing was connected and a connect
-   with `calendar_readonly` alone succeeds, Google refused restricted scopes
-   to the unverified app; only calendar access will work. Then name
-   `calendar_readonly` alone in the `oauth-connect` line of the section 6
-   text, so the assistant's connects stop asking for the refused scope.
+   with `calendar_readonly` and `calendar_events` alone succeeds, Google
+   refused restricted scopes to the unverified app; only calendar access will
+   work. Then name `calendar_readonly` and `calendar_events` alone in the
+   `oauth-connect` line of the section 6 text, so the assistant's connects
+   stop asking for the refused scopes.
 2. **A family member connects from a phone.** Same steps, on their phone. If
    the link opens in a browser where they are not signed in to Brenn, they see
    the Brenn login page. After logging in they land back on the callback and
@@ -546,10 +612,32 @@ sections 3 and 5 in place.
     than your own from step 8 — a shared or subscribed one, such as a
     holidays calendar. Expect `CalendarEvents` with that calendar's `id` as
     `calendar`; an id with `#` appears in the log as `%23`.
-13. **No account.** A second Brenn user who has not connected asks the
+13. **Create.** Ask the assistant to create an event tomorrow with one
+    attendee — another of your own addresses — without saying whom to
+    notify. Expect one `CalendarCreate` call; the log shows one `POST` line
+    for `/calendar/v3/calendars/primary/events` with `sendUpdates=none`, the
+    event is in Google Calendar, and no invitation mail arrives. This is the
+    live check of `sendUpdates` and of the timed shape. Then ask for an
+    all-day event by giving dates: the check of the `date` shape.
+14. **Update.** Ask to move the timed event an hour later. Expect one
+    `CalendarUpdate` call; the log shows one `PATCH` line, and the event is
+    moved in Google Calendar, its description and attendees untouched. Then
+    ask for the all-day event to be given a time: expect one `PATCH` line and
+    the event timed in Google Calendar. This is the live check of the patch
+    semantics the tool relies on: a time object sent with the other kind's
+    key `null` clears that key. If Google refuses the `PATCH`, or saves the
+    event holding both a date and a time (the tool then answers `internal`
+    naming `events.patch`), record it beside this step.
+15. **Delete.** Ask to delete the timed event. Expect one `CalendarDelete`
+    call; the log shows one `GET` line, then one `DELETE` line, status 204,
+    and the answer names its summary. Delete the all-day event the same way.
+16. **A series.** Ask to delete a recurring meeting without saying "the
+    whole series". Expect the refusal naming it as a series and no `DELETE`
+    line in the log.
+17. **No account.** A second Brenn user who has not connected asks the
     assistant for their mail. The assistant is answered `credential_invalid`
     and offers to connect, with a link.
-14. **When a step fails**, the tool's error says whose answer it is.
+18. **When a step fails**, the tool's error says whose answer it is.
     - A `denied` quoting Google's 403 is Google's refusal: the account was
       connected without the Gmail read scope (reconnect with
       `gmail_readonly`), or Google refuses restricted scopes to the
@@ -558,21 +646,41 @@ sections 3 and 5 in place.
       was the read of a reply's original; on `GmailModifyLabels` the Gmail
       organize scope (reconnect with `gmail_organize`). On a Calendar tool it
       is the account connected without the Calendar read scope (reconnect
-      with `calendar_readonly`), or the Google Calendar API not enabled in
-      the project (section 1, step 2).
+      with `calendar_readonly`), or on `CalendarCreate`, `CalendarUpdate` or
+      `CalendarDelete` without the Calendar events scope (reconnect with
+      `calendar_events`), or the Google Calendar API not enabled in the
+      project (section 1, step 2). On a Calendar write it can also be a
+      calendar the user may only read; the hint then names a scope the
+      account already has.
     - A `GmailDraft` or `GmailModifyLabels` answer `internal` saying the
       draft may have been created, or the labels may already have been
       changed, is a write whose answer was lost: Google may have acted. For
       a draft, look in Drafts before asking again, or the user has two; for
       labels, asking again with the same arguments is safe. Nothing needs
       changing.
+    - A `CalendarCreate`, `CalendarUpdate` or `CalendarDelete` answer
+      `internal` saying the event may have been created, the change may
+      already have been applied, or the event may already be deleted, is a
+      write whose answer was lost: Google may have acted. For a create, look
+      for the event with `CalendarEvents` before asking again, or the user
+      has two; for an update or a delete, asking again with the same
+      arguments is safe. Nothing needs changing.
+    - A `CalendarDelete` answer `invalid_args` naming the event as a
+      recurring series, or as already cancelled, is the tool's own refusal:
+      a series is deleted only with `series: true`, and a cancelled event has
+      nothing left to delete.
     - A `GmailModifyLabels` answer `invalid_args` saying `add` may not name
       `TRASH` or `SPAM` is the tool's own refusal: these tools never move
       mail to Trash or Spam.
     - A Calendar tool's `invalid_args` quoting Google's 400 is usually a
       `from` or `to` without an offset, or a `to` not after `from`; a 404 is
       an event or calendar id Google does not know — most often an event read
-      without the `calendar` it is on.
+      without the `calendar` it is on. On `CalendarCreate` and
+      `CalendarUpdate`, a `start`/`end` of different kinds, one without the
+      other, `time_zone` without them, or a recurring timed event without
+      `time_zone`, is the tool's own refusal; Google's 400 is usually an
+      inverted window, a time zone it does not know, or a malformed date or
+      time.
     - An `internal` error whose `detail` starts "api-request could not be
       issued" is Brenn's refusal before any call. It is almost always a clause
       that does not admit the method, host or path; the detail names it.
@@ -638,12 +746,12 @@ sections 3 and 5 in place.
          only remedy left.
 
     Fix the cause and restart.
-15. **No token in the container.** In the agent's container home, `grep -r`
+19. **No token in the container.** In the agent's container home, `grep -r`
     for the start of the access token (`ya29.`) and for the refresh token
     (`1//`). Nothing should match.
-16. **Vault modes.** `ls -la` of the vault shows `0700` directories and
+20. **Vault modes.** `ls -la` of the vault shows `0700` directories and
     `0600` files, owned by the server's user.
-17. **Disconnect.** Ask the assistant to disconnect one account. Then confirm
+21. **Disconnect.** Ask the assistant to disconnect one account. Then confirm
     that Brenn no longer appears at `myaccount.google.com/permissions` for
     that account, and that its file is gone from the vault.
 
@@ -655,8 +763,9 @@ and settings, the assistant can call Google itself through `api-request`.
 the Gmail profile, attachments, a message in another form, history, thread
 listings and draft listings; Calendar's colors and settings; and Calendar's
 events in a window for a caller without a user, as the automation below is.
-For the assistant, the calendar list, events, one event and free/busy, draft
-creation and label changes are the component's tools (section 5). Each host it names must be in the provider's `api_hosts`
+For the assistant, the calendar list, events, one event and free/busy,
+creating, changing and deleting events, draft creation and label changes are
+the component's tools (section 5). Each host it names must be in the provider's `api_hosts`
 (section 3) and admitted by a clause of the agent's grant.
 
 The assistant, reading only, beside its other grants:
@@ -686,6 +795,13 @@ clause there gives up that promise, whatever the tools refuse. For example:
   `add`, but that refusal covers only the tool's own calls.
 - **Deleting:** a `DELETE` on `drafts/*`, which deletes a draft outright,
   not to Trash.
+
+A raw write clause on `www.googleapis.com` likewise admits any body and gives
+up the Calendar promises: a `POST` on `events/*/move` moves an event to
+another calendar, a `POST` on `calendars/*/clear` deletes every event of a
+calendar, and a write with `sendUpdates=all` mails every guest whatever the
+user asked. The Calendar writes the assistant needs are `CalendarCreate`,
+`CalendarUpdate` and `CalendarDelete`; it needs no raw clause for them.
 
 A WASM automation with no conversation behind it, reading one user's calendar.
 The component's tools serve only a caller with a user of its own (section 5),

@@ -100,6 +100,9 @@ pub struct StubState {
     /// Status and body for every API request to an exact path, query
     /// excluded; ahead of `api_statuses` and `api_bodies`.
     pub api_failures: BTreeMap<String, (u16, Vec<u8>)>,
+    /// Status and body for every API request with an exact method and path,
+    /// query excluded; ahead of `api_failures`.
+    pub api_by_method: BTreeMap<(String, String), (u16, Vec<u8>)>,
     /// Extra headers on every API response.
     pub api_headers: Vec<(String, String)>,
     /// The body of every API response whose path has no entry in
@@ -205,7 +208,11 @@ async fn api(
         headers,
         body: body.to_vec(),
     });
-    let failure = s.api_failures.get(uri.path()).cloned();
+    let failure = s
+        .api_by_method
+        .get(&(method.to_string(), uri.path().to_string()))
+        .or_else(|| s.api_failures.get(uri.path()))
+        .cloned();
     let status = match &failure {
         Some((status, _)) => *status,
         None => s.api_statuses.pop_front().unwrap_or(200),

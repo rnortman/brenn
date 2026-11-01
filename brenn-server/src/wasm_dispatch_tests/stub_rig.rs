@@ -215,6 +215,17 @@ impl StubRig {
             .insert(path.to_string(), (status, body));
     }
 
+    /// The stub answers every `method` request for `path` with `status` and
+    /// `body`, ahead of `respond` and `answer` for that path; other methods
+    /// on it are answered as before.
+    pub fn respond_to(&self, method: &str, path: &str, status: u16, body: Vec<u8>) {
+        self.stub
+            .lock()
+            .unwrap()
+            .api_by_method
+            .insert((method.to_string(), path.to_string()), (status, body));
+    }
+
     /// Every API request the stub saw, as method, path and decoded query
     /// pairs, sorted.
     pub fn seen(&self) -> Vec<(String, String, Pairs)> {

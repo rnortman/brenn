@@ -183,6 +183,17 @@ const CALENDAR_LIST_PAGE: usize = 100;
 
 /// The path Calendar lists a calendar's events below: `{CALENDARS_PATH}/{id}/events`.
 const CALENDARS_PATH: &str = "/calendar/v3/calendars";
+
+/// A calendar's events collection. The calendar id goes into the path as it
+/// is; `api-request` percent-encodes it.
+fn events_path(calendar: &str) -> String {
+    format!("{CALENDARS_PATH}/{calendar}/events")
+}
+
+/// One event of a calendar, by `events_path`'s rule.
+fn event_path(calendar: &str, id: &str) -> String {
+    format!("{}/{id}", events_path(calendar))
+}
 /// The calendar a tool reads when the caller names none.
 const PRIMARY_CALENDAR: &str = "primary";
 /// events.list's mask: what an events line carries, the page token and the
@@ -211,7 +222,7 @@ const EVENT_GET_FIELDS: &str = "id,status,summary,description,location,start,end
                                 conferenceData/entryPoints(entryPointType,uri)";
 /// events.get's `maxAttendees`: past it Google returns only the calendar
 /// read's own attendee entry and marks the event `attendeesOmitted`. It bounds the read
-/// and the answer alike.
+/// and the answer alike, and is the most attendees an event write may name.
 const ATTENDEES_MAX: usize = 50;
 /// The most UTF-8 bytes of one event's text field (`summary`, `location`, the
 /// organizer's name, a recurrence line, the conference link) copied into an
@@ -331,6 +342,61 @@ const MODIFY_ADD_REFUSED: [&str; 2] = ["TRASH", "SPAM"];
 const MODIFY_UNKNOWN_HINT: &str =
     "the labels may already have been changed; asking again with the same arguments is safe";
 
+/// The most characters an event write's `summary` or `location` may hold. A
+/// write's arguments travel as one JSON body inside the nested call's args,
+/// which the host caps at 64 KiB: with every argument at its cap, each at its
+/// escaped width — `summary` and `location` at 7 bytes a character (escaped in
+/// the body and again in the args), `description` at 7, `recurrence` at 4
+/// (printable ASCII whose `"` and `\` escape twice), `attendees` at
+/// `ATTENDEES_MAX_BYTES` plus their `{"email":…}` wrapping, `start`, `end`
+/// and `time_zone` at 7 with `time_zone` written into both times, `account` at
+/// 6, the calendar id and an update's event id in the path at their bytes —
+/// the widest admitted create serializes to about 52 500 bytes and the widest
+/// update to about 53 600.
+const EVENT_FIELD_MAX_CHARS: usize = 1000;
+/// The most characters an event write's `description` may hold; see
+/// `EVENT_FIELD_MAX_CHARS` for the call's budget.
+const EVENT_DESCRIPTION_MAX_CHARS: usize = 2000;
+/// The most characters an event write's `time_zone` may hold: an IANA name,
+/// passed to Google as given.
+const EVENT_TIME_ZONE_MAX_CHARS: usize = 64;
+/// The most UTF-8 bytes an event write's `attendees` may hold together. A
+/// calendar id holds nothing JSON escapes (`calendar_id_shape` refuses `"`,
+/// `\` and controls), so its bytes are what it adds to the call; see
+/// `EVENT_FIELD_MAX_CHARS` for the call's budget.
+const ATTENDEES_MAX_BYTES: usize = 8_000;
+/// The most lines an event write's `recurrence` may hold.
+const RECURRENCE_WRITE_MAX: usize = 5;
+/// The most characters one `recurrence` line may hold, each printable ASCII.
+const RECURRENCE_LINE_MAX_CHARS: usize = 500;
+/// Google's `sendUpdates` words, in the order the schema states them: who
+/// Google emails about a write.
+const NOTIFY: [&str; 3] = ["none", "all", "externalOnly"];
+/// Whom a write notifies when the caller names nobody: nobody.
+const NOTIFY_DEFAULT: &str = "none";
+/// What the caller is told when an events.insert may have been acted on and
+/// its answer was lost or unreadable.
+const CREATE_UNKNOWN_HINT: &str = "the event may have been created before its answer was lost: \
+                                   look for it with CalendarEvents in its window before asking \
+                                   again, or the user has two";
+/// What the caller is told when an events.patch may have been acted on and
+/// its answer was lost or unreadable.
+const UPDATE_UNKNOWN_HINT: &str = "the change may already have been applied before its answer \
+                                   was lost: CalendarEvent shows the event as it is, and asking \
+                                   again with the same arguments is safe";
+/// `CalendarDelete`'s read of the event it deletes.
+const DELETE_READ_STEP: u8 = 1;
+/// `CalendarDelete`'s `DELETE`.
+const DELETE_STEP: u8 = 2;
+/// The fields the delete's read asks for: what the answer names, and what
+/// the series rule and the already-cancelled refusal read.
+const DELETE_READ_FIELDS: &str = "id,summary,start,recurrence,recurringEventId,status";
+/// What the caller is told when an events.delete may have been acted on and
+/// its answer was lost or unreadable.
+const DELETE_UNKNOWN_HINT: &str = "the event may already be deleted before its answer was lost: \
+                                   asking again is safe, since a deleted event is refused as \
+                                   already cancelled";
+
 /// The Google scope a step's call needs, named in a 403's hint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -338,6 +404,7 @@ pub enum Scope {
     GmailCompose,
     GmailOrganize,
     CalendarRead,
+    CalendarWrite,
 }
 
 impl Scope {
@@ -349,6 +416,7 @@ impl Scope {
             Scope::GmailCompose => "Gmail compose",
             Scope::GmailOrganize => "Gmail organize",
             Scope::CalendarRead => "Calendar read",
+            Scope::CalendarWrite => "Calendar events",
         }
     }
 }
@@ -374,6 +442,12 @@ fn scope(tool: Provided, step: u8) -> Scope {
             | Provided::CalendarFreeBusy,
             _,
         ) => Scope::CalendarRead,
+        // The delete's read is under the write set too: `calendar.events`
+        // reads, and an account connected for reading alone fails the
+        // `DELETE`, so the hint names the set that makes the whole tool work.
+        (Provided::CalendarCreate | Provided::CalendarUpdate | Provided::CalendarDelete, _) => {
+            Scope::CalendarWrite
+        }
     }
 }
 
@@ -437,10 +511,11 @@ fn get_call(
     new_call(settings, "GET", host, account, path, query, None)
 }
 
-/// A POST on `host` for `account` carrying `body` as JSON text, which
+/// A `method` call on `host` for `account` carrying `body` as JSON text, which
 /// `api-request` sends as `application/json` when no `Content-Type` is given.
-fn post_json_call(
+fn json_call(
     settings: &Settings,
+    method: &str,
     host: &str,
     account: Option<&str>,
     path: String,
@@ -448,7 +523,18 @@ fn post_json_call(
     body: Value,
 ) -> ApiCall {
     let body = serde_json::to_string(&body).expect("a JSON value serializes");
-    new_call(settings, "POST", host, account, path, query, Some(body))
+    new_call(settings, method, host, account, path, query, Some(body))
+}
+
+/// A DELETE on `host` for `account`, with no body.
+fn delete_call(
+    settings: &Settings,
+    host: &str,
+    account: Option<&str>,
+    path: String,
+    query: Query,
+) -> ApiCall {
+    new_call(settings, "DELETE", host, account, path, query, None)
 }
 
 /// One `api-request` call's arguments. `account`, when the caller named one,
@@ -618,7 +704,7 @@ fn calendars(args: &Args) -> Result<Vec<String>, String> {
     let Some(out) = id_list(
         args,
         "calendars",
-        FREEBUSY_CALENDARS_MAX,
+        (1, FREEBUSY_CALENDARS_MAX),
         "calendar ids",
         is_calendar_id,
         calendar_id_rule,
@@ -634,13 +720,13 @@ fn calendars(args: &Args) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// An argument that is 1 to `max` distinct ids, each held to `valid`; absent
-/// is `None`. Refusals say "`key` must be an array of 1 to `max`" `what`,
-/// "each of `key` must be" `rule`, or that it names an id twice.
+/// An argument that is `min` to `max` distinct ids, each held to `valid`;
+/// absent is `None`. Refusals say "`key` must be an array of `min` to `max`"
+/// `what`, "each of `key` must be" `rule`, or that it names an id twice.
 fn id_list(
     args: &Args,
     key: &str,
-    max: usize,
+    (min, max): (usize, usize),
     what: &str,
     valid: fn(&str) -> bool,
     rule: impl Fn() -> String,
@@ -649,8 +735,8 @@ fn id_list(
         return Ok(None);
     };
     let ids = match value {
-        Value::Array(ids) if (1..=max).contains(&ids.len()) => ids,
-        _ => return Err(format!("`{key}` must be an array of 1 to {max} {what}")),
+        Value::Array(ids) if (min..=max).contains(&ids.len()) => ids,
+        _ => return Err(format!("`{key}` must be an array of {min} to {max} {what}")),
     };
     let mut out: Vec<String> = Vec::with_capacity(ids.len());
     let mut seen = BTreeSet::new();
@@ -676,7 +762,28 @@ fn gmail_ids(
     max: usize,
     what: &str,
 ) -> Result<Option<Vec<String>>, String> {
-    id_list(args, key, max, what, is_gmail_id, gmail_id_rule)
+    id_list(args, key, (1, max), what, is_gmail_id, gmail_id_rule)
+}
+
+/// An argument that is one of `values`; absent is `None`. A refusal says
+/// "`key` must be one of" the values.
+// TODO(reuse-choice-refusal-duplicates-maps-one-of): the kit's parser, shared
+// with `google-maps-tools`.
+fn choice(args: &Args, key: &str, values: &[&'static str]) -> Result<Option<&'static str>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::String(given)) => match values.iter().find(|value| *value == given) {
+            Some(value) => Ok(Some(value)),
+            None => Err(choice_refusal(key, values)),
+        },
+        Some(_) => Err(choice_refusal(key, values)),
+    }
+}
+
+/// `choice`'s refusal.
+fn choice_refusal(key: &str, values: &[&str]) -> String {
+    let values: Vec<String> = values.iter().map(|value| format!("`{value}`")).collect();
+    format!("`{key}` must be one of {}", values.join(", "))
 }
 
 /// The `max_chars` argument: `MAX_CHARS_MIN` to `MAX_CHARS_MAX`, default
@@ -767,6 +874,27 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
             Ok(Call {
                 step: 1,
                 api: batch_modify_call(&modify, settings),
+            })
+        }
+        Provided::CalendarCreate => {
+            let create = EventWriteArgs::parse_create(args)?;
+            Ok(Call {
+                step: 1,
+                api: event_insert_call(&create, settings),
+            })
+        }
+        Provided::CalendarUpdate => {
+            let update = EventWriteArgs::parse_update(args)?;
+            Ok(Call {
+                step: 1,
+                api: event_patch_call(&update, settings),
+            })
+        }
+        Provided::CalendarDelete => {
+            let delete = DeleteArgs::parse(args)?;
+            Ok(Call {
+                step: DELETE_READ_STEP,
+                api: delete_read_call(&delete, settings),
             })
         }
     }
@@ -1011,8 +1139,7 @@ impl EventsArgs {
 }
 
 /// events.list of the window `from`..`to`, recurring events expanded into
-/// their instances in start order, one page of at most `max`. The calendar id
-/// goes into the path as it is; `api-request` percent-encodes it.
+/// their instances in start order, one page of at most `max`.
 fn events_list_call(args: &EventsArgs, settings: &Settings) -> ApiCall {
     let mut query = query([
         ("timeMin", args.from.clone()),
@@ -1033,7 +1160,7 @@ fn events_list_call(args: &EventsArgs, settings: &Settings) -> ApiCall {
         settings,
         &settings.calendar_host,
         args.account.as_deref(),
-        format!("{CALENDARS_PATH}/{}/events", args.calendar),
+        events_path(&args.calendar),
         query,
     )
 }
@@ -1061,14 +1188,13 @@ impl EventArgs {
     }
 }
 
-/// events.get of one event, at most `ATTENDEES_MAX` attendees listed. The
-/// calendar id goes into the path as it is; `api-request` percent-encodes it.
+/// events.get of one event, at most `ATTENDEES_MAX` attendees listed.
 fn event_get_call(args: &EventArgs, settings: &Settings) -> ApiCall {
     get_call(
         settings,
         &settings.calendar_host,
         args.account.as_deref(),
-        format!("{CALENDARS_PATH}/{}/events/{}", args.calendar, args.id),
+        event_path(&args.calendar, &args.id),
         query([
             ("maxAttendees", ATTENDEES_MAX.to_string()),
             ("fields", EVENT_GET_FIELDS.to_string()),
@@ -1107,8 +1233,9 @@ fn free_busy_call(args: &FreeBusyArgs, settings: &Settings) -> ApiCall {
         .iter()
         .map(|id| json!({ "id": id }))
         .collect();
-    post_json_call(
+    json_call(
         settings,
+        "POST",
         &settings.calendar_host,
         args.account.as_deref(),
         FREEBUSY_PATH.to_string(),
@@ -1120,6 +1247,423 @@ fn free_busy_call(args: &FreeBusyArgs, settings: &Settings) -> ApiCall {
             "calendarExpansionMax": args.calendars.len(),
         }),
     )
+}
+
+/// Which event write a `EventWriteArgs` is parsed for: a create requires
+/// `summary`, `start` and `end`; an update requires `id`, admits an empty
+/// `attendees`, and moves `start` and `end` together.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventWrite {
+    Create,
+    Update,
+}
+
+/// `CalendarCreate`'s and `CalendarUpdate`'s arguments. Every value is passed
+/// to Google as given; the parser decides only which of Google's two time
+/// shapes `start` and `end` are sent as.
+struct EventWriteArgs {
+    calendar: String,
+    /// The event an update changes; `None` on a create.
+    id: Option<String>,
+    summary: Option<String>,
+    start: Option<String>,
+    end: Option<String>,
+    description: Option<String>,
+    location: Option<String>,
+    attendees: Option<Vec<String>>,
+    time_zone: Option<String>,
+    recurrence: Option<Vec<String>>,
+    notify: &'static str,
+    account: Option<String>,
+}
+
+impl EventWriteArgs {
+    /// Every argument `CalendarCreate` takes.
+    const CREATE_KEYS: &[&str] = &[
+        "calendar",
+        "summary",
+        "start",
+        "end",
+        "description",
+        "location",
+        "attendees",
+        "time_zone",
+        "recurrence",
+        "notify",
+        "account",
+    ];
+    /// Every argument `CalendarUpdate` takes.
+    const UPDATE_KEYS: &[&str] = &[
+        "id",
+        "calendar",
+        "summary",
+        "start",
+        "end",
+        "description",
+        "location",
+        "attendees",
+        "time_zone",
+        "recurrence",
+        "notify",
+        "account",
+    ];
+
+    fn parse_create(args: &Value) -> Result<EventWriteArgs, String> {
+        Self::parse(args, EventWrite::Create)
+    }
+
+    fn parse_update(args: &Value) -> Result<EventWriteArgs, String> {
+        Self::parse(args, EventWrite::Update)
+    }
+
+    fn parse(args: &Value, write: EventWrite) -> Result<EventWriteArgs, String> {
+        let keys = match write {
+            EventWrite::Create => Self::CREATE_KEYS,
+            EventWrite::Update => Self::UPDATE_KEYS,
+        };
+        let map = object(args, keys)?;
+        let id = match write {
+            EventWrite::Create => None,
+            EventWrite::Update => Some(event_id(map, "id")?.ok_or("`id` is required")?),
+        };
+        let text = |key: &str, max: usize| -> Result<Option<String>, String> {
+            Ok(capped(map, key, max)?.map(str::to_string))
+        };
+        let summary = text("summary", EVENT_FIELD_MAX_CHARS)?;
+        let start = time(map, "start")?;
+        let end = time(map, "end")?;
+        if write == EventWrite::Create {
+            for (key, value) in [("summary", &summary), ("start", &start), ("end", &end)] {
+                if value.is_none() {
+                    return Err(format!("`{key}` is required"));
+                }
+            }
+        }
+        let min_attendees = match write {
+            EventWrite::Create => 1,
+            EventWrite::Update => 0,
+        };
+        let attendees = id_list(
+            map,
+            "attendees",
+            (min_attendees, ATTENDEES_MAX),
+            "email addresses",
+            is_calendar_id,
+            calendar_id_rule,
+        )?;
+        if attendees.iter().flatten().map(String::len).sum::<usize>() > ATTENDEES_MAX_BYTES {
+            return Err(format!(
+                "`attendees` together exceed {ATTENDEES_MAX_BYTES} bytes (UTF-8); name fewer"
+            ));
+        }
+        let recurrence = id_list(
+            map,
+            "recurrence",
+            (1, RECURRENCE_WRITE_MAX),
+            "RRULE, RDATE or EXDATE lines",
+            is_recurrence_line,
+            || format!("1 to {RECURRENCE_LINE_MAX_CHARS} printable ASCII characters"),
+        )?;
+        let parsed = EventWriteArgs {
+            calendar: calendar_id(map, "calendar")?.unwrap_or_else(|| PRIMARY_CALENDAR.to_string()),
+            id,
+            summary,
+            start,
+            end,
+            description: text("description", EVENT_DESCRIPTION_MAX_CHARS)?,
+            location: text("location", EVENT_FIELD_MAX_CHARS)?,
+            attendees,
+            time_zone: text("time_zone", EVENT_TIME_ZONE_MAX_CHARS)?,
+            recurrence,
+            notify: choice(map, "notify", &NOTIFY)?.unwrap_or(NOTIFY_DEFAULT),
+            account: account(map)?,
+        };
+        parsed.cross_field(write)?;
+        Ok(parsed)
+    }
+
+    /// The rules between arguments: `start` and `end` of one shape; on an
+    /// update, both or neither, and `time_zone` only with them; a recurring
+    /// timed event names its `time_zone`; an update names a field to change.
+    fn cross_field(&self, write: EventWrite) -> Result<(), String> {
+        if write == EventWrite::Update
+            && (self.start.is_some() != self.end.is_some()
+                || (self.time_zone.is_some() && self.start.is_none()))
+        {
+            return Err(
+                "`start` and `end` must be given together, and `time_zone` only with \
+                        them"
+                    .to_string(),
+            );
+        }
+        if let (Some(start), Some(end)) = (&self.start, &self.end)
+            && is_date_shape(start) != is_date_shape(end)
+        {
+            return Err(
+                "`start` and `end` must both be `YYYY-MM-DD` dates or both be times".to_string(),
+            );
+        }
+        if self.recurrence.is_some()
+            && self
+                .start
+                .as_deref()
+                .is_some_and(|start| !is_date_shape(start))
+            && self.time_zone.is_none()
+        {
+            return Err("a recurring timed event needs `time_zone`".to_string());
+        }
+        if write == EventWrite::Update
+            && self.summary.is_none()
+            && self.start.is_none()
+            && self.description.is_none()
+            && self.location.is_none()
+            && self.attendees.is_none()
+            && self.recurrence.is_none()
+        {
+            return Err("`CalendarUpdate` changes nothing: name a field".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Whether `value` is one `recurrence` line: 1 to `RECURRENCE_LINE_MAX_CHARS`
+/// printable ASCII characters.
+fn is_recurrence_line(value: &str) -> bool {
+    is_printable_ascii(value, RECURRENCE_LINE_MAX_CHARS)
+}
+
+/// Whether `value` has the shape of an all-day date, `dddd-dd-dd`: ten bytes,
+/// digits but for a hyphen at the fifth and eighth. Nothing is interpreted; a
+/// value of this shape Google does not take as a date is Google's to refuse.
+fn is_date_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(at, b)| match at {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+/// One event time as Google takes it: `{"date"}` for a date-shaped value,
+/// `{"dateTime"}` for any other, with `timeZone` when given. A `complete`
+/// time also sends the other shape's key as `null`, so a patch replaces the
+/// stored time whole whichever shape it held.
+fn event_time(value: &str, time_zone: Option<&str>, complete: bool) -> Value {
+    let (given, other) = if is_date_shape(value) {
+        ("date", "dateTime")
+    } else {
+        ("dateTime", "date")
+    };
+    let mut time = Args::new();
+    time.insert(given.to_string(), json!(value));
+    if complete {
+        time.insert(other.to_string(), Value::Null);
+    }
+    if let Some(zone) = time_zone {
+        time.insert("timeZone".to_string(), json!(zone));
+    }
+    Value::Object(time)
+}
+
+/// An event write's body: each field the caller named, and no other. No
+/// top-level key is ever `null`; times are `complete` on an update.
+fn event_body(args: &EventWriteArgs, complete: bool) -> Value {
+    let mut body = Args::new();
+    for (key, value) in [
+        ("summary", &args.summary),
+        ("description", &args.description),
+        ("location", &args.location),
+    ] {
+        if let Some(value) = value {
+            body.insert(key.to_string(), json!(value));
+        }
+    }
+    for (key, value) in [("start", &args.start), ("end", &args.end)] {
+        if let Some(value) = value {
+            body.insert(
+                key.to_string(),
+                event_time(value, args.time_zone.as_deref(), complete),
+            );
+        }
+    }
+    if let Some(attendees) = &args.attendees {
+        let attendees: Vec<Value> = attendees
+            .iter()
+            .map(|email| json!({ "email": email }))
+            .collect();
+        body.insert("attendees".to_string(), Value::Array(attendees));
+    }
+    if let Some(recurrence) = &args.recurrence {
+        body.insert("recurrence".to_string(), json!(recurrence));
+    }
+    Value::Object(body)
+}
+
+/// An event write's query: whom Google notifies, always sent, and the
+/// events.get mask, so the answer is the event `compact_event` reads.
+fn event_write_query(args: &EventWriteArgs) -> Query {
+    query([
+        ("sendUpdates", args.notify.to_string()),
+        ("maxAttendees", ATTENDEES_MAX.to_string()),
+        ("fields", EVENT_GET_FIELDS.to_string()),
+    ])
+}
+
+/// events.insert of the arguments' event on their calendar.
+fn event_insert_call(args: &EventWriteArgs, settings: &Settings) -> ApiCall {
+    json_call(
+        settings,
+        "POST",
+        &settings.calendar_host,
+        args.account.as_deref(),
+        events_path(&args.calendar),
+        event_write_query(args),
+        event_body(args, false),
+    )
+}
+
+/// events.patch of the arguments' event: only the fields named change.
+fn event_patch_call(args: &EventWriteArgs, settings: &Settings) -> ApiCall {
+    let id = args.id.as_deref().expect("an update's parse requires `id`");
+    json_call(
+        settings,
+        "PATCH",
+        &settings.calendar_host,
+        args.account.as_deref(),
+        event_path(&args.calendar, id),
+        event_write_query(args),
+        event_body(args, true),
+    )
+}
+
+/// `CalendarDelete`'s arguments.
+struct DeleteArgs {
+    id: String,
+    calendar: String,
+    /// Whether the caller asked to delete a recurring series whole.
+    series: bool,
+    notify: &'static str,
+    account: Option<String>,
+}
+
+impl DeleteArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["id", "calendar", "series", "notify", "account"];
+
+    fn parse(args: &Value) -> Result<DeleteArgs, String> {
+        let map = object(args, Self::KEYS)?;
+        Ok(DeleteArgs {
+            id: event_id(map, "id")?.ok_or("`id` is required")?,
+            calendar: calendar_id(map, "calendar")?.unwrap_or_else(|| PRIMARY_CALENDAR.to_string()),
+            series: flag(map, "series")?,
+            notify: choice(map, "notify", &NOTIFY)?.unwrap_or(NOTIFY_DEFAULT),
+            account: account(map)?,
+        })
+    }
+
+    fn path(&self) -> String {
+        event_path(&self.calendar, &self.id)
+    }
+}
+
+/// events.get of the event a delete names: what the answer reports and what
+/// the series rule reads, nothing more.
+fn delete_read_call(args: &DeleteArgs, settings: &Settings) -> ApiCall {
+    get_call(
+        settings,
+        &settings.calendar_host,
+        args.account.as_deref(),
+        args.path(),
+        query([("fields", DELETE_READ_FIELDS.to_string())]),
+    )
+}
+
+/// events.delete of the event, whom Google notifies always sent.
+fn event_delete_call(args: &DeleteArgs, settings: &Settings) -> ApiCall {
+    delete_call(
+        settings,
+        &settings.calendar_host,
+        args.account.as_deref(),
+        args.path(),
+        query([("sendUpdates", args.notify.to_string())]),
+    )
+}
+
+/// The delete's read: the event's `DELETE` next, carrying in `derived` the
+/// `summary` and `start` the answer names and `series: true` for a series
+/// master. An event already cancelled is refused; a series master is deleted
+/// only with `series`, and `series` is refused for any other event. An event
+/// whose id is not the one asked for is Google's fault.
+fn delete_checked(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
+    let api = "events.get";
+    let args = stored(state, DeleteArgs::parse)?;
+    let mut event = Compact::of(body, api)?;
+    if event.string("id")? != Some(args.id.as_str()) {
+        return Err(shape(api));
+    }
+    let status = event.string("status")?;
+    let master = !event.array("recurrence")?.is_empty();
+    let occurrence_of = match event.string("recurringEventId")? {
+        None => None,
+        Some(master_id) if is_event_id(master_id) => Some(master_id),
+        Some(_) => return Err(shape(api)),
+    };
+    event.text("summary", "summary", EVENT_TEXT_MAX_BYTES)?;
+    event.when("start")?;
+    let id = &args.id;
+    let refusal = if status == Some("cancelled") {
+        Some(format!(
+            "`{id}` is already cancelled (deleted); nothing to delete"
+        ))
+    } else if master && !args.series {
+        Some(format!(
+            "`{id}` is a recurring series: pass `series: true` to delete every occurrence, or \
+             delete one occurrence by its own `id` from `CalendarEvents`"
+        ))
+    } else if args.series && !master {
+        Some(match occurrence_of {
+            Some(master_id) => format!(
+                "`{id}` is one occurrence of the series `{master_id}`: delete the series by that \
+                 id with `series: true`, or this occurrence without `series`"
+            ),
+            None => format!("`{id}` is not a recurring series: delete it without `series`"),
+        })
+    } else {
+        None
+    };
+    if let Some(detail) = refusal {
+        return Err(Failure {
+            kind: ErrorKind::InvalidArgs,
+            detail,
+        });
+    }
+    let Value::Object(mut derived) = event.done() else {
+        unreachable!("a compacted event is an object");
+    };
+    if master {
+        derived.insert("series".to_string(), json!(true));
+    }
+    Ok(Next::Call {
+        call: Call {
+            step: DELETE_STEP,
+            api: event_delete_call(&args, settings),
+        },
+        derived,
+    })
+}
+
+/// An events.delete Google accepted, whatever 2xx it answered with:
+/// `deleted: true`, the `id`, and from the read before it the event's
+/// `summary`, `start` and `series: true` for a series master.
+fn delete_accepted(state: &InFlight) -> Result<Next, Failure> {
+    let args = stored(state, DeleteArgs::parse).map_err(|failure| at_write(state, failure))?;
+    let mut out = Args::new();
+    out.insert("deleted".to_string(), json!(true));
+    out.insert("id".to_string(), json!(args.id));
+    for key in ["summary", "start", "series", "fields_truncated"] {
+        copy(&mut out, key, state.derived.get(key));
+    }
+    Ok(Next::Complete(Value::Object(out)))
 }
 
 /// `GmailDraft`'s arguments, each header value held to what the message
@@ -1184,7 +1728,9 @@ struct Threading {
 fn header_ascii(args: &Args, key: &str) -> Result<Option<String>, String> {
     match args.get(key) {
         None => Ok(None),
-        Some(Value::String(value)) if is_header_ascii(value) => Ok(Some(value.clone())),
+        Some(Value::String(value)) if is_printable_ascii(value, HEADER_VALUE_MAX_BYTES) => {
+            Ok(Some(value.clone()))
+        }
         Some(_) => Err(format!(
             "`{key}` must be 1 to {HEADER_VALUE_MAX_BYTES} printable ASCII characters (a \
              display name in another script is left out or written in ASCII)"
@@ -1192,17 +1738,16 @@ fn header_ascii(args: &Args, key: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Whether `value` is 1 to `HEADER_VALUE_MAX_BYTES` bytes of 0x20 to 0x7E.
-fn is_header_ascii(value: &str) -> bool {
-    (1..=HEADER_VALUE_MAX_BYTES).contains(&value.len())
-        && value.bytes().all(|b| (0x20..=0x7e).contains(&b))
+/// Whether `value` is 1 to `max` bytes of 0x20 to 0x7E.
+fn is_printable_ascii(value: &str, max: usize) -> bool {
+    (1..=max).contains(&value.len()) && value.bytes().all(|b| (0x20..=0x7e).contains(&b))
 }
 
-/// What `is_header_ascii` admits, as the `pattern` an `input_schema` states
-/// it.
+/// What `is_printable_ascii` admits for `max`, as the `pattern` an
+/// `input_schema` states it.
 #[cfg(test)]
-fn header_ascii_pattern() -> String {
-    format!(r"^[\x20-\x7e]{{1,{HEADER_VALUE_MAX_BYTES}}}$")
+fn printable_ascii_pattern(max: usize) -> String {
+    format!(r"^[\x20-\x7e]{{1,{max}}}$")
 }
 
 /// A draft's `subject`: at most `SUBJECT_MAX_CHARS` characters, no control
@@ -1266,8 +1811,9 @@ fn draft_create_call(
     if let Some(reply) = reply {
         message["threadId"] = json!(reply.thread_id);
     }
-    post_json_call(
+    json_call(
         settings,
+        "POST",
         &settings.gmail_host,
         args.account.as_deref(),
         DRAFTS_PATH.to_string(),
@@ -1295,15 +1841,15 @@ fn draft_reply(state: &InFlight, body: &Value, settings: &Settings) -> Result<Ne
         Some(Value::String(id)) if is_gmail_id(id) => id.clone(),
         _ => return Err(shape(api)),
     };
-    let message_id =
-        raw_header(body, "Message-ID", api)?.filter(|id| is_header_ascii(id) && !id.contains(' '));
+    let message_id = raw_header(body, "Message-ID", api)?
+        .filter(|id| is_printable_ascii(id, HEADER_VALUE_MAX_BYTES) && !id.contains(' '));
     let original_references = raw_header(body, "References", api)?;
     let original_subject = raw_header(body, "Subject", api)?;
     let threading = message_id.map(|id| Threading {
         in_reply_to: id.to_string(),
         references: match original_references {
             Some(references)
-                if is_header_ascii(references)
+                if is_printable_ascii(references, HEADER_VALUE_MAX_BYTES)
                     && references.len() + 1 + id.len() <= HEADER_VALUE_MAX_BYTES =>
             {
                 format!("{references} {id}")
@@ -1467,8 +2013,9 @@ fn batch_modify_call(args: &ModifyLabelsArgs, settings: &Settings) -> ApiCall {
     if let Some(remove) = &args.remove {
         body["removeLabelIds"] = json!(remove);
     }
-    post_json_call(
+    json_call(
         settings,
+        "POST",
         &settings.gmail_host,
         args.account.as_deref(),
         BATCH_MODIFY_PATH.to_string(),
@@ -1747,11 +2294,30 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
                 .and_then(|args| compact_events(&body, args.max))
                 .map(Next::Complete),
             (Provided::CalendarEvent, 1) => stored(state, EventArgs::parse)
-                .and_then(|args| compact_event(&body, &args))
+                .and_then(|args| compact_event(&body, "events.get", Some(&args.id), args.max_chars))
                 .map(Next::Complete),
+            (Provided::CalendarCreate, 1) => {
+                compact_event(&body, "events.insert", None, written_event_max_chars())
+                    .map(Next::Complete)
+                    .map_err(|failure| at_write(state, failure))
+            }
+            (Provided::CalendarUpdate, 1) => stored(state, EventWriteArgs::parse_update)
+                .and_then(|args| {
+                    compact_event(
+                        &body,
+                        "events.patch",
+                        args.id.as_deref(),
+                        written_event_max_chars(),
+                    )
+                })
+                .map(Next::Complete)
+                .map_err(|failure| at_write(state, failure)),
             (Provided::CalendarFreeBusy, 1) => stored(state, FreeBusyArgs::parse)
                 .and_then(|args| compact_free_busy(&body, &args))
                 .map(Next::Complete),
+            (Provided::CalendarDelete, DELETE_READ_STEP) => delete_checked(state, &body, settings),
+            // Google's acceptance of a delete, whatever its body.
+            (Provided::CalendarDelete, DELETE_STEP) => delete_accepted(state),
             (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 named(state, &body)
             }
@@ -1795,6 +2361,7 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
             | (Provided::GmailRead, STRUCTURE_STEP)
             | (Provided::GmailThread, THREAD_NARROW_STEP)
             | (Provided::CalendarList | Provided::CalendarEvent, 1)
+            | (Provided::CalendarDelete, DELETE_READ_STEP)
             | (Provided::GmailDraft, DRAFT_ORIGINAL_STEP)
             | (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 Err(why.failure(None))
@@ -1813,6 +2380,9 @@ fn write_hint(tool: Provided, step: u8) -> Option<&'static str> {
     match (tool, step) {
         (Provided::GmailDraft, DRAFT_CREATE_STEP) => Some(DRAFT_UNKNOWN_HINT),
         (Provided::GmailModifyLabels, 1) => Some(MODIFY_UNKNOWN_HINT),
+        (Provided::CalendarCreate, 1) => Some(CREATE_UNKNOWN_HINT),
+        (Provided::CalendarUpdate, 1) => Some(UPDATE_UNKNOWN_HINT),
+        (Provided::CalendarDelete, DELETE_STEP) => Some(DELETE_UNKNOWN_HINT),
         _ => None,
     }
 }
@@ -1832,13 +2402,17 @@ fn at_write(state: &InFlight, failure: Failure) -> Failure {
     }
 }
 
-/// A 2xx with no body, decided by the step: a label change is accepted;
-/// every other step refuses it, naming the API whose answer it expected, as
-/// that step's `shape` failure names it, with a write step's hint.
+/// A 2xx with no body, decided by the step: a label change and an event's
+/// delete are accepted; every other step refuses it, naming the API whose
+/// answer it expected, as that step's `shape` failure names it, with a write
+/// step's hint.
 fn no_body(state: &InFlight, status: u64) -> Result<Next, Failure> {
     let (api, answers) = match (state.tool, state.step) {
         (Provided::GmailModifyLabels, 1) => return modify_labels_accepted(state),
+        (Provided::CalendarDelete, DELETE_STEP) => return delete_accepted(state),
         (Provided::GmailDraft, DRAFT_CREATE_STEP) => ("drafts.create", "the draft"),
+        (Provided::CalendarCreate, 1) => ("events.insert", "the event"),
+        (Provided::CalendarUpdate, 1) => ("events.patch", "the event"),
         (Provided::GmailLabels, 1) => match stored(state, LabelsArgs::parse) {
             Ok(LabelsArgs { id: Some(_), .. }) => ("labels.get", "JSON"),
             Ok(LabelsArgs { id: None, .. }) => ("labels.list", "JSON"),
@@ -1854,7 +2428,9 @@ fn no_body(state: &InFlight, status: u64) -> Result<Next, Failure> {
         }
         (Provided::CalendarList, 1) => ("calendarList.list", "JSON"),
         (Provided::CalendarEvents, 1) => ("events.list", "JSON"),
-        (Provided::CalendarEvent, 1) => ("events.get", "JSON"),
+        (Provided::CalendarEvent, 1) | (Provided::CalendarDelete, DELETE_READ_STEP) => {
+            ("events.get", "JSON")
+        }
         (Provided::CalendarFreeBusy, 1) => ("freebusy.query", "JSON"),
         (tool, step) => return Err(no_such_step(tool, step)),
     };
@@ -1875,7 +2451,7 @@ fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
         Ok(Next::Complete(value)) => {
             let (value, hint) = match tool {
                 Provided::GmailRead => (fit_text(value, "text", COMPACT_RESULT_CEILING), None),
-                Provided::CalendarEvent => {
+                Provided::CalendarEvent | Provided::CalendarCreate | Provided::CalendarUpdate => {
                     (fit_text(value, "description", COMPACT_RESULT_CEILING), None)
                 }
                 Provided::GmailThread => (fit_thread(value, COMPACT_RESULT_CEILING), None),
@@ -1885,7 +2461,8 @@ fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
                 | Provided::CalendarList
                 | Provided::CalendarEvents
                 | Provided::GmailDraft
-                | Provided::GmailModifyLabels => (value, None),
+                | Provided::GmailModifyLabels
+                | Provided::CalendarDelete => (value, None),
             };
             bounded(value, COMPACT_RESULT_CEILING, hint)
         }
@@ -2726,22 +3303,35 @@ fn self_response<'a>(event: &Compact<'a>) -> Result<Option<&'a str>, Failure> {
     Ok(found.flatten())
 }
 
-/// events.get as one event: `id`, `summary`, `description` (cut at
+/// The `max_chars` a written event's answer cuts `description` at: a write
+/// takes no `max_chars`, so `CalendarEvent`'s default.
+fn written_event_max_chars() -> usize {
+    usize::try_from(MAX_CHARS_DEFAULT).expect("MAX_CHARS_DEFAULT fits usize")
+}
+
+/// One event as events.get, insert or patch answers it: `id`, `summary`, `description` (cut at
 /// `max_chars` characters, `description_chars` its whole length), `start`,
 /// `end`, `location`, `status`, `organizer`, `self_response`, `attendees`
 /// with their counts or `attendees_omitted`, `recurrence`,
 /// `recurring_event_id` and `conference`. An event whose id is not the one
-/// asked for is Google's fault.
-fn compact_event(body: &Value, args: &EventArgs) -> Result<Value, Failure> {
-    let api = "events.get";
+/// asked for (`expected`, when the caller knows it) is Google's fault, and
+/// every shape failure names `api`, the method that answered.
+fn compact_event(
+    body: &Value,
+    api: &str,
+    expected: Option<&str>,
+    max_chars: usize,
+) -> Result<Value, Failure> {
     let mut event = Compact::of(body, api)?;
-    if event.string("id")? != Some(args.id.as_str()) {
+    if let Some(expected) = expected
+        && event.string("id")? != Some(expected)
+    {
         return Err(shape(api));
     }
     event.id("id", "id", is_event_id)?;
     event.text("summary", "summary", EVENT_TEXT_MAX_BYTES)?;
     if let Some(description) = event.string("description")? {
-        put_cut_text(&mut event.out, "description", description, args.max_chars);
+        put_cut_text(&mut event.out, "description", description, max_chars);
     }
     event.when("start")?;
     event.when("end")?;
@@ -5363,15 +5953,22 @@ mod tests {
             | Provided::CalendarEvents
             | Provided::CalendarEvent
             | Provided::CalendarFreeBusy
-            | Provided::GmailModifyLabels => vec![1],
+            | Provided::GmailModifyLabels
+            | Provided::CalendarCreate
+            | Provided::CalendarUpdate => vec![1],
             Provided::GmailDraft => vec![DRAFT_ORIGINAL_STEP, DRAFT_CREATE_STEP],
+            Provided::CalendarDelete => vec![DELETE_READ_STEP, DELETE_STEP],
         }
     }
 
     /// Every step that completes on any 2xx, an empty one included, and so
     /// names no API it expected: `a_label_change_is_accepted_on_any_2xx`
-    /// holds the label change's.
-    const ACCEPTS_EVERY_2XX: [(Provided, u8); 1] = [(Provided::GmailModifyLabels, 1)];
+    /// holds the label change's, `a_delete_is_accepted_on_any_2xx` the
+    /// event's delete.
+    const ACCEPTS_EVERY_2XX: [(Provided, u8); 2] = [
+        (Provided::GmailModifyLabels, 1),
+        (Provided::CalendarDelete, DELETE_STEP),
+    ];
 
     #[test]
     fn every_step_names_its_scope() {
@@ -5380,6 +5977,12 @@ mod tests {
                 let expected = match (tool, step) {
                     (Provided::GmailDraft, DRAFT_CREATE_STEP) => Scope::GmailCompose,
                     (Provided::GmailModifyLabels, 1) => Scope::GmailOrganize,
+                    (
+                        Provided::CalendarCreate
+                        | Provided::CalendarUpdate
+                        | Provided::CalendarDelete,
+                        _,
+                    ) => Scope::CalendarWrite,
                     _ if tool.name().starts_with("gmail-") => Scope::GmailRead,
                     _ => {
                         assert!(tool.name().starts_with("calendar-"), "{}", tool.name());
@@ -5997,19 +6600,27 @@ mod tests {
     /// Every argument `tool` takes, with the bound its parser holds it to,
     /// and the arguments it requires: the parser's own constants and key
     /// lists, as `every_tools_schema_states_what_its_parser_enforces` holds
-    /// the spec to them. Eight parser rules are outside what a schema
+    /// the spec to them. Thirteen parser rules are outside what a schema
     /// states, each leaving the schema wider than the parser and each in the
     /// description: `calendars`' ids together hold at most
     /// `FREEBUSY_IDS_MAX_BYTES`, a draft's `body` at most `BODY_MAX_BYTES` in
-    /// its CRLF form, and a label change's `ids` at most
-    /// `MODIFY_IDS_MAX_CHARS`, as `every_description_states_its_parsers_budgets`
-    /// holds them; a draft's `subject` holds no control character; a label
-    /// change's `add` names none of `MODIFY_ADD_REFUSED`; and three
-    /// are cross-field — a draft without `reply_to_id` requires `subject`,
-    /// as `draft_requires_a_subject_unless_it_replies` holds, and a label
-    /// change names a label in `add` or `remove` and none in both, as
-    /// `modify_labels_refuses_bad_arguments` holds. The per-value probes are
-    /// this component's, in `workspace_probes`.
+    /// its CRLF form, a label change's `ids` at most `MODIFY_IDS_MAX_CHARS`,
+    /// and an event write's `attendees` at most `ATTENDEES_MAX_BYTES`, as
+    /// `every_description_states_its_parsers_budgets` holds them; a draft's
+    /// `subject` holds no control character; a label change's `add` names
+    /// none of `MODIFY_ADD_REFUSED`; and seven are cross-field — a draft
+    /// without `reply_to_id` requires `subject`, as
+    /// `draft_requires_a_subject_unless_it_replies` holds; a label change
+    /// names a label in `add` or `remove` and none in both, as
+    /// `modify_labels_refuses_bad_arguments` holds; an event write's `start`
+    /// and `end` are both dates or both times, an update gives them together
+    /// and `time_zone` only with them, a recurring timed event names its
+    /// `time_zone`, and an update names a field to change, as
+    /// `event_times_are_both_dates_or_both_times`,
+    /// `an_update_moves_start_and_end_together`,
+    /// `a_recurring_timed_event_needs_a_time_zone` and
+    /// `an_update_names_a_field` hold. The per-value probes are this
+    /// component's, in `workspace_probes`.
     fn bounds(tool: Provided) -> ToolBounds<'static> {
         let (keys, required): (&'static [&'static str], &'static [&'static str]) = match tool {
             Provided::GmailLabels => (LabelsArgs::KEYS, &[]),
@@ -6022,6 +6633,9 @@ mod tests {
             Provided::CalendarFreeBusy => (FreeBusyArgs::KEYS, &["from", "to"]),
             Provided::GmailDraft => (DraftArgs::KEYS, &["to", "body"]),
             Provided::GmailModifyLabels => (ModifyLabelsArgs::KEYS, &["ids"]),
+            Provided::CalendarCreate => (EventWriteArgs::CREATE_KEYS, &["summary", "start", "end"]),
+            Provided::CalendarUpdate => (EventWriteArgs::UPDATE_KEYS, &["id"]),
+            Provided::CalendarDelete => (DeleteArgs::KEYS, &["id"]),
         };
         let text = |max_chars| Bound::Text {
             max_chars,
@@ -6039,12 +6653,32 @@ mod tests {
         let property = |key: &'static str| {
             let bound = match (tool, key) {
                 (_, "account") => text(ACCOUNT_MAX_CHARS),
-                (Provided::GmailDraft, "to" | "cc") => Bound::Pattern(header_ascii_pattern()),
+                (Provided::GmailDraft, "to" | "cc") => {
+                    Bound::Pattern(printable_ascii_pattern(HEADER_VALUE_MAX_BYTES))
+                }
                 (Provided::GmailDraft, "subject") => text(SUBJECT_MAX_CHARS),
                 (Provided::GmailDraft, "body") => text(BODY_MAX_CHARS),
                 (_, "q") => text(QUERY_MAX_CHARS),
                 (_, "page") => text(PAGE_MAX_CHARS),
-                (_, "from" | "to") => text(TIME_MAX_CHARS),
+                (_, "from" | "to" | "start" | "end") => text(TIME_MAX_CHARS),
+                (_, "summary" | "location") => text(EVENT_FIELD_MAX_CHARS),
+                (_, "description") => text(EVENT_DESCRIPTION_MAX_CHARS),
+                (_, "time_zone") => text(EVENT_TIME_ZONE_MAX_CHARS),
+                (_, "attendees") => Bound::Array {
+                    min: usize::from(tool == Provided::CalendarCreate),
+                    max: ATTENDEES_MAX,
+                    unique: true,
+                    item: Box::new(Bound::Pattern(calendar_id_pattern())),
+                },
+                (_, "recurrence") => Bound::Array {
+                    min: 1,
+                    max: RECURRENCE_WRITE_MAX,
+                    unique: true,
+                    item: Box::new(Bound::Pattern(printable_ascii_pattern(
+                        RECURRENCE_LINE_MAX_CHARS,
+                    ))),
+                },
+                (_, "notify") => Bound::Enum(NOTIFY.to_vec()),
                 (_, "calendar") => Bound::Pattern(calendar_id_pattern()),
                 (_, "calendars") => Bound::Array {
                     min: 1,
@@ -6055,12 +6689,15 @@ mod tests {
                 (Provided::GmailModifyLabels, "ids") => gmail_ids(MODIFY_IDS_MAX),
                 (Provided::GmailModifyLabels, "add" | "remove") => gmail_ids(MODIFY_LABELS_MAX),
                 (_, "max_chars") => integer(MAX_CHARS_MIN, MAX_CHARS_MAX),
-                (_, "spam_trash") => Bound::Bool,
+                (_, "spam_trash" | "series") => Bound::Bool,
                 (Provided::GmailLabels | Provided::GmailRead | Provided::GmailThread, "id")
                 | (Provided::GmailDraft, "reply_to_id") => Bound::Token {
                     max_chars: ID_MAX_CHARS,
                 },
-                (Provided::CalendarEvent, "id") => Bound::Token {
+                (
+                    Provided::CalendarEvent | Provided::CalendarUpdate | Provided::CalendarDelete,
+                    "id",
+                ) => Bound::Token {
                     max_chars: EVENT_ID_MAX_CHARS,
                 },
                 (Provided::GmailSearch, "max") => integer(SEARCH_MAX_MIN, SEARCH_MAX_MAX),
@@ -6083,12 +6720,14 @@ mod tests {
             Provided::GmailLabels | Provided::CalendarList => json!({}),
             Provided::GmailSearch => json!({ "q": "from:alice" }),
             Provided::GmailRead | Provided::GmailThread => json!({ "id": "m1" }),
-            Provided::CalendarEvent => json!({ "id": "e1" }),
+            Provided::CalendarEvent | Provided::CalendarDelete => json!({ "id": "e1" }),
             Provided::CalendarEvents | Provided::CalendarFreeBusy => {
                 json!({ "from": FROM, "to": TO })
             }
             Provided::GmailDraft => draft_args(json!({})),
             Provided::GmailModifyLabels => modify_args(json!({})),
+            Provided::CalendarCreate => create_args(json!({})),
+            Provided::CalendarUpdate => update_args(json!({})),
         }
     }
 
@@ -6233,6 +6872,75 @@ mod tests {
                 .chain([json!(1)])
                 .collect(),
             },
+            (_, "attendees") => {
+                let min = usize::from(tool == Provided::CalendarCreate);
+                let emails = |n: usize| {
+                    json!(
+                        (0..n)
+                            .map(|i| format!("a{i}@example.com"))
+                            .collect::<Vec<_>>()
+                    )
+                };
+                // Ids of four-byte characters, `n` of them at `len`.
+                let wide_ids = |n: usize, len: usize| {
+                    json!((0..n).map(|i| four_byte(i, len)).collect::<Vec<_>>())
+                };
+                let at_budget = ATTENDEES_MAX_BYTES / (4 * CALENDAR_ID_MAX_CHARS);
+                let mut probes = Probes {
+                    admitted: vec![
+                        emails(1),
+                        emails(ATTENDEES_MAX),
+                        // The budget's bytes, at the most attendees.
+                        wide_ids(at_budget, CALENDAR_ID_MAX_CHARS),
+                    ],
+                    refused: vec![
+                        emails(ATTENDEES_MAX + 1),
+                        json!(["a@example.com", "a@example.com"]),
+                        json!([""]),
+                        json!(["a b@example.com"]),
+                        json!(["a/b"]),
+                        json!([1]),
+                        json!("a@example.com"),
+                        // The byte budget the schema cannot state.
+                        wide_ids(ATTENDEES_MAX, CALENDAR_ID_MAX_CHARS / 2),
+                    ],
+                };
+                if min == 0 {
+                    probes.admitted.push(json!([]));
+                } else {
+                    probes.refused.push(json!([]));
+                }
+                probes
+            }
+            (_, "recurrence") => {
+                let line = |n: usize| "R".repeat(n);
+                Probes {
+                    admitted: vec![
+                        json!(["RRULE:FREQ=WEEKLY;BYDAY=MO"]),
+                        json!(
+                            (0..RECURRENCE_WRITE_MAX)
+                                .map(|i| format!("{i}{}", line(RECURRENCE_LINE_MAX_CHARS - 1)))
+                                .collect::<Vec<_>>()
+                        ),
+                        json!(["\"\\~ "]),
+                    ],
+                    refused: vec![
+                        json!([]),
+                        json!(
+                            (0..=RECURRENCE_WRITE_MAX)
+                                .map(|i| format!("RRULE:COUNT={i}"))
+                                .collect::<Vec<_>>()
+                        ),
+                        json!(["RRULE:FREQ=DAILY", "RRULE:FREQ=DAILY"]),
+                        json!([line(RECURRENCE_LINE_MAX_CHARS + 1)]),
+                        json!([""]),
+                        json!(["RRULE:FREQ=DAILY\r\nX"]),
+                        json!(["é"]),
+                        json!([1]),
+                        json!("RRULE:FREQ=DAILY"),
+                    ],
+                }
+            }
             (_, "calendars") => Probes {
                 admitted: vec![ids(1), ids(FREEBUSY_CALENDARS_MAX)],
                 refused: vec![
@@ -6297,6 +7005,25 @@ mod tests {
             .to_string()
     }
 
+    /// What an event write's description says of `attendees`, which may
+    /// hold `min` of them or more.
+    fn attendees_budget(min: usize) -> String {
+        format!(
+            "`attendees` is a list of {min} to {ATTENDEES_MAX} distinct email addresses; \
+             together they may hold at most {ATTENDEES_MAX_BYTES} bytes of UTF-8, and more is \
+             refused"
+        )
+    }
+
+    /// What an event write's description says of each `recurrence` line.
+    fn recurrence_bound() -> String {
+        format!(
+            "`recurrence` is 1 to {RECURRENCE_WRITE_MAX} RRULE, RDATE or EXDATE lines as Google \
+             writes them (`RRULE:FREQ=WEEKLY;BYDAY=MO`), each 1 to {RECURRENCE_LINE_MAX_CHARS} \
+             printable ASCII characters"
+        )
+    }
+
     /// The parser budgets no schema can state: each tool's description gives
     /// the number its parser's constant holds.
     #[test]
@@ -6337,6 +7064,10 @@ mod tests {
                      more is refused"
                 ),
             ),
+            (Provided::CalendarCreate, attendees_budget(1)),
+            (Provided::CalendarUpdate, attendees_budget(0)),
+            (Provided::CalendarCreate, recurrence_bound()),
+            (Provided::CalendarUpdate, recurrence_bound()),
         ] {
             assert!(
                 description(&spec, tool.name()).contains(&budget),
@@ -7948,71 +8679,6 @@ mod tests {
     }
 
     #[test]
-    fn a_write_steps_internal_failure_carries_its_hint_and_a_denied_one_does_not() {
-        let state = draft_state(draft_args(json!({})));
-        let hinted = |detail: &str| Next::Fail(internal(format!("{detail}; {DRAFT_UNKNOWN_HINT}")));
-        assert_eq!(
-            answered(&state, nested("invalid_args", "bad wrapper")),
-            hinted("api-request rejected the wrapper's request: bad wrapper")
-        );
-        assert_eq!(
-            answered(&state, nested("rate_limited", "slow down")),
-            hinted("rate_limited: slow down")
-        );
-        assert_eq!(
-            answered(&state, http(200, "<html>")),
-            hinted("Google returned HTTP 200 with a body that is not JSON")
-        );
-        assert_eq!(
-            answered(&state, http(302, "")),
-            hinted("Google answered 302 with a redirect, which Brenn does not follow")
-        );
-        let Next::Fail(denied) = answered(&state, nested("denied", "no clause admits it")) else {
-            panic!("a refused call fails");
-        };
-        assert_eq!(denied.kind, ErrorKind::Denied);
-        assert!(
-            !denied.detail.contains(DRAFT_UNKNOWN_HINT),
-            "{}",
-            denied.detail
-        );
-        // A Google error mapped `internal` may follow a saved draft; a 400,
-        // 403 or 404 is Google's refusal and carries no hint.
-        for status in [500, 503] {
-            let Next::Fail(failed) = answered(&state, http(status, "{}")) else {
-                panic!("a {status} fails");
-            };
-            assert_eq!(failed.kind, ErrorKind::Internal);
-            assert!(
-                failed.detail.ends_with(&format!("; {DRAFT_UNKNOWN_HINT}")),
-                "{}",
-                failed.detail
-            );
-        }
-        for status in [400, 403, 404] {
-            let Next::Fail(refused) = answered(&state, http(status, "{}")) else {
-                panic!("a {status} fails");
-            };
-            assert_ne!(refused.kind, ErrorKind::Internal);
-            assert!(
-                !refused.detail.contains(DRAFT_UNKNOWN_HINT),
-                "{}",
-                refused.detail
-            );
-        }
-        // A read step's failure carries no hint.
-        assert_eq!(
-            answered(
-                &labels_state(json!({})),
-                nested("invalid_args", "bad wrapper")
-            ),
-            Next::Fail(internal(
-                "api-request rejected the wrapper's request: bad wrapper"
-            ))
-        );
-    }
-
-    #[test]
     fn a_draft_403_names_the_compose_scope() {
         let body = google(
             403,
@@ -8262,6 +8928,16 @@ mod tests {
         }
     }
 
+    /// What `tool`'s step `step` expects Google to answer, as a no-body
+    /// refusal names it.
+    fn no_body_answers(tool: Provided, step: u8) -> &'static str {
+        match (tool, step) {
+            (Provided::GmailDraft, DRAFT_CREATE_STEP) => "the draft",
+            (Provided::CalendarCreate | Provided::CalendarUpdate, 1) => "the event",
+            _ => "JSON",
+        }
+    }
+
     #[test]
     fn an_empty_answer_is_internal_at_every_step() {
         for tool in Provided::ALL {
@@ -8280,9 +8956,10 @@ mod tests {
                     assert_eq!(kind, ErrorKind::Internal);
                     let prefix = format!("Google answered HTTP {status} with no body where ");
                     assert!(detail.starts_with(&prefix), "{detail}");
+                    let answers = no_body_answers(tool, step);
                     let expected_end = match write_hint(tool, step) {
-                        Some(hint) => format!(" answers the draft; {hint}"),
-                        None => " answers JSON".to_string(),
+                        Some(hint) => format!(" answers {answers}; {hint}"),
+                        None => format!(" answers {answers}"),
                     };
                     assert!(detail.ends_with(&expected_end), "{detail}");
                 }
@@ -8312,6 +8989,9 @@ mod tests {
             event_state(json!({ "id": "e1" })),
             free_busy_state(json!({ "from": FROM, "to": TO })),
             reply_state(json!({})),
+            create_state(create_args(json!({}))),
+            update_state(update_args(json!({}))),
+            delete_state(json!({ "id": "e1" })),
         ];
         for tool in Provided::ALL {
             if steps(tool)
@@ -8551,49 +9231,6 @@ mod tests {
     }
 
     #[test]
-    fn a_label_changes_internal_failure_carries_its_hint() {
-        let state = modify_state(modify_args(json!({})));
-        let hinted =
-            |detail: &str| Next::Fail(internal(format!("{detail}; {MODIFY_UNKNOWN_HINT}")));
-        assert_eq!(
-            answered(&state, http(200, "<html>")),
-            hinted("Google returned HTTP 200 with a body that is not JSON")
-        );
-        assert_eq!(
-            answered(&state, nested("rate_limited", "slow down")),
-            hinted("rate_limited: slow down")
-        );
-        let Next::Fail(failed) = answered(&state, http(503, "{}")) else {
-            panic!("a 503 fails");
-        };
-        assert_eq!(failed.kind, ErrorKind::Internal);
-        assert!(
-            failed.detail.ends_with(&format!("; {MODIFY_UNKNOWN_HINT}")),
-            "{}",
-            failed.detail
-        );
-        // Google's refusal of an unknown label changed nothing, and a call
-        // `api-request` refused reached no API: neither carries the hint.
-        for outcome in [
-            http(
-                400,
-                &google(400, "INVALID_ARGUMENT", "Invalid label: Label_404"),
-            ),
-            nested("denied", "no clause admits it"),
-        ] {
-            let Next::Fail(refused) = answered(&state, outcome) else {
-                panic!("a refusal fails");
-            };
-            assert_ne!(refused.kind, ErrorKind::Internal);
-            assert!(
-                !refused.detail.contains(MODIFY_UNKNOWN_HINT),
-                "{}",
-                refused.detail
-            );
-        }
-    }
-
-    #[test]
     fn a_modify_labels_403_names_the_organize_scope() {
         let body = google(
             403,
@@ -8650,6 +9287,1025 @@ mod tests {
             ))
             .unwrap_err(),
             "`ids` together exceed 48000 characters; ask for fewer"
+        );
+    }
+
+    /// An event's start and end, timed, in one zone.
+    const START: &str = "2026-11-02T09:00:00-05:00";
+    const END: &str = "2026-11-02T09:30:00-05:00";
+    const ZONE: &str = "America/New_York";
+
+    /// `extra` set over `base`.
+    fn over(mut base: Value, extra: Value) -> Value {
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        base
+    }
+
+    /// A create's arguments: a timed lunch in `ZONE`, with `extra` set over
+    /// them.
+    fn create_args(extra: Value) -> Value {
+        over(
+            json!({ "summary": "Lunch", "start": START, "end": END, "time_zone": ZONE }),
+            extra,
+        )
+    }
+
+    /// An update's arguments: event `e1` moved to `START`..`END` in `ZONE`,
+    /// with `extra` set over them.
+    fn update_args(extra: Value) -> Value {
+        over(
+            json!({ "id": "e1", "start": START, "end": END, "time_zone": ZONE }),
+            extra,
+        )
+    }
+
+    fn create(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::CalendarCreate, &args, &settings()).map(|call| {
+            assert_eq!(call.step, 1);
+            call.api
+        })
+    }
+
+    fn update(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::CalendarUpdate, &args, &settings()).map(|call| {
+            assert_eq!(call.step, 1);
+            call.api
+        })
+    }
+
+    fn write_state(tool: Provided, args: Value) -> InFlight {
+        let call = plan(tool, &args, &settings()).unwrap();
+        InFlight::new(&"a".repeat(32), tool, &args, &call, Map::new(), 1_000)
+    }
+
+    fn create_state(args: Value) -> InFlight {
+        write_state(Provided::CalendarCreate, args)
+    }
+
+    fn update_state(args: Value) -> InFlight {
+        write_state(Provided::CalendarUpdate, args)
+    }
+
+    /// A call's JSON body.
+    fn json_body(call: &ApiCall) -> Value {
+        serde_json::from_str(call.body.as_deref().expect("a write has a body")).unwrap()
+    }
+
+    /// The paths of every `null` in `value`.
+    fn nulls(value: &Value, at: &str) -> Vec<String> {
+        match value {
+            Value::Null => vec![at.to_string()],
+            Value::Object(map) => map
+                .iter()
+                .flat_map(|(key, value)| nulls(value, &format!("{at}.{key}")))
+                .collect(),
+            Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .flat_map(|(i, value)| nulls(value, &format!("{at}[{i}]")))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// An event write's query: `notify`'s word, then the read's mask.
+    fn event_write_query_with(notify: &str) -> Query {
+        query([
+            ("sendUpdates", notify.to_string()),
+            ("maxAttendees", "50".to_string()),
+            ("fields", EVENT_GET_FIELDS.to_string()),
+            ("prettyPrint", "false".to_string()),
+        ])
+    }
+
+    #[test]
+    fn a_create_posts_only_the_fields_given_with_send_updates() {
+        let call = create(create_args(json!({
+            "calendar": "team@group.calendar.example.com",
+            "description": "Agenda",
+            "location": "Room 4",
+            "attendees": ["bob@example.com", "carol@example.com"],
+            "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+            "notify": "externalOnly",
+            "account": "alice@example.com",
+        })))
+        .unwrap();
+        assert_eq!(
+            call,
+            ApiCall {
+                provider: "google".to_string(),
+                account: Some("alice@example.com".to_string()),
+                method: "POST".to_string(),
+                host: "calendar.example.com".to_string(),
+                path: "/calendar/v3/calendars/team@group.calendar.example.com/events".to_string(),
+                query: event_write_query_with("externalOnly"),
+                headers: BTreeMap::new(),
+                body: call.body.clone(),
+            }
+        );
+        assert_eq!(
+            json_body(&call),
+            json!({
+                "summary": "Lunch",
+                "description": "Agenda",
+                "location": "Room 4",
+                "start": { "dateTime": START, "timeZone": ZONE },
+                "end": { "dateTime": END, "timeZone": ZONE },
+                "attendees": [{ "email": "bob@example.com" }, { "email": "carol@example.com" }],
+                "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+            })
+        );
+        // The fewest arguments: only those fields, on `primary`, and
+        // `sendUpdates=none` sent although nobody was named.
+        let call = create(json!({ "summary": "Lunch", "start": START, "end": END })).unwrap();
+        assert_eq!(call.path, "/calendar/v3/calendars/primary/events");
+        assert_eq!(call.query, event_write_query_with("none"));
+        let body = json_body(&call);
+        assert_eq!(
+            body,
+            json!({
+                "summary": "Lunch",
+                "start": { "dateTime": START },
+                "end": { "dateTime": END },
+            })
+        );
+        assert_eq!(nulls(&body, "body"), Vec::<String>::new());
+        for notify in NOTIFY {
+            let call = create(create_args(json!({ "notify": notify }))).unwrap();
+            assert_eq!(call.query, event_write_query_with(notify));
+        }
+    }
+
+    #[test]
+    fn an_update_patches_only_the_fields_named() {
+        // Every subset of the fields an update changes, `start` and `end`
+        // (with `time_zone`) moving as one.
+        let fields: [(&[&str], Value); 6] = [
+            (&["summary"], json!({ "summary": "Lunch" })),
+            (&["description"], json!({ "description": "Agenda" })),
+            (&["location"], json!({ "location": "Room 4" })),
+            (&["attendees"], json!({ "attendees": [] })),
+            (
+                &["recurrence"],
+                json!({ "recurrence": ["RRULE:FREQ=DAILY"] }),
+            ),
+            (
+                &["start", "end"],
+                json!({ "start": START, "end": END, "time_zone": ZONE }),
+            ),
+        ];
+        for subset in 1_u32..(1 << fields.len()) {
+            let mut args = json!({ "id": "e1" });
+            let mut named = BTreeSet::new();
+            for (at, (keys, given)) in fields.iter().enumerate() {
+                if subset & (1 << at) != 0 {
+                    args = over(args, given.clone());
+                    named.extend(keys.iter().copied());
+                }
+            }
+            let call = update(args.clone()).unwrap_or_else(|error| panic!("{args}: {error}"));
+            assert_eq!(call.method, "PATCH");
+            assert_eq!(call.path, "/calendar/v3/calendars/primary/events/e1");
+            assert_eq!(call.query, event_write_query_with("none"));
+            let body = json_body(&call);
+            let keys: BTreeSet<&str> = body
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys, named, "{args}");
+            // The only nulls are the unused kind inside a given time.
+            let mut expected_nulls = Vec::new();
+            if named.contains("start") {
+                expected_nulls = vec!["body.end.date".to_string(), "body.start.date".to_string()];
+            }
+            let mut found = nulls(&body, "body");
+            found.sort();
+            assert_eq!(found, expected_nulls, "{args}");
+        }
+        assert_eq!(
+            json_body(&update(update_args(json!({}))).unwrap()),
+            json!({
+                "start": { "dateTime": START, "date": null, "timeZone": ZONE },
+                "end": { "dateTime": END, "date": null, "timeZone": ZONE },
+            })
+        );
+    }
+
+    #[test]
+    fn a_date_shaped_time_is_sent_as_date() {
+        for (value, date) in [
+            ("2026-11-02", true),
+            ("2026-13-45", true),
+            ("0000-00-00", true),
+            ("2026-11-2", false),
+            ("2026/11/02", false),
+            ("2026-11-02 ", false),
+            ("20261-1-02", false),
+            ("２０２６-11-02", false),
+            (START, false),
+            ("2026-11-02T09:00:00Z", false),
+        ] {
+            assert_eq!(is_date_shape(value), date, "{value:?}");
+        }
+        let all_day = json!({ "start": "2026-11-02", "end": "2026-11-03" });
+        // A create sends the date alone, `time_zone` beside it when given.
+        let body = json_body(&create(over(json!({ "summary": "Trip" }), all_day.clone())).unwrap());
+        assert_eq!(body["start"], json!({ "date": "2026-11-02" }));
+        assert_eq!(body["end"], json!({ "date": "2026-11-03" }));
+        let body = json_body(&create(create_args(all_day.clone())).unwrap());
+        assert_eq!(
+            body["start"],
+            json!({ "date": "2026-11-02", "timeZone": ZONE })
+        );
+        // An update clears the other kind, so an event moves between them.
+        let body = json_body(&update(over(json!({ "id": "e1" }), all_day)).unwrap());
+        assert_eq!(
+            body["start"],
+            json!({ "date": "2026-11-02", "dateTime": null })
+        );
+        assert_eq!(
+            body["end"],
+            json!({ "date": "2026-11-03", "dateTime": null })
+        );
+        let body = json_body(&update(json!({ "id": "e1", "start": START, "end": END })).unwrap());
+        assert_eq!(body["start"], json!({ "dateTime": START, "date": null }));
+    }
+
+    #[test]
+    fn event_times_are_both_dates_or_both_times() {
+        let refusal = "`start` and `end` must both be `YYYY-MM-DD` dates or both be times";
+        for (start, end) in [("2026-11-02", END), (START, "2026-11-03")] {
+            let times = json!({ "start": start, "end": end });
+            assert_eq!(create(create_args(times.clone())).unwrap_err(), refusal);
+            assert_eq!(update(update_args(times)).unwrap_err(), refusal);
+        }
+    }
+
+    #[test]
+    fn an_update_moves_start_and_end_together() {
+        let refusal = "`start` and `end` must be given together, and `time_zone` only with them";
+        for args in [
+            json!({ "id": "e1", "start": START }),
+            json!({ "id": "e1", "end": END }),
+            json!({ "id": "e1", "time_zone": ZONE }),
+            json!({ "id": "e1", "start": START, "time_zone": ZONE }),
+            json!({ "id": "e1", "end": END, "time_zone": ZONE, "summary": "Lunch" }),
+            json!({ "id": "e1", "time_zone": ZONE, "summary": "Lunch" }),
+        ] {
+            assert_eq!(update(args.clone()).unwrap_err(), refusal, "{args}");
+        }
+        assert!(update(json!({ "id": "e1", "start": START, "end": END })).is_ok());
+    }
+
+    #[test]
+    fn a_recurring_timed_event_needs_a_time_zone() {
+        let refusal = "a recurring timed event needs `time_zone`";
+        let weekly = json!({ "recurrence": ["RRULE:FREQ=WEEKLY"] });
+        let zoneless = |base: Value| {
+            let mut args = over(base, weekly.clone());
+            args.as_object_mut().unwrap().remove("time_zone");
+            args
+        };
+        assert_eq!(
+            create(zoneless(create_args(json!({})))).unwrap_err(),
+            refusal
+        );
+        assert_eq!(
+            update(zoneless(update_args(json!({})))).unwrap_err(),
+            refusal
+        );
+        assert!(create(create_args(weekly.clone())).is_ok());
+        assert!(update(update_args(weekly.clone())).is_ok());
+        // An all-day series needs no zone, and an update's rules alone leave
+        // the stored time to Google.
+        let all_day = json!({ "start": "2026-11-02", "end": "2026-11-03" });
+        assert!(create(zoneless(create_args(all_day))).is_ok());
+        assert!(update(over(json!({ "id": "e1" }), weekly)).is_ok());
+    }
+
+    #[test]
+    fn an_update_names_a_field() {
+        let refusal = "`CalendarUpdate` changes nothing: name a field";
+        for args in [
+            json!({ "id": "e1" }),
+            json!({
+                "id": "e1",
+                "calendar": "primary",
+                "notify": "all",
+                "account": "alice@example.com",
+            }),
+        ] {
+            assert_eq!(update(args.clone()).unwrap_err(), refusal, "{args}");
+        }
+        // An empty list is a change: every attendee removed.
+        let call = update(json!({ "id": "e1", "attendees": [] })).unwrap();
+        assert_eq!(json_body(&call), json!({ "attendees": [] }));
+    }
+
+    #[test]
+    fn event_writes_refuse_bad_arguments() {
+        for (args, refusal) in [
+            (
+                json!({ "start": START, "end": END }),
+                "`summary` is required",
+            ),
+            (
+                json!({ "summary": "Lunch", "end": END }),
+                "`start` is required",
+            ),
+            (
+                create_args(json!({ "notify": "everyone" })),
+                "`notify` must be one of `none`, `all`, `externalOnly`",
+            ),
+            (
+                create_args(json!({ "notify": true })),
+                "`notify` must be one of `none`, `all`, `externalOnly`",
+            ),
+            (
+                create_args(json!({ "attendees": [] })),
+                "`attendees` must be an array of 1 to 50 email addresses",
+            ),
+            (
+                create_args(json!({ "attendees": ["bob@example.com", "bob@example.com"] })),
+                "`attendees` names \"bob@example.com\" twice",
+            ),
+            (
+                create_args(json!({
+                    "attendees": (0..ATTENDEES_MAX)
+                        .map(|i| four_byte(i, CALENDAR_ID_MAX_CHARS / 2))
+                        .collect::<Vec<_>>(),
+                })),
+                "`attendees` together exceed 8000 bytes (UTF-8); name fewer",
+            ),
+            (
+                create_args(json!({ "recurrence": ["RRULE:FREQ=DAILY\nEXDATE:x"] })),
+                "each of `recurrence` must be 1 to 500 printable ASCII characters",
+            ),
+            (
+                create_args(json!({ "recurrence": [] })),
+                "`recurrence` must be an array of 1 to 5 RRULE, RDATE or EXDATE lines",
+            ),
+            (
+                create_args(json!({ "reminders": { "useDefault": false } })),
+                "unknown argument `reminders`; this tool takes `calendar`, `summary`, `start`, \
+                 `end`, `description`, `location`, `attendees`, `time_zone`, `recurrence`, \
+                 `notify`, `account`",
+            ),
+            (
+                create_args(json!({ "id": "e1" })),
+                "unknown argument `id`; this tool takes `calendar`, `summary`, `start`, `end`, \
+                 `description`, `location`, `attendees`, `time_zone`, `recurrence`, `notify`, \
+                 `account`",
+            ),
+        ] {
+            assert_eq!(create(args.clone()).unwrap_err(), refusal, "{args}");
+        }
+        for (args, refusal) in [
+            (json!({ "summary": "Lunch" }), "`id` is required"),
+            (
+                update_args(json!({ "id": "e/1" })),
+                "`id` must be 1 to 1024 letters, digits, `_` or `-`",
+            ),
+            (
+                update_args(json!({ "attendees": ["a b"] })),
+                "each of `attendees` must be a calendar id of 1 to 320 characters with no `/`, \
+                 `\\`, `%`, `\"`, space or control character",
+            ),
+            (
+                update_args(json!({ "conferenceData": {} })),
+                "unknown argument `conferenceData`; this tool takes `id`, `calendar`, `summary`, \
+                 `start`, `end`, `description`, `location`, `attendees`, `time_zone`, \
+                 `recurrence`, `notify`, `account`",
+            ),
+        ] {
+            assert_eq!(update(args.clone()).unwrap_err(), refusal, "{args}");
+        }
+    }
+
+    #[test]
+    fn a_create_answers_the_event_with_its_new_id() {
+        // The answer is the event as `CalendarEvent` answers it.
+        let state = create_state(create_args(json!({})));
+        assert_eq!(answered(&state, http(200, EVENT)), read_event(EVENT));
+        // A new id is required and held to an event id's shape; a failure
+        // to read it carries the hint, since the event may exist.
+        let hinted = Next::Fail(internal(format!(
+            "unexpected Google events.insert response shape; {CREATE_UNKNOWN_HINT}"
+        )));
+        for body in [
+            event_with(json!({ "id": null })),
+            event_with(json!({ "id": "not/an/id" })),
+            event_with(json!({ "start": { "date": "2026-11-04", "dateTime": START } })),
+            "42".to_string(),
+        ] {
+            assert_eq!(answered(&state, http(200, &body)), hinted, "{body}");
+        }
+    }
+
+    #[test]
+    fn an_update_answers_the_event_as_google_holds_it() {
+        let state = update_state(update_args(json!({ "id": EVENT_ID })));
+        assert_eq!(answered(&state, http(200, EVENT)), read_event(EVENT));
+        // Another event's answer is Google's fault, named for the patch.
+        let state = update_state(update_args(json!({})));
+        assert_eq!(
+            answered(&state, http(200, EVENT)),
+            Next::Fail(internal(format!(
+                "unexpected Google events.patch response shape; {UPDATE_UNKNOWN_HINT}"
+            )))
+        );
+    }
+
+    #[test]
+    fn a_written_events_description_is_cut_as_an_events_read_cuts_it() {
+        let whole = usize::try_from(MAX_CHARS_DEFAULT).unwrap() + 1;
+        let body = event_with(json!({ "description": "d".repeat(whole) }));
+        let read = read_event(&body);
+        let answer = completed(read.clone());
+        assert_eq!(answer["description"], json!("d".repeat(whole - 1)));
+        assert_eq!(answer["description_truncated"], json!(true));
+        assert_eq!(answer["description_chars"], json!(whole));
+        for state in [
+            create_state(create_args(json!({}))),
+            update_state(update_args(json!({ "id": EVENT_ID }))),
+        ] {
+            assert_eq!(
+                answered(&state, http(200, &body)),
+                read,
+                "{}",
+                state.tool.name()
+            );
+        }
+    }
+
+    #[test]
+    fn an_update_refuses_an_event_holding_both_kinds() {
+        // Should Google keep both kinds after a patch that cleared one, the
+        // read's both-or-neither rule still refuses the answer.
+        let state = update_state(update_args(json!({ "id": EVENT_ID })));
+        for key in ["start", "end"] {
+            let body = event_with(json!({
+                key: { "date": "2026-11-04", "dateTime": START, "timeZone": ZONE },
+            }));
+            assert_eq!(
+                answered(&state, http(200, &body)),
+                Next::Fail(internal(format!(
+                    "unexpected Google events.patch response shape; {UPDATE_UNKNOWN_HINT}"
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_writes_refusal_carries_googles_message_and_a_403_the_write_scope() {
+        for (state, hint) in [
+            (create_state(create_args(json!({}))), CREATE_UNKNOWN_HINT),
+            (update_state(update_args(json!({}))), UPDATE_UNKNOWN_HINT),
+        ] {
+            let name = state.tool.name();
+            // Google's refusal changed nothing: its message, no hint.
+            let refused = google(
+                400,
+                "INVALID_ARGUMENT",
+                "The specified time range is empty.",
+            );
+            let Next::Fail(failed) = answered(&state, http(400, &refused)) else {
+                panic!("{name} fails");
+            };
+            assert_eq!(failed.kind, ErrorKind::InvalidArgs, "{name}");
+            assert!(
+                failed.detail.contains("The specified time range is empty."),
+                "{name}: {failed:?}"
+            );
+            assert!(!failed.detail.contains(hint), "{name}: {failed:?}");
+            // A 403 names the scope set that makes every Calendar write work.
+            let denied = google(
+                403,
+                "PERMISSION_DENIED",
+                "Request had insufficient authentication scopes.",
+            );
+            assert_eq!(
+                answered(&state, http(403, &denied)),
+                Next::Fail(failure(
+                    ErrorKind::Denied,
+                    &format!(
+                        "Google PERMISSION_DENIED (HTTP 403): Request had insufficient \
+                         authentication scopes. {}",
+                        scope_hint(Scope::CalendarWrite)
+                    )
+                )),
+                "{name}"
+            );
+        }
+        assert!(scope_hint(Scope::CalendarWrite).contains("the Calendar events scope"));
+    }
+
+    /// The widest admitted event write of `tool`: every text at its cap at
+    /// its escaped width, the most attendees at their budget, the most and
+    /// longest recurrence lines of `"`, and the calendar id at four bytes a
+    /// character.
+    fn widest_event_write(tool: Provided) -> Value {
+        let mut args = json!({
+            "calendar": four_byte(0, CALENDAR_ID_MAX_CHARS),
+            "summary": escaped_widest(EVENT_FIELD_MAX_CHARS),
+            "start": escaped_widest(TIME_MAX_CHARS),
+            "end": escaped_widest(TIME_MAX_CHARS),
+            "description": escaped_widest(EVENT_DESCRIPTION_MAX_CHARS),
+            "location": escaped_widest(EVENT_FIELD_MAX_CHARS),
+            "attendees": (0..ATTENDEES_MAX)
+                .map(|i| four_byte(i, ATTENDEES_MAX_BYTES / ATTENDEES_MAX / 4))
+                .collect::<Vec<_>>(),
+            "time_zone": escaped_widest(EVENT_TIME_ZONE_MAX_CHARS),
+            "recurrence": (0..RECURRENCE_WRITE_MAX)
+                .map(|i| format!("{i}{}", "\"".repeat(RECURRENCE_LINE_MAX_CHARS - 1)))
+                .collect::<Vec<_>>(),
+            "notify": "externalOnly",
+            "account": escaped_widest(ACCOUNT_MAX_CHARS),
+        });
+        if tool == Provided::CalendarUpdate {
+            args["id"] = json!("e".repeat(EVENT_ID_MAX_CHARS));
+        }
+        args
+    }
+
+    #[test]
+    fn the_widest_create_call_fits_the_args_cap() {
+        let args = widest_event_write(Provided::CalendarCreate);
+        let attendees: usize = args["attendees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().len())
+            .sum();
+        assert_eq!(attendees, ATTENDEES_MAX_BYTES);
+        let call = serde_json::to_vec(&create(args).unwrap()).unwrap();
+        assert!(
+            call.len() <= HOST_ARGS_CAP_BYTES,
+            "{} bytes of args",
+            call.len()
+        );
+    }
+
+    #[test]
+    fn the_widest_update_call_fits_the_args_cap() {
+        let call =
+            serde_json::to_vec(&update(widest_event_write(Provided::CalendarUpdate)).unwrap())
+                .unwrap();
+        assert!(
+            call.len() <= HOST_ARGS_CAP_BYTES,
+            "{} bytes of args",
+            call.len()
+        );
+    }
+
+    fn delete(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::CalendarDelete, &args, &settings()).map(|call| {
+            assert_eq!(call.step, DELETE_READ_STEP);
+            call.api
+        })
+    }
+
+    fn delete_state(args: Value) -> InFlight {
+        write_state(Provided::CalendarDelete, args)
+    }
+
+    /// The delete's read of event `e1`, a timed standup, with `extra` set
+    /// over Google's answer.
+    fn delete_read(extra: Value) -> String {
+        over(
+            json!({
+                "id": "e1",
+                "status": "confirmed",
+                "summary": "Standup",
+                "start": { "dateTime": START, "timeZone": ZONE },
+            }),
+            extra,
+        )
+        .to_string()
+    }
+
+    /// The delete's row at its `DELETE`, after `read` was answered to
+    /// `args`, and that `DELETE`'s call.
+    fn delete_after_read(args: Value, read: &str) -> (InFlight, Call) {
+        let state = delete_state(args);
+        follow(&state, answered(&state, http(200, read)))
+    }
+
+    #[test]
+    fn a_delete_reads_then_deletes() {
+        let args = json!({
+            "id": "e1",
+            "calendar": "team@example.com",
+            "notify": "all",
+            "account": "alice@example.com",
+        });
+        assert_eq!(
+            delete(args.clone()).unwrap(),
+            ApiCall {
+                provider: "google".to_string(),
+                account: Some("alice@example.com".to_string()),
+                method: "GET".to_string(),
+                host: "calendar.example.com".to_string(),
+                path: "/calendar/v3/calendars/team@example.com/events/e1".to_string(),
+                query: query([
+                    ("fields", DELETE_READ_FIELDS.to_string()),
+                    ("prettyPrint", "false".to_string()),
+                ]),
+                headers: BTreeMap::new(),
+                body: None,
+            }
+        );
+        let (row, call) = delete_after_read(args, &delete_read(json!({})));
+        assert_eq!(call.step, DELETE_STEP);
+        assert_eq!(
+            call.api,
+            ApiCall {
+                provider: "google".to_string(),
+                account: Some("alice@example.com".to_string()),
+                method: "DELETE".to_string(),
+                host: "calendar.example.com".to_string(),
+                path: "/calendar/v3/calendars/team@example.com/events/e1".to_string(),
+                query: query([
+                    ("sendUpdates", "all".to_string()),
+                    ("prettyPrint", "false".to_string()),
+                ]),
+                headers: BTreeMap::new(),
+                body: None,
+            }
+        );
+        assert_eq!(
+            answered(&row, http(204, "")),
+            Next::Complete(json!({
+                "deleted": true,
+                "id": "e1",
+                "summary": "Standup",
+                "start": { "date_time": START, "time_zone": ZONE },
+            }))
+        );
+        // Whom Google notifies is always sent: nobody by default.
+        let (_, call) = delete_after_read(json!({ "id": "e1" }), &delete_read(json!({})));
+        assert_eq!(
+            call.api.query.get("sendUpdates"),
+            Some(&QueryValue::One("none".to_string()))
+        );
+        assert_eq!(call.api.path, "/calendar/v3/calendars/primary/events/e1");
+    }
+
+    #[test]
+    fn delete_refuses_bad_arguments() {
+        for (args, refusal) in [
+            (json!({}), "`id` is required"),
+            (
+                json!({ "id": "e/1" }),
+                "`id` must be 1 to 1024 letters, digits, `_` or `-`",
+            ),
+            (
+                json!({ "id": "e1", "series": "yes" }),
+                "`series` must be true or false",
+            ),
+            (
+                json!({ "id": "e1", "notify": "everyone" }),
+                "`notify` must be one of `none`, `all`, `externalOnly`",
+            ),
+            (
+                json!({ "id": "e1", "calendar": "a/b" }),
+                "`calendar` must be a calendar id of 1 to 320 characters with no `/`, `\\`, \
+                 `%`, `\"`, space or control character",
+            ),
+            (
+                json!({ "id": "e1", "move_to": "team@example.com" }),
+                "unknown argument `move_to`; this tool takes `id`, `calendar`, `series`, \
+                 `notify`, `account`",
+            ),
+        ] {
+            assert_eq!(delete(args.clone()).unwrap_err(), refusal, "{args}");
+        }
+    }
+
+    #[test]
+    fn a_delete_applies_the_series_rule_before_deleting() {
+        let master = json!({ "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"] });
+        let occurrence = json!({ "id": "e1", "recurringEventId": "s1" });
+        let refused = |detail: &str| Next::Fail(failure(ErrorKind::InvalidArgs, detail));
+        // Refused at the read: nothing is deleted.
+        for (args, read, answer) in [
+            (
+                json!({ "id": "e1" }),
+                master.clone(),
+                refused(
+                    "`e1` is a recurring series: pass `series: true` to delete every \
+                     occurrence, or delete one occurrence by its own `id` from \
+                     `CalendarEvents`",
+                ),
+            ),
+            (
+                json!({ "id": "e1", "series": true }),
+                occurrence.clone(),
+                refused(
+                    "`e1` is one occurrence of the series `s1`: delete the series by that id \
+                     with `series: true`, or this occurrence without `series`",
+                ),
+            ),
+            (
+                json!({ "id": "e1", "series": true }),
+                json!({}),
+                refused("`e1` is not a recurring series: delete it without `series`"),
+            ),
+            (
+                json!({ "id": "e1" }),
+                json!({ "status": "cancelled" }),
+                refused("`e1` is already cancelled (deleted); nothing to delete"),
+            ),
+            // A cancelled series is refused as cancelled, whatever `series` says.
+            (
+                json!({ "id": "e1", "series": true }),
+                over(master.clone(), json!({ "status": "cancelled" })),
+                refused("`e1` is already cancelled (deleted); nothing to delete"),
+            ),
+        ] {
+            let state = delete_state(args.clone());
+            assert_eq!(
+                answered(&state, http(200, &delete_read(read.clone()))),
+                answer,
+                "{args} {read}"
+            );
+        }
+        // Deleted: a master with `series`, an occurrence without it.
+        let (row, call) =
+            delete_after_read(json!({ "id": "e1", "series": true }), &delete_read(master));
+        assert_eq!(call.api.method, "DELETE");
+        assert_eq!(
+            answered(&row, http(204, "")),
+            Next::Complete(json!({
+                "deleted": true,
+                "id": "e1",
+                "summary": "Standup",
+                "start": { "date_time": START, "time_zone": ZONE },
+                "series": true,
+            }))
+        );
+        let (row, call) = delete_after_read(json!({ "id": "e1" }), &delete_read(occurrence));
+        assert_eq!(call.api.method, "DELETE");
+        assert_eq!(
+            answered(&row, http(204, "")),
+            Next::Complete(json!({
+                "deleted": true,
+                "id": "e1",
+                "summary": "Standup",
+                "start": { "date_time": START, "time_zone": ZONE },
+            }))
+        );
+    }
+
+    #[test]
+    fn a_delete_reads_what_google_answers_strictly() {
+        let state = delete_state(json!({ "id": "e1" }));
+        let bad = Next::Fail(internal(
+            "unexpected Google events.get response shape".to_string(),
+        ));
+        for body in [
+            delete_read(json!({ "id": "e2" })),
+            delete_read(json!({ "id": null })),
+            delete_read(json!({ "recurrence": "RRULE:FREQ=DAILY" })),
+            delete_read(json!({ "recurringEventId": "s/1" })),
+            delete_read(json!({ "status": 1 })),
+            delete_read(json!({ "start": { "date": "2026-11-02", "dateTime": START } })),
+            "42".to_string(),
+        ] {
+            assert_eq!(answered(&state, http(200, &body)), bad, "{body}");
+        }
+        // An all-day event, no summary: the answer names what Google gave.
+        let (row, _) = delete_after_read(
+            json!({ "id": "e1" }),
+            &json!({ "id": "e1", "start": { "date": "2026-11-02" } }).to_string(),
+        );
+        assert_eq!(
+            answered(&row, http(204, "")),
+            Next::Complete(json!({
+                "deleted": true,
+                "id": "e1",
+                "start": { "date": "2026-11-02" },
+            }))
+        );
+        // A summary past the answer's bound is cut, and says so.
+        let long = "s".repeat(EVENT_TEXT_MAX_BYTES + 1);
+        let (row, _) = delete_after_read(
+            json!({ "id": "e1" }),
+            &delete_read(json!({ "summary": &long })),
+        );
+        assert_eq!(
+            answered(&row, http(204, "")),
+            Next::Complete(json!({
+                "deleted": true,
+                "id": "e1",
+                "summary": cut(&long, EVENT_TEXT_MAX_BYTES).0,
+                "start": { "date_time": START, "time_zone": ZONE },
+                "fields_truncated": ["summary"],
+            }))
+        );
+    }
+
+    #[test]
+    fn a_delete_is_accepted_on_any_2xx() {
+        let (row, _) = delete_after_read(json!({ "id": "e1" }), &delete_read(json!({})));
+        let accepted = json!({
+            "deleted": true,
+            "id": "e1",
+            "summary": "Standup",
+            "start": { "date_time": START, "time_zone": ZONE },
+        });
+        for outcome in [
+            http(204, ""),
+            http(200, ""),
+            http(200, "{}"),
+            http(200, r#"{"unexpected":[1]}"#),
+            http(200, "42"),
+        ] {
+            assert_eq!(answered(&row, outcome), Next::Complete(accepted.clone()));
+        }
+    }
+
+    #[test]
+    fn a_deletes_410_carries_its_hint_and_its_reads_failures_none() {
+        let row = write_step_state(Provided::CalendarDelete, DELETE_STEP);
+        // A 410 is an event deleted between the read and the `DELETE`.
+        let Next::Fail(failed) = answered(
+            &row,
+            http(410, &google(410, "GONE", "Resource has been deleted")),
+        ) else {
+            panic!("the delete fails");
+        };
+        assert_eq!(failed.kind, ErrorKind::Internal);
+        assert!(
+            failed.detail.ends_with(&format!("; {DELETE_UNKNOWN_HINT}")),
+            "{failed:?}"
+        );
+        // The read deletes nothing: its failures carry no hint.
+        let read = delete_state(json!({ "id": "e1" }));
+        for outcome in [
+            http(503, "{}"),
+            http(404, &google(404, "NOT_FOUND", "Not Found")),
+            cut_read(json!(300000)),
+            nested("rate_limited", "slow down"),
+        ] {
+            let Next::Fail(failed) = answered(&read, outcome) else {
+                panic!("the read fails");
+            };
+            assert!(!failed.detail.contains(DELETE_UNKNOWN_HINT), "{failed:?}");
+        }
+        assert_eq!(
+            answered(&read, http(404, &google(404, "NOT_FOUND", "Not Found"))),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "Google NOT_FOUND (HTTP 404): Not Found"
+            ))
+        );
+        // A 403 at either step names the scope set the whole tool needs.
+        let denied = google(
+            403,
+            "PERMISSION_DENIED",
+            "Request had insufficient authentication scopes.",
+        );
+        for state in [&read, &row] {
+            assert_eq!(
+                answered(state, http(403, &denied)),
+                Next::Fail(failure(
+                    ErrorKind::Denied,
+                    &format!(
+                        "Google PERMISSION_DENIED (HTTP 403): Request had insufficient \
+                         authentication scopes. {}",
+                        scope_hint(Scope::CalendarWrite)
+                    )
+                )),
+                "step {}",
+                state.step
+            );
+        }
+    }
+
+    /// The row of `tool` at its write step `step`, as `write_hint` names it.
+    fn write_step_state(tool: Provided, step: u8) -> InFlight {
+        let state = match (tool, step) {
+            (Provided::GmailDraft, DRAFT_CREATE_STEP) => draft_state(draft_args(json!({}))),
+            (Provided::GmailModifyLabels, 1) => modify_state(modify_args(json!({}))),
+            (Provided::CalendarCreate, 1) => create_state(create_args(json!({}))),
+            (Provided::CalendarUpdate, 1) => update_state(update_args(json!({}))),
+            (Provided::CalendarDelete, DELETE_STEP) => {
+                delete_after_read(json!({ "id": "e1" }), &delete_read(json!({}))).0
+            }
+            _ => panic!("no row for {} step {step}", tool.name()),
+        };
+        assert_eq!((state.tool, state.step), (tool, step));
+        state
+    }
+
+    #[test]
+    fn every_write_steps_failure_carries_its_hint_only_when_google_may_have_acted() {
+        let mut write_steps = 0;
+        for tool in Provided::ALL {
+            for step in steps(tool) {
+                let Some(hint) = write_hint(tool, step) else {
+                    continue;
+                };
+                write_steps += 1;
+                let state = write_step_state(tool, step);
+                let at = format!("{} step {step}", tool.name());
+                let hinted = |detail: &str| Next::Fail(internal(format!("{detail}; {hint}")));
+                for (outcome, detail) in [
+                    (
+                        nested("invalid_args", "bad wrapper"),
+                        "api-request rejected the wrapper's request: bad wrapper",
+                    ),
+                    (
+                        nested("rate_limited", "slow down"),
+                        "rate_limited: slow down",
+                    ),
+                    (
+                        http(200, "<html>"),
+                        "Google returned HTTP 200 with a body that is not JSON",
+                    ),
+                    (
+                        http(302, ""),
+                        "Google answered 302 with a redirect, which Brenn does not follow",
+                    ),
+                ] {
+                    assert_eq!(answered(&state, outcome), hinted(detail), "{at}");
+                }
+                for outcome in [
+                    http(500, "{}"),
+                    http(503, "{}"),
+                    http(429, "{}"),
+                    cut_read(json!(300000)),
+                ] {
+                    let Next::Fail(failed) = answered(&state, outcome) else {
+                        panic!("{at} fails");
+                    };
+                    assert_eq!(failed.kind, ErrorKind::Internal, "{at}");
+                    assert!(
+                        failed.detail.ends_with(&format!("; {hint}")),
+                        "{at}: {failed:?}"
+                    );
+                }
+                // Google's refusal, or `api-request`'s, changed nothing: its
+                // kind and message, no hint.
+                let denied = format!(
+                    "Google PERMISSION_DENIED (HTTP 403): Insufficient Permission. {}",
+                    scope_hint(scope(tool, step))
+                );
+                for (outcome, kind, detail) in [
+                    (
+                        http(400, &google(400, "INVALID_ARGUMENT", "Invalid value")),
+                        ErrorKind::InvalidArgs,
+                        "Google INVALID_ARGUMENT (HTTP 400): Invalid value",
+                    ),
+                    (
+                        http(
+                            403,
+                            &google(403, "PERMISSION_DENIED", "Insufficient Permission"),
+                        ),
+                        ErrorKind::Denied,
+                        denied.as_str(),
+                    ),
+                    (
+                        http(404, &google(404, "NOT_FOUND", "Not Found")),
+                        ErrorKind::InvalidArgs,
+                        "Google NOT_FOUND (HTTP 404): Not Found",
+                    ),
+                ] {
+                    assert_eq!(
+                        answered(&state, outcome),
+                        Next::Fail(failure(kind, detail)),
+                        "{at}"
+                    );
+                }
+                let Next::Fail(refused) = answered(&state, nested("denied", "no clause admits it"))
+                else {
+                    panic!("{at} fails");
+                };
+                assert_eq!(refused.kind, ErrorKind::Denied, "{at}");
+                assert!(
+                    refused
+                        .detail
+                        .starts_with("api-request refused the nested ")
+                        && refused.detail.ends_with(": no clause admits it"),
+                    "{at}: {refused:?}"
+                );
+            }
+        }
+        assert!(write_steps > 0);
+        // A read step's failure carries no hint.
+        assert_eq!(
+            answered(
+                &labels_state(json!({})),
+                nested("invalid_args", "bad wrapper")
+            ),
+            Next::Fail(internal(
+                "api-request rejected the wrapper's request: bad wrapper"
+            ))
         );
     }
 }

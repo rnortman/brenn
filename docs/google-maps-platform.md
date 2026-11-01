@@ -179,10 +179,11 @@ use @google-maps-tools::*;
 Then the inbox tuning, the instance and the agent:
 
 ```
-// Each live request has one nested call outstanding: Σ max_concurrency (18)
+// Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered. The family default of 16 would drop some; a dropped result is
-// a request answered `internal` four minutes later.
+// re-delivered. The config check holds Σ to at most 32, so 64 holds any class
+// twice over. The family default of 16 would drop some; a dropped result is a
+// request answered `internal` four minutes later.
 channel at "brenn:tool-results/maps" {
   push_depth = 1;
   retain_depth = 64;
@@ -230,12 +231,14 @@ agent PersonalAssistant {
 **The result inbox.** The `channel at "brenn:tool-results/maps"` block sizes
 the inbox the instance's nested answers arrive on (the slug after the `/` is
 the instance's name). Each request the component serves has at most one
-Google call outstanding, so at most Σ `max_concurrency` = 18 answers are
-outstanding at once, and an answer may be delivered twice: 18 × 2 = 36,
-rounded up to 64, which also covers the 32 ceiling on Σ `max_concurrency`
-once. The default window of 16 is below 18 and would lose answers under load,
-each lost answer leaving its request to be answered `internal` after the
-240-second ceiling. `push_depth = 1` is the inert channel rung, and
+Google call outstanding, so at most Σ `max_concurrency` answers are
+outstanding at once, and an answer may be delivered twice: the window must
+hold 2 × Σ. The config check holds Σ to at most 32
+(`PROVIDER_CONCURRENCY_CEILING`), and 64 holds that twice over, so tools
+joining this class change nothing the inbox needs. The default window of 16
+is too small for a full window and would lose answers under load, each lost
+answer leaving its request to be answered `internal` after the 240-second
+ceiling. `push_depth = 1` is the inert channel rung, and
 `noise = alarm` makes a drop here an alert.
 
 **The clauses.** The instance holds nine clauses, one per endpoint, and
