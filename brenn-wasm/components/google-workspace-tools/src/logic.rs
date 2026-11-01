@@ -19,7 +19,7 @@ mod compose;
 #[path = "decode.rs"]
 mod decode;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use brenn_provider_kit::{
     Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure,
@@ -305,11 +305,38 @@ const DRAFT_UNKNOWN_HINT: &str = "the draft may have been created before its ans
                                   look for it with GmailSearch (`q: in:drafts`) before asking \
                                   again, or the user has two";
 
+/// The path Gmail changes many messages' labels at in one call.
+const BATCH_MODIFY_PATH: &str = "/gmail/v1/users/me/messages/batchModify";
+/// The most message ids one batchModify takes: Google's limit.
+const MODIFY_IDS_MAX: usize = 1000;
+/// The most characters `GmailModifyLabels`' message ids may hold together
+/// (ids are ASCII, so characters are bytes). They travel in the POST body
+/// inside the nested call's args, which the host caps at 64 KiB: with `add`
+/// and `remove` at `MODIFY_LABELS_MAX` ids of `ID_MAX_CHARS` and `account` at
+/// its escaped width, the widest admitted call serializes to about 61 000
+/// bytes.
+const MODIFY_IDS_MAX_CHARS: usize = 48_000;
+/// The most label ids `add` or `remove` may name.
+const MODIFY_LABELS_MAX: usize = 20;
+/// The system label ids `add` refuses. Applying `TRASH` or `SPAM` moves mail
+/// to a folder Gmail empties after 30 days, and `SPAM` also trains the spam
+/// filter; these tools never trash mail or report it. Every other label Gmail
+/// lets a caller apply (`INBOX`, `UNREAD`, `STARRED`, `IMPORTANT`, the
+/// `CATEGORY_` tabs, the user's `Label_` ids) is undone by removing it, and
+/// `remove` may name these two, which restores mail. Compared ignoring ASCII
+/// case: no label id an account has is either name in another case.
+const MODIFY_ADD_REFUSED: [&str; 2] = ["TRASH", "SPAM"];
+/// What the caller is told when a batchModify may have been acted on and its
+/// answer was lost or unreadable.
+const MODIFY_UNKNOWN_HINT: &str =
+    "the labels may already have been changed; asking again with the same arguments is safe";
+
 /// The Google scope a step's call needs, named in a 403's hint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     GmailRead,
     GmailCompose,
+    GmailOrganize,
     CalendarRead,
 }
 
@@ -320,6 +347,7 @@ impl Scope {
         match self {
             Scope::GmailRead => "Gmail read",
             Scope::GmailCompose => "Gmail compose",
+            Scope::GmailOrganize => "Gmail organize",
             Scope::CalendarRead => "Calendar read",
         }
     }
@@ -338,6 +366,7 @@ fn scope(tool: Provided, step: u8) -> Scope {
         ) => Scope::GmailRead,
         (Provided::GmailDraft, DRAFT_ORIGINAL_STEP) => Scope::GmailRead,
         (Provided::GmailDraft, _) => Scope::GmailCompose,
+        (Provided::GmailModifyLabels, _) => Scope::GmailOrganize,
         (
             Provided::CalendarList
             | Provided::CalendarEvents
@@ -500,9 +529,12 @@ fn id_arg(
 
 /// A Gmail id argument: one path segment of letters, digits, `_` and `-`.
 fn gmail_id(args: &Args, key: &str) -> Result<Option<String>, String> {
-    id_arg(args, key, is_gmail_id, || {
-        format!("1 to {ID_MAX_CHARS} letters, digits, `_` or `-`")
-    })
+    id_arg(args, key, is_gmail_id, gmail_id_rule)
+}
+
+/// What `is_gmail_id` admits, as a refusal states it.
+fn gmail_id_rule() -> String {
+    format!("1 to {ID_MAX_CHARS} letters, digits, `_` or `-`")
 }
 
 /// Whether `id` has a calendar id's shape, whatever its length: one path
@@ -583,40 +615,68 @@ fn time(args: &Args, key: &str) -> Result<Option<String>, String> {
 /// `FREEBUSY_IDS_MAX_BYTES`; absent is `primary` alone. Google answers one
 /// entry per distinct id, so a repeated id is refused.
 fn calendars(args: &Args) -> Result<Vec<String>, String> {
-    let Some(value) = args.get("calendars") else {
+    let Some(out) = id_list(
+        args,
+        "calendars",
+        FREEBUSY_CALENDARS_MAX,
+        "calendar ids",
+        is_calendar_id,
+        calendar_id_rule,
+    )?
+    else {
         return Ok(vec![PRIMARY_CALENDAR.to_string()]);
     };
-    let ids = match value {
-        Value::Array(ids) if (1..=FREEBUSY_CALENDARS_MAX).contains(&ids.len()) => ids,
-        _ => {
-            return Err(format!(
-                "`calendars` must be an array of 1 to {FREEBUSY_CALENDARS_MAX} calendar ids"
-            ));
-        }
-    };
-    let mut out: Vec<String> = Vec::with_capacity(ids.len());
-    for id in ids {
-        match id {
-            Value::String(id) if is_calendar_id(id) => {
-                if out.contains(id) {
-                    return Err(format!("`calendars` names {id:?} twice"));
-                }
-                out.push(id.clone());
-            }
-            _ => {
-                return Err(format!(
-                    "each of `calendars` must be {}",
-                    calendar_id_rule()
-                ));
-            }
-        }
-    }
     if out.iter().map(String::len).sum::<usize>() > FREEBUSY_IDS_MAX_BYTES {
         return Err(format!(
             "`calendars` together exceed {FREEBUSY_IDS_MAX_BYTES} bytes (UTF-8); ask for fewer"
         ));
     }
     Ok(out)
+}
+
+/// An argument that is 1 to `max` distinct ids, each held to `valid`; absent
+/// is `None`. Refusals say "`key` must be an array of 1 to `max`" `what`,
+/// "each of `key` must be" `rule`, or that it names an id twice.
+fn id_list(
+    args: &Args,
+    key: &str,
+    max: usize,
+    what: &str,
+    valid: fn(&str) -> bool,
+    rule: impl Fn() -> String,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let ids = match value {
+        Value::Array(ids) if (1..=max).contains(&ids.len()) => ids,
+        _ => return Err(format!("`{key}` must be an array of 1 to {max} {what}")),
+    };
+    let mut out: Vec<String> = Vec::with_capacity(ids.len());
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        match id {
+            Value::String(id) if valid(id) => {
+                if !seen.insert(id.as_str()) {
+                    return Err(format!("`{key}` names {id:?} twice"));
+                }
+                out.push(id.clone());
+            }
+            _ => return Err(format!("each of `{key}` must be {}", rule())),
+        }
+    }
+    Ok(Some(out))
+}
+
+/// A list of Gmail ids: 1 to `max` distinct ids, each one path segment of
+/// letters, digits, `_` and `-`.
+fn gmail_ids(
+    args: &Args,
+    key: &str,
+    max: usize,
+    what: &str,
+) -> Result<Option<Vec<String>>, String> {
+    id_list(args, key, max, what, is_gmail_id, gmail_id_rule)
 }
 
 /// The `max_chars` argument: `MAX_CHARS_MIN` to `MAX_CHARS_MAX`, default
@@ -700,6 +760,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                 (None, None) => {
                     unreachable!("a draft's parse refuses one without `subject` or `reply_to_id`")
                 }
+            })
+        }
+        Provided::GmailModifyLabels => {
+            let modify = ModifyLabelsArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: batch_modify_call(&modify, settings),
             })
         }
     }
@@ -1339,6 +1406,94 @@ fn compact_draft(body: &Value, derived: &Args) -> Result<Value, Failure> {
     Ok(Value::Object(out))
 }
 
+/// `GmailModifyLabels`' arguments: the messages, and the label ids to add
+/// and to remove, at least one of the two given and no id in both.
+struct ModifyLabelsArgs {
+    ids: Vec<String>,
+    add: Option<Vec<String>>,
+    remove: Option<Vec<String>>,
+    account: Option<String>,
+}
+
+impl ModifyLabelsArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["ids", "add", "remove", "account"];
+
+    fn parse(args: &Value) -> Result<ModifyLabelsArgs, String> {
+        let map = object(args, Self::KEYS)?;
+        let ids =
+            gmail_ids(map, "ids", MODIFY_IDS_MAX, "message ids")?.ok_or("`ids` is required")?;
+        if ids.iter().map(String::len).sum::<usize>() > MODIFY_IDS_MAX_CHARS {
+            return Err(format!(
+                "`ids` together exceed {MODIFY_IDS_MAX_CHARS} characters; ask for fewer"
+            ));
+        }
+        let add = gmail_ids(map, "add", MODIFY_LABELS_MAX, "label ids")?;
+        if let Some(refused) = add.iter().flatten().find(|id| {
+            MODIFY_ADD_REFUSED
+                .iter()
+                .any(|label| id.eq_ignore_ascii_case(label))
+        }) {
+            return Err(format!(
+                "`add` may not name `{refused}`: these tools never move mail to Trash or Spam"
+            ));
+        }
+        let remove = gmail_ids(map, "remove", MODIFY_LABELS_MAX, "label ids")?;
+        match (&add, &remove) {
+            (None, None) => return Err("`add` or `remove` must name a label".to_string()),
+            (Some(add), Some(remove)) => {
+                if let Some(both) = add.iter().find(|id| remove.contains(id)) {
+                    return Err(format!("`add` and `remove` both name `{both}`"));
+                }
+            }
+            _ => {}
+        }
+        Ok(ModifyLabelsArgs {
+            ids,
+            add,
+            remove,
+            account: account(map)?,
+        })
+    }
+}
+
+/// messages.batchModify of the arguments' messages: one `POST`, each label
+/// list only when given. Google applies it whole or refuses it.
+fn batch_modify_call(args: &ModifyLabelsArgs, settings: &Settings) -> ApiCall {
+    let mut body = json!({ "ids": args.ids });
+    if let Some(add) = &args.add {
+        body["addLabelIds"] = json!(add);
+    }
+    if let Some(remove) = &args.remove {
+        body["removeLabelIds"] = json!(remove);
+    }
+    post_json_call(
+        settings,
+        &settings.gmail_host,
+        args.account.as_deref(),
+        BATCH_MODIFY_PATH.to_string(),
+        Query::new(),
+        body,
+    )
+}
+
+/// A batchModify Google accepted, whatever 2xx it answered with: how many
+/// messages, and the label ids added and removed, as asked.
+fn modify_labels_accepted(state: &InFlight) -> Result<Next, Failure> {
+    let args =
+        stored(state, ModifyLabelsArgs::parse).map_err(|failure| at_write(state, failure))?;
+    let mut out = Args::new();
+    out.insert("accepted".to_string(), json!(true));
+    out.insert("ids".to_string(), json!(args.ids.len()));
+    if let Some(add) = args.add {
+        out.insert("add".to_string(), json!(add));
+    }
+    if let Some(remove) = args.remove {
+        out.insert("remove".to_string(), json!(remove));
+    }
+    Ok(Next::Complete(Value::Object(out)))
+}
+
 /// labels.list for the names of the user labels an answer carries.
 fn label_names_call(account: Option<&str>, settings: &Settings) -> ApiCall {
     get_call(
@@ -1544,9 +1699,7 @@ fn google_error(status: u64, body: &str, scope: Scope) -> Failure {
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
     let body = match read_api_result(outcome, &state.target) {
         Ok(Answer::Body(body)) => body,
-        Ok(Answer::NoBody { status }) => {
-            return Next::Fail(at_write(state, no_body(state, status)));
-        }
+        Ok(Answer::NoBody { status }) => return settle(state.tool, no_body(state, status)),
         Ok(Answer::Relay(value)) => return Next::Complete(value),
         Ok(Answer::Unreadable(why)) => return unreadable(state, why, settings),
         // A message deleted between the listing and its read is listed
@@ -1574,6 +1727,8 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             (Provided::GmailDraft, DRAFT_CREATE_STEP) => compact_draft(&body, &state.derived)
                 .map(Next::Complete)
                 .map_err(|failure| at_write(state, failure)),
+            // Google's acceptance of a label change, whatever its body.
+            (Provided::GmailModifyLabels, 1) => modify_labels_accepted(state),
             (Provided::GmailLabels, 1) => stored(state, LabelsArgs::parse)
                 .and_then(|args| match args.id {
                     Some(_) => compact_label(&body),
@@ -1657,6 +1812,7 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
 fn write_hint(tool: Provided, step: u8) -> Option<&'static str> {
     match (tool, step) {
         (Provided::GmailDraft, DRAFT_CREATE_STEP) => Some(DRAFT_UNKNOWN_HINT),
+        (Provided::GmailModifyLabels, 1) => Some(MODIFY_UNKNOWN_HINT),
         _ => None,
     }
 }
@@ -1676,15 +1832,17 @@ fn at_write(state: &InFlight, failure: Failure) -> Failure {
     }
 }
 
-/// A 2xx with no body, which no step accepts: each names the API whose
-/// answer it expected, as that step's `shape` failure names it.
-fn no_body(state: &InFlight, status: u64) -> Failure {
+/// A 2xx with no body, decided by the step: a label change is accepted;
+/// every other step refuses it, naming the API whose answer it expected, as
+/// that step's `shape` failure names it, with a write step's hint.
+fn no_body(state: &InFlight, status: u64) -> Result<Next, Failure> {
     let (api, answers) = match (state.tool, state.step) {
+        (Provided::GmailModifyLabels, 1) => return modify_labels_accepted(state),
         (Provided::GmailDraft, DRAFT_CREATE_STEP) => ("drafts.create", "the draft"),
         (Provided::GmailLabels, 1) => match stored(state, LabelsArgs::parse) {
             Ok(LabelsArgs { id: Some(_), .. }) => ("labels.get", "JSON"),
             Ok(LabelsArgs { id: None, .. }) => ("labels.list", "JSON"),
-            Err(failure) => return failure,
+            Err(failure) => return Err(failure),
         },
         (Provided::GmailSearch, 1) => ("messages.list", "JSON"),
         (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET)
@@ -1698,10 +1856,13 @@ fn no_body(state: &InFlight, status: u64) -> Failure {
         (Provided::CalendarEvents, 1) => ("events.list", "JSON"),
         (Provided::CalendarEvent, 1) => ("events.get", "JSON"),
         (Provided::CalendarFreeBusy, 1) => ("freebusy.query", "JSON"),
-        (tool, step) => return no_such_step(tool, step),
+        (tool, step) => return Err(no_such_step(tool, step)),
     };
-    internal(format!(
-        "Google answered HTTP {status} with no body where {api} answers {answers}"
+    Err(at_write(
+        state,
+        internal(format!(
+            "Google answered HTTP {status} with no body where {api} answers {answers}"
+        )),
     ))
 }
 
@@ -1723,7 +1884,8 @@ fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
                 | Provided::GmailSearch
                 | Provided::CalendarList
                 | Provided::CalendarEvents
-                | Provided::GmailDraft => (value, None),
+                | Provided::GmailDraft
+                | Provided::GmailModifyLabels => (value, None),
             };
             bounded(value, COMPACT_RESULT_CEILING, hint)
         }
@@ -5200,10 +5362,16 @@ mod tests {
             Provided::CalendarList
             | Provided::CalendarEvents
             | Provided::CalendarEvent
-            | Provided::CalendarFreeBusy => vec![1],
+            | Provided::CalendarFreeBusy
+            | Provided::GmailModifyLabels => vec![1],
             Provided::GmailDraft => vec![DRAFT_ORIGINAL_STEP, DRAFT_CREATE_STEP],
         }
     }
+
+    /// Every step that completes on any 2xx, an empty one included, and so
+    /// names no API it expected: `a_label_change_is_accepted_on_any_2xx`
+    /// holds the label change's.
+    const ACCEPTS_EVERY_2XX: [(Provided, u8); 1] = [(Provided::GmailModifyLabels, 1)];
 
     #[test]
     fn every_step_names_its_scope() {
@@ -5211,6 +5379,7 @@ mod tests {
             for step in steps(tool) {
                 let expected = match (tool, step) {
                     (Provided::GmailDraft, DRAFT_CREATE_STEP) => Scope::GmailCompose,
+                    (Provided::GmailModifyLabels, 1) => Scope::GmailOrganize,
                     _ if tool.name().starts_with("gmail-") => Scope::GmailRead,
                     _ => {
                         assert!(tool.name().starts_with("calendar-"), "{}", tool.name());
@@ -5758,6 +5927,14 @@ mod tests {
         "é".repeat(n)
     }
 
+    /// `n` distinct ids of exactly `len` ASCII characters: `prefix`, then the
+    /// id's number zero-padded to fill the rest.
+    fn padded_ids(prefix: &str, n: usize, len: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("{prefix}{i:0>width$}", width = len - prefix.len()))
+            .collect()
+    }
+
     /// A `key` of `max` characters is admitted and one of `max + 1` refused,
     /// both in characters of two UTF-8 bytes, beside the arguments `base`.
     fn admits_characters(
@@ -5820,15 +5997,19 @@ mod tests {
     /// Every argument `tool` takes, with the bound its parser holds it to,
     /// and the arguments it requires: the parser's own constants and key
     /// lists, as `every_tools_schema_states_what_its_parser_enforces` holds
-    /// the spec to them. Four parser rules are outside what a schema states,
-    /// each leaving the schema wider than the parser and each in the
+    /// the spec to them. Eight parser rules are outside what a schema
+    /// states, each leaving the schema wider than the parser and each in the
     /// description: `calendars`' ids together hold at most
-    /// `FREEBUSY_IDS_MAX_BYTES`, and a draft's `body` at most `BODY_MAX_BYTES`
-    /// in its CRLF form, as `every_description_states_its_parsers_budgets`
-    /// holds them; a draft's `subject` holds no control character; and a
-    /// draft without `reply_to_id` requires `subject`, a cross-field rule
-    /// `draft_requires_a_subject_unless_it_replies` holds. The per-value
-    /// probes are this component's, in `workspace_probes`.
+    /// `FREEBUSY_IDS_MAX_BYTES`, a draft's `body` at most `BODY_MAX_BYTES` in
+    /// its CRLF form, and a label change's `ids` at most
+    /// `MODIFY_IDS_MAX_CHARS`, as `every_description_states_its_parsers_budgets`
+    /// holds them; a draft's `subject` holds no control character; a label
+    /// change's `add` names none of `MODIFY_ADD_REFUSED`; and three
+    /// are cross-field — a draft without `reply_to_id` requires `subject`,
+    /// as `draft_requires_a_subject_unless_it_replies` holds, and a label
+    /// change names a label in `add` or `remove` and none in both, as
+    /// `modify_labels_refuses_bad_arguments` holds. The per-value probes are
+    /// this component's, in `workspace_probes`.
     fn bounds(tool: Provided) -> ToolBounds<'static> {
         let (keys, required): (&'static [&'static str], &'static [&'static str]) = match tool {
             Provided::GmailLabels => (LabelsArgs::KEYS, &[]),
@@ -5840,12 +6021,21 @@ mod tests {
             Provided::CalendarEvent => (EventArgs::KEYS, &["id"]),
             Provided::CalendarFreeBusy => (FreeBusyArgs::KEYS, &["from", "to"]),
             Provided::GmailDraft => (DraftArgs::KEYS, &["to", "body"]),
+            Provided::GmailModifyLabels => (ModifyLabelsArgs::KEYS, &["ids"]),
         };
         let text = |max_chars| Bound::Text {
             max_chars,
             format: None,
         };
         let integer = |min, max| Bound::Integer { min, max };
+        let gmail_ids = |max| Bound::Array {
+            min: 1,
+            max,
+            unique: true,
+            item: Box::new(Bound::Token {
+                max_chars: ID_MAX_CHARS,
+            }),
+        };
         let property = |key: &'static str| {
             let bound = match (tool, key) {
                 (_, "account") => text(ACCOUNT_MAX_CHARS),
@@ -5862,6 +6052,8 @@ mod tests {
                     unique: true,
                     item: Box::new(Bound::Pattern(calendar_id_pattern())),
                 },
+                (Provided::GmailModifyLabels, "ids") => gmail_ids(MODIFY_IDS_MAX),
+                (Provided::GmailModifyLabels, "add" | "remove") => gmail_ids(MODIFY_LABELS_MAX),
                 (_, "max_chars") => integer(MAX_CHARS_MIN, MAX_CHARS_MAX),
                 (_, "spam_trash") => Bound::Bool,
                 (Provided::GmailLabels | Provided::GmailRead | Provided::GmailThread, "id")
@@ -5896,16 +6088,19 @@ mod tests {
                 json!({ "from": FROM, "to": TO })
             }
             Provided::GmailDraft => draft_args(json!({})),
+            Provided::GmailModifyLabels => modify_args(json!({})),
         }
     }
 
     /// The probes of the arguments whose bounds are this component's, or
     /// whose parser holds a rule past the kit's bound: the calendar id, alone
-    /// as `calendar` and as `calendars`' items, and a draft's header values
-    /// and body. `None` where the kit's probes for the bound hold.
+    /// as `calendar` and as `calendars`' items, a draft's header values and
+    /// body, and a label change's id lists. `None` where the kit's probes for
+    /// the bound hold.
     fn workspace_probes(tool: Provided, key: &str, bound: &Bound) -> Option<Probes> {
         let ids = |n: usize| json!((0..n).map(|i| format!("c{i}")).collect::<Vec<_>>());
         let strings = |values: &[&str]| values.iter().map(|v| json!(v)).collect::<Vec<_>>();
+        let gmail_ids = |prefix: &str, n: usize, len: usize| json!(padded_ids(prefix, n, len));
         Some(match (tool, key) {
             (Provided::GmailDraft, "to" | "cc") => Probes {
                 admitted: strings(&[
@@ -5954,6 +6149,59 @@ mod tests {
                 ]
                 .concat(),
             },
+            (Provided::GmailModifyLabels, "ids") => Probes {
+                admitted: vec![
+                    json!(["m1"]),
+                    gmail_ids("m", MODIFY_IDS_MAX, 8),
+                    json!([&"m".repeat(ID_MAX_CHARS)]),
+                    // The ids at their budget together.
+                    gmail_ids("m", MODIFY_IDS_MAX_CHARS / ID_MAX_CHARS, ID_MAX_CHARS),
+                ],
+                refused: [vec![
+                    json!([]),
+                    gmail_ids("m", MODIFY_IDS_MAX + 1, 8),
+                    json!(["m1", "m1"]),
+                    json!([""]),
+                    json!([&"m".repeat(ID_MAX_CHARS + 1)]),
+                    json!(["a/b"]),
+                    json!(["a b"]),
+                    json!([1]),
+                    json!("m1"),
+                    // The budget the schema cannot state.
+                    gmail_ids("m", MODIFY_IDS_MAX_CHARS / ID_MAX_CHARS + 1, ID_MAX_CHARS),
+                ]]
+                .concat(),
+            },
+            (Provided::GmailModifyLabels, "add" | "remove") => {
+                let mut probes = Probes {
+                    admitted: vec![
+                        json!(["STARRED"]),
+                        gmail_ids("l", MODIFY_LABELS_MAX, ID_MAX_CHARS),
+                    ],
+                    refused: vec![
+                        json!([]),
+                        gmail_ids("l", MODIFY_LABELS_MAX + 1, 8),
+                        json!(["STARRED", "STARRED"]),
+                        json!([""]),
+                        json!(["My label"]),
+                        json!([1]),
+                        json!("STARRED"),
+                    ],
+                };
+                // The labels `add` refuses and the schema cannot state;
+                // `remove` restores mail from them.
+                let trash_and_spam = [
+                    json!(["TRASH"]),
+                    json!(["SPAM"]),
+                    json!(["Label_8", "trash"]),
+                ];
+                if key == "add" {
+                    probes.refused.extend(trash_and_spam);
+                } else {
+                    probes.admitted.extend(trash_and_spam);
+                }
+                probes
+            }
             (_, "calendar") => Probes {
                 admitted: [
                     wide(CALENDAR_ID_MAX_CHARS),
@@ -6080,6 +6328,13 @@ mod tests {
                 format!(
                     "an original whose subject is over {DERIVED_SUBJECT_MAX_BYTES} bytes is \
                      refused"
+                ),
+            ),
+            (
+                Provided::GmailModifyLabels,
+                format!(
+                    "the ids together may hold at most {MODIFY_IDS_MAX_CHARS} characters, and \
+                     more is refused"
                 ),
             ),
         ] {
@@ -7930,6 +8185,12 @@ mod tests {
                 "; the draft may have been created before its answer was lost: look for it \
                  with GmailSearch (`q: in:drafts`) before asking again, or the user has two",
             ),
+            (
+                modify_state(modify_args(json!({}))),
+                MODIFY_UNKNOWN_HINT,
+                "; the labels may already have been changed; asking again with the same \
+                 arguments is safe",
+            ),
         ] {
             for (outcome, why) in outcomes() {
                 let answer = answered(&state, outcome);
@@ -8005,6 +8266,9 @@ mod tests {
     fn an_empty_answer_is_internal_at_every_step() {
         for tool in Provided::ALL {
             for step in steps(tool) {
+                if ACCEPTS_EVERY_2XX.contains(&(tool, step)) {
+                    continue;
+                }
                 let mut state = labels_state(json!({}));
                 state.tool = tool;
                 state.step = step;
@@ -8050,6 +8314,12 @@ mod tests {
             reply_state(json!({})),
         ];
         for tool in Provided::ALL {
+            if steps(tool)
+                .into_iter()
+                .all(|step| ACCEPTS_EVERY_2XX.contains(&(tool, step)))
+            {
+                continue;
+            }
             assert!(
                 bases.iter().any(|state| state.tool == tool),
                 "{} has no state here",
@@ -8062,6 +8332,9 @@ mod tests {
         };
         for base in &bases {
             for step in steps(base.tool) {
+                if ACCEPTS_EVERY_2XX.contains(&(base.tool, step)) {
+                    continue;
+                }
                 let mut state = base.clone();
                 state.step = step;
                 // The label-names step reads after an answer it carries, and
@@ -8109,5 +8382,274 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A label change's arguments: `m1` gains `Label_7`, with `extra` set
+    /// over them.
+    fn modify_args(extra: Value) -> Value {
+        let mut args = json!({ "ids": ["m1"], "add": ["Label_7"] });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        args
+    }
+
+    fn modify(args: Value) -> Result<ApiCall, String> {
+        plan(Provided::GmailModifyLabels, &args, &settings()).map(|call| {
+            assert_eq!(call.step, 1);
+            call.api
+        })
+    }
+
+    fn modify_state(args: Value) -> InFlight {
+        let call = plan(Provided::GmailModifyLabels, &args, &settings()).unwrap();
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::GmailModifyLabels,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+        )
+    }
+
+    #[test]
+    fn a_label_change_posts_one_batch_modify_on_the_gmail_host() {
+        let call = modify(json!({
+            "ids": ["m1", "m2"],
+            "add": ["Label_7", "STARRED"],
+            "remove": ["INBOX"],
+            "account": "alice@example.com",
+        }))
+        .unwrap();
+        assert_eq!(
+            call,
+            ApiCall {
+                provider: "google".to_string(),
+                account: Some("alice@example.com".to_string()),
+                method: "POST".to_string(),
+                host: "gmail.example.com".to_string(),
+                path: "/gmail/v1/users/me/messages/batchModify".to_string(),
+                query: query([("prettyPrint", "false".to_string())]),
+                headers: BTreeMap::new(),
+                body: call.body.clone(),
+            }
+        );
+        let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "ids": ["m1", "m2"],
+                "addLabelIds": ["Label_7", "STARRED"],
+                "removeLabelIds": ["INBOX"],
+            })
+        );
+        // Each label list only when given.
+        let body = |args: Value| -> Value {
+            serde_json::from_str(modify(args).unwrap().body.as_deref().unwrap()).unwrap()
+        };
+        assert_eq!(
+            body(json!({ "ids": ["m1"], "add": ["Label_7"] })),
+            json!({ "ids": ["m1"], "addLabelIds": ["Label_7"] })
+        );
+        assert_eq!(
+            body(json!({ "ids": ["m1"], "remove": ["UNREAD"] })),
+            json!({ "ids": ["m1"], "removeLabelIds": ["UNREAD"] })
+        );
+    }
+
+    #[test]
+    fn modify_labels_refuses_bad_arguments() {
+        for (args, refusal) in [
+            (json!({ "add": ["Label_7"] }), "`ids` is required"),
+            (
+                json!({ "ids": ["m1"] }),
+                "`add` or `remove` must name a label",
+            ),
+            (
+                json!({ "ids": ["m1"], "add": ["UNREAD", "Label_7"], "remove": ["Label_7"] }),
+                "`add` and `remove` both name `Label_7`",
+            ),
+            (
+                json!({ "ids": [], "add": ["Label_7"] }),
+                "`ids` must be an array of 1 to 1000 message ids",
+            ),
+            (
+                json!({ "ids": ["m1", "m1"], "add": ["Label_7"] }),
+                "`ids` names \"m1\" twice",
+            ),
+            (
+                json!({ "ids": ["m/1"], "add": ["Label_7"] }),
+                "each of `ids` must be 1 to 128 letters, digits, `_` or `-`",
+            ),
+            (
+                json!({ "ids": ["m1"], "add": ["Receipts 2026"] }),
+                "each of `add` must be 1 to 128 letters, digits, `_` or `-`",
+            ),
+            (
+                json!({ "ids": ["m1"], "remove": "INBOX" }),
+                "`remove` must be an array of 1 to 20 label ids",
+            ),
+            (
+                json!({ "ids": ["m1"], "add": ["Label_7", "TRASH"] }),
+                "`add` may not name `TRASH`: these tools never move mail to Trash or Spam",
+            ),
+            (
+                json!({ "ids": ["m1"], "add": ["Spam"], "remove": ["INBOX"] }),
+                "`add` may not name `Spam`: these tools never move mail to Trash or Spam",
+            ),
+            (
+                json!({ "ids": ["m1"], "add": ["Label_7"], "labels": ["INBOX"] }),
+                "unknown argument `labels`; this tool takes `ids`, `add`, `remove`, `account`",
+            ),
+        ] {
+            assert_eq!(modify(args.clone()).unwrap_err(), refusal, "{args}");
+        }
+        assert!(modify(json!({ "ids": ["m1"], "remove": ["TRASH", "SPAM"] })).is_ok());
+        let ids = |n: usize| padded_ids("m", n, ID_MAX_CHARS);
+        let at_budget = ids(MODIFY_IDS_MAX_CHARS / ID_MAX_CHARS);
+        assert_eq!(
+            at_budget.iter().map(String::len).sum::<usize>(),
+            MODIFY_IDS_MAX_CHARS
+        );
+        assert!(modify(modify_args(json!({ "ids": at_budget }))).is_ok());
+        assert_eq!(
+            modify(modify_args(
+                json!({ "ids": ids(MODIFY_IDS_MAX_CHARS / ID_MAX_CHARS + 1) })
+            ))
+            .unwrap_err(),
+            "`ids` together exceed 48000 characters; ask for fewer"
+        );
+    }
+
+    #[test]
+    fn a_label_change_is_accepted_on_any_2xx() {
+        let accepted =
+            json!({ "accepted": true, "ids": 2, "add": ["Label_7"], "remove": ["INBOX"] });
+        let state = modify_state(json!({
+            "ids": ["m1", "m2"],
+            "add": ["Label_7"],
+            "remove": ["INBOX"],
+        }));
+        for outcome in [
+            http(204, ""),
+            http(200, ""),
+            http(200, "{}"),
+            http(200, r#"{"unexpected":[1]}"#),
+            http(200, "42"),
+        ] {
+            assert_eq!(answered(&state, outcome), Next::Complete(accepted.clone()));
+        }
+        // Only the label lists asked for are answered.
+        assert_eq!(
+            answered(
+                &modify_state(json!({ "ids": ["m1"], "remove": ["UNREAD"] })),
+                http(204, "")
+            ),
+            Next::Complete(json!({ "accepted": true, "ids": 1, "remove": ["UNREAD"] }))
+        );
+    }
+
+    #[test]
+    fn a_label_changes_internal_failure_carries_its_hint() {
+        let state = modify_state(modify_args(json!({})));
+        let hinted =
+            |detail: &str| Next::Fail(internal(format!("{detail}; {MODIFY_UNKNOWN_HINT}")));
+        assert_eq!(
+            answered(&state, http(200, "<html>")),
+            hinted("Google returned HTTP 200 with a body that is not JSON")
+        );
+        assert_eq!(
+            answered(&state, nested("rate_limited", "slow down")),
+            hinted("rate_limited: slow down")
+        );
+        let Next::Fail(failed) = answered(&state, http(503, "{}")) else {
+            panic!("a 503 fails");
+        };
+        assert_eq!(failed.kind, ErrorKind::Internal);
+        assert!(
+            failed.detail.ends_with(&format!("; {MODIFY_UNKNOWN_HINT}")),
+            "{}",
+            failed.detail
+        );
+        // Google's refusal of an unknown label changed nothing, and a call
+        // `api-request` refused reached no API: neither carries the hint.
+        for outcome in [
+            http(
+                400,
+                &google(400, "INVALID_ARGUMENT", "Invalid label: Label_404"),
+            ),
+            nested("denied", "no clause admits it"),
+        ] {
+            let Next::Fail(refused) = answered(&state, outcome) else {
+                panic!("a refusal fails");
+            };
+            assert_ne!(refused.kind, ErrorKind::Internal);
+            assert!(
+                !refused.detail.contains(MODIFY_UNKNOWN_HINT),
+                "{}",
+                refused.detail
+            );
+        }
+    }
+
+    #[test]
+    fn a_modify_labels_403_names_the_organize_scope() {
+        let body = google(
+            403,
+            "PERMISSION_DENIED",
+            "Request had insufficient authentication scopes.",
+        );
+        assert_eq!(
+            answered(&modify_state(modify_args(json!({}))), http(403, &body)),
+            Next::Fail(failure(
+                ErrorKind::Denied,
+                "Google PERMISSION_DENIED (HTTP 403): Request had insufficient authentication \
+                 scopes. If Google names insufficient authentication scopes, the account was \
+                 connected without the Gmail organize scope: run oauth-connect with that scope \
+                 set and relay its steps."
+            ))
+        );
+    }
+
+    #[test]
+    fn the_widest_modify_labels_call_fits_the_args_cap() {
+        // The most ids, and the longest, each at the ids' budget, beside
+        // label lists of the most and longest ids and `account` at its
+        // escaped width.
+        let labels = |prefix: &str| padded_ids(prefix, MODIFY_LABELS_MAX, ID_MAX_CHARS);
+        let with = |ids: Vec<String>| {
+            modify(json!({
+                "ids": ids,
+                "add": labels("a"),
+                "remove": labels("r"),
+                "account": escaped_widest(ACCOUNT_MAX_CHARS),
+            }))
+        };
+        for (n, len) in [
+            (MODIFY_IDS_MAX, MODIFY_IDS_MAX_CHARS / MODIFY_IDS_MAX),
+            (MODIFY_IDS_MAX_CHARS / ID_MAX_CHARS, ID_MAX_CHARS),
+        ] {
+            let ids = padded_ids("m", n, len);
+            assert_eq!(
+                ids.iter().map(String::len).sum::<usize>(),
+                MODIFY_IDS_MAX_CHARS
+            );
+            let args = serde_json::to_vec(&with(ids).unwrap()).unwrap();
+            assert!(
+                args.len() <= HOST_ARGS_CAP_BYTES,
+                "{n} ids: {} bytes of args",
+                args.len()
+            );
+        }
+        assert_eq!(
+            with(padded_ids(
+                "m",
+                MODIFY_IDS_MAX,
+                MODIFY_IDS_MAX_CHARS / MODIFY_IDS_MAX + 1
+            ))
+            .unwrap_err(),
+            "`ids` together exceed 48000 characters; ask for fewer"
+        );
     }
 }

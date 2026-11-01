@@ -29,6 +29,21 @@ All notable changes to Brenn are documented here.
   the user's Gmail read access as well as `gmail_compose`. No config changes
   beyond those `GmailDraft` already needs.
 
+- **The Google Workspace assistant tools can now label and archive Gmail
+  messages.** The `google-workspace-tools` component gains
+  `GmailModifyLabels`: one change that adds and removes labels on up to
+  1000 messages at once, all or none, using the label ids `GmailLabels`
+  lists — removing `INBOX` archives, removing `UNREAD` marks read. The tool
+  never moves mail to Trash or Spam: adding `TRASH` or `SPAM` is refused
+  before anything is changed, while removing them is allowed. **Config
+  change required:** the instance's `api-request` grant needs a `POST`
+  clause for `/gmail/v1/users/me/messages/batchModify` on the Gmail host;
+  the Google provider needs a `gmail_organize` scope set
+  (`https://www.googleapis.com/auth/gmail.labels` and
+  `https://www.googleapis.com/auth/gmail.modify`); the assistant needs
+  `tool gmail-modify-labels {}`; and each user reconnects their Google
+  account with `gmail_organize` before the tool can change labels.
+
 - **The Google Workspace assistant tools can now tell when the user is
   busy.** The `google-workspace-tools` component gains `CalendarFreeBusy`:
   for a window between two RFC 3339 times and up to 50 calendars (`primary`

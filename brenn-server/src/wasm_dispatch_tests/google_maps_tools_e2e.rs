@@ -307,7 +307,7 @@ async fn geocode_reverse_answers_compactly() {
 #[tokio::test]
 async fn a_google_error_body_is_the_tools_error() {
     let r = rig().await;
-    r.fail(
+    r.respond(
         GEOCODE_ADDRESS,
         403,
         json!({

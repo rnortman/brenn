@@ -55,6 +55,7 @@ const THREADS: &str = "/gmail/v1/users/me/threads";
 const CALENDAR_LIST: &str = "/calendar/v3/users/me/calendarList";
 const FREE_BUSY: &str = "/calendar/v3/freeBusy";
 const DRAFTS: &str = "/gmail/v1/users/me/drafts";
+const BATCH_MODIFY: &str = "/gmail/v1/users/me/messages/batchModify";
 
 /// The instance's `api-request` clauses, as method and exact path, each on
 /// the stub's host for any user: one per endpoint the tools call.
@@ -69,6 +70,7 @@ const CLAUSES: &[(&str, &str)] = &[
     ("GET", "/calendar/v3/calendars/*/events/*"),
     ("POST", FREE_BUSY),
     ("POST", DRAFTS),
+    ("POST", BATCH_MODIFY),
 ];
 
 /// The component's `provide` statements, lowered from its packaged
@@ -578,7 +580,7 @@ async fn search_with_only_system_labels_skips_the_label_names() {
 async fn a_google_403_mid_search_fails_the_search() {
     let r = rig().await;
     r.answer(MESSAGES, listing_body(&["m1", "m2"]));
-    r.fail(&format!("{MESSAGES}/m1"), 403, insufficient_scope_body());
+    r.respond(&format!("{MESSAGES}/m1"), 403, insufficient_scope_body());
     let call = r.call_for_alice("GmailSearch", json!({ "q": "is:unread" }));
     let id = r.requested_id().await;
     r.run(2).await;
@@ -810,7 +812,7 @@ async fn a_userless_caller_is_denied_with_the_reason() {
 #[tokio::test]
 async fn a_google_403_is_denied_with_the_scope_hint() {
     let r = rig().await;
-    r.fail(LABELS, 403, insufficient_scope_body());
+    r.respond(LABELS, 403, insufficient_scope_body());
     let call = r.call_for_alice("GmailLabels", json!({}));
     let id = r.requested_id().await;
     r.run(1).await;
@@ -1016,7 +1018,7 @@ async fn an_html_only_read_answers_its_text() {
 #[tokio::test]
 async fn a_google_404_on_a_read_is_invalid_args() {
     let r = rig().await;
-    r.fail(
+    r.respond(
         &format!("{MESSAGES}/m404"),
         404,
         json!({ "error": {
@@ -1588,7 +1590,7 @@ async fn calendar_list_reads_the_users_calendars() {
 #[tokio::test]
 async fn a_calendar_403_is_denied_with_the_calendar_scope_hint() {
     let r = rig().await;
-    r.fail(CALENDAR_LIST, 403, insufficient_scope_body());
+    r.respond(CALENDAR_LIST, 403, insufficient_scope_body());
     let call = r.call_for_alice("CalendarList", json!({}));
     let id = r.requested_id().await;
     r.run(1).await;
@@ -1755,7 +1757,7 @@ async fn a_window_too_large_to_read_whole_is_refused_with_what_to_narrow() {
 #[tokio::test]
 async fn a_google_400_on_a_window_is_invalid_args() {
     let r = rig().await;
-    r.fail(
+    r.respond(
         "/calendar/v3/calendars/primary/events",
         400,
         json!({ "error": { "code": 400, "message": "Bad Request", "status": "INVALID_ARGUMENT" } })
@@ -1890,7 +1892,7 @@ async fn an_event_too_large_to_read_whole_is_refused_with_the_reason_alone() {
 #[tokio::test]
 async fn a_google_404_on_an_event_is_invalid_args() {
     let r = rig().await;
-    r.fail(
+    r.respond(
         "/calendar/v3/calendars/primary/events/e1",
         404,
         json!({ "error": { "code": 404, "message": "Not Found", "status": "NOT_FOUND" } })
@@ -2251,7 +2253,7 @@ async fn gmail_draft_refuses_a_header_with_a_line_break_before_any_call() {
 #[tokio::test]
 async fn a_draft_403_names_the_compose_scope() {
     let r = rig().await;
-    r.fail(DRAFTS, 403, insufficient_scope_body());
+    r.respond(DRAFTS, 403, insufficient_scope_body());
     let call = r.call_for_alice(
         "GmailDraft",
         json!({ "to": "bob@example.com", "subject": "Lunch", "body": "Friday?" }),
@@ -2425,7 +2427,7 @@ async fn gmail_draft_replies_to_an_original_without_a_message_id() {
 #[tokio::test]
 async fn a_reply_read_403_names_the_read_scope() {
     let r = rig().await;
-    r.fail(&format!("{MESSAGES}/m1"), 403, insufficient_scope_body());
+    r.respond(&format!("{MESSAGES}/m1"), 403, insufficient_scope_body());
     let call = r.call_for_alice(
         "GmailDraft",
         json!({ "to": "bob@example.com", "body": "Noon works.", "reply_to_id": "m1" }),
@@ -2443,4 +2445,144 @@ async fn a_reply_read_403_names_the_read_scope() {
         )]
     );
     r.assert_finished(&id);
+}
+
+/// What `GmailModifyLabels` is called with in these cases: two messages
+/// gain `Label_7` and leave the inbox.
+fn modify_args() -> serde_json::Value {
+    json!({ "ids": ["m1", "m2"], "add": ["Label_7"], "remove": ["INBOX"] })
+}
+
+/// `GmailModifyLabels` changes the labels with one `POST` to batchModify
+/// carrying alice's bearer and the ids and label lists; Google's 204 with
+/// no body is the change accepted.
+#[tokio::test]
+async fn gmail_modify_labels_posts_one_batch_modify_and_a_204_is_success() {
+    let r = rig().await;
+    r.respond(BATCH_MODIFY, 204, Vec::new());
+    let call = r.call_for_alice("GmailModifyLabels", modify_args());
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap(),
+        Ok(json!({ "accepted": true, "ids": 2, "add": ["Label_7"], "remove": ["INBOX"] }))
+    );
+    assert_eq!(
+        r.seen(),
+        [(
+            "POST".to_string(),
+            BATCH_MODIFY.to_string(),
+            google_query(&[])
+        )]
+    );
+    assert_eq!(r.bearers(), [format!("Bearer {BEARER}")]);
+    let bodies = r.bodies();
+    assert_eq!(bodies.len(), 1, "exactly one POST carried a body");
+    let request: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+    assert_eq!(
+        request,
+        json!({ "ids": ["m1", "m2"], "addLabelIds": ["Label_7"], "removeLabelIds": ["INBOX"] })
+    );
+    r.assert_finished(&id);
+}
+
+/// A 2xx carrying a JSON body is the change accepted as well: Google's
+/// acceptance, whatever it answered with.
+#[tokio::test]
+async fn a_batch_modify_answered_with_json_is_success() {
+    let r = rig().await;
+    r.answer(BATCH_MODIFY, "{}");
+    let call = r.call_for_alice(
+        "GmailModifyLabels",
+        json!({ "ids": ["m1"], "remove": ["UNREAD"] }),
+    );
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap(),
+        Ok(json!({ "accepted": true, "ids": 1, "remove": ["UNREAD"] }))
+    );
+    r.assert_finished(&id);
+}
+
+/// Google's 403 on the batchModify is `denied`, telling the assistant to
+/// reconnect with the Gmail organize scope.
+#[tokio::test]
+async fn a_modify_labels_403_names_the_organize_scope() {
+    let r = rig().await;
+    r.respond(BATCH_MODIFY, 403, insufficient_scope_body());
+    let call = r.call_for_alice("GmailModifyLabels", modify_args());
+    let id = r.requested_id().await;
+    r.run(1).await;
+
+    assert_eq!(
+        call.await.unwrap(),
+        Err(ToolError::Denied(
+            "Google PERMISSION_DENIED (HTTP 403): Request had insufficient authentication \
+             scopes. If Google names insufficient authentication scopes, the account was \
+             connected without the Gmail organize scope: run oauth-connect with that scope set \
+             and relay its steps."
+                .to_string(),
+        ))
+    );
+    r.assert_finished(&id);
+}
+
+/// Without the batchModify clause the `POST` is refused when it is queued,
+/// even though the other `POST` clauses stand.
+#[tokio::test]
+async fn a_batch_modify_post_without_its_clause_could_not_be_issued() {
+    let clauses: Vec<(&str, &str)> = CLAUSES
+        .iter()
+        .copied()
+        .filter(|&(_, path)| path != BATCH_MODIFY)
+        .collect();
+    let r = rig_with(&clauses, &[(ACCOUNT, BEARER)], None).await;
+    let call = r.call_for_alice("GmailModifyLabels", modify_args());
+    let id = r.requested_id().await;
+    r.serve().await;
+
+    assert_could_not_be_issued(call.await.unwrap());
+    r.owed(&r.executor_sub(), 0).await;
+    assert!(r.seen().is_empty(), "a refused call reaches no API");
+    r.assert_finished(&id);
+}
+
+/// A label change naming no label, or one label both to add and to
+/// remove, is refused `invalid_args` before any call is issued.
+#[tokio::test]
+async fn gmail_modify_labels_refuses_bad_arguments_before_any_call() {
+    for (args, refusal) in [
+        (
+            json!({ "ids": ["m1"] }),
+            "`add` or `remove` must name a label",
+        ),
+        (
+            json!({ "ids": ["m1"], "add": ["INBOX"], "remove": ["INBOX"] }),
+            "`add` and `remove` both name `INBOX`",
+        ),
+        (
+            json!({ "ids": ["m1"], "add": ["TRASH"] }),
+            "`add` may not name `TRASH`: these tools never move mail to Trash or Spam",
+        ),
+    ] {
+        let r = rig().await;
+        let call = r.call_for_alice("GmailModifyLabels", args.clone());
+        let id = r.requested_id().await;
+        r.serve().await;
+
+        assert_eq!(
+            call.await.unwrap(),
+            Err(ToolError::InvalidArgs(refusal.to_string())),
+            "{args}"
+        );
+        r.owed(&r.executor_sub(), 0).await;
+        assert!(
+            r.seen().is_empty(),
+            "{args}: a refused change reaches no API"
+        );
+        r.assert_finished(&id);
+    }
 }

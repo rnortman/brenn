@@ -207,7 +207,7 @@ impl StubRig {
 
     /// The stub answers every request for `path` with `status` and `body`;
     /// requests for other paths are answered as before.
-    pub fn fail(&self, path: &str, status: u16, body: Vec<u8>) {
+    pub fn respond(&self, path: &str, status: u16, body: Vec<u8>) {
         self.stub
             .lock()
             .unwrap()
