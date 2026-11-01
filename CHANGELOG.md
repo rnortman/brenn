@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-11-01
+
 - **"What's the weather?" now means "here".** The `Weather` tool, called
   without a place or coordinates, uses the user's most recent shared device
   location (from `DeviceLocation`) and says which device it used, how old the
