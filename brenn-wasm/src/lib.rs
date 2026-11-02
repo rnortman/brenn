@@ -1041,31 +1041,28 @@ pub const PROCESSOR_MAX_FAST_TOOL_RESULT_BYTES: usize = 256 * 1024;
 /// Bounds host-fn flood from a hostile or buggy component. Calls beyond the cap
 /// return `internal`; the overflow is surfaced as a single post-activation warn
 /// (same family as the publish/log per-activation quotas). `call-async` and
-/// `provides.call-async-for` count against the same cap. A provider's request
-/// window is bounded by [`PROVIDER_CONCURRENCY_CEILING`], pinned to half this
-/// cap by the assertions below it, which pin the publish ceiling the same way.
+/// `provides.call-async-for` count against the same cap. Buffered async calls
+/// ride the publish gate's entry ceiling with the port publishes, so the cap is
+/// held to half of `brenn_budget::MAX_PUBLISHES_PER_ACTIVATION`: an activation
+/// that spends every call still has half its publishes.
 pub const PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION: usize = 64;
 const _: () = assert!(
-    2 * PROVIDER_CONCURRENCY_CEILING as usize <= PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION,
-    "a provider's request window must fit a nested call per request in half of one \
-     activation's call budget"
+    2 * PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION <= brenn_budget::MAX_PUBLISHES_PER_ACTIVATION,
+    "an activation's nested calls must fit in half of its publish budget"
 );
-const _: () = assert!(
-    2 * PROVIDER_CONCURRENCY_CEILING as usize <= brenn_budget::MAX_PUBLISHES_PER_ACTIVATION,
-    "a provider's request window must fit a nested call per request in half of one \
-     activation's publish budget"
-);
-/// Maximum `provides.complete` calls per activation (2 × the sum of the two
-/// reserved windows a provider can be handed in one activation).
+/// Maximum `provides.complete` calls per activation (2 × the most completes one
+/// activation can owe).
 ///
 /// A `complete` is called once per delivered request (`tool-requests`, a window
-/// never deeper than [`PROVIDER_CONCURRENCY_CEILING`]) or once per delivered
+/// never deeper than [`PROVIDER_CONCURRENCY_CEILING`]), once per delivered
 /// result that carries `serving` (`tool-results`, a window the operator may
-/// deepen to [`WINDOW_DEPTH_CEILING`]); live or stale, each costs one call, and
-/// `invalid-outcome` allows one retry. A call past this is a guest looping on
-/// `complete`, and traps the activation.
+/// deepen to [`WINDOW_DEPTH_CEILING`]), and once per request a
+/// `brenn-provider-kit` provider holds in its backlog and answers when it can
+/// no longer be served (never more than the request window). Live or stale,
+/// each costs one call, and `invalid-outcome` allows one retry. A call past
+/// this is a guest looping on `complete`, and traps the activation.
 pub const PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION: usize =
-    2 * (PROVIDER_CONCURRENCY_CEILING + WINDOW_DEPTH_CEILING) as usize;
+    2 * (2 * PROVIDER_CONCURRENCY_CEILING + WINDOW_DEPTH_CEILING) as usize;
 /// Maximum bytes in a guest-supplied `provides.complete` `outcome-json`
 /// (512 KiB, the registry's async result cap).
 ///

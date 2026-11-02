@@ -1,0 +1,13 @@
+[package]
+name = "brenn-provider-kit-guest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The guest-SDK side of brenn-provider-kit: one activation of a provider component, served through brenn-guest"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+brenn-guest = { path = "../guest" }
+brenn-provider-kit = { version = "0.1.0", path = "../host-crates/brenn-provider-kit" }

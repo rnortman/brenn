@@ -40,7 +40,7 @@ pub struct Target {
 
 /// One query parameter: a single value, or several that `api-request` sends
 /// as the key repeated once per value.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum QueryValue {
     One(String),
@@ -61,8 +61,10 @@ pub fn query<const N: usize>(pairs: [(&str, String); N]) -> Query {
 /// One `api-request` call's arguments. Every optional field is left off the
 /// wire when unset, so a component sends only what it uses: `account` only
 /// to an OAuth provider (`api-request` refuses it for a key provider), and
-/// `headers` only where the API wants one.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// `headers` only where the API wants one. It parses back from what it writes:
+/// an absent field is unset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiCall {
     pub provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,9 +72,9 @@ pub struct ApiCall {
     pub method: String,
     pub host: String,
     pub path: String,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub query: Query,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
     /// The request body as text; `api-request` sends it as
     /// `application/json` when no `Content-Type` is given.
@@ -91,7 +93,8 @@ impl ApiCall {
 }
 
 /// A nested call to issue: the request's step it is, and its arguments.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Call {
     pub step: u8,
     pub api: ApiCall,
@@ -167,6 +170,45 @@ mod tests {
                 "body": "{}",
             })
         );
+    }
+
+    #[test]
+    fn a_call_parses_back_from_its_wire_form() {
+        let mut full = bare();
+        full.account = Some("alice@example.com".to_string());
+        full.query = query([("q", "cafe".to_string())]);
+        full.query.insert(
+            "fields".to_string(),
+            QueryValue::Many(vec!["id".to_string(), "name".to_string()]),
+        );
+        full.headers
+            .insert("X-Goog-FieldMask".to_string(), "places.id".to_string());
+        full.body = Some("{}".to_string());
+        for api in [bare(), full] {
+            let call = Call { step: 2, api };
+            let wire = serde_json::to_vec(&call).unwrap();
+            assert_eq!(serde_json::from_slice::<Call>(&wire).unwrap(), call);
+        }
+    }
+
+    #[test]
+    fn a_one_element_list_parses_back_as_a_list() {
+        let mut api = bare();
+        api.query.insert(
+            "fields".to_string(),
+            QueryValue::Many(vec!["id".to_string()]),
+        );
+        let wire = serde_json::to_vec(&api).unwrap();
+        assert_eq!(serde_json::from_slice::<ApiCall>(&wire).unwrap(), api);
+    }
+
+    #[test]
+    fn a_call_with_a_field_this_build_does_not_write_does_not_parse() {
+        let wire = json!({ "step": 1, "api": serde_json::to_value(bare()).unwrap(), "port": 1 });
+        assert!(serde_json::from_value::<Call>(wire).is_err());
+        let mut api = serde_json::to_value(bare()).unwrap();
+        api["port"] = json!(443);
+        assert!(serde_json::from_value::<ApiCall>(api).is_err());
     }
 
     #[test]

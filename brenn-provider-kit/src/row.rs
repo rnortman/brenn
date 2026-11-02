@@ -7,6 +7,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::activation::INFLIGHT_TTL_MS;
 use crate::call::{Call, Failure, Target, internal};
 
 /// A provided-tool enum as the spec scaffold generates it: each tool has a
@@ -16,13 +17,8 @@ pub trait Tool: Copy + fmt::Debug + PartialEq {
     fn from_name(name: &str) -> Option<Self>;
 }
 
-/// An in-flight row older than this is garbage: longer than the host's
-/// 240 s provided-tool ceiling plus `api-request`'s 60 s HTTP timeout, so no
-/// row whose result can still arrive is ever swept.
-pub const INFLIGHT_TTL_MS: u64 = 300_000;
-
 /// The correlation id of a request's nested call: `<pending id>/<step>`.
-pub fn call_id(id: &str, step: u8) -> String {
+pub(crate) fn call_id(id: &str, step: u8) -> String {
     format!("{id}/{step}")
 }
 
@@ -33,6 +29,8 @@ pub fn call_id(id: &str, step: u8) -> String {
 pub struct InFlight<T: Tool> {
     /// The pending id as the host spells it.
     pub id: String,
+    /// When the request arrived, which its deadline counts from.
+    pub received_at_ms: u64,
     #[serde(with = "tool_name")]
     pub tool: T,
     pub step: u8,
@@ -52,10 +50,12 @@ impl<T: Tool> InFlight<T> {
         args: &Value,
         call: &Call,
         derived: Map<String, Value>,
+        received_at_ms: u64,
         now_ms: u64,
     ) -> InFlight<T> {
         InFlight {
             id: id.to_string(),
+            received_at_ms,
             tool,
             step: call.step,
             args: args.clone(),
@@ -66,9 +66,17 @@ impl<T: Tool> InFlight<T> {
     }
 
     /// The row for this request's next step, `call`, carrying what earlier
-    /// steps learned in `derived`.
+    /// steps learned in `derived` and the request's arrival time.
     pub fn next(&self, call: &Call, derived: Map<String, Value>, now_ms: u64) -> InFlight<T> {
-        InFlight::new(&self.id, self.tool, &self.args, call, derived, now_ms)
+        InFlight::new(
+            &self.id,
+            self.tool,
+            &self.args,
+            call,
+            derived,
+            self.received_at_ms,
+            now_ms,
+        )
     }
 
     pub fn call_id(&self) -> String {
@@ -90,21 +98,26 @@ impl<T: Tool> InFlight<T> {
 /// whatever else it holds, including a row a different build wrote in a shape
 /// this one does not parse. A row with no readable issue time is a corrupt
 /// store.
-pub fn row_expired(bytes: &[u8], now_ms: u64) -> Result<bool, String> {
+pub(crate) fn row_expired(bytes: &[u8], now_ms: u64) -> Result<bool, String> {
+    Ok(issued_at_ms(bytes)?.saturating_add(INFLIGHT_TTL_MS) < now_ms)
+}
+
+/// A stored in-flight row's issue time, read alone.
+pub(crate) fn issued_at_ms(bytes: &[u8]) -> Result<u64, String> {
     #[derive(Deserialize)]
     struct Issued {
         issued_at_ms: u64,
     }
     let row: Issued = serde_json::from_slice(bytes)
         .map_err(|e| format!("in-flight row has no readable issue time: {e}"))?;
-    Ok(row.issued_at_ms.saturating_add(INFLIGHT_TTL_MS) < now_ms)
+    Ok(row.issued_at_ms)
 }
 
 /// The in-flight state a result for request `id`, correlated by `call_id`,
 /// answers; `row` is what the store holds under `call_id`. No row means the
 /// result is a duplicate or arrived after its row was swept, and is ignored.
 /// A row belonging to another request is a host fault.
-pub fn claim<T: Tool>(
+pub(crate) fn claim<T: Tool>(
     id: &str,
     call_id: &str,
     row: Option<&[u8]>,
@@ -146,7 +159,7 @@ pub fn no_such_step<T: Tool>(tool: T, step: u8) -> Failure {
 
 /// A stored row names its tool by the registry name the specification gives
 /// it; a name the specification no longer declares does not parse.
-mod tool_name {
+pub(crate) mod tool_name {
     use serde::de::Error as _;
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -197,6 +210,7 @@ mod tests {
             &args,
             &call(1, "/v1/items/one"),
             Map::new(),
+            900,
             1_000,
         )
     }
@@ -227,7 +241,8 @@ mod tests {
         assert_eq!(
             String::from_utf8(state.encode()).unwrap(),
             format!(
-                "{{\"id\":\"{}\",\"tool\":\"fixture-lookup\",\"step\":1,\"args\":{{\"q\":\"x\"}},\
+                "{{\"id\":\"{}\",\"received_at_ms\":900,\"tool\":\"fixture-lookup\",\"step\":1,\
+                 \"args\":{{\"q\":\"x\"}},\
                  \"derived\":{{}},\"target\":{{\"method\":\"GET\",\"host\":\"api.example.com\",\
                  \"path\":\"/v1/items/one\"}},\"issued_at_ms\":1000}}",
                 "a".repeat(32)

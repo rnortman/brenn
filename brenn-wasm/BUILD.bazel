@@ -214,7 +214,10 @@ native_test(
         for name in COMPONENT_NAMES
     ] + [
         "//brenn-wasm/components/{}:policy_srcs".format(name)
-        for name in COMPONENT_NAMES + ["guest"]
+        for name in COMPONENT_NAMES + [
+            "guest",
+            "provider-kit-guest",
+        ]
     ],
     out = "wit_gates.run",
 )

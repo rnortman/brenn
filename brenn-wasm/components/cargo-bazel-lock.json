@@ -1,5 +1,5 @@
 {
-  "checksum": "cb4caa22a46dc4bb310a42c10bdf4858ee413faf6be5ec0444628ea03305b9f6",
+  "checksum": "21f618ed25633c7570abccd1bd44d5c1424e0eb10facd056a516956c416a02e4",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -779,6 +779,37 @@
           ],
           "selects": {}
         },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-provider-kit-guest 0.1.0": {
+      "name": "brenn-provider-kit-guest",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_provider_kit_guest",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_provider_kit_guest",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -4125,6 +4156,7 @@
     "brenn-processor-tool-test 0.1.0": "brenn-wasm/components/processor-tool-test",
     "brenn-processor-transplant 0.1.0": "brenn-wasm/components/processor-transplant",
     "brenn-provider-kit 0.1.0": "brenn-wasm/components/host-crates/brenn-provider-kit",
+    "brenn-provider-kit-guest 0.1.0": "brenn-wasm/components/provider-kit-guest",
     "brenn-replay 0.1.0": "brenn-wasm/components/replay",
     "brenn-replay-fault-test 0.1.0": "brenn-wasm/components/replay-fault-test",
     "brenn-replay-generic 0.1.0": "brenn-wasm/components/replay-generic"

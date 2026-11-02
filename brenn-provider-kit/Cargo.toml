@@ -3,7 +3,7 @@ name = "brenn-provider-kit"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "The provider-component core shared by Brenn's in-tree WASM tool providers: the in-flight row, argument helpers and api-request answer reading"
+description = "The core of a Brenn WASM tool-provider component: its activation loop with deferred nested calls, the rows a request keeps, and the reading of `api-request`'s answers"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

@@ -4903,8 +4903,8 @@ fn the_sum_of_the_largest_counts_does_not_wrap() {
     );
 }
 
-/// One activation can be handed the whole window and serves each request with
-/// a nested call, so the class's sum is held to the ceiling.
+/// The class's sum is its request inbox's depth, so it is held to the window
+/// ceiling.
 #[test]
 fn the_summed_concurrency_is_held_to_the_ceiling() {
     let pair = |first: u32, second: u32| {
@@ -4922,16 +4922,16 @@ fn the_summed_concurrency_is_held_to_the_ceiling() {
             ),
         ))
     };
-    let config = resolved(&pair(16, 16));
+    let config = resolved(&pair(500, 500));
     assert_eq!(config.consumers[0].class.provides.len(), 2);
-    let source = pair(17, 16);
+    let source = pair(501, 500);
     assert_eq!(
         refusal(&source),
-        "`Mail` declares Σ max_concurrency = 33 across its provide statements; a provider may \
-         hold at most 32 requests in flight (`PROVIDER_CONCURRENCY_CEILING`): one activation \
-         can be handed a full window of new requests and serves each with one nested call, and \
-         the ceiling is half an activation's tool-call budget so the activation keeps calls for \
-         its other work"
+        "`Mail` declares Σ max_concurrency = 1001 across its provide statements; a provider may \
+         hold at most 1000 requests in flight (`PROVIDER_CONCURRENCY_CEILING`): a providing \
+         instance's request inbox is a window Σ deep, and a WASM input window holds at most 1000 \
+         messages (`WINDOW_DEPTH_CEILING`); what a full window weighs against the guest's 16 MiB \
+         is the operator's to size, as for every input window"
     );
 }
 

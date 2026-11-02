@@ -24,6 +24,7 @@ wasm_guest_cdylib(
     deps = all_crate_deps(normal = True) + [
         "//brenn-provider-kit:brenn-provider-kit_guest",
         "//brenn-wasm/components/guest:brenn-guest",
+        "//brenn-wasm/components/provider-kit-guest:brenn-provider-kit-guest",
     ],
 )
 

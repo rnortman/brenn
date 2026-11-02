@@ -25,6 +25,7 @@ wasm_guest_cdylib(
         "//brenn-cal",
         "//brenn-provider-kit:brenn-provider-kit_guest",
         "//brenn-wasm/components/guest:brenn-guest",
+        "//brenn-wasm/components/provider-kit-guest:brenn-provider-kit-guest",
     ],
 )
 

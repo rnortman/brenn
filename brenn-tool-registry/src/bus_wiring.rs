@@ -159,11 +159,12 @@ pub fn inbox_input_port(slug: &str, ch: &ResolvedChannel) -> WasmInputPort {
 }
 
 // A request inbox's depth is at most the provider ceiling and takes no window
-// ceiling check of its own, so the ceiling must sit within the window a host
-// reads.
+// ceiling check of its own, so the provider ceiling is the window ceiling:
+// the same number, spelled in `brenn-envelope` because the config language
+// reads that crate and not `brenn-activation`.
 const _: () = assert!(
-    PROVIDER_CONCURRENCY_CEILING <= WINDOW_DEPTH_CEILING,
-    "a provider's request inbox must fit the window one activation reads"
+    PROVIDER_CONCURRENCY_CEILING == WINDOW_DEPTH_CEILING,
+    "a provider's request inbox is held to the window one activation reads"
 );
 
 /// The depth N of a providing consumer's request inbox: the sum of its
@@ -664,8 +665,8 @@ mod tests {
     #[test]
     fn the_request_inbox_depth_is_the_summed_concurrency() {
         assert_eq!(
-            request_inbox_depth("prov", &[provided(2), provided(30)]),
-            32
+            request_inbox_depth("prov", &[provided(2), provided(998)]),
+            1000
         );
         assert_eq!(request_inbox_depth("prov", &[provided(3)]), 3);
         assert_eq!(request_inbox_depth("prov", &[]), 1);
@@ -674,10 +675,10 @@ mod tests {
     #[test]
     #[should_panic(
         expected = "BUG: [[wasm_consumer]] \"prov\" reached the request-inbox fold \
-                               with Σ max_concurrency = 33"
+                               with Σ max_concurrency = 1001"
     )]
     fn a_request_inbox_sum_above_the_ceiling_is_a_bug() {
-        request_inbox_depth("prov", &[provided(32), provided(1)]);
+        request_inbox_depth("prov", &[provided(1000), provided(1)]);
     }
 
     /// Depth, standing depth and both subscription rungs are N, and the rung is

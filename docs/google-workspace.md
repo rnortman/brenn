@@ -147,6 +147,14 @@ when those were the oversized headers; any other read of it is answered
 message is simply not readable through these tools; it is the sender's
 doing, not the operator's configuration, and mail is untrusted input.
 
+The cap also sizes what the result inbox can weigh: a full window is up to
+`retain_depth` × `max_body_bytes` before the component parses it — 64 ×
+384 KiB is 24 MiB — against a guest memory of 16 MiB, and the request window
+is up to Σ × 64 KiB of arguments, 2 MiB for this class. An activation handed
+more than the guest can hold traps, and the host fails its new requests and
+alerts. That weight is the operator's to size (`docs/config-dsl.md`, the
+`provide` statement); nothing at load refuses it.
+
 Operators who already have the Maps guide's `messaging` block need nothing
 more: the cap is bus-wide, and the value is the same.
 
@@ -215,8 +223,8 @@ Then the inbox tuning and the instance:
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered. The config check holds Σ to at most 32, and 64 holds that
-// twice over, so tools joining the class change nothing here.
+// re-delivered: retain_depth ≥ 2 × Σ. This class's Σ is 31, so 64 holds it;
+// a tool joining the class that takes Σ past 32 needs this raised.
 channel at "brenn:tool-results/workspace" {
   push_depth = 1;
   retain_depth = 64;
@@ -287,11 +295,10 @@ sizes the inbox the instance's nested answers arrive on (the slug after the
 `/` is the instance's name). Each request the component serves has at most
 one Google call outstanding, so at most Σ `max_concurrency` answers are
 outstanding at once, and an answer may be delivered twice: the window must
-hold 2 × Σ. The config check holds Σ to at most 32
-(`PROVIDER_CONCURRENCY_CEILING`), and the block sets 64, which holds that
-twice over, so tools joining this class later change nothing deployed. The
-default window of 16 is too small for a full window and would lose answers
-under load, each lost answer leaving its request to be answered `internal`
+hold 2 × Σ: `retain_depth ≥ 2 × Σ` for this class. This class's Σ is 31, so
+the block's 64 holds it; a tool joining the class that takes Σ past 32 needs
+the block raised. The family default of 16 is too small for any class whose Σ
+is above 8 and would lose answers under load, each lost answer leaving its request to be answered `internal`
 after the 240-second ceiling. `push_depth = 1` is the inert
 channel rung, and `noise = alarm` makes a drop here an alert.
 

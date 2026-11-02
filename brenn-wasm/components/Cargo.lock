@@ -65,6 +65,7 @@ version = "0.1.0"
 dependencies = [
  "brenn-guest",
  "brenn-provider-kit",
+ "brenn-provider-kit-guest",
  "serde_json",
 ]
 
@@ -75,6 +76,7 @@ dependencies = [
  "brenn-cal",
  "brenn-guest",
  "brenn-provider-kit",
+ "brenn-provider-kit-guest",
  "serde_json",
 ]
 
@@ -192,6 +194,14 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "brenn-provider-kit-guest"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+ "brenn-provider-kit",
 ]
 
 [[package]]

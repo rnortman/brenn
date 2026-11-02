@@ -21,9 +21,10 @@
 /// Size the instance's result inbox with a `channel at
 /// "brenn:tool-results/<slug>"` block: each live request has at most one
 /// nested call outstanding, so the window must hold Σ max_concurrency results,
-/// twice over for a re-delivered result. 64 is the documented value: it holds
-/// any Σ max_concurrency up to the 32 ceiling twice over, and the family
-/// default of 16 is too small for a full window.
+/// twice over for a re-delivered result — `retain_depth ≥ 2 × Σ` for this
+/// class. This class's Σ is 18, so 64 holds it; a tool joining the class that
+/// takes Σ past 32 needs the block raised, and the family default of 16 is too
+/// small for any class whose Σ is above 8.
 ///
 /// Every nested answer crosses the bus as a tool result, so Google's body — a
 /// JSON string inside `api-request`'s value, inside the result envelope — must

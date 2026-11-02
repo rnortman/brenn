@@ -134,22 +134,24 @@ pub const TOOL_REQUEST_INPUT_PORT: &str = "tool-requests";
 /// The most requests a providing instance may hold in flight: the sum of
 /// `max_concurrency` over its class's `provide` statements.
 ///
-/// Derived from what one activation can do. A provider can be handed its whole
-/// request window as new requests in one activation and serves each with one
-/// nested call, so the window must fit in half an activation's tool-call
-/// budget, leaving the other half for whatever else that activation calls.
-/// Lives here because the config language refuses a class above it and
-/// depends on nothing but this crate; the budgets it derives from are pinned to
-/// it by a compile-time assertion in `brenn-wasm`.
-pub const PROVIDER_CONCURRENCY_CEILING: u64 = 32;
+/// A providing instance's request inbox is a window Σ deep and takes no
+/// window-depth check of its own, so the ceiling equals the WASM input window
+/// ceiling (`WINDOW_DEPTH_CEILING`); `brenn-tool-registry` pins the two equal
+/// at compile time. Lives here because the config language refuses a class
+/// above it and depends on nothing but this crate.
+///
+/// The ceiling is a count. Sizing a full window's bytes against guest memory
+/// is the operator's, as for every WASM input window.
+pub const PROVIDER_CONCURRENCY_CEILING: u64 = 1_000;
 
 /// The reason half of every refusal of a provider above
 /// [`PROVIDER_CONCURRENCY_CEILING`], so the operator reads the same derivation
 /// wherever the sum is refused. Callers state the sum, the ceiling and the
 /// constant's name ahead of it.
-pub const PROVIDER_CONCURRENCY_REFUSAL: &str = "one activation can be handed a full window of \
-     new requests and serves each with one nested call, and the ceiling is half an activation's \
-     tool-call budget so the activation keeps calls for its other work";
+pub const PROVIDER_CONCURRENCY_REFUSAL: &str = "a providing instance's request inbox is a window \
+     Σ deep, and a WASM input window holds at most 1000 messages (`WINDOW_DEPTH_CEILING`); what a \
+     full window weighs against the guest's 16 MiB is the operator's to size, as for every input \
+     window";
 
 /// Every name the host's core and repo virtual tools can take, conditional
 /// ones included.

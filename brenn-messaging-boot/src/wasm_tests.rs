@@ -202,14 +202,15 @@ fn a_provided_tool_with_no_concurrency_panics() {
 
 #[test]
 #[should_panic(
-    expected = "[[wasm_consumer]] \"provider\" declares Σ max_concurrency = 33 across \
-                           its provided tools; a provider may hold at most 32 requests in flight \
-                           (`PROVIDER_CONCURRENCY_CEILING`)"
+    expected = "[[wasm_consumer]] \"provider\" declares Σ max_concurrency = 1001 across \
+                           its provided tools; a provider may hold at most 1000 requests in \
+                           flight (`PROVIDER_CONCURRENCY_CEILING`): a providing instance's \
+                           request inbox is a window Σ deep"
 )]
 fn a_provider_above_the_concurrency_ceiling_panics() {
     resolve(
         &[provider_raw(vec![
-            provided_tool("echo-for-user", 32),
+            provided_tool("echo-for-user", 1000),
             provided_tool("echo-twice", 1),
         ])],
         &dir_of(vec![]),

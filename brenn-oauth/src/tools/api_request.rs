@@ -2125,3 +2125,39 @@ mod tests {
         }
     }
 }
+
+/// `brenn-provider-kit`'s timing and call budget are derived from the numbers
+/// below; a change to either side breaks these assertions, which is where the
+/// kit's constants are re-derived.
+#[cfg(test)]
+mod provider_kit_pins {
+    use brenn_provider_kit::{CALL_BUDGET, HOST_DEADLINE_MS, NESTED_WORST_CASE_MS};
+    use brenn_tool_registry::{MAX_FAST_CALLS_PER_ACTIVATION, PROVIDED_TOOL_CEILING};
+
+    use crate::http::{API_TIMEOUT, AUTH_SERVER_TIMEOUT};
+
+    #[test]
+    fn the_kit_deadline_is_the_hosts_provided_tool_ceiling() {
+        assert_eq!(
+            u128::from(HOST_DEADLINE_MS),
+            PROVIDED_TOOL_CEILING.as_millis()
+        );
+    }
+
+    /// `execute_oauth`'s worst case: refresh, send, and on a 401 to a stored
+    /// token one more refresh and one resend.
+    #[test]
+    fn the_kit_nested_worst_case_is_refresh_send_refresh_resend() {
+        assert_eq!(
+            u128::from(NESTED_WORST_CASE_MS),
+            2 * AUTH_SERVER_TIMEOUT.as_millis() + 2 * API_TIMEOUT.as_millis()
+        );
+    }
+
+    /// The kit spends at most half the host's per-activation call cap, which
+    /// the registry mirrors from `brenn-wasm`.
+    #[test]
+    fn the_kit_call_budget_is_at_most_half_the_hosts_call_cap() {
+        const { assert!(2 * CALL_BUDGET <= MAX_FAST_CALLS_PER_ACTIVATION) };
+    }
+}

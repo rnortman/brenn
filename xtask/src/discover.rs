@@ -19,6 +19,10 @@ pub enum Family {
     Guest,
     /// The brenn-guest SDK itself. Builds no component artifact.
     Sdk,
+    /// A library on the brenn-guest SDK (brenn-guest in `[dependencies]`,
+    /// `[lib] crate-type = ["rlib"]`). Builds no component artifact; the
+    /// components that link it are gated.
+    Library,
 }
 
 /// A member crate of the wasm workspace.
@@ -74,8 +78,15 @@ fn classify_family(manifest: &toml::Value, crate_dir: &Path) -> Family {
         .get("dependencies")
         .and_then(|d| d.as_table())
         .is_some_and(|deps| deps.contains_key("brenn-guest"));
-    if has_guest_dep {
-        return Family::Guest;
+    let is_rlib = manifest
+        .get("lib")
+        .and_then(|l| l.get("crate-type"))
+        .and_then(|t| t.as_array())
+        .is_some_and(|types| types.len() == 1 && types[0].as_str() == Some("rlib"));
+    match (has_guest_dep, is_rlib) {
+        (true, true) => return Family::Library,
+        (true, false) => return Family::Guest,
+        (false, _) => {}
     }
     panic!(
         "discover: unclassifiable wasm workspace member at {crate_dir:?}.\n\
@@ -83,6 +94,7 @@ fn classify_family(manifest: &toml::Value, crate_dir: &Path) -> Family {
          - Sdk (package.name == \"brenn-guest\"): no\n\
          - Raw ([package.metadata.component]): no\n\
          - Guest (brenn-guest in [dependencies]): no\n\
+         - Library (brenn-guest in [dependencies], an rlib): no\n\
          Add a classification rule in xtask/src/discover.rs or re-examine this crate's structure."
     );
 }
@@ -171,6 +183,7 @@ mod tests {
             ("processor-provider-test", Family::Guest),
             ("processor-store-rt", Family::Guest),
             ("processor-transplant", Family::Guest),
+            ("provider-kit-guest", Family::Library),
         ]
         .into_iter()
         .map(|(name, family)| (name.to_string(), family))
@@ -210,6 +223,16 @@ mod tests {
                 dir
             ),
             Family::Guest
+        );
+        assert_eq!(
+            classify_family(
+                &manifest(
+                    "[package]\nname = \"kit\"\n\n[lib]\ncrate-type = [\"rlib\"]\n\n\
+                     [dependencies]\nbrenn-guest = { path = \"../guest\" }\n"
+                ),
+                dir
+            ),
+            Family::Library
         );
     }
 

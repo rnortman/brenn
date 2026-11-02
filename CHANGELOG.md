@@ -4,6 +4,43 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Tool providers can now take far more concurrent requests: a provider
+  no longer has to make every outbound API call in one go.** Brenn's tool
+  providers (WASM components such as `google-workspace-tools` and
+  `google-maps-tools`, built on the shared `brenn-provider-kit` library)
+  used to make every nested `api-request` call in the same activation that
+  received the requests, which capped a providing class at a combined
+  `max_concurrency` of 32. A kit-built provider now makes at most 32 calls
+  per activation and queues the rest, issuing them as earlier calls answer;
+  a request that waits in the queue for 60 seconds is answered `internal`
+  rather than left to time out silently at the host's 240-second deadline.
+  Callers see the same tools and the same answers.
+
+  For operators:
+  - A providing class may now sum `max_concurrency` up to 1000 (was 32).
+  - The `tool-results` inbox must keep `retain_depth ≥ 2 × Σ max_concurrency`.
+    The 64 the guides set covers Σ up to 32; a larger class needs it raised
+    (at most 1000, so Σ up to 500). Sizing a full window against the
+    guest's 16 MiB memory is yours to check — see `docs/config-dsl.md`.
+  - Requests in flight across the upgrade are lost with the restart. A late
+    result for one fails that activation with "in-flight row does not
+    parse" until it is cleared, seven minutes after it was issued. A queued
+    request whose stored shape changes across a future upgrade fails
+    activations with "backlog row does not parse" for up to 60 seconds, then
+    is answered `internal` and cleared.
+
+- **BREAKING for component authors: `brenn-provider-kit` and the new
+  `brenn-provider-kit-guest` are now build-time contracts for out-of-tree
+  components, and this release cuts them.** Like `brenn-guest`, they change
+  only at your pin bump; `docs/component-packages.md`, "A tool provider on
+  the kit", explains how to depend on them. A provider now implements
+  `Logic` and calls `brenn_provider_kit_guest::serve` from `receive`; the
+  kit owns the activation loop and the queueing. Other cuts:
+  `read_api_result`, `Unreadable::render` and `Unreadable::failure` take the
+  API's display name instead of saying "Google"; `google_error_detail` and
+  the `GOOGLE_*` bounds moved to `brenn_provider_kit::google`; the in-flight
+  row gained `received_at_ms`.
+
 - **`Weather` no longer looks up the user's location itself; the "here"
   default from the previous unreleased change is withdrawn.** `Weather`
   takes a `place` or `lat`/`lng` again. For "what's the weather here?", the
@@ -16,7 +53,7 @@ All notable changes to Brenn are documented here.
   shows "Share location from this device" in the user menu.
   A `google-maps-tools` request in flight across the upgrade is lost with the
   restart; a late result for one fails that activation with "in-flight row
-  does not parse" and is cleared five minutes after it was issued.
+  does not parse" and is cleared seven minutes after it was issued.
 
 - **A call to a tool that acts as the user, made with no user attached, is
   refused instead of crashing the server.** Such tools (`DeviceLocation`,

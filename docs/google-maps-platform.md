@@ -151,7 +151,13 @@ cap plus 136 KiB, about 2.4 MiB at 393 216 bytes. The MQTT publish payload
 cap and a guest component's publish and sync-reply caps equal it. The
 permitted growth of a fragment channel between reaps, which
 `docs/security-posture.md` bounds by default rate × `max_body_bytes` × the
-reap gap, is six times the 64 KiB figure.
+reap gap, is six times the 64 KiB figure. A full result inbox weighs up to
+`retain_depth` × `max_body_bytes` before the component parses it — 64 ×
+384 KiB is 24 MiB — against a guest memory of 16 MiB, and the request window
+up to Σ × 64 KiB of arguments, about 1 MiB for this class; an activation
+handed more than the guest can hold traps, and the host fails its new
+requests and alerts. That weight is the operator's to size
+(`docs/config-dsl.md`, the `provide` statement); nothing at load refuses it.
 
 The alternative, for an operator who will not raise the cap: leave
 `messaging` out and set `max_response_bytes = 40960;` in the
@@ -181,9 +187,10 @@ Then the inbox tuning, the instance and the agent:
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered. The config check holds Σ to at most 32, so 64 holds any class
-// twice over. The family default of 16 would drop some; a dropped result is a
-// request answered `internal` four minutes later.
+// re-delivered: retain_depth ≥ 2 × Σ. This class's Σ is 18, so 64 holds it;
+// a tool joining the class that takes Σ past 32 needs this raised. The family
+// default of 16 would drop some; a dropped result is a request answered
+// `internal` four minutes later.
 channel at "brenn:tool-results/maps" {
   push_depth = 1;
   retain_depth = 64;
@@ -239,10 +246,10 @@ the inbox the instance's nested answers arrive on (the slug after the `/` is
 the instance's name). Each request the component serves has at most one
 Google call outstanding, so at most Σ `max_concurrency` answers are
 outstanding at once, and an answer may be delivered twice: the window must
-hold 2 × Σ. The config check holds Σ to at most 32
-(`PROVIDER_CONCURRENCY_CEILING`), and 64 holds that twice over, so tools
-joining this class change nothing the inbox needs. The default window of 16
-is too small for a full window and would lose answers under load, each lost
+hold 2 × Σ: `retain_depth ≥ 2 × Σ` for this class. This class's Σ is 18, so
+64 holds it; a tool joining the class that takes Σ past 32 needs the block
+raised. The family default of 16 is too small for any class whose Σ is above
+8 and would lose answers under load, each lost
 answer leaving its request to be answered `internal` after the 240-second
 ceiling. `push_depth = 1` is the inert channel rung, and
 `noise = alarm` makes a drop here an alert.

@@ -40,6 +40,7 @@ members = [
     "processor-store-rt",
     "processor-tool-test",
     "processor-transplant",
+    "provider-kit-guest",
     "replay",
     "replay-fault-test",
     "replay-generic",

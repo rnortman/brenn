@@ -1119,14 +1119,34 @@ component GmailTools {
   JSON text lives in a `.brenn` file.
 - `max_concurrency` (default `1`) is the most calls of this tool outstanding at
   once. It is a count of at least one that fits a `u32`, and **the class's sum
-  over its `provide` statements is at most 32** (`PROVIDER_CONCURRENCY_CEILING`).
-  The ceiling comes from what one activation can do: a provider can be handed
-  its whole request window as new requests in one activation and serves each
-  with one nested call, so the window must fit in half an activation's
-  tool-call budget, leaving the other half for whatever else that activation
-  calls. Above it the class is refused: "`{Class}` declares Σ max_concurrency =
-  {sum} across its provide statements; a provider may hold at most 32 requests
-  in flight (`PROVIDER_CONCURRENCY_CEILING`): …".
+  Σ over its `provide` statements is at most 1000**
+  (`PROVIDER_CONCURRENCY_CEILING`). The instance's request inbox is a window Σ
+  deep, and a WASM input window holds at most 1000 messages
+  (`WINDOW_DEPTH_CEILING`), so the ceiling is that number. A provider built on
+  `brenn-provider-kit` serves a window of any depth across activations,
+  issuing at most 32 nested calls in one and queueing the rest. Above the
+  ceiling the class is refused: "`{Class}` declares Σ max_concurrency = {sum}
+  across its provide statements; a provider may hold at most 1000 requests in
+  flight (`PROVIDER_CONCURRENCY_CEILING`): …".
+
+  A kit-built provider's `tool-results` inbox is sized `retain_depth ≥ 2 × Σ`
+  (each live request has at most one nested call outstanding, and an answer
+  may arrive twice). That inbox is a WASM input window too, so it is at most
+  1000 deep: the rule holds for Σ up to 500. For Σ from 501 to 1000, a
+  1000-deep inbox still holds one answer for every outstanding call, but not
+  the second copy, and a burst can push an answer out unseen; its request is
+  then answered `internal` at the host's 240-second deadline, and an inbox
+  set `noise = alarm`, as the guides set theirs, reports the drop.
+
+  The ceiling is a count; what a full window weighs is the operator's to
+  size, as for every input window. A request's args are up to 64 KiB
+  (`MAX_ARGS_BYTES`), so the request window holds up to Σ × 64 KiB — 64 MiB at
+  Σ = 1000 — and the `tool-results` inbox up to `retain_depth` ×
+  `[messaging] max_body_bytes`, both before the guest parses them, against a
+  guest memory of 16 MiB (`PROCESSOR_MAX_MEMORY_BYTES`). An activation handed
+  more than the guest can hold traps; the host fails that activation's new
+  requests and alerts, every time the window fills. Nothing at load refuses
+  such a window.
 - `auto_approve` (default `true`) is whether a call skips the approval prompt.
 - A `provide` statement takes no sub-blocks. Two statements in one class may not
   name the same tool, nor the same `mcp_name`.

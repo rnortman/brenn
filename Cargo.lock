@@ -1001,6 +1001,7 @@ dependencies = [
  "brenn-envelope",
  "brenn-lib",
  "brenn-obs",
+ "brenn-provider-kit",
  "brenn-tool-registry",
  "chrono",
  "hex",

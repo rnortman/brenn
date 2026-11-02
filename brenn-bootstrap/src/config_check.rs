@@ -2633,11 +2633,11 @@ new search: Search {{
             (
                 provider_doc(
                     "provides",
-                    &(provide("doc-search", "DocSearch", OBJECT_SCHEMA, 32)
+                    &(provide("doc-search", "DocSearch", OBJECT_SCHEMA, 1000)
                         + &provide("doc-read", "DocRead", OBJECT_SCHEMA, 1)),
                     "provides",
                 ),
-                "declares Σ max_concurrency = 33 across its provide statements",
+                "declares Σ max_concurrency = 1001 across its provide statements",
             ),
             (
                 provider_doc(

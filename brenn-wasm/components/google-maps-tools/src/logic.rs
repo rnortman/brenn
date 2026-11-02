@@ -14,10 +14,9 @@ mod spec;
 use std::collections::BTreeMap;
 
 use brenn_provider_kit::{
-    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, NestedError, Next,
-    Query, QueryValue, Tool, Unreadable, bounded, capped, choice, copy, cut, flag,
-    google_error_detail, host, integer, internal, no_such_step, object, query, read_api_result,
-    required, stored,
+    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, Logic, NestedError,
+    Next, Query, QueryValue, Tool, Unreadable, bounded, capped, choice, copy, cut, flag, google,
+    host, integer, internal, no_such_step, object, query, read_api_result, required, stored,
 };
 use serde_json::{Value, json};
 
@@ -252,6 +251,22 @@ impl Tool for Provided {
 
 /// A request's in-flight row, naming one of this component's tools.
 pub type InFlight = brenn_provider_kit::InFlight<Provided>;
+
+/// This component's step functions, for the kit's activation loop.
+pub struct Maps;
+
+impl Logic for Maps {
+    type Tool = Provided;
+    type Settings = Settings;
+
+    fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, String> {
+        plan(tool, args, settings)
+    }
+
+    fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
+        advance(state, outcome, settings)
+    }
+}
 
 /// A free-text argument, capped at [`TEXT_MAX_CHARS`] before anything else is
 /// done with it.
@@ -1072,14 +1087,14 @@ fn google_error(status: u64, body: &str) -> Failure {
     };
     Failure {
         kind,
-        detail: google_error_detail(status, body),
+        detail: google::error_detail(status, body),
     }
 }
 
 /// What the request does with its nested call's answer: complete, fail, or
 /// issue its next step.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
-    let body = match read_api_result(outcome, &state.target) {
+    let body = match read_api_result(outcome, &state.target, google::API_NAME) {
         Ok(Answer::Body(body)) => body,
         // Every step reads a JSON answer; none accepts an empty one.
         Ok(Answer::NoBody { status }) => {
@@ -1140,24 +1155,34 @@ fn unreadable(state: &InFlight, why: &Unreadable) -> Failure {
         (Provided::SearchAlongRoute, ALONG_ROUTE_ROUTE_STEP) => match why {
             Unreadable::Cut(_) => Failure {
                 kind: ErrorKind::InvalidArgs,
-                detail: format!("route too long to search along: {}", why.render(None)),
+                detail: format!(
+                    "route too long to search along: {}",
+                    why.render(google::API_NAME, None)
+                ),
             },
-            Unreadable::Refused(_) => why.failure(Some(ROUTE_HINT)),
+            Unreadable::Refused(_) => why.failure(google::API_NAME, Some(ROUTE_HINT)),
         },
         (Provided::PlacesSearch, PLACES_SEARCH_STEP)
-        | (Provided::SearchAlongRoute, ALONG_ROUTE_SEARCH_STEP) => why.failure(Some(PLACES_HINT)),
+        | (Provided::SearchAlongRoute, ALONG_ROUTE_SEARCH_STEP) => {
+            why.failure(google::API_NAME, Some(PLACES_HINT))
+        }
         (Provided::PlaceDetails, 1) => stored(state, PlaceDetailsArgs::parse).map_or_else(
             |failure| failure,
-            |args| why.failure(args.reviews.then_some(REVIEWS_HINT)),
+            |args| why.failure(google::API_NAME, args.reviews.then_some(REVIEWS_HINT)),
         ),
         (Provided::Weather, WEATHER_LOOKUP_STEP) => stored(state, WeatherArgs::parse).map_or_else(
             |failure| failure,
-            |args| why.failure((args.kind == WeatherKind::Daily).then_some(DAYS_HINT)),
+            |args| {
+                why.failure(
+                    google::API_NAME,
+                    (args.kind == WeatherKind::Daily).then_some(DAYS_HINT),
+                )
+            },
         ),
         (Provided::Geocode, 1)
         | (Provided::Weather, WEATHER_GEOCODE_STEP)
         | (Provided::PlacesSearch, PLACES_GEOCODE_STEP)
-        | (Provided::Directions, 1) => why.failure(None),
+        | (Provided::Directions, 1) => why.failure(google::API_NAME, None),
         (tool, step) => no_such_step(tool, step),
     }
 }
@@ -2380,6 +2405,7 @@ mod tests {
             &call,
             Args::new(),
             1_000,
+            1_000,
         )
     }
 
@@ -2489,7 +2515,15 @@ mod tests {
     /// Request `args` of `tool`, its row moved to `step`.
     fn at_step(tool: Provided, args: Value, step: u8) -> InFlight {
         let call = plan(tool, &args, &settings()).unwrap();
-        let mut state = InFlight::new(&"a".repeat(32), tool, &args, &call, Args::new(), 1_000);
+        let mut state = InFlight::new(
+            &"a".repeat(32),
+            tool,
+            &args,
+            &call,
+            Args::new(),
+            1_000,
+            1_000,
+        );
         state.step = step;
         state
     }
@@ -2650,6 +2684,7 @@ mod tests {
             &args,
             call,
             derived,
+            1_000,
             1_000,
         )
     }
@@ -3503,6 +3538,7 @@ mod tests {
             &call,
             Args::new(),
             1_000,
+            1_000,
         );
         advance(&state, http(200, body), settings)
     }
@@ -3884,6 +3920,7 @@ mod tests {
             &call,
             Args::new(),
             1_000,
+            1_000,
         );
         assert_eq!(
             advance(
@@ -3910,6 +3947,7 @@ mod tests {
             &args,
             call,
             derived,
+            1_000,
             1_000,
         )
     }
@@ -4372,6 +4410,7 @@ mod tests {
             &call,
             Args::new(),
             1_000,
+            1_000,
         );
         advance(&state, http(200, &body.to_string()), &settings())
     }
@@ -4516,6 +4555,7 @@ mod tests {
             args,
             call,
             derived,
+            1_000,
             1_000,
         )
     }

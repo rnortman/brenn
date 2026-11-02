@@ -189,6 +189,7 @@ filegroup(
         "//brenn-wasm/components/processor-store-rt:policy_srcs",
         "//brenn-wasm/components/processor-tool-test:policy_srcs",
         "//brenn-wasm/components/processor-transplant:policy_srcs",
+        "//brenn-wasm/components/provider-kit-guest:policy_srcs",
         "//brenn-wasm/components/replay:policy_srcs",
         "//brenn-wasm/components/replay-fault-test:policy_srcs",
         "//brenn-wasm/components/replay-generic:policy_srcs",

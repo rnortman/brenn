@@ -2936,6 +2936,10 @@ Code site (`TODO(system-participant-noise-inert)`):
 Done = a tuning block's `noise` is either enacted by the system participant
 subscribed to that channel or refused at load, with no family in between.
 
+## `wasm-window-byte-cap`
+
+A WASM input window is capped by count (`WINDOW_DEPTH_CEILING` = 1000) and not by bytes. A providing instance's request inbox is Σ `max_concurrency` deep (up to `PROVIDER_CONCURRENCY_CEILING` = 1000) with each request's args up to `MAX_ARGS_BYTES` (64 KiB), and its `tool-results` inbox is `retain_depth` deep with each result up to `[messaging] max_body_bytes`; either window, full of maximal messages, can exceed the guest's `PROCESSOR_MAX_MEMORY_BYTES` (16 MiB) and trap the activation every time the window fills. The host alerts the trap and fails that activation's new requests, but no check at config resolution or boot refuses such a window. Decide whether boot or the config language should refuse a window whose worst-case bytes exceed guest memory, and if so against what arithmetic: Σ × `MAX_ARGS_BYTES` for a request inbox, depth × `max_body_bytes` for every other input window, both before parsing, against `PROCESSOR_MAX_MEMORY_BYTES` or some fraction of it that leaves the guest room to parse. Raising `PROVIDER_CONCURRENCY_CEILING` from 32 to 1000 widened the request-window side of this; the result-window side predates it. A provider built on `brenn-provider-kit` also reads its live requests' store rows into guest memory beside that window — each live request is one in-flight or one backlog row carrying its args, so up to Σ rows, scanned one namespace at a time — so a request-side arithmetic for such a provider is up to twice Σ × `MAX_ARGS_BYTES`. Done is a refusal with a stated arithmetic at the place depths resolve, or a documented decision beside `WINDOW_DEPTH_CEILING` that the window's weight stays the operator's.
+
 ## `webhook-crate-wasm-dep`
 
 `brenn-webhook` is the request-path crate: address parsing, signature and

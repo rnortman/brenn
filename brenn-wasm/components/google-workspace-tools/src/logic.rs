@@ -22,10 +22,10 @@ mod decode;
 use std::collections::{BTreeMap, BTreeSet};
 
 use brenn_provider_kit::{
-    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure,
-    GOOGLE_MESSAGE_MAX_BYTES, NestedError, Next, Query, QueryValue, Tool, Unreadable, bounded,
-    capped, choice, copy, cut, flag, google_error_detail, host, integer, internal, no_such_step,
-    object, query, read_api_result, required, serialized_len, stored,
+    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, Logic, NestedError,
+    Next, Query, QueryValue, Tool, Unreadable, bounded, capped, choice, copy, cut, flag, google,
+    host, integer, internal, no_such_step, object, query, read_api_result, required,
+    serialized_len, stored,
 };
 use serde_json::{Value, json};
 
@@ -58,7 +58,7 @@ const ID_MAX_CHARS: usize = 128;
 /// stays under `COMPACT_RESULT_CEILING` while each line's label names
 /// serialize to at most 1 715 bytes. A page past that answers `internal`. A
 /// listed message is a line or an `unavailable` entry, and an entry (an id and
-/// a reason cut to `GOOGLE_MESSAGE_MAX_BYTES`) serializes to at most 2 155.
+/// a reason cut to `google::MESSAGE_MAX_BYTES`) serializes to at most 2 155.
 const HEADER_MAX_BYTES: usize = 1000;
 
 /// The most UTF-8 bytes of a recipient header's value (`To`, `Cc`, `Bcc`,
@@ -581,6 +581,22 @@ impl Tool for Provided {
 
 /// A request's in-flight row, naming one of this component's tools.
 pub type InFlight = brenn_provider_kit::InFlight<Provided>;
+
+/// This component's step functions, for the kit's activation loop.
+pub struct Workspace;
+
+impl Logic for Workspace {
+    type Tool = Provided;
+    type Settings = Settings;
+
+    fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, String> {
+        plan(tool, args, settings)
+    }
+
+    fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
+        advance(state, outcome, settings)
+    }
+}
 
 /// The Google account to act on, when the caller named one.
 fn account(args: &Args) -> Result<Option<String>, String> {
@@ -2193,13 +2209,20 @@ fn plain(text: &str) -> String {
 }
 
 /// `why`'s rendering as copied into an answer: through `plain`, cut to
-/// `GOOGLE_MESSAGE_MAX_BYTES`, since a refusal's detail is the host's and
+/// `google::MESSAGE_MAX_BYTES`, since a refusal's detail is the host's and
 /// unbounded.
 fn quoted(why: &Unreadable, estimate: Option<u64>) -> String {
-    cut(&plain(&why.render(estimate)), GOOGLE_MESSAGE_MAX_BYTES).0
+    cut(
+        &plain(&why.render(
+            google::API_NAME,
+            estimate.map(|n| format!("sizeEstimate {n}")).as_deref(),
+        )),
+        google::MESSAGE_MAX_BYTES,
+    )
+    .0
 }
 
-/// A 4xx/5xx answer, its detail as `google_error_detail` writes it. 400 and
+/// A 4xx/5xx answer, its detail as `google::error_detail` writes it. 400 and
 /// 404 are the caller's arguments; 403 is Google's refusal, answered with the
 /// hint naming the step's scope; every other status (401 after
 /// `api-request`'s retry, 429, 5xx) is the wrapper's or Google's.
@@ -2213,7 +2236,7 @@ fn google_error(status: u64, body: &str, scope: Scope) -> Failure {
         403 => ErrorKind::Denied,
         _ => ErrorKind::Internal,
     };
-    let mut detail = google_error_detail(status, body);
+    let mut detail = google::error_detail(status, body);
     if kind == ErrorKind::Denied {
         let stop = if detail.ends_with('.') { "" } else { "." };
         detail = format!("{detail}{stop} {}", scope_hint(scope));
@@ -2225,7 +2248,7 @@ fn google_error(status: u64, body: &str, scope: Scope) -> Failure {
 /// issue its next step. Every answer completed here is held to the result
 /// ceiling; a relayed credential answer is `api-request`'s own and is not.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
-    let body = match read_api_result(outcome, &state.target) {
+    let body = match read_api_result(outcome, &state.target, google::API_NAME) {
         Ok(Answer::Body(body)) => body,
         Ok(Answer::NoBody { status }) => return settle(state.tool, no_body(state, status)),
         Ok(Answer::Relay(value)) => return Next::Complete(value),
@@ -2315,7 +2338,7 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
 /// fails with why.
 fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
     if let Some(hint) = write_hint(state.tool, state.step) {
-        return settle(state.tool, Err(why.failure(Some(hint))));
+        return settle(state.tool, Err(why.failure(google::API_NAME, Some(hint))));
     }
     settle(
         state.tool,
@@ -2345,10 +2368,12 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
             | (Provided::CalendarDelete, DELETE_READ_STEP)
             | (Provided::GmailDraft, DRAFT_ORIGINAL_STEP)
             | (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
-                Err(why.failure(None))
+                Err(why.failure(google::API_NAME, None))
             }
-            (Provided::CalendarEvents, 1) => Err(why.failure(Some(EVENTS_HINT))),
-            (Provided::CalendarFreeBusy, 1) => Err(why.failure(Some(FREEBUSY_HINT))),
+            (Provided::CalendarEvents, 1) => Err(why.failure(google::API_NAME, Some(EVENTS_HINT))),
+            (Provided::CalendarFreeBusy, 1) => {
+                Err(why.failure(google::API_NAME, Some(FREEBUSY_HINT)))
+            }
             (tool, step) => Err(no_such_step(tool, step)),
         },
     )
@@ -3849,7 +3874,7 @@ mod tests {
         let long = Unreadable::Refused("x".repeat(5000));
         assert_eq!(
             quoted(&long, None).len(),
-            GOOGLE_MESSAGE_MAX_BYTES + "…".len()
+            google::MESSAGE_MAX_BYTES + "…".len()
         );
     }
 
@@ -3925,6 +3950,7 @@ mod tests {
             &args,
             &call,
             Map::new(),
+            1_000,
             1_000,
         )
     }
@@ -4021,7 +4047,9 @@ mod tests {
     fn advance_answers_a_cut_listing_internal() {
         assert_eq!(
             answered(&labels_state(json!({})), truncated(200, Value::Null, "{")),
-            Next::Fail(Unreadable::Cut("of unstated length".to_string()).failure(None))
+            Next::Fail(
+                Unreadable::Cut("of unstated length".to_string()).failure(google::API_NAME, None)
+            )
         );
     }
 
@@ -4166,6 +4194,7 @@ mod tests {
             &args,
             &call,
             Map::new(),
+            1_000,
             1_000,
         )
     }
@@ -4925,6 +4954,7 @@ mod tests {
             &call,
             Map::new(),
             1_000,
+            1_000,
         )
     }
 
@@ -5441,7 +5471,7 @@ mod tests {
         );
         assert_eq!(
             answered(&row, cut_read(json!(900000))),
-            Next::Fail(Unreadable::Cut("900000 bytes".to_string()).failure(None))
+            Next::Fail(Unreadable::Cut("900000 bytes".to_string()).failure(google::API_NAME, None))
         );
     }
 
@@ -5515,6 +5545,7 @@ mod tests {
             &args,
             &call,
             Map::new(),
+            1_000,
             1_000,
         )
     }
@@ -5850,7 +5881,9 @@ mod tests {
             // The narrower read cut or refused again is the request's failure.
             assert_eq!(
                 answered(&row, cut_read(json!(200000))),
-                Next::Fail(Unreadable::Cut("200000 bytes".to_string()).failure(None))
+                Next::Fail(
+                    Unreadable::Cut("200000 bytes".to_string()).failure(google::API_NAME, None)
+                )
             );
         }
     }
@@ -6081,6 +6114,7 @@ mod tests {
             &args,
             &call,
             Map::new(),
+            1_000,
             1_000,
         )
     }
@@ -6387,6 +6421,7 @@ mod tests {
             &args,
             &call,
             Map::new(),
+            1_000,
             1_000,
         )
     }
@@ -7283,6 +7318,7 @@ mod tests {
             &call,
             Map::new(),
             1_000,
+            1_000,
         )
     }
 
@@ -7826,6 +7862,7 @@ mod tests {
             &call,
             Map::new(),
             1_000,
+            1_000,
         )
     }
 
@@ -8102,6 +8139,7 @@ mod tests {
             &args,
             &call,
             Map::new(),
+            1_000,
             1_000,
         )
     }
@@ -8728,7 +8766,15 @@ mod tests {
                 "account": escaped_widest(ACCOUNT_MAX_CHARS),
             });
             let call = plan(Provided::GmailDraft, &args, &settings())?;
-            let state = InFlight::new("a", Provided::GmailDraft, &args, &call, Map::new(), 1_000);
+            let state = InFlight::new(
+                "a",
+                Provided::GmailDraft,
+                &args,
+                &call,
+                Map::new(),
+                1_000,
+                1_000,
+            );
             let message_id = format!("<{}>", "i".repeat(HEADER_VALUE_MAX_BYTES - 2));
             let original = json!({
                 "id": "m".repeat(ID_MAX_CHARS),
@@ -8807,7 +8853,7 @@ mod tests {
             for (outcome, why) in outcomes() {
                 assert_eq!(
                     answered(&state, outcome),
-                    Next::Fail(why.failure(None)),
+                    Next::Fail(why.failure(google::API_NAME, None)),
                     "{}",
                     name(&state)
                 );
@@ -8843,7 +8889,7 @@ mod tests {
                 let answer = answered(&state, outcome);
                 assert_eq!(
                     answer,
-                    Next::Fail(why.failure(Some(hint))),
+                    Next::Fail(why.failure(google::API_NAME, Some(hint))),
                     "{}",
                     name(&state)
                 );
@@ -8880,7 +8926,8 @@ mod tests {
         for step in SEARCH_FIRST_GET..=SEARCH_LAST_GET {
             let index = usize::from(step - SEARCH_FIRST_GET);
             for (outcome, why) in outcomes() {
-                let entry = json!([{ "id": ids[index], "reason": why.render(None) }]);
+                let entry =
+                    json!([{ "id": ids[index], "reason": why.render(google::API_NAME, None) }]);
                 match answered(&at(row.clone(), step), outcome) {
                     Next::Call { call, derived } => {
                         assert!(step < SEARCH_LAST_GET, "{step}");
@@ -9070,6 +9117,7 @@ mod tests {
             &args,
             &call,
             Map::new(),
+            1_000,
             1_000,
         )
     }
@@ -9318,7 +9366,15 @@ mod tests {
 
     fn write_state(tool: Provided, args: Value) -> InFlight {
         let call = plan(tool, &args, &settings()).unwrap();
-        InFlight::new(&"a".repeat(32), tool, &args, &call, Map::new(), 1_000)
+        InFlight::new(
+            &"a".repeat(32),
+            tool,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+            1_000,
+        )
     }
 
     fn create_state(args: Value) -> InFlight {
