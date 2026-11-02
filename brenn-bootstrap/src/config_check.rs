@@ -104,6 +104,13 @@ pub fn run_config_check(file: &Path, roots: &Roots) -> bool {
             for advisory in &advisories {
                 eprintln!("{}: warning: {advisory}", file.display());
             }
+            for user in brenn_messaging_boot::device_location_users_named_in(&document.config) {
+                eprintln!(
+                    "{}: note: {}",
+                    file.display(),
+                    unchecked_location_user(&user)
+                );
+            }
             // The hash names the whole tree that was checked, not just the
             // root file, so an operator can hold what they certified against
             // what a running process says it is projecting.
@@ -123,6 +130,16 @@ pub fn run_config_check(file: &Path, roots: &Roots) -> bool {
             false
         }
     }
+}
+
+/// What the check says about a port bound to `user`'s location channel: the
+/// channel exists once per registered user, and this tool has no users table.
+fn unchecked_location_user(user: &str) -> String {
+    format!(
+        "a port binds {}; the channel exists only if user {user:?} is registered, \
+         which boot checks and this tool cannot",
+        brenn_lib::messaging::device_location_address(user),
+    )
 }
 
 /// Run the document half of webhook resolution, returning the replay store
@@ -2491,6 +2508,7 @@ new git-sync-consumer: GitSyncConsumer {{
             mqtt_clients: &brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients),
             tool_registry: Some(&registry),
             replay_store_paths: &[],
+            device_location_users: &[],
         })
         .expect("a consumer-declaring document configures messaging");
 

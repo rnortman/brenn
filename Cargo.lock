@@ -685,6 +685,7 @@ dependencies = [
  "async-trait",
  "brenn-db",
  "brenn-lib",
+ "brenn-messaging",
  "brenn-tool-registry",
  "chrono",
  "chrono-tz",

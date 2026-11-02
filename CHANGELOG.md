@@ -25,16 +25,26 @@ All notable changes to Brenn are documented here.
 - **The assistant can now ask where the user is.** The PWA's user menu gains
   "Share location from this device": with the browser's permission, the
   device reports its position on connect, when the app comes to the
-  foreground, and every five minutes while it is visible; "Stop sharing
-  location from this device" deletes the stored position. The new
-  `DeviceLocation` tool answers, for the acting user only, each sharing
-  device's name, coordinates, accuracy, when Brenn received the fix and its
-  age, the device's time zone and its local time; a fix older than 15 minutes
-  is marked `stale`. Brenn also stores each device's browser time zone per
-  user, so the tool knows it off-connection. Coordinates are never logged.
+  foreground, and every five minutes while it is visible. Each report, with
+  the browser's time zone, goes to the user's own durable bus channel,
+  `brenn:device-location.<username>`, which Brenn creates for every user;
+  "Stop sharing location from this device" adds a `stopped` message for the
+  device and deletes nothing. The channel keeps the last 2000 reports by
+  default (about a week of one device); size it with
+  `channel at prefix "brenn:device-location." { … }`, or for one user with an
+  exact address, and restart to change it (its send rate is fixed by Brenn
+  and a `send_rate` there is refused). The new `DeviceLocation` tool
+  answers, for the acting user only, each sharing device's name, coordinates,
+  accuracy, when Brenn received the fix and its age, the device's time zone
+  and its local time; a fix older than 15 minutes is marked `stale`. A
+  component written for one user can bind that user's channel as an `in`
+  port. Coordinates are never logged.
   **Config change required:** the assistant needs `tool device-location {}`;
   without it the menu item does not appear and the tool is not callable. The
   grant is refused on `multiuser` apps and apps with no `container`.
+  Deployments that ran an earlier unreleased build with location sharing
+  drop its `device_locations` table and `device_users.browser_tz` column on
+  upgrade; each device must turn sharing on again.
 
 - **The Google Workspace assistant can now create, change and delete
   Calendar events.** The `google-workspace-tools` component gains three

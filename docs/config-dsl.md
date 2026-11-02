@@ -554,6 +554,67 @@ app's reporting; it does not end the pair's sharing. The user ends it with
 "Stop sharing location from this device" in any app that holds the grant, and
 an app whose grant is restored resumes reporting on its next connect.
 
+The positions live on the bus, not in a table: every report goes to the
+user's durable channel `brenn:device-location.<username>`, which Brenn mints
+for every registered user and writes as `system:device-location`. The tool
+reads the newest fix per device from that channel's window. The message
+shape, the sharing rule and the default window (2000 messages, about a week
+of one device reporting every five minutes) are in `docs/message-bus.md`
+§2.7. The operator sizes the window for every user with a tuning block, or
+for one user with an exact one:
+
+```
+channel at prefix "brenn:device-location." {
+  push_depth = 1;
+  retain_depth = 4000;
+  standing_retain_depth = 4000;
+}
+channel at "brenn:device-location.alice" {
+  push_depth = 1;
+  retain_depth = 500;
+  standing_retain_depth = 500;
+}
+```
+
+Every tool call, every reported fix, every share or stop and every connect
+of an app holding the location grant reads the user's window up to
+`standing_retain_depth`, holding the database lock while it does. A larger
+window therefore costs more on each of them, not only in storage, and an
+`unbounded` window scans the user's whole history every time. Retuning the family is restart-only: a reload whose
+document changes one of these blocks is refused with `NEEDS_RESTART`.
+
+The window also holds each device's sharing state, shared by all of the
+user's devices: a device whose last fix is pushed out by the user's other
+devices' reports stops sharing at its next report, with no error shown. Size
+it to hold every other device's reports between two of one device's; a
+window of 1 keeps only the most recent reporter sharing. A block may not set
+`send_rate` on the family: the rate is the host's, because a device's stop
+shares the bucket with the user's fixes (`docs/message-bus.md` §2.7).
+
+A location automation is a component created for one user and granted that
+user's channel exactly. A top-level consumer binds the channel as an `in`
+port:
+
+```
+new alice_fixes: AliceLocationAutomation {
+  grants = [ports];
+  in fixes <- "brenn:device-location.alice" { push_depth = 1; retain_depth = 16; }
+}
+```
+
+The binding must state its own `retain_depth`: without one it inherits the
+channel's 2000, above the consumer window ceiling of 1000, and is refused at
+boot. Only a top-level component binds a family address, and only as an `in`
+port; an `out` or `io` binding, and a binding on an agent, a surface, a
+remote or an instance a surface places, are refused at compile time. The
+channel exists for every registered user, so a port naming a username that
+is not registered refuses to boot; the offline config check cannot know the
+users and notes each name it assumed. An agent reaches the channel with
+`MessageSubscribe` under `acl subscribe [exact "brenn:device-location.alice"]`,
+not with a static `subscribe`, which resolves against declared channels only.
+A `prefix "brenn:device-location."` matcher reaches every user's positions;
+grant one user's address exactly instead.
+
 The request path is checked after each segment is percent-decoded once. A
 decoded segment that is empty (including from a trailing `/`), that is `.` or
 `..`, or that contains `/`, `\` or `%` is refused before matching. So `%2F`
@@ -798,7 +859,9 @@ channel at prefix "mqtt:broker:alice/" { push_depth = 4; retain_depth = 16; }
 The first **declares** a channel and binds a handle to it: `bar_layout` is now a
 name other statements can reach. The second is a **tuning** — no handle, a
 matcher over a system-minted family, possibly a prefix — which says something
-about channels the system creates rather than creating one. A handle and a
+about channels the system creates rather than creating one. The tunable
+families are `webhook:`, `mqtt:`, `brenn:tools/`, `brenn:tool-results/` and
+`brenn:device-location.` (`docs/message-bus.md` §2.7). A handle and a
 literal address are disjoint spellings: a channel that is declared is referred
 to by its handle, never by re-spelling its address.
 
@@ -1147,7 +1210,8 @@ new p1: Protobar {
 A binding names a port, an arrow, and a channel: `in port <- chan`,
 `out port -> chan`, `io port <-> chan`. The channel is a handle where a
 declaration exists and a literal address where none does (`local:` planes,
-system-minted `webhook:`/`mqtt:` channels). The trailing block tunes *this
+system-minted `webhook:`/`mqtt:` channels, a user's
+`brenn:device-location.<username>` channel). The trailing block tunes *this
 subscription* — `push_depth` is what wakes this instance, `retain_depth` what it
 can see — and both are held at or under the channel's ceiling: its
 `standing_retain_depth` on a durable channel, its `retain_depth` on every other
@@ -2282,7 +2346,8 @@ What converges is components, surfaces and their wiring:
   **retune** a channel a dynamic subscription sits on, folded or dormant, and
   when it would **remove** one the subscription is still folded into, or one
   carrying a *dormant* subscription on a **system-minted** address — `mqtt:`,
-  `webhook:`, `brenn:tools/…` or `brenn:tool-results/…`, the addresses a fresh
+  `webhook:`, `brenn:tools/…`, `brenn:tool-results/…` or
+  `brenn:device-location.…`, the addresses a fresh
   boot rebuilds from their stored rows without any `[[channel]]` block: the
   subscription is in no document, so nothing can re-derive it against the entry
   the reload would put there instead. Those pairings need a restart. Removing an

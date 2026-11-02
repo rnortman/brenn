@@ -989,6 +989,7 @@ mod tests {
             mqtt_clients: &clients,
             tool_registry: None,
             replay_store_paths: &[],
+            device_location_users: &[],
         })
         .expect("a document declaring channels configures messaging")
     }

@@ -2,11 +2,11 @@
 //! the tables that schema creates.
 //!
 //! The crate owns exactly the tables its own production code touches: the base
-//! tables ([`run_base_migrations`]), `pwa_push_subscriptions`
-//! ([`push_subscriptions`]) and `device_locations` ([`device_locations`]) — the
-//! last two written here because `unenroll_device` deletes their rows inside
-//! the unenroll transaction. [`run_migrations`] runs all three, so any caller
-//! that has run it can call any function in this crate.
+//! tables ([`run_base_migrations`]) and `pwa_push_subscriptions`
+//! ([`push_subscriptions`]) — the latter written here because
+//! `unenroll_device` deletes its rows inside the unenroll transaction.
+//! [`run_migrations`] runs both, so any caller that has run it can call any
+//! function in this crate.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -18,7 +18,6 @@ use tokio::sync::Mutex;
 pub mod auth;
 pub mod conversation;
 pub mod cost_samples;
-pub mod device_locations;
 pub mod push_subscriptions;
 
 /// App-wide database handle. Single mutex-guarded connection.
@@ -99,14 +98,17 @@ pub fn into_db(conn: Connection) -> Db {
     Arc::new(Mutex::new(conn))
 }
 
-/// Run every migration this crate owns: the base tables, the
-/// push-subscription table and the device-location table. Idempotent.
+/// Run every migration this crate owns: the base tables and the
+/// push-subscription table. Idempotent.
 ///
 /// This is the whole set a caller needs before calling anything in this crate.
 pub fn run_migrations(conn: &Connection) {
     run_base_migrations(conn);
     push_subscriptions::run_push_subscription_migrations(conn);
-    device_locations::run_device_location_migrations(conn);
+    // Device positions are retained on the bus, not in a table; a database
+    // that carried the table loses it here, its index with it.
+    conn.execute_batch("DROP TABLE IF EXISTS device_locations;")
+        .expect("drop device_locations");
 }
 
 /// Open an in-memory database carrying this crate's tables only.
@@ -357,10 +359,9 @@ pub fn run_base_migrations(conn: &Connection) {
     // Both default NULL — no backfill needed; existing rows have no override.
     add_column_if_missing(conn, "device_users", "tz_override", "TEXT");
     add_column_if_missing(conn, "device_users", "tz_override_expires_at", "INTEGER");
-    // `browser_tz` is the IANA zone the browser last reported for this pair,
-    // written only from a zone name chrono-tz parsed. NULL until the first
-    // report; no backfill.
-    add_column_if_missing(conn, "device_users", "browser_tz", "TEXT");
+    // Device zones travel with each location fix on the bus; a database that
+    // carried a per-pair `browser_tz` column loses it here.
+    drop_column_if_present(conn, "device_users", "browser_tz");
 
     // Add the epoch column to conversations if not present: the conversation
     // epoch a singleton successor was minted under. NULL for every row created
@@ -430,6 +431,15 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, col_def: 
             "ALTER TABLE {table} ADD COLUMN {column} {col_def}"
         ))
         .unwrap_or_else(|e| panic!("add_column_if_missing {table}.{column}: {e}"));
+    }
+}
+
+/// Drop a column from a table if it exists. The column must carry no index,
+/// view or trigger: SQLite refuses the drop otherwise, and that panics here.
+fn drop_column_if_present(conn: &Connection, table: &str, column: &str) {
+    if column_exists(conn, table, column) {
+        conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+            .unwrap_or_else(|e| panic!("drop_column_if_present {table}.{column}: {e}"));
     }
 }
 
@@ -708,6 +718,53 @@ fn row_to_pending_tool_request(row: &rusqlite::Row) -> PendingToolRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
+    #[test]
+    fn migrations_drop_the_location_table_and_the_browser_zone_column() {
+        let conn = open_connection_memory();
+        run_migrations(&conn);
+        // A database written by a build that kept positions in a table and
+        // the browser's zone on the pair.
+        conn.execute_batch(
+            "CREATE TABLE device_locations (
+                 device_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                 latitude REAL NOT NULL, longitude REAL NOT NULL,
+                 accuracy_m REAL NOT NULL, reported_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY (device_id, user_id));
+             CREATE INDEX idx_device_locations_user ON device_locations(user_id);
+             ALTER TABLE device_users ADD COLUMN browser_tz TEXT;",
+        )
+        .unwrap();
+        assert!(table_exists(&conn, "device_locations"));
+        assert!(column_exists(&conn, "device_users", "browser_tz"));
+
+        run_migrations(&conn);
+        assert!(!table_exists(&conn, "device_locations"));
+        assert!(!column_exists(&conn, "device_users", "browser_tz"));
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_device_locations_user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 0);
+
+        // Idempotent on a database that no longer has either.
+        run_migrations(&conn);
+        assert!(!table_exists(&conn, "device_locations"));
+        assert!(column_exists(&conn, "device_users", "tz_override"));
+    }
 
     #[test]
     fn format_ts_for_db_never_emits_z() {

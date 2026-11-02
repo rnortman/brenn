@@ -146,9 +146,12 @@ async fn boot(extra: &str) {
                 None,
                 brenn_lib::config::resolve_api_key_providers(config),
             );
-            native.extend(brenn_device_location::registered(brenn_db::into_db(
-                brenn_db::open_connection_memory(),
-            )));
+            native.extend(
+                brenn_device_location::registered(brenn_db::into_db(
+                    brenn_db::open_connection_memory(),
+                ))
+                .0,
+            );
             native
         },
     )

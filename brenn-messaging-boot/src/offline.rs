@@ -67,14 +67,36 @@ pub fn resolve_messaging_offline(
     config: &BrennConfig,
     replay_store_paths: &[std::path::PathBuf],
 ) -> Option<brenn_surface_server::SurfaceErrorAdvisory> {
+    let device_location_users = device_location_users_named_in(config);
     let plan = plan_messaging(&PlanInputs {
         config,
         apps: None,
         mqtt_clients: &brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients),
         tool_registry: None,
         replay_store_paths,
+        device_location_users: &device_location_users,
     });
     plan.and_then(|plan| plan.surface_error_advisory)
+}
+
+/// The usernames whose location channels the document's own ports bind,
+/// sorted and duplicate-free.
+///
+/// A config check has no users table, so it plans with these: a top-level
+/// consumer's `in` port at `brenn:device-location.<username>` resolves, and
+/// whether that user is registered stays a question for boot. Only consumer
+/// inputs are scanned because they are the only bindings the DSL admits at a
+/// family address.
+pub fn device_location_users_named_in(config: &BrennConfig) -> Vec<String> {
+    let names: std::collections::BTreeSet<String> = config
+        .wasm_consumers
+        .iter()
+        .flat_map(|consumer| &consumer.subscriptions)
+        .filter_map(|sub| sub.channel.as_deref())
+        .filter_map(brenn_lib::messaging::device_location_user)
+        .map(str::to_string)
+        .collect();
+    names.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -161,5 +183,70 @@ mod tests {
             max_sessions: None,
             max_subscriptions: None,
         }
+    }
+
+    /// A consumer reading `user`'s location channel, granted it exactly.
+    fn location_consumer(
+        slug: &str,
+        users: &[&str],
+    ) -> brenn_lib::messaging::config::WasmConsumerConfigRaw {
+        let addresses: Vec<String> = users
+            .iter()
+            .map(|user| brenn_lib::messaging::device_location_address(user))
+            .collect();
+        let refs: Vec<&str> = addresses.iter().map(String::as_str).collect();
+        let mut consumer =
+            brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(slug, slug, &refs);
+        for (sub, user) in consumer.subscriptions.iter_mut().zip(users) {
+            sub.port = format!("in-{user}");
+            sub.retain_depth = Some(Depth::Bounded(16));
+        }
+        consumer.subscribe_acl = users
+            .iter()
+            .map(|user| {
+                ChannelMatcherRaw::Exact(format!(
+                    "{}{user}",
+                    brenn_lib::messaging::DEVICE_LOCATION_PREFIX
+                ))
+            })
+            .collect();
+        consumer
+    }
+
+    /// The names come from consumers' input ports only, once each, sorted.
+    #[test]
+    fn the_users_a_document_binds_are_read_off_its_consumer_inputs() {
+        let mut config = BrennConfig::default();
+        config
+            .wasm_consumers
+            .push(location_consumer("first", &["bob", "alice"]));
+        config
+            .wasm_consumers
+            .push(location_consumer("second", &["alice"]));
+        config.wasm_consumers.push(
+            brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
+                "other",
+                "other",
+                &["brenn:device-location", "brenn:alerts"],
+            ),
+        );
+        assert_eq!(
+            super::device_location_users_named_in(&config),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+    }
+
+    /// A document whose consumer binds a user's channel checks offline: the
+    /// plan mints the channel for the name the document gives.
+    #[test]
+    fn a_document_binding_a_users_location_channel_checks_offline() {
+        let mut config = BrennConfig::default();
+        config
+            .channels
+            .push(durable_channel("brenn:surface.index", Depth::Unbounded));
+        config
+            .wasm_consumers
+            .push(location_consumer("fixes", &["alice"]));
+        assert!(resolve_messaging_offline(&config, &[]).is_none());
     }
 }

@@ -109,10 +109,31 @@ pub fn get_user_credentials(conn: &Connection, username: &str) -> Option<(i64, S
     }
 }
 
+/// Every registered username, oldest registration first.
+pub fn list_usernames(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT username FROM users ORDER BY id")
+        .expect("prepare list_usernames");
+    stmt.query_map([], |row| row.get(0))
+        .expect("query list_usernames")
+        .collect::<Result<Vec<String>, _>>()
+        .expect("read list_usernames row")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::init_db_memory;
+
+    #[test]
+    fn list_usernames_is_every_user_in_registration_order() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        assert!(list_usernames(&conn).is_empty());
+        create_user(&conn, "bob", "$argon2id$fake-hash");
+        create_user(&conn, "alice", "$argon2id$fake-hash");
+        assert_eq!(list_usernames(&conn), vec!["bob", "alice"]);
+    }
 
     #[test]
     fn create_and_lookup_user() {

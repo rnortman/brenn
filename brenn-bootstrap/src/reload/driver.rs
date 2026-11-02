@@ -176,6 +176,11 @@ pub(crate) struct ReloadEnv {
     /// The process's pending provided-tool calls, handed to every providing
     /// consumer a reload starts so its failed activations answer their callers.
     pub provider_runtime: Arc<brenn_tool_registry::ProviderRuntime>,
+    /// The usernames boot minted location channels for. Every reload plans
+    /// with this same list: a user registered since boot already has a live
+    /// channel from registration, and a plan that named it would class that
+    /// channel as added beside a live one.
+    pub device_location_users: Arc<[String]>,
     pub alert_dispatcher: AlertDispatcher,
 }
 
@@ -894,6 +899,7 @@ impl ReloadDriver {
                 mqtt_clients: clients,
                 tool_registry: Some(&self.env.tool_registry),
                 replay_store_paths,
+                device_location_users: &self.env.device_location_users,
             })
         }))
         .map_err(|payload| vec![planner_refusal(payload)])?;
@@ -2191,6 +2197,7 @@ channel scratch at "ephemeral:scratch" {{
         config: &BrennConfig,
         apps: &Arc<IndexMap<String, AppConfig>>,
         tool_registry: &Arc<brenn_tool_registry::ToolRegistry>,
+        device_location_users: &[String],
     ) -> MessagingPlan {
         plan_messaging(&PlanInputs {
             config,
@@ -2203,6 +2210,7 @@ channel scratch at "ephemeral:scratch" {{
             replay_store_paths: &brenn_lib::webhook::config::webhook_store_paths(
                 webhook_identities(config).values(),
             ),
+            device_location_users,
         })
         .expect("the fixture document configures messaging")
     }
@@ -2465,6 +2473,10 @@ channel scratch at "ephemeral:scratch" {{
         let loaded_mounts = mounts.load();
         let components_roots = loaded_mounts.roots.components_roots.clone();
         let db = db.unwrap_or_else(init_db_memory);
+        // The users the boot below mints location channels for; must be read
+        // the way production boot reads them.
+        let device_location_users: Arc<[String]> =
+            brenn_db::auth::user::list_usernames(&*db.lock().await).into();
         let document = check_config(&deployment_inputs(&tree.root(), &loaded_mounts.roots))
             .expect("the fixture document must load");
         // Resolved by the same function boot and reload call, so the
@@ -2545,7 +2557,12 @@ channel scratch at "ephemeral:scratch" {{
             messenger.dispatch_kick();
             handle
         });
-        let plan = plan_like_the_driver(&document.config, &apps, &tool_registry);
+        let plan = plan_like_the_driver(
+            &document.config,
+            &apps,
+            &tool_registry,
+            &device_location_users,
+        );
         // Registered from the document's own declarations whether or not a
         // fixture asked for the live variant: boot spawns a session per
         // *declared* client, so a rig that left one unregistered would be a
@@ -2702,6 +2719,7 @@ channel scratch at "ephemeral:scratch" {{
                 router: router.clone(),
                 tool_caller_grants: tool_caller_grants.clone(),
                 provider_runtime,
+                device_location_users,
                 alert_dispatcher,
             },
             Baseline::of(document, loaded_mounts, &plan),
@@ -6672,8 +6690,8 @@ new sifter: Sifter {{
             "    working_dir = \".\";\n    allowed_users = [\"alice\", \"bob\"];",
         ));
         let mut booted = boot(&tree, Vec::new()).await;
-        let alice = seat_user(&booted.db, "alice").await;
-        let bob = seat_user(&booted.db, "bob").await;
+        let alice = seat_user(&booted, "alice").await;
+        let bob = seat_user(&booted, "bob").await;
         let alices = seat_bridge(&booted, alice).await;
         let bobs = seat_bridge(&booted, bob).await;
         let mut pulses = booted.apps_swapped_tx.subscribe();
@@ -6719,11 +6737,17 @@ new sifter: Sifter {{
         brenn_db::conversation::get_singleton_conversation_id(&conn, user.id, slug)
     }
 
-    /// Seat a user row and return its id. The bus path resolves an agent's
-    /// owner through this table, and a bridge is keyed on it.
-    pub(crate) async fn seat_user(db: &brenn_db::Db, username: &str) -> i64 {
-        let conn = db.lock().await;
-        brenn_db::auth::user::create_user(&conn, username, "$argon2id$fake")
+    /// Register a user on the running rig as registration does: the row, and
+    /// the location channel minted under the same lock. Returns the user's id.
+    /// The bus path resolves an agent's owner through this table, and a bridge
+    /// is keyed on it.
+    pub(crate) async fn seat_user(booted: &Booted, username: &str) -> i64 {
+        let conn = booted.db.lock().await;
+        let id = brenn_db::auth::user::create_user(&conn, username, "$argon2id$fake");
+        booted
+            .messenger
+            .provision_device_location_channel(&conn, username);
+        id
     }
 
     /// A registered session for the reader agent, owned by `user_id`: what the
@@ -6816,7 +6840,7 @@ new sifter: Sifter {{
         // The directive's own sender, seated first so it takes user id 1 as
         // `probe` assumes, and the agent's owner after it.
         seat_a_conversation(&booted.db, 1).await;
-        let alice = seat_user(&booted.db, "alice").await;
+        let alice = seat_user(&booted, "alice").await;
         // Seated before the reload: the attach publishes the chat roster,
         // and with the dispatcher running that wakes the conversation. A
         // missing session would trigger a CC spawn this rig has no stand-in
@@ -6896,7 +6920,7 @@ new sifter: Sifter {{
     async fn a_first_push_subscription_mints_the_agents_conversation_and_position() {
         let tree = Tree::holding(&document_push_subscribing("", &["alice"], &[]));
         let mut booted = boot(&tree, Vec::new()).await;
-        seat_user(&booted.db, "alice").await;
+        seat_user(&booted, "alice").await;
         assert!(
             conversation_of(&booted, READER).await.is_none(),
             "the agent has no conversation before it reads anything",
@@ -6946,7 +6970,7 @@ new sifter: Sifter {{
     async fn removing_a_push_subscription_deletes_the_agents_cursor() {
         let tree = Tree::holding(&document_push_subscribing("", &["alice"], &["work"]));
         let mut booted = boot(&tree, Vec::new()).await;
-        seat_user(&booted.db, "alice").await;
+        seat_user(&booted, "alice").await;
         // Boot's own attach runs before the user row exists in this rig, so the
         // position is minted by a reload that re-states the same document.
         booted
@@ -6991,8 +7015,8 @@ new sifter: Sifter {{
     async fn an_owner_change_attaches_the_new_owners_conversation() {
         let tree = Tree::holding(&document_push_subscribing("", &["alice"], &["work"]));
         let mut booted = boot(&tree, Vec::new()).await;
-        seat_user(&booted.db, "alice").await;
-        seat_user(&booted.db, "bob").await;
+        seat_user(&booted, "alice").await;
+        seat_user(&booted, "bob").await;
         booted
             .messenger
             .attach_conversation(
@@ -7059,8 +7083,8 @@ new sifter: Sifter {{
     async fn an_owner_change_seats_the_new_owner_on_a_dynamic_channel_too() {
         let tree = Tree::holding(&push_owner_covering_work(&["alice"]));
         let mut booted = boot(&tree, Vec::new()).await;
-        seat_user(&booted.db, "alice").await;
-        seat_user(&booted.db, "bob").await;
+        seat_user(&booted, "alice").await;
+        seat_user(&booted, "bob").await;
         let uuid = insert_push_dynamic_row(&booted, "brenn:work").await;
         booted
             .messenger
@@ -7118,8 +7142,8 @@ new sifter: Sifter {{
     async fn an_owner_change_reaps_a_position_on_an_undeclared_channel() {
         let tree = Tree::holding(&document_push_subscribing("", &["alice"], &["work"]));
         let mut booted = boot(&tree, Vec::new()).await;
-        seat_user(&booted.db, "alice").await;
-        seat_user(&booted.db, "bob").await;
+        seat_user(&booted, "alice").await;
+        seat_user(&booted, "bob").await;
         booted
             .messenger
             .attach_conversation(
@@ -7211,7 +7235,7 @@ new sifter: Sifter {{
     async fn a_per_process_edit_retires_the_idle_session_and_defers_the_busy_one() {
         let tree = Tree::holding(&document(""));
         let mut booted = boot(&tree, Vec::new()).await;
-        let user = seat_user(&booted.db, "alice").await;
+        let user = seat_user(&booted, "alice").await;
         let idle = seat_bridge(&booted, user).await;
         let busy = seat_bridge(&booted, user).await;
         busy.set_cc_idle_for_test(false);
@@ -7257,8 +7281,8 @@ new sifter: Sifter {{
     async fn restricting_an_open_agent_retires_the_sessions_it_now_denies() {
         let tree = Tree::holding(&document(""));
         let mut booted = boot(&tree, Vec::new()).await;
-        let alice = seat_user(&booted.db, "alice").await;
-        let bob = seat_user(&booted.db, "bob").await;
+        let alice = seat_user(&booted, "alice").await;
+        let bob = seat_user(&booted, "bob").await;
         let alices = seat_bridge(&booted, alice).await;
         let bobs = seat_bridge(&booted, bob).await;
         let mut pulses = booted.apps_swapped_tx.subscribe();
@@ -7302,7 +7326,7 @@ new sifter: Sifter {{
         const LIMIT: &str = "\nmessaging {\n    max_body_bytes = 1500;\n}\n";
         let tree = Tree::holding(&document(LIMIT));
         let mut booted = boot(&tree, Vec::new()).await;
-        let user = seat_user(&booted.db, "alice").await;
+        let user = seat_user(&booted, "alice").await;
         for _ in 0..30 {
             seat_bridge(&booted, user).await;
         }
@@ -7808,7 +7832,7 @@ channel spill at "brenn:spill" {{
             &[],
         ));
         let mut booted = boot(&tree, Vec::new()).await;
-        seat_user(&booted.db, "alice").await;
+        seat_user(&booted, "alice").await;
         // The agent's conversation: what `app_conversation` resolves the
         // dormant row's position through, on both sides of the comparison.
         booted
@@ -7949,7 +7973,7 @@ channel spill at "brenn:spill" {{
             &[],
         ));
         let mut booted = boot(&tree, Vec::new()).await;
-        seat_user(&booted.db, "alice").await;
+        seat_user(&booted, "alice").await;
         booted
             .messenger
             .attach_conversation(

@@ -622,6 +622,10 @@ pub async fn run_server(
     // attached once messaging is built.
     let provider_runtime =
         brenn_tool_registry::ProviderRuntime::new(guard.alert_dispatcher.clone());
+    // The device-location tool's messenger handle, attached beside the
+    // provider runtime's.
+    let (device_location_tools, device_location_bus) =
+        brenn_device_location::registered(db.clone());
     let tool_registry_core: std::sync::Arc<brenn_tool_registry::ToolRegistry> = {
         let git_repo_pull = brenn_tool_registry::GitRepoPullTool::new(
             repo_sync_result.clones.clone(),
@@ -635,7 +639,7 @@ pub async fn run_server(
             oauth_service.as_ref(),
             api_key_providers,
         ));
-        tools.extend(brenn_device_location::registered(db.clone()));
+        tools.extend(device_location_tools);
         let registry = build_tool_registry(tools, &config.wasm_consumers, &apps, &provider_runtime);
         registry.validate_config(&apps);
         std::sync::Arc::new(registry)
@@ -661,6 +665,14 @@ pub async fn run_server(
 
     let mqtt_client_identities = brenn_lib::mqtt::config::client_identities(&mqtt_clients);
 
+    // Every registered user gets a location channel in the plan. The list is
+    // the one a reload plans with too: a user registered after this point is
+    // provisioned at registration and is in neither plan.
+    let device_location_users: std::sync::Arc<[String]> = {
+        let conn = db.lock().await;
+        brenn_db::auth::user::list_usernames(&conn).into()
+    };
+
     let (mut messaging_result, plan_carried) = brenn_messaging_boot::build_messaging(
         &config,
         db.clone(),
@@ -671,6 +683,7 @@ pub async fn run_server(
         &mqtt_client_identities,
         &tool_registry_core,
         &replay_store_paths,
+        &device_location_users,
     )
     .await;
 
@@ -766,6 +779,7 @@ pub async fn run_server(
     let messenger = messaging_result.messenger.as_ref();
     if let Some(messenger) = messenger {
         provider_runtime.attach(messenger.clone());
+        device_location_bus.attach(messenger.clone());
     }
 
     // Unconditional: a broken install is refused independently of what today's
@@ -1266,6 +1280,7 @@ pub async fn run_server(
                 router: router.clone(),
                 tool_caller_grants: reload_tool_caller_grants,
                 provider_runtime: provider_runtime.clone(),
+                device_location_users: device_location_users.clone(),
                 alert_dispatcher: guard.alert_dispatcher.clone(),
             };
             let baseline = reload::driver::Baseline::from_parts(

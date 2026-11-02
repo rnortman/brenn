@@ -29,6 +29,9 @@ function spyAppendError() {
 
 const realWebSocket = globalThis.WebSocket;
 
+/** The zone the test environment's browser reports, which every fix carries. */
+const ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
 type Coords = { latitude: number; longitude: number; accuracy: number };
 type Outcome = { coords: Coords } | { code: number } | "pending";
 let outcome: Outcome;
@@ -157,7 +160,7 @@ describe("location menu item", () => {
     await settle(app);
     expect((app as unknown as AppInternals).userMenuOpen).toBe(false);
     expect(sentOfType(ws, "DeviceLocationShare", before)).toEqual([
-      { type: "DeviceLocationShare", latitude: 51.5, longitude: -0.25, accuracy_m: 35 },
+      { type: "DeviceLocationShare", latitude: 51.5, longitude: -0.25, accuracy_m: 35, time_zone: ZONE },
     ]);
     expect(sentOfType(ws, "DeviceLocationFix", before)).toHaveLength(0);
 
@@ -169,8 +172,8 @@ describe("location menu item", () => {
     outcome = { coords: { latitude: 48.75, longitude: 2.25, accuracy: 12.5 } };
     await vi.advanceTimersByTimeAsync(REPORT_INTERVAL_MS);
     expect(sentOfType(ws, "DeviceLocationFix", beforeSharing)).toEqual([
-      { type: "DeviceLocationFix", latitude: 51.5, longitude: -0.25, accuracy_m: 35 },
-      { type: "DeviceLocationFix", latitude: 48.75, longitude: 2.25, accuracy_m: 12.5 },
+      { type: "DeviceLocationFix", latitude: 51.5, longitude: -0.25, accuracy_m: 35, time_zone: ZONE },
+      { type: "DeviceLocationFix", latitude: 48.75, longitude: 2.25, accuracy_m: 12.5, time_zone: ZONE },
     ]);
 
     await openMenu(app);
@@ -321,5 +324,9 @@ describe("location menu item", () => {
     const types = ws.sent.slice(before).map((s) => (JSON.parse(s) as WsClientMessage).type);
     expect(types).toEqual(["SetTimezone", "DeviceLocationFix"]);
     expect(sentOfType(ws, "SetTimezone", before)).toEqual([{ type: "SetTimezone", timezone: "Asia/Tokyo" }]);
+    // The fix carries the zone the browser reported with it.
+    expect(sentOfType(ws, "DeviceLocationFix", before)).toEqual([
+      { type: "DeviceLocationFix", latitude: 51.5, longitude: -0.25, accuracy_m: 35, time_zone: "Asia/Tokyo" },
+    ]);
   });
 });

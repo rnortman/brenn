@@ -338,6 +338,80 @@ pub fn chat_channel_uuid_from_address(address: &str) -> Uuid {
 }
 
 // ---------------------------------------------------------------------------
+// Device-location channels
+// ---------------------------------------------------------------------------
+
+/// Bare-name prefix of the per-user device-location family:
+/// `brenn:device-location.<username>` carries every fix a user's devices
+/// report. Ends at a `.` so it is a boundary both ACL prefix matchers and
+/// tuning prefixes stop at.
+pub const DEVICE_LOCATION_PREFIX: &str = "device-location.";
+
+/// Longest username registration accepts, in characters.
+pub const MAX_USERNAME_LEN: usize = 64;
+
+/// Is `name` a username registration would accept: 1 to
+/// [`MAX_USERNAME_LEN`] characters of `[A-Za-z0-9_-]`?
+///
+/// Shared by registration and by the per-user channel families, whose bare
+/// names embed a username and so are only well-formed when it is.
+pub fn is_username(name: &str) -> bool {
+    let len = name.chars().count();
+    (1..=MAX_USERNAME_LEN).contains(&len)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The canonical address of `username`'s device-location channel,
+/// `brenn:device-location.<username>`.
+pub fn device_location_address(username: &str) -> String {
+    canonical_address(&format!("{DEVICE_LOCATION_PREFIX}{username}"))
+}
+
+/// Is `bare` (a scheme-stripped `brenn:` name) one user's device-location
+/// channel? The prefix followed by a non-empty remainder: neither
+/// `device-location` nor `device-location.` names a channel.
+pub fn in_the_device_location_family(bare: &str) -> bool {
+    bare.strip_prefix(DEVICE_LOCATION_PREFIX)
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// Does `bare_prefix` (a scheme-stripped tuning or matcher prefix) reach only
+/// into the device-location family? True for the family prefix itself and for
+/// anything longer that starts with it.
+pub fn is_device_location_prefix(bare_prefix: &str) -> bool {
+    bare_prefix.starts_with(DEVICE_LOCATION_PREFIX)
+}
+
+/// The username a device-location address names, or `None` when `address`
+/// (canonical or bare) is not in the family.
+pub fn device_location_user(address: &str) -> Option<&str> {
+    let bare = address
+        .strip_prefix(BRENN_ADDRESS_PREFIX)
+        .unwrap_or(address);
+    if !in_the_device_location_family(bare) {
+        return None;
+    }
+    bare.strip_prefix(DEVICE_LOCATION_PREFIX)
+}
+
+/// Derive a deterministic UUIDv5 for a device-location channel from its full
+/// canonical address (`brenn:device-location.<username>`).
+///
+/// The channels are minted per registered user, at boot and at registration,
+/// by different code paths and different processes over time; deriving the
+/// uuid from the address is what makes every mint of one user's channel land
+/// on the same row.
+///
+/// The namespace seed (`"brenn.device-location-channel"`) is distinct from
+/// every other family's, so the address space cannot collide with any other.
+pub fn device_location_channel_uuid(address: &str) -> Uuid {
+    let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.device-location-channel");
+    Uuid::new_v5(&ns, address.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
 // Segment boundaries
 // ---------------------------------------------------------------------------
 
@@ -815,5 +889,66 @@ mod tests {
             "ephemeral_channel_uuid_from_name(\"phonebuddy\") must be stable"
         );
         assert_eq!(u.get_version(), Some(uuid::Version::Sha1));
+    }
+    #[test]
+    fn device_location_address_is_well_formed_and_in_the_family() {
+        let address = device_location_address("alice");
+        assert_eq!(address, "brenn:device-location.alice");
+        let bare = address.strip_prefix(BRENN_ADDRESS_PREFIX).unwrap();
+        assert!(is_unreserved_name(bare));
+        assert!(in_the_device_location_family(bare));
+        assert_eq!(device_location_user(&address), Some("alice"));
+        assert_eq!(device_location_user(bare), Some("alice"));
+    }
+
+    #[test]
+    fn the_family_needs_a_non_empty_remainder_after_its_boundary() {
+        assert!(!in_the_device_location_family("device-location"));
+        assert!(!in_the_device_location_family("device-location."));
+        assert!(!in_the_device_location_family("device-locationx"));
+        assert!(!in_the_device_location_family(
+            "tools/device-location.alice"
+        ));
+        assert_eq!(device_location_user("brenn:device-location."), None);
+        assert_eq!(
+            device_location_user("ephemeral:device-location.alice"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_family_prefix_starts_at_the_boundary() {
+        assert!(is_device_location_prefix("device-location."));
+        assert!(is_device_location_prefix("device-location.alice."));
+        assert!(!is_device_location_prefix("device-location"));
+        assert!(!is_device_location_prefix("device-"));
+    }
+
+    #[test]
+    fn a_username_is_one_to_sixty_four_of_the_registration_charset() {
+        assert!(is_username("alice"));
+        assert!(is_username("alice_b-2"));
+        assert!(is_username(&"a".repeat(MAX_USERNAME_LEN)));
+        assert!(!is_username(""));
+        assert!(!is_username(&"a".repeat(MAX_USERNAME_LEN + 1)));
+        assert!(!is_username("alice.b"));
+        assert!(!is_username("not a user!"));
+        assert!(!is_username("al~ice"));
+    }
+
+    /// Pinned: every mint of one user's channel, in any process, must land on
+    /// the row an earlier one wrote.
+    ///
+    /// **Do NOT change this test if the UUID changes.** Fix the derivation.
+    #[test]
+    fn device_location_channel_uuid_is_pinned_and_distinct() {
+        let address = "brenn:device-location.alice";
+        let u = device_location_channel_uuid(address);
+        assert_eq!(u, device_location_channel_uuid(address));
+        assert_eq!(u.to_string(), "531c34fe-c46b-5ab7-b8ea-4b9c177b33d4");
+        assert_ne!(u, device_location_channel_uuid("brenn:device-location.bob"));
+        assert_ne!(u, tool_channel_uuid_from_address(address));
+        assert_ne!(u, chat_channel_uuid_from_address(address));
+        assert_ne!(u, durable_auto_channel_uuid(address));
     }
 }

@@ -21,6 +21,7 @@ pub mod chat_provision;
 pub mod chat_roster;
 pub mod config_reload;
 pub mod conversations;
+pub mod device_location;
 pub mod dispatcher;
 pub mod edit;
 pub mod format;

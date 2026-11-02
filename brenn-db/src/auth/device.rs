@@ -50,10 +50,6 @@ pub struct DeviceUser {
     /// Unix epoch seconds (UTC) at which the override expires. `None` means no expiry.
     /// Meaningless when `tz_override` is `None`.
     pub tz_override_expires_at: Option<i64>,
-    /// IANA zone name the browser last reported for this pair. `None` until
-    /// the first report, or when the latest reported zone was one chrono-tz
-    /// does not know.
-    pub browser_tz: Option<String>,
 }
 
 impl DeviceUser {
@@ -354,9 +350,6 @@ pub fn unenroll_device(conn: &Connection, device_id: i64, reason: &str) -> Unenr
     // Step 3: delete all push subscriptions for this device.
     crate::push_subscriptions::delete_all_subscriptions_for_device(&tx, device_id);
 
-    // Step 3b: delete every stored location fix for this device.
-    crate::device_locations::delete_all_locations_for_device(&tx, device_id);
-
     // Step 4: commit (fail-fast on any error — partial unenroll states are unacceptable).
     tx.commit().expect("unenroll_device: commit");
 
@@ -399,12 +392,25 @@ pub fn load_device(conn: &Connection, id: i64) -> Device {
 pub fn load_device_user(conn: &Connection, device_id: i64, user_id: i64) -> DeviceUser {
     conn.query_row(
         "SELECT device_id, user_id, assigned_slug, slug_prompted_at, \
-                tz_override, tz_override_expires_at, browser_tz \
+                tz_override, tz_override_expires_at \
          FROM device_users WHERE device_id = ?1 AND user_id = ?2",
         rusqlite::params![device_id, user_id],
         |row| device_user_from_row(row, 0),
     )
     .unwrap_or_else(|e| panic!("load_device_user device_id={device_id} user_id={user_id}: {e}"))
+}
+
+/// The name `user_id` sees for `device_id`: their assigned slug, else the
+/// device's guessed slug. Panics if the pair does not exist.
+pub fn display_slug(conn: &Connection, device_id: i64, user_id: i64) -> String {
+    conn.query_row(
+        "SELECT COALESCE(du.assigned_slug, d.guessed_slug) \
+         FROM device_users du JOIN devices d ON d.id = du.device_id \
+         WHERE du.device_id = ?1 AND du.user_id = ?2",
+        rusqlite::params![device_id, user_id],
+        |row| row.get(0),
+    )
+    .unwrap_or_else(|e| panic!("display_slug device_id={device_id} user_id={user_id}: {e}"))
 }
 
 /// The `device_users` columns [`device_user_from_row`] reads, in its order,
@@ -418,7 +424,6 @@ pub fn device_user_columns(alias: &str) -> String {
         "slug_prompted_at",
         "tz_override",
         "tz_override_expires_at",
-        "browser_tz",
     ]
     .iter()
     .map(|c| format!("{alias}.{c}"))
@@ -426,7 +431,7 @@ pub fn device_user_columns(alias: &str) -> String {
     .join(", ")
 }
 
-/// Build a [`DeviceUser`] from the seven columns [`device_user_columns`]
+/// Build a [`DeviceUser`] from the six columns [`device_user_columns`]
 /// names, starting at column index `first`.
 ///
 /// Panics if `slug_prompted_at` is not RFC 3339: only this crate writes it.
@@ -443,7 +448,6 @@ pub fn device_user_from_row(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::
         }),
         tz_override: row.get(first + 4)?,
         tz_override_expires_at: row.get(first + 5)?,
-        browser_tz: row.get(first + 6)?,
     })
 }
 
@@ -491,37 +495,6 @@ pub fn effective_timezone_opt(
         return browser_tz;
     }
     Some(override_tz)
-}
-
-/// Parse the stored `browser_tz` of a `device_users` row.
-///
-/// Panics on a name chrono-tz does not parse: the column is written only from
-/// a parsed zone's name, so an unparseable value is corruption.
-pub fn stored_browser_tz(du: &DeviceUser) -> Option<chrono_tz::Tz> {
-    du.browser_tz.as_deref().map(|s| {
-        s.parse()
-            .unwrap_or_else(|_| panic!("corrupt browser_tz in device_users: {s:?}"))
-    })
-}
-
-/// Record the browser-reported zone for the given `(device_id, user_id)` row.
-///
-/// `tz` must be the name of a zone chrono-tz parsed; the caller passes
-/// `Tz::name()`, never a raw client string. `None` records that the latest
-/// reported zone was one chrono-tz does not know, so no earlier zone outlives
-/// it. Panics if the row is missing.
-pub fn set_browser_tz(conn: &Connection, device_id: i64, user_id: i64, tz: Option<&str>) {
-    let rows = conn
-        .execute(
-            "UPDATE device_users SET browser_tz = ?1 WHERE device_id = ?2 AND user_id = ?3",
-            rusqlite::params![tz, device_id, user_id],
-        )
-        .expect("set_browser_tz UPDATE");
-    assert_eq!(
-        rows, 1,
-        "set_browser_tz: expected 1 row updated, got {rows} \
-         (device_id={device_id}, user_id={user_id}) — device_users row missing"
-    );
 }
 
 /// Write a timezone override for the given `(device_id, user_id)` row.
@@ -1973,56 +1946,6 @@ mod tests {
         );
     }
 
-    fn insert_location(conn: &Connection, device_id: i64, user_id: i64) {
-        conn.execute(
-            "INSERT INTO device_locations
-                 (device_id, user_id, latitude, longitude, accuracy_m, reported_at_ms)
-                 VALUES (?1, ?2, 1.5, 2.5, 30.0, 1000)",
-            rusqlite::params![device_id, user_id],
-        )
-        .expect("insert device location");
-    }
-
-    fn location_exists(conn: &Connection, device_id: i64, user_id: i64) -> bool {
-        use rusqlite::OptionalExtension as _;
-        conn.query_row(
-            "SELECT 1 FROM device_locations WHERE device_id = ?1 AND user_id = ?2",
-            rusqlite::params![device_id, user_id],
-            |_| Ok(()),
-        )
-        .optional()
-        .expect("query device location")
-        .is_some()
-    }
-
-    #[test]
-    fn unenroll_device_deletes_device_locations() {
-        let db = init_db_memory();
-        let conn = db.blocking_lock();
-        let alice = setup_user(&conn, "alice");
-        let bob = setup_user(&conn, "bob");
-
-        let r = resolve_or_create_device(&conn, None, alice, "Mozilla/5.0 Chrome/125");
-        let device_id = r.id;
-        let token = r.new_token.as_deref().unwrap().to_owned();
-        resolve_or_create_device(&conn, Some(&token), bob, "Mozilla/5.0 Chrome/125");
-        // A second device of alice's keeps its row.
-        let other = resolve_or_create_device(&conn, None, alice, "Mozilla/5.0 Firefox/126").id;
-
-        insert_location(&conn, device_id, alice);
-        insert_location(&conn, device_id, bob);
-        insert_location(&conn, other, alice);
-
-        unenroll_device(&conn, device_id, "test cleanup");
-
-        assert!(!location_exists(&conn, device_id, alice));
-        assert!(!location_exists(&conn, device_id, bob));
-        assert!(
-            location_exists(&conn, other, alice),
-            "another device's location must survive the unenroll"
-        );
-    }
-
     #[test]
     #[should_panic(expected = "unenroll_device: load row")]
     fn unenroll_device_panics_on_missing_id() {
@@ -2437,7 +2360,6 @@ mod tests {
             slug_prompted_at: None,
             tz_override: None,
             tz_override_expires_at: None,
-            browser_tz: None,
         }
     }
 
@@ -2449,7 +2371,6 @@ mod tests {
             slug_prompted_at: None,
             tz_override: Some(tz.to_string()),
             tz_override_expires_at: expires_at,
-            browser_tz: None,
         }
     }
 
@@ -2530,54 +2451,43 @@ mod tests {
             slug_prompted_at: None,
             tz_override: None,
             tz_override_expires_at: Some(1), // stale expiry, no zone
-            browser_tz: None,
         };
         let browser = chrono_tz::America::New_York;
         let result = effective_timezone(&du, browser, Utc::now());
         assert_eq!(result, browser);
     }
 
-    // ── browser_tz storage ────────────────────────────────────────────────────
-
     #[test]
-    fn set_browser_tz_round_trips_through_load_device_user() {
+    fn display_slug_is_the_assigned_slug_else_the_guessed_one() {
         let db = init_db_memory();
         let conn = db.blocking_lock();
         let alice = setup_user(&conn, "alice");
-        let device_id = resolve_or_create_device(&conn, None, alice, "Mozilla/5.0 Chrome/125").id;
+        let bob = setup_user(&conn, "bob");
+        let r = resolve_or_create_device(&conn, None, alice, "Mozilla/5.0 Chrome/125");
+        let token = r.new_token.as_deref().unwrap().to_owned();
+        resolve_or_create_device(&conn, Some(&token), bob, "Mozilla/5.0 Chrome/125");
+        let guessed = load_device(&conn, r.id).guessed_slug;
 
-        assert_eq!(load_device_user(&conn, device_id, alice).browser_tz, None);
-        set_browser_tz(&conn, device_id, alice, Some("Europe/Berlin"));
-        let du = load_device_user(&conn, device_id, alice);
-        assert_eq!(du.browser_tz.as_deref(), Some("Europe/Berlin"));
-        assert_eq!(stored_browser_tz(&du), Some(chrono_tz::Europe::Berlin));
-        set_browser_tz(&conn, device_id, alice, Some("Asia/Tokyo"));
+        assert_eq!(display_slug(&conn, r.id, alice), guessed);
+        conn.execute(
+            "UPDATE device_users SET assigned_slug = 'pocket' WHERE device_id = ?1 AND user_id = ?2",
+            rusqlite::params![r.id, alice],
+        )
+        .unwrap();
+        assert_eq!(display_slug(&conn, r.id, alice), "pocket");
         assert_eq!(
-            load_device_user(&conn, device_id, alice)
-                .browser_tz
-                .as_deref(),
-            Some("Asia/Tokyo")
+            display_slug(&conn, r.id, bob),
+            guessed,
+            "one user's name for a device is not another's"
         );
-        set_browser_tz(&conn, device_id, alice, None);
-        let du = load_device_user(&conn, device_id, alice);
-        assert_eq!(du.browser_tz, None);
-        assert_eq!(stored_browser_tz(&du), None);
     }
 
     #[test]
-    #[should_panic(expected = "set_browser_tz: expected 1 row updated, got 0")]
-    fn set_browser_tz_panics_on_missing_pair() {
+    #[should_panic(expected = "display_slug device_id=99999")]
+    fn display_slug_panics_on_a_missing_pair() {
         let db = init_db_memory();
         let conn = db.blocking_lock();
-        set_browser_tz(&conn, 99999, 99999, Some("Europe/Berlin"));
-    }
-
-    #[test]
-    #[should_panic(expected = "corrupt browser_tz")]
-    fn stored_browser_tz_panics_on_corrupt_value() {
-        let mut du = du_no_override();
-        du.browser_tz = Some("Not/AZone".to_string());
-        stored_browser_tz(&du);
+        display_slug(&conn, 99999, 99999);
     }
 
     // ── effective_timezone_opt ────────────────────────────────────────────────

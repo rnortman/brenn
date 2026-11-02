@@ -9,6 +9,7 @@ exports_files(["Cargo.toml"])
 FIRST_PARTY_DEPS = [
     "//brenn-db",
     "//brenn-lib",
+    "//brenn-messaging",
     "//brenn-tool-registry",
 ]
 
@@ -21,8 +22,9 @@ rust_library(
     deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
 )
 
-# The validator's bounds, the DAOs over an in-memory SQLite database and the
-# tool against seeded rows. Sub-second locally; `small` (60s) holds with margin
+# The validator's bounds, the channel reads and consent section and the tool,
+# over an in-memory SQLite database and a messenger holding the seeded users'
+# channels. Sub-second locally; `small` (60s) holds with margin
 # on a cold 4-vCPU runner.
 rust_test(
     name = "brenn-device-location_test",

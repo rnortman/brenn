@@ -346,10 +346,12 @@ unstated one refuses to boot.
 
 Some channels are minted by the system rather than declared by the operator: the
 webhook ingress channels (`webhook:<slug>`), the MQTT ingress channels
-(`mqtt:<client>:<topic>`), and the async-tool substrate's request and result
-channels (`brenn:tools/<tool>`, `brenn:tool-results/<slug>`). Nothing in config
-brings these into existence — an endpoint block, a subscription, or a registered
-tool does — so there is no declaring `[[channel]]` block to carry their depths.
+(`mqtt:<client>:<topic>`), the async-tool substrate's request and result
+channels (`brenn:tools/<tool>`, `brenn:tool-results/<slug>`), and the per-user
+device-location channels (`brenn:device-location.<username>`). Nothing in config
+brings these into existence — an endpoint block, a subscription, a registered
+tool or a registered user does — so there is no declaring `[[channel]]` block to
+carry their depths.
 
 They still have to be *sized*, and the sizing rule is the same one everything
 else obeys: bounded, and visible to whoever ought to be deciding. Each family has
@@ -359,13 +361,69 @@ a bounded in-code default:
 |---|---|---|---|
 | `webhook:<slug>`, `mqtt:<client>:<topic>` | 1 | 100 | 100 |
 | `brenn:tools/<tool>`, `brenn:tool-results/<slug>` | 1 | 16 | 16 |
+| `brenn:device-location.<username>` | 1 | 2000 | 2000 |
 
 Ingress channels are fact channels; at their arrival rates a hundred messages is
 a horizon of days to months, which is what "sized for the outage you intend to
 survive" means for them. The tool channels' executor and consumers are in-process
 and eager, so their window covers a burst arriving while the executor is busy.
-The channel-level push rung is near-inert on all four families — every
+The channel-level push rung is near-inert on these families — every
 subscriber on them states its own depths — so 1 is the honest floor.
+
+A `brenn:device-location.<username>` channel holds every location report from
+that user's devices. Brenn mints one per registered user, at boot from the users
+table and at registration, and writes it only as the system participant
+`system:device-location`, from the user's own authenticated connection; whoever
+the operator grants the channel may read it. The PWA reports one fix per device
+every five minutes while the page is visible, so the default 2000 is about a
+week of one device reporting around the clock, or about a day of seven. That
+window is the history a reader can ask about and the whole retention story:
+nothing is deleted when a user stops sharing or a device is unenrolled. The host
+reads the window to decide every report it admits, so a larger window is also a
+larger cost per report (`docs/config-dsl.md`, the device-location tool). A device
+silent for longer than the window has no message left in it, counts as not
+sharing, and is re-enabled from the user menu.
+
+The window is also where each device's sharing state lives, and one window
+serves all of a user's devices. Size it as a count of other devices' reports,
+not only as history: a device's last fix must survive every report the user's
+other devices make before its next one. A window smaller than that pushes the
+fix out, the device's next report is refused as not sharing, and its sharing
+turns off with no error shown. At `retain_depth = 1` only the device that
+reported last stays sharing — a configuration for a user with one device.
+
+The family's send rate is the host's: 240 messages in a burst and 30 a second
+sustained per user channel, whatever `[messaging] default_send_rate` says, and a
+tuning block stating `send_rate` on the family is refused. A device's stop shares
+that bucket with the user's fixes, and a stop the rate refused would leave the
+device recorded as sharing; the rate is far above what the PWA sends, so only a
+session of the same user flooding reports can empty it.
+
+The family's tuning is restart-only, and a reload enforces it: a reload whose
+document adds, removes or changes a tuning block for `brenn:device-location.`
+or for one user's address is refused with `NEEDS_RESTART`, so every channel in
+the family — minted at boot or at a later registration — carries the depths the
+process booted with.
+
+Each message body is JSON, tagged by `kind`:
+
+- `{"kind": "fix", "device_id": 7, "device": "phone", "latitude": 52.37,
+  "longitude": 4.89, "accuracy_m": 12.0, "time_zone": "Europe/Amsterdam"}` — a
+  position report. `latitude` and `longitude` are decimal degrees, `accuracy_m`
+  metres, `time_zone` the browser's IANA zone or `null` when the server does not
+  know the name.
+- `{"kind": "stopped", "device_id": 7, "device": "phone"}` — the device stopped
+  sharing: the user's menu action, or the browser withdrawing its permission.
+
+`device_id` is the stable key for a device; `device` is its display name at
+publish time and may change between messages. The envelope's `publish_ts` is
+the server's receipt time; no browser timestamp is carried. A device is sharing
+while its newest message in the window is a `fix`. A reader believes only
+envelopes whose `sender` is `system:device-location`: an operator's `acl
+publish` matcher can let any component write to a user's channel, and the
+`DeviceLocation` tool skips and logs anything else. The body has **no
+compatibility guarantee**: it may change between releases, and a reader
+outside this repository is built against the release it runs with.
 
 A consumer's `brenn:tool-results/<slug>` inbox feeds its reserved `tool-results`
 input port: the substrate subscribes the consumer to its own inbox at that
@@ -412,7 +470,9 @@ against a population: the MQTT population is open-ended and a prefix is a
 standing rule for a family whose membership is dynamic. An exact `mqtt:` key is
 still checked for *shape* — it must be a well-formed `mqtt:<client>:<topic>`
 with a legal filter — since a spelling no mint path can produce would tune
-nothing for the same reason a typo would.
+nothing for the same reason a typo would. An exact `brenn:device-location.`
+key is the same: its population — the registered users — changes at runtime,
+so the block is checked only for shape, a remainder that is a legal username.
 
 Nothing about a resolved channel is persisted — depths are re-read from config
 each boot — so retuning takes effect on restart with no migration. Lowering
@@ -434,7 +494,8 @@ A reload that would **retune** the channel itself while a dynamic subscription
 sits on it — folded or dormant — is refused instead, and needs a restart; so is
 one that **removes** a channel the subscription is still folded into, or one
 carrying a dormant subscription on a system-minted address — `mqtt:`,
-`webhook:`, `brenn:tools/…`, `brenn:tool-results/…` — whose channel a fresh boot
+`webhook:`, `brenn:tools/…`, `brenn:tool-results/…`,
+`brenn:device-location.…` — whose channel a fresh boot
 rebuilds from its stored row with no block declaring it. Removing an
 operator-declared channel — one a fresh boot cannot rebuild that way — under a
 *dormant* subscription is applied and leaves it as a restart leaves it: dormant,

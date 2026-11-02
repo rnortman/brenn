@@ -67,4 +67,9 @@ before?: TodoAnchor | null, } | { "type": "LoadMoreHistory", before_seq: number,
 /**
  * 68 % confidence radius in metres, as the browser reports it.
  */
-accuracy_m: number, } | { "type": "DeviceLocationFix", latitude: number, longitude: number, accuracy_m: number, } | { "type": "DeviceLocationClear" } | { "type": "DebugViewportSnapshot", snapshot: DebugViewportSnapshotData, };
+accuracy_m: number, 
+/**
+ * The browser's IANA zone,
+ * `Intl.DateTimeFormat().resolvedOptions().timeZone`.
+ */
+time_zone: string, } | { "type": "DeviceLocationFix", latitude: number, longitude: number, accuracy_m: number, time_zone: string, } | { "type": "DeviceLocationClear" } | { "type": "DebugViewportSnapshot", snapshot: DebugViewportSnapshotData, };

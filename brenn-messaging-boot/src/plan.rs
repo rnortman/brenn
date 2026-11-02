@@ -60,6 +60,11 @@ pub struct PlanInputs<'a> {
     /// against which the consumers' stores must not alias. Empty when the
     /// caller has not resolved the endpoints.
     pub replay_store_paths: &'a [std::path::PathBuf],
+    /// The usernames whose location channels the plan mints, one
+    /// `brenn:device-location.<username>` entry each. Boot passes every
+    /// registered user; a reload passes the boot-time list; a config check
+    /// passes the names the document's own ports bind.
+    pub device_location_users: &'a [String],
 }
 
 /// Everything the messaging lowering derives from a document, and nothing it
@@ -266,8 +271,20 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
 
     let apps_with_messaging = build_apps_with_messaging(apps, global_defaults);
 
+    // One location channel per user the caller names. Minted with the other
+    // environment entries so a consumer's `in` port bound to one resolves
+    // against `pre_directory` below.
+    let device_location_entries = inputs.device_location_users.iter().map(|username| {
+        brenn_messaging::device_location::device_location_entry(
+            username,
+            &system_channel_tuning,
+            global_defaults,
+        )
+    });
+
     let mut environment_entries = webhook_channel_entries;
     environment_entries.extend(mqtt_channel_entries);
+    environment_entries.extend(device_location_entries);
     let topology = lower_channel_topology(config, environment_entries);
 
     // Resolve WASM consumer subscriptions before finalizing the directory:
@@ -537,6 +554,9 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
     system_participants.push(brenn_surface_server::description::surface_config_spec(
         &config_bares,
     ));
+    // The location channels' writer exists whenever messaging does: the
+    // grant that feeds it lives on an app, and an app means messaging.
+    system_participants.push(brenn_messaging::device_location::device_location_spec());
     // One roster channel per configured app, and the single identity that
     // writes them. Boot-declared rather than provisioned with a conversation:
     // apps are static config, and an app with no conversations still owes a
@@ -815,6 +835,7 @@ mod tests {
             mqtt_clients: &indexmap::IndexMap::new(),
             tool_registry: None,
             replay_store_paths: &[],
+            device_location_users: &[],
         })
         .expect("a document declaring channels configures messaging")
     }
@@ -889,6 +910,7 @@ mod tests {
             mqtt_clients: &indexmap::IndexMap::new(),
             tool_registry: None,
             replay_store_paths: &[],
+            device_location_users: &[],
         })
         .expect("a document declaring channels configures messaging");
 
@@ -1135,6 +1157,7 @@ mod tests {
             mqtt_clients: &indexmap::IndexMap::new(),
             tool_registry: None,
             replay_store_paths: &[],
+            device_location_users: &[],
         })
         .expect("a document declaring channels configures messaging");
     }
@@ -1182,6 +1205,7 @@ mod tests {
             mqtt_clients: &indexmap::IndexMap::new(),
             tool_registry: Some(&registry),
             replay_store_paths: &[],
+            device_location_users: &[],
         })
         .expect("a document declaring channels configures messaging");
     }
@@ -1361,5 +1385,151 @@ mod tests {
             (shared, "consumer-b".to_string()),
         ];
         assert_unique_store_paths(&[], &consumer);
+    }
+
+    // ---------------------------------------------------------------------
+    // The location family: one channel per named user, minted at plan time.
+    // ---------------------------------------------------------------------
+
+    fn plan_for_users(config: &BrennConfig, users: &[String]) -> super::MessagingPlan {
+        plan_messaging(&PlanInputs {
+            config,
+            apps: None,
+            mqtt_clients: &indexmap::IndexMap::new(),
+            tool_registry: None,
+            replay_store_paths: &[],
+            device_location_users: users,
+        })
+        .expect("a document declaring channels configures messaging")
+    }
+
+    fn index_only() -> BrennConfig {
+        let mut config = BrennConfig::default();
+        config
+            .channels
+            .push(durable_channel("brenn:surface.index", Depth::Unbounded));
+        config
+    }
+
+    /// A consumer whose `in` port is `user`'s location channel, granted that
+    /// channel exactly.
+    fn location_consumer(user: &str) -> brenn_lib::messaging::config::WasmConsumerConfigRaw {
+        use brenn_lib::access::raw::ChannelMatcherRaw;
+        use brenn_lib::messaging::config::WasmConsumerSubscriptionRaw;
+        let address = brenn_lib::messaging::device_location_address(user);
+        brenn_lib::messaging::config::WasmConsumerConfigRaw {
+            slug: "fixes".to_string(),
+            package: "fixes".to_string(),
+            subscribe_acl: vec![ChannelMatcherRaw::Exact(format!(
+                "{}{user}",
+                brenn_lib::messaging::DEVICE_LOCATION_PREFIX
+            ))],
+            subscriptions: vec![WasmConsumerSubscriptionRaw {
+                channel: Some(address),
+                port: "fixes".to_string(),
+                push_depth: Some(Depth::Bounded(1)),
+                retain_depth: Some(Depth::Bounded(16)),
+                noise: None,
+                wake_min: None,
+                amplification: None,
+            }],
+            ..crate::test_fixtures::minimal_wasm_consumer()
+        }
+    }
+
+    /// Each named user's channel is a durable entry at the family default,
+    /// and the writer exists whether or not any user is named.
+    #[test]
+    fn a_plan_mints_one_location_channel_per_named_user() {
+        use brenn_messaging::device_location::{DEVICE_LOCATION_COMPONENT, device_location_spec};
+
+        let users = vec!["alice".to_string(), "bob".to_string()];
+        let plan = plan_for_users(&index_only(), &users);
+        for user in &users {
+            let address = brenn_lib::messaging::device_location_address(user);
+            let entry = plan
+                .directory
+                .resolve(&address)
+                .expect("every named user has a channel");
+            assert_eq!(
+                entry.uuid,
+                brenn_lib::messaging::device_location_channel_uuid(&address)
+            );
+            assert!(entry.capabilities().durable);
+            assert_eq!(
+                entry.resolved_channel.retain_depth,
+                brenn_lib::messaging::config::DEVICE_LOCATION_DEFAULT_RETAIN_DEPTH
+            );
+        }
+        assert!(
+            plan.directory
+                .resolve("brenn:device-location.carol")
+                .is_none()
+        );
+
+        for users in [&users[..], &[]] {
+            let writers: Vec<_> = plan_for_users(&index_only(), users)
+                .system_participants
+                .into_iter()
+                .filter(|spec| spec.component == DEVICE_LOCATION_COMPONENT)
+                .collect();
+            assert_eq!(writers, vec![device_location_spec()]);
+        }
+    }
+
+    /// A prefix tuning block sizes every user's channel the plan mints.
+    #[test]
+    fn a_prefix_tuning_block_sizes_the_minted_channels() {
+        let mut config = index_only();
+        config
+            .channels
+            .push(brenn_lib::messaging::config::ChannelConfigRaw {
+                address: None,
+                address_prefix: Some("brenn:device-location.".to_string()),
+                push_depth: Some(Depth::Bounded(1)),
+                retain_depth: Some(Depth::Bounded(50)),
+                standing_retain_depth: Some(Depth::Bounded(50)),
+                ..brenn_lib::messaging::config::ChannelConfigRaw::minimal("unused")
+            });
+        let plan = plan_for_users(&config, &["alice".to_string()]);
+        let entry = plan
+            .directory
+            .resolve("brenn:device-location.alice")
+            .expect("alice has a channel");
+        assert_eq!(entry.resolved_channel.retain_depth, Depth::Bounded(50));
+        assert_eq!(
+            entry.resolved_channel.standing_retain_depth,
+            Depth::Bounded(50)
+        );
+    }
+
+    /// A top-level consumer binds a named user's channel as an input port.
+    #[test]
+    fn a_consumer_port_at_a_named_users_channel_resolves() {
+        let mut config = index_only();
+        config.wasm_consumers.push(location_consumer("alice"));
+        let plan = plan_for_users(&config, &["alice".to_string()]);
+        let consumer = &plan.wasm_consumers[0];
+        assert_eq!(
+            consumer.inputs[0].sub.channel_address,
+            "brenn:device-location.alice"
+        );
+        assert!(
+            consumer
+                .policy
+                .allows_brenn_delivery("device-location.alice")
+        );
+    }
+
+    /// A port naming a user the plan was not given misses the directory, and
+    /// the refusal says the channel exists per registered user.
+    #[test]
+    #[should_panic(
+        expected = "no user named \"carol\" — the channel is minted per registered user"
+    )]
+    fn a_consumer_port_at_an_unnamed_users_channel_is_refused() {
+        let mut config = index_only();
+        config.wasm_consumers.push(location_consumer("carol"));
+        plan_for_users(&config, &["alice".to_string()]);
     }
 }

@@ -192,26 +192,34 @@ pub enum WsClientMessage {
 
     // ── Device location ────────────────────────────────────────────────────
     /// Start sharing location from this device: the user's menu action, with
-    /// the first fix from the browser's Geolocation API. Creates or replaces
-    /// the stored fix for this `(device, user)` pair. No browser timestamp:
-    /// the server stamps receipt time, and the fix's age counts from that.
+    /// the first fix from the browser's Geolocation API. Always recorded: the
+    /// server publishes it as a `fix` on the user's location channel,
+    /// `brenn:device-location.<username>`. No browser timestamp: the server
+    /// stamps receipt time, and the fix's age counts from that.
     DeviceLocationShare {
         latitude: f64,
         longitude: f64,
         /// 68 % confidence radius in metres, as the browser reports it.
         accuracy_m: f64,
+        /// The browser's IANA zone,
+        /// `Intl.DateTimeFormat().resolvedOptions().timeZone`.
+        time_zone: String,
     },
 
     /// A newer fix for a device that already shares. Same fields as
-    /// `DeviceLocationShare`; replaces the stored fix only if one exists, so a
-    /// tab that was turned off from another tab cannot re-enable sharing.
+    /// `DeviceLocationShare`; recorded only if the device's newest message on
+    /// the channel is a `fix`, so a tab that was turned off from another tab
+    /// cannot re-enable sharing.
     DeviceLocationFix {
         latitude: f64,
         longitude: f64,
         accuracy_m: f64,
+        time_zone: String,
     },
 
-    /// Stop sharing location from this device: delete the stored fix.
+    /// Stop sharing location from this device: the server publishes a
+    /// `stopped` fact on the user's location channel if the device shares.
+    /// Nothing is deleted.
     DeviceLocationClear,
 
     /// User-initiated viewport/layout geometry snapshot for diagnosing the
@@ -969,12 +977,13 @@ pub enum WsServerMessage {
 
     // ── Device location ────────────────────────────────────────────────────
     /// Whether this connection shares location: the app holds the
-    /// `device-location` grant and a stored fix exists for this `(device, user)`
-    /// pair. Sent on WS connect when the app may use location, and after every
-    /// `DeviceLocationShare`, `DeviceLocationFix` and `DeviceLocationClear`,
-    /// accepted or refused. `false` from an app without the grant does not mean
-    /// the pair's fix is gone: the row is the user's consent and survives grant
-    /// changes; only `DeviceLocationClear` and unenrolment delete it.
+    /// `device-location` grant and this device's newest message on the user's
+    /// location channel is a `fix`. Sent on WS connect when the app may use
+    /// location, and after every `DeviceLocationShare`, `DeviceLocationFix` and
+    /// `DeviceLocationClear`, accepted or refused. `false` from an app without
+    /// the grant does not mean the device stopped sharing: the channel carries
+    /// the user's consent and grant changes do not touch it; only
+    /// `DeviceLocationClear` publishes a `stopped`.
     DeviceLocationSharing { enabled: bool },
 }
 

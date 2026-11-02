@@ -3532,3 +3532,41 @@ the checks on — `bazel test -c opt
 the one lane that exercises the proposed configuration: tests do not build under
 `--config=release` because that config clears `testutils`, but `-c opt` alone
 does not clear it, so the test targets configure under it.
+
+## `history-sender-tz-ignores-tz-override`
+
+`messages.sender_tz` is stored from the raw connection zone
+(`brenn-server/src/routes/ws/messaging.rs`, `sender_tz: Some(self.timezone_str())`
+in `persist_and_send`), while the `UserMessageEcho` timestamp and the CC message
+prefix on the same send use the override-aware zone from `effective_timezone`.
+History rendering later reads `sender_tz` (`brenn-render/src/history.rs`).
+Establish whether a live `tz_override` is meant to affect the stored zone, and
+align the two paths or document why they differ.
+
+## `efficiency-full-window-scan-per-fix-under-global-lock`
+
+Every admission decision and every `DeviceLocation` call asks only for the
+newest message per device on a user's `brenn:device-location.<username>`
+channel, but `read_window` (`brenn-device-location/src/channel.rs`) loads the
+whole retained tail up to `standing_retain_depth` (2000 by default) through
+`MessageStore::retained_tail`, under the shared database lock, and parses every
+body; `record` does so inside the user's consent section. The cost
+grows with the operator's window rather than with the number of devices. Design
+a read that stops at the newest message per device — a newest-first paged
+`MessageStore` read, or a per-channel newest-per-key query — and decide whether
+it is a store-trait method every family may use. Done = the admission read and
+the tool's read cost O(devices) regardless of window size.
+
+## `quality-system-family-classification-triplicated`
+
+"Which system-minted family does this address or tuning prefix name?" is
+answered twice: `SystemChannelFamily::of` / `of_prefix` in
+`brenn-lib/src/messaging/config.rs` and `is_system_minted` /
+`is_system_minted_prefix` in `brenn-dsl/src/derive.rs`, each carrying the
+`brenn:device-location.` prefix special case. The two parse schemes
+differently (`ChannelScheme::split` with a bare name read as `brenn:`, versus
+the DSL's `split_spellable`), so one classifier in `brenn-envelope` needs a
+decision on which reading is canonical for the ingress, tool and
+device-location families before both crates call it. Done = one classifier
+(address and prefix) in `brenn-envelope`, `brenn-lib` attaching its depth
+defaults, and `derive.rs` calling it.

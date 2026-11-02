@@ -2282,7 +2282,7 @@ async fn a_first_push_subscription_matches_a_fresh_boot() {
         // Without it `allowed_users.first()` finds no matching user and
         // the conversation is never minted.
         async |booted| {
-            seat_user(&booted.db, "alice").await;
+            seat_user(booted, "alice").await;
         },
         async |booted| {
             reload_onto(
@@ -2456,7 +2456,7 @@ async fn a_dormant_row_on_a_removed_channel_matches_a_fresh_boot() {
         &tree,
         agent_fixture,
         async |booted| {
-            seat_user(&booted.db, "alice").await;
+            seat_user(booted, "alice").await;
             // The conversation both `app_conversation` calls resolve through —
             // the reload's and the fresh boot's reconcile.
             booted
@@ -2533,8 +2533,8 @@ async fn an_owner_change_matches_a_fresh_boot() {
         // Both owners' rows, and alice's conversation with its position: the
         // starting state both processes have to walk away from.
         async |booted| {
-            seat_user(&booted.db, "alice").await;
-            seat_user(&booted.db, "bob").await;
+            seat_user(booted, "alice").await;
+            seat_user(booted, "bob").await;
             booted
                 .messenger
                 .attach_conversation("brenn:work", READER, Depth::Bounded(1))
@@ -2591,8 +2591,8 @@ async fn an_owner_change_under_a_dynamic_row_matches_a_fresh_boot() {
         &tree,
         agent_fixture,
         async |booted| {
-            seat_user(&booted.db, "alice").await;
-            seat_user(&booted.db, "bob").await;
+            seat_user(booted, "alice").await;
+            seat_user(booted, "bob").await;
             insert_push_dynamic_row(booted, "brenn:work").await;
             booted
                 .messenger

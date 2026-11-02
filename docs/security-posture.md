@@ -92,17 +92,32 @@ In rough order of severity if compromised:
   tokens a user granted Brenn at a provider (their mailbox, their calendar).
   Compromise means acting as that user at the provider, outside Brenn, for as
   long as the token lives.
-- **Users' device positions.** The latest location fix per (device, user) in
-  `device_locations`: latitude, longitude, accuracy, and the server's receipt
-  time (no client timestamp is taken). The PWA reports a fix only after the
-  user turns on sharing for that device from the user menu and the browser
-  grants its own location permission. One tool reads it, `device-location`,
-  bound to the acting user and refused at boot to `multiuser` apps, to apps
-  with no `container`, and to WASM consumers. The row is deleted when the
-  user stops sharing and when the device is unenrolled. Coordinates are never
-  logged; log lines carry user and device ids and counts only. A position
-  appears in a conversation's transcript only where the assistant called the
-  tool, as any tool result does.
+- **Users' device positions.** Every location fix a user's devices report,
+  in one durable channel per user, `brenn:device-location.<username>`: device
+  id and display name, latitude, longitude, accuracy, the browser's time zone,
+  and the server's receipt time as the envelope's `publish_ts` (no client
+  timestamp is taken). Brenn writes it as `system:device-location`, from the
+  user's own authenticated connection only. The PWA reports a fix only after
+  the user turns on sharing for that device from the user menu and the
+  browser grants its own location permission. The retained window is the
+  retention story: the operator sizes it (default 2000 messages, about a week
+  of one device reporting around the clock), and older fixes roll out.
+  Stopping sharing publishes a `stopped` fact for the device; nothing is
+  deleted when the user stops sharing or when a device is unenrolled. The
+  `device-location` tool reads only the acting user's channel, as host code
+  without a subscription; it is refused at boot to `multiuser` apps, to apps
+  with no `container`, and to WASM consumers, and it ignores messages from any
+  sender but `system:device-location`. Any other publisher on the channel
+  exists only through an operator's `acl publish` matcher. Beyond the tool,
+  a principal reads positions only through an operator grant: an `exact
+  "brenn:device-location.alice"` subscribe ACL, or an `in` port on that
+  address on a top-level component, reaches one user; a `prefix
+  "brenn:device-location."` grant reaches every user's positions and should
+  not be written — a location automation is a component for one user, granted
+  that user's channel exactly. Coordinates are never logged; log lines carry
+  user and device ids and counts only. A position appears in a conversation's
+  transcript only where the assistant called the tool, as any tool result
+  does.
 - **Cross-user and cross-app isolation.** Conversation history, per-app data,
   per-app filesystem scope, per-component WASM storage. One user or one app must
   not reach another's data.
@@ -309,9 +324,9 @@ claim bounds it. On a home the agent has not rewritten, the placement above is
 exact: the file is in no git tree and no Brenn git operation touches it.
 
 **Device location.** `DeviceLocationShare` (the user's menu action, which
-creates the stored fix) and `DeviceLocationFix` (the PWA's periodic report,
-which only replaces a fix that already exists) carry a latitude, a longitude
-and an accuracy in metres, bounded at intake: latitude finite and in
+always publishes a fix) and `DeviceLocationFix` (the PWA's periodic report,
+published only while the device is sharing) carry a latitude, a longitude,
+an accuracy in metres and the browser's IANA zone, bounded at intake: latitude finite and in
 −90..=90, longitude finite and in −180..=180, accuracy finite and in
 0..=20 000 000. A value outside a bound is refused and raised as a
 `MalformedMessage` security event with the client IP; no browser's
@@ -319,16 +334,34 @@ Geolocation API produces such a value, so a refusal means a modified client.
 The event names the field and the bound and never the value. The device and
 user come from the connection, never the message, and no timestamp is taken
 from the browser: the server stamps receipt time, so a phone's clock can
-neither trigger a refusal nor change a stored age. A share or fix from an app
-without the `device-location` grant stores nothing, is answered
-`DeviceLocationSharing { enabled: false }` and logged at `warn` without the
-IP — it is not a security event, because the message can touch only the
-sender's own row and an unmodified PWA sends one when a reload removes the
-grant under a connection that is sharing. The pair's row survives that reply:
-it is the user's consent, deleted only by `DeviceLocationClear` and
-unenrolment, and an app that regains the grant resumes reporting it on
-connect. `DeviceLocationClear` is honoured
-whatever the app's grants: it deletes the sender's own row.
+neither trigger a refusal nor change a stored age. A zone chrono-tz does not
+know is logged at `warn` and published as `null`; a browser can be newer than
+chrono-tz, so it is not a security event. An accepted report is published to
+the sender's own channel, `brenn:device-location.<username>`, as
+`system:device-location`. A device is sharing while its newest message on
+that channel is a fix: a `DeviceLocationFix` from a device whose newest
+message is `stopped`, or that has none in the window, publishes nothing and
+is answered `DeviceLocationSharing { enabled: false }`, so a tab turned off
+from another tab cannot turn sharing back on. The decision and the publish
+run under a lock per user, so a fix cannot overtake a stop it read before.
+The channel's send rate is the host's (240 burst, 30 a second), not the
+operator's to lower. A fix that rate refuses is dropped, logged at `warn`
+with user and device ids, and answered with the unchanged state. A stop it
+refuses is logged at `error` and answered `enabled: false`, so the device
+stops reporting, but the channel still records the device as sharing until
+its next stop; only a session of the same user flooding shares above 30 a
+second can bring that about. A share
+or fix from an app without the `device-location` grant publishes nothing, is
+answered `DeviceLocationSharing { enabled: false }` and logged at `warn`
+without the IP — it is not a security event, because the message can touch
+only the sender's own channel and an unmodified PWA sends one when a reload
+removes the grant under a connection that is sharing. The device's sharing
+state survives that reply: it is the user's consent, ended only by
+`DeviceLocationClear`, and an app that regains the grant resumes reporting on
+connect. `DeviceLocationClear` is honoured whatever the app's grants: if the
+device is sharing it publishes a `stopped` fact for it, and it deletes
+nothing. It is ungated because the consent outlives the grant: a stop the
+gate refused would leave the device sharing when the grant returns.
 
 **What the reviewer verifies:** authority comes from the session everywhere; the
 inbound schema is closed and rejects+signals unknowns; every security-relevant
@@ -479,6 +512,32 @@ building one to feed a mis-aimed signal would buy nothing.
   reaches a log.
 
 ---
+
+### 6.5 Accepted risk — location frames are unmetered and each reads the user's window
+
+`DeviceLocationShare`, `DeviceLocationFix` and `DeviceLocationClear` carry no
+per-connection rate limit. Each reads the sender's location window (up to the
+channel's `standing_retain_depth`, 2000 messages by default) under the shared
+database lock to decide the report, and `DeviceLocationClear` needs no grant. A
+clear from a device that is not sharing publishes nothing, so the channel's send
+rate never meters it.
+
+- **What it enables:** an authenticated user, or a stolen session, can loop
+  these frames and keep the shared database lock busy with window reads that
+  every other request waits on. Nothing logs the loop.
+- **Why the blast radius is bounded:** each read is bounded by the channel's
+  standing depth, which is bounded unless the operator writes `unbounded`. The
+  per-user consent lock means a flood serialises only its own user's location
+  decisions. The abuse is sustained *degradation* (shared database contention,
+  the same shape as §6.2), never unbounded growth, and it reads only the
+  sender's own channel.
+- **Why it is accepted:** every authenticated frame that reads the database has
+  the same exposure, and the deployment is a household whose users the operator
+  admits. A per-connection meter would be a new mechanism for one frame family.
+- **Revisit trigger:** users outside the operator's trust, or a window read that
+  stops being bounded. The read's cost is `efficiency-full-window-scan-per-fix-under-global-lock`
+  in `TODO.md`; once it is a per-device read, this exposure is that of any other
+  database-reading frame.
 
 ## 7. Boundaries B2 / B3 — The Claude Code Subprocess
 

@@ -43,7 +43,8 @@ use uuid::Uuid;
 use brenn_envelope::ChannelScheme;
 use brenn_envelope::addressing::{
     MATCHER_BOUNDARIES, TOOL_REQUESTS_NAMESPACE, TUNING_BOUNDARIES, ends_at_matcher_boundary,
-    ends_at_tuning_boundary, in_a_tool_namespace, is_auto_channel_name, nondurable_channel_uuid,
+    ends_at_tuning_boundary, in_a_tool_namespace, in_the_device_location_family,
+    is_auto_channel_name, is_device_location_prefix, nondurable_channel_uuid,
 };
 use brenn_envelope::channel_model::{
     ChannelBlockRole, ChannelDepthKey, TUNING_DURABILITY_IGNORED, depth_required, sink_admitted,
@@ -93,18 +94,44 @@ pub fn derive(config: ResolvedConfig) -> Result<DerivedConfig, Vec<Diagnostic>> 
     ))
 }
 
+// TODO(quality-system-family-classification-triplicated): one family
+// classifier, shared with `brenn-lib`'s `SystemChannelFamily`.
 /// Is this address one the system mints for itself?
 ///
-/// The ingress families (`mqtt:`, `webhook:`) and the tool substrate's
-/// (`brenn:tools/`, `brenn:tool-results/`, `brenn:tool-requests/`). Everything
+/// The ingress families (`mqtt:`, `webhook:`), the tool substrate's
+/// (`brenn:tools/`, `brenn:tool-results/`, `brenn:tool-requests/`) and the
+/// per-user location channels (`brenn:device-location.<username>`). Everything
 /// else is an operator-declared channel's address. A total function of the
 /// address, which is what makes the declaring and tuning roles disjoint.
 fn is_system_minted(address: &str) -> bool {
     match split_spellable(address) {
         Some((ChannelScheme::Mqtt | ChannelScheme::Webhook, _)) => true,
-        Some((ChannelScheme::Brenn, name)) => in_a_tool_namespace(name),
+        Some((ChannelScheme::Brenn, name)) => {
+            in_a_tool_namespace(name) || in_the_device_location_family(name)
+        }
         _ => false,
     }
+}
+
+/// Does this tuning prefix name a family the system mints?
+///
+/// [`is_system_minted`] read on the prefix, plus `brenn:device-location.`,
+/// which names the whole location family although no user's channel is
+/// spelled that way.
+fn is_system_minted_prefix(prefix: &str) -> bool {
+    is_system_minted(prefix)
+        || matches!(
+            split_spellable(prefix),
+            Some((ChannelScheme::Brenn, name)) if is_device_location_prefix(name)
+        )
+}
+
+/// Is this address one user's location channel?
+fn is_device_location_address(address: &str) -> bool {
+    matches!(
+        split_spellable(address),
+        Some((ChannelScheme::Brenn, name)) if in_the_device_location_family(name)
+    )
 }
 
 /// Is this address, or the family a prefix names, a provider's request inbox
@@ -325,13 +352,18 @@ fn check_tuning_address(tuning: &RTuning, errors: &mut Vec<Diagnostic>) {
             ),
             span.clone(),
         ));
-    } else if classify && !is_system_minted(address) {
+    } else if classify
+        && !match tuning.is_prefix {
+            true => is_system_minted_prefix(address),
+            false => is_system_minted(address),
+        }
+    {
         errors.push(Diagnostic::at(
             format!(
                 "`{address}` names no system-minted family, so a handle-less block tunes \
-                 nothing; tuning blocks name `mqtt:`, `webhook:`, `brenn:tools/` and \
-                 `brenn:tool-results/` channels, and a declarable channel is written \
-                 `channel <handle> at \"{address}\"`"
+                 nothing; tuning blocks name `mqtt:`, `webhook:`, `brenn:tools/`, \
+                 `brenn:tool-results/` and `brenn:device-location.` channels, and a \
+                 declarable channel is written `channel <handle> at \"{address}\"`"
             ),
             span.clone(),
         ));
@@ -2554,7 +2586,8 @@ fn unbindable(
 ///
 /// A transportable address exists because a `channel` block declares it, so a
 /// literal one that names no declaration attaches to nothing — except in the tool
-/// namespaces, which the substrate mints and no document declares.
+/// namespaces and the location family, which the system mints and no document
+/// declares.
 fn bound_address(
     bound: &Bound<'_>,
     kind: EntityKind,
@@ -2596,6 +2629,10 @@ fn bound_address(
         ));
         return None;
     }
+    if is_device_location_address(address) {
+        return device_location_bound(bound, kind, address, errors)
+            .then(|| (scheme, bare.to_string()));
+    }
     if matches!(bound.chan, RChanRef::Addr(_))
         && matches!(scheme, ChannelScheme::Brenn | ChannelScheme::Ephemeral)
         && !tool_namespace
@@ -2613,6 +2650,48 @@ fn bound_address(
         return None;
     }
     Some((scheme, bare.to_string()))
+}
+
+/// Whether a position may name a user's location channel: an `in` port of a
+/// top-level component, and nothing else.
+///
+/// The direction is checked first and for every kind: an `out` or `io` port
+/// would derive a publish entry, handing its holder write access to a user's
+/// positions with no `acl publish` written. Agents reach the channel through
+/// `MessageSubscribe` under an ACL, because a static subscription resolves
+/// against declared channels only; surfaces, remotes and the instances placed
+/// on a surface run in the browser, which does not get users' positions.
+fn device_location_bound(
+    bound: &Bound<'_>,
+    kind: EntityKind,
+    address: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> bool {
+    if !bound.dir.inbound() || bound.dir.outbound() {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{address}` is a per-user location channel written only by Brenn as \
+                 `system:device-location`: a component binds it as an `in` port, never \
+                 `out` or `io`; a publisher other than Brenn is granted only by an \
+                 operator's `acl publish` matcher"
+            ),
+            bound.span.clone(),
+        ));
+        return false;
+    }
+    if kind != EntityKind::Component(ComponentHost::TopLevel) {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{address}` is a per-user location channel: only a top-level component \
+                 binds it, as an `in` port; an agent reaches it with `MessageSubscribe` \
+                 under `acl subscribe [exact \"{address}\"]`, and surfaces, remotes and \
+                 their placed instances do not reach users' positions"
+            ),
+            bound.span.clone(),
+        ));
+        return false;
+    }
+    true
 }
 
 /// The entry one position derives.

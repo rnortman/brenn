@@ -479,7 +479,7 @@ mod wasm_tests;
 use brenn_surface_server::boot_policy::{
     assert_output_bindings_covered, inject_surface_geometry_status_grants,
 };
-pub use offline::resolve_messaging_offline;
+pub use offline::{device_location_users_named_in, resolve_messaging_offline};
 pub use plan::{MessagingPlan, PlanInputs, plan_messaging};
 pub(crate) use surfaces::{
     inject_surface_config_subscribe_grants, inject_surface_error_grant, resolve_surfaces,
@@ -986,14 +986,16 @@ pub(crate) fn derive_mqtt_ingress_channels(
 /// `mqtt:` exact blocks and every prefix block are deliberately exempt: the MQTT
 /// channel population is open-ended (a runtime dynamic subscribe mints channels
 /// long after boot), and a prefix is a standing rule for a family whose
-/// membership is dynamic.
+/// membership is dynamic. `brenn:device-location.` exact blocks are open-ended
+/// the same way — users register at runtime — and are checked for shape only.
 ///
 /// # Panics
 ///
 /// On a `webhook:` block naming no declared endpoint, a `brenn:tools/` block
 /// naming no registered async tool, or a `brenn:tool-results/` block naming no
-/// consumer that holds an async tool grant. Also on an exact key of any scheme
-/// but `mqtt:` reaching the fall-through, which is a host bug.
+/// consumer that holds an async tool grant, or a `brenn:device-location.` block
+/// whose remainder is not a username. Also on an exact key of any scheme but
+/// `mqtt:` reaching the fall-through, which is a host bug.
 pub(crate) fn validate_exact_tuning_blocks(
     tuning: &messaging::config::SystemChannelTuning,
     webhook_slugs: &[&str],
@@ -1031,6 +1033,17 @@ pub(crate) fn validate_exact_tuning_blocks(
                 inbox_slugs.contains(slug),
                 "a consumer holding an async tool grant with that slug",
             )
+        } else if let Some(username) = brenn_envelope::addressing::device_location_user(address) {
+            // Users register at runtime, so the population is open-ended like
+            // `mqtt:`'s and only the shape is checkable: a remainder no
+            // registration could produce names a channel that is never minted.
+            assert!(
+                brenn_envelope::addressing::is_username(username),
+                "config: [[channel]] {address:?} tunes a location channel no user can have — \
+                 {username:?} is not a username (1 to {} of letters, digits, `-` and `_`)",
+                brenn_envelope::addressing::MAX_USERNAME_LEN,
+            );
+            continue;
         } else {
             // `mqtt:` — open-ended population, not boot-checkable. Nothing else
             // reaches here: the table admits only system-minted families, refuses
@@ -1061,6 +1074,9 @@ pub(crate) fn validate_exact_tuning_blocks(
 /// `[[webhook_endpoint]]`, mqtt-ingress, `[[wasm_consumer]]`, or `[[surface]]`
 /// blocks — messaging effectively disabled, no DB rows touched).
 ///
+/// `device_location_users` is every registered username: each gets its
+/// `brenn:device-location.<username>` channel in the plan.
+///
 /// `server_origin` must be the value resolved once at bootstrap entry (via
 /// `resolve_source`) and shared with `build_pwa_push` so both publish paths
 /// produce consistent `app:<slug>@<server>` identities. This consistency is
@@ -1083,6 +1099,7 @@ pub async fn build_messaging(
     mqtt_clients: &IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity>,
     tool_registry: &Arc<brenn_tool_registry::ToolRegistry>,
     replay_store_paths: &[std::path::PathBuf],
+    device_location_users: &[String],
 ) -> (MessagingResult, PlanCarried) {
     // The map the plan is derived from is the table's own, so the identity
     // `commit_messaging` asserts holds structurally: there is no second map for
@@ -1094,6 +1111,7 @@ pub async fn build_messaging(
         mqtt_clients,
         tool_registry: Some(tool_registry),
         replay_store_paths,
+        device_location_users,
     });
     let Some(mut plan) = plan else {
         return (MessagingResult::default(), PlanCarried::default());

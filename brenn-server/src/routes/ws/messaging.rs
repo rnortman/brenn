@@ -500,6 +500,9 @@ impl WsConnection {
                 cc_text,
                 extra_blocks,
                 sender_user_id: self.user_id,
+                // TODO(history-sender-tz-ignores-tz-override): the stored zone is the
+                // raw connection zone, while the echo timestamp and the CC prefix above
+                // use the override-aware `effective_timezone`.
                 sender_tz: Some(self.timezone_str()),
                 sender_device_id: Some(self.device_id),
                 attachments: resolved,
