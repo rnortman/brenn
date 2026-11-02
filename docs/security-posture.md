@@ -98,22 +98,11 @@ In rough order of severity if compromised:
   user turns on sharing for that device from the user menu and the browser
   grants its own location permission. One tool reads it, `device-location`,
   bound to the acting user and refused at boot to `multiuser` apps, to apps
-  with no `container`, and to WASM consumers that provide no tool; a
-  provider's nested call for a user's request may read it, and a call that
-  carries no user is refused. The row is deleted when the
+  with no `container`, and to WASM consumers. The row is deleted when the
   user stops sharing and when the device is unenrolled. Coordinates are never
-  logged; log lines carry user and device ids and counts only. Positions are
-  also kept outside the row:
-  - A tool result carries them into a conversation's transcript and history
-    where the assistant called `DeviceLocation`, and where it called a tool
-    answered from the position: `Weather` with no location answers with the
-    fix's latitude and longitude.
-  - A provider's nested `device-location` call is answered with every sharing
-    device of the user, and that answer is kept, like every nested answer, in
-    the bus record of the provider's durable `brenn:tool-results` inbox until
-    newer results push it out of the channel's window. Stopping sharing or
-    unenrolling a device deletes the row, not these copies. One maps instance
-    serving several users keeps all of their positions in one window.
+  logged; log lines carry user and device ids and counts only. A position
+  appears in a conversation's transcript only where the assistant called the
+  tool, as any tool result does.
 - **Cross-user and cross-app isolation.** Conversation history, per-app data,
   per-app filesystem scope, per-component WASM storage. One user or one app must
   not reach another's data.
@@ -1535,10 +1524,8 @@ sent. Two limits stand beside that guarantee:
   act for them. The rule holds for a grant naming only key providers: a bare
   agent could read the key file as it could the vault.
 - **No owner, no owner-bound tool.** A WASM component is never granted the tools
-  that connect, list or disconnect an owner's accounts. A provider's nested call
-  carries the user of the request it serves, which is enough to read where that
-  user is or to act through `api-request`'s clauses, but a request a component
-  serves is not where a user's accounts are connected or removed.
+  that connect, list or disconnect an owner's accounts, because there is no
+  owner to act for.
 - **Unstamped component calls are read-only.** A component's credentialed
   request that carries no acting user is admitted for reading methods only. Such
   a call can be re-run from its channel window, and a re-run write (a second

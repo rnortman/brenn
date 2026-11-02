@@ -47,12 +47,12 @@ pub struct ToolCtx {
 }
 
 impl ToolCtx {
-    /// The acting user of a call to a tool bound to one, or the refusal of a
-    /// call that carries none. A conversation's call always carries its owner;
-    /// a provider's nested call carries the user of the call it serves, which
-    /// is `None` when that call came from the bus or from a component's own
-    /// `call-async`; a component's own call never carries one. The grant admits
-    /// the tool to the participant; this is what admits the call.
+    /// The acting user of a call to a tool bound to one, or `Denied` naming
+    /// `tool` and the caller when the call carries none. Grant validation
+    /// refuses an `ActingUser` tool to every caller kind whose calls carry no
+    /// user, so a call reaching here without one came past validation; it is
+    /// refused rather than panicked on because the missing user is the
+    /// caller's input, not a broken host invariant.
     pub fn require_acting_user(&self, tool: &str) -> Result<&ActingUser, ToolError> {
         self.acting_user.as_ref().ok_or_else(|| {
             ToolError::Denied(format!(

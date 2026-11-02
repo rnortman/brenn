@@ -1,5 +1,61 @@
 # TODOs
 
+## `xtask-deny-warnings`
+
+`make check`'s `xtask-deny` step prints two warnings that are not failures.
+(1) `chacha20 0.10.0` in the root `Cargo.lock` is yanked; it arrives through
+`rand 0.10.1`, and the index has 0.10.1 and 0.10.2. Repin it with
+`CARGO_BAZEL_REPIN=chacha20 CARGO_BAZEL_REPIN_ONLY=crates bazel mod deps` (the
+root hub only; the other two lockfiles do not carry it) and regenerate
+`cargo-bazel-lock.json`, as `MODULE.bazel` requires. (2) `unmatched-source` on
+the `graf.git` line of `deny.toml`'s `allow-git`: one `deny.toml` is applied to
+all three workspace units, `brenn-graf` in the root unit uses that source, and
+the `brenn-wasm/components` and `tools/scrub` units do not, so cargo-deny warns
+in those two. Deleting the line breaks the root unit (`unknown-git = "deny"`).
+Decide between a per-unit config passed by `xtask deny` and keeping one shared
+file with the warning documented beside the line. Done is `xtask-deny`
+printing neither warning, or (2) resolved as "documented, kept" with the
+comment at the line saying so.
+
+## `brenn-tool-requires-approval-dead-gate`
+
+`brenn-tool` refuses `GitRepoCommitAndPush`, `GitRepoRun`, `ExportUsage` and
+any registry tool not marked auto-approve with `requires_approval`
+(`docs/agent-tool-cli.md`, `CliAccess::RequiresApproval` in
+`brenn-lib/src/integration.rs`) on the premise that a tool call would go
+through an approval card and a command has no approval leg. Brenn spawns
+Claude Code with `--permission-mode auto` (`build_cc_args` in
+`brenn-cc/src/session/mod.rs`); the comment there says risky calls still fall
+back to the stdio permission prompt, and the bridge's `approval_dispatch.rs`
+routes such requests to the browser, but in operation no approval card is
+shown. Establish which is true under auto mode. If no card is ever shown, the
+refusal protects nothing and only blocks scripts from those tools: decide
+what, if anything, gates them for a script, and drop the `requires_approval`
+reason. Deferred until it blocks someone.
+
+## `gmail-filters-tier-3`
+
+Gmail filter tools (`GmailFilters`, `GmailFilterCreate`, `GmailFilterDelete`,
+on the `gmail.settings.basic` scope) were planned as the last Workspace tier
+of `google-workspace-tools` and never built. Build them only if a Google-mail
+user still needs them: the household has largely moved to Fastmail, and a
+Fastmail filter tool, if any, is built out of tree. Done is the three tools
+and their scope set in `brenn-wasm/components/google-workspace-tools`, or this
+entry removed because nobody needs them.
+
+## `security-posture-approval-gate-vs-auto-mode`
+
+`docs/security-posture.md` §7.3 ("The approval gate — the central invariant")
+says every privileged action is authorised by an operator auto-approve rule
+or explicit human approval, and its threat list rates a bypass of that gate
+critical. Brenn spawns Claude Code with `--permission-mode auto`
+(`build_cc_args` in `brenn-cc/src/session/mod.rs`), whose classifier approves
+calls no operator rule named, and in operation no approval card is shown. The
+posture text, the comment at the spawn site (which says risky calls still
+reach Brenn's approval UI) and the running system do not agree. Decide which
+§7.3 invariants hold under auto mode and rewrite the section and the threat
+entry to match; correct the spawn-site comment in the same change.
+
 ## `api-request-read-limit-vs-bus-cap`
 
 `api-request`'s default read limit (`DEFAULT_MAX_RESPONSE_BYTES`, 256 KiB) and
@@ -141,31 +197,6 @@ and message generalised beyond `server.vault_dir`.
 
 Done = every file kind the posture covers is refused at boot and on reload when
 it lies inside an agent-visible root, with a test per kind.
-
-## `security-nested-location-answer-retained-in-durable-result-window`
-
-A provider's nested `device-location` call (`brenn-provider-kit/src/call.rs`,
-`Nested::DeviceLocation`; `google-maps-tools`'s `Weather` with no location) is
-answered with every sharing device of the user — latitude, longitude,
-accuracy, zone, local time — and the executor publishes that answer whole to
-the provider's durable `brenn:tool-results/<slug>` inbox
-(`brenn-tool-registry/src/bus_wiring.rs`). It stays there until newer results
-push it out of the window, and stopping sharing or unenrolling a device does
-not delete it, so the inbox holds a short position history the
-`device_locations` row was meant to be the only copy of. The component reads
-only the most recent device. `docs/security-posture.md` (users' device
-positions) states the retention as it stands.
-
-Deciding it is a posture question: whether the retention is accepted; whether
-the nested call narrows to the one fix it uses (a `device-location` argument
-or answer shape that the model-facing tool also exposes), which reduces the
-breadth but not the history; or whether a result inbox carrying such answers
-stops being durable or forgets them once delivered, which is a tool-substrate
-change touching every nested answer (mail bodies included).
-
-Done = the chosen reduction is in place with a test that the bus record of a
-"here" request holds no more than the decision allows, and the posture
-paragraph says what is kept and for how long.
 
 ## `quality-virtual-tools-final-symlink-left-open-though-local-fix-exists`
 

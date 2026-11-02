@@ -24,10 +24,6 @@ pub const NAME: &str = "device-location";
 /// minutes; fifteen is the first round number past both.
 pub const STALE_AFTER_SECONDS: i64 = 900;
 
-/// What the answer tells the assistant when no device shares location.
-pub const HOW_TO_ENABLE: &str = "No device shares location. The user can turn it on from the user \
-                                 menu in the app: \"Share location from this device\".";
-
 /// The tools this crate registers: `device-location`, over `db`.
 pub fn registered(db: brenn_db::Db) -> Vec<RegisteredTool> {
     vec![RegisteredTool::Async(Arc::new(

@@ -1,8 +1,7 @@
 //! Shared fixtures for the tool-registry suites here and above: the ACL
 //! clause/grant constructors and the single-key `repo` ACL check that the stub
-//! tools all use, plus the one-async-tool registry every fold-in test needs,
-//! the user-bound stub tool, and a registry holding it bound to the served
-//! user.
+//! tools all use, plus the one-async-tool registry every fold-in test needs
+//! and the user-bound stub tool.
 //! One copy so a change to the ACL convention is verified against one encoding,
 //! not three slightly different ones.
 
@@ -74,13 +73,6 @@ pub fn bound(name: &'static str, binding: UserBinding) -> RegisteredTool {
         auto_approve: true,
         user_binding: binding,
     })))
-}
-
-/// A registry holding only `served-user`, bound `ActingOrServedUser`: the
-/// shape of a tool a providing component may be granted and no other
-/// component may.
-pub fn served_user_only() -> ToolRegistry {
-    ToolRegistry::new(vec![bound("served-user", UserBinding::ActingOrServedUser)])
 }
 
 /// A single ACL clause from `(key, value)` pairs.

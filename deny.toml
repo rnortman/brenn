@@ -58,6 +58,8 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # graf is a git dependency from its public GitHub home. (brenn-mcp, graf's own
 # dependency, arrives via the crates.io registry allowed above.)
+# TODO(xtask-deny-warnings): the units that do not use graf warn that this
+# source is unmatched.
 allow-git = [
     "https://github.com/rnortman/graf.git",
 ]

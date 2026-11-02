@@ -1,15 +1,13 @@
 /// Google Maps Platform for an assistant, as native tools, each answered by
-/// nested calls: one or two `api-request` calls against the
-/// `api_key_provider` the instance names, and for `Weather` with no location
-/// a `device-location` call first. Answers are compacted to what a model
-/// needs. The key never reaches this component; `api-request` attaches it
-/// host-side.
+/// one or two `api-request` calls against the `api_key_provider` the instance
+/// names, compacted to what a model needs. The key never reaches this
+/// component; `api-request` attaches it host-side.
 ///
 /// Every capability is load-bearing: `config` names the provider and its
 /// hosts, without which no call can be addressed; `store` carries each
 /// request's state between the activation that issues its nested call and the
 /// one that receives the answer; `tools` is the authority to call
-/// `api-request` and `device-location`; `provides` is what makes the tools exist; `log` records each
+/// `api-request`; `provides` is what makes the tools exist; `log` records each
 /// step's tool, status and size — never a body, never a header.
 ///
 /// The instance's `config = { ... };` map is flat: `provider` is the
@@ -42,7 +40,7 @@ component GoogleMapsTools {
   in tool-requests;
   provide weather {
     mcp_name = "Weather";
-    description = "Weather at a place from Google's Weather API. Pass `place` (free text, geocoded first, or \"<lat>,<lng>\") or `lat` and `lng` (decimal degrees), not both, or neither — then the weather is at the user's most recent device location fix, and the answer's `location` names the `device`, the fix's `age_seconds` and whether it is `stale` (older than 15 minutes; tell the user the age rather than treating it as current). With no device sharing location the call is refused and says how the user turns sharing on; pass a location then. For another of the user's devices, call `DeviceLocation` and pass its coordinates as `lat`/`lng`. Pass `kind`: `current` for conditions now; `hourly` for an hourly forecast from the current hour, `hours` (1-240, default 24) being the whole horizon, answered 24 hours a page; `daily` for `days` (1-10, default 5) of day and night forecasts; `alerts` for public weather alerts where Google covers the region. A `next_page` in an hourly or alerts answer is passed back as `page`, with the same location and `hours`, for the next page; for an answer given no location, pass its `location.lat` and `location.lng` as `lat` and `lng` (`page` with no location is refused). Every answer states its `location` (with the resolved `place` when one was geocoded); all but alerts state the `timezone` and `units`. An alert's `source` name and link, when Google gives them, must be shown with it. An empty `alerts` list is Google's answer when no alert is active, and Google gives the same answer when a provider's alert lacked a required field, so it is not proof that none is in force. Maps Platform endpoints this component does not wrap (air quality, time zone, weather history, nearby search, …) are listed with `api-request` examples in `docs/providers/google-maps.md`.";
+    description = "Weather at a place from Google's Weather API. Pass `place` (free text, geocoded first, or \"<lat>,<lng>\") or `lat` and `lng` (decimal degrees), not both. A device's position from `DeviceLocation` is passed as `lat` and `lng`. Pass `kind`: `current` for conditions now; `hourly` for an hourly forecast from the current hour, `hours` (1-240, default 24) being the whole horizon, answered 24 hours a page; `daily` for `days` (1-10, default 5) of day and night forecasts; `alerts` for public weather alerts where Google covers the region. A `next_page` in an hourly or alerts answer is passed back as `page`, with the same location and `hours`, for the next page. Every answer states its `location` (with the resolved `place` when one was geocoded); all but alerts state the `timezone` and `units`. An alert's `source` name and link, when Google gives them, must be shown with it. An empty `alerts` list is Google's answer when no alert is active, and Google gives the same answer when a provider's alert lacked a required field, so it is not proof that none is in force. Maps Platform endpoints this component does not wrap (air quality, time zone, weather history, nearby search, …) are listed with `api-request` examples in `docs/providers/google-maps.md`.";
     input_schema = """{ "type": "object", "properties": { "kind": { "type": "string", "enum": ["current", "hourly", "daily", "alerts"] }, "place": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "[^\\s\\u0085]" }, "lat": { "type": "number", "minimum": -90, "maximum": 90 }, "lng": { "type": "number", "minimum": -180, "maximum": 180 }, "hours": { "type": "integer", "minimum": 1, "maximum": 240 }, "days": { "type": "integer", "minimum": 1, "maximum": 10 }, "page": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "[^\\s\\u0085]" } }, "required": ["kind"], "additionalProperties": false }""";
     max_concurrency = 4;
   }

@@ -7,10 +7,10 @@
 //! committed state.
 //!
 //! Serving a request validates its arguments and issues its first nested
-//! registry-tool call for the caller's user through `call_async_for`, recording the
+//! `api-request` for the caller's user through `call_async_for`, recording the
 //! request's state in the store under the call's id. Answering a result reads
 //! that state back, deletes it, and either completes the request from
-//! the nested call's answer or issues the request's next step the same way, so a
+//! `api-request`'s answer or issues the request's next step the same way, so a
 //! request has at most one nested call outstanding. A request's own problem —
 //! bad arguments, Brenn's refusal, Google's error — is answered with `complete_err`; only a
 //! structural fault (a bad `config`, a store failure, a malformed envelope)
@@ -32,6 +32,8 @@ use crate::spec::{Provided, config, log, provides, store};
 
 /// The store namespace of in-flight rows, keyed by call id.
 const INFLIGHT_NS: &str = "inflight";
+/// The tool every nested call reaches.
+const NESTED_TOOL: &str = "api-request";
 
 struct GoogleMapsTools;
 
@@ -104,24 +106,23 @@ fn issue(
     state: &InFlight,
 ) -> Result<(), Error> {
     let call_id = state.call_id();
-    match provides::call_async_for(id, call.nested.tool(), &call.nested.args(), &call_id) {
+    match provides::call_async_for(id, NESTED_TOOL, &call.api, &call_id) {
         Ok(()) => {
             log::info(format!(
-                "{} step {} {}",
+                "{} step {} {} {}{}",
                 state.tool.name(),
                 call.step,
-                state.target
+                call.api.method,
+                call.api.host,
+                call.api.path
             ));
             tx.put(INFLIGHT_NS, call_id.as_bytes(), &state.encode())
         }
-        Err(refused) => {
-            let failure = not_issued(&state.target, &refused.to_string());
-            drop_not_pending(provides::complete_err(
-                id,
-                outcome_kind(failure.kind),
-                &failure.detail,
-            ))
-        }
+        Err(refused) => drop_not_pending(provides::complete_err(
+            id,
+            OutcomeErrorKind::Internal,
+            &not_issued(&refused.to_string()),
+        )),
     }
 }
 
@@ -158,7 +159,7 @@ fn answer(
         "{} step {} result {}",
         state.tool.name(),
         state.step,
-        result_summary(&outcome, &state.target)
+        result_summary(&outcome)
     ));
     match logic::advance(&state, outcome, settings) {
         Next::Complete(value) => drop_not_pending(provides::complete(&id, &value)),

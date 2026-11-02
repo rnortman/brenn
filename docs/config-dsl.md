@@ -463,9 +463,7 @@ reload:
 - Any of the four on an app with no `container`, because a bare agent runs as
   Brenn's user and could read the vault.
 - `oauth-connect`, `oauth-accounts` or `oauth-disconnect` on a WASM component.
-  A component that provides a tool does serve calls that carry a user, but
-  these tools connect, list and remove that user's accounts, and only the
-  user's own app may hold them.
+  A component has no user to act for.
 
 A conversation's calls always use its owner's credentials. A component's
 `api-request` call has no owner, so it uses a *lent* credential. Every one of
@@ -482,9 +480,7 @@ admits; no user is lent. `allow { provider = "google"; user = "*"; method =
 "POST"; … }` on a provider's grant admits it for whichever user is calling. A
 request from a component calling on its own account carries no user. A nested
 call made for it is a lent call like the component's own calls: read-only, and
-under the lent-user rule above. The same stamp is what admits a provider's
-nested `device-location` call (*The device-location tool*): it reads the
-calling user's devices, and with no user stamped it is refused.
+under the lent-user rule above.
 
 A `user = "*"` clause leaves no single user to lend, so on an instance holding
 one, every call to that provider that carries no user is refused, reads
@@ -546,10 +542,7 @@ agent PersonalAssistant {
 
 It acts as a Brenn user, so it is refused at boot and on reload, as the
 OAuth tools are, on a `multiuser` app, on an app with no `container`, and on
-a WASM component that provides no tool. A component that provides a tool may
-hold it: the grant admits only a nested call made for a request whose caller
-had a user, and reads that user's devices; any other call to the tool is
-answered `denied`.
+a WASM component.
 
 Granting it to an app also shows that app's users the "Share location from
 this device" item in the PWA's user menu; without the grant the item does
@@ -1339,10 +1332,9 @@ a reserved input port named `tool-requests`:
 
 A provider answers each request through the `provides` interface and may act
 for the calling user only on a request it is serving; its instance names no
-inbox and no user. A nested call (`api-request`, `device-location`) made for a
-request it serves is the calling user's call when that request's caller had a
-user (see *The OAuth tools* and *The device-location tool*, which give the
-rule and its limits). What the host guarantees about a
+inbox and no user. A nested `api-request` made for a request it serves is the
+calling user's call when that request's caller had a user (see *The OAuth
+tools*, which gives the rule and its limits). What the host guarantees about a
 provider, and the limits beside it, are in `docs/security-posture.md` §8.4.
 
 A `tool` statement naming a provided tool is admitted as an `api-request`

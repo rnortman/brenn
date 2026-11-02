@@ -399,6 +399,8 @@ const DELETE_UNKNOWN_HINT: &str = "the event may already be deleted before its a
 
 /// The Google scope a step's call needs, named in a 403's hint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// TODO(gmail-filters-tier-3): Gmail filter tools would add a scope here,
+// `gmail.settings.basic`.
 pub enum Scope {
     GmailRead,
     GmailCompose,
@@ -778,47 +780,71 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
     match tool {
         Provided::GmailLabels => {
             let labels = LabelsArgs::parse(args)?;
-            Ok(Call::api(1, labels_call(&labels, settings)))
+            Ok(Call {
+                step: 1,
+                api: labels_call(&labels, settings),
+            })
         }
         Provided::GmailSearch => {
             let search = SearchArgs::parse(args)?;
-            Ok(Call::api(1, search_list_call(&search, settings)))
+            Ok(Call {
+                step: 1,
+                api: search_list_call(&search, settings),
+            })
         }
         Provided::GmailRead => {
             let read = ReadArgs::parse(args)?;
-            Ok(Call::api(1, read_call(&read, None, settings)))
+            Ok(Call {
+                step: 1,
+                api: read_call(&read, None, settings),
+            })
         }
         Provided::GmailThread => {
             let thread = ThreadArgs::parse(args)?;
-            Ok(Call::api(1, thread_call(&thread, THREAD_HEADERS, settings)))
+            Ok(Call {
+                step: 1,
+                api: thread_call(&thread, THREAD_HEADERS, settings),
+            })
         }
         Provided::CalendarList => {
             let list = CalendarListArgs::parse(args)?;
-            Ok(Call::api(1, calendar_list_call(&list, settings)))
+            Ok(Call {
+                step: 1,
+                api: calendar_list_call(&list, settings),
+            })
         }
         Provided::CalendarEvents => {
             let events = EventsArgs::parse(args)?;
-            Ok(Call::api(1, events_list_call(&events, settings)))
+            Ok(Call {
+                step: 1,
+                api: events_list_call(&events, settings),
+            })
         }
         Provided::CalendarEvent => {
             let event = EventArgs::parse(args)?;
-            Ok(Call::api(1, event_get_call(&event, settings)))
+            Ok(Call {
+                step: 1,
+                api: event_get_call(&event, settings),
+            })
         }
         Provided::CalendarFreeBusy => {
             let free_busy = FreeBusyArgs::parse(args)?;
-            Ok(Call::api(1, free_busy_call(&free_busy, settings)))
+            Ok(Call {
+                step: 1,
+                api: free_busy_call(&free_busy, settings),
+            })
         }
         Provided::GmailDraft => {
             let draft = DraftArgs::parse(args)?;
             Ok(match (&draft.reply_to_id, &draft.subject) {
-                (Some(id), _) => Call::api(
-                    DRAFT_ORIGINAL_STEP,
-                    draft_original_call(id, draft.account.as_deref(), settings),
-                ),
-                (None, Some(subject)) => Call::api(
-                    DRAFT_CREATE_STEP,
-                    draft_create_call(&draft, subject, None, settings),
-                ),
+                (Some(id), _) => Call {
+                    step: DRAFT_ORIGINAL_STEP,
+                    api: draft_original_call(id, draft.account.as_deref(), settings),
+                },
+                (None, Some(subject)) => Call {
+                    step: DRAFT_CREATE_STEP,
+                    api: draft_create_call(&draft, subject, None, settings),
+                },
                 (None, None) => {
                     unreachable!("a draft's parse refuses one without `subject` or `reply_to_id`")
                 }
@@ -826,22 +852,31 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
         }
         Provided::GmailModifyLabels => {
             let modify = ModifyLabelsArgs::parse(args)?;
-            Ok(Call::api(1, batch_modify_call(&modify, settings)))
+            Ok(Call {
+                step: 1,
+                api: batch_modify_call(&modify, settings),
+            })
         }
         Provided::CalendarCreate => {
             let create = EventWriteArgs::parse_create(args)?;
-            Ok(Call::api(1, event_insert_call(&create, settings)))
+            Ok(Call {
+                step: 1,
+                api: event_insert_call(&create, settings),
+            })
         }
         Provided::CalendarUpdate => {
             let update = EventWriteArgs::parse_update(args)?;
-            Ok(Call::api(1, event_patch_call(&update, settings)))
+            Ok(Call {
+                step: 1,
+                api: event_patch_call(&update, settings),
+            })
         }
         Provided::CalendarDelete => {
             let delete = DeleteArgs::parse(args)?;
-            Ok(Call::api(
-                DELETE_READ_STEP,
-                delete_read_call(&delete, settings),
-            ))
+            Ok(Call {
+                step: DELETE_READ_STEP,
+                api: delete_read_call(&delete, settings),
+            })
         }
     }
 }
@@ -1590,7 +1625,10 @@ fn delete_checked(state: &InFlight, body: &Value, settings: &Settings) -> Result
         derived.insert("series".to_string(), json!(true));
     }
     Ok(Next::Call {
-        call: Call::api(DELETE_STEP, event_delete_call(&args, settings)),
+        call: Call {
+            step: DELETE_STEP,
+            api: event_delete_call(&args, settings),
+        },
         derived,
     })
 }
@@ -1818,10 +1856,10 @@ fn draft_reply(state: &InFlight, body: &Value, settings: &Settings) -> Result<Ne
         threading,
     };
     Ok(Next::Call {
-        call: Call::api(
-            DRAFT_CREATE_STEP,
-            draft_create_call(&args, &subject, Some(&reply), settings),
-        ),
+        call: Call {
+            step: DRAFT_CREATE_STEP,
+            api: draft_create_call(&args, &subject, Some(&reply), settings),
+        },
         derived,
     })
 }
@@ -2286,17 +2324,17 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
                 search_message(state, Read::Unreadable(why), settings)
             }
             (Provided::GmailRead, 1) => stored(state, ReadArgs::parse).map(|args| Next::Call {
-                call: Call::api(
-                    STRUCTURE_STEP,
-                    read_call(&args, Some(STRUCTURE_FIELDS), settings),
-                ),
+                call: Call {
+                    step: STRUCTURE_STEP,
+                    api: read_call(&args, Some(STRUCTURE_FIELDS), settings),
+                },
                 derived: why.to_derived(),
             }),
             (Provided::GmailThread, 1) => stored(state, ThreadArgs::parse).map(|args| Next::Call {
-                call: Call::api(
-                    THREAD_NARROW_STEP,
-                    thread_call(&args, THREAD_NARROW_HEADERS, settings),
-                ),
+                call: Call {
+                    step: THREAD_NARROW_STEP,
+                    api: thread_call(&args, THREAD_NARROW_HEADERS, settings),
+                },
                 derived: why.to_derived(),
             }),
             (Provided::GmailLabels, 1)
@@ -2452,10 +2490,10 @@ fn search_listed(state: &InFlight, body: &Value, settings: &Settings) -> Result<
     let Some(Value::String(first)) = ids.first() else {
         return Ok(Next::Complete(search_answer(derived)));
     };
-    let call = Call::api(
-        SEARCH_FIRST_GET,
-        message_metadata_call(first, args.account.as_deref(), settings),
-    );
+    let call = Call {
+        step: SEARCH_FIRST_GET,
+        api: message_metadata_call(first, args.account.as_deref(), settings),
+    };
     derived.insert("ids".to_string(), Value::Array(ids));
     derived.insert("lines".to_string(), Value::Array(Vec::new()));
     derived.insert("unavailable".to_string(), Value::Array(Vec::new()));
@@ -2498,10 +2536,10 @@ fn search_message(state: &InFlight, read: Read, settings: &Settings) -> Result<N
     derived.insert(key.to_string(), Value::Array(list));
     match next_id {
         Some(Value::String(next)) => Ok(Next::Call {
-            call: Call::api(
-                state.step + 1,
-                message_metadata_call(&next, args.account.as_deref(), settings),
-            ),
+            call: Call {
+                step: state.step + 1,
+                api: message_metadata_call(&next, args.account.as_deref(), settings),
+            },
             derived,
         }),
         Some(_) => Err(internal(
@@ -2870,7 +2908,10 @@ fn finish(answer: Value, account: Option<&str>, settings: &Settings) -> Result<N
         return Ok(Next::Complete(answer));
     }
     Ok(Next::Call {
-        call: Call::api(LABELS_STEP, label_names_call(account, settings)),
+        call: Call {
+            step: LABELS_STEP,
+            api: label_names_call(account, settings),
+        },
         derived: Args::from_iter([("answer".to_string(), answer)]),
     })
 }
@@ -3507,8 +3548,7 @@ fn shape(api: &str) -> Failure {
 
 #[cfg(test)]
 mod tests {
-    use brenn_provider_kit::Target;
-    use brenn_provider_kit::testutil::{api, failure, google, http, nested, truncated};
+    use brenn_provider_kit::testutil::{failure, google, http, nested, truncated};
     use brenn_provider_kit::{
         Bound, Probes, ToolBounds, check, hold_probes, hold_required, input_schema, probes,
     };
@@ -3681,7 +3721,7 @@ mod tests {
     fn labels(args: Value) -> Result<ApiCall, String> {
         plan(Provided::GmailLabels, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            api(&call).clone()
+            call.api
         })
     }
 
@@ -4009,7 +4049,7 @@ mod tests {
     fn search(args: Value) -> Result<ApiCall, String> {
         plan(Provided::GmailSearch, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            api(&call).clone()
+            call.api
         })
     }
 
@@ -4138,7 +4178,7 @@ mod tests {
         };
         let row = InFlight::decode(&state.next(&call, derived, 2_000).encode()).unwrap();
         assert_eq!(row.step, call.step);
-        assert_eq!(row.target, api(&call).target());
+        assert_eq!(row.target, call.api.target());
         assert_eq!(row.issued_at_ms, 2_000);
         (row, call)
     }
@@ -4194,7 +4234,7 @@ mod tests {
         let (state, call) = follow(&state, answered(&state, http(200, &list)));
         assert_eq!(call.step, 2);
         assert_eq!(
-            api(&call).clone(),
+            call.api,
             message_metadata_call("m1", Some("alice@example.com"), &settings())
         );
         let (state, call) = follow(
@@ -4202,7 +4242,7 @@ mod tests {
             answered(&state, http(200, &metadata("m1", &["INBOX", "UNREAD"]))),
         );
         assert_eq!(
-            (call.step, api(&call).path.as_str()),
+            (call.step, call.api.path.as_str()),
             (3, "/gmail/v1/users/me/messages/m2")
         );
         let (state, call) = follow(
@@ -4210,13 +4250,13 @@ mod tests {
             answered(&state, http(200, &metadata("m2", &["Label_7", "INBOX"]))),
         );
         assert_eq!(
-            (call.step, api(&call).path.as_str()),
+            (call.step, call.api.path.as_str()),
             (4, "/gmail/v1/users/me/messages/m3")
         );
         let (state, call) = follow(&state, answered(&state, http(200, &metadata("m3", &[]))));
         assert_eq!(call.step, 100);
         assert_eq!(
-            api(&call).clone(),
+            call.api,
             ApiCall {
                 provider: "google".to_string(),
                 account: Some("alice@example.com".to_string()),
@@ -4283,7 +4323,7 @@ mod tests {
         let (state, _) = follow(&state, answered(&state, http(200, &list)));
         let gone = google(404, "NOT_FOUND", "Requested entity was not found.");
         let (state, call) = follow(&state, answered(&state, http(404, &gone)));
-        assert_eq!(api(&call).path, "/gmail/v1/users/me/messages/m2");
+        assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m2");
         let (state, _) = follow(&state, answered(&state, http(200, &metadata("m2", &[]))));
         assert_eq!(
             answered(&state, http(404, &gone)),
@@ -4319,7 +4359,7 @@ mod tests {
             let list = listing(&["m1", "m2"], json!({ "nextPageToken": "next-1" }));
             let (state, _) = follow(&state, answered(&state, http(200, &list)));
             let (state, call) = follow(&state, answered(&state, outcome));
-            assert_eq!(api(&call).path, "/gmail/v1/users/me/messages/m2");
+            assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m2");
             assert_eq!(
                 answered(&state, http(200, &metadata("m2", &[]))),
                 Next::Complete(json!({
@@ -4372,7 +4412,7 @@ mod tests {
             let (mut state, mut call) = follow(&state, answered(&state, http(200, &list)));
             for (i, id) in ids[..24].iter().enumerate() {
                 assert_eq!(
-                    (call.step, api(&call).path.as_str()),
+                    (call.step, call.api.path.as_str()),
                     (
                         2 + i as u8,
                         format!("/gmail/v1/users/me/messages/{id}").as_str()
@@ -4381,7 +4421,7 @@ mod tests {
                 (state, call) = follow(&state, answered(&state, http(200, &metadata(id, &[]))));
             }
             assert_eq!(
-                (call.step, api(&call).path.as_str()),
+                (call.step, call.api.path.as_str()),
                 (26, "/gmail/v1/users/me/messages/m25")
             );
             let Next::Complete(answer) = answered(&state, last) else {
@@ -4813,7 +4853,10 @@ mod tests {
 
     fn naming_state(derived: Args) -> InFlight {
         let state = search_state(json!({ "q": "lunch" }));
-        let call = Call::api(LABELS_STEP, label_names_call(None, &settings()));
+        let call = Call {
+            step: LABELS_STEP,
+            api: label_names_call(None, &settings()),
+        };
         state.next(&call, derived, 2_000)
     }
 
@@ -4929,7 +4972,7 @@ mod tests {
         .unwrap();
         assert_eq!(call.step, 1);
         assert_eq!(
-            serde_json::to_value(api(&call)).unwrap(),
+            serde_json::to_value(&call.api).unwrap(),
             json!({
                 "provider": "google",
                 "account": "alice@example.com",
@@ -5355,13 +5398,13 @@ mod tests {
         let state = read_state(json!({ "id": "m1" }));
         let (row, call) = follow(&state, answered(&state, cut_read(json!(300000))));
         assert_eq!(call.step, STRUCTURE_STEP);
-        assert_eq!(api(&call).path, "/gmail/v1/users/me/messages/m1");
+        assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m1");
         assert_eq!(
-            api(&call).query["format"],
+            call.api.query["format"],
             QueryValue::One("full".to_string())
         );
         assert_eq!(
-            api(&call).query["fields"],
+            call.api.query["fields"],
             QueryValue::One(
                 "id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload(mimeType,\
                  filename,headers,body(size,attachmentId),parts(mimeType,filename,headers,\
@@ -5409,7 +5452,7 @@ mod tests {
         let (row, call) = follow(&state, answered(&state, nested("internal", refusal)));
         assert_eq!(call.step, STRUCTURE_STEP);
         assert_eq!(
-            api(&call).query["fields"],
+            call.api.query["fields"],
             QueryValue::One(STRUCTURE_FIELDS.to_string())
         );
         let answer = completed(answered(&row, http(200, STRUCTURE)));
@@ -5505,7 +5548,7 @@ mod tests {
         .unwrap();
         assert_eq!(call.step, 1);
         assert_eq!(
-            serde_json::to_value(api(&call)).unwrap(),
+            serde_json::to_value(&call.api).unwrap(),
             json!({
                 "provider": "google",
                 "account": "alice@example.com",
@@ -5552,7 +5595,7 @@ mod tests {
         let state = thread_state(json!({ "id": "t1", "account": "alice@example.com" }));
         let (row, call) = follow(&state, answered(&state, http(200, THREAD)));
         assert_eq!(call.step, LABELS_STEP);
-        assert_eq!(api(&call).account.as_deref(), Some("alice@example.com"));
+        assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
         let names = r#"{ "labels": [{ "id": "Label_7", "name": "Projects" }] }"#;
         assert_eq!(
             completed(answered(&row, http(200, names))),
@@ -5752,7 +5795,7 @@ mod tests {
             let (row, call) = follow(&state, answered(&state, outcome));
             assert_eq!(call.step, THREAD_NARROW_STEP);
             assert_eq!(
-                serde_json::to_value(api(&call)).unwrap(),
+                serde_json::to_value(&call.api).unwrap(),
                 json!({
                     "provider": "google",
                     "account": "alice@example.com",
@@ -5778,10 +5821,7 @@ mod tests {
             });
             let (named_row, names_call) = follow(&row, answered(&row, http(200, &narrow)));
             assert_eq!(names_call.step, LABELS_STEP);
-            assert_eq!(
-                api(&names_call).account.as_deref(),
-                Some("alice@example.com")
-            );
+            assert_eq!(names_call.api.account.as_deref(), Some("alice@example.com"));
             let names = r#"{ "labels": [{ "id": "Label_7", "name": "Projects" }] }"#;
             let answer = completed(answered(&named_row, http(200, names)));
             assert_eq!(answer["recipients_omitted"], json!(why));
@@ -5967,7 +6007,7 @@ mod tests {
     fn calendar_list(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarList, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            api(&call).clone()
+            call.api
         })
     }
 
@@ -6242,7 +6282,7 @@ mod tests {
     fn events(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarEvents, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            api(&call).clone()
+            call.api
         })
     }
 
@@ -7148,7 +7188,7 @@ mod tests {
     fn event(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarEvent, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            api(&call).clone()
+            call.api
         })
     }
 
@@ -7588,7 +7628,7 @@ mod tests {
     fn free_busy(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarFreeBusy, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            api(&call).clone()
+            call.api
         })
     }
 
@@ -8050,7 +8090,7 @@ mod tests {
     fn draft(args: Value) -> Result<ApiCall, String> {
         plan(Provided::GmailDraft, &args, &settings()).map(|call| {
             assert_eq!(call.step, DRAFT_CREATE_STEP);
-            api(&call).clone()
+            call.api
         })
     }
 
@@ -8099,8 +8139,8 @@ mod tests {
             panic!("a reply posts after its read");
         };
         assert_eq!(call.step, DRAFT_CREATE_STEP);
-        let message = raw_message(api(&call));
-        (api(&call).clone(), message, derived)
+        let message = raw_message(&call.api);
+        (call.api, message, derived)
     }
 
     /// A message's header lines before the empty line, unfolded: each
@@ -8296,7 +8336,7 @@ mod tests {
             QueryValue::One("false".to_string()),
         );
         assert_eq!(
-            api(&read).clone(),
+            read.api,
             ApiCall {
                 provider: "google".to_string(),
                 account: Some("alice@example.com".to_string()),
@@ -8317,13 +8357,13 @@ mod tests {
             panic!("a reply posts after its read");
         };
         assert_eq!(call.step, DRAFT_CREATE_STEP);
-        assert_eq!(api(&call).method, "POST");
-        assert_eq!(api(&call).path, DRAFTS_PATH);
-        assert_eq!(api(&call).account.as_deref(), Some("alice@example.com"));
-        let body: Value = serde_json::from_str(api(&call).body.as_deref().unwrap()).unwrap();
+        assert_eq!(call.api.method, "POST");
+        assert_eq!(call.api.path, DRAFTS_PATH);
+        assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
+        let body: Value = serde_json::from_str(call.api.body.as_deref().unwrap()).unwrap();
         assert_eq!(body["message"]["threadId"], json!("t1"));
         assert_eq!(
-            raw_message(api(&call)),
+            raw_message(&call.api),
             "To: alice@example.com\r\n\
              Subject: Re: Lunch\r\n\
              In-Reply-To: <b@example.com>\r\n\
@@ -8652,18 +8692,11 @@ mod tests {
         }
         // A reply reads its original and then posts the draft.
         let state = reply_state(json!({}));
-        assert!(
-            matches!(
-                &state.target,
-                Target::ApiRequest { method, path, .. }
-                    if method == "GET" && *path == format!("{MESSAGES_PATH}/m0")
-            ),
-            "{:?}",
-            state.target
-        );
+        assert_eq!(state.target.method, "GET");
+        assert_eq!(state.target.path, format!("{MESSAGES_PATH}/m0"));
         let (row, call) = follow(&state, answered(&state, original(&[])));
-        assert_eq!(api(&call).method, "POST");
-        assert_eq!(api(&call).path, DRAFTS_PATH);
+        assert_eq!(call.api.method, "POST");
+        assert_eq!(call.api.path, DRAFTS_PATH);
         // Every answer to the `POST` completes or fails; none issues a call.
         for state in [draft_state(draft_args(json!({}))), row] {
             for outcome in [
@@ -8708,12 +8741,12 @@ mod tests {
             let Next::Call { call, .. } = answered(&state, http(200, &original.to_string())) else {
                 panic!("a reply posts after its read");
             };
-            let message = raw_message(api(&call));
+            let message = raw_message(&call.api);
             // Both at the bound: a `Message-ID` that leaves no room to join
             // the original's `References` is the draft's `References` alone.
             assert!(message.contains(&format!("\r\nIn-Reply-To: {message_id}\r\n")));
             assert!(message.contains(&format!("\r\nReferences: {message_id}\r\n")));
-            Ok::<ApiCall, String>(api(&call).clone())
+            Ok::<ApiCall, String>(call.api)
         };
         let four_byte_body = four_byte(1, BODY_MAX_BYTES / 4);
         assert_eq!(four_byte_body.len(), BODY_MAX_BYTES);
@@ -8853,7 +8886,7 @@ mod tests {
                         assert!(step < SEARCH_LAST_GET, "{step}");
                         assert_eq!(call.step, step + 1);
                         assert_eq!(
-                            api(&call).path,
+                            call.api.path,
                             format!("/gmail/v1/users/me/messages/{}", ids[index + 1])
                         );
                         assert_eq!(derived["unavailable"], entry);
@@ -9025,7 +9058,7 @@ mod tests {
     fn modify(args: Value) -> Result<ApiCall, String> {
         plan(Provided::GmailModifyLabels, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            api(&call).clone()
+            call.api
         })
     }
 
@@ -9272,14 +9305,14 @@ mod tests {
     fn create(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarCreate, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            api(&call).clone()
+            call.api
         })
     }
 
     fn update(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarUpdate, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            api(&call).clone()
+            call.api
         })
     }
 
@@ -9813,7 +9846,7 @@ mod tests {
     fn delete(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarDelete, &args, &settings()).map(|call| {
             assert_eq!(call.step, DELETE_READ_STEP);
-            api(&call).clone()
+            call.api
         })
     }
 
@@ -9870,7 +9903,7 @@ mod tests {
         let (row, call) = delete_after_read(args, &delete_read(json!({})));
         assert_eq!(call.step, DELETE_STEP);
         assert_eq!(
-            api(&call).clone(),
+            call.api,
             ApiCall {
                 provider: "google".to_string(),
                 account: Some("alice@example.com".to_string()),
@@ -9897,10 +9930,10 @@ mod tests {
         // Whom Google notifies is always sent: nobody by default.
         let (_, call) = delete_after_read(json!({ "id": "e1" }), &delete_read(json!({})));
         assert_eq!(
-            api(&call).query.get("sendUpdates"),
+            call.api.query.get("sendUpdates"),
             Some(&QueryValue::One("none".to_string()))
         );
-        assert_eq!(api(&call).path, "/calendar/v3/calendars/primary/events/e1");
+        assert_eq!(call.api.path, "/calendar/v3/calendars/primary/events/e1");
     }
 
     #[test]
@@ -9985,7 +10018,7 @@ mod tests {
         // Deleted: a master with `series`, an occurrence without it.
         let (row, call) =
             delete_after_read(json!({ "id": "e1", "series": true }), &delete_read(master));
-        assert_eq!(api(&call).method, "DELETE");
+        assert_eq!(call.api.method, "DELETE");
         assert_eq!(
             answered(&row, http(204, "")),
             Next::Complete(json!({
@@ -9997,7 +10030,7 @@ mod tests {
             }))
         );
         let (row, call) = delete_after_read(json!({ "id": "e1" }), &delete_read(occurrence));
-        assert_eq!(api(&call).method, "DELETE");
+        assert_eq!(call.api.method, "DELETE");
         assert_eq!(
             answered(&row, http(204, "")),
             Next::Complete(json!({

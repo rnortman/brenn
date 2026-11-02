@@ -470,7 +470,6 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
             registry.validate_grants(
                 brenn_tool_registry::GrantOwner::WasmConsumer {
                     slug: &consumer.slug,
-                    provides: !consumer.provides.is_empty(),
                 },
                 &consumer.policy.tool_grants,
             );
@@ -1269,58 +1268,6 @@ mod tests {
                 .allows_channel_access("brenn:tool-requests/prov")
         );
         assert!(!consumer.policy.allows_brenn_publish("tool-requests/prov"));
-    }
-
-    /// `providing_config` with the provider granted the `served-user` tool, or
-    /// with its `provides` cleared when `provides` is false, planned against a
-    /// registry holding that tool.
-    fn plan_with_a_served_user_grant(provides: bool) -> super::MessagingPlan {
-        let mut config = providing_config([1, 1]);
-        let consumer = &mut config.wasm_consumers[0];
-        if !provides {
-            consumer.provides.clear();
-            consumer.grants.clear();
-        }
-        consumer.tool_grants = vec![brenn_lib::tools::config::ToolGrantRaw {
-            tool: "served-user".to_string(),
-            acl: vec![std::collections::BTreeMap::from([(
-                "provider".to_string(),
-                "google".to_string(),
-            )])],
-            rate_limit: None,
-        }];
-        let registry = brenn_tool_registry::testutil::served_user_only();
-        plan_messaging(&PlanInputs {
-            config: &config,
-            apps: None,
-            mqtt_clients: &indexmap::IndexMap::new(),
-            tool_registry: Some(&registry),
-            replay_store_paths: &[],
-        })
-        .expect("a document declaring channels configures messaging")
-    }
-
-    /// A consumer that provides a tool may hold a grant for a tool bound to
-    /// the served user: its nested calls carry the user of the call it serves.
-    #[test]
-    fn a_providing_consumer_plans_a_served_user_tool_grant() {
-        let plan = plan_with_a_served_user_grant(true);
-        assert_eq!(
-            plan.tool_caller_grants["wasm:prov"]
-                .keys()
-                .collect::<Vec<_>>(),
-            vec!["served-user"]
-        );
-    }
-
-    /// A consumer that provides nothing never serves a call carrying a user,
-    /// so the same grant is refused naming why.
-    #[test]
-    #[should_panic(
-        expected = "wasm consumer \"prov\": tool_grant for \"served-user\" is refused: the tool acts as the acting user, and a component that provides no tool never serves a call that carries one"
-    )]
-    fn a_consumer_providing_nothing_is_refused_a_served_user_tool_grant() {
-        plan_with_a_served_user_grant(false);
     }
 
     /// A consumer that provides nothing gets no request inbox.

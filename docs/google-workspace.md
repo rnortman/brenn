@@ -192,10 +192,8 @@ clauses (section 8).
 
 `device-location` is held under the same restrictions. It gives the
 assistant the user's position and time zone from the devices on which the
-user shares location: the Calendar tools take its time zone as an
-argument, and `Weather` given no location takes the position itself, through
-the maps instance's own `device-location` grant (`docs/google-maps-platform.md`,
-section 4). Granting it to the app also shows the "Share location from this device"
+user shares location, which `Weather` and the Calendar tools take as
+arguments; granting it also shows the "Share location from this device"
 item in the PWA's user menu (see `docs/config-dsl.md`, *The device-location
 tool*).
 
@@ -520,10 +518,9 @@ CalendarFreeBusy, CalendarCreate, CalendarUpdate and CalendarDelete.
   with CalendarEvent first.
 - CalendarDelete deletes a recurring series only with `series: true`; ask
   the user before passing it.
-- Weather with no place is the weather where the user is, from their most
-  recent device location fix, and names the device and the fix's age. For
-  "now" in the Calendar tools, call DeviceLocation and pass its `time_zone`.
-  Tell the user a fix's age when it is `stale`.
+- For "here" or "now", call DeviceLocation first: pass its latitude and
+  longitude to Weather as `lat`/`lng`, and its `time_zone` to the Calendar
+  tools. Tell the user a fix's age when it is `stale`.
 - In CalendarEvents, `self_response` is "the answer to the invitation of the
   calendar read — `needsAction`, `declined`, `tentative` or `accepted` — when
   that calendar is an attendee: on `primary` the user's own, on another

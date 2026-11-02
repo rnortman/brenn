@@ -1,7 +1,6 @@
-//! A nested call that could not be issued, the log line of its answer,
-//! reading `api-request`'s answer envelope and bounding what is copied out of
-//! it, and the ceiling on a request's compact result. The envelope is read as
-//! a Google API's answer: its refusals name Google.
+//! Reading a nested `api-request` call's answer envelope, bounding what is
+//! copied out of it, and the ceiling on a request's compact result. The
+//! envelope is read as a Google API's answer: its refusals name Google.
 
 use serde_json::{Value, json};
 
@@ -38,49 +37,26 @@ pub fn cut(text: &str, max_bytes: usize) -> (String, bool) {
     (format!("{}…", &text[..at]), true)
 }
 
-/// The request's answer when its nested call to `target` could not be
-/// queued: Brenn's refusal text plus the one sentence of operator guidance.
-/// An `api-request` refusal is the wrapper's fault or a clause the operator
-/// must widen, so `internal`; a `device-location` refusal is the instance
-/// lacking an optional grant, so `denied`.
-pub fn not_issued(target: &Target, refusal: &str) -> Failure {
-    match target {
-        Target::ApiRequest { .. } => internal(format!(
-            "api-request could not be issued: {refusal}. If this names the clause, the \
-             instance's `tool api-request` grant must admit the method, host and path."
-        )),
-        Target::DeviceLocation => Failure {
-            kind: ErrorKind::Denied,
-            detail: device_location_not_granted(refusal),
-        },
-    }
-}
-
-/// The detail of a `device-location` call the instance's grants do not admit.
-pub(crate) fn device_location_not_granted(refusal: &str) -> String {
+/// The detail of a nested call that issued but could not be queued: Brenn's
+/// refusal text plus the one sentence of operator guidance.
+pub fn not_issued(refusal: &str) -> String {
     format!(
-        "device-location could not be issued: {refusal}. The instance's grants must include \
-         `tool device-location {{}}` for a request to be answered from the user's device \
-         location; otherwise the caller passes a location."
+        "api-request could not be issued: {refusal}. If this names the clause, the instance's \
+         `tool api-request` grant must admit the method, host and path."
     )
 }
 
-/// One line for the log: for an API step its status, size and truncation;
-/// for a location step how many devices answered; otherwise the error kind.
-/// Never a body, a header, a coordinate or a device name.
-pub fn result_summary(outcome: &Result<Value, NestedError>, target: &Target) -> String {
-    match (outcome, target) {
-        (Ok(value), Target::ApiRequest { .. }) => format!(
+/// One line for the log: status, size and truncation, or the error kind.
+/// Never a body or a header.
+pub fn result_summary(outcome: &Result<Value, NestedError>) -> String {
+    match outcome {
+        Ok(value) => format!(
             "status {} bytes {} truncated {}",
             value.get("status").unwrap_or(&Value::Null),
             value.get("bytes").unwrap_or(&Value::Null),
             value.get("truncated").unwrap_or(&Value::Null),
         ),
-        (Ok(value), Target::DeviceLocation) => match value.get("devices") {
-            Some(Value::Array(devices)) => format!("devices {}", devices.len()),
-            _ => "devices unreadable".to_string(),
-        },
-        (Err(error), _) => format!("error {}", error.kind),
+        Err(error) => format!("error {}", error.kind),
     }
 }
 
@@ -182,11 +158,6 @@ pub fn read_api_result(
     outcome: Result<Value, NestedError>,
     target: &Target,
 ) -> Result<Answer, Failure> {
-    if !matches!(target, Target::ApiRequest { .. }) {
-        return Err(internal(format!(
-            "in-flight row at a {target} step was read as an api-request answer"
-        )));
-    }
     let value = match outcome {
         Ok(value) => value,
         Err(error) => {
@@ -194,7 +165,10 @@ pub fn read_api_result(
             return match kind.as_str() {
                 "denied" => Err(Failure {
                     kind: ErrorKind::Denied,
-                    detail: format!("api-request refused the nested {target}: {detail}"),
+                    detail: format!(
+                        "api-request refused the nested {} {}{}: {detail}",
+                        target.method, target.host, target.path
+                    ),
                 }),
                 "invalid_args" => Err(internal(format!(
                     "api-request rejected the wrapper's request: {detail}"
@@ -311,12 +285,10 @@ pub fn copy(to: &mut Args, name: &str, from: Option<&Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{
-        device_location_answer, failure, google, http, nested, no_devices, truncated,
-    };
+    use crate::testutil::{failure, google, http, nested, truncated};
 
     fn target() -> Target {
-        Target::ApiRequest {
+        Target {
             method: "GET".to_string(),
             host: "api.example.com".to_string(),
             path: "/v1/items".to_string(),
@@ -629,79 +601,19 @@ mod tests {
     #[test]
     fn the_summary_names_status_size_and_truncation_only() {
         assert_eq!(
-            result_summary(&http(200, "{\"secret\": 1}"), &target()),
+            result_summary(&http(200, "{\"secret\": 1}")),
             "status 200 bytes 13 truncated false"
         );
-        assert_eq!(
-            result_summary(&nested("denied", "secret"), &target()),
-            "error denied"
-        );
-    }
-
-    #[test]
-    fn a_location_summary_counts_devices_only() {
-        let here = Target::DeviceLocation;
-        assert_eq!(
-            result_summary(
-                &device_location_answer(&[("phone", 51.5, -0.12, 30, false)]),
-                &here
-            ),
-            "devices 1"
-        );
-        assert_eq!(result_summary(&no_devices(), &here), "devices 0");
-        assert_eq!(
-            result_summary(&Ok(json!({ "devices": "x" })), &here),
-            "devices unreadable"
-        );
-        assert_eq!(
-            result_summary(&nested("denied", "secret"), &here),
-            "error denied"
-        );
+        assert_eq!(result_summary(&nested("denied", "secret")), "error denied");
     }
 
     #[test]
     fn not_issued_carries_brenns_text_and_the_guidance() {
-        let failed = not_issued(
-            &target(),
-            "call-async api-request: denied: no clause admits GET",
-        );
-        assert_eq!(failed.kind, ErrorKind::Internal);
-        assert!(failed.detail.starts_with(
+        let detail = not_issued("call-async api-request: denied: no clause admits GET");
+        assert!(detail.starts_with(
             "api-request could not be issued: call-async api-request: denied: no clause admits GET."
         ));
-        assert!(
-            failed
-                .detail
-                .ends_with("must admit the method, host and path.")
-        );
-    }
-
-    #[test]
-    fn a_location_step_not_issued_is_denied_naming_the_grant() {
-        assert_eq!(
-            not_issued(
-                &Target::DeviceLocation,
-                "call-async device-location: not-granted"
-            ),
-            failure(
-                ErrorKind::Denied,
-                "device-location could not be issued: call-async device-location: \
-                 not-granted. The instance's grants must include `tool device-location {}` for \
-                 a request to be answered from the user's device location; otherwise the \
-                 caller passes a location."
-            )
-        );
-    }
-
-    #[test]
-    fn a_location_target_read_as_an_api_answer_is_internal() {
-        assert_eq!(
-            read_api_result(http(200, "{}"), &Target::DeviceLocation),
-            Err(failure(
-                ErrorKind::Internal,
-                "in-flight row at a device-location step was read as an api-request answer"
-            ))
-        );
+        assert!(detail.ends_with("must admit the method, host and path."));
     }
 
     #[test]

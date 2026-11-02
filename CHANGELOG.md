@@ -4,27 +4,23 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
-- **"What's the weather?" now means "here".** The `Weather` tool, called
-  without a place or coordinates, uses the user's most recent shared device
-  location (from `DeviceLocation`) and says which device it used, how old the
-  position is, and whether it is stale. If no device is sharing location, the
-  call is refused with instructions for turning sharing on. To page through a
-  "here" forecast, pass the coordinates the first answer reported.
-  **Config change required:** add `tool device-location {}` to the
-  `google-maps-tools` instance, next to its `api-request` grant. Without it,
-  `Weather` with no location is refused, naming the missing grant; calls that
-  give a location work as before. The app still needs its own
-  `device-location` grant to show the sharing menu item.
-  **Privacy note:** each "here" call stores the user's sharing devices'
-  positions in that instance's durable `brenn:tool-results` inbox. They stay
-  there until newer results push them out (64 results in the documented
-  configuration), even if the user stops sharing.
+- **`Weather` no longer looks up the user's location itself; the "here"
+  default from the previous unreleased change is withdrawn.** `Weather`
+  takes a `place` or `lat`/`lng` again. For "what's the weather here?", the
+  assistant first asks `DeviceLocation` for the device's position and passes
+  it on. The Maps component therefore no longer copies users' device
+  positions into its stored tool results.
+  **Config change required:** remove `tool device-location {}` from the
+  `google-maps-tools` instance if you added it; boot refuses it there (and on
+  any other WASM component). Keep the grant on the *assistant* — it is what
+  shows "Share location from this device" in the user menu.
+  A `google-maps-tools` request in flight across the upgrade is lost with the
+  restart; a late result for one fails that activation with "in-flight row
+  does not parse" and is cleared five minutes after it was issued.
 
-- **WASM components that provide tools may now be granted tools that act as
-  the user**, such as `device-location`. Such a call is allowed only when it
-  serves a request made on behalf of a user. Any other call is refused with
-  `denied` instead of crashing the server. The OAuth account tools are still
-  refused to all components.
+- **A call to a tool that acts as the user, made with no user attached, is
+  refused instead of crashing the server.** Such tools (`DeviceLocation`,
+  the OAuth account tools) answer `denied`, naming the tool and the caller.
 
 - **The assistant can now ask where the user is.** The PWA's user menu gains
   "Share location from this device": with the browser's permission, the
@@ -245,6 +241,8 @@ All notable changes to Brenn are documented here.
   an empty body (as some write endpoints give) instead of failing it as "not
   JSON". The Google tools have no such call yet and still fail one, now
   reading "Google answered HTTP … with no body". No config changes.
+
+- Bumped pulldown-cmark from 0.13.5 to 0.13.6, clearing RUSTSEC-2026-0433.
 
 ## [0.30.1] — 2026-10-31
 

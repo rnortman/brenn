@@ -1,55 +1,11 @@
 //! Test fixtures for a step's inputs and outputs: `api-request`'s answer
-//! envelope, `device-location`'s answer, a nested-call error, a Google error
-//! body, the error answer a step returns, and a test's view of a step's
-//! `api-request` arguments.
+//! envelope, a nested-call error, a Google error body and the error answer a
+//! step returns.
 
 use serde_json::{Value, json};
 
 use crate::answer::NestedError;
-use crate::call::{ApiCall, Call, ErrorKind, Failure, Nested};
-
-/// The `ApiCall` of a step's call, for a test's assertions; a location step
-/// has none, which is the test's mistake.
-pub fn api(call: &Call) -> &ApiCall {
-    match &call.nested {
-        Nested::ApiRequest(api) => api,
-        other => panic!("step {} calls {}, not api-request", call.step, other.tool()),
-    }
-}
-
-/// Stands in for `device-location`'s text on turning sharing on, which a
-/// step passes through without reading.
-pub const HOW_TO_ENABLE: &str = "<how to enable>";
-
-/// `device-location`'s answer listing `devices` as `(device, latitude,
-/// longitude, age_seconds, stale)`, in the order given, with every field the
-/// tool writes.
-pub fn device_location_answer(
-    devices: &[(&str, f64, f64, u64, bool)],
-) -> Result<Value, NestedError> {
-    let devices: Vec<Value> = devices
-        .iter()
-        .map(|(device, latitude, longitude, age_seconds, stale)| {
-            json!({
-                "device": device,
-                "latitude": latitude,
-                "longitude": longitude,
-                "accuracy_m": 12.0,
-                "reported_at": "2026-11-01T12:00:00Z",
-                "age_seconds": age_seconds,
-                "stale": stale,
-                "time_zone": "Europe/London",
-                "local_time": "2026-11-01T12:00:30+00:00",
-            })
-        })
-        .collect();
-    Ok(json!({ "devices": devices, "stale_after_seconds": 900 }))
-}
-
-/// `device-location`'s answer when no device shares location.
-pub fn no_devices() -> Result<Value, NestedError> {
-    Ok(json!({ "devices": [], "stale_after_seconds": 900, "how_to_enable": HOW_TO_ENABLE }))
-}
+use crate::call::{ErrorKind, Failure};
 
 /// A nested call that failed with `kind` and `detail`.
 pub fn nested(kind: &str, detail: &str) -> Result<Value, NestedError> {
@@ -89,37 +45,5 @@ pub fn failure(kind: ErrorKind, detail: &str) -> Failure {
     Failure {
         kind,
         detail: detail.to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-    use crate::call::Query;
-
-    fn bare() -> ApiCall {
-        ApiCall {
-            provider: "maps".to_string(),
-            account: None,
-            method: "GET".to_string(),
-            host: "maps.example.com".to_string(),
-            path: "/v1/places".to_string(),
-            query: Query::new(),
-            headers: BTreeMap::new(),
-            body: None,
-        }
-    }
-
-    #[test]
-    fn api_is_the_steps_api_call() {
-        assert_eq!(api(&Call::api(1, bare())), &bare());
-    }
-
-    #[test]
-    #[should_panic(expected = "step 3 calls device-location, not api-request")]
-    fn api_of_a_location_step_panics() {
-        api(&Call::device_location(3));
     }
 }

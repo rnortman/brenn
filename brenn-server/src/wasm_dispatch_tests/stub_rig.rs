@@ -54,8 +54,6 @@ pub(super) struct StubProvider<'a> {
     /// The `api-request` grant's clauses, each as its fields but `host`; every
     /// clause is on the stub's host.
     pub clauses: Vec<Vec<(&'a str, &'a str)>>,
-    /// The other registry tools the provider is granted, with no clauses.
-    pub tools: &'a [&'a str],
     pub config: HashMap<String, String>,
     pub caller: Option<CallerSetup<'a>>,
     /// The OAuth service's vault, held for the rig's life.
@@ -127,12 +125,11 @@ pub(super) fn assert_could_not_be_issued(answer: Result<Value, ToolError>) {
 
 impl StubRig {
     /// Build the provider over `started`'s stub: its `api-request` grant holds
-    /// `setup.clauses` on the stub's host, it holds `setup.tools` with no
-    /// clauses, and it holds every grant a provider component needs, with its
-    /// store open.
+    /// `setup.clauses` on the stub's host, and it holds every grant a
+    /// provider component needs, with its store open.
     pub async fn build(started: Started, setup: StubProvider<'_>) -> StubRig {
         let Started { host, stub, .. } = started;
-        let mut grants: BTreeMap<String, ResolvedToolGrant> = BTreeMap::from([(
+        let grants: BTreeMap<String, ResolvedToolGrant> = BTreeMap::from([(
             "api-request".to_string(),
             grant(
                 setup
@@ -146,12 +143,6 @@ impl StubRig {
                     .collect(),
             ),
         )]);
-        grants.extend(
-            setup
-                .tools
-                .iter()
-                .map(|tool| (tool.to_string(), grant(vec![]))),
-        );
         let dir = tempfile::tempdir().expect("a store directory");
         let store_path = dir.path().join(format!("{}.db", setup.slug));
         let base = ProviderRig::build(ProviderSetup {
