@@ -1,4 +1,5 @@
-//! Google Workspace tools (brenn:processor world).
+//! Gmail read (brenn:processor world): `GmailLabels`, `GmailSearch`,
+//! `GmailRead` and `GmailThread`.
 //!
 //! Each activation reads the instance's `config` and hands the activation to
 //! `brenn-provider-kit`'s loop, which runs it in one store transaction: it
@@ -21,19 +22,19 @@
 mod logic;
 mod spec;
 
+use brenn_google_workspace::settings::Settings;
 use brenn_guest::{Activation, Error, Processor};
 
-use crate::logic::Settings;
 use crate::spec::config;
 
-struct GoogleWorkspaceTools;
+struct GoogleGmailRead;
 
-impl Processor for GoogleWorkspaceTools {
+impl Processor for GoogleGmailRead {
     fn receive(activation: Activation) -> Result<Option<String>, Error> {
-        let settings = Settings::from_lookup(config::get).map_err(Error::failed)?;
-        brenn_provider_kit_guest::serve::<logic::Workspace>(&activation, &settings)?;
+        let settings = Settings::from_lookup(config::get, "gmail_host").map_err(Error::failed)?;
+        brenn_provider_kit_guest::serve::<logic::GmailReads>(&activation, &settings)?;
         Ok(None)
     }
 }
 
-brenn_guest::export_processor!(GoogleWorkspaceTools);
+brenn_guest::export_processor!(GoogleGmailRead);

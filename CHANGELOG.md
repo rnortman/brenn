@@ -4,6 +4,32 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **BREAKING: `google-workspace-tools` is split into five components, one
+  per Google scope set; no compatibility shim.** The package
+  `google-workspace-tools` and its class `GoogleWorkspaceTools` are gone.
+  In their place: `google-gmail-read` (`GoogleGmailRead`: `GmailLabels`,
+  `GmailSearch`, `GmailRead`, `GmailThread`), `google-gmail-compose`
+  (`GoogleGmailCompose`: `GmailDraft`), `google-gmail-organize`
+  (`GoogleGmailOrganize`: `GmailModifyLabels`), `google-calendar-read`
+  (`GoogleCalendarRead`: `CalendarList`, `CalendarEvents`, `CalendarEvent`,
+  `CalendarFreeBusy`) and `google-calendar-write` (`GoogleCalendarWrite`:
+  `CalendarCreate`, `CalendarUpdate`, `CalendarDelete`). Each instance holds
+  only the `api-request` clauses its own tools call, with its own rate-limit
+  bucket and result inbox, so reading mail, drafting, changing labels,
+  reading calendars and changing them are separate grants. The tools' names,
+  descriptions, arguments and answers are unchanged.
+  **Config change required:** replace `use @google-workspace-tools::*;`, the
+  `brenn:tool-results/workspace` tuning block and the `workspace` instance
+  with the five `use` lines, five tuning blocks and five instances of
+  `docs/google-workspace.md` section 5, which is the paste. Each instance's
+  `config` names `provider` and its one host key: `gmail_host` for the three
+  Gmail components, `calendar_host` for the two Calendar ones. Leave out the
+  instances whose tools you do not want, with their grants. The agent's
+  `tool` grants are unchanged. The old store file
+  (`/var/lib/brenn/google-workspace-tools.db`) is no longer opened and may be
+  deleted. A request in flight across the upgrade is answered `internal` by
+  the host at its 240-second deadline, as across any restart.
+
 - **Tool providers can now take far more concurrent requests: a provider
   no longer has to make every outbound API call in one go.** Brenn's tool
   providers (WASM components such as `google-workspace-tools` and

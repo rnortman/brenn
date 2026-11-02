@@ -36,11 +36,12 @@ reason. Deferred until it blocks someone.
 ## `gmail-filters-tier-3`
 
 Gmail filter tools (`GmailFilters`, `GmailFilterCreate`, `GmailFilterDelete`,
-on the `gmail.settings.basic` scope) were planned as the last Workspace tier
-of `google-workspace-tools` and never built. Build them only if a Google-mail
+on the `gmail.settings.basic` scope) were planned as the last tier of the
+Google Workspace tools and never built. Build them only if a Google-mail
 user still needs them: the household has largely moved to Fastmail, and a
 Fastmail filter tool, if any, is built out of tree. Done is the three tools
-and their scope set in `brenn-wasm/components/google-workspace-tools`, or this
+and their scope set as a sixth component beside
+`brenn-wasm/components/google-gmail-*`, on `brenn-google-workspace`, or this
 entry removed because nobody needs them.
 
 ## `security-posture-approval-gate-vs-auto-mode`
@@ -71,8 +72,8 @@ cap it means. Escaping is not a fixed half-again: a JSON answer whose text is
 dense in `"` or `\` (sender-written mail headers, for one) serializes to about
 twice its length, so at a `max_body_bytes` of half again the read limit such a
 read is refused on the bus cap at about three quarters of the read limit.
-The tools treat that refusal as they treat a cut (`google-workspace-tools`
-`Unreadable`): a per-message search read is named unreadable, a message or
+The tools treat that refusal as they treat a cut (the Google Workspace
+components' `Unreadable`): a per-message search read is named unreadable, a message or
 thread is read again narrower, and any other read fails naming why. What
 stays open here is the configuration question above; a sender who fills
 `From` or `Subject` is unreadable through the tools under any pair, which the
@@ -80,8 +81,9 @@ operator guide states.
 
 ## `errhandling-gmail-403-always-denied-with-scope-hint`
 
-`google-workspace-tools` answers every Google HTTP 403 `denied` with a
-sentence pointing at `oauth-connect` (`google_error`). Gmail also answers 403
+The Google Workspace components answer every Google HTTP 403 `denied` with
+a sentence pointing at `oauth-connect` (`google_error` in
+`brenn-google-workspace`). Gmail also answers 403
 for usage limits (`userRateLimitExceeded`, `rateLimitExceeded`,
 `dailyLimitExceeded` — transient, like 429, which is answered `internal`) and
 for an API not enabled in the operator's Cloud project (`SERVICE_DISABLED` /
@@ -97,8 +99,8 @@ Calendar API not enabled; the hint names the Calendar read scope.
 
 ## `errhandling-gmail-4xx-on-fixed-request-blamed-on-caller`
 
-`google-workspace-tools` answers every Google 400 and 404 `invalid_args`
-(`google_error`), including on requests whose path and `fields` mask are
+The Google Workspace components answer every Google 400 and 404
+`invalid_args` (`google_error` in `brenn-google-workspace`), including on requests whose path and `fields` mask are
 constants and carry nothing from the caller: `GmailLabels` without `id`, and
 the mask on `labels.get`. A refused mask or a moved path there is the
 wrapper's or Google's fault, but reaches the model and the invocation log as
@@ -113,16 +115,21 @@ apply it to every step. Calendar's steps carry caller input in `from`, `to`,
 
 The provider components' tests each copy the host's nested-args cap
 (`brenn_wasm::PROCESSOR_MAX_TOOL_ARGS_BYTES`, 64 KiB) to prove their widest
-call fits: `google-workspace-tools` as `HOST_ARGS_CAP_BYTES` in its
-`logic.rs` tests, `google-maps-tools` as a literal `< 64 * 1024` in its
-`logic.rs` tests (strict, where the host refuses only `>`). Nothing ties
+call fits: the Google Workspace tools share one copy, `HOST_ARGS_CAP_BYTES`
+in `brenn-google-workspace`'s `args` module, and `google-maps-tools` writes a
+literal `< 64 * 1024` in its `logic.rs` tests (strict, where the host refuses
+only `>`). Nothing ties
 either copy to the host's constant, so a changed cap leaves every widest-call
 test passing against the old number. Decide where the one copy lives (the
 kit's `testutil` is the natural home, serializing the `ApiCall` as
 `call_async_for` does and asserting `<=`) and what pins it to the host's
 constant, as `brenn-tool-registry/src/descriptor.rs` const-asserts its own
 copy; no host crate depends on `brenn-provider-kit` today, so the pin needs a
-new dependency edge or another tie. Then replace both components' copies.
+new dependency edge or another tie. Then replace both copies.
+
+## `provider-split-granularity`
+
+Decision 13 (`02-core--provider-and-location-rework/decisions.md`, the owner's transcribed ruling) says "separate tools are separate providers". Cycle 4 of `oauth-and-google-followup` read it as one provider per Google scope set — five components for the thirteen Workspace tools, Gmail compose and organize each a one-tool component — rather than one per tool (thirteen crates, specs, tests, instances and store files; `GmailSearch`/`GmailRead`/`GmailThread` share most of their code). The same cycle left `google-maps-tools` whole: six read tools on one API key, four of which chain two hosts in one request (`Weather` geocodes then calls weather; `PlacesSearch` and `SearchAlongRoute` likewise), Σ 18, so a per-host cut would put one tool's steps in two components. Owner to rule: (a) leave both as cycle 4 shipped; (b) split Workspace further, per tool; (c) split Maps by host or by tool. (b) and (c) are each a mechanical repeat of cycle 4's registration checklist; (a) costs nothing.
 
 ## `security-host-paths-follow-agent-symlinks`
 

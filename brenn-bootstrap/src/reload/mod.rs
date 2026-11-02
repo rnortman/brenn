@@ -71,7 +71,7 @@ mod device_location_boot_tests;
 mod google_maps_tools_boot_tests;
 
 #[cfg(test)]
-mod google_workspace_tools_boot_tests;
+mod google_workspace_boot_tests;
 
 #[cfg(test)]
 mod provided_tools_tests;

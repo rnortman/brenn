@@ -1,5 +1,5 @@
 {
-  "checksum": "4e0abfcb25f4bc0d006215e05916f26fe6c5bd317c2618b06c87aaab192890cb",
+  "checksum": "9c2635e6b3dd98102bc9c3fb3281c2e0622e64738217a141cb4eaab128fff164",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -3672,6 +3672,46 @@
             {
               "id": "tracing-test 0.2.6",
               "target": "tracing_test"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-google-workspace 0.1.0": {
+      "name": "brenn-google-workspace",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_google_workspace",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_google_workspace",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
             }
           ],
           "selects": {}
@@ -37262,6 +37302,7 @@
     "brenn-echo-stub 0.1.0": "surface/components/echo-stub",
     "brenn-envelope 0.1.0": "brenn-envelope",
     "brenn-git 0.1.0": "brenn-git",
+    "brenn-google-workspace 0.1.0": "brenn-google-workspace",
     "brenn-graf 0.1.0": "brenn-graf",
     "brenn-hooks 0.1.0": "brenn-hooks",
     "brenn-host-conformance 0.1.0": "brenn-host-conformance",

@@ -23,9 +23,9 @@ The configuration keys are documented in `docs/config-dsl.md`, under *API-key
 providers*, *Messaging defaults* and *Provided tools*. This guide covers the
 Google side, the key file, the configuration, the component, what to tell the
 assistant, an acceptance check, the raw route, and rotation. Connecting users'
-own Google accounts (Gmail, Calendar), and the `google-workspace-tools`
-component that reads their Gmail, is a separate setup, in
-`docs/google-workspace.md`; the two can be declared together or alone.
+own Google accounts (Gmail, Calendar), and the Google Workspace components
+(`docs/google-workspace.md`) that read their Gmail, is a separate setup, in
+that guide; the two can be declared together or alone.
 
 ## 1. A key
 

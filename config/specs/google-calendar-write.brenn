@@ -1,0 +1,64 @@
+/// A user's Google Calendar events created, changed and deleted for an
+/// assistant, as the native tools `CalendarCreate`, `CalendarUpdate` and
+/// `CalendarDelete`, answered by `api-request` calls against the
+/// `oauth_provider` the instance names, stamped with the calling
+/// conversation's owner. The user's token never reaches this component;
+/// `api-request` attaches it host-side. Every call is nested under a request:
+/// an instance whose clauses say `user = "*"` cannot call on its own account,
+/// so a caller with no user of its own is answered `denied`. Its calls are
+/// Calendar's `events.insert`, `events.patch` and `events.delete`, the delete
+/// after an `events.get` of the event it deletes, all under the Calendar
+/// events scope set.
+///
+/// Every capability is load-bearing: `config` names the provider and its
+/// host, without which no call can be addressed; `store` carries each
+/// request's state between the activation that issues its nested call and the
+/// one that receives the answer; `tools` is the authority to call
+/// `api-request`; `provides` is what makes the tools exist; `log` records each
+/// step's tool, status and size — never a body, a header or a query.
+///
+/// The instance's `config = { ... };` map is flat: `provider` is the
+/// `oauth_provider` name; `calendar_host` is the `host[:port]` Calendar is
+/// called on, which `api-request` matches against that provider's `api_hosts`
+/// and the instance's clauses must admit. A missing or malformed key fails
+/// every activation, naming the key.
+///
+/// Size the instance's result inbox with a `channel at
+/// "brenn:tool-results/<slug>"` block: each live request has at most one
+/// nested call outstanding, so the window must hold Σ max_concurrency results,
+/// twice over for a re-delivered result — `retain_depth ≥ 2 × Σ`, rounded up
+/// to a power of two. This class's Σ is 3, which the family default of 16
+/// holds; the block in the guide restates it and sets `noise = alarm`.
+///
+/// Every nested answer crosses the bus as a tool result, so Google's body — a
+/// JSON string inside `api-request`'s value, inside the result envelope — must
+/// fit `[messaging] max_body_bytes` (64 KiB default). Either raise that cap to
+/// carry the OAuth provider's `max_response_bytes` (256 KiB default) with a
+/// margin for escaping, `messaging { max_body_bytes = 393216; }`, or lower
+/// `max_response_bytes` to fit the default cap.
+/// An answer over the bus cap never reaches this component as Google's answer;
+/// the tools treat that refusal as they treat an answer cut at the read limit.
+component GoogleCalendarWrite {
+  abi = processor;
+  requires = [log, store, config, tools, provides];
+  in tool-results;
+  in tool-requests;
+  provide calendar-create {
+    mcp_name = "CalendarCreate";
+    description = "Create an event on one of the user's Google calendars. `calendar` is a calendar `id` from `CalendarList`, default `primary` (the user's own calendar). `summary` (the event's title) is required; `summary` and `location` are at most 1000 characters each, `description` at most 2000. Google requires `start` and `end` of the same kind: both `YYYY-MM-DD` for an all-day event (`end` is the day after the last day), or both RFC 3339 with an offset, as `2026-11-02T09:00:00-05:00`; nothing is converted. `time_zone` is an IANA name (`America/New_York`) and is required for a recurring timed event. `attendees` is a list of 1 to 50 distinct email addresses; together they may hold at most 8000 bytes of UTF-8, and more is refused. `recurrence` is 1 to 5 RRULE, RDATE or EXDATE lines as Google writes them (`RRULE:FREQ=WEEKLY;BYDAY=MO`), each 1 to 500 printable ASCII characters; with it the event is a recurring series, and `CalendarDelete` deletes the series only with `series: true`. `notify` is who Google emails about the event — `none` (default), `all`, or `externalOnly` (guests outside the user's domain); with attendees and `all`, Google sends invitations from the user's account. By default nobody is notified. Answers the event as `CalendarEvent` does, with its new `id`. A refusal saying the event may have been created means Google may have saved it before its answer was lost: look for it with `CalendarEvents` in its window before asking again, or the user has two. Conference links, reminders, attachments, colors and visibility are not arguments, and no tool moves an event to another calendar or clears a calendar. `account` is needed only when the user has several Google accounts connected: the refusal lists them. An answer `{\"error\": \"credential_invalid\", …}` means this user has no usable Google credential: run `oauth-connect` for the provider with the Calendar events scope set the operator named and relay its steps, then `oauth-accounts` confirms. Gmail endpoints these tools do not cover (attachments, profile, history) and Calendar's colors and settings are listed with `api-request` examples in `docs/providers/google.md`.";
+    input_schema = """{ "type": "object", "properties": { "calendar": { "type": "string", "pattern": "^(?!\\.\\.?$)[^\\s/\\\\%\"\\x00-\\x1f\\x7f-\\x9f]{1,320}$" }, "summary": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "[^\\s\\u0085]" }, "start": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "[^\\s\\u0085]" }, "end": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "[^\\s\\u0085]" }, "description": { "type": "string", "minLength": 1, "maxLength": 2000, "pattern": "[^\\s\\u0085]" }, "location": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "[^\\s\\u0085]" }, "attendees": { "type": "array", "minItems": 1, "maxItems": 50, "uniqueItems": true, "items": { "type": "string", "pattern": "^(?!\\.\\.?$)[^\\s/\\\\%\"\\x00-\\x1f\\x7f-\\x9f]{1,320}$" } }, "time_zone": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "[^\\s\\u0085]" }, "recurrence": { "type": "array", "minItems": 1, "maxItems": 5, "uniqueItems": true, "items": { "type": "string", "pattern": "^[\\x20-\\x7e]{1,500}$" } }, "notify": { "type": "string", "enum": ["none", "all", "externalOnly"] }, "account": { "type": "string", "minLength": 1, "maxLength": 320, "pattern": "[^\\s\\u0085]" } }, "required": ["summary", "start", "end"], "additionalProperties": false }""";
+    max_concurrency = 1;
+  }
+  provide calendar-update {
+    mcp_name = "CalendarUpdate";
+    description = "Change one event of one of the user's Google calendars by `id` (an event `id` from `CalendarEvents`). `calendar` is the calendar `id` the event is on, from `CalendarList`, default `primary` (the user's own calendar). Changes only the fields named; a field not named keeps its value, and no field can be cleared (an `attendees` of `[]` removes every attendee). At least one of `summary`, `start` and `end`, `description`, `location`, `attendees` and `recurrence` must be given. `summary` and `location` are at most 1000 characters each, `description` at most 2000. `attendees` replaces the whole list: give the complete new list — `CalendarEvent` shows the current one. `attendees` is a list of 0 to 50 distinct email addresses; together they may hold at most 8000 bytes of UTF-8, and more is refused. If `start` or `end` is given, both must be, and `time_zone` only with them; they replace the event's time and may change it between all-day (`YYYY-MM-DD`) and timed (RFC 3339 with an offset). Both are of the same kind: both `YYYY-MM-DD` for an all-day event (`end` is the day after the last day), or both RFC 3339 with an offset, as `2026-11-02T09:00:00-05:00`; nothing is converted. `time_zone` is an IANA name (`America/New_York`). `recurrence` is 1 to 5 RRULE, RDATE or EXDATE lines as Google writes them (`RRULE:FREQ=WEEKLY;BYDAY=MO`), each 1 to 500 printable ASCII characters, and replaces the event's rules; given with a timed `start`, it needs `time_zone`. `notify` is who Google emails about the change — `none` (default), `all`, or `externalOnly` (guests outside the user's domain). By default nobody is notified. Answers the event as Google holds it after the change, as `CalendarEvent` does. A refusal saying the change may already have been applied means Google may have applied it before its answer was lost: `CalendarEvent` shows the event as it is, and asking again with the same arguments is safe. Conference links, reminders, attachments, colors and visibility are not arguments, and no tool moves an event to another calendar or clears a calendar. `account` is needed only when the user has several Google accounts connected: the refusal lists them. An answer `{\"error\": \"credential_invalid\", …}` means this user has no usable Google credential: run `oauth-connect` for the provider with the Calendar events scope set the operator named and relay its steps, then `oauth-accounts` confirms. Gmail endpoints these tools do not cover (attachments, profile, history) and Calendar's colors and settings are listed with `api-request` examples in `docs/providers/google.md`.";
+    input_schema = """{ "type": "object", "properties": { "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,1024}$" }, "calendar": { "type": "string", "pattern": "^(?!\\.\\.?$)[^\\s/\\\\%\"\\x00-\\x1f\\x7f-\\x9f]{1,320}$" }, "summary": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "[^\\s\\u0085]" }, "start": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "[^\\s\\u0085]" }, "end": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "[^\\s\\u0085]" }, "description": { "type": "string", "minLength": 1, "maxLength": 2000, "pattern": "[^\\s\\u0085]" }, "location": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "[^\\s\\u0085]" }, "attendees": { "type": "array", "minItems": 0, "maxItems": 50, "uniqueItems": true, "items": { "type": "string", "pattern": "^(?!\\.\\.?$)[^\\s/\\\\%\"\\x00-\\x1f\\x7f-\\x9f]{1,320}$" } }, "time_zone": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "[^\\s\\u0085]" }, "recurrence": { "type": "array", "minItems": 1, "maxItems": 5, "uniqueItems": true, "items": { "type": "string", "pattern": "^[\\x20-\\x7e]{1,500}$" } }, "notify": { "type": "string", "enum": ["none", "all", "externalOnly"] }, "account": { "type": "string", "minLength": 1, "maxLength": 320, "pattern": "[^\\s\\u0085]" } }, "required": ["id"], "additionalProperties": false }""";
+    max_concurrency = 1;
+  }
+  provide calendar-delete {
+    mcp_name = "CalendarDelete";
+    description = "Deletes one event by `id` (an event `id` from `CalendarEvents`) from one of the user's Google calendars. `calendar` is the calendar `id` the event is on, from `CalendarList`, default `primary` (the user's own calendar). The event is read first, which needs the same scope. An event that is a recurring series (it has `recurrence`) is deleted only with `series: true`, which removes every occurrence; without it the refusal names the event as a series. To delete one occurrence, give its own `id` from `CalendarEvents` (an occurrence's id carries a suffix) without `series`. An event already cancelled is refused as already deleted. `notify` is who Google emails about the cancellation — `none` (default), `all`, or `externalOnly`. By default nobody is notified. Answers `deleted: true`, `id`, the event's `summary` and `start` as read before deletion, and `series: true` for a series. A refusal saying the event may already be deleted means Google may have acted before its answer was lost: asking again is safe — a deleted event is refused as already cancelled. No tool moves an event to another calendar or clears a calendar. `account` is needed only when the user has several Google accounts connected: the refusal lists them. An answer `{\"error\": \"credential_invalid\", …}` means this user has no usable Google credential: run `oauth-connect` for the provider with the Calendar events scope set the operator named and relay its steps, then `oauth-accounts` confirms. Gmail endpoints these tools do not cover (attachments, profile, history) and Calendar's colors and settings are listed with `api-request` examples in `docs/providers/google.md`.";
+    input_schema = """{ "type": "object", "properties": { "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,1024}$" }, "calendar": { "type": "string", "pattern": "^(?!\\.\\.?$)[^\\s/\\\\%\"\\x00-\\x1f\\x7f-\\x9f]{1,320}$" }, "series": { "type": "boolean" }, "notify": { "type": "string", "enum": ["none", "all", "externalOnly"] }, "account": { "type": "string", "minLength": 1, "maxLength": 320, "pattern": "[^\\s\\u0085]" } }, "required": ["id"], "additionalProperties": false }""";
+    max_concurrency = 1;
+  }
+}

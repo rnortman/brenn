@@ -13,16 +13,16 @@ policy_srcs()
 # editing it stops this crate compiling until the guest keeps up.
 guest_spec_scaffold(
     name = "spec",
-    spec = "//:config/specs/google-workspace-tools.brenn",
+    spec = "//:config/specs/google-calendar-write.brenn",
 )
 
 wasm_guest_cdylib(
-    name = "brenn-google-workspace-tools",
+    name = "brenn-google-calendar-write",
     generated_srcs = {"src/spec.rs": ":spec"},
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
-        "//brenn-cal",
+        "//brenn-google-workspace:brenn-google-workspace_guest",
         "//brenn-provider-kit:brenn-provider-kit_guest",
         "//brenn-wasm/components/guest:brenn-guest",
         "//brenn-wasm/components/provider-kit-guest:brenn-provider-kit-guest",
@@ -31,36 +31,30 @@ wasm_guest_cdylib(
 
 wasm_component(
     name = "component",
-    module = ":brenn-google-workspace-tools",
+    module = ":brenn-google-calendar-write",
     visibility = ["//visibility:public"],
 )
 
 # Argument validation, request assembly and result reading are std,
-# serde_json, brenn-cal and brenn-provider-kit only, so they run on the host;
-# the glue in lib.rs needs the guest SDK and builds for wasm32 alone. The
-# generated `spec` module compiles here too, since its SDK-facing items are
-# wasm32-only: the tools the planner matches on are the specification's own
-# `Provided`.
+# serde_json, brenn-google-workspace and brenn-provider-kit only, so they run
+# on the host; the glue in lib.rs needs the guest SDK and builds for wasm32
+# alone. The generated `spec` module compiles here too, since its SDK-facing
+# items are wasm32-only: the tool the planner matches on is the
+# specification's own `Provided`.
 rust_test(
     name = "logic_test",
     srcs = [
-        "src/compose.rs",
-        "src/decode.rs",
         "src/logic.rs",
         ":spec",
     ],
-    compile_data = glob(["src/fixtures/*.json"]),
     crate_root = "src/logic.rs",
-    data = [
-        "//:config/specs/google-workspace-tools.brenn",
-        "//docs:google-workspace.md",
-    ],
+    data = ["//:config/specs/google-calendar-write.brenn"],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": package_name()},
     proc_macro_deps = all_crate_deps(proc_macro = True),
     target_compatible_with = HOST_ONLY,
     deps = all_crate_deps(normal = True) + [
-        "//brenn-cal",
+        "//brenn-google-workspace:brenn-google-workspace_guest",
         "//brenn-provider-kit:brenn-provider-kit_guest",
     ],
 )

@@ -86,11 +86,16 @@ rust_test(
         # The recycler's dispatch cases drive the deployed guest through the real
         # lowering.
         "//brenn-wasm:fixture_conversation_recycler",
-        # The google-maps-tools and google-workspace-tools boot-path cases each
-        # install the component's own artifact under its packaged
-        # specification.
+        # The google-maps-tools boot-path case and the five Google Workspace
+        # ones (gmail-read, gmail-compose, gmail-organize, calendar-read,
+        # calendar-write) each install the component's own artifact under its
+        # packaged specification.
+        "//brenn-wasm:fixture_google_calendar_read",
+        "//brenn-wasm:fixture_google_calendar_write",
+        "//brenn-wasm:fixture_google_gmail_compose",
+        "//brenn-wasm:fixture_google_gmail_organize",
+        "//brenn-wasm:fixture_google_gmail_read",
         "//brenn-wasm:fixture_google_maps_tools",
-        "//brenn-wasm:fixture_google_workspace_tools",
         # The config-map reload case asks a guest what its config map holds, so
         # that a `config`-only edit is observed by the activation rather than
         # only by the delta.

@@ -1,11 +1,12 @@
 # Gmail and Google Calendar endpoints through `api-request`
 
-The `google-workspace-tools` component answers Gmail's labels, searches,
-messages and threads as the tools `GmailLabels`, `GmailSearch`, `GmailRead`
-and `GmailThread`, creates drafts as `GmailDraft` and changes labels as
-`GmailModifyLabels`, and answers Google Calendar's calendar list, events,
+The Google Workspace components answer Gmail's labels, searches, messages
+and threads as the tools `GmailLabels`, `GmailSearch`, `GmailRead` and
+`GmailThread` (`google-gmail-read`), create drafts as `GmailDraft`
+(`google-gmail-compose`) and change labels as `GmailModifyLabels`
+(`google-gmail-organize`), and answer Google Calendar's calendar list, events,
 single events and free/busy as `CalendarList`, `CalendarEvents`,
-`CalendarEvent` and `CalendarFreeBusy`. This document lists Gmail and Google
+`CalendarEvent` and `CalendarFreeBusy` (`google-calendar-read`). This document lists Gmail and Google
 Calendar endpoints
 those tools do not cover, and Calendar's events listing for a caller the
 tools do not serve, each with one `api-request` call that reaches it through
@@ -256,8 +257,9 @@ operator guide's block).
 ### Calendars, events and free/busy
 
 The calendar list, a calendar's events in a window, one event and free/busy
-are answered by the component's tools — `CalendarList`, `CalendarEvents`,
-`CalendarEvent` and `CalendarFreeBusy` — which build the request, bound
+are answered by the `google-calendar-read` component's tools —
+`CalendarList`, `CalendarEvents`, `CalendarEvent` and `CalendarFreeBusy` —
+which build the request, bound
 Google's answer and compact it. A conversation's assistant, or a component
 serving a conversation's request, uses them rather than `api-request` for
 those reads. The tools' descriptions state their arguments and answers, and

@@ -746,6 +746,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-google-workspace"
+version = "0.1.0"
+dependencies = [
+ "brenn-cal",
+ "brenn-provider-kit",
+ "serde_json",
+]
+
+[[package]]
 name = "brenn-graf"
 version = "0.1.0"
 dependencies = [

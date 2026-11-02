@@ -11,7 +11,8 @@
 # discovers crates by globbing this directory.
 #
 # `host-crates/` holds symlinks to the first-party crates this workspace shares
-# with the host tree (`brenn-envelope`, `brenn-cal`, `brenn-provider-kit`), and
+# with the host tree (`brenn-envelope`, `brenn-cal`, `brenn-provider-kit`,
+# `brenn-google-workspace`), and
 # members reach them through it rather than by `../../../`. The reason is not
 # cosmetic: a path dependency that escapes the workspace root cannot be
 # resolved when the workspace is reconstructed elsewhere on disk, which is
@@ -25,8 +26,12 @@ members = [
     "guest",
     "git-forge-parser",
     "git-sync-consumer",
+    "google-calendar-read",
+    "google-calendar-write",
+    "google-gmail-compose",
+    "google-gmail-organize",
+    "google-gmail-read",
     "google-maps-tools",
-    "google-workspace-tools",
     "processor-call-test",
     "processor-config",
     "processor-demo",
