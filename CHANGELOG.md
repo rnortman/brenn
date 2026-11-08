@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-11-08
+
 - **An `api_key_provider` can hold per-user accounts.** Instead of one
   `key_file`, a block may hold `account <name> { user = "…"; key_file = "…";
   default = true; }` sub-blocks, each one registered user's key in its own
