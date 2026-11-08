@@ -3581,3 +3581,21 @@ decision on which reading is canonical for the ingress, tool and
 device-location families before both crates call it. Done = one classifier
 (address and prefix) in `brenn-envelope`, `brenn-lib` attaching its depth
 defaults, and `derive.rs` calling it.
+
+## `shared-mail-html-to-text`
+
+Export the mail HTML-to-text reader (`html_to_text` / `decode_entities` in
+`brenn-google-workspace/src/gmail/decode.rs`) from a neutral, dependency-free
+crate with a guest target that out-of-tree components can depend on.
+`brenn-fastmail` carries its own copy today (its tracker entry
+`reuse-html-to-text-reimplements-gmail-decoder-and-drops-text`) and the two
+will drift. Done is brenn-fastmail depending on the shared reader and deleting
+its copy.
+
+## `config-check-empty-segment-path`
+
+`brenn config-check` accepts an `api-request` `allow` clause whose path
+template has an empty segment (a trailing slash, e.g. `/jmap/api/`), which
+brenn then refuses at boot. A deployer gets a green check and a server that
+does not start. `config-check` should refuse the template the same way boot
+does.
