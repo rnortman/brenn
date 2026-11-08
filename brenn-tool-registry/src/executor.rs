@@ -862,13 +862,6 @@ mod tests {
             self.gate = Some(gate.clone());
             self
         }
-
-        /// Bind the tool to the acting user as `ActingOrServedUser`: a call
-        /// carrying none is refused through `require_acting_user`.
-        fn served_user(mut self) -> Self {
-            self.descriptor.user_binding = crate::UserBinding::ActingOrServedUser;
-            self
-        }
     }
 
     #[async_trait]
@@ -893,10 +886,6 @@ mod tests {
                 let _open = gate.acquire().await.expect("the gate is never closed");
             }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            if self.descriptor.user_binding == crate::UserBinding::ActingOrServedUser {
-                let user = ctx.require_acting_user(self.descriptor.name)?;
-                return Ok(json!({ "echoed": args, "user": user.username }));
-            }
             Ok(json!({ "echoed": args }))
         }
     }
@@ -2085,64 +2074,6 @@ mod tests {
         let mut seen = seen.lock().unwrap().clone();
         seen.sort_by_key(|u| u.as_ref().map(|u| u.id));
         assert_eq!(seen, vec![None, Some(alice())]);
-    }
-
-    /// A tool bound to the served user runs for a nested call whose served
-    /// call carried a user, and refuses one whose served call carried none and
-    /// a plain call of the component's own: both are `denied` naming the tool.
-    #[tokio::test]
-    async fn a_served_user_tool_admits_only_a_nested_call_that_carries_a_user() {
-        let h = harness().await;
-        let stamped = h.provider.begin(
-            CALLER_SLUG,
-            "echo-for-user",
-            &crate::provided::tests::pending_ctx(Some(alice())),
-        );
-        let userless = h.provider.begin(
-            CALLER_SLUG,
-            "echo-for-user",
-            &crate::provided::tests::pending_ctx(None),
-        );
-        insert_request(
-            &h,
-            &serving_body("n1", stamped.id().as_str()),
-            Some(h.results_uuid),
-        )
-        .await;
-        insert_request(
-            &h,
-            &serving_body("n2", userless.id().as_str()),
-            Some(h.results_uuid),
-        )
-        .await;
-        insert_request(&h, &request_body("p1", "brenn"), Some(h.results_uuid)).await;
-        let (alert, _hg) = noop_alert_dispatcher();
-        let exec = executor(
-            &h,
-            registry(StubAsync::new(4, Duration::ZERO).served_user()),
-            caller_grants(vec![clause(&[("repo", "brenn")])]),
-            alert,
-        );
-
-        drain_and_join(&exec).await;
-
-        let rows = results(&h).await;
-        let row = |id: &str| {
-            rows.iter()
-                .find(|r| r["call_id"] == id)
-                .unwrap_or_else(|| panic!("no result for {id}: {rows:?}"))
-                .clone()
-        };
-        let n1 = row("n1");
-        assert_eq!(n1["outcome"]["ok"]["user"], "alice");
-        assert_eq!(n1["serving"], stamped.id().as_str());
-        let refused =
-            format!("apull: acts as the acting user, and this call carries none (caller {CALLER})");
-        for id in ["n2", "p1"] {
-            let r = row(id);
-            assert_eq!(r["outcome"]["err"]["kind"], "denied", "{id}: {r}");
-            assert_eq!(r["outcome"]["err"]["detail"], refused.as_str(), "{id}: {r}");
-        }
     }
 
     /// An id pending for a different instance is, to this caller, not pending:

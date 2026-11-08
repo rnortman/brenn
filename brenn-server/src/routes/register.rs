@@ -18,8 +18,6 @@ use crate::state::AppState;
 
 /// Minimum password length. 12 characters — not a consumer SaaS with password fatigue.
 const MIN_PASSWORD_LEN: usize = 12;
-/// Maximum username length in characters.
-const MAX_USERNAME_LEN: usize = 64;
 
 #[derive(Deserialize)]
 pub struct RegisterQuery {
@@ -133,15 +131,7 @@ pub async fn register_submit(
             return Redirect::to("/auth/register?error=invite").into_response();
         }
 
-        // Validate username: non-empty, within length limit, alphanumeric + hyphens/underscores.
-        let username_len = form.username.chars().count();
-        if username_len == 0
-            || username_len > MAX_USERNAME_LEN
-            || !form
-                .username
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !brenn_envelope::addressing::is_username(&form.username) {
             warn!(username = %form.username, ip = %ip, "registration rejected: invalid username format");
             state.alert_dispatcher.alert(
                 AlertSeverity::Info,
@@ -201,6 +191,14 @@ pub async fn register_submit(
         }
     };
 
+    // The new user's location channel, minted under the same lock so no
+    // connection of theirs can report a fix before it exists. With no
+    // messaging there is no bus to mint on; the next boot that has one mints
+    // it from the users table.
+    if let Some(messenger) = &state.messenger {
+        messenger.provision_device_location_channel(&conn, &form.username);
+    }
+
     // Mark invite code as used.
     use_invite_code(&conn, &form.invite_code, user_id);
 
@@ -223,4 +221,63 @@ pub async fn register_submit(
         ],
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use axum::extract::{Form, State};
+    use axum::http::HeaderMap;
+    use axum::{Extension, http::StatusCode};
+
+    use super::{RegisterForm, register_submit};
+    use crate::client_ip::ClientIp;
+    use crate::state::AppState;
+
+    /// Registration mints the new user's location channel on the running
+    /// messenger: a directory entry and a row in the server's database.
+    #[tokio::test]
+    async fn registration_mints_the_users_location_channel() {
+        let db = crate::test_support::init_db_memory();
+        let code = brenn_db::auth::invite::create_invite_code(&*db.lock().await);
+        let messenger =
+            brenn_messaging::testutils::empty_directory_messenger_over(db.clone(), "test-source");
+        let mut state = AppState::for_test(db.clone(), None);
+        state.messenger = Some(messenger.clone());
+
+        let response = register_submit(
+            State(state),
+            Extension(ClientIp(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            HeaderMap::new(),
+            Form(RegisterForm {
+                username: "alice".to_string(),
+                password: "correct horse battery staple".to_string(),
+                invite_code: code,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[axum::http::header::LOCATION],
+            "/",
+            "registration succeeded"
+        );
+
+        let address = brenn_lib::messaging::device_location_address("alice");
+        let entry = messenger
+            .directory()
+            .resolve(&address)
+            .expect("registration minted the channel");
+        let rows: i64 = db
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM messaging_channels WHERE uuid = ?1",
+                rusqlite::params![entry.uuid.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("count the channel's rows");
+        assert_eq!(rows, 1);
+    }
 }

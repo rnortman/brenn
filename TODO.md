@@ -1,5 +1,62 @@
 # TODOs
 
+## `xtask-deny-warnings`
+
+`make check`'s `xtask-deny` step prints two warnings that are not failures.
+(1) `chacha20 0.10.0` in the root `Cargo.lock` is yanked; it arrives through
+`rand 0.10.1`, and the index has 0.10.1 and 0.10.2. Repin it with
+`CARGO_BAZEL_REPIN=chacha20 CARGO_BAZEL_REPIN_ONLY=crates bazel mod deps` (the
+root hub only; the other two lockfiles do not carry it) and regenerate
+`cargo-bazel-lock.json`, as `MODULE.bazel` requires. (2) `unmatched-source` on
+the `graf.git` line of `deny.toml`'s `allow-git`: one `deny.toml` is applied to
+all three workspace units, `brenn-graf` in the root unit uses that source, and
+the `brenn-wasm/components` and `tools/scrub` units do not, so cargo-deny warns
+in those two. Deleting the line breaks the root unit (`unknown-git = "deny"`).
+Decide between a per-unit config passed by `xtask deny` and keeping one shared
+file with the warning documented beside the line. Done is `xtask-deny`
+printing neither warning, or (2) resolved as "documented, kept" with the
+comment at the line saying so.
+
+## `brenn-tool-requires-approval-dead-gate`
+
+`brenn-tool` refuses `GitRepoCommitAndPush`, `GitRepoRun`, `ExportUsage` and
+any registry tool not marked auto-approve with `requires_approval`
+(`docs/agent-tool-cli.md`, `CliAccess::RequiresApproval` in
+`brenn-lib/src/integration.rs`) on the premise that a tool call would go
+through an approval card and a command has no approval leg. Brenn spawns
+Claude Code with `--permission-mode auto` (`build_cc_args` in
+`brenn-cc/src/session/mod.rs`); the comment there says risky calls still fall
+back to the stdio permission prompt, and the bridge's `approval_dispatch.rs`
+routes such requests to the browser, but in operation no approval card is
+shown. Establish which is true under auto mode. If no card is ever shown, the
+refusal protects nothing and only blocks scripts from those tools: decide
+what, if anything, gates them for a script, and drop the `requires_approval`
+reason. Deferred until it blocks someone.
+
+## `gmail-filters-tier-3`
+
+Gmail filter tools (`GmailFilters`, `GmailFilterCreate`, `GmailFilterDelete`,
+on the `gmail.settings.basic` scope) were planned as the last tier of the
+Google Workspace tools and never built. Build them only if a Google-mail
+user still needs them: the household has largely moved to Fastmail, and a
+Fastmail filter tool, if any, is built out of tree. Done is the three tools
+and their scope set as a sixth component beside
+`brenn-wasm/components/google-gmail-*`, on `brenn-google-workspace`, or this
+entry removed because nobody needs them.
+
+## `security-posture-approval-gate-vs-auto-mode`
+
+`docs/security-posture.md` §7.3 ("The approval gate — the central invariant")
+says every privileged action is authorised by an operator auto-approve rule
+or explicit human approval, and its threat list rates a bypass of that gate
+critical. Brenn spawns Claude Code with `--permission-mode auto`
+(`build_cc_args` in `brenn-cc/src/session/mod.rs`), whose classifier approves
+calls no operator rule named, and in operation no approval card is shown. The
+posture text, the comment at the spawn site (which says risky calls still
+reach Brenn's approval UI) and the running system do not agree. Decide which
+§7.3 invariants hold under auto mode and rewrite the section and the threat
+entry to match; correct the spawn-site comment in the same change.
+
 ## `api-request-read-limit-vs-bus-cap`
 
 `api-request`'s default read limit (`DEFAULT_MAX_RESPONSE_BYTES`, 256 KiB) and
@@ -15,8 +72,8 @@ cap it means. Escaping is not a fixed half-again: a JSON answer whose text is
 dense in `"` or `\` (sender-written mail headers, for one) serializes to about
 twice its length, so at a `max_body_bytes` of half again the read limit such a
 read is refused on the bus cap at about three quarters of the read limit.
-The tools treat that refusal as they treat a cut (`google-workspace-tools`
-`Unreadable`): a per-message search read is named unreadable, a message or
+The tools treat that refusal as they treat a cut (the Google Workspace
+components' `Unreadable`): a per-message search read is named unreadable, a message or
 thread is read again narrower, and any other read fails naming why. What
 stays open here is the configuration question above; a sender who fills
 `From` or `Subject` is unreadable through the tools under any pair, which the
@@ -24,8 +81,9 @@ operator guide states.
 
 ## `errhandling-gmail-403-always-denied-with-scope-hint`
 
-`google-workspace-tools` answers every Google HTTP 403 `denied` with a
-sentence pointing at `oauth-connect` (`google_error`). Gmail also answers 403
+The Google Workspace components answer every Google HTTP 403 `denied` with
+a sentence pointing at `oauth-connect` (`google_error` in
+`brenn-google-workspace`). Gmail also answers 403
 for usage limits (`userRateLimitExceeded`, `rateLimitExceeded`,
 `dailyLimitExceeded` — transient, like 429, which is answered `internal`) and
 for an API not enabled in the operator's Cloud project (`SERVICE_DISABLED` /
@@ -41,8 +99,8 @@ Calendar API not enabled; the hint names the Calendar read scope.
 
 ## `errhandling-gmail-4xx-on-fixed-request-blamed-on-caller`
 
-`google-workspace-tools` answers every Google 400 and 404 `invalid_args`
-(`google_error`), including on requests whose path and `fields` mask are
+The Google Workspace components answer every Google 400 and 404
+`invalid_args` (`google_error` in `brenn-google-workspace`), including on requests whose path and `fields` mask are
 constants and carry nothing from the caller: `GmailLabels` without `id`, and
 the mask on `labels.get`. A refused mask or a moved path there is the
 wrapper's or Google's fault, but reaches the model and the invocation log as
@@ -57,16 +115,21 @@ apply it to every step. Calendar's steps carry caller input in `from`, `to`,
 
 The provider components' tests each copy the host's nested-args cap
 (`brenn_wasm::PROCESSOR_MAX_TOOL_ARGS_BYTES`, 64 KiB) to prove their widest
-call fits: `google-workspace-tools` as `HOST_ARGS_CAP_BYTES` in its
-`logic.rs` tests, `google-maps-tools` as a literal `< 64 * 1024` in its
-`logic.rs` tests (strict, where the host refuses only `>`). Nothing ties
+call fits: the Google Workspace tools share one copy, `HOST_ARGS_CAP_BYTES`
+in `brenn-google-workspace`'s `args` module, and `google-maps-tools` writes a
+literal `< 64 * 1024` in its `logic.rs` tests (strict, where the host refuses
+only `>`). Nothing ties
 either copy to the host's constant, so a changed cap leaves every widest-call
 test passing against the old number. Decide where the one copy lives (the
 kit's `testutil` is the natural home, serializing the `ApiCall` as
 `call_async_for` does and asserting `<=`) and what pins it to the host's
 constant, as `brenn-tool-registry/src/descriptor.rs` const-asserts its own
 copy; no host crate depends on `brenn-provider-kit` today, so the pin needs a
-new dependency edge or another tie. Then replace both components' copies.
+new dependency edge or another tie. Then replace both copies.
+
+## `provider-split-granularity`
+
+Decision 13 (`02-core--provider-and-location-rework/decisions.md`, the owner's transcribed ruling) says "separate tools are separate providers". Cycle 4 of `oauth-and-google-followup` read it as one provider per Google scope set — five components for the thirteen Workspace tools, Gmail compose and organize each a one-tool component — rather than one per tool (thirteen crates, specs, tests, instances and store files; `GmailSearch`/`GmailRead`/`GmailThread` share most of their code). The same cycle left `google-maps-tools` whole: six read tools on one API key, four of which chain two hosts in one request (`Weather` geocodes then calls weather; `PlacesSearch` and `SearchAlongRoute` likewise), Σ 18, so a per-host cut would put one tool's steps in two components. Owner to rule: (a) leave both as cycle 4 shipped; (b) split Workspace further, per tool; (c) split Maps by host or by tool. (b) and (c) are each a mechanical repeat of cycle 4's registration checklist; (a) costs nothing.
 
 ## `security-host-paths-follow-agent-symlinks`
 
@@ -141,31 +204,6 @@ and message generalised beyond `server.vault_dir`.
 
 Done = every file kind the posture covers is refused at boot and on reload when
 it lies inside an agent-visible root, with a test per kind.
-
-## `security-nested-location-answer-retained-in-durable-result-window`
-
-A provider's nested `device-location` call (`brenn-provider-kit/src/call.rs`,
-`Nested::DeviceLocation`; `google-maps-tools`'s `Weather` with no location) is
-answered with every sharing device of the user — latitude, longitude,
-accuracy, zone, local time — and the executor publishes that answer whole to
-the provider's durable `brenn:tool-results/<slug>` inbox
-(`brenn-tool-registry/src/bus_wiring.rs`). It stays there until newer results
-push it out of the window, and stopping sharing or unenrolling a device does
-not delete it, so the inbox holds a short position history the
-`device_locations` row was meant to be the only copy of. The component reads
-only the most recent device. `docs/security-posture.md` (users' device
-positions) states the retention as it stands.
-
-Deciding it is a posture question: whether the retention is accepted; whether
-the nested call narrows to the one fix it uses (a `device-location` argument
-or answer shape that the model-facing tool also exposes), which reduces the
-breadth but not the history; or whether a result inbox carrying such answers
-stops being durable or forgets them once delivered, which is a tool-substrate
-change touching every nested answer (mail bodies included).
-
-Done = the chosen reduction is in place with a test that the bus record of a
-"here" request holds no more than the decision allows, and the posture
-paragraph says what is kept and for how long.
 
 ## `quality-virtual-tools-final-symlink-left-open-though-local-fix-exists`
 
@@ -2905,6 +2943,10 @@ Code site (`TODO(system-participant-noise-inert)`):
 Done = a tuning block's `noise` is either enacted by the system participant
 subscribed to that channel or refused at load, with no family in between.
 
+## `wasm-window-byte-cap`
+
+A WASM input window is capped by count (`WINDOW_DEPTH_CEILING` = 1000) and not by bytes. A providing instance's request inbox is Σ `max_concurrency` deep (up to `PROVIDER_CONCURRENCY_CEILING` = 1000) with each request's args up to `MAX_ARGS_BYTES` (64 KiB), and its `tool-results` inbox is `retain_depth` deep with each result up to `[messaging] max_body_bytes`; either window, full of maximal messages, can exceed the guest's `PROCESSOR_MAX_MEMORY_BYTES` (16 MiB) and trap the activation every time the window fills. The host alerts the trap and fails that activation's new requests, but no check at config resolution or boot refuses such a window. Decide whether boot or the config language should refuse a window whose worst-case bytes exceed guest memory, and if so against what arithmetic: Σ × `MAX_ARGS_BYTES` for a request inbox, depth × `max_body_bytes` for every other input window, both before parsing, against `PROCESSOR_MAX_MEMORY_BYTES` or some fraction of it that leaves the guest room to parse. Raising `PROVIDER_CONCURRENCY_CEILING` from 32 to 1000 widened the request-window side of this; the result-window side predates it. A provider built on `brenn-provider-kit` also reads its live requests' store rows into guest memory beside that window — each live request is one in-flight or one backlog row carrying its args, so up to Σ rows, scanned one namespace at a time — so a request-side arithmetic for such a provider is up to twice Σ × `MAX_ARGS_BYTES`. Done is a refusal with a stated arithmetic at the place depths resolve, or a documented decision beside `WINDOW_DEPTH_CEILING` that the window's weight stays the operator's.
+
 ## `webhook-crate-wasm-dep`
 
 `brenn-webhook` is the request-path crate: address parsing, signature and
@@ -3501,3 +3543,59 @@ the checks on — `bazel test -c opt
 the one lane that exercises the proposed configuration: tests do not build under
 `--config=release` because that config clears `testutils`, but `-c opt` alone
 does not clear it, so the test targets configure under it.
+
+## `history-sender-tz-ignores-tz-override`
+
+`messages.sender_tz` is stored from the raw connection zone
+(`brenn-server/src/routes/ws/messaging.rs`, `sender_tz: Some(self.timezone_str())`
+in `persist_and_send`), while the `UserMessageEcho` timestamp and the CC message
+prefix on the same send use the override-aware zone from `effective_timezone`.
+History rendering later reads `sender_tz` (`brenn-render/src/history.rs`).
+Establish whether a live `tz_override` is meant to affect the stored zone, and
+align the two paths or document why they differ.
+
+## `efficiency-full-window-scan-per-fix-under-global-lock`
+
+Every admission decision and every `DeviceLocation` call asks only for the
+newest message per device on a user's `brenn:device-location.<username>`
+channel, but `read_window` (`brenn-device-location/src/channel.rs`) loads the
+whole retained tail up to `standing_retain_depth` (2000 by default) through
+`MessageStore::retained_tail`, under the shared database lock, and parses every
+body; `record` does so inside the user's consent section. The cost
+grows with the operator's window rather than with the number of devices. Design
+a read that stops at the newest message per device — a newest-first paged
+`MessageStore` read, or a per-channel newest-per-key query — and decide whether
+it is a store-trait method every family may use. Done = the admission read and
+the tool's read cost O(devices) regardless of window size.
+
+## `quality-system-family-classification-triplicated`
+
+"Which system-minted family does this address or tuning prefix name?" is
+answered twice: `SystemChannelFamily::of` / `of_prefix` in
+`brenn-lib/src/messaging/config.rs` and `is_system_minted` /
+`is_system_minted_prefix` in `brenn-dsl/src/derive.rs`, each carrying the
+`brenn:device-location.` prefix special case. The two parse schemes
+differently (`ChannelScheme::split` with a bare name read as `brenn:`, versus
+the DSL's `split_spellable`), so one classifier in `brenn-envelope` needs a
+decision on which reading is canonical for the ingress, tool and
+device-location families before both crates call it. Done = one classifier
+(address and prefix) in `brenn-envelope`, `brenn-lib` attaching its depth
+defaults, and `derive.rs` calling it.
+
+## `shared-mail-html-to-text`
+
+Export the mail HTML-to-text reader (`html_to_text` / `decode_entities` in
+`brenn-google-workspace/src/gmail/decode.rs`) from a neutral, dependency-free
+crate with a guest target that out-of-tree components can depend on.
+`brenn-fastmail` carries its own copy today (its tracker entry
+`reuse-html-to-text-reimplements-gmail-decoder-and-drops-text`) and the two
+will drift. Done is brenn-fastmail depending on the shared reader and deleting
+its copy.
+
+## `config-check-empty-segment-path`
+
+`brenn config-check` accepts an `api-request` `allow` clause whose path
+template has an empty segment (a trailing slash, e.g. `/jmap/api/`), which
+brenn then refuses at boot. A deployer gets a green check and a server that
+does not start. `config-check` should refuse the template the same way boot
+does.

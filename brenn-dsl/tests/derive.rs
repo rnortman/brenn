@@ -32,13 +32,14 @@ const CHROME: &str = "    new shell: Shell { chrome = true; grants = []; }\n";
 #[test]
 fn a_handle_less_block_tunes_every_family_the_system_mints() {
     let config = derived(&format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         tuning("mqtt:broker:alice/status"),
         tuning("webhook:alice-inbox"),
         tuning("brenn:tools/pull"),
         tuning("brenn:tool-results/alice"),
+        tuning("brenn:device-location.alice"),
     ));
-    assert_eq!(config.resolved.tunings.len(), 4);
+    assert_eq!(config.resolved.tunings.len(), 5);
     assert!(config.resolved.channels.is_empty());
     assert!(config.channel_uuids.is_empty());
 }
@@ -48,9 +49,9 @@ fn a_handle_less_block_on_a_declarable_address_is_refused() {
     assert_eq!(
         derive_refusal(&tuning("brenn:alice.status")),
         "`brenn:alice.status` names no system-minted family, so a handle-less block tunes \
-         nothing; tuning blocks name `mqtt:`, `webhook:`, `brenn:tools/` and \
-         `brenn:tool-results/` channels, and a declarable channel is written \
-         `channel <handle> at \"brenn:alice.status\"`"
+         nothing; tuning blocks name `mqtt:`, `webhook:`, `brenn:tools/`, \
+         `brenn:tool-results/` and `brenn:device-location.` channels, and a declarable \
+         channel is written `channel <handle> at \"brenn:alice.status\"`"
     );
 }
 
@@ -82,6 +83,7 @@ fn a_declaration_on_a_system_minted_address_is_refused() {
             durable as fn(&str, &str) -> String,
         ),
         ("results", "brenn:tool-results/alice", durable),
+        ("fixes", "brenn:device-location.alice", durable),
         ("inbox", "webhook:alice-inbox", nondurable),
         ("status", "mqtt:broker:alice/status", nondurable),
     ] {
@@ -141,6 +143,22 @@ fn every_boundary_a_family_ends_at_is_accepted() {
         prefix_tuning("webhook:alice."),
     ));
     assert_eq!(config.resolved.tunings.len(), 3);
+}
+
+#[test]
+fn the_location_family_is_tuned_by_its_prefix() {
+    let config = derived(&prefix_tuning("brenn:device-location."));
+    assert_eq!(config.resolved.tunings.len(), 1);
+}
+
+#[test]
+fn the_location_family_prefix_is_not_an_address() {
+    // The prefix names the family; as an exact address it names no user.
+    let refusal = derive_refusal(&tuning("brenn:device-location."));
+    assert!(
+        refusal.contains("names no system-minted family"),
+        "{refusal}"
+    );
 }
 
 #[test]

@@ -60,20 +60,75 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-google-calendar-read"
+version = "0.1.0"
+dependencies = [
+ "brenn-google-workspace",
+ "brenn-guest",
+ "brenn-provider-kit",
+ "brenn-provider-kit-guest",
+ "serde_json",
+]
+
+[[package]]
+name = "brenn-google-calendar-write"
+version = "0.1.0"
+dependencies = [
+ "brenn-google-workspace",
+ "brenn-guest",
+ "brenn-provider-kit",
+ "brenn-provider-kit-guest",
+ "serde_json",
+]
+
+[[package]]
+name = "brenn-google-gmail-compose"
+version = "0.1.0"
+dependencies = [
+ "brenn-google-workspace",
+ "brenn-guest",
+ "brenn-provider-kit",
+ "brenn-provider-kit-guest",
+ "serde_json",
+]
+
+[[package]]
+name = "brenn-google-gmail-organize"
+version = "0.1.0"
+dependencies = [
+ "brenn-google-workspace",
+ "brenn-guest",
+ "brenn-provider-kit",
+ "brenn-provider-kit-guest",
+ "serde_json",
+]
+
+[[package]]
+name = "brenn-google-gmail-read"
+version = "0.1.0"
+dependencies = [
+ "brenn-google-workspace",
+ "brenn-guest",
+ "brenn-provider-kit",
+ "brenn-provider-kit-guest",
+ "serde_json",
+]
+
+[[package]]
 name = "brenn-google-maps-tools"
 version = "0.1.0"
 dependencies = [
  "brenn-guest",
  "brenn-provider-kit",
+ "brenn-provider-kit-guest",
  "serde_json",
 ]
 
 [[package]]
-name = "brenn-google-workspace-tools"
+name = "brenn-google-workspace"
 version = "0.1.0"
 dependencies = [
  "brenn-cal",
- "brenn-guest",
  "brenn-provider-kit",
  "serde_json",
 ]
@@ -192,6 +247,14 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "brenn-provider-kit-guest"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+ "brenn-provider-kit",
 ]
 
 [[package]]

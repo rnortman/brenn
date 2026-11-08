@@ -40,7 +40,10 @@ rust_test(
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": package_name()},
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
-    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS + ["//brenn-envelope"],
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS + [
+        "//brenn-envelope",
+        "//brenn-provider-kit",
+    ],
 )
 
 rust_doc_test(

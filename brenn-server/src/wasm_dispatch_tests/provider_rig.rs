@@ -184,13 +184,7 @@ impl ProviderRig {
         }
         super::attach_tool_executor(&messenger).await;
 
-        registry.validate_grants(
-            GrantOwner::WasmConsumer {
-                slug,
-                provides: true,
-            },
-            &provider_grants,
-        );
+        registry.validate_grants(GrantOwner::WasmConsumer { slug }, &provider_grants);
         let provider_tools = Arc::new(WasmToolHost::new(
             registry.clone(),
             provider_grants.clone(),
@@ -232,13 +226,7 @@ impl ProviderRig {
             .zip(caller_inboxes)
             .map(|(setup, (trigger, _, results_ch))| {
                 let grants = BTreeMap::from([(setup.tool.to_string(), grant(vec![]))]);
-                registry.validate_grants(
-                    GrantOwner::WasmConsumer {
-                        slug: setup.slug,
-                        provides: false,
-                    },
-                    &grants,
-                );
+                registry.validate_grants(GrantOwner::WasmConsumer { slug: setup.slug }, &grants);
                 let sub = ParticipantId::for_wasm(setup.slug);
                 caller_grants.insert(sub.as_str().to_string(), grants.clone());
                 let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {

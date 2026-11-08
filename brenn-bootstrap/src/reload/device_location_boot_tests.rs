@@ -2,11 +2,7 @@
 //! device-location {}` grant validated against the registry `run_server`
 //! builds, and the app gate the WebSocket location messages read.
 
-use brenn_lib::config::PACKAGED;
-
-use super::driver::tests::{
-    BootFixture, Tree, boot_with, install_package, resolve_fixture_apps, staged_module,
-};
+use super::driver::tests::{Tree, resolve_fixture_apps};
 
 /// The agent holding the grant.
 const ASSISTANT: &str = "assistant";
@@ -41,7 +37,7 @@ fn validate(tree: &Tree) -> indexmap::IndexMap<String, brenn_lib::config::AppCon
     let (alert, _drain) = brenn_obs::alerting::AlertDispatcher::noop();
     let runtime = brenn_tool_registry::ProviderRuntime::new(alert);
     let registry = crate::build_tool_registry(
-        brenn_device_location::registered(brenn_db::into_db(brenn_db::open_connection_memory())),
+        brenn_device_location::registered(brenn_db::into_db(brenn_db::open_connection_memory())).0,
         &document.config.wasm_consumers,
         &apps,
         &runtime,
@@ -88,58 +84,108 @@ async fn a_multiuser_agent_is_refused_the_grant() {
     validate(&tree);
 }
 
-/// A component that provides no tool never serves a call that carries a user,
-/// so boot refuses it the grant. (A providing component holding it boots:
-/// `google_maps_tools_boot_tests`.)
-#[tokio::test(flavor = "multi_thread")]
-#[should_panic(
-    expected = "tool_grant for \"device-location\" is refused: the tool acts as the acting user, \
-                and a component that provides no tool never serves a call that carries one"
-)]
-async fn a_component_that_provides_nothing_is_refused_the_grant() {
-    let home = tempfile::tempdir().expect("a container home");
-    let tree = Tree::holding(&super::driver::tests::document(&format!(
-        r#"
-container sandbox {{
-    image = "example.com/cc:latest";
-    home_dir = "{home}";
-}}
-
-channel sink at "brenn:sink" {{
-    push_depth = 1;
-    retain_depth = 4;
-    standing_retain_depth = 4;
-}}
-
-{PACKAGED}component Demo {{
+/// The extra declarations of a document whose consumer reads `user`'s
+/// location channel, granted it exactly, and writes the work channel.
+fn location_consumer(user: &str) -> String {
+    use brenn_lib::config::PACKAGED;
+    format!(
+        r#"{PACKAGED}component LocationAutomation {{
     abi = processor;
-    requires = [ports, tools];
-    in inbound;
-    in tool-results;
+    requires = [ports];
+    in fixes;
     out digest;
 }}
 {PACKAGED}
-new locator: Demo {{
-    grants = [ports, tools];
-    in inbound <- work {{ push_depth = 4; }}
-    out digest -> sink;
-    tool {name} {{}}
+new {user}-fixes: LocationAutomation {{
+    grants = [ports];
+    acl subscribe [exact "brenn:device-location.{user}"];
+    in fixes <- "brenn:device-location.{user}" {{ push_depth = 1; retain_depth = 16; }}
+    out digest -> work;
 }}
-"#,
-        home = home.path().display(),
-        name = brenn_device_location::NAME,
-    )));
+"#
+    )
+}
+
+/// A consumer bound to a user's location channel boots when the user is
+/// registered: boot mints the channel from the users table, and the
+/// consumer's input port resolves to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consumer_reading_a_registered_users_channel_boots() {
+    use super::driver::tests::{BootFixture, boot_with, install_package, staged_module};
+
+    let db = brenn_server::test_support::init_db_memory();
+    {
+        let conn = db.lock().await;
+        brenn_db::auth::user::create_user(&conn, "alice", "$argon2id$fake");
+    }
+    let tree = Tree::holding(&super::driver::tests::document(&location_consumer("alice")));
     let components = tempfile::tempdir().expect("a components root");
     install_package(components.path(), &staged_module(&tree));
-    boot_with(
+    let booted = boot_with(
         &tree,
         BootFixture {
+            db: Some(db),
             components_roots: vec![components.path().to_path_buf()],
-            native_tools: brenn_device_location::registered(brenn_db::into_db(
-                brenn_db::open_connection_memory(),
-            )),
             ..BootFixture::default()
         },
     )
     .await;
+
+    let entry = booted
+        .messenger
+        .directory()
+        .resolve("brenn:device-location.alice")
+        .expect("boot minted alice's channel");
+    assert!(
+        entry.subscribers.iter().any(|sub| matches!(
+            &sub.kind,
+            brenn_lib::messaging::SubscriberEntryKind::Wasm(slug) if slug == "alice-fixes"
+        )),
+        "the consumer reads alice's channel: {:?}",
+        entry.subscribers
+    );
+}
+
+/// A user registered after boot has a live channel but is not in the plan a
+/// reload lowers, so a candidate binding a consumer to it is refused with the
+/// directory miss; a restart mints the user from the table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_cannot_bind_a_user_registered_since_boot() {
+    use super::driver::TriggerSource;
+    use super::driver::tests::{boot, install_package, seat_user, staged_module};
+    use brenn_messaging::config_reload::Outcome;
+
+    let tree = Tree::holding(&super::driver::tests::document(""));
+    let components = tempfile::tempdir().expect("a components root");
+    let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+    seat_user(&booted, "alice").await;
+    assert!(
+        booted
+            .messenger
+            .directory()
+            .resolve("brenn:device-location.alice")
+            .is_some(),
+        "registration minted alice's channel"
+    );
+
+    tree.write(&super::driver::tests::document(&location_consumer("alice")));
+    install_package(components.path(), &staged_module(&tree));
+    assert!(
+        booted
+            .driver
+            .prepare_and_report(TriggerSource::Bus)
+            .await
+            .is_none()
+    );
+
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Refused);
+    assert!(
+        status
+            .refusals
+            .iter()
+            .any(|r| r.contains("no user named \"alice\"")),
+        "{:?}",
+        status.refusals
+    );
 }

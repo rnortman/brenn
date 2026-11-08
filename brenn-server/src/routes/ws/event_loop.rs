@@ -553,16 +553,19 @@ impl super::connection::WsConnection {
 }
 
 /// On connect, tell the PWA whether this connection shares location: the app
-/// may use location and the pair has a stored fix. Sent only when the app may
-/// use location; `true` starts the PWA's reporter.
+/// may use location and the device's newest message on the user's location
+/// channel is a fix. Sent only when the app may use location; `true` starts
+/// the PWA's reporter.
 pub(super) async fn send_device_location_sharing_on_connect(conn: &WsConnection) {
     if !conn.app_config().device_location_enabled() {
         return;
     }
-    let enabled = {
-        let db = conn.state.db.lock().await;
-        brenn_device_location::db::fix_exists(&db, conn.device_id, conn.user_id)
-    };
+    let window = brenn_device_location::channel::read_window(
+        super::dispatch::location_messenger(conn),
+        &conn.username,
+    )
+    .await;
+    let enabled = brenn_device_location::channel::is_sharing(&window, conn.device_id);
     let _ = conn.send_ws(WsServerMessage::DeviceLocationSharing { enabled });
 }
 

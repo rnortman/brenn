@@ -1,0 +1,55 @@
+/// A user's Gmail drafts created for an assistant, as the native tool
+/// `GmailDraft`, answered by `api-request` calls against the `oauth_provider`
+/// the instance names, stamped with the calling conversation's owner. The
+/// user's token never reaches this component; `api-request` attaches it
+/// host-side. Every call is nested under a request: an instance whose clauses
+/// say `user = "*"` cannot call on its own account, so a caller with no user
+/// of its own is answered `denied`. Its calls are Gmail's `drafts.create`,
+/// under the Gmail compose scope set, and, for a reply, `messages.get` of the
+/// original's headers first, under the Gmail read scope set. No call sends
+/// mail.
+///
+/// Every capability is load-bearing: `config` names the provider and its
+/// host, without which no call can be addressed; `store` carries each
+/// request's state between the activation that issues its nested call and the
+/// one that receives the answer; `tools` is the authority to call
+/// `api-request`; `provides` is what makes the tool exist; `log` records each
+/// step's tool, status and size — never a body, a header or a query.
+///
+/// The instance's `config = { ... };` map is flat: `provider` is the
+/// `oauth_provider` name; `gmail_host` is the `host[:port]` Gmail is called
+/// on, which `api-request` matches against that provider's `api_hosts` and
+/// the instance's clauses must admit. A missing or malformed key fails every
+/// activation, naming the key.
+///
+/// Size the instance's result inbox with a `channel at
+/// "brenn:tool-results/<slug>"` block: each live request has at most one
+/// nested call outstanding, so the window must hold Σ max_concurrency results,
+/// twice over for a re-delivered result — `retain_depth ≥ 2 × Σ`, rounded up
+/// to a power of two. This class's Σ is 2, which the family default of 16
+/// holds; the block in the guide restates it and sets `noise = alarm`.
+///
+/// Every nested answer crosses the bus as a tool result, so Google's body — a
+/// JSON string inside `api-request`'s value, inside the result envelope — must
+/// fit `[messaging] max_body_bytes` (64 KiB default). Either raise that cap to
+/// carry the OAuth provider's `max_response_bytes` (256 KiB default) with a
+/// margin for escaping, `messaging { max_body_bytes = 393216; }`, or lower
+/// `max_response_bytes` to fit the default cap, at the cost of most HTML mail.
+/// Half again covers message bodies, which are base64url and do not grow when
+/// escaped; sender-written headers dense in quotes or backslashes escape to
+/// about twice their size, so such a read can pass the cap below the read
+/// limit.
+/// An answer over the bus cap never reaches this component as Google's answer;
+/// the tool treats that refusal as it treats an answer cut at the read limit.
+component GoogleGmailCompose {
+  abi = processor;
+  requires = [log, store, config, tools, provides];
+  in tool-results;
+  in tool-requests;
+  provide gmail-draft {
+    mcp_name = "GmailDraft";
+    description = "Create a draft in the user's Gmail. The draft is saved in Gmail's Drafts for the user to review and send from Gmail; no tool sends it. `to` and `cc` are the recipients as an email's header writes them (`Alice Example <alice@example.com>, bob@example.com`), each 1 to 980 printable ASCII characters: a display name in another script is left out or written in ASCII. `subject` is at most 500 characters with no control character or line break, and is required unless `reply_to_id` is given. `body` is the message's plain text, at most 20000 characters and about 20000 bytes of UTF-8 text, where a line break counts as two; a longer body is refused. `reply_to_id` (a message `id` from `GmailSearch` or `GmailRead`) makes the draft a reply in that message's thread: the original is read first, which needs the Gmail read scope set, and the draft carries the original's `Message-ID` as `In-Reply-To` and `References`. Without `subject`, a reply's subject is the original's with `Re: ` before it (kept as is when it already starts with `Re:`), and an original whose subject is over 1000 bytes is refused: give `subject`. Gmail files a draft in the thread only when its subject matches the thread's and it carries the original's `Message-ID`, so a `subject` given for a reply is the thread's. Answers `draft_id`, `message_id` and `thread_id` (when Google gives it); for a reply, also `in_reply_to` (the `Message-ID` the draft answers, absent when the original has no usable one), `subject` when it was derived, and `in_thread: false` when Gmail filed the draft outside the original's thread: the draft exists as a new conversation, so tell the user rather than drafting again; nothing the caller wrote is echoed. A refusal saying the draft may have been created means Google may have saved it before its answer was lost: look for it with `GmailSearch` (`q: in:drafts`) before asking again, or the user has two. `account` is needed only when the user has several Google accounts connected: the refusal lists them. An answer `{\"error\": \"credential_invalid\", …}` means this user has no usable Google credential: run `oauth-connect` for the provider with the Gmail compose scope set the operator named and relay its steps, then `oauth-accounts` confirms. Gmail endpoints these tools do not cover (attachments, profile, history) and Calendar's colors and settings are listed with `api-request` examples in `docs/providers/google.md`.";
+    input_schema = """{ "type": "object", "properties": { "to": { "type": "string", "pattern": "^[\\x20-\\x7e]{1,980}$" }, "cc": { "type": "string", "pattern": "^[\\x20-\\x7e]{1,980}$" }, "subject": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "[^\\s\\u0085]" }, "body": { "type": "string", "minLength": 1, "maxLength": 20000, "pattern": "[^\\s\\u0085]" }, "reply_to_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" }, "account": { "type": "string", "minLength": 1, "maxLength": 320, "pattern": "[^\\s\\u0085]" } }, "required": ["to", "body"], "additionalProperties": false }""";
+    max_concurrency = 2;
+  }
+}

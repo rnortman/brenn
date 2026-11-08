@@ -4076,6 +4076,23 @@ fn an_mqtt_block_matching_nothing_boots_and_real_blocks_pass() {
     validate_exact_tuning_blocks(&tuning, &["gh-events"], &["apull"], &slugs, true);
 }
 
+/// A location block is checked for shape: any username registration could
+/// produce passes, whether or not that user exists yet.
+#[test]
+fn a_location_block_naming_a_well_formed_user_passes() {
+    let tuning = tuning_of(&[tuning_raw("brenn:device-location.alice")]);
+    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), true);
+}
+
+/// A remainder no registration could produce tunes a channel that is never
+/// minted, which is the silent no-op the check exists to refuse.
+#[test]
+#[should_panic(expected = "tunes a location channel no user can have")]
+fn a_location_block_naming_no_possible_user_panics() {
+    let tuning = tuning_of(&[tuning_raw("brenn:device-location.not a user!")]);
+    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), true);
+}
+
 /// The tuning table reaches every site that mints a system channel.
 ///
 /// Each mint site resolves independently, and each one falls back to the family
@@ -4794,6 +4811,7 @@ async fn commit_refuses_an_apps_map_the_plan_was_not_derived_from() {
         mqtt_clients: &brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients),
         tool_registry: Some(&registry),
         replay_store_paths: &[],
+        device_location_users: &[],
     })
     .expect("a channel-declaring document configures messaging");
 
@@ -4933,5 +4951,69 @@ fn every_authored_binding_sampled_names_them_all() {
     assert_eq!(
         ports_that_never_activate(&bindings),
         Some(vec!["commands", "status"])
+    );
+}
+
+/// Boot over a database holding users mints each one's location channel —
+/// a row and a directory entry — and registers the writer, which can then
+/// publish on it.
+#[tokio::test]
+async fn build_messaging_mints_a_location_channel_per_registered_user() {
+    use brenn_messaging::device_location::DEVICE_LOCATION_COMPONENT;
+    use brenn_server::test_support::init_db_memory;
+
+    let db = init_db_memory();
+    {
+        let conn = db.lock().await;
+        brenn_db::auth::user::create_user(&conn, "alice", "$argon2id$fake");
+        brenn_db::auth::user::create_user(&conn, "bob", "$argon2id$fake");
+    }
+    let mut config = brenn_lib::config::BrennConfig::default();
+    config.channels.push(surface_index_channel());
+
+    let result = boot_messaging(&config, db.clone()).await;
+    let messenger = result.messenger.expect("messaging must be up");
+    assert!(
+        result
+            .system_participants
+            .iter()
+            .any(|spec| spec.component == DEVICE_LOCATION_COMPONENT)
+    );
+
+    for user in ["alice", "bob"] {
+        let address = brenn_lib::messaging::device_location_address(user);
+        let uuid = brenn_lib::messaging::device_location_channel_uuid(&address);
+        assert_eq!(
+            messenger
+                .directory()
+                .resolve(&address)
+                .expect("every user has a directory entry")
+                .uuid,
+            uuid
+        );
+        let row: String = db
+            .lock()
+            .await
+            .query_row(
+                "SELECT address FROM messaging_channels WHERE uuid = ?1",
+                rusqlite::params![uuid.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("every user's channel has a row");
+        assert_eq!(row, address);
+    }
+
+    let published = messenger
+        .publish_from_system(
+            DEVICE_LOCATION_COMPONENT,
+            "brenn:device-location.alice",
+            "{}",
+            brenn_messaging::Urgency::Normal,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(published, brenn_messaging::PublishResult::Ok { .. }),
+        "the writer publishes on a user's channel: {published:?}"
     );
 }

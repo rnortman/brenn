@@ -134,22 +134,24 @@ pub const TOOL_REQUEST_INPUT_PORT: &str = "tool-requests";
 /// The most requests a providing instance may hold in flight: the sum of
 /// `max_concurrency` over its class's `provide` statements.
 ///
-/// Derived from what one activation can do. A provider can be handed its whole
-/// request window as new requests in one activation and serves each with one
-/// nested call, so the window must fit in half an activation's tool-call
-/// budget, leaving the other half for whatever else that activation calls.
-/// Lives here because the config language refuses a class above it and
-/// depends on nothing but this crate; the budgets it derives from are pinned to
-/// it by a compile-time assertion in `brenn-wasm`.
-pub const PROVIDER_CONCURRENCY_CEILING: u64 = 32;
+/// A providing instance's request inbox is a window Σ deep and takes no
+/// window-depth check of its own, so the ceiling equals the WASM input window
+/// ceiling (`WINDOW_DEPTH_CEILING`); `brenn-tool-registry` pins the two equal
+/// at compile time. Lives here because the config language refuses a class
+/// above it and depends on nothing but this crate.
+///
+/// The ceiling is a count. Sizing a full window's bytes against guest memory
+/// is the operator's, as for every WASM input window.
+pub const PROVIDER_CONCURRENCY_CEILING: u64 = 1_000;
 
 /// The reason half of every refusal of a provider above
 /// [`PROVIDER_CONCURRENCY_CEILING`], so the operator reads the same derivation
 /// wherever the sum is refused. Callers state the sum, the ceiling and the
 /// constant's name ahead of it.
-pub const PROVIDER_CONCURRENCY_REFUSAL: &str = "one activation can be handed a full window of \
-     new requests and serves each with one nested call, and the ceiling is half an activation's \
-     tool-call budget so the activation keeps calls for its other work";
+pub const PROVIDER_CONCURRENCY_REFUSAL: &str = "a providing instance's request inbox is a window \
+     Σ deep, and a WASM input window holds at most 1000 messages (`WINDOW_DEPTH_CEILING`); what a \
+     full window weighs against the guest's 16 MiB is the operator's to size, as for every input \
+     window";
 
 /// Every name the host's core and repo virtual tools can take, conditional
 /// ones included.
@@ -334,6 +336,80 @@ pub fn tool_channel_uuid_from_address(address: &str) -> Uuid {
 /// cannot collide with any other.
 pub fn chat_channel_uuid_from_address(address: &str) -> Uuid {
     let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.chat-channel");
+    Uuid::new_v5(&ns, address.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Device-location channels
+// ---------------------------------------------------------------------------
+
+/// Bare-name prefix of the per-user device-location family:
+/// `brenn:device-location.<username>` carries every fix a user's devices
+/// report. Ends at a `.` so it is a boundary both ACL prefix matchers and
+/// tuning prefixes stop at.
+pub const DEVICE_LOCATION_PREFIX: &str = "device-location.";
+
+/// Longest username registration accepts, in characters.
+pub const MAX_USERNAME_LEN: usize = 64;
+
+/// Is `name` a username registration would accept: 1 to
+/// [`MAX_USERNAME_LEN`] characters of `[A-Za-z0-9_-]`?
+///
+/// Shared by registration and by the per-user channel families, whose bare
+/// names embed a username and so are only well-formed when it is.
+pub fn is_username(name: &str) -> bool {
+    let len = name.chars().count();
+    (1..=MAX_USERNAME_LEN).contains(&len)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The canonical address of `username`'s device-location channel,
+/// `brenn:device-location.<username>`.
+pub fn device_location_address(username: &str) -> String {
+    canonical_address(&format!("{DEVICE_LOCATION_PREFIX}{username}"))
+}
+
+/// Is `bare` (a scheme-stripped `brenn:` name) one user's device-location
+/// channel? The prefix followed by a non-empty remainder: neither
+/// `device-location` nor `device-location.` names a channel.
+pub fn in_the_device_location_family(bare: &str) -> bool {
+    bare.strip_prefix(DEVICE_LOCATION_PREFIX)
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// Does `bare_prefix` (a scheme-stripped tuning or matcher prefix) reach only
+/// into the device-location family? True for the family prefix itself and for
+/// anything longer that starts with it.
+pub fn is_device_location_prefix(bare_prefix: &str) -> bool {
+    bare_prefix.starts_with(DEVICE_LOCATION_PREFIX)
+}
+
+/// The username a device-location address names, or `None` when `address`
+/// (canonical or bare) is not in the family.
+pub fn device_location_user(address: &str) -> Option<&str> {
+    let bare = address
+        .strip_prefix(BRENN_ADDRESS_PREFIX)
+        .unwrap_or(address);
+    if !in_the_device_location_family(bare) {
+        return None;
+    }
+    bare.strip_prefix(DEVICE_LOCATION_PREFIX)
+}
+
+/// Derive a deterministic UUIDv5 for a device-location channel from its full
+/// canonical address (`brenn:device-location.<username>`).
+///
+/// The channels are minted per registered user, at boot and at registration,
+/// by different code paths and different processes over time; deriving the
+/// uuid from the address is what makes every mint of one user's channel land
+/// on the same row.
+///
+/// The namespace seed (`"brenn.device-location-channel"`) is distinct from
+/// every other family's, so the address space cannot collide with any other.
+pub fn device_location_channel_uuid(address: &str) -> Uuid {
+    let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.device-location-channel");
     Uuid::new_v5(&ns, address.as_bytes())
 }
 
@@ -815,5 +891,66 @@ mod tests {
             "ephemeral_channel_uuid_from_name(\"phonebuddy\") must be stable"
         );
         assert_eq!(u.get_version(), Some(uuid::Version::Sha1));
+    }
+    #[test]
+    fn device_location_address_is_well_formed_and_in_the_family() {
+        let address = device_location_address("alice");
+        assert_eq!(address, "brenn:device-location.alice");
+        let bare = address.strip_prefix(BRENN_ADDRESS_PREFIX).unwrap();
+        assert!(is_unreserved_name(bare));
+        assert!(in_the_device_location_family(bare));
+        assert_eq!(device_location_user(&address), Some("alice"));
+        assert_eq!(device_location_user(bare), Some("alice"));
+    }
+
+    #[test]
+    fn the_family_needs_a_non_empty_remainder_after_its_boundary() {
+        assert!(!in_the_device_location_family("device-location"));
+        assert!(!in_the_device_location_family("device-location."));
+        assert!(!in_the_device_location_family("device-locationx"));
+        assert!(!in_the_device_location_family(
+            "tools/device-location.alice"
+        ));
+        assert_eq!(device_location_user("brenn:device-location."), None);
+        assert_eq!(
+            device_location_user("ephemeral:device-location.alice"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_family_prefix_starts_at_the_boundary() {
+        assert!(is_device_location_prefix("device-location."));
+        assert!(is_device_location_prefix("device-location.alice."));
+        assert!(!is_device_location_prefix("device-location"));
+        assert!(!is_device_location_prefix("device-"));
+    }
+
+    #[test]
+    fn a_username_is_one_to_sixty_four_of_the_registration_charset() {
+        assert!(is_username("alice"));
+        assert!(is_username("alice_b-2"));
+        assert!(is_username(&"a".repeat(MAX_USERNAME_LEN)));
+        assert!(!is_username(""));
+        assert!(!is_username(&"a".repeat(MAX_USERNAME_LEN + 1)));
+        assert!(!is_username("alice.b"));
+        assert!(!is_username("not a user!"));
+        assert!(!is_username("al~ice"));
+    }
+
+    /// Pinned: every mint of one user's channel, in any process, must land on
+    /// the row an earlier one wrote.
+    ///
+    /// **Do NOT change this test if the UUID changes.** Fix the derivation.
+    #[test]
+    fn device_location_channel_uuid_is_pinned_and_distinct() {
+        let address = "brenn:device-location.alice";
+        let u = device_location_channel_uuid(address);
+        assert_eq!(u, device_location_channel_uuid(address));
+        assert_eq!(u.to_string(), "531c34fe-c46b-5ab7-b8ea-4b9c177b33d4");
+        assert_ne!(u, device_location_channel_uuid("brenn:device-location.bob"));
+        assert_ne!(u, tool_channel_uuid_from_address(address));
+        assert_ne!(u, chat_channel_uuid_from_address(address));
+        assert_ne!(u, durable_auto_channel_uuid(address));
     }
 }

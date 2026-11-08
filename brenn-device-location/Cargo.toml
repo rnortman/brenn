@@ -3,17 +3,15 @@ name = "brenn-device-location"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Device location: the fix validator, the per-(device, user) fix DAOs, and the registry tool that answers the acting user's devices' positions and zones"
+description = "Device location: the fix validator, the per-user location channel's messages and consent section, and the registry tool that answers the acting user's devices' positions and zones"
 
-# Reaches down to brenn-db for the connection handle, the table's DDL and the
-# `device_users` row shape, to brenn-tool-registry for the tool traits, and to
-# brenn-lib for the grant types those traits carry. Nothing above is named
-# here: brenn-server calls the validator and the DAOs from its WebSocket
-# handlers, brenn-bootstrap registers the tool.
+# Depends only downward: no crate that wires this one in (server, bootstrap)
+# is named here.
 [dependencies]
 async-trait = "0.1.89"
 brenn-db = { version = "0.1.0", path = "../brenn-db" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
 brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry" }
 chrono = { version = "0.4.44", features = ["serde"] }
 chrono-tz = "0.10.4"
@@ -24,4 +22,5 @@ tokio = { version = "1.50.0", features = ["sync"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging", features = ["testutils"] }
 tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread"] }

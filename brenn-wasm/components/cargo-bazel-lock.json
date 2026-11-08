@@ -1,5 +1,5 @@
 {
-  "checksum": "cb4caa22a46dc4bb310a42c10bdf4858ee413faf6be5ec0444628ea03305b9f6",
+  "checksum": "b81fd6eb9f09b57ca7952f93567dc550e5a63305911a96007ef23222109bac30",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -317,6 +317,141 @@
       "license_ids": [],
       "license_file": null
     },
+    "brenn-google-calendar-read 0.1.0": {
+      "name": "brenn-google-calendar-read",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-google-calendar-write 0.1.0": {
+      "name": "brenn-google-calendar-write",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-google-gmail-compose 0.1.0": {
+      "name": "brenn-google-gmail-compose",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-google-gmail-organize 0.1.0": {
+      "name": "brenn-google-gmail-organize",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-google-gmail-read 0.1.0": {
+      "name": "brenn-google-gmail-read",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
     "brenn-google-maps-tools 0.1.0": {
       "name": "brenn-google-maps-tools",
       "version": "0.1.0",
@@ -344,13 +479,26 @@
       "license_ids": [],
       "license_file": null
     },
-    "brenn-google-workspace-tools 0.1.0": {
-      "name": "brenn-google-workspace-tools",
+    "brenn-google-workspace 0.1.0": {
+      "name": "brenn-google-workspace",
       "version": "0.1.0",
       "package_url": null,
       "repository": null,
-      "targets": [],
-      "library_target_name": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_google_workspace",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_google_workspace",
       "common_attrs": {
         "compile_data_glob": [
           "**"
@@ -779,6 +927,37 @@
           ],
           "selects": {}
         },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-provider-kit-guest 0.1.0": {
+      "name": "brenn-provider-kit-guest",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_provider_kit_guest",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_provider_kit_guest",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -4108,8 +4287,13 @@
     "brenn-envelope 0.1.0": "brenn-wasm/components/host-crates/brenn-envelope",
     "brenn-git-forge-parser 0.1.0": "brenn-wasm/components/git-forge-parser",
     "brenn-git-sync-consumer 0.1.0": "brenn-wasm/components/git-sync-consumer",
+    "brenn-google-calendar-read 0.1.0": "brenn-wasm/components/google-calendar-read",
+    "brenn-google-calendar-write 0.1.0": "brenn-wasm/components/google-calendar-write",
+    "brenn-google-gmail-compose 0.1.0": "brenn-wasm/components/google-gmail-compose",
+    "brenn-google-gmail-organize 0.1.0": "brenn-wasm/components/google-gmail-organize",
+    "brenn-google-gmail-read 0.1.0": "brenn-wasm/components/google-gmail-read",
     "brenn-google-maps-tools 0.1.0": "brenn-wasm/components/google-maps-tools",
-    "brenn-google-workspace-tools 0.1.0": "brenn-wasm/components/google-workspace-tools",
+    "brenn-google-workspace 0.1.0": "brenn-wasm/components/host-crates/brenn-google-workspace",
     "brenn-guest 0.1.0": "brenn-wasm/components/guest",
     "brenn-processor-call-test 0.1.0": "brenn-wasm/components/processor-call-test",
     "brenn-processor-config 0.1.0": "brenn-wasm/components/processor-config",
@@ -4125,6 +4309,7 @@
     "brenn-processor-tool-test 0.1.0": "brenn-wasm/components/processor-tool-test",
     "brenn-processor-transplant 0.1.0": "brenn-wasm/components/processor-transplant",
     "brenn-provider-kit 0.1.0": "brenn-wasm/components/host-crates/brenn-provider-kit",
+    "brenn-provider-kit-guest 0.1.0": "brenn-wasm/components/provider-kit-guest",
     "brenn-replay 0.1.0": "brenn-wasm/components/replay",
     "brenn-replay-fault-test 0.1.0": "brenn-wasm/components/replay-fault-test",
     "brenn-replay-generic 0.1.0": "brenn-wasm/components/replay-generic"

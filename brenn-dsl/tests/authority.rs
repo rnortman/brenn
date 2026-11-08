@@ -5342,3 +5342,76 @@ fn a_handed_principal_placing_beyond_the_enclosing_ceiling_is_refused() {
         "{refusals:?}"
     );
 }
+
+// ── the per-user location channels ───────────────────────────────────────────
+
+const ALICE_LOCATION: &str = "brenn:device-location.alice";
+
+#[test]
+fn a_consumer_binds_a_user_location_channel_as_an_input() {
+    let config = derived(&relay(&format!(
+        "    in inbound <- \"{ALICE_LOCATION}\";\n"
+    )));
+    let acl = &config.consumers[0].acl;
+    assert_eq!(patterns(&acl.brenn_subscribe), ["device-location.alice"]);
+    assert!(acl.brenn_publish.is_empty(), "{:?}", acl.brenn_publish);
+}
+
+#[test]
+fn an_exact_subscribe_acl_on_a_user_location_channel_compiles() {
+    let config = derived(&relay(&format!(
+        "    acl subscribe [exact \"{ALICE_LOCATION}\"];\n"
+    )));
+    let acl = &config.consumers[0].acl;
+    assert_eq!(patterns(&acl.brenn_subscribe), ["device-location.alice"]);
+}
+
+#[test]
+fn only_a_top_level_component_binds_a_user_location_channel() {
+    let kind_refusal = format!(
+        "`{ALICE_LOCATION}` is a per-user location channel: only a top-level component \
+         binds it, as an `in` port; an agent reaches it with `MessageSubscribe` under \
+         `acl subscribe [exact \"{ALICE_LOCATION}\"]`, and surfaces, remotes and their \
+         placed instances do not reach users' positions"
+    );
+    for (what, source) in [
+        (
+            "an agent subscription",
+            agent(&format!("    subscribe \"{ALICE_LOCATION}\";\n")),
+        ),
+        (
+            "a placed instance's binding",
+            panel_surface(
+                "",
+                &format!("        in messages <- \"{ALICE_LOCATION}\";\n"),
+            ),
+        ),
+        (
+            "a placed instance on a surface holding both planes",
+            placed_panel(
+                "",
+                &format!("        in messages <- \"{ALICE_LOCATION}\";\n"),
+            ),
+        ),
+    ] {
+        assert_eq!(derive_refusal(&source), kind_refusal, "{what}");
+    }
+}
+
+#[test]
+fn a_user_location_channel_is_never_bound_outbound() {
+    let direction_refusal = format!(
+        "`{ALICE_LOCATION}` is a per-user location channel written only by Brenn as \
+         `system:device-location`: a component binds it as an `in` port, never `out` or \
+         `io`; a publisher other than Brenn is granted only by an operator's `acl publish` \
+         matcher"
+    );
+    for body in [
+        format!("    out outbound -> \"{ALICE_LOCATION}\";\n"),
+        format!("    io acks <-> \"{ALICE_LOCATION}\";\n"),
+    ] {
+        let errors = derive_errors(&relay_with("ports", &body));
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, [direction_refusal.as_str()], "{body}");
+    }
+}

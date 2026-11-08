@@ -23,9 +23,9 @@ The configuration keys are documented in `docs/config-dsl.md`, under *API-key
 providers*, *Messaging defaults* and *Provided tools*. This guide covers the
 Google side, the key file, the configuration, the component, what to tell the
 assistant, an acceptance check, the raw route, and rotation. Connecting users'
-own Google accounts (Gmail, Calendar), and the `google-workspace-tools`
-component that reads their Gmail, is a separate setup, in
-`docs/google-workspace.md`; the two can be declared together or alone.
+own Google accounts (Gmail, Calendar), and the Google Workspace components
+(`docs/google-workspace.md`) that read their Gmail, is a separate setup, in
+that guide; the two can be declared together or alone.
 
 ## 1. A key
 
@@ -151,7 +151,13 @@ cap plus 136 KiB, about 2.4 MiB at 393 216 bytes. The MQTT publish payload
 cap and a guest component's publish and sync-reply caps equal it. The
 permitted growth of a fragment channel between reaps, which
 `docs/security-posture.md` bounds by default rate × `max_body_bytes` × the
-reap gap, is six times the 64 KiB figure.
+reap gap, is six times the 64 KiB figure. A full result inbox weighs up to
+`retain_depth` × `max_body_bytes` before the component parses it — 64 ×
+384 KiB is 24 MiB — against a guest memory of 16 MiB, and the request window
+up to Σ × 64 KiB of arguments, about 1 MiB for this class; an activation
+handed more than the guest can hold traps, and the host fails its new
+requests and alerts. That weight is the operator's to size
+(`docs/config-dsl.md`, the `provide` statement); nothing at load refuses it.
 
 The alternative, for an operator who will not raise the cap: leave
 `messaging` out and set `max_response_bytes = 40960;` in the
@@ -160,7 +166,7 @@ A Google answer over 40 KiB is then cut and the tool answers `internal`
 naming `max_response_bytes`. Long transit routes, places asked for with
 reviews, and possibly 24-hour forecasts fail that way. With neither block, an
 answer between the two limits is answered `internal` naming `max_body_bytes`
-(section 6, step 5).
+(section 6, step 4).
 
 Changing either block takes a restart. A reload that changes them is refused.
 
@@ -181,9 +187,10 @@ Then the inbox tuning, the instance and the agent:
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered. The config check holds Σ to at most 32, so 64 holds any class
-// twice over. The family default of 16 would drop some; a dropped result is a
-// request answered `internal` four minutes later.
+// re-delivered: retain_depth ≥ 2 × Σ. This class's Σ is 18, so 64 holds it;
+// a tool joining the class that takes Σ past 32 needs this raised. The family
+// default of 16 would drop some; a dropped result is a request answered
+// `internal` four minutes later.
 channel at "brenn:tool-results/maps" {
   push_depth = 1;
   retain_depth = 64;
@@ -206,7 +213,6 @@ new maps: GoogleMapsTools {
     allow { provider = "google-maps"; method = "POST"; host = "routes.googleapis.com";  path = "/directions/v2:computeRoutes"; }
     rate_limit { burst = 20; sustained_per_minute = 60; }
   }
-  tool device-location {}
   config = {
     provider = "google-maps",
     weather_host = "weather.googleapis.com",
@@ -230,22 +236,20 @@ agent PersonalAssistant {
 }
 ```
 
-A device shares its location only through an app that holds `tool
-device-location {}` — it is what shows the "Share location from this device"
-menu item — so `Weather` with no location needs the grant on the app as well
-as on the instance. It also lets the assistant call `DeviceLocation` itself,
-for the other tools. The rule is stated in `docs/config-dsl.md`, *The
-device-location tool*.
+`tool device-location {}` on the agent is what shows the "Share location from
+this device" menu item and lets the assistant call `DeviceLocation` for
+"here"; the rule is stated in `docs/config-dsl.md`, *The device-location
+tool*.
 
 **The result inbox.** The `channel at "brenn:tool-results/maps"` block sizes
 the inbox the instance's nested answers arrive on (the slug after the `/` is
 the instance's name). Each request the component serves has at most one
 Google call outstanding, so at most Σ `max_concurrency` answers are
 outstanding at once, and an answer may be delivered twice: the window must
-hold 2 × Σ. The config check holds Σ to at most 32
-(`PROVIDER_CONCURRENCY_CEILING`), and 64 holds that twice over, so tools
-joining this class change nothing the inbox needs. The default window of 16
-is too small for a full window and would lose answers under load, each lost
+hold 2 × Σ: `retain_depth ≥ 2 × Σ` for this class. This class's Σ is 18, so
+64 holds it; a tool joining the class that takes Σ past 32 needs the block
+raised. The family default of 16 is too small for any class whose Σ is above
+8 and would lose answers under load, each lost
 answer leaving its request to be answered `internal` after the 240-second
 ceiling. `push_depth = 1` is the inert channel rung, and
 `noise = alarm` makes a drop here an alert.
@@ -253,13 +257,10 @@ ceiling. `push_depth = 1` is the inert channel rung, and
 **The clauses.** The instance holds nine clauses, one per endpoint, and
 nothing wider. Only the details path takes `*`, for its one variable segment,
 the place id. A clause that does not admit a call's method, host and path is
-refused before anything is sent (section 6, step 5). The `rate_limit` is one
+refused before anything is sent (section 6, step 4). The `rate_limit` is one
 bucket for the instance across every user it serves, and is the spend bound
 on the key: a burst of ten two-call tools, then one Google call a second.
-Callers over it are delayed, never refused. The `device-location` grant
-carries no `rate_limit`: it is a read of Brenn's own database, bounded by the
-tool's `max_concurrency` of 4, and no spend rides on it. Its bucket, if one
-were set, would be its own, separate from `api-request`'s.
+Callers over it are delayed, never refused.
 
 **Acting for the caller.** Places text search and Routes are `POST`s. A
 component may make a `POST` through a key provider only while serving a
@@ -267,12 +268,7 @@ request whose caller had a user — an agent's conversation or `brenn-tool` —
 and the call then acts as that user. `PlacesSearch`, `Directions` and
 `SearchAlongRoute` asked for by a component on its own account are answered
 `denied`, with the reason. `Weather`, `Geocode` and `PlaceDetails` are reads
-and work for any caller. `Weather` with no location reads the calling user's
-device location through the instance's `device-location` grant; asked for by
-a component on its own account, it is `denied` like the `POST`s, because
-there is no user whose location to read. Without the grant, it is `denied`
-naming the missing `tool device-location {}`; calls given a location are
-unaffected.
+and work for any caller.
 
 **`config`.** The map is flat:
 
@@ -315,15 +311,13 @@ them is the household's context. Add lines like these to its instructions
 ```
 You have Google Maps tools: Weather, Geocode, PlacesSearch, PlaceDetails,
 Directions and SearchAlongRoute.
-- Weather with no place is the weather where the user is, from their most
-  recent device location fix; its answer names the device and the fix's age.
-  The other tools take a place name or "<lat>,<lng>"; for "here" in those,
-  call DeviceLocation first. When the user means home, use: <the household's
-  usual place, e.g. "Springfield, IL">.
+- Weather and the other tools take a place name or "<lat>,<lng>"; Weather
+  also takes `lat` and `lng`. For "here", call DeviceLocation first and pass
+  its latitude and longitude, to Weather as `lat`/`lng` and to the others as
+  "<lat>,<lng>"; tell the user the fix's age when it is `stale`. When the user
+  means home, use: <the household's usual place, e.g. "Springfield, IL">.
 - Hourly weather comes 24 hours to a page. When an answer has `next_page`,
-  pass it back as `page` with the same place and `hours` for the next 24;
-  for weather where the user is, pass the answer's `location.lat` and
-  `location.lng` as `lat` and `lng`.
+  pass it back as `page` with the same place and `hours` for the next 24.
 - When you relay a weather alert, name its source when the alert gives one.
   An empty alerts list is Google's answer when no alert is active, and also
   when a provider's alert lacked a required field, so it is not proof that
@@ -349,22 +343,15 @@ and 4 in place.
    `api-request` lines for `google-maps`, each with status 200: one for
    `geocode.googleapis.com` `/v4/geocode/address`, then one for
    `weather.googleapis.com` `/v1/currentConditions:lookup`.
-2. **Weather here.** Turn on "Share location from this device" in the user
-   menu of the assistant's app, then ask the assistant for the weather
-   without naming a place. Expect one `Weather` call with no `place`, `lat`
-   or `lng`, whose answer's `location` names the device and the fix's
-   `age_seconds`. The diagnostic log shows a `weather step 3
-   device-location` line, then one `api-request` line for
-   `/v1/currentConditions:lookup`.
-3. **Weather alerts.** Ask the assistant for weather alerts at a named place.
+2. **Weather alerts.** Ask the assistant for weather alerts at a named place.
    Expect a `Weather` call with `kind: alerts`; the diagnostic log shows an
    `api-request` line for `/v1/publicAlerts:lookup` with status 200. An
    answer listing alerts and an answer saying none were returned are both a
    pass: the step exercises the request, not the weather.
-4. **Directions.** Ask the assistant for directions between two places.
+3. **Directions.** Ask the assistant for directions between two places.
    Expect a `Directions` call; the diagnostic log shows a `POST` to
    `routes.googleapis.com` `/directions/v2:computeRoutes` with status 200.
-5. **When a step fails**, the tool's error says whose answer it is.
+4. **When a step fails**, the tool's error says whose answer it is.
    - A `detail` quoting a Google 400 or 403 is Google's answer, returned as
      it is; Brenn does not retry. The causes: a mistyped key; an API not
      enabled; an IP restriction that does not match the server; a used-up
@@ -387,10 +374,10 @@ and 4 in place.
      applied. It takes a restart.
 
    Fix the cause and restart.
-6. **Placement.** Read the configuration and check that `key_file` lies
+5. **Placement.** Read the configuration and check that `key_file` lies
    under none of the paths section 2 lists. Brenn checks only the file's
    mode.
-7. **The key not in the container home.** In the agent's container home,
+6. **The key not in the container home.** In the agent's container home,
    search for the key without putting it on a command line (bash):
 
    ```
@@ -404,7 +391,7 @@ and 4 in place.
    `tr` drops those bytes and `sed` the spaces left at either end. A carriage
    return, a no-break space or a blank line in the file does not hide a
    match.
-8. **The key not in the log directory.** Brenn writes its logs to the directory
+7. **The key not in the log directory.** Brenn writes its logs to the directory
    `logging.log_dir` names (`/var/log/brenn` by default): the diagnostic log,
    the security log and each conversation's transcript. Search it with the
    same pattern:
@@ -418,7 +405,7 @@ and 4 in place.
    such as a systemd journal, search that too. Each call's final log line
    names the provider, the user, the method, host and path, and the status;
    never the key or the query.
-9. **Mode.** `ls -l /etc/brenn/google/maps-api-key` shows `-rw-------`.
+8. **Mode.** `ls -l /etc/brenn/google/maps-api-key` shows `-rw-------`.
 
 What Brenn does not check: it does not inspect Google's answer. A provider
 that quoted request headers in its own error body would return the key to
@@ -427,7 +414,7 @@ its answer and logs no body, but the full answer reaches it on its
 `brenn:tool-results` inbox on the bus. On the raw route the full answer is
 the tool result, and Brenn keeps it as it keeps every tool result: in the
 conversation's transcript in the log directory, and in the conversation's
-history in the database (`/var/lib/brenn/brenn.db` by default). Step 8 finds
+history in the database (`/var/lib/brenn/brenn.db` by default). Step 7 finds
 a copy in the log directory; it does not search the database or the bus
 store. Nothing prevents any of these copies.
 

@@ -26,7 +26,8 @@ use uuid::Uuid;
 use super::{
     AttachGrant, ChannelEntry, ChannelScheme, ComponentGrant, MessagingDirectory,
     SubscriberEntryKind, TOOL_RESULTS_NAMESPACE, WakeMin, canonicalize_channel_address,
-    ends_at_tuning_boundary, in_a_tool_namespace, is_reserved_channel_name, is_unreserved_char,
+    ends_at_tuning_boundary, in_a_tool_namespace, in_the_device_location_family,
+    is_device_location_prefix, is_reserved_channel_name, is_unreserved_char,
     nondurable_channel_uuid, tuning_boundary_list,
 };
 use crate::config::AppConfigRaw;
@@ -2353,6 +2354,31 @@ pub const INGRESS_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(100);
 /// burst arriving while the executor is busy, not a multi-day outage.
 pub const TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(16);
 
+/// Retained window each user's `brenn:device-location.<username>` channel
+/// defaults to.
+///
+/// Sized as a duration: the PWA reports one fix per device every five minutes
+/// while visible, so 2000 messages is about a week of one device visible around
+/// the clock, or about a day of seven. That keeps a phone's morning fix alive
+/// through a desktop's day of reports, and leaves a reader granted the channel
+/// enough history to ask where its user was yesterday.
+pub const DEVICE_LOCATION_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(2000);
+
+/// The send rate of `system:device-location` on every `brenn:device-location.`
+/// channel, in place of the operator's `default_send_rate`; a tuning block
+/// carrying `send_rate` on the family is refused.
+///
+/// The writer publishes a user's stop on the same bucket as that user's fixes,
+/// and a stop the bucket refuses is a withdrawal of consent the channel never
+/// records. This rate is far above what the PWA sends (one fix per device every
+/// five minutes), so only a session of the same user flooding shares empties
+/// it; a lower rate would let ordinary reporting crowd out a stop.
+pub const DEVICE_LOCATION_SEND_RATE: SendRate = SendRate {
+    burst: 240,
+    refill_interval_secs: 1,
+    refill: 30,
+};
+
 /// The families of channel the system mints for itself, each with its own
 /// bounded default window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2363,6 +2389,9 @@ pub enum SystemChannelFamily {
     /// `brenn:tool-requests/<slug>` — the async-tool request/result substrate
     /// and the per-provider request inboxes.
     Tool,
+    /// `brenn:device-location.<username>` — one per registered user, carrying
+    /// every location fix and sharing change that user's devices report.
+    DeviceLocation,
 }
 
 impl SystemChannelFamily {
@@ -2371,11 +2400,37 @@ impl SystemChannelFamily {
     pub fn of(address: &str) -> Option<Self> {
         match ChannelScheme::split(address) {
             Some((ChannelScheme::Mqtt | ChannelScheme::Webhook, _)) => Some(Self::Ingress),
-            Some((ChannelScheme::Brenn, name)) if in_a_tool_namespace(name) => Some(Self::Tool),
+            Some((ChannelScheme::Brenn, name)) => Self::of_brenn_name(name),
             Some(_) => None,
             // A bare (scheme-less) address canonicalizes to `brenn:`.
-            None if in_a_tool_namespace(address) => Some(Self::Tool),
-            None => None,
+            None => Self::of_brenn_name(address),
+        }
+    }
+
+    fn of_brenn_name(name: &str) -> Option<Self> {
+        if in_a_tool_namespace(name) {
+            Some(Self::Tool)
+        } else if in_the_device_location_family(name) {
+            Some(Self::DeviceLocation)
+        } else {
+            None
+        }
+    }
+
+    /// The family a tuning prefix names, or `None` if it names none.
+    ///
+    /// [`Self::of`] read on the prefix as an address, plus the one prefix that
+    /// is not itself an address of its family: `brenn:device-location.`, whose
+    /// empty remainder names no user.
+    pub fn of_prefix(prefix: &str) -> Option<Self> {
+        let bare = match ChannelScheme::split(prefix) {
+            Some((ChannelScheme::Brenn, name)) => Some(name),
+            Some(_) => None,
+            None => Some(prefix),
+        };
+        match bare {
+            Some(name) if is_device_location_prefix(name) => Some(Self::DeviceLocation),
+            _ => Self::of(prefix),
         }
     }
 
@@ -2386,6 +2441,7 @@ impl SystemChannelFamily {
         match self {
             Self::Ingress => INGRESS_DEFAULT_RETAIN_DEPTH,
             Self::Tool => TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH,
+            Self::DeviceLocation => DEVICE_LOCATION_DEFAULT_RETAIN_DEPTH,
         }
     }
 }
@@ -2521,14 +2577,12 @@ pub fn build_system_channel_tuning(
                     tuning_boundary_list(),
                 );
                 let canonical = canonicalize_channel_address(prefix);
-                // A prefix ending at a segment boundary is itself the shortest
-                // address of the family, so `of()` classifies it directly.
                 assert!(
-                    SystemChannelFamily::of(&canonical).is_some(),
+                    SystemChannelFamily::of_prefix(&canonical).is_some(),
                     "config: [[channel]] address_prefix {prefix:?} names no system-minted \
-                     family — prefixes tune mqtt:, webhook:, brenn:tools/ and \
-                     brenn:tool-results/ channels, and an operator-declared channel takes \
-                     its own [[channel]] block",
+                     family — prefixes tune mqtt:, webhook:, brenn:tools/, \
+                     brenn:tool-results/ and brenn:device-location. channels, and an \
+                     operator-declared channel takes its own [[channel]] block",
                 );
                 (format!("prefix {prefix:?}"), canonical)
             }
@@ -2622,6 +2676,14 @@ pub fn build_system_channel_tuning(
              inbox's send rate is the host's: the tool executor is its only publisher and \
              publishes at most one result per request it dequeues, so the rate that bounds a \
              component's calls is the one on its `brenn:tools/<tool>` channels",
+        );
+        assert!(
+            !(SystemChannelFamily::of_prefix(&entry_key)
+                == Some(SystemChannelFamily::DeviceLocation)
+                && entry.send_rate.is_some()),
+            "config: [[channel]] {label} tunes a location channel's `send_rate` — the rate \
+             is the host's: a user's stop shares the bucket with that user's fixes, and a \
+             stop the rate refuses is a withdrawal of sharing that is never recorded",
         );
         if let Some(rate) = entry.send_rate {
             rate.validate(&format!("[[channel]] {label}"));
@@ -4442,6 +4504,103 @@ channel demo at "ephemeral:protobar-demo" {
             ChannelBlockRole::Declaring
         );
         assert_eq!(channel_block_role("webhook:hook"), ChannelBlockRole::Tuning);
+    }
+
+    #[test]
+    fn a_user_channel_is_in_the_device_location_family() {
+        for address in ["brenn:device-location.alice", "device-location.alice"] {
+            assert_eq!(
+                SystemChannelFamily::of(address),
+                Some(SystemChannelFamily::DeviceLocation),
+                "{address}"
+            );
+        }
+        for address in [
+            "brenn:device-location.",
+            "brenn:device-location",
+            "brenn:device-locationx",
+            "ephemeral:device-location.alice",
+        ] {
+            assert_eq!(SystemChannelFamily::of(address), None, "{address}");
+        }
+        assert_eq!(
+            SystemChannelFamily::of_prefix("brenn:device-location."),
+            Some(SystemChannelFamily::DeviceLocation)
+        );
+        assert_eq!(
+            SystemChannelFamily::of_prefix("device-location."),
+            Some(SystemChannelFamily::DeviceLocation)
+        );
+        assert_eq!(
+            SystemChannelFamily::of_prefix("ephemeral:device-location."),
+            None
+        );
+        assert_eq!(
+            SystemChannelFamily::DeviceLocation.default_retain_depth(),
+            Depth::Bounded(2000)
+        );
+        assert_eq!(
+            channel_block_role("brenn:device-location.alice"),
+            ChannelBlockRole::Tuning
+        );
+    }
+
+    #[test]
+    fn the_device_location_family_defaults_to_its_window() {
+        let resolved = resolve_system_channel(
+            "brenn:device-location.alice",
+            &tuning_of(&[]),
+            &global_defaults(),
+        );
+        assert_eq!(resolved.push_depth, SYSTEM_CHANNEL_DEFAULT_PUSH_DEPTH);
+        assert_eq!(resolved.retain_depth, DEVICE_LOCATION_DEFAULT_RETAIN_DEPTH);
+        assert_eq!(
+            resolved.standing_retain_depth,
+            DEVICE_LOCATION_DEFAULT_RETAIN_DEPTH
+        );
+    }
+
+    /// The family prefix sizes every user; an exact block sizes one and wins.
+    #[test]
+    fn the_device_location_family_is_tuned_by_prefix_and_by_one_user() {
+        let tuning = tuning_of(&[
+            tuning_prefix("brenn:device-location.", 1, 500, 500),
+            tuning_block("brenn:device-location.alice", 2, 50, 60),
+        ]);
+        let defaults = global_defaults();
+        let bob = resolve_system_channel("brenn:device-location.bob", &tuning, &defaults);
+        assert_eq!(bob.retain_depth, Depth::Bounded(500));
+        let alice = resolve_system_channel("brenn:device-location.alice", &tuning, &defaults);
+        assert_eq!(alice.push_depth, Depth::Bounded(2));
+        assert_eq!(alice.retain_depth, Depth::Bounded(50));
+        assert_eq!(alice.standing_retain_depth, Depth::Bounded(60));
+    }
+
+    /// A location channel's send rate is the host's: a block stating one, for
+    /// the family or for one user, is refused.
+    #[test]
+    fn a_send_rate_on_the_device_location_family_panics() {
+        for mut block in [
+            tuning_prefix("brenn:device-location.", 1, 500, 500),
+            tuning_block("brenn:device-location.alice", 1, 50, 50),
+        ] {
+            block.send_rate = Some(a_send_rate());
+            let refused = std::panic::catch_unwind(|| tuning_of(&[block]))
+                .expect_err("a send_rate on the location family is refused");
+            let message = refused
+                .downcast_ref::<String>()
+                .expect("the refusal is a formatted message");
+            assert!(
+                message.contains("tunes a location channel's `send_rate` — the rate is the host's"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "names no system-minted family")]
+    fn a_prefix_beside_the_device_location_family_panics() {
+        tuning_of(&[tuning_prefix("brenn:device.", 1, 8, 8)]);
     }
 
     /// A misspelled scheme must not register as a `brenn:` channel whose name

@@ -93,6 +93,9 @@ pub async fn boot_messaging_over_bridges(
     tool_registry: &Arc<brenn_tool_registry::ToolRegistry>,
     active_bridges: ActiveBridges,
 ) -> (MessagingResult, PlanCarried) {
+    // Must match how boot lists users: every user seated before the boot
+    // gets a location channel.
+    let users = brenn_db::auth::user::list_usernames(&*db.lock().await);
     build_messaging(
         config,
         db,
@@ -103,6 +106,7 @@ pub async fn boot_messaging_over_bridges(
         &brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients),
         tool_registry,
         &[],
+        &users,
     )
     .await
 }

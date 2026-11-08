@@ -40,7 +40,7 @@ pub fn run_check_wit(repo_root: &Path) -> bool {
                     ok = false;
                 }
             }
-            Family::Sdk => {
+            Family::Sdk | Family::Library => {
                 // Builds no artifact; nothing to gate.
             }
         }
@@ -71,7 +71,7 @@ impl LoadedArtifact {
         assert!(
             path.exists(),
             "xtask check-wit: artifact {path:?} not found. Every member of the guest \
-             workspace but the SDK builds one, staged under {ARTIFACT_DIR}."
+             workspace but the SDK and its libraries builds one, staged under {ARTIFACT_DIR}."
         );
 
         // Existence was just asserted; a read failure now is unexpected → fail fast.
@@ -275,7 +275,7 @@ fn wit_source_for_crate(family: &Family, crate_dir: &Path, repo_root: &Path) -> 
             guest_sdk_world_is_processor(repo_root);
             (wit_path, GUEST_SDK_WORLD.to_string())
         }
-        Family::Sdk => {
+        Family::Sdk | Family::Library => {
             panic!("xtask check-wit: {family:?} crates carry no artifact to compare")
         }
     }

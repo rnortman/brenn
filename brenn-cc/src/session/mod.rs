@@ -512,6 +512,9 @@ fn build_cc_args(config: &CcSessionConfig) -> Vec<String> {
     // `--permission-mode auto` lets CC's classifier auto-approve safe tool
     // calls; risky ones still fall back to `--permission-prompt-tool stdio`
     // and surface in Brenn's approval UI.
+    // TODO(security-posture-approval-gate-vs-auto-mode): the security
+    // posture's approval-gate invariants assume an approval on every
+    // privileged call that no operator rule auto-approves.
     let mut args = vec![
         "--input-format".into(),
         "stream-json".into(),

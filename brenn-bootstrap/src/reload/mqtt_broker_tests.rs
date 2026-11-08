@@ -889,7 +889,7 @@ async fn an_agent_binding_added_by_reload_receives_from_the_broker() {
 
     let tree = Tree::holding(&document_agent_over_the_broker(harness.port, &ca_file, &[]));
     let mut booted = boot_live(&tree, None).await;
-    seat_user(&booted.db, "alice").await;
+    seat_user(&booted, "alice").await;
     let (service, router) = booted.mqtt.clone();
     assert_eq!(service.ingress_filter_qos(CLIENT, &topic).await, None);
 
@@ -1202,7 +1202,7 @@ async fn compare_agent_over_the_broker(
         &tree,
         fixture,
         async |booted| {
-            seat_user(&booted.db, "alice").await;
+            seat_user(booted, "alice").await;
         },
         async |booted| {
             let (service, _) = booted.mqtt.clone();

@@ -4,6 +4,102 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **BREAKING: `google-workspace-tools` is split into five components, one
+  per Google scope set; no compatibility shim.** The package
+  `google-workspace-tools` and its class `GoogleWorkspaceTools` are gone.
+  In their place: `google-gmail-read` (`GoogleGmailRead`: `GmailLabels`,
+  `GmailSearch`, `GmailRead`, `GmailThread`), `google-gmail-compose`
+  (`GoogleGmailCompose`: `GmailDraft`), `google-gmail-organize`
+  (`GoogleGmailOrganize`: `GmailModifyLabels`), `google-calendar-read`
+  (`GoogleCalendarRead`: `CalendarList`, `CalendarEvents`, `CalendarEvent`,
+  `CalendarFreeBusy`) and `google-calendar-write` (`GoogleCalendarWrite`:
+  `CalendarCreate`, `CalendarUpdate`, `CalendarDelete`). Each instance holds
+  only the `api-request` clauses its own tools call, with its own rate-limit
+  bucket and result inbox, so reading mail, drafting, changing labels,
+  reading calendars and changing them are separate grants. The tools' names,
+  descriptions, arguments and answers are unchanged.
+  **Config change required:** replace `use @google-workspace-tools::*;`, the
+  `brenn:tool-results/workspace` tuning block and the `workspace` instance
+  with the five `use` lines, five tuning blocks and five instances of
+  `docs/google-workspace.md` section 5, which is the paste. Each instance's
+  `config` names `provider` and its one host key: `gmail_host` for the three
+  Gmail components, `calendar_host` for the two Calendar ones. Leave out the
+  instances whose tools you do not want, with their grants. The agent's
+  `tool` grants are unchanged. The old store file
+  (`/var/lib/brenn/google-workspace-tools.db`) is no longer opened and may be
+  deleted. A request in flight across the upgrade is answered `internal` by
+  the host at its 240-second deadline, as across any restart.
+
+- **Tool providers can now take far more concurrent requests: a provider
+  no longer has to make every outbound API call in one go.** Brenn's tool
+  providers (WASM components such as `google-workspace-tools` and
+  `google-maps-tools`, built on the shared `brenn-provider-kit` library)
+  used to make every nested `api-request` call in the same activation that
+  received the requests, which capped a providing class at a combined
+  `max_concurrency` of 32. A kit-built provider now makes at most 32 calls
+  per activation and queues the rest, issuing them as earlier calls answer;
+  a request that waits in the queue for 60 seconds is answered `internal`
+  rather than left to time out silently at the host's 240-second deadline.
+  Callers see the same tools and the same answers.
+
+  For operators:
+  - A providing class may now sum `max_concurrency` up to 1000 (was 32).
+  - The `tool-results` inbox must keep `retain_depth ≥ 2 × Σ max_concurrency`.
+    The 64 the guides set covers Σ up to 32; a larger class needs it raised
+    (at most 1000, so Σ up to 500). Sizing a full window against the
+    guest's 16 MiB memory is yours to check — see `docs/config-dsl.md`.
+  - Requests in flight across the upgrade are lost with the restart. A late
+    result for one fails that activation with "in-flight row does not
+    parse" until it is cleared, seven minutes after it was issued. A queued
+    request whose stored shape changes across a future upgrade fails
+    activations with "backlog row does not parse" for up to 60 seconds, then
+    is answered `internal` and cleared.
+
+- **BREAKING for component authors: `brenn-provider-kit` and the new
+  `brenn-provider-kit-guest` are now build-time contracts for out-of-tree
+  components, and this release cuts them.** Like `brenn-guest`, they change
+  only at your pin bump; `docs/component-packages.md`, "A tool provider on
+  the kit", explains how to depend on them. A provider now implements
+  `Logic` and calls `brenn_provider_kit_guest::serve` from `receive`; the
+  kit owns the activation loop and the queueing. Other cuts:
+  `read_api_result`, `Unreadable::render` and `Unreadable::failure` take the
+  API's display name instead of saying "Google"; `google_error_detail` and
+  the `GOOGLE_*` bounds moved to `brenn_provider_kit::google`; the in-flight
+  row gained `received_at_ms`.
+
+- **`Weather` no longer looks up the user's location itself; the "here"
+  default added in 0.31.0 is withdrawn, and so is 0.31.0's grant of
+  user-acting tools to WASM components.** `Weather` takes a `place` or
+  `lat`/`lng` again. For "what's the weather here?", the assistant first asks
+  `DeviceLocation` for the device's position and passes it on. The Maps
+  component therefore no longer copies users' device positions into its
+  stored tool results.
+  **Config change required:** remove `tool device-location {}` from the
+  `google-maps-tools` instance if you added it; boot refuses it there (and on
+  any other WASM component). Keep the grant on the *assistant* — it is what
+  shows "Share location from this device" in the user menu.
+  A `google-maps-tools` request in flight across the upgrade is lost with the
+  restart; a late result for one fails that activation with "in-flight row
+  does not parse" and is cleared seven minutes after it was issued.
+
+- **Device locations are now kept in a per-user bus channel instead of the
+  database.** Each report from a sharing device, with the browser's time
+  zone, goes to the user's own durable bus channel,
+  `brenn:device-location.<username>`, which Brenn creates for every user;
+  "Stop sharing location from this device" adds a `stopped` message for the
+  device and deletes nothing. The channel keeps the last 2000 reports by
+  default (about a week of one device); size it with
+  `channel at prefix "brenn:device-location." { … }`, or for one user with an
+  exact address, and restart to change it (its send rate is fixed by Brenn
+  and a `send_rate` there is refused). A component written for one user can
+  bind that user's channel as an `in` port. `DeviceLocation` answers as
+  before.
+  Deployments that ran 0.31.0 with location sharing drop its
+  `device_locations` table and `device_users.browser_tz` column on upgrade;
+  each device must turn sharing on again.
+
+- Bumped pulldown-cmark from 0.13.5 to 0.13.6, clearing RUSTSEC-2026-0433.
+
 ## [0.31.0] — 2026-11-01
 
 - **"What's the weather?" now means "here".** The `Weather` tool, called

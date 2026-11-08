@@ -12,8 +12,11 @@
  * history is kept. `watchPosition` is never used.
  */
 
-/** One fix as sent to the server. The browser's own timestamp is not sent. */
-export type Fix = { latitude: number; longitude: number; accuracy_m: number };
+/**
+ * One fix as sent to the server, with the browser's IANA zone at the time of
+ * the fix. The browser's own timestamp is not sent.
+ */
+export type Fix = { latitude: number; longitude: number; accuracy_m: number; time_zone: string };
 
 /** Outcome of one fix request. */
 export type FixResult =
@@ -53,6 +56,7 @@ export function requestFix(maximumAgeMs: number): Promise<FixResult> {
             latitude: position.coords.latitude,
             longitude: position.coords.longitude,
             accuracy_m: position.coords.accuracy,
+            time_zone: Intl.DateTimeFormat().resolvedOptions().timeZone,
           },
         });
       },

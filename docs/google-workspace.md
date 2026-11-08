@@ -7,8 +7,8 @@ agent's container: Brenn attaches the credential to each request itself.
 
 The assistant reaches Google in one of two ways:
 
-- **The `google-workspace-tools` component** (section 5) gives it
-  native tools — `GmailLabels`, `GmailSearch`, `GmailRead` and `GmailThread`
+- **The Google Workspace components** (section 5), five of them, one per
+  Google scope set, give it native tools — `GmailLabels`, `GmailSearch`, `GmailRead` and `GmailThread`
   for reading mail, `GmailDraft` and `GmailModifyLabels` for drafting replies
   and filing mail, `CalendarList`, `CalendarEvents`, `CalendarEvent` and
   `CalendarFreeBusy` for reading the calendar, and `CalendarCreate`,
@@ -21,13 +21,13 @@ The assistant reaches Google in one of two ways:
   when asked (`notify`).
 - **The raw `api-request` route** (section 8) lets it call any Gmail or
   Calendar endpoint directly, assembling the request and reading Google's
-  answer itself. It is the route for the endpoints the component does not
+  answer itself. It is the route for the endpoints the components do not
   wrap.
 
 The configuration keys are documented in `docs/config-dsl.md`, under *OAuth
 providers and the credential vault*, *Messaging defaults* and *Provided
 tools*. This guide covers the Google side, the vault, a working
-configuration, the grants, the component, what to tell the assistant, the
+configuration, the grants, the components, what to tell the assistant, the
 first connect, the raw route, and rotation.
 
 Google Maps Platform APIs (Weather, Places, Routes) take a deployment-wide API
@@ -115,7 +115,7 @@ oauth_provider google {
 token on every connect, including a reconnect. Without them a reconnect can
 come back with no refresh token, and Brenn stores nothing.
 
-The component (section 5) needs one more block, the bus's body cap:
+The components (section 5) need one more block, the bus's body cap:
 
 ```
 // Every nested api-request answer crosses the bus as a tool result, so the
@@ -146,6 +146,16 @@ when those were the oversized headers; any other read of it is answered
 `internal` naming `max_body_bytes`. No cap setting closes that, and that
 message is simply not readable through these tools; it is the sender's
 doing, not the operator's configuration, and mail is untrusted input.
+
+The cap also sizes what each result inbox can weigh: a full window is up to
+`retain_depth` × `max_body_bytes` before the component parses it — 32 ×
+384 KiB is 12 MiB for `gmail-read` and `calendar-read`, 16 × 384 KiB is
+6 MiB for the other three — against a guest memory of 16 MiB, and the request
+window is up to Σ × 64 KiB of arguments: 768 KiB for `gmail-read` and
+`calendar-read`, 128 KiB for `gmail-compose` and `gmail-organize`, 192 KiB for
+`calendar-write`. An activation handed more than the guest can hold traps,
+and the host fails its new requests and alerts. That weight is the operator's to size (`docs/config-dsl.md`, the
+`provide` statement); nothing at load refuses it.
 
 Operators who already have the Maps guide's `messaging` block need nothing
 more: the cap is bus-wide, and the value is the same.
@@ -184,7 +194,7 @@ agent PersonalAssistant {
 ```
 
 Reading mail and calendars, creating drafts, changing labels and creating,
-changing and deleting events are granted through the component's tools
+changing and deleting events are granted through the components' tools
 (section 5); no tool sends, deletes or trashes mail, and the Calendar write
 tools send invitations only when asked (`notify`). Gmail endpoints the tools do not
 cover, and Calendar's colors and settings, are granted as `api-request`
@@ -192,70 +202,150 @@ clauses (section 8).
 
 `device-location` is held under the same restrictions. It gives the
 assistant the user's position and time zone from the devices on which the
-user shares location: the Calendar tools take its time zone as an
-argument, and `Weather` given no location takes the position itself, through
-the maps instance's own `device-location` grant (`docs/google-maps-platform.md`,
-section 4). Granting it to the app also shows the "Share location from this device"
+user shares location, which `Weather` and the Calendar tools take as
+arguments; granting it also shows the "Share location from this device"
 item in the PWA's user menu (see `docs/config-dsl.md`, *The device-location
 tool*).
 
-## 5. The component
+## 5. The components
 
-The `google-workspace-tools` component answers the assistant's Gmail and
-Calendar tools with stamped `api-request` calls for whichever user is calling. Its class,
-`GoogleWorkspaceTools`, is imported from the release's module root. One
-instance serves every agent granted its tools. The import goes at the top of
-the document, with any other `use` lines: a `use` after any other
-declaration is a syntax error.
+Five components answer the assistant's Gmail and Calendar tools with stamped
+`api-request` calls for whichever user is calling, one per Google scope set
+(section 7, step 1, names the sets):
+
+| Package | Class | Tools |
+|---|---|---|
+| `google-gmail-read` | `GoogleGmailRead` | `GmailLabels`, `GmailSearch`, `GmailRead`, `GmailThread` |
+| `google-gmail-compose` | `GoogleGmailCompose` | `GmailDraft` |
+| `google-gmail-organize` | `GoogleGmailOrganize` | `GmailModifyLabels` |
+| `google-calendar-read` | `GoogleCalendarRead` | `CalendarList`, `CalendarEvents`, `CalendarEvent`, `CalendarFreeBusy` |
+| `google-calendar-write` | `GoogleCalendarWrite` | `CalendarCreate`, `CalendarUpdate`, `CalendarDelete` |
+
+Each class is imported from the release's module root, and one instance of
+each serves every agent granted its tools. Each instance holds only the
+`api-request` clauses its own tools call, so the authority to read mail, to
+draft, to change labels, to read calendars and to change them are five
+separate grants. An operator who wants no drafts, no label changes or no
+calendar writes leaves that component's `use` line, tuning block and instance
+out, and grants none of its tools: the instances are independent, and the
+agent's `tool` grants must name only tools of instances the document
+declares. The imports go at the top of the document, with any other `use`
+lines: a `use` after any other declaration is a syntax error.
 
 ```
-use @google-workspace-tools::*;
+use @google-gmail-read::*;
+use @google-gmail-compose::*;
+use @google-gmail-organize::*;
+use @google-calendar-read::*;
+use @google-calendar-write::*;
 ```
 
-Then the inbox tuning and the instance:
+Then the inbox tuning and the instances:
 
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered. The config check holds Σ to at most 32, and 64 holds that
-// twice over, so tools joining the class change nothing here.
-channel at "brenn:tool-results/workspace" {
+// re-delivered: retain_depth ≥ 2 × Σ. gmail-read's Σ is 12, so 32 holds it.
+channel at "brenn:tool-results/gmail-read" {
   push_depth = 1;
-  retain_depth = 64;
-  standing_retain_depth = 64;
+  retain_depth = 32;
+  standing_retain_depth = 32;
   noise = alarm;
 }
+// gmail-compose's Σ is 2: the family default of 16 holds it; the block
+// restates it so that a drop here alarms rather than passing silently.
+channel at "brenn:tool-results/gmail-compose" {
+  push_depth = 1;
+  retain_depth = 16;
+  standing_retain_depth = 16;
+  noise = alarm;
+}
+// gmail-organize's Σ is 2.
+channel at "brenn:tool-results/gmail-organize" { push_depth = 1; retain_depth = 16; standing_retain_depth = 16; noise = alarm; }
+// calendar-read's Σ is 12, so 32 holds it.
+channel at "brenn:tool-results/calendar-read" { push_depth = 1; retain_depth = 32; standing_retain_depth = 32; noise = alarm; }
+// calendar-write's Σ is 3.
+channel at "brenn:tool-results/calendar-write" { push_depth = 1; retain_depth = 16; standing_retain_depth = 16; noise = alarm; }
 
-new workspace: GoogleWorkspaceTools {
+new gmail-read: GoogleGmailRead {
   grants = [log, store, config, tools, provides];
-  store_path = "/var/lib/brenn/google-workspace-tools.db";
+  store_path = "/var/lib/brenn/google-gmail-read.db";
   tool api-request {
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/labels"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/labels/*"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/*"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/threads/*"; }
-    allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/users/me/calendarList"; }
-    allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events"; }
-    allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
-    allow { provider = "google"; user = "*"; method = "POST"; host = "www.googleapis.com"; path = "/calendar/v3/freeBusy"; }
-    allow { provider = "google"; user = "*"; method = "POST"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/drafts"; }
-    allow { provider = "google"; user = "*"; method = "POST"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/batchModify"; }
-    allow { provider = "google"; user = "*"; method = "POST"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events"; }
-    allow { provider = "google"; user = "*"; method = "PATCH"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
-    allow { provider = "google"; user = "*"; method = "DELETE"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
     rate_limit { burst = 60; sustained_per_minute = 120; }
   }
   config = {
     provider = "google",
-    gmail_host = "gmail.googleapis.com",
+    gmail_host = "gmail.googleapis.com"
+  };
+}
+
+new gmail-compose: GoogleGmailCompose {
+  grants = [log, store, config, tools, provides];
+  store_path = "/var/lib/brenn/google-gmail-compose.db";
+  tool api-request {
+    allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/*"; }
+    allow { provider = "google"; user = "*"; method = "POST"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/drafts"; }
+    rate_limit { burst = 10; sustained_per_minute = 30; }
+  }
+  config = {
+    provider = "google",
+    gmail_host = "gmail.googleapis.com"
+  };
+}
+
+new gmail-organize: GoogleGmailOrganize {
+  grants = [log, store, config, tools, provides];
+  store_path = "/var/lib/brenn/google-gmail-organize.db";
+  tool api-request {
+    allow { provider = "google"; user = "*"; method = "POST"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/batchModify"; }
+    rate_limit { burst = 10; sustained_per_minute = 30; }
+  }
+  config = {
+    provider = "google",
+    gmail_host = "gmail.googleapis.com"
+  };
+}
+
+new calendar-read: GoogleCalendarRead {
+  grants = [log, store, config, tools, provides];
+  store_path = "/var/lib/brenn/google-calendar-read.db";
+  tool api-request {
+    allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/users/me/calendarList"; }
+    allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events"; }
+    allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
+    allow { provider = "google"; user = "*"; method = "POST"; host = "www.googleapis.com"; path = "/calendar/v3/freeBusy"; }
+    rate_limit { burst = 30; sustained_per_minute = 60; }
+  }
+  config = {
+    provider = "google",
+    calendar_host = "www.googleapis.com"
+  };
+}
+
+new calendar-write: GoogleCalendarWrite {
+  grants = [log, store, config, tools, provides];
+  store_path = "/var/lib/brenn/google-calendar-write.db";
+  tool api-request {
+    allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
+    allow { provider = "google"; user = "*"; method = "POST"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events"; }
+    allow { provider = "google"; user = "*"; method = "PATCH"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
+    allow { provider = "google"; user = "*"; method = "DELETE"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
+    rate_limit { burst = 10; sustained_per_minute = 30; }
+  }
+  config = {
+    provider = "google",
     calendar_host = "www.googleapis.com"
   };
 }
 ```
 
-The assistant, granted every tool the instance provides beside its account tools
-(section 4):
+The assistant, granted every tool the five instances provide beside its
+account tools (section 4):
 
 ```
 agent PersonalAssistant {
@@ -284,71 +374,91 @@ agent PersonalAssistant {
 An `api-request` grant (section 8) may sit beside these; the tools do not
 need one.
 
-**The result inbox.** The `channel at "brenn:tool-results/workspace"` block
-sizes the inbox the instance's nested answers arrive on (the slug after the
-`/` is the instance's name). Each request the component serves has at most
-one Google call outstanding, so at most Σ `max_concurrency` answers are
+**The result inboxes.** Each `channel at "brenn:tool-results/<slug>"` block
+sizes the inbox one instance's nested answers arrive on (the slug after the
+`/` is the instance's name). Each request a component serves has at most one
+Google call outstanding, so at most Σ `max_concurrency` answers are
 outstanding at once, and an answer may be delivered twice: the window must
-hold 2 × Σ. The config check holds Σ to at most 32
-(`PROVIDER_CONCURRENCY_CEILING`), and the block sets 64, which holds that
-twice over, so tools joining this class later change nothing deployed. The
-default window of 16 is too small for a full window and would lose answers
-under load, each lost answer leaving its request to be answered `internal`
-after the 240-second ceiling. `push_depth = 1` is the inert
-channel rung, and `noise = alarm` makes a drop here an alert.
+hold 2 × Σ, `retain_depth ≥ 2 × Σ` for each class, rounded up to a power of
+two. `gmail-read`'s and `calendar-read`'s Σ is 12, so their blocks' 32 holds
+it; a tool joining either class that takes its Σ past 16 needs its block
+raised. `gmail-compose`'s and `gmail-organize`'s Σ is 2 and
+`calendar-write`'s 3, which the family default of 16 holds; their blocks
+restate 16. The family default is too small for any class whose Σ is above 8
+and would lose answers under load, each lost answer leaving its request to be
+answered `internal` after the 240-second ceiling. Every block sets
+`push_depth = 1`, the inert channel rung, and `noise = alarm`, which makes a
+drop on that inbox an alert: without a block an inbox's overflow is silent.
 
-**The clauses.** The instance holds one clause per endpoint the tools call
-— Gmail's label list, one label, the message search, one message, one
-thread, draft creation and the batch label change, and Calendar's calendar
-list, one calendar's events, one event, free/busy, and creating, changing
-and deleting one event — and nothing wider. The reads are `GET`s. Every
-other method is admitted only for a stamped call: the `POST` for free/busy,
-which changes nothing; the `POST` for `drafts`, which creates a draft in the
-user's Drafts and sends nothing; the `POST` for `messages/batchModify`,
-which adds and removes labels on the messages named; and on Calendar the
-`POST` for `calendars/*/events`, which creates an event, the `PATCH` for
-`calendars/*/events/*`, which changes one, and the `DELETE` for the same
-path, which deletes one. Each write path is exact: a clause's path matches
-only a path with the same number of segments and every literal segment
-equal, with no prefix match. So `drafts` does not admit `drafts/send`;
-`calendars/*/events/*` admits neither `…/move` nor `…/instances`, which
-have one segment more; and `calendars/*/events` does not admit
-`calendars/*/clear`, which has the same number of segments but whose
+**The clauses.** Each instance holds one clause per endpoint its own tools
+call, and nothing wider:
+
+- `gmail-read` — Gmail's label list, one label, the message search, one
+  message and one thread, all `GET`s.
+- `gmail-compose` — the `GET` of one message, for a reply's original, and the
+  `POST` for `drafts`, which creates a draft in the user's Drafts and sends
+  nothing.
+- `gmail-organize` — the `POST` for `messages/batchModify`, which adds and
+  removes labels on the messages named.
+- `calendar-read` — Calendar's calendar list, one calendar's events and one
+  event, `GET`s, and the `POST` for free/busy, which changes nothing.
+- `calendar-write` — the `GET` of one event, which `CalendarDelete` reads
+  first; the `POST` for `calendars/*/events`, which creates an event; the
+  `PATCH` for `calendars/*/events/*`, which changes one; and the `DELETE` for
+  the same path, which deletes one.
+
+Every method but `GET` is admitted only for a stamped call. Each write path is
+exact: a clause's path matches only a path with the same number of segments
+and every literal segment equal, with no prefix match. So `drafts` does not
+admit `drafts/send`; `calendars/*/events/*` admits neither `…/move` nor
+`…/instances`, which have one segment more; and `calendars/*/events` does not
+admit `calendars/*/clear`, which has the same number of segments but whose
 literal `clear` is not `events`. The `*` segments take a label, message,
 thread, calendar or event id. A clause that does not admit a call's method,
 host and path is refused before anything is sent (section 7).
 
 **Acting for the caller.** `user = "*"` admits a call for whichever user is
-calling: each call the component makes for a request is stamped with the
+calling: each call a component makes for a request is stamped with the
 user of the conversation that asked, and uses that user's credential. Nothing
-is lent and no user is named in the configuration. The consequence: the
-instance cannot read on its own account. A component calling these tools on
+is lent and no user is named in the configuration. The consequence: no
+instance can read on its own account. A component calling these tools on
 its own account, with no user behind the request, is answered `denied`, with
 the reason. This is a property of serving any caller, not a defect.
 
-**The rate limit.** The `rate_limit` is one bucket for the instance across
-every user it serves. `GmailSearch` at its largest (`max = 25`) is 27 calls —
-the search, one per message, and one for label names — so a burst of 60
-admits two such searches without stalling. `GmailRead` and `GmailThread` are
-at most three: the read, one narrower read when the first is too large, and
-label names. `GmailDraft` is one call, two for a reply (the original's
-headers, then the draft); `GmailModifyLabels` is one call whatever the
-number of messages. Each Calendar read is one call; `CalendarCreate` and
-`CalendarUpdate` are one, `CalendarDelete` two (the read, then the delete).
-Callers over the limit are
-delayed, never refused. Google's own quota, 250 units per user per second
-with a list or a get costing 5, is the real bound on a user.
+**The rate limits.** Each instance's `rate_limit` is one bucket for that
+instance across every user it serves, keyed by the instance:
 
-**`config`.** The map is flat:
+- `gmail-read` — `GmailSearch` at its largest (`max = 25`) is 27 calls — the
+  search, one per message, and one for label names — so a burst of 60 admits
+  two such searches without stalling. `GmailRead` and `GmailThread` are at
+  most three: the read, one narrower read when the first is too large, and
+  label names.
+- `gmail-compose` — `GmailDraft` is one call, two for a reply (the
+  original's headers, then the draft), so a burst of 10 admits five replies.
+- `gmail-organize` — `GmailModifyLabels` is one call whatever the number of
+  messages.
+- `calendar-read` — each Calendar read is one call, so a burst of 30 admits
+  the class's full Σ of 12 twice over.
+- `calendar-write` — `CalendarCreate` and `CalendarUpdate` are one call,
+  `CalendarDelete` two (the read, then the delete), so a burst of 10 admits
+  five deletes.
+
+Callers over a limit are delayed, never refused. The five buckets are
+independent, so the rate the operator admits across the instances is their
+sum. Google's own quota, 250 units per user per second with a list or a get
+costing 5, is the real bound on a user.
+
+**`config`.** Each instance's map is flat:
 
 - `provider` — the `oauth_provider` name.
-- `gmail_host` — the `host[:port]` Gmail is called on. It must be one of the
-  provider's `api_hosts` and admitted by the clauses.
-- `calendar_host` — the `host[:port]` Calendar is called on, under the same
-  two conditions.
+- `gmail_host` (`gmail-read`, `gmail-compose`, `gmail-organize`) — the
+  `host[:port]` Gmail is called on. It must be one of the provider's
+  `api_hosts` and admitted by the instance's clauses.
+- `calendar_host` (`calendar-read`, `calendar-write`) — the `host[:port]`
+  Calendar is called on, under the same two conditions.
 
-A missing key, an empty one, or a host containing `/` fails every activation
-with the key named.
+Each component reads only its own host key. A missing key, an empty one, or a
+host containing `/` fails every activation with the key named.
 
 **The user's connection.** Each user connects their account with the
 `gmail_readonly`, `gmail_compose`, `gmail_organize`, `calendar_readonly` and
@@ -367,9 +477,9 @@ On Gmail the tools write drafts and labels and nothing else: no send, no
 delete, no trash. Neither the scopes nor the clauses alone make that true:
 
 - **Sending.** `gmail.modify` and `gmail.compose` can send at the API level.
-  What keeps mail from being sent is the component's exact clauses: the
-  component never calls `drafts/send` or `messages/send`, and no clause in
-  the block above admits either. `gmail.send` goes in no scope set.
+  What keeps mail from being sent is the components' exact clauses: no
+  component calls `drafts/send` or `messages/send`, and no clause in the
+  blocks above admits either. `gmail.send` goes in no scope set.
 - **Trashing.** `gmail.modify` can trash at the API level, and the
   `batchModify` clause admits any body, including one that adds the `TRASH`
   or `SPAM` label — which moves mail to a folder Gmail empties after 30
@@ -461,7 +571,7 @@ change to every message named or to none. When a write's answer is lost —
 cut, refused, or an error from Google that does not say the call was
 refused — the tool is answered `internal` saying the write may have
 happened: the draft may exist (look in Drafts before asking again), or the
-labels may already be changed (asking again is safe). The component never
+labels may already be changed (asking again is safe). Neither component
 retries a write.
 
 The three Calendar writes answer what Google holds. `CalendarCreate` answers
@@ -480,7 +590,8 @@ write may have happened: the event may have been created (look for it with
 `CalendarEvents` in its window before asking again, or the user has two),
 the change may already be applied (asking again with the same arguments is
 safe), or the event may already be deleted (asking again is safe: a deleted
-event is refused as cancelled). The component never retries a write.
+event is refused as cancelled). The `calendar-write` component never retries
+a write.
 
 ## 6. Telling the assistant
 
@@ -520,10 +631,9 @@ CalendarFreeBusy, CalendarCreate, CalendarUpdate and CalendarDelete.
   with CalendarEvent first.
 - CalendarDelete deletes a recurring series only with `series: true`; ask
   the user before passing it.
-- Weather with no place is the weather where the user is, from their most
-  recent device location fix, and names the device and the fix's age. For
-  "now" in the Calendar tools, call DeviceLocation and pass its `time_zone`.
-  Tell the user a fix's age when it is `stale`.
+- For "here" or "now", call DeviceLocation first: pass its latitude and
+  longitude to Weather as `lat`/`lng`, and its `time_zone` to the Calendar
+  tools. Tell the user a fix's age when it is `stale`.
 - In CalendarEvents, `self_response` is "the answer to the invitation of the
   calendar read — `needsAction`, `declined`, `tentative` or `accepted` — when
   that calendar is an attendee: on `primary` the user's own, on another
@@ -771,7 +881,7 @@ sections 3 and 5 in place.
 
 ## 8. The raw `api-request` route
 
-For Gmail endpoints the component does not wrap, and for Calendar's colors
+For Gmail endpoints the components do not wrap, and for Calendar's colors
 and settings, the assistant can call Google itself through `api-request`.
 `docs/providers/google.md` lists the endpoints with an example call each:
 the Gmail profile, attachments, a message in another form, history, thread
@@ -779,7 +889,7 @@ listings and draft listings; Calendar's colors and settings; and Calendar's
 events in a window for a caller without a user, as the automation below is.
 For the assistant, the calendar list, events, one event and free/busy,
 creating, changing and deleting events, draft creation and label changes are
-the component's tools (section 5). Each host it names must be in the provider's `api_hosts`
+the components' tools (section 5). Each host it names must be in the provider's `api_hosts`
 (section 3) and admitted by a clause of the agent's grant.
 
 The assistant, reading only, beside its other grants:
@@ -818,7 +928,7 @@ user asked. The Calendar writes the assistant needs are `CalendarCreate`,
 `CalendarUpdate` and `CalendarDelete`; it needs no raw clause for them.
 
 A WASM automation with no conversation behind it, reading one user's calendar.
-The component's tools serve only a caller with a user of its own (section 5),
+The components' tools serve only a caller with a user of its own (section 5),
 so this is the raw route's: its clause lends it that user's credential. A
 lent credential is read-only:
 
@@ -859,12 +969,14 @@ accounts connected. Endpoints and examples are in docs/providers/google.md.
   provider until restart, and users' requests fail without asking them to
   reconnect: their credentials are fine, and reconnecting cannot work until
   the client file is fixed.
-- **Everything.** Remove the component: the `google-workspace-tools`
-  instance, its channel block, and the agents' grants of its tools. Then the
-  `oauth_provider` block, the `vault_dir` key and every grant of
+- **Everything.** Remove the five components: their `use` lines, their
+  instances and channel blocks, and the agents' grants of their tools. Then
+  the `oauth_provider` block, the `vault_dir` key and every grant of
   `api-request`, `oauth-connect`, `oauth-accounts` and `oauth-disconnect`
-  naming the provider; restart, then delete the vault directory and the
-  component's store file.
+  naming the provider; restart, then delete the vault directory and the five
+  store files (`/var/lib/brenn/google-gmail-read.db`,
+  `google-gmail-compose.db`, `google-gmail-organize.db`,
+  `google-calendar-read.db` and `google-calendar-write.db`).
 - **A stale consent.** If a connect reports that Google did not issue a
   long-lived credential, the user removes Brenn at
   `myaccount.google.com/permissions` and connects again.

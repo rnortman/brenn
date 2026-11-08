@@ -321,19 +321,19 @@ fn the_google_maps_guide_configuration_compiles() {
 
 /// The Google Workspace guide's configuration compiles as an operator pastes
 /// it — its `server` and `oauth_provider` block, its `messaging` block, the
-/// component's import, its tuning and instance block and the agent granted
-/// the component's tools — with the guide's bus cap in force, the `google`
-/// provider declared, and its tuning reaching the `workspace` result inbox
-/// at the depth and noise its prose defends.
+/// five components' imports, their tuning and instance block and the agent
+/// granted their tools — with the guide's bus cap in force, the `google`
+/// provider declared, and its tuning reaching each instance's result inbox at
+/// the depth and noise its prose defends.
 #[test]
 fn the_google_workspace_guide_configuration_compiles() {
     let config = compile_guide(
         "docs/google-workspace.md",
         &[
-            "use @google-workspace-tools::*;",
+            "use @google-gmail-read::*;",
             "oauth_provider google {",
             "messaging { max_body_bytes",
-            "new workspace: GoogleWorkspaceTools {",
+            "new gmail-read: GoogleGmailRead {",
             "tool gmail-thread {}",
         ],
     );
@@ -342,12 +342,25 @@ fn the_google_workspace_guide_configuration_compiles() {
         config.oauth_providers.contains_key("google"),
         "the guide declares no oauth_provider `google`"
     );
-    let inbox = guide_result_inbox(&config, "workspace");
-    assert_eq!(
-        inbox.retain_depth,
-        crate::messaging::config::Depth::Bounded(64)
-    );
-    assert_eq!(inbox.noise, crate::messaging::config::NoiseLevel::Alarm);
+    for (instance, depth) in [
+        ("gmail-read", 32),
+        ("gmail-compose", 16),
+        ("gmail-organize", 16),
+        ("calendar-read", 32),
+        ("calendar-write", 16),
+    ] {
+        let inbox = guide_result_inbox(&config, instance);
+        assert_eq!(
+            inbox.retain_depth,
+            crate::messaging::config::Depth::Bounded(depth),
+            "{instance}'s result inbox"
+        );
+        assert_eq!(
+            inbox.noise,
+            crate::messaging::config::NoiseLevel::Alarm,
+            "{instance}'s result inbox"
+        );
+    }
 }
 
 /// The configuration a guide teaches, compiled as an operator pastes it.

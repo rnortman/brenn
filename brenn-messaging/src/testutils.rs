@@ -55,8 +55,15 @@ fn registrations_for(
 /// channel-carrying builders below. Wakes through the no-op router: wake routing
 /// belongs to a composition root above.
 pub fn empty_directory_messenger(origin: &str) -> Arc<Messenger> {
+    empty_directory_messenger_over(db::init_db_memory(), origin)
+}
+
+/// [`empty_directory_messenger`] over a caller's `db`, which must carry the
+/// messaging tables: for a test that also reads or writes that database
+/// directly.
+pub fn empty_directory_messenger_over(db: Db, origin: &str) -> Arc<Messenger> {
     Messenger::new(
-        db::init_db_memory(),
+        db,
         Arc::new(MessagingDirectory::with_entries(vec![])),
         Arc::from(origin),
         Arc::new(IndexMap::new()),
@@ -373,12 +380,34 @@ pub async fn insert_bus_message_at(
     envelope_type: ChannelScheme,
     ts_ns: i64,
 ) -> Uuid {
+    insert_bus_message_from(
+        messenger,
+        channel,
+        "test-sender",
+        body,
+        envelope_type,
+        ts_ns,
+    )
+    .await
+}
+
+/// [`insert_bus_message_at`] with the envelope's `sender` chosen by the caller:
+/// for a test that needs a message from a particular participant, bypassing the
+/// publish gates that would admit or refuse it.
+pub async fn insert_bus_message_from(
+    messenger: &Messenger,
+    channel: &ChannelEntry,
+    sender: &str,
+    body: &str,
+    envelope_type: ChannelScheme,
+    ts_ns: i64,
+) -> Uuid {
     let conn = messenger.db().lock().await;
     insert_message(
         &conn,
         channel.uuid,
         "test",
-        "test-sender",
+        sender,
         body,
         Urgency::Normal,
         envelope_type,

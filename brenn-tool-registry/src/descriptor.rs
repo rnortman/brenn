@@ -96,16 +96,10 @@ pub enum Idempotency {
 pub enum UserBinding {
     /// The tool does not act as a user (e.g. `git-repo-pull`).
     None,
-    /// The tool acts as the acting user and manages that user's own
-    /// standing — connects, lists or disconnects their accounts. Only the
-    /// user's own app may hold the grant: a request a component serves is
-    /// not where a user's consent is given or withdrawn.
+    /// The tool acts with the acting user's identity or credentials and
+    /// requires `ToolCtx::acting_user` to be `Some`: only a conversation caller
+    /// may hold the grant.
     ActingUser,
-    /// The tool acts as the acting user, and a component that provides a
-    /// tool may hold the grant too: its nested call for a request it serves
-    /// carries that request's user, stamped by the executor. A call that
-    /// carries none is refused by the tool.
-    ActingOrServedUser,
     /// As `ActingUser`, but a caller with no acting user is also admitted; the
     /// tool then derives a lent user from the caller's own grant.
     ActingOrLentUser,

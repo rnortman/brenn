@@ -109,7 +109,8 @@ its own coordinated event with its own design, and nothing has been decided.
 **Build-time contracts are hard-cut, at the pin.** These are consumed against a
 commit the consumer names in its own `git_override`: the macros in
 `bazel/wasm/defs.bzl` and `bazel/surface/dist.bzl`, `brenn-guest`'s Rust API,
-the scaffold's generated module shape, `surface/page-harness`, `dsl_cli`'s
+`brenn-provider-kit`'s Rust API, and `brenn-provider-kit-guest`'s, the
+scaffold's generated module shape, `surface/page-harness`, `dsl_cli`'s
 subcommands, and the guest alias sets. A cut costs the consumer a migration
 when it next bumps that pin, and nothing before, because nothing that is
 already deployed reads them. `examples/component/` is the canary that a cut is
@@ -131,10 +132,27 @@ together and are hash-bound, so this is a rebuild per kind at the next pin bump,
 never a deployment skew. A `dom`-granted kind that never calls `listen` is
 untouched.
 
+Another cut of this kind in force now, in the provider kit: **the activation
+loop moved into `brenn-provider-kit`, served through
+`brenn-provider-kit-guest::serve`.** A provider that ran its own loop over the
+kit's rows implements `brenn_provider_kit::Logic` (its `plan` and `advance`)
+and calls `serve` from `receive`. `read_api_result`, `Unreadable::render` and
+`Unreadable::failure` take the API's display name (and `render` the caller's
+size note, where it took a Gmail size estimate); `google_error_detail` and the
+`GOOGLE_*` bounds moved to `brenn_provider_kit::google` as `error_detail`,
+`MESSAGE_MAX_BYTES` and `STATUS_MAX_BYTES`, beside `API_NAME`. The `InFlight`
+row gained `received_at_ms`, so a row written by a build before the cut does
+not parse after it. A row of either kind that a later cut leaves unparsable
+expires on its age alone: an in-flight row at `INFLIGHT_TTL_MS` after issue, a
+backlog entry `BACKLOG_MAX_WAIT_MS` after its request arrived, answered
+`internal` then; until then each activation that reads it fails.
+
 Freezing the macro vocabulary of a one-operator ecosystem buys nothing a pin
 does not already buy, which is why the two are split rather than held to one
-promise. There is no changelog file: the git history of the files named above
-is the record.
+promise. `CHANGELOG.md` announces a cut to component authors in an entry
+headed **BREAKING for component authors:**; additive changes for authors sit
+in an entry's "For WASM component authors" sentence. The git history of the
+files named above is the record of what cut when.
 
 The out-of-tree population that these rules exist for is not hypothetical any
 more — `brenn-component-demo` is a repository outside this one that builds
@@ -373,6 +391,42 @@ and does not list serde in its own `Cargo.toml` at all. Those two aliases are
 the whole set — the external crates that appear in brenn-guest's API. Every
 other third-party crate a component wants comes from the consumer's own hub;
 its types never cross the boundary.
+
+### A tool provider on the kit
+
+A component that serves `provide`d tools by nested `api-request` calls can
+take its activation loop from brenn's provider kit. It lists, beside the three
+guest labels above,
+
+```
+"@brenn//brenn-provider-kit:brenn-provider-kit_guest",
+"@brenn//brenn-wasm/components/provider-kit-guest:brenn-provider-kit-guest",
+```
+
+and names neither in its own `Cargo.toml`. The kit's serde is the guest
+instance, so its `Value`s are the ones `brenn-guest` hands over.
+`brenn-provider-kit` names no guest SDK: it holds the loop (behind a `Host`
+trait), the rows a request keeps, the backlog, the call and answer types, and
+the argument and settings readers, and its loop issues at most `CALL_BUDGET`
+nested calls per activation, queueing the rest for later activations.
+`brenn-provider-kit-guest` is the SDK glue: one `serve::<L: Logic>(&activation,
+&settings)` per activation, where `L` is the component's `plan` and `advance`.
+
+`:brenn-provider-kit_guest` carries no platform constraint, so the consumer's
+host `logic_test` links it the way `profile-switcher`'s `report_test` links the
+guest `serde` on the host; `:brenn-provider-kit-guest` is wasm32-only, like
+`brenn-guest`. The `testutils` feature — on by default through
+`@brenn//bazel/features:testutils`, cleared by
+`--@brenn//bazel/features:testutils=False` — carries the schema parity checker
+(`schema`), the step fixtures and the in-memory `MemoryHost` (`testutil`). The
+select resolves against `@brenn` from a consumer's build, which is the
+situation `@brenn//brenn-envelope` is already in; this has not been proven by
+an out-of-tree build, and a logic test that fails to compile naming `schema`
+or `testutil` is that flag. `@brenn//brenn-provider-kit:brenn-provider-kit`
+(against the host hub's serde) is the crate's own test build and not the
+contract. The labels are the crates' own targets, as
+`@brenn//brenn-envelope:brenn-envelope_wasm` is for `profile-switcher`; the
+guest alias set is for third-party crates only.
 
 ### The gate set
 

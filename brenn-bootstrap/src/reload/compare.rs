@@ -27,9 +27,11 @@
 //!   sets `spawn_changed`, and the agent's live sessions are retired at their
 //!   next idle moment so their successors are spawned from the new map.
 //!
-//! One part of a convergible block is not: the tools a consumer provides join
+//! Two parts of convergible blocks are not. The tools a consumer provides join
 //! the tool registry, which is built once per process, so a change to them is
-//! refused per consumer.
+//! refused per consumer. The `channels` blocks that tune the
+//! `brenn:device-location.` family size channels that registration mints from
+//! the process's boot-time tuning table, so a change to one is refused.
 //!
 //! What is left is boot-shaped: folded into another subsystem's tables or side
 //! effects, so converging it means converging that subsystem. Those fields are
@@ -45,7 +47,10 @@
 use std::collections::BTreeMap;
 
 use brenn_lib::config::{AppConfigRaw, BrennConfig, sort_order_dead_collections};
-use brenn_lib::messaging::config::{ProvidedToolDecl, WasmConsumerConfigRaw};
+use brenn_lib::messaging::config::{
+    ChannelConfigRaw, ProvidedToolDecl, SystemChannelFamily, WasmConsumerConfigRaw,
+};
+use brenn_lib::messaging::{canonicalize_channel_address, device_location_address};
 
 use super::NEEDS_RESTART;
 
@@ -228,10 +233,59 @@ pub(crate) fn non_convergible_differences(
     plain("wasm", wasm, b_wasm, &mut out);
     plain("watchdog", watchdog, b_watchdog, &mut out);
     provided_tools(wasm_consumers, b_wasm_consumers, &mut out);
+    device_location_tuning(&a.channels, &b.channels, &mut out);
     LevelOne {
         refusals: out,
         app_diffs,
     }
+}
+
+/// The `[[channel]]` blocks that tune the location family, keyed by what they
+/// name and sorted by it: which block sizes which channel is a key lookup, so
+/// their order carries nothing.
+fn device_location_tuning_blocks(
+    channels: &[ChannelConfigRaw],
+) -> Vec<(String, &ChannelConfigRaw)> {
+    let mut blocks: Vec<(String, &ChannelConfigRaw)> = channels
+        .iter()
+        .filter_map(|ch| {
+            let key = match (ch.address.as_deref(), ch.address_prefix.as_deref()) {
+                (Some(address), None) => {
+                    let canonical = canonicalize_channel_address(address);
+                    (SystemChannelFamily::of(&canonical)
+                        == Some(SystemChannelFamily::DeviceLocation))
+                    .then_some(canonical)?
+                }
+                (None, Some(prefix)) => {
+                    let canonical = canonicalize_channel_address(prefix);
+                    (SystemChannelFamily::of_prefix(&canonical)
+                        == Some(SystemChannelFamily::DeviceLocation))
+                    .then(|| format!("prefix {canonical}"))?
+                }
+                _ => return None,
+            };
+            Some((key, ch))
+        })
+        .collect();
+    blocks.sort_by(|x, y| x.0.cmp(&y.0));
+    blocks
+}
+
+/// The location family's tuning is the process's: the messenger's tuning table
+/// is installed once, and a channel provisioned at registration mints from it.
+/// A reload that retuned the family would leave the channels it re-plans and
+/// the ones registration mints at different depths, so any change to a block
+/// that tunes the family is a refusal; every other `channels` block converges.
+fn device_location_tuning(a: &[ChannelConfigRaw], b: &[ChannelConfigRaw], out: &mut Vec<String>) {
+    let blocks_a = device_location_tuning_blocks(a);
+    let blocks_b = device_location_tuning_blocks(b);
+    keyed_vec(
+        &format!("channel tuning for {}", device_location_address("")),
+        &blocks_a,
+        &blocks_b,
+        |(key, _)| key,
+        out,
+    );
 }
 
 /// A whole section that is not a keyed collection: named, not diffed.
@@ -1292,5 +1346,85 @@ mod tests {
             refusals(&provider("/keys/one"), &base()),
             vec!["api_key_providers[maps] removed: this change needs a restart".to_string()],
         );
+    }
+
+    /// A tuning block for the location family, keyed by `address` or, when
+    /// `prefix` is set, by `address_prefix`.
+    fn location_tuning(key: &str, prefix: bool, retain: u64) -> ChannelConfigRaw {
+        ChannelConfigRaw {
+            address: (!prefix).then(|| key.to_string()),
+            address_prefix: prefix.then(|| key.to_string()),
+            push_depth: Some(Depth::Bounded(1)),
+            retain_depth: Some(Depth::Bounded(retain)),
+            standing_retain_depth: Some(Depth::Bounded(retain)),
+            ..ChannelConfigRaw::minimal("unused")
+        }
+    }
+
+    /// `base()` carrying `channels`.
+    fn with_channels(channels: Vec<ChannelConfigRaw>) -> BrennConfig {
+        BrennConfig { channels, ..base() }
+    }
+
+    const FAMILY: &str = "brenn:device-location.";
+    const ALICE: &str = "brenn:device-location.alice";
+
+    /// Adding, removing or retuning a block that sizes the family — by prefix
+    /// or for one user — is a restart.
+    #[test]
+    fn a_change_to_the_location_familys_tuning_is_refused() {
+        let prefix = location_tuning(FAMILY, true, 100);
+        let alice = location_tuning(ALICE, false, 50);
+        let cases = [
+            (
+                vec![],
+                vec![prefix.clone()],
+                "[prefix brenn:device-location.] added",
+            ),
+            (
+                vec![prefix.clone()],
+                vec![],
+                "[prefix brenn:device-location.] removed",
+            ),
+            (
+                vec![prefix.clone()],
+                vec![location_tuning(FAMILY, true, 200)],
+                "[prefix brenn:device-location.] differs",
+            ),
+            (
+                vec![],
+                vec![alice.clone()],
+                "[brenn:device-location.alice] added",
+            ),
+            (
+                vec![alice.clone()],
+                vec![location_tuning(ALICE, false, 60)],
+                "[brenn:device-location.alice] differs",
+            ),
+        ];
+        for (before, after, expected) in cases {
+            let refused = refusals(&with_channels(before), &with_channels(after));
+            assert_eq!(
+                refused,
+                vec![format!(
+                    "channel tuning for brenn:device-location.{expected}: {NEEDS_RESTART}"
+                )]
+            );
+        }
+    }
+
+    /// The family's blocks are a keyed set: reordering them, or changing a
+    /// `channels` block outside the family, is not a refusal.
+    #[test]
+    fn other_channel_blocks_and_order_still_converge() {
+        let prefix = location_tuning(FAMILY, true, 100);
+        let alice = location_tuning(ALICE, false, 50);
+        let mut alerts = ChannelConfigRaw::minimal("brenn:alerts");
+        alerts.retain_depth = Some(Depth::Bounded(4));
+        let mut alerts_retuned = alerts.clone();
+        alerts_retuned.retain_depth = Some(Depth::Bounded(8));
+        let baseline = with_channels(vec![prefix.clone(), alice.clone(), alerts]);
+        let candidate = with_channels(vec![alerts_retuned, alice, prefix]);
+        assert!(refusals(&baseline, &candidate).is_empty());
     }
 }

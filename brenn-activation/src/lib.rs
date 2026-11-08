@@ -341,6 +341,12 @@ pub mod sync;
 /// A configured depth above this is **refused** where it resolves — never
 /// capped. A silently capped depth is a component served a window it did not
 /// ask for, with nothing anywhere saying so.
+///
+/// The ceiling is a count; no bound on a window's bytes exists, so a full
+/// window of maximal messages can outgrow guest memory and trap the
+/// activation.
+// TODO(wasm-window-byte-cap): decide whether a window whose worst-case bytes
+// exceed guest memory is refused where depths resolve.
 pub const WINDOW_DEPTH_CEILING: u64 = 1_000;
 
 /// One activation: every bound input port of one instance, windowed.

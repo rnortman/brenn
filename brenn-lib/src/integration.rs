@@ -82,6 +82,8 @@ pub enum CliAccess {
     /// from a script.
     ConversationBound,
     /// Not auto-approved on the hook path; a command has no approval leg.
+    // TODO(brenn-tool-requires-approval-dead-gate): whether this refusal
+    // protects anything when Claude Code runs in auto permission mode.
     RequiresApproval,
 }
 

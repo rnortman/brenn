@@ -12,6 +12,9 @@ const PERMISSION_DENIED = 1;
 const POSITION_UNAVAILABLE = 2;
 const TIMEOUT = 3;
 
+/** The zone the test environment's browser reports, which every fix carries. */
+const ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
 type Outcome = { coords: { latitude: number; longitude: number; accuracy: number } } | { code: number };
 
 /** A fake Geolocation whose calls are recorded and answered from `outcome`. */
@@ -93,7 +96,10 @@ afterEach(() => {
 describe("requestFix", () => {
   it("returns the coordinates and accuracy, with the reporter's options", async () => {
     const result = await requestFix(1234);
-    expect(result).toEqual({ ok: true, fix: { latitude: 51.5, longitude: -0.25, accuracy_m: 35 } });
+    expect(result).toEqual({
+      ok: true,
+      fix: { latitude: 51.5, longitude: -0.25, accuracy_m: 35, time_zone: ZONE },
+    });
     expect(geo.calls).toEqual([{ enableHighAccuracy: false, maximumAge: 1234, timeout: FIX_TIMEOUT_MS }]);
   });
 
@@ -186,7 +192,7 @@ describe("LocationReporter", () => {
 
     geo.outcome = { coords: { latitude: 1, longitude: 2, accuracy: 3 } };
     await vi.advanceTimersByTimeAsync(REPORT_INTERVAL_MS);
-    expect(sent).toEqual([{ latitude: 1, longitude: 2, accuracy_m: 3 }]);
+    expect(sent).toEqual([{ latitude: 1, longitude: 2, accuracy_m: 3, time_zone: ZONE }]);
     r.stop();
   });
 

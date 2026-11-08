@@ -41,10 +41,10 @@ pub fn input_schema(spec: &str, name: &str) -> Value {
 /// is left: the schema refuses a value that is only U+FEFF which the parser
 /// admits, the one difference left, and it never promises what the parser
 /// refuses.
-pub const NON_BLANK: &str = r"[^\s\u0085]";
+pub(crate) const NON_BLANK: &str = r"[^\s\u0085]";
 
 /// The `pattern` of an ASCII token id of 1 to `max_chars` characters.
-pub fn token_pattern(max_chars: usize) -> String {
+pub(crate) fn token_pattern(max_chars: usize) -> String {
     format!("^[A-Za-z0-9_-]{{1,{max_chars}}}$")
 }
 

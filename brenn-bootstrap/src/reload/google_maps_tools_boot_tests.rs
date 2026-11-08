@@ -4,7 +4,6 @@
 //! The document declares the component's class as its packaged specification
 //! states it, word for word, installed with the component's own artifact; one
 //! instance of it with the key provider, the `api-request` clauses, the
-//! `device-location` grant that answers `Weather` with no location, the
 //! `config` map and the result-inbox tuning block an operator writes; and a
 //! containerized agent granted every tool the class provides. The registry is
 //! built over the document's key providers as `run_server` builds it.
@@ -43,9 +42,14 @@ fn spec() -> String {
 }
 
 /// The operator's document: the class, the key provider, the tuning block,
-/// one instance with its nine clauses, its `device-location` grant and
-/// `config`, and an agent granted every tool.
-fn document(home: &std::path::Path, key_file: &std::path::Path, store: &std::path::Path) -> String {
+/// one instance with its nine clauses, `extra` and `config`, and an agent
+/// granted every tool.
+fn document(
+    home: &std::path::Path,
+    key_file: &std::path::Path,
+    store: &std::path::Path,
+    extra: &str,
+) -> String {
     let grants: String = TOOLS
         .iter()
         .map(|(name, _)| format!("    tool {name} {{}}\n"))
@@ -90,8 +94,7 @@ new {MAPS}: GoogleMapsTools {{
         allow {{ provider = "google-maps"; method = "POST"; host = "routes.googleapis.com";  path = "/directions/v2:computeRoutes"; }}
         rate_limit {{ burst = 20; sustained_per_minute = 60; }}
     }}
-    tool device-location {{}}
-    config = {{
+{extra}    config = {{
         provider = "google-maps",
         weather_host = "weather.googleapis.com",
         geocoding_host = "geocode.googleapis.com",
@@ -116,13 +119,10 @@ new {ASSISTANT}: Assistant();
     ))
 }
 
-/// The packaged class boots over the document's key providers: each tool is a
-/// provided tool in the registry and on the agent's written list, the request
-/// inbox is as deep as the class's summed concurrency, and the result inbox
-/// takes the tuning block's depth. The instance's `device-location` grant
-/// validates: the component provides tools.
-#[tokio::test(flavor = "multi_thread")]
-async fn google_maps_tools_boots_into_an_agents_tool_list() {
+/// Boot the packaged class with `extra` in the instance, over the document's
+/// key providers plus `device-location`, asserting what
+/// [`assert_provider_class_boots`] asserts.
+async fn boot(extra: &str) {
     let home = tempfile::tempdir().expect("a container home");
     let host = tempfile::tempdir().expect("a host directory");
     let key_file = host.path().join("maps-api-key");
@@ -130,7 +130,7 @@ async fn google_maps_tools_boots_into_an_agents_tool_list() {
     std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))
         .expect("the key file is private");
     let store = host.path().join("google-maps-tools.db");
-    let tree = Tree::holding(&document(home.path(), &key_file, &store));
+    let tree = Tree::holding(&document(home.path(), &key_file, &store, extra));
 
     assert_provider_class_boots(
         ProviderClassBoot {
@@ -146,11 +146,34 @@ async fn google_maps_tools_boots_into_an_agents_tool_list() {
                 None,
                 brenn_lib::config::resolve_api_key_providers(config),
             );
-            native.extend(brenn_device_location::registered(brenn_db::into_db(
-                brenn_db::open_connection_memory(),
-            )));
+            native.extend(
+                brenn_device_location::registered(brenn_db::into_db(
+                    brenn_db::open_connection_memory(),
+                ))
+                .0,
+            );
             native
         },
     )
     .await;
+}
+
+/// The packaged class boots over the document's key providers: each tool is a
+/// provided tool in the registry and on the agent's written list, the request
+/// inbox is as deep as the class's summed concurrency, and the result inbox
+/// takes the tuning block's depth.
+#[tokio::test(flavor = "multi_thread")]
+async fn google_maps_tools_boots_into_an_agents_tool_list() {
+    boot("").await;
+}
+
+/// A component's calls carry no acting user, so boot refuses the instance a
+/// `device-location` grant though the component provides tools.
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(
+    expected = "tool_grant for \"device-location\" is refused: the tool acts as the acting user \
+                and a wasm consumer's calls carry none"
+)]
+async fn the_instance_is_refused_the_device_location_grant() {
+    boot("    tool device-location {}\n").await;
 }

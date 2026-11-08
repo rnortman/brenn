@@ -1,0 +1,18 @@
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "wasm_guest_library")
+
+policy_srcs()
+
+# brenn-provider-kit's loop served through the guest SDK. wasm32-only, like
+# brenn-guest; the loop itself is the kit's and is tested on the host there.
+# A provider component names this beside `//brenn-provider-kit:brenn-provider-kit_guest`.
+wasm_guest_library(
+    name = "brenn-provider-kit-guest",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-provider-kit:brenn-provider-kit_guest",
+        "//brenn-wasm/components/guest:brenn-guest",
+    ],
+)

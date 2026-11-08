@@ -463,9 +463,7 @@ reload:
 - Any of the four on an app with no `container`, because a bare agent runs as
   Brenn's user and could read the vault.
 - `oauth-connect`, `oauth-accounts` or `oauth-disconnect` on a WASM component.
-  A component that provides a tool does serve calls that carry a user, but
-  these tools connect, list and remove that user's accounts, and only the
-  user's own app may hold them.
+  A component has no user to act for.
 
 A conversation's calls always use its owner's credentials. A component's
 `api-request` call has no owner, so it uses a *lent* credential. Every one of
@@ -482,9 +480,7 @@ admits; no user is lent. `allow { provider = "google"; user = "*"; method =
 "POST"; … }` on a provider's grant admits it for whichever user is calling. A
 request from a component calling on its own account carries no user. A nested
 call made for it is a lent call like the component's own calls: read-only, and
-under the lent-user rule above. The same stamp is what admits a provider's
-nested `device-location` call (*The device-location tool*): it reads the
-calling user's devices, and with no user stamped it is refused.
+under the lent-user rule above.
 
 A `user = "*"` clause leaves no single user to lend, so on an instance holding
 one, every call to that provider that carries no user is refused, reads
@@ -546,10 +542,7 @@ agent PersonalAssistant {
 
 It acts as a Brenn user, so it is refused at boot and on reload, as the
 OAuth tools are, on a `multiuser` app, on an app with no `container`, and on
-a WASM component that provides no tool. A component that provides a tool may
-hold it: the grant admits only a nested call made for a request whose caller
-had a user, and reads that user's devices; any other call to the tool is
-answered `denied`.
+a WASM component.
 
 Granting it to an app also shows that app's users the "Share location from
 this device" item in the PWA's user menu; without the grant the item does
@@ -560,6 +553,67 @@ item shows the same state in both. Removing the grant from an app stops that
 app's reporting; it does not end the pair's sharing. The user ends it with
 "Stop sharing location from this device" in any app that holds the grant, and
 an app whose grant is restored resumes reporting on its next connect.
+
+The positions live on the bus, not in a table: every report goes to the
+user's durable channel `brenn:device-location.<username>`, which Brenn mints
+for every registered user and writes as `system:device-location`. The tool
+reads the newest fix per device from that channel's window. The message
+shape, the sharing rule and the default window (2000 messages, about a week
+of one device reporting every five minutes) are in `docs/message-bus.md`
+§2.7. The operator sizes the window for every user with a tuning block, or
+for one user with an exact one:
+
+```
+channel at prefix "brenn:device-location." {
+  push_depth = 1;
+  retain_depth = 4000;
+  standing_retain_depth = 4000;
+}
+channel at "brenn:device-location.alice" {
+  push_depth = 1;
+  retain_depth = 500;
+  standing_retain_depth = 500;
+}
+```
+
+Every tool call, every reported fix, every share or stop and every connect
+of an app holding the location grant reads the user's window up to
+`standing_retain_depth`, holding the database lock while it does. A larger
+window therefore costs more on each of them, not only in storage, and an
+`unbounded` window scans the user's whole history every time. Retuning the family is restart-only: a reload whose
+document changes one of these blocks is refused with `NEEDS_RESTART`.
+
+The window also holds each device's sharing state, shared by all of the
+user's devices: a device whose last fix is pushed out by the user's other
+devices' reports stops sharing at its next report, with no error shown. Size
+it to hold every other device's reports between two of one device's; a
+window of 1 keeps only the most recent reporter sharing. A block may not set
+`send_rate` on the family: the rate is the host's, because a device's stop
+shares the bucket with the user's fixes (`docs/message-bus.md` §2.7).
+
+A location automation is a component created for one user and granted that
+user's channel exactly. A top-level consumer binds the channel as an `in`
+port:
+
+```
+new alice_fixes: AliceLocationAutomation {
+  grants = [ports];
+  in fixes <- "brenn:device-location.alice" { push_depth = 1; retain_depth = 16; }
+}
+```
+
+The binding must state its own `retain_depth`: without one it inherits the
+channel's 2000, above the consumer window ceiling of 1000, and is refused at
+boot. Only a top-level component binds a family address, and only as an `in`
+port; an `out` or `io` binding, and a binding on an agent, a surface, a
+remote or an instance a surface places, are refused at compile time. The
+channel exists for every registered user, so a port naming a username that
+is not registered refuses to boot; the offline config check cannot know the
+users and notes each name it assumed. An agent reaches the channel with
+`MessageSubscribe` under `acl subscribe [exact "brenn:device-location.alice"]`,
+not with a static `subscribe`, which resolves against declared channels only.
+A `prefix "brenn:device-location."` matcher reaches every user's positions;
+grant one user's address exactly instead.
 
 The request path is checked after each segment is percent-decoded once. A
 decoded segment that is empty (including from a trailing `/`), that is `.` or
@@ -805,7 +859,9 @@ channel at prefix "mqtt:broker:alice/" { push_depth = 4; retain_depth = 16; }
 The first **declares** a channel and binds a handle to it: `bar_layout` is now a
 name other statements can reach. The second is a **tuning** — no handle, a
 matcher over a system-minted family, possibly a prefix — which says something
-about channels the system creates rather than creating one. A handle and a
+about channels the system creates rather than creating one. The tunable
+families are `webhook:`, `mqtt:`, `brenn:tools/`, `brenn:tool-results/` and
+`brenn:device-location.` (`docs/message-bus.md` §2.7). A handle and a
 literal address are disjoint spellings: a channel that is declared is referred
 to by its handle, never by re-spelling its address.
 
@@ -1063,14 +1119,34 @@ component GmailTools {
   JSON text lives in a `.brenn` file.
 - `max_concurrency` (default `1`) is the most calls of this tool outstanding at
   once. It is a count of at least one that fits a `u32`, and **the class's sum
-  over its `provide` statements is at most 32** (`PROVIDER_CONCURRENCY_CEILING`).
-  The ceiling comes from what one activation can do: a provider can be handed
-  its whole request window as new requests in one activation and serves each
-  with one nested call, so the window must fit in half an activation's
-  tool-call budget, leaving the other half for whatever else that activation
-  calls. Above it the class is refused: "`{Class}` declares Σ max_concurrency =
-  {sum} across its provide statements; a provider may hold at most 32 requests
-  in flight (`PROVIDER_CONCURRENCY_CEILING`): …".
+  Σ over its `provide` statements is at most 1000**
+  (`PROVIDER_CONCURRENCY_CEILING`). The instance's request inbox is a window Σ
+  deep, and a WASM input window holds at most 1000 messages
+  (`WINDOW_DEPTH_CEILING`), so the ceiling is that number. A provider built on
+  `brenn-provider-kit` serves a window of any depth across activations,
+  issuing at most 32 nested calls in one and queueing the rest. Above the
+  ceiling the class is refused: "`{Class}` declares Σ max_concurrency = {sum}
+  across its provide statements; a provider may hold at most 1000 requests in
+  flight (`PROVIDER_CONCURRENCY_CEILING`): …".
+
+  A kit-built provider's `tool-results` inbox is sized `retain_depth ≥ 2 × Σ`
+  (each live request has at most one nested call outstanding, and an answer
+  may arrive twice). That inbox is a WASM input window too, so it is at most
+  1000 deep: the rule holds for Σ up to 500. For Σ from 501 to 1000, a
+  1000-deep inbox still holds one answer for every outstanding call, but not
+  the second copy, and a burst can push an answer out unseen; its request is
+  then answered `internal` at the host's 240-second deadline, and an inbox
+  set `noise = alarm`, as the guides set theirs, reports the drop.
+
+  The ceiling is a count; what a full window weighs is the operator's to
+  size, as for every input window. A request's args are up to 64 KiB
+  (`MAX_ARGS_BYTES`), so the request window holds up to Σ × 64 KiB — 64 MiB at
+  Σ = 1000 — and the `tool-results` inbox up to `retain_depth` ×
+  `[messaging] max_body_bytes`, both before the guest parses them, against a
+  guest memory of 16 MiB (`PROCESSOR_MAX_MEMORY_BYTES`). An activation handed
+  more than the guest can hold traps; the host fails that activation's new
+  requests and alerts, every time the window fills. Nothing at load refuses
+  such a window.
 - `auto_approve` (default `true`) is whether a call skips the approval prompt.
 - A `provide` statement takes no sub-blocks. Two statements in one class may not
   name the same tool, nor the same `mcp_name`.
@@ -1154,7 +1230,8 @@ new p1: Protobar {
 A binding names a port, an arrow, and a channel: `in port <- chan`,
 `out port -> chan`, `io port <-> chan`. The channel is a handle where a
 declaration exists and a literal address where none does (`local:` planes,
-system-minted `webhook:`/`mqtt:` channels). The trailing block tunes *this
+system-minted `webhook:`/`mqtt:` channels, a user's
+`brenn:device-location.<username>` channel). The trailing block tunes *this
 subscription* — `push_depth` is what wakes this instance, `retain_depth` what it
 can see — and both are held at or under the channel's ceiling: its
 `standing_retain_depth` on a durable channel, its `retain_depth` on every other
@@ -1339,10 +1416,9 @@ a reserved input port named `tool-requests`:
 
 A provider answers each request through the `provides` interface and may act
 for the calling user only on a request it is serving; its instance names no
-inbox and no user. A nested call (`api-request`, `device-location`) made for a
-request it serves is the calling user's call when that request's caller had a
-user (see *The OAuth tools* and *The device-location tool*, which give the
-rule and its limits). What the host guarantees about a
+inbox and no user. A nested `api-request` made for a request it serves is the
+calling user's call when that request's caller had a user (see *The OAuth
+tools*, which gives the rule and its limits). What the host guarantees about a
 provider, and the limits beside it, are in `docs/security-posture.md` §8.4.
 
 A `tool` statement naming a provided tool is admitted as an `api-request`
@@ -2290,7 +2366,8 @@ What converges is components, surfaces and their wiring:
   **retune** a channel a dynamic subscription sits on, folded or dormant, and
   when it would **remove** one the subscription is still folded into, or one
   carrying a *dormant* subscription on a **system-minted** address — `mqtt:`,
-  `webhook:`, `brenn:tools/…` or `brenn:tool-results/…`, the addresses a fresh
+  `webhook:`, `brenn:tools/…`, `brenn:tool-results/…` or
+  `brenn:device-location.…`, the addresses a fresh
   boot rebuilds from their stored rows without any `[[channel]]` block: the
   subscription is in no document, so nothing can re-derive it against the entry
   the reload would put there instead. Those pairings need a restart. Removing an

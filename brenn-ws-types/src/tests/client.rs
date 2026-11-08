@@ -246,17 +246,18 @@ fn push_unsubscribe_deserializes_frontend_wire_shape() {
 fn device_location_share_deserializes_frontend_wire_shape() {
     // SYNC: frontend send site app.ts `_handleEnableLocation`
     // `ws.send({ type: "DeviceLocationShare", ...fix })`.
-    let json =
-        r#"{"type":"DeviceLocationShare","latitude":51.5,"longitude":-0.25,"accuracy_m":35}"#;
+    let json = r#"{"type":"DeviceLocationShare","latitude":51.5,"longitude":-0.25,"accuracy_m":35,"time_zone":"Europe/London"}"#;
     match serde_json::from_str::<WsClientMessage>(json).unwrap() {
         WsClientMessage::DeviceLocationShare {
             latitude,
             longitude,
             accuracy_m,
+            time_zone,
         } => {
             assert_eq!(latitude, 51.5);
             assert_eq!(longitude, -0.25);
             assert_eq!(accuracy_m, 35.0);
+            assert_eq!(time_zone, "Europe/London");
         }
         _ => panic!("wrong variant"),
     }
@@ -266,17 +267,18 @@ fn device_location_share_deserializes_frontend_wire_shape() {
 fn device_location_fix_deserializes_frontend_wire_shape() {
     // SYNC: frontend send site app.ts LocationReporter `send`
     // `ws.send({ type: "DeviceLocationFix", ...fix })`.
-    let json =
-        r#"{"type":"DeviceLocationFix","latitude":-33.875,"longitude":151.25,"accuracy_m":12.5}"#;
+    let json = r#"{"type":"DeviceLocationFix","latitude":-33.875,"longitude":151.25,"accuracy_m":12.5,"time_zone":"Australia/Sydney"}"#;
     match serde_json::from_str::<WsClientMessage>(json).unwrap() {
         WsClientMessage::DeviceLocationFix {
             latitude,
             longitude,
             accuracy_m,
+            time_zone,
         } => {
             assert_eq!(latitude, -33.875);
             assert_eq!(longitude, 151.25);
             assert_eq!(accuracy_m, 12.5);
+            assert_eq!(time_zone, "Australia/Sydney");
         }
         _ => panic!("wrong variant"),
     }
@@ -294,7 +296,13 @@ fn device_location_clear_deserializes_frontend_wire_shape() {
 
 #[test]
 fn device_location_fix_refuses_non_numeric_coordinate() {
-    let json = r#"{"type":"DeviceLocationFix","latitude":"51.5","longitude":0,"accuracy_m":1}"#;
+    let json = r#"{"type":"DeviceLocationFix","latitude":"51.5","longitude":0,"accuracy_m":1,"time_zone":"UTC"}"#;
+    assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
+}
+
+#[test]
+fn device_location_fix_refuses_a_missing_zone() {
+    let json = r#"{"type":"DeviceLocationFix","latitude":51.5,"longitude":0,"accuracy_m":1}"#;
     assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
 }
 

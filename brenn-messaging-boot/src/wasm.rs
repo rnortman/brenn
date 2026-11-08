@@ -340,6 +340,13 @@ pub(crate) fn resolve_wasm_consumers(
                 auto_wiring.wasm_channel(slug, &sub.port),
             );
             let entry = directory.resolve(&channel).unwrap_or_else(|| {
+                if let Some(user) = brenn_lib::messaging::device_location_user(&channel) {
+                    panic!(
+                        "[[wasm_consumer]] {slug:?}: subscription.channel {channel:?} is not a \
+                         known channel address: no user named {user:?} — the channel is \
+                         minted per registered user",
+                    );
+                }
                 panic!(
                     "[[wasm_consumer]] {slug:?}: subscription.channel {channel:?} is not a known \
                      channel address (not a [[channel]] or [[webhook_endpoint]] declaration, \

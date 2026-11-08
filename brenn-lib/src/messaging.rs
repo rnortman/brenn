@@ -26,10 +26,12 @@ pub mod tombstone;
 pub mod test_support;
 
 pub use brenn_envelope::addressing::{
-    AUTO_CHANNEL_SEGMENT, TOOL_RESULTS_NAMESPACE, auto_channel_cid, auto_channel_name,
-    canonical_address, canonicalize_channel_address, chat_channel_uuid_from_address,
-    durable_auto_channel_uuid, ends_at_matcher_boundary, ends_at_tuning_boundary,
-    ephemeral_channel_uuid_from_name, in_a_tool_namespace, is_auto_channel_name,
+    AUTO_CHANNEL_SEGMENT, DEVICE_LOCATION_PREFIX, TOOL_RESULTS_NAMESPACE, auto_channel_cid,
+    auto_channel_name, canonical_address, canonicalize_channel_address,
+    chat_channel_uuid_from_address, device_location_address, device_location_channel_uuid,
+    device_location_user, durable_auto_channel_uuid, ends_at_matcher_boundary,
+    ends_at_tuning_boundary, ephemeral_channel_uuid_from_name, in_a_tool_namespace,
+    in_the_device_location_family, is_auto_channel_name, is_device_location_prefix,
     is_reserved_channel, is_reserved_channel_name, is_unreserved_char, is_unreserved_name,
     local_channel_uuid_from_name, matcher_boundary_list, mqtt_channel_uuid_from_address,
     nondurable_channel_uuid, tool_channel_uuid_from_address, tuning_boundary_list,

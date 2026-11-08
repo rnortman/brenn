@@ -318,25 +318,11 @@ pub(super) async fn handle_client_message(
             conn.handle_steal_app().await;
         }
         WsClientMessage::SetTimezone { timezone } => match timezone.parse::<chrono_tz::Tz>() {
-            Ok(tz) => {
-                conn.timezone = tz;
-                // The parsed zone's own name, never the raw string: the
-                // column holds only names chrono-tz parses.
-                let db = conn.state.db.lock().await;
-                brenn_db::auth::device::set_browser_tz(
-                    &db,
-                    conn.device_id,
-                    conn.user_id,
-                    Some(tz.name()),
-                );
-            }
+            Ok(tz) => conn.timezone = tz,
             Err(_) => {
                 // Not a security event: a real browser can report a zone
-                // chrono-tz does not know. The stored zone is cleared so an
-                // earlier one is not answered beside newer fixes.
+                // chrono-tz does not know.
                 warn!(timezone = %timezone, "invalid IANA timezone from client, keeping UTC");
-                let db = conn.state.db.lock().await;
-                brenn_db::auth::device::set_browser_tz(&db, conn.device_id, conn.user_id, None);
             }
         },
         WsClientMessage::SetDeviceInfo {
@@ -576,12 +562,14 @@ pub(super) async fn handle_client_message(
         }
         // Device location. A gate miss is answered `{ enabled: false }` and
         // is not a security event: the message touches only the sender's own
-        // row, and an unmodified PWA that was sharing sends a fix after a
-        // config reload removes the grant under its open connection.
+        // channel and device, and an unmodified PWA that was sharing sends a
+        // fix after a config reload removes the grant under its open
+        // connection.
         WsClientMessage::DeviceLocationShare {
             latitude,
             longitude,
             accuracy_m,
+            time_zone,
         } => {
             handle_device_location_fix(
                 conn,
@@ -590,6 +578,7 @@ pub(super) async fn handle_client_message(
                 latitude,
                 longitude,
                 accuracy_m,
+                &time_zone,
             )
             .await;
         }
@@ -597,6 +586,7 @@ pub(super) async fn handle_client_message(
             latitude,
             longitude,
             accuracy_m,
+            time_zone,
         } => {
             handle_device_location_fix(
                 conn,
@@ -605,20 +595,25 @@ pub(super) async fn handle_client_message(
                 latitude,
                 longitude,
                 accuracy_m,
+                &time_zone,
             )
             .await;
         }
         WsClientMessage::DeviceLocationClear => {
             // No gate: withdrawing consent is honoured whatever the app's
-            // grants are, and it deletes only the sender's own row.
-            let db = conn.state.db.lock().await;
-            brenn_device_location::db::delete_fix(&db, conn.device_id, conn.user_id);
-            drop(db);
-            let _ = conn.send_ws(WsServerMessage::DeviceLocationSharing { enabled: false });
-            debug!(
-                device_id = conn.device_id,
-                "DeviceLocationClear: fix deleted"
-            );
+            // grants are, and it touches only the sender's own channel and
+            // device.
+            let enabled = brenn_device_location::channel::record(
+                location_messenger(conn),
+                &conn.state.db,
+                &conn.username,
+                conn.user_id,
+                conn.device_id,
+                brenn_device_location::channel::Report::Clear,
+            )
+            .await;
+            let _ = conn.send_ws(WsServerMessage::DeviceLocationSharing { enabled });
+            debug!(device_id = conn.device_id, "DeviceLocationClear: handled");
         }
         WsClientMessage::DebugViewportSnapshot { snapshot } => {
             // Diagnostic, not usage-billable — no `record_usage`/`EventType`
@@ -632,10 +627,20 @@ pub(super) async fn handle_client_message(
 /// Which location message a fix arrived in.
 #[derive(Debug, Clone, Copy)]
 enum FixKind {
-    /// `DeviceLocationShare`: creates or replaces the stored fix.
+    /// `DeviceLocationShare`: always recorded; turns sharing on.
     Share,
-    /// `DeviceLocationFix`: replaces the stored fix only if one exists.
+    /// `DeviceLocationFix`: recorded only while the device shares.
     Update,
+}
+
+/// The messenger location messages are recorded through, the ungated
+/// `DeviceLocationClear` included. A connection exists only on a configured
+/// app, a server with any app runs messaging, and a reload cannot remove it,
+/// so its absence here is a broken boot.
+pub(super) fn location_messenger(conn: &WsConnection) -> &brenn_messaging::Messenger {
+    conn.state.messenger.as_deref().expect(
+        "device location: a WebSocket connection on an app exists on a server without messaging",
+    )
 }
 
 impl FixKind {
@@ -647,9 +652,10 @@ impl FixKind {
     }
 }
 
-/// `DeviceLocationShare` and `DeviceLocationFix`: gate, validate, store, and
-/// answer `DeviceLocationSharing` with the pair's resulting state. No log line
-/// carries a coordinate, an accuracy or a timestamp.
+/// `DeviceLocationShare` and `DeviceLocationFix`: gate, validate, record on
+/// the user's location channel, and answer `DeviceLocationSharing` with the
+/// device's resulting state. No log line carries a coordinate, an accuracy or
+/// a timestamp.
 async fn handle_device_location_fix(
     conn: &mut WsConnection,
     client_ip: std::net::IpAddr,
@@ -657,6 +663,7 @@ async fn handle_device_location_fix(
     latitude: f64,
     longitude: f64,
     accuracy_m: f64,
+    time_zone: &str,
 ) {
     let variant = kind.variant();
     if !conn.app_config().device_location_enabled() {
@@ -682,42 +689,35 @@ async fn handle_device_location_fix(
                     conn.user_id, conn.device_id
                 ),
             );
-            let enabled = {
-                let db = conn.state.db.lock().await;
-                brenn_device_location::db::fix_exists(&db, conn.device_id, conn.user_id)
-            };
+            let window = brenn_device_location::channel::read_window(
+                location_messenger(conn),
+                &conn.username,
+            )
+            .await;
+            let enabled = brenn_device_location::channel::is_sharing(&window, conn.device_id);
             let _ = conn.send_ws(WsServerMessage::DeviceLocationSharing { enabled });
             return;
         }
     };
-    let reported_at_ms = chrono::Utc::now().timestamp_millis();
-    let enabled = {
-        let db = conn.state.db.lock().await;
-        match kind {
-            FixKind::Share => {
-                brenn_device_location::db::upsert_fix(
-                    &db,
-                    conn.device_id,
-                    conn.user_id,
-                    &fix,
-                    reported_at_ms,
-                );
-                true
-            }
-            FixKind::Update => brenn_device_location::db::update_fix(
-                &db,
-                conn.device_id,
-                conn.user_id,
-                &fix,
-                reported_at_ms,
-            ),
-        }
+    let time_zone = brenn_device_location::channel::parse_zone(time_zone);
+    let report = match kind {
+        FixKind::Share => brenn_device_location::channel::Report::Share { fix, time_zone },
+        FixKind::Update => brenn_device_location::channel::Report::Update { fix, time_zone },
     };
+    let enabled = brenn_device_location::channel::record(
+        location_messenger(conn),
+        &conn.state.db,
+        &conn.username,
+        conn.user_id,
+        conn.device_id,
+        report,
+    )
+    .await;
     let _ = conn.send_ws(WsServerMessage::DeviceLocationSharing { enabled });
     debug!(
         user = %conn.username,
         device_id = conn.device_id,
-        stored = enabled,
+        enabled,
         "{variant}: handled"
     );
 }
@@ -1819,29 +1819,57 @@ mod tests {
     }
 
     /// A capturing-alerter connection on the "test" app, holding the
-    /// `device-location` grant when `granted`.
+    /// `device-location` grant when `granted`, on a messenger holding its
+    /// user's location channel.
     async fn location_conn(
         granted: bool,
     ) -> (
         WsConnection,
         mpsc::Receiver<WsServerMessage>,
-        brenn_db::Db,
+        Arc<brenn_messaging::Messenger>,
         Arc<std::sync::Mutex<Vec<(String, String)>>>,
         tokio::task::JoinHandle<()>,
     ) {
-        ws_conn_with_capturing_alerter(Some(apps_with_device_location(granted))).await
+        let (mut conn, ws_rx, db, captured, h) =
+            ws_conn_with_capturing_alerter(Some(apps_with_device_location(granted))).await;
+        let messenger = brenn_messaging::device_location::device_location_messenger(
+            db,
+            &[conn.username.as_str()],
+        )
+        .await;
+        conn.state.messenger = Some(messenger.clone());
+        (conn, ws_rx, messenger, captured, h)
     }
 
-    fn stored_fix(db_conn: &rusqlite::Connection, user_id: i64) -> Option<(f64, f64, f64)> {
-        let fixes = brenn_device_location::db::list_fixes_for_user(db_conn, user_id);
-        assert!(
-            fixes.len() <= 1,
-            "one device in these tests: {}",
-            fixes.len()
-        );
-        fixes
-            .first()
-            .map(|f| (f.latitude, f.longitude, f.accuracy_m))
+    /// The connection's user's location channel, oldest first.
+    async fn channel(
+        conn: &WsConnection,
+        m: &brenn_messaging::Messenger,
+    ) -> Vec<brenn_device_location::channel::LocationMessage> {
+        brenn_device_location::channel::read_window(m, &conn.username)
+            .await
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    /// The channel's fixes as `(latitude, longitude, accuracy_m, time_zone)`,
+    /// and whether its newest message is a `stopped`.
+    async fn fixes(
+        conn: &WsConnection,
+        m: &brenn_messaging::Messenger,
+    ) -> Vec<(f64, f64, f64, Option<String>)> {
+        channel(conn, m)
+            .await
+            .into_iter()
+            .filter_map(|message| match message {
+                brenn_device_location::channel::LocationMessage::Fix(f) => {
+                    assert_eq!(f.device_id, conn.device_id);
+                    Some((f.latitude, f.longitude, f.accuracy_m, f.time_zone))
+                }
+                brenn_device_location::channel::LocationMessage::Stopped { .. } => None,
+            })
+            .collect()
     }
 
     fn expect_sharing(ws_rx: &mut mpsc::Receiver<WsServerMessage>, expected: bool) {
@@ -1857,78 +1885,103 @@ mod tests {
         assert!(ws_rx.try_recv().is_err(), "exactly one reply");
     }
 
-    const SHARE: &str =
-        r#"{"type":"DeviceLocationShare","latitude":51.5,"longitude":-0.25,"accuracy_m":35}"#;
-    const FIX: &str =
-        r#"{"type":"DeviceLocationFix","latitude":48.75,"longitude":2.25,"accuracy_m":12.5}"#;
+    const SHARE: &str = r#"{"type":"DeviceLocationShare","latitude":51.5,"longitude":-0.25,"accuracy_m":35,"time_zone":"Europe/London"}"#;
+    const FIX: &str = r#"{"type":"DeviceLocationFix","latitude":48.75,"longitude":2.25,"accuracy_m":12.5,"time_zone":"Europe/Paris"}"#;
     const CLEAR: &str = r#"{"type":"DeviceLocationClear"}"#;
 
+    fn london() -> (f64, f64, f64, Option<String>) {
+        (51.5, -0.25, 35.0, Some("Europe/London".into()))
+    }
+
+    fn paris() -> (f64, f64, f64, Option<String>) {
+        (48.75, 2.25, 12.5, Some("Europe/Paris".into()))
+    }
+
     #[tokio::test]
-    async fn device_location_share_on_gated_app_stores_and_confirms() {
-        let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+    async fn device_location_share_publishes_a_fix_with_the_zone() {
+        let (mut conn, mut ws_rx, m, captured, h) = location_conn(true).await;
         handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
         expect_sharing(&mut ws_rx, true);
-        assert_eq!(
-            stored_fix(&*db.lock().await, conn.user_id),
-            Some((51.5, -0.25, 35.0))
-        );
+        assert_eq!(fixes(&conn, &m).await, vec![london()]);
+        let guessed = {
+            let db = conn.state.db.lock().await;
+            brenn_db::auth::device::display_slug(&db, conn.device_id, conn.user_id)
+        };
+        assert!(matches!(
+            &channel(&conn, &m).await[0],
+            brenn_device_location::channel::LocationMessage::Fix(f) if f.device == guessed
+        ));
         assert!(drain_alerts(conn, captured, h).await.is_empty());
     }
 
     #[tokio::test]
-    async fn device_location_fix_after_share_replaces_the_row() {
-        let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+    async fn device_location_fix_while_sharing_publishes() {
+        let (mut conn, mut ws_rx, m, captured, h) = location_conn(true).await;
         handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
         expect_sharing(&mut ws_rx, true);
         handle_client_message(FIX, &mut conn, TEST_CLIENT_IP).await;
         expect_sharing(&mut ws_rx, true);
-        assert_eq!(
-            stored_fix(&*db.lock().await, conn.user_id),
-            Some((48.75, 2.25, 12.5))
-        );
+        assert_eq!(fixes(&conn, &m).await, vec![london(), paris()]);
         assert!(drain_alerts(conn, captured, h).await.is_empty());
     }
 
-    /// A fix with no stored row is a tab whose sharing was turned off
-    /// elsewhere: nothing stored, no security event, `{ enabled: false }`.
+    /// A fix from a device that does not share is a tab whose sharing was
+    /// turned off elsewhere: nothing published, no security event,
+    /// `{ enabled: false }`.
     #[tokio::test]
-    async fn device_location_fix_without_row_stores_nothing() {
-        let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+    async fn device_location_fix_while_not_sharing_publishes_nothing() {
+        let (mut conn, mut ws_rx, m, captured, h) = location_conn(true).await;
         handle_client_message(FIX, &mut conn, TEST_CLIENT_IP).await;
         expect_sharing(&mut ws_rx, false);
-        assert_eq!(stored_fix(&*db.lock().await, conn.user_id), None);
+        assert!(channel(&conn, &m).await.is_empty());
         assert!(drain_alerts(conn, captured, h).await.is_empty());
     }
 
-    /// An out-of-range latitude on either message stores nothing, raises a
+    /// A zone chrono-tz does not know is recorded as no zone, and is not a
+    /// security event.
+    #[tokio::test]
+    async fn device_location_unknown_zone_is_published_as_null() {
+        let (mut conn, mut ws_rx, m, captured, h) = location_conn(true).await;
+        handle_client_message(
+            r#"{"type":"DeviceLocationShare","latitude":1.5,"longitude":2.5,"accuracy_m":3,"time_zone":"Not/A/Zone"}"#,
+            &mut conn,
+            TEST_CLIENT_IP,
+        )
+        .await;
+        expect_sharing(&mut ws_rx, true);
+        assert_eq!(fixes(&conn, &m).await, vec![(1.5, 2.5, 3.0, None)]);
+        assert!(drain_alerts(conn, captured, h).await.is_empty());
+    }
+
+    /// An out-of-range latitude on either message publishes nothing, raises a
     /// `MalformedMessage` event whose text carries no coordinate, and answers
-    /// with the stored state.
+    /// with the channel's state.
     #[tokio::test]
     async fn device_location_out_of_range_is_malformed_and_carries_no_coordinate() {
         for (msg, prior_share, expect_enabled) in [
             (
-                r#"{"type":"DeviceLocationShare","latitude":91.125,"longitude":-0.375,"accuracy_m":35}"#,
+                r#"{"type":"DeviceLocationShare","latitude":91.125,"longitude":-0.375,"accuracy_m":35,"time_zone":"UTC"}"#,
                 false,
                 false,
             ),
             (
-                r#"{"type":"DeviceLocationFix","latitude":91.125,"longitude":-0.375,"accuracy_m":35}"#,
+                r#"{"type":"DeviceLocationFix","latitude":91.125,"longitude":-0.375,"accuracy_m":35,"time_zone":"UTC"}"#,
                 true,
                 true,
             ),
         ] {
-            let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+            let (mut conn, mut ws_rx, m, captured, h) = location_conn(true).await;
             if prior_share {
                 handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
                 expect_sharing(&mut ws_rx, true);
             }
             handle_client_message(msg, &mut conn, TEST_CLIENT_IP).await;
             expect_sharing(&mut ws_rx, expect_enabled);
-            let stored = stored_fix(&*db.lock().await, conn.user_id);
+            let published = fixes(&conn, &m).await;
             if prior_share {
-                assert_eq!(stored, Some((51.5, -0.25, 35.0)), "prior fix kept");
+                assert_eq!(published, vec![london()], "only the prior fix");
             } else {
-                assert_eq!(stored, None);
+                assert!(published.is_empty());
             }
             let alerts = drain_alerts(conn, captured, h).await;
             assert_eq!(alerts.len(), 1, "one security event: {alerts:?}");
@@ -1944,10 +1997,10 @@ mod tests {
 
     /// Share and fix from an app without the grant — the reload-revokes-grant
     /// case: the connection opened on a gated app, then the app map loses the
-    /// grant. Nothing stored, no security event, `{ enabled: false }`.
+    /// grant. Nothing published, no security event, `{ enabled: false }`.
     #[tokio::test]
     async fn device_location_from_app_without_grant_is_refused_quietly() {
-        let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+        let (mut conn, mut ws_rx, m, captured, h) = location_conn(true).await;
         handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
         expect_sharing(&mut ws_rx, true);
 
@@ -1956,16 +2009,16 @@ mod tests {
         handle_client_message(FIX, &mut conn, TEST_CLIENT_IP).await;
         expect_sharing(&mut ws_rx, false);
         handle_client_message(
-            r#"{"type":"DeviceLocationShare","latitude":10.5,"longitude":20.5,"accuracy_m":5}"#,
+            r#"{"type":"DeviceLocationShare","latitude":10.5,"longitude":20.5,"accuracy_m":5,"time_zone":"UTC"}"#,
             &mut conn,
             TEST_CLIENT_IP,
         )
         .await;
         expect_sharing(&mut ws_rx, false);
         assert_eq!(
-            stored_fix(&*db.lock().await, conn.user_id),
-            Some((51.5, -0.25, 35.0)),
-            "the row written before the reload is untouched"
+            fixes(&conn, &m).await,
+            vec![london()],
+            "only the fix published before the reload"
         );
         assert!(
             drain_alerts(conn, captured, h).await.is_empty(),
@@ -1973,14 +2026,13 @@ mod tests {
         );
     }
 
-    /// The row survives a grant removal as the user's consent: once the
-    /// grant is back, the next connect reports sharing on and the stored fix
-    /// is the one the share wrote.
+    /// Sharing survives a grant removal as the user's consent: once the
+    /// grant is back, the next connect reports sharing on.
     #[tokio::test]
     async fn device_location_grant_restored_resumes_on_connect() {
         use super::super::event_loop::send_device_location_sharing_on_connect;
 
-        let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+        let (mut conn, mut ws_rx, m, captured, h) = location_conn(true).await;
         handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
         expect_sharing(&mut ws_rx, true);
 
@@ -1992,18 +2044,19 @@ mod tests {
         send_device_location_sharing_on_connect(&conn).await;
         expect_sharing(&mut ws_rx, true);
         assert_eq!(
-            stored_fix(&*db.lock().await, conn.user_id),
-            Some((51.5, -0.25, 35.0)),
-            "the share's row, not the refused fix"
+            fixes(&conn, &m).await,
+            vec![london()],
+            "not the refused fix"
         );
         assert!(drain_alerts(conn, captured, h).await.is_empty());
     }
 
-    /// Clear is honoured whatever the app's grants are.
+    /// Clear is honoured whatever the app's grants are: a sharing device
+    /// gets one `stopped`, and a second clear adds nothing.
     #[tokio::test]
-    async fn device_location_clear_deletes_row_with_and_without_grant() {
+    async fn device_location_clear_publishes_stopped_with_and_without_grant() {
         for revoke in [false, true] {
-            let (mut conn, mut ws_rx, db, captured, h) = location_conn(true).await;
+            let (mut conn, mut ws_rx, m, captured, h) = location_conn(true).await;
             handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
             expect_sharing(&mut ws_rx, true);
             if revoke {
@@ -2011,59 +2064,72 @@ mod tests {
             }
             handle_client_message(CLEAR, &mut conn, TEST_CLIENT_IP).await;
             expect_sharing(&mut ws_rx, false);
-            assert_eq!(stored_fix(&*db.lock().await, conn.user_id), None);
+            handle_client_message(CLEAR, &mut conn, TEST_CLIENT_IP).await;
+            expect_sharing(&mut ws_rx, false);
+            let messages = channel(&conn, &m).await;
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert!(matches!(
+                messages[1],
+                brenn_device_location::channel::LocationMessage::Stopped { device_id, .. }
+                    if device_id == conn.device_id
+            ));
             assert!(drain_alerts(conn, captured, h).await.is_empty());
         }
     }
 
-    /// On connect, `DeviceLocationSharing` is sent only for a gated app, with
-    /// `enabled` reflecting the stored row.
+    /// A clear from a device that does not share publishes nothing.
     #[tokio::test]
-    async fn device_location_sharing_on_connect_follows_grant_and_row() {
+    async fn device_location_clear_while_not_sharing_publishes_nothing() {
+        let (mut conn, mut ws_rx, m, captured, h) = location_conn(true).await;
+        handle_client_message(CLEAR, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, false);
+        assert!(channel(&conn, &m).await.is_empty());
+        assert!(drain_alerts(conn, captured, h).await.is_empty());
+    }
+
+    /// On connect, `DeviceLocationSharing` is sent only for a gated app, with
+    /// `enabled` reflecting the channel.
+    #[tokio::test]
+    async fn device_location_sharing_on_connect_follows_grant_and_channel() {
         use super::super::event_loop::send_device_location_sharing_on_connect;
 
-        let (conn, mut ws_rx, _db, _captured, _h) = location_conn(false).await;
+        let (conn, mut ws_rx, _m, _captured, _h) = location_conn(false).await;
         send_device_location_sharing_on_connect(&conn).await;
         assert!(ws_rx.try_recv().is_err(), "nothing sent without the grant");
 
-        let (mut conn, mut ws_rx, _db, _captured, _h) = location_conn(true).await;
+        let (mut conn, mut ws_rx, _m, _captured, _h) = location_conn(true).await;
         send_device_location_sharing_on_connect(&conn).await;
         expect_sharing(&mut ws_rx, false);
         handle_client_message(SHARE, &mut conn, TEST_CLIENT_IP).await;
         expect_sharing(&mut ws_rx, true);
         send_device_location_sharing_on_connect(&conn).await;
         expect_sharing(&mut ws_rx, true);
+        handle_client_message(CLEAR, &mut conn, TEST_CLIENT_IP).await;
+        expect_sharing(&mut ws_rx, false);
+        send_device_location_sharing_on_connect(&conn).await;
+        expect_sharing(&mut ws_rx, false);
     }
 
     /// An unparseable zone from the browser is not a security event and
-    /// clears the stored zone, including one a valid report stored earlier.
+    /// writes nothing; a valid one sets the connection's zone.
     #[tokio::test]
     async fn set_timezone_invalid_is_not_a_security_event() {
-        let (mut conn, _ws_rx, db, captured, h) = location_conn(true).await;
+        let (mut conn, _ws_rx, m, captured, h) = location_conn(true).await;
         handle_client_message(
             r#"{"type":"SetTimezone","timezone":"Europe/Berlin"}"#,
             &mut conn,
             TEST_CLIENT_IP,
         )
         .await;
-        let du = brenn_db::auth::device::load_device_user(
-            &*db.lock().await,
-            conn.device_id,
-            conn.user_id,
-        );
-        assert_eq!(du.browser_tz.as_deref(), Some("Europe/Berlin"));
+        assert_eq!(conn.timezone, chrono_tz::Europe::Berlin);
         handle_client_message(
             r#"{"type":"SetTimezone","timezone":"Not/A/Zone"}"#,
             &mut conn,
             TEST_CLIENT_IP,
         )
         .await;
-        let du = brenn_db::auth::device::load_device_user(
-            &*db.lock().await,
-            conn.device_id,
-            conn.user_id,
-        );
-        assert_eq!(du.browser_tz, None);
+        assert_eq!(conn.timezone, chrono_tz::Europe::Berlin, "kept");
+        assert!(channel(&conn, &m).await.is_empty(), "the bus is untouched");
         assert!(drain_alerts(conn, captured, h).await.is_empty());
     }
 }
