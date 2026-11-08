@@ -19,7 +19,7 @@ use crate::access::raw::{
     AppAclRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
 };
 use crate::config::alerting::{AlertingConfig, MailConfig, NtfyConfig, default_subject_label};
-use crate::config::api_key_provider::ApiKeyProviderRaw;
+use crate::config::api_key_provider::{ApiKeyAccountRaw, ApiKeyProviderRaw, ApiKeySourceRaw};
 use crate::config::app::AppConfigRaw;
 use crate::config::attachment::{
     AttachmentHandlerConfig, AttachmentTargetRaw, default_timeout_secs,
@@ -943,6 +943,17 @@ api_key_provider maps {
     max_response_bytes = 65536;
 }
 
+api_key_provider mail {
+    header = "Authorization";
+    api_hosts = ["https://api.mail.example.com"];
+    max_response_bytes = 32768;
+    account alice {
+        user = "alice";
+        key_file = "/etc/brenn/mail/alice";
+        default = true;
+    }
+}
+
 repo_sync {
     repo_dir = "/home/alice/repos";
     poll_interval_secs = 301;
@@ -1091,18 +1102,36 @@ container cc {
                     max_response_bytes: 131072,
                 },
             )]),
-            api_key_providers: BTreeMap::from([(
-                "maps".to_string(),
-                ApiKeyProviderRaw {
-                    key_file: PathBuf::from("/etc/brenn/maps/api-key"),
-                    header: "X-Api-Key".to_string(),
-                    api_hosts: vec![
-                        "https://weather.example.com".to_string(),
-                        "https://places.example.com".to_string(),
-                    ],
-                    max_response_bytes: 65536,
-                },
-            )]),
+            api_key_providers: BTreeMap::from([
+                (
+                    "maps".to_string(),
+                    ApiKeyProviderRaw {
+                        source: ApiKeySourceRaw::Deployment {
+                            key_file: PathBuf::from("/etc/brenn/maps/api-key"),
+                        },
+                        header: "X-Api-Key".to_string(),
+                        api_hosts: vec![
+                            "https://weather.example.com".to_string(),
+                            "https://places.example.com".to_string(),
+                        ],
+                        max_response_bytes: 65536,
+                    },
+                ),
+                (
+                    "mail".to_string(),
+                    ApiKeyProviderRaw {
+                        source: ApiKeySourceRaw::Accounts(vec![ApiKeyAccountRaw {
+                            name: "alice".to_string(),
+                            user: "alice".to_string(),
+                            key_file: PathBuf::from("/etc/brenn/mail/alice"),
+                            default: true,
+                        }]),
+                        header: "Authorization".to_string(),
+                        api_hosts: vec!["https://api.mail.example.com".to_string()],
+                        max_response_bytes: 32768,
+                    },
+                ),
+            ]),
             claude_profiles: BTreeMap::from([
                 (
                     "main".to_string(),
@@ -1491,7 +1520,9 @@ fn a_minimal_api_key_provider_takes_its_defaults() {
         BTreeMap::from([(
             "maps".to_string(),
             ApiKeyProviderRaw {
-                key_file: PathBuf::from("/etc/brenn/maps/api-key"),
+                source: ApiKeySourceRaw::Deployment {
+                    key_file: PathBuf::from("/etc/brenn/maps/api-key"),
+                },
                 header: "X-Api-Key".to_string(),
                 api_hosts: vec!["https://api.example.com".to_string()],
                 max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
@@ -1575,6 +1606,207 @@ fn an_api_key_provider_missing_a_required_key_or_stating_an_unknown_one_is_refus
     .collect();
     assert!(
         messages.iter().any(|message| message.contains("`key`")),
+        "{messages:?}"
+    );
+}
+
+/// A key provider holding users' accounts rather than the deployment's key.
+const ACCOUNTS_API_KEY_PROVIDER: &str = r#"api_key_provider mail {
+    header = "Authorization";
+    api_hosts = ["https://api.example.com"];
+    account alice {
+        user = "alice";
+        key_file = "/etc/brenn/mail/alice";
+        default = true;
+    }
+    account alice-work {
+        user = "alice";
+        key_file = "/etc/brenn/mail/alice-work";
+    }
+    account bob {
+        user = "bob";
+        key_file = "/etc/brenn/mail/bob";
+    }
+}"#;
+
+fn account(name: &str, user: &str, default: bool) -> ApiKeyAccountRaw {
+    ApiKeyAccountRaw {
+        name: name.to_string(),
+        user: user.to_string(),
+        key_file: PathBuf::from(format!("/etc/brenn/mail/{name}")),
+        default,
+    }
+}
+
+/// The account form lowers each block to a named account, in document order,
+/// `default` false where unstated.
+#[test]
+fn an_api_key_provider_with_accounts_lowers_each_account() {
+    let config = config_from_dsl(ACCOUNTS_API_KEY_PROVIDER);
+    assert_eq!(
+        config.api_key_providers["mail"].source,
+        ApiKeySourceRaw::Accounts(vec![
+            account("alice", "alice", true),
+            account("alice-work", "alice", false),
+            account("bob", "bob", false),
+        ]),
+    );
+}
+
+fn refusal_messages(document: &str) -> Vec<String> {
+    refusals(document)
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+#[test]
+fn an_api_key_provider_with_both_key_forms_or_neither_is_refused() {
+    let both = ACCOUNTS_API_KEY_PROVIDER.replace(
+        r#"    header = "Authorization";"#,
+        r#"    header = "Authorization";
+    key_file = "/etc/brenn/mail/shared";"#,
+    );
+    let messages = refusal_messages(&both);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("one deployment key or per-user accounts, not both")),
+        "{messages:?}"
+    );
+    let neither = key_provider_with(
+        r#"    key_file = "/etc/brenn/maps/api-key";
+"#,
+        "",
+    );
+    let messages = refusal_messages(&neither);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("`api_key_provider maps` names no key")),
+        "{messages:?}"
+    );
+    // A refusal elsewhere in the block does not hide the missing key.
+    let neither_and_bad_header = key_provider_with(KEY_HEADER_LINE, "    header = 5;\n").replace(
+        r#"    key_file = "/etc/brenn/maps/api-key";
+"#,
+        "",
+    );
+    let messages = refusal_messages(&neither_and_bad_header);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("`header`: expected a string"))
+            && messages
+                .iter()
+                .any(|m| m.contains("`api_key_provider maps` names no key")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn an_account_name_that_is_not_a_slug_is_refused() {
+    let messages =
+        refusal_messages(&ACCOUNTS_API_KEY_PROVIDER.replace("account bob", "account Bob"));
+    assert!(
+        messages.iter().any(|m| m.contains("`account Bob`")
+            && m.contains("lowercase letters, digits and `-`")),
+        "{messages:?}"
+    );
+    let messages =
+        refusal_messages(&ACCOUNTS_API_KEY_PROVIDER.replace("account bob", "account b_ob"));
+    assert!(
+        messages.iter().any(|m| m.contains("`account b_ob`")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn an_account_user_that_is_not_a_username_is_refused() {
+    let diagnostic =
+        refusal(&ACCOUNTS_API_KEY_PROVIDER.replace(r#"user = "bob";"#, r#"user = "bob smith";"#));
+    assert!(
+        diagnostic
+            .message
+            .contains("`user` \"bob smith\" is not a Brenn username"),
+        "{}",
+        diagnostic.message
+    );
+    assert_eq!(diagnostic.span.text_str(), Some(r#""bob smith""#));
+}
+
+#[test]
+fn a_second_default_for_one_user_is_refused_at_the_second_account() {
+    let diagnostic = refusal(&ACCOUNTS_API_KEY_PROVIDER.replace(
+        r#"key_file = "/etc/brenn/mail/alice-work";"#,
+        r#"key_file = "/etc/brenn/mail/alice-work"; default = true;"#,
+    ));
+    assert!(
+        diagnostic.message.contains("`account alice-work`")
+            && diagnostic
+                .message
+                .contains("user \"alice\" already has a default account, `alice`"),
+        "{}",
+        diagnostic.message
+    );
+    // One default per user, not per provider.
+    let config = config_from_dsl(&ACCOUNTS_API_KEY_PROVIDER.replace(
+        r#"key_file = "/etc/brenn/mail/bob";"#,
+        r#"key_file = "/etc/brenn/mail/bob"; default = true;"#,
+    ));
+    assert!(matches!(
+        &config.api_key_providers["mail"].source,
+        ApiKeySourceRaw::Accounts(accounts) if accounts.iter().filter(|a| a.default).count() == 2
+    ));
+}
+
+#[test]
+fn an_account_missing_a_required_key_or_stating_an_unknown_one_is_refused() {
+    for (line, key) in [
+        (r#"user = "bob";"#, "user"),
+        (r#"key_file = "/etc/brenn/mail/bob";"#, "key_file"),
+    ] {
+        let messages = refusal_messages(&ACCOUNTS_API_KEY_PROVIDER.replace(line, ""));
+        assert!(
+            messages.iter().any(|m| m.contains(key)),
+            "{key}: {messages:?}"
+        );
+    }
+    let messages = refusal_messages(
+        &ACCOUNTS_API_KEY_PROVIDER.replace(r#"user = "bob";"#, r#"user = "bob"; scope = "mail";"#),
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("`scope`")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn a_sub_block_other_than_account_or_inside_an_account_is_refused() {
+    let messages = refusal_messages(&ACCOUNTS_API_KEY_PROVIDER.replace(
+        "    account bob {",
+        "    owner bob { user = \"bob\"; }\n    account bob {",
+    ));
+    assert!(
+        messages.iter().any(|m| m.contains("`owner`")),
+        "{messages:?}"
+    );
+    let messages = refusal_messages(&ACCOUNTS_API_KEY_PROVIDER.replace(
+        r#"user = "bob";"#,
+        r#"user = "bob"; account nested { user = "bob"; key_file = "/k"; }"#,
+    ));
+    assert!(
+        messages.iter().any(|m| m.contains("`account`")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn a_duplicate_account_name_is_refused() {
+    let messages =
+        refusal_messages(&ACCOUNTS_API_KEY_PROVIDER.replace("account alice-work", "account alice"));
+    assert!(
+        messages.iter().any(|m| m.contains("account alice")),
         "{messages:?}"
     );
 }
@@ -1769,6 +2001,21 @@ const MINIMAL_AGENT_BLOCKS: [(&str, &str, BlockWitness); 6] = [
     ),
 ];
 
+const MINIMAL_API_KEY_PROVIDER_BLOCKS: [(&str, &str, BlockWitness); 1] = [(
+    "account",
+    r#"api_key_provider mail {
+           header = "Authorization";
+           api_hosts = ["https://api.example.com"];
+           account alice { user = "alice"; key_file = "/etc/brenn/mail/alice"; }
+       }"#,
+    |config| {
+        matches!(
+            &config.api_key_providers["mail"].source,
+            ApiKeySourceRaw::Accounts(accounts) if accounts.len() == 1
+        )
+    },
+)];
+
 /// Every sub-block kindword the language admits reaches a lowering arm, and the
 /// arm reads the block rather than dropping it.
 #[test]
@@ -1781,6 +2028,10 @@ fn every_sub_block_kindword_lowers() {
         (
             brenn_dsl::model::OBSERVABILITY_BLOCK_KINDWORDS,
             MINIMAL_OBSERVABILITY_BLOCKS.as_slice(),
+        ),
+        (
+            brenn_dsl::model::API_KEY_PROVIDER_BLOCK_KINDWORDS,
+            MINIMAL_API_KEY_PROVIDER_BLOCKS.as_slice(),
         ),
         (
             brenn_dsl::model::AGENT_BLOCK_KINDWORDS,

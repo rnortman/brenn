@@ -60,8 +60,9 @@ pub fn query<const N: usize>(pairs: [(&str, String); N]) -> Query {
 
 /// One `api-request` call's arguments. Every optional field is left off the
 /// wire when unset, so a component sends only what it uses: `account` only
-/// to an OAuth provider (`api-request` refuses it for a key provider), and
-/// `headers` only where the API wants one. It parses back from what it writes:
+/// to an OAuth provider or a key provider with per-user accounts
+/// (`api-request` refuses it for a key provider holding one deployment key),
+/// and `headers` only where the API wants one. It parses back from what it writes:
 /// an absent field is unset.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

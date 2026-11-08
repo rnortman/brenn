@@ -78,7 +78,7 @@ use crate::webhook::config::{
 use brenn_envelope::grants::AppCapability;
 
 use super::alerting::{AlertingConfig, MailConfig, NtfyConfig, default_subject_label};
-use super::api_key_provider::ApiKeyProviderRaw;
+use super::api_key_provider::{ApiKeyAccountRaw, ApiKeyProviderRaw, ApiKeySourceRaw};
 use super::app::AppConfigRaw;
 use super::attachment::{AttachmentHandlerConfig, AttachmentTargetRaw, default_timeout_secs};
 use super::automation::AutomationGlobalConfig;
@@ -1074,7 +1074,7 @@ fn sections(list: &[RSection], errors: &mut Vec<Diagnostic>) -> Sections {
                     errors,
                 );
                 if let Some(provider) =
-                    api_key_provider(&name, section.kindword.span(), &mut body, errors)
+                    api_key_provider(&name, section.kindword.span(), &mut body, &mut subs, errors)
                 {
                     out.api_key_providers.insert(name, provider);
                 }
@@ -1190,6 +1190,19 @@ impl<'a> Subs<'a> {
             .find(|(section, _)| section.kindword.value() == kindword)?;
         held.1 = true;
         Some(held.0)
+    }
+
+    /// Every sub-block under `kindword`, in document order, each marked as
+    /// read.
+    fn take_all(&mut self, kindword: &str) -> Vec<&'a RSection> {
+        self.held
+            .iter_mut()
+            .filter(|(section, _)| section.kindword.value() == kindword)
+            .map(|held| {
+                held.1 = true;
+                held.0
+            })
+            .collect()
     }
 
     /// Refuse whatever no reader took.
@@ -1522,13 +1535,16 @@ fn is_provider_slug(name: &str) -> bool {
 /// One `api_key_provider` block.
 ///
 /// The name takes `oauth_provider`'s slug rule: both kinds are named by the
-/// same `provider` argument and ACL key. A block with no API host is refused
-/// here. The key file, the header name and the origins are boot checks
+/// same `provider` argument and ACL key. The block names its keys either by
+/// `key_file` (the deployment's) or by `account` sub-blocks (users'), never
+/// both and never neither. A block with no API host is refused here. The key
+/// files, the header name and the origins are boot checks
 /// (`resolve_api_key_providers`).
 fn api_key_provider(
     name: &str,
     at: &Span,
     body: &mut Body,
+    subs: &mut Subs,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<ApiKeyProviderRaw> {
     let before = errors.len();
@@ -1543,18 +1559,138 @@ fn api_key_provider(
             at.clone(),
         ));
     }
-    let key_file = body.required_path("key_file", errors);
+    let before_key_file = errors.len();
+    let key_file = body.path("key_file", errors);
+    let key_file_refused = errors.len() != before_key_file;
+    let accounts: Vec<Option<(ApiKeyAccountRaw, Span)>> = subs
+        .take_all("account")
+        .into_iter()
+        .map(|block| api_key_account(&what, block, errors))
+        .collect();
     let header = body.required_str("header", errors);
     let (api_hosts, max_response_bytes) = provider_egress(&what, at, body, errors);
+    let source = match (key_file, accounts.is_empty()) {
+        (Some(key_file), true) => Some(ApiKeySourceRaw::Deployment { key_file }),
+        (Some(_), false) => {
+            errors.push(Diagnostic::at(
+                format!(
+                    "{what}: states both `key_file` and `account` blocks; it holds one \
+                     deployment key or per-user accounts, not both"
+                ),
+                at.clone(),
+            ));
+            None
+        }
+        (None, false) => accounts
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .map(|accounts| {
+                refuse_second_default(&what, &accounts, errors);
+                ApiKeySourceRaw::Accounts(accounts.into_iter().map(|(a, _)| a).collect())
+            }),
+        (None, true) => {
+            // A `key_file` that was stated but refused already has its error.
+            if !key_file_refused {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "{what} names no key: state `key_file` for the deployment's key, or \
+                         one `account` block per user's key"
+                    ),
+                    at.clone(),
+                ));
+            }
+            None
+        }
+    };
     if errors.len() != before {
         return None;
     }
     Some(ApiKeyProviderRaw {
-        key_file: key_file?,
+        source: source?,
         header: header?,
         api_hosts: api_hosts?,
         max_response_bytes,
     })
+}
+
+/// One `account` block of an `api_key_provider`, with the span of its
+/// kindword.
+///
+/// The name takes the provider slug rule: it is the `account` a call passes
+/// and an ACL clause names. Nothing may nest inside the block.
+fn api_key_account(
+    provider: &str,
+    block: &RSection,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<(ApiKeyAccountRaw, Span)> {
+    let before = errors.len();
+    let at = block.kindword.span().clone();
+    let name = block
+        .name
+        .as_ref()
+        .expect("an account block carries a name")
+        .value()
+        .clone();
+    let what = format!("{provider} `account {name}`");
+    if !is_provider_slug(&name) {
+        errors.push(Diagnostic::at(
+            format!(
+                "{what}: the name must be lowercase letters, digits and `-` — it is the \
+                 `account` an api-request call and its ACL clauses name"
+            ),
+            at.clone(),
+        ));
+    }
+    let mut body = Body::new(what.clone(), at.clone(), &block.attrs);
+    let user = body.required_spanned_str("user", errors);
+    if let Some((user, span)) = &user
+        && !brenn_envelope::addressing::is_username(user)
+    {
+        errors.push(Diagnostic::at(
+            format!("{what}: `user` {user:?} is not a Brenn username"),
+            span.clone(),
+        ));
+    }
+    let key_file = body.required_path("key_file", errors);
+    let default = body.bool("default", errors).unwrap_or(false);
+    body.finish(errors);
+    Subs::new(block, &what, errors).finish(&what, errors);
+    if errors.len() != before {
+        return None;
+    }
+    Some((
+        ApiKeyAccountRaw {
+            name,
+            user: user?.0,
+            key_file: key_file?,
+            default,
+        },
+        at,
+    ))
+}
+
+/// Refuse a second `default = true` among one user's accounts: an omitted
+/// `account` must resolve to one.
+fn refuse_second_default(
+    provider: &str,
+    accounts: &[(ApiKeyAccountRaw, Span)],
+    errors: &mut Vec<Diagnostic>,
+) {
+    let mut defaults: BTreeMap<&str, &str> = BTreeMap::new();
+    for (account, at) in accounts.iter().filter(|(account, _)| account.default) {
+        if let Some(first) = defaults.get(account.user.as_str()) {
+            errors.push(Diagnostic::at(
+                format!(
+                    "{provider} `account {}`: user {:?} already has a default account, `{first}`; \
+                     at most one of a user's accounts is `default`",
+                    account.name, account.user
+                ),
+                at.clone(),
+            ));
+        } else {
+            defaults.insert(&account.user, &account.name);
+        }
+    }
 }
 
 fn repo_sync(body: &mut Body, errors: &mut Vec<Diagnostic>) -> RepoSyncConfig {

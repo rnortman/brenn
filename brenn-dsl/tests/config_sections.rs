@@ -7,9 +7,10 @@
 use std::mem::Discriminant;
 
 use brenn_dsl::model::{
-    ALERTING_BLOCK_KINDWORDS, AlertingBlock, CONFIG_BLOCK_KINDWORDS, ConfigBlock, File,
-    OBSERVABILITY_BLOCK_KINDWORDS, ObservabilityBlock, SectionNode, Value, alerting_block,
-    config_block, observability_block, section_kindword,
+    ALERTING_BLOCK_KINDWORDS, API_KEY_PROVIDER_BLOCK_KINDWORDS, AlertingBlock, ApiKeyProviderBlock,
+    CONFIG_BLOCK_KINDWORDS, ConfigBlock, File, OBSERVABILITY_BLOCK_KINDWORDS, ObservabilityBlock,
+    SectionNode, Value, alerting_block, api_key_provider_block, config_block, observability_block,
+    section_kindword,
 };
 use brenn_dsl::parse_str;
 
@@ -313,6 +314,25 @@ fn every_nested_kindword_is_written_by_the_corpus() {
             .find(|node| section_kindword(node).0 == *kindword)
             .unwrap_or_else(|| panic!("no corpus `alerting` section writes `{kindword}`"));
         alerting_block(node).unwrap_or_else(|error| panic!("{kindword}: {error}"));
+    }
+
+    let key_providers: Vec<_> = file
+        .sections()
+        .filter(|node| section_kindword(node).0 == "api_key_provider")
+        .map(|node| match config_block(node) {
+            Ok(ConfigBlock::ApiKeyProvider(provider)) => provider,
+            _ => panic!("an api_key_provider section types as one"),
+        })
+        .collect();
+    for kindword in API_KEY_PROVIDER_BLOCK_KINDWORDS {
+        let node = key_providers
+            .iter()
+            .flat_map(|provider| provider.subs.iter())
+            .find(|node| section_kindword(node).0 == *kindword)
+            .unwrap_or_else(|| panic!("no corpus `api_key_provider` section writes `{kindword}`"));
+        let ApiKeyProviderBlock::Account(account) =
+            api_key_provider_block(node).unwrap_or_else(|error| panic!("{kindword}: {error}"));
+        assert!(account.attrs.default.is_some());
     }
 
     let ConfigBlock::Observability(observability) = typed(&file, "observability") else {

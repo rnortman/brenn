@@ -665,13 +665,17 @@ pub async fn run_server(
 
     let mqtt_client_identities = brenn_lib::mqtt::config::client_identities(&mqtt_clients);
 
-    // Every registered user gets a location channel in the plan. The list is
-    // the one a reload plans with too: a user registered after this point is
-    // provisioned at registration and is in neither plan.
-    let device_location_users: std::sync::Arc<[String]> = {
+    let registered_users: std::sync::Arc<[String]> = {
         let conn = db.lock().await;
         brenn_db::auth::user::list_usernames(&conn).into()
     };
+    // Every key-provider account belongs to a registered user. Registration
+    // needs no restart; the restart that adds an account comes after it.
+    brenn_lib::config::assert_api_key_account_users_registered(&config, &registered_users);
+    // Every registered user gets a location channel in the plan. The list is
+    // the one a reload plans with too: a user registered after this point is
+    // provisioned at registration and is in neither plan.
+    let device_location_users = registered_users;
 
     let (mut messaging_result, plan_carried) = brenn_messaging_boot::build_messaging(
         &config,

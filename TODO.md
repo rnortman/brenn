@@ -3599,3 +3599,20 @@ template has an empty segment (a trailing slash, e.g. `/jmap/api/`), which
 brenn then refuses at boot. A deployer gets a green check and a server that
 does not start. `config-check` should refuse the template the same way boot
 does.
+
+## `per-agent-account-bound`
+
+An agent's grant of a provided tool cannot restrict which of the acting
+user's `api_key_provider` accounts the nested `api-request` call may use:
+every agent serving a user reaches all of that user's accounts, narrowed
+only by the call's `account` argument and the user's default. The
+mechanism: `provide` declares `account` as an ACL key (today a provided
+tool registers `acl_keys: &[]` in `brenn-tool-registry/src/provided.rs`),
+the admitting clause's `account` set rides the pending record onto the
+nested call's `ToolCtx`, and `execute_key_accounts` in
+`brenn-oauth/src/tools/api_request.rs` intersects it — an `account`
+outside the set is denied, an omitted `account` with a one-name set
+resolves to that name before the user's default. Deferred because the
+evidence was a multi-user install, not several agents of one person on
+different mailboxes. Done is an agent's `allow { account = "…"; }` on a
+provided tool bounding the nested call.

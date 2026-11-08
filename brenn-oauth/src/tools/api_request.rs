@@ -1,13 +1,15 @@
 //! `api-request`: an HTTP request to a provider's API with a credential
-//! attached by Brenn — a user's stored OAuth credential, or the deployment's
-//! key for an `api_key_provider`.
+//! attached by Brenn — a user's stored OAuth credential, or for an
+//! `api_key_provider` either the deployment's key or a user's.
 //!
 //! The caller names the request; the credential is never an argument. On an
-//! OAuth provider a caller with an acting user acts with that user's
-//! credential: a conversation's owner, or the user of the provided-tool call
-//! a component's call serves, stamped by the executor. A caller with no acting
-//! user (a WASM component calling on its own account) borrows the one user its
-//! grant names. On a key provider every caller sends the same key.
+//! OAuth provider or a key provider with per-user accounts a caller with an
+//! acting user acts with that user's credential: a conversation's owner, or
+//! the user of the provided-tool call a component's call serves, stamped by
+//! the executor. A caller with no acting user (a WASM component calling on its
+//! own account) borrows the one user its grant names. The call's `account`
+//! picks among the user's accounts. On a key provider holding the deployment's
+//! key every caller sends the same key.
 //!
 //! A caller with no acting user only reads, on either kind: its call can be
 //! re-run from its channel window. A stamped component call is its user's
@@ -18,10 +20,10 @@
 //!
 //! The ACL is matched here, not by [`AclClause::matches`]: `path` is a segment
 //! template (see [`crate::path_template`]) and every other key exact or `*`.
-//! `check_acl` sees only the arguments, so on an OAuth provider it defers
-//! `user` (and an omitted `account`); `execute` matches the full attribute set
-//! once the credential is resolved. A key-provider call has no `user` or
-//! `account`: a clause constraining either never admits it.
+//! `check_acl` sees only the arguments, so on an OAuth or per-user key
+//! provider it defers `user` (and an omitted `account`); `execute` matches the
+//! full attribute set once the credential is resolved. A deployment-key call
+//! has no `user` or `account`: a clause constraining either never admits it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -29,7 +31,10 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use base64ct::{Base64, Encoding};
-use brenn_lib::config::{ApiKeyProviderConfig, OAuthProviderConfig, TRANSPORT_HEADERS};
+use brenn_lib::config::{
+    AccountKeys, AccountLookup, ApiKeyAccountRaw, ApiKeyProviderConfig, ApiKeySourceRaw, ApiKeys,
+    OAuthProviderConfig, TRANSPORT_HEADERS,
+};
 use brenn_lib::tools::AclClause;
 use brenn_tool_registry::{
     AclDenied, AsyncTool, ENVELOPE_MARGIN, Idempotency, MAX_ASYNC_RESULT_BYTES, ToolClass, ToolCtx,
@@ -112,6 +117,15 @@ impl ResolvedProvider<'_> {
             ResolvedProvider::Key(config) => Some(&config.header),
         }
     }
+
+    /// Whether this is a key provider holding the deployment's one key.
+    fn is_deployment_key(&self) -> bool {
+        matches!(self, ResolvedProvider::Key(config) if is_deployment_key(config))
+    }
+}
+
+fn is_deployment_key(config: &ApiKeyProviderConfig) -> bool {
+    matches!(config.keys, ApiKeys::Deployment(_))
 }
 
 /// One ACL attribute of a call.
@@ -194,6 +208,45 @@ fn lent_user(acl: &[AclClause], provider: &str) -> Result<String, ToolError> {
     }
 }
 
+/// Refuses a clause on the per-user key provider `provider` whose non-`*`
+/// `user` or `account` no account of `accounts` can match: a user no account
+/// binds, an account name not configured, or an account of another user.
+fn validate_account_clause(
+    provider: &str,
+    accounts: &[ApiKeyAccountRaw],
+    user: Option<&str>,
+    account: Option<&str>,
+) -> Result<(), String> {
+    let user = user.filter(|user| *user != "*");
+    if let Some(user) = user
+        && !accounts.iter().any(|a| a.user == user)
+    {
+        let users: BTreeSet<&str> = accounts.iter().map(|a| a.user.as_str()).collect();
+        return Err(format!(
+            "api_key_provider {provider:?} holds no account for user {user:?}; its accounts' \
+             users are {users:?}; the clause admits no call"
+        ));
+    }
+    let Some(account) = account.filter(|account| *account != "*") else {
+        return Ok(());
+    };
+    let Some(named) = accounts.iter().find(|a| a.name == account) else {
+        let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+        return Err(format!(
+            "api_key_provider {provider:?} has no account {account:?}; its accounts are \
+             {names:?}; the clause admits no call"
+        ));
+    };
+    match user {
+        Some(user) if named.user != user => Err(format!(
+            "api_key_provider {provider:?} account {account:?} belongs to user {:?}, not \
+             {user:?}; the clause admits no call",
+            named.user
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// A call checked against everything but the credential.
 struct Prepared {
     provider: String,
@@ -223,6 +276,31 @@ impl Prepared {
         request_line(&self.provider, &self.method, &self.host, &self.segments)
     }
 
+    /// The user whose credential a per-user call uses: the acting user, or
+    /// the one the grant lends a caller with none.
+    fn credential_user(&self, ctx: &ToolCtx) -> Result<String, ToolError> {
+        match &ctx.acting_user {
+            Some(acting) => Ok(acting.username.clone()),
+            None => lent_user(&ctx.grant.acl, &self.provider),
+        }
+    }
+
+    /// Hold the call, its credential resolved to `user`'s `account`, to the
+    /// grant's clauses.
+    fn admit(&self, ctx: &ToolCtx, user: &str, account: &str) -> Result<(), ToolError> {
+        if acl_admits(
+            &ctx.grant.acl,
+            &self.attrs(Attr::Is(user), Attr::Is(account)),
+        ) {
+            Ok(())
+        } else {
+            Err(ToolError::Denied(format!(
+                "{} as user {user:?}, account {account:?}",
+                self.line()
+            )))
+        }
+    }
+
     /// The request as sent, before its credential is placed.
     fn call(&self) -> ApiCall {
         ApiCall {
@@ -235,24 +313,25 @@ impl Prepared {
     }
 
     /// A request that got no answer, logged with its scrubbed text, as the
-    /// tool's error. `account` is set on an OAuth provider only.
-    fn transport_failed(&self, user: &str, account: Option<&str>, text: &str) -> ToolError {
+    /// tool's error. `account` is `-` on a deployment-key provider.
+    fn transport_failed(&self, user: &str, account: &str, text: &str) -> ToolError {
         error!(
             provider = %self.provider,
             user = %user,
-            account = account.map(tracing::field::display),
+            account = %account,
             error = %text,
             "api-request: transport failure"
         );
         ToolError::Internal(format!("{NAME}: {text}"))
     }
 
-    /// The completion line of an answered request. `account` and `refreshed`
-    /// are set on an OAuth provider only; the query is never logged.
+    /// The completion line of an answered request. `account` is `-` on a
+    /// deployment-key provider, `refreshed` set on an OAuth provider only; the
+    /// query is never logged.
     fn log_sent(
         &self,
         user: &str,
-        account: Option<&str>,
+        account: &str,
         refreshed: Option<bool>,
         response: &ApiResponse,
         started: Instant,
@@ -260,7 +339,7 @@ impl Prepared {
         info!(
             provider = %self.provider,
             user = %user,
-            account = account.map(tracing::field::display),
+            account = %account,
             method = %self.method,
             host = %self.host,
             path = %display_path(&self.segments),
@@ -282,10 +361,10 @@ fn request_line(provider: &str, method: &str, host: &str, segments: &[String]) -
 fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, ToolError> {
     let invalid = |detail: String| ToolError::InvalidArgs(format!("{NAME}: {detail}"));
     let key_header = provider.key_header();
-    if key_header.is_some() && args.account.is_some() {
+    if provider.is_deployment_key() && args.account.is_some() {
         return Err(invalid(format!(
-            "`account` applies to OAuth providers only; {:?} is an api_key_provider and sends \
-             the deployment's key",
+            "`account` applies to OAuth providers and key providers with `account` blocks; \
+             {:?} holds one deployment key",
             args.provider
         )));
     }
@@ -534,7 +613,8 @@ impl ApiRequestTool {
                 mcp_name: "mcp__brenn__ApiRequest",
                 description: "Make an HTTP request to a provider's API with a credential Brenn \
                               attaches (never you): the user's connected account for an OAuth \
-                              provider, or the deployment's key for an API-key provider. Name \
+                              provider, or for an API-key provider the deployment's key or \
+                              the user's own. Name \
                               the provider, the API host and the path; the operator's \
                               instructions say which providers and hosts exist. The response's \
                               status, headers and body come back as they are, non-2xx \
@@ -543,9 +623,9 @@ impl ApiRequestTool {
                               retry. OAuth providers only: a result with `error: \
                               \"credential_invalid\"` means the user must connect again: run \
                               `oauth-connect` and relay its steps; after the user says done, \
-                              `oauth-accounts` confirms. With several accounts connected for \
-                              an OAuth provider, name `account`; `account` is refused on an \
-                              API-key provider.",
+                              `oauth-accounts` confirms. With several accounts for a provider, \
+                              name `account`; `account` is refused on an API-key provider \
+                              holding one deployment key.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -556,9 +636,12 @@ impl ApiRequestTool {
                         },
                         "account": {
                             "type": "string",
-                            "description": "OAuth providers only: the account, as \
-                                            `oauth-accounts` lists it. Omitted: the user's \
-                                            only account there.",
+                            "description": "For an OAuth provider, the account as \
+                                            `oauth-accounts` lists it; for a key provider with \
+                                            per-user accounts, the account's configured name. \
+                                            Omitted: the user's only account, or the one the \
+                                            operator marked default. Refused on a key provider \
+                                            holding one deployment key.",
                         },
                         "method": {
                             "type": "string",
@@ -770,17 +853,31 @@ impl AsyncTool for ApiRequestTool {
         let value = |name: &str| clause.iter().find(|(key, _)| *key == name).map(|(_, v)| v);
         if value("user").is_some() || value("account").is_some() {
             if let Some(provider) = value("provider")
-                && self.keys.contains_key(provider)
+                && let Some(config) = self.keys.get(provider)
             {
-                return Err(format!(
-                    "`user` and `account` have no meaning for api_key_provider {provider:?}; the \
-                     clause admits no call"
-                ));
+                match &config.raw.source {
+                    ApiKeySourceRaw::Deployment { .. } => {
+                        return Err(format!(
+                            "`user` and `account` have no meaning for api_key_provider \
+                             {provider:?}, which holds one deployment key; the clause admits no \
+                             call"
+                        ));
+                    }
+                    ApiKeySourceRaw::Accounts(accounts) => {
+                        validate_account_clause(
+                            provider,
+                            accounts,
+                            value("user"),
+                            value("account"),
+                        )?;
+                    }
+                }
             }
-            if self.oauth.is_none() {
+            if self.oauth.is_none() && self.keys.values().all(is_deployment_key) {
                 return Err(
-                    "`user` and `account` have no meaning for an api_key_provider and no \
-                     oauth_provider is declared; the clause admits no call"
+                    "`user` and `account` have no meaning for a deployment-key api_key_provider, \
+                     and no oauth_provider and no key provider with accounts is declared; the \
+                     clause admits no call"
                         .to_string(),
                 );
             }
@@ -800,7 +897,7 @@ impl AsyncTool for ApiRequestTool {
         let Ok(segments) = decode_path(&args.path) else {
             return Ok(());
         };
-        let (user, account) = if self.keys.contains_key(&args.provider) {
+        let (user, account) = if self.keys.get(&args.provider).is_some_and(is_deployment_key) {
             (Attr::Absent, Attr::Absent)
         } else {
             (Attr::Deferred, Attr::from(args.account.as_deref()))
@@ -842,7 +939,16 @@ impl AsyncTool for ApiRequestTool {
             )));
         }
         match provider {
-            ResolvedProvider::Key(config) => self.execute_key(ctx, config, request, started).await,
+            ResolvedProvider::Key(config) => match &config.keys {
+                ApiKeys::Deployment(key) => {
+                    self.execute_key(ctx, config, key.expose(), request, started)
+                        .await
+                }
+                ApiKeys::Accounts(keys) => {
+                    self.execute_key_accounts(ctx, config, keys, request, started)
+                        .await
+                }
+            },
             ResolvedProvider::OAuth { service, config } => {
                 self.execute_oauth(ctx, service, config, request, started)
                     .await
@@ -858,12 +964,13 @@ impl ApiRequestTool {
         &self,
         ctx: &ToolCtx,
         config: &ApiKeyProviderConfig,
+        key: &str,
         request: Prepared,
         started: Instant,
     ) -> Result<serde_json::Value, ToolError> {
         if !acl_admits(&ctx.grant.acl, &request.attrs(Attr::Absent, Attr::Absent)) {
             return Err(ToolError::Denied(format!(
-                "{} (an api_key_provider call has no user or account)",
+                "{} (a deployment-key call has no user or account)",
                 request.line()
             )));
         }
@@ -871,16 +978,76 @@ impl ApiRequestTool {
             .acting_user
             .as_ref()
             .map_or("-", |acting| acting.username.as_str());
+        self.send_key(config, key, &request, user, "-", started)
+            .await
+    }
+
+    /// One request with the acting (or lent) user's key for the account the
+    /// call names, or their default or only one: sent once, its answer
+    /// returned whatever the status.
+    async fn execute_key_accounts(
+        &self,
+        ctx: &ToolCtx,
+        config: &ApiKeyProviderConfig,
+        keys: &AccountKeys,
+        request: Prepared,
+        started: Instant,
+    ) -> Result<serde_json::Value, ToolError> {
+        let user = request.credential_user(ctx)?;
+        let provider = &request.provider;
+        // TODO(per-agent-account-bound): every account of the acting user is
+        // reachable here; no bound from the agent's grant of the provided tool
+        // reaches the nested call to narrow it.
+        let (account, key) = match keys.lookup(&user, request.account.as_deref()) {
+            AccountLookup::Found { account, key } => (account, key.expose()),
+            AccountLookup::NoUser => {
+                return Err(ToolError::Denied(format!(
+                    "{}: api_key_provider {provider} holds no account for user {user}; the \
+                     operator adds an `account` block naming the user and restarts Brenn",
+                    request.line()
+                )));
+            }
+            AccountLookup::NoSuchAccount { available } => {
+                return Err(ToolError::Denied(format!(
+                    "{}: {provider} has no account {:?} for user {user}; theirs: {available:?}",
+                    request.line(),
+                    request.account.as_deref().unwrap_or_default(),
+                )));
+            }
+            AccountLookup::Ambiguous { available } => {
+                return Err(ToolError::Denied(format!(
+                    "{}: user {user} has several {provider} accounts and none is the default; \
+                     name one as `account`: {available:?}",
+                    request.line()
+                )));
+            }
+        };
+        request.admit(ctx, &user, account)?;
+        self.send_key(config, key, &request, &user, account, started)
+            .await
+    }
+
+    /// Send `request` once with `key` in the provider's header, and log it
+    /// under `user` and `account` (`-` where there is none).
+    async fn send_key(
+        &self,
+        config: &ApiKeyProviderConfig,
+        key: &str,
+        request: &Prepared,
+        user: &str,
+        account: &str,
+        started: Instant,
+    ) -> Result<serde_json::Value, ToolError> {
         let auth = Auth::Header {
             name: &config.header,
-            value: config.key.expose(),
+            value: key,
         };
         let response = self
             .http
             .api(request.call(), auth, config.raw.max_response_bytes)
             .await
-            .map_err(|text| request.transport_failed(user, None, &text))?;
-        request.log_sent(user, None, None, &response, started);
+            .map_err(|text| request.transport_failed(user, account, &text))?;
+        request.log_sent(user, account, None, &response, started);
         bounded_result(response)
     }
 
@@ -894,10 +1061,7 @@ impl ApiRequestTool {
         request: Prepared,
         started: Instant,
     ) -> Result<serde_json::Value, ToolError> {
-        let user = match &ctx.acting_user {
-            Some(acting) => acting.username.clone(),
-            None => lent_user(&ctx.grant.acl, &request.provider)?,
-        };
+        let user = request.credential_user(ctx)?;
         let account = match &request.account {
             Some(account) => account.clone(),
             None => match Self::sole_account(service, &request.provider, &user).await? {
@@ -912,15 +1076,7 @@ impl ApiRequestTool {
                 }
             },
         };
-        if !acl_admits(
-            &ctx.grant.acl,
-            &request.attrs(Attr::Is(&user), Attr::Is(&account)),
-        ) {
-            return Err(ToolError::Denied(format!(
-                "{} as user {user:?}, account {account:?}",
-                request.line()
-            )));
-        }
+        request.admit(ctx, &user, &account)?;
 
         let mut rejected: Option<String> = None;
         let mut refreshed = false;
@@ -960,7 +1116,7 @@ impl ApiRequestTool {
                     config.raw.max_response_bytes,
                 )
                 .await
-                .map_err(|text| request.transport_failed(&user, Some(&account), &text))?;
+                .map_err(|text| request.transport_failed(&user, &account, &text))?;
             if response.status != 401 {
                 break response;
             }
@@ -976,7 +1132,7 @@ impl ApiRequestTool {
             // and resend.
             rejected = Some(access);
         };
-        request.log_sent(&user, Some(&account), Some(refreshed), &response, started);
+        request.log_sent(&user, &account, Some(refreshed), &response, started);
         bounded_result(response)
     }
 }
@@ -989,8 +1145,9 @@ mod tests {
 
     use super::*;
     use crate::testutil::{
-        KEY, Stub, alice, credential, key_provider_config, provider_clause, provider_config,
-        service, service_with_alerts, start_stub, tool_ctx,
+        KEY, Stub, account_key, alice, credential, key_accounts_provider_config,
+        key_provider_config, provider_clause, provider_config, service, service_with_alerts,
+        start_stub, tool_ctx,
     };
     use crate::vault::Credential;
 
@@ -1841,7 +1998,10 @@ mod tests {
             clause(&[("provider", "other"), ("account", "*")]),
         ] {
             let err = tool.validate_clause(&bad).unwrap_err();
-            assert!(err.contains("no oauth_provider is declared"), "{err}");
+            assert!(
+                err.contains("no oauth_provider and no key provider with accounts is declared"),
+                "{err}"
+            );
         }
         let err = tool
             .validate_clause(&clause(&[("provider", "maps"), ("user", "alice")]))
@@ -1853,6 +2013,298 @@ mod tests {
         ] {
             assert_eq!(tool.validate_clause(&good), Ok(()), "{good:?}");
         }
+    }
+
+    /// A tool over the OAuth provider `google`, the deployment-key provider
+    /// `maps` and the per-user key provider `mail`
+    /// ([`key_accounts_provider_config`]), all pointed at one stub.
+    async fn accounts_fixture() -> KeyFixture {
+        let (base, stub) = start_stub().await;
+        let (svc, dir) = service(vec![provider_config("google", &base)]);
+        let keys = BTreeMap::from([
+            key_provider_config("maps", &base),
+            key_accounts_provider_config("mail", &base),
+        ]);
+        KeyFixture {
+            tool: ApiRequestTool::new(Some(svc), keys),
+            stub,
+            host: base.trim_start_matches("http://").to_string(),
+            _dir: dir,
+        }
+    }
+
+    fn user(id: i64, username: &str) -> ActingUser {
+        ActingUser {
+            id,
+            username: username.to_string(),
+        }
+    }
+
+    impl KeyFixture {
+        fn mail_args(&self, method: &str, account: Option<&str>) -> serde_json::Value {
+            let mut args = serde_json::json!({
+                "provider": "mail", "method": method, "host": self.host, "path": "/v1/mail",
+            });
+            if let Some(account) = account {
+                args["account"] = serde_json::json!(account);
+            }
+            args
+        }
+
+        /// The key header of the last request the stub saw.
+        fn last_key(&self) -> String {
+            let seen = self.seen();
+            let last = seen.last().expect("a request was sent");
+            last.headers["x-api-key"].to_str().unwrap().to_string()
+        }
+    }
+
+    fn denied(out: Result<serde_json::Value, ToolError>) -> String {
+        match out {
+            Err(ToolError::Denied(detail)) => detail,
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_per_user_key_is_chosen_by_the_acting_user_and_account() {
+        let f = accounts_fixture().await;
+        let acl = vec![provider_clause("mail")];
+        for (who, account, sent) in [
+            (alice(), None, "alice"),
+            (alice(), Some("alice-work"), "alice-work"),
+            (alice(), Some("alice"), "alice"),
+            (bob(), None, "bob"),
+            (user(4, "dan"), Some("dan-home"), "dan-home"),
+        ] {
+            let out = f
+                .call(Some(who.clone()), acl.clone(), f.mail_args("GET", account))
+                .await
+                .unwrap_or_else(|e| panic!("{} {account:?}: {e:?}", who.username));
+            assert_eq!(out["status"], 200);
+            assert_eq!(
+                f.last_key(),
+                account_key(sent),
+                "{} {account:?}",
+                who.username
+            );
+            assert!(!out.to_string().contains("K3Y"), "{out}");
+        }
+        assert_eq!(f.seen().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_per_user_key_call_without_a_usable_account_is_refused_unsent() {
+        let f = accounts_fixture().await;
+        let acl = vec![provider_clause("mail")];
+        let detail = denied(
+            f.call(Some(alice()), acl.clone(), f.mail_args("GET", Some("bob")))
+                .await,
+        );
+        assert!(
+            detail.contains(r#"mail has no account "bob" for user alice"#)
+                && detail.contains(r#"theirs: ["alice", "alice-work"]"#),
+            "{detail}"
+        );
+        let detail = denied(
+            f.call(
+                Some(user(3, "carol")),
+                acl.clone(),
+                f.mail_args("GET", None),
+            )
+            .await,
+        );
+        assert!(
+            detail.contains("api_key_provider mail holds no account for user carol")
+                && detail.contains("the operator adds an `account` block"),
+            "{detail}"
+        );
+        let detail = denied(
+            f.call(Some(user(4, "dan")), acl.clone(), f.mail_args("GET", None))
+                .await,
+        );
+        assert!(
+            detail.contains("user dan has several mail accounts and none is the default")
+                && detail.contains(r#"["dan-home", "dan-work"]"#),
+            "{detail}"
+        );
+        assert!(!detail.contains("K3Y"), "{detail}");
+        assert!(f.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_and_account_clauses_bound_a_per_user_key_call() {
+        let f = accounts_fixture().await;
+        let args = f.mail_args("GET", None);
+        let work = f.mail_args("GET", Some("alice-work"));
+        // `check_acl` defers the user and an omitted account.
+        let alice_only = vec![clause(&[("provider", "mail"), ("user", "alice")])];
+        assert_eq!(f.tool.check_acl(&args, &alice_only), Ok(()));
+        let home_only = vec![clause(&[("provider", "mail"), ("account", "alice")])];
+        assert_eq!(f.tool.check_acl(&args, &home_only), Ok(()));
+        assert!(f.tool.check_acl(&work, &home_only).is_err());
+
+        f.call(Some(alice()), alice_only.clone(), args.clone())
+            .await
+            .unwrap();
+        let detail = denied(f.call(Some(bob()), alice_only, args.clone()).await);
+        assert!(
+            detail.contains(r#"as user "bob", account "bob""#),
+            "{detail}"
+        );
+        f.call(Some(alice()), home_only.clone(), args.clone())
+            .await
+            .unwrap();
+        // The omitted account resolves to the default, then meets the clause.
+        let work_only = vec![clause(&[("provider", "mail"), ("account", "alice-work")])];
+        let detail = denied(f.call(Some(alice()), work_only.clone(), args).await);
+        assert!(
+            detail.contains(r#"as user "alice", account "alice""#),
+            "{detail}"
+        );
+        f.call(Some(alice()), work_only, work).await.unwrap();
+        assert_eq!(f.seen().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_lent_caller_uses_its_clauses_user_and_only_reads() {
+        let f = accounts_fixture().await;
+        let lent = vec![clause(&[("provider", "mail"), ("user", "bob")])];
+        f.call(None, lent.clone(), f.mail_args("GET", None))
+            .await
+            .unwrap();
+        assert_eq!(f.last_key(), account_key("bob"));
+        let detail = denied(f.call(None, lent, f.mail_args("POST", None)).await);
+        assert!(detail.contains("may only read"), "{detail}");
+        let detail = denied(
+            f.call(
+                None,
+                vec![clause(&[("provider", "mail"), ("user", "*")])],
+                f.mail_args("GET", None),
+            )
+            .await,
+        );
+        assert!(detail.contains("borrows the one user"), "{detail}");
+        assert_eq!(f.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stamped_component_call_uses_its_users_key() {
+        let f = accounts_fixture().await;
+        let mut post = f.mail_args("POST", Some("alice-work"));
+        post["body"] = serde_json::json!("{}");
+        let out = f
+            .tool
+            .execute(
+                &stamped_component_ctx(vec![clause(&[
+                    ("provider", "mail"),
+                    ("user", "*"),
+                    ("method", "POST"),
+                ])]),
+                post,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["status"], 200);
+        assert_eq!(f.last_key(), account_key("alice-work"));
+    }
+
+    #[tokio::test]
+    async fn validate_clause_admits_user_and_account_on_a_per_user_key_provider() {
+        let f = accounts_fixture().await;
+        for good in [
+            clause(&[("provider", "mail"), ("user", "alice")]),
+            clause(&[("provider", "mail"), ("account", "alice-work")]),
+        ] {
+            assert_eq!(f.tool.validate_clause(&good), Ok(()), "{good:?}");
+        }
+        let err = f
+            .tool
+            .validate_clause(&clause(&[("provider", "maps"), ("user", "alice")]))
+            .unwrap_err();
+        assert!(err.contains("holds one deployment key"), "{err}");
+
+        // With no OAuth provider, a per-user key provider is enough.
+        let base = "http://127.0.0.1:9";
+        let tool = ApiRequestTool::new(
+            None,
+            BTreeMap::from([
+                key_provider_config("maps", base),
+                key_accounts_provider_config("mail", base),
+            ]),
+        );
+        assert_eq!(
+            tool.validate_clause(&clause(&[("provider", "*"), ("user", "alice")])),
+            Ok(())
+        );
+    }
+
+    /// A per-user key provider's accounts are fixed at boot, so a clause
+    /// naming it exactly with a `user` or `account` none of them matches is
+    /// refused, naming what is configured.
+    #[tokio::test]
+    async fn validate_clause_refuses_users_and_accounts_the_per_user_provider_lacks() {
+        let f = accounts_fixture().await;
+        for good in [
+            clause(&[
+                ("provider", "mail"),
+                ("user", "alice"),
+                ("account", "alice-work"),
+            ]),
+            clause(&[("provider", "mail"), ("user", "*"), ("account", "bob")]),
+            clause(&[("provider", "mail"), ("user", "dan"), ("account", "*")]),
+            clause(&[("provider", "*"), ("user", "carol"), ("account", "nobody")]),
+        ] {
+            assert_eq!(f.tool.validate_clause(&good), Ok(()), "{good:?}");
+        }
+        let err = f
+            .tool
+            .validate_clause(&clause(&[("provider", "mail"), ("user", "carol")]))
+            .unwrap_err();
+        assert!(
+            err.contains(r#"no account for user "carol""#)
+                && err.contains(r#"{"alice", "bob", "dan"}"#),
+            "{err}"
+        );
+        let err = f
+            .tool
+            .validate_clause(&clause(&[("provider", "mail"), ("account", "alice-wrok")]))
+            .unwrap_err();
+        assert!(
+            err.contains(r#"no account "alice-wrok""#) && err.contains(r#""alice-work""#),
+            "{err}"
+        );
+        let err = f
+            .tool
+            .validate_clause(&clause(&[
+                ("provider", "mail"),
+                ("user", "bob"),
+                ("account", "alice-work"),
+            ]))
+            .unwrap_err();
+        assert!(
+            err.contains(r#"account "alice-work" belongs to user "alice", not "bob""#),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_on_a_deployment_key_provider_names_both_forms() {
+        let f = accounts_fixture().await;
+        let mut args = f.args("GET", "/v1/things");
+        args["account"] = serde_json::json!("alice");
+        let out = f
+            .call(Some(alice()), vec![provider_clause("*")], args)
+            .await;
+        let Err(ToolError::InvalidArgs(detail)) = out else {
+            panic!("expected InvalidArgs, got {out:?}");
+        };
+        assert!(
+            detail.contains("key providers with `account` blocks")
+                && detail.contains(r#""maps" holds one deployment key"#),
+            "{detail}"
+        );
+        assert!(f.seen().is_empty());
     }
 
     #[tokio::test]

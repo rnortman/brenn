@@ -104,12 +104,8 @@ pub fn run_config_check(file: &Path, roots: &Roots) -> bool {
             for advisory in &advisories {
                 eprintln!("{}: warning: {advisory}", file.display());
             }
-            for user in brenn_messaging_boot::device_location_users_named_in(&document.config) {
-                eprintln!(
-                    "{}: note: {}",
-                    file.display(),
-                    unchecked_location_user(&user)
-                );
+            for note in unchecked_user_notes(&document.config) {
+                eprintln!("{}: note: {note}", file.display());
             }
             // The hash names the whole tree that was checked, not just the
             // root file, so an operator can hold what they certified against
@@ -132,6 +128,18 @@ pub fn run_config_check(file: &Path, roots: &Roots) -> bool {
     }
 }
 
+/// One note per user the document names whose registration only boot can
+/// check: location-channel users, then `api_key_provider` account users.
+fn unchecked_user_notes(config: &BrennConfig) -> Vec<String> {
+    let locations = brenn_messaging_boot::device_location_users_named_in(config)
+        .into_iter()
+        .map(|user| unchecked_location_user(&user));
+    let accounts = brenn_lib::config::api_key_account_users(config)
+        .into_iter()
+        .map(|user| unchecked_key_account_user(&user));
+    locations.chain(accounts).collect()
+}
+
 /// What the check says about a port bound to `user`'s location channel: the
 /// channel exists once per registered user, and this tool has no users table.
 fn unchecked_location_user(user: &str) -> String {
@@ -139,6 +147,16 @@ fn unchecked_location_user(user: &str) -> String {
         "a port binds {}; the channel exists only if user {user:?} is registered, \
          which boot checks and this tool cannot",
         brenn_lib::messaging::device_location_address(user),
+    )
+}
+
+/// What the check says about an `api_key_provider` account bound to `user`:
+/// boot refuses an account whose user is not registered, and this tool has no
+/// users table.
+fn unchecked_key_account_user(user: &str) -> String {
+    format!(
+        "an api_key_provider account names user {user:?}; boot refuses it unless the user is \
+         registered, which this tool cannot check"
     )
 }
 
@@ -783,6 +801,35 @@ new sifter: Sink {
         assert!(
             report.contains(&format!("--mounted {flag}:1:")) && report.contains("main.brenn"),
             "{report}"
+        );
+    }
+
+    /// Key-provider accounts check clean without their users or key files: both
+    /// are host facts. The note names the user boot will look for.
+    #[test]
+    fn a_key_provider_account_checks_clean_off_host_and_its_user_is_noted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.brenn");
+        std::fs::write(
+            &file,
+            r#"api_key_provider mail {
+    header = "Authorization";
+    api_hosts = ["https://api.example.com"];
+    account alice {
+        user = "alice";
+        key_file = "/absent/alice";
+    }
+}
+"#,
+        )
+        .unwrap();
+        assert!(run_config_check(&file, &Default::default()));
+        let document = check_config(&deployment_inputs(&file, &Default::default())).unwrap();
+        let notes = unchecked_user_notes(&document.config);
+        assert_eq!(notes, [unchecked_key_account_user("alice")]);
+        assert!(
+            notes[0].contains("\"alice\"") && notes[0].contains("registered"),
+            "{notes:?}"
         );
     }
 

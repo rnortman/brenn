@@ -774,6 +774,35 @@ fn a_second_sub_block_under_the_other_nesting_parent_is_refused() {
     );
 }
 
+/// An `api_key_provider` nests too: an account name is one per provider,
+/// whatever user each block names, and two providers may each hold one.
+#[test]
+fn a_second_account_of_one_name_in_a_key_provider_is_refused() {
+    let provider = |name: &str, accounts: &[(&str, &str)]| {
+        let body: String = accounts
+            .iter()
+            .map(|(account, user)| {
+                format!(
+                    "    account {account} {{ user = \"{user}\"; key_file = \"/etc/brenn/{account}\"; }}\n"
+                )
+            })
+            .collect();
+        format!(
+            "api_key_provider {name} {{\n    header = \"Authorization\";\n    \
+             api_hosts = [\"https://api.example.com\"];\n{body}}}\n"
+        )
+    };
+    resolved(&format!(
+        "{}{}",
+        provider("mail", &[("work", "alice")]),
+        provider("files", &[("work", "alice")]),
+    ));
+    assert_eq!(
+        refusal(&provider("mail", &[("work", "alice"), ("work", "bob")])),
+        "a `api_key_provider` section states `account work` once, and this is the second"
+    );
+}
+
 /// A kindword the context admits none of is not counted: saying `bogus` appears
 /// twice would claim one `bogus` would have been fine, and would swallow the
 /// dispatch's refusal for the second one.

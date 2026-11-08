@@ -4,6 +4,18 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **An `api_key_provider` can hold per-user accounts.** Instead of one
+  `key_file`, a block may hold `account <name> { user = "…"; key_file = "…";
+  default = true; }` sub-blocks, each one registered user's key in its own
+  `0600` file. `api-request` picks the acting user's key: `account` names one
+  of that user's accounts, and an omitted `account` resolves to the user's
+  default or only one. `user` and `account` clauses bound such calls as they
+  do OAuth calls, and a clause naming such a provider with a `user` or
+  `account` none of its accounts matches is refused at boot and on reload.
+  Boot refuses an account whose user is not registered;
+  `brenn config-check` notes each user it cannot check. The `key_file` form is
+  unchanged. Adding or changing an account takes a restart.
+
 ## [0.32.0] — 2026-11-08
 
 - **BREAKING: `google-workspace-tools` is split into five components, one

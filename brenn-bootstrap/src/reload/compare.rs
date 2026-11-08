@@ -1328,7 +1328,9 @@ mod tests {
             config.api_key_providers.insert(
                 "maps".to_string(),
                 brenn_lib::config::ApiKeyProviderRaw {
-                    key_file: std::path::PathBuf::from(key_file),
+                    source: brenn_lib::config::ApiKeySourceRaw::Deployment {
+                        key_file: std::path::PathBuf::from(key_file),
+                    },
                     ..brenn_lib::config::test_api_key_provider_raw("https://api.example.com")
                 },
             );
@@ -1346,6 +1348,47 @@ mod tests {
             refusals(&provider("/keys/one"), &base()),
             vec!["api_key_providers[maps] removed: this change needs a restart".to_string()],
         );
+    }
+
+    /// An account added, removed, rebound to another user or re-pathed is a
+    /// changed provider: every account's key is read once at boot.
+    #[test]
+    fn a_changed_api_key_account_needs_a_restart() {
+        let account =
+            |name: &str, user: &str, key_file: &str| brenn_lib::config::ApiKeyAccountRaw {
+                name: name.to_string(),
+                user: user.to_string(),
+                key_file: std::path::PathBuf::from(key_file),
+                default: false,
+            };
+        let provider = |accounts: Vec<brenn_lib::config::ApiKeyAccountRaw>| {
+            let mut config = base();
+            config.api_key_providers.insert(
+                "mail".to_string(),
+                brenn_lib::config::ApiKeyProviderRaw {
+                    source: brenn_lib::config::ApiKeySourceRaw::Accounts(accounts),
+                    ..brenn_lib::config::test_api_key_provider_raw("https://api.example.com")
+                },
+            );
+            config
+        };
+        let alice = || account("alice", "alice", "/keys/alice");
+        let before = provider(vec![alice()]);
+        assert!(refusals(&before, &provider(vec![alice()])).is_empty());
+        let changed =
+            vec!["api_key_providers[mail] differs: this change needs a restart".to_string()];
+        for after in [
+            vec![alice(), account("bob", "bob", "/keys/bob")],
+            vec![account("bob", "bob", "/keys/bob")],
+            vec![account("alice", "bob", "/keys/alice")],
+            vec![account("alice", "alice", "/keys/other")],
+        ] {
+            assert_eq!(
+                refusals(&before, &provider(after.clone())),
+                changed,
+                "{after:?}"
+            );
+        }
     }
 
     /// A tuning block for the location family, keyed by `address` or, when

@@ -79,6 +79,21 @@ api_key_provider maps {
   api_hosts = ["https://weather.example.com"];
 }
 
+// A service each user has their own key to, chosen by the acting user.
+api_key_provider mail {
+  header = "Authorization";
+  api_hosts = ["https://api.mail.example.com"];
+  account alice {
+    user = "alice";
+    key_file = "/etc/brenn/mail/alice";
+    default = true;
+  }
+  account alice-work {
+    user = "alice";
+    key_file = "/etc/brenn/mail/alice-work";
+  }
+}
+
 repo_sync {
   repo_dir = "/home/alice/repos";
   poll_interval_secs = 300;

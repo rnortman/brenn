@@ -1948,14 +1948,25 @@ vocabulary! {
         opt max_response_bytes: V,
     }
 
-    /// An `api_key_provider` block: one service Brenn sends a deployment-wide
-    /// key to. The block's name is the provider's slug, shared with
-    /// `oauth_provider` names. The key is sent as the value of `header`.
+    /// An `api_key_provider` block: one service Brenn sends a key to. The
+    /// block's name is the provider's slug, shared with `oauth_provider`
+    /// names. The key is sent as the value of `header`: either the
+    /// deployment's, named by `key_file`, or a user's, named by one of the
+    /// block's `account` sub-blocks.
     struct ApiKeyProviderAttrs<V> {
-        req key_file: V,
+        opt key_file: V,
         req header: V,
         req api_hosts: V,
         opt max_response_bytes: V,
+    }
+
+    /// `account alice-work { user = "alice"; key_file = "…"; default = true; }`
+    /// inside an `api_key_provider`: one user's key, under the name a call
+    /// passes as `account`.
+    struct ApiKeyAccountAttrs<V> {
+        req user: V,
+        req key_file: V,
+        opt default: V,
     }
 
     /// The `repo_sync` section: where repo clones live, how often repos are
@@ -2096,6 +2107,17 @@ kindword_dispatch! {
     context "an alerting body";
     "ntfy" unnamed => Ntfy(NtfyAttrs),
     "mail" unnamed => Mail(MailAttrs),
+}
+
+kindword_dispatch! {
+    /// A sub-block of an `api_key_provider` section.
+    enum ApiKeyProviderBlock;
+    /// The kindwords an `api_key_provider` body admits.
+    const API_KEY_PROVIDER_BLOCK_KINDWORDS;
+    /// Type an `api_key_provider` body's held sub-block.
+    fn api_key_provider_block;
+    context "an api_key_provider body";
+    "account" named => Account(ApiKeyAccountAttrs),
 }
 
 kindword_dispatch! {

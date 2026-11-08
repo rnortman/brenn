@@ -11,7 +11,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use brenn_lib::config::{
-    ApiKeyProviderConfig, OAuthProviderConfig, OAuthProviderRaw, ResolvedOAuth, SecretString,
+    AccountKeys, ApiKeyAccountRaw, ApiKeyProviderConfig, ApiKeySourceRaw, ApiKeys,
+    OAuthProviderConfig, OAuthProviderRaw, ResolvedOAuth, SecretString,
 };
 
 use crate::OAuthService;
@@ -47,10 +48,46 @@ pub fn key_provider_config(name: &str, base: &str) -> (String, ApiKeyProviderCon
     let header = reqwest::header::HeaderName::from_bytes(raw.header.as_bytes()).unwrap();
     let config = ApiKeyProviderConfig {
         raw,
-        key: SecretString::new(KEY.to_string()),
+        keys: ApiKeys::Deployment(SecretString::new(KEY.to_string())),
         header,
         api_origins: vec![(brenn_lib::config::origin_host(&url), url)],
     };
+    (name.to_string(), config)
+}
+
+/// The key a [`key_accounts_provider_config`] account sends: `K3Y-` and the
+/// account's name.
+pub fn account_key(account: &str) -> String {
+    format!("K3Y-{account}")
+}
+
+/// A key provider like [`key_provider_config`] holding per-user accounts:
+/// alice has `alice` (her default) and `alice-work`, bob has `bob`, dan has
+/// `dan-home` and `dan-work` and no default. Each sends [`account_key`].
+pub fn key_accounts_provider_config(name: &str, base: &str) -> (String, ApiKeyProviderConfig) {
+    let accounts = [
+        ("alice", "alice", true),
+        ("alice-work", "alice", false),
+        ("bob", "bob", false),
+        ("dan-home", "dan", false),
+        ("dan-work", "dan", false),
+    ];
+    let accounts: Vec<ApiKeyAccountRaw> = accounts
+        .iter()
+        .map(|&(account, user, default)| ApiKeyAccountRaw {
+            name: account.to_string(),
+            user: user.to_string(),
+            key_file: std::path::PathBuf::from(format!("/unused/{account}")),
+            default,
+        })
+        .collect();
+    let (_, mut config) = key_provider_config(name, base);
+    config.keys = ApiKeys::Accounts(AccountKeys::new(
+        accounts
+            .iter()
+            .map(|account| (account, SecretString::new(account_key(&account.name)))),
+    ));
+    config.raw.source = ApiKeySourceRaw::Accounts(accounts);
     (name.to_string(), config)
 }
 

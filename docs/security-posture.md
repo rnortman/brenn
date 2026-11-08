@@ -1562,6 +1562,18 @@ sent. Two limits stand beside that guarantee:
 - **Placement.** Keeping the key file outside agent-visible paths is the
   operator's responsibility; Brenn checks the file's mode and nothing else.
 
+**A per-user key is a user's credential the operator placed.** An
+`api_key_provider` may instead hold named accounts, each bound to a
+registered user and holding that user's key in its own host file. The trust
+decision above is unchanged: the backend picks the key by the stamped (or
+lent) user, the caller names at most which of that user's accounts, by name,
+and the grant's `user` and `account` keys bound the choice as on OAuth. A
+caller can never reach another user's account: an account name that is not
+one of the stamped user's is refused before anything is sent. Every guarantee
+and limit stated for the deployment key — header-only, configured origins,
+no redirects, never in the container or a log line, echo and placement — holds
+for each account's file, and a caller with no user is admitted only to read.
+
 **Policies:**
 
 - **Vault placement.** The vault is a host directory owned by the server's

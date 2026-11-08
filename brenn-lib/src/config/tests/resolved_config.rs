@@ -436,7 +436,7 @@ fn config_with_key_provider(dir: &std::path::Path, mode: u32) -> BrennConfig {
         api_key_providers: std::collections::BTreeMap::from([(
             "maps".to_string(),
             crate::config::ApiKeyProviderRaw {
-                key_file,
+                source: crate::config::ApiKeySourceRaw::Deployment { key_file },
                 ..crate::config::test_api_key_provider_raw("https://api.example.com")
             },
         )]),
@@ -457,7 +457,10 @@ fn resolved_config_carries_api_key_providers() {
         super::test_runtime_dir(),
     );
     assert_eq!(api_key_providers.keys().collect::<Vec<_>>(), ["maps"]);
-    assert_eq!(api_key_providers["maps"].key.expose(), "k3y-value");
+    let crate::config::ApiKeys::Deployment(key) = &api_key_providers["maps"].keys else {
+        panic!("a deployment key");
+    };
+    assert_eq!(key.expose(), "k3y-value");
 }
 
 /// A key provider whose key file is group-readable refuses boot.

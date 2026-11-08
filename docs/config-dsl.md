@@ -626,11 +626,14 @@ the provider's `api_hosts`.
 
 ### API-key providers
 
-An `api_key_provider` block names a service that authenticates with one
-deployment-wide key, such as Google's Maps Platform APIs. The operator places
-the key in a file on the host; Brenn reads it at boot and attaches it to
-requests itself. Brenn never passes the key into an agent's container.
-`docs/google-maps-platform.md` walks through a Google Maps Platform setup.
+An `api_key_provider` block names a service that authenticates with a key
+rather than OAuth. It holds keys in one of two forms: one deployment-wide key,
+sent for every caller, such as Google's Maps Platform key; or named accounts,
+each one user's key, such as a mail service where every user has a token of
+their own. The operator places each key in a file on the host; Brenn reads it
+at boot and attaches it to requests itself. Brenn never passes a key into an
+agent's container. `docs/google-maps-platform.md` walks through a Google Maps
+Platform setup.
 
 ```
 api_key_provider google-maps {
@@ -648,10 +651,14 @@ The block's name follows the `oauth_provider` rule: lowercase letters, digits
 and `-`. Both kinds of provider share one namespace, so a name declared as both
 is refused at the second block.
 
-- `key_file` — required. The host path to a file holding the key: mode `0600`
-  or tighter, not empty. Surrounding whitespace is trimmed. The file is read
-  once at boot and its content is never written to the diagnostic or
-  security log.
+- `key_file` — the deployment form's key. The host path to a file holding
+  the key: mode `0600` or tighter, not empty. Surrounding whitespace is
+  trimmed. The file is read once at boot and its content is never written to
+  the diagnostic or security log.
+- `account <name> { … }` — the per-user form; see *Per-user accounts* below.
+  A block holds `key_file` or one or more `account` blocks: both are refused
+  ("one deployment key or per-user accounts, not both"), and so is neither
+  ("names no key").
 - `header` — required. The header the key is sent in on each request:
   `header = "X-Goog-Api-Key"` sends the file's content as that header's value.
   The content is sent verbatim, so a provider that wants
@@ -672,8 +679,53 @@ is refused at the second block.
 
 A key provider needs no `server.vault_dir`. That key stays required exactly
 when an `oauth_provider` is declared. Changing a key provider takes a restart,
-and a reload that changes one is refused, naming it. A key file replaced in
+and a reload that changes one is refused, naming it; adding, removing,
+rebinding or re-pathing an account is such a change. A key file replaced in
 place is not noticed until the next restart.
+
+#### Per-user accounts
+
+```
+api_key_provider fastmail {
+  header = "Authorization";
+  api_hosts = ["https://api.fastmail.com"];
+  account alice {
+    user = "alice";
+    key_file = "/etc/brenn/fastmail/alice";
+    default = true;
+  }
+  account alice-work {
+    user = "alice";
+    key_file = "/etc/brenn/fastmail/alice-work";
+  }
+  account bob {
+    user = "bob";
+    key_file = "/etc/brenn/fastmail/bob";
+  }
+}
+```
+
+An `account` block's name is what a call passes as `account` and a clause
+names under `account`. It follows the provider rule: lowercase letters, digits
+and `-`, starting with a letter and not ending in `-`. Names are unique within
+the provider, not per user, so two users' second accounts are `alice-work` and
+`bob-work`, never two `work`s; a name therefore picks one account whoever is
+calling.
+
+- `user` — required. The Brenn username whose key this is, as a string. Boot
+  refuses an account whose user is not registered, naming the provider, the
+  account and the user; `brenn config-check` cannot see the users table and
+  prints a note per user instead. Register the user first (no restart), then
+  place the key, add the block and restart.
+- `key_file` — required. As the deployment form's `key_file`, one file per
+  account. Two accounts may name the same file; a shared mailbox is the
+  operator's choice.
+- `default` — optional, `false` by default. The account an omitted `account`
+  argument resolves to for this user. At most one per user; a second is
+  refused. A user with one account needs none: the only account is the
+  default. A user with several and no default must name one on every call.
+
+No other attribute or block is accepted inside an `account`.
 
 #### `api-request` on a key provider
 
@@ -681,23 +733,36 @@ A key provider is called through `api-request`, named by its block's name as
 `provider`. The `method`, `host` and `path` keys, the path template, and the
 request rules are those of *The OAuth tools*. What differs:
 
-- **Every caller sends the same key.** The key is the deployment's, not a
-  user's: there is no account to connect and no consent. Its spend is the
-  operator's.
+- **Whose key.** On the deployment form every caller sends the same key: it
+  is the deployment's, not a user's, there is no account to connect and no
+  consent, and its spend is the operator's. On the per-user form the key is
+  the acting user's, picked as an OAuth credential is: the caller never names
+  the user, and `account` picks among that user's accounts by name. An
+  omitted `account` is the user's default, or their only account; a user with
+  several and no default is refused with their account names, a name that is
+  not one of theirs is refused with theirs, and a user with no account on the
+  provider is refused naming the operator's fix. Nothing is sent on any of
+  these refusals.
 - **The key's header is Brenn's.** A caller header with the configured
   `header` name (in any case) is refused before anything is sent. Only that
   name is reserved: a caller may still send a `key` query parameter.
   `Authorization`, `Host`, `Cookie` and the transport headers are refused to
   callers on both kinds.
-- **`account` is refused.** An `account` argument on a key-provider call is an
-  invalid argument; it is never silently ignored.
-- **`user` and `account` never admit a key call.** A clause constraining
-  either, even to `"*"`, admits no key-provider call. A clause whose `provider`
-  names a key provider exactly and also names `user` or `account` admits
-  nothing, so it is refused at boot and on reload. A clause with
-  `provider = "*"` and a `user` is valid and admits only OAuth calls; on a
-  deployment with no `oauth_provider` it admits nothing and is refused too.
-  Give key providers their own clauses.
+- **`account` on the deployment form is refused.** An `account` argument on
+  a call to a deployment-key provider is an invalid argument; it is never
+  silently ignored.
+- **`user` and `account` clauses.** On the per-user form they bound calls as
+  on OAuth: `user` against the acting (or lent) user, `account` against the
+  account the call resolved to. They never admit a deployment-key call: a
+  clause constraining either, even to `"*"`, admits none. A clause whose
+  `provider` names a deployment-key provider exactly and also names `user` or
+  `account` admits nothing, so it is refused at boot and on reload. So is a
+  clause whose `provider` names a per-user provider exactly and whose `user`
+  or `account` (other than `"*"`) no account of it matches: a user no account
+  binds, an account name not configured, or a `user` and `account` pair where
+  the account belongs to someone else. A clause with `provider = "*"` and a `user` admits OAuth and per-user key calls; on a
+  deployment with neither an `oauth_provider` nor a key provider with accounts
+  it admits nothing and is refused too.
 - **The answer is returned as it is.** The request is sent once. A 401 or 403
   is the provider's answer, returned like any other status: there is no
   refresh and no `credential_invalid`. Brenn does not read provider bodies, so
@@ -708,7 +773,9 @@ request rules are those of *The OAuth tools*. What differs:
 - **A WASM component only reads, on its own account.** A caller with no acting
   user is admitted with `GET` and `HEAD` only, as with a lent OAuth credential.
   A component's call can be replayed from its channel window, and a replayed
-  write is the wrong thing whatever the credential. No `user` is named or lent.
+  write is the wrong thing whatever the credential. On the deployment form no
+  `user` is named or lent; on the per-user form the component borrows the one
+  user its clauses name, as on OAuth, and is refused when they name none.
   A nested call a provider makes for a request whose caller had a user
   carries that user and may use any method its clause admits, as on OAuth;
   one made for a userless request only reads (see *The OAuth tools*).
@@ -718,8 +785,8 @@ request rules are those of *The OAuth tools*. What differs:
   key file.
 
 The final log line of a key call names the provider, the acting user (`-` for
-a component), the method, host and path, the status and the sizes. It never
-carries the query.
+a component), the account (`-` on the deployment form), the method, host and
+path, the status and the sizes. It never carries the query or the key.
 
 ```
 agent PersonalAssistant {

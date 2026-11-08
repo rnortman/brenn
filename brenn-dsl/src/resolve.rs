@@ -4215,6 +4215,9 @@ fn resolve_section(
         Some(other) => match nesting(other) {
             Some(Nesting::Alerting) => dispatched!(crate::model::alerting_block(node)),
             Some(Nesting::Observability) => dispatched!(crate::model::observability_block(node)),
+            Some(Nesting::ApiKeyProvider) => {
+                dispatched!(crate::model::api_key_provider_block(node))
+            }
             // Every other parent admits no sub-block — including `ntfy`, `mail`
             // and `usage`, which are themselves sub-blocks.
             None => {
@@ -4229,6 +4232,7 @@ fn resolve_section(
 enum Nesting {
     Alerting,
     Observability,
+    ApiKeyProvider,
 }
 
 /// What a parent kindword nests, if it nests anything.
@@ -4242,6 +4246,7 @@ fn nesting(parent: &str) -> Option<Nesting> {
     match parent {
         "alerting" => Some(Nesting::Alerting),
         "observability" => Some(Nesting::Observability),
+        "api_key_provider" => Some(Nesting::ApiKeyProvider),
         _ => None,
     }
 }
@@ -4252,6 +4257,7 @@ impl Nesting {
         match self {
             Self::Alerting => crate::model::ALERTING_BLOCK_KINDWORDS,
             Self::Observability => crate::model::OBSERVABILITY_BLOCK_KINDWORDS,
+            Self::ApiKeyProvider => crate::model::API_KEY_PROVIDER_BLOCK_KINDWORDS,
         }
     }
 }

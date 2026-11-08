@@ -20,9 +20,9 @@ use brenn_dsl::diag::Diagnostic;
 use crate::access::AppPolicy;
 use crate::access::raw::ChannelMatcherRaw;
 use crate::config::{
-    ApiKeyProviderRaw, AppConfig, BrennConfig, DEFAULT_MAX_RESPONSE_BYTES, FrontmatterRenderConfig,
-    OAuthProviderRaw, PathMapper, PostPullHooksConfig, RepoSyncConfig, StartHooksConfig,
-    StartupHooksConfig,
+    ApiKeyProviderRaw, ApiKeySourceRaw, AppConfig, BrennConfig, DEFAULT_MAX_RESPONSE_BYTES,
+    FrontmatterRenderConfig, OAuthProviderRaw, PathMapper, PostPullHooksConfig, RepoSyncConfig,
+    StartHooksConfig, StartupHooksConfig,
 };
 use crate::messaging::AttachGrant;
 use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
@@ -58,7 +58,9 @@ pub fn test_oauth_provider_raw(base: &str) -> OAuthProviderRaw {
 /// limit. Tests override the fields they exercise with struct update.
 pub fn test_api_key_provider_raw(base: &str) -> ApiKeyProviderRaw {
     ApiKeyProviderRaw {
-        key_file: PathBuf::from("/unused/api-key"),
+        source: ApiKeySourceRaw::Deployment {
+            key_file: PathBuf::from("/unused/api-key"),
+        },
         header: "X-Api-Key".to_string(),
         api_hosts: vec![base.to_string()],
         max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
