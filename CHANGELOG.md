@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.32.0] — 2026-11-08
+
 - **BREAKING: `google-workspace-tools` is split into five components, one
   per Google scope set; no compatibility shim.** The package
   `google-workspace-tools` and its class `GoogleWorkspaceTools` are gone.
