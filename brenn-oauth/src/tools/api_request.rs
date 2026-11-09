@@ -47,15 +47,19 @@ use tracing::{error, info, warn};
 
 use crate::http::{ApiCall, ApiResponse, Auth, CallFailure, OAuthHttp, Refreshed};
 use crate::path_template::{
-    build_url, decode_path, display_path, template_admits, validate_template,
+    ANY_PATH, RequestPath, build_url, decode_path, display_path, template_admits, validate_template,
 };
 use crate::{CallSite, OAuthService};
 
 const NAME: &str = API_REQUEST_TOOL;
 
-const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
+const METHODS: &[&str] = &[
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "PROPFIND", "REPORT",
+];
 
-/// Methods a caller with no acting user may use.
+/// Methods a caller with no acting user may use. `PROPFIND` and `REPORT` read
+/// too and are deliberately absent, left to the `consumer-own-credentials`
+/// TODO entry.
 const READ_METHODS: &[&str] = &["GET", "HEAD"];
 
 /// An access token expiring sooner than this is refreshed before use.
@@ -152,12 +156,21 @@ struct Attrs<'a> {
     account: Attr<'a>,
     method: &'a str,
     host: &'a str,
-    segments: &'a [String],
+    path: &'a RequestPath,
 }
 
 /// Whether `clause` admits `attrs`: every constrained key is deferred or
-/// matches — `path` as a segment template, every other key exactly or `*`.
+/// matches — `path` as a segment template, every other key exactly or `*`. A
+/// clause naming no `path` is matched as `path = "*"`, which admits no path
+/// ending in `/`.
 fn clause_admits(clause: &AclClause, attrs: &Attrs<'_>) -> bool {
+    let path_template = clause
+        .iter()
+        .find(|(key, _)| *key == "path")
+        .map_or(ANY_PATH, |(_, template)| template);
+    if !template_admits(path_template, attrs.path) {
+        return false;
+    }
     let exact = |allowed: &str, value: Attr<'_>| match value {
         Attr::Deferred => true,
         Attr::Absent => false,
@@ -169,7 +182,7 @@ fn clause_admits(clause: &AclClause, attrs: &Attrs<'_>) -> bool {
         "account" => exact(allowed, attrs.account),
         "method" => exact(allowed, Attr::Is(attrs.method)),
         "host" => exact(allowed, Attr::Is(attrs.host)),
-        "path" => template_admits(allowed, attrs.segments),
+        "path" => true,
         other => panic!(
             "BUG: {NAME} clause constrains {other:?}, which grant validation admits only for \
              declared keys"
@@ -243,7 +256,7 @@ struct Prepared {
     method: String,
     host: String,
     origin: url::Url,
-    segments: Vec<String>,
+    path: RequestPath,
     query: Vec<(String, String)>,
     headers: HeaderMap,
     body: Option<Vec<u8>>,
@@ -257,12 +270,12 @@ impl Prepared {
             account,
             method: &self.method,
             host: &self.host,
-            segments: &self.segments,
+            path: &self.path,
         }
     }
 
     fn line(&self) -> String {
-        request_line(&self.provider, &self.method, &self.host, &self.segments)
+        request_line(&self.provider, &self.method, &self.host, &self.path)
     }
 
     /// The user whose credential a per-user call uses: the acting user, or
@@ -295,7 +308,7 @@ impl Prepared {
         ApiCall {
             method: reqwest::Method::from_bytes(self.method.as_bytes())
                 .expect("METHODS are valid methods"),
-            url: build_url(&self.origin, &self.segments, &self.query),
+            url: build_url(&self.origin, &self.path, &self.query),
             headers: self.headers.clone(),
             body: self.body.clone(),
         }
@@ -331,7 +344,7 @@ impl Prepared {
             account = %account,
             method = %self.method,
             host = %self.host,
-            path = %display_path(&self.segments),
+            path = %display_path(&self.path),
             status = response.status,
             bytes = response.content_length.unwrap_or(response.body.len() as u64),
             truncated = response.truncated,
@@ -343,8 +356,8 @@ impl Prepared {
 }
 
 /// The request line as logs and refusals name it.
-fn request_line(provider: &str, method: &str, host: &str, segments: &[String]) -> String {
-    format!("{provider} {method} {host}{}", display_path(segments))
+fn request_line(provider: &str, method: &str, host: &str, path: &RequestPath) -> String {
+    format!("{provider} {method} {host}{}", display_path(path))
 }
 
 fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, ToolError> {
@@ -379,7 +392,7 @@ fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, T
             ))
         })?
         .clone();
-    let segments = decode_path(&args.path).map_err(invalid)?;
+    let path = decode_path(&args.path).map_err(invalid)?;
     let reserved = |what: &str, name: &str| {
         invalid(format!(
             "{what} {name:?} is Brenn's to set, not the caller's"
@@ -429,7 +442,7 @@ fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, T
         method: args.method,
         host: args.host,
         origin,
-        segments,
+        path,
         query,
         headers,
         body,
@@ -641,7 +654,8 @@ impl ApiRequestTool {
                         "path": {
                             "type": "string",
                             "description": "Absolute path, percent-encoded within each \
-                                            segment, e.g. \"/v1/things\".",
+                                            segment, e.g. \"/v1/things\"; a trailing `/` \
+                                            is sent as written.",
                         },
                         "query": {
                             "type": "object",
@@ -823,7 +837,7 @@ impl AsyncTool for ApiRequestTool {
         let Ok(args) = serde_json::from_value::<ApiArgs>(args.clone()) else {
             return Ok(());
         };
-        let Ok(segments) = decode_path(&args.path) else {
+        let Ok(path) = decode_path(&args.path) else {
             return Ok(());
         };
         // A pre-screen: `execute` re-admits the call against its own snapshot.
@@ -843,13 +857,13 @@ impl AsyncTool for ApiRequestTool {
             account,
             method: &args.method,
             host: &args.host,
-            segments: &segments,
+            path: &path,
         };
         if acl_admits(acl, &attrs) {
             Ok(())
         } else {
             Err(AclDenied {
-                resource: request_line(&args.provider, &args.method, &args.host, &segments),
+                resource: request_line(&args.provider, &args.method, &args.host, &path),
             })
         }
     }
@@ -1262,10 +1276,12 @@ mod tests {
             with("host", serde_json::json!("evil.example.com")),
             with("method", serde_json::json!("get")),
             with("method", serde_json::json!("TRACE")),
+            with("method", serde_json::json!("propfind")),
+            with("method", serde_json::json!("MKCOL")),
             with("provider", serde_json::json!("nope")),
             with("path", serde_json::json!("/a/%2e%2e/b")),
             with("path", serde_json::json!("/a%2Fb")),
-            with("path", serde_json::json!("/a/")),
+            with("path", serde_json::json!("/a//")),
             with("headers", serde_json::json!({"Authorization": "Bearer x"})),
             with("headers", serde_json::json!({"cookie": "a=b"})),
             with("headers", serde_json::json!({"Host": "x"})),
@@ -1337,12 +1353,141 @@ mod tests {
         let tool = ApiRequestTool::new(Some(svc), ApiKeyTable::empty());
         assert_eq!(tool.validate_clause(&clause(&[("path", "/a/*/b")])), Ok(()));
         assert_eq!(tool.validate_clause(&clause(&[("path", "*")])), Ok(()));
+        assert_eq!(tool.validate_clause(&clause(&[("path", "/a/")])), Ok(()));
         assert_eq!(tool.validate_clause(&clause(&[("method", "GET")])), Ok(()));
-        for bad in ["a/b", "/a//b", "/a/"] {
+        for bad in ["a/b", "/a//b", "/a//"] {
             assert!(
                 tool.validate_clause(&clause(&[("path", bad)])).is_err(),
                 "{bad}"
             );
+        }
+    }
+
+    /// A path ending in `/` is sent as written, and only a clause whose `path`
+    /// template ends in `/` admits it.
+    #[tokio::test]
+    async fn a_slashed_path_is_admitted_by_a_slashed_template_alone() {
+        let f = fixture().await;
+        let home = "/dav/calendars/user/alice@example.com/";
+        let slashed = clause(&[("provider", "google"), ("path", "/dav/calendars/user/*/")]);
+        f.call(
+            Some(alice()),
+            vec![slashed.clone()],
+            f.args("PROPFIND", home),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            f.tool
+                .check_acl(&f.args("PROPFIND", home), std::slice::from_ref(&slashed)),
+            Ok(())
+        );
+        let seen = f.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "PROPFIND");
+        assert_eq!(seen[0].path_and_query, home);
+
+        for acl in [
+            clause(&[("provider", "google"), ("path", "*")]),
+            provider_clause("google"),
+            clause(&[("provider", "google"), ("path", "/dav/calendars/user/*")]),
+        ] {
+            assert!(
+                f.tool
+                    .check_acl(&f.args("PROPFIND", home), std::slice::from_ref(&acl))
+                    .is_err(),
+                "{acl:?}"
+            );
+            let detail = denied(
+                f.call(Some(alice()), vec![acl.clone()], f.args("PROPFIND", home))
+                    .await,
+            );
+            assert!(detail.contains(home), "{detail}");
+        }
+        let out = f
+            .call(
+                Some(alice()),
+                vec![slashed],
+                f.args("PROPFIND", "/dav/calendars/user/alice@example.com"),
+            )
+            .await;
+        assert!(matches!(out, Err(ToolError::Denied(_))), "{out:?}");
+        assert_eq!(f.seen().len(), 1);
+    }
+
+    /// The root path `/` is sent as `/`, under a clause whose `path` is `/`.
+    #[tokio::test]
+    async fn the_root_is_admitted_by_the_root_template_alone() {
+        let f = fixture().await;
+        let out = f
+            .call(
+                Some(alice()),
+                vec![provider_clause("google")],
+                f.args("GET", "/"),
+            )
+            .await;
+        assert!(matches!(out, Err(ToolError::Denied(_))), "{out:?}");
+        f.call(
+            Some(alice()),
+            vec![clause(&[("provider", "google"), ("path", "/")])],
+            f.args("GET", "/"),
+        )
+        .await
+        .unwrap();
+        let seen = f.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path_and_query, "/");
+    }
+
+    /// `PROPFIND` and `REPORT` carry the caller's headers and XML body, and a
+    /// `207` comes back as it was answered.
+    #[tokio::test]
+    async fn propfind_and_report_are_sent_and_answered() {
+        let f = fixture().await;
+        let multistatus = "<?xml version=\"1.0\"?>\r\n<d:multistatus xmlns:d=\"DAV:\">\r\n\
+                           </d:multistatus>\r\n";
+        {
+            let mut s = f.stub.lock().unwrap();
+            s.api_statuses = [207, 207].into();
+            s.api_body = multistatus.as_bytes().to_vec();
+            s.api_headers = vec![
+                ("etag".to_string(), "\"e1\"".to_string()),
+                (
+                    "content-type".to_string(),
+                    "application/xml; charset=utf-8".to_string(),
+                ),
+            ];
+        }
+        let acl = vec![clause(&[("provider", "google"), ("path", "/dav/*/")])];
+        let request = "<d:propfind xmlns:d=\"DAV:\"><d:prop><d:getetag/></d:prop></d:propfind>";
+        for (method, depth) in [("PROPFIND", "1"), ("REPORT", "0")] {
+            let mut args = f.args(method, "/dav/calendar/");
+            args["headers"] = serde_json::json!({
+                "Depth": depth,
+                "Content-Type": "application/xml; charset=utf-8",
+            });
+            args["body"] = serde_json::json!(request);
+            let out = f.call(Some(alice()), acl.clone(), args).await.unwrap();
+            assert_eq!(out["status"], 207, "{method}");
+            assert_eq!(out["body"], multistatus, "{method}");
+            assert_eq!(out["headers"]["etag"], "\"e1\"", "{method}");
+            assert_eq!(
+                out["headers"]["content-type"], "application/xml; charset=utf-8",
+                "{method}"
+            );
+            assert_eq!(out["truncated"], false, "{method}");
+        }
+        let seen = f.seen();
+        assert_eq!(seen.len(), 2);
+        for (seen, (method, depth)) in seen.iter().zip([("PROPFIND", "1"), ("REPORT", "0")]) {
+            assert_eq!(seen.method, method);
+            assert_eq!(seen.path_and_query, "/dav/calendar/");
+            assert_eq!(seen.headers["depth"], depth);
+            assert_eq!(
+                seen.headers["content-type"],
+                "application/xml; charset=utf-8"
+            );
+            assert_eq!(seen.body, request.as_bytes());
         }
     }
 
@@ -1771,6 +1916,10 @@ mod tests {
         assert!(d.auto_approve);
         assert!(matches!(d.class, ToolClass::Async { max_concurrency: 8 }));
         assert_eq!(d.idempotency, Idempotency::Natural);
+        assert_eq!(
+            d.input_schema["properties"]["method"]["enum"],
+            serde_json::json!(METHODS)
+        );
     }
 
     /// A tool over the OAuth provider `google` and the key provider `maps`,
@@ -2111,8 +2260,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(f.last_key(), account_key("bob"));
-        let detail = denied(f.call(None, lent, f.mail_args("POST", None)).await);
-        assert!(detail.contains("may only read"), "{detail}");
+        for method in ["POST", "PROPFIND", "REPORT"] {
+            let detail = denied(f.call(None, lent.clone(), f.mail_args(method, None)).await);
+            assert!(detail.contains("may only read"), "{method}: {detail}");
+        }
         let detail = denied(
             f.call(
                 None,
@@ -2227,6 +2378,17 @@ mod tests {
             panic!("expected Denied, got {out:?}");
         };
         assert!(detail.contains("may only read"), "{detail}");
+        for method in ["PROPFIND", "REPORT"] {
+            let detail = denied(
+                f.call(
+                    None,
+                    vec![provider_clause("maps")],
+                    f.args(method, "/v1/things"),
+                )
+                .await,
+            );
+            assert!(detail.contains("may only read"), "{method}: {detail}");
+        }
         assert_eq!(f.seen().len(), 1);
     }
 
@@ -2300,6 +2462,37 @@ mod tests {
             .await;
         assert!(matches!(out, Err(ToolError::Denied(_))), "{out:?}");
         assert_eq!(f.seen().len(), 1);
+    }
+
+    /// A stamped component call sends `REPORT` under a clause naming it or
+    /// naming no method, and not under one naming another method.
+    #[tokio::test]
+    async fn a_stamped_component_call_reports_within_its_clause() {
+        let f = key_fixture().await;
+        for acl in [
+            clause(&[("provider", "maps"), ("method", "REPORT")]),
+            provider_clause("maps"),
+        ] {
+            let out = f
+                .tool
+                .execute(
+                    &stamped_component_ctx(vec![acl.clone()]),
+                    f.args("REPORT", "/dav/calendar"),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{acl:?}: {e:?}"));
+            assert_eq!(out["status"], 200);
+        }
+        let out = f
+            .tool
+            .execute(
+                &stamped_component_ctx(vec![clause(&[("provider", "maps"), ("method", "GET")])]),
+                f.args("REPORT", "/dav/calendar"),
+            )
+            .await;
+        assert!(matches!(out, Err(ToolError::Denied(_))), "{out:?}");
+        let methods: Vec<String> = f.seen().into_iter().map(|seen| seen.method).collect();
+        assert_eq!(methods, ["REPORT", "REPORT"]);
     }
 
     #[tokio::test]

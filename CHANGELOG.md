@@ -19,6 +19,24 @@ All notable changes to Brenn are documented here.
     same message startup would give.
   - Adding the deployment's first API-key provider, or removing its last,
     still needs a restart.
+- `api-request` accepts `PROPFIND` and `REPORT`, so a provider's CalDAV or
+  WebDAV endpoint can be read. A grant clause that names no `method`, or
+  `method = "*"`, now admits them. A caller with no acting user is still
+  admitted `GET` and `HEAD` only. Note that a grant clause's `path` limits
+  the request URL, not what a DAV request returns: a `PROPFIND` on a
+  collection (a DAV folder, whose path ends in `/`) lists everything beneath
+  it, and a `REPORT` can return data from elsewhere on the same account. See
+  `docs/security-posture.md`; keep data that must stay apart behind separate
+  credentials.
+- `api-request` sends a path that ends in `/`, and the root path `/`, as
+  written; both used to be refused. A grant clause's `path` template may end
+  in `/` and then admits only such paths. No existing clause admits one:
+  `path = "*"` and a clause with no `path` admit only paths that do not end in
+  `/`.
+- For WASM component authors: the provider kit's new `read_api_payload`
+  reads a successful (2xx) answer's body as bytes or text, whatever its content type and whichever
+  field carried it, together with the response headers; `read_api_result` is
+  unchanged and still requires JSON. The `testutil` fixtures gain `payload`.
 - Provider components built with the provider kit can send a binary request
   body (`Body::Bytes`), and a binary (`body_base64`) response is read back
   as `Answer::Bytes` instead of failing.

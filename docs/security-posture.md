@@ -1600,7 +1600,8 @@ for each account's file, and a caller with no user is admitted only to read.
   that connect, list or disconnect an owner's accounts, because there is no
   owner to act for.
 - **Unstamped component calls are read-only.** A component's credentialed
-  request that carries no acting user is admitted for reading methods only. Such
+  request that carries no acting user is admitted for the reading methods `GET`
+  and `HEAD` only; `PROPFIND` and `REPORT` are not among them. Such
   a call can be re-run from its channel window, and a re-run write (a second
   draft, a second event) is the wrong thing. So a lent credential does not
   write. The same holds for an unstamped call on a key provider: no user is
@@ -1624,10 +1625,54 @@ for each account's file, and a caller with no user is admitted only to read.
 - **Exact destination.** The host must be one of the provider's configured
   origins, matched exactly. Every credentialed URL is `https`; plain `http` is
   allowed only on loopback, for tests. The path is matched as a
-  segment template on segments decoded exactly once. Traversal, an encoded
-  separator and double encoding are refused before matching. The URL sent is
-  built from the matched segments, so the bytes on the wire are the bytes
-  that were authorized.
+  segment template on segments decoded exactly once. A trailing `/` is part of
+  the path: matched, and sent as written. A path ending in `/` is admitted only
+  by a template that ends in `/`, never by `*` or by a clause naming no
+  `path`, so no clause written before a slashed path could be sent admits one.
+  Brenn does not treat `/a` and `/a/` as one path; whether they name one
+  resource is the server's. Traversal, an encoded separator and double
+  encoding are refused before matching. The URL sent is built from the matched
+  segments and the trailing `/`, so the bytes on the wire are the bytes that
+  were authorized.
+- **A clause bounds the request line, not what the request asks.**
+    - A clause is matched against the method, the host and the path of the
+      request and against nothing in its headers or body. What the body asks
+      of the resource at that path is bounded by the credential and by the
+      provider, not by the grant. This holds for every method and is not new:
+      a `POST` to a JSON API endpoint names in its body whichever of the
+      account's data the credential reaches.
+    - The DAV instances, named because a DAV `path` looks like a boundary
+      between single resources and is not one. A `path` template is matched
+      segment for segment against the request URI, and it confines a request
+      to the resource at that URI and, when that resource is a collection, to
+      everything beneath it — never to less. A collection's URL ends in `/`
+      and is admitted only by a template that carries the slash; a server that
+      also answers the slashless path as the collection (RFC 4918 section 5.2
+      allows it) lets a slashless template reach it. `GET`, `HEAD` and `PUT`
+      act on the resource at the request URI alone. A `DELETE` of a collection
+      removes every member beneath it (RFC 4918 section 9.6.1: it acts as if
+      `Depth: infinity` were given), and a `PROPFIND` on a collection returns
+      its members unless it carries `Depth: 0` (RFC 4918 section 9.1: an
+      absent `Depth` is treated as `infinity`), though the template admitted
+      none of the members' own paths. A `REPORT` may return data from outside
+      that subtree: `expand-property` (RFC 3253 section 3.8) returns properties
+      of whatever resources the target's href-valued properties point at, and
+      a principal search with `apply-to-principal-collection-set` (RFC 3744
+      section 9.4) searches the server's principal collections in place of the
+      target.
+    - The consequence for an operator, in two parts. A `path` template does
+      not separate the members of an admitted collection from one another, for
+      reading (`PROPFIND`) or for deletion (`DELETE`): a clause that admits a
+      collection's path to either method admits the whole subtree to it, so
+      such a clause names a collection only where the whole subtree is meant.
+      And a `path` template on `REPORT` is not a confidentiality boundary
+      between resources one credential reaches on one host. There the boundary
+      is the credential; data that must stay apart is put behind separate
+      credentials (a second provider, or an account whose key the provider
+      itself scopes).
+    - No method on the list carries a second target URI in a header (WebDAV
+      `COPY` and `MOVE`, `Destination`); no clause is matched against such a
+      URI.
 - **Bounded results.** A response is cut to a configured size, and then to what
   the tool result can carry, on every caller path.
 - **The redirect back is provider-authored data carried by a B1 browser.** The

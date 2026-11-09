@@ -2,6 +2,8 @@
 //! copied out of it, and the ceiling on a request's compact result. The text
 //! the model sees names the API by the display name the caller passes.
 
+use std::collections::BTreeMap;
+
 use base64ct::{Base64, Encoding};
 use serde_json::{Value, json};
 
@@ -132,9 +134,9 @@ pub enum Answer {
     /// body as text whenever its bytes are valid UTF-8, whatever the API's
     /// content type, so a UTF-8 payload never arrives here: it is read as
     /// JSON, and fails as "a body that is not JSON" when it is not. Never
-    /// empty: an empty body is text, and reads as [`Answer::NoBody`].
-    // TODO(kit-utf8-payload-as-bytes): a component that downloads files needs
-    // a 2xx payload as bytes whichever field `api-request` carries it in.
+    /// empty: an empty body is text, and reads as [`Answer::NoBody`]. A
+    /// component that wants a payload's bytes whichever field carried them
+    /// calls [`read_api_payload`].
     Bytes { status: u64, body: Vec<u8> },
     /// A 2xx with no body: the API accepted the call and answers nothing (a
     /// 204, or an endpoint that answers an empty 200). Only `status` is known.
@@ -150,19 +152,80 @@ pub enum Answer {
     Error { status: u64, body: String },
 }
 
-/// `api-request`'s answer read: the API's JSON, its bytes or its empty 2xx,
-/// the credential relay, a cut or undelivered answer or the API's error for
-/// the component to decide on, or the request's error answer. A 2xx body of
-/// zero bytes is [`Answer::NoBody`], a 2xx `body_base64` is [`Answer::Bytes`],
-/// and any other 2xx body must be JSON; a non-text body under any other
-/// status is internal. `api` is the API's display name, which the refusals the
-/// model sees name.
-pub fn read_api_result(
+/// A 2xx answer, whole: its status, its response headers and its body's bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payload {
+    pub status: u64,
+    /// The response headers as `api-request` returns them: names lower-case,
+    /// a repeated header's values joined with `, `.
+    pub headers: BTreeMap<String, String>,
+    /// The body's bytes, whichever of `body` and `body_base64` carried them;
+    /// empty when the API answered no body.
+    pub body: Vec<u8>,
+}
+
+impl Payload {
+    /// The header `name`, matched without regard to ASCII case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The body as text; `None` when its bytes are not UTF-8.
+    pub fn text(&self) -> Option<&str> {
+        std::str::from_utf8(&self.body).ok()
+    }
+}
+
+/// What a nested `api-request` call answered, read without interpreting a
+/// 2xx body.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PayloadAnswer {
+    /// The API's 2xx answer: status, headers and body bytes.
+    Payload(Payload),
+    /// `api-request`'s `credential_invalid` value, as [`Answer::Relay`].
+    Relay(Value),
+    /// The answer was cut at the read limit, or not delivered.
+    Unreadable(Unreadable),
+    /// The API's whole 4xx/5xx answer: its HTTP status and body text.
+    Error { status: u64, body: String },
+}
+
+/// A 2xx body as the envelope carried it.
+enum SuccessBody {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+/// An answer read up to its 2xx body, which each reader interprets its own
+/// way.
+enum Envelope {
+    /// A 2xx: its status, its body as carried, and the envelope it was read
+    /// from, a text body taken out of it.
+    Success {
+        status: u64,
+        body: SuccessBody,
+        value: Value,
+    },
+    Relay(Value),
+    Unreadable(Unreadable),
+    Error {
+        status: u64,
+        body: String,
+    },
+}
+
+/// Read `api-request`'s answer up to the 2xx body: the nested error's
+/// mapping, the credential relay, the cut answer, the base64 body, the
+/// redirect, the 4xx/5xx error and the status that is neither.
+fn read_envelope(
     outcome: Result<Value, NestedError>,
     target: &Target,
     api: &str,
-) -> Result<Answer, Failure> {
-    let value = match outcome {
+) -> Result<Envelope, Failure> {
+    let mut value = match outcome {
         Ok(value) => value,
         Err(error) => {
             let NestedError { kind, detail } = error;
@@ -177,13 +240,13 @@ pub fn read_api_result(
                 "invalid_args" => Err(internal(format!(
                     "api-request rejected the wrapper's request: {detail}"
                 ))),
-                "internal" => Ok(Answer::Unreadable(Unreadable::Refused(detail))),
+                "internal" => Ok(Envelope::Unreadable(Unreadable::Refused(detail))),
                 other => Err(internal(format!("{other}: {detail}"))),
             };
         }
     };
     if value.get("error").and_then(Value::as_str) == Some("credential_invalid") {
-        return Ok(Answer::Relay(value));
+        return Ok(Envelope::Relay(value));
     }
     let status = value
         .get("status")
@@ -192,7 +255,7 @@ pub fn read_api_result(
     if value.get("truncated").and_then(Value::as_bool) == Some(true) {
         // On a cut answer `bytes` is the response's Content-Length, not a
         // count of what was read; null when the API sent none.
-        return Ok(Answer::Unreadable(Unreadable::Cut(
+        return Ok(Envelope::Unreadable(Unreadable::Cut(
             match value.get("bytes").and_then(Value::as_u64) {
                 Some(bytes) => format!("{bytes} bytes"),
                 None => "of unstated length".to_string(),
@@ -211,36 +274,124 @@ pub fn read_api_result(
                 "{api} answered HTTP {status} with a non-text body"
             )));
         }
-        return Ok(Answer::Bytes { status, body });
+        return Ok(Envelope::Success {
+            status,
+            body: SuccessBody::Bytes(body),
+            value,
+        });
     }
     if (300..400).contains(&status) {
         return Err(internal(format!(
             "{api} answered {status} with a redirect, which Brenn does not follow"
         )));
     }
-    let body = value
-        .get("body")
-        .and_then(Value::as_str)
-        .ok_or_else(|| internal("api-request's answer carries no body"))?;
+    let body = match value.get_mut("body").map(Value::take) {
+        Some(Value::String(body)) => body,
+        _ => return Err(internal("api-request's answer carries no body")),
+    };
     if status >= 400 {
-        return Ok(Answer::Error {
-            status,
-            body: body.to_string(),
-        });
+        return Ok(Envelope::Error { status, body });
     }
     if !(200..300).contains(&status) {
         return Err(internal(format!(
             "{api} answered HTTP {status}, which is neither a success nor an error"
         )));
     }
-    if body.is_empty() {
-        return Ok(Answer::NoBody { status });
-    }
-    serde_json::from_str(body).map(Answer::Body).map_err(|_| {
-        internal(format!(
-            "{api} returned HTTP {status} with a body that is not JSON"
-        ))
+    Ok(Envelope::Success {
+        status,
+        body: SuccessBody::Text(body),
+        value,
     })
+}
+
+/// `api-request`'s answer read: the API's JSON, its bytes or its empty 2xx,
+/// the credential relay, a cut or undelivered answer or the API's error for
+/// the component to decide on, or the request's error answer. A 2xx body of
+/// zero bytes is [`Answer::NoBody`], a 2xx `body_base64` is [`Answer::Bytes`],
+/// and any other 2xx body must be JSON; a non-text body under any other
+/// status is internal. `api` is the API's display name, which the refusals the
+/// model sees name. An API that answers something other than JSON, or whose
+/// response headers the component needs, is read with [`read_api_payload`].
+pub fn read_api_result(
+    outcome: Result<Value, NestedError>,
+    target: &Target,
+    api: &str,
+) -> Result<Answer, Failure> {
+    Ok(match read_envelope(outcome, target, api)? {
+        Envelope::Relay(value) => Answer::Relay(value),
+        Envelope::Unreadable(why) => Answer::Unreadable(why),
+        Envelope::Error { status, body } => Answer::Error { status, body },
+        Envelope::Success {
+            status,
+            body: SuccessBody::Bytes(body),
+            ..
+        } => Answer::Bytes { status, body },
+        Envelope::Success {
+            status,
+            body: SuccessBody::Text(body),
+            ..
+        } => {
+            if body.is_empty() {
+                Answer::NoBody { status }
+            } else {
+                serde_json::from_str(&body).map(Answer::Body).map_err(|_| {
+                    internal(format!(
+                        "{api} returned HTTP {status} with a body that is not JSON"
+                    ))
+                })?
+            }
+        }
+    })
+}
+
+// TODO(kit-payload-reader-cannot-read-304): decide whether a 304 gets a case
+// of its own.
+/// `api-request`'s answer read as [`read_api_result`] reads it, except that a
+/// 2xx is never interpreted: it is a [`Payload`] of the status, the response
+/// headers and the body's bytes, whatever its content type and whichever
+/// field carried it. A 3xx is internal, `304 Not Modified` included, so a
+/// conditional `GET` or `HEAD` cannot be read. `api` is the API's display
+/// name, which the refusals the model sees name.
+pub fn read_api_payload(
+    outcome: Result<Value, NestedError>,
+    target: &Target,
+    api: &str,
+) -> Result<PayloadAnswer, Failure> {
+    Ok(match read_envelope(outcome, target, api)? {
+        Envelope::Relay(value) => PayloadAnswer::Relay(value),
+        Envelope::Unreadable(why) => PayloadAnswer::Unreadable(why),
+        Envelope::Error { status, body } => PayloadAnswer::Error { status, body },
+        Envelope::Success {
+            status,
+            body,
+            value,
+        } => PayloadAnswer::Payload(Payload {
+            status,
+            headers: read_headers(&value)?,
+            body: match body {
+                SuccessBody::Text(text) => text.into_bytes(),
+                SuccessBody::Bytes(bytes) => bytes,
+            },
+        }),
+    })
+}
+
+/// The envelope's `headers` object. `api-request` always writes one of
+/// string values, so anything else is a host bug.
+fn read_headers(value: &Value) -> Result<BTreeMap<String, String>, Failure> {
+    let unreadable = || internal("api-request's answer carries no readable headers");
+    value
+        .get("headers")
+        .and_then(Value::as_object)
+        .ok_or_else(unreadable)?
+        .iter()
+        .map(|(name, value)| {
+            value
+                .as_str()
+                .map(|value| (name.clone(), value.to_string()))
+                .ok_or_else(unreadable)
+        })
+        .collect()
 }
 
 /// `value`'s length as serialized JSON.
@@ -277,7 +428,7 @@ pub fn copy(to: &mut Args, name: &str, from: Option<&Value>) {
 mod tests {
     use super::*;
     use crate::google::API_NAME;
-    use crate::testutil::{binary, failure, http, nested, truncated};
+    use crate::testutil::{binary, failure, http, nested, payload, truncated};
 
     fn target() -> Target {
         Target {
@@ -574,6 +725,216 @@ mod tests {
             ))
         );
         assert!(read(http(101, "")).unwrap_err().detail.contains("HTTP 101"));
+    }
+
+    fn read_payload(outcome: Result<Value, NestedError>) -> Result<PayloadAnswer, Failure> {
+        read_api_payload(outcome, &target(), API_NAME)
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    const MULTISTATUS: &str = "<?xml version=\"1.0\"?>\r\n<d:multistatus xmlns:d=\"DAV:\">\
+                               </d:multistatus>\r\n";
+
+    #[test]
+    fn a_multistatus_answer_is_read_with_its_headers() {
+        let answer = read_payload(payload(
+            207,
+            &[
+                ("Content-Type", "application/xml; charset=utf-8"),
+                ("ETag", "\"e1\""),
+            ],
+            MULTISTATUS.as_bytes(),
+        ));
+        let Ok(PayloadAnswer::Payload(read)) = answer else {
+            panic!("expected a payload, got {answer:?}");
+        };
+        assert_eq!(
+            read,
+            Payload {
+                status: 207,
+                headers: headers(&[
+                    ("content-type", "application/xml; charset=utf-8"),
+                    ("etag", "\"e1\""),
+                ]),
+                body: MULTISTATUS.as_bytes().to_vec(),
+            }
+        );
+        assert_eq!(read.text(), Some(MULTISTATUS));
+        assert_eq!(read.header("ETag"), Some("\"e1\""));
+        assert_eq!(read.header("etag"), Some("\"e1\""));
+        assert_eq!(read.header("location"), None);
+    }
+
+    #[test]
+    fn a_download_reads_to_its_bytes_whichever_field_carried_it() {
+        let text = "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".as_bytes();
+        let binary_body: &[u8] = &[0xff, 0, 0xfe];
+        for (body, as_text) in [(text, Some(text)), (binary_body, None)] {
+            let answer = read_payload(payload(200, &[("Content-Type", "x/y")], body));
+            let Ok(PayloadAnswer::Payload(read)) = answer else {
+                panic!("expected a payload, got {answer:?}");
+            };
+            assert_eq!(read.status, 200);
+            assert_eq!(read.body, body);
+            assert_eq!(read.headers, headers(&[("content-type", "x/y")]));
+            assert_eq!(read.text().map(str::as_bytes), as_text);
+        }
+    }
+
+    #[test]
+    fn a_bodyless_2xx_is_a_payload_with_its_headers() {
+        assert_eq!(
+            read_payload(payload(204, &[("ETag", "\"e2\"")], b"")),
+            Ok(PayloadAnswer::Payload(Payload {
+                status: 204,
+                headers: headers(&[("etag", "\"e2\"")]),
+                body: Vec::new(),
+            }))
+        );
+    }
+
+    /// Everything before the 2xx body reads as it does through
+    /// [`read_api_result`], with the same texts.
+    #[test]
+    fn the_payload_reader_shares_the_envelope_handling() {
+        let relay = json!({
+            "error": "credential_invalid", "provider": "google", "account": null, "detail": "x",
+        });
+        assert_eq!(
+            read_payload(Ok(relay.clone())),
+            Ok(PayloadAnswer::Relay(relay))
+        );
+        assert_eq!(
+            read_payload(nested("denied", "no clause")),
+            Err(failure(
+                ErrorKind::Denied,
+                "api-request refused the nested GET api.example.com/v1/items: no clause"
+            ))
+        );
+        assert_eq!(
+            read_payload(nested("invalid_args", "bad query")),
+            Err(failure(
+                ErrorKind::Internal,
+                "api-request rejected the wrapper's request: bad query"
+            ))
+        );
+        assert_eq!(
+            read_payload(nested("internal", "result exceeds the cap")),
+            Ok(PayloadAnswer::Unreadable(Unreadable::Refused(
+                "result exceeds the cap".to_string()
+            )))
+        );
+        assert_eq!(
+            read_payload(truncated(207, json!(300000), "<d:")),
+            Ok(PayloadAnswer::Unreadable(Unreadable::Cut(
+                "300000 bytes".to_string()
+            )))
+        );
+        assert_eq!(
+            read_payload(http(412, "precondition failed")),
+            Ok(PayloadAnswer::Error {
+                status: 412,
+                body: "precondition failed".to_string(),
+            })
+        );
+        assert_eq!(
+            read_payload(http(302, "")),
+            Err(failure(
+                ErrorKind::Internal,
+                "Google answered 302 with a redirect, which Brenn does not follow"
+            ))
+        );
+        assert_eq!(
+            read_payload(payload(304, &[("etag", "\"a1\"")], b"")),
+            Err(failure(
+                ErrorKind::Internal,
+                "Google answered 304 with a redirect, which Brenn does not follow"
+            ))
+        );
+        assert_eq!(
+            read_payload(binary(404, &[0, 1])),
+            Err(failure(
+                ErrorKind::Internal,
+                "Google answered HTTP 404 with a non-text body"
+            ))
+        );
+        assert_eq!(
+            read_payload(Ok(json!({
+                "status": 200, "headers": {}, "bytes": 3, "truncated": false,
+                "body_base64": "not base64!",
+            }))),
+            Err(failure(
+                ErrorKind::Internal,
+                "api-request's answer carries a body_base64 that is not base64"
+            ))
+        );
+        assert_eq!(
+            read_payload(Ok(json!({ "truncated": false }))),
+            Err(failure(
+                ErrorKind::Internal,
+                "api-request's answer carries no status"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_payload_needs_readable_headers() {
+        for envelope in [
+            json!({ "status": 200, "bytes": 2, "truncated": false, "body": "{}" }),
+            json!({ "status": 200, "headers": [], "bytes": 2, "truncated": false, "body": "{}" }),
+            json!({
+                "status": 200, "headers": { "etag": 7 }, "bytes": 2, "truncated": false,
+                "body": "{}",
+            }),
+        ] {
+            assert_eq!(
+                read_payload(Ok(envelope.clone())),
+                Err(failure(
+                    ErrorKind::Internal,
+                    "api-request's answer carries no readable headers"
+                )),
+                "{envelope}"
+            );
+            assert_eq!(
+                read(Ok(envelope.clone())),
+                Ok(Answer::Body(json!({}))),
+                "{envelope}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_json_reader_still_refuses_a_payload() {
+        assert_eq!(
+            read(payload(
+                207,
+                &[("Content-Type", "application/xml")],
+                MULTISTATUS.as_bytes()
+            )),
+            Err(failure(
+                ErrorKind::Internal,
+                "Google returned HTTP 207 with a body that is not JSON"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_payload_fixture_carries_bytes_as_the_host_does() {
+        let text = payload(200, &[("ETag", "\"e\""), ("X-Thing", "1")], b"abc").unwrap();
+        assert_eq!(text["body"], "abc");
+        assert!(text.get("body_base64").is_none(), "{text}");
+        assert_eq!(text["bytes"], 3);
+        assert_eq!(text["headers"], json!({ "etag": "\"e\"", "x-thing": "1" }));
+        let bytes = payload(200, &[], &[0xff, 0]).unwrap();
+        assert_eq!(bytes["body_base64"], Base64::encode_string(&[0xff, 0]));
+        assert!(bytes.get("body").is_none(), "{bytes}");
+        assert_eq!(bytes["bytes"], 2);
     }
 
     #[test]

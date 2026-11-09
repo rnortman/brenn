@@ -159,8 +159,8 @@ as `Answer::Bytes { status, body }`, decoded, where it used to fail
 still fails `internal`. `api-request` answers in `body_base64` only when the
 API's bytes are not valid UTF-8, whatever their content type: a plain-text,
 CSV or calendar file, or any ASCII payload, arrives as `body` and fails the
-JSON read as "a body that is not JSON", so `Bytes` is not yet a way to download
-a file. A component that matches `Answer` exhaustively adds an arm for `Bytes`
+JSON read as "a body that is not JSON"; `read_api_payload` reads a payload's
+bytes whichever field carried them. A component that matches `Answer` exhaustively adds an arm for `Bytes`
 — failing `internal`, if the API it calls never answers in bytes. The `testutil` fixtures gained `binary`, an answer carrying bytes, and
 `text_body`, a call's text body.
 
@@ -446,6 +446,25 @@ test that fails to compile naming `schema` or `testutil` is that flag.
 is the crate's own test build and not the contract. The labels are the crates'
 own targets, as `@brenn//brenn-envelope:brenn-envelope_wasm` is for
 `profile-switcher`; the guest alias set is for third-party crates only.
+
+A step reads a nested call's answer with one of two readers. `read_api_result`
+is for an API that answers JSON: a 2xx body is parsed as JSON, or read as
+`Answer::Bytes` when it is not UTF-8, or as `Answer::NoBody` when empty.
+`read_api_payload` is for any other 2xx body and for the response headers —
+XML, iCalendar, vCard, a download, an `ETag` — and answers a `Payload` of the
+status, the headers (names lower-case, `header` matching without regard to
+case) and the body's bytes, whichever of `body` and `body_base64` carried them
+(`text` gives them as a string when they are UTF-8). Both give the same relay,
+cut, undelivered and error handling, with the same texts, and both fail a 3xx
+as `internal`: `304 Not Modified` included, so a component cannot read the
+answer to a `GET` or `HEAD` sent with `If-None-Match` or `If-Modified-Since`.
+A payload is bounded
+by the provider's `max_response_bytes` and its ceiling and by the bus cap, and
+arrives as `Unreadable` when it exceeds either. The `testutil` fixture
+`payload` fakes one, carried in `body` or `body_base64` by the rule the host
+uses. A DAV component sets its own `Content-Type` (`api-request` defaults a
+body's to `application/json`), and sends a collection's path with its
+trailing `/`, as the server's href gives it.
 
 ### The gate set
 

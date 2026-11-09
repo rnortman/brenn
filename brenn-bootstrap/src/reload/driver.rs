@@ -3807,10 +3807,11 @@ new sifter: Demo {{
     /// thing outside commit that can see those instants at all.
     ///
     /// A probe cannot invent a violation: every predicate below reads the same
-    /// tables the publish path reads. What it must not be allowed to do is pass
-    /// while saying nothing, which is what a sampler that was never scheduled
-    /// across the transition does. Two gates keep that from reading as a green
-    /// run:
+    /// tables the publish path reads, and a predicate over two tables reads
+    /// the one that moves on both sides of the other, counting no sample a
+    /// step fell inside. What it must not be allowed to do is pass while saying
+    /// nothing, which is what a sampler that was never scheduled across the
+    /// transition does. Two gates keep that from reading as a green run:
     ///
     /// - [`Self::spawn`] does not return until the sampler has taken its first
     ///   sample, so every run is sampling *before* the reload under test
@@ -3949,12 +3950,19 @@ new sifter: Demo {{
         let apps = booted.messenger.app_table();
         let service = booted.mqtt.0.clone();
         Probe::spawn(move || {
-            let authorized = apps
-                .load()
-                .values()
-                .any(|app| app.policy.allows_mqtt_publish(client));
+            let authorized_now = || {
+                apps.load()
+                    .values()
+                    .any(|app| app.policy.allows_mqtt_publish(client))
+            };
+            // The authority changes only at the swap. If both reads of it
+            // agree, it held at the registry read; if they differ, the swap
+            // fell between them and the sample is not counted as a violation.
+            let before = authorized_now();
+            let absent = service.get_client(client).is_none();
+            let authorized = authorized_now();
             Sample {
-                violation: (authorized && service.get_client(client).is_none()).then(|| {
+                violation: (before && authorized && absent).then(|| {
                     format!("an agent may publish through {client}, which has no session")
                 }),
                 // The agent swap is the transition: the authority naming the

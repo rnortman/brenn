@@ -23,25 +23,65 @@ pub fn nested(kind: &str, detail: &str) -> Result<Value, NestedError> {
 
 /// A whole JSON answer with `status` and `body`.
 pub fn http(status: u64, body: &str) -> Result<Value, NestedError> {
-    Ok(json!({
-        "status": status,
-        "headers": { "content-type": "application/json" },
-        "bytes": body.len(),
-        "truncated": false,
-        "body": body,
-    }))
+    whole(
+        status,
+        json!({ "content-type": "application/json" }),
+        body.as_bytes(),
+        Carrier::Text,
+    )
 }
 
 /// A whole answer with `status` and a body that is not text, as `api-request`
 /// carries one: `body_base64`.
 pub fn binary(status: u64, body: &[u8]) -> Result<Value, NestedError> {
-    Ok(json!({
+    whole(
+        status,
+        json!({ "content-type": "application/octet-stream" }),
+        body,
+        Carrier::Base64,
+    )
+}
+
+/// A whole answer with `status`, `headers` and `body`, carried as
+/// `api-request` carries it: `body` when the bytes are UTF-8, `body_base64`
+/// otherwise. Header names are lower-cased, as `api-request` returns them.
+pub fn payload(status: u64, headers: &[(&str, &str)], body: &[u8]) -> Result<Value, NestedError> {
+    let headers: serde_json::Map<String, Value> = headers
+        .iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), json!(value)))
+        .collect();
+    let carrier = match std::str::from_utf8(body) {
+        Ok(_) => Carrier::Text,
+        Err(_) => Carrier::Base64,
+    };
+    whole(status, Value::Object(headers), body, carrier)
+}
+
+/// The field an answer's body is carried in.
+enum Carrier {
+    /// `body`; the bytes must be UTF-8.
+    Text,
+    /// `body_base64`.
+    Base64,
+}
+
+/// A whole, uncut answer with `status`, `headers` and `body` carried in
+/// `carrier`.
+fn whole(status: u64, headers: Value, body: &[u8], carrier: Carrier) -> Result<Value, NestedError> {
+    let mut answer = json!({
         "status": status,
-        "headers": { "content-type": "application/octet-stream" },
+        "headers": headers,
         "bytes": body.len(),
         "truncated": false,
-        "body_base64": Base64::encode_string(body),
-    }))
+    });
+    match carrier {
+        Carrier::Text => {
+            let text = std::str::from_utf8(body).expect("a text-carried body is UTF-8");
+            answer["body"] = json!(text);
+        }
+        Carrier::Base64 => answer["body_base64"] = json!(Base64::encode_string(body)),
+    }
+    Ok(answer)
 }
 
 /// The text body of a nested call.

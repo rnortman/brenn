@@ -1,34 +1,58 @@
 //! `api-request`'s reading of a request path and of its `path` ACL value.
 //!
-//! A request path is split on `/`, each segment percent-decoded once and
-//! checked; the decoded segments are what an ACL template is matched against
-//! and what the outbound URL is built from, so the bytes on the wire are the
-//! segments that matched.
+//! A request path is `/`, or `/`-initial segments optionally followed by one
+//! trailing `/`. It is split on `/`, each segment percent-decoded once and
+//! checked; the decoded segments and whether the path ends in `/` are what an
+//! ACL template is matched against and what the outbound URL is built from,
+//! so the bytes on the wire are the path that matched. `/` is the root: no
+//! segments, ending in `/`. An empty segment anywhere but the one trailing
+//! `/` is refused.
 //!
-//! A template is `*` (any path) or `/`-initial segments, each matching its
-//! request segment exactly or, as `*`, any one segment. Segment counts must be
-//! equal: there is no prefix match.
+//! A template is `*`, `/`, or `/`-initial segments optionally followed by one
+//! `/`, each segment matching its request segment exactly or, as `*`, any one
+//! segment. Segment counts must be equal: there is no prefix match. A template
+//! ending in `/` admits only a path ending in `/`, and one that does not
+//! admits only a path that does not; `*` admits every path not ending in `/`
+//! and none that does.
 
 use percent_encoding::percent_decode_str;
 use url::Url;
 
-/// The `path` value meaning any path.
-const ANY_PATH: &str = "*";
+/// The `path` value meaning any path that does not end in `/`.
+pub const ANY_PATH: &str = "*";
 
-/// The `/`-separated segments after the leading `/`. `None` when `text` does
-/// not begin with `/`.
-fn raw_segments(text: &str) -> Option<std::str::Split<'_, char>> {
-    text.strip_prefix('/').map(|rest| rest.split('/'))
+/// A decoded request path: its segments, and whether it ends in `/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestPath {
+    pub segments: Vec<String>,
+    pub trailing_slash: bool,
 }
 
-/// Check a clause's `path` value: `*`, or `/`-initial with no empty, `.`,
-/// `..` or `%`-bearing segment (a decoded request segment is never any of
-/// those, so such a template could match nothing).
+/// The raw `/`-separated segments of `text` and whether it ends in one
+/// trailing `/`: the leading `/` stripped, an empty rest the root (no
+/// segments, trailing slash), otherwise one trailing `/` taken off and the
+/// rest split. `None` when `text` does not begin with `/`.
+fn raw_split(text: &str) -> Option<(Vec<&str>, bool)> {
+    let rest = text.strip_prefix('/')?;
+    if rest.is_empty() {
+        return Some((Vec::new(), true));
+    }
+    let (rest, trailing_slash) = match rest.strip_suffix('/') {
+        Some(rest) => (rest, true),
+        None => (rest, false),
+    };
+    Some((rest.split('/').collect(), trailing_slash))
+}
+
+/// Check a clause's `path` value: `*`, `/`, or `/`-initial segments
+/// optionally followed by one `/`, with no empty, `.`, `..` or `%`-bearing
+/// segment (a decoded request segment is never any of those, so such a
+/// template could match nothing).
 pub fn validate_template(template: &str) -> Result<(), String> {
     if template == ANY_PATH {
         return Ok(());
     }
-    let Some(segments) = raw_segments(template) else {
+    let Some((segments, _)) = raw_split(template) else {
         return Err(format!(
             "path template {template:?} must be \"*\" or begin with \"/\""
         ));
@@ -37,7 +61,8 @@ pub fn validate_template(template: &str) -> Result<(), String> {
         if segment.is_empty() || segment == "." || segment == ".." || segment.contains('%') {
             return Err(format!(
                 "path template {template:?} has segment {segment:?}; a segment is a literal \
-                 (no \"%\", \".\" or \"..\") or \"*\", and none is empty"
+                 (no \"%\", \".\" or \"..\") or \"*\", and none is empty (one trailing \"/\" \
+                 is allowed; an empty segment anywhere else is not)"
             ));
         }
     }
@@ -45,60 +70,75 @@ pub fn validate_template(template: &str) -> Result<(), String> {
 }
 
 /// Split a request path, decode each segment once, and refuse any segment
-/// that is empty, `.`, `..`, or holds `/`, `\` or `%` once decoded.
-pub fn decode_path(path: &str) -> Result<Vec<String>, String> {
-    let Some(raw) = raw_segments(path) else {
+/// that is empty, `.`, `..`, or holds `/`, `\` or `%` once decoded. One
+/// trailing `/` is allowed and recorded; an empty segment anywhere else is
+/// refused.
+pub fn decode_path(path: &str) -> Result<RequestPath, String> {
+    let Some((raw, trailing_slash)) = raw_split(path) else {
         return Err(format!("path {path:?} must begin with \"/\""));
     };
-    raw.map(|segment| {
-        let decoded = percent_decode_str(segment)
-            .decode_utf8()
-            .map_err(|_| format!("path segment {segment:?} is not UTF-8 once decoded"))?;
-        if decoded.is_empty() || decoded == "." || decoded == ".." {
-            return Err(format!(
-                "path {path:?} has an empty, \".\" or \"..\" segment"
-            ));
-        }
-        if decoded.contains(['/', '\\', '%']) {
-            return Err(format!(
-                "path segment {segment:?} decodes to {decoded:?}, which holds \"/\", \"\\\" or \
-                 \"%\" (an encoded separator or double encoding)"
-            ));
-        }
-        Ok(decoded.into_owned())
+    let segments = raw
+        .into_iter()
+        .map(|segment| {
+            let decoded = percent_decode_str(segment)
+                .decode_utf8()
+                .map_err(|_| format!("path segment {segment:?} is not UTF-8 once decoded"))?;
+            if decoded.is_empty() || decoded == "." || decoded == ".." {
+                return Err(format!(
+                    "path {path:?} has an empty, \".\" or \"..\" segment (one trailing \"/\" \
+                     is allowed; an empty segment anywhere else is not)"
+                ));
+            }
+            if decoded.contains(['/', '\\', '%']) {
+                return Err(format!(
+                    "path segment {segment:?} decodes to {decoded:?}, which holds \"/\", \"\\\" \
+                     or \"%\" (an encoded separator or double encoding)"
+                ));
+            }
+            Ok(decoded.into_owned())
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(RequestPath {
+        segments,
+        trailing_slash,
     })
-    .collect()
 }
 
-/// Whether `template` (already valid) admits the decoded `segments`.
-pub fn template_admits(template: &str, segments: &[String]) -> bool {
+// TODO(api-request-no-grant-for-collections-at-every-depth): no template
+// admits a slashed path at every depth.
+/// Whether `template` (already valid) admits `path`: `*` admits any path not
+/// ending in `/`; any other template admits a path when both end in `/` or
+/// neither does, and their segments match one for one.
+pub fn template_admits(template: &str, path: &RequestPath) -> bool {
     if template == ANY_PATH {
-        return true;
+        return !path.trailing_slash;
     }
-    let Some(parts) = raw_segments(template) else {
+    let Some((parts, trailing_slash)) = raw_split(template) else {
         return false;
     };
-    let parts: Vec<&str> = parts.collect();
-    parts.len() == segments.len()
+    trailing_slash == path.trailing_slash
+        && parts.len() == path.segments.len()
         && parts
             .iter()
-            .zip(segments)
+            .zip(&path.segments)
             .all(|(part, segment)| *part == "*" || part == segment)
 }
 
 /// The path as it will be sent, for logs and ACL messages: each decoded
-/// segment re-encoded the way the URL builder encodes it.
-pub fn display_path(segments: &[String]) -> String {
+/// segment re-encoded the way the URL builder encodes it, and the trailing
+/// `/` when the path has one.
+pub fn display_path(path: &RequestPath) -> String {
     let mut url = Url::parse("http://localhost").expect("a literal URL parses");
-    push_segments(&mut url, segments);
+    push_path(&mut url, path);
     url.path().to_string()
 }
 
-/// `origin` with `segments` as its path and `query` as its query, every
-/// segment and pair percent-encoded by `url`.
-pub fn build_url(origin: &Url, segments: &[String], query: &[(String, String)]) -> Url {
+/// `origin` with `path` as its path and `query` as its query, every segment
+/// and pair percent-encoded by `url`, and the trailing `/` when the path has
+/// one.
+pub fn build_url(origin: &Url, path: &RequestPath, query: &[(String, String)]) -> Url {
     let mut url = origin.clone();
-    push_segments(&mut url, segments);
+    push_path(&mut url, path);
     if !query.is_empty() {
         let mut pairs = url.query_pairs_mut();
         for (key, value) in query {
@@ -108,18 +148,24 @@ pub fn build_url(origin: &Url, segments: &[String], query: &[(String, String)]) 
     url
 }
 
-fn push_segments(url: &mut Url, segments: &[String]) {
-    url.path_segments_mut()
-        .expect("an http(s) URL has path segments")
-        .clear()
-        .extend(segments);
+/// Write `path` as `url`'s path. A trailing `/` after segments is one empty
+/// segment pushed last; the root is a path with no segments, which `url`
+/// writes as `/`.
+fn push_path(url: &mut Url, path: &RequestPath) {
+    let mut segments = url
+        .path_segments_mut()
+        .expect("an http(s) URL has path segments");
+    segments.clear().extend(&path.segments);
+    if path.trailing_slash && !path.segments.is_empty() {
+        segments.push("");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn segs(path: &str) -> Vec<String> {
+    fn segs(path: &str) -> RequestPath {
         decode_path(path).unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
@@ -130,11 +176,14 @@ mod tests {
             "/gmail/v1/users/me/drafts",
             "/calendar/v3/calendars/*/events",
             "/*",
+            "/",
+            "/a/",
+            "/a/*/",
         ] {
             assert_eq!(validate_template(ok), Ok(()), "{ok}");
         }
         for bad in [
-            "gmail/v1", "", "/", "/a//b", "/a/", "/a/./b", "/a/../b", "/a%2Fb", "**",
+            "gmail/v1", "", "/a//b", "/a//", "//", "/a/./b", "/a/../b", "/a%2Fb", "**",
         ] {
             assert!(validate_template(bad).is_err(), "{bad:?} must be refused");
         }
@@ -152,15 +201,84 @@ mod tests {
             "/a%2fb",
             "/a/%252e%252e/b",
             "/a/%252F",
-            "/a/",
-            "/",
+            "/a//",
+            "//",
             "/a//b",
+            "/a/%2F",
+            "/a/%2F/",
             "/a%5Cb",
             "/a\\b",
             "/a/%ff",
         ] {
             assert!(decode_path(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn a_trailing_slash_is_part_of_the_path() {
+        let path = |segments: &[&str], trailing_slash| RequestPath {
+            segments: segments.iter().map(|s| s.to_string()).collect(),
+            trailing_slash,
+        };
+        assert_eq!(segs("/a/"), path(&["a"], true));
+        assert_eq!(segs("/"), path(&[], true));
+        assert_eq!(segs("/a"), path(&["a"], false));
+        assert_eq!(segs("/a/b/"), path(&["a", "b"], true));
+    }
+
+    #[test]
+    fn a_slashed_path_needs_a_slashed_template() {
+        for (template, path) in [("/a/", "/a/"), ("/a/*/", "/a/x/"), ("/", "/")] {
+            assert!(
+                template_admits(template, &segs(path)),
+                "{template} must admit {path}"
+            );
+        }
+        for (template, path) in [
+            ("/a", "/a/"),
+            ("/a/", "/a"),
+            ("/a/*", "/a/"),
+            ("/a/*", "/a/x/"),
+            ("/a/*/", "/a/x"),
+            ("/", "/a/"),
+            ("/*", "/"),
+            ("*", "/a/"),
+            ("*", "/"),
+        ] {
+            assert!(
+                !template_admits(template, &segs(path)),
+                "{template} must not admit {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_slash_is_sent_as_written() {
+        let origin = Url::parse("https://dav.example.com").unwrap();
+        let home = segs("/dav/calendars/user/alice%40example.com/");
+        assert_eq!(
+            build_url(&origin, &home, &[]).as_str(),
+            "https://dav.example.com/dav/calendars/user/alice@example.com/"
+        );
+        assert_eq!(
+            display_path(&home),
+            "/dav/calendars/user/alice@example.com/"
+        );
+        assert_eq!(
+            build_url(&origin, &segs("/a/b/"), &[]).as_str(),
+            "https://dav.example.com/a/b/"
+        );
+        assert_eq!(display_path(&segs("/a/b/")), "/a/b/");
+        assert_eq!(
+            build_url(&origin, &segs("/"), &[]).as_str(),
+            "https://dav.example.com/"
+        );
+        assert_eq!(display_path(&segs("/")), "/");
+        assert_eq!(
+            build_url(&origin, &segs("/a/b"), &[]).as_str(),
+            "https://dav.example.com/a/b"
+        );
+        assert_eq!(display_path(&segs("/a/b")), "/a/b");
     }
 
     #[test]
@@ -193,7 +311,10 @@ mod tests {
 
         let holiday =
             segs("/calendar/v3/calendars/en.usa%23holiday%40group.v.calendar.google.com/events");
-        assert_eq!(holiday[3], "en.usa#holiday@group.v.calendar.google.com");
+        assert_eq!(
+            holiday.segments[3],
+            "en.usa#holiday@group.v.calendar.google.com"
+        );
         assert!(template_admits(events, &holiday));
         let question = segs("/calendar/v3/calendars/x%3F/events/y");
         assert!(template_admits(
@@ -237,8 +358,11 @@ mod tests {
     fn a_raw_hash_or_question_mark_is_segment_content() {
         let holiday =
             segs("/calendar/v3/calendars/en.usa#holiday@group.v.calendar.google.com/events");
-        assert_eq!(holiday.len(), 5);
-        assert_eq!(holiday[3], "en.usa#holiday@group.v.calendar.google.com");
+        assert_eq!(holiday.segments.len(), 5);
+        assert_eq!(
+            holiday.segments[3],
+            "en.usa#holiday@group.v.calendar.google.com"
+        );
         assert!(template_admits("/calendar/v3/calendars/*/events", &holiday));
         let url = build_url(
             &Url::parse("https://www.googleapis.com").unwrap(),
@@ -252,7 +376,7 @@ mod tests {
         assert_eq!(url.fragment(), None);
 
         let question = segs("/calendar/v3/calendars/a?b/events/e1");
-        assert_eq!(question[3], "a?b");
+        assert_eq!(question.segments[3], "a?b");
         assert!(template_admits(
             "/calendar/v3/calendars/*/events/*",
             &question

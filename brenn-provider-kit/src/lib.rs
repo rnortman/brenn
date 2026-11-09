@@ -13,8 +13,10 @@
 //! - [`call`]: the request's error answer, the nested call's arguments and
 //!   what a step decides next.
 //! - [`args`]: reading a tool's JSON arguments.
-//! - [`answer`]: reading `api-request`'s answer envelope, bounding what is
-//!   copied out of it, and the result ceiling.
+//! - [`answer`]: reading `api-request`'s answer envelope — as JSON with
+//!   `read_api_result`, or as a payload with its headers with
+//!   `read_api_payload` — bounding what is copied out of it, and the result
+//!   ceiling.
 //! - [`google`]: Google's display name and the detail of its standard error
 //!   shape, shared by the components that call Google APIs.
 //! - [`settings`]: reading an instance's `config` values.
@@ -57,8 +59,8 @@ pub use activation::{
     Level, Logic, NESTED_WORST_CASE_MS, Request, Rows, serve,
 };
 pub use answer::{
-    Answer, COMPACT_RESULT_CEILING, NestedError, Unreadable, bounded, copy, cut, read_api_result,
-    serialized_len,
+    Answer, COMPACT_RESULT_CEILING, NestedError, Payload, PayloadAnswer, Unreadable, bounded, copy,
+    cut, read_api_payload, read_api_result, serialized_len,
 };
 pub use args::{Args, capped, choice, flag, integer, object};
 pub use backlog::Queued;

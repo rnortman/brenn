@@ -1,5 +1,68 @@
 # TODOs
 
+## `kit-payload-reader-cannot-read-304`
+
+The provider kit's `read_api_payload` and `read_api_result` fail every 3xx
+answer as an internal error, `304 Not Modified` included. A component
+therefore cannot send a conditional `GET` or `HEAD` (`If-None-Match`,
+`If-Modified-Since`) and read the answer, so it cannot revalidate a resource
+it holds by its `ETag`. No component sends a conditional read today. Reading a
+304 needs a new case on `PayloadAnswer` or another shape. `PayloadAnswer` is a
+public enum that a component may match exhaustively, so a case added after
+components are built on it is a contract change that components outside this
+repository pay for at their next pin move; the cost of adding one grows with
+every component built on the reader. Decide between: (a) the kit reads a 304
+with its response headers; (b) the limit stays as the documented contract.
+Done = for (a), a component reads a 304 and its headers through the kit, with
+a test; for (b), this entry and its comment removed, the limit staying in the
+reader's documentation. The `TODO(kit-payload-reader-cannot-read-304)` comment
+sits at `read_api_payload` in `brenn-provider-kit/src/answer.rs`.
+
+## `api-request-no-grant-for-collections-at-every-depth`
+
+`api-request` admits a request path ending in `/` only under a clause whose
+`path` template ends in `/`, and a template matches a fixed number of
+segments. So neither `path = "*"`, nor a clause naming no `path`, nor any
+single template admits collection paths at every depth. A component whose
+collections nest arbitrarily — WebDAV folders — needs one clause per depth,
+and a folder deeper than the deepest clause is refused. Decide whether a grant
+gains a spelling for "any path ending in `/`", or for every path under a
+prefix, and what that does to the rule that no clause admits a path ending in
+`/` unless its template says so. Done = the decision recorded here; if a
+spelling is added, its matching tests and the text in `docs/config-dsl.md` and
+`docs/security-posture.md`. The
+`TODO(api-request-no-grant-for-collections-at-every-depth)` comment sits at
+`template_admits` in `brenn-oauth/src/path_template.rs`.
+
+## `api-request-body-caps-bound-file-transfer`
+
+A provider component cannot move an ordinary file through `api-request`. The
+request body rides inside the tool call's arguments, capped at 64 KiB
+(`MAX_ARGS_BYTES`, equal to `brenn_wasm::PROCESSOR_MAX_TOOL_ARGS_BYTES`) and
+base64-encoded when binary: an upload of under about 48 KiB. The answer is
+capped at the provider's `max_response_bytes`, whose ceiling is the
+compile-time `MAX_RESPONSE_BYTES_CEILING` (512 KiB, tied to
+`MAX_ASYNC_RESULT_BYTES`), again base64 when binary: a download of about
+380 KiB, and less under the bus default (see
+`api-request-read-limit-vs-bus-cap`). What the component then answers its own
+caller is bounded again, by the provider kit's `COMPACT_RESULT_CEILING`
+(256 KiB) and the bus cap. A WebDAV file component or a mail-attachment tool
+built on the provider kit is therefore limited to small files. Decide
+between: (a) raising the caps to a stated size, with what that costs in
+memory per call and on the bus; (b) a route for a body that does not ride in
+the call — the host holds the bytes and the component names them by handle,
+for upload and for download — which is also what delivering a file to a user
+(`agent-file-delivery-beyond-markdown`) and attachments on the bus
+(`chat-bus-attachments`) would use; (c) keeping the caps and documenting them
+as the limit of what a provider component transfers. Under (b) the provider
+kit's contract probably changes, which components built outside this
+repository pay for at their next pin move. Done = the decision recorded here,
+and for (a) or (b) a component test that uploads and downloads a body larger
+than today's caps through the kit. The
+`TODO(api-request-body-caps-bound-file-transfer)` comments sit at
+`MAX_ARGS_BYTES` and `MAX_ASYNC_RESULT_BYTES` in
+`brenn-tool-registry/src/descriptor.rs`.
+
 ## `agent-file-delivery-beyond-markdown`
 
 Brenn hands a user an agent's file only as markdown: `DisplayFile` takes a
@@ -25,7 +88,10 @@ acting user, and `api-request` refuses such a caller every method but `GET`
 and `HEAD` ("a caller with no acting user may only read"), whatever the
 credential: a deployment-key provider's one key, which a clause reaches with
 no user, and a user's credential, which a clause's `user` lends, both read
-only. So an automation that runs without a model — a component on a timer
+only. `PROPFIND` and `REPORT`, which `api-request` also sends, are safe
+methods by their RFCs (RFC 4918 section 9.1, RFC 3253 section 3.6) and are
+refused to such a caller all the same, because the read-only list is `GET`
+and `HEAD`; whatever resolves this entry decides them too. So an automation that runs without a model — a component on a timer
 that files mail in its user's account, spending no model tokens — cannot be
 written, though deterministic automations holding a credential from the
 credential store are a use that store is wanted for. The Fastmail tooling
@@ -3655,7 +3721,7 @@ its copy.
 ## `config-check-empty-segment-path`
 
 `brenn config-check` accepts an `api-request` `allow` clause whose path
-template has an empty segment (a trailing slash, e.g. `/jmap/api/`), which
+template has an empty segment (e.g. `/jmap//api`), which
 brenn then refuses at boot. A deployer gets a green check and a server that
 does not start. `config-check` should refuse the template the same way boot
 does.
@@ -3731,18 +3797,3 @@ across such a reload. The `TODO(reload-grant-reaches-queued-calls)` comment
 sits where `invoke_for_llm` builds the call's context in
 `brenn-tool-registry/src/registry.rs`.
 
-## `kit-utf8-payload-as-bytes`
-
-The provider kit reads a nested `api-request` answer's 2xx `body_base64` as
-`Answer::Bytes`, but `api-request` carries a response in `body_base64` only
-when its bytes are not valid UTF-8, whatever the content type. A downloaded
-file whose bytes happen to be UTF-8 (plain text, CSV, iCalendar, vCard, a
-message source, any ASCII file) arrives as `body`, and `read_api_result` reads
-a 2xx `body` only as JSON, failing "a body that is not JSON". A component that
-downloads files needs the payload as bytes whichever field carries it: a
-reader that takes a 2xx body as bytes under the same status handling, or an
-answer variant for a 2xx text body that is not JSON. Which shape is the first
-file-downloading component's design. Done = such a component reads a UTF-8 and
-a non-UTF-8 download through the kit alike, with tests over both. The
-`TODO(kit-utf8-payload-as-bytes)` comment sits on `Answer::Bytes` in
-`brenn-provider-kit/src/answer.rs`.

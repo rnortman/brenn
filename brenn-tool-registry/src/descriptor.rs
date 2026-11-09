@@ -24,12 +24,14 @@ pub const MAX_FAST_BUDGET: Duration = Duration::from_millis(50);
 pub const MAX_FAST_CALLS_PER_ACTIVATION: usize = 64;
 
 /// Maximum `args-json` size accepted for any tool call (both classes).
+// TODO(api-request-body-caps-bound-file-transfer): bounds an upload's request body.
 pub const MAX_ARGS_BYTES: usize = 64 * 1024;
 
 /// Maximum serialized result size for a fast-class call.
 pub const MAX_FAST_RESULT_BYTES: usize = 256 * 1024;
 
 /// Maximum serialized result size for an async-class result activation.
+// TODO(api-request-body-caps-bound-file-transfer): bounds a download's answer.
 pub const MAX_ASYNC_RESULT_BYTES: usize = 512 * 1024;
 
 // An OAuth provider's response body limit is refused above this cap at boot;

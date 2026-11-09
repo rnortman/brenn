@@ -453,7 +453,9 @@ other tool (see *Tool grants*), and each takes `provider` as an ACL key.
 - `api-request` — sends one HTTP request to a provider's `api_hosts` with the
   credential attached: a user's OAuth credential, or the deployment's key for
   an `api_key_provider`. Its ACL keys are `provider`, `user`, `account`,
-  `method`, `host` and `path`.
+  `method`, `host` and `path`. `method` is one of `GET`, `HEAD`, `POST`,
+  `PUT`, `PATCH`, `DELETE`, `PROPFIND` and `REPORT`, upper-case; any other is
+  refused. A clause naming no `method`, or `method = "*"`, admits all of them.
 
 These tools act as a Brenn user, so some grants are refused at boot and on
 reload:
@@ -469,7 +471,8 @@ A conversation's calls always use its owner's credentials. A component's
 `api-request` call has no owner, so it uses a *lent* credential. Every one of
 its clauses for the provider must name the same `user` (not `"*"`), and that
 user's credential is used. A lent credential is read-only: only `GET` and
-`HEAD` are admitted. `account` picks one of the user's accounts. When it is
+`HEAD` are admitted. `PROPFIND` and `REPORT`, though they read, are refused
+to a caller with no acting user. `account` picks one of the user's accounts. When it is
 omitted and the user has more than one, the call is refused and lists them.
 
 The exception is a component serving a provided-tool call (*The request inbox
@@ -511,15 +514,24 @@ new agenda_sync: AgendaSync {
 
 **`api-request` reads its `path` key as a segment template.** This is that
 tool's own rule. The exact-or-`"*"` matching of *Tool grants* still holds for
-every other key and every other tool. A `path` value is either `"*"`, which
-admits any path, or a template beginning with `/`. Both the template and the
-request path are split on `/`. They must have the same number of segments, and
-each template segment either equals the request's segment or is `*`, which
-matches exactly one segment. There is no prefix matching:
-`"/gmail/v1/users/me/drafts"` admits `drafts` but not `drafts/send`, and
-`"/calendar/v3/calendars/*/events"` does not admit `calendars/x/clear`. A
-template with an empty segment, or a `.`, `..` or `%` segment, is refused at
-boot.
+every other key and every other tool. A `path` value is either `"*"`, or a
+template beginning with `/`. Both the template and the request path are split
+on `/`. They must have the same number of segments, and each template segment
+either equals the request's segment or is `*`, which matches exactly one
+segment. There is no prefix matching: `"/gmail/v1/users/me/drafts"` admits
+`drafts` but not `drafts/send`, and `"/calendar/v3/calendars/*/events"` does
+not admit `calendars/x/clear`.
+
+A template may end in `/`, and `/` alone is the root. A template ending in `/`
+admits only a request path ending in `/` with matching segments, and a
+template that does not end in `/` admits only a path that does not. `"*"`
+admits any path that does not end in `/`, and so does a clause naming no
+`path`. A request path ending in `/` (a WebDAV or CalDAV collection) therefore
+needs a clause whose template ends in `/`: `"/dav/calendars/user/*/"` admits a
+user's calendar home, and neither `/dav/calendars/user/alice@example.com` nor
+a calendar beneath it. A `*` segment never matches an empty one, so `"/a/*"`
+does not admit `/a/`. A template with an empty segment other than the one a
+trailing `/` leaves, or a `.`, `..` or `%` segment, is refused at boot.
 
 #### The device-location tool
 
@@ -616,8 +628,10 @@ A `prefix "brenn:device-location."` matcher reaches every user's positions;
 grant one user's address exactly instead.
 
 The request path is checked after each segment is percent-decoded once. A
-decoded segment that is empty (including from a trailing `/`), that is `.` or
-`..`, or that contains `/`, `\` or `%` is refused before matching. So `%2F`
+decoded segment that is empty, other than the one trailing `/` a path may end
+in, that is `.` or `..`, or that contains `/`, `\` or `%` is refused before
+matching. A trailing `/` is part of the path: it is matched, and sent as
+written. `/` is the root. So `%2F`
 can never act as a separator, and double encoding is refused. A decoded `?` or
 `#` is ordinary segment content (calendar IDs contain `#`). Brenn builds the
 outgoing URL from the matched segments, re-encoding each one, so what is sent
@@ -773,7 +787,8 @@ request rules are those of *The OAuth tools*. What differs:
   that quotes request headers in its own error bodies would return the key to
   the caller.
 - **A WASM component only reads, on its own account.** A caller with no acting
-  user is admitted with `GET` and `HEAD` only, as with a lent OAuth credential.
+  user is admitted with `GET` and `HEAD` only, as with a lent OAuth credential;
+  `PROPFIND` and `REPORT`, though they read, are refused to it.
   A component's call can be replayed from its channel window, and a replayed
   write is the wrong thing whatever the credential. On the deployment form no
   `user` is named or lent; on the per-user form the component borrows the one
