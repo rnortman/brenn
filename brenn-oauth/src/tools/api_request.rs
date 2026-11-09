@@ -870,6 +870,8 @@ impl AsyncTool for ApiRequestTool {
         // A caller with no acting user can be replayed from its channel
         // window, so it only reads, whatever the credential. A stamped
         // component call is its user's and is bounded by its clause alone.
+        // TODO(consumer-own-credentials): no configured way lets a consumer
+        // with no acting user write, with any credential.
         if ctx.acting_user.is_none() && !READ_METHODS.contains(&request.method.as_str()) {
             return Err(ToolError::Denied(format!(
                 "{}: a caller with no acting user may only read ({READ_METHODS:?})",

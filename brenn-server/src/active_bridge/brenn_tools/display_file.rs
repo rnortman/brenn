@@ -94,6 +94,8 @@ pub(super) async fn handle(
 
             let mount_roots = bridge.artifact_mount_roots();
 
+            // TODO(agent-file-delivery-beyond-markdown): only a markdown file
+            // reaches the user's surface from here.
             match brenn_render::artifact::read_artifact_content(
                 &host_file_path,
                 Path::new(&cwd),

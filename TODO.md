@@ -1,5 +1,42 @@
 # TODOs
 
+## `agent-file-delivery-beyond-markdown`
+
+Brenn hands a user an agent's file only as markdown: `DisplayFile` takes a
+`.md` path and renders it in the artifact viewer, and refuses any other
+type. A JSON export, a CSV or an iCalendar file an agent or a tool produces
+has no delivery path; the file route under `/app/{slug}/file/` will serve
+one of up to 1 MB with a download link, but only when the user navigates to
+it, and nothing in an agent's output links there. On the bus chat record
+even the markdown artifact is absent. Inbound attachments exist in the
+legacy TypeScript UI (the upload route) and not on the bus
+(`chat-bus-attachments`); this entry is the outbound half. The gap surfaced
+in the Fastmail tooling, whose mail-filter export and import route and mail
+attachments would be its first callers. Done is a delivery path for a
+non-markdown file from a tool result or a component to the user's surface.
+The `TODO(agent-file-delivery-beyond-markdown)` comment sits at the
+`DisplayFile` handler's read in
+`brenn-server/src/active_bridge/brenn_tools/display_file.rs`.
+
+## `consumer-own-credentials`
+
+A wasm consumer activated by its own timer or by a channel message has no
+acting user, and `api-request` refuses such a caller every method but `GET`
+and `HEAD` ("a caller with no acting user may only read"), whatever the
+credential: a deployment-key provider's one key, which a clause reaches with
+no user, and a user's credential, which a clause's `user` lends, both read
+only. So an automation that runs without a model — a component on a timer
+that files mail in its user's account, spending no model tokens — cannot be
+written, though deterministic automations holding a credential from the
+credential store are a use that store is wanted for. The Fastmail tooling
+recorded the gap rather than fix it. Done, as proposed here: a configured way
+for a consumer with no acting user to write with a credential, a user's
+among them, with the replay rationale behind the read-only
+rule (`docs/security-posture.md` section 9f, "Unstamped component calls are
+read-only") answered there. The `TODO(consumer-own-credentials)` comment
+sits at the read-only check for userless callers in
+`brenn-oauth/src/tools/api_request.rs`.
+
 ## `config-check-agent-tool-grant-unchecked`
 
 `brenn config-check` accepts an agent's `tool <name> {}` grant that names a
