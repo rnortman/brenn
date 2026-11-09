@@ -537,6 +537,12 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
         Ok(Answer::Error { status, body }) => {
             return Next::Fail(google_error(status, &body, scope(state.tool, state.step)));
         }
+        Ok(Answer::Bytes { status, .. }) => {
+            return Next::Fail(internal(format!(
+                "{} returned a non-text body ({status})",
+                google::API_NAME
+            )));
+        }
         Err(failure) => return Next::Fail(failure),
     };
     settle(
@@ -1169,7 +1175,7 @@ mod tests {
         no_body_parts,
     };
     use brenn_google_workspace::text::PAGE_MAX_BYTES;
-    use brenn_provider_kit::testutil::{failure, google, http, nested, truncated};
+    use brenn_provider_kit::testutil::{binary, failure, google, http, nested, truncated};
     use brenn_provider_kit::{
         Bound, ErrorKind, Query, ToolBounds, check, hold_probes, hold_required, input_schema,
         probes,
@@ -1440,6 +1446,17 @@ mod tests {
             Next::Fail(
                 Unreadable::Cut("of unstated length".to_string()).failure(google::API_NAME, None)
             )
+        );
+    }
+
+    #[test]
+    fn advance_answers_a_binary_listing_internal() {
+        assert_eq!(
+            answered(&labels_state(json!({})), binary(200, &[0, 1, 2])),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "Google returned a non-text body (200)"
+            ))
         );
     }
 
@@ -1791,14 +1808,11 @@ mod tests {
             answered(&state, untold),
             Next::Complete(json!({ "messages": [], "unavailable": [deleted("m1")] }))
         );
-        let binary = Ok(json!({
-            "status": 404, "headers": {}, "bytes": 3, "truncated": false, "body_base64": "AAEC",
-        }));
         assert_eq!(
-            answered(&state, binary),
+            answered(&state, binary(404, &[0, 1, 2])),
             Next::Fail(failure(
                 ErrorKind::Internal,
-                "Google returned a non-text body (404)"
+                "Google answered HTTP 404 with a non-text body"
             ))
         );
     }

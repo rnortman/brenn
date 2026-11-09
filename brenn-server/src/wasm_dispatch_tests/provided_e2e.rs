@@ -101,7 +101,9 @@ async fn rig(provider_acl: Vec<&[(&str, &str)]>, caller_args: Value) -> Rig {
         decls: vec![echo_for_user()],
         native: brenn_oauth::tools::registered(
             Some(&service),
-            BTreeMap::from([testutil::key_provider_config("maps", &base)]),
+            brenn_lib::config::ApiKeyTable::new(std::sync::Arc::new(BTreeMap::from([
+                testutil::key_provider_config("maps", &base),
+            ]))),
         ),
         grants,
         component: ProcessorLoadSpec {

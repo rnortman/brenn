@@ -149,6 +149,9 @@ pub struct StubState {
     pub api_bodies: BTreeMap<String, Vec<u8>>,
     /// Every API request, as received.
     pub api_seen: Vec<ApiSeen>,
+    /// When set, every API request is recorded and then held until it takes
+    /// one permit.
+    pub api_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// One API request the stub received.
@@ -235,16 +238,26 @@ async fn api(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let gate = {
+        let mut s = stub.lock().unwrap();
+        s.api_seen.push(ApiSeen {
+            method: method.to_string(),
+            path_and_query: uri
+                .path_and_query()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            headers,
+            body: body.to_vec(),
+        });
+        s.api_gate.clone()
+    };
+    if let Some(gate) = gate {
+        gate.acquire()
+            .await
+            .expect("the gate is never closed")
+            .forget();
+    }
     let mut s = stub.lock().unwrap();
-    s.api_seen.push(ApiSeen {
-        method: method.to_string(),
-        path_and_query: uri
-            .path_and_query()
-            .map(ToString::to_string)
-            .unwrap_or_default(),
-        headers,
-        body: body.to_vec(),
-    });
     let failure = s
         .api_by_method
         .get(&(method.to_string(), uri.path().to_string()))

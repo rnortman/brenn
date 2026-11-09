@@ -1,5 +1,6 @@
 mod alerting;
 mod api_key_provider;
+mod api_key_table;
 mod app;
 mod app_table;
 mod attachment;
@@ -32,6 +33,7 @@ mod watchdog;
 
 pub use alerting::*;
 pub use api_key_provider::*;
+pub use api_key_table::ApiKeyTable;
 pub use app::*;
 pub use app_table::{AppRef, AppTable};
 pub use attachment::*;

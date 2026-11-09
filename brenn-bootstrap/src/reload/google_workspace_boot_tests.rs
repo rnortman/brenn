@@ -10,7 +10,6 @@
 //! `run_server` builds: the document's provider and vault, resolved by
 //! `resolve_oauth`.
 
-use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 
 use brenn_lib::config::PACKAGED;
@@ -294,7 +293,7 @@ async fn assert_class_boots(class: &Class) {
             let resolved = brenn_lib::config::resolve_oauth(config, &apps)
                 .expect("the document declares a provider");
             let service = std::sync::Arc::new(brenn_oauth::OAuthService::new(resolved, alerts));
-            brenn_oauth::tools::registered(Some(&service), BTreeMap::new())
+            brenn_oauth::tools::registered(Some(&service), brenn_lib::config::ApiKeyTable::empty())
         },
     )
     .await;

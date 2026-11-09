@@ -27,7 +27,7 @@ use brenn_google_workspace::settings::Settings;
 use brenn_google_workspace::text::shape;
 use brenn_provider_kit::{
     Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, Logic, NestedError,
-    Next, Query, Tool, Unreadable, bounded, capped, copy, google, no_such_step, object,
+    Next, Query, Tool, Unreadable, bounded, capped, copy, google, internal, no_such_step, object,
     read_api_result, stored,
 };
 use serde_json::{Value, json};
@@ -417,6 +417,13 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
                 google_error(status, &body, scope(state.tool, state.step)),
             ));
         }
+        Ok(Answer::Bytes { status, .. }) => {
+            let failure = internal(format!(
+                "{} returned a non-text body ({status})",
+                google::API_NAME
+            ));
+            return Next::Fail(at_write(state, failure));
+        }
         Err(failure) => return Next::Fail(at_write(state, failure)),
     };
     settle(
@@ -501,7 +508,7 @@ mod tests {
         admits_characters, cut_read, description, escaped_widest, follow, four_byte, lookup,
         no_body_parts, wide,
     };
-    use brenn_provider_kit::testutil::{failure, google, http, nested};
+    use brenn_provider_kit::testutil::{failure, google, http, nested, text_body};
     use brenn_provider_kit::{
         Bound, Probes, QueryValue, ToolBounds, check, hold_probes, hold_required, input_schema,
         internal, probes, query,
@@ -612,7 +619,7 @@ mod tests {
 
     /// The message a draft call carries in `raw`, decoded.
     fn raw_message(call: &ApiCall) -> String {
-        let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+        let body: Value = serde_json::from_str(text_body(call)).unwrap();
         let raw = body["message"]["raw"].as_str().unwrap();
         assert!(
             raw.bytes()
@@ -648,7 +655,7 @@ mod tests {
                 body: call.body.clone(),
             }
         );
-        let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+        let body: Value = serde_json::from_str(text_body(&call)).unwrap();
         assert_eq!(
             body.as_object().unwrap().keys().collect::<Vec<_>>(),
             ["message"]
@@ -805,7 +812,7 @@ mod tests {
         assert_eq!(call.api.method, "POST");
         assert_eq!(call.api.path, DRAFTS_PATH);
         assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
-        let body: Value = serde_json::from_str(call.api.body.as_deref().unwrap()).unwrap();
+        let body: Value = serde_json::from_str(text_body(&call.api)).unwrap();
         assert_eq!(body["message"]["threadId"], json!("t1"));
         assert_eq!(
             raw_message(&call.api),
@@ -943,7 +950,7 @@ mod tests {
             );
             // The thread is the original's whether or not its headers were
             // usable.
-            let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+            let body: Value = serde_json::from_str(text_body(&call)).unwrap();
             assert_eq!(body["message"]["threadId"], json!("t1"));
         }
     }

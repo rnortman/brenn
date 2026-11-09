@@ -4,9 +4,10 @@
 //! the process reports afterwards:
 //!
 //! - [`compare`] is level 1, over the raw documents. Everything outside the
-//!   six convergible blocks — `channels`, `links`, `wasm_consumers`,
-//!   `surfaces`, `webhook_endpoints` and `mqtt_clients` — must be equal, and a
-//!   difference anywhere else is a refusal naming the section.
+//!   seven convergible blocks — `channels`, `links`, `wasm_consumers`,
+//!   `surfaces`, `webhook_endpoints`, `mqtt_clients` and `api_key_providers`
+//!   — must be equal, and a difference anywhere else is a refusal naming the
+//!   section.
 //! - [`delta`] is level 2, over the two lowered plans. It says which channel
 //!   entries and which consumers moved, and refuses the moves that cannot be
 //!   made without restarting. [`agents`] is its agent half: which agents moved,
@@ -42,6 +43,7 @@
 //! the way boot ends it. Both land in the same list of lines.
 
 pub(crate) mod agents;
+pub(crate) mod api_keys;
 pub(crate) mod commit;
 pub(crate) mod compare;
 pub(crate) mod delta;
@@ -63,6 +65,9 @@ mod oracle_tests;
 /// The boot-path contract the packaged provider classes' boot tests share.
 #[cfg(test)]
 mod provider_class_boot;
+
+#[cfg(test)]
+mod api_key_reload_tests;
 
 #[cfg(test)]
 mod device_location_boot_tests;

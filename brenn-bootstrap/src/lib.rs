@@ -468,6 +468,11 @@ pub async fn run_server(
     // reads it through a clone of this handle, so a reload converges them all by
     // swapping the map inside it.
     let app_table = brenn_lib::config::AppTable::new(apps.clone());
+    // The one key-provider table of this process: `api-request` reads it per
+    // call and the reload driver swaps it. Each is handed a clone of this
+    // handle, at `registered` and at `ReloadEnv` below; a second table would
+    // swap a map `api-request` never reads.
+    let api_key_table = brenn_lib::config::ApiKeyTable::new(std::sync::Arc::new(api_key_providers));
 
     // A token is opaque: Brenn cannot read its lifetime, so the only expiry
     // signal there is is the date the operator wrote down. One alert per
@@ -637,7 +642,7 @@ pub async fn run_server(
         )];
         tools.extend(brenn_oauth::tools::registered(
             oauth_service.as_ref(),
-            api_key_providers,
+            api_key_table.clone(),
         ));
         tools.extend(device_location_tools);
         let registry = build_tool_registry(tools, &config.wasm_consumers, &apps, &provider_runtime);
@@ -670,7 +675,7 @@ pub async fn run_server(
         brenn_db::auth::user::list_usernames(&conn).into()
     };
     // Every key-provider account belongs to a registered user. Registration
-    // needs no restart; the restart that adds an account comes after it.
+    // needs no restart; the reload that adds an account comes after it.
     brenn_lib::config::assert_api_key_account_users_registered(&config, &registered_users);
     // Every registered user gets a location channel in the plan. The list is
     // the one a reload plans with too: a user registered after this point is
@@ -1268,6 +1273,7 @@ pub async fn run_server(
                 root: root_path.clone(),
                 build_id,
                 apps: app_table.clone(),
+                api_keys: api_key_table.clone(),
                 integration_registry: integration_registry.clone(),
                 runtime_dir: runtime_dir.clone(),
                 tool_registry: state.tools.clone(),

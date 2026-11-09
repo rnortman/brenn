@@ -2,6 +2,7 @@
 //! copied out of it, and the ceiling on a request's compact result. The text
 //! the model sees names the API by the display name the caller passes.
 
+use base64ct::{Base64, Encoding};
 use serde_json::{Value, json};
 
 use crate::args::Args;
@@ -127,6 +128,14 @@ impl Unreadable {
 pub enum Answer {
     /// The API's 2xx JSON body.
     Body(Value),
+    /// The API's 2xx body when it is not UTF-8, decoded. `api-request` sends a
+    /// body as text whenever its bytes are valid UTF-8, whatever the API's
+    /// content type, so a UTF-8 payload never arrives here: it is read as
+    /// JSON, and fails as "a body that is not JSON" when it is not. Never
+    /// empty: an empty body is text, and reads as [`Answer::NoBody`].
+    // TODO(kit-utf8-payload-as-bytes): a component that downloads files needs
+    // a 2xx payload as bytes whichever field `api-request` carries it in.
+    Bytes { status: u64, body: Vec<u8> },
     /// A 2xx with no body: the API accepted the call and answers nothing (a
     /// 204, or an endpoint that answers an empty 200). Only `status` is known.
     NoBody { status: u64 },
@@ -141,11 +150,13 @@ pub enum Answer {
     Error { status: u64, body: String },
 }
 
-/// `api-request`'s answer read: the API's JSON or its empty 2xx, the
-/// credential relay, a cut or undelivered answer or the API's error for the
-/// component to decide on, or the request's error answer. A 2xx body of zero
-/// bytes is [`Answer::NoBody`]; any other 2xx body must be JSON. `api` is the
-/// API's display name, which the refusals the model sees name.
+/// `api-request`'s answer read: the API's JSON, its bytes or its empty 2xx,
+/// the credential relay, a cut or undelivered answer or the API's error for
+/// the component to decide on, or the request's error answer. A 2xx body of
+/// zero bytes is [`Answer::NoBody`], a 2xx `body_base64` is [`Answer::Bytes`],
+/// and any other 2xx body must be JSON; a non-text body under any other
+/// status is internal. `api` is the API's display name, which the refusals the
+/// model sees name.
 pub fn read_api_result(
     outcome: Result<Value, NestedError>,
     target: &Target,
@@ -188,10 +199,19 @@ pub fn read_api_result(
             },
         )));
     }
-    if value.get("body_base64").is_some() {
-        return Err(internal(format!(
-            "{api} returned a non-text body ({status})"
-        )));
+    if let Some(encoded) = value.get("body_base64") {
+        let body = encoded
+            .as_str()
+            .and_then(|encoded| Base64::decode_vec(encoded).ok())
+            .ok_or_else(|| {
+                internal("api-request's answer carries a body_base64 that is not base64")
+            })?;
+        if !(200..300).contains(&status) {
+            return Err(internal(format!(
+                "{api} answered HTTP {status} with a non-text body"
+            )));
+        }
+        return Ok(Answer::Bytes { status, body });
     }
     if (300..400).contains(&status) {
         return Err(internal(format!(
@@ -257,7 +277,7 @@ pub fn copy(to: &mut Args, name: &str, from: Option<&Value>) {
 mod tests {
     use super::*;
     use crate::google::API_NAME;
-    use crate::testutil::{failure, http, nested, truncated};
+    use crate::testutil::{binary, failure, http, nested, truncated};
 
     fn target() -> Target {
         Target {
@@ -398,17 +418,34 @@ mod tests {
     }
 
     #[test]
-    fn a_binary_body_or_a_redirect_is_internal() {
-        let outcome = Ok(json!({
-            "status": 200, "headers": {}, "bytes": 3, "truncated": false, "body_base64": "AAEC",
-        }));
+    fn a_binary_2xx_body_is_read_as_bytes() {
         assert_eq!(
-            read(outcome),
-            Err(failure(
-                ErrorKind::Internal,
-                "Google returned a non-text body (200)"
-            ))
+            read(binary(200, &[0, 1, 2])),
+            Ok(Answer::Bytes {
+                status: 200,
+                body: vec![0, 1, 2],
+            })
         );
+        assert_eq!(
+            read(binary(206, &[0xff])),
+            Ok(Answer::Bytes {
+                status: 206,
+                body: vec![0xff],
+            })
+        );
+    }
+
+    #[test]
+    fn a_binary_body_under_another_status_or_a_redirect_is_internal() {
+        for status in [404, 302, 500, 101] {
+            assert_eq!(
+                read(binary(status, &[0, 1, 2])),
+                Err(failure(
+                    ErrorKind::Internal,
+                    &format!("Google answered HTTP {status} with a non-text body")
+                ))
+            );
+        }
         assert_eq!(
             read(http(302, "")),
             Err(failure(
@@ -419,13 +456,42 @@ mod tests {
     }
 
     #[test]
+    fn a_body_base64_that_is_not_base64_is_internal() {
+        for encoded in [json!("not base64!"), json!("AAE"), json!(7)] {
+            let outcome = Ok(json!({
+                "status": 200, "headers": {}, "bytes": 3, "truncated": false, "body_base64": encoded,
+            }));
+            assert_eq!(
+                read(outcome),
+                Err(failure(
+                    ErrorKind::Internal,
+                    "api-request's answer carries a body_base64 that is not base64"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_binary_answer_is_cut() {
+        let outcome = Ok(json!({
+            "status": 200, "headers": {}, "bytes": 900000, "truncated": true, "body_base64": "AAEC",
+        }));
+        assert_eq!(
+            read(outcome),
+            Ok(Answer::Unreadable(Unreadable::Cut(
+                "900000 bytes".to_string()
+            )))
+        );
+    }
+
+    #[test]
     fn the_refusals_name_the_api_they_are_given() {
         let read = |outcome| read_api_result(outcome, &target(), "Fastmail");
-        let binary = Ok(json!({
-            "status": 200, "headers": {}, "bytes": 3, "truncated": false, "body_base64": "AAEC",
-        }));
         for (outcome, detail) in [
-            (binary, "Fastmail returned a non-text body (200)"),
+            (
+                binary(404, &[0, 1, 2]),
+                "Fastmail answered HTTP 404 with a non-text body",
+            ),
             (
                 http(302, ""),
                 "Fastmail answered 302 with a redirect, which Brenn does not follow",

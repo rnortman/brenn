@@ -1,15 +1,17 @@
 //! Test fixtures for a step's inputs and outputs: `api-request`'s answer
-//! envelope, a nested-call error, a Google error body and the error answer a
-//! step returns; and `MemoryHost`, an in-memory host for a loop's tests.
+//! envelope, a nested call's text body, a nested-call error, a Google error
+//! body and the error answer a step returns; and `MemoryHost`, an in-memory
+//! host for a loop's tests.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
+use base64ct::{Base64, Encoding};
 use serde_json::{Value, json};
 
 use crate::activation::{Host, Input, Level, Logic, Rows, serve};
 use crate::answer::NestedError;
-use crate::call::{ApiCall, ErrorKind, Failure};
+use crate::call::{ApiCall, Body, ErrorKind, Failure};
 
 /// A nested call that failed with `kind` and `detail`.
 pub fn nested(kind: &str, detail: &str) -> Result<Value, NestedError> {
@@ -28,6 +30,29 @@ pub fn http(status: u64, body: &str) -> Result<Value, NestedError> {
         "truncated": false,
         "body": body,
     }))
+}
+
+/// A whole answer with `status` and a body that is not text, as `api-request`
+/// carries one: `body_base64`.
+pub fn binary(status: u64, body: &[u8]) -> Result<Value, NestedError> {
+    Ok(json!({
+        "status": status,
+        "headers": { "content-type": "application/octet-stream" },
+        "bytes": body.len(),
+        "truncated": false,
+        "body_base64": Base64::encode_string(body),
+    }))
+}
+
+/// The text body of a nested call.
+///
+/// # Panics
+/// When the call carries no body or a byte body.
+pub fn text_body(call: &ApiCall) -> &str {
+    match &call.body {
+        Some(Body::Text(text)) => text,
+        other => panic!("the call carries no text body: {other:?}"),
+    }
 }
 
 /// An answer `api-request` cut at the provider's read limit: `bytes` is the

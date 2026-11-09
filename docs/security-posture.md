@@ -1540,7 +1540,8 @@ or page carries a token.
 
 **A deployment key is the operator's, not a user's.** An `api_key_provider`
 holds one key for the whole deployment. The operator places it by hand in a
-host file; the backend reads it once at boot and attaches it host-side. It has
+host file; the backend reads it at boot and at every reload and attaches it
+host-side. It has
 no owner, no account and no consent: every caller a grant admits sends the
 same key, and its spend is the operator's. What Brenn guarantees for it is
 exactly this: the key is sent only as a request header, to a configured
@@ -1585,9 +1586,10 @@ for each account's file, and a caller with no user is admitted only to read.
   `extra_args` reach podman unread, so a mount written there is not checked:
   host mounts belong in `extra_mounts`, where the check sees them.
 - **Key placement.** A deployment key is a host file of mode `0600` or
-  tighter, outside the vault, read once at boot and never written to the
-  diagnostic or security log. Unlike the vault, its location is not checked
-  against the agent-visible roots; the operator places it outside them.
+  tighter, outside the vault, read at boot and at every reload and never
+  written to the diagnostic or security log. Unlike the vault, its location
+  is not checked against the agent-visible roots; the operator places it
+  outside them.
 - **Only container apps.** An app with no container runs its agent as the
   server's user, which could read the vault, so it is refused every
   credential-bearing grant. A `multiuser` app is refused too: whoever types in a

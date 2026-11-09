@@ -1,8 +1,9 @@
 //! Level 1: everything a reload cannot converge must be equal.
 //!
-//! Six blocks of a document are convergible — `channels`, `links`,
-//! `wasm_consumers`, `surfaces`, `webhook_endpoints` and `mqtt_clients` — and
-//! this pass ignores exactly those. Every other section describes an entity
+//! Seven blocks of a document are convergible — `channels`, `links`,
+//! `wasm_consumers`, `surfaces`, `webhook_endpoints`, `mqtt_clients` and
+//! `api_key_providers` — and this pass ignores those but for the parts named
+//! below. Every other section describes an entity
 //! whose runtime tables are boot snapshots: a remote's token is loaded once,
 //! a repo's mount is bound once. Converging any of them is a later slice's
 //! work; a difference in one of them here is a refusal.
@@ -27,11 +28,14 @@
 //!   sets `spawn_changed`, and the agent's live sessions are retired at their
 //!   next idle moment so their successors are spawned from the new map.
 //!
-//! Two parts of convergible blocks are not. The tools a consumer provides join
+//! Three parts of convergible blocks are not. The tools a consumer provides join
 //! the tool registry, which is built once per process, so a change to them is
-//! refused per consumer. The `channels` blocks that tune the
-//! `brenn:device-location.` family size channels that registration mints from
-//! the process's boot-time tuning table, so a change to one is refused.
+//! refused per consumer. The same registry holds `api-request` only while some
+//! provider exists, so the first key provider in a document that had no
+//! provider of either kind, and the removal of the last, are refused. The
+//! `channels` blocks that tune the `brenn:device-location.` family size
+//! channels that registration mints from the process's boot-time tuning
+//! table, so a change to one is refused.
 //!
 //! What is left is boot-shaped: folded into another subsystem's tables or side
 //! effects, so converging it means converging that subsystem. Those fields are
@@ -46,7 +50,9 @@
 
 use std::collections::BTreeMap;
 
-use brenn_lib::config::{AppConfigRaw, BrennConfig, sort_order_dead_collections};
+use brenn_lib::config::{
+    ApiKeyProviderRaw, AppConfigRaw, BrennConfig, OAuthProviderRaw, sort_order_dead_collections,
+};
 use brenn_lib::messaging::config::{
     ChannelConfigRaw, ProvidedToolDecl, SystemChannelFamily, WasmConsumerConfigRaw,
 };
@@ -189,17 +195,26 @@ pub(crate) fn non_convergible_differences(
     );
     // Tools are built once at boot from the providers and their client files;
     // a changed provider takes a restart, as a changed Claude profile does.
+    // TODO(reload-oauth-providers): an OAuth provider's client file, scopes and
+    // endpoints are re-read and swapped at reload instead of refused.
     keyed_map(
         "oauth_providers",
         &by_key(oauth_providers),
         &by_key(b_oauth_providers),
         &mut out,
     );
-    // Keys are read once at boot, as client files are.
-    keyed_map(
-        "api_key_providers",
-        &by_key(api_key_providers),
-        &by_key(b_api_key_providers),
+    // Key providers converge: every key is read off the host at every reload
+    // and `api-request` reads the table per call. The one thing that cannot
+    // move is whether `api-request` is registered at all — it is, iff some
+    // provider of either kind existed at boot — and the registry is fixed for
+    // the life of the process. `oauth_providers` is frozen above, so "no
+    // provider of either kind" is the same question on both sides of this arm.
+    // TODO(reload-provided-tools): the first and the last provider need a
+    // restart until the registry can take a tool in and out.
+    api_key_registration(
+        oauth_providers,
+        api_key_providers,
+        b_api_key_providers,
         &mut out,
     );
     plain("repo_sync", repo_sync, b_repo_sync, &mut out);
@@ -642,6 +657,8 @@ fn compare_app(
 /// providing consumer converges; removing the consumer removes its tools and is
 /// refused with them. Consumers that provide nothing are absent from both maps,
 /// so adding or removing one is not this pass's business.
+// TODO(reload-provided-tools): a consumer's `provides` converges once the
+// registry can take a tool in and out.
 fn provided_tools(a: &[WasmConsumerConfigRaw], b: &[WasmConsumerConfigRaw], out: &mut Vec<String>) {
     fn providing(consumers: &[WasmConsumerConfigRaw]) -> BTreeMap<&str, &Vec<ProvidedToolDecl>> {
         consumers
@@ -656,6 +673,36 @@ fn provided_tools(a: &[WasmConsumerConfigRaw], b: &[WasmConsumerConfigRaw], out:
         &providing(b),
         out,
     );
+}
+
+/// The two key-provider changes that would move whether `api-request` is
+/// registered: a first provider in a document that had none of either kind,
+/// and the removal of the last. Each is refused per provider, in name order.
+/// Every other `api_key_providers` difference converges.
+fn api_key_registration(
+    oauth_providers: &BTreeMap<String, OAuthProviderRaw>,
+    a: &BTreeMap<String, ApiKeyProviderRaw>,
+    b: &BTreeMap<String, ApiKeyProviderRaw>,
+    out: &mut Vec<String>,
+) {
+    if !oauth_providers.is_empty() {
+        return;
+    }
+    if a.is_empty() {
+        for name in b.keys() {
+            out.push(format!(
+                "api_key_providers[{name}] added: the first provider needs a restart: \
+                 {NEEDS_RESTART}"
+            ));
+        }
+    } else if b.is_empty() {
+        for name in a.keys() {
+            out.push(format!(
+                "api_key_providers[{name}] removed: the last provider needs a restart: \
+                 {NEEDS_RESTART}"
+            ));
+        }
+    }
 }
 
 /// A section that is a map: reported per key, in key order.
@@ -1319,41 +1366,65 @@ mod tests {
         );
     }
 
-    /// An added, removed or changed key provider is refused by name: its key
-    /// is read once at boot.
-    #[test]
-    fn a_changed_api_key_provider_is_named_and_needs_a_restart() {
-        let provider = |key_file: &str| {
-            let mut config = base();
-            config.api_key_providers.insert(
-                "maps".to_string(),
-                brenn_lib::config::ApiKeyProviderRaw {
-                    source: brenn_lib::config::ApiKeySourceRaw::Deployment {
-                        key_file: std::path::PathBuf::from(key_file),
-                    },
-                    ..brenn_lib::config::test_api_key_provider_raw("https://api.example.com")
+    /// A deployment-key provider named `name`, its key at `key_file`.
+    fn key_provider(name: &str, key_file: &str) -> (String, brenn_lib::config::ApiKeyProviderRaw) {
+        (
+            name.to_string(),
+            brenn_lib::config::ApiKeyProviderRaw {
+                source: brenn_lib::config::ApiKeySourceRaw::Deployment {
+                    key_file: std::path::PathBuf::from(key_file),
                 },
-            );
-            config
-        };
-        assert_eq!(
-            refusals(&provider("/keys/one"), &provider("/keys/two")),
-            vec!["api_key_providers[maps] differs: this change needs a restart".to_string()],
+                ..brenn_lib::config::test_api_key_provider_raw("https://api.example.com")
+            },
+        )
+    }
+
+    /// `base()` holding the given key providers.
+    fn with_key_providers(
+        providers: impl IntoIterator<Item = (String, brenn_lib::config::ApiKeyProviderRaw)>,
+    ) -> BrennConfig {
+        let mut config = base();
+        config.api_key_providers.extend(providers);
+        config
+    }
+
+    /// A key provider that differs, or one added or removed beside another,
+    /// converges: every key is re-read at reload and `api-request` reads the
+    /// table per call.
+    #[test]
+    fn a_changed_api_key_provider_converges() {
+        let maps = |key_file: &str| key_provider("maps", key_file);
+        let other = || key_provider("other", "/keys/other");
+        assert!(
+            refusals(
+                &with_key_providers([maps("/keys/one")]),
+                &with_key_providers([maps("/keys/two")]),
+            )
+            .is_empty()
         );
-        assert_eq!(
-            refusals(&base(), &provider("/keys/one")),
-            vec!["api_key_providers[maps] added: this change needs a restart".to_string()],
+        let mut header = with_key_providers([maps("/keys/one")]);
+        header.api_key_providers.get_mut("maps").unwrap().header = "x-other-key".to_string();
+        assert!(refusals(&with_key_providers([maps("/keys/one")]), &header).is_empty());
+        assert!(
+            refusals(
+                &with_key_providers([other()]),
+                &with_key_providers([other(), maps("/keys/one")]),
+            )
+            .is_empty()
         );
-        assert_eq!(
-            refusals(&provider("/keys/one"), &base()),
-            vec!["api_key_providers[maps] removed: this change needs a restart".to_string()],
+        assert!(
+            refusals(
+                &with_key_providers([other(), maps("/keys/one")]),
+                &with_key_providers([other()]),
+            )
+            .is_empty()
         );
     }
 
-    /// An account added, removed, rebound to another user or re-pathed is a
-    /// changed provider: every account's key is read once at boot.
+    /// An account added, removed, rebound to another user or re-pathed
+    /// converges, as every other change to the provider does.
     #[test]
-    fn a_changed_api_key_account_needs_a_restart() {
+    fn a_changed_api_key_account_converges() {
         let account =
             |name: &str, user: &str, key_file: &str| brenn_lib::config::ApiKeyAccountRaw {
                 name: name.to_string(),
@@ -1362,33 +1433,77 @@ mod tests {
                 default: false,
             };
         let provider = |accounts: Vec<brenn_lib::config::ApiKeyAccountRaw>| {
-            let mut config = base();
-            config.api_key_providers.insert(
+            with_key_providers([(
                 "mail".to_string(),
                 brenn_lib::config::ApiKeyProviderRaw {
                     source: brenn_lib::config::ApiKeySourceRaw::Accounts(accounts),
                     ..brenn_lib::config::test_api_key_provider_raw("https://api.example.com")
                 },
-            );
-            config
+            )])
         };
         let alice = || account("alice", "alice", "/keys/alice");
         let before = provider(vec![alice()]);
-        assert!(refusals(&before, &provider(vec![alice()])).is_empty());
-        let changed =
-            vec!["api_key_providers[mail] differs: this change needs a restart".to_string()];
         for after in [
+            vec![alice()],
             vec![alice(), account("bob", "bob", "/keys/bob")],
             vec![account("bob", "bob", "/keys/bob")],
             vec![account("alice", "bob", "/keys/alice")],
             vec![account("alice", "alice", "/keys/other")],
+            vec![brenn_lib::config::ApiKeyAccountRaw {
+                default: true,
+                ..alice()
+            }],
         ] {
-            assert_eq!(
-                refusals(&before, &provider(after.clone())),
-                changed,
+            assert!(
+                refusals(&before, &provider(after.clone())).is_empty(),
                 "{after:?}"
             );
         }
+    }
+
+    /// With no `oauth_provider`, the first key provider and the removal of
+    /// the last move whether `api-request` is registered: each is refused per
+    /// provider. An `oauth_provider` on both sides keeps the tool registered,
+    /// and neither is refused.
+    #[test]
+    fn the_first_and_the_last_api_key_provider_need_a_restart() {
+        let two = || {
+            with_key_providers([
+                key_provider("maps", "/keys/maps"),
+                key_provider("mail", "/keys/mail"),
+            ])
+        };
+        assert_eq!(
+            refusals(&base(), &two()),
+            vec![
+                "api_key_providers[mail] added: the first provider needs a restart: \
+                 this change needs a restart"
+                    .to_string(),
+                "api_key_providers[maps] added: the first provider needs a restart: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+        );
+        assert_eq!(
+            refusals(&two(), &base()),
+            vec![
+                "api_key_providers[mail] removed: the last provider needs a restart: \
+                 this change needs a restart"
+                    .to_string(),
+                "api_key_providers[maps] removed: the last provider needs a restart: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+        );
+        let with_oauth = |mut config: BrennConfig| {
+            config.oauth_providers.insert(
+                "google".to_string(),
+                brenn_lib::config::test_oauth_provider_raw("https://accounts.example.com"),
+            );
+            config
+        };
+        assert!(refusals(&with_oauth(base()), &with_oauth(two())).is_empty());
+        assert!(refusals(&with_oauth(two()), &with_oauth(base())).is_empty());
     }
 
     /// A tuning block for the location family, keyed by `address` or, when

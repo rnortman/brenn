@@ -463,6 +463,31 @@ fn resolved_config_carries_api_key_providers() {
     assert_eq!(key.expose(), "k3y-value");
 }
 
+/// An agent's `api-request` clause naming a `user` on a deployment-key
+/// provider refuses boot at app resolution, in the registry's words.
+#[test]
+#[should_panic(
+    expected = "app \"myapp\": tool_grant for \"api-request\" has an invalid ACL clause: `user` \
+                and `account` have no meaning for api_key_provider \"maps\""
+)]
+fn an_api_request_clause_no_key_can_admit_refuses_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config_with_key_provider(dir.path(), 0o600);
+    config.apps[0].tool_grants = vec![crate::tools::config::ToolGrantRaw {
+        tool: "api-request".to_string(),
+        acl: vec![std::collections::BTreeMap::from([
+            ("provider".to_string(), "maps".to_string()),
+            ("user".to_string(), "alice".to_string()),
+        ])],
+        rate_limit: None,
+    }];
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        super::test_runtime_dir(),
+    );
+}
+
 /// A key provider whose key file is group-readable refuses boot.
 #[test]
 #[should_panic(expected = "api_key_provider `maps`")]

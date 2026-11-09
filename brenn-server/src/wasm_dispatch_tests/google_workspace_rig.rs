@@ -13,7 +13,7 @@
 
 use super::*;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use brenn_lib::config::{PACKAGED, config_from_dsl};
 use brenn_lib::messaging::config::ProvidedToolDecl;
@@ -208,7 +208,10 @@ async fn rig_configured(
             slug: class.slug,
             wasm: class.wasm,
             decls: provided(class),
-            native: brenn_oauth::tools::registered(Some(&service), BTreeMap::new()),
+            native: brenn_oauth::tools::registered(
+                Some(&service),
+                brenn_lib::config::ApiKeyTable::empty(),
+            ),
             clauses: clauses
                 .iter()
                 .map(|&(method, path)| {

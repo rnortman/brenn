@@ -67,8 +67,8 @@ pub struct ResolvedConfig {
     /// The credential vault and every OAuth provider, each client file read
     /// once. `Some` iff an `oauth_provider` is declared.
     pub oauth: Option<super::ResolvedOAuth>,
-    /// Every API-key provider, each key file read once; empty when none is
-    /// declared.
+    /// Every API-key provider, each key file read at boot and at every
+    /// reload; empty when none is declared.
     pub api_key_providers: std::collections::BTreeMap<String, super::ApiKeyProviderConfig>,
 }
 
@@ -1082,7 +1082,7 @@ pub fn resolve_apps(
 
     // Runs after the other phases so MQTT client slugs in ACL matchers can be
     // cross-checked against the resolved client set.
-    resolve_access_policies(&config.apps, &mut apps, mqtt_clients, &config.llm_chat);
+    resolve_access_policies(config, &mut apps, mqtt_clients);
 
     if let Some(refusal) = pwa_push_grant_without_section(config) {
         panic!("{refusal}");
@@ -1175,12 +1175,11 @@ fn resolve_messaging_layer(
 /// its own field: the harness's chat-tree authority never enters `policy`, so
 /// the app's LLM sees only what the operator wrote.
 fn resolve_access_policies(
-    raw_apps: &[AppConfigRaw],
+    config: &BrennConfig,
     apps: &mut IndexMap<String, AppConfig>,
     mqtt_clients: &IndexMap<String, crate::mqtt::config::MqttClientIdentity>,
-    llm_chat: &crate::config::llm_chat::LlmChatConfig,
 ) {
-    for raw in raw_apps {
+    for raw in &config.apps {
         let Some(app) = apps.get_mut(&raw.slug) else {
             continue;
         };
@@ -1198,9 +1197,10 @@ fn resolve_access_policies(
         let mount_slugs: Vec<String> = app.mounts.iter().map(|m| m.slug.clone()).collect();
         policy.tool_grants =
             crate::tools::config::resolve_app_tool_grants(&owner, &raw.tool_grants, &mount_slugs);
+        crate::config::assert_api_request_clauses(config, &owner, &policy.tool_grants);
         warn_granted_publish_no_matcher(&raw.slug, &policy);
         app.policy = std::sync::Arc::new(policy);
-        app.chat_harness_policy = std::sync::Arc::new(llm_chat.harness_policy(&raw.slug));
+        app.chat_harness_policy = std::sync::Arc::new(config.llm_chat.harness_policy(&raw.slug));
     }
 }
 

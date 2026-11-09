@@ -147,6 +147,23 @@ expires on its age alone: an in-flight row at `INFLIGHT_TTL_MS` after issue, a
 backlog entry `BACKLOG_MAX_WAIT_MS` after its request arrived, answered
 `internal` then; until then each activation that reads it fails.
 
+Another cut of this kind in force now, in the provider kit: **a nested call's
+body is a `Body`, and an answer can be bytes.** `ApiCall.body` is an
+`Option<Body>`: `Body::Text(String)` goes on the wire as `body`, exactly as the
+`String` did, and `Body::Bytes(Vec<u8>)` as `body_base64` (standard padded
+base64, as `api-request` reads it); a call cannot carry both, and a wire form
+that does is refused when it is parsed back. A component that set a text body
+wraps it in `Body::Text`. `read_api_result` reads a 2xx `body_base64` answer
+as `Answer::Bytes { status, body }`, decoded, where it used to fail
+`internal`; a `body_base64` under any other status, or one that is not base64,
+still fails `internal`. `api-request` answers in `body_base64` only when the
+API's bytes are not valid UTF-8, whatever their content type: a plain-text,
+CSV or calendar file, or any ASCII payload, arrives as `body` and fails the
+JSON read as "a body that is not JSON", so `Bytes` is not yet a way to download
+a file. A component that matches `Answer` exhaustively adds an arm for `Bytes`
+— failing `internal`, if the API it calls never answers in bytes. The `testutil` fixtures gained `binary`, an answer carrying bytes, and
+`text_body`, a call's text body.
+
 Freezing the macro vocabulary of a one-operator ecosystem buys nothing a pin
 does not already buy, which is why the two are split rather than held to one
 promise. `CHANGELOG.md` announces a cut to component authors in an entry
@@ -420,13 +437,15 @@ guest `serde` on the host; `:brenn-provider-kit-guest` is wasm32-only, like
 `--@brenn//bazel/features:testutils=False` — carries the schema parity checker
 (`schema`), the step fixtures and the in-memory `MemoryHost` (`testutil`). The
 select resolves against `@brenn` from a consumer's build, which is the
-situation `@brenn//brenn-envelope` is already in; this has not been proven by
-an out-of-tree build, and a logic test that fails to compile naming `schema`
-or `testutil` is that flag. `@brenn//brenn-provider-kit:brenn-provider-kit`
-(against the host hub's serde) is the crate's own test build and not the
-contract. The labels are the crates' own targets, as
-`@brenn//brenn-envelope:brenn-envelope_wasm` is for `profile-switcher`; the
-guest alias set is for third-party crates only.
+situation `@brenn//brenn-envelope` is already in; `brenn-fastmail`
+(`https://github.com/rnortman/brenn-fastmail`) builds its provider against
+`@brenn//brenn-provider-kit:brenn-provider-kit_guest` and runs its host
+`logic_test` over `testutil`, so an out-of-tree build has proven it. A logic
+test that fails to compile naming `schema` or `testutil` is that flag.
+`@brenn//brenn-provider-kit:brenn-provider-kit` (against the host hub's serde)
+is the crate's own test build and not the contract. The labels are the crates'
+own targets, as `@brenn//brenn-envelope:brenn-envelope_wasm` is for
+`profile-switcher`; the guest alias set is for third-party crates only.
 
 ### The gate set
 

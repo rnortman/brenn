@@ -490,6 +490,14 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
                 },
                 &consumer.policy.tool_grants,
             );
+            brenn_lib::config::assert_api_request_clauses(
+                config,
+                &brenn_tool_registry::GrantOwner::WasmConsumer {
+                    slug: &consumer.slug,
+                }
+                .to_string(),
+                &consumer.policy.tool_grants,
+            );
         }
         tool_caller_grants.insert(
             brenn_lib::messaging::ParticipantId::for_wasm(&consumer.slug)

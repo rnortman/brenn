@@ -123,6 +123,11 @@ new {ASSISTANT}: Assistant();
 /// key providers plus `device-location`, asserting what
 /// [`assert_provider_class_boots`] asserts.
 async fn boot(extra: &str) {
+    boot_edited(extra, |document| document).await;
+}
+
+/// [`boot`] over the document as `edit` returns it.
+async fn boot_edited(extra: &str, edit: impl FnOnce(String) -> String) {
     let home = tempfile::tempdir().expect("a container home");
     let host = tempfile::tempdir().expect("a host directory");
     let key_file = host.path().join("maps-api-key");
@@ -130,7 +135,7 @@ async fn boot(extra: &str) {
     std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))
         .expect("the key file is private");
     let store = host.path().join("google-maps-tools.db");
-    let tree = Tree::holding(&document(home.path(), &key_file, &store, extra));
+    let tree = Tree::holding(&edit(document(home.path(), &key_file, &store, extra)));
 
     assert_provider_class_boots(
         ProviderClassBoot {
@@ -141,18 +146,11 @@ async fn boot(extra: &str) {
             tools: TOOLS,
             result_depth: 64,
         },
-        |config| {
-            let mut native = brenn_oauth::tools::registered(
-                None,
-                brenn_lib::config::resolve_api_key_providers(config),
-            );
-            native.extend(
-                brenn_device_location::registered(brenn_db::into_db(
-                    brenn_db::open_connection_memory(),
-                ))
-                .0,
-            );
-            native
+        // `api-request` over the document's key providers is the boot
+        // fixture's own registration.
+        |_| {
+            brenn_device_location::registered(brenn_db::into_db(brenn_db::open_connection_memory()))
+                .0
         },
     )
     .await;
@@ -176,4 +174,58 @@ async fn google_maps_tools_boots_into_an_agents_tool_list() {
 )]
 async fn the_instance_is_refused_the_device_location_grant() {
     boot("    tool device-location {}\n").await;
+}
+
+/// The instance's clauses are held to the document's key providers at boot:
+/// a `user` on the deployment-key provider admits no call and is refused in
+/// the registry's words.
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(
+    expected = "wasm consumer \"maps\": tool_grant for \"api-request\" has an invalid ACL clause: \
+                `user` and `account` have no meaning for api_key_provider \"google-maps\""
+)]
+async fn an_instance_clause_naming_a_user_on_the_deployment_key_is_refused() {
+    boot_edited("", |document| {
+        document.replacen(
+            r#"allow { provider = "google-maps"; method = "GET";"#,
+            r#"allow { provider = "google-maps"; user = "alice"; method = "GET";"#,
+            1,
+        )
+    })
+    .await;
+}
+
+/// With no provider of either kind `api-request` is not registered, so an
+/// agent's grant naming it is refused as an unknown tool rather than by what
+/// its clause names.
+#[tokio::test]
+#[should_panic(expected = "app \"assistant\": tool_grant names unknown tool \"api-request\"")]
+async fn with_no_provider_an_api_request_grant_names_an_unknown_tool() {
+    let tree = Tree::holding(&super::driver::tests::document(&format!(
+        r#"
+agent Assistant() {{
+    working_dir = ".";
+    tool api-request {{
+        allow {{ provider = "*"; user = "alice"; }}
+    }}
+}}
+
+new {ASSISTANT}: Assistant();
+"#
+    )));
+    let document = tree.load();
+    let apps = super::driver::tests::resolve_fixture_apps(&document.config, &tree.runtime_dir());
+    let (alert, _drain) = brenn_obs::alerting::AlertDispatcher::noop();
+    let registry = crate::build_tool_registry(
+        brenn_oauth::tools::registered(
+            None,
+            brenn_lib::config::ApiKeyTable::new(std::sync::Arc::new(
+                brenn_lib::config::resolve_api_key_providers(&document.config),
+            )),
+        ),
+        &document.config.wasm_consumers,
+        &apps,
+        &brenn_tool_registry::ProviderRuntime::new(alert),
+    );
+    registry.validate_config(&apps);
 }

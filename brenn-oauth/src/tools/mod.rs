@@ -9,18 +9,16 @@ pub mod disconnect;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use brenn_lib::config::ApiKeyProviderConfig;
+use brenn_lib::config::ApiKeyTable;
 use brenn_lib::tools::{AclClause, acl_admits};
 use brenn_tool_registry::{AclDenied, RegisteredTool};
 
 use crate::OAuthService;
 
 /// The registry tools for the declared providers: the three OAuth tools when
-/// `oauth` is present, and `api-request` when either kind is declared.
-pub fn registered(
-    oauth: Option<&Arc<OAuthService>>,
-    keys: BTreeMap<String, ApiKeyProviderConfig>,
-) -> Vec<RegisteredTool> {
+/// `oauth` is present, and `api-request` when either kind is declared — when
+/// `keys` holds a provider as it stands now, for the key kind.
+pub fn registered(oauth: Option<&Arc<OAuthService>>, keys: ApiKeyTable) -> Vec<RegisteredTool> {
     let mut tools: Vec<RegisteredTool> = Vec::new();
     if let Some(service) = oauth {
         tools.push(RegisteredTool::Async(Arc::new(
@@ -33,7 +31,7 @@ pub fn registered(
             disconnect::OAuthDisconnectTool::new(service.clone()),
         )));
     }
-    if oauth.is_some() || !keys.is_empty() {
+    if oauth.is_some() || !keys.load().is_empty() {
         tools.push(RegisteredTool::Async(Arc::new(
             api_request::ApiRequestTool::new(oauth.cloned(), keys),
         )));
@@ -59,6 +57,12 @@ mod tests {
     use super::*;
     use crate::testutil::{key_provider_config, provider_config, service};
 
+    fn maps(base: &str) -> ApiKeyTable {
+        ApiKeyTable::new(Arc::new(BTreeMap::from([key_provider_config(
+            "maps", base,
+        )])))
+    }
+
     fn names(tools: &[RegisteredTool]) -> Vec<&'static str> {
         tools.iter().map(|tool| tool.descriptor().name).collect()
     }
@@ -66,7 +70,6 @@ mod tests {
     #[tokio::test]
     async fn each_kind_registers_its_tools() {
         let base = "http://127.0.0.1:9";
-        let keys = || BTreeMap::from([key_provider_config("maps", base)]);
         let (svc, _dir) = service(vec![provider_config("google", base)]);
         let all = [
             "oauth-connect",
@@ -74,10 +77,10 @@ mod tests {
             "oauth-disconnect",
             "api-request",
         ];
-        assert_eq!(names(&registered(None, keys())), ["api-request"]);
-        assert_eq!(names(&registered(Some(&svc), BTreeMap::new())), all);
-        assert_eq!(names(&registered(Some(&svc), keys())), all);
-        assert!(registered(None, BTreeMap::new()).is_empty());
+        assert_eq!(names(&registered(None, maps(base))), ["api-request"]);
+        assert_eq!(names(&registered(Some(&svc), ApiKeyTable::empty())), all);
+        assert_eq!(names(&registered(Some(&svc), maps(base))), all);
+        assert!(registered(None, ApiKeyTable::empty()).is_empty());
     }
 
     /// Every descriptor's schema has the shape a call is validated against.
@@ -85,10 +88,7 @@ mod tests {
     async fn every_descriptor_schema_has_the_checked_shape() {
         let base = "http://127.0.0.1:9";
         let (svc, _dir) = service(vec![provider_config("google", base)]);
-        let tools = registered(
-            Some(&svc),
-            BTreeMap::from([key_provider_config("maps", base)]),
-        );
+        let tools = registered(Some(&svc), maps(base));
         assert_eq!(tools.len(), 4);
         for tool in &tools {
             let d = tool.descriptor();

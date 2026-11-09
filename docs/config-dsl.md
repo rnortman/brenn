@@ -631,7 +631,7 @@ rather than OAuth. It holds keys in one of two forms: one deployment-wide key,
 sent for every caller, such as Google's Maps Platform key; or named accounts,
 each one user's key, such as a mail service where every user has a token of
 their own. The operator places each key in a file on the host; Brenn reads it
-at boot and attaches it to requests itself. Brenn never passes a key into an
+at boot and at every reload and attaches it to requests itself. Brenn never passes a key into an
 agent's container. `docs/google-maps-platform.md` walks through a Google Maps
 Platform setup.
 
@@ -653,8 +653,8 @@ is refused at the second block.
 
 - `key_file` — the deployment form's key. The host path to a file holding
   the key: mode `0600` or tighter, not empty. Surrounding whitespace is
-  trimmed. The file is read once at boot and its content is never written to
-  the diagnostic or security log.
+  trimmed. The file is read at boot and at every reload and its content is
+  never written to the diagnostic or security log.
 - `account <name> { … }` — the per-user form; see *Per-user accounts* below.
   A block holds `key_file` or one or more `account` blocks: both are refused
   ("one deployment key or per-user accounts, not both"), and so is neither
@@ -678,10 +678,12 @@ is refused at the second block.
   envelope, or the answer is an `internal` error naming the cap.
 
 A key provider needs no `server.vault_dir`. That key stays required exactly
-when an `oauth_provider` is declared. Changing a key provider takes a restart,
-and a reload that changes one is refused, naming it; adding, removing,
-rebinding or re-pathing an account is such a change. A key file replaced in
-place is not noticed until the next restart.
+when an `oauth_provider` is declared. Changing a key provider converges on
+reload — adding, removing, rebinding or re-pathing an account, and a key file
+replaced in place, are all picked up by the next reload (see
+[What reload converges](#what-reload-converges)). The one exception: the
+deployment's first provider of either kind, and its last, need a restart,
+because `api-request` is registered only when one exists.
 
 #### Per-user accounts
 
@@ -716,7 +718,7 @@ calling.
   refuses an account whose user is not registered, naming the provider, the
   account and the user; `brenn config-check` cannot see the users table and
   prints a note per user instead. Register the user first (no restart), then
-  place the key, add the block and restart.
+  place the key, add the block and reload.
 - `key_file` — required. As the deployment form's `key_file`, one file per
   account. Two accounts may name the same file; a shared mailbox is the
   operator's choice.
@@ -2365,6 +2367,22 @@ What converges is components, surfaces and their wiring:
   client it names is answered as a tool error naming that client — the agent
   asked for something the document said was there when it asked — and, for a
   subscribe, the durable row it had already written is left dormant.
+- `api_key_provider` declarations — added, removed, and changed, where changed
+  includes an `account` added, removed, rebound or re-pathed, a `header`,
+  `api_hosts` or `max_response_bytes` edit, a switch between `key_file` and
+  `account` blocks, and a key file replaced in place under an unmoved
+  document. The table `api-request` reads is swapped whole before the agents'
+  new authority goes live; a call already in flight finishes with the key it
+  started with. A call keeps the grant it was issued under while it waits for
+  admission, so one issued before the reload and still waiting on its rate
+  limit or a concurrency slot runs under its old clause against the new table:
+  it is sent only with a key of the user it acts as, but it can reach an
+  account the same reload adds. To add an account that a clause must not
+  reach, narrow the clause in one reload and add the account in a later one.
+  An `account` naming a user who is not registered, and a clause no account
+  matches, refuse the reload in boot's words. The status body's
+  `api_key_providers_added`, `api_key_providers_removed` and
+  `api_key_providers_changed` say what moved.
 - `surface` instances — added, removed, and changed. A surface is *changed* when
   its own block moved, when a channel it binds moved, or when the installed
   bytes of a kind it instantiates moved, which is what a bundle upgrade under a
@@ -2456,12 +2474,13 @@ What converges is components, surfaces and their wiring:
   such a channel under one is the folded refusal above.
 
 **What a fresh boot reads off the host, a reload reads off the host.** Every
-declared endpoint's `secret_file`s and every declared `mqtt_client`'s
-`password_file` and `ca_file` are read at every reload, whether or not the block
-that names them moved, and the *bytes* are what the comparison is over — so
-rotating a signing secret or a broker password in place and reloading is enough
-to serve the new one, with the entity named in `webhook_endpoints_changed` or
-`mqtt_clients_changed`. The other side of that: a secret file that is missing,
+declared endpoint's `secret_file`s, every declared `mqtt_client`'s
+`password_file` and `ca_file`, and every declared `api_key_provider`'s
+`key_file`s are read at every reload, whether or not the block that names them
+moved, and the *bytes* are what the comparison is over — so rotating a signing
+secret, a broker password or an API key in place and reloading is enough to
+serve the new one, with the entity named in `webhook_endpoints_changed`,
+`mqtt_clients_changed` or `api_key_providers_changed`. The other side of that: a secret file that is missing,
 unreadable or readable by another local account refuses the whole reload, even
 when the edit that triggered it was somewhere else, because a fresh boot could
 not have produced that state either. The same holds for a replay component's
@@ -2494,7 +2513,9 @@ PWA push, tool declarations, Claude profiles, and the
 `server` / `database` / `logging` / `messaging` / `observability` /
 `surface_description` sections are all compared whole: any difference is a
 refusal naming the section, and for a block array the key that differs
-(`remotes[laptop]`). The surface *kernel* is in that group
+(`remotes[laptop]`). So is the first `api_key_provider` or `oauth_provider`
+in a document that had neither at boot, and the last — `api-request` is
+registered only while one exists. The surface *kernel* is in that group
 too: every page loads it, and a reload reloads only the pages of surfaces that
 moved, so a mount offering a different kernel than the one being served is a
 refusal.

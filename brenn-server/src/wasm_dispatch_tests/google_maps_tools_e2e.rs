@@ -143,7 +143,9 @@ async fn rig_with(
             decls: provided(),
             native: brenn_oauth::tools::registered(
                 Some(&service),
-                BTreeMap::from([(key_name, key_config)]),
+                brenn_lib::config::ApiKeyTable::new(std::sync::Arc::new(BTreeMap::from([(
+                    key_name, key_config,
+                )]))),
             ),
             clauses: clauses
                 .iter()

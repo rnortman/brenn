@@ -513,6 +513,9 @@ impl ToolRegistry {
             .clone();
         let name = tool.descriptor().name;
         let rate_limit = grant.rate_limit;
+        // TODO(reload-grant-reaches-queued-calls): `ctx.grant` is fixed here,
+        // before admission waits, so a reload that narrows the grant does not
+        // reach a call already waiting.
         let mut ctx = ToolCtx {
             caller,
             grant: grant.clone(),

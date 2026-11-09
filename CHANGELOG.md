@@ -4,6 +4,25 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **`api_key_provider` changes now take effect on reload, without a
+  restart.** Adding, changing or removing an `account`, editing a provider's
+  `header`, `api_hosts` or `max_response_bytes`, switching a provider between
+  a single `key_file` and per-user `account` blocks, adding or removing a
+  provider block, and replacing a key file in place are all applied by the
+  next reload. Every key file is re-read at each reload and compared by
+  content, the same way rotated MQTT and webhook secrets are handled. The
+  reload status reports what moved in `api_key_providers_added`,
+  `api_key_providers_removed` and `api_key_providers_changed`.
+  - The startup checks now also run at reload: a missing, world-readable or
+    malformed key file, an account naming an unregistered user, or a
+    permission clause that no account matches refuses the reload with the
+    same message startup would give.
+  - Adding the deployment's first API-key provider, or removing its last,
+    still needs a restart.
+- Provider components built with the provider kit can send a binary request
+  body (`Body::Bytes`), and a binary (`body_base64`) response is read back
+  as `Answer::Bytes` instead of failing.
+
 ## [0.33.0] — 2026-11-08
 
 - **An `api_key_provider` can hold per-user accounts.** Instead of one

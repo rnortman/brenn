@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use brenn_provider_kit::{ApiCall, Query, QueryValue};
+use brenn_provider_kit::{ApiCall, Body, Query, QueryValue};
 use serde_json::Value;
 
 use crate::settings::Settings;
@@ -24,7 +24,14 @@ pub fn json_call(
     body: Value,
 ) -> ApiCall {
     let body = serde_json::to_string(&body).expect("a JSON value serializes");
-    new_call(settings, method, account, path, query, Some(body))
+    new_call(
+        settings,
+        method,
+        account,
+        path,
+        query,
+        Some(Body::Text(body)),
+    )
 }
 
 /// A DELETE on the instance's host for `account`, with no body.
@@ -48,7 +55,7 @@ pub fn new_call(
     account: Option<&str>,
     path: String,
     mut query: Query,
-    body: Option<String>,
+    body: Option<Body>,
 ) -> ApiCall {
     query.insert(
         "prettyPrint".to_string(),

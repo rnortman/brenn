@@ -3616,3 +3616,73 @@ resolves to that name before the user's default. Deferred because the
 evidence was a multi-user install, not several agents of one person on
 different mailboxes. Done is an agent's `allow { account = "…"; }` on a
 provided tool bounding the nested call.
+
+## `reload-provided-tools`
+
+A `wasm_consumer` added with a `provide` block, or an existing consumer's
+`provides` changed, is refused at reload, and so is the first
+`api_key_provider` or `oauth_provider` in a document that had neither at boot,
+and the removal of the last provider of either kind (the `api-request` tool is
+registered only while one exists): the tool registry
+(`brenn-tool-registry/src/registry.rs`, `ToolRegistry`) is built once per
+process from the native tools and every consumer's `provide` declarations,
+and is plain maps with no interior mutability; it feeds grant validation, the
+messaging planner, consumer loading and the agents' virtual-tools files.
+Deploying a new provider component (for example a second Fastmail component
+beside the first), or a deployment's first API provider, therefore takes a
+restart. Making the registered-tool set converge means a swappable registry
+view that every one of those readers sees consistently in commit order, with
+the per-tool semaphores and MCP-name index rebuilt, and the virtual-tools
+files re-projected. Done = a consumer with a new `provide` added to a
+document, a first `api_key_provider`, and the removal of the last provider are
+applied at reload rather than refused, with the same post-commit state a fresh
+boot would produce. The `TODO(reload-provided-tools)` comment sits at the
+`provides` refusal in `brenn-bootstrap/src/reload/compare.rs`, with a second
+at the first- and last-provider refusal (`api_key_registration`) in the same
+file.
+
+## `reload-oauth-providers`
+
+An `oauth_provider` block added, changed or removed is refused at reload
+because `OAuthService` is built once at boot from the providers and their
+client files and never rebuilt. Converging it means re-reading the client
+files on every reload as key files now are, comparing resolved values, and
+swapping the service's provider table in commit without disturbing tokens
+already held for unchanged providers. Done = an `oauth_provider` added to or
+removed from a document is applied at reload rather than refused, matching a
+fresh boot. The `TODO(reload-oauth-providers)` comment sits at the
+`oauth_providers` refusal in `brenn-bootstrap/src/reload/compare.rs`.
+
+## `reload-grant-reaches-queued-calls`
+
+A tool call carries the grant it was issued under through admission: the
+registry's `invoke_for_llm` and the async executor both fix the grant before
+the call waits on its rate limit and the tool's concurrency semaphore, and the
+tool's `execute` re-admits against that grant. A reload that narrows a grant
+therefore does not reach a call already waiting, which can wait up to the 300 s
+PostToolUse ceiling. With `api_key_provider` changes converging on reload, a
+call queued under a clause that did not constrain `account` can be sent with
+an account the same reload adds and the new clause excludes (always a key of
+the user it acts as). Converging it means judging a call, after admission, by
+the grant the caller holds at that moment, for every tool and both callers.
+Done = a reload that narrows a grant refuses a call issued before it and
+executed after it, with a test that queues a call behind a held semaphore
+across such a reload. The `TODO(reload-grant-reaches-queued-calls)` comment
+sits where `invoke_for_llm` builds the call's context in
+`brenn-tool-registry/src/registry.rs`.
+
+## `kit-utf8-payload-as-bytes`
+
+The provider kit reads a nested `api-request` answer's 2xx `body_base64` as
+`Answer::Bytes`, but `api-request` carries a response in `body_base64` only
+when its bytes are not valid UTF-8, whatever the content type. A downloaded
+file whose bytes happen to be UTF-8 (plain text, CSV, iCalendar, vCard, a
+message source, any ASCII file) arrives as `body`, and `read_api_result` reads
+a 2xx `body` only as JSON, failing "a body that is not JSON". A component that
+downloads files needs the payload as bytes whichever field carries it: a
+reader that takes a 2xx body as bytes under the same status handling, or an
+answer variant for a 2xx text body that is not JSON. Which shape is the first
+file-downloading component's design. Done = such a component reads a UTF-8 and
+a non-UTF-8 download through the kit alike, with tests over both. The
+`TODO(kit-utf8-payload-as-bytes)` comment sits on `Answer::Bytes` in
+`brenn-provider-kit/src/answer.rs`.

@@ -16,7 +16,7 @@ use brenn_google_workspace::scope::{Scope, google_error, with_write_hint};
 use brenn_google_workspace::settings::Settings;
 use brenn_provider_kit::{
     Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, Failure, Logic, NestedError, Next, Query,
-    Tool, Unreadable, bounded, google, no_such_step, object, read_api_result, stored,
+    Tool, Unreadable, bounded, google, internal, no_such_step, object, read_api_result, stored,
 };
 use serde_json::{Value, json};
 
@@ -214,6 +214,13 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>) -> Next {
                 google_error(status, &body, scope(state.tool, state.step)),
             ));
         }
+        Ok(Answer::Bytes { status, .. }) => {
+            let failure = internal(format!(
+                "{} returned a non-text body ({status})",
+                google::API_NAME
+            ));
+            return Next::Fail(at_write(state, failure));
+        }
         Err(failure) => return Next::Fail(at_write(state, failure)),
     }
     settle(
@@ -282,7 +289,7 @@ mod tests {
     use brenn_google_workspace::testutil::{
         admits_characters, cut_read, description, escaped_widest, lookup,
     };
-    use brenn_provider_kit::testutil::{failure, google, http, nested};
+    use brenn_provider_kit::testutil::{failure, google, http, nested, text_body};
     use brenn_provider_kit::{
         Bound, ErrorKind, Probes, ToolBounds, check, hold_probes, hold_required, input_schema,
         internal, probes, query,
@@ -643,7 +650,7 @@ mod tests {
                 body: call.body.clone(),
             }
         );
-        let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+        let body: Value = serde_json::from_str(text_body(&call)).unwrap();
         assert_eq!(
             body,
             json!({
@@ -654,7 +661,7 @@ mod tests {
         );
         // Each label list only when given.
         let body = |args: Value| -> Value {
-            serde_json::from_str(modify(args).unwrap().body.as_deref().unwrap()).unwrap()
+            serde_json::from_str(text_body(&modify(args).unwrap())).unwrap()
         };
         assert_eq!(
             body(json!({ "ids": ["m1"], "add": ["Label_7"] })),

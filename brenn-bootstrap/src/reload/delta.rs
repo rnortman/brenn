@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 use super::NEEDS_RESTART;
 use super::agents::{AgentChange, AgentClosure, AgentInputs, agent_delta};
+use super::api_keys::ApiKeyDelta;
 use super::dynamic::{
     DynamicSnapshot, dormant_rows_the_reload_cannot_follow, dynamic_ingress, folded_now,
 };
@@ -132,6 +133,10 @@ pub(crate) struct PlanDelta {
     /// endpoints, not from either plan: an endpoint is a document block and a
     /// runtime table entry, and the plan sees only the channel it mints.
     pub webhook: WebhookDelta,
+    /// Which key providers the commit installs, drops or replaces. Derived
+    /// from the live key table against the candidate's resolved providers,
+    /// not from either plan: no plan reads a key.
+    pub api_keys: ApiKeyDelta,
     /// Kinds the two sides' scans of the declared mounts disagree about. The
     /// kind half of the surface delta's closure, kept because the status body
     /// reports it: "this reload's surfaces moved because that bundle upgraded"
@@ -218,6 +223,7 @@ impl PlanDelta {
             && self.mqtt_clients.is_empty()
             && self.surfaces.is_empty()
             && self.webhook.is_empty()
+            && self.api_keys.is_empty()
             && self.agents_changed.is_empty()
     }
 

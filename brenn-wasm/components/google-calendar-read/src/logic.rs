@@ -369,6 +369,12 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>) -> Next {
         Ok(Answer::Error { status, body }) => {
             return Next::Fail(google_error(status, &body, scope(state.tool, state.step)));
         }
+        Ok(Answer::Bytes { status, .. }) => {
+            return Next::Fail(internal(format!(
+                "{} returned a non-text body ({status})",
+                google::API_NAME
+            )));
+        }
         Err(failure) => return Next::Fail(failure),
     };
     settle(
@@ -640,7 +646,7 @@ mod tests {
         no_body_parts, wide,
     };
     use brenn_google_workspace::text::PAGE_MAX_BYTES;
-    use brenn_provider_kit::testutil::{failure, google, http, nested};
+    use brenn_provider_kit::testutil::{failure, google, http, nested, text_body};
     use brenn_provider_kit::{
         Bound, ErrorKind, Probes, ToolBounds, check, hold_probes, hold_required, input_schema,
         probes, serialized_len,
@@ -1794,7 +1800,7 @@ mod tests {
 
     /// The JSON body a free/busy call carries.
     fn free_busy_body(call: &ApiCall) -> Value {
-        serde_json::from_str(call.body.as_deref().expect("a POST carries a body")).unwrap()
+        serde_json::from_str(text_body(call)).unwrap()
     }
 
     #[test]
@@ -1824,7 +1830,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(&call).unwrap()["body"],
-            json!(call.body.as_deref().unwrap())
+            json!(text_body(&call))
         );
 
         let holidays = "en.usa#holiday@group.v.calendar.google.com";

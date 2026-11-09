@@ -32,7 +32,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use base64ct::{Base64, Encoding};
 use brenn_lib::config::{
-    AccountKeys, AccountLookup, ApiKeyAccountRaw, ApiKeyProviderConfig, ApiKeySourceRaw, ApiKeys,
+    API_REQUEST_TOOL, AccountKeys, AccountLookup, ApiKeyProviderConfig, ApiKeyTable, ApiKeys,
     OAuthProviderConfig, TRANSPORT_HEADERS,
 };
 use brenn_lib::tools::AclClause;
@@ -51,7 +51,7 @@ use crate::path_template::{
 };
 use crate::{CallSite, OAuthService};
 
-const NAME: &str = "api-request";
+const NAME: &str = API_REQUEST_TOOL;
 
 const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
 
@@ -208,43 +208,32 @@ fn lent_user(acl: &[AclClause], provider: &str) -> Result<String, ToolError> {
     }
 }
 
-/// Refuses a clause on the per-user key provider `provider` whose non-`*`
-/// `user` or `account` no account of `accounts` can match: a user no account
-/// binds, an account name not configured, or an account of another user.
-fn validate_account_clause(
-    provider: &str,
-    accounts: &[ApiKeyAccountRaw],
-    user: Option<&str>,
-    account: Option<&str>,
-) -> Result<(), String> {
-    let user = user.filter(|user| *user != "*");
-    if let Some(user) = user
-        && !accounts.iter().any(|a| a.user == user)
+/// The provider named `name`, of either kind, from `oauth` and the key
+/// snapshot `keys`, or the refusal naming every configured provider with its
+/// kind.
+fn resolve<'a>(
+    oauth: Option<&'a OAuthService>,
+    keys: &'a BTreeMap<String, ApiKeyProviderConfig>,
+    name: &str,
+) -> Result<ResolvedProvider<'a>, ToolError> {
+    if let Some(config) = keys.get(name) {
+        return Ok(ResolvedProvider::Key(config));
+    }
+    if let Some(service) = oauth
+        && let Some(config) = service.provider(name)
     {
-        let users: BTreeSet<&str> = accounts.iter().map(|a| a.user.as_str()).collect();
-        return Err(format!(
-            "api_key_provider {provider:?} holds no account for user {user:?}; its accounts' \
-             users are {users:?}; the clause admits no call"
-        ));
+        return Ok(ResolvedProvider::OAuth { service, config });
     }
-    let Some(account) = account.filter(|account| *account != "*") else {
-        return Ok(());
-    };
-    let Some(named) = accounts.iter().find(|a| a.name == account) else {
-        let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
-        return Err(format!(
-            "api_key_provider {provider:?} has no account {account:?}; its accounts are \
-             {names:?}; the clause admits no call"
-        ));
-    };
-    match user {
-        Some(user) if named.user != user => Err(format!(
-            "api_key_provider {provider:?} account {account:?} belongs to user {:?}, not \
-             {user:?}; the clause admits no call",
-            named.user
-        )),
-        _ => Ok(()),
-    }
+    let mut configured: Vec<String> = oauth
+        .iter()
+        .flat_map(|service| service.provider_names())
+        .map(|name| format!("{name} (oauth_provider)"))
+        .chain(keys.keys().map(|name| format!("{name} (api_key_provider)")))
+        .collect();
+    configured.sort();
+    Err(ToolError::InvalidArgs(format!(
+        "unknown provider {name:?}; configured: {configured:?}"
+    )))
 }
 
 /// A call checked against everything but the credential.
@@ -577,11 +566,11 @@ fn bounded_result(response: ApiResponse) -> Result<serde_json::Value, ToolError>
 }
 
 /// The `api-request` tool, over the OAuth providers of `oauth` and the key
-/// providers of `keys`.
+/// providers `keys` holds when a call reads it.
 pub struct ApiRequestTool {
     descriptor: ToolDescriptor,
     oauth: Option<Arc<OAuthService>>,
-    keys: BTreeMap<String, ApiKeyProviderConfig>,
+    keys: ApiKeyTable,
     /// Sends every API request: a clone of the service's client when there is
     /// a service, so requests and refreshes share one pool.
     http: OAuthHttp,
@@ -590,15 +579,13 @@ pub struct ApiRequestTool {
 impl ApiRequestTool {
     /// # Panics
     ///
-    /// A provider name is declared as both kinds.
-    pub fn new(
-        oauth: Option<Arc<OAuthService>>,
-        keys: BTreeMap<String, ApiKeyProviderConfig>,
-    ) -> Self {
+    /// A provider name is declared as both kinds in the table as it stands.
+    pub fn new(oauth: Option<Arc<OAuthService>>, keys: ApiKeyTable) -> Self {
         if let Some(service) = &oauth {
+            let initial = keys.load();
             for name in service.provider_names() {
                 assert!(
-                    !keys.contains_key(name),
+                    !initial.contains_key(name),
                     "BUG: provider {name:?} is both an oauth_provider and an api_key_provider; \
                      config lowering refuses that"
                 );
@@ -698,34 +685,6 @@ impl ApiRequestTool {
             keys,
             http,
         }
-    }
-
-    /// The provider named `name`, of either kind, or the refusal naming every
-    /// configured provider with its kind.
-    fn resolve(&self, name: &str) -> Result<ResolvedProvider<'_>, ToolError> {
-        if let Some(config) = self.keys.get(name) {
-            return Ok(ResolvedProvider::Key(config));
-        }
-        if let Some(service) = &self.oauth
-            && let Some(config) = service.provider(name)
-        {
-            return Ok(ResolvedProvider::OAuth { service, config });
-        }
-        let mut configured: Vec<String> = self
-            .oauth
-            .iter()
-            .flat_map(|service| service.provider_names())
-            .map(|name| format!("{name} (oauth_provider)"))
-            .chain(
-                self.keys
-                    .keys()
-                    .map(|name| format!("{name} (api_key_provider)")),
-            )
-            .collect();
-        configured.sort();
-        Err(ToolError::InvalidArgs(format!(
-            "unknown provider {name:?}; configured: {configured:?}"
-        )))
     }
 
     /// The account to use when the caller named none: the user's only one.
@@ -849,41 +808,11 @@ impl AsyncTool for ApiRequestTool {
         &self.descriptor
     }
 
+    /// The path template only: the clause rules that read the key providers
+    /// are a document rule, checked where the document is resolved.
     fn validate_clause(&self, clause: &AclClause) -> Result<(), String> {
-        let value = |name: &str| clause.iter().find(|(key, _)| *key == name).map(|(_, v)| v);
-        if value("user").is_some() || value("account").is_some() {
-            if let Some(provider) = value("provider")
-                && let Some(config) = self.keys.get(provider)
-            {
-                match &config.raw.source {
-                    ApiKeySourceRaw::Deployment { .. } => {
-                        return Err(format!(
-                            "`user` and `account` have no meaning for api_key_provider \
-                             {provider:?}, which holds one deployment key; the clause admits no \
-                             call"
-                        ));
-                    }
-                    ApiKeySourceRaw::Accounts(accounts) => {
-                        validate_account_clause(
-                            provider,
-                            accounts,
-                            value("user"),
-                            value("account"),
-                        )?;
-                    }
-                }
-            }
-            if self.oauth.is_none() && self.keys.values().all(is_deployment_key) {
-                return Err(
-                    "`user` and `account` have no meaning for a deployment-key api_key_provider, \
-                     and no oauth_provider and no key provider with accounts is declared; the \
-                     clause admits no call"
-                        .to_string(),
-                );
-            }
-        }
-        match value("path") {
-            Some(template) => validate_template(template),
+        match clause.iter().find(|(key, _)| *key == "path") {
+            Some((_, template)) => validate_template(template),
             None => Ok(()),
         }
     }
@@ -897,7 +826,13 @@ impl AsyncTool for ApiRequestTool {
         let Ok(segments) = decode_path(&args.path) else {
             return Ok(());
         };
-        let (user, account) = if self.keys.get(&args.provider).is_some_and(is_deployment_key) {
+        // A pre-screen: `execute` re-admits the call against its own snapshot.
+        let deployment_key = self
+            .keys
+            .load()
+            .get(&args.provider)
+            .is_some_and(is_deployment_key);
+        let (user, account) = if deployment_key {
             (Attr::Absent, Attr::Absent)
         } else {
             (Attr::Deferred, Attr::from(args.account.as_deref()))
@@ -927,7 +862,10 @@ impl AsyncTool for ApiRequestTool {
         let started = Instant::now();
         let args: ApiArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("{NAME} args: {e}")))?;
-        let provider = self.resolve(&args.provider)?;
+        // One snapshot for the whole call: the request completes with the key
+        // it resolved here, whatever a reload stores meanwhile.
+        let keys = self.keys.load();
+        let provider = resolve(self.oauth.as_deref(), &keys, &args.provider)?;
         let request = prepare(&provider, args)?;
         // A caller with no acting user can be replayed from its channel
         // window, so it only reads, whatever the credential. A stamped
@@ -1003,7 +941,7 @@ impl ApiRequestTool {
             AccountLookup::NoUser => {
                 return Err(ToolError::Denied(format!(
                     "{}: api_key_provider {provider} holds no account for user {user}; the \
-                     operator adds an `account` block naming the user and restarts Brenn",
+                     operator adds an `account` block naming the user and reloads Brenn",
                     request.line()
                 )));
             }
@@ -1160,6 +1098,10 @@ mod tests {
         )
     }
 
+    fn table(keys: BTreeMap<String, ApiKeyProviderConfig>) -> ApiKeyTable {
+        ApiKeyTable::new(Arc::new(keys))
+    }
+
     fn bob() -> ActingUser {
         ActingUser {
             id: 2,
@@ -1193,7 +1135,7 @@ mod tests {
             .store("alice", &credential("google", "alice@example.com", "RT-a"))
             .await;
         Fixture {
-            tool: ApiRequestTool::new(Some(svc.clone()), BTreeMap::new()),
+            tool: ApiRequestTool::new(Some(svc.clone()), ApiKeyTable::empty()),
             svc,
             stub,
             host: base.trim_start_matches("http://").to_string(),
@@ -1390,7 +1332,7 @@ mod tests {
     #[tokio::test]
     async fn validate_clause_checks_path_templates() {
         let (svc, _dir) = service(vec![provider_config("google", "http://127.0.0.1:9")]);
-        let tool = ApiRequestTool::new(Some(svc), BTreeMap::new());
+        let tool = ApiRequestTool::new(Some(svc), ApiKeyTable::empty());
         assert_eq!(tool.validate_clause(&clause(&[("path", "/a/*/b")])), Ok(()));
         assert_eq!(tool.validate_clause(&clause(&[("path", "*")])), Ok(()));
         assert_eq!(tool.validate_clause(&clause(&[("method", "GET")])), Ok(()));
@@ -1843,7 +1785,7 @@ mod tests {
         let (svc, dir) = service(vec![provider_config("google", &base)]);
         let keys = BTreeMap::from([key_provider_config("maps", &base)]);
         KeyFixture {
-            tool: ApiRequestTool::new(Some(svc), keys),
+            tool: ApiRequestTool::new(Some(svc), table(keys)),
             stub,
             host: base.trim_start_matches("http://").to_string(),
             _dir: dir,
@@ -1890,6 +1832,49 @@ mod tests {
         assert_eq!(seen[0].path_and_query, "/v1/things?a=1&key=mine");
         assert_eq!(seen[0].headers["x-api-key"], KEY);
         assert!(!seen[0].headers.contains_key("authorization"));
+    }
+
+    /// A table stored while a request is in flight reaches the next call, not
+    /// the one already resolved.
+    #[tokio::test]
+    async fn a_call_in_flight_completes_with_the_key_it_started_with() {
+        let (base, stub) = start_stub().await;
+        let keys = table(BTreeMap::from([key_provider_config("maps", &base)]));
+        let tool = Arc::new(ApiRequestTool::new(None, keys.clone()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        stub.lock().unwrap().api_gate = Some(gate.clone());
+        let args = serde_json::json!({
+            "provider": "maps", "method": "GET",
+            "host": base.trim_start_matches("http://"), "path": "/v1/things",
+        });
+        let ctx = || tool_ctx(Some(alice()), vec![provider_clause("maps")]);
+
+        let in_flight = tokio::spawn({
+            let (tool, args, ctx) = (tool.clone(), args.clone(), ctx());
+            async move { tool.execute(&ctx, args).await }
+        });
+        while stub.lock().unwrap().api_seen.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let (name, mut rotated) = key_provider_config("maps", &base);
+        rotated.keys = ApiKeys::Deployment(brenn_lib::config::SecretString::new(
+            "K3Y-rotated".to_string(),
+        ));
+        keys.store(Arc::new(BTreeMap::from([(name, rotated)])));
+        gate.add_permits(1);
+        let out = in_flight.await.unwrap().unwrap();
+        assert_eq!(out["status"], 200);
+
+        stub.lock().unwrap().api_gate = None;
+        tool.execute(&ctx(), args).await.unwrap();
+        let sent: Vec<String> = stub
+            .lock()
+            .unwrap()
+            .api_seen
+            .iter()
+            .map(|seen| seen.headers["x-api-key"].to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(sent, [KEY, "K3Y-rotated"]);
     }
 
     #[tokio::test]
@@ -1965,56 +1950,6 @@ mod tests {
         assert_eq!(f.seen().len(), 3);
     }
 
-    #[tokio::test]
-    async fn validate_clause_refuses_user_and_account_on_a_named_key_provider() {
-        let f = key_fixture().await;
-        for bad in [
-            clause(&[("provider", "maps"), ("user", "alice")]),
-            clause(&[("provider", "maps"), ("account", "*")]),
-        ] {
-            let err = f.tool.validate_clause(&bad).unwrap_err();
-            assert!(err.contains("api_key_provider \"maps\""), "{err}");
-        }
-        for good in [
-            clause(&[("provider", "maps"), ("method", "GET")]),
-            clause(&[("provider", "*"), ("user", "alice")]),
-            clause(&[("provider", "google"), ("user", "alice")]),
-            clause(&[("user", "alice")]),
-        ] {
-            assert_eq!(f.tool.validate_clause(&good), Ok(()), "{good:?}");
-        }
-    }
-
-    /// With no OAuth provider every call has no `user` or `account`, so a
-    /// clause naming either admits nothing whatever its `provider`.
-    #[test]
-    fn validate_clause_refuses_user_and_account_without_an_oauth_provider() {
-        let base = "http://127.0.0.1:9";
-        let keys = BTreeMap::from([key_provider_config("maps", base)]);
-        let tool = ApiRequestTool::new(None, keys);
-        for bad in [
-            clause(&[("provider", "*"), ("user", "alice")]),
-            clause(&[("user", "alice"), ("host", "weather.example.com")]),
-            clause(&[("provider", "other"), ("account", "*")]),
-        ] {
-            let err = tool.validate_clause(&bad).unwrap_err();
-            assert!(
-                err.contains("no oauth_provider and no key provider with accounts is declared"),
-                "{err}"
-            );
-        }
-        let err = tool
-            .validate_clause(&clause(&[("provider", "maps"), ("user", "alice")]))
-            .unwrap_err();
-        assert!(err.contains("api_key_provider \"maps\""), "{err}");
-        for good in [
-            clause(&[("provider", "maps"), ("method", "GET")]),
-            clause(&[("provider", "*")]),
-        ] {
-            assert_eq!(tool.validate_clause(&good), Ok(()), "{good:?}");
-        }
-    }
-
     /// A tool over the OAuth provider `google`, the deployment-key provider
     /// `maps` and the per-user key provider `mail`
     /// ([`key_accounts_provider_config`]), all pointed at one stub.
@@ -2026,7 +1961,7 @@ mod tests {
             key_accounts_provider_config("mail", &base),
         ]);
         KeyFixture {
-            tool: ApiRequestTool::new(Some(svc), keys),
+            tool: ApiRequestTool::new(Some(svc), table(keys)),
             stub,
             host: base.trim_start_matches("http://").to_string(),
             _dir: dir,
@@ -2210,85 +2145,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_clause_admits_user_and_account_on_a_per_user_key_provider() {
-        let f = accounts_fixture().await;
-        for good in [
-            clause(&[("provider", "mail"), ("user", "alice")]),
-            clause(&[("provider", "mail"), ("account", "alice-work")]),
-        ] {
-            assert_eq!(f.tool.validate_clause(&good), Ok(()), "{good:?}");
-        }
-        let err = f
-            .tool
-            .validate_clause(&clause(&[("provider", "maps"), ("user", "alice")]))
-            .unwrap_err();
-        assert!(err.contains("holds one deployment key"), "{err}");
-
-        // With no OAuth provider, a per-user key provider is enough.
-        let base = "http://127.0.0.1:9";
-        let tool = ApiRequestTool::new(
-            None,
-            BTreeMap::from([
-                key_provider_config("maps", base),
-                key_accounts_provider_config("mail", base),
-            ]),
-        );
-        assert_eq!(
-            tool.validate_clause(&clause(&[("provider", "*"), ("user", "alice")])),
-            Ok(())
-        );
-    }
-
-    /// A per-user key provider's accounts are fixed at boot, so a clause
-    /// naming it exactly with a `user` or `account` none of them matches is
-    /// refused, naming what is configured.
-    #[tokio::test]
-    async fn validate_clause_refuses_users_and_accounts_the_per_user_provider_lacks() {
-        let f = accounts_fixture().await;
-        for good in [
-            clause(&[
-                ("provider", "mail"),
-                ("user", "alice"),
-                ("account", "alice-work"),
-            ]),
-            clause(&[("provider", "mail"), ("user", "*"), ("account", "bob")]),
-            clause(&[("provider", "mail"), ("user", "dan"), ("account", "*")]),
-            clause(&[("provider", "*"), ("user", "carol"), ("account", "nobody")]),
-        ] {
-            assert_eq!(f.tool.validate_clause(&good), Ok(()), "{good:?}");
-        }
-        let err = f
-            .tool
-            .validate_clause(&clause(&[("provider", "mail"), ("user", "carol")]))
-            .unwrap_err();
-        assert!(
-            err.contains(r#"no account for user "carol""#)
-                && err.contains(r#"{"alice", "bob", "dan"}"#),
-            "{err}"
-        );
-        let err = f
-            .tool
-            .validate_clause(&clause(&[("provider", "mail"), ("account", "alice-wrok")]))
-            .unwrap_err();
-        assert!(
-            err.contains(r#"no account "alice-wrok""#) && err.contains(r#""alice-work""#),
-            "{err}"
-        );
-        let err = f
-            .tool
-            .validate_clause(&clause(&[
-                ("provider", "mail"),
-                ("user", "bob"),
-                ("account", "alice-work"),
-            ]))
-            .unwrap_err();
-        assert!(
-            err.contains(r#"account "alice-work" belongs to user "alice", not "bob""#),
-            "{err}"
-        );
-    }
-
-    #[tokio::test]
     async fn account_on_a_deployment_key_provider_names_both_forms() {
         let f = accounts_fixture().await;
         let mut args = f.args("GET", "/v1/things");
@@ -2312,7 +2168,7 @@ mod tests {
         let (base, stub) = start_stub().await;
         let (name, mut config) = key_provider_config("maps", &base);
         config.raw.max_response_bytes = 9;
-        let tool = ApiRequestTool::new(None, BTreeMap::from([(name, config)]));
+        let tool = ApiRequestTool::new(None, table(BTreeMap::from([(name, config)])));
         stub.lock().unwrap().api_body = b"abcdefghijklmnop".to_vec();
         let args = serde_json::json!({
             "provider": "maps", "method": "GET",
@@ -2488,7 +2344,7 @@ mod tests {
         let base = "http://127.0.0.1:9";
         let (svc, _dir) = service(vec![provider_config("maps", base)]);
         let keys = BTreeMap::from([key_provider_config("maps", base)]);
-        ApiRequestTool::new(Some(svc), keys);
+        ApiRequestTool::new(Some(svc), table(keys));
     }
 
     /// The ` ```json ` blocks of the provider document at `relative` (from the

@@ -3,11 +3,11 @@
 //! A provider holds either the deployment's key — one `0600` host file, sent
 //! for every caller — or named accounts, each a user's key in its own `0600`
 //! file, chosen by the acting user and the call's `account`. Every key is read
-//! once at boot and held as a [`SecretString`]. Brenn attaches it to a request
+//! at boot and at every reload and held as a [`SecretString`]. Brenn attaches it to a request
 //! as the value of the header the block names; it is never passed into a
 //! container.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use http::HeaderName;
@@ -15,6 +15,7 @@ use http::HeaderName;
 use super::brenn::BrennConfig;
 use super::oauth_provider::{assert_max_response_bytes, resolve_api_origins};
 use super::secret::{SecretString, load_secret_file_private};
+use crate::tools::{AclClause, ResolvedToolGrant};
 
 /// Header names neither a key provider's header nor a caller may set: the
 /// transport's own framing headers, and `cookie`.
@@ -44,7 +45,8 @@ pub struct ApiKeyAccountRaw {
     pub name: String,
     /// The Brenn username whose key this is.
     pub user: String,
-    /// Host path to the file holding the key. 0600; read once at boot.
+    /// Host path to the file holding the key. 0600; read at boot and at every
+    /// reload.
     pub key_file: PathBuf,
     /// The account an omitted `account` resolves to for `user`.
     pub default: bool,
@@ -64,7 +66,7 @@ pub struct ApiKeyProviderRaw {
 }
 
 /// A provider's keys, read.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ApiKeys {
     /// The deployment's one key.
     Deployment(SecretString),
@@ -73,11 +75,11 @@ pub enum ApiKeys {
 }
 
 /// A per-user provider's keys, keyed by username.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AccountKeys(BTreeMap<String, UserAccounts>);
 
 /// One user's accounts on one provider.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct UserAccounts {
     /// Keyed by account name.
     keys: BTreeMap<String, SecretString>,
@@ -170,7 +172,33 @@ pub struct ApiKeyProviderConfig {
     pub api_origins: Vec<(String, url::Url)>,
 }
 
-/// Validate every declared key provider, reading each key file once.
+/// `PartialEq` is what a reload's delta is taken over: the provider in
+/// resolved form — its header, its origins, its size limit and the bytes of
+/// every key — and not the rest of `raw`. A re-cased header, reordered
+/// `account` blocks or a key file moved to a path holding the same bytes is
+/// not a change; reordered `api_hosts` is, because the origins are ordered.
+impl PartialEq for ApiKeyProviderConfig {
+    fn eq(&self, other: &Self) -> bool {
+        let ApiKeyProviderConfig {
+            raw:
+                ApiKeyProviderRaw {
+                    source: _,
+                    header: _,
+                    api_hosts: _,
+                    max_response_bytes,
+                },
+            keys,
+            header,
+            api_origins,
+        } = self;
+        *max_response_bytes == other.raw.max_response_bytes
+            && *keys == other.keys
+            && *header == other.header
+            && *api_origins == other.api_origins
+    }
+}
+
+/// Validate every declared key provider, reading each key file.
 ///
 /// # Panics
 ///
@@ -203,10 +231,124 @@ pub fn assert_api_key_account_users_registered(config: &BrennConfig, registered:
         assert!(
             registered.contains(&account.user),
             "config: api_key_provider `{provider}` account `{}` names user {:?}, who is not \
-             registered; register the user, then restart Brenn",
+             registered; register the user first",
             account.name,
             account.user,
         );
+    }
+}
+
+/// The registry tool a key provider's clauses are written on.
+pub const API_REQUEST_TOOL: &str = "api-request";
+
+/// Hold every `api-request` clause of `grants` to the key providers `config`
+/// declares: `user` or `account` on a provider holding one deployment key is
+/// refused; on a per-user provider a `user` no account binds, an `account`
+/// not configured, or an account of another user is refused; and `user` or
+/// `account` with no `oauth_provider` and no per-user provider declared is
+/// refused. `owner` names the agent or consumer in the message.
+///
+/// A document declaring no provider of either kind registers no
+/// `api-request`, so its grants are left to the registry, which refuses a
+/// grant naming an unknown tool.
+///
+/// # Panics
+///
+/// The message is `{owner}: tool_grant for "api-request" has an invalid ACL
+/// clause: {reason}` — the registry's wording for a refused clause.
+pub fn assert_api_request_clauses(
+    config: &BrennConfig,
+    owner: &str,
+    grants: &BTreeMap<String, ResolvedToolGrant>,
+) {
+    if config.oauth_providers.is_empty() && config.api_key_providers.is_empty() {
+        return;
+    }
+    let Some(grant) = grants.get(API_REQUEST_TOOL) else {
+        return;
+    };
+    for clause in &grant.acl {
+        if let Err(reason) = api_request_clause_refusal(config, clause) {
+            panic!(
+                "{owner}: tool_grant for {API_REQUEST_TOOL:?} has an invalid ACL clause: {reason}"
+            );
+        }
+    }
+}
+
+/// Why `clause` admits no call on the providers `config` declares, if it
+/// admits none.
+fn api_request_clause_refusal(config: &BrennConfig, clause: &AclClause) -> Result<(), String> {
+    let value = |name: &str| clause.iter().find(|(key, _)| *key == name).map(|(_, v)| v);
+    if value("user").is_none() && value("account").is_none() {
+        return Ok(());
+    }
+    if let Some(provider) = value("provider")
+        && let Some(raw) = config.api_key_providers.get(provider)
+    {
+        match &raw.source {
+            ApiKeySourceRaw::Deployment { .. } => {
+                return Err(format!(
+                    "`user` and `account` have no meaning for api_key_provider {provider:?}, \
+                     which holds one deployment key; the clause admits no call"
+                ));
+            }
+            ApiKeySourceRaw::Accounts(accounts) => {
+                account_clause_refusal(provider, accounts, value("user"), value("account"))?;
+            }
+        }
+    }
+    let every_key_is_the_deployments = config
+        .api_key_providers
+        .values()
+        .all(|raw| matches!(raw.source, ApiKeySourceRaw::Deployment { .. }));
+    if config.oauth_providers.is_empty() && every_key_is_the_deployments {
+        return Err(
+            "`user` and `account` have no meaning for a deployment-key api_key_provider, and no \
+             oauth_provider and no key provider with accounts is declared; the clause admits no \
+             call"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Refuses a clause on the per-user key provider `provider` whose non-`*`
+/// `user` or `account` no account of `accounts` can match: a user no account
+/// binds, an account name not configured, or an account of another user.
+fn account_clause_refusal(
+    provider: &str,
+    accounts: &[ApiKeyAccountRaw],
+    user: Option<&str>,
+    account: Option<&str>,
+) -> Result<(), String> {
+    let user = user.filter(|user| *user != "*");
+    if let Some(user) = user
+        && !accounts.iter().any(|a| a.user == user)
+    {
+        let users: BTreeSet<&str> = accounts.iter().map(|a| a.user.as_str()).collect();
+        return Err(format!(
+            "api_key_provider {provider:?} holds no account for user {user:?}; its accounts' \
+             users are {users:?}; the clause admits no call"
+        ));
+    }
+    let Some(account) = account.filter(|account| *account != "*") else {
+        return Ok(());
+    };
+    let Some(named) = accounts.iter().find(|a| a.name == account) else {
+        let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+        return Err(format!(
+            "api_key_provider {provider:?} has no account {account:?}; its accounts are \
+             {names:?}; the clause admits no call"
+        ));
+    };
+    match user {
+        Some(user) if named.user != user => Err(format!(
+            "api_key_provider {provider:?} account {account:?} belongs to user {:?}, not \
+             {user:?}; the clause admits no call",
+            named.user
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -613,6 +755,260 @@ mod tests {
             ["alice", "bob"]
         );
         assert!(api_key_account_users(&BrennConfig::default()).is_empty());
+    }
+
+    /// `mail` with accounts `alice` (default) and `bob`, each key
+    /// `k3y-<name>` in a file under `dir`.
+    fn two_accounts(dir: &Path) -> ApiKeyProviderRaw {
+        std::fs::create_dir_all(dir).unwrap();
+        let key = |name: &str| write_named_key(dir, name, &format!("k3y-{name}"), 0o600);
+        accounts_raw(vec![
+            account("alice", "alice", key("alice"), true),
+            account("bob", "bob", key("bob"), false),
+        ])
+    }
+
+    #[test]
+    fn equality_is_over_the_resolved_provider_not_its_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before = resolve_provider("mail", &two_accounts(&tmp.path().join("a")));
+
+        // Re-pathed to files holding the same bytes, re-cased, and reordered.
+        let mut respelled = two_accounts(&tmp.path().join("b"));
+        respelled.header = "x-API-key".to_string();
+        let ApiKeySourceRaw::Accounts(accounts) = &mut respelled.source else {
+            unreachable!("two_accounts is per-user")
+        };
+        accounts.reverse();
+        let after = resolve_provider("mail", &respelled);
+        assert_ne!(before.raw, after.raw);
+        assert_eq!(before, after);
+
+        write_named_key(&tmp.path().join("b"), "bob", "k3y-bob-rotated", 0o600);
+        assert_ne!(before, resolve_provider("mail", &respelled));
+
+        let mut limit = before.clone();
+        limit.raw.max_response_bytes -= 1;
+        assert_ne!(before, limit);
+        let mut header = before.clone();
+        header.header = HeaderName::from_static("x-other-key");
+        assert_ne!(before, header);
+        let mut origins = before.clone();
+        origins.api_origins.push((
+            "other.example.com".to_string(),
+            "https://other.example.com".parse().unwrap(),
+        ));
+        assert_ne!(before, origins);
+        let mut reordered = origins.clone();
+        reordered.api_origins.reverse();
+        assert_ne!(origins, reordered);
+    }
+
+    fn clause(pairs: &[(&str, &str)]) -> AclClause {
+        AclClause::new(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    /// The deployment-key provider `maps`; the per-user provider `mail` when
+    /// `per_user` is set (alice: `alice`, default, and `alice-work`; bob:
+    /// `bob`; dan: `dan-home` and `dan-work`); and the OAuth provider `google`
+    /// when `oauth` is set.
+    fn clause_config(oauth: bool, per_user: bool) -> BrennConfig {
+        let mut config = BrennConfig::default();
+        config
+            .api_key_providers
+            .insert("maps".to_string(), raw(PathBuf::from("/keys/maps")));
+        if per_user {
+            let key = |name: &str| PathBuf::from(format!("/keys/{name}"));
+            config.api_key_providers.insert(
+                "mail".to_string(),
+                accounts_raw(vec![
+                    account("alice", "alice", key("alice"), true),
+                    account("alice-work", "alice", key("alice-work"), false),
+                    account("bob", "bob", key("bob"), false),
+                    account("dan-home", "dan", key("dan-home"), false),
+                    account("dan-work", "dan", key("dan-work"), false),
+                ]),
+            );
+        }
+        if oauth {
+            config.oauth_providers.insert(
+                "google".to_string(),
+                crate::config::test_oauth_provider_raw("https://accounts.example.com"),
+            );
+        }
+        config
+    }
+
+    fn refusal(config: &BrennConfig, pairs: &[(&str, &str)]) -> String {
+        api_request_clause_refusal(config, &clause(pairs))
+            .expect_err(&format!("{pairs:?} is refused"))
+    }
+
+    fn admitted(config: &BrennConfig, pairs: &[(&str, &str)]) {
+        assert_eq!(
+            api_request_clause_refusal(config, &clause(pairs)),
+            Ok(()),
+            "{pairs:?}"
+        );
+    }
+
+    #[test]
+    fn user_and_account_on_a_deployment_key_provider_are_refused() {
+        let config = clause_config(true, false);
+        for bad in [
+            &[("provider", "maps"), ("user", "alice")][..],
+            &[("provider", "maps"), ("account", "*")],
+        ] {
+            let err = refusal(&config, bad);
+            assert!(
+                err.contains("api_key_provider \"maps\"")
+                    && err.contains("holds one deployment key"),
+                "{err}"
+            );
+        }
+        for good in [
+            &[("provider", "maps"), ("method", "GET")][..],
+            &[("provider", "*"), ("user", "alice")],
+            &[("provider", "google"), ("user", "alice")],
+            &[("user", "alice")],
+        ] {
+            admitted(&config, good);
+        }
+    }
+
+    /// With no OAuth provider and only deployment keys every call has no
+    /// `user` or `account`, so a clause naming either admits nothing whatever
+    /// its `provider`.
+    #[test]
+    fn user_and_account_without_an_oauth_or_per_user_provider_are_refused() {
+        let config = clause_config(false, false);
+        for bad in [
+            &[("provider", "*"), ("user", "alice")][..],
+            &[("user", "alice"), ("host", "weather.example.com")],
+            &[("provider", "other"), ("account", "*")],
+        ] {
+            let err = refusal(&config, bad);
+            assert!(
+                err.contains("no oauth_provider and no key provider with accounts is declared"),
+                "{err}"
+            );
+        }
+        let err = refusal(&config, &[("provider", "maps"), ("user", "alice")]);
+        assert!(err.contains("api_key_provider \"maps\""), "{err}");
+        admitted(&config, &[("provider", "maps"), ("method", "GET")]);
+        admitted(&config, &[("provider", "*")]);
+        // A per-user key provider is enough without an OAuth provider.
+        admitted(
+            &clause_config(false, true),
+            &[("provider", "*"), ("user", "alice")],
+        );
+    }
+
+    #[test]
+    fn a_per_user_provider_admits_clauses_its_accounts_match() {
+        let config = clause_config(true, true);
+        for good in [
+            &[("provider", "mail"), ("user", "alice")][..],
+            &[("provider", "mail"), ("account", "alice-work")],
+            &[
+                ("provider", "mail"),
+                ("user", "alice"),
+                ("account", "alice-work"),
+            ],
+            &[("provider", "mail"), ("user", "*"), ("account", "bob")],
+            &[("provider", "mail"), ("user", "dan"), ("account", "*")],
+            &[("provider", "*"), ("user", "carol"), ("account", "nobody")],
+        ] {
+            admitted(&config, good);
+        }
+        let err = refusal(&config, &[("provider", "maps"), ("user", "alice")]);
+        assert!(err.contains("holds one deployment key"), "{err}");
+    }
+
+    #[test]
+    fn a_per_user_provider_refuses_users_and_accounts_it_lacks() {
+        let config = clause_config(true, true);
+        let err = refusal(&config, &[("provider", "mail"), ("user", "carol")]);
+        assert!(
+            err.contains(r#"no account for user "carol""#)
+                && err.contains(r#"{"alice", "bob", "dan"}"#),
+            "{err}"
+        );
+        let err = refusal(&config, &[("provider", "mail"), ("account", "alice-wrok")]);
+        assert!(
+            err.contains(r#"no account "alice-wrok""#) && err.contains(r#""alice-work""#),
+            "{err}"
+        );
+        let err = refusal(
+            &config,
+            &[
+                ("provider", "mail"),
+                ("user", "bob"),
+                ("account", "alice-work"),
+            ],
+        );
+        assert!(
+            err.contains(r#"account "alice-work" belongs to user "alice", not "bob""#),
+            "{err}"
+        );
+    }
+
+    fn grants(tool: &str, acl: Vec<AclClause>) -> BTreeMap<String, ResolvedToolGrant> {
+        BTreeMap::from([(
+            tool.to_string(),
+            ResolvedToolGrant {
+                acl,
+                rate_limit: None,
+            },
+        )])
+    }
+
+    #[test]
+    fn a_refused_clause_panics_in_the_registrys_words() {
+        let config = clause_config(true, true);
+        let grants = grants(
+            API_REQUEST_TOOL,
+            vec![
+                clause(&[("provider", "mail"), ("user", "alice")]),
+                clause(&[("provider", "mail"), ("user", "carol")]),
+            ],
+        );
+        let msg = panic_of(move || {
+            assert_api_request_clauses(&config, "app \"home\"", &grants);
+        });
+        assert!(
+            msg.starts_with(
+                "app \"home\": tool_grant for \"api-request\" has an invalid ACL clause: \
+                 api_key_provider \"mail\" holds no account for user \"carol\""
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn only_api_request_grants_are_held_to_the_providers() {
+        let config = clause_config(true, false);
+        let other = grants(
+            "other-tool",
+            vec![clause(&[("provider", "maps"), ("user", "alice")])],
+        );
+        assert_api_request_clauses(&config, "app \"home\"", &other);
+    }
+
+    /// With no provider of either kind `api-request` is not registered, and a
+    /// grant naming it is the registry's to refuse as an unknown tool.
+    #[test]
+    fn a_document_with_no_provider_leaves_the_grant_to_the_registry() {
+        let grants = grants(
+            API_REQUEST_TOOL,
+            vec![clause(&[("provider", "*"), ("user", "alice")])],
+        );
+        assert_api_request_clauses(&BrennConfig::default(), "app \"home\"", &grants);
     }
 
     #[test]

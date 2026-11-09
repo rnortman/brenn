@@ -14,9 +14,10 @@ mod spec;
 use std::collections::BTreeMap;
 
 use brenn_provider_kit::{
-    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, Logic, NestedError,
-    Next, Query, QueryValue, Tool, Unreadable, bounded, capped, choice, copy, cut, flag, google,
-    host, integer, internal, no_such_step, object, query, read_api_result, required, stored,
+    Answer, ApiCall, Args, Body, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, Logic,
+    NestedError, Next, Query, QueryValue, Tool, Unreadable, bounded, capped, choice, copy, cut,
+    flag, google, host, integer, internal, no_such_step, object, query, read_api_result, required,
+    stored,
 };
 use serde_json::{Value, json};
 
@@ -855,7 +856,7 @@ fn compute_routes_call(
         path: COMPUTE_ROUTES_PATH.to_string(),
         query: Query::new(),
         headers: BTreeMap::from([("X-Goog-FieldMask".to_string(), mask.to_string())]),
-        body: Some(Value::Object(body).to_string()),
+        body: Some(Body::Text(Value::Object(body).to_string())),
     }
 }
 
@@ -998,7 +999,7 @@ fn search_text_call(
             "X-Goog-FieldMask".to_string(),
             PLACES_SEARCH_FIELD_MASK.to_string(),
         )]),
-        body: Some(Value::Object(body).to_string()),
+        body: Some(Body::Text(Value::Object(body).to_string())),
     }
 }
 
@@ -1105,6 +1106,12 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
         Ok(Answer::Relay(value)) => return Next::Complete(value),
         Ok(Answer::Unreadable(why)) => return Next::Fail(unreadable(state, &why)),
         Ok(Answer::Error { status, body }) => return Next::Fail(google_error(status, &body)),
+        Ok(Answer::Bytes { status, .. }) => {
+            return Next::Fail(internal(format!(
+                "{} returned a non-text body ({status})",
+                google::API_NAME
+            )));
+        }
         Err(failure) => return Next::Fail(failure),
     };
     let next = match (state.tool, state.step) {
@@ -2081,7 +2088,7 @@ fn minutes(to: &mut Args, name: &str, duration: Option<&Value>) -> Result<(), Fa
 
 #[cfg(test)]
 mod tests {
-    use brenn_provider_kit::testutil::{failure, google, http, nested, truncated};
+    use brenn_provider_kit::testutil::{failure, google, http, nested, text_body, truncated};
     use brenn_provider_kit::{
         Bound, ToolBounds, check, hold_probes, hold_required, input_schema, probes,
     };
@@ -3336,7 +3343,7 @@ mod tests {
 
     /// The JSON body a call posts.
     fn posted(call: &ApiCall) -> Value {
-        serde_json::from_str(call.body.as_deref().expect("a body")).expect("a JSON body")
+        serde_json::from_str(text_body(call)).expect("a JSON body")
     }
 
     #[test]

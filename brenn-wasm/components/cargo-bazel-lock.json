@@ -1,5 +1,5 @@
 {
-  "checksum": "b81fd6eb9f09b57ca7952f93567dc550e5a63305911a96007ef23222109bac30",
+  "checksum": "ddfe793ae73340c9b3832113cf3ffe7158ef973117dc352ab61a42f3cb3931a5",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -107,6 +107,51 @@
         ],
         "edition": "2015",
         "version": "1.5.1"
+      },
+      "license": "Apache-2.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "base64ct 1.8.3": {
+      "name": "base64ct",
+      "version": "1.8.3",
+      "package_url": "https://github.com/RustCrypto/formats",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/base64ct/1.8.3/download",
+          "sha256": "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "base64ct",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "base64ct",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc"
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "1.8.3"
       },
       "license": "Apache-2.0 OR MIT",
       "license_ids": [
@@ -916,6 +961,10 @@
         ],
         "deps": {
           "common": [
+            {
+              "id": "base64ct 1.8.3",
+              "target": "base64ct"
+            },
             {
               "id": "serde 1.0.229",
               "target": "serde"
@@ -4324,6 +4373,7 @@
     ]
   },
   "direct_deps": [
+    "base64ct 1.8.3",
     "chrono 0.4.45",
     "serde 1.0.229",
     "serde_json 1.0.151",

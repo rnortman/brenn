@@ -106,6 +106,9 @@ impl From<&PlanDelta> for StatusDelta {
             mqtt_clients_added: super::mqtt::slugs(&delta.mqtt_clients.added),
             mqtt_clients_removed: delta.mqtt_clients.removed.iter().cloned().collect(),
             mqtt_clients_changed: super::mqtt::slugs(&delta.mqtt_clients.changed),
+            api_key_providers_added: delta.api_keys.added.clone(),
+            api_key_providers_removed: delta.api_keys.removed.clone(),
+            api_key_providers_changed: delta.api_keys.changed.clone(),
             agents_changed: delta
                 .agents_changed
                 .iter()
@@ -275,6 +278,12 @@ mod tests {
                     brenn_lib::mqtt::test_support::test_client_config("rotated"),
                 )],
             },
+            api_keys: super::super::api_keys::ApiKeyDelta {
+                added: vec!["maps".to_string()],
+                removed: vec!["weather".to_string()],
+                changed: vec!["mail".to_string()],
+                candidate: Default::default(),
+            },
             dynamic_observed: Default::default(),
         };
         let status: StatusDelta = (&plan_delta).into();
@@ -297,6 +306,12 @@ mod tests {
         assert_eq!(status.mqtt_clients_added, vec!["spare".to_string()]);
         assert_eq!(status.mqtt_clients_removed, vec!["retired".to_string()]);
         assert_eq!(status.mqtt_clients_changed, vec!["rotated".to_string()]);
+        assert_eq!(status.api_key_providers_added, vec!["maps".to_string()]);
+        assert_eq!(
+            status.api_key_providers_removed,
+            vec!["weather".to_string()]
+        );
+        assert_eq!(status.api_key_providers_changed, vec!["mail".to_string()]);
         // A changed surface is named by the slug the candidate runs it under,
         // which is the slug an operator reads in the document.
         assert_eq!(status.surfaces_added, vec!["wall".to_string()]);

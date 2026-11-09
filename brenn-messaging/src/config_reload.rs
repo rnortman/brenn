@@ -233,6 +233,16 @@ pub struct StatusDelta {
     pub mqtt_clients_added: Vec<String>,
     pub mqtt_clients_removed: Vec<String>,
     pub mqtt_clients_changed: Vec<String>,
+    /// Names of the `api_key_provider`s this reload installed, dropped, and
+    /// replaced. A provider is here when its resolved form moved — its header,
+    /// its origins, its size limit, or the bytes of any key file — so a
+    /// rotated key under an unmoved document reports the provider as changed.
+    ///
+    /// From the moment the reload applied, the next `api-request` call sends
+    /// the new key.
+    pub api_key_providers_added: Vec<String>,
+    pub api_key_providers_removed: Vec<String>,
+    pub api_key_providers_changed: Vec<String>,
     /// Slugs of the agents whose authority, per-call settings, per-process view
     /// or static subscriptions moved. An agent here decides every gate on the
     /// new document's terms from the moment the reload applied.

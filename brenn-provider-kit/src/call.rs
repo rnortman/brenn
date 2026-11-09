@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use base64ct::{Base64, Encoding};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -58,6 +59,15 @@ pub fn query<const N: usize>(pairs: [(&str, String); N]) -> Query {
         .collect()
 }
 
+/// A request body: text, sent as `body`, or bytes, sent as `body_base64`
+/// (standard padded base64, as `api-request` reads it). One or the other by
+/// construction; `api-request` refuses a call carrying both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Body {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
 /// One `api-request` call's arguments. Every optional field is left off the
 /// wire when unset, so a component sends only what it uses: `account` only
 /// to an OAuth provider or a key provider with per-user accounts
@@ -65,22 +75,85 @@ pub fn query<const N: usize>(pairs: [(&str, String); N]) -> Query {
 /// and `headers` only where the API wants one. It parses back from what it writes:
 /// an absent field is unset.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(into = "ApiCallWire", try_from = "ApiCallWire")]
 pub struct ApiCall {
     pub provider: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     pub method: String,
     pub host: String,
     pub path: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub query: Query,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
-    /// The request body as text; `api-request` sends it as
+    /// The request body; `api-request` sends a text body as
     /// `application/json` when no `Content-Type` is given.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub body: Option<String>,
+    pub body: Option<Body>,
+}
+
+/// [`ApiCall`] as `api-request` reads it: the body is `body` when text and
+/// `body_base64` when bytes.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiCallWire {
+    provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account: Option<String>,
+    method: String,
+    host: String,
+    path: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    query: Query,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body_base64: Option<String>,
+}
+
+impl From<ApiCall> for ApiCallWire {
+    fn from(call: ApiCall) -> Self {
+        let (body, body_base64) = match call.body {
+            None => (None, None),
+            Some(Body::Text(text)) => (Some(text), None),
+            Some(Body::Bytes(bytes)) => (None, Some(Base64::encode_string(&bytes))),
+        };
+        ApiCallWire {
+            provider: call.provider,
+            account: call.account,
+            method: call.method,
+            host: call.host,
+            path: call.path,
+            query: call.query,
+            headers: call.headers,
+            body,
+            body_base64,
+        }
+    }
+}
+
+impl TryFrom<ApiCallWire> for ApiCall {
+    type Error = String;
+
+    fn try_from(wire: ApiCallWire) -> Result<Self, String> {
+        let body = match (wire.body, wire.body_base64) {
+            (None, None) => None,
+            (Some(text), None) => Some(Body::Text(text)),
+            (None, Some(encoded)) => Some(Body::Bytes(
+                Base64::decode_vec(&encoded).map_err(|_| "`body_base64` is not base64")?,
+            )),
+            (Some(_), Some(_)) => return Err("`body` and `body_base64` are exclusive".to_string()),
+        };
+        Ok(ApiCall {
+            provider: wire.provider,
+            account: wire.account,
+            method: wire.method,
+            host: wire.host,
+            path: wire.path,
+            query: wire.query,
+            headers: wire.headers,
+            body,
+        })
+    }
 }
 
 impl ApiCall {
@@ -157,7 +230,7 @@ mod tests {
         call.headers
             .insert("X-Goog-FieldMask".to_string(), "places.id".to_string());
         call.method = "POST".to_string();
-        call.body = Some("{}".to_string());
+        call.body = Some(Body::Text("{}".to_string()));
         assert_eq!(
             serde_json::to_value(call).unwrap(),
             json!({
@@ -184,12 +257,44 @@ mod tests {
         );
         full.headers
             .insert("X-Goog-FieldMask".to_string(), "places.id".to_string());
-        full.body = Some("{}".to_string());
-        for api in [bare(), full] {
+        full.body = Some(Body::Text("{}".to_string()));
+        let mut bytes = bare();
+        bytes.body = Some(Body::Bytes(vec![0, 1, 2, 0xff]));
+        for api in [bare(), full, bytes] {
             let call = Call { step: 2, api };
             let wire = serde_json::to_vec(&call).unwrap();
             assert_eq!(serde_json::from_slice::<Call>(&wire).unwrap(), call);
         }
+    }
+
+    #[test]
+    fn a_byte_body_is_sent_as_padded_standard_base64() {
+        let mut call = bare();
+        call.method = "PUT".to_string();
+        call.body = Some(Body::Bytes(vec![0xfb, 0xff]));
+        assert_eq!(
+            serde_json::to_value(call).unwrap(),
+            json!({
+                "provider": "maps",
+                "method": "PUT",
+                "host": "maps.example.com",
+                "path": "/v1/places",
+                "body_base64": "+/8=",
+            })
+        );
+    }
+
+    #[test]
+    fn a_wire_form_with_both_bodies_or_a_bad_base64_does_not_parse() {
+        let mut both = serde_json::to_value(bare()).unwrap();
+        both["body"] = json!("{}");
+        both["body_base64"] = json!("AAEC");
+        let refused = serde_json::from_value::<ApiCall>(both).unwrap_err();
+        assert!(refused.to_string().contains("exclusive"), "{refused}");
+        let mut bad = serde_json::to_value(bare()).unwrap();
+        bad["body_base64"] = json!("not base64!");
+        let refused = serde_json::from_value::<ApiCall>(bad).unwrap_err();
+        assert!(refused.to_string().contains("not base64"), "{refused}");
     }
 
     #[test]

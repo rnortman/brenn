@@ -167,6 +167,7 @@ pub(crate) async fn apply(
     };
     remove_channels(env, delta);
     add_channels(env, delta).await;
+    swap_api_keys(env, delta);
     swap_agents(env, plan, delta);
     let sessions = retire_stale_sessions(env, delta).await;
     start_agent_subscriptions(env, delta, &planned).await;
@@ -456,6 +457,25 @@ async fn reap_previous_owner_positions(env: &ReloadEnv, change: &AgentChange) {
         conversation,
         "reload: the former owner's positions on the agent's channels are reaped",
     );
+}
+
+/// Install the candidate's key table. Before the agent swap, so a candidate
+/// clause naming an account this reload adds is admitted only once the table
+/// holds it. A call carries the grant it was issued under through admission,
+/// so one issued before this reload and executed after it is judged by its old
+/// clause against this table: it can reach an account this reload adds that
+/// the old clause did not exclude, but it is only ever sent with a key of the
+/// user it acts as or is lent.
+///
+/// The name-collision invariant `ApiRequestTool::new` asserts at boot is not
+/// asserted again: a name declared as both kinds is refused by lowering, which
+/// prepare runs on every candidate, and `oauth_providers` cannot move at
+/// reload, so a colliding table never reaches this step.
+fn swap_api_keys(env: &ReloadEnv, delta: &PlanDelta) {
+    if delta.api_keys.is_empty() {
+        return;
+    }
+    env.api_keys.store(Arc::clone(&delta.api_keys.candidate));
 }
 
 /// Step 5: install the candidate's agent map, and with it the tool list every

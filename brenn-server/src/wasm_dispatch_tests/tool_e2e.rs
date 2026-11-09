@@ -461,7 +461,7 @@ async fn guest_api_request_reads_with_a_lent_credential() {
     service.vault().store("bob", &other).await;
     let registry = Arc::new(ToolRegistry::new(brenn_oauth::tools::registered(
         Some(&service),
-        std::collections::BTreeMap::new(),
+        brenn_lib::config::ApiKeyTable::empty(),
     )));
 
     let host = base

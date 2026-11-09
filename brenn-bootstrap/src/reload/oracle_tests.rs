@@ -120,6 +120,11 @@ pub(crate) struct Snapshot {
     /// endpoint mints and differs here. Secrets are rendered as digests: what
     /// must match is the bytes, and a snapshot is a panic message.
     webhook_endpoints: Vec<String>,
+    /// The key table `api-request` reads: one line per provider and one per
+    /// account, sorted. Read through the table the process holds, not off the
+    /// resolved document, so a reload that resolved the candidate and never
+    /// stored it differs here. Keys are rendered as digests.
+    api_key_providers: Vec<String>,
     /// The authority view of every agent, one line per slug, sorted.
     ///
     /// Read off the table the gates read, not off the plan: a reload that
@@ -177,6 +182,7 @@ impl Snapshot {
             mqtt_sessions,
             mqtt_client_configs,
             webhook_endpoints,
+            api_key_providers,
             agent_authority,
             agent_spawn,
             agent_per_call,
@@ -205,6 +211,11 @@ impl Snapshot {
             "webhook_endpoints",
             webhook_endpoints,
             &fresh.webhook_endpoints,
+        );
+        assert_lines(
+            "api_key_providers",
+            api_key_providers,
+            &fresh.api_key_providers,
         );
         assert_lines("agent_authority", agent_authority, &fresh.agent_authority);
         assert_lines("agent_spawn", agent_spawn, &fresh.agent_spawn);
@@ -261,6 +272,61 @@ impl Snapshot {
     pub(crate) fn webhook_endpoints(&self) -> &[String] {
         &self.webhook_endpoints
     }
+
+    /// The key table, for a transition asserting it moved at all.
+    pub(crate) fn api_key_providers(&self) -> &[String] {
+        &self.api_key_providers
+    }
+}
+
+/// A key table as lines: each provider's resolved header, origins and size
+/// limit, then each account's user, name, whether it is its user's resolved
+/// default, and its key's digest. The accounts are enumerated off the
+/// provider's block and every other fact is read off the resolved table.
+fn api_key_lines(
+    table: &std::collections::BTreeMap<String, brenn_lib::config::ApiKeyProviderConfig>,
+) -> Vec<String> {
+    use brenn_lib::config::{AccountLookup, ApiKeySourceRaw, ApiKeys};
+    let digest = |key: &brenn_lib::config::SecretString| {
+        brenn_lib::util::sha256_hex(key.expose().as_bytes())
+    };
+    let mut lines = Vec::new();
+    for (name, provider) in table {
+        let origins: Vec<&str> = provider
+            .api_origins
+            .iter()
+            .map(|(_, origin)| origin.as_str())
+            .collect();
+        lines.push(format!(
+            "{name} header={} origins={origins:?} max_response_bytes={}",
+            provider.header, provider.raw.max_response_bytes,
+        ));
+        match (&provider.keys, &provider.raw.source) {
+            (ApiKeys::Deployment(key), _) => lines.push(format!("{name} key={}", digest(key))),
+            (ApiKeys::Accounts(keys), ApiKeySourceRaw::Accounts(accounts)) => {
+                for account in accounts {
+                    let key = match keys.lookup(&account.user, Some(&account.name)) {
+                        AccountLookup::Found { key, .. } => digest(key),
+                        other => format!("unresolved {other:?}"),
+                    };
+                    let default = matches!(
+                        keys.lookup(&account.user, None),
+                        AccountLookup::Found { account: resolved, .. } if resolved == account.name
+                    );
+                    lines.push(format!(
+                        "{name} user={} account={} default={default} key={key}",
+                        account.user, account.name,
+                    ));
+                }
+            }
+            // Keys of one form under a block of the other is drift in itself.
+            (ApiKeys::Accounts(_), source) => {
+                lines.push(format!("{name} inconsistent source={source:?}"));
+            }
+        }
+    }
+    lines.sort();
+    lines
 }
 
 /// One field of two snapshots, compared element for element and reported as
@@ -542,6 +608,7 @@ async fn snapshot(booted: &Booted) -> Snapshot {
         .map(|entry| endpoint_line(entry))
         .collect();
     webhook_endpoints.sort();
+    let api_key_providers = api_key_lines(&booted.api_keys.load());
 
     Snapshot {
         channels,
@@ -559,6 +626,7 @@ async fn snapshot(booted: &Booted) -> Snapshot {
         mqtt_sessions,
         mqtt_client_configs,
         webhook_endpoints,
+        api_key_providers,
         agent_authority,
         agent_spawn,
         agent_per_call,
@@ -2101,6 +2169,101 @@ async fn a_rotated_webhook_secret_matches_a_fresh_boot() {
         },
         |reloaded| {
             assert_eq!(reloaded.webhook_endpoints().len(), 1);
+        },
+    )
+    .await;
+}
+
+// ── The oracle over the key-provider transitions ──────────────────────────
+
+/// A per-user provider `mail` whose accounts are `(name, key file)` pairs,
+/// every one alice's.
+fn mail_provider(accounts: &[(&str, &std::path::Path)]) -> String {
+    let blocks: String = accounts
+        .iter()
+        .map(|(name, path)| {
+            format!(
+                "    account {name} {{ user = \"alice\"; key_file = \"{}\"; }}\n",
+                path.display()
+            )
+        })
+        .collect();
+    document(&format!(
+        "\napi_key_provider mail {{\n    header = \"Authorization\";\n    api_hosts = \
+         [\"https://api.example.com\"];\n{blocks}}}\n"
+    ))
+}
+
+/// A 0600 key file `name` under the tree's secrets holding `text`.
+fn key_file(tree: &Tree, name: &str, text: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = tree.secret(name, text);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("the key file is private");
+    path
+}
+
+/// **A rotated key under an unmoved document.** The bytes on disk are the
+/// entity: the reloaded table has to send the new key, which is only a
+/// convergence if a fresh boot of the same document sends it too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotated_api_key_matches_a_fresh_boot() {
+    let tree = Tree::new();
+    let path = key_file(&tree, "alice", "k3y-before");
+    tree.write(&mail_provider(&[("alice", &path)]));
+
+    a_seeded_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            seat_user(booted, "alice").await;
+        },
+        async |booted| {
+            let before = snapshot(booted).await.api_key_providers().to_vec();
+            key_file(&tree, "alice", "k3y-after");
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.api_key_providers_changed,
+                vec!["mail".to_string()],
+            );
+            assert_ne!(
+                snapshot(booted).await.api_key_providers(),
+                before.as_slice(),
+                "the rotation moved the table, or this transition compares nothing",
+            );
+        },
+        |reloaded| {
+            assert_eq!(reloaded.api_key_providers().len(), 2);
+        },
+    )
+    .await;
+}
+
+/// **An account added.** The second account's key is in the reloaded table,
+/// and alice's resolved default is the same one a fresh boot resolves.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_added_api_key_account_matches_a_fresh_boot() {
+    let tree = Tree::new();
+    let home = key_file(&tree, "alice-home", "k3y-home");
+    let work = key_file(&tree, "alice-work", "k3y-work");
+    tree.write(&mail_provider(&[("home", &home)]));
+
+    a_seeded_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            seat_user(booted, "alice").await;
+        },
+        async |booted| {
+            tree.write(&mail_provider(&[("home", &home), ("work", &work)]));
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.api_key_providers_changed,
+                vec!["mail".to_string()],
+            );
+        },
+        |reloaded| {
+            assert_eq!(reloaded.api_key_providers().len(), 3);
         },
     )
     .await;

@@ -56,6 +56,7 @@ use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 
 use crate::consumers::{ConsumerLoadContext, ConsumerRegistry, LoadedConsumer, load_consumer};
 use crate::reload::agents::AgentInputs;
+use crate::reload::api_keys::api_keys_delta;
 use crate::reload::compare::non_convergible_differences;
 use crate::reload::delta::{LiveFacts, PlanDelta, PlanFacts, convergibility_refusals, plan_delta};
 use crate::reload::dynamic::DynamicSnapshot;
@@ -120,6 +121,10 @@ pub(crate) struct ReloadEnv {
     /// The agent table this process reads through. Held rather than
     /// snapshotted: a reload plans against the map the gates are reading now.
     pub apps: brenn_lib::config::AppTable,
+    /// The key table `api-request` reads per call. Held rather than
+    /// snapshotted, for the reason `apps` is: the baseline is what
+    /// `api-request` is sending now, and commit swaps this same table.
+    pub api_keys: brenn_lib::config::ApiKeyTable,
     /// The integration factories this process was built with. Immutable after
     /// construction; every reload resolves the same factories.
     pub integration_registry: Arc<brenn_lib::integration::IntegrationRegistry>,
@@ -422,7 +427,16 @@ impl ReloadDriver {
     /// it stamps the `applied` body commit will publish, and `trigger` is one of
     /// that body's fields: a body measured under one trigger and published under
     /// another is not the body that was measured.
-    pub fn prepare(&self, source: TriggerSource, dynamic: &DynamicSnapshot) -> Prepared {
+    ///
+    /// `registered_users` is the users table as it stands now, read by the
+    /// async caller for the reason `dynamic` is: an `account` block may name
+    /// a user registered since boot, and boot's check runs against this list.
+    pub fn prepare(
+        &self,
+        source: TriggerSource,
+        dynamic: &DynamicSnapshot,
+        registered_users: &[String],
+    ) -> Prepared {
         // 0. The mounts document, re-read and re-verified before anything asks
         //    what is installed. It is what says which trees this host may read
         //    at all, so the deployment document's imports, the cross-root scans
@@ -602,6 +616,25 @@ impl ReloadDriver {
         let mqtt_clients =
             mqtt_clients_delta(&self.env.mqtt_service.baseline(), &candidate_clients);
 
+        // 4k. The `api_key_provider` environment half, beside 4w and 4m and
+        //     for the same reason: every key file is read off the host on
+        //     every reload, so a rotated key under an unmoved document is a
+        //     change and a missing, world-readable, empty or non-ASCII one
+        //     refuses the whole reload. Then boot's user check, against the
+        //     users registered *now*.
+        let candidate_keys = match catch_quietly(AssertUnwindSafe(|| {
+            let keys = brenn_lib::config::resolve_api_key_providers(&candidate.config);
+            brenn_lib::config::assert_api_key_account_users_registered(
+                &candidate.config,
+                registered_users,
+            );
+            keys
+        })) {
+            Ok(keys) => Arc::new(keys),
+            Err(payload) => return refused(Some(sha), vec![environment_refusal(payload)]),
+        };
+        let api_keys = api_keys_delta(&self.env.api_keys.load(), candidate_keys);
+
         let baseline_records = self.baseline_records();
         let baseline_apps = self.env.apps.load();
         let baseline_facts = PlanFacts {
@@ -637,6 +670,7 @@ impl ReloadDriver {
         );
         delta.webhook = webhook;
         delta.mqtt_clients = mqtt_clients;
+        delta.api_keys = api_keys;
         let refusals = convergibility_refusals(
             &baseline_facts,
             &candidate_facts,
@@ -1265,6 +1299,14 @@ impl ReloadDriver {
         }
     }
 
+    /// The usernames registered right now, in registration order: what an
+    /// `account` block's user is checked against at this reload, exactly as
+    /// boot checks it.
+    pub(crate) async fn registered_users(&self) -> Vec<String> {
+        let conn = self.env.messenger.db().lock().await;
+        brenn_db::auth::user::list_usernames(&conn)
+    }
+
     /// Run prepare and report every outcome that is settled without touching
     /// the running system.
     ///
@@ -1293,7 +1335,9 @@ impl ReloadDriver {
         // synchronous. Read here, classified in there, and re-read at commit,
         // which is where a set that moved in between is caught.
         let dynamic = self.dynamic_snapshot().await;
-        let prepared = tokio::task::block_in_place(|| self.prepare(source, &dynamic));
+        let registered_users = self.registered_users().await;
+        let prepared =
+            tokio::task::block_in_place(|| self.prepare(source, &dynamic, &registered_users));
         match prepared {
             Prepared::Refused {
                 document_sha256,
@@ -2180,6 +2224,9 @@ channel scratch at "ephemeral:scratch" {{
         /// replay-protected one, so a candidate is compared against what is
         /// actually being served.
         pub(crate) webhook: Arc<brenn_webhook::WebhookService>,
+        /// The key table `api-request` reads and the reload swaps, so a case
+        /// can read what the process would send.
+        pub(crate) api_keys: brenn_lib::config::ApiKeyTable,
         /// The dispatcher task, when the fixture asked for one.
         ///
         /// Held rather than detached so that a wait for something the
@@ -2487,6 +2534,15 @@ channel scratch at "ephemeral:scratch" {{
         // One runtime serves the registry's provided tools and the providers'
         // hosts, as at boot; its messenger is attached once messaging is up.
         let provider_runtime = brenn_tool_registry::ProviderRuntime::new(alert_dispatcher.clone());
+        // The document's key providers, resolved as `run_server` resolves
+        // them, and `api-request` registered over the table on the terms
+        // `registered` uses. A fixture with an `oauth_provider` brings its own
+        // `api-request` in `native_tools` and declares no key provider.
+        let api_keys = brenn_lib::config::ApiKeyTable::new(Arc::new(
+            brenn_lib::config::resolve_api_key_providers(&document.config),
+        ));
+        let mut native_tools = native_tools;
+        native_tools.extend(brenn_oauth::tools::registered(None, api_keys.clone()));
         let tool_registry = Arc::new(crate::build_tool_registry(
             native_tools,
             &document.config.wasm_consumers,
@@ -2701,6 +2757,7 @@ channel scratch at "ephemeral:scratch" {{
                 root: Some(root),
                 build_id: TEST_BUILD_ID,
                 apps: messenger.app_table(),
+                api_keys: api_keys.clone(),
                 integration_registry: Arc::new(brenn_lib::integration::IntegrationRegistry::new(
                     vec![],
                 )),
@@ -2728,6 +2785,7 @@ channel scratch at "ephemeral:scratch" {{
         Booted {
             driver,
             webhook: webhook_service,
+            api_keys,
             apps_swapped_tx,
             active_bridges: bridges_for_fixture,
             mounts,
@@ -2988,7 +3046,11 @@ channel spare at "brenn:spare" {
 "#,
         ));
         let dynamic = booted.driver.dynamic_snapshot().await;
-        let ready = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
+        let users = booted.driver.registered_users().await;
+        let ready = match booted
+            .driver
+            .prepare(TriggerSource::Signal, &dynamic, &users)
+        {
             Prepared::Ready(ready) => ready,
             other => panic!("the candidate is applicable: {}", outcome_of(&other)),
         };
@@ -4577,7 +4639,11 @@ new sifter: Demo {{
         install_package(components.path(), &staged_module(&tree));
 
         let dynamic = booted.driver.dynamic_snapshot().await;
-        let ready = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
+        let users = booted.driver.registered_users().await;
+        let ready = match booted
+            .driver
+            .prepare(TriggerSource::Signal, &dynamic, &users)
+        {
             Prepared::Ready(ready) => ready,
             other => panic!("the candidate is applicable: {}", outcome_of(&other)),
         };
@@ -4637,8 +4703,11 @@ new sifter: Demo {{
 
         tree.write("// a document that configures nothing at all\n");
         let dynamic = booted.driver.dynamic_snapshot().await;
+        let users = booted.driver.registered_users().await;
         let Prepared::Refused { refusals, .. } =
-            booted.driver.prepare(TriggerSource::Signal, &dynamic)
+            booted
+                .driver
+                .prepare(TriggerSource::Signal, &dynamic, &users)
         else {
             panic!("a candidate that configures no messaging must be refused");
         };
@@ -6323,7 +6392,11 @@ new sifter: Sifter {{
 
         tree.write(&document(&padding_channels(40)));
         let dynamic = booted.driver.dynamic_snapshot().await;
-        let measured = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
+        let users = booted.driver.registered_users().await;
+        let measured = match booted
+            .driver
+            .prepare(TriggerSource::Signal, &dynamic, &users)
+        {
             Prepared::Ready(ready) => ready.applied,
             other => panic!("the candidate is applicable: {}", outcome_of(&other)),
         };
@@ -7420,7 +7493,11 @@ new sifter: Sifter {{
             "acl publish [exact reload_requests, exact work, client \"mqtt:ha\"];",
         ));
         let dynamic = booted.driver.dynamic_snapshot().await;
-        let ready = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
+        let users = booted.driver.registered_users().await;
+        let ready = match booted
+            .driver
+            .prepare(TriggerSource::Signal, &dynamic, &users)
+        {
             Prepared::Ready(ready) => ready,
             other => panic!("the candidate is applicable: {}", outcome_of(&other)),
         };
@@ -8173,7 +8250,11 @@ channel spill at "brenn:spill" {{
         // changed agent and its dynamic rows this reload's business.
         tree.write(&document(""));
         let dynamic = booted.driver.dynamic_snapshot().await;
-        let ready = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
+        let users = booted.driver.registered_users().await;
+        let ready = match booted
+            .driver
+            .prepare(TriggerSource::Signal, &dynamic, &users)
+        {
             Prepared::Ready(ready) => ready,
             other => panic!("the candidate is applicable: {}", outcome_of(&other)),
         };
@@ -8278,7 +8359,11 @@ channel spill at "ephemeral:spill" {
         // read.
         tree.write(&document(""));
         let dynamic = booted.driver.dynamic_snapshot().await;
-        let ready = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
+        let users = booted.driver.registered_users().await;
+        let ready = match booted
+            .driver
+            .prepare(TriggerSource::Signal, &dynamic, &users)
+        {
             Prepared::Ready(ready) => ready,
             other => panic!("the candidate is applicable: {}", outcome_of(&other)),
         };

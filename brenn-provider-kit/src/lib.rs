@@ -28,10 +28,11 @@
 //!   error answers — and `MemoryHost`, an in-memory [`Host`] for a loop's
 //!   tests.
 //!
-//! The crate is `std` plus `serde`/`serde_json` and names no guest SDK, so all
-//! of it runs on the host under test; `brenn-provider-kit-guest` is where the
-//! guest SDK is named, and serves the loop through it. Each component keeps
-//! its own tools, settings keys and status-to-kind mapping.
+//! The crate is `std` plus `serde`/`serde_json` and `base64ct`, and names no
+//! guest SDK, so all of it runs on the host under test;
+//! `brenn-provider-kit-guest` is where the guest SDK is named, and serves the
+//! loop through it. Each component keeps its own tools, settings keys and
+//! status-to-kind mapping.
 //!
 //! The kit is a build-time contract for out-of-tree provider components, cut
 //! at the consumer's pin as `docs/component-packages.md`, "Contract evolution",
@@ -62,7 +63,7 @@ pub use answer::{
 pub use args::{Args, capped, choice, flag, integer, object};
 pub use backlog::Queued;
 pub use call::{
-    ApiCall, Call, ErrorKind, Failure, Next, Query, QueryValue, Target, internal, query,
+    ApiCall, Body, Call, ErrorKind, Failure, Next, Query, QueryValue, Target, internal, query,
 };
 pub use row::{InFlight, Tool, no_such_step, stored};
 #[cfg(feature = "testutils")]

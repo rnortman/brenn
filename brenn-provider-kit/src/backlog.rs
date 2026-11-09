@@ -85,7 +85,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::call::{ApiCall, Query, QueryValue, query};
+    use crate::call::{ApiCall, Body, Query, QueryValue, query};
     use crate::fixture::Fixture;
 
     fn queued(received_at_ms: u64, id: &str) -> Queued<Fixture> {
@@ -127,7 +127,7 @@ mod tests {
             .headers
             .insert("X-Field-Mask".to_string(), "id".to_string());
         full.call.api.method = "POST".to_string();
-        full.call.api.body = Some("{\"a\":1}".to_string());
+        full.call.api.body = Some(Body::Text("{\"a\":1}".to_string()));
         for row in [bare, full] {
             assert_eq!(Queued::decode(&row.encode()), Ok(row));
         }

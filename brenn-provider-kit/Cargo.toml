@@ -6,6 +6,7 @@ publish = false
 description = "The core of a Brenn WASM tool-provider component: its activation loop with deferred nested calls, the rows a request keeps, and the reading of `api-request`'s answers"
 
 [dependencies]
+base64ct = { version = "1.8.3", features = ["alloc"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 

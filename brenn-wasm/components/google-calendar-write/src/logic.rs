@@ -22,8 +22,8 @@ use brenn_google_workspace::settings::Settings;
 use brenn_google_workspace::text::{fit_text, shape};
 use brenn_provider_kit::{
     Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, Logic, NestedError,
-    Next, Query, Tool, Unreadable, bounded, capped, choice, copy, flag, google, no_such_step,
-    object, query, read_api_result, stored,
+    Next, Query, Tool, Unreadable, bounded, capped, choice, copy, flag, google, internal,
+    no_such_step, object, query, read_api_result, stored,
 };
 use serde_json::{Value, json};
 
@@ -582,6 +582,13 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
                 google_error(status, &body, scope(state.tool, state.step)),
             ));
         }
+        Ok(Answer::Bytes { status, .. }) => {
+            let failure = internal(format!(
+                "{} returned a non-text body ({status})",
+                google::API_NAME
+            ));
+            return Next::Fail(at_write(state, failure));
+        }
         Err(failure) => return Next::Fail(at_write(state, failure)),
     };
     settle(
@@ -692,7 +699,7 @@ mod tests {
         EVENT, EVENT_ID, admits_characters, calendar_id_probes, completed, cut_read, description,
         escaped_widest, event_with, follow, four_byte, lookup, no_body_parts,
     };
-    use brenn_provider_kit::testutil::{failure, google, http, nested};
+    use brenn_provider_kit::testutil::{failure, google, http, nested, text_body};
     use brenn_provider_kit::{
         Bound, Probes, QueryValue, ToolBounds, check, cut, hold_probes, hold_required,
         input_schema, internal, probes,
@@ -799,7 +806,7 @@ mod tests {
 
     /// A call's JSON body.
     fn json_body(call: &ApiCall) -> Value {
-        serde_json::from_str(call.body.as_deref().expect("a write has a body")).unwrap()
+        serde_json::from_str(text_body(call)).unwrap()
     }
 
     /// The paths of every `null` in `value`.
