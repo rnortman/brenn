@@ -68,6 +68,9 @@ pub fn tool_roots(
     brenn_lib::config::try_load_mounts(Some(path)).map(|mounts| mounts.roots)
 }
 
+// TODO(config-check-agent-tool-grant-unchecked): no tool registry is built
+// here, so an agent's `tool` grant naming no tool passes this check and is
+// refused at boot by `ToolRegistry::validate_config`.
 /// Check one config file, print the verdict. Returns whether it would load.
 ///
 /// Strictly stronger than [`check_config`]: a document that compiles and lowers

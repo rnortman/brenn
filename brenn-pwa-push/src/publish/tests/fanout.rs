@@ -15,6 +15,7 @@ use crate::test_helpers::{fake_auth, fake_p256dh};
 
 use std::collections::HashMap as StdHashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -146,40 +147,50 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PublishWideCapLaye
     }
 }
 
-// Thread-local counters used by `install_sql_trace`.
-// rusqlite's `Connection::trace` accepts only bare `fn` pointers, not
-// closures. We use thread-locals to pass state into the callback.
-thread_local! {
-    static TL_BEGIN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static TL_COMMIT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+/// `BEGIN` and `COMMIT` statement counts on one `Db` connection, shared with
+/// the trace callback `install_sql_trace` installs.
+struct SqlCounters {
+    begin: Arc<AtomicUsize>,
+    commit: Arc<AtomicUsize>,
 }
 
-fn sql_trace_fn(event: rusqlite::trace::TraceEvent<'_>) {
-    if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
-        if sql.starts_with("BEGIN") {
-            TL_BEGIN_COUNT.with(|c| c.set(c.get() + 1));
-        } else if sql.starts_with("COMMIT") {
-            TL_COMMIT_COUNT.with(|c| c.set(c.get() + 1));
-        }
+impl SqlCounters {
+    fn begin(&self) -> usize {
+        self.begin.load(Ordering::SeqCst)
+    }
+
+    fn commit(&self) -> usize {
+        self.commit.load(Ordering::SeqCst)
     }
 }
 
 /// Install a SQL statement counter on a `Db` connection (test helper).
 ///
-/// Counts `BEGIN` and `COMMIT` statements via `Connection::trace_v2`. Values
-/// are read back via `TL_BEGIN_COUNT` / `TL_COMMIT_COUNT` on the same thread.
-async fn install_sql_trace(db: &brenn_db::Db) {
-    use rusqlite::trace::TraceEventCodes;
-    let conn = db.lock().await;
-    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(sql_trace_fn));
-}
-
-fn read_begin_count() -> usize {
-    TL_BEGIN_COUNT.with(|c| c.get())
-}
-
-fn read_commit_count() -> usize {
-    TL_COMMIT_COUNT.with(|c| c.get())
+/// Counts `BEGIN` and `COMMIT` statements via `Connection::trace_v2` and
+/// returns the counters to the caller.
+async fn install_sql_trace(db: &brenn_db::Db) -> SqlCounters {
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    let counters = SqlCounters {
+        begin: Arc::new(AtomicUsize::new(0)),
+        commit: Arc::new(AtomicUsize::new(0)),
+    };
+    let begin = Arc::clone(&counters.begin);
+    let commit = Arc::clone(&counters.commit);
+    let mut conn = db.lock().await;
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(move |event: TraceEvent<'_>| {
+            if let TraceEvent::Stmt(_, sql) = event {
+                if sql.starts_with("BEGIN") {
+                    begin.fetch_add(1, Ordering::SeqCst);
+                } else if sql.starts_with("COMMIT") {
+                    commit.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }),
+    )
+    .expect("install SQL trace");
+    counters
 }
 
 /// Seed N subscriptions for alice via `upsert_subscription` with mock
@@ -345,36 +356,16 @@ async fn publish_wide_cap_fires_on_hung_endpoint() {
 
 /// After fanout, the DB batch write acquires exactly one BEGIN/COMMIT pair.
 ///
-/// Note: uses thread-local SQL counters. The current-thread runtime
-/// (`#[tokio::test]` default, no `flavor`) ensures all `Db` mutex
-/// acquisitions — and thus all `rusqlite` trace callbacks — execute on the
-/// same OS thread as the `TL_*` thread-locals.
-///
-/// We record the baseline BEGIN/COMMIT count immediately before `send()` and
-/// assert the delta is exactly 1, not the absolute value. This accounts for
-/// the one implicit `BEGIN` issued by `insert_message` in the
-/// pre-fanout phase (step 7), which is a separate DB operation.
-///
-/// **Runtime/task invariant:** Two code-change vectors silently break the counters
-/// without crashing or panicking — the test simply reports wrong values, which can
-/// cause the assertion to pass or fail spuriously:
-///
-/// 1. Switching this test to `#[tokio::test(flavor = "multi_thread")]` moves the
-///    `rusqlite` trace callbacks onto worker threads where the `TL_*` thread-locals
-///    are never initialized, so the counts stay at zero.
-/// 2. Moving DB operations into `tokio::spawn(...)` (or any other off-current-task
-///    execution) has the same effect even with the default current-thread runtime,
-///    because the spawned task may run on a different thread.
-///
-/// If the runtime flavor changes, replace `TL_BEGIN_COUNT` / `TL_COMMIT_COUNT` with
-/// an `Arc<Mutex<(usize, usize)>>` shared between the trace callback and the
-/// assertion site (passed in via a global or a `Connection` wrapper).
+/// The counters are read immediately before `send()`, and the test asserts
+/// the delta is exactly 2: one `BEGIN`/`COMMIT` pair from `insert_message`
+/// (step 7) and one from the batch write (step 10), so an extra transaction
+/// anywhere in `send()` fails it.
 #[tokio::test]
 async fn outcome_batch_acquires_db_lock_once() {
     let db = make_db_with_users().await;
     let eps = seed_subscriptions(&db, 3).await;
 
-    install_sql_trace(&db).await;
+    let counts = install_sql_trace(&db).await;
 
     let mut responses = StdHashMap::new();
     responses.insert(
@@ -402,9 +393,8 @@ async fn outcome_batch_acquires_db_lock_once() {
     let poster = MockHttpPoster::new(responses);
     let svc = make_service_with_poster(db, poster);
 
-    // Snapshot counters just before send().
-    let begin_before = read_begin_count();
-    let commit_before = read_commit_count();
+    let begin_before = counts.begin();
+    let commit_before = counts.commit();
 
     let _ = Arc::clone(&svc)
         .send(
@@ -421,16 +411,9 @@ async fn outcome_batch_acquires_db_lock_once() {
         )
         .await;
 
-    // The batch write (step 10) must issue exactly one BEGIN/COMMIT pair.
-    // Other BEGINs in send() (e.g. insert_message) are accounted
-    // for in the delta.
-    let delta_begin = read_begin_count() - begin_before;
-    let delta_commit = read_commit_count() - commit_before;
+    let delta_begin = counts.begin() - begin_before;
+    let delta_commit = counts.commit() - commit_before;
 
-    // send() issues exactly two BEGIN/COMMIT pairs: one from
-    // insert_message (pre-fanout, step 7) and one from our
-    // batch write (post-fanout, step 10). We assert the total delta is 2
-    // (not 1) to confirm no extra transactions were introduced.
     assert_eq!(
         delta_begin, 2,
         "expected 2 BEGINs per send: one for message insert, one for batch write"
@@ -468,9 +451,9 @@ async fn device_targeted_acquires_db_lock_once_on_non_happy_paths() {
             &fake_auth(),
         );
     }
-    install_sql_trace(&db).await;
-    let begin_before = read_begin_count();
-    let commit_before = read_commit_count();
+    let counts = install_sql_trace(&db).await;
+    let begin_before = counts.begin();
+    let commit_before = counts.commit();
     let poster = MockHttpPoster::new(StdHashMap::new());
     let svc = make_service_with_poster(db, poster);
     let _ = Arc::clone(&svc)
@@ -487,8 +470,8 @@ async fn device_targeted_acquires_db_lock_once_on_non_happy_paths() {
             None,
         )
         .await;
-    let delta_begin = read_begin_count() - begin_before;
-    let delta_commit = read_commit_count() - commit_before;
+    let delta_begin = counts.begin() - begin_before;
+    let delta_commit = counts.commit() - commit_before;
     assert_eq!(
         delta_begin, 2,
         "stale-user Device path: expected 2 BEGINs (insert_message + batch), got {delta_begin}"
@@ -501,9 +484,9 @@ async fn device_targeted_acquires_db_lock_once_on_non_happy_paths() {
     // --- Not-found path ---
     let db2 = make_db_with_users().await;
     // No subscription seeded — pure NotFound path.
-    install_sql_trace(&db2).await;
-    let begin_before2 = read_begin_count();
-    let commit_before2 = read_commit_count();
+    let counts2 = install_sql_trace(&db2).await;
+    let begin_before2 = counts2.begin();
+    let commit_before2 = counts2.commit();
     let poster2 = MockHttpPoster::new(StdHashMap::new());
     let svc2 = make_service_with_poster(db2, poster2);
     let _ = Arc::clone(&svc2)
@@ -520,8 +503,8 @@ async fn device_targeted_acquires_db_lock_once_on_non_happy_paths() {
             None,
         )
         .await;
-    let delta_begin2 = read_begin_count() - begin_before2;
-    let delta_commit2 = read_commit_count() - commit_before2;
+    let delta_begin2 = counts2.begin() - begin_before2;
+    let delta_commit2 = counts2.commit() - commit_before2;
     assert_eq!(
         delta_begin2, 2,
         "not-found Device path: expected 2 BEGINs (insert_message + batch), got {delta_begin2}"

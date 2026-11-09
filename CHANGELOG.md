@@ -22,6 +22,10 @@ All notable changes to Brenn are documented here.
 - Provider components built with the provider kit can send a binary request
   body (`Body::Bytes`), and a binary (`body_base64`) response is read back
   as `Answer::Bytes` instead of failing.
+- The bundled SQLite moves from 3.51.3 to 3.54.1 (`rusqlite` 0.41.1,
+  `libsqlite3-sys` 0.39.1), which carries the fix for CVE-2026-119375
+  (RUSTSEC-2026-0459): a database opened together with a crafted `-wal` file
+  of a different page size could return uninitialized memory.
 
 ## [0.33.0] — 2026-11-08
 

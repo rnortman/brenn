@@ -12,7 +12,7 @@ description = "Usage sessions and interaction events: the tables, their DAOs, an
 brenn-db = { version = "0.1.0", path = "../brenn-db" }
 chrono = { version = "0.4.44", features = ["serde"] }
 csv = "1.4.0"
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tracing = "0.1.44"

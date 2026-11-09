@@ -41,7 +41,7 @@ brenn-messaging = { version = "0.1.0", path = "../../brenn-messaging", features 
 brenn-messaging-store = { version = "0.1.0", path = "../../brenn-messaging-store" }
 indexmap = "2"
 brenn-wasm = { version = "0.1.0", path = "../../brenn-wasm" }
-rusqlite = "0.39.0"
+rusqlite = "0.41.1"
 tempfile = "3.24.0"
 # "no-env-filter" makes `#[traced_test]` capture unconditionally; without it
 # tracing-test applies a default env filter and `logs_contain` assertions fail.

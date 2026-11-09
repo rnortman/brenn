@@ -37,7 +37,7 @@ rand = "0.10.0"
 regex = "1.12.3"
 reopen = { version = "1.0.3", features = ["signals"] }
 signal-hook = "0.3"
-rusqlite = { version = "0.39.0", features = ["bundled", "trace"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "trace"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.50.0", features = ["sync", "time", "fs", "io-util", "process", "macros", "rt"] }

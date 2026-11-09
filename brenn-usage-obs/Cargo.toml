@@ -15,7 +15,7 @@ brenn-usage-db = { version = "0.1.0", path = "../brenn-usage-db" }
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 csv = "1.4.0"
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde_json = "1.0.149"
 
 [dev-dependencies]

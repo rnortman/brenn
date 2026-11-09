@@ -36,6 +36,6 @@ brenn-wasm = { version = "0.1.0", path = "../brenn-wasm" }
 brenn-wasm-dispatch = { version = "0.1.0", path = "../brenn-wasm-dispatch", features = ["testutils"] }
 chrono = "0.4.44"
 indexmap = "2"
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 tokio = { version = "1.50.0", features = ["full", "test-util"] }
 uuid = { version = "1.23.0", features = ["v4"] }

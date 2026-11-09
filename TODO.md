@@ -1,5 +1,28 @@
 # TODOs
 
+## `config-check-agent-tool-grant-unchecked`
+
+`brenn config-check` accepts an agent's `tool <name> {}` grant that names a
+tool nothing in the document provides. `run_config_check`
+(`brenn-bootstrap/src/config_check.rs`) compiles, lowers and runs the
+offline messaging planner, but builds no tool registry, and the registry is
+where a grant is held to the tools that exist: at boot `build_tool_registry`
+then `ToolRegistry::validate_config` (`brenn-bootstrap/src/lib.rs`) panic
+with `tool_grant names unknown tool`. So a misspelt grant passes the check
+an installer runs before stopping the service and fails the restart — the
+outcome `config-check` exists to catch — while a misspelt component class
+name is refused by the check. Observed from `brenn-fastmail`'s example
+document, where `tool fastmail-draftz {}` passed `config-check` beside a
+component providing `fastmail-draft`; not reproduced in brenn's own tests,
+and the boot's refusal of that document was read from the code, not run.
+Done is `config-check` refusing an agent grant naming no tool the document
+would register — the native tools, every `[[wasm_consumer]]` `provides`
+declaration, the integrations' virtual tools — with the boot's wording, and
+a test holding it. The open design point is how the check gets the
+descriptors of the tools whose registration reads the environment (OAuth,
+`api-request`) without their services; the same gap covers a WASM
+consumer's tool grants, validated at the component-load site.
+
 ## `xtask-deny-warnings`
 
 `make check`'s `xtask-deny` step prints two warnings that are not failures.

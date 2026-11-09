@@ -8,7 +8,7 @@ publish = false
 brenn-common = { version = "0.1.0", path = "../brenn-common" }
 wasmtime = { version = "48", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
 chrono = "0.4.44"
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 tracing = "0.1"
 semver = "1.0.28"
 brenn-budget = { version = "0.1.0", path = "../brenn-budget" }

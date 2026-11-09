@@ -15,7 +15,7 @@ brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
 brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry" }
 chrono = { version = "0.4.44", features = ["serde"] }
 chrono-tz = "0.10.4"
-rusqlite = { version = "0.39.0", features = ["bundled", "trace"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "trace"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.50.0", features = ["sync"] }
