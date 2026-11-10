@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-11-10
+
 - **`api_key_provider` changes now take effect on reload, without a
   restart.** Adding, changing or removing an `account`, editing a provider's
   `header`, `api_hosts` or `max_response_bytes`, switching a provider between
