@@ -284,6 +284,7 @@ mod tests {
                 changed: vec!["mail".to_string()],
                 candidate: Default::default(),
             },
+            tools: Default::default(),
             dynamic_observed: Default::default(),
         };
         let status: StatusDelta = (&plan_delta).into();

@@ -14,7 +14,12 @@
 //! The order of the steps below is the whole of the design. Consumers and
 //! surfaces leave before channels move, so nothing wakes a task that is on its
 //! way out; channels are described, then removed, then added, so a rename frees
-//! its address before the new entry claims it; the surface asset roots and the
+//! its address before the new entry claims it; the key table, then the tool
+//! registry, then the tool executor's subscription to each added tool's
+//! request channel go in before the agent map and the arriving consumers, so a
+//! tool is registered and served before any caller is granted it, and its
+//! position exists before the directory shows the subscription the executor's
+//! drain loop reads; the surface asset roots and the
 //! two surface-description registrations are swapped next, so the documents
 //! republished after them have a writer whose policy admits their addresses;
 //! surfaces and then consumers arrive last, so every channel they are folded
@@ -168,6 +173,8 @@ pub(crate) async fn apply(
     remove_channels(env, delta);
     add_channels(env, delta).await;
     swap_api_keys(env, delta);
+    swap_tools(env, delta);
+    subscribe_tool_executor(env, delta, &planned).await;
     swap_agents(env, plan, delta);
     let sessions = retire_stale_sessions(env, delta).await;
     start_agent_subscriptions(env, delta, &planned).await;
@@ -476,6 +483,79 @@ fn swap_api_keys(env: &ReloadEnv, delta: &PlanDelta) {
         return;
     }
     env.api_keys.store(Arc::clone(&delta.api_keys.candidate));
+}
+
+/// Install the candidate's tool registry. After the key table, so a newly
+/// registered `api-request` never stands over a table that lacks the provider
+/// that caused it; before the executor's subscriptions, so a request it
+/// dequeues from a new channel resolves its tool; before the agent swap and the
+/// arriving consumers, so no caller is granted a tool the registry lacks.
+///
+/// Every tool already registered is the same entry in the candidate, so a call
+/// in flight on the snapshot it loaded shares its semaphore and rate buckets
+/// with a call admitted on the new one.
+fn swap_tools(env: &ReloadEnv, delta: &PlanDelta) {
+    if delta.tools.added.is_empty() {
+        return;
+    }
+    env.tool_registry.store(Arc::clone(&delta.tools.candidate));
+    info!(tools = ?delta.tools.added, "reload: tools registered");
+}
+
+/// Give the running tool executor its subscription to each request channel
+/// this reload adds.
+///
+/// Every position before any directory entry: the executor's drain loop
+/// derives its channels from the directory on every pass and panics on one it
+/// holds no position on. Until the subscriber entries land the added channels
+/// have no subscriber, so neither the drain loop nor the dispatcher's
+/// owed-subscriber walk sees them. Positions and entries are taken from the
+/// same planned entries, so every entry the fold adds has its position. The
+/// entries are the candidate plan's verbatim. The kick runs the dispatcher's
+/// owed-subscriber walk now, which wakes the executor for any request a channel
+/// row retained from an earlier life of the same tool name, as a fresh boot's
+/// first drain pass would.
+async fn subscribe_tool_executor(
+    env: &ReloadEnv,
+    delta: &PlanDelta,
+    planned: &PlannedSubscribers<'_>,
+) {
+    let component = brenn_tool_registry::TOOL_EXECUTOR_COMPONENT;
+    let kind = SubscriberEntryKind::System(component.to_string());
+    let participant = ParticipantId::for_system(component);
+    let added: HashSet<Uuid> = delta
+        .channels_added
+        .iter()
+        .map(|entry| entry.uuid)
+        .collect();
+    let subscribing: Vec<_> = planned
+        .of_principal(&kind)
+        .iter()
+        .filter(|(entry, _)| added.contains(&entry.uuid))
+        .collect();
+    if subscribing.is_empty() {
+        return;
+    }
+    for (entry, subscriber) in &subscribing {
+        env.messenger
+            .attach_subscriber(
+                &entry.address,
+                component,
+                &participant,
+                subscriber.push_depth,
+            )
+            .await;
+    }
+    planned.fold_onto(
+        env.messenger.directory(),
+        &kind,
+        "system participant",
+        &added,
+    );
+    for (entry, _) in &subscribing {
+        info!(address = %entry.address, "reload: tool executor subscription started");
+    }
+    env.messenger.dispatch_kick();
 }
 
 /// Step 5: install the candidate's agent map, and with it the tool list every
@@ -1691,9 +1771,9 @@ fn remove_channels(env: &ReloadEnv, delta: &PlanDelta) {
 ///
 /// Each goes in with no subscribers. Rule 1 of the convergibility rules has
 /// already established that every subscriber on a channel-delta entry is a
-/// consumer the delta also moves, and step 5 folds each of those in as it
-/// starts — so an entry that arrives empty here is an entry that is complete
-/// here.
+/// consumer, surface or agent the delta also moves, or the tool executor on an
+/// added tool's request channel, and a later step folds each of those in — so
+/// an entry that arrives empty here is an entry that is complete here.
 ///
 /// A dormant durable dynamic subscription row on an *arriving* uuid is the
 /// mirror of the removal walk above, and the one case that reaches it is a

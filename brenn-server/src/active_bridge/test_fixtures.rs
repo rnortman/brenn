@@ -571,8 +571,10 @@ impl ActiveBridge {
         // Resolve: None → fresh per-bridge registry; Some → caller-supplied shared registry.
         let active_bridges = active_bridges_opt.unwrap_or_else(ActiveBridges::new);
         // Default: an empty first-class tool registry (no tools registered).
-        let tools =
-            tools.unwrap_or_else(|| Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])));
+        let tools: brenn_tool_registry::ToolRegistryCell = tools.map_or_else(
+            || brenn_tool_registry::ToolRegistry::new(vec![]).into(),
+            Into::into,
+        );
         // Mounts and integrations go into the agent as well as onto the bridge,
         // as production copies the bridge's from the agent at spawn: the tool
         // catalog reads the agent's.

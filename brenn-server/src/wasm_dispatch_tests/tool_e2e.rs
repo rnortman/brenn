@@ -169,7 +169,7 @@ async fn tool_harness(
     // The plan build's check on a consumer's grants, run on the same map.
     registry.validate_grants(GrantOwner::WasmConsumer { slug }, &tool_grants);
     let tool_host: brenn_wasm::ToolHostFn = Arc::new(WasmToolHost::new(
-        Arc::clone(&registry),
+        Arc::clone(&registry).into(),
         tool_grants.clone(),
         slug.to_string(),
         alert_dispatcher.clone(),
@@ -335,7 +335,7 @@ async fn execute_and_read_result(
     let (exec_alert, _exec_alert_handle) = noop_alert_dispatcher();
     let executor = ToolExecutor::new(
         Arc::clone(&harness.messenger),
-        Arc::clone(registry),
+        Arc::clone(registry).into(),
         caller_grants,
         brenn_tool_registry::ProviderRuntime::new(exec_alert.clone()),
         exec_alert,

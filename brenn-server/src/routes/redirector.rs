@@ -220,7 +220,7 @@ mod tests {
             surface_roots: Default::default(),
             cached_models: Default::default(),
             tool_registry: Default::default(),
-            tools: std::sync::Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),
+            tools: brenn_tool_registry::ToolRegistry::new(vec![]).into(),
             tool_server_origin: std::sync::Arc::from("test-origin"),
             wake_locks: WakeLocks::default(),
             spawn_backoff: Default::default(),

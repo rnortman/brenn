@@ -36,6 +36,7 @@ use super::dynamic::{
 };
 use super::mqtt::{MqttClientsDelta, MqttDelta, MqttIngressSet, mqtt_delta};
 use super::surfaces::{SurfaceClosure, SurfaceDelta, surface_delta};
+use super::tools::ToolsDelta;
 use super::webhook::WebhookDelta;
 
 /// One side of the comparison: everything a reload reads off a plan.
@@ -137,6 +138,10 @@ pub(crate) struct PlanDelta {
     /// from the live key table against the candidate's resolved providers,
     /// not from either plan: no plan reads a key.
     pub api_keys: ApiKeyDelta,
+    /// Which tools the commit registers, and the registry it installs. Derived
+    /// from the live registry against the candidate's providing consumers and
+    /// key providers.
+    pub tools: ToolsDelta,
     /// Kinds the two sides' scans of the declared mounts disagree about. The
     /// kind half of the surface delta's closure, kept because the status body
     /// reports it: "this reload's surfaces moved because that bundle upgraded"
@@ -224,6 +229,7 @@ impl PlanDelta {
             && self.surfaces.is_empty()
             && self.webhook.is_empty()
             && self.api_keys.is_empty()
+            && self.tools.added.is_empty()
             && self.agents_changed.is_empty()
     }
 
@@ -589,45 +595,43 @@ pub(crate) fn convergibility_refusals(
     let leaving_surfaces = departing_surfaces(delta);
     let joining_surfaces = arriving_surfaces(delta);
     // An agent on a moving channel qualifies on the same terms as a surface:
-    // the commit folds its subscriber entries out and back in.
+    // the commit folds its subscriber entries out and back in. The tool
+    // executor qualifies on an added entry only: commit folds its subscription
+    // to a newly registered tool's request channel in, and rule 7 has vetted
+    // that its subscriptions are exactly the registered async tools' channels.
+    // A system participant is never folded out.
     let moving_agents = delta.moving_agents();
     for entry in &delta.channels_added {
         rule_1(
             entry,
             "added",
-            &arriving,
-            &joining_surfaces,
-            &moving_agents,
+            &Movers {
+                consumers: &arriving,
+                surfaces: &joining_surfaces,
+                agents: &moving_agents,
+                tool_executor: true,
+            },
             &mut out,
         );
     }
+    let leaving = Movers {
+        consumers: &departing,
+        surfaces: &leaving_surfaces,
+        agents: &moving_agents,
+        tool_executor: false,
+    };
+    let joining = Movers {
+        consumers: &arriving,
+        surfaces: &joining_surfaces,
+        agents: &moving_agents,
+        tool_executor: false,
+    };
     for entry in &delta.channels_removed {
-        rule_1(
-            entry,
-            "removed",
-            &departing,
-            &leaving_surfaces,
-            &moving_agents,
-            &mut out,
-        );
+        rule_1(entry, "removed", &leaving, &mut out);
     }
     for change in &delta.channels_changed {
-        rule_1(
-            &change.old,
-            "changed",
-            &departing,
-            &leaving_surfaces,
-            &moving_agents,
-            &mut out,
-        );
-        rule_1(
-            &change.new,
-            "changed",
-            &arriving,
-            &joining_surfaces,
-            &moving_agents,
-            &mut out,
-        );
+        rule_1(&change.old, "changed", &leaving, &mut out);
+        rule_1(&change.new, "changed", &joining, &mut out);
     }
 
     // Rule 2: the same question asked of the directory as it actually stands.
@@ -687,6 +691,15 @@ pub(crate) fn live_subscriber_refusals(
         .map(String::as_str)
         .collect();
     let leaving_surfaces = departing_surfaces(delta);
+    // No agent is accounted here: only *dynamic* rows reach this rule, and
+    // those are in neither plan.
+    let no_agents = HashSet::new();
+    let leaving = Movers {
+        consumers: &departing,
+        surfaces: &leaving_surfaces,
+        agents: &no_agents,
+        tool_executor: false,
+    };
     let mut out = Vec::new();
     // The added arm. A channel the candidate mints that the live directory
     // already holds under that address was minted by something the plan cannot
@@ -713,16 +726,7 @@ pub(crate) fn live_subscriber_refusals(
             // has answered for them. What is left is what boot did not put
             // there: a dynamic app row, an attach-minted surface or remote, a
             // live session streaming from the channel.
-            // No agent is accounted here: only *dynamic* rows reach this
-            // arm, and those are in neither plan.
-            if !planned.contains(&subscriber.kind)
-                && !accounted(
-                    &subscriber.kind,
-                    &departing,
-                    &leaving_surfaces,
-                    &HashSet::new(),
-                )
-            {
+            if !planned.contains(&subscriber.kind) && !leaving.accounts(&subscriber.kind) {
                 out.push(format!(
                     "{} is going away but {} subscribes to it right now: {NEEDS_RESTART}",
                     entry.address,
@@ -759,17 +763,10 @@ fn arriving_surfaces(delta: &PlanDelta) -> HashSet<&str> {
 }
 
 /// Rule 1: every subscriber on a moving entry must be a consumer, a surface or
-/// an agent that moves with it.
-fn rule_1(
-    entry: &ChannelEntry,
-    what: &str,
-    moving: &HashSet<&str>,
-    moving_surfaces: &HashSet<&str>,
-    moving_agents: &HashSet<&str>,
-    out: &mut Vec<String>,
-) {
+/// an agent that moves with it, or the tool executor on an added entry.
+fn rule_1(entry: &ChannelEntry, what: &str, movers: &Movers<'_>, out: &mut Vec<String>) {
     for subscriber in &entry.subscribers {
-        if !accounted(&subscriber.kind, moving, moving_surfaces, moving_agents) {
+        if !movers.accounts(&subscriber.kind) {
             out.push(format!(
                 "{} is {what} but {} subscribes to it: {NEEDS_RESTART}",
                 entry.address,
@@ -779,19 +776,30 @@ fn rule_1(
     }
 }
 
-/// Whether a subscriber on a moving entry is one this reload already takes out
-/// of service and puts back.
-fn accounted(
-    kind: &SubscriberEntryKind,
-    moving: &HashSet<&str>,
-    moving_surfaces: &HashSet<&str>,
-    moving_agents: &HashSet<&str>,
-) -> bool {
-    match kind {
-        SubscriberEntryKind::Wasm(slug) => moving.contains(slug.as_str()),
-        SubscriberEntryKind::Surface(slug) => moving_surfaces.contains(slug.as_str()),
-        SubscriberEntryKind::App(slug) => moving_agents.contains(slug.as_str()),
-        _ => false,
+/// The principals this reload takes out of service and puts back on one side
+/// of the channel delta, so a subscriber of theirs on a moving entry is
+/// re-wired by the commit.
+struct Movers<'a> {
+    consumers: &'a HashSet<&'a str>,
+    surfaces: &'a HashSet<&'a str>,
+    agents: &'a HashSet<&'a str>,
+    /// Whether the tool executor's subscriber is folded in on this side: true
+    /// for added entries only.
+    tool_executor: bool,
+}
+
+impl Movers<'_> {
+    /// Whether a subscriber on a moving entry is one this reload re-wires.
+    fn accounts(&self, kind: &SubscriberEntryKind) -> bool {
+        match kind {
+            SubscriberEntryKind::Wasm(slug) => self.consumers.contains(slug.as_str()),
+            SubscriberEntryKind::Surface(slug) => self.surfaces.contains(slug.as_str()),
+            SubscriberEntryKind::App(slug) => self.agents.contains(slug.as_str()),
+            SubscriberEntryKind::System(name) => {
+                self.tool_executor && name == brenn_tool_registry::TOOL_EXECUTOR_COMPONENT
+            }
+            _ => false,
+        }
     }
 }
 
@@ -897,7 +905,8 @@ mod tests {
     fn no_agents() -> AgentInputs<'static> {
         AgentInputs {
             app_diffs: &NO_DIFFS,
-            tool_registry: &NO_TOOLS,
+            baseline_tools: &NO_TOOLS,
+            candidate_tools: &NO_TOOLS,
         }
     }
 
@@ -1854,6 +1863,82 @@ mod tests {
                     .to_string(),
             ],
             "a kind no delta walks is refused beside an accounted agent",
+        );
+    }
+
+    /// The refusals for one entry that the candidate adds (`added`) or drops,
+    /// whose subscriber list is `subscribers`, with nothing else moving.
+    fn refusals_for_arrival_or_departure(
+        subscribers: Vec<SubscriberEntry>,
+        added: bool,
+    ) -> Vec<String> {
+        let present = one_entry(entry(
+            "brenn:tools/echo",
+            Uuid::from_u128(8),
+            4,
+            subscribers,
+        ));
+        let absent = MessagingDirectory::with_entries(Vec::new());
+        let (before, after) = if added {
+            (&absent, &present)
+        } else {
+            (&present, &absent)
+        };
+        let empty = HashMap::new();
+        let old = PlanFacts {
+            apps: &NO_APPS,
+            directory: before,
+            consumers: &[],
+            records: &empty,
+            mqtt_ingress: &[],
+            surfaces: &[],
+        };
+        let new = PlanFacts {
+            directory: after,
+            ..old
+        };
+        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        convergibility_refusals(&old, &new, &delta, before)
+    }
+
+    fn tool_executor() -> SubscriberEntry {
+        subscriber(SubscriberEntryKind::System(
+            brenn_tool_registry::TOOL_EXECUTOR_COMPONENT.into(),
+        ))
+    }
+
+    /// Rule 1's tool-executor arm: commit folds the executor's subscriber in
+    /// on an added entry, and on no other side of the delta; another system
+    /// participant is folded in nowhere.
+    #[test]
+    fn the_tool_executor_is_accounted_on_an_added_entry_only() {
+        assert!(refusals_for_arrival_or_departure(vec![tool_executor()], true).is_empty());
+        assert_eq!(
+            refusals_for_arrival_or_departure(vec![tool_executor()], false),
+            vec![
+                "brenn:tools/echo is removed but the \"tool-executor\" system participant \
+                 subscribes to it: this change needs a restart"
+                    .to_string(),
+            ],
+        );
+        assert_eq!(
+            refusals_for_retune(vec![tool_executor()]),
+            vec![
+                "brenn:work is changed but the \"tool-executor\" system participant \
+                 subscribes to it: this change needs a restart"
+                    .to_string(),
+            ],
+        );
+        assert_eq!(
+            refusals_for_arrival_or_departure(
+                vec![subscriber(SubscriberEntryKind::System("cc-profile".into()))],
+                true,
+            ),
+            vec![
+                "brenn:tools/echo is added but the \"cc-profile\" system participant \
+                 subscribes to it: this change needs a restart"
+                    .to_string(),
+            ],
         );
     }
 

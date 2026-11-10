@@ -69,7 +69,7 @@ fn assert_build_id_valid(build_id: &str) {
 }
 
 /// Who already holds a bare tool name an agent may be offered, for the
-/// provided-tool refusal in [`build_tool_registry`].
+/// provided-tool refusal in [`assert_provided_names_unreserved`].
 enum ReservedBy {
     Core,
     Integration(String),
@@ -81,11 +81,9 @@ enum ReservedBy {
 ///
 /// # Panics
 ///
-/// When a provided tool's `mcp_name` suffix is a name an agent can be offered
-/// outside the registry — a core or repo virtual tool, or a virtual tool of an
-/// integration of any app in `apps`, granted or not, since a reload can add the
-/// grant but not the integration. Then, from [`ToolRegistry::with_provided`],
-/// when a provided name or `mcp_name` is already registered.
+/// As [`assert_provided_names_unreserved`]. Then, from
+/// [`ToolRegistry::with_provided`], when a provided name or `mcp_name` is
+/// already registered.
 ///
 /// [`ToolRegistry::with_provided`]: brenn_tool_registry::ToolRegistry::with_provided
 pub fn build_tool_registry(
@@ -94,6 +92,43 @@ pub fn build_tool_registry(
     apps: &indexmap::IndexMap<String, brenn_lib::config::AppConfig>,
     runtime: &std::sync::Arc<brenn_tool_registry::ProviderRuntime>,
 ) -> brenn_tool_registry::ToolRegistry {
+    assert_provided_names_unreserved(consumers.iter(), apps);
+    brenn_tool_registry::ToolRegistry::with_provided(native, provided_tools(consumers, runtime))
+}
+
+/// One provided tool per `provide` declaration of every consumer in
+/// `consumers`, over `runtime`.
+pub(crate) fn provided_tools<'a>(
+    consumers: impl IntoIterator<Item = &'a brenn_lib::messaging::config::WasmConsumerConfigRaw>,
+    runtime: &std::sync::Arc<brenn_tool_registry::ProviderRuntime>,
+) -> Vec<std::sync::Arc<brenn_tool_registry::ProvidedTool>> {
+    consumers
+        .into_iter()
+        .flat_map(|consumer| {
+            consumer.provides.iter().map(|decl| {
+                std::sync::Arc::new(brenn_tool_registry::ProvidedTool::new(
+                    &consumer.slug,
+                    decl,
+                    runtime.clone(),
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Refuse a provided tool whose `mcp_name` suffix is a name an agent can be
+/// offered outside the registry.
+///
+/// # Panics
+///
+/// When a `provide` declaration of a consumer in `consumers` has an `mcp_name`
+/// that is a core or repo virtual tool's, or a virtual tool's of an integration
+/// of any app in `apps` — granted or not, since a reload can add the grant but
+/// not the integration.
+pub(crate) fn assert_provided_names_unreserved<'a>(
+    consumers: impl IntoIterator<Item = &'a brenn_lib::messaging::config::WasmConsumerConfigRaw>,
+    apps: &indexmap::IndexMap<String, brenn_lib::config::AppConfig>,
+) {
     use brenn_envelope::addressing::{CORE_VIRTUAL_TOOL_NAME_REFUSAL, CORE_VIRTUAL_TOOL_NAMES};
 
     let mut reserved: std::collections::HashMap<String, ReservedBy> = CORE_VIRTUAL_TOOL_NAMES
@@ -108,7 +143,6 @@ pub fn build_tool_registry(
         }
     }
 
-    let mut provided = Vec::new();
     for consumer in consumers {
         for decl in &consumer.provides {
             if let Some(holder) = reserved.get(&decl.mcp_name) {
@@ -123,14 +157,8 @@ pub fn build_tool_registry(
                     decl.name, consumer.slug, decl.mcp_name,
                 );
             }
-            provided.push(std::sync::Arc::new(brenn_tool_registry::ProvidedTool::new(
-                &consumer.slug,
-                decl,
-                runtime.clone(),
-            )));
         }
     }
-    brenn_tool_registry::ToolRegistry::with_provided(native, provided)
 }
 
 /// What a server refuses to start on, before any of it is used.
@@ -650,6 +678,10 @@ pub async fn run_server(
         std::sync::Arc::new(registry)
     };
 
+    // Every holder of the registry reads it through this one cell, so a
+    // reload that registers more tools reaches them all with one swap.
+    let tool_registry_cell = brenn_tool_registry::ToolRegistryCell::new(tool_registry_core.clone());
+
     // Write virtual tools files for each app's noop MCP server (once at
     // startup), now that the registry can project granted registry tools.
     apps::write_virtual_tools(&apps, &tool_registry_core);
@@ -887,7 +919,7 @@ pub async fn run_server(
             components_roots: &components_roots,
             alert_dispatcher: &guard.alert_dispatcher,
             mqtt_service: mqtt_result.service.clone(),
-            tool_registry: &tool_registry_core,
+            tool_registry: &tool_registry_cell,
             provider_runtime: &provider_runtime,
             max_payload_bytes: config.messaging.max_body_bytes,
             sync_router: messaging_result.router.clone(),
@@ -1102,7 +1134,7 @@ pub async fn run_server(
         ))),
         cached_models: Default::default(),
         tool_registry,
-        tools: tool_registry_core,
+        tools: tool_registry_cell,
         tool_server_origin,
         wake_locks: Default::default(),
         spawn_backoff: Default::default(),

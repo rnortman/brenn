@@ -186,7 +186,7 @@ impl ProviderRig {
 
         registry.validate_grants(GrantOwner::WasmConsumer { slug }, &provider_grants);
         let provider_tools = Arc::new(WasmToolHost::new(
-            registry.clone(),
+            registry.clone().into(),
             provider_grants.clone(),
             slug.to_string(),
             alert.clone(),
@@ -247,7 +247,7 @@ impl ProviderRig {
                     .collect(),
                     alerter: noop_proc_alerter(),
                     tool_host: Some(Arc::new(WasmToolHost::new(
-                        registry.clone(),
+                        registry.clone().into(),
                         grants,
                         setup.slug.to_string(),
                         alert.clone(),
@@ -289,7 +289,7 @@ impl ProviderRig {
 
         let executor = ToolExecutor::new(
             messenger.clone(),
-            registry.clone(),
+            registry.clone().into(),
             Arc::new(ToolCallerGrants::new(caller_grants)),
             runtime.clone(),
             alert.clone(),

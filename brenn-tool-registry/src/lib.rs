@@ -4,8 +4,8 @@
 //! A tool is a registry object with a native implementation, invocable by any
 //! granted participant — LLM conversation or WASM component — under one grant
 //! vocabulary. This crate owns the substrate: the descriptor/trait vocabulary
-//! (`descriptor`, `tool`), the built-once table plus config validation
-//! (`registry`), per-`(participant, tool)` throttling (`rate_limit`), the
+//! (`descriptor`, `tool`), the tool table plus config validation (`registry`)
+//! and the cell its holders read it through (`cell`), per-`(participant, tool)` throttling (`rate_limit`), the
 //! async execution loop over the message bus (`executor`, `bus_wiring`), the
 //! WASM caller path (`wasm_host`), tools a WASM instance provides
 //! (`provided`) and the host a provider answers through (`provides_host`),
@@ -16,6 +16,7 @@
 //! store, the clone index, and the sync-trigger channel.
 
 pub mod bus_wiring;
+pub mod cell;
 pub mod descriptor;
 pub mod executor;
 pub mod git_repo_pull;
@@ -30,6 +31,7 @@ pub mod wasm_host;
 #[cfg(any(test, feature = "testutils"))]
 pub mod testutil;
 
+pub use cell::ToolRegistryCell;
 pub use descriptor::{
     AclDenied, DEFAULT_FAST_BUDGET, ENVELOPE_MARGIN, Idempotency, MAX_ARGS_BYTES,
     MAX_ASYNC_RESULT_BYTES, MAX_FAST_BUDGET, MAX_FAST_CALLS_PER_ACTIVATION, MAX_FAST_RESULT_BYTES,

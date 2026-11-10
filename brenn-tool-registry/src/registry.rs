@@ -1,13 +1,14 @@
-//! The tool registry: the built-once, immutable table of registered tools plus
-//! the shared rate limiter and per-tool concurrency semaphores.
+//! The tool registry: the immutable table of registered tools plus the shared
+//! rate limiter and per-tool concurrency semaphores.
 //!
-//! Built at bootstrap, then `validate_config` runs against resolved config
+//! Built at bootstrap and extended, never shrunk, by a reload that registers
+//! more tools ([`ToolRegistry::extended`]). At bootstrap `validate_config` runs against resolved config
 //! before serving. Registration and validation are both fail-fast (panic) — a
 //! duplicate tool, an unsupported idempotency mode, an over-budget fast tool, or
 //! a grant naming an unknown tool/ACL key are all operator/wiring bugs that must
 //! stop startup, never degrade at runtime.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,7 +25,7 @@ use super::descriptor::{
 };
 use super::provided::ProvidedTool;
 use super::rate_limit::RateLimiter;
-use super::tool::{ActingUser, AsyncTool, RegisteredTool, ToolCtx};
+use super::tool::{ActingUser, RegisteredTool, ToolCtx};
 
 /// The `internal` detail of a provided tool's call whose ceiling passed while
 /// it waited for admission ([`ToolRegistry::admit_async_by`]).
@@ -100,8 +101,11 @@ fn user_binding_refusal(owner: &GrantOwner<'_>, binding: UserBinding) -> Option<
     }
 }
 
-/// The immutable tool table. Lookup is by canonical name or MCP name; async
-/// tools additionally carry a global concurrency semaphore.
+/// A tool table. A registry value never changes after it is built; a reload
+/// that registers more tools installs a larger registry built by
+/// [`ToolRegistry::extended`], which shares every entry of the one it extends.
+/// Lookup is by canonical name or MCP name; async tools additionally carry a
+/// global concurrency semaphore.
 pub struct ToolRegistry {
     /// Registered tools keyed by canonical name.
     tools: HashMap<&'static str, RegisteredTool>,
@@ -110,11 +114,11 @@ pub struct ToolRegistry {
     /// Per-async-tool global concurrency bound; `execute` acquires a permit on
     /// every path (executor and LLM).
     semaphores: HashMap<&'static str, Arc<Semaphore>>,
-    /// Canonical names of the tools a WASM instance provides. Their calls carry
-    /// a deadline from admission on.
-    provided: HashSet<&'static str>,
+    /// The tools a WASM instance provides, canonical name to the providing
+    /// instance's slug. Their calls carry a deadline from admission on.
+    provided: HashMap<&'static str, String>,
     /// Shared per-`(participant, tool)` rate limiter.
-    rate_limiter: RateLimiter,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl ToolRegistry {
@@ -140,114 +144,155 @@ impl ToolRegistry {
     /// As [`ToolRegistry::new`]; a provided tool whose name or MCP name is
     /// already taken panics naming both sources.
     pub fn with_provided(native: Vec<RegisteredTool>, provided: Vec<Arc<ProvidedTool>>) -> Self {
-        // Who holds each name and each MCP name so far, so a provided tool's
-        // collision names both sides. `None` is a native tool.
-        let mut names: HashMap<&'static str, Option<&str>> = HashMap::new();
-        let mut mcp_names: HashMap<&'static str, Option<&str>> = HashMap::new();
-        for tool in &native {
-            let desc = tool.descriptor();
-            names.insert(desc.name, None);
-            mcp_names.insert(desc.mcp_name, None);
-        }
-        let mut provided_names = HashSet::new();
-        for tool in &provided {
-            let desc = tool.descriptor();
-            let slug = tool.instance();
-            for (what, key, held) in [
-                ("tool", desc.name, &mut names),
-                ("tool mcp_name", desc.mcp_name, &mut mcp_names),
-            ] {
-                match held.insert(key, Some(slug)) {
-                    None => {}
-                    Some(None) => panic!(
-                        "{what} {key:?} is provided by [[wasm_consumer]] {slug:?} and registered \
-                         natively"
-                    ),
-                    Some(Some(other)) => panic!(
-                        "{what} {key:?} is provided by [[wasm_consumer]] {other:?} and by {slug:?}"
-                    ),
-                }
-            }
-            provided_names.insert(desc.name);
-        }
-
-        let tools = native
-            .into_iter()
-            .chain(provided.into_iter().map(|t| RegisteredTool::Async(t as _)));
-        let mut registry = Self::build(tools);
-        registry.provided = provided_names;
+        let mut registry = Self {
+            tools: HashMap::new(),
+            by_mcp_name: HashMap::new(),
+            semaphores: HashMap::new(),
+            provided: HashMap::new(),
+            rate_limiter: Arc::new(RateLimiter::default()),
+        };
+        registry.insert_all(native, provided);
         registry
     }
 
-    fn build(tools: impl Iterator<Item = RegisteredTool>) -> Self {
-        let mut map: HashMap<&'static str, RegisteredTool> = HashMap::new();
-        let mut by_mcp_name: HashMap<&'static str, &'static str> = HashMap::new();
-        let mut semaphores: HashMap<&'static str, Arc<Semaphore>> = HashMap::new();
+    /// A registry holding every entry of `self` as the same objects — each
+    /// tool, its concurrency semaphore and the rate limiter — plus `native` and
+    /// `provided`, each validated as [`ToolRegistry::with_provided`] validates
+    /// and given a fresh semaphore. A call admitted on either registry
+    /// therefore shares permits and rate buckets with a call on the other.
+    ///
+    /// # Panics
+    ///
+    /// As [`ToolRegistry::with_provided`]; an added tool whose name or MCP name
+    /// `self` already holds panics naming both holders.
+    pub fn extended(
+        &self,
+        native: Vec<RegisteredTool>,
+        provided: Vec<Arc<ProvidedTool>>,
+    ) -> ToolRegistry {
+        let mut registry = Self {
+            tools: self.tools.clone(),
+            by_mcp_name: self.by_mcp_name.clone(),
+            semaphores: self.semaphores.clone(),
+            provided: self.provided.clone(),
+            rate_limiter: self.rate_limiter.clone(),
+        };
+        registry.insert_all(native, provided);
+        registry
+    }
 
-        for tool in tools {
-            let desc = tool.descriptor();
-            // Copy the static fields out before moving `tool` into the map.
-            let name = desc.name;
-            let mcp_name = desc.mcp_name;
-            let class = desc.class;
-            let idempotency = desc.idempotency;
+    /// Insert `native`, then `provided`: the one insertion path both
+    /// construction routes take.
+    fn insert_all(&mut self, native: Vec<RegisteredTool>, provided: Vec<Arc<ProvidedTool>>) {
+        for tool in native {
+            self.insert(tool, None);
+        }
+        for tool in provided {
+            let slug = tool.instance().to_string();
+            self.insert(RegisteredTool::Async(tool as _), Some(slug));
+        }
+    }
 
-            assert!(
-                matches!(idempotency, Idempotency::Natural),
-                "tool {name:?}: RequiresKey idempotency is not supported this cycle \
-                 (dedupe table deferred; see TODO(tool-registry-idempotency-dedupe))",
-            );
-            // The `RegisteredTool` variant and the descriptor's class must agree.
-            // Without this check a `Fast` tool declaring an `Async` class (or
-            // vice versa) passes registration — even receives a semaphore — and
-            // only panics when first invoked, at request time. Fail at startup.
-            assert!(
-                matches!(
-                    (&tool, class),
-                    (RegisteredTool::Fast(_), ToolClass::Fast { .. })
-                        | (RegisteredTool::Async(_), ToolClass::Async { .. })
+    /// Who holds the canonical name `name`: `None` when nothing does,
+    /// `Some(None)` for a native tool, `Some(Some(slug))` for a provided one.
+    fn holder(&self, name: &str) -> Option<Option<String>> {
+        self.tools.get(name)?;
+        Some(self.provided_by(name).map(str::to_string))
+    }
+
+    /// Validate one tool and add it; `provider` is the providing instance's
+    /// slug, `None` for a native tool.
+    fn insert(&mut self, tool: RegisteredTool, provider: Option<String>) {
+        let desc = tool.descriptor();
+        // Copy the static fields out before moving `tool` into the map.
+        let name = desc.name;
+        let mcp_name = desc.mcp_name;
+        let class = desc.class;
+        let idempotency = desc.idempotency;
+
+        // (the key in a cross-kind message, the key in a native duplicate's
+        // message, the key, its current holder)
+        let held = [
+            ("tool", "tool name", name, self.holder(name)),
+            (
+                "tool mcp_name",
+                "tool mcp_name",
+                mcp_name,
+                self.by_mcp_name
+                    .get(mcp_name)
+                    .and_then(|canonical| self.holder(canonical)),
+            ),
+        ];
+        for (what, duplicate, key, holder) in held {
+            let Some(holder) = holder else { continue };
+            match (provider.as_deref(), holder.as_deref()) {
+                (None, None) => panic!("duplicate {duplicate}: {key:?}"),
+                (Some(slug), None) | (None, Some(slug)) => panic!(
+                    "{what} {key:?} is provided by [[wasm_consumer]] {slug:?} and registered \
+                     natively"
                 ),
-                "tool {name:?}: RegisteredTool variant disagrees with descriptor class {class:?}",
-            );
-            match class {
-                ToolClass::Fast { budget } => {
-                    assert!(
-                        budget <= MAX_FAST_BUDGET,
-                        "tool {name:?}: declared fast budget {budget:?} exceeds the {MAX_FAST_BUDGET:?} cap \
-                         (a tool wanting more is not fast)",
-                    );
-                }
-                ToolClass::Async { max_concurrency } => {
-                    assert!(
-                        max_concurrency >= 1,
-                        "tool {name:?}: async max_concurrency must be >= 1",
-                    );
-                    semaphores.insert(name, Arc::new(Semaphore::new(max_concurrency)));
-                }
+                (Some(slug), Some(other)) => panic!(
+                    "{what} {key:?} is provided by [[wasm_consumer]] {other:?} and by {slug:?}"
+                ),
             }
-
-            assert!(
-                by_mcp_name.insert(mcp_name, name).is_none(),
-                "duplicate tool mcp_name: {mcp_name:?}",
-            );
-            assert!(
-                map.insert(name, tool).is_none(),
-                "duplicate tool name: {name:?}",
-            );
         }
 
-        Self {
-            tools: map,
-            by_mcp_name,
-            semaphores,
-            provided: HashSet::new(),
-            rate_limiter: RateLimiter::default(),
+        assert!(
+            matches!(idempotency, Idempotency::Natural),
+            "tool {name:?}: RequiresKey idempotency is not supported this cycle \
+             (dedupe table deferred; see TODO(tool-registry-idempotency-dedupe))",
+        );
+        // The `RegisteredTool` variant and the descriptor's class must agree.
+        // Without this check a `Fast` tool declaring an `Async` class (or
+        // vice versa) passes registration — even receives a semaphore — and
+        // only panics when first invoked, at request time. Fail at startup.
+        assert!(
+            matches!(
+                (&tool, class),
+                (RegisteredTool::Fast(_), ToolClass::Fast { .. })
+                    | (RegisteredTool::Async(_), ToolClass::Async { .. })
+            ),
+            "tool {name:?}: RegisteredTool variant disagrees with descriptor class {class:?}",
+        );
+        match class {
+            ToolClass::Fast { budget } => {
+                assert!(
+                    budget <= MAX_FAST_BUDGET,
+                    "tool {name:?}: declared fast budget {budget:?} exceeds the {MAX_FAST_BUDGET:?} cap \
+                     (a tool wanting more is not fast)",
+                );
+            }
+            ToolClass::Async { max_concurrency } => {
+                assert!(
+                    max_concurrency >= 1,
+                    "tool {name:?}: async max_concurrency must be >= 1",
+                );
+                self.semaphores
+                    .insert(name, Arc::new(Semaphore::new(max_concurrency)));
+            }
+        }
+
+        self.by_mcp_name.insert(mcp_name, name);
+        self.tools.insert(name, tool);
+        if let Some(slug) = provider {
+            self.provided.insert(name, slug);
         }
     }
 
     /// Whether `name` is a tool a WASM instance provides.
     pub fn is_provided(&self, name: &str) -> bool {
-        self.provided.contains(name)
+        self.provided.contains_key(name)
+    }
+
+    /// The slug of the WASM instance providing `name`, `None` for a native or
+    /// unknown tool.
+    pub fn provided_by(&self, name: &str) -> Option<&str> {
+        self.provided.get(name).map(String::as_str)
+    }
+
+    /// The slugs of every WASM instance providing at least one tool.
+    pub fn providing_instances(&self) -> BTreeSet<&str> {
+        self.provided.values().map(String::as_str).collect()
     }
 
     /// Look up a tool by its canonical name.
@@ -267,16 +312,28 @@ impl ToolRegistry {
         self.semaphores.get(name)
     }
 
+    /// Canonical names of every registered tool, sorted.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn tool_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = self.tools.keys().copied().collect();
+        names.sort_unstable();
+        names
+    }
+
     /// Canonical names of every registered async-class tool. The tool-bus
     /// bootstrap creates one `brenn:tools/<name>` request channel per entry.
+    /// Sorted, so two registries holding the same tools derive the same plan.
     pub fn async_tool_names(&self) -> Vec<&'static str> {
-        self.tools
+        let mut names: Vec<&'static str> = self
+            .tools
             .values()
             .filter_map(|t| match t {
                 RegisteredTool::Async(a) => Some(a.descriptor().name),
                 RegisteredTool::Fast(_) => None,
             })
-            .collect()
+            .collect();
+        names.sort_unstable();
+        names
     }
 
     /// The shared rate limiter.
@@ -1232,6 +1289,7 @@ mod tests {
 
     use crate::provided::tests::{PROVIDER, decl, messenger, published_id, requests};
     use crate::provided::{ProvidedTool, ProviderRuntime};
+    use brenn_lib::messaging::config::ProvidedToolDecl;
 
     fn provided(
         slug: &str,
@@ -1450,5 +1508,203 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// Whether two registered tools are the same object.
+    fn same(a: &RegisteredTool, b: &RegisteredTool) -> bool {
+        match (a, b) {
+            (RegisteredTool::Fast(a), RegisteredTool::Fast(b)) => Arc::ptr_eq(a, b),
+            (RegisteredTool::Async(a), RegisteredTool::Async(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    fn base() -> ToolRegistry {
+        ToolRegistry::with_provided(
+            vec![
+                fast("stub", "mcp__brenn__Stub", &[]),
+                crate::testutil::bound("apull", UserBinding::None),
+            ],
+            vec![provided(PROVIDER, &decl(1))],
+        )
+    }
+
+    fn one_per_minute() -> Option<ResolvedRateLimit> {
+        Some(ResolvedRateLimit {
+            burst: 1,
+            sustained_per_minute: 1,
+        })
+    }
+
+    /// The extended registry holds the original's entries as the same objects
+    /// — tools, semaphores, rate buckets — and the added tools beside them.
+    #[tokio::test]
+    async fn extended_shares_every_existing_entry() {
+        let base = base();
+        assert!(base.rate_limiter().try_take("c", "stub", one_per_minute()));
+        let ext = base.extended(
+            vec![],
+            vec![provided("other", &renamed("echo-two", "EchoTwo"))],
+        );
+
+        for name in ["stub", "apull", "echo-for-user"] {
+            assert!(
+                same(base.get(name).unwrap(), ext.get(name).unwrap()),
+                "{name}"
+            );
+        }
+        for name in ["apull", "echo-for-user"] {
+            assert!(Arc::ptr_eq(
+                base.concurrency(name).unwrap(),
+                ext.concurrency(name).unwrap()
+            ));
+        }
+        assert!(
+            !ext.rate_limiter().try_take("c", "stub", one_per_minute()),
+            "the bucket drained through the original is drained in the extension"
+        );
+
+        assert_eq!(ext.concurrency("echo-two").unwrap().available_permits(), 1);
+        assert!(ext.get_by_mcp_name("mcp__brenn__EchoTwo").is_some());
+        assert_eq!(ext.provided_by("echo-two"), Some("other"));
+        assert_eq!(ext.provided_by("echo-for-user"), Some(PROVIDER));
+        assert_eq!(ext.provided_by("apull"), None);
+        assert_eq!(
+            ext.providing_instances(),
+            BTreeSet::from(["other", PROVIDER])
+        );
+        assert_eq!(
+            ext.async_tool_names(),
+            vec!["apull", "echo-for-user", "echo-two"]
+        );
+        assert!(base.get("echo-two").is_none(), "the original is unchanged");
+    }
+
+    #[tokio::test]
+    async fn extended_with_nothing_holds_the_same_tools() {
+        let base = base();
+        let ext = base.extended(vec![], vec![]);
+        assert_eq!(base.tool_names(), ext.tool_names());
+        assert_eq!(
+            base.tool_names().len(),
+            base.tools.len(),
+            "every tool is named"
+        );
+        assert_eq!(base.providing_instances(), ext.providing_instances());
+    }
+
+    #[tokio::test]
+    async fn extended_admits_an_added_native_tool() {
+        let ext = base().extended(vec![fast("more", "mcp__brenn__More", &[])], vec![]);
+        assert!(ext.get("more").is_some());
+        assert!(!ext.is_provided("more"));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "TODO(tool-registry-idempotency-dedupe)")]
+    async fn extended_refuses_a_requires_key_tool() {
+        base().extended(
+            vec![RegisteredTool::Fast(Arc::new(StubTool {
+                descriptor: descriptor(
+                    "keyed",
+                    "mcp__brenn__Keyed",
+                    ToolClass::Fast {
+                        budget: DEFAULT_FAST_BUDGET,
+                    },
+                    &[],
+                    Idempotency::RequiresKey,
+                ),
+            }))],
+            vec![],
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "variant disagrees with descriptor class")]
+    async fn extended_refuses_a_variant_class_disagreement() {
+        base().extended(
+            vec![RegisteredTool::Fast(Arc::new(StubTool {
+                descriptor: descriptor(
+                    "mismatch",
+                    "mcp__brenn__Mismatch",
+                    ToolClass::Async { max_concurrency: 2 },
+                    &[],
+                    Idempotency::Natural,
+                ),
+            }))],
+            vec![],
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "exceeds the")]
+    async fn extended_refuses_an_over_budget_fast_tool() {
+        base().extended(
+            vec![RegisteredTool::Fast(Arc::new(StubTool {
+                descriptor: descriptor(
+                    "slow",
+                    "mcp__brenn__Slow",
+                    ToolClass::Fast {
+                        budget: Duration::from_millis(51),
+                    },
+                    &[],
+                    Idempotency::Natural,
+                ),
+            }))],
+            vec![],
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "async max_concurrency must be >= 1")]
+    async fn extended_refuses_a_zero_concurrency_tool() {
+        base().extended(
+            vec![],
+            vec![provided(
+                "third",
+                &ProvidedToolDecl {
+                    max_concurrency: 0,
+                    ..renamed("echo-three", "EchoThree")
+                },
+            )],
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "tool \"stub\" is provided by [[wasm_consumer]] \"other\" and registered natively"
+    )]
+    async fn extended_refuses_a_provided_tool_taking_a_native_name() {
+        base().extended(vec![], vec![provided("other", &renamed("stub", "Other"))]);
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "tool \"echo-for-user\" is provided by [[wasm_consumer]] \"prov\" and \
+                    registered natively"
+    )]
+    async fn extended_refuses_a_native_tool_taking_a_provided_name() {
+        base().extended(
+            vec![fast("echo-for-user", "mcp__brenn__Other", &[])],
+            vec![],
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "tool mcp_name \"mcp__brenn__EchoForUser\" is provided by [[wasm_consumer]] \
+                    \"prov\" and by \"other\""
+    )]
+    async fn extended_refuses_a_provided_tool_taking_a_provided_mcp_name() {
+        base().extended(
+            vec![],
+            vec![provided("other", &renamed("other", "EchoForUser"))],
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "duplicate tool mcp_name: \"mcp__brenn__Stub\"")]
+    async fn extended_refuses_a_native_tool_taking_a_native_mcp_name() {
+        base().extended(vec![fast("stub-two", "mcp__brenn__Stub", &[])], vec![]);
     }
 }

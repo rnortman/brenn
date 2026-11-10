@@ -1,21 +1,5 @@
 # TODOs
 
-## `reload-probe-fix-misdescribed-in-commit-message`
-
-The commit "Carry CalDAV/WebDAV reads through api-request and the provider
-kit" says of `brenn-bootstrap/src/reload/driver.rs` only "reload driver
-adjusted for the method set". That is wrong: the change there is unrelated to
-HTTP methods. It narrows `authority_probe`, the sampling probe the
-reload-order tests share (`a_removed_client_is_stopped_after_agents_swap`
-among them), which read the agent table and the client registry at different
-instants and could report a state the program is never in; the probe now
-reads the authority on both sides of the registry read and counts no sample
-the swap fell inside. Done = the commit's message corrected before it reaches
-the public remote, or, if it is already public, this entry and its comment
-removed, the entry having been the correction. The
-`TODO(reload-probe-fix-misdescribed-in-commit-message)` comment sits at
-`authority_probe` in `brenn-bootstrap/src/reload/driver.rs`.
-
 ## `kit-payload-reader-cannot-read-304`
 
 The provider kit's `read_api_payload` and `read_api_result` fail every 3xx
@@ -3761,46 +3745,44 @@ provided tool bounding the nested call.
 
 ## `reload-provided-tools`
 
-A `wasm_consumer` added with a `provide` block, or an existing consumer's
-`provides` changed, is refused at reload, and so is the first
-`api_key_provider` or `oauth_provider` in a document that had neither at boot,
-and the removal of the last provider of either kind (the `api-request` tool is
-registered only while one exists): the tool registry
-(`brenn-tool-registry/src/registry.rs`, `ToolRegistry`) is built once per
-process from the native tools and every consumer's `provide` declarations,
-and is plain maps with no interior mutability; it feeds grant validation, the
-messaging planner, consumer loading and the agents' virtual-tools files.
-Deploying a new provider component (for example a second Fastmail component
-beside the first), or a deployment's first API provider, therefore takes a
-restart. Making the registered-tool set converge means a swappable registry
-view that every one of those readers sees consistently in commit order, with
-the per-tool semaphores and MCP-name index rebuilt, and the virtual-tools
-files re-projected. A swappable registry meets three things these refusals
-hide today. First, the reload driver plans the candidate against the booted
-registry (`plan_of` in `brenn-bootstrap/src/reload/driver.rs`) and validates
-the candidate's agents against it, so neither sees a tool the candidate adds;
-once the candidate is planned from a rebuilt registry, the driver's
-system-participant check (`system_participant_refusals` in
-`brenn-bootstrap/src/reload/surfaces.rs`) refuses it, because the tool
-executor subscribes once per async tool name (`tool_executor_spec` in
-`brenn-tool-registry/src/bus_wiring.rs`): that check has to admit the
-executor's subscriptions changing. Second, `ProvidedTool::execute`
-(`brenn-tool-registry/src/provided.rs`) panics when publishing a request finds
-no inbox, on the invariant that a providing instance's inbox lives as long as
-the process, and panics again when a pending record is removed unanswered
-while its guard is alive; a provider removed at reload breaks the first for
-every call that starts afterwards. Third, `ToolRegistry` holds the rate
-limiter's buckets and the per-tool semaphores by value, and
-`ProvidedTool::new` leaks each descriptor's strings on the ground that the
-registry is built once: a rebuilt registry starts with empty buckets and
-fresh semaphores unless unchanged tools carry theirs over, and leaks once per
-rebuild. Done = a consumer with a new `provide` added to a
-document, a first `api_key_provider`, and the removal of the last provider are
-applied at reload rather than refused, with the same post-commit state a fresh
-boot would produce. The `TODO(reload-provided-tools)` comment sits at the
-`provides` refusal in `brenn-bootstrap/src/reload/compare.rs`, with a second
-at the first- and last-provider refusal (`api_key_registration`) in the same
-file.
+A reload applies a `wasm_consumer` that newly provides tools — a new instance
+of a providing class, or an existing instance that provided nothing — and a
+deployment's first `api_key_provider`. Three changes are still refused, each
+naming a restart: an instance's `provide` set changing (a tool added, dropped
+or re-declared, which is what upgrading a component to a version with a
+different tool set does), a providing instance leaving the document, and the
+removal of the last provider of either kind, which would unregister
+`api-request`. What converging them needs. First, retiring a tool:
+`ProvidedTool::execute` (`brenn-tool-registry/src/provided.rs`) panics when
+publishing a request finds no inbox and when a pending record is dropped
+unanswered, and the pending-call table can fail listed calls only, not every
+call of one instance; a reload that retires a provider has to stop new calls
+being admitted, then answer its pending and queued calls, before the inbox
+goes. A changed `provide` set meets the same hazard without retiring
+anything, because the instance's request inbox is sized from its tools and is
+re-created. Second, the executor's unsubscription: the tool executor gains
+subscriptions at reload and never loses one; taking one away means removing
+its subscriber entry and its position in an order its running drain loop
+cannot observe half-done, and a rule for the request rows left on the removed
+`brenn:tools/<name>` channel (see `tool-registry-unregistered-tool-sweep`).
+Third, a tool whose shape changed: the registry is extended at reload, never
+rebuilt, so unchanged tools keep their semaphore and callers their rate
+buckets by being the same entries; a tool whose `max_concurrency` moved needs
+a rule for calls holding permits on the old semaphore, and every agent
+granted it needs its tool list rendered against the new schema. Fourth,
+unregistering a native tool, for the last provider. Whether this work is
+wanted is a decision for the project's owner: adding a provider now reloads;
+should changing a component's provided tools and removing a component reload
+too, or is a restart acceptable for those? (a) Both converge, the work above.
+(b) Changing converges and removal stays a restart. (c) Neither, and a
+restart is the accepted answer. Done = that decision made and, under (a) or
+(b), the chosen changes applied at reload with the post-commit state a fresh
+boot would produce and a call in flight on a retiring or changing tool
+answered rather than panicking; under (c), this entry and its comments
+removed, the refusals and the configuration reference already saying
+restart. The `TODO(reload-provided-tools)` comments sit at the `provides`
+refusal (`provided_tools`) and the last-provider refusal in
+`brenn-bootstrap/src/reload/compare.rs`.
 
 ## `reload-oauth-providers`
 

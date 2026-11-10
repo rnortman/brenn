@@ -128,7 +128,7 @@ mod tests {
     fn host(runtime: &Arc<ProviderRuntime>, slug: &str) -> WasmProvidesHost {
         let (alert, _drain) = noop_alert_dispatcher();
         let tools = WasmToolHost::new(
-            Arc::new(git_repo_pull_only()),
+            Arc::new(git_repo_pull_only()).into(),
             BTreeMap::from([(
                 "git-repo-pull".to_string(),
                 grant(vec![clause(&[("repo", "r")])]),
@@ -295,7 +295,7 @@ mod tests {
         let guard = runtime.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
         let (alert, _drain) = noop_alert_dispatcher();
         let tools = WasmToolHost::new(
-            Arc::new(git_repo_pull_only()),
+            Arc::new(git_repo_pull_only()).into(),
             BTreeMap::new(),
             PROVIDER.to_string(),
             alert,

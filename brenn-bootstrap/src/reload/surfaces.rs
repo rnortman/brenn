@@ -18,6 +18,7 @@ use brenn_surface_server::description::{
     DescriptionSelection, SURFACE_CONFIG_COMPONENT, SURFACE_HELP_COMPONENT,
     build_description_docs_selected, distinct_kinds,
 };
+use brenn_tool_registry::TOOL_EXECUTOR_COMPONENT;
 use uuid::Uuid;
 
 use super::NEEDS_RESTART;
@@ -159,6 +160,15 @@ const SURFACE_DESCRIPTION_PARTICIPANTS: [&str; 2] =
 ///
 /// The pair set aside carries one exact-match ACL matcher per surface and per
 /// distinct kind, which is surface *identity* rather than a frozen input.
+///
+/// The tool executor is the one participant whose subscriptions may grow: one
+/// per asynchronous tool the registry holds, and a reload may register more.
+/// Its policy must still be equal and every subscription it has must remain;
+/// added ones are admitted. That is safe because its inbox reads its channel
+/// set from the directory on every pass, its registration and delivery binding
+/// are keyed by participant rather than by channel, and its policy matches the
+/// request channels by prefix. A process that runs no executor has no inbox
+/// to grow, so an executor newly derived is refused.
 pub(crate) fn system_participant_refusals(
     baseline: &[SystemParticipantSpec],
     candidate: &[SystemParticipantSpec],
@@ -167,19 +177,43 @@ pub(crate) fn system_participant_refusals(
     let new = compared(candidate);
     let mut out = Vec::new();
     for (component, spec) in &old {
-        match new.get(component) {
-            Some(now) if now == spec => {}
-            Some(_) => out.push(format!(
+        let Some(now) = new.get(component) else {
+            out.push(format!(
+                "the {component:?} system participant is no longer derived: {NEEDS_RESTART}"
+            ));
+            continue;
+        };
+        if now.policy != spec.policy {
+            out.push(format!(
                 "the {component:?} system participant's code-built policy is not the one this \
                  process is running: {NEEDS_RESTART}"
-            )),
-            None => out.push(format!(
-                "the {component:?} system participant is no longer derived: {NEEDS_RESTART}"
-            )),
+            ));
+        }
+        if *component == TOOL_EXECUTOR_COMPONENT {
+            for address in &spec.subscriptions {
+                if !now.subscriptions.contains(address) {
+                    out.push(format!(
+                        "the tool executor would stop serving {address}: {NEEDS_RESTART}"
+                    ));
+                }
+            }
+        } else if now.subscriptions != spec.subscriptions {
+            out.push(format!(
+                "the {component:?} system participant's subscriptions are not the ones this \
+                 process is running: {NEEDS_RESTART}"
+            ));
         }
     }
     for component in new.keys() {
-        if !old.contains_key(component) {
+        if old.contains_key(component) {
+            continue;
+        }
+        if *component == TOOL_EXECUTOR_COMPONENT {
+            out.push(format!(
+                "this process started with no asynchronous tool and runs no tool executor, so \
+                 the first one needs a restart: {NEEDS_RESTART}"
+            ));
+        } else {
             out.push(format!(
                 "the {component:?} system participant is newly derived: {NEEDS_RESTART}"
             ));
@@ -964,21 +998,114 @@ mod tests {
 
     #[test]
     fn a_participant_whose_policy_moved_is_refused() {
-        let one = vec![spec("tool-executor", &["a"])];
-        let two = vec![spec("tool-executor", &["a", "b"])];
+        let one = vec![spec("roster", &["a"])];
+        let two = vec![spec("roster", &["a", "b"])];
         let refusals = system_participant_refusals(&one, &two);
         assert_eq!(refusals.len(), 1, "{refusals:?}");
-        assert!(refusals[0].contains("\"tool-executor\" system participant's code-built policy"));
+        assert!(refusals[0].contains("\"roster\" system participant's code-built policy"));
         assert!(refusals[0].ends_with(NEEDS_RESTART));
+    }
+
+    /// `spec(component, channels)`, subscribed to `subscriptions`.
+    fn subscribed(
+        component: &'static str,
+        channels: &[&str],
+        subscriptions: &[&str],
+    ) -> SystemParticipantSpec {
+        SystemParticipantSpec {
+            subscriptions: subscriptions.iter().map(|s| (*s).to_string()).collect(),
+            ..spec(component, channels)
+        }
+    }
+
+    #[test]
+    fn another_participant_whose_subscriptions_moved_is_refused_naming_them() {
+        let one = vec![subscribed("cc-profile", &["a"], &["brenn:a"])];
+        let two = vec![subscribed("cc-profile", &["a"], &["brenn:a", "brenn:b"])];
+        assert_eq!(
+            system_participant_refusals(&one, &two),
+            vec![format!(
+                "the \"cc-profile\" system participant's subscriptions are not the ones this \
+                 process is running: {NEEDS_RESTART}"
+            )],
+        );
+    }
+
+    #[test]
+    fn the_tool_executor_may_gain_subscriptions() {
+        let one = vec![subscribed(
+            TOOL_EXECUTOR_COMPONENT,
+            &["a"],
+            &["brenn:tools/a"],
+        )];
+        let two = vec![subscribed(
+            TOOL_EXECUTOR_COMPONENT,
+            &["a"],
+            &["brenn:tools/a", "brenn:tools/b"],
+        )];
+        assert!(system_participant_refusals(&one, &two).is_empty());
+    }
+
+    #[test]
+    fn the_tool_executor_losing_a_subscription_is_refused() {
+        let one = vec![subscribed(
+            TOOL_EXECUTOR_COMPONENT,
+            &["a"],
+            &["brenn:tools/a", "brenn:tools/b"],
+        )];
+        let two = vec![subscribed(
+            TOOL_EXECUTOR_COMPONENT,
+            &["a"],
+            &["brenn:tools/b", "brenn:tools/c"],
+        )];
+        assert_eq!(
+            system_participant_refusals(&one, &two),
+            vec![format!(
+                "the tool executor would stop serving brenn:tools/a: {NEEDS_RESTART}"
+            )],
+        );
+    }
+
+    #[test]
+    fn the_tool_executor_whose_policy_moved_is_refused() {
+        let one = vec![subscribed(
+            TOOL_EXECUTOR_COMPONENT,
+            &["a"],
+            &["brenn:tools/a"],
+        )];
+        let two = vec![subscribed(
+            TOOL_EXECUTOR_COMPONENT,
+            &["a", "b"],
+            &["brenn:tools/a", "brenn:tools/b"],
+        )];
+        assert_eq!(
+            system_participant_refusals(&one, &two),
+            vec![format!(
+                "the \"tool-executor\" system participant's code-built policy is not the one \
+                 this process is running: {NEEDS_RESTART}"
+            )],
+        );
+    }
+
+    #[test]
+    fn a_tool_executor_newly_derived_is_refused() {
+        let two = vec![subscribed(TOOL_EXECUTOR_COMPONENT, &[], &["brenn:tools/a"])];
+        assert_eq!(
+            system_participant_refusals(&[], &two),
+            vec![format!(
+                "this process started with no asynchronous tool and runs no tool executor, so \
+                 the first one needs a restart: {NEEDS_RESTART}"
+            )],
+        );
     }
 
     #[test]
     fn a_participant_that_arrives_or_leaves_is_refused() {
-        let one = vec![spec("tool-executor", &["a"])];
+        let one = vec![spec("roster", &["a"])];
         let two = vec![spec("cc-profile", &["c"])];
         let refusals = system_participant_refusals(&one, &two);
         assert_eq!(refusals.len(), 2, "{refusals:?}");
-        assert!(refusals[0].contains("\"tool-executor\" system participant is no longer derived"));
+        assert!(refusals[0].contains("\"roster\" system participant is no longer derived"));
         assert!(refusals[1].contains("\"cc-profile\" system participant is newly derived"));
     }
 

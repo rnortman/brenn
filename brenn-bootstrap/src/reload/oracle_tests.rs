@@ -31,8 +31,8 @@ use super::driver::tests::{
     document, document_covering_work, document_push_subscribing, document_push_subscribing_acl,
     document_subscribing, document_with, document_with_a_broker_only, document_with_a_consumer,
     document_with_an_mqtt_consumer, document_with_clients, document_with_webhooks, fragment,
-    insert_dynamic_row, insert_push_dynamic_row, install_package, install_package_from,
-    push_owner_covering_work, restage, seat_a_conversation, seat_position, seat_user,
+    insert_dynamic_row, insert_push_dynamic_row, install_package, install_package_from, key_file,
+    push_owner_covering_work, reload_onto, restage, seat_a_conversation, seat_position, seat_user,
     spill_channel, staged_module, subscriber_debug_lines, surface_document, surfaces_document,
     write_surface_kind,
 };
@@ -154,6 +154,14 @@ pub(crate) struct Snapshot {
     /// staged rendering never landed holds the old bytes here while a fresh
     /// boot holds the new.
     virtual_tools: Vec<String>,
+    /// Every tool the registry holds, read through the process's cell: one
+    /// line per tool with its MCP name, class, providing instance or `native`,
+    /// description, schema, `auto_approve` and user binding, sorted by name.
+    ///
+    /// What a reload that adds a tool installs is a registry, and nothing
+    /// else in the snapshot is one: the request channel and the executor's
+    /// position say a tool was planned, not that a caller can reach it.
+    tools: Vec<String>,
 }
 
 impl Snapshot {
@@ -188,6 +196,7 @@ impl Snapshot {
             agent_per_call,
             dynamic_subs,
             virtual_tools,
+            tools,
         } = self;
         assert_lines("channels", channels, &fresh.channels);
         assert_lines("registrations", registrations, &fresh.registrations);
@@ -222,6 +231,12 @@ impl Snapshot {
         assert_lines("agent_per_call", agent_per_call, &fresh.agent_per_call);
         assert_lines("dynamic_subs", dynamic_subs, &fresh.dynamic_subs);
         assert_lines("virtual_tools", virtual_tools, &fresh.virtual_tools);
+        assert_lines("tools", tools, &fresh.tools);
+    }
+
+    /// The registered tools, for the transitions that add one.
+    pub(crate) fn tools(&self) -> &[String] {
+        &self.tools
     }
 
     /// The authority view, for a transition asserting the agent moved at all.
@@ -632,7 +647,33 @@ async fn snapshot(booted: &Booted) -> Snapshot {
         agent_per_call,
         dynamic_subs: dynamic_subs(&booted.messenger).await,
         virtual_tools,
+        tools: tool_lines(&booted.driver.env().tool_registry.load()),
     }
+}
+
+/// One line per registered tool, sorted by canonical name.
+fn tool_lines(registry: &brenn_tool_registry::ToolRegistry) -> Vec<String> {
+    registry
+        .tool_names()
+        .into_iter()
+        .map(|name| {
+            let descriptor = registry
+                .get(name)
+                .expect("a named tool is registered")
+                .descriptor();
+            format!(
+                "{name} mcp={} class={:?} by={} description={:?} schema={} auto_approve={} \
+                 user={:?}",
+                descriptor.mcp_name,
+                descriptor.class,
+                registry.provided_by(name).unwrap_or("native"),
+                descriptor.description,
+                descriptor.input_schema,
+                descriptor.auto_approve,
+                descriptor.user_binding,
+            )
+        })
+        .collect()
 }
 
 /// Every durable dynamic-subscription row, as lines.
@@ -1090,6 +1131,10 @@ pub(crate) async fn a_seeded_reload_matches_a_fresh_boot(
     // both connect under one client id — for the whole of the fresh side's
     // life. A no-op when the fixture stood no supervisor up.
     booted.stop_mqtt();
+    // And its consumers, for the same reason: a consumer's KV store admits one
+    // holder, and the fresh side's instance of the same consumer opens the same
+    // file.
+    booted.driver.stop_consumers().await;
 
     // A fresh boot of A′ over the database as it stood before the reload:
     // what the operator would have got by restarting the service instead.
@@ -1169,12 +1214,6 @@ fn panel_fixture(assets: &std::path::Path) -> impl Fn(brenn_db::Db) -> BootFixtu
         surface_assets: Some(assets.to_path_buf()),
         ..BootFixture::default()
     }
-}
-
-/// Rewrite the document and reload.
-async fn reload_onto(booted: &mut Booted, tree: &Tree, document: &str) {
-    tree.write(document);
-    booted.driver.reload(TriggerSource::Signal).await;
 }
 
 /// **The first surface in a document that had none.** Nothing surface-shaped
@@ -2194,22 +2233,13 @@ fn mail_provider(accounts: &[(&str, &std::path::Path)]) -> String {
     ))
 }
 
-/// A 0600 key file `name` under the tree's secrets holding `text`.
-fn key_file(tree: &Tree, name: &str, text: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = tree.secret(name, text);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .expect("the key file is private");
-    path
-}
-
 /// **A rotated key under an unmoved document.** The bytes on disk are the
 /// entity: the reloaded table has to send the new key, which is only a
 /// convergence if a fresh boot of the same document sends it too.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rotated_api_key_matches_a_fresh_boot() {
     let tree = Tree::new();
-    let path = key_file(&tree, "alice", "k3y-before");
+    let path = key_file(tree.secret_path("alice"), "k3y-before");
     tree.write(&mail_provider(&[("alice", &path)]));
 
     a_seeded_reload_matches_a_fresh_boot(
@@ -2220,7 +2250,7 @@ async fn a_rotated_api_key_matches_a_fresh_boot() {
         },
         async |booted| {
             let before = snapshot(booted).await.api_key_providers().to_vec();
-            key_file(&tree, "alice", "k3y-after");
+            key_file(tree.secret_path("alice"), "k3y-after");
             booted.driver.reload(TriggerSource::Signal).await;
             assert_eq!(
                 booted.last_status().await.delta.api_key_providers_changed,
@@ -2244,8 +2274,8 @@ async fn a_rotated_api_key_matches_a_fresh_boot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_added_api_key_account_matches_a_fresh_boot() {
     let tree = Tree::new();
-    let home = key_file(&tree, "alice-home", "k3y-home");
-    let work = key_file(&tree, "alice-work", "k3y-work");
+    let home = key_file(tree.secret_path("alice-home"), "k3y-home");
+    let work = key_file(tree.secret_path("alice-work"), "k3y-work");
     tree.write(&mail_provider(&[("home", &home)]));
 
     a_seeded_reload_matches_a_fresh_boot(

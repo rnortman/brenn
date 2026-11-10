@@ -9,19 +9,18 @@
 //! built over the document's key providers as `run_server` builds it.
 
 use brenn_lib::config::PACKAGED;
-use std::os::unix::fs::PermissionsExt;
 
-use super::driver::tests::Tree;
+use super::driver::tests::{Tree, key_file};
 use super::provider_class_boot::{ProviderClassBoot, assert_provider_class_boots};
 
 /// The instance's slug.
-const MAPS: &str = "maps";
+pub(super) const MAPS: &str = "maps";
 
 /// The agent granted the tools.
 const ASSISTANT: &str = "assistant";
 
 /// The component's artifact.
-const ARTIFACT: &str = "brenn_google_maps_tools.wasm";
+pub(super) const ARTIFACT: &str = "brenn_google_maps_tools.wasm";
 
 /// The tools the class provides, by registry name and MCP name, in
 /// declaration order.
@@ -44,7 +43,7 @@ fn spec() -> String {
 /// The operator's document: the class, the key provider, the tuning block,
 /// one instance with its nine clauses, `extra` and `config`, and an agent
 /// granted every tool.
-fn document(
+pub(super) fn document(
     home: &std::path::Path,
     key_file: &std::path::Path,
     store: &std::path::Path,
@@ -130,10 +129,7 @@ async fn boot(extra: &str) {
 async fn boot_edited(extra: &str, edit: impl FnOnce(String) -> String) {
     let home = tempfile::tempdir().expect("a container home");
     let host = tempfile::tempdir().expect("a host directory");
-    let key_file = host.path().join("maps-api-key");
-    std::fs::write(&key_file, "K3Y-deployment-secret\n").expect("write the key file");
-    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))
-        .expect("the key file is private");
+    let key_file = key_file(host.path().join("maps-api-key"), "K3Y-deployment-secret\n");
     let store = host.path().join("google-maps-tools.db");
     let tree = Tree::holding(&edit(document(home.path(), &key_file, &store, extra)));
 

@@ -36,7 +36,8 @@ pub(super) async fn handle(
             // Copy the canonical name + auto_approve out so the immutable borrow
             // of the registry ends before the grant table is read.
             let (canonical, auto_approve) = {
-                let tool = bridge.tools.get_by_mcp_name(tool_name)?;
+                let tools = bridge.tools.load();
+                let tool = tools.get_by_mcp_name(tool_name)?;
                 let desc = tool.descriptor();
                 (desc.name, desc.auto_approve)
             };
@@ -78,7 +79,7 @@ pub(super) async fn handle(
             tool_response,
             ..
         } => {
-            bridge.tools.get_by_mcp_name(tool_name)?;
+            bridge.tools.load().get_by_mcp_name(tool_name)?;
             Some(HandleBrennToolResult::Respond(
                 answer_post_tool_use(
                     bridge,
@@ -106,7 +107,10 @@ pub(super) async fn execute_registry_tool(
     mcp_name: &str,
     input: &serde_json::Value,
 ) -> Option<ToolOutcome> {
-    let canonical = bridge.tools.get_by_mcp_name(mcp_name)?.descriptor().name;
+    // One snapshot for the lookup and the call: a reload between the two
+    // cannot change which tool runs.
+    let tools = bridge.tools.load();
+    let canonical = tools.get_by_mcp_name(mcp_name)?.descriptor().name;
     let Some(grant) = bridge
         .app_config()
         .policy
@@ -131,8 +135,7 @@ pub(super) async fn execute_registry_tool(
         id: bridge.user_id,
         username: bridge.get_username().await,
     };
-    let result = bridge
-        .tools
+    let result = tools
         .invoke_for_llm(
             mcp_name,
             caller,

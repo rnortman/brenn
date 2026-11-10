@@ -115,7 +115,7 @@ pub struct AppState {
     /// WASM callers alike). Threaded onto each `ActiveBridge` for the LLM path.
     /// Read only on the (non-test) bridge-spawn path.
     #[cfg_attr(test, allow(dead_code))]
-    pub tools: Arc<brenn_tool_registry::ToolRegistry>,
+    pub tools: brenn_tool_registry::ToolRegistryCell,
     /// Origin string for tool-caller `ParticipantId`s (`app:<slug>@<origin>`).
     /// The messaging source when configured, else the server bind address.
     /// Read only on the (non-test) bridge-spawn path.
@@ -952,7 +952,7 @@ impl AppState {
             surface_roots: Default::default(),
             cached_models: Default::default(),
             tool_registry: Default::default(),
-            tools: Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),
+            tools: brenn_tool_registry::ToolRegistry::new(vec![]).into(),
             tool_server_origin: Arc::from("test-origin"),
             wake_locks: Default::default(),
             spawn_backoff: Default::default(),

@@ -4,7 +4,7 @@
 //! A `system:` identity attests naming authority — no config file can produce
 //! one — not what executes behind it. This module is the substrate for
 //! authoring them: [`SystemParticipantSpec`] declares a participant (its
-//! component name, policy, and static subscriptions) so bootstrap derives its
+//! component name, policy, and subscriptions) so bootstrap derives its
 //! registry entry, directory subscriber entries, deliverability validation,
 //! and delivery binding from one declaration; [`SystemInbox`] is the shared
 //! park/wake drain loop for the subscribing ones.
@@ -41,7 +41,9 @@ pub struct SystemParticipantSpec {
     pub component: &'static str,
     /// Code-built policy; no config can produce one.
     pub policy: AppPolicy,
-    /// Static subscriptions (canonical channel addresses). Empty for
+    /// Subscriptions (canonical channel addresses), as a plan derives them.
+    /// They are never torn down and only grow: the tool executor's grow at
+    /// reload, one per tool registered. Empty for
     /// publish-only participants. Non-empty ⇒ the participant is a
     /// subscriber and must be given a drain task (see [`SystemInbox`]).
     pub subscriptions: Vec<String>,
@@ -167,7 +169,7 @@ pub fn registrations_from_specs(
     map
 }
 
-/// Fold each spec's static subscriptions into the channel entries as
+/// Fold each spec's subscriptions into the channel entries as
 /// `System(component)` directory subscribers, ahead of directory
 /// finalization — so system subscriptions flow through the same
 /// deliverability validation and dispatch as every other subscriber.
@@ -378,9 +380,10 @@ impl SystemInbox {
                 self.messenger.warn_acl_denied(&entry, &subscriber);
                 continue;
             }
-            // A system participant's subscriptions are static: attached at the
-            // top of its loop and torn down by nothing, so a missing position
-            // is a wiring bug rather than a departure to tolerate.
+            // A system participant's subscriptions are never torn down and only
+            // grow, and whoever adds one creates the position before the
+            // directory entry, so a missing position is a wiring bug rather
+            // than a departure to tolerate.
             let window = self
                 .messenger
                 .store_for(&entry)
@@ -645,9 +648,10 @@ mod tests {
         batch.iter().map(|(_, env)| env.body.clone()).collect()
     }
 
-    /// A system participant's positions are static — attached at the top of its
-    /// loop and torn down by nothing — so a push-enabled read that finds none is
-    /// a wiring bug. The store reports the absence; this caller judges it fatal.
+    /// A system participant's positions are never torn down, and each is
+    /// created before the directory shows its subscription, so a push-enabled
+    /// read that finds none is a wiring bug. The store reports the absence;
+    /// this caller judges it fatal.
     ///
     /// The expected text names the *read* site specifically. The advance site
     /// carries its own panic, and no single-threaded case can reach it: once the

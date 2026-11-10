@@ -65,6 +65,7 @@ use crate::reload::surfaces::{
     SurfaceDocInputs, SurfaceDocParams, SurfaceDocs, arriving, build_surface_docs,
     system_participant_refusals,
 };
+use crate::reload::tools::{ToolsDelta, candidate_tools};
 use crate::reload::webhook::{WebhookArrivals, replay_releases, webhook_delta};
 use brenn_messaging::config_reload::{
     Outcome, ReloadStatus, STATUS_VERSION, StatusDelta, StatusMount, Trigger, now, publish_status,
@@ -98,8 +99,8 @@ impl From<TriggerSource> for Trigger {
 ///
 /// Every plan input here is a *booted* value, which is legitimate exactly
 /// because level 1 refuses any candidate that would have moved one: an app
-/// map, a tool registry and an integration registry are all projections of
-/// blocks a reload cannot converge. The roots are not among
+/// map and an integration registry are projections of blocks a reload cannot
+/// converge. The roots are not among
 /// them: they are the mounts document's answer, re-read on every reload, so a
 /// bundle installed since boot is a tree this process may read the moment the
 /// operator declared it.
@@ -131,7 +132,9 @@ pub(crate) struct ReloadEnv {
     /// The validated `XDG_RUNTIME_DIR` boot resolved. Every reload resolves
     /// against the same one.
     pub runtime_dir: PathBuf,
-    pub tool_registry: Arc<brenn_tool_registry::ToolRegistry>,
+    /// The cell every holder of the tool registry reads through. Held rather
+    /// than snapshotted, for the reason `apps` is.
+    pub tool_registry: brenn_tool_registry::ToolRegistryCell,
     /// The endpoint table every inbound webhook request is matched against.
     ///
     /// Held rather than snapshotted, for the reason the surface cell is: a
@@ -283,6 +286,9 @@ impl Baseline {
     }
 }
 
+/// A candidate document's resolved agent map.
+type CandidateApps = Arc<IndexMap<String, AppConfig>>;
+
 /// A detached copy of a directory's entries, unaffected by later edits to it.
 fn snapshot(directory: &MessagingDirectory) -> MessagingDirectory {
     MessagingDirectory::from_arcs(directory.list())
@@ -398,6 +404,15 @@ impl ReloadDriver {
         &self.registry
     }
 
+    /// Stop every running consumer and wait for each task to finish, leaving
+    /// the registry empty: what a process that is going away does with the
+    /// consumers' KV stores, each of which admits one holder.
+    pub(crate) async fn stop_consumers(&mut self) {
+        for (_, running) in self.registry.drain() {
+            running.handle.stop_and_join().await;
+        }
+    }
+
     /// The surface table, served asset roots, and attach registry.
     pub(crate) fn env(&self) -> &ReloadEnv {
         &self.env
@@ -506,12 +521,18 @@ impl ReloadDriver {
         // 2a. The candidate's agent map — must be the candidate's, not the
         //     booted one, because the plan derives static subscriptions from it
         //     and the gates read authority per call through the swapped table.
-        let candidate_apps = match self.resolve_candidate_apps(
+        //     Then the candidate's tool registry, the running one extended by
+        //     the tools the candidate newly declares, which every later step
+        //     plans, validates and renders against. Loaded once: prepare and
+        //     commit run on this one task, and nothing else stores the cell.
+        let running_tools = self.env.tool_registry.load();
+        let (candidate_apps, tools) = match self.resolve_candidate_apps(
             &candidate.config,
             &client_identities,
             &webhook_subscriptions,
+            &running_tools,
         ) {
-            Ok(apps) => apps,
+            Ok(resolved) => resolved,
             Err(refusals) => return refused(Some(sha), refusals),
         };
 
@@ -531,6 +552,7 @@ impl ReloadDriver {
             &candidate_apps,
             &client_identities,
             &replay_store_paths,
+            &tools.candidate,
         ) {
             Ok(plan) => plan,
             Err(refusals) => return refused(Some(sha), refusals),
@@ -659,7 +681,8 @@ impl ReloadDriver {
             kind_differences.into_keys().collect(),
             &AgentInputs {
                 app_diffs: &app_diffs,
-                tool_registry: &self.env.tool_registry,
+                baseline_tools: &running_tools,
+                candidate_tools: &tools.candidate,
             },
             &LiveFacts {
                 directory: self.env.messenger.directory(),
@@ -671,6 +694,7 @@ impl ReloadDriver {
         delta.webhook = webhook;
         delta.mqtt_clients = mqtt_clients;
         delta.api_keys = api_keys;
+        delta.tools = tools;
         let refusals = convergibility_refusals(
             &baseline_facts,
             &candidate_facts,
@@ -805,7 +829,7 @@ impl ReloadDriver {
             });
             let path = super::agents::staged_virtual_tools_path(app);
             let rendered =
-                brenn_server::active_bridge::render_virtual_tools(app, &self.env.tool_registry);
+                brenn_server::active_bridge::render_virtual_tools(app, &delta.tools.candidate);
             // TODO(security-host-paths-follow-agent-symlinks): std::fs::write follows a
             // symlink planted at `virtual-tools.json.next` and overwrites its target.
             // TODO(quality-virtual-tools-final-symlink-left-open-though-local-fix-exists):
@@ -889,6 +913,12 @@ impl ReloadDriver {
     /// wrong one to gate the new document with. The credential vault is checked
     /// against the candidate's roots, which a reload may move. A panic out of
     /// the resolver is classified as a refusal.
+    ///
+    /// The candidate's tool registry is built in the same pass, from
+    /// `running` and the resolved agents, and the agents' grants are validated
+    /// against it: a grant naming a tool only the candidate registers is
+    /// admitted, and a duplicate or reserved tool name is a refusal in boot's
+    /// wording.
     fn resolve_candidate_apps(
         &self,
         candidate: &brenn_lib::config::BrennConfig,
@@ -897,7 +927,8 @@ impl ReloadDriver {
             String,
             Vec<brenn_lib::webhook::config::ResolvedWebhookSubscription>,
         >,
-    ) -> Result<Arc<IndexMap<String, AppConfig>>, Vec<String>> {
+        running: &Arc<brenn_tool_registry::ToolRegistry>,
+    ) -> Result<(CandidateApps, ToolsDelta), Vec<String>> {
         let registry = &self.env.integration_registry;
         let runtime_dir = self.env.runtime_dir.as_path();
         let resolved = catch_quietly(AssertUnwindSafe(|| {
@@ -908,30 +939,39 @@ impl ReloadDriver {
                 clients,
                 webhook_subscriptions,
             );
-            self.env.tool_registry.validate_config(&apps);
+            let tools = candidate_tools(
+                running,
+                candidate,
+                &apps,
+                &self.env.provider_runtime,
+                &self.env.api_keys,
+            );
+            tools.candidate.validate_config(&apps);
             brenn_lib::config::assert_vault_disjoint_from_apps(candidate, &apps);
-            apps
+            (apps, tools)
         }))
         .map_err(|payload| vec![app_resolver_refusal(payload)])?;
-        Ok(Arc::new(resolved))
+        let (apps, tools) = resolved;
+        Ok((Arc::new(apps), tools))
     }
 
     /// Lower a candidate document with the candidate's agents, the candidate's
-    /// clients, the candidate's replay store paths and the booted plan inputs
-    /// level 1 froze.
+    /// clients, the candidate's replay store paths, the candidate's tool
+    /// registry and the booted plan inputs level 1 froze.
     fn plan_of(
         &self,
         candidate: &LoadedDocument,
         apps: &Arc<IndexMap<String, AppConfig>>,
         clients: &IndexMap<String, MqttClientIdentity>,
         replay_store_paths: &[PathBuf],
+        tools: &brenn_tool_registry::ToolRegistry,
     ) -> Result<MessagingPlan, Vec<String>> {
         let planned = catch_quietly(AssertUnwindSafe(|| {
             plan_messaging(&PlanInputs {
                 config: &candidate.config,
                 apps: Some(apps),
                 mqtt_clients: clients,
-                tool_registry: Some(&self.env.tool_registry),
+                tool_registry: Some(tools),
                 replay_store_paths,
                 device_location_users: &self.env.device_location_users,
             })
@@ -2481,6 +2521,13 @@ channel scratch at "ephemeral:scratch" {{
         /// independently timed processes rests on. The cases that watch an
         /// activation turn it on.
         pub(crate) dispatcher: bool,
+        /// Spawn the async tool executor's drain task over the rig's registry
+        /// cell, grant table and provider runtime, bound to the parked-notify
+        /// binding the rig registers for it, as `run_server` does. Off by
+        /// default for the reason `dispatcher` is; the cases whose call travels
+        /// the bus to the executor turn it on. The document must derive the
+        /// executor's spec.
+        pub(crate) executor: bool,
     }
 
     /// Boot the messaging layer on `tree`'s document and hand back a driver
@@ -2506,6 +2553,7 @@ channel scratch at "ephemeral:scratch" {{
             surface_bundle,
             mqtt_live,
             dispatcher,
+            executor,
         } = fixture;
         // The roots every load below reads are the mounts document's, exactly
         // as `run_server` derives them: a record read out of a path the reload
@@ -2550,6 +2598,7 @@ channel scratch at "ephemeral:scratch" {{
             &provider_runtime,
         ));
         tool_registry.validate_config(&apps);
+        let tool_registry_cell = brenn_tool_registry::ToolRegistryCell::new(tool_registry.clone());
         // What boot writes for every agent, so the file the reload renames onto
         // has a predecessor and a fresh boot of the same rig produces its own.
         // Without it the oracle's virtual-tools field would compare a file the
@@ -2575,6 +2624,15 @@ channel scratch at "ephemeral:scratch" {{
         let messenger = result.messenger.clone().expect("messaging must be up");
         provider_runtime.attach(messenger.clone());
         let router = result.router.clone().expect("the wake router must be up");
+        // The executor's positions on its request channels, attached whether or
+        // not its task runs, as `run_server` attaches them before anything can
+        // publish: a reload that adds a tool attaches one on the new channel,
+        // and a rig that held none on the booted ones would disagree with it.
+        brenn_messaging::system::SystemInbox::attach_for(
+            brenn_tool_registry::TOOL_EXECUTOR_COMPONENT,
+            &messenger,
+        )
+        .await;
         // The delivery bindings boot registers for everything that is not a
         // consumer. Without them the cross-check commit runs at the end of its
         // walk would fail on the reader app and the facility's own participant
@@ -2586,6 +2644,7 @@ channel scratch at "ephemeral:scratch" {{
             );
         }
         let mut reload_notify = None;
+        let mut executor_notify = None;
         for spec in &result.system_participants {
             if spec.subscriptions.is_empty() {
                 continue;
@@ -2593,6 +2652,9 @@ channel scratch at "ephemeral:scratch" {{
             let notify = Arc::new(tokio::sync::Notify::new());
             if spec.component == brenn_messaging::config_reload::CONFIG_RELOAD_COMPONENT {
                 reload_notify = Some(Arc::clone(&notify));
+            }
+            if spec.component == brenn_tool_registry::TOOL_EXECUTOR_COMPONENT {
+                executor_notify = Some(Arc::clone(&notify));
             }
             router.register_delivery_binding(
                 SubscriberEntryKind::System(spec.component.to_string()),
@@ -2665,7 +2727,7 @@ channel scratch at "ephemeral:scratch" {{
                     components_roots: &components_roots,
                     alert_dispatcher: &alert_dispatcher,
                     mqtt_service: mqtt.0.clone(),
-                    tool_registry: &tool_registry,
+                    tool_registry: &tool_registry_cell,
                     provider_runtime: &provider_runtime,
                     max_payload_bytes: document.config.messaging.max_body_bytes,
                     sync_router: Some(router.clone()),
@@ -2689,6 +2751,25 @@ channel scratch at "ephemeral:scratch" {{
                     &alert_dispatcher,
                     &provider_runtime,
                 ),
+            );
+        }
+
+        // Detached, as `run_server` detaches it: a panic in the drain loop is
+        // the test runtime's to report.
+        if executor {
+            let notify = executor_notify.expect("an executor fixture's document derives its spec");
+            drop(
+                brenn_tool_registry::ToolExecutor::new(
+                    messenger.clone(),
+                    tool_registry_cell.clone(),
+                    tool_caller_grants
+                        .clone()
+                        .expect("the grant table exists wherever the executor's spec does"),
+                    provider_runtime.clone(),
+                    alert_dispatcher.clone(),
+                    notify,
+                )
+                .spawn(),
             );
         }
 
@@ -2762,7 +2843,7 @@ channel scratch at "ephemeral:scratch" {{
                     vec![],
                 )),
                 runtime_dir,
-                tool_registry,
+                tool_registry: tool_registry_cell,
                 webhook: webhook_service.clone(),
                 surface_roots: Arc::new(std::sync::RwLock::new(Arc::new(surface_roots))),
                 surfaces: surfaces_cell,
@@ -3169,25 +3250,65 @@ new sifter: Sifter {{
         module_text: &str,
         artifact: &str,
     ) -> String {
-        let dir = root.join(PACKAGED_MODULE);
+        install_named_package(root, PACKAGED_MODULE, module_text, artifact)
+    }
+
+    /// [`install_package_from`] under the package `name`, for a document that
+    /// imports a second module beside the fenced one, written to the tree's
+    /// module root as `<name>.brenn`: each module's classes run one artifact,
+    /// so two artifacts in one document are two packages.
+    pub(crate) fn install_named_package(
+        root: &std::path::Path,
+        name: &str,
+        module_text: &str,
+        artifact: &str,
+    ) -> String {
+        let dir = root.join(name);
         std::fs::create_dir_all(&dir).expect("a package directory");
         let artifact_bytes = crate::consumers::fixture_artifact(artifact);
         let artifact_sha256 = brenn_lib::util::sha256_hex(&artifact_bytes);
         std::fs::write(dir.join("demo.wasm"), &artifact_bytes).expect("write the artifact");
-        std::fs::write(dir.join(format!("{PACKAGED_MODULE}.brenn")), module_text)
+        std::fs::write(dir.join(format!("{name}.brenn")), module_text)
             .expect("write the packaged spec");
         std::fs::write(
             dir.join("package.json"),
             format!(
-                "{{\n  \"v\": 2,\n  \"name\": \"{PACKAGED_MODULE}\",\n  \"world\": \
+                "{{\n  \"v\": 2,\n  \"name\": \"{name}\",\n  \"world\": \
                  \"brenn:processor\",\n  \"artifact\": \"demo.wasm\",\n  \
                  \"artifact_sha256\": \"{artifact_sha256}\",\n  \"spec\": \
-                 \"{PACKAGED_MODULE}.brenn\",\n  \"spec_sha256\": \"{}\"\n}}\n",
+                 \"{name}.brenn\",\n  \"spec_sha256\": \"{}\"\n}}\n",
                 brenn_lib::util::sha256_hex(module_text.as_bytes()),
             ),
         )
         .expect("write the record");
         artifact_sha256
+    }
+
+    /// Write `text` as a 0600 key file at `path`, creating its directory. A
+    /// document written before its tree takes a path outside it; otherwise
+    /// `path` is a [`Tree::secret_path`].
+    pub(crate) fn key_file(path: PathBuf, text: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().expect("a key directory")).expect("a key directory");
+        std::fs::write(&path, text).expect("write the key file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("the key file is private");
+        path
+    }
+
+    /// Rewrite the document and reload, answering the outcome.
+    pub(crate) async fn reload_onto(
+        booted: &mut Booted,
+        tree: &Tree,
+        document: &str,
+    ) -> ReloadStatus {
+        tree.write(document);
+        booted.driver.reload(TriggerSource::Signal).await;
+        booted.last_status().await
+    }
+
+    pub(crate) fn assert_applied(status: &ReloadStatus) {
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
     }
 
     /// The staged module's bytes — the file the instance's class was declared
@@ -3946,9 +4067,6 @@ new sifter: Demo {{
     /// session is taken out afterwards, so it is never entered on the way out
     /// either. A single step on the wrong side of the swap enters it for the
     /// width of everything between.
-    // TODO(reload-probe-fix-misdescribed-in-commit-message): the commit that
-    // made this probe read the authority on both sides of the registry read
-    // describes its change to this file as a method-set adjustment.
     async fn authority_probe(booted: &Booted, client: &'static str) -> Probe {
         let apps = booted.messenger.app_table();
         let service = booted.mqtt.0.clone();
@@ -7495,7 +7613,7 @@ new sifter: Sifter {{
         let staged = super::super::agents::staged_virtual_tools_path(&before[READER]);
         let booted_rendering = brenn_server::active_bridge::render_virtual_tools(
             &before[READER],
-            booted.driver.env().tool_registry.as_ref(),
+            &booted.driver.env().tool_registry.load(),
         );
         std::fs::write(&path, &booted_rendering).expect("the rig writes the live file");
 

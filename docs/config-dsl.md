@@ -695,9 +695,10 @@ A key provider needs no `server.vault_dir`. That key stays required exactly
 when an `oauth_provider` is declared. Changing a key provider converges on
 reload — adding, removing, rebinding or re-pathing an account, and a key file
 replaced in place, are all picked up by the next reload (see
-[What reload converges](#what-reload-converges)). The one exception: the
-deployment's first provider of either kind, and its last, need a restart,
-because `api-request` is registered only when one exists.
+[What reload converges](#what-reload-converges)). So does the deployment's
+first key provider: the reload that adds it registers `api-request`. The one
+exception is the last provider of either kind, whose removal needs a restart,
+because `api-request` cannot be unregistered while the process runs.
 
 #### Per-user accounts
 
@@ -2516,21 +2517,31 @@ refusal on its own — nothing about the deployment document is read. The outcom
 body's `mounts` array names what the process is reading: the candidate's on
 `applied` and `unchanged`, the running one's on `refused`.
 
-Provided tools need a restart too: the tool registry is fixed for the life of
-the process. A reload that adds, removes or changes a `provide` statement, or
-adds or removes an instance whose class provides one, is refused naming the
-instance (`wasm_consumers[search].provides differs`); any other change to a
-providing instance — its bindings, its own `tool` statements — converges as for
-any instance.
+**Provided tools can be added, not changed or removed.** A reload that adds an
+instance whose class provides tools, or that gives an instance providing
+nothing a class that provides, registers its tools: they are callable by
+agents granted them in the same document and by components, and each added
+tool's request channel, `brenn:tools/<name>`, is listed in the outcome body's
+`channels_added`. The deployment's first `api_key_provider` registers
+`api-request` the same way. Tools already registered are carried across
+unchanged — a call in flight finishes, and every tool keeps its concurrency
+bound and its callers' rate buckets. What still needs a restart: a providing
+instance's `provide` set changing (a tool added, dropped or re-declared, as a
+component upgrade with a different tool set does), refused as
+`wasm_consumers[search].provides differs`; a providing instance removed
+(`wasm_consumers[search].provides removed`); the last `api_key_provider` or
+`oauth_provider` removed; and the first asynchronous tool of a process that
+started with none, which runs no tool executor. Any other change to a
+providing instance — its bindings, its own `tool` statements — converges as
+for any instance.
 
 Everything else needs a restart, and says so. Remotes,
-PWA push, tool declarations, Claude profiles, and the
+PWA push, Claude profiles, and the
 `server` / `database` / `logging` / `messaging` / `observability` /
 `surface_description` sections are all compared whole: any difference is a
 refusal naming the section, and for a block array the key that differs
-(`remotes[laptop]`). So is the first `api_key_provider` or `oauth_provider`
-in a document that had neither at boot, and the last — `api-request` is
-registered only while one exists. The surface *kernel* is in that group
+(`remotes[laptop]`). So is any `oauth_provider` added, removed or changed.
+The surface *kernel* is in that group
 too: every page loads it, and a reload reloads only the pages of surfaces that
 moved, so a mount offering a different kernel than the one being served is a
 refusal.
@@ -2538,7 +2549,8 @@ refusal.
 Three further refusals come from the wiring rather than from a section:
 
 - A channel that is added, removed or retuned may carry no subscriber other than
-  the consumers and surfaces the same reload is moving. An agent, a remote or a
+  the consumers and surfaces the same reload is moving, and the tool executor on
+  the request channel of a tool the same reload adds. An agent, a remote or a
   live attached session on such a channel is a refusal naming it — those belong
   to entities that do not converge, and re-wiring them to a re-created channel
   would need their own convergence. An agent on a channel

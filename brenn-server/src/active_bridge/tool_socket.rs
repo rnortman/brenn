@@ -350,20 +350,23 @@ async fn answer(shared: &Shared, line: &[u8]) -> Response {
     };
     match request {
         Request::List => {
-            let entries: Vec<CatalogEntry> = virtual_tools(&bridge.app_config(), &bridge.tools)
-                .into_iter()
-                .map(|def| catalog_entry(def, false))
-                .collect();
+            let entries: Vec<CatalogEntry> =
+                virtual_tools(&bridge.app_config(), &bridge.tools.load())
+                    .into_iter()
+                    .map(|def| catalog_entry(def, false))
+                    .collect();
             Response::Ok(serde_json::to_value(entries).expect("catalog entries serialize"))
         }
-        Request::Describe { tool } => find_virtual_tool(&bridge.app_config(), &bridge.tools, &tool)
-            .map(|def| {
-                Response::Ok(
-                    serde_json::to_value(catalog_entry(def, true))
-                        .expect("a catalog entry serializes"),
-                )
-            })
-            .unwrap_or_else(|| Response::Err(ExecuteError::UnknownTool.to_wire(&tool))),
+        Request::Describe { tool } => {
+            find_virtual_tool(&bridge.app_config(), &bridge.tools.load(), &tool)
+                .map(|def| {
+                    Response::Ok(
+                        serde_json::to_value(catalog_entry(def, true))
+                            .expect("a catalog entry serializes"),
+                    )
+                })
+                .unwrap_or_else(|| Response::Err(ExecuteError::UnknownTool.to_wire(&tool)))
+        }
         Request::Call { tool, input } => {
             let started = Instant::now();
             let response = match execute_tool(&bridge, CallOrigin::Socket, &tool, input).await {
@@ -525,7 +528,7 @@ mod tests {
             panic!("list failed");
         };
         let entries: Vec<CatalogEntry> = serde_json::from_value(list).unwrap();
-        let expected = virtual_tools(&bridge.app_config(), &bridge.tools);
+        let expected = virtual_tools(&bridge.app_config(), &bridge.tools.load());
         assert_eq!(entries.len(), expected.len());
         let by_name = |n: &str| entries.iter().find(|e| e.name == n).unwrap().clone();
         let display = by_name("DisplayFile");

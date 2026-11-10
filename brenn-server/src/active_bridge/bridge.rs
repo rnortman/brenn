@@ -97,7 +97,7 @@ pub struct ActiveBridge {
     pub(super) tool_registry: Arc<HashMap<String, Arc<dyn AppTool>>>,
     /// First-class tool registry (grant-governed tools). The `registry_adapter`
     /// intercept routes CC's `mcp__brenn__*` calls that resolve here through it.
-    pub(super) tools: Arc<brenn_tool_registry::ToolRegistry>,
+    pub(super) tools: brenn_tool_registry::ToolRegistryCell,
     /// The agent registry, shared with every other gate. Authority is read
     /// through it per call — tool grants, `allowed_users`, the send budget —
     /// so a reload's swap reaches a session that is already running.
@@ -366,7 +366,7 @@ pub struct SpawnContext<'a> {
     pub model_override: Option<&'a str>,
     pub tool_registry: Arc<HashMap<String, Arc<dyn AppTool>>>,
     /// First-class tool registry, for the LLM tool-call adapter.
-    pub tools: Arc<brenn_tool_registry::ToolRegistry>,
+    pub tools: brenn_tool_registry::ToolRegistryCell,
     /// Origin string for this app's tool-caller `ParticipantId`.
     pub server_origin: Arc<str>,
     pub server_shutting_down: Arc<AtomicBool>,

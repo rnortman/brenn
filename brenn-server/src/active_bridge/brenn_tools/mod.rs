@@ -288,8 +288,10 @@ mod tests {
     async fn admission_covers_every_catalog_tool() {
         let dir = tempfile::tempdir().unwrap();
         let bridge = execute::tests::full_catalog_bridge(dir.path(), None).await;
-        let catalog =
-            super::super::cc_spawn_config::virtual_tools(&bridge.app_config(), &bridge.tools);
+        let catalog = super::super::cc_spawn_config::virtual_tools(
+            &bridge.app_config(),
+            &bridge.tools.load(),
+        );
         assert!(catalog.len() > 25, "fixture should offer the whole catalog");
         for def in &catalog {
             let tool_use_id = format!("tu_{}", def.name);

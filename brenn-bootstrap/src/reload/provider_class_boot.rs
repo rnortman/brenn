@@ -79,7 +79,7 @@ pub(super) async fn assert_provider_class_boots(
     )
     .await;
 
-    let registry = booted.driver.env().tool_registry.clone();
+    let registry = booted.driver.env().tool_registry.load();
     for (name, mcp_name) in class.tools {
         assert!(registry.is_provided(name), "{name}");
         let descriptor = registry

@@ -1,8 +1,8 @@
 //! `api_key_provider` changes against a running process: every key file is
 //! re-read at reload, the resolved table is compared against the one
 //! `api-request` reads, and commit installs the candidate's table whole. The
-//! first and the last provider are the exceptions, refused because the tool
-//! is registered only while one exists.
+//! first provider registers `api-request`; the last is refused, because the
+//! tool cannot be unregistered.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -12,19 +12,12 @@ use brenn_messaging::config_reload::{Outcome, ReloadStatus};
 
 use super::driver::TriggerSource;
 use super::driver::tests::{
-    BootFixture, Booted, Tree, boot_with, document, install_package, seat_user, staged_module,
+    BootFixture, Booted, Tree, assert_applied, async_pull_tool, boot_with, document,
+    install_package, key_file, seat_user, staged_module,
 };
 
 /// The user every case registers before boot.
 const ALICE: &str = "alice";
-
-/// Write `text` as the key file `name` under the tree's secrets, at 0600.
-fn key(tree: &Tree, name: &str, text: &str) -> PathBuf {
-    let path = tree.secret(name, text);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .expect("the key file is private");
-    path
-}
 
 /// One `account` block: name, user, key file, default.
 struct Account<'a>(&'a str, &'a str, &'a PathBuf, bool);
@@ -106,10 +99,6 @@ async fn reload(booted: &mut Booted) -> ReloadStatus {
     booted.last_status().await
 }
 
-fn assert_applied(status: &ReloadStatus) {
-    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
-}
-
 /// The key the running table sends for `user` on `provider` when the call
 /// names `account`, or `None` when the table resolves none.
 fn sent(booted: &Booted, provider: &str, user: &str, account: Option<&str>) -> Option<String> {
@@ -129,9 +118,9 @@ fn sent(booted: &Booted, provider: &str, user: &str, account: Option<&str>) -> O
 #[tokio::test(flavor = "multi_thread")]
 async fn account_edits_converge() {
     let tree = Tree::new();
-    let home = key(&tree, "alice-home", "k3y-home");
-    let work = key(&tree, "alice-work", "k3y-work");
-    let other = key(&tree, "alice-other", "k3y-other");
+    let home = key_file(tree.secret_path("alice-home"), "k3y-home");
+    let work = key_file(tree.secret_path("alice-work"), "k3y-work");
+    let other = key_file(tree.secret_path("alice-other"), "k3y-other");
     let doc = |accounts: &[Account<'_>]| document(&per_user("mail", accounts));
     tree.write(&doc(&[Account("home", ALICE, &home, false)]));
     let mut booted = boot_registered(&tree, &[ALICE]).await;
@@ -187,14 +176,14 @@ async fn account_edits_converge() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_rotated_in_place_is_applied_without_a_document_edit() {
     let tree = Tree::new();
-    let path = key(&tree, "alice", "k3y-one");
+    let path = key_file(tree.secret_path("alice"), "k3y-one");
     tree.write(&document(&per_user(
         "mail",
         &[Account("alice", ALICE, &path, false)],
     )));
     let mut booted = boot_registered(&tree, &[ALICE]).await;
 
-    key(&tree, "alice", "k3y-two");
+    key_file(tree.secret_path("alice"), "k3y-two");
     let status = reload(&mut booted).await;
     assert_applied(&status);
     assert_eq!(status.delta.api_key_providers_changed, vec!["mail"]);
@@ -214,8 +203,8 @@ async fn a_key_rotated_in_place_is_applied_without_a_document_edit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_beside_another_is_added_and_removed() {
     let tree = Tree::new();
-    let maps = key(&tree, "maps", "k3y-maps");
-    let alice = key(&tree, "alice", "k3y-alice");
+    let maps = key_file(tree.secret_path("maps"), "k3y-maps");
+    let alice = key_file(tree.secret_path("alice"), "k3y-alice");
     let mail = per_user("mail", &[Account("alice", ALICE, &alice, false)]);
     tree.write(&document(&deployment("maps", &maps)));
     let mut booted = boot_registered(&tree, &[ALICE]).await;
@@ -240,12 +229,64 @@ async fn a_provider_beside_another_is_added_and_removed() {
     );
 }
 
-/// With no provider of either kind at boot, the first is refused in the
-/// restart grammar and the table stays empty.
+/// With no provider of either kind at boot, the first registers `api-request`
+/// and installs its key; the tool's request channel is reported added.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_first_provider_is_refused() {
+async fn the_first_provider_registers_api_request() {
     let tree = Tree::new();
-    let maps = key(&tree, "maps", "k3y-maps");
+    let maps = key_file(tree.secret_path("maps"), "k3y-maps");
+    tree.write(&document(""));
+    let mut booted = boot_with(
+        &tree,
+        BootFixture {
+            native_tools: vec![async_pull_tool()],
+            ..BootFixture::default()
+        },
+    )
+    .await;
+    assert!(
+        booted
+            .driver
+            .env()
+            .tool_registry
+            .load()
+            .get("api-request")
+            .is_none()
+    );
+    tree.write(&document(&deployment("maps", &maps)));
+    let status = reload(&mut booted).await;
+    assert_applied(&status);
+    assert_eq!(status.delta.api_key_providers_added, vec!["maps"]);
+    assert!(
+        status
+            .delta
+            .channels_added
+            .contains(&"brenn:tools/api-request".to_string()),
+        "{:?}",
+        status.delta.channels_added,
+    );
+    assert!(
+        booted
+            .driver
+            .env()
+            .tool_registry
+            .load()
+            .get("api-request")
+            .is_some()
+    );
+    assert_eq!(
+        sent(&booted, "maps", ALICE, None).as_deref(),
+        Some("k3y-maps")
+    );
+}
+
+/// A process that started with no asynchronous tool runs no tool executor, so
+/// a first provider, which would register its first, is refused naming a
+/// restart and the table stays empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_provider_of_a_process_with_no_async_tool_is_refused() {
+    let tree = Tree::new();
+    let maps = key_file(tree.secret_path("maps"), "k3y-maps");
     tree.write(&document(""));
     let mut booted = boot_registered(&tree, &[]).await;
     tree.write(&document(&deployment("maps", &maps)));
@@ -254,11 +295,20 @@ async fn the_first_provider_is_refused() {
     assert_eq!(
         status.refusals,
         vec![
-            "api_key_providers[maps] added: the first provider needs a restart: this change \
-             needs a restart"
+            "this process started with no asynchronous tool and runs no tool executor, so the \
+             first one needs a restart: this change needs a restart"
         ],
     );
     assert!(booted.api_keys.load().is_empty());
+    assert!(
+        booted
+            .driver
+            .env()
+            .tool_registry
+            .load()
+            .get("api-request")
+            .is_none()
+    );
 }
 
 /// With one provider at boot and no `oauth_provider`, removing it is refused
@@ -266,7 +316,7 @@ async fn the_first_provider_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_last_provider_is_refused() {
     let tree = Tree::new();
-    let maps = key(&tree, "maps", "k3y-maps");
+    let maps = key_file(tree.secret_path("maps"), "k3y-maps");
     tree.write(&document(&deployment("maps", &maps)));
     let mut booted = boot_registered(&tree, &[]).await;
     tree.write(&document(""));
@@ -291,8 +341,8 @@ async fn the_last_provider_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_account_for_an_unregistered_user_applies_once_the_user_registers() {
     let tree = Tree::new();
-    let alice = key(&tree, "alice", "k3y-alice");
-    let bob = key(&tree, "bob", "k3y-bob");
+    let alice = key_file(tree.secret_path("alice"), "k3y-alice");
+    let bob = key_file(tree.secret_path("bob"), "k3y-bob");
     tree.write(&document(&per_user(
         "mail",
         &[Account("alice", ALICE, &alice, false)],
@@ -337,8 +387,8 @@ async fn an_account_for_an_unregistered_user_applies_once_the_user_registers() {
 async fn a_clause_naming_an_account_the_candidate_lacks_is_refused() {
     let tree = Tree::new();
     let home_dir = tempfile::tempdir().expect("a container home");
-    let home = key(&tree, "alice-home", "k3y-home");
-    let work = key(&tree, "alice-work", "k3y-work");
+    let home = key_file(tree.secret_path("alice-home"), "k3y-home");
+    let work = key_file(tree.secret_path("alice-work"), "k3y-work");
     let both = per_user(
         "mail",
         &[
@@ -409,8 +459,8 @@ new sifter: Demo {{
 async fn a_consumer_clause_naming_an_account_the_candidate_lacks_is_refused() {
     let components = tempfile::tempdir().expect("a components root");
     let tree = Tree::new();
-    let home = key(&tree, "alice-home", "k3y-home");
-    let work = key(&tree, "alice-work", "k3y-work");
+    let home = key_file(tree.secret_path("alice-home"), "k3y-home");
+    let work = key_file(tree.secret_path("alice-work"), "k3y-work");
     let both = per_user(
         "mail",
         &[
@@ -464,7 +514,7 @@ async fn a_consumer_clause_naming_an_account_the_candidate_lacks_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreadable_key_file_refuses_and_leaves_the_table() {
     let tree = Tree::new();
-    let path = key(&tree, "alice", "k3y-alice");
+    let path = key_file(tree.secret_path("alice"), "k3y-alice");
     tree.write(&document(&per_user(
         "mail",
         &[Account("alice", ALICE, &path, false)],

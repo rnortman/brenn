@@ -64,7 +64,9 @@ impl<'a> PlannedSubscribers<'a> {
     ///
     /// An agent is not an arriving principal: it keeps every subscription this
     /// reload did not move, so only the entries level 2 put on its `subs_added`
-    /// side are folded, and the rest are left exactly where they are.
+    /// side are folded, and the rest are left exactly where they are. The tool
+    /// executor is folded onto the request channels the reload adds, the same
+    /// way.
     pub(crate) fn fold_onto(
         &self,
         live: &MessagingDirectory,

@@ -112,6 +112,9 @@ rust_test(
         # The provided-tool boot-path case installs the provider fixture as a
         # providing class's package.
         "//brenn-wasm:fixture_processor_provider_test",
+        # The provided-tool reload cases call an added tool from a component,
+        # through the executor, with the async-call fixture.
+        "//brenn-wasm:fixture_processor_tool_test",
         "//brenn-wasm:fixture_replay",
         # The bumped-replay-package case installs a second replay artifact
         # under one package name, which is what makes the release comparison

@@ -95,9 +95,12 @@ pub(crate) struct AgentClosure<'a> {
 /// the agent delta.
 pub(crate) struct AgentInputs<'a> {
     pub app_diffs: &'a BTreeMap<String, AppFieldDiff>,
-    /// The registry the virtual-tools file is rendered against — the same one
-    /// boot renders with, since the tool set is a process constant.
-    pub tool_registry: &'a brenn_tool_registry::ToolRegistry,
+    /// The registry the running agent's virtual-tools file was rendered
+    /// against: the one the process is reading now.
+    pub baseline_tools: &'a brenn_tool_registry::ToolRegistry,
+    /// The registry the candidate's file is rendered against: the running one,
+    /// extended by whatever tools this reload registers.
+    pub candidate_tools: &'a brenn_tool_registry::ToolRegistry,
 }
 
 /// Classify every agent the two maps hold.
@@ -132,8 +135,11 @@ pub(crate) fn agent_delta(
         // withdraws a tool renders differently; a matcher-only ACL change does
         // not, and retires nothing.
         let virtual_tools_staged =
-            brenn_server::active_bridge::render_virtual_tools(old_app, inputs.tool_registry)
-                != brenn_server::active_bridge::render_virtual_tools(new_app, inputs.tool_registry);
+            brenn_server::active_bridge::render_virtual_tools(old_app, inputs.baseline_tools)
+                != brenn_server::active_bridge::render_virtual_tools(
+                    new_app,
+                    inputs.candidate_tools,
+                );
         let spawn_changed = inputs
             .app_diffs
             .get(slug)
@@ -388,7 +394,8 @@ mod tests {
             },
             &AgentInputs {
                 app_diffs: &app_diffs,
-                tool_registry: &registry,
+                baseline_tools: &registry,
+                candidate_tools: &registry,
             },
             &LiveFacts {
                 directory: &brenn_lib::messaging::MessagingDirectory::with_entries(Vec::new()),

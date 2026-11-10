@@ -170,7 +170,7 @@ async fn consumer_harness(
         grant(grant_repos.iter().map(|r| clause(&[("repo", r)])).collect()),
     );
     let tool_host: brenn_wasm::ToolHostFn = Arc::new(WasmToolHost::new(
-        Arc::clone(&registry),
+        Arc::clone(&registry).into(),
         tool_grants.clone(),
         slug.to_string(),
         alert_dispatcher.clone(),
@@ -370,7 +370,7 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
     let (exec_alert, _h) = noop_alert_dispatcher();
     let executor = ToolExecutor::new(
         Arc::clone(&harness.messenger),
-        registry,
+        registry.into(),
         caller_grants,
         brenn_tool_registry::ProviderRuntime::new(exec_alert.clone()),
         exec_alert,

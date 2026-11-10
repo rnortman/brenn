@@ -31,12 +31,22 @@ pub fn registered(oauth: Option<&Arc<OAuthService>>, keys: ApiKeyTable) -> Vec<R
             disconnect::OAuthDisconnectTool::new(service.clone()),
         )));
     }
-    if oauth.is_some() || !keys.load().is_empty() {
-        tools.push(RegisteredTool::Async(Arc::new(
-            api_request::ApiRequestTool::new(oauth.cloned(), keys),
-        )));
+    if api_request_registered(oauth.is_some(), !keys.load().is_empty()) {
+        tools.push(api_request(oauth.cloned(), keys));
     }
     tools
+}
+
+/// Whether a process registers `api-request`: when it runs an OAuth service or
+/// holds at least one key provider.
+pub fn api_request_registered(has_oauth: bool, has_key_providers: bool) -> bool {
+    has_oauth || has_key_providers
+}
+
+/// The `api-request` tool over `oauth` and the key table `keys`, which it reads
+/// per call.
+pub fn api_request(oauth: Option<Arc<OAuthService>>, keys: ApiKeyTable) -> RegisteredTool {
+    RegisteredTool::Async(Arc::new(api_request::ApiRequestTool::new(oauth, keys)))
 }
 
 /// Whether `acl` admits `provider`, for a tool whose only ACL key is

@@ -343,6 +343,24 @@ impl Drop for PendingGuard {
     }
 }
 
+/// The process-wide string interner behind provided tools' descriptors.
+static INTERNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// `s` as a `&'static str`, leaked the first time the process sees it and
+/// reused every time after.
+fn intern(s: &str) -> &'static str {
+    let mut set = INTERNED
+        .lock()
+        .expect("BUG: provided-tool interner poisoned");
+    if let Some(&held) = set.get(s) {
+        return held;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    set.insert(leaked);
+    leaked
+}
+
 /// A tool a WASM instance provides, registered beside the native tools.
 pub struct ProvidedTool {
     descriptor: ToolDescriptor,
@@ -353,16 +371,16 @@ pub struct ProvidedTool {
 impl ProvidedTool {
     /// The tool `decl` declares, provided by the consumer `instance`.
     ///
-    /// The descriptor's strings are leaked: the registry is built once per
-    /// process and a provided tool changes only across a restart, so they live
-    /// exactly as long as the registry that holds them.
+    /// The descriptor's strings are interned for the process's life: a reload
+    /// may build a provided tool on every attempt, refused ones included, so
+    /// each distinct string is leaked once and every later build of an equal
+    /// declaration reuses it.
     pub fn new(instance: &str, decl: &ProvidedToolDecl, runtime: Arc<ProviderRuntime>) -> Self {
-        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
         Self {
             descriptor: ToolDescriptor {
-                name: leak(decl.name.clone()),
-                mcp_name: leak(format!("{MCP_BRENN_PREFIX}{}", decl.mcp_name)),
-                description: leak(decl.description.clone()),
+                name: intern(&decl.name),
+                mcp_name: intern(&format!("{MCP_BRENN_PREFIX}{}", decl.mcp_name)),
+                description: intern(&decl.description),
                 input_schema: decl.input_schema.clone(),
                 class: ToolClass::Async {
                     max_concurrency: usize::try_from(decl.max_concurrency)
@@ -1000,5 +1018,20 @@ pub(crate) mod tests {
         let messenger = messenger().await;
         rt.attach(messenger.clone());
         rt.attach(messenger);
+    }
+
+    /// Two builds of equal declarations share their descriptor strings: a
+    /// rebuilt tool leaks nothing new.
+    #[tokio::test]
+    async fn equal_declarations_share_interned_strings() {
+        let (alert, _drain) = noop_alert_dispatcher();
+        let runtime = ProviderRuntime::new(alert);
+        let a = ProvidedTool::new(PROVIDER, &decl(1), runtime.clone());
+        let b = ProvidedTool::new("other", &decl(2), runtime);
+        let (a, b) = (a.descriptor(), b.descriptor());
+        assert!(std::ptr::eq(a.name, b.name));
+        assert!(std::ptr::eq(a.mcp_name, b.mcp_name));
+        assert!(std::ptr::eq(a.description, b.description));
+        assert_eq!(a.mcp_name, "mcp__brenn__EchoForUser");
     }
 }

@@ -17,8 +17,20 @@ All notable changes to Brenn are documented here.
     malformed key file, an account naming an unregistered user, or a
     permission clause that no account matches refuses the reload with the
     same message startup would give.
-  - Adding the deployment's first API-key provider, or removing its last,
-    still needs a restart.
+  - Removing the deployment's last API-key or OAuth provider still needs a
+    restart.
+- **Adding a tool provider now takes effect on reload.** A reload that adds a
+  `wasm_consumer` whose class provides tools, or gives an existing instance
+  that provided nothing a class that does, registers its tools: agents
+  granted them in the same document and other components can call them
+  straight away, and each added tool's `brenn:tools/<name>` channel is listed
+  in `channels_added`. A deployment's first `api_key_provider` registers
+  `api-request` the same way. Tools already registered keep their
+  concurrency bounds, rate limits and in-flight calls across the reload.
+  Still needing a restart: changing a providing instance's set of tools (as
+  upgrading a component to a version with different tools does), removing a
+  providing instance, removing the last provider, and adding the first
+  asynchronous tool to a process that started with none.
 - `api-request` accepts `PROPFIND` and `REPORT`, so a provider's CalDAV or
   WebDAV endpoint can be read. A grant clause that names no `method`, or
   `method = "*"`, now admits them. A caller with no acting user is still

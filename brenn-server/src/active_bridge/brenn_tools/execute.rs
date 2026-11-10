@@ -105,7 +105,7 @@ pub(crate) fn admit_tool_call(
     short_name: &str,
     input: &serde_json::Value,
 ) -> Result<(), ExecuteError> {
-    let def = find_virtual_tool(&bridge.app_config(), &bridge.tools, short_name)
+    let def = find_virtual_tool(&bridge.app_config(), &bridge.tools.load(), short_name)
         .ok_or(ExecuteError::UnknownTool)?;
     if origin == CallOrigin::Socket && def.cli != CliAccess::Available {
         return Err(ExecuteError::NotAvailable(def.cli));
@@ -165,7 +165,7 @@ pub(crate) async fn execute_admitted(
     if let Some(outcome) = dispatch(bridge, short_name, input).await {
         return outcome;
     }
-    match find_virtual_tool(&bridge.app_config(), &bridge.tools, short_name) {
+    match find_virtual_tool(&bridge.app_config(), &bridge.tools.load(), short_name) {
         Some(def) => panic!(
             "BUG: tool {short_name} is in the catalog as `cli = {}` but no family executes it",
             def.cli
@@ -273,7 +273,7 @@ pub(super) mod tests {
     async fn available_tools_are_exactly_the_command_list() {
         let dir = tempfile::tempdir().unwrap();
         let bridge = full_catalog_bridge(dir.path(), None).await;
-        let catalog = virtual_tools(&bridge.app_config(), &bridge.tools);
+        let catalog = virtual_tools(&bridge.app_config(), &bridge.tools.load());
         let mut available: Vec<&str> = catalog
             .iter()
             .filter(|d| d.cli == CliAccess::Available)
@@ -552,7 +552,7 @@ pub(super) mod tests {
         assert!(bridge.messenger().is_none());
         assert!(bridge.automation_engine().is_none());
         assert!(bridge.pwa_push_service().is_none());
-        let catalog = virtual_tools(&bridge.app_config(), &bridge.tools);
+        let catalog = virtual_tools(&bridge.app_config(), &bridge.tools.load());
         let mut probed = 0;
         for def in catalog.iter().filter(|d| d.cli == CliAccess::Available) {
             assert!(
@@ -571,7 +571,7 @@ pub(super) mod tests {
     async fn non_commands_are_not_on_the_dispatch_table() {
         let dir = tempfile::tempdir().unwrap();
         let bridge = full_catalog_bridge(dir.path(), None).await;
-        let catalog = virtual_tools(&bridge.app_config(), &bridge.tools);
+        let catalog = virtual_tools(&bridge.app_config(), &bridge.tools.load());
         for def in catalog.iter().filter(|d| d.cli != CliAccess::Available) {
             assert!(
                 dispatch(&bridge, &def.name, &json!({})).await.is_none(),

@@ -364,7 +364,7 @@ async fn build_pipeline() -> Pipeline {
         grant(vec![clause(&[("repo", SLUG)])]),
     );
     let tool_host: brenn_wasm::ToolHostFn = Arc::new(WasmToolHost::new(
-        Arc::clone(&registry),
+        Arc::clone(&registry).into(),
         tool_grants.clone(),
         CONSUMER_SLUG.to_string(),
         consumer_alert.clone(),
@@ -438,7 +438,7 @@ async fn build_pipeline() -> Pipeline {
     let (exec_alert, _exec_alert_handle) = noop_alert_dispatcher();
     let executor = ToolExecutor::new(
         Arc::clone(&messenger),
-        Arc::clone(&registry),
+        Arc::clone(&registry).into(),
         caller_grants,
         brenn_tool_registry::ProviderRuntime::new(exec_alert.clone()),
         exec_alert,

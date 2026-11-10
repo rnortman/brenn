@@ -54,6 +54,7 @@ pub(crate) mod mqtt;
 pub(crate) mod status;
 pub(crate) mod subscribers;
 pub(crate) mod surfaces;
+pub(crate) mod tools;
 pub(crate) mod webhook;
 
 /// The correctness rule above, checked against a running process, and the

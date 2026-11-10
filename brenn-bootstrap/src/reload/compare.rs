@@ -29,10 +29,10 @@
 //!   next idle moment so their successors are spawned from the new map.
 //!
 //! Three parts of convergible blocks are not. The tools a consumer provides join
-//! the tool registry, which is built once per process, so a change to them is
-//! refused per consumer. The same registry holds `api-request` only while some
-//! provider exists, so the first key provider in a document that had no
-//! provider of either kind, and the removal of the last, are refused. The
+//! the tool registry, which a reload extends and never shrinks, so a providing
+//! consumer that leaves or whose tools change is refused per consumer. The same
+//! registry holds `api-request` once some provider exists, so the removal of
+//! the last provider of either kind is refused. The
 //! `channels` blocks that tune the `brenn:device-location.` family size
 //! channels that registration mints from the process's boot-time tuning
 //! table, so a change to one is refused.
@@ -204,14 +204,14 @@ pub(crate) fn non_convergible_differences(
         &mut out,
     );
     // Key providers converge: every key is read off the host at every reload
-    // and `api-request` reads the table per call. The one thing that cannot
-    // move is whether `api-request` is registered at all — it is, iff some
-    // provider of either kind existed at boot — and the registry is fixed for
-    // the life of the process. `oauth_providers` is frozen above, so "no
-    // provider of either kind" is the same question on both sides of this arm.
-    // TODO(reload-provided-tools): the first and the last provider need a
-    // restart until the registry can take a tool in and out.
-    api_key_registration(
+    // and `api-request` reads the table per call. `api-request` is registered
+    // by the reload that adds the first provider of either kind and cannot be
+    // unregistered, so the removal of the last is refused. `oauth_providers` is
+    // frozen above, so "no provider of either kind" is the same question on
+    // both sides of this arm.
+    // TODO(reload-provided-tools): the last provider's removal needs a restart
+    // until the registry can unregister a native tool.
+    last_provider_removed(
         oauth_providers,
         api_key_providers,
         b_api_key_providers,
@@ -652,13 +652,14 @@ fn compare_app(
 /// The tools each consumer provides, the one part of a convergible block that
 /// is not.
 ///
-/// The tool registry is built once per process, so a provided tool cannot
-/// appear, vanish or change shape without a restart. Every other change to a
-/// providing consumer converges; removing the consumer removes its tools and is
-/// refused with them. Consumers that provide nothing are absent from both maps,
-/// so adding or removing one is not this pass's business.
-// TODO(reload-provided-tools): a consumer's `provides` converges once the
-// registry can take a tool in and out.
+/// A provided tool can appear at reload and cannot vanish or change shape: the
+/// registry is extended, never shrunk. A slug that provides in the candidate
+/// and not in the baseline converges — every tool it brings is new. A providing
+/// slug that leaves, or whose `provides` differs, is refused. Every other
+/// change to a providing consumer converges. Consumers that provide nothing
+/// are absent from both maps.
+// TODO(reload-provided-tools): a providing consumer's removal and a changed
+// `provides` need a restart until the registry can retire a tool.
 fn provided_tools(a: &[WasmConsumerConfigRaw], b: &[WasmConsumerConfigRaw], out: &mut Vec<String>) {
     fn providing(consumers: &[WasmConsumerConfigRaw]) -> BTreeMap<&str, &Vec<ProvidedToolDecl>> {
         consumers
@@ -667,19 +668,25 @@ fn provided_tools(a: &[WasmConsumerConfigRaw], b: &[WasmConsumerConfigRaw], out:
             .map(|consumer| (consumer.slug.as_str(), &consumer.provides))
             .collect()
     }
-    keyed_refusals(
-        |slug| format!("wasm_consumers[{slug}].provides"),
-        &providing(a),
-        &providing(b),
-        out,
-    );
+    let b = providing(b);
+    for (slug, provides) in providing(a) {
+        match b.get(slug) {
+            None => out.push(format!(
+                "wasm_consumers[{slug}].provides removed: {NEEDS_RESTART}"
+            )),
+            Some(other) if provides != *other => out.push(format!(
+                "wasm_consumers[{slug}].provides differs: {NEEDS_RESTART}"
+            )),
+            Some(_) => {}
+        }
+    }
 }
 
-/// The two key-provider changes that would move whether `api-request` is
-/// registered: a first provider in a document that had none of either kind,
-/// and the removal of the last. Each is refused per provider, in name order.
-/// Every other `api_key_providers` difference converges.
-fn api_key_registration(
+/// The key-provider change that would unregister `api-request`: the removal
+/// of the last provider of either kind, refused per provider in name order.
+/// Every other `api_key_providers` difference converges, the first provider
+/// included.
+fn last_provider_removed(
     oauth_providers: &BTreeMap<String, OAuthProviderRaw>,
     a: &BTreeMap<String, ApiKeyProviderRaw>,
     b: &BTreeMap<String, ApiKeyProviderRaw>,
@@ -688,14 +695,7 @@ fn api_key_registration(
     if !oauth_providers.is_empty() {
         return;
     }
-    if a.is_empty() {
-        for name in b.keys() {
-            out.push(format!(
-                "api_key_providers[{name}] added: the first provider needs a restart: \
-                 {NEEDS_RESTART}"
-            ));
-        }
-    } else if b.is_empty() {
+    if !a.is_empty() && b.is_empty() {
         for name in a.keys() {
             out.push(format!(
                 "api_key_providers[{name}] removed: the last provider needs a restart: \
@@ -819,16 +819,21 @@ mod tests {
         config
     }
 
+    /// An existing consumer gaining its first `provide` and a providing
+    /// consumer new to the document both converge: every tool they bring is
+    /// new to the registry.
     #[test]
-    fn a_provided_tool_added_or_removed_needs_a_restart() {
+    fn a_slug_that_newly_provides_converges() {
         let without = with_provider("provider", vec![]);
         let with = with_provider("provider", vec![provided(2)]);
-        assert_eq!(
-            refusals(&without, &with),
-            vec![format!(
-                "wasm_consumers[provider].provides added: {NEEDS_RESTART}"
-            )],
-        );
+        assert!(refusals(&without, &with).is_empty());
+        assert!(refusals(&base(), &with).is_empty());
+    }
+
+    #[test]
+    fn a_provided_tool_removed_needs_a_restart() {
+        let without = with_provider("provider", vec![]);
+        let with = with_provider("provider", vec![provided(2)]);
         assert_eq!(
             refusals(&with, &without),
             vec![format!(
@@ -1461,29 +1466,19 @@ mod tests {
         }
     }
 
-    /// With no `oauth_provider`, the first key provider and the removal of
-    /// the last move whether `api-request` is registered: each is refused per
-    /// provider. An `oauth_provider` on both sides keeps the tool registered,
-    /// and neither is refused.
+    /// With no `oauth_provider`, the first key provider converges and the
+    /// removal of the last, which would unregister `api-request`, is refused
+    /// per provider. An `oauth_provider` on both sides keeps the tool
+    /// registered, and neither is refused.
     #[test]
-    fn the_first_and_the_last_api_key_provider_need_a_restart() {
+    fn the_first_api_key_provider_converges_and_the_last_needs_a_restart() {
         let two = || {
             with_key_providers([
                 key_provider("maps", "/keys/maps"),
                 key_provider("mail", "/keys/mail"),
             ])
         };
-        assert_eq!(
-            refusals(&base(), &two()),
-            vec![
-                "api_key_providers[mail] added: the first provider needs a restart: \
-                 this change needs a restart"
-                    .to_string(),
-                "api_key_providers[maps] added: the first provider needs a restart: \
-                 this change needs a restart"
-                    .to_string(),
-            ],
-        );
+        assert!(refusals(&base(), &two()).is_empty());
         assert_eq!(
             refusals(&two(), &base()),
             vec![

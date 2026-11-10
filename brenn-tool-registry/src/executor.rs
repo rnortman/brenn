@@ -80,6 +80,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use super::bus_wiring::request_channel_name;
+use super::cell::ToolRegistryCell;
 use super::descriptor::{MAX_ASYNC_RESULT_BYTES, PROVIDED_TOOL_CEILING, ToolError, outcome_label};
 use super::provided::ProviderRuntime;
 use super::registry::ToolRegistry;
@@ -200,17 +201,19 @@ pub(crate) struct ToolRequest {
 #[derive(Clone)]
 struct ExecutorShared {
     messenger: Arc<Messenger>,
-    registry: Arc<ToolRegistry>,
+    registry: ToolRegistryCell,
     caller_grants: Arc<ToolCallerGrants>,
     provider: Arc<ProviderRuntime>,
     alert: AlertDispatcher,
 }
 
-/// What one dequeued batch's tasks share: the executor's handles and the
-/// instant the batch was dequeued.
+/// What one dequeued batch's tasks share: the executor's handles, the
+/// registry snapshot loaded once the batch was dequeued, and the instant it
+/// was dequeued. Every lookup and admission of one batch reads that snapshot.
 #[derive(Clone)]
 struct BatchCtx {
     shared: ExecutorShared,
+    registry: Arc<ToolRegistry>,
     dequeued: tokio::time::Instant,
 }
 
@@ -219,6 +222,7 @@ impl ExecutorShared {
     fn batch_ctx(&self) -> BatchCtx {
         BatchCtx {
             shared: self.clone(),
+            registry: self.registry.load(),
             dequeued: tokio::time::Instant::now(),
         }
     }
@@ -240,7 +244,7 @@ impl ToolExecutor {
     /// parked-notify delivery binding.
     pub fn new(
         messenger: Arc<Messenger>,
-        registry: Arc<ToolRegistry>,
+        registry: ToolRegistryCell,
         caller_grants: Arc<ToolCallerGrants>,
         provider: Arc<ProviderRuntime>,
         alert: AlertDispatcher,
@@ -325,7 +329,7 @@ async fn process_batch(cx: BatchCtx, rows: Vec<(MessageSeq, MessageEnvelope)>) {
     for (channel, tool_rows) in by_tool {
         let provided = channel
             .strip_prefix(tools_prefix.as_str())
-            .is_some_and(|tool| cx.shared.registry.is_provided(tool));
+            .is_some_and(|tool| cx.registry.is_provided(tool));
         let cx = cx.clone();
         let task = tokio::spawn(async move {
             let mut executions = Vec::new();
@@ -427,11 +431,12 @@ async fn admit_and_dispatch(
         shared:
             ExecutorShared {
                 messenger,
-                registry,
                 caller_grants,
                 provider,
                 alert,
+                ..
             },
+        registry,
         dequeued,
     } = cx;
     let seq = seq.0;
@@ -1179,13 +1184,13 @@ mod tests {
 
     fn executor(
         h: &Harness,
-        reg: Arc<ToolRegistry>,
+        reg: impl Into<ToolRegistryCell>,
         grants: Arc<ToolCallerGrants>,
         alert: AlertDispatcher,
     ) -> ToolExecutor {
         ToolExecutor::new(
             h.messenger.clone(),
-            reg,
+            reg.into(),
             grants,
             h.provider.clone(),
             alert,
@@ -1241,6 +1246,42 @@ mod tests {
         assert_eq!(result["tool"], "apull");
         assert_eq!(result["call_id"], "c1");
         assert_eq!(result["outcome"]["ok"]["echoed"]["repo"], "brenn");
+    }
+
+    /// Each batch reads the registry the cell holds once it was dequeued: a
+    /// tool registered by a swap between two batches is executed in the second.
+    #[tokio::test]
+    async fn a_batch_after_a_swap_reads_the_swapped_registry() {
+        let h = harness().await;
+        let cell = ToolRegistryCell::from(ToolRegistry::new(vec![]));
+        let (alert, _hg) = noop_alert_dispatcher();
+        let exec = executor(
+            &h,
+            cell.clone(),
+            caller_grants(vec![clause(&[("repo", "brenn")])]),
+            alert,
+        );
+
+        insert_request(&h, &request_body("before", "brenn"), Some(h.results_uuid)).await;
+        drain_and_join(&exec).await;
+        cell.store(registry(StubAsync::new(4, Duration::ZERO)));
+        insert_request(&h, &request_body("after", "brenn"), Some(h.results_uuid)).await;
+        drain_and_join(&exec).await;
+
+        let rows = brenn_messaging::testutils::owed_everywhere(
+            &h.messenger,
+            &ParticipantId::for_wasm(CALLER_SLUG),
+        )
+        .await;
+        let results: Vec<Value> = rows
+            .iter()
+            .map(|(_, env)| serde_json::from_str(&env.body).unwrap())
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["call_id"], "before");
+        assert_eq!(results[0]["outcome"]["err"]["kind"], "not_granted");
+        assert_eq!(results[1]["call_id"], "after");
+        assert_eq!(results[1]["outcome"]["ok"]["echoed"]["repo"], "brenn");
     }
 
     #[tokio::test]

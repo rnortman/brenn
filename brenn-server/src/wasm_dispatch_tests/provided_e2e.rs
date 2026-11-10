@@ -135,7 +135,7 @@ impl Rig {
         WasmProvidesHost::new(
             self.runtime.clone(),
             Arc::new(WasmToolHost::new(
-                self.registry.clone(),
+                self.registry.clone().into(),
                 self.provider_grants.clone(),
                 slug.to_string(),
                 self.alert.clone(),

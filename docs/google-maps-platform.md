@@ -168,7 +168,8 @@ reviews, and possibly 24-hour forecasts fail that way. With neither block, an
 answer between the two limits is answered `internal` naming `max_body_bytes`
 (section 6, step 4).
 
-Changing either block takes a restart. A reload that changes them is refused.
+A change to the `api_key_provider` block is applied by a reload. A change to
+the `messaging` block takes a restart; a reload that changes it is refused.
 
 ## 4. The component
 
@@ -474,11 +475,11 @@ so a wrong name is corrected at the first call.
 ## 8. Rotating and removing
 
 - **The key.** Create a new key (or, for the Demo Key, retrieve the new one),
-  write it over the key file keeping mode `0600`, and restart Brenn. A key
-  file replaced in place is not noticed until the restart. Delete the old key
-  in the console once Brenn is running on the new one.
+  write it over the key file keeping mode `0600`, and reload Brenn. A key
+  file replaced in place is not noticed until the next reload or restart.
+  Delete the old key in the console once Brenn is running on the new one.
 - **A suspected leak.** Delete the key in the console first; that cuts it off
-  at Google whatever holds a copy. Then place a new one and restart. A key a
+  at Google whatever holds a copy. Then place a new one and reload. A key a
   provider echoed is also wherever that tool result is kept (section 6): the
   conversation's transcript in the log directory, the conversation's history
   in the database, and any copy of either a log rotation or backup made.

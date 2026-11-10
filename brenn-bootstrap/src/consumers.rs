@@ -207,7 +207,7 @@ pub(crate) struct ConsumerLoadContext<'a> {
     /// callback over it; one that does not gets no callback and no linked
     /// interface.
     pub mqtt_service: Arc<brenn_mqtt::MqttService>,
-    pub tool_registry: &'a Arc<brenn_tool_registry::ToolRegistry>,
+    pub tool_registry: &'a brenn_tool_registry::ToolRegistryCell,
     /// The process's pending-call table. A consumer holding the `provides`
     /// grant answers its requests and acts for their users through a host
     /// over it.
@@ -924,7 +924,9 @@ mod tests {
     #[should_panic(expected = "parent directory does not exist")]
     async fn a_load_of_a_consumer_whose_store_parent_is_missing_panics() {
         let (alert_dispatcher, _drainer) = brenn_obs::alerting::noop_alert_dispatcher();
-        let tool_registry = Arc::new(brenn_tool_registry::ToolRegistry::new(vec![]));
+        let tool_registry = brenn_tool_registry::ToolRegistryCell::from(
+            brenn_tool_registry::ToolRegistry::new(vec![]),
+        );
         let ctx = ConsumerLoadContext {
             components_roots: &[],
             alert_dispatcher: &alert_dispatcher,

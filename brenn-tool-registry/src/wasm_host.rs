@@ -13,7 +13,6 @@
 //! guest buffers it and the dispatch layer flushes it transactionally.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use brenn_lib::messaging::{ParticipantId, canonical_address};
 use brenn_lib::tools::ResolvedToolGrant;
@@ -21,15 +20,16 @@ use brenn_obs::alerting::AlertDispatcher;
 use brenn_wasm::{QueuedToolRequest, ToolCallError, ToolHost};
 
 use super::bus_wiring;
+use super::cell::ToolRegistryCell;
 use super::descriptor::ToolError;
 use super::executor::ToolRequest;
-use super::registry::ToolRegistry;
 use super::tool::{RegisteredTool, ToolCtx};
 
-/// A per-consumer tool host: the shared registry plus this consumer's resolved
-/// grants and `wasm:<slug>` identity.
+/// A per-consumer tool host: the shared registry cell plus this consumer's
+/// resolved grants and `wasm:<slug>` identity. Each call reads the registry the
+/// cell holds when it is made.
 pub struct WasmToolHost {
-    registry: Arc<ToolRegistry>,
+    registry: ToolRegistryCell,
     /// This consumer's resolved tool grants, keyed by canonical tool name. A tool
     /// absent from this map is ungranted for this caller (→ `NotGranted`).
     tool_grants: BTreeMap<String, ResolvedToolGrant>,
@@ -45,7 +45,7 @@ impl WasmToolHost {
     /// Build the host for a WASM consumer. `slug` must be a valid wasm slug (it
     /// already is — the consumer was resolved with it).
     pub fn new(
-        registry: Arc<ToolRegistry>,
+        registry: ToolRegistryCell,
         tool_grants: BTreeMap<String, ResolvedToolGrant>,
         slug: String,
         alert: AlertDispatcher,
@@ -101,7 +101,10 @@ impl ToolHost for WasmToolHost {
         };
         // `invoke_fast` emits the unified invocation log (tool, caller, class,
         // duration, outcome) on every path, so nothing is logged here.
-        let value = self.registry.invoke_fast(tool, &ctx, args, &self.alert)?;
+        let value = self
+            .registry
+            .load()
+            .invoke_fast(tool, &ctx, args, &self.alert)?;
         serde_json::to_string(&value).map_err(|e| ToolCallError::Internal(e.to_string()))
     }
 
@@ -134,7 +137,8 @@ impl WasmToolHost {
         // Resolve the tool and confirm its class. A grant for a fast tool reached
         // via `call-async` is a class mismatch (the class is the tool's, never the
         // caller's). An unregistered but somehow-granted tool is `NotGranted`.
-        let registered = self.registry.get(tool).ok_or(ToolCallError::NotGranted)?;
+        let registry = self.registry.load();
+        let registered = registry.get(tool).ok_or(ToolCallError::NotGranted)?;
         let async_tool = match registered {
             RegisteredTool::Async(t) => t,
             RegisteredTool::Fast(_) => return Err(ToolCallError::WrongClass),
@@ -241,6 +245,9 @@ mod tests {
         }
     }
 
+    use std::sync::Arc;
+
+    use crate::registry::ToolRegistry;
     use crate::testutil::{clause, grant};
 
     fn registry() -> Arc<ToolRegistry> {
@@ -252,7 +259,7 @@ mod tests {
 
     fn host(grants: BTreeMap<String, ResolvedToolGrant>) -> WasmToolHost {
         let (alert, _h) = noop_alert_dispatcher();
-        WasmToolHost::new(registry(), grants, "sync".to_string(), alert)
+        WasmToolHost::new(registry().into(), grants, "sync".to_string(), alert)
     }
 
     #[tokio::test]
