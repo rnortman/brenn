@@ -1,5 +1,21 @@
 # TODOs
 
+## `reload-probe-fix-misdescribed-in-commit-message`
+
+The commit "Carry CalDAV/WebDAV reads through api-request and the provider
+kit" says of `brenn-bootstrap/src/reload/driver.rs` only "reload driver
+adjusted for the method set". That is wrong: the change there is unrelated to
+HTTP methods. It narrows `authority_probe`, the sampling probe the
+reload-order tests share (`a_removed_client_is_stopped_after_agents_swap`
+among them), which read the agent table and the client registry at different
+instants and could report a state the program is never in; the probe now
+reads the authority on both sides of the registry read and counts no sample
+the swap fell inside. Done = the commit's message corrected before it reaches
+the public remote, or, if it is already public, this entry and its comment
+removed, the entry having been the correction. The
+`TODO(reload-probe-fix-misdescribed-in-commit-message)` comment sits at
+`authority_probe` in `brenn-bootstrap/src/reload/driver.rs`.
+
 ## `kit-payload-reader-cannot-read-304`
 
 The provider kit's `read_api_payload` and `read_api_result` fail every 3xx
@@ -3759,7 +3775,26 @@ beside the first), or a deployment's first API provider, therefore takes a
 restart. Making the registered-tool set converge means a swappable registry
 view that every one of those readers sees consistently in commit order, with
 the per-tool semaphores and MCP-name index rebuilt, and the virtual-tools
-files re-projected. Done = a consumer with a new `provide` added to a
+files re-projected. A swappable registry meets three things these refusals
+hide today. First, the reload driver plans the candidate against the booted
+registry (`plan_of` in `brenn-bootstrap/src/reload/driver.rs`) and validates
+the candidate's agents against it, so neither sees a tool the candidate adds;
+once the candidate is planned from a rebuilt registry, the driver's
+system-participant check (`system_participant_refusals` in
+`brenn-bootstrap/src/reload/surfaces.rs`) refuses it, because the tool
+executor subscribes once per async tool name (`tool_executor_spec` in
+`brenn-tool-registry/src/bus_wiring.rs`): that check has to admit the
+executor's subscriptions changing. Second, `ProvidedTool::execute`
+(`brenn-tool-registry/src/provided.rs`) panics when publishing a request finds
+no inbox, on the invariant that a providing instance's inbox lives as long as
+the process, and panics again when a pending record is removed unanswered
+while its guard is alive; a provider removed at reload breaks the first for
+every call that starts afterwards. Third, `ToolRegistry` holds the rate
+limiter's buckets and the per-tool semaphores by value, and
+`ProvidedTool::new` leaks each descriptor's strings on the ground that the
+registry is built once: a rebuilt registry starts with empty buckets and
+fresh semaphores unless unchanged tools carry theirs over, and leaks once per
+rebuild. Done = a consumer with a new `provide` added to a
 document, a first `api_key_provider`, and the removal of the last provider are
 applied at reload rather than refused, with the same post-commit state a fresh
 boot would produce. The `TODO(reload-provided-tools)` comment sits at the

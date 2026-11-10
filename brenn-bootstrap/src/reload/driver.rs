@@ -3946,6 +3946,9 @@ new sifter: Demo {{
     /// session is taken out afterwards, so it is never entered on the way out
     /// either. A single step on the wrong side of the swap enters it for the
     /// width of everything between.
+    // TODO(reload-probe-fix-misdescribed-in-commit-message): the commit that
+    // made this probe read the authority on both sides of the registry read
+    // describes its change to this file as a method-set adjustment.
     async fn authority_probe(booted: &Booted, client: &'static str) -> Probe {
         let apps = booted.messenger.app_table();
         let service = booted.mqtt.0.clone();
