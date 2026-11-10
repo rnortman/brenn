@@ -799,6 +799,55 @@ mod tests {
         );
     }
 
+    /// The answers to a WebDAV `MKCOL`, `COPY` or `MOVE` (RFC 4918 sections
+    /// 9.3, 9.8.5 and 9.9.4): a created or replaced resource, a partly failed
+    /// collection copy or move, and the refusals.
+    #[test]
+    fn webdav_write_answers_are_read_as_their_statuses() {
+        let location = "https://dav.example.com/files/a/";
+        assert_eq!(
+            read_payload(payload(201, &[("Location", location)], b"")),
+            Ok(PayloadAnswer::Payload(Payload {
+                status: 201,
+                headers: headers(&[("location", location)]),
+                body: Vec::new(),
+            }))
+        );
+        assert_eq!(
+            read_payload(payload(204, &[], b"")),
+            Ok(PayloadAnswer::Payload(Payload {
+                status: 204,
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+            }))
+        );
+        let failed = "<?xml version=\"1.0\"?>\r\n<d:multistatus xmlns:d=\"DAV:\"><d:response>\
+                      <d:href>/files/a/b</d:href><d:status>HTTP/1.1 423 Locked</d:status>\
+                      </d:response></d:multistatus>\r\n";
+        assert_eq!(
+            read_payload(payload(
+                207,
+                &[("Content-Type", "application/xml")],
+                failed.as_bytes()
+            )),
+            Ok(PayloadAnswer::Payload(Payload {
+                status: 207,
+                headers: headers(&[("content-type", "application/xml")]),
+                body: failed.as_bytes().to_vec(),
+            }))
+        );
+        for (status, body) in [(409, "no parent collection"), (423, "locked")] {
+            assert_eq!(
+                read_payload(http(status, body)),
+                Ok(PayloadAnswer::Error {
+                    status,
+                    body: body.to_string(),
+                })
+            );
+        }
+        assert_eq!(read(http(201, "")), Ok(Answer::NoBody { status: 201 }));
+    }
+
     /// Everything before the 2xx body reads as it does through
     /// [`read_api_result`], with the same texts.
     #[test]

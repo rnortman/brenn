@@ -18,22 +18,6 @@ a test; for (b), this entry and its comment removed, the limit staying in the
 reader's documentation. The `TODO(kit-payload-reader-cannot-read-304)` comment
 sits at `read_api_payload` in `brenn-provider-kit/src/answer.rs`.
 
-## `api-request-no-grant-for-collections-at-every-depth`
-
-`api-request` admits a request path ending in `/` only under a clause whose
-`path` template ends in `/`, and a template matches a fixed number of
-segments. So neither `path = "*"`, nor a clause naming no `path`, nor any
-single template admits collection paths at every depth. A component whose
-collections nest arbitrarily — WebDAV folders — needs one clause per depth,
-and a folder deeper than the deepest clause is refused. Decide whether a grant
-gains a spelling for "any path ending in `/`", or for every path under a
-prefix, and what that does to the rule that no clause admits a path ending in
-`/` unless its template says so. Done = the decision recorded here; if a
-spelling is added, its matching tests and the text in `docs/config-dsl.md` and
-`docs/security-posture.md`. The
-`TODO(api-request-no-grant-for-collections-at-every-depth)` comment sits at
-`template_admits` in `brenn-oauth/src/path_template.rs`.
-
 ## `api-request-body-caps-bound-file-transfer`
 
 A provider component cannot move an ordinary file through `api-request`. The

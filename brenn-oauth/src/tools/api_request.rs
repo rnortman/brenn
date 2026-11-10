@@ -54,8 +54,16 @@ use crate::{CallSite, OAuthService};
 const NAME: &str = API_REQUEST_TOOL;
 
 const METHODS: &[&str] = &[
-    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "PROPFIND", "REPORT",
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "PROPFIND", "REPORT", "MKCOL", "COPY", "MOVE",
 ];
+
+/// Methods that read a `Destination` header (RFC 4918 section 10.3): the
+/// caller writes it as an absolute path, and Brenn sends the absolute URI it
+/// builds on the request's origin.
+const DESTINATION_METHODS: &[&str] = &["COPY", "MOVE"];
+
+/// The header [`DESTINATION_METHODS`] read, as a parsed header name.
+const DESTINATION: &str = "destination";
 
 /// Methods a caller with no acting user may use. `PROPFIND` and `REPORT` read
 /// too and are deliberately absent, left to the `consumer-own-credentials`
@@ -150,6 +158,7 @@ impl<'a> From<Option<&'a str>> for Attr<'a> {
 }
 
 /// The ACL attributes of a call.
+#[derive(Clone, Copy)]
 struct Attrs<'a> {
     provider: &'a str,
     user: Attr<'a>,
@@ -192,6 +201,81 @@ fn clause_admits(clause: &AclClause, attrs: &Attrs<'_>) -> bool {
 
 fn acl_admits(acl: &[AclClause], attrs: &Attrs<'_>) -> bool {
     acl.iter().any(|clause| clause_admits(clause, attrs))
+}
+
+/// Which target of a call no clause admits.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// The request path.
+    Source,
+    /// The `Destination` of a `COPY` or `MOVE`.
+    Destination,
+}
+
+/// Whether `acl` admits the call `attrs` describes and, when it has one, its
+/// `destination` matched as the path under the same attributes. The two may
+/// be admitted by different clauses.
+fn grant_admits(
+    acl: &[AclClause],
+    attrs: Attrs<'_>,
+    destination: Option<&RequestPath>,
+) -> Result<(), Refused> {
+    if !acl_admits(acl, &attrs) {
+        return Err(Refused::Source);
+    }
+    match destination {
+        Some(path) if !acl_admits(acl, &Attrs { path, ..attrs }) => Err(Refused::Destination),
+        _ => Ok(()),
+    }
+}
+
+/// What a refusal appends to the request line: nothing when the request path
+/// is refused, the words naming the destination when it is.
+fn refusal_reason(method: &str, refused: Refused) -> String {
+    match refused {
+        Refused::Source => String::new(),
+        Refused::Destination => format!(": no clause admits {method} to the destination"),
+    }
+}
+
+/// The destination `headers` name for `method`: on a method in
+/// [`DESTINATION_METHODS`] exactly one `Destination` holding an absolute path,
+/// decoded as a request path is; on any other method none. A header counts as
+/// `Destination` when its name parses to that header name, as every header
+/// sent is parsed.
+fn read_destination(
+    method: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<Option<RequestPath>, String> {
+    let values: Vec<&str> = headers
+        .iter()
+        .filter(|(name, _)| {
+            HeaderName::from_bytes(name.as_bytes()).is_ok_and(|name| name.as_str() == DESTINATION)
+        })
+        .map(|(_, value)| value.as_str())
+        .collect();
+    let reads = DESTINATION_METHODS.contains(&method);
+    match (values.as_slice(), reads) {
+        ([], false) => Ok(None),
+        ([_, _, ..], _) => Err(
+            "more than one `Destination` header (header names are case-insensitive)".to_string(),
+        ),
+        ([_], false) => Err(format!(
+            "a `Destination` header is read by {DESTINATION_METHODS:?} only, not by {method}"
+        )),
+        ([], true) => Err(format!(
+            "{method} needs a `Destination` header holding an absolute path on the request's \
+             host"
+        )),
+        ([value], true) if !value.starts_with('/') => Err(format!(
+            "`Destination` {value:?} is not an absolute path; a destination is an absolute \
+             path on the request's host, written like `path`, and Brenn sends it as the \
+             absolute URI there"
+        )),
+        ([value], true) => decode_path(value)
+            .map(Some)
+            .map_err(|e| format!("`Destination`: {e}")),
+    }
 }
 
 /// The user a caller with no acting user borrows: the one non-`*` `user`
@@ -257,6 +341,8 @@ struct Prepared {
     host: String,
     origin: url::Url,
     path: RequestPath,
+    /// The `Destination` of a `COPY` or `MOVE`, sent as built on `origin`.
+    destination: Option<RequestPath>,
     query: Vec<(String, String)>,
     headers: HeaderMap,
     body: Option<Vec<u8>>,
@@ -275,7 +361,31 @@ impl Prepared {
     }
 
     fn line(&self) -> String {
-        request_line(&self.provider, &self.method, &self.host, &self.path)
+        request_line(
+            &self.provider,
+            &self.method,
+            &self.host,
+            &self.path,
+            self.destination.as_ref(),
+        )
+    }
+
+    /// Hold the call, with `user` and `account` as its attributes, to `acl`,
+    /// refusing with the request line followed by `context`.
+    fn admits(
+        &self,
+        acl: &[AclClause],
+        user: Attr<'_>,
+        account: Attr<'_>,
+        context: &str,
+    ) -> Result<(), ToolError> {
+        grant_admits(acl, self.attrs(user, account), self.destination.as_ref()).map_err(|refused| {
+            ToolError::Denied(format!(
+                "{}{context}{}",
+                self.line(),
+                refusal_reason(&self.method, refused)
+            ))
+        })
     }
 
     /// The user whose credential a per-user call uses: the acting user, or
@@ -290,17 +400,12 @@ impl Prepared {
     /// Hold the call, its credential resolved to `user`'s `account`, to the
     /// grant's clauses.
     fn admit(&self, ctx: &ToolCtx, user: &str, account: &str) -> Result<(), ToolError> {
-        if acl_admits(
+        self.admits(
             &ctx.grant.acl,
-            &self.attrs(Attr::Is(user), Attr::Is(account)),
-        ) {
-            Ok(())
-        } else {
-            Err(ToolError::Denied(format!(
-                "{} as user {user:?}, account {account:?}",
-                self.line()
-            )))
-        }
+            Attr::Is(user),
+            Attr::Is(account),
+            &format!(" as user {user:?}, account {account:?}"),
+        )
     }
 
     /// The request as sent, before its credential is placed.
@@ -345,6 +450,7 @@ impl Prepared {
             method = %self.method,
             host = %self.host,
             path = %display_path(&self.path),
+            destination = self.destination.as_ref().map(display_path).as_deref(),
             status = response.status,
             bytes = response.content_length.unwrap_or(response.body.len() as u64),
             truncated = response.truncated,
@@ -355,9 +461,20 @@ impl Prepared {
     }
 }
 
-/// The request line as logs and refusals name it.
-fn request_line(provider: &str, method: &str, host: &str, path: &RequestPath) -> String {
-    format!("{provider} {method} {host}{}", display_path(path))
+/// The request line as logs and refusals name it, followed by ` to ` and
+/// the destination when the call has one.
+fn request_line(
+    provider: &str,
+    method: &str,
+    host: &str,
+    path: &RequestPath,
+    destination: Option<&RequestPath>,
+) -> String {
+    let line = format!("{provider} {method} {host}{}", display_path(path));
+    match destination {
+        Some(destination) => format!("{line} to {}", display_path(destination)),
+        None => line,
+    }
 }
 
 fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, ToolError> {
@@ -393,6 +510,7 @@ fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, T
         })?
         .clone();
     let path = decode_path(&args.path).map_err(invalid)?;
+    let destination = read_destination(&args.method, &args.headers).map_err(invalid)?;
     let reserved = |what: &str, name: &str| {
         invalid(format!(
             "{what} {name:?} is Brenn's to set, not the caller's"
@@ -410,6 +528,9 @@ fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, T
     for (name, value) in &args.headers {
         let name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| invalid(format!("{name:?} is not a header name")))?;
+        if name.as_str() == DESTINATION {
+            continue;
+        }
         if name == reqwest::header::AUTHORIZATION
             || TRANSPORT_HEADERS.contains(&name.as_str())
             || key_header == Some(&name)
@@ -419,6 +540,13 @@ fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, T
         let value = HeaderValue::from_str(value)
             .map_err(|_| invalid(format!("header {:?} has an invalid value", name.as_str())))?;
         headers.append(name, value);
+    }
+    if let Some(destination) = &destination {
+        let uri = build_url(&origin, destination, &[]);
+        headers.insert(
+            HeaderName::from_static(DESTINATION),
+            HeaderValue::from_str(uri.as_str()).expect("a serialized URL is a valid header value"),
+        );
     }
     let body = match (args.body, args.body_base64) {
         (Some(_), Some(_)) => {
@@ -443,6 +571,7 @@ fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, T
         host: args.host,
         origin,
         path,
+        destination,
         query,
         headers,
         body,
@@ -673,7 +802,10 @@ impl ApiRequestTool {
                             "additionalProperties": { "type": "string" },
                             "description": "Extra request headers. Not Authorization, Host, \
                                             Cookie, transport headers, or the provider's key \
-                                            header.",
+                                            header. On COPY and MOVE, `Destination` is \
+                                            required: an absolute path on the same host, \
+                                            written like `path`; Brenn sends it as the \
+                                            absolute URI. Refused on every other method.",
                         },
                         "body": {
                             "type": "string",
@@ -840,6 +972,9 @@ impl AsyncTool for ApiRequestTool {
         let Ok(path) = decode_path(&args.path) else {
             return Ok(());
         };
+        let Ok(destination) = read_destination(&args.method, &args.headers) else {
+            return Ok(());
+        };
         // A pre-screen: `execute` re-admits the call against its own snapshot.
         let deployment_key = self
             .keys
@@ -859,13 +994,19 @@ impl AsyncTool for ApiRequestTool {
             host: &args.host,
             path: &path,
         };
-        if acl_admits(acl, &attrs) {
-            Ok(())
-        } else {
-            Err(AclDenied {
-                resource: request_line(&args.provider, &args.method, &args.host, &path),
-            })
-        }
+        grant_admits(acl, attrs, destination.as_ref()).map_err(|refused| AclDenied {
+            resource: format!(
+                "{}{}",
+                request_line(
+                    &args.provider,
+                    &args.method,
+                    &args.host,
+                    &path,
+                    destination.as_ref(),
+                ),
+                refusal_reason(&args.method, refused)
+            ),
+        })
     }
 
     async fn execute(
@@ -922,12 +1063,12 @@ impl ApiRequestTool {
         request: Prepared,
         started: Instant,
     ) -> Result<serde_json::Value, ToolError> {
-        if !acl_admits(&ctx.grant.acl, &request.attrs(Attr::Absent, Attr::Absent)) {
-            return Err(ToolError::Denied(format!(
-                "{} (a deployment-key call has no user or account)",
-                request.line()
-            )));
-        }
+        request.admits(
+            &ctx.grant.acl,
+            Attr::Absent,
+            Attr::Absent,
+            " (a deployment-key call has no user or account)",
+        )?;
         let user = ctx
             .acting_user
             .as_ref()
@@ -1277,7 +1418,7 @@ mod tests {
             with("method", serde_json::json!("get")),
             with("method", serde_json::json!("TRACE")),
             with("method", serde_json::json!("propfind")),
-            with("method", serde_json::json!("MKCOL")),
+            with("method", serde_json::json!("PROPPATCH")),
             with("provider", serde_json::json!("nope")),
             with("path", serde_json::json!("/a/%2e%2e/b")),
             with("path", serde_json::json!("/a%2Fb")),
@@ -1293,7 +1434,12 @@ mod tests {
             with("body_base64", serde_json::json!("not base64!")),
             with("extra", serde_json::json!(1)),
             both,
-        ];
+        ]
+        .into_iter()
+        .chain(malformed_destinations(
+            &|m: &str, p: &str| f.args(m, p),
+            &f.host,
+        ));
         for args in cases {
             let out = f
                 .call(Some(alice()), vec![provider_clause("*")], args.clone())
@@ -1304,6 +1450,247 @@ mod tests {
             );
         }
         assert!(f.seen().is_empty());
+    }
+
+    /// Calls whose `Destination` is missing, misplaced, doubled or malformed,
+    /// each built by `args` on a method that would otherwise be admitted.
+    fn malformed_destinations(
+        args: &dyn Fn(&str, &str) -> serde_json::Value,
+        host: &str,
+    ) -> Vec<serde_json::Value> {
+        let with = |method: &str, headers: serde_json::Value| {
+            let mut args = args(method, "/files/a");
+            args["headers"] = headers;
+            args
+        };
+        let destination = |value: &str| with("MOVE", serde_json::json!({ "Destination": value }));
+        vec![
+            with("PUT", serde_json::json!({"Destination": "/files/b"})),
+            with("MKCOL", serde_json::json!({"destination": "/files/b"})),
+            args("COPY", "/files/a"),
+            args("MOVE", "/files/a"),
+            with(
+                "COPY",
+                serde_json::json!({"Destination": "/files/b", "destination": "/files/c"}),
+            ),
+            destination("https://other.example.com/files/b"),
+            destination(&format!("https://{host}/files/b")),
+            destination(&format!("http://{host}/files/b")),
+            destination("files/b"),
+            destination(""),
+            destination("//other.example.com/files/b"),
+            destination("/files/../b"),
+            destination("/files/%2e%2e/b"),
+            destination("/files%2Fb"),
+            destination("/files/%252e%252e/b"),
+            destination("/files//b"),
+        ]
+    }
+
+    /// The pre-screen leaves a malformed destination to `execute`, as it does
+    /// an undecodable path.
+    #[tokio::test]
+    async fn check_acl_leaves_a_malformed_destination_to_execute() {
+        let f = fixture().await;
+        let acl = vec![clause(&[("provider", "google"), ("path", "/nothing")])];
+        for args in malformed_destinations(&|m: &str, p: &str| f.args(m, p), &f.host) {
+            assert_eq!(f.tool.check_acl(&args, &acl), Ok(()), "{args}");
+        }
+    }
+
+    /// The args of a `method` from `path` to `destination` on `host`.
+    fn moving(
+        args: &dyn Fn(&str, &str) -> serde_json::Value,
+        method: &str,
+        path: &str,
+        destination: &str,
+    ) -> serde_json::Value {
+        let mut args = args(method, path);
+        args["headers"] = serde_json::json!({ "Destination": destination });
+        args
+    }
+
+    #[tokio::test]
+    async fn mkcol_copy_and_move_are_sent_and_answered() {
+        let f = fixture().await;
+        f.stub.lock().unwrap().api_statuses = [201, 201, 204].into();
+        let acl = vec![
+            clause(&[("provider", "google"), ("path", "/files/*/")]),
+            clause(&[("provider", "google"), ("path", "/files/*")]),
+        ];
+        let args = |m: &str, p: &str| f.args(m, p);
+        for (args, status) in [
+            (f.args("MKCOL", "/files/new/"), 201),
+            (moving(&args, "COPY", "/files/a", "/files/b"), 201),
+            (moving(&args, "MOVE", "/files/b", "/files/c"), 204),
+        ] {
+            let out = f.call(Some(alice()), acl.clone(), args).await.unwrap();
+            assert_eq!(out["status"], status);
+        }
+        let seen = f.seen();
+        let sent: Vec<(&str, &str)> = seen
+            .iter()
+            .map(|s| (s.method.as_str(), s.path_and_query.as_str()))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                ("MKCOL", "/files/new/"),
+                ("COPY", "/files/a"),
+                ("MOVE", "/files/b")
+            ]
+        );
+        assert!(!seen[0].headers.contains_key("content-type"));
+        assert!(!seen[0].headers.contains_key("destination"));
+        let origin = format!("http://{}", f.host);
+        assert_eq!(seen[1].headers["destination"], format!("{origin}/files/b"));
+        assert_eq!(seen[2].headers["destination"], format!("{origin}/files/c"));
+    }
+
+    /// The `Destination` sent is the absolute URI of the matched path on the
+    /// request's origin, whatever the spelling written; `Overwrite` and
+    /// `Depth` pass as written; the request's query stays on the request.
+    #[tokio::test]
+    async fn the_destination_sent_is_the_path_that_matched() {
+        let f = fixture().await;
+        let acl = vec![
+            clause(&[("provider", "google"), ("path", "/files/**")]),
+            clause(&[("provider", "google"), ("path", "/files/**/")]),
+        ];
+        let args = |m: &str, p: &str| f.args(m, p);
+        for (method, path, destination) in [
+            ("COPY", "/files/a", "/files/a%20b%40c"),
+            ("MOVE", "/files/d/", "/files/e/f/"),
+            ("COPY", "/files/a", "/files/x?y"),
+        ] {
+            let mut args = moving(&args, method, path, destination);
+            args["headers"]["Overwrite"] = serde_json::json!("F");
+            args["headers"]["Depth"] = serde_json::json!("0");
+            args["query"] = serde_json::json!({"q": "1"});
+            f.call(Some(alice()), acl.clone(), args).await.unwrap();
+        }
+        let origin = format!("http://{}", f.host);
+        let seen = f.seen();
+        let destinations: Vec<&str> = seen
+            .iter()
+            .map(|s| s.headers["destination"].to_str().unwrap())
+            .collect();
+        assert_eq!(
+            destinations,
+            [
+                format!("{origin}/files/a%20b@c"),
+                format!("{origin}/files/e/f/"),
+                format!("{origin}/files/x%3Fy"),
+            ]
+        );
+        for seen in &seen {
+            assert_eq!(seen.headers["overwrite"], "F");
+            assert_eq!(seen.headers["depth"], "0");
+            assert_eq!(seen.headers.get_all("destination").iter().count(), 1);
+            assert!(
+                seen.path_and_query.ends_with("?q=1"),
+                "{}",
+                seen.path_and_query
+            );
+        }
+    }
+
+    /// Both the request path and the destination must be admitted, by clauses
+    /// for the request's own method and host, though not necessarily one
+    /// clause.
+    #[tokio::test]
+    async fn a_destination_no_clause_admits_is_denied() {
+        let f = fixture().await;
+        let host = f.host.clone();
+        let on = |method: &str, path: &str| {
+            clause(&[("provider", "google"), ("method", method), ("path", path)])
+        };
+        let args = |m: &str, p: &str| f.args(m, p);
+        let move_ab = moving(&args, "MOVE", "/files/a", "/files/b");
+        for acl in [
+            vec![on("MOVE", "/files/a")],
+            vec![on("MOVE", "/files/a"), on("COPY", "/files/b")],
+            vec![
+                on("MOVE", "/files/a"),
+                clause(&[
+                    ("provider", "google"),
+                    ("method", "MOVE"),
+                    ("host", "other.example.com"),
+                    ("path", "/files/b"),
+                ]),
+            ],
+            vec![on("MOVE", "/files/a"), on("MOVE", "/files/b/")],
+        ] {
+            let denied_line = f.tool.check_acl(&move_ab, &acl).expect_err("pre-screen");
+            assert!(
+                denied_line.resource.ends_with(&format!(
+                    "MOVE {host}/files/a to /files/b: no clause admits MOVE to the destination"
+                )),
+                "{}",
+                denied_line.resource
+            );
+            let detail = denied(f.call(Some(alice()), acl.clone(), move_ab.clone()).await);
+            assert!(
+                detail.contains("to /files/b")
+                    && detail.contains("no clause admits MOVE to the destination"),
+                "{detail}"
+            );
+        }
+        // The source alone refused: no word of the destination.
+        let source_only = vec![on("MOVE", "/files/b")];
+        let denied_line = f
+            .tool
+            .check_acl(&move_ab, &source_only)
+            .expect_err("pre-screen");
+        assert!(
+            denied_line
+                .resource
+                .ends_with(&format!("MOVE {host}/files/a to /files/b")),
+            "{}",
+            denied_line.resource
+        );
+        let detail = denied(f.call(Some(alice()), source_only, move_ab.clone()).await);
+        assert!(!detail.contains("to the destination"), "{detail}");
+        assert!(f.seen().is_empty());
+
+        let two = vec![on("MOVE", "/files/a"), on("MOVE", "/files/b")];
+        assert_eq!(f.tool.check_acl(&move_ab, &two), Ok(()));
+        f.call(Some(alice()), two, move_ab).await.unwrap();
+        assert_eq!(f.seen().len(), 1);
+    }
+
+    /// A deep clause admits a `MOVE` between depths beneath its prefix and
+    /// refuses one leaving it.
+    #[tokio::test]
+    async fn a_deep_clause_admits_a_move_at_any_depth_beneath_it() {
+        let f = fixture().await;
+        let acl = vec![
+            clause(&[
+                ("provider", "google"),
+                ("method", "MOVE"),
+                ("path", "/files/**"),
+            ]),
+            clause(&[
+                ("provider", "google"),
+                ("method", "MOVE"),
+                ("path", "/files/**/"),
+            ]),
+        ];
+        let args = |m: &str, p: &str| f.args(m, p);
+        for (path, destination) in [
+            ("/files/a", "/files/x/y/z/a"),
+            ("/files/x/y/z/", "/files/q/"),
+        ] {
+            let args = moving(&args, "MOVE", path, destination);
+            assert_eq!(f.tool.check_acl(&args, &acl), Ok(()), "{args}");
+            f.call(Some(alice()), acl.clone(), args).await.unwrap();
+        }
+        for destination in ["/files2/a", "/files/", "/a"] {
+            let args = moving(&args, "MOVE", "/files/x/a", destination);
+            assert!(f.tool.check_acl(&args, &acl).is_err(), "{args}");
+            denied(f.call(Some(alice()), acl.clone(), args).await);
+        }
+        assert_eq!(f.seen().len(), 2);
     }
 
     #[tokio::test]
@@ -1355,7 +1742,9 @@ mod tests {
         assert_eq!(tool.validate_clause(&clause(&[("path", "*")])), Ok(()));
         assert_eq!(tool.validate_clause(&clause(&[("path", "/a/")])), Ok(()));
         assert_eq!(tool.validate_clause(&clause(&[("method", "GET")])), Ok(()));
-        for bad in ["a/b", "/a//b", "/a//"] {
+        assert_eq!(tool.validate_clause(&clause(&[("path", "/a/**")])), Ok(()));
+        assert_eq!(tool.validate_clause(&clause(&[("path", "/a/**/")])), Ok(()));
+        for bad in ["a/b", "/a//b", "/a//", "/a/**/b"] {
             assert!(
                 tool.validate_clause(&clause(&[("path", bad)])).is_err(),
                 "{bad}"
@@ -2260,8 +2649,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(f.last_key(), account_key("bob"));
-        for method in ["POST", "PROPFIND", "REPORT"] {
-            let detail = denied(f.call(None, lent.clone(), f.mail_args(method, None)).await);
+        for method in ["POST", "PROPFIND", "REPORT", "MKCOL", "COPY", "MOVE"] {
+            let mut args = f.mail_args(method, None);
+            if DESTINATION_METHODS.contains(&method) {
+                args["headers"] = serde_json::json!({"Destination": "/v1/other"});
+            }
+            let detail = denied(f.call(None, lent.clone(), args).await);
             assert!(detail.contains("may only read"), "{method}: {detail}");
         }
         let detail = denied(
@@ -2378,18 +2771,57 @@ mod tests {
             panic!("expected Denied, got {out:?}");
         };
         assert!(detail.contains("may only read"), "{detail}");
-        for method in ["PROPFIND", "REPORT"] {
-            let detail = denied(
-                f.call(
-                    None,
-                    vec![provider_clause("maps")],
-                    f.args(method, "/v1/things"),
-                )
-                .await,
-            );
+        for method in ["PROPFIND", "REPORT", "MKCOL", "COPY", "MOVE"] {
+            let mut args = f.args(method, "/v1/things");
+            if DESTINATION_METHODS.contains(&method) {
+                args["headers"] = serde_json::json!({"Destination": "/v1/other"});
+            }
+            let detail = denied(f.call(None, vec![provider_clause("maps")], args).await);
             assert!(detail.contains("may only read"), "{method}: {detail}");
         }
         assert_eq!(f.seen().len(), 1);
+    }
+
+    /// The destination is held on a deployment-key and a per-user key
+    /// provider as on an OAuth one.
+    #[tokio::test]
+    async fn a_destination_is_held_on_key_providers() {
+        let f = accounts_fixture().await;
+        for provider in ["maps", "mail"] {
+            let acl = vec![clause(&[
+                ("provider", provider),
+                ("method", "COPY"),
+                ("path", "/v1/*"),
+            ])];
+            let args = |m: &str, p: &str| {
+                let mut args = f.args(m, p);
+                args["provider"] = serde_json::json!(provider);
+                args
+            };
+            let detail = denied(
+                f.call(
+                    Some(alice()),
+                    acl.clone(),
+                    moving(&args, "COPY", "/v1/a", "/v2/a"),
+                )
+                .await,
+            );
+            assert!(
+                detail.contains("no clause admits COPY to the destination"),
+                "{provider}: {detail}"
+            );
+            f.call(Some(alice()), acl, moving(&args, "COPY", "/v1/a", "/v1/b"))
+                .await
+                .unwrap_or_else(|e| panic!("{provider}: {e:?}"));
+        }
+        let seen = f.seen();
+        assert_eq!(seen.len(), 2);
+        for seen in seen {
+            assert_eq!(
+                seen.headers["destination"],
+                format!("http://{}/v1/b", f.host)
+            );
+        }
     }
 
     /// A component's call the executor stamped with the user of the

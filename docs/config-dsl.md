@@ -454,8 +454,8 @@ other tool (see *Tool grants*), and each takes `provider` as an ACL key.
   credential attached: a user's OAuth credential, or the deployment's key for
   an `api_key_provider`. Its ACL keys are `provider`, `user`, `account`,
   `method`, `host` and `path`. `method` is one of `GET`, `HEAD`, `POST`,
-  `PUT`, `PATCH`, `DELETE`, `PROPFIND` and `REPORT`, upper-case; any other is
-  refused. A clause naming no `method`, or `method = "*"`, admits all of them.
+  `PUT`, `PATCH`, `DELETE`, `PROPFIND`, `REPORT`, `MKCOL`, `COPY` and `MOVE`,
+  upper-case; any other is refused. A clause naming no `method`, or `method = "*"`, admits all of them.
 
 These tools act as a Brenn user, so some grants are refused at boot and on
 reload:
@@ -518,9 +518,10 @@ every other key and every other tool. A `path` value is either `"*"`, or a
 template beginning with `/`. Both the template and the request path are split
 on `/`. They must have the same number of segments, and each template segment
 either equals the request's segment or is `*`, which matches exactly one
-segment. There is no prefix matching: `"/gmail/v1/users/me/drafts"` admits
-`drafts` but not `drafts/send`, and `"/calendar/v3/calendars/*/events"` does
-not admit `calendars/x/clear`.
+segment. A template without a `**` segment matches a fixed number of
+segments: `"/gmail/v1/users/me/drafts"` admits `drafts` but not
+`drafts/send`, and `"/calendar/v3/calendars/*/events"` does not admit
+`calendars/x/clear`.
 
 A template may end in `/`, and `/` alone is the root. A template ending in `/`
 admits only a request path ending in `/` with matching segments, and a
@@ -532,6 +533,42 @@ user's calendar home, and neither `/dav/calendars/user/alice@example.com` nor
 a calendar beneath it. A `*` segment never matches an empty one, so `"/a/*"`
 does not admit `/a/`. A template with an empty segment other than the one a
 trailing `/` leaves, or a `.`, `..` or `%` segment, is refused at boot.
+
+A template's last segment may be `**`, which matches one or more segments, at
+any depth. The trailing-`/` rule still holds: `"/files/**"` admits every path
+beneath `/files/` that does not end in `/` (`/files/a`, `/files/a/b/c`), and
+`"/files/**/"` every path beneath it that does (`/files/a/`, `/files/a/b/c/`).
+Neither admits `/files/` or `/files` itself: a clause that reaches the prefix
+names it, as `path = "/files/";` does. `"/**"` admits what `"*"` admits, and
+`"/**/"` every path ending in `/` but the root. `**` anywhere but the last
+segment, before the one trailing `/`, is refused at boot and at reload; a
+segment that only contains asterisks, such as `**x`, is a literal.
+
+`COPY` and `MOVE` name a second resource, the destination, in a `Destination`
+header (RFC 4918 section 10.3). The caller writes it as an absolute path on
+the request's host, percent-encoded within each segment exactly like `path`.
+It is read and checked as `path` is, and matched against the caller's clauses
+under the request's own provider, user, account, method and host: the call is
+admitted only when some clause admits the request path and some clause, the
+same or another, admits the destination. Brenn sends the header as the
+absolute URI of the destination on the request's host. A `COPY` or `MOVE`
+without a `Destination`, a `Destination` on any other method, two of them, or
+one that is not an absolute path (a URI, a host-relative `//` form, a
+traversal) is refused, and nothing is sent. A grant for a files folder and
+everything beneath it lists the folder for `PROPFIND`, and gives each method
+a `**/` clause for folders and a `**` clause for files:
+
+```
+tool api-request {
+  allow { provider = "dav"; method = "PROPFIND"; path = "/files/alice/"; }
+  allow { provider = "dav"; method = "PROPFIND"; path = "/files/alice/**/"; }
+  allow { provider = "dav"; method = "GET"; path = "/files/alice/**"; }
+  allow { provider = "dav"; method = "PUT"; path = "/files/alice/**"; }
+  allow { provider = "dav"; method = "MKCOL"; path = "/files/alice/**/"; }
+  allow { provider = "dav"; method = "MOVE"; path = "/files/alice/**"; }
+  allow { provider = "dav"; method = "MOVE"; path = "/files/alice/**/"; }
+}
+```
 
 #### The device-location tool
 
@@ -679,7 +716,8 @@ is refused at the second block.
   `Authorization: Bearer <key>` takes `header = "Authorization"` and a file
   holding `Bearer <key>`. Boot refuses a `header` that is not a valid header
   name, or that names `host`, `content-length`, `transfer-encoding`,
-  `connection` or `cookie`. It also refuses a key holding anything but visible
+  `connection`, `cookie` or `destination` (Brenn writes `Destination` on
+  `COPY` and `MOVE`). It also refuses a key holding anything but visible
   ASCII and spaces, such as a control character, a byte-order mark or a
   non-ASCII character pasted in with it.
 - `api_hosts` — required. As for `oauth_provider`: the origins requests

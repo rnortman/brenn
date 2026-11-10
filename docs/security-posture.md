@@ -1617,9 +1617,13 @@ for each account's file, and a caller with no user is admitted only to read.
   (`tool-registry-idempotency-dedupe`).
 - **The caller cannot touch the credential or the transport.** `Authorization`,
   `Cookie`, `Host` and the framing headers are refused from the caller.
+  `Destination` is the caller's to name, as a path, and Brenn's to write: the
+  header sent is the one Brenn builds, and a `Destination` Brenn did not build
+  is never sent, on any method.
 - **Reserved injection name.** The key's header is Brenn's. A caller header of
   that name, in any case, is refused on a key-provider call before anything is
-  sent.
+  sent. Boot and reload refuse `Destination` as a key's header, so the key
+  never replaces the destination Brenn builds.
 - **No redirect is followed.** A 3xx is returned to the caller, so the
   credential never goes to a `Location` the provider or an attacker chose.
 - **Exact destination.** The host must be one of the provider's configured
@@ -1633,10 +1637,14 @@ for each account's file, and a caller with no user is admitted only to read.
   resource is the server's. Traversal, an encoded separator and double
   encoding are refused before matching. The URL sent is built from the matched
   segments and the trailing `/`, so the bytes on the wire are the bytes that
-  were authorized.
+  were authorized. A template whose last segment is `**` admits every path
+  beneath its prefix with the same trailing-slash kind, and not the prefix
+  itself; it is the only template that admits more than a fixed number of
+  segments.
 - **A clause bounds the request line, not what the request asks.**
     - A clause is matched against the method, the host and the path of the
-      request and against nothing in its headers or body. What the body asks
+      request, on `COPY` and `MOVE` against the second target as well, and
+      against nothing else in its headers or body. What the body asks
       of the resource at that path is bounded by the credential and by the
       provider, not by the grant. This holds for every method and is not new:
       a `POST` to a JSON API endpoint names in its body whichever of the
@@ -1651,7 +1659,14 @@ for each account's file, and a caller with no user is admitted only to read.
       allows it) lets a slashless template reach it. `GET`, `HEAD` and `PUT`
       act on the resource at the request URI alone. A `DELETE` of a collection
       removes every member beneath it (RFC 4918 section 9.6.1: it acts as if
-      `Depth: infinity` were given), and a `PROPFIND` on a collection returns
+      `Depth: infinity` were given). `MKCOL` creates the collection at the
+      request URI alone (RFC 4918 section 9.3). A `COPY` of a collection
+      copies everything beneath it unless it carries `Depth: 0` (RFC 4918
+      section 9.8.3), and a `MOVE` of a collection always moves everything
+      beneath it (RFC 4918 section 9.9.2). A `COPY` or `MOVE` onto an existing
+      resource replaces it, and for a collection everything beneath it,
+      unless the request carries `Overwrite: F`; an absent `Overwrite` is `T`
+      (RFC 4918 sections 9.8.4, 9.9.3 and 10.6). A `PROPFIND` on a collection returns
       its members unless it carries `Depth: 0` (RFC 4918 section 9.1: an
       absent `Depth` is treated as `infinity`), though the template admitted
       none of the members' own paths. A `REPORT` may return data from outside
@@ -1665,14 +1680,29 @@ for each account's file, and a caller with no user is admitted only to read.
       reading (`PROPFIND`) or for deletion (`DELETE`): a clause that admits a
       collection's path to either method admits the whole subtree to it, so
       such a clause names a collection only where the whole subtree is meant.
+      The same holds for `COPY` and `MOVE`: a clause that admits a
+      collection's path admits its whole subtree as a source, and as a thing
+      to be replaced when it is the destination. A clause's `path` does not
+      tell a source from a destination: a grant cannot say "may be moved out
+      of here but not into here". A `**` clause hands its method the whole
+      subtree beneath the prefix by name, so a `**` clause on `DELETE`,
+      `MOVE`, `COPY` or `PUT` is a grant of everything there that the
+      credential can change.
       And a `path` template on `REPORT` is not a confidentiality boundary
       between resources one credential reaches on one host. There the boundary
       is the credential; data that must stay apart is put behind separate
       credentials (a second provider, or an account whose key the provider
       itself scopes).
-    - No method on the list carries a second target URI in a header (WebDAV
-      `COPY` and `MOVE`, `Destination`); no clause is matched against such a
-      URI.
+    - `COPY` and `MOVE` carry a second target, in the `Destination` header
+      (RFC 4918 section 10.3). The caller names it as an absolute path; it is
+      on the request's origin by construction, decoded and refused as the
+      request path is, admitted only by a clause for the same method,
+      provider, user, account and host, and sent as the absolute URI Brenn
+      builds from the matched segments. A second target on another host,
+      another of the provider's own hosts included, cannot be sent, though
+      RFC 4918 allows a copy or move across servers. No other header is
+      matched: the `If` header (RFC 4918 section 10.4) may name resources,
+      as conditions and not as targets.
 - **Bounded results.** A response is cut to a configured size, and then to what
   the tool result can carry, on every caller path.
 - **The redirect back is provider-authored data carried by a B1 browser.** The

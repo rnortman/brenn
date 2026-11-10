@@ -466,6 +466,15 @@ uses. A DAV component sets its own `Content-Type` (`api-request` defaults a
 body's to `application/json`), and sends a collection's path with its
 trailing `/`, as the server's href gives it.
 
+A component issues `MKCOL`, `COPY` and `MOVE` as any other method. On `COPY`
+and `MOVE` it sets `headers["Destination"]` to the destination's absolute
+path, percent-encoded within each segment as `path` is, and `api-request`
+sends the absolute URI on the request's host; the destination must be
+admitted by a clause for that method as the request path is. `read_api_payload`
+reads a `201` or `204` as a `Payload`, a `207` answering a partly failed
+`COPY` or `MOVE` as a `Payload` carrying the multi-status body, and a `409`,
+`412` or `423` as `PayloadAnswer::Error`.
+
 ### The gate set
 
 The example's `BUILD.bazel` is the list: `guest_spec_scaffold` generates the

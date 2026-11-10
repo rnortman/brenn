@@ -45,6 +45,35 @@ All notable changes to Brenn are documented here.
   in `/` and then admits only such paths. No existing clause admits one:
   `path = "*"` and a clause with no `path` admit only paths that do not end in
   `/`.
+- **A grant clause's `path` template that already ended in a `**` segment
+  now admits every path beneath its prefix**; it used to admit only a path
+  whose last segment was literally `**`. A template with a `**` segment
+  anywhere else, which used to be a literal, is now refused at startup and at
+  reload. `**` as a template's last segment is a new thing a grant can
+  express: `path = "/files/**/"` admits every folder beneath `/files/`, at any
+  depth, and `path = "/files/**"` every file there. Neither admits `/files/`
+  itself, which takes its own clause. See `docs/config-dsl.md`.
+- `api-request` accepts `MKCOL`, `COPY` and `MOVE`, so a provider's WebDAV
+  endpoint can make folders and copy, move and rename files and folders. A
+  grant clause that names no `method`, or `method = "*"`, now admits them; an
+  operator who does not want that names the methods. A caller with no acting
+  user is still admitted `GET` and `HEAD` only.
+- `COPY` and `MOVE` take their destination as a `Destination` header holding
+  an absolute path, written like `path`. Both the request path and the
+  destination must be admitted by the caller's grant clauses for that method,
+  and Brenn sends the destination as the absolute URI on the request's host;
+  a destination on another host cannot be named. A `Destination` header on
+  any other method, which used to be passed through, is now refused. A `COPY`
+  or `MOVE` of a folder carries everything beneath it, and one onto an
+  existing file or folder replaces it unless the request sends
+  `Overwrite: F`. An `api_key_provider` whose `header` is `Destination` is
+  now refused at boot and reload, since Brenn writes that header. See
+  `docs/security-posture.md`.
+- For WASM component authors: the provider kit needs no change to issue
+  `MKCOL`, `COPY` or `MOVE`. On `COPY` and `MOVE` set
+  `headers["Destination"]` to the destination's absolute path;
+  `api-request` sends the absolute URI. `read_api_payload` reads their
+  `201`, `204` and `207` answers as a `Payload`.
 - For WASM component authors: the provider kit's new `read_api_payload`
   reads a successful (2xx) answer's body as bytes or text, whatever its content type and whichever
   field carried it, together with the response headers; `read_api_result` is

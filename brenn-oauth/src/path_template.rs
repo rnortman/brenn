@@ -10,16 +10,22 @@
 //!
 //! A template is `*`, `/`, or `/`-initial segments optionally followed by one
 //! `/`, each segment matching its request segment exactly or, as `*`, any one
-//! segment. Segment counts must be equal: there is no prefix match. A template
+//! segment. Segment counts must be equal, except that a template's last
+//! segment may be `**`, which matches one or more segments: `/files/**`
+//! admits every path beneath `/files/` and not `/files/` itself. A template
 //! ending in `/` admits only a path ending in `/`, and one that does not
-//! admits only a path that does not; `*` admits every path not ending in `/`
-//! and none that does.
+//! admits only a path that does not, `**` included; `*` admits every path
+//! not ending in `/` and none that does.
 
 use percent_encoding::percent_decode_str;
 use url::Url;
 
 /// The `path` value meaning any path that does not end in `/`.
 pub const ANY_PATH: &str = "*";
+
+/// The template segment matching one or more request segments; only a
+/// template's last segment.
+pub const ANY_DEPTH: &str = "**";
 
 /// A decoded request path: its segments, and whether it ends in `/`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +53,7 @@ fn raw_split(text: &str) -> Option<(Vec<&str>, bool)> {
 /// Check a clause's `path` value: `*`, `/`, or `/`-initial segments
 /// optionally followed by one `/`, with no empty, `.`, `..` or `%`-bearing
 /// segment (a decoded request segment is never any of those, so such a
-/// template could match nothing).
+/// template could match nothing), and `**` as the last segment only.
 pub fn validate_template(template: &str) -> Result<(), String> {
     if template == ANY_PATH {
         return Ok(());
@@ -57,7 +63,14 @@ pub fn validate_template(template: &str) -> Result<(), String> {
             "path template {template:?} must be \"*\" or begin with \"/\""
         ));
     };
-    for segment in segments {
+    let last = segments.len().saturating_sub(1);
+    for (index, segment) in segments.into_iter().enumerate() {
+        if segment == ANY_DEPTH && index != last {
+            return Err(format!(
+                "path template {template:?} has \"**\" before its last segment; \"**\" is \
+                 only the last segment (before the one trailing \"/\", when there is one)"
+            ));
+        }
         if segment.is_empty() || segment == "." || segment == ".." || segment.contains('%') {
             return Err(format!(
                 "path template {template:?} has segment {segment:?}; a segment is a literal \
@@ -104,11 +117,12 @@ pub fn decode_path(path: &str) -> Result<RequestPath, String> {
     })
 }
 
-// TODO(api-request-no-grant-for-collections-at-every-depth): no template
-// admits a slashed path at every depth.
 /// Whether `template` (already valid) admits `path`: `*` admits any path not
-/// ending in `/`; any other template admits a path when both end in `/` or
-/// neither does, and their segments match one for one.
+/// ending in `/`; any other template admits a path only when both end in `/`
+/// or neither does. A template whose last segment is `**` then admits a path
+/// with more segments than the template has before `**`, those leading
+/// segments matching one for one; any other template admits a path whose
+/// segments match its own one for one.
 pub fn template_admits(template: &str, path: &RequestPath) -> bool {
     if template == ANY_PATH {
         return !path.trailing_slash;
@@ -116,12 +130,23 @@ pub fn template_admits(template: &str, path: &RequestPath) -> bool {
     let Some((parts, trailing_slash)) = raw_split(template) else {
         return false;
     };
-    trailing_slash == path.trailing_slash
-        && parts.len() == path.segments.len()
-        && parts
-            .iter()
-            .zip(&path.segments)
-            .all(|(part, segment)| *part == "*" || part == segment)
+    if trailing_slash != path.trailing_slash {
+        return false;
+    }
+    let matches = |part: &&str, segment: &String| *part == "*" || part == segment;
+    match parts.split_last() {
+        Some((&ANY_DEPTH, prefix)) => {
+            path.segments.len() > prefix.len()
+                && prefix
+                    .iter()
+                    .zip(&path.segments)
+                    .all(|(p, s)| matches(p, s))
+        }
+        _ => {
+            parts.len() == path.segments.len()
+                && parts.iter().zip(&path.segments).all(|(p, s)| matches(p, s))
+        }
+    }
 }
 
 /// The path as it will be sent, for logs and ACL messages: each decoded
@@ -249,6 +274,86 @@ mod tests {
                 !template_admits(template, &segs(path)),
                 "{template} must not admit {path}"
             );
+        }
+    }
+
+    #[test]
+    fn a_deep_template_admits_its_kind_at_every_depth_beneath_its_prefix() {
+        for (template, paths) in [
+            ("/files/**", ["/files/a", "/files/a/b", "/files/a/b/c/d/e"]),
+            (
+                "/files/**/",
+                ["/files/a/", "/files/a/b/", "/files/a/b/c/d/e/"],
+            ),
+            ("/**/", ["/a/", "/a/b/", "/a/b/c/d/e/"]),
+        ] {
+            for path in paths {
+                assert!(
+                    template_admits(template, &segs(path)),
+                    "{template} must admit {path}"
+                );
+            }
+        }
+        for (template, path) in [
+            ("/files/**", "/files/a/"),
+            ("/files/**", "/files/a/b/c/d/e/"),
+            ("/files/**", "/files"),
+            ("/files/**", "/files/"),
+            ("/files/**", "/files2/a"),
+            ("/files/**", "/a"),
+            ("/files/**", "/"),
+            ("/files/**/", "/files/a"),
+            ("/files/**/", "/files/a/b/c/d/e"),
+            ("/files/**/", "/files"),
+            ("/files/**/", "/files/"),
+            ("/files/**/", "/files2/a/"),
+            ("/files/**/", "/a/"),
+            ("/files/**/", "/"),
+            ("/**/", "/"),
+            ("/**/", "/a"),
+            ("/**", "/a/"),
+            ("/**", "/"),
+        ] {
+            assert!(
+                !template_admits(template, &segs(path)),
+                "{template} must not admit {path}"
+            );
+        }
+    }
+
+    /// `/**` admits exactly what `*` admits.
+    #[test]
+    fn a_root_deep_template_is_the_any_path_set() {
+        for path in ["/a/", "/a/x/", "/", "/a", "/a/x", "/a/b/c", "/x/", "/*"] {
+            let path = segs(path);
+            assert_eq!(
+                template_admits("/**", &path),
+                template_admits(ANY_PATH, &path),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_star_before_a_deep_segment_matches_one_segment() {
+        let template = "/dav/*/**/";
+        assert!(template_admits(template, &segs("/dav/alice/a/")));
+        assert!(template_admits(template, &segs("/dav/bob/a/b/c/")));
+        assert!(!template_admits(template, &segs("/dav/alice/")));
+        assert!(!template_admits(template, &segs("/other/alice/a/")));
+        // A request segment literally `**` is content: `*` and `**` admit it.
+        assert!(template_admits("/a/**", &segs("/a/**")));
+        assert!(template_admits("/a/*", &segs("/a/**")));
+    }
+
+    #[test]
+    fn a_deep_segment_is_only_the_last() {
+        for ok in ["/**", "/**/", "/a/**", "/a/*/**/", "/a/**x", "/a/x**/b"] {
+            assert_eq!(validate_template(ok), Ok(()), "{ok}");
+        }
+        for bad in ["/**/a", "/a/**/b/", "/a/**/**", "/**/**/"] {
+            let err = validate_template(bad).expect_err(bad);
+            assert!(err.contains("only the last segment"), "{bad}: {err}");
         }
     }
 

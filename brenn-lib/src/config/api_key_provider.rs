@@ -164,8 +164,8 @@ impl UserAccounts {
 pub struct ApiKeyProviderConfig {
     pub raw: ApiKeyProviderRaw,
     pub keys: ApiKeys,
-    /// `raw.header`, lowercased: a valid header name that is not a
-    /// [`TRANSPORT_HEADERS`] entry.
+    /// `raw.header`, lowercased: a valid header name that is neither a
+    /// [`TRANSPORT_HEADERS`] entry nor `destination`.
     pub header: HeaderName,
     /// `raw.api_hosts`, parsed: each origin's `host[:port]` and the origin
     /// itself, as `OAuthProviderConfig::api_origins`.
@@ -417,6 +417,11 @@ fn resolve_header(label: &str, text: &str) -> HeaderName {
         "config: {label}: header {text:?} is a transport header or the cookie; \
          the key cannot be sent in it",
     );
+    assert!(
+        header != "destination",
+        "config: {label}: header {text:?} is the `Destination` header, which Brenn writes \
+         on `COPY` and `MOVE`; the key cannot be sent in it",
+    );
     header
 }
 
@@ -541,6 +546,8 @@ mod tests {
             ("Transfer-Encoding", "transport header"),
             ("connection", "transport header"),
             ("Cookie", "transport header"),
+            ("Destination", "the `Destination` header"),
+            ("destination", "the `Destination` header"),
         ] {
             let mut provider = raw(PathBuf::from("/nonexistent"));
             provider.header = header.to_string();
