@@ -41,6 +41,7 @@ members = [
     "processor-log",
     "processor-mem-exhaust",
     "processor-mqtt-test",
+    "processor-page-test",
     "processor-multiport",
     "processor-provider-test",
     "processor-stale-contract-test",

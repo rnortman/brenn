@@ -151,6 +151,29 @@ write_file(
     content = ['{"type": "object"}', ""],
 )
 
+# The page rig's fixture kind, staged like a served kind and never served: it is
+# outside `_PROCESSOR_KINDS`, so it is not in `dist`.
+surface_processor_assets(
+    name = "processor-page-test_assets",
+    component = "//brenn-wasm/components/processor-page-test:component",
+    kind = "processor-page-test",
+    spec = "//brenn-wasm/components/processor-page-test:spec/processor-page-test.brenn",
+)
+
+# What the page rig serves: the production kernel bundle and the fixture kind,
+# laid out as `dist` lays them out.
+surface_dist(
+    name = "page_rig_dist",
+    testonly = True,
+    dirname = "page-rig-dist",
+    stages = [
+        ":processor-page-test_assets",
+        "//surface/kernel:kernel_dist",
+    ],
+    target_compatible_with = HOST_ONLY,
+    visibility = ["//frontend:__pkg__"],
+)
+
 # Derived, not retyped. `surface_processor_component()` mints `<kind>_dist` in every
 # component package, and a hand-written list here is a second edit a mechanical
 # component addition would not know to make — the component would build, lint

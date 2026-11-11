@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 
-use crate::test_support::bindings::{body_with_unknown_grant, imply_vocabularies};
+use crate::test_support::bindings::{body_with_unknown_grant, call, imply_vocabularies};
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Binding, CallBinding, ComponentEntry, LOCAL_LINK_STATE_CHANNEL, LOCAL_THEME_CHANNEL,
-    LOCAL_TOAST_CHANNEL, LocalChannel, LogLevel, NoiseLevel, OutputBinding, Urgency,
-    reserved_local_channel,
+    Binding, ComponentEntry, LOCAL_LINK_STATE_CHANNEL, LOCAL_THEME_CHANNEL, LOCAL_TOAST_CHANNEL,
+    LocalChannel, LogLevel, NoiseLevel, OutputBinding, Urgency, reserved_local_channel,
 };
 
 use super::AppliedBindings;
@@ -227,12 +226,7 @@ fn doc_with_call() -> BindingsDocument {
     let mut doc = doc();
     doc.components[0].call_ports = vec!["lookup".to_string()];
     doc.components[1].sync_ports = vec!["resolve".to_string()];
-    doc.calls = vec![CallBinding {
-        instance: "p1".to_string(),
-        port: "lookup".to_string(),
-        target_instance: "p2".to_string(),
-        target_port: "resolve".to_string(),
-    }];
+    doc.calls = vec![call("p1", "lookup", "p2", "resolve")];
     doc
 }
 

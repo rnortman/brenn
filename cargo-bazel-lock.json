@@ -1,5 +1,5 @@
 {
-  "checksum": "300a1ab3dc3b6cdcc7189e189e7f244b50d635a9435ae52b57586156c0e8f7fa",
+  "checksum": "cd4d63c5f3b28c25254178d28bc4e50ead76febc53d943801799ac7435ebf06d",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -5891,6 +5891,54 @@
             {
               "id": "tempfile 3.27.0",
               "target": "tempfile"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-surface-test-peer 0.1.0": {
+      "name": "brenn-surface-test-peer",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_surface_test_peer",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_surface_test_peer",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "chrono 0.4.45",
+              "target": "chrono"
+            },
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            },
+            {
+              "id": "uuid 1.24.0",
+              "target": "uuid"
             }
           ],
           "selects": {}
@@ -37309,6 +37357,7 @@
     "brenn-surface-schema 0.1.0": "surface/schema",
     "brenn-surface-server 0.1.0": "surface/server",
     "brenn-surface-test-fixtures 0.1.0": "surface/test-fixtures",
+    "brenn-surface-test-peer 0.1.0": "surface/test-fixtures/peer",
     "brenn-tool 0.1.0": "brenn-tool",
     "brenn-tool-proto 0.1.0": "brenn-tool-proto",
     "brenn-tool-registry 0.1.0": "brenn-tool-registry",

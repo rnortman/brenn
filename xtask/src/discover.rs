@@ -166,6 +166,7 @@ mod tests {
             ("processor-exhaust", Family::Raw),
             ("processor-mem-exhaust", Family::Raw),
             ("processor-mqtt-test", Family::Raw),
+            ("processor-page-test", Family::Raw),
             ("processor-stale-contract-test", Family::Raw),
             ("processor-tool-test", Family::Raw),
             ("replay", Family::Raw),

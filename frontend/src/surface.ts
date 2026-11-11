@@ -808,10 +808,17 @@ function processorImports(
 ): Record<string, Record<string, unknown>> {
     // The kernel answers every one of these calls with a variant name or the empty
     // string for ok; whether that name comes from `publish-error` or `defer-error`
-    // is the kernel's business, so one thrower serves them all.
+    // is the kernel's business, so one thrower serves them all. Every thrown
+    // variant carries a string `val`: the glue reads it only when lowering a
+    // variant that has a payload (`invalid-payload`), and lowering one without
+    // it traps the guest.
+    // TODO(surface-publish-refusal-diagnostic): the `val` is fixed text, because
+    // the kernel answers a bare variant name and drops the refusal's detail.
     const refuse = (error: string): void => {
         if (error !== "") {
-            throw { payload: { tag: error } };
+            throw {
+                payload: { tag: error, val: "payload refused by the page host" },
+            };
         }
     };
     const publish = (port: string, payload: string, urgency?: string): void =>

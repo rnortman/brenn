@@ -331,7 +331,9 @@ fn port_answer<E>(
 /// the WIT `publish-error` string the guest lifts, or the empty string for ok. A
 /// `None` from `try_buffered_publish` means no activation of this instance is in
 /// flight — a component publishing outside `receive`, which its world gives it no
-/// way to do — so it is refused, exactly as the DOM seam refuses one.
+/// way to do — so it is refused, exactly as the DOM seam refuses one. An urgency
+/// outside the WIT enum is an `Err`, which the loader's shim passes through as a
+/// trap.
 #[wasm_bindgen]
 pub fn brenn_processor_publish(
     instance: &str,
@@ -343,8 +345,16 @@ pub fn brenn_processor_publish(
         Some(raw) => match crate::Urgency::parse(&raw) {
             Some(urgency) => Some(urgency),
             // The guest's WIT enum lifts to a fixed string set, so an
-            // unrecognized value is transpile-glue drift, not a component typo.
-            None => return Ok("invalid-payload".to_string()),
+            // unrecognized value is transpile-glue drift, not a component typo:
+            // it traps the instance rather than answering with a refusal the
+            // guest could carry on past.
+            None => {
+                return Err(JsValue::from_str(&format!(
+                    "surface kernel: '{instance}' published on '{port}' with urgency \
+                     {raw:?}, which the kernel does not recognize: the page glue and \
+                     the kernel disagree on the urgency enum"
+                )));
+            }
         },
         None => None,
     };
@@ -531,8 +541,9 @@ fn call_error_thrown(error: &crate::contract::CallError) -> JsValue {
 /// [`crate::publish_buffer::PublishBuffer::admit_call`], the answer in
 /// [`crate::calls::call_answer`], the stack discipline in
 /// [`crate::front::InFlightStack`]. TODO(surface-wasm-test-in-ci): the order
-/// they are asked in, and this export itself, are browser-only and pinned by
-/// nothing that runs.
+/// they are asked in, and this export itself, are wasm32-only; the node page rig
+/// drives them for one admitted call between headless kinds, and their other
+/// arms run nowhere.
 ///
 /// [`CallError`]: crate::contract::CallError
 #[wasm_bindgen]

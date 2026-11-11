@@ -238,8 +238,9 @@ impl SyncDoor {
     /// the caller's in-flight frame, for the reason
     /// [`crate::front::InFlightPublish::effects`] gives.
     ///
-    /// TODO(surface-wasm-test-in-ci): this body is browser-only and is driven by
-    /// no runner. What it composes is pinned natively — the gate in
+    /// TODO(surface-wasm-test-in-ci): this body is wasm32-only. The node page rig
+    /// drives it for one admitted call between headless kinds; its other arms run
+    /// nowhere. What it composes is pinned natively — the gate in
     /// [`crate::turn`], the stack in [`crate::front::InFlightStack`], the answer
     /// in [`crate::calls::call_answer`] — but the composition is not.
     ///

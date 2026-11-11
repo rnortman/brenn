@@ -16,7 +16,7 @@ use uuid::Uuid;
 /// The peer's opening `Hello`, stating this build's whole supported range — a
 /// peer that speaks what we speak, which is what every test but a negotiation
 /// one wants.
-pub(crate) fn server_hello() -> String {
+pub fn server_hello() -> String {
     frame(&ServerFrame::Hello {
         versions: SUPPORTED_VERSIONS,
         ident: "peer".to_string(),
@@ -25,7 +25,7 @@ pub(crate) fn server_hello() -> String {
 
 /// The `Welcome` stating `facts`. Every field of the frame is one of the
 /// attachment facts, so the two cannot drift.
-pub(crate) fn welcome(facts: AttachmentFacts) -> String {
+pub fn welcome(facts: AttachmentFacts) -> String {
     frame(&ServerFrame::Welcome {
         version: facts.version,
         participant_id: facts.participant_id,
@@ -38,7 +38,7 @@ pub(crate) fn welcome(facts: AttachmentFacts) -> String {
 }
 
 /// An accepted subscribe, replaying `replay_count` messages behind it.
-pub(crate) fn subscribe_result(channel: &str, replay_count: u32) -> String {
+pub fn subscribe_result(channel: &str, replay_count: u32) -> String {
     frame(&ServerFrame::SubscribeResult {
         channel: channel.to_string(),
         outcome: SubscribeOutcome::Ok,
@@ -51,7 +51,7 @@ pub(crate) fn subscribe_result(channel: &str, replay_count: u32) -> String {
 /// identity: a store dedups by message id and a span refuses a `seq` it has
 /// already seen, so two rows on one channel must differ in both. The cursor is
 /// `c{seq}`, which is what a suite asserting a resume claim reads back.
-pub(crate) fn row(channel: &str, body: &str, seq: u64, id: u128) -> DeliverRow {
+pub fn row(channel: &str, body: &str, seq: u64, id: u128) -> DeliverRow {
     DeliverRow {
         envelope: MessageEnvelope {
             message_id: Uuid::from_u128(id),
@@ -76,7 +76,7 @@ pub(crate) fn row(channel: &str, body: &str, seq: u64, id: u128) -> DeliverRow {
 
 /// A whole delivery pass on `channel`, one row per `(body, seq, id)`, as the
 /// peer writes it — one frame, however many rows.
-pub(crate) fn deliver_pass(channel: &str, rows: &[(&str, u64, u128)]) -> String {
+pub fn deliver_pass(channel: &str, rows: &[(&str, u64, u128)]) -> String {
     frame(&ServerFrame::Deliver {
         channel: channel.to_string(),
         rows: rows
@@ -87,16 +87,16 @@ pub(crate) fn deliver_pass(channel: &str, rows: &[(&str, u64, u128)]) -> String 
 }
 
 /// A one-row pass at a stated position and identity.
-pub(crate) fn deliver_at(channel: &str, body: &str, seq: u64, id: u128) -> String {
+pub fn deliver_at(channel: &str, body: &str, seq: u64, id: u128) -> String {
     deliver_pass(channel, &[(body, seq, id)])
 }
 
 /// A one-row pass at the first position, for a channel a test delivers on once.
-pub(crate) fn deliver(channel: &str, body: &str) -> String {
+pub fn deliver(channel: &str, body: &str) -> String {
     deliver_at(channel, body, 1, 0x9001)
 }
 
 /// Serialize a server frame the way a peer writes it.
-pub(crate) fn frame(frame: &ServerFrame) -> String {
+pub fn frame(frame: &ServerFrame) -> String {
     serde_json::to_string(frame).expect("a server frame serializes")
 }

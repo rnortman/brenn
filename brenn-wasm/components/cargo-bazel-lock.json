@@ -1,5 +1,5 @@
 {
-  "checksum": "529a45f4fbc15258f93756979643fa2fac7d8b9c433c4bf82647846b79fff35d",
+  "checksum": "73bf3480eeec85866b4e4baf7f72bee1825380f27e69e048006ca586451ab480",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -848,6 +848,37 @@
             {
               "id": "serde_json 1.0.151",
               "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-page-test 0.1.0": {
+      "name": "brenn-processor-page-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            },
+            {
+              "id": "wit-bindgen 0.60.0",
+              "target": "wit_bindgen"
             }
           ],
           "selects": {}
@@ -4408,6 +4439,7 @@
     "brenn-processor-mem-exhaust 0.1.0": "brenn-wasm/components/processor-mem-exhaust",
     "brenn-processor-mqtt-test 0.1.0": "brenn-wasm/components/processor-mqtt-test",
     "brenn-processor-multiport 0.1.0": "brenn-wasm/components/processor-multiport",
+    "brenn-processor-page-test 0.1.0": "brenn-wasm/components/processor-page-test",
     "brenn-processor-provider-test 0.1.0": "brenn-wasm/components/processor-provider-test",
     "brenn-processor-stale-contract-test 0.1.0": "brenn-wasm/components/processor-stale-contract-test",
     "brenn-processor-store-rt 0.1.0": "brenn-wasm/components/processor-store-rt",

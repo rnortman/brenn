@@ -4,6 +4,11 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- A page-hosted component's oversize publish is refused with
+  `invalid-payload` and no longer terminates the instance. Before, the
+  refusal reached a `brenn:processor@0.1.0` guest with no payload, the
+  generated glue could not lower it, and the instance failed with
+  `expected a string`.
 - **BREAKING for component authors: `MessageEnvelope.body` is a
   `MessageBody`.** A message body on the bus is now bytes with an optional
   content type. Under the current component contract every body a component
@@ -67,6 +72,13 @@ All notable changes to Brenn are documented here.
   writes one `warn!` at boot and after each applied reload naming them. No
   removal release is scheduled and nothing needs to change yet; the removal
   period does not begin until the byte-carrying contract is declared stable.
+- In the browser surface, a publish carrying an unrecognized urgency value
+  now traps the component instead of being refused as `invalid-payload`.
+  Such a value can only come from the page glue and the kernel disagreeing,
+  not from a component bug.
+- Development: `make check` now runs the real browser page kernel, the page
+  glue and real transpiled components together in node (the "page rig"),
+  covering publish, retained round trips and sync calls on the page.
 
 ## [0.34.0] — 2026-11-10
 

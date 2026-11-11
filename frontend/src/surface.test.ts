@@ -1420,7 +1420,10 @@ describe("surface processor bring-up", () => {
         // kernel's answer rather than a fixed set of its own.
         expect(() => ports.deferCancel("out", 7)).toThrowError(
             expect.objectContaining({
-                payload: { tag: "out-of-range" },
+                payload: {
+                    tag: "out-of-range",
+                    val: "payload refused by the page host",
+                },
             }) as Error,
         );
     });
@@ -1457,7 +1460,25 @@ describe("surface processor bring-up", () => {
         // is the WIT variant name the guest sees.
         expect(() => ports.publish("out", "{}")).toThrowError(
             expect.objectContaining({
-                payload: { tag: "quota-exceeded" },
+                payload: {
+                    tag: "quota-exceeded",
+                    val: "payload refused by the page host",
+                },
+            }) as Error,
+        );
+
+        // Every thrown variant carries a string `val`, so a refusal whose WIT
+        // variant has a payload (`invalid-payload`) lowers instead of trapping.
+        kernel.brenn_processor_publish = vi.fn(
+            (_i: string, _p: string, _b: string, _u?: string) =>
+                "invalid-payload",
+        );
+        expect(() => ports.publish("out", "{}")).toThrowError(
+            expect.objectContaining({
+                payload: {
+                    tag: "invalid-payload",
+                    val: "payload refused by the page host",
+                },
             }) as Error,
         );
     });

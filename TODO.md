@@ -1,5 +1,54 @@
 # TODOs
 
+## `surface-byte-crossing-in-browser`
+
+The page's body crossing — guest, jco glue, `frontend/src/surface.ts`,
+the kernel's wasm-bindgen exports, the page-local store, and back through
+the activation — is gated only by the node rig: node's WebAssembly
+engine, and stand-ins for `Window`, `document`, `HTMLElement`,
+`WebSocket`, `fetch` and the timer functions. The page's own `bootstrap`,
+its default kernel init and its streaming compile run there, but against
+node's implementations and a `fetch` that answers from disk. No test runs
+the crossing in a real browser: no spec in `e2e/` binds a `local:`
+channel. The binary-bus project accepts the surface host's byte path
+(`brenn:processor@0.2.0`) on that rig, so "a surface component stores
+large binary state on an `io` port" is shown in node, not in a page, and
+its timings are V8 under node. A difference between the two in the
+engine, a real network fetch, a real socket or a real `Window` would be
+found by an out-of-tree component. Done when a spec in the `make e2e`
+suite runs a kind's retained round trip on a page-local `io` port in
+Chromium, the body compared byte for byte — a non-UTF-8 body once the
+surface host serves 0.2.0 — and records the time per activation at the
+rig's sizes; or when the owner rules that the node rig is enough and
+removes this entry. Facts that bear on it: `make e2e` is operator-run
+("before tagging a release, and after any change under `surface/`",
+`e2e-in-ci`) and no gate runs it; no browser is installed where the agent
+cycles run, so a spec written there lands unrun unless Playwright's
+chromium is provisioned first. `processor-transplant-browser-engine` tracks
+the same missing engine for the transplant parity test's guest; the
+Chromium spec here runs a transpiled guest in a browser engine too.
+
+Code site (`TODO(surface-byte-crossing-in-browser)`):
+`frontend/src/page-rig/globals.ts`, at the install function.
+
+## `surface-publish-refusal-diagnostic`
+
+A page-hosted component whose publish is refused as `invalid-payload` is
+handed a fixed diagnostic, "payload refused by the page host", where the
+backend's says what was wrong (the body's length and the cap). The page's
+kernel answers its port exports with a bare variant name
+(`surface/kernel/src/entry.rs`, `port_answer`) and drops the fault's text
+before the seam (`surface/kernel/src/publish_buffer.rs`,
+`publish_error`), so the glue has nothing better to pass on. Done when
+the kernel's port exports carry a payload-bearing variant's text to the
+guest, as `call_error_thrown` already does for `calls`, and the glue
+passes it through. It is a change to the kernel-to-glue answer vocabulary
+and belongs with the byte contract's port errors, which add more
+payload-bearing variants.
+
+Code site (`TODO(surface-publish-refusal-diagnostic)`): the thrower in
+`processorImports`, `frontend/src/surface.ts`.
+
 ## `binary-contract-version-mechanism`
 
 Owner confirmation wanted: the byte-carrying component contract
@@ -869,9 +918,18 @@ nothing says so; that has already happened once, to the kernel's publish-route
 test, when a per-instance grant gate landed against a fixture that granted
 nothing. And a suite that never runs answers no behavioral question — these are
 the XSS-adjacent text-not-markup pins, the DOM seam, mount/unmount, port
-dispatch, and the whole sync-call seam (the `brenn-activation-sync` listener,
-the door's answer vocabulary, the publish route's buffered/refused split), which
-exists only in the browser and is pinned only here.
+dispatch, and the sync-call seam's remaining arms — the `brenn-activation-sync`
+listener, a `dom` peer, the door's refusal answers — which no gate runs.
+
+A node rig (`//frontend:vitest_page_rig`) now runs the production kernel
+bundle with the production page glue and a transpiled kind against a
+scripted attach peer under `make check`, and through it pins the publish
+route, a refused publish, the deferred view, the activation crossing and
+one sync call, for headless kinds. It runs node's WebAssembly engine with
+stand-in browser globals: it does not compile or run the
+`wasm-bindgen-test` suites, and it covers nothing that needs a real DOM —
+the text-not-markup pins, the DOM capability host, mount and unmount stay
+uncovered and are what this entry is still for.
 
 Done when a gate runs them. Two things have to land, in order. First a Bazel
 rule that drives `wasm-bindgen-test-runner` against a WebDriver browser — no
@@ -889,8 +947,9 @@ the browser suite over the live DOM capability host, which is the whole of what
 the five migrated kinds render through and is compiled by nothing in CI. The
 `calls` seam is the other one: `surface/kernel/src/entry.rs`'s
 `brenn_processor_call` and `surface/kernel/src/sync_door.rs`'s `SyncDoor::call`
-are browser-only compositions — each decision they make is pinned natively, the
-order they ask them in is not.
+are wasm32-only compositions — each decision they make is pinned natively, and
+the node rig runs their order for one admitted call between headless kinds; the
+refusal arms and a `dom` peer are run by nothing.
 
 ---
 
@@ -1448,9 +1507,10 @@ resume path.
 The surface-half transplant parity test
 (`frontend/src/processor-transplant.test.ts`) exercises the real
 jco-transpiled artifact, but under node's WebAssembly engine rather than a
-real browser engine. The harness resolves artifacts by filesystem path: it
-dynamic-imports a `file://` URL and reads the core wasm bytes with
-`readFileSync`. The wasm-bindgen headless-browser runner has no filesystem, so
+real browser engine. The harness
+(`frontend/src/test-helpers/transpiled-processor.ts`) resolves artifacts by
+filesystem path: it dynamic-imports a `file://` URL and reads the core wasm
+bytes with `readFileSync`. The wasm-bindgen headless-browser runner has no filesystem, so
 the test cannot move there as written.
 
 The residual uncovered case is narrow and specific: **the transpiled guest
@@ -1464,9 +1524,13 @@ Done when `surface/dist` is served in the browser test fixture and those two
 filesystem calls (the `file://` dynamic import and the `readFileSync` of core
 wasm) are swapped for `fetch`.
 
+`surface-byte-crossing-in-browser` tracks the same missing browser engine for
+the page's whole body crossing: the Chromium spec it asks for also runs a
+jco-transpiled guest in a browser engine, loaded by the page's own `fetch`.
+
 Code site (`TODO(processor-transplant-browser-engine)`):
-`frontend/src/processor-transplant.test.ts`, the header note on how artifacts
-are resolved.
+`frontend/src/test-helpers/transpiled-processor.ts`, the header note on how
+artifacts are resolved.
 
 ---
 

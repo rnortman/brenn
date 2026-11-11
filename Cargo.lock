@@ -1279,6 +1279,7 @@ dependencies = [
  "brenn-surface-contract",
  "brenn-surface-schema",
  "brenn-surface-test-fixtures",
+ "brenn-surface-test-peer",
  "chrono",
  "futures-channel",
  "futures-util",
@@ -1343,6 +1344,19 @@ dependencies = [
  "brenn-surface-contract",
  "serde_json",
  "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "brenn-surface-test-peer"
+version = "0.1.0"
+dependencies = [
+ "brenn-attach-client",
+ "brenn-attach-proto",
+ "brenn-envelope",
+ "brenn-surface-schema",
+ "chrono",
+ "serde_json",
  "uuid",
 ]
 

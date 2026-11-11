@@ -363,17 +363,23 @@ TRANSPILED_TESTS = [
     "src/surface-activation-golden.test.ts",
 ]
 
+# The page rig runs in its own target, below.
+PAGE_RIG_TESTS = [
+    "src/page-rig/page-rig.test.ts",
+    "src/page-rig/page-rig-measure.test.ts",
+]
+
 vitest_bin.vitest_test(
     name = "vitest",
     size = "medium",
-    # Neither file has a skip path — absent its tree each fails naming the
-    # command that builds it — so both are excluded here rather than left to
-    # bail.
+    # None of these files has a skip path — absent its tree each fails naming
+    # the command or target that builds it — so all are excluded here rather
+    # than left to bail.
     args = [
         "run",
     ] + [
         arg
-        for test in TRANSPILED_TESTS
+        for test in TRANSPILED_TESTS + PAGE_RIG_TESTS
         for arg in [
             "--exclude",
             "**/" + test,
@@ -398,5 +404,59 @@ vitest_bin.vitest_test(
         ":node_modules",
         ":vitest_transpiled_root",
     ],
+    target_compatible_with = HOST_ONLY,
+)
+
+# ---------------------------------------------------------------------------
+# The page rig
+# ---------------------------------------------------------------------------
+# The production kernel bundle, the production `surface.ts` and a transpiled
+# kind, brought up by the page's own `bootstrap` in node against a scripted
+# attach peer. Its closure is the kernel and the one fixture kind, not
+# `//surface:dist`, so an edit to a shipped component does not rerun it.
+
+copy_to_directory(
+    name = "vitest_page_rig_root",
+    testonly = True,
+    srcs = [
+        "//surface:page_rig_dist",
+        "//surface/test-fixtures/peer:page_rig_kit.json",
+        ":ts_src",
+    ],
+    replace_prefixes = {"frontend/ts_src": "frontend"},
+    root_paths = [],
+    target_compatible_with = HOST_ONLY,
+)
+
+vitest_bin.vitest_test(
+    name = "vitest_page_rig",
+    size = "medium",
+    args = [
+        "run",
+        "src/page-rig/page-rig.test.ts",
+    ],
+    chdir = package_name() + "/vitest_page_rig_root/frontend",
+    data = [
+        ":node_modules",
+        ":vitest_page_rig_root",
+    ],
+    target_compatible_with = HOST_ONLY,
+)
+
+# The 0.1.0 base64 state baseline at three sizes: timings printed, nothing
+# asserted on time. Run by hand with `bazel test --test_output=all`.
+vitest_bin.vitest_test(
+    name = "page_rig_measure",
+    size = "large",
+    args = [
+        "run",
+        "src/page-rig/page-rig-measure.test.ts",
+    ],
+    chdir = package_name() + "/vitest_page_rig_root/frontend",
+    data = [
+        ":node_modules",
+        ":vitest_page_rig_root",
+    ],
+    tags = ["manual"],
     target_compatible_with = HOST_ONLY,
 )

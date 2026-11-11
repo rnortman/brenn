@@ -1,0 +1,22 @@
+[package]
+name = "brenn-processor-page-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The macro generates this crate's bindings from the 0.1.0 world at expansion
+# time; it tracks the tree's single wit-bindgen version.
+wit-bindgen = "0.60"
+# Envelopes cross the 0.1.0 boundary as JSON text; the fixture reads a body out
+# of one where a command needs it.
+serde_json = "1"
+
+[package.metadata.component]
+package = "brenn:processor"
+target = { path = "../../wit/processor.wit" }
+
+[package.metadata.component.dependencies]

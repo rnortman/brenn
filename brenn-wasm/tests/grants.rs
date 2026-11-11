@@ -349,6 +349,7 @@ fn drift_guard_all_fixture_imports_recognized() {
         "brenn_processor_multiport",
         "brenn_processor_store_rt",
         "brenn_processor_bytes_test",
+        "brenn_processor_page_test",
     ];
 
     for fixture in &fixtures {
