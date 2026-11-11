@@ -1774,10 +1774,14 @@ async fn a_typed_text_body_is_delivered_as_its_text() {
     let typed_frames = send_one_row(typed).await;
     let untyped_frames = send_one_row("# hi".into()).await;
     assert_eq!(typed_frames.len(), 1);
-    let typed_text = serde_json::to_string(&typed_frames[0]).unwrap();
+    let v4 = brenn_attach_proto::Codec::negotiated(4);
+    let brenn_attach_proto::WireMessage::Text(typed_text) = v4.encode_server(&typed_frames[0])
+    else {
+        panic!("a v4 frame is text");
+    };
     assert_eq!(
-        typed_text,
-        serde_json::to_string(&untyped_frames[0]).unwrap()
+        brenn_attach_proto::WireMessage::Text(typed_text.clone()),
+        v4.encode_server(&untyped_frames[0])
     );
     assert!(typed_text.contains(r##""body":"# hi""##), "{typed_text}");
     assert!(!typed_text.contains("content_type"), "{typed_text}");
@@ -1794,4 +1798,67 @@ async fn a_non_text_body_panics_where_the_deliver_row_is_built() {
     )
     .unwrap();
     send_one_row(body).await;
+}
+
+/// A v5 session subscribes to a channel declared `non_text` and is replayed
+/// its non-text row byte-exact, with its content type.
+#[tokio::test]
+async fn a_v5_subscribe_to_a_non_text_channel_replays_a_non_text_row() {
+    use brenn_lib::messaging::{ChannelScheme, MessageBody, Urgency};
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (messenger, uuid) =
+        crate::test_support::one_channel_messenger_declared(&db, BARE, Depth::Unbounded, true)
+            .await;
+    let body = MessageBody::from_parts(Some("image/png"), &[0x89, 0x00, 0xff]).unwrap();
+    {
+        let conn = db.lock().await;
+        brenn_messaging_store::db::insert_message(
+            &conn,
+            uuid,
+            "test",
+            "sender",
+            &body,
+            Urgency::Normal,
+            ChannelScheme::Brenn,
+            None,
+            None,
+            None,
+            None,
+            100,
+        );
+    }
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy.acls.brenn_subscribe = vec![ChannelMatcher::Exact(BARE.to_string())];
+    let profile = TestProfile {
+        subscribable: HashMap::from([(
+            ADDR.to_string(),
+            SubscriptionFacts {
+                push_depth: 8,
+                retain_depth: 8,
+            },
+        )]),
+        subscribe_burst: 16,
+        runtime_entry: Some(minted_entry(8, 8)),
+        ..TestProfile::new()
+    };
+    let (ctx, mut rx) = AttachCtxBuilder::new(profile)
+        .messenger(messenger)
+        .policy(policy)
+        .version(5)
+        .build();
+    let mut wire = Wire::new(&ctx);
+
+    assert!(matches!(wire.open(&ctx, 8).await, FrameOutcome::Continue));
+
+    let out = frames(&mut rx);
+    assert_eq!(out.len(), 2, "the result plus one replay frame");
+    assert_eq!(subscribe_result(&out[0]), (1, None));
+    let ServerFrame::Deliver { rows, .. } = &out[1] else {
+        panic!("expected a Deliver, got {:?}", out[1]);
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].envelope.body, body);
+    assert_eq!(rows[0].envelope.body.content_type(), Some("image/png"));
+    assert!(wire.active.is_active(ADDR));
 }

@@ -11,9 +11,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use brenn_attach_proto::{
-    ClientFrame, SUPPORTED_VERSIONS, Urgency, VersionRange, max_client_frame_bytes,
-};
+use brenn_attach_proto::{ClientFrame, Codec, SUPPORTED_VERSIONS, Urgency, VersionRange};
 use brenn_db::Db;
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::AppPolicy;
@@ -62,8 +60,7 @@ async fn dispatch(
     state: &mut SessionState,
     frame: &ClientFrame,
 ) -> FrameOutcome {
-    let text = serde_json::to_string(frame).expect("frame serializes");
-    handle_client_frame(ctx, &text, state).await
+    handle_client_message(ctx, ctx.codec().encode_client(frame), state).await
 }
 
 fn violation_detail(outcome: FrameOutcome) -> String {
@@ -173,9 +170,9 @@ async fn an_unparseable_frame_is_a_violation_that_never_echoes_it() {
     let (ctx, _rx) = ctx_with(TestProfile::new(), AlertDispatcher::noop().0);
     let mut state = session_state(&ctx);
 
-    let outcome = handle_client_frame(
+    let outcome = handle_client_message(
         &ctx,
-        "{\"type\":\"Publish\",\"smuggled\":\"CANARY\"}",
+        WireMessage::Text("{\"type\":\"Publish\",\"smuggled\":\"CANARY\"}".to_string()),
         &mut state,
     )
     .await;
@@ -186,6 +183,43 @@ async fn an_unparseable_frame_is_a_violation_that_never_echoes_it() {
         format!("attacher surface:{ATTACHER} account dev: unparseable client frame")
     );
     assert!(!detail.contains("CANARY"), "payload echoed: {detail}");
+}
+
+/// The route's read cap is the largest over every version it serves, so the
+/// session holds each message to its own version's cap as well; one over it is
+/// the same violation as one the transport refused, and one at it is not. At
+/// v5 the cap is below v4's, so a v5 message over its own cap is still within
+/// what the route's transport reads.
+#[tokio::test]
+async fn a_message_over_the_versions_frame_cap_is_a_violation() {
+    let size_violation =
+        format!("attacher surface:{ATTACHER} account dev: inbound frame exceeds size cap");
+    for version in [4, 5] {
+        let (ctx, _rx) = AttachCtxBuilder::new(TestProfile::new())
+            .version(version)
+            .build();
+        let cap = ctx.codec().max_client_frame_bytes(ctx.max_body_bytes);
+
+        let mut state = session_state(&ctx);
+        let at_cap =
+            handle_client_message(&ctx, WireMessage::Text(" ".repeat(cap)), &mut state).await;
+        assert_ne!(
+            violation_detail(at_cap),
+            size_violation,
+            "v{version}: a message at the cap is read"
+        );
+
+        let mut state = session_state(&ctx);
+        let over =
+            handle_client_message(&ctx, WireMessage::Text(" ".repeat(cap + 1)), &mut state).await;
+        assert_eq!(violation_detail(over), size_violation, "v{version}");
+    }
+    let v4 = Codec::negotiated(4).max_client_frame_bytes(TEST_BODY_BYTES);
+    let v5 = Codec::negotiated(5).max_client_frame_bytes(TEST_BODY_BYTES);
+    assert!(
+        v5 < v4,
+        "the v5 case is the one the route's read cap admits"
+    );
 }
 
 /// The handshake happens once. A version in force is in force for the
@@ -265,7 +299,7 @@ async fn a_publish_reaches_the_publish_plane() {
         &ClientFrame::Publish {
             channel: "brenn:nonesuch".to_string(),
             attribution: None,
-            body: "{}".to_string(),
+            body: "{}".into(),
             urgency: Urgency::Normal,
             correlation: Some(7),
         },
@@ -661,6 +695,7 @@ impl Attachment {
             account: "dev".to_string(),
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             max_body_bytes: TEST_BODY_BYTES,
+            versions: SUPPORTED_VERSIONS,
             heartbeat_secs,
             store_incarnation: messenger.store_incarnation(),
             ident: "brenn-server-test".to_string(),
@@ -693,18 +728,16 @@ impl Attachment {
     }
 
     fn send_frame(&self, frame: &ClientFrame) {
-        self.send(Message::Text(
-            serde_json::to_string(frame)
-                .expect("client frame serializes")
-                .into(),
+        self.send(to_message(
+            Codec::negotiated(SUPPORTED_VERSIONS.max).encode_client(frame),
         ));
     }
 
     fn send_hello(&self, versions: VersionRange) {
-        self.send_frame(&ClientFrame::Hello {
+        self.send(to_message(brenn_attach_proto::encode_client_hello(
             versions,
-            ident: "test-attacher".to_string(),
-        });
+            "test-attacher",
+        )));
     }
 
     /// The next application frame the session wrote, waiting for it.
@@ -716,8 +749,8 @@ impl Attachment {
         let next = async {
             loop {
                 let message = self.outbound.recv().await.expect("the writer is alive");
-                if let Message::Text(text) = message {
-                    return serde_json::from_str(text.as_str()).expect("server frame parses");
+                if let Some(frame) = decode_written(message) {
+                    return frame;
                 }
             }
         };
@@ -754,12 +787,35 @@ impl Attachment {
         self.dispatcher.flush().await;
         let mut frames = Vec::new();
         while let Ok(message) = self.outbound.try_recv() {
-            if let Message::Text(text) = message {
-                frames.push(serde_json::from_str(text.as_str()).expect("server frame parses"));
+            if let Some(frame) = decode_written(message) {
+                frames.push(frame);
             }
         }
         (outcome, frames)
     }
+}
+
+fn to_message(msg: WireMessage) -> Message {
+    match msg {
+        WireMessage::Text(text) => Message::Text(text.into()),
+        WireMessage::Binary(bytes) => Message::Binary(bytes.into()),
+    }
+}
+
+/// A written websocket message as the frame it carries, decoded with the
+/// codec these attachments negotiate; `None` for a liveness or close message.
+/// A message the codec cannot decode fails the test rather than being skipped.
+fn decode_written(message: Message) -> Option<ServerFrame> {
+    let wire = match message {
+        Message::Text(text) => WireMessage::Text(text.as_str().to_string()),
+        Message::Binary(bytes) => WireMessage::Binary(bytes.to_vec()),
+        Message::Ping(_) | Message::Pong(_) | Message::Close(_) => return None,
+    };
+    Some(
+        Codec::negotiated(SUPPORTED_VERSIONS.max)
+            .decode_server(wire)
+            .unwrap_or_else(|err| panic!("the session wrote an undecodable message: {err}")),
+    )
 }
 
 /// The opening sequence in order: the server's `Hello` goes out without waiting,
@@ -793,7 +849,8 @@ async fn an_attachment_opens_with_hello_then_welcome() {
             assert_eq!(*max_body_bytes, TEST_BODY_BYTES as u64);
             assert_eq!(
                 *max_frame_bytes,
-                max_client_frame_bytes(TEST_BODY_BYTES) as u64
+                Codec::negotiated(SUPPORTED_VERSIONS.max).max_client_frame_bytes(TEST_BODY_BYTES)
+                    as u64
             );
             assert!(!alert_granted);
         }
@@ -941,13 +998,13 @@ async fn an_attributed_alert_crosses_the_socket_and_is_judged_on_the_instance_it
     );
 }
 
-/// The protocol is JSON text in both directions, so a binary frame is not a frame
-/// this attachment could have meant.
+/// Under v4 every frame is JSON text, so a binary message is not a frame this
+/// attachment could have meant.
 #[tokio::test]
-async fn a_binary_frame_is_a_violation() {
+async fn a_binary_frame_on_a_v4_session_is_a_violation() {
     let attachment = Attachment::start();
     let captured = attachment.captured.clone();
-    attachment.send_hello(SUPPORTED_VERSIONS);
+    attachment.send_hello(VersionRange::exactly(4));
     attachment.send(Message::Binary(Vec::new().into()));
     let (outcome, _frames) = attachment.finish().await;
 
@@ -1218,4 +1275,136 @@ async fn a_close_reaches_only_the_named_attacher() {
     assert_eq!(attachment.registry.close_all(ATTACHER, &reason), 1);
     let (_outcome, closes) = attachment.join_for_closes().await;
     assert_eq!(closes, vec![(3002, "surface reconfigured".to_string())]);
+}
+
+const FRAMES: &str = "brenn:frames-demo";
+const FRAMES_BARE: &str = "frames-demo";
+
+/// An attachment whose bare identity may publish onto [`FRAMES`], a channel
+/// declared `non_text`.
+async fn publishing_attachment(db: &Db) -> Attachment {
+    use brenn_lib::messaging::AttachScope;
+    use brenn_lib::messaging::config::{AttachSendBudget, Depth};
+    let (messenger, _uuid) = crate::test_support::one_channel_messenger_declared(
+        db,
+        FRAMES_BARE,
+        Depth::Unbounded,
+        true,
+    )
+    .await;
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::MessagingPublish);
+    policy.acls.brenn_publish = vec![ChannelMatcher::Exact(FRAMES_BARE.to_string())];
+    let messenger = messenger
+        .with_subscriber_registrations(brenn_messaging::testutils::surface_registrations(
+            HashMap::from([(ATTACHER.to_string(), policy.clone())]),
+        ))
+        .with_attach_send_budgets(brenn_messaging::attach_principal_budgets(
+            AttachScope::surface(ATTACHER),
+            vec![(
+                None,
+                AttachSendBudget {
+                    burst: 8,
+                    refill: Duration::from_secs(3600),
+                },
+            )],
+        ));
+    let profile = TestProfile {
+        publishable: HashMap::from([(None, HashSet::from([FRAMES.to_string()]))]),
+        ..TestProfile::new()
+    };
+    Attachment::start_with(profile, messenger, policy, IDLE_HEARTBEAT_SECS)
+}
+
+/// Negotiate v5 and consume the server's `Hello` and `Welcome`.
+async fn attached_at_v5(attachment: &mut Attachment) {
+    attachment.send_hello(VersionRange::exactly(5));
+    assert!(matches!(
+        attachment.next_frame().await,
+        ServerFrame::Hello { .. }
+    ));
+    match attachment.next_frame().await {
+        ServerFrame::Welcome { version, .. } => assert_eq!(version, 5),
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+}
+
+/// A v5 `Publish` is a binary message; the session reads it, decodes it with
+/// the negotiated codec, and the publish plane stores the body byte-exact with
+/// its content type.
+#[tokio::test]
+async fn a_v5_binary_publish_reaches_the_bus_byte_exact() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let mut attachment = publishing_attachment(&db).await;
+    attached_at_v5(&mut attachment).await;
+    let body = brenn_attach_proto::MessageBody::from_parts(Some("image/png"), &[0x89, 0x00, 0xff])
+        .unwrap();
+    let frame = ClientFrame::Publish {
+        channel: FRAMES.to_string(),
+        attribution: None,
+        body: body.clone(),
+        urgency: Urgency::Normal,
+        correlation: Some(3),
+    };
+    let message = Codec::negotiated(5).encode_client(&frame);
+    assert!(
+        matches!(message, WireMessage::Binary(_)),
+        "v5 Publish is binary"
+    );
+    attachment.send(to_message(message));
+
+    match attachment.next_frame().await {
+        ServerFrame::PublishResult {
+            correlation,
+            outcome,
+        } => {
+            assert_eq!(correlation, Some(3));
+            assert_eq!(outcome, brenn_attach_proto::PublishOutcome::Ok);
+        }
+        other => panic!("expected PublishResult, got {other:?}"),
+    }
+    let retained = attachment
+        .messenger
+        .store_for_address(FRAMES)
+        .replay_from(None, brenn_lib::messaging::config::Depth::Bounded(8))
+        .await
+        .messages;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].message.body, body);
+    assert_eq!(retained[0].message.body.content_type(), Some("image/png"));
+    let (outcome, _frames) = attachment.finish().await;
+    assert!(!outcome.violation);
+}
+
+/// A v5 binary message whose stated body lengths run past its end is a
+/// violation naming the codec's rule.
+#[tokio::test]
+async fn a_truncated_v5_binary_message_is_a_violation_naming_the_rule() {
+    let mut attachment = Attachment::start();
+    let captured = attachment.captured.clone();
+    attached_at_v5(&mut attachment).await;
+    let frame = ClientFrame::Publish {
+        channel: "brenn:nonesuch".to_string(),
+        attribution: None,
+        body: "{}".into(),
+        urgency: Urgency::Normal,
+        correlation: None,
+    };
+    let WireMessage::Binary(mut bytes) = Codec::negotiated(5).encode_client(&frame) else {
+        panic!("v5 Publish is binary");
+    };
+    bytes.pop();
+    attachment.send(Message::Binary(bytes.into()));
+    let (outcome, _frames) = attachment.join_session().await;
+
+    assert!(outcome.violation);
+    let alerts = captured.lock().expect("captured");
+    assert_eq!(alerts.len(), 1);
+    assert!(
+        alerts[0].2.contains(&format!(
+            "attacher surface:{ATTACHER} account dev: frame header and bodies disagree"
+        )),
+        "{}",
+        alerts[0].2
+    );
 }

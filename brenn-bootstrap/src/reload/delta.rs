@@ -21,8 +21,9 @@ use indexmap::IndexMap;
 
 use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::config::{ResolvedSurface, ResolvedWasmConsumer};
+use brenn_lib::messaging::remote::RemoteFacts;
 use brenn_lib::messaging::{
-    ChannelEntry, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
+    ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
 };
 use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
 use brenn_lib::wasm_package::Verified;
@@ -803,6 +804,63 @@ impl Movers<'_> {
     }
 }
 
+/// Every durable channel this delta takes from `non_text` to text-only while a
+/// `[[remote]]` may publish to it, as refusal lines.
+///
+/// A reload neither re-plans nor retires a remote, and the attach door decides
+/// whether to admit a non-text body against the live directory, which holds the
+/// old `non_text` entry until the commit's channel walk replaces it. The commit
+/// reaches that walk only after the retirement waits, which are unbounded, so a
+/// remote's ordinary traffic can store a non-text row on a channel the
+/// candidate declares text-only: before the commit's second store check that
+/// row kills the process mid-walk, after it the row is kept unseen, and either
+/// way the next boot refuses to start over it. A restart has no such window:
+/// every writer stops first, and the door answers the first publish after it
+/// against the new declaration.
+///
+/// Read off the `[[remote]]` blocks, which level 1 holds equal on both sides. A
+/// remote whose durable publish ACL covers the address refuses the reload
+/// whatever version it attaches at, prefix grants included: the version is a
+/// per-connection fact, and this rule must hold for a remote that connects
+/// while the commit runs. Only durable channels: an ephemeral channel's ring
+/// leaves with its old entry, so nothing written in the window outlives it.
+///
+/// Both addresses are asked about. Until the walk, a remote writes through the
+/// old entry by naming the old address, and a change that keeps its uuid can
+/// rename the channel as well as narrow it.
+pub(crate) fn text_only_flips_under_remote_publishers(
+    delta: &PlanDelta,
+    remotes: &[RemoteFacts],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for change in &delta.channels_changed {
+        if !change.old.resolved_channel.non_text || change.new.resolved_channel.non_text {
+            continue;
+        }
+        let bares: Vec<&str> = [&change.old.address, &change.new.address]
+            .into_iter()
+            .filter_map(|address| match ChannelScheme::split(address) {
+                Some((ChannelScheme::Brenn, bare)) => Some(bare),
+                _ => None,
+            })
+            .collect();
+        for remote in remotes {
+            if bares
+                .iter()
+                .any(|bare| remote.policy().allows_brenn_publish(bare))
+            {
+                out.push(format!(
+                    "{} is changed to text-only but remote {:?} may publish to it: \
+                     {NEEDS_RESTART}",
+                    change.new.address,
+                    remote.slug(),
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// A subscriber as a refusal names it: the kind an operator reads in the
 /// document, and the slug they look it up by.
 fn describe(kind: &SubscriberEntryKind) -> String {
@@ -931,6 +989,7 @@ mod tests {
         }
     }
 
+    use brenn_lib::access::raw::ChannelMatcherRaw;
     /// Every plan in this module is compared with an empty `kinds_changed`:
     /// these cases are about channels and consumers, and a kind set that never
     /// moves keeps the surface delta's kind closure out of them.
@@ -2478,5 +2537,209 @@ mod tests {
             .push(revoking("writer", ADDRESS, &rows[1]));
         let (_, after) = dynamic_ingress_sides(&facts, &facts, &delta, &live);
         assert!(after.is_empty(), "nobody holds it any more");
+    }
+
+    /// A `[[remote]]` publishing to `exact` on the durable plane. Resolved
+    /// without its token, which only commit reads.
+    fn remote_publishing(slug: &str, exact: &str) -> RemoteFacts {
+        remote_with_acls(
+            slug,
+            vec![ChannelMatcherRaw::Exact(exact.to_string())],
+            vec![],
+        )
+    }
+
+    /// A remote granted publish under the two ACLs as stated.
+    fn remote_with_acls(
+        slug: &str,
+        publish_acl: Vec<ChannelMatcherRaw>,
+        ephemeral_publish_acl: Vec<ChannelMatcherRaw>,
+    ) -> RemoteFacts {
+        let raw = brenn_lib::messaging::remote::RemoteConfigRaw {
+            slug: slug.to_string(),
+            token_file: std::path::PathBuf::from("/nonexistent/token"),
+            grants: [
+                (!publish_acl.is_empty()).then_some(brenn_lib::messaging::AttachGrant::Publish),
+                (!ephemeral_publish_acl.is_empty())
+                    .then_some(brenn_lib::messaging::AttachGrant::EphemeralPublish),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            subscribe_acl: vec![],
+            ephemeral_subscribe_acl: vec![],
+            publish_acl,
+            ephemeral_publish_acl,
+            publish_burst: None,
+            publish_per_sec: None,
+            max_sessions: None,
+            max_subscriptions: None,
+        };
+        brenn_lib::messaging::remote::resolve_remote_facts_all(
+            &[raw],
+            &brenn_lib::messaging::config::MessagingGlobalConfig::default(),
+        )
+        .pop()
+        .expect("one remote")
+    }
+
+    /// `brenn:work` declared `non_text` or not, otherwise the base document.
+    fn work_declared(non_text: bool) -> BrennConfig {
+        let mut config = base();
+        let work = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.address.as_deref() == Some("brenn:work"))
+            .expect("the base declares brenn:work");
+        work.non_text = non_text;
+        config
+    }
+
+    /// Taking a durable channel from `non_text` to text-only is refused while a
+    /// remote may publish to it, and only then: the remote keeps writing
+    /// through the old declaration for as long as the commit's retirements
+    /// wait, and a reload does not retire it.
+    #[test]
+    fn a_text_only_flip_under_a_publishing_remote_is_refused() {
+        let pod = remote_publishing("pod", "work");
+        let elsewhere = remote_publishing("elsewhere", "other");
+        let to_text_only = delta_between(&work_declared(true), &work_declared(false), "aa", "aa");
+        let to_non_text = delta_between(&work_declared(false), &work_declared(true), "aa", "aa");
+        assert_eq!(
+            addresses(
+                &to_text_only
+                    .channels_changed
+                    .iter()
+                    .map(|change| Arc::clone(&change.new))
+                    .collect::<Vec<_>>()
+            ),
+            vec!["brenn:work"],
+            "the declaration is a retune of the one entry",
+        );
+
+        assert_eq!(
+            text_only_flips_under_remote_publishers(
+                &to_text_only,
+                &[pod.clone(), elsewhere.clone()]
+            ),
+            vec![
+                "brenn:work is changed to text-only but remote \"pod\" may publish to it: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+        );
+        assert!(
+            text_only_flips_under_remote_publishers(&to_text_only, &[elsewhere]).is_empty(),
+            "a remote whose ACL does not cover the channel cannot write to it",
+        );
+        assert!(
+            text_only_flips_under_remote_publishers(&to_non_text, &[pod]).is_empty(),
+            "widening a channel to non-text strands nothing",
+        );
+    }
+
+    /// A prefix grant covers the channel as an exact one does.
+    #[test]
+    fn a_text_only_flip_under_a_prefix_granted_remote_is_refused() {
+        let frames = |non_text: bool| {
+            let mut config = base();
+            config.channels.push(ChannelConfigRaw {
+                non_text,
+                ..durable(
+                    "brenn:pod.frames",
+                    "5f1d1a9e-0000-4000-8000-0000000000f1",
+                    4,
+                    None,
+                )
+            });
+            config
+        };
+        let pod = remote_with_acls(
+            "pod",
+            vec![ChannelMatcherRaw::Prefix("pod.".to_string())],
+            vec![],
+        );
+        let delta = delta_between(&frames(true), &frames(false), "aa", "aa");
+        assert_eq!(
+            text_only_flips_under_remote_publishers(&delta, &[pod]),
+            vec![
+                "brenn:pod.frames is changed to text-only but remote \"pod\" may publish to it: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// A change that keeps its uuid can rename the channel as it narrows it.
+    /// Until the commit's walk the remote writes through the old entry, by the
+    /// old address, so a grant on either address refuses the reload.
+    #[test]
+    fn a_text_only_flip_that_renames_is_refused_for_a_grant_on_either_address() {
+        let mut renamed = work_declared(false);
+        renamed
+            .channels
+            .iter_mut()
+            .find(|channel| channel.address.as_deref() == Some("brenn:work"))
+            .expect("the base declares brenn:work")
+            .address = Some("brenn:rest".to_string());
+        let delta = delta_between(&work_declared(true), &renamed, "aa", "aa");
+        let [change] = delta.channels_changed.as_slice() else {
+            panic!(
+                "one pinned uuid, one changed entry: {:?}",
+                delta.channels_changed.len()
+            );
+        };
+        assert_eq!(
+            (change.old.address.as_str(), change.new.address.as_str()),
+            ("brenn:work", "brenn:rest"),
+        );
+
+        let old_grant = remote_publishing("old", "work");
+        let new_grant = remote_publishing("new", "rest");
+        let neither = remote_publishing("neither", "other");
+        assert_eq!(
+            text_only_flips_under_remote_publishers(&delta, &[old_grant, new_grant, neither]),
+            vec![
+                "brenn:rest is changed to text-only but remote \"old\" may publish to it: \
+                 this change needs a restart"
+                    .to_string(),
+                "brenn:rest is changed to text-only but remote \"new\" may publish to it: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// An ephemeral channel's flip is not refused: its ring leaves with the old
+    /// entry, so nothing a remote writes in the window outlives the reload.
+    #[test]
+    fn an_ephemeral_text_only_flip_under_a_publishing_remote_is_not_refused() {
+        let feed = |non_text: bool| {
+            let mut config = base();
+            config.channels.push(ChannelConfigRaw {
+                uuid: None,
+                standing_retain_depth: None,
+                non_text,
+                ..durable_channel("ephemeral:feed", Depth::Bounded(1))
+            });
+            config
+        };
+        let delta = delta_between(&feed(true), &feed(false), "aa", "aa");
+        assert_eq!(
+            addresses(
+                &delta
+                    .channels_changed
+                    .iter()
+                    .map(|change| Arc::clone(&change.new))
+                    .collect::<Vec<_>>()
+            ),
+            vec!["ephemeral:feed"],
+        );
+        let pod = remote_with_acls(
+            "pod",
+            vec![ChannelMatcherRaw::Exact("feed".to_string())],
+            vec![ChannelMatcherRaw::Exact("feed".to_string())],
+        );
+        assert!(text_only_flips_under_remote_publishers(&delta, &[pod]).is_empty());
     }
 }

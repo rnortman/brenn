@@ -14,13 +14,13 @@ mod tests;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Display;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::extract::ws::Message;
 use brenn_attach_proto::{
-    AlertSeverity as ProtoAlertSeverity, ClientFrame, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES,
-    ServerFrame,
+    AlertSeverity as ProtoAlertSeverity, ClientFrame, Codec, MAX_ALERT_BODY_BYTES,
+    MAX_ALERT_TITLE_BYTES, SUPPORTED_VERSIONS, ServerFrame, VersionRange, WireMessage,
 };
 use brenn_common::sanitize_untrusted_str;
 use brenn_lib::access::AppPolicy;
@@ -96,8 +96,9 @@ pub struct AttachSessionCtx {
     pub tx: mpsc::Sender<ServerFrame>,
     /// The transport version the two `Hello` frames agreed on. Set once, by the
     /// opening sequence, before any frame handler runs; read through
-    /// [`AttachSessionCtx::version`].
-    pub(crate) negotiated_version: std::sync::OnceLock<u32>,
+    /// [`AttachSessionCtx::version`]. Shared with the writer task, which encodes
+    /// with it.
+    pub(crate) negotiated_version: Arc<OnceLock<u32>>,
 }
 
 impl AttachSessionCtx {
@@ -112,6 +113,15 @@ impl AttachSessionCtx {
             .negotiated_version
             .get()
             .expect("a frame handler runs only after the opening sequence agreed a version")
+    }
+
+    /// The codec of the negotiated version.
+    ///
+    /// # Panics
+    ///
+    /// As [`AttachSessionCtx::version`].
+    pub fn codec(&self) -> Codec {
+        Codec::negotiated(self.version())
     }
 
     /// A protocol violation on this attachment, named by attacher and account.
@@ -174,6 +184,16 @@ pub struct SessionCounters {
     /// them out of the transport-reject count so escalation is not conflated
     /// with an internal disagreement.
     pub publish_body_cap_disagreement: u64,
+    /// `Publish` and `PublishBatch` frames answered `TextOnlyChannel`: a
+    /// non-text body offered to a channel not declared `non_text`. One per
+    /// refused frame, whatever the batch held. Drives the first-occurrence warn.
+    pub publish_text_only_refused: u64,
+    /// Deferred-view entries left out of a frame because this session's version
+    /// cannot carry their bodies — a sibling session's non-text parked entries.
+    pub deferred_view_entries_omitted: u64,
+    /// The `(channel, attribution)` views this session has already logged an
+    /// omission for, so each is logged once per session.
+    pub(crate) deferred_view_omission_logged: HashSet<(String, Option<String>)>,
     /// `Alert` frames dispatched to the process alert dispatcher (granted, and
     /// within the per-connection alert bucket) — the operator's count of how
     /// many times this attachment paged.
@@ -359,6 +379,10 @@ pub struct AttachSessionParams<S> {
     pub account: String,
     pub ip: IpAddr,
     pub max_body_bytes: usize,
+    /// The transport versions this route serves, within
+    /// [`SUPPORTED_VERSIONS`]; the `Hello` states it and negotiation picks from
+    /// it.
+    pub versions: VersionRange,
     /// The cadence the writer probes on and the attacher's inbound-silence rule
     /// is measured in, advertised in `Welcome`.
     pub heartbeat_secs: u32,
@@ -441,6 +465,7 @@ where
         account,
         ip,
         max_body_bytes,
+        versions,
         heartbeat_secs,
         store_incarnation,
         ident,
@@ -451,7 +476,14 @@ where
         mut close_rx,
         socket,
     } = params;
+    assert!(
+        SUPPORTED_VERSIONS.contains_range(versions),
+        "attach session: served range {}..={} is empty or outside this build's",
+        versions.min,
+        versions.max
+    );
     let heartbeat = Duration::from_secs(u64::from(heartbeat_secs));
+    let negotiated_version = Arc::new(OnceLock::new());
 
     let (sink, mut ws_stream) = socket.split();
     let (tx, rx) = mpsc::channel::<ServerFrame>(OUTBOUND_QUEUE_FRAMES);
@@ -461,7 +493,14 @@ where
     // Instrument the writer with the session span so its logs carry the same
     // attacher/session/account/ip attribution as this task's.
     let writer = tokio::spawn(
-        writer_task(sink, rx, writer_close_rx, heartbeat).instrument(tracing::Span::current()),
+        writer_task(
+            sink,
+            rx,
+            writer_close_rx,
+            heartbeat,
+            Arc::clone(&negotiated_version),
+        )
+        .instrument(tracing::Span::current()),
     );
 
     // The shared per-connection context. It owns `tx`, so dropping it at teardown
@@ -477,7 +516,7 @@ where
         account,
         ip,
         tx,
-        negotiated_version: std::sync::OnceLock::new(),
+        negotiated_version,
     };
 
     let mut state = SessionState::new(ctx.profile.as_ref(), active_channels, store_incarnation);
@@ -485,6 +524,7 @@ where
     let violation_detail = match open_attachment(
         &ctx,
         &mut ws_stream,
+        versions,
         heartbeat_secs,
         &ident,
         &mut state.counters,
@@ -556,6 +596,8 @@ where
         publish_rate_limited = state.counters.publish_rate_limited,
         publish_body_too_large = state.counters.publish_body_too_large,
         publish_body_cap_disagreement = state.counters.publish_body_cap_disagreement,
+        publish_text_only_refused = state.counters.publish_text_only_refused,
+        deferred_view_entries_omitted = state.counters.deferred_view_entries_omitted,
         alerts_dispatched = state.counters.alerts_dispatched,
         alerts_suppressed = state.counters.alerts_suppressed,
         // Rendered via `Debug` on a `BTreeMap`, so the breakdown is one
@@ -582,6 +624,7 @@ where
 async fn open_attachment<St>(
     ctx: &AttachSessionCtx,
     ws_stream: &mut St,
+    versions: VersionRange,
     heartbeat_secs: u32,
     ident: &str,
     counters: &mut SessionCounters,
@@ -589,11 +632,13 @@ async fn open_attachment<St>(
 where
     St: Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
-    if let FrameOutcome::Disconnect = send_frame(&ctx.tx, server_hello(ident), counters).await {
+    if let FrameOutcome::Disconnect =
+        send_frame(&ctx.tx, server_hello(versions, ident), counters).await
+    {
         return Opening::Closed(None);
     }
 
-    let version = match read_client_hello(ws_stream, HELLO_TIMEOUT).await {
+    let version = match read_client_hello(ws_stream, HELLO_TIMEOUT, versions).await {
         Handshake::Agreed(version) => version,
         Handshake::Incompatible(peer) => {
             // Both ranges have already crossed, so each end closes on its own
@@ -722,41 +767,28 @@ where
                 }
             }
             incoming = ws_stream.next() => {
-                match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        state.counters.frames_in += 1;
-                        match handle_client_frame(ctx, text.as_str(), state).await {
-                            FrameOutcome::Continue => last_inbound = Instant::now(),
-                            FrameOutcome::Violation(detail) => return ReadExit::Violation(detail),
-                            // Writer gone (socket died mid-send): tear down.
-                            FrameOutcome::Disconnect => return ReadExit::Peer,
+                let msg = match incoming {
+                    // Text is copied out: a `String` cannot take the buffer
+                    // without checking its UTF-8 again.
+                    Some(Ok(Message::Text(text))) => WireMessage::Text(text.as_str().to_string()),
+                    // Whether a binary message is a frame is the negotiated
+                    // version's to say, as for a text one. The payload's
+                    // buffer is taken over, not copied, when nothing else
+                    // holds it.
+                    Some(Ok(Message::Binary(bytes))) => WireMessage::Binary(Vec::from(bytes)),
+                    other => {
+                        if let Some(exit) = read_non_frame(ctx, other, &mut last_inbound) {
+                            return exit;
                         }
+                        continue;
                     }
-                    // The protocol is JSON text in both directions, so a binary
-                    // frame is not a frame this attachment could have meant.
-                    Some(Ok(Message::Binary(_))) => {
-                        return ReadExit::Violation(ctx.violation_detail("binary frame"));
-                    }
-                    // Inbound pings are auto-ponged by axum; an inbound pong is
-                    // the peer answering our liveness probe.
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
-                        last_inbound = Instant::now();
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        info!("attachment closed by peer");
-                        return ReadExit::Peer;
-                    }
-                    Some(Err(e)) => {
-                        return match classify_read_error(e) {
-                            InboundError::Oversized => ReadExit::Violation(
-                                ctx.violation_detail("inbound frame exceeds size cap"),
-                            ),
-                            InboundError::Transport(detail) => {
-                                warn!("attachment WS read error: {detail}");
-                                ReadExit::Peer
-                            }
-                        };
-                    }
+                };
+                state.counters.frames_in += 1;
+                match handle_client_message(ctx, msg, state).await {
+                    FrameOutcome::Continue => last_inbound = Instant::now(),
+                    FrameOutcome::Violation(detail) => return ReadExit::Violation(detail),
+                    // Writer gone (socket died mid-send): tear down.
+                    FrameOutcome::Disconnect => return ReadExit::Peer,
                 }
             }
             // Host-initiated close. Must leave through the ordinary detach
@@ -777,22 +809,73 @@ where
     }
 }
 
-/// Parse and dispatch one inbound frame.
-///
-/// Unparseable input — malformed JSON, an unknown `type`, a field the negotiated
-/// schema does not have — is a violation: both ends agreed which schema is in
-/// force, so unparseable traffic is a bug or tampering, never skew. Each plane
-/// owns what its own frames cost; the two this function decides are the second
-/// `Hello` (there is no re-negotiation) and the `Subscribe`/`Unsubscribe` token,
-/// charged here so both frames draw one bucket.
-async fn handle_client_frame(
+/// Answer one socket read that is not a text or binary message: `None` to keep
+/// reading, or why the read loop ends.
+fn read_non_frame(
     ctx: &AttachSessionCtx,
-    text: &str,
+    incoming: Option<Result<Message, axum::Error>>,
+    last_inbound: &mut Instant,
+) -> Option<ReadExit> {
+    match incoming {
+        Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+            unreachable!("text and binary messages are frames, read by the caller")
+        }
+        // Inbound pings are auto-ponged by axum; an inbound pong is the peer
+        // answering our liveness probe.
+        Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+            *last_inbound = Instant::now();
+            None
+        }
+        Some(Ok(Message::Close(_))) | None => {
+            info!("attachment closed by peer");
+            Some(ReadExit::Peer)
+        }
+        Some(Err(e)) => Some(match classify_read_error(e) {
+            InboundError::Oversized => {
+                ReadExit::Violation(ctx.violation_detail("inbound frame exceeds size cap"))
+            }
+            InboundError::Transport(detail) => {
+                warn!("attachment WS read error: {detail}");
+                ReadExit::Peer
+            }
+        }),
+    }
+}
+
+/// Hold one inbound message to the negotiated version's frame cap, decode it
+/// with that version's codec, and dispatch the frame.
+///
+/// The route's websocket read cap is the largest of every version it serves,
+/// so a message under it may still be over this session's own; that is the
+/// same violation as one the transport refused. A message the codec cannot
+/// decode is a violation named by the codec's rule: both ends agreed which
+/// schema is in force, so undecodable traffic is a bug or tampering, never
+/// skew, and nothing is decoded a second way.
+async fn handle_client_message(
+    ctx: &AttachSessionCtx,
+    msg: WireMessage,
     state: &mut SessionState,
 ) -> FrameOutcome {
-    let Ok(frame) = serde_json::from_str::<ClientFrame>(text) else {
-        return ctx.violation("unparseable client frame");
-    };
+    let codec = ctx.codec();
+    if msg.len() > codec.max_client_frame_bytes(ctx.max_body_bytes) {
+        return ctx.violation("inbound frame exceeds size cap");
+    }
+    match codec.decode_client(msg) {
+        Ok(frame) => handle_client_frame(ctx, frame, state).await,
+        Err(err) => ctx.violation(err.rule()),
+    }
+}
+
+/// Dispatch one inbound frame.
+///
+/// Each plane owns what its own frames cost; the two this function decides are
+/// the second `Hello` (there is no re-negotiation) and the
+/// `Subscribe`/`Unsubscribe` token, charged here so both frames draw one bucket.
+async fn handle_client_frame(
+    ctx: &AttachSessionCtx,
+    frame: ClientFrame,
+    state: &mut SessionState,
+) -> FrameOutcome {
     match frame {
         // The handshake happens once, before any other frame; a version in force
         // is in force for the connection's life.

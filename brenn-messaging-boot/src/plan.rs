@@ -786,6 +786,8 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
                 s.principal_send_budgets().collect(),
             )
         })
+        // TODO(remote-send-budget-knob): a remote's budget is fixed, with no
+        // operator setting.
         .chain(remote_facts.iter().flat_map(|r| {
             messaging::attach_principal_budgets(
                 messaging::AttachScope::remote(r.slug()),

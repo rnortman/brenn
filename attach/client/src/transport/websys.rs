@@ -10,9 +10,8 @@
 //! Server liveness pings/pongs are invisible to the browser WebSocket API, so —
 //! exactly as with the native transport — they never become a [`TransportEvent`]
 //! and both transports age identically under the client liveness rule. The
-//! binary type is arraybuffer; the server never sends binary, so a binary
-//! message is surfaced as [`TransportEvent::Binary`] and the core treats it as a
-//! fatal protocol error.
+//! binary type is arraybuffer, so a binary message is surfaced as a
+//! [`TransportEvent::Message`] holding its bytes, for the core to decode.
 
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_util::StreamExt;
@@ -20,6 +19,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
 use web_sys::{BinaryType, CloseEvent, MessageEvent, WebSocket};
+
+use brenn_attach_proto::WireMessage;
 
 use super::{TransportConnection, TransportConnector, TransportError, TransportEvent};
 
@@ -92,8 +93,11 @@ pub struct WebSysConnection {
 }
 
 impl TransportConnection for WebSysConnection {
-    async fn send_text(&mut self, text: String) -> Result<(), TransportError> {
-        self.socket.ws.send_with_str(&text).map_err(js_err)
+    async fn send(&mut self, message: WireMessage) -> Result<(), TransportError> {
+        match message {
+            WireMessage::Text(text) => self.socket.ws.send_with_str(&text).map_err(js_err),
+            WireMessage::Binary(bytes) => self.socket.ws.send_with_u8_array(&bytes).map_err(js_err),
+        }
     }
 
     async fn next_event(&mut self) -> TransportEvent {
@@ -220,15 +224,17 @@ fn deliver(tx: &UnboundedSender<Incoming>, incoming: Incoming) {
 }
 
 /// Decode a `MessageEvent`'s payload into a [`TransportEvent`]. A string is a
-/// text frame; an arraybuffer is binary (fatal at the core). Anything else is a
+/// text frame; an arraybuffer is binary, for the core to decode. Anything else is a
 /// transport failure — the browser only yields these two with an arraybuffer
 /// binary type.
 fn message_event(event: MessageEvent) -> TransportEvent {
     let data = event.data();
     if let Some(text) = data.as_string() {
-        TransportEvent::Text(text)
+        TransportEvent::Message(WireMessage::Text(text))
     } else if let Ok(buffer) = data.dyn_into::<js_sys::ArrayBuffer>() {
-        TransportEvent::Binary(js_sys::Uint8Array::new(&buffer).to_vec())
+        TransportEvent::Message(WireMessage::Binary(
+            js_sys::Uint8Array::new(&buffer).to_vec(),
+        ))
     } else {
         TransportEvent::Failed("websocket message was neither text nor arraybuffer".to_string())
     }

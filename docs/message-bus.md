@@ -114,8 +114,12 @@ A durable channel that holds a non-text message, visible or parked, cannot be
 redeclared text-only: boot and reload refuse it, naming the channel. The way
 out is to keep the declaration, or to give the channel a new address;
 retention removes the messages in time on a bounded channel, so on an
-unbounded durable channel the declaration is in practice permanent. A ring is
-rebuilt empty when its declaration changes, as for any other attribute.
+unbounded durable channel the declaration is in practice permanent. A reload
+also refuses to redeclare a durable channel text-only while any `remote`'s
+publish ACL covers it, under its old address or its new one, whatever protocol
+version the remote attaches at; a
+restart applies it. A ring is rebuilt empty when its declaration changes, as
+for any other attribute.
 
 ### 2.1.1 Which schemes each placement may bind
 
@@ -198,7 +202,8 @@ Who is shown the content type today:
 | The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` |
 | 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | bytes and type | bytes and type |
 | 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload |
-| Attach v4 sessions (`Deliver`, `DeferredView`) | bare text, **no type** | never bound: a surface binding is refused at plan, a remote's subscribe is answered `Unavailable` |
+| Attach v4 sessions (`Deliver`, `DeferredView`) | bare text, **no type** | never bound: a surface binding is refused at plan, a remote's subscribe is answered `Unavailable`; left out of a deferred view |
+| Attach v5 sessions (`Deliver`, `DeferredView`) | text and type | bytes and type |
 
 The two string carriers lose a typed text body's *type*, never its content.
 They cannot carry a non-text body at all, so they are kept off every channel
@@ -206,14 +211,68 @@ declared `non_text` (§2.1) before any message flows, and a text-only channel
 never holds a non-text body. Reaching a string carrier with one anyway is a
 host bug and a panic.
 
+One exception is cut rather than refused. A remote may hold a v4 and a v5
+attach session at once, and both mirror the one parked set that belongs to the
+remote. A non-text entry the v5 session parked is left out of the deferred view
+sent to the v4 session (counted on its detach line, logged once per channel and
+attribution). For that session an empty view means nothing *it can represent*
+is standing; it cannot cancel or edit what it cannot see, and nothing it can
+name is affected.
+
 What can publish a typed or non-text body: a component built against the
 byte-carrying contract `brenn:processor@0.2.0`, through its publish, deferred
 publish, deferred edit and sync call, onto a channel declared `non_text` for a
 non-text body and onto any channel for a typed text one. A non-text body
 offered for a text-only channel is refused to that component
-(`text-only-channel`) and nothing is stored. What still cannot: a 0.1.0
-component, an attach session, a conversation and every host door that takes a
-string; every body they produce is untyped text.
+(`text-only-channel`) and nothing is stored. A remote attacher on attach
+protocol v5, through `Publish` and `PublishBatch` (entries and deferred edits),
+on the same terms: a non-text body offered for a text-only channel is answered
+`TextOnlyChannel` — the whole batch, if any body in it is refused — and nothing
+is stored. What still cannot: a 0.1.0 component, an attach v4 session (the
+page's, and a remote's that negotiated v4), a conversation and every host door
+that takes a string; every body they produce is untyped text.
+
+### 2.1.3 Limits on a remote's stream of messages
+
+At default configuration, for a remote attacher on attach v5. "Operator" names
+the setting that raises a limit; "fixed" is a compile-time constant.
+
+| Limit | Default | Raised by |
+|---|---|---|
+| Body cap, one message | 65,536 bytes raw | Operator: `messaging { max_body_bytes }` (restart) |
+| v5 frame cap | 204,800 bytes | Derived from the body cap |
+| `PublishBatch`, whole frame | 65,536 charged bytes over at most 512 operations; and 4 MiB of bodies per activation, never the binding one below a 4 MiB body cap | The first follows the body cap; the second is fixed |
+| Connection publish bucket (single `Publish`) | burst 60, then 1 per second, per connection | Operator: `publish_burst`, `publish_per_sec` on the `remote` block, up to the bus's `default_send_rate` |
+| Per-(sender, channel) send rate (single `Publish`) | burst 240, then 30 per second | Operator: `messaging { default_send_rate }`, or `send_rate` on the channel |
+| Attach send budget (every durable `Publish`; every `PublishBatch` entry on any channel) | 256 tokens, then 1 per 15 seconds, shared by all the remote's sessions | **Fixed** |
+| Sessions per remote | 2 | Operator: `max_sessions` |
+| Channel window | the channel's `retain_depth` | Operator |
+| Session push queue / writer queue | 256 / 256 frames | Fixed |
+
+What a remote can sustain:
+
+- **Onto an `ephemeral:` channel with single `Publish` frames** — the
+  streaming path: 1 message per second of up to 64 KiB after a burst of 60.
+  With `publish_per_sec = 30`, 30 messages per second, up to about 1.9 MiB/s
+  at the default body cap. Beyond 30 per second needs `default_send_rate`
+  raised as well.
+- **Onto a durable `brenn:` channel**: 4 messages per minute sustained, and no
+  setting raises it. With single frames the burst before that is 60 at once,
+  then 1 per second until the 256-token budget is spent, then 4 per minute.
+- **With `PublishBatch`**: up to 256 entries at once, then 4 entries per
+  minute, on any channel class. A batch is not a streaming carrier for a
+  remote.
+- **Delivery to a subscribed remote**: one `Deliver` frame per live message,
+  with no rate limit of its own. A subscriber more than 256 frames behind loses
+  the queued copies and reads the rest from the channel's window by cursor;
+  what it loses past the window is reported in `dropped`. The window's depth,
+  as a duration at the publish rate, is how long a stall it survives.
+
+So a camera frame that fits 64 KiB travels from a remote onto an ephemeral
+channel at 1 per second with no configuration and at up to 30 per second with
+one `remote`-block setting; larger frames need the body cap raised, which
+raises it bus-wide; a durable channel is not a video carrier. These are limits,
+not measurements.
 
 **The archive line format.** An `archive` sink writes one JSON object per
 evicted message, one per line. The fields are the envelope's, in its order —
@@ -428,8 +487,9 @@ channel: `io state { push_depth = 0; retain_depth = 1; non_text = true; }`.
 On a declared channel the same key on a port is a check, not a declaration: a
 port stating `non_text = true` bound to a channel that does not is refused
 when the plan is built, so `config-check` reports it. A surface binding may not state it, and a
-surface may not be bound to a `non_text` channel, until the surface host and
-the attach protocol carry bytes.
+surface may not be bound to a `non_text` channel, until the surface host
+carries bytes and the page speaks attach v5. A remote attacher on v5 is served
+a `non_text` channel; one on v4 is answered `Unavailable`.
 
 **The timer-cap coupling.** A channel's `retain_depth` also caps its channel-wide
 deferred set, so on an auto channel the fold above is what bounds how many

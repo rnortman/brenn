@@ -25,11 +25,11 @@
 
 use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_proto::{
-    BatchDeferredOp, BatchEntry, ClientFrame, DeferredOpKind, PublishBatchOutcome, PublishOutcome,
-    SUPPORTED_VERSIONS, ServerFrame, SubscribeOutcome, Urgency, max_client_frame_bytes,
+    BatchDeferredOp, BatchEntry, ClientFrame, Codec, DeferredOpKind, PublishBatchOutcome,
+    PublishOutcome, ServerFrame, SubscribeOutcome, Urgency, VersionRange,
 };
-use brenn_surface_schema::ComponentGrant;
 use brenn_surface_schema::bindings::BindingsDocument;
+use brenn_surface_schema::{ComponentGrant, SURFACE_ATTACH_VERSION};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -143,12 +143,15 @@ pub fn document(staters: &[&str]) -> BindingsDocument {
 pub fn facts(max_body_bytes: u64) -> AttachmentFacts {
     let body = usize::try_from(max_body_bytes).expect("a body cap fits usize");
     AttachmentFacts {
-        version: SUPPORTED_VERSIONS.max,
+        version: SURFACE_ATTACH_VERSION,
         participant_id: "surface:rig".to_string(),
         session_id: "rig-session".to_string(),
         heartbeat_secs: 30,
         max_body_bytes,
-        max_frame_bytes: u64::try_from(max_client_frame_bytes(body)).expect("a frame cap fits u64"),
+        max_frame_bytes: u64::try_from(
+            Codec::negotiated(SURFACE_ATTACH_VERSION).max_client_frame_bytes(body),
+        )
+        .expect("a frame cap fits u64"),
         alert_granted: false,
     }
 }
@@ -223,7 +226,8 @@ fn number(slot: (&str, Sentinel)) -> u64 {
 /// pointers being every place its sentinel landed. A slot whose sentinel
 /// landed nowhere is a template that cannot be filled, and panics.
 fn template(frame: &ServerFrame, slots: &[(&str, Sentinel)]) -> Value {
-    let value = serde_json::to_value(frame).expect("a server frame serializes");
+    let value: Value =
+        serde_json::from_str(&crate::frames::frame(frame)).expect("a server frame is JSON");
     let mut found = serde_json::Map::new();
     for &(name, sentinel) in slots {
         let mut pointers = Vec::new();
@@ -331,7 +335,7 @@ fn deliver_template() -> Value {
 fn client_samples() -> Value {
     let samples = [
         ClientFrame::Hello {
-            versions: SUPPORTED_VERSIONS,
+            versions: VersionRange::exactly(SURFACE_ATTACH_VERSION),
             ident: BUILD_ID.to_string(),
         },
         ClientFrame::Subscribe {
@@ -343,7 +347,7 @@ fn client_samples() -> Value {
         ClientFrame::Publish {
             channel: REPORT_CHANNEL.to_string(),
             attribution: Some("keeper".to_string()),
-            body: "{}".to_string(),
+            body: "{}".into(),
             urgency: Urgency::Normal,
             correlation: Some(1),
         },
@@ -352,7 +356,7 @@ fn client_samples() -> Value {
             correlation: 2,
             publishes: vec![BatchEntry {
                 channel: REPORT_CHANNEL.to_string(),
-                body: "{}".to_string(),
+                body: "{}".into(),
                 urgency: Urgency::Normal,
                 deliver_after: None,
             }],
@@ -366,7 +370,10 @@ fn client_samples() -> Value {
     Value::Array(
         samples
             .iter()
-            .map(|f| serde_json::to_value(f).expect("a client frame serializes"))
+            .map(|f| {
+                serde_json::from_str(&crate::frames::client_frame(f))
+                    .expect("a client frame is JSON")
+            })
             .collect(),
     )
 }
@@ -411,7 +418,25 @@ mod tests {
                     .unwrap_or_else(|| panic!("{pointer} is in the frame")) = value.clone();
             }
         }
-        serde_json::from_value(frame).expect("a filled template is a server frame")
+        crate::frames::read_server_frame(&frame.to_string())
+    }
+
+    /// The page stays on attach v4, so every frame of the kit is a v4 text
+    /// message: `frames::frame` and `frames::client_frame` panic on anything
+    /// else, and building the kit runs every frame the rig is handed through
+    /// one of them.
+    #[test]
+    fn every_kit_frame_is_a_text_message_at_version_4() {
+        assert_eq!(SURFACE_ATTACH_VERSION, 4);
+        assert_eq!(facts(CASES_BODY_CAP).version, 4);
+        let kit = kit();
+        assert!(kit["answers"].is_object());
+        assert!(
+            !kit["client_samples"]
+                .as_array()
+                .expect("the client samples are a list")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -494,19 +519,18 @@ mod tests {
             ("measure", MEASURE_BODY_CAP, &MEASURE_STATERS[..]),
         ] {
             let ladder = &kit["pages"][name]["ladder"];
-            let hello: ServerFrame =
-                serde_json::from_value(ladder["hello"].clone()).expect("hello parses");
+            let hello: ServerFrame = crate::frames::read_server_frame(&ladder["hello"].to_string());
             assert!(
-                matches!(hello, ServerFrame::Hello { versions, .. } if versions == SUPPORTED_VERSIONS)
+                matches!(hello, ServerFrame::Hello { versions, .. } if versions == VersionRange::exactly(SURFACE_ATTACH_VERSION))
             );
             let welcome: ServerFrame =
-                serde_json::from_value(ladder["welcome"].clone()).expect("welcome parses");
+                crate::frames::read_server_frame(&ladder["welcome"].to_string());
             let ServerFrame::Welcome { max_body_bytes, .. } = welcome else {
                 panic!("{name}: the second rung is a Welcome");
             };
             assert_eq!(max_body_bytes, cap, "{name} states its body cap");
-            let deliver: ServerFrame = serde_json::from_value(ladder["config_deliver"].clone())
-                .expect("the config deliver parses");
+            let deliver: ServerFrame =
+                crate::frames::read_server_frame(&ladder["config_deliver"].to_string());
             let ServerFrame::Deliver { channel, rows } = deliver else {
                 panic!("{name}: the third rung is a Deliver");
             };
@@ -535,8 +559,12 @@ mod tests {
     #[test]
     fn the_client_samples_are_one_of_each_frame_the_peer_reads() {
         let samples = kit()["client_samples"].clone();
-        let frames: Vec<ClientFrame> =
-            serde_json::from_value(samples).expect("every sample is a client frame");
+        let frames: Vec<ClientFrame> = samples
+            .as_array()
+            .expect("the samples are an array")
+            .iter()
+            .map(|sample| crate::frames::read_client_frame(&sample.to_string()))
+            .collect();
         let kinds: Vec<&str> = frames
             .iter()
             .map(|f| match f {

@@ -58,7 +58,10 @@ use crate::consumers::{ConsumerLoadContext, ConsumerRegistry, LoadedConsumer, lo
 use crate::reload::agents::AgentInputs;
 use crate::reload::api_keys::api_keys_delta;
 use crate::reload::compare::non_convergible_differences;
-use crate::reload::delta::{LiveFacts, PlanDelta, PlanFacts, convergibility_refusals, plan_delta};
+use crate::reload::delta::{
+    LiveFacts, PlanDelta, PlanFacts, convergibility_refusals, plan_delta,
+    text_only_flips_under_remote_publishers,
+};
 use crate::reload::dynamic::DynamicSnapshot;
 use crate::reload::mqtt::mqtt_clients_delta;
 use crate::reload::surfaces::{
@@ -695,12 +698,16 @@ impl ReloadDriver {
         delta.mqtt_clients = mqtt_clients;
         delta.api_keys = api_keys;
         delta.tools = tools;
-        let refusals = convergibility_refusals(
+        let mut refusals = convergibility_refusals(
             &baseline_facts,
             &candidate_facts,
             &delta,
             self.env.messenger.directory(),
         );
+        refusals.extend(text_only_flips_under_remote_publishers(
+            &delta,
+            &plan.remotes,
+        ));
         if !refusals.is_empty() {
             return refused(Some(sha), refusals);
         }
@@ -5153,6 +5160,53 @@ new sifter: Demo {{
                 status.refusals[0]
             );
         }
+        assert!(
+            booted
+                .messenger
+                .directory()
+                .resolve("brenn:frames")
+                .expect("the running declaration")
+                .resolved_channel
+                .non_text,
+            "the running directory keeps the `non_text` declaration",
+        );
+    }
+
+    /// Declaring a durable channel text-only while a remote may publish to it
+    /// is refused at prepare, with the remote named, and the running
+    /// declaration stays `non_text`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn declaring_a_channel_a_remote_publishes_to_text_only_is_refused() {
+        let mut token = tempfile::NamedTempFile::new().expect("a token file");
+        std::io::Write::write_all(&mut token, b"pod-token\n").expect("the token is written");
+        let with_remote = |non_text: bool| {
+            document(&format!(
+                r#"{channels}
+remote pod {{
+    token_file = "{token}";
+    grants = [publish];
+    acl publish [exact frames];
+}}
+"#,
+                channels = frames_channels(non_text),
+                token = token.path().display(),
+            ))
+        };
+        let tree = Tree::holding(&with_remote(true));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        tree.write(&with_remote(false));
+        let refusals = refusals_of(&booted).await;
+        assert_eq!(
+            refusals,
+            vec![format!(
+                "brenn:frames is changed to text-only but remote \"pod\" may publish to it: \
+                 {}",
+                super::super::NEEDS_RESTART,
+            )],
+        );
+        booted.driver.reload(TriggerSource::Signal).await;
+        assert_eq!(booted.last_status().await.outcome, Outcome::Refused);
         assert!(
             booted
                 .messenger

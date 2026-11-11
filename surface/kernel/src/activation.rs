@@ -990,8 +990,18 @@ fn deferred_windows<P: PlanePolicy>(
                             "surface client: a deferred set is bounded by its channel's depth",
                         ),
                         // The body, not the envelope: what a component gets back
-                        // is what it handed over, on every hosting.
-                        payload: entry.body,
+                        // is what it handed over, on every hosting. The 0.1.0
+                        // payload is a string; a page never holds a non-text
+                        // parked body, since the page is on v4 and a page-local
+                        // non-text body is refused before it is buffered.
+                        payload: match entry.body.as_text() {
+                            Some(text) => text.to_owned(),
+                            None => panic!(
+                                "surface client: the 0.1.0 deferred-entry payload cannot carry a \
+                                 non-text body ({})",
+                                entry.body.summary()
+                            ),
+                        },
                         deliver_after: entry.deliver_after,
                     },
                     entry.message_id,

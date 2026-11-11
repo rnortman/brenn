@@ -57,9 +57,44 @@ All notable changes to Brenn are documented here.
   the component, port and channel); a surface binding to a `non_text`
   channel, a `non_text` key on any surface binding, and a `non_text` surface
   config channel; redeclaring a durable channel text-only while it holds a
-  non-text message. A remote attacher subscribing to a `non_text` channel is
-  answered `Unavailable`, which is not a violation and feeds nothing to
-  fail2ban. See `docs/config-dsl.md` and `docs/message-bus.md` §2.1.
+  non-text message, and, on reload only, while a `remote`'s publish ACL covers
+  it (restart instead). A remote attacher on attach protocol v4 subscribing to a
+  `non_text` channel is answered `Unavailable`, which is not a violation and
+  feeds nothing to fail2ban; one on v5 is served it. See
+  `docs/config-dsl.md` and `docs/message-bus.md` §2.1.
+- **For remote daemons: attach protocol v5, served beside v4 on the remote
+  route.** Under v5 the body-carrying frames (`Publish`, `PublishBatch`,
+  `Deliver`, `DeferredView`) are binary websocket messages — a JSON header,
+  then the raw body bytes — so a remote can publish and receive non-text
+  bodies, onto and from channels declared `non_text`, and receives every body
+  with its content type. A non-text body offered for a text-only channel is
+  answered with the new outcome `TextOnlyChannel` and nothing is stored. v5
+  carries no blob transfer. The browser page and the surface route stay on
+  v4. **A deployed v4 daemon keeps everything it has, frame for frame**: it
+  negotiates v4 and sees the frames it saw before. It does not get non-text
+  bodies, content types, `non_text` channels, or the non-text entries a v5
+  session of the same remote parked, which are left out of its deferred
+  view. No end date is set for v4's service. Limits on what a remote can
+  sustain are in `docs/message-bus.md` §2.1.3.
+- **BREAKING for daemon authors, at the next `brenn-attach-client` pin
+  bump.** The body-carrying types (`PublishRequest`, `BatchEntry`, deferred
+  edits, `DeferredViewEntry`) hold a `MessageBody` instead of a `String`
+  (`"text".into()` converts); build requests with `PublishRequest::new` and
+  `BatchEntry::new`. `ConnConfig` gains `versions`, the range offered — offer
+  `VersionRange::exactly(5)` to require bytes, or `SUPPORTED_VERSIONS` to
+  keep working against an older server. `TransportConnection::send_text` is
+  `send(WireMessage)` and `TransportEvent` carries one `Message(WireMessage)`.
+  The batch law and frame cap moved onto `Codec`
+  (`AttachmentFacts::codec()`), and `FlushBatch::frame_bytes` and
+  `Outboxes::on_attached` take it. `PublishOutcome` and
+  `PublishBatchOutcome` gain `TextOnlyChannel`; `BatchAnswer` gains
+  `outcome`. A daemon asks `AttachmentFacts::carries` before publishing a
+  body its attachment may not carry. See the `brenn-attach-client` crate
+  documentation.
+- The attach frame cap is per protocol version: v4's is unchanged (532 480
+  bytes at the default body cap); v5's is 204 800. `docs/config-dsl.md`
+  documents the `remote` block's `publish_burst`, `publish_per_sec`,
+  `max_sessions` and `max_subscriptions`.
 - **Slower first start.** The first start of this release rebuilds the
   message search index once and builds one new index on the message store,
   both before serving, so it takes longer on a large database. No stored

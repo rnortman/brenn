@@ -192,7 +192,7 @@ fn flush_batch(n: u64) -> FlushBatch {
     FlushBatch {
         entries: vec![BatchEntry {
             channel: OUT.to_string(),
-            body: format!(r#"{{"n":{n}}}"#),
+            body: format!(r#"{{"n":{n}}}"#).into(),
             urgency: WireUrgency::Normal,
             deliver_after: None,
         }],
@@ -840,11 +840,28 @@ fn a_batch_result_for_a_correlation_nothing_sent_is_fatal() {
 }
 
 #[test]
+fn a_text_only_refusal_of_a_flush_is_fatal_at_v4() {
+    let mut page = configured(W::default());
+    let correlation = batch_correlation(&queue_flush(&mut page, 1));
+    let err = on_server_frame(
+        &mut page,
+        ServerFrame::PublishBatchResult {
+            correlation,
+            outcome: PublishBatchOutcome::TextOnlyChannel,
+        },
+        NOW,
+    )
+    .expect_err("a v4 attachment cannot earn the refusal");
+    assert!(err.contains("TextOnlyChannel"), "{err}");
+    assert!(err.contains(&correlation.to_string()), "{err}");
+}
+
+#[test]
 fn a_deferred_view_replaces_the_mirror_and_answers_nothing() {
     let mut page = configured(W::default());
     let entry = DeferredViewEntry {
         message_id: Uuid::from_u128(0xbeef),
-        body: "{}".to_string(),
+        body: "{}".into(),
         deliver_after: 9_000,
     };
     let inbound = route(

@@ -9,16 +9,19 @@
 //! gains a field lands in one place.
 
 use brenn_attach_client::conn::AttachmentFacts;
-use brenn_attach_proto::{DeliverRow, SUPPORTED_VERSIONS, ServerFrame, SubscribeOutcome};
+use brenn_attach_proto::{
+    ClientFrame, Codec, DeliverRow, ServerFrame, SubscribeOutcome, VersionRange, WireMessage,
+};
 use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
+use brenn_surface_schema::SURFACE_ATTACH_VERSION;
 use uuid::Uuid;
 
-/// The peer's opening `Hello`, stating this build's whole supported range — a
-/// peer that speaks what we speak, which is what every test but a negotiation
-/// one wants.
+/// The peer's opening `Hello`, stating the surface route's range — a peer that
+/// speaks what the page speaks, which is what every test but a negotiation one
+/// wants.
 pub fn server_hello() -> String {
     frame(&ServerFrame::Hello {
-        versions: SUPPORTED_VERSIONS,
+        versions: VersionRange::exactly(SURFACE_ATTACH_VERSION),
         ident: "peer".to_string(),
     })
 }
@@ -96,7 +99,39 @@ pub fn deliver(channel: &str, body: &str) -> String {
     deliver_at(channel, body, 1, 0x9001)
 }
 
-/// Serialize a server frame the way a peer writes it.
+/// The codec of the version the surface route serves.
+fn surface_codec() -> Codec {
+    Codec::negotiated(SURFACE_ATTACH_VERSION)
+}
+
+/// Serialize a server frame the way a peer writes it: a text message at the
+/// surface route's version.
 pub fn frame(frame: &ServerFrame) -> String {
-    serde_json::to_string(frame).expect("a server frame serializes")
+    match surface_codec().encode_server(frame) {
+        WireMessage::Text(text) => text,
+        WireMessage::Binary(_) => panic!("a surface peer frame is a text message: {frame:?}"),
+    }
+}
+
+/// Serialize a client frame the way the page writes it, at the surface
+/// route's version.
+pub fn client_frame(frame: &ClientFrame) -> String {
+    match surface_codec().encode_client(frame) {
+        WireMessage::Text(text) => text,
+        WireMessage::Binary(_) => panic!("a page frame is a text message: {frame:?}"),
+    }
+}
+
+/// Read a server frame a peer wrote at the surface route's version.
+pub fn read_server_frame(text: &str) -> ServerFrame {
+    surface_codec()
+        .decode_server(WireMessage::Text(text.to_string()))
+        .unwrap_or_else(|err| panic!("not a server frame: {err}"))
+}
+
+/// Read a client frame the page wrote at the surface route's version.
+pub fn read_client_frame(text: &str) -> ClientFrame {
+    surface_codec()
+        .decode_client(WireMessage::Text(text.to_string()))
+        .unwrap_or_else(|err| panic!("not a client frame: {err}"))
 }

@@ -53,6 +53,9 @@ pub struct DeferredViewPush {
     /// The sub-identity whose parked set this is, or `None` for the attacher's
     /// own bare identity.
     pub attribution: Option<String>,
+    /// Every entry of the set, whatever its body. One push reaches every
+    /// session of the attacher, and each receiving session leaves out what its
+    /// own version cannot carry.
     pub entries: Vec<DeferredViewEntry>,
 }
 

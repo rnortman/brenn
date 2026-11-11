@@ -20,6 +20,10 @@ const BODY_CAP: usize = 64 * 1024;
 const CHANNEL: &str = "ephemeral:demo";
 const OTHER: &str = "brenn:other";
 
+fn v4() -> Codec {
+    Codec::negotiated(4)
+}
+
 fn now() -> Millis {
     Millis(1_000)
 }
@@ -28,7 +32,7 @@ fn request(body: &str) -> PublishRequest {
     PublishRequest {
         channel: CHANNEL.to_string(),
         attribution: Some("alpha".to_string()),
-        body: body.to_string(),
+        body: body.into(),
         urgency: Urgency::Normal,
     }
 }
@@ -36,7 +40,7 @@ fn request(body: &str) -> PublishRequest {
 fn entry(body: &str) -> BatchEntry {
     BatchEntry {
         channel: CHANNEL.to_string(),
-        body: body.to_string(),
+        body: body.into(),
         urgency: Urgency::Normal,
         deliver_after: None,
     }
@@ -65,7 +69,7 @@ fn alpha() -> String {
 fn attached(depth: u64) -> Outboxes<String> {
     let mut outboxes = Outboxes::new();
     outboxes.register(alpha(), Some(alpha()), depth);
-    let steps = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
+    let steps = outboxes.on_attached(v4(), BODY_CAP, now(), |_, _| true);
     assert!(steps.frames.is_empty(), "nothing was queued to send");
     outboxes
 }
@@ -80,7 +84,10 @@ fn batch_frame(frame: &ClientFrame) -> (u64, Vec<&str>, usize) {
             ..
         } => (
             *correlation,
-            publishes.iter().map(|e| e.body.as_str()).collect(),
+            publishes
+                .iter()
+                .map(|e| e.body.as_text().unwrap())
+                .collect(),
             deferred_ops.len(),
         ),
         other => panic!("expected a PublishBatch, got {other:?}"),
@@ -98,7 +105,7 @@ fn correlation_of(frame: &ClientFrame) -> u64 {
 fn view_entry(deliver_after: u64) -> DeferredViewEntry {
     DeferredViewEntry {
         message_id: Uuid::from_u128(u128::from(deliver_after)),
-        body: format!("parked at {deliver_after}"),
+        body: format!("parked at {deliver_after}").into(),
         deliver_after,
     }
 }
@@ -114,7 +121,7 @@ fn a_publish_frame_carries_the_request_verbatim() {
         ClientFrame::Publish {
             channel: CHANNEL.to_string(),
             attribution: Some(alpha()),
-            body: "hi".to_string(),
+            body: "hi".into(),
             urgency: Urgency::Normal,
             correlation: Some(7),
         }
@@ -225,7 +232,7 @@ fn a_flush_while_detached_queues_and_leaves_at_the_next_attach() {
     );
     assert_eq!(outboxes.parked_len(&alpha()), 1);
 
-    let steps = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
+    let steps = outboxes.on_attached(v4(), BODY_CAP, now(), |_, _| true);
     assert_eq!(bodies_of(&steps.frames[0]), vec!["one"]);
     assert_eq!(
         steps.retry_wakeup, None,
@@ -288,7 +295,7 @@ fn the_outbox_drops_oldest_at_its_cap_and_counts_it() {
     assert_eq!(outboxes.dropped_count(&alpha()), 1);
     assert_eq!(outboxes.parked_len(&alpha()), 2);
 
-    let steps = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
+    let steps = outboxes.on_attached(v4(), BODY_CAP, now(), |_, _| true);
     assert_eq!(
         bodies_of(&steps.frames[0]),
         vec!["two"],
@@ -454,6 +461,65 @@ fn a_head_the_peer_keeps_refusing_converges_on_counted_drops() {
     );
     assert_eq!(outboxes.dropped_count(&alpha()), 1);
     assert_eq!(outboxes.parked_len(&alpha()), 1);
+}
+
+/// No retry of a flush refused for a text-only channel can succeed, so it is
+/// dropped and counted rather than parked, and the wire goes to the next flush.
+#[test]
+fn a_text_only_refusal_drops_the_flush_and_pumps_the_next() {
+    let mut outboxes = attached(4);
+    let first = outboxes.flush(&alpha(), batch(&["one"]), now());
+    outboxes.flush(&alpha(), batch(&["two"]), now());
+
+    let answer = outboxes
+        .on_batch_result(
+            correlation_of(&first.frames[0]),
+            PublishBatchOutcome::TextOnlyChannel,
+            now(),
+        )
+        .expect("a correlation this attachment sent");
+    assert_eq!(answer.registrant, alpha());
+    assert_eq!(answer.outcome, PublishBatchOutcome::TextOnlyChannel);
+    assert_eq!(answer.lost, Some(batch(&["one"])));
+    assert_eq!(answer.steps.dropped, vec![alpha()]);
+    assert_eq!(outboxes.dropped_count(&alpha()), 1);
+    assert_eq!(
+        outboxes.rate_limited_count(&alpha()),
+        0,
+        "a text-only refusal is not metering"
+    );
+    assert_eq!(
+        bodies_of(&answer.steps.frames[0]),
+        vec!["two"],
+        "the next flush goes out at once"
+    );
+    assert_eq!(answer.steps.frames.len(), 1);
+    assert_eq!(outboxes.parked_len(&alpha()), 0, "nothing was re-parked");
+    assert_eq!(
+        answer.steps.retry_wakeup, None,
+        "nothing is blocked, so no timer is armed"
+    );
+    assert!(
+        outboxes.on_retry_tick(Millis(2_000)).frames.is_empty(),
+        "the refused flush is never offered again"
+    );
+}
+
+#[test]
+fn a_text_only_refusal_after_deregistration_hands_the_lost_flush_back() {
+    let mut outboxes = attached(4);
+    let sent = outboxes.flush(&alpha(), batch(&["one"]), now());
+    let correlation = correlation_of(&sent.frames[0]);
+    outboxes.deregister(&alpha());
+
+    let answer = outboxes
+        .on_batch_result(correlation, PublishBatchOutcome::TextOnlyChannel, now())
+        .expect("the correlation survives its registrant");
+    assert_eq!(answer.outcome, PublishBatchOutcome::TextOnlyChannel);
+    assert_eq!(answer.lost, Some(batch(&["one"])));
+    assert!(answer.steps.frames.is_empty());
+    assert!(answer.steps.dropped.is_empty());
+    assert!(!outboxes.is_registered(&alpha()));
 }
 
 // --- the embedder's own discard ----------------------------------------------
@@ -718,13 +784,11 @@ fn deregistration_hands_back_the_flushes_nobody_is_left_to_send() {
 #[test]
 fn a_flush_measures_the_frame_it_composes_to() {
     let batch = batch(&["one", "two"]);
-    let measured = batch.frame_bytes(Some("alpha"));
+    let measured = batch.frame_bytes(v4(), Some("alpha"));
 
     let mut outboxes = attached(4);
     let steps = outboxes.flush(&alpha(), batch, now());
-    let sent = serde_json::to_string(&steps.frames[0])
-        .expect("a PublishBatch frame serializes")
-        .len();
+    let sent = v4().encode_client(&steps.frames[0]).len();
     assert!(
         measured >= sent,
         "measured {measured} understates the {sent}-byte frame"
@@ -785,7 +849,7 @@ fn a_detach_frees_the_wire_without_resending_the_unanswered_flush() {
         "the batch the previous connection carried is unanswerable"
     );
 
-    let steps = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
+    let steps = outboxes.on_attached(v4(), BODY_CAP, now(), |_, _| true);
     assert!(
         steps.frames.is_empty(),
         "a flush the peer may have applied is never resent"
@@ -825,7 +889,7 @@ fn an_attach_re_validates_every_queued_flush_against_the_new_contract() {
         FlushBatch {
             entries: vec![BatchEntry {
                 channel: OTHER.to_string(),
-                body: "drop".to_string(),
+                body: "drop".into(),
                 urgency: Urgency::Normal,
                 deliver_after: None,
             }],
@@ -835,7 +899,7 @@ fn an_attach_re_validates_every_queued_flush_against_the_new_contract() {
     );
     outboxes.flush(&alpha(), batch(&["also-keep"]), now());
 
-    let steps = outboxes.on_attached(BODY_CAP, now(), |_, flush| {
+    let steps = outboxes.on_attached(v4(), BODY_CAP, now(), |_, flush| {
         flush.entries.iter().all(|e| e.channel == CHANNEL)
     });
     assert_eq!(steps.dropped, vec![alpha()]);
@@ -848,6 +912,68 @@ fn an_attach_re_validates_every_queued_flush_against_the_new_contract() {
     );
 }
 
+/// A flush queued while detached can hold a body the attachment that comes up
+/// cannot carry: at v4, a typed entry or a typed edit body. Each such flush is
+/// dropped whole on attach, before the embedder is asked, and counted like any
+/// other re-validation drop; under v5 the same flushes go out.
+#[test]
+fn an_attach_drops_a_queued_flush_its_version_cannot_carry() {
+    let typed = MessageBody::from_parts(Some("image/png"), &[0x89, 0x00, 0xff]).unwrap();
+    let queue = |outboxes: &mut Outboxes<String>| {
+        outboxes.register(alpha(), None, 4);
+        outboxes.flush(
+            &alpha(),
+            FlushBatch {
+                entries: vec![BatchEntry {
+                    body: typed.clone(),
+                    ..entry("")
+                }],
+                ops: Vec::new(),
+            },
+            now(),
+        );
+        outboxes.flush(&alpha(), batch(&["keep"]), now());
+        outboxes.flush(
+            &alpha(),
+            FlushBatch {
+                entries: Vec::new(),
+                ops: vec![BatchDeferredOp {
+                    op: DeferredOpKind::Edit {
+                        body: Some(typed.clone()),
+                        deliver_after: None,
+                    },
+                    ..cancel_op(Uuid::from_u128(1))
+                }],
+            },
+            now(),
+        );
+    };
+
+    let mut outboxes = Outboxes::new();
+    queue(&mut outboxes);
+    let asked = std::cell::Cell::new(0);
+    let steps = outboxes.on_attached(v4(), BODY_CAP, now(), |_, _| {
+        asked.set(asked.get() + 1);
+        true
+    });
+    assert_eq!(
+        asked.get(),
+        1,
+        "only the carried flush reaches the embedder"
+    );
+    assert_eq!(steps.dropped, vec![alpha(), alpha()]);
+    assert_eq!(outboxes.dropped_count(&alpha()), 2);
+    assert_eq!(bodies_of(&steps.frames[0]), vec!["keep"]);
+    assert_eq!(outboxes.parked_len(&alpha()), 0);
+
+    let mut outboxes = Outboxes::new();
+    queue(&mut outboxes);
+    let steps = outboxes.on_attached(Codec::negotiated(5), BODY_CAP, now(), |_, _| true);
+    assert!(steps.dropped.is_empty());
+    assert_eq!(steps.frames.len(), 1, "one head on the wire");
+    assert_eq!(outboxes.parked_len(&alpha()), 2, "the rest wait their turn");
+}
+
 #[test]
 fn one_head_per_registrant_leaves_on_a_retry_tick() {
     let mut outboxes = Outboxes::new();
@@ -857,7 +983,7 @@ fn one_head_per_registrant_leaves_on_a_retry_tick() {
         outboxes.flush(&alpha(), batch(&[body]), now());
         outboxes.flush(&"beta".to_string(), batch(&[body]), now());
     }
-    let steps = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
+    let steps = outboxes.on_attached(v4(), BODY_CAP, now(), |_, _| true);
     assert_eq!(steps.frames.len(), 2, "one head each, in registrant order");
     assert_eq!(bodies_of(&steps.frames[0]), vec!["one"]);
 
@@ -876,7 +1002,7 @@ fn traffic_while_a_head_is_blocked_leaves_the_armed_timer_alone() {
     let mut outboxes = Outboxes::new();
     outboxes.register(alpha(), None, 4);
     outboxes.register("beta".to_string(), None, 4);
-    let sent = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
+    let sent = outboxes.on_attached(v4(), BODY_CAP, now(), |_, _| true);
     assert!(sent.frames.is_empty());
 
     let alphas = outboxes.flush(&alpha(), batch(&["one"]), now());
@@ -922,7 +1048,7 @@ fn a_siblings_result_leaves_a_blocked_registrants_deadline_where_it_was() {
     outboxes.flush(&alpha(), batch(&["one"]), now());
     outboxes.flush(&"beta".to_string(), batch(&["b1"]), now());
     outboxes.flush(&"beta".to_string(), batch(&["b2"]), now());
-    let heads = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
+    let heads = outboxes.on_attached(v4(), BODY_CAP, now(), |_, _| true);
     assert_eq!(heads.frames.len(), 2, "one head each");
 
     let armed = outboxes
@@ -994,7 +1120,7 @@ fn a_queued_flush_is_judged_against_the_attachment_that_carries_it() {
     outboxes.register(alpha(), None, 4);
     let body = "x".repeat(64);
     outboxes.flush(&alpha(), batch(&[body.as_str()]), now());
-    outboxes.on_attached(32, now(), |_, _| true);
+    outboxes.on_attached(v4(), 32, now(), |_, _| true);
 }
 
 // --- the parked-set mirror --------------------------------------------------

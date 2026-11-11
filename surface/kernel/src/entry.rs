@@ -17,6 +17,8 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::Element;
 
 use brenn_attach_client::conn::ConnConfig;
+use brenn_attach_proto::VersionRange;
+use brenn_surface_schema::SURFACE_ATTACH_VERSION;
 
 use crate::WebSysConnector;
 use crate::front::{self, EventStream, SurfaceHandle};
@@ -92,6 +94,8 @@ pub fn start() -> KernelHandle {
         // a deploy restart decorrelates its reconnects.
         backoff_jitter_seed: crate::entropy::seed(),
         terminal_close_codes: crate::logic::ClosePolicy::terminal_codes(),
+        // The surface route serves this one version, and the page moves with it.
+        versions: VersionRange::exactly(SURFACE_ATTACH_VERSION),
     };
     // The page's store epoch, minted here for the same reason as the jitter seed:
     // nothing below this edge reads entropy. `Uuid::new_v4` reads the platform

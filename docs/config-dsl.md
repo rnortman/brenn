@@ -260,10 +260,14 @@ messaging { max_body_bytes = 393216; }
   65 536 (64 KiB). It bounds every message on the bus, a tool result
   included: a result over it is answered to its caller as an `internal` error
   naming the cap, with a Warning alert once per process. Several caps are
-  derived from it — the attach client frame cap (`max_client_frame_bytes`,
-  which adds room for JSON escaping and batch overhead), the MQTT publish
-  payload cap, and a guest's publish and sync-reply caps — so raising it
-  raises them.
+  derived from it — the attach client frame cap, the MQTT publish payload
+  cap, and a guest's publish and sync-reply caps — so raising it raises them.
+  The attach frame cap is per protocol version (`Codec::max_client_frame_bytes`):
+  v4, which writes bodies as JSON strings, allows six times the body cap for
+  escaping plus batch overhead (532 480 bytes at the default); v5, which
+  writes bodies raw, allows the body cap plus the same overhead (204 800
+  bytes). A route sets its websocket read cap to the largest among the
+  versions it serves and checks each frame against its session's own.
 - `default_noise` — a subscription's noise level when it states none. Default
   `silent`.
 - `default_sink` — a channel's sink when it states none. Default `drop`.
@@ -1023,10 +1027,13 @@ Only a declaration states it: a tuning block is refused for it, because every
 system-minted family is text-only. A channel declared `non_text` may not be
 bound by a component built against the string contract
 `brenn:processor@0.1.0` — the component's load is refused at boot and at
-reload, naming the port and the channel — nor by a surface, nor served to an
-attach session; a remote asking for it is answered `Unavailable`. A durable
+reload, naming the port and the channel — nor by a surface. It is served to a
+remote whose attach session negotiated protocol v5; one on v4 asking for it is
+answered `Unavailable`. A durable
 channel holding a non-text message cannot later be declared text-only; give it
-a new address instead.
+a new address instead. A reload does not redeclare a durable channel
+text-only while a `remote`'s publish ACL covers its old or its new address;
+that change needs a restart.
 
 The address prefix is the contract: it says the blast radius without consulting
 any subscriber table. Which prefixes exist, and what each one promises about
@@ -1884,7 +1891,21 @@ it is on an agent.
 Five more declarations, each a body of attrs:
 
 - `remote <name> { … }` — a native daemon that attaches to the bus over the
-  wire, with a token file, transport grants, and ACLs.
+  wire, with a token file, transport grants, and ACLs. Four optional keys
+  bound what it may do:
+  - `publish_burst`, `publish_per_sec` — the per-connection bucket in front of
+    every single `Publish`: burst tokens and sustained refill per second.
+    Default 60 and 1, as a surface's. Zero is refused, and so is a value
+    above the bus's per-sender send rate (`messaging { default_send_rate }`),
+    so the bucket trips no later than the bus does.
+  - `max_sessions` — concurrent sessions admitted for the remote. Default 2,
+    so a reconnect after a netsplit lands while the half-dead session drains;
+    the sessions share one parked set and one send budget.
+  - `max_subscriptions` — concurrent subscriptions per session. Default 256.
+
+  A remote's attach send budget — 256 tokens, refilled one per 15 seconds,
+  drawn by every durable `Publish` and every `PublishBatch` entry — is fixed
+  and has no key (`docs/message-bus.md` §2.1.3).
 - `webhook <name> { … }` — an HTTP ingress endpoint: mount path, content type,
   and named sub-blocks for `signature`, `key`, and `replay_protection`. The
   replay block names its guard by installed package —

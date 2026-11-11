@@ -467,6 +467,12 @@ pub const RESERVED_LOCAL_CHANNELS: &[ReservedLocalChannel] = &[
 // mismatch, or drop the field) and apply it uniformly across the planes.
 pub const CONTROL_PLANE_VERSION: u8 = 1;
 
+/// The one attach protocol version the page speaks and the surface route
+/// serves. A plain number, so this crate takes no dependency on the protocol
+/// crate; the page offers exactly this version and the route serves exactly
+/// this version, so the two move together.
+pub const SURFACE_ATTACH_VERSION: u32 = 4;
+
 /// The link state the kernel reports on [`LOCAL_LINK_STATE_CHANNEL`].
 ///
 /// The connection's state as the *page* experiences it, which is why it is a

@@ -10,11 +10,12 @@
 mod tests;
 
 use std::fmt::Display;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message};
 use brenn_attach_proto::{
-    ClientFrame, SUPPORTED_VERSIONS, ServerFrame, VersionRange, max_client_frame_bytes, negotiate,
+    Codec, HelloRead, ServerFrame, VersionRange, WireMessage, encode_server_hello, negotiate,
 };
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
@@ -37,10 +38,11 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Both ends state their whole range and each computes the agreement itself, so
 /// neither waits on the other and an incompatibility needs no refusal frame.
-/// `ident` is a free-form build string for logs; the peer never parses it.
-pub fn server_hello(ident: &str) -> ServerFrame {
+/// `versions` is the range this route serves; `ident` is a free-form build
+/// string for logs, which the peer never parses.
+pub fn server_hello(versions: VersionRange, ident: &str) -> ServerFrame {
     ServerFrame::Hello {
-        versions: SUPPORTED_VERSIONS,
+        versions,
         ident: ident.to_string(),
     }
 }
@@ -64,7 +66,8 @@ pub enum Handshake {
     Disconnect,
 }
 
-/// Read the attacher's `Hello` and negotiate against this build's range.
+/// Read the attacher's `Hello` and negotiate against the served range
+/// `versions`.
 ///
 /// `within` bounds the wait: the protocol has the attacher send `Hello` as its
 /// first frame without waiting for the server's, so silence past this bound is a
@@ -72,11 +75,15 @@ pub enum Handshake {
 /// violation. Liveness frames ahead of the `Hello` are skipped; any other frame
 /// before it is a violation, because until a version is agreed there is no schema
 /// under which a second frame kind could be read.
-pub async fn read_client_hello<S>(stream: &mut S, within: Duration) -> Handshake
+pub async fn read_client_hello<S>(
+    stream: &mut S,
+    within: Duration,
+    versions: VersionRange,
+) -> Handshake
 where
     S: Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
-    match tokio::time::timeout(within, next_hello(stream)).await {
+    match tokio::time::timeout(within, next_hello(stream, versions)).await {
         Ok(verdict) => verdict,
         Err(_) => Handshake::Violation(format!("no Hello within {}s of upgrade", within.as_secs())),
     }
@@ -84,13 +91,15 @@ where
 
 /// The unbounded half of [`read_client_hello`]: read until the first frame that
 /// is not a liveness frame, and judge it.
-async fn next_hello<S>(stream: &mut S) -> Handshake
+async fn next_hello<S>(stream: &mut S, versions: VersionRange) -> Handshake
 where
     S: Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
     loop {
         match stream.next().await {
-            Some(Ok(Message::Text(text))) => return classify_hello(text.as_str()),
+            Some(Ok(Message::Text(text))) => {
+                return classify_hello(&WireMessage::Text(text.as_str().to_string()), versions);
+            }
             // Not application frames. Pong replies are handled by axum.
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
             Some(Ok(Message::Binary(_))) => {
@@ -116,14 +125,19 @@ where
 ///
 /// The frame's own shape is frozen across every version, so a parse failure here
 /// is not version skew — it is a client that cannot speak the handshake at all.
-fn classify_hello(text: &str) -> Handshake {
-    let Ok(frame) = serde_json::from_str::<ClientFrame>(text) else {
-        return Handshake::Violation("unparseable client frame before Hello".to_string());
+/// A frame is told from a non-frame by its `type` tag alone: no version is in
+/// force to read the rest of a non-`Hello` by.
+fn classify_hello(msg: &WireMessage, served: VersionRange) -> Handshake {
+    let (versions, ident) = match brenn_attach_proto::read_client_hello(msg) {
+        HelloRead::Hello { versions, ident } => (versions, ident),
+        HelloRead::NotHello { .. } => {
+            return Handshake::Violation("first client frame is not Hello".to_string());
+        }
+        HelloRead::Unparseable { .. } => {
+            return Handshake::Violation("unparseable client frame before Hello".to_string());
+        }
     };
-    let ClientFrame::Hello { versions, ident } = frame else {
-        return Handshake::Violation("first client frame is not Hello".to_string());
-    };
-    match negotiate(SUPPORTED_VERSIONS, versions) {
+    match negotiate(served, versions) {
         Some(version) => {
             info!(
                 version,
@@ -144,8 +158,9 @@ fn classify_hello(text: &str) -> Handshake {
 ///
 /// Every field is a fact of the connection: the identity it speaks as, the id it
 /// self-attributes with, what it may send, and how it knows the peer is alive.
-/// The frame cap is derived from the body cap here rather than client-side, so
-/// the number the server enforces is the number the attacher honours.
+/// The frame cap is the negotiated version's, derived from the body cap here
+/// rather than client-side, so the number the server enforces is the number
+/// the attacher honours.
 pub fn welcome(ctx: &AttachSessionCtx, version: u32, heartbeat_secs: u32) -> ServerFrame {
     ServerFrame::Welcome {
         version,
@@ -153,16 +168,17 @@ pub fn welcome(ctx: &AttachSessionCtx, version: u32, heartbeat_secs: u32) -> Ser
         session_id: ctx.session_id.simple().to_string(),
         heartbeat_secs,
         max_body_bytes: ctx.max_body_bytes as u64,
-        max_frame_bytes: max_client_frame_bytes(ctx.max_body_bytes) as u64,
+        max_frame_bytes: Codec::negotiated(version).max_client_frame_bytes(ctx.max_body_bytes)
+            as u64,
         alert_granted: ctx.profile.alert_granted(),
     }
 }
 
 /// What an inbound websocket read error was.
 pub enum InboundError {
-    /// The read cap fired: the peer sent a frame larger than
-    /// [`max_client_frame_bytes`] of the attachment's body cap. Every legal
-    /// frame fits under it — a single publish by the body cap, a batch by the
+    /// The read cap fired: the peer sent a frame larger than the route's
+    /// transport cap, the largest frame cap of any version it serves. Every
+    /// legal frame fits under it — a single publish by the body cap, a batch by the
     /// legality law the cap is derived from — so this is tampering or a serious
     /// client bug, a protocol violation and fail2ban signal.
     Oversized,
@@ -198,12 +214,17 @@ pub fn classify_read_error(err: axum::Error) -> InboundError {
 
 /// Owns the WS sink for the life of the connection.
 ///
-/// Serializes outbound frames, emits the server-side liveness probe (a native
+/// Encodes outbound frames, emits the server-side liveness probe (a native
 /// `Ping`) every `heartbeat`, adds an idle [`ServerFrame::Heartbeat`] when
 /// nothing else was written since the last tick — a browser websocket cannot
 /// observe protocol-level pings, so the application frame is what an attacher's
 /// inbound-silence rule actually sees — and bounds every write with a
 /// stalled-reader watchdog.
+///
+/// `version` is the session's negotiated version, set once by the opening
+/// sequence. `Hello` is written in its frozen shell whatever is set; every
+/// other frame through the codec of the version set, and the idle `Heartbeat`
+/// only once one is.
 ///
 /// Exits on any sink error, watchdog timeout, or sender drop; exiting drops `rx`,
 /// which is what tears the session down.
@@ -218,6 +239,7 @@ pub async fn writer_task<S>(
     mut rx: mpsc::Receiver<ServerFrame>,
     mut close_rx: oneshot::Receiver<CloseReason>,
     heartbeat: Duration,
+    version: Arc<OnceLock<u32>>,
 ) where
     S: Sink<Message> + Unpin,
     S::Error: Display,
@@ -237,11 +259,8 @@ pub async fn writer_task<S>(
             maybe_frame = rx.recv() => {
                 match maybe_frame {
                     Some(frame) => {
-                        let json = serde_json::to_string(&frame)
-                            .expect("ServerFrame serialization");
-                        if !write_with_watchdog(&mut sink, Message::Text(json.into()), watchdog)
-                            .await
-                        {
+                        let msg = encode(&frame, &version);
+                        if !write_with_watchdog(&mut sink, msg, watchdog).await {
                             return;
                         }
                         wrote_frame_since_tick = true;
@@ -266,8 +285,8 @@ pub async fn writer_task<S>(
                     continue;
                 };
                 while let Ok(frame) = rx.try_recv() {
-                    let json = serde_json::to_string(&frame).expect("ServerFrame serialization");
-                    if !write_with_watchdog(&mut sink, Message::Text(json.into()), watchdog).await {
+                    let msg = encode(&frame, &version);
+                    if !write_with_watchdog(&mut sink, msg, watchdog).await {
                         return;
                     }
                 }
@@ -279,16 +298,40 @@ pub async fn writer_task<S>(
                 {
                     return;
                 }
-                if !wrote_frame_since_tick {
-                    let json = serde_json::to_string(&ServerFrame::Heartbeat)
-                        .expect("ServerFrame serialization");
-                    if !write_with_watchdog(&mut sink, Message::Text(json.into()), watchdog).await {
+                // Before a version is in force there is no schema to write a
+                // `Heartbeat` in; the native `Ping` alone covers the handshake.
+                if !wrote_frame_since_tick && version.get().is_some() {
+                    let msg = encode(&ServerFrame::Heartbeat, &version);
+                    if !write_with_watchdog(&mut sink, msg, watchdog).await {
                         return;
                     }
                 }
                 wrote_frame_since_tick = false;
             }
         }
+    }
+}
+
+/// One outbound frame as the websocket message it is written as.
+///
+/// # Panics
+///
+/// On a frame other than `Hello` with no version set: `Welcome` is enqueued
+/// only after the version is set and the queue is FIFO, so such a frame is a
+/// host bug.
+fn encode(frame: &ServerFrame, version: &OnceLock<u32>) -> Message {
+    let msg = match frame {
+        ServerFrame::Hello { versions, ident } => encode_server_hello(*versions, ident),
+        frame => {
+            let version = version
+                .get()
+                .expect("attach writer: a frame other than Hello before a version is in force");
+            Codec::negotiated(*version).encode_server(frame)
+        }
+    };
+    match msg {
+        WireMessage::Text(text) => Message::Text(text.into()),
+        WireMessage::Binary(bytes) => Message::Binary(bytes.into()),
     }
 }
 

@@ -14,6 +14,8 @@
 
 use std::fmt;
 
+use brenn_attach_proto::WireMessage;
+
 pub mod clock;
 pub mod timer;
 
@@ -40,9 +42,9 @@ pub trait TransportConnector {
 /// every peer-triggered outcome is a typed [`TransportEvent`].
 #[allow(async_fn_in_trait)]
 pub trait TransportConnection {
-    /// Send a text frame. An error means the connection is gone; the driver
-    /// treats it as a transport failure.
-    async fn send_text(&mut self, text: String) -> Result<(), TransportError>;
+    /// Send one message, as a text or binary websocket frame. An error means
+    /// the connection is gone; the driver treats it as a transport failure.
+    async fn send(&mut self, message: WireMessage) -> Result<(), TransportError>;
 
     /// Await the next transport-level event. Resolves to [`TransportEvent`];
     /// never panics regardless of what the peer sends.
@@ -57,11 +59,10 @@ pub trait TransportConnection {
 /// absent (see module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportEvent {
-    /// A text frame. The core parses it as a server protocol frame.
-    Text(String),
-    /// A binary frame. The server never sends binary; the core treats this as
-    /// a fatal protocol error.
-    Binary(Vec<u8>),
+    /// A text or binary message, in the vocabulary [`TransportConnection::send`]
+    /// takes. The core decodes either as a server protocol frame: whether a
+    /// binary message is a frame is the negotiated version's to say.
+    Message(WireMessage),
     /// The peer closed the connection, with an optional WS close code and the
     /// close reason string.
     Closed { code: Option<u16>, reason: String },
@@ -71,7 +72,7 @@ pub enum TransportEvent {
 }
 
 /// A transport-level failure returned from [`TransportConnector::connect`] or
-/// [`TransportConnection::send_text`]. Carries a human-readable description;
+/// [`TransportConnection::send`]. Carries a human-readable description;
 /// the core does not branch on its contents, only on success vs failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportError {

@@ -70,6 +70,8 @@ pub const MAX_PUBLISHES_PER_ACTIVATION: usize = 256;
 /// which publish overran instead of losing the whole atomic flush at the wire. A
 /// component emitting to a transportable channel should size against that
 /// budget, not against this constant.
+// TODO(byte-body-ceiling-per-activation): whether 4 MiB stays the ceiling on
+// one message of binary state, or blobs take over below it.
 pub const MAX_PUBLISH_BYTES_PER_ACTIVATION: usize = 4 * 1024 * 1024;
 
 /// Maximum total publish calls (successful + failed) per activation.

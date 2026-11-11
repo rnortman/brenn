@@ -368,7 +368,12 @@ fn schedule_of(
     router
         .parked_for(stores, PLANE, origin)
         .into_iter()
-        .map(|entry| (entry.body, entry.deliver_after))
+        .map(|entry| {
+            (
+                entry.body.as_text().unwrap().to_string(),
+                entry.deliver_after,
+            )
+        })
         .collect()
 }
 
@@ -463,7 +468,7 @@ fn a_schedule_reads_back_in_the_shape_the_peer_answers_for_a_wire_channel() {
     let entries = router.parked_for(&stores, PLANE, Origin::Sub("widget-7"));
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].message_id, Uuid::from_u128(42));
-    assert_eq!(entries[0].body, "body");
+    assert_eq!(entries[0].body, MessageBody::from("body"));
     assert_eq!(entries[0].deliver_after, SOON);
     router.release_due(&mut stores, SOON);
     assert!(
@@ -824,38 +829,24 @@ fn a_transportable_channels_schedule_is_not_the_routers_to_answer() {
     router.parked_for(&stores, "ephemeral:demo", Origin::Attacher);
 }
 
-/// A typed text body parked on a confined channel is viewed as exactly its
-/// text: the v4 entry has no place for its type.
+/// A body parked on a confined channel is viewed as the body it is, type and
+/// all: what a carrier can hold of it is the carrier's to decide.
 #[test]
-fn a_parked_typed_text_body_is_viewed_as_its_text() {
-    let mut stores = stores(4);
-    let mut router = router(TestPlanes::default());
-    let body = MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
-    parked_until(router.route(
-        &mut stores,
-        RouteRequest {
-            body,
-            ..scheduled(PLANE, Origin::Attacher, "", 1, SOON)
-        },
-    ));
-    let entries = router.parked_for(&stores, PLANE, Origin::Attacher);
-    assert_eq!(entries[0].body, "# hi");
-}
-
-/// A non-text body parked on a confined channel never reaches a v4
-/// `DeferredView` entry: building it panics, naming the carrier.
-#[test]
-#[should_panic(expected = "attach v4 DeferredView")]
-fn a_parked_non_text_body_panics_where_the_view_entry_is_built() {
-    let mut stores = stores(4);
-    let mut router = router(TestPlanes::default());
-    let body = MessageBody::from_parts(Some("application/octet-stream"), &[0xff]).unwrap();
-    parked_until(router.route(
-        &mut stores,
-        RouteRequest {
-            body,
-            ..scheduled(PLANE, Origin::Attacher, "", 1, SOON)
-        },
-    ));
-    router.parked_for(&stores, PLANE, Origin::Attacher);
+fn a_parked_body_is_viewed_as_it_is() {
+    for body in [
+        MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap(),
+        MessageBody::from_parts(Some("application/octet-stream"), &[0xff]).unwrap(),
+    ] {
+        let mut stores = stores(4);
+        let mut router = router(TestPlanes::default());
+        parked_until(router.route(
+            &mut stores,
+            RouteRequest {
+                body: body.clone(),
+                ..scheduled(PLANE, Origin::Attacher, "", 1, SOON)
+            },
+        ));
+        let entries = router.parked_for(&stores, PLANE, Origin::Attacher);
+        assert_eq!(entries[0].body, body);
+    }
 }

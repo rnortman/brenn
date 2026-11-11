@@ -171,7 +171,7 @@ fn block_the_outbox(page: &mut SurfacePage) {
         FlushBatch {
             entries: vec![BatchEntry {
                 channel: OUT.to_string(),
-                body: "{}".to_string(),
+                body: "{}".into(),
                 urgency: Urgency::Normal,
                 deliver_after: None,
             }],

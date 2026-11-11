@@ -325,7 +325,7 @@ fn route_publishes<P: PlanePolicy>(
             // park-vs-immediate against its own clock.
             entries.push(BatchEntry {
                 channel,
-                body,
+                body: body.into(),
                 urgency,
                 deliver_after,
             });
@@ -395,15 +395,7 @@ fn wire_op(op: BufferedDeferOp) -> BatchDeferredOp {
                 body,
                 deliver_after,
             } => DeferredOpKind::Edit {
-                // Attach v4 carries an edit's body as a string, and every
-                // buffered edit body was minted from a component's string.
-                body: body.map(|body| {
-                    body.as_text()
-                        .expect(
-                            "surface client: a buffered edit body is the text a component wrote",
-                        )
-                        .to_owned()
-                }),
+                body,
                 deliver_after,
             },
         },

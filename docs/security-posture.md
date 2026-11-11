@@ -826,7 +826,8 @@ internally-originated.
   verified is a finding. A non-text body is admitted only onto a channel
   declared `non_text`, and every reader that can only represent text — a 0.1.0
   component, a surface, an attach v4 session — is refused at binding or at
-  subscribe rather than at delivery; a store write of a non-text body to a
+  subscribe rather than at delivery (an attach v4 session's deferred view
+  leaves out a non-text entry a v5 sibling session parked); a store write of a non-text body to a
   text-only channel panics as a host bug.
 
 **What the reviewer verifies:** capabilities are deny-by-default and
@@ -1189,6 +1190,39 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   the route answers `503` with a warning and no security event: a remote at its
   cap is an operator's topology or a netsplit corpse awaiting the heartbeat
   watchdog, and banning the pod's IP for either turns a transient into an outage.
+- **The route serves two wire versions, each strict, and decodes once.** It
+  serves attach protocol v4 (every frame JSON text, bodies strings) and v5
+  (the body-carrying frames binary: a big-endian `u32` header length, a strict
+  JSON header with a `{len, content_type}` descriptor per body, then the raw
+  bodies), negotiated by the frozen `Hello`. A frame malformed for the
+  session's version is a violation with no fallback decoding: a binary message
+  under v4, a text message of a binary kind or a binary message of a text kind
+  under v5, a v5 header whose lengths disagree with the bytes after it, a
+  malformed content type, a text body that is not UTF-8. The decoder compares
+  every peer-supplied length with the bytes that remain and never sums them,
+  so no input makes it panic or wrap. The websocket read cap is set at the
+  upgrade, before a version is agreed, to the largest frame cap among the
+  served versions; after negotiation each frame is checked against its own
+  version's cap (204 800 bytes for v5 at the default body cap, against v4's
+  532 480), and a frame over it is the existing over-cap violation.
+- **A remote's bytes and content types are its assertion.** A v5 remote
+  publishes bodies of bytes with a content type; the type is validated for
+  syntax and, for a text type, the bytes for UTF-8 (`MessageBody::from_parts`),
+  and is **never checked against the bytes**, exactly as a guest's (§8). A
+  non-text body is admitted only onto a channel declared `non_text`. Offered
+  for a text-only channel, it is refused by the attach handler before the bus
+  is asked, answered `TextOnlyChannel` with nothing stored: a conforming
+  client's ordinary mistake (it cannot see the declaration), so not a
+  violation and not fail2ban signal. Offered for a channel the directory does
+  not hold at that moment — deprovisioned, or mid-reload — it is answered as an
+  absent channel is (`Failed` for a single publish, the entry dropped from a
+  batch) and is never handed to the bus, whose own later read could find an
+  entry the handler never checked. A refused single publish has already
+  spent a connection-bucket token and a refused batch its send-budget draw, so
+  a client looping on the mistake is metered like any other publisher. Each
+  refusal is counted on the session's detach line, and the first on a
+  connection is a warning naming the channel and the body's content type and
+  size, never its bytes.
 
 **Accepted risks:**
 

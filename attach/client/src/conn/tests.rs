@@ -18,6 +18,7 @@ fn config() -> ConnConfig {
         liveness_multiplier: 3,
         backoff_jitter_seed: 0x5EED,
         terminal_close_codes: vec![4001],
+        versions: SUPPORTED_VERSIONS,
     }
 }
 
@@ -40,23 +41,35 @@ fn welcome_frame(version: u32) -> ServerFrame {
     }
 }
 
+/// A server frame as v4 writes it, which is how every frame without a body is
+/// written in every version.
 fn frame(frame: ServerFrame) -> ConnInput {
-    ConnInput::TextFrame(serde_json::to_string(&frame).expect("frame serializes"))
+    frame_at(4, frame)
 }
 
-/// A connection driven to `Active` at `now = 0`, with the effects of getting
-/// there discarded.
+fn frame_at(version: u32, frame: ServerFrame) -> ConnInput {
+    ConnInput::Frame(Codec::negotiated(version).encode_server(&frame))
+}
+
+/// A connection driven to `Active` on v4 at `now = 0`, with the effects of
+/// getting there discarded.
 fn attached() -> Connection {
     attached_with(config())
 }
 
 /// [`attached`] over a stated config, for the tests that vary one of its fields.
 fn attached_with(config: ConnConfig) -> Connection {
+    attached_at(config, 4)
+}
+
+/// A connection driven to `Active` on `version`.
+fn attached_at(config: ConnConfig, version: u32) -> Connection {
     let (mut conn, _) = Connection::start(config, Millis(0));
     conn.on_input(ConnInput::Opened, Millis(0));
-    conn.on_input(peer_hello(SUPPORTED_VERSIONS), Millis(0));
-    conn.on_input(frame(welcome_frame(SUPPORTED_VERSIONS.max)), Millis(0));
+    conn.on_input(peer_hello(VersionRange::exactly(version)), Millis(0));
+    conn.on_input(frame(welcome_frame(version)), Millis(0));
     assert_eq!(conn.state(), ConnState::Active);
+    assert_eq!(conn.version(), Some(version));
     conn
 }
 
@@ -170,7 +183,9 @@ fn unparseable_text_is_fatal_and_diagnoses_the_failing_field() {
     let (mut conn, _) = Connection::start(config(), Millis(0));
     conn.on_input(ConnInput::Opened, Millis(0));
     let step = conn.on_input(
-        ConnInput::TextFrame(r#"{"type":"Hello","versions":"not-a-range"}"#.to_string()),
+        ConnInput::Frame(WireMessage::Text(
+            r#"{"type":"Hello","versions":"not-a-range"}"#.to_string(),
+        )),
         Millis(0),
     );
     let detail = fatal_detail(&step.effects);
@@ -184,11 +199,11 @@ fn unparseable_text_is_fatal_and_diagnoses_the_failing_field() {
 fn an_unknown_field_in_a_known_frame_is_fatal() {
     let mut conn = attached();
     let step = conn.on_input(
-        ConnInput::TextFrame(
+        ConnInput::Frame(WireMessage::Text(
             r#"{"type":"SubscribeResult","channel":"brenn:orders","outcome":{"kind":"Ok"},
                 "replay_count":0,"depth":4}"#
                 .to_string(),
-        ),
+        )),
         Millis(0),
     );
     assert_eq!(conn.state(), ConnState::Terminal);
@@ -319,10 +334,188 @@ fn a_repeated_handshake_frame_on_a_live_attachment_is_fatal() {
 }
 
 #[test]
-fn a_binary_frame_is_fatal_in_every_state_that_owns_a_transport() {
+fn a_binary_frame_is_fatal_on_a_v4_attachment() {
     let mut conn = attached();
-    let step = conn.on_input(ConnInput::BinaryFrame, Millis(0));
+    let step = conn.on_input(ConnInput::Frame(WireMessage::Binary(vec![1])), Millis(0));
+    assert_eq!(
+        fatal_detail(&step.effects),
+        "unexpected binary frame from peer"
+    );
+}
+
+/// A v5 attachment reads the body-carrying frames as binary messages and
+/// routes them, bodies intact.
+#[test]
+fn a_v5_attachment_routes_binary_frames() {
+    let mut conn = attached_at(config(), 5);
+    let view = ServerFrame::DeferredView {
+        channel: "brenn:frames".to_string(),
+        attribution: None,
+        entries: vec![brenn_attach_proto::DeferredViewEntry {
+            message_id: uuid::Uuid::from_u128(1),
+            body: MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8]).unwrap(),
+            deliver_after: 5,
+        }],
+    };
+    let step = conn.on_input(frame_at(5, view.clone()), Millis(0));
+    assert_eq!(step.routed, Some(view));
+}
+
+/// A binary message whose header and bodies disagree is fatal, naming the
+/// rule.
+#[test]
+fn a_malformed_binary_frame_is_fatal_on_a_v5_attachment() {
+    let mut conn = attached_at(config(), 5);
+    let step = conn.on_input(ConnInput::Frame(WireMessage::Binary(vec![0, 0])), Millis(0));
+    assert_eq!(conn.state(), ConnState::Terminal);
+    assert_eq!(
+        fatal_detail(&step.effects),
+        "frame header and bodies disagree"
+    );
+}
+
+/// Under v5 a body-carrying kind written as text is fatal.
+#[test]
+fn a_text_deliver_is_fatal_on_a_v5_attachment() {
+    let mut conn = attached_at(config(), 5);
+    let text = r#"{"type":"Deliver","channel":"brenn:frames","rows":[]}"#;
+    let step = conn.on_input(
+        ConnInput::Frame(WireMessage::Text(text.to_string())),
+        Millis(0),
+    );
+    assert_eq!(fatal_detail(&step.effects), "text frame of a binary kind");
+}
+
+/// Before a version is in force a binary message cannot be the peer's `Hello`.
+#[test]
+fn a_binary_frame_while_negotiating_is_fatal() {
+    let (mut conn, _) = Connection::start(config(), Millis(0));
+    conn.on_input(ConnInput::Opened, Millis(0));
+    let step = conn.on_input(ConnInput::Frame(WireMessage::Binary(vec![1])), Millis(0));
+    assert_eq!(conn.state(), ConnState::Terminal);
     assert!(fatal_detail(&step.effects).contains("binary frame"));
+}
+
+/// The `Hello` this end sends states the configured range, and an
+/// incompatibility reports that range as ours.
+#[test]
+fn the_offered_range_is_the_configured_one() {
+    let offered = VersionRange::exactly(SUPPORTED_VERSIONS.min);
+    let (mut conn, _) = Connection::start(
+        ConnConfig {
+            versions: offered,
+            ..config()
+        },
+        Millis(0),
+    );
+    let step = conn.on_input(ConnInput::Opened, Millis(0));
+    assert_eq!(
+        step.effects,
+        vec![ConnEffect::SendFrame(ClientFrame::Hello {
+            versions: offered,
+            ident: IDENT.to_string(),
+        })]
+    );
+    let theirs = VersionRange {
+        min: offered.max + 1,
+        max: offered.max + 2,
+    };
+    let step = conn.on_input(peer_hello(theirs), Millis(0));
+    assert!(
+        step.effects
+            .contains(&ConnEffect::Emit(ConnEvent::Incompatible {
+                ours: offered,
+                theirs,
+            }))
+    );
+}
+
+/// Every offered range against every range a server may serve: the highest
+/// version both speak, or a terminal `Incompatible` naming the configured
+/// range as ours.
+#[test]
+fn each_offered_range_against_each_served_range() {
+    let v4 = VersionRange::exactly(4);
+    let v5 = VersionRange::exactly(5);
+    let both = VersionRange { min: 4, max: 5 };
+    let later = VersionRange { min: 6, max: 9 };
+    let table = [
+        (v4, v4, Some(4)),
+        (v4, v5, None),
+        (v4, both, Some(4)),
+        (v4, later, None),
+        (v5, v4, None),
+        (v5, v5, Some(5)),
+        (v5, both, Some(5)),
+        (v5, later, None),
+        (both, v4, Some(4)),
+        (both, v5, Some(5)),
+        (both, both, Some(5)),
+        (both, later, None),
+    ];
+    for (offered, served, agreed) in table {
+        let (mut conn, _) = Connection::start(
+            ConnConfig {
+                versions: offered,
+                ..config()
+            },
+            Millis(0),
+        );
+        conn.on_input(ConnInput::Opened, Millis(0));
+        let step = conn.on_input(peer_hello(served), Millis(0));
+        let context = format!("offered {offered:?}, served {served:?}");
+        match agreed {
+            Some(version) => {
+                assert_eq!(conn.state(), ConnState::AwaitingWelcome, "{context}");
+                assert_eq!(conn.version(), Some(version), "{context}");
+                conn.on_input(frame(welcome_frame(version)), Millis(0));
+                assert_eq!(conn.state(), ConnState::Active, "{context}");
+                assert_eq!(conn.codec().map(Codec::version), Some(version), "{context}");
+            }
+            None => {
+                assert_eq!(conn.state(), ConnState::Terminal, "{context}");
+                assert!(
+                    step.effects
+                        .contains(&ConnEffect::Emit(ConnEvent::Incompatible {
+                            ours: offered,
+                            theirs: served,
+                        })),
+                    "{context}: {:?}",
+                    step.effects
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "outside this build's")]
+fn an_offered_range_outside_this_build_is_an_embedder_bug() {
+    Connection::start(
+        ConnConfig {
+            versions: VersionRange {
+                min: SUPPORTED_VERSIONS.min,
+                max: SUPPORTED_VERSIONS.max + 1,
+            },
+            ..config()
+        },
+        Millis(0),
+    );
+}
+
+#[test]
+#[should_panic(expected = "is empty")]
+fn an_empty_offered_range_is_an_embedder_bug() {
+    Connection::start(
+        ConnConfig {
+            versions: VersionRange {
+                min: SUPPORTED_VERSIONS.max,
+                max: SUPPORTED_VERSIONS.min - 1,
+            },
+            ..config()
+        },
+        Millis(0),
+    );
 }
 
 #[test]
@@ -629,7 +822,7 @@ fn a_terminal_connection_absorbs_every_further_input() {
             reason: String::new(),
         },
         frame(ServerFrame::Heartbeat),
-        ConnInput::BinaryFrame,
+        ConnInput::Frame(WireMessage::Binary(Vec::new())),
         ConnInput::Tick,
     ] {
         let step = conn.on_input(input, Millis(1_000_000));
@@ -680,8 +873,7 @@ fn a_host_fatal_is_terminal_from_any_live_state() {
 
 #[test]
 fn a_dropped_connection_forgets_the_version_it_negotiated() {
-    let mut conn = attached();
-    assert_eq!(conn.version(), Some(SUPPORTED_VERSIONS.max));
+    let mut conn = attached_at(config(), SUPPORTED_VERSIONS.max);
     conn.on_input(
         ConnInput::Disconnected {
             code: None,

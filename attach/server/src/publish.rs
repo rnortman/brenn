@@ -17,14 +17,16 @@
 mod tests;
 
 use brenn_attach_proto::{
-    BatchDeferredOp, BatchEntry, DeferredOpKind, DeferredViewEntry, PublishBatchOutcome,
-    PublishOutcome, ServerFrame, Urgency, check_batch_legality,
+    BatchDeferredOp, BatchEntry, DeferredOpKind, DeferredViewEntry, MessageBody,
+    PublishBatchOutcome, PublishOutcome, ServerFrame, Urgency,
 };
 use brenn_budget::{MAX_PUBLISH_BYTES_PER_ACTIVATION, MAX_PUBLISHES_PER_ACTIVATION};
 use brenn_lib::messaging::gates::well_formed_name;
 use brenn_lib::messaging::{ChannelScheme, ParticipantId, utc_from_epoch_ms};
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
-use brenn_messaging::{AttachBatchPublish, AttachSendVerdict, PublishResult};
+use brenn_messaging::{
+    AttachBatchPublish, AttachSendVerdict, MissingChannelPosture, PublishResult,
+};
 use brenn_messaging_store::store::{DeferralOutcome, DeferredMessage};
 use chrono::{DateTime, Utc};
 use tracing::{error, info, warn};
@@ -64,7 +66,7 @@ pub struct PublishRequest<'a> {
     pub channel: &'a str,
     /// The sub-identity sending, or `None` for the attacher itself.
     pub attribution: Option<&'a str>,
-    pub body: &'a str,
+    pub body: &'a MessageBody,
     /// Sender intent, concrete on the wire — the client resolved the channel's
     /// configured default before sending, because it needs that default anyway
     /// to stamp the envelopes it routes without a server.
@@ -106,7 +108,9 @@ pub(crate) fn admit_attribution_or_violate(
 ///
 /// Then the body cap (an outcome, metered and escalating — see
 /// [`BODY_TOO_LARGE_VIOLATION_THRESHOLD`]), then the connection's rate bucket
-/// (an outcome; a legitimate retry loop reaches it), then the bus. What each of
+/// (an outcome; a legitimate retry loop reaches it), then the text-only
+/// refusal (an outcome, behind the bucket so a client looping on it is metered),
+/// then the bus. What each of
 /// the bus's own refusals means is the profile's call: on a channel boot proved
 /// reachable and policy-covered an invariant-excluded outcome is a broken
 /// server, and on a diagnostics channel the same outcome is reported instead —
@@ -192,16 +196,36 @@ pub async fn handle_publish(
         }
     }
 
-    // 5. Publish. The budget bucket is the principal the scope and attribution
+    // 5. A non-text body bound for a text-only channel. The attacher cannot see
+    //    the declaration, so this is a conforming client's mistake and gets an
+    //    outcome. Nothing is stored and no bus budget is drawn.
+    let door = text_only_door(ctx, channel, body);
+    if door == TextOnlyDoor::Refuse {
+        note_text_only_refusal(ctx, counters, channel, body);
+        let frame = ServerFrame::PublishResult {
+            correlation,
+            outcome: PublishOutcome::TextOnlyChannel,
+        };
+        return super::session::send_frame(&ctx.tx, frame, counters).await;
+    }
+
+    // 6. Publish. The budget bucket is the principal the scope and attribution
     //    name together: a sub-identity's retry loop drains its own allowance and
     //    leaves its siblings and the attacher's own writes able to publish.
+    //    A non-text body for a channel the door found absent is answered as the
+    //    bus answers an absent channel, without the bus.
     let posture = ctx.profile.publish_posture(channel);
     let scope = ctx.profile.attach_scope();
-    let outcome = match ctx
-        .messenger
-        .publish_from_attacher(scope, attribution, channel, body.into(), urgency)
-        .await
-    {
+    let result = match door {
+        TextOnlyDoor::Absent => PublishResult::UnknownChannel(channel.to_string()),
+        TextOnlyDoor::Admit => {
+            ctx.messenger
+                .publish_from_attacher(scope, attribution, channel, body.clone(), urgency)
+                .await
+        }
+        TextOnlyDoor::Refuse => unreachable!("a refused publish was answered at step 5"),
+    };
+    let outcome = match result {
         PublishResult::Ok { .. } => {
             counters.publish_ok(attribution);
             if matches!(posture, PublishPosture::Diagnostic) {
@@ -314,12 +338,14 @@ pub struct PublishBatchRequest<'a> {
 /// single clock read before any of the batch is applied.
 struct ResolvedBatchEntry<'a> {
     channel: &'a str,
-    body: &'a str,
+    body: &'a MessageBody,
     urgency: Urgency,
     /// The release time, or `None` for an immediate publish — including a time
     /// the flush's clock read has already passed, which is decided here so every
     /// entry of one flush answers park-vs-immediate at the same instant.
     deliver_after: Option<DateTime<Utc>>,
+    /// The text-only door's answer for this entry, read once at resolve.
+    door: TextOnlyDoor,
 }
 
 /// One control op of a batch, resolved before any of it is applied: the batch is
@@ -329,7 +355,10 @@ struct ResolvedDeferredOp<'a> {
     message_id: Uuid,
     /// `None` for a cancel; the edit's two halves otherwise, the release time
     /// already converted from the wire's epoch milliseconds.
-    edit: Option<(Option<String>, Option<DateTime<Utc>>)>,
+    edit: Option<(Option<MessageBody>, Option<DateTime<Utc>>)>,
+    /// The text-only door's answer for the edit's body, read once at resolve;
+    /// `Admit` for a cancel and for an edit that carries no body.
+    door: TextOnlyDoor,
 }
 
 /// What one control op left behind.
@@ -407,7 +436,7 @@ pub async fn handle_publish_batch(
         .iter()
         .map(|op| match &op.op {
             DeferredOpKind::Cancel => 0,
-            DeferredOpKind::Edit { body, .. } => body.as_ref().map_or(0, String::len),
+            DeferredOpKind::Edit { body, .. } => body.as_ref().map_or(0, MessageBody::len),
         })
         .sum();
     let total_bytes = publish_bytes + edit_bytes;
@@ -423,7 +452,10 @@ pub async fn handle_publish_batch(
     // illegal-but-parseable batch is the same non-conforming signal an oversized
     // frame is — reported here, where the fields can name what was wrong,
     // instead of as a bare read failure.
-    if let Err(illegal) = check_batch_legality(publishes, deferred_ops, ctx.max_body_bytes) {
+    if let Err(illegal) =
+        ctx.codec()
+            .check_batch_legality(publishes, deferred_ops, ctx.max_body_bytes)
+    {
         return ctx.violation(format!("illegal PublishBatch: {illegal}"));
     }
 
@@ -442,6 +474,37 @@ pub async fn handle_publish_batch(
         Ok(ops) => ops,
         Err(violation) => return violation,
     };
+    // The first entry or edit carrying a non-text body to a text-only channel.
+    // Answered only after the draw below, so a refused flush is metered like
+    // any other.
+    let text_only_refusal = resolved
+        .iter()
+        .filter(|entry| entry.door == TextOnlyDoor::Refuse)
+        .map(|entry| (entry.channel, entry.body))
+        .chain(resolved_ops.iter().filter_map(|op| match &op.edit {
+            Some((Some(body), _)) if op.door == TextOnlyDoor::Refuse => Some((op.channel, body)),
+            _ => None,
+        }))
+        .next();
+    // A non-text body whose target the door found absent never reaches the
+    // bus: under `Race` its entry is dropped at step 7 and its edit is a lost
+    // race at step 6, the bus's own answers for a target that is gone.
+    let posture = ctx.profile.missing_channel_posture();
+    if posture == MissingChannelPosture::Invariant
+        && let Some(channel) = resolved
+            .iter()
+            .filter(|entry| entry.door == TextOnlyDoor::Absent)
+            .map(|entry| entry.channel)
+            .chain(
+                resolved_ops
+                    .iter()
+                    .filter(|op| op.door == TextOnlyDoor::Absent)
+                    .map(|op| op.channel),
+            )
+            .next()
+    {
+        absent_bound_output(ctx, channel);
+    }
 
     // 4. The sender's send budget, one all-or-nothing draw. One token per
     //    publish, and one for a batch that publishes nothing: an ops-only flush
@@ -473,7 +536,19 @@ pub async fn handle_publish_batch(
         return super::session::send_frame(&ctx.tx, frame, counters).await;
     }
 
-    // 5. The control ops, ahead of the publishes. A violation here can leave
+    // 5. A refused body refuses the whole flush: no control op, no publish, no
+    //    view restated. The draw stands — a path that draws nothing is a path a
+    //    client rides for free.
+    if let Some((channel, body)) = text_only_refusal {
+        note_text_only_refusal(ctx, counters, channel, body);
+        let frame = ServerFrame::PublishBatchResult {
+            correlation,
+            outcome: PublishBatchOutcome::TextOnlyChannel,
+        };
+        return super::session::send_frame(&ctx.tx, frame, counters).await;
+    }
+
+    // 6. The control ops, ahead of the publishes. A violation here can leave
     //    earlier ops of the same batch applied: whether a message is someone
     //    else's is only knowable by asking the store, and each ask is its own
     //    round trip. The ops that landed were legitimate ones; the connection
@@ -513,15 +588,31 @@ pub async fn handle_publish_batch(
         ctx.messenger.dispatch_kick();
     }
 
-    // 6. Stamp every entry, in call order, in one pass across the whole batch —
+    // 7. Stamp every entry, in call order, in one pass across the whole batch —
     //    before the substrate split, so call order is visible *across* the class
     //    boundary and not merely within each half. Each entry takes
     //    max(prev + 1, now), so the stamps are strictly increasing whatever the
     //    clock does. The delivered envelope's `publish_ts` carries this at ns
     //    precision; it is the ordering contract's only observable.
+    //
+    //    An entry the door found absent is dropped here, warned about as the
+    //    bus warns about a target that is gone, and published nothing.
+    for entry in resolved
+        .iter()
+        .filter(|entry| entry.door == TextOnlyDoor::Absent)
+    {
+        warn!(
+            attacher = %ctx.profile.attacher().as_str(),
+            channel = %sanitize_client_detail(entry.channel),
+            body = %entry.body.summary(),
+            "attach PublishBatch entry dropped — a non-text body for a target the directory does \
+             not hold"
+        );
+    }
     let mut prev_ts: Option<i64> = None;
     let batch: Vec<AttachBatchPublish<'_>> = resolved
         .iter()
+        .filter(|entry| entry.door != TextOnlyDoor::Absent)
         .map(|entry| {
             let now_ns = brenn_messaging_store::db::utc_to_ns(Utc::now());
             let ts = match prev_ts {
@@ -531,7 +622,7 @@ pub async fn handle_publish_batch(
             prev_ts = Some(ts);
             AttachBatchPublish {
                 channel_address: entry.channel,
-                body: entry.body.into(),
+                body: entry.body.clone(),
                 urgency: entry.urgency,
                 publish_ts_ns: ts,
                 deliver_after: entry.deliver_after,
@@ -539,7 +630,7 @@ pub async fn handle_publish_batch(
         })
         .collect();
 
-    // 7. Apply. Entries that published nothing — a schedule the channel's
+    // 8. Apply. Entries that published nothing — a schedule the channel's
     //    deferred cap refused, or a target that vanished under a route whose
     //    targets are provisioned at runtime — reduce the publish count. No wire
     //    error: the activation already returned, so there is nothing left to
@@ -547,12 +638,7 @@ pub async fn handle_publish_batch(
     //    one it merely scheduled.
     let schedules_dropped = ctx
         .messenger
-        .publish_batch_from_attacher(
-            ctx.profile.attach_scope(),
-            attribution,
-            &batch,
-            ctx.profile.missing_channel_posture(),
-        )
+        .publish_batch_from_attacher(ctx.profile.attach_scope(), attribution, &batch, posture)
         .await;
     for _ in 0..(batch.len() - schedules_dropped) {
         counters.publish_ok(attribution);
@@ -610,9 +696,10 @@ fn resolve_batch_entries<'a>(
         };
         resolved.push(ResolvedBatchEntry {
             channel: entry.channel.as_str(),
-            body: entry.body.as_str(),
+            body: &entry.body,
             urgency: entry.urgency,
             deliver_after,
+            door: text_only_door(ctx, &entry.channel, &entry.body),
         });
     }
     Ok(resolved)
@@ -657,10 +744,15 @@ fn resolve_deferred_ops<'a>(
                 Some((body.clone(), release_at))
             }
         };
+        let door = match &edit {
+            Some((Some(body), _)) => text_only_door(ctx, &op.channel, body),
+            _ => TextOnlyDoor::Admit,
+        };
         resolved.push(ResolvedDeferredOp {
             channel: op.channel.as_str(),
             message_id: op.message_id,
             edit,
+            door,
         });
     }
     Ok(resolved)
@@ -709,6 +801,69 @@ fn assert_publishable(
     Ok(())
 }
 
+/// What the door makes of one body bound for one channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextOnlyDoor {
+    /// A text body, or a channel declared `non_text`: the bus is asked.
+    Admit,
+    /// A non-text body for a channel declared text-only: `TextOnlyChannel`.
+    Refuse,
+    /// A non-text body for a channel the directory does not hold. The bus is
+    /// never handed it: the bus resolves the address again later, and a reload
+    /// that retunes a channel takes it out of the directory and puts it back,
+    /// so the second read can find a text-only entry the door never checked.
+    /// The caller answers it as the bus answers an absent channel.
+    Absent,
+}
+
+/// The door's text-only check of `body` against `channel`.
+///
+/// Reads the same directory, by the same address string, that the messenger
+/// resolves the publish against; the bus's own text-only assertion stays behind
+/// this as the backstop. A text body never reads the directory: every channel
+/// may hold it, and what an absent channel means for it is the bus's call.
+fn text_only_door(ctx: &AttachSessionCtx, channel: &str, body: &MessageBody) -> TextOnlyDoor {
+    if body.is_text() {
+        return TextOnlyDoor::Admit;
+    }
+    match ctx.messenger.directory().resolve(channel) {
+        None => TextOnlyDoor::Absent,
+        Some(entry) if entry.may_hold(body) => TextOnlyDoor::Admit,
+        Some(_) => TextOnlyDoor::Refuse,
+    }
+}
+
+/// The panic of a batch whose target the directory does not hold on a route
+/// whose targets are boot-declared.
+fn absent_bound_output(ctx: &AttachSessionCtx, channel: &str) -> ! {
+    panic!(
+        "attach session: {} names channel {channel} the directory does not hold — the profile \
+         admits only boot-validated channels, so this is a broken boot invariant",
+        ctx.profile.attacher().as_str(),
+    )
+}
+
+/// Count one `TextOnlyChannel` answer, logging the connection's first.
+///
+/// The log names the channel (sanitized: a prefix-granted attacher composes
+/// the suffix) and the body's content type and size, never its bytes.
+fn note_text_only_refusal(
+    ctx: &AttachSessionCtx,
+    counters: &mut SessionCounters,
+    channel: &str,
+    body: &MessageBody,
+) {
+    if counters.publish_text_only_refused == 0 {
+        warn!(
+            attacher = %ctx.profile.attacher().as_str(),
+            channel = %sanitize_client_detail(channel),
+            body = %body.summary(),
+            "attach publish of a non-text body to a text-only channel; answering TextOnlyChannel"
+        );
+    }
+    counters.publish_text_only_refused += 1;
+}
+
 /// Apply one resolved control op under the batch's sender. The caller restates
 /// the view for the channel on either outcome.
 ///
@@ -729,6 +884,11 @@ fn assert_publishable(
 ///   from a sender-scoped view, so this is a client naming a schedule no window
 ///   ever offered it. Reported rather than panicked precisely because it is
 ///   client-reachable: a panic here would be a remote kill switch.
+///
+/// A channel the directory does not hold — at the door, for an edit carrying a
+/// non-text body, or at the bus — is a no-op under the `Race` posture: a
+/// runtime-provisioned target deprovisions under a conforming attacher, so it
+/// is the same lost race, logged and restated. Under `Invariant` it panics.
 async fn apply_deferred_op(
     ctx: &AttachSessionCtx,
     sender: &ParticipantId,
@@ -736,24 +896,37 @@ async fn apply_deferred_op(
     op: &ResolvedDeferredOp<'_>,
     now: DateTime<Utc>,
 ) -> Result<OpEffect, FrameOutcome> {
-    let outcome = match &op.edit {
-        None => {
+    let outcome = match (&op.edit, op.door) {
+        (_, TextOnlyDoor::Absent) => None,
+        (None, _) => {
             ctx.messenger
-                .cancel_deferred_for_sender(op.channel, sender.as_str(), op.message_id, now)
+                .cancel_deferred_if_present(op.channel, sender.as_str(), op.message_id, now)
                 .await
         }
-        Some((body, release_at)) => {
+        (Some((body, release_at)), _) => {
             ctx.messenger
-                .edit_deferred_for_sender(
+                .edit_deferred_if_present(
                     op.channel,
                     sender.as_str(),
                     op.message_id,
-                    body.clone().map(brenn_envelope::MessageBody::text),
+                    body.clone(),
                     *release_at,
                     now,
                 )
                 .await
         }
+    };
+    let Some(outcome) = outcome else {
+        if ctx.profile.missing_channel_posture() == MissingChannelPosture::Invariant {
+            absent_bound_output(ctx, op.channel);
+        }
+        info!(
+            attacher = %ctx.profile.attacher().as_str(),
+            attribution = attribution.unwrap_or("<attacher>"),
+            channel = %sanitize_client_detail(op.channel),
+            "attach deferred control op is a no-op — the directory does not hold its channel"
+        );
+        return Ok(OpEffect::Raced);
     };
     match outcome {
         DeferralOutcome::Applied => Ok(OpEffect::Applied),
@@ -800,21 +973,64 @@ async fn emit_views(ctx: &AttachSessionCtx, attribution: Option<&str>, channels:
 /// The wire form of one sender's parked messages: the identity both authorities
 /// know each message by, its body, and its release time in epoch milliseconds
 /// UTC — the units an attacher's own clock reads.
+///
+/// Every parked entry, whatever its body: what one session's version can carry
+/// is cut by [`entries_for_session`] where the frame is built for it.
 pub fn deferred_view_entries(parked: &[DeferredMessage]) -> Vec<DeferredViewEntry> {
     parked
         .iter()
         .map(|message| DeferredViewEntry {
             message_id: message.envelope.message_id,
-            body: message
-                .envelope
-                .require_text_body("attach v4 DeferredView")
-                .to_owned(),
+            body: message.envelope.body.clone(),
             deliver_after: u64::try_from(message.release_at.timestamp_millis()).expect(
                 "a parked release time was admitted from epoch milliseconds, so it is at or after \
                  the epoch",
             ),
         })
         .collect()
+}
+
+/// The entries of one view that this session's version can carry.
+///
+/// A parked set belongs to the sender, and every session of one attacher
+/// mirrors it, so a non-text entry one session parked is part of the set a
+/// sibling on a text-only version mirrors. That sibling is sent the set without
+/// the entries it cannot represent; typed text stays and is written as its
+/// text. The first omission per `(channel, attribution)` on a session is logged.
+pub(crate) fn entries_for_session(
+    ctx: &AttachSessionCtx,
+    channel: &str,
+    attribution: Option<&str>,
+    entries: Vec<DeferredViewEntry>,
+    counters: &mut SessionCounters,
+) -> Vec<DeferredViewEntry> {
+    if brenn_attach_proto::carries_non_text_bodies(ctx.version()) {
+        return entries;
+    }
+    let before = entries.len();
+    let kept: Vec<DeferredViewEntry> = entries
+        .into_iter()
+        .filter(|entry| entry.body.is_text())
+        .collect();
+    let omitted = before - kept.len();
+    if omitted > 0 {
+        counters.deferred_view_entries_omitted += omitted as u64;
+        let first = counters
+            .deferred_view_omission_logged
+            .insert((channel.to_string(), attribution.map(str::to_string)));
+        if first {
+            info!(
+                attacher = %ctx.profile.attacher().as_str(),
+                channel,
+                attribution = attribution.unwrap_or("<attacher>"),
+                omitted,
+                version = ctx.version(),
+                "attach deferred view: entries with non-text bodies left out for a session whose \
+                 version carries only text"
+            );
+        }
+    }
+    kept
 }
 
 /// The sender one attribution's parked set belongs to.
@@ -853,12 +1069,17 @@ fn parked_sender(ctx: &AttachSessionCtx, attribution: Option<&str>) -> Participa
 /// released, with no further emission owed if that release was the set's last
 /// change.
 ///
+/// A channel the directory does not hold is not restated under the `Race`
+/// posture: a runtime-provisioned target can deprovision under the flush that
+/// named it.
+///
 /// # Panics
 ///
 /// If `attribution` is not one the profile declares. Callers reach here from a
 /// frame whose attribution was already admitted, or from the profile's own
 /// target list, so an undeclared one is a broken invariant rather than client
-/// input.
+/// input. Under the `Invariant` posture, if the directory does not hold
+/// `channel`.
 pub async fn broadcast_deferred_view(
     ctx: &AttachSessionCtx,
     attribution: Option<&str>,
@@ -866,11 +1087,19 @@ pub async fn broadcast_deferred_view(
 ) {
     let sender = parked_sender(ctx, attribution);
     let _order = ctx.messenger.lock_deferred_view_gate().await;
-    let entries = deferred_view_entries(
-        &ctx.messenger
-            .deferred_view_for_sender(channel, sender.as_str())
-            .await,
-    );
+    let Some(parked) = ctx
+        .messenger
+        .deferred_view_if_present(channel, sender.as_str())
+        .await
+    else {
+        if ctx.profile.missing_channel_posture() == MissingChannelPosture::Invariant {
+            absent_bound_output(ctx, channel);
+        }
+        // Nothing to restate: the channel is gone, and a view of it would be a
+        // statement about a set no frame can reach.
+        return;
+    };
+    let entries = deferred_view_entries(&parked);
     // Keyed by the registry key, which is what a session registers under — a
     // surface's is its bare slug, and the participant id the profile states is a
     // different spelling that no registration answers to.
@@ -886,7 +1115,8 @@ pub async fn broadcast_deferred_view(
 
 /// Seed this connection's parked-set mirrors, immediately behind `Welcome`.
 ///
-/// One frame per `(attribution, channel)` whose parked set is nonempty. The
+/// One frame per `(attribution, channel)` whose parked set holds an entry this
+/// session's version can carry ([`entries_for_session`]). The
 /// attacher clears every mirror at `Welcome`, so an absent frame means an empty
 /// set — which is also what makes a set that emptied while the attacher was away
 /// arrive correctly empty.
@@ -903,10 +1133,16 @@ pub async fn seed_deferred_views(
     let targets = ctx.profile.deferred_view_targets();
     for target in targets {
         let sender = parked_sender(ctx, target.attribution.as_deref());
-        let entries = deferred_view_entries(
-            &ctx.messenger
-                .deferred_view_for_sender(&target.channel, sender.as_str())
-                .await,
+        let entries = entries_for_session(
+            ctx,
+            &target.channel,
+            target.attribution.as_deref(),
+            deferred_view_entries(
+                &ctx.messenger
+                    .deferred_view_for_sender(&target.channel, sender.as_str())
+                    .await,
+            ),
+            counters,
         );
         if entries.is_empty() {
             continue;

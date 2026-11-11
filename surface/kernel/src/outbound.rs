@@ -35,7 +35,7 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::{
     BatchAnswer, Discarded, FlushBatch, OutboxSteps, Outboxes, PendingPublishes, PublishRequest,
 };
-use brenn_attach_proto::{ClientFrame, PublishBatchOutcome, PublishOutcome, check_batch_legality};
+use brenn_attach_proto::{ClientFrame, PublishBatchOutcome, PublishOutcome};
 use brenn_envelope::Urgency;
 use brenn_surface_schema::telemetry::ErrorReportDocument;
 use brenn_surface_schema::{LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES};
@@ -346,7 +346,7 @@ impl SurfaceOutbound {
         let request = PublishRequest {
             channel: out.channel.to_string(),
             attribution: Some(req.instance.clone()),
-            body: req.body,
+            body: req.body.into(),
             urgency: out.urgency,
         };
         let tag = PublishTag::Port {
@@ -392,7 +392,7 @@ impl SurfaceOutbound {
             // attributed to the component it is about and draws down that
             // component's send budget rather than its neighbours'.
             attribution: report.subject.map(str::to_owned),
-            body,
+            body: body.into(),
             urgency: PLATFORM_URGENCY,
         };
         Some(self.send(PublishTag::ErrorReport, request))
@@ -413,7 +413,7 @@ impl SurfaceOutbound {
         let request = PublishRequest {
             channel: kind.channel(bindings).to_string(),
             attribution: None,
-            body,
+            body: body.into(),
             urgency: PLATFORM_URGENCY,
         };
         self.send(PublishTag::Telemetry(kind), request)
@@ -440,6 +440,14 @@ impl SurfaceOutbound {
         outcome: PublishOutcome,
     ) -> Result<Option<PublishAnswer>, String> {
         let tag = self.pending.on_result(correlation)?;
+        // The page attaches at v4, which cannot carry the non-text body this
+        // refusal answers, so a peer that sends it is not a conforming one.
+        if outcome == PublishOutcome::TextOnlyChannel {
+            return Err(format!(
+                "PublishResult {correlation:?} answered {outcome:?}, which a v4 attachment \
+                 cannot earn"
+            ));
+        }
         match tag {
             PublishTag::Port {
                 instance,
@@ -467,6 +475,9 @@ impl SurfaceOutbound {
                 PublishOutcome::Failed => Err(format!(
                     "PublishResult refused a {kind:?} document the wiring names: {outcome:?}"
                 )),
+                PublishOutcome::TextOnlyChannel => {
+                    unreachable!("refused above: a v4 attachment cannot earn {outcome:?}")
+                }
             },
         }
     }
@@ -671,10 +682,12 @@ impl SurfaceOutbound {
         facts: &AttachmentFacts,
         now: Millis,
     ) -> OutboxSteps<String> {
-        self.outboxes
-            .on_attached(facts.max_body_bytes as usize, now, |instance, batch| {
-                survives(bindings, instance, batch, Some(facts))
-            })
+        self.outboxes.on_attached(
+            facts.codec(),
+            facts.max_body_bytes as usize,
+            now,
+            |instance, batch| survives(bindings, instance, batch, Some(facts)),
+        )
     }
 
     /// The attachment went away: outstanding flushes die with it, queued ones
@@ -737,10 +750,13 @@ fn survives(
 /// attachment, and a peer built against a different derivation would state a
 /// different one.
 fn fits_the_caps(instance: &str, batch: &FlushBatch, facts: &AttachmentFacts) -> bool {
-    check_batch_legality(&batch.entries, &batch.ops, facts.max_body_bytes as usize).is_ok()
-        // Last, because it is the one gate that has to serialize the flush to
+    let codec = facts.codec();
+    codec
+        .check_batch_legality(&batch.entries, &batch.ops, facts.max_body_bytes as usize)
+        .is_ok()
+        // Last, because it is the one gate that has to encode the flush to
         // answer.
-        && batch.frame_bytes(Some(instance)) as u64 <= facts.max_frame_bytes
+        && batch.frame_bytes(codec, Some(instance)) as u64 <= facts.max_frame_bytes
 }
 
 /// The caller-facing status of one wire outcome.
@@ -750,5 +766,8 @@ fn publish_status(outcome: PublishOutcome) -> PublishStatus {
         PublishOutcome::RateLimited => PublishStatus::RateLimited,
         PublishOutcome::BodyTooLarge { len, max } => PublishStatus::BodyTooLarge { len, max },
         PublishOutcome::Failed => PublishStatus::Failed,
+        PublishOutcome::TextOnlyChannel => {
+            unreachable!("refused where the result is settled: a v4 attachment cannot earn it")
+        }
     }
 }

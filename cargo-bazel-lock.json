@@ -1,5 +1,5 @@
 {
-  "checksum": "cd4d63c5f3b28c25254178d28bc4e50ead76febc53d943801799ac7435ebf06d",
+  "checksum": "680c7c56942c8c10a62890514fa76ec140a5449b21928155636f807bfa8ea58e",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2615,6 +2615,10 @@
               "target": "serde"
             },
             {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            },
+            {
               "id": "uuid 1.24.0",
               "target": "uuid"
             }
@@ -2626,10 +2630,6 @@
             {
               "id": "chrono 0.4.45",
               "target": "chrono"
-            },
-            {
-              "id": "serde_json 1.0.150",
-              "target": "serde_json"
             }
           ],
           "selects": {}

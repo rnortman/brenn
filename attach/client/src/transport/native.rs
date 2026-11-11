@@ -22,6 +22,8 @@ use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, COOKIE, Invali
 use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, Uri};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use brenn_attach_proto::WireMessage;
+
 use super::{TransportConnection, TransportConnector, TransportError, TransportEvent};
 
 /// Single source of truth for the cookie-authenticated WS handshake auth header: sets
@@ -185,10 +187,14 @@ pub struct NativeConnection {
 }
 
 impl TransportConnection for NativeConnection {
-    async fn send_text(&mut self, text: String) -> Result<(), TransportError> {
+    async fn send(&mut self, message: WireMessage) -> Result<(), TransportError> {
+        let message = match message {
+            WireMessage::Text(text) => Message::Text(text.into()),
+            WireMessage::Binary(bytes) => Message::Binary(bytes.into()),
+        };
         // `send` feeds and flushes, keeping the stream drained.
         self.ws
-            .send(Message::Text(text.into()))
+            .send(message)
             .await
             .map_err(|err| TransportError::new(err.to_string()))
     }
@@ -196,9 +202,15 @@ impl TransportConnection for NativeConnection {
     async fn next_event(&mut self) -> TransportEvent {
         loop {
             match self.ws.next().await {
-                Some(Ok(Message::Text(text))) => return TransportEvent::Text(text.to_string()),
+                // Text is copied out: a `String` cannot take the buffer
+                // without checking its UTF-8 again.
+                Some(Ok(Message::Text(text))) => {
+                    return TransportEvent::Message(WireMessage::Text(text.to_string()));
+                }
+                // The payload's buffer is taken over, not copied, when nothing
+                // else holds it.
                 Some(Ok(Message::Binary(bytes))) => {
-                    return TransportEvent::Binary(bytes.to_vec());
+                    return TransportEvent::Message(WireMessage::Binary(Vec::from(bytes)));
                 }
                 Some(Ok(Message::Ping(_))) => {
                     // tungstenite queued the Pong; flush it so an otherwise idle
@@ -496,11 +508,11 @@ mod tests {
 
         assert_eq!(
             conn.next_event().await,
-            TransportEvent::Text("hello".into())
+            TransportEvent::Message(WireMessage::Text("hello".into()))
         );
         assert_eq!(
             conn.next_event().await,
-            TransportEvent::Binary(vec![1, 2, 3])
+            TransportEvent::Message(WireMessage::Binary(vec![1, 2, 3]))
         );
         // The Ping produces no event; the next event is the Close, meaning the
         // Ping was silently consumed (and its Pong flushed — the server asserts
@@ -542,10 +554,10 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// `send_text` and `close` reach the peer: the server observes the text
-    /// frame and then the close handshake.
+    /// `send` and `close` reach the peer: the server observes the text frame,
+    /// the binary frame, and then the close handshake.
     #[tokio::test]
-    async fn send_text_and_close_reach_the_peer() {
+    async fn send_and_close_reach_the_peer() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -555,6 +567,10 @@ mod tests {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => assert_eq!(text.as_str(), "from-client"),
                 other => panic!("expected the client's text frame, got {other:?}"),
+            }
+            match ws.next().await {
+                Some(Ok(Message::Binary(bytes))) => assert_eq!(bytes.as_ref(), &[0xff, 0, 7]),
+                other => panic!("expected the client's binary frame, got {other:?}"),
             }
             loop {
                 match ws.next().await {
@@ -568,7 +584,12 @@ mod tests {
         let mut connector = NativeConnector::new("devtoken");
         let url = format!("ws://{addr}/surface/demo/ws");
         let mut conn = connector.connect(&url).await.unwrap();
-        conn.send_text("from-client".into()).await.unwrap();
+        conn.send(WireMessage::Text("from-client".into()))
+            .await
+            .unwrap();
+        conn.send(WireMessage::Binary(vec![0xff, 0, 7]))
+            .await
+            .unwrap();
         conn.close().await;
 
         server.await.unwrap();

@@ -276,7 +276,7 @@ impl PublishBuffer {
 
     /// What this activation's *transportable* work has already spent of the wire
     /// batch budget: every channel address and body it will carry, charged
-    /// exactly as `brenn_attach_proto::batch_charged_bytes` charges the frame it
+    /// exactly as v4's `Codec::batch_charged_bytes` charges the frame it
     /// composes into. Summed from the buffered work rather than accumulated, so
     /// the two cannot drift.
     ///
@@ -621,7 +621,8 @@ impl PublishBuffer {
 
 #[cfg(test)]
 mod tests {
-    use brenn_attach_proto::{BatchEntry, check_batch_legality};
+    use brenn_attach_proto::{BatchEntry, Codec};
+    use brenn_surface_schema::SURFACE_ATTACH_VERSION;
 
     use super::*;
 
@@ -745,12 +746,15 @@ mod tests {
             .into_iter()
             .map(|p| BatchEntry {
                 channel: p.channel,
-                body: p.body,
+                body: p.body.into(),
                 urgency: p.urgency,
                 deliver_after: p.deliver_after,
             })
             .collect();
-        assert_eq!(check_batch_legality(&entries, &[], cap), Ok(()));
+        assert_eq!(
+            Codec::negotiated(SURFACE_ATTACH_VERSION).check_batch_legality(&entries, &[], cap),
+            Ok(())
+        );
     }
 
     /// A body at exactly the advertised cap cannot survive a batch, because the

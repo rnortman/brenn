@@ -8,7 +8,9 @@
 //! reaches the session with *this* remote's profile, and that the registry key
 //! the route registers under is the one the delivery path looks up.
 
-use brenn_attach_proto::{ClientFrame, SUPPORTED_VERSIONS, ServerFrame, max_client_frame_bytes};
+use brenn_attach_proto::{
+    ClientFrame, Codec, SUPPORTED_VERSIONS, ServerFrame, WireMessage, encode_client_hello,
+};
 use brenn_lib::messaging::AttachScope;
 use brenn_lib::messaging::remote::RemoteConfigRaw;
 use futures::{SinkExt, StreamExt};
@@ -45,21 +47,40 @@ async fn probe(base: &str, slug: &str, credential: Option<&str>) -> UpgradeProbe
     }
 }
 
+/// The codec of the version [`open_attachment`] negotiates: the client offers
+/// every supported version and the route serves them all. `Hello` reads the
+/// same under every codec.
+fn codec() -> Codec {
+    Codec::negotiated(SUPPORTED_VERSIONS.max)
+}
+
+/// The next frame, failing the test on a message the codec cannot decode.
 async fn next_server_frame(ws: &mut RemoteWs) -> ServerFrame {
     loop {
-        match ws.next().await.expect("stream ended").expect("frame error") {
-            Message::Text(text) => {
-                return serde_json::from_str(&text).expect("a server frame");
-            }
+        let message = match ws.next().await.expect("stream ended").expect("frame error") {
+            Message::Text(text) => WireMessage::Text(text.to_string()),
+            Message::Binary(bytes) => WireMessage::Binary(bytes.to_vec()),
             Message::Ping(_) | Message::Pong(_) => continue,
-            other => panic!("expected a text frame, got {other:?}"),
-        }
+            other => panic!("expected a frame, got {other:?}"),
+        };
+        return codec().decode_server(message).expect("a server frame");
     }
 }
 
 async fn send(ws: &mut RemoteWs, frame: &ClientFrame) {
-    let text = serde_json::to_string(frame).unwrap();
-    ws.send(Message::Text(text.into())).await.unwrap();
+    let message = match frame {
+        ClientFrame::Hello { versions, ident } => encode_client_hello(*versions, ident),
+        other => codec().encode_client(other),
+    };
+    send_wire(ws, message).await;
+}
+
+async fn send_wire(ws: &mut RemoteWs, message: WireMessage) {
+    let message = match message {
+        WireMessage::Text(text) => Message::Text(text.into()),
+        WireMessage::Binary(bytes) => Message::Binary(bytes.into()),
+    };
+    ws.send(message).await.unwrap();
 }
 
 /// Read the peer's `Hello`, answer it, and read what follows.
@@ -109,7 +130,7 @@ async fn a_valid_token_attaches_and_welcomes_as_the_remote_principal() {
             assert_eq!(max_body_bytes, TEST_MAX_BODY_BYTES as u64);
             assert_eq!(
                 max_frame_bytes,
-                max_client_frame_bytes(TEST_MAX_BODY_BYTES) as u64
+                Codec::negotiated(version).max_client_frame_bytes(TEST_MAX_BODY_BYTES) as u64
             );
             assert!(alert_granted, "the fleet block grants alert");
         }
@@ -345,5 +366,56 @@ async fn a_session_cookie_is_not_a_credential_and_there_is_no_redirect() {
         !observed.headers.iter().any(|(name, _)| name == "location"),
         "daemons do not log in: no redirect, got {:?}",
         observed.headers
+    );
+}
+
+/// A v5 binary `Publish` whose body section is shorter than its descriptor says
+/// is a protocol violation: the socket closes and the event names the rule. The
+/// message is a real encoding with its last byte cut, so the header parses and
+/// only the lengths disagree.
+#[tokio::test]
+async fn a_v5_publish_whose_lengths_disagree_closes_with_a_security_event() {
+    let db = crate::test_support::init_db_memory();
+    let harness = remote_harness(&db, fleet).await;
+    let (base, _sd) = spawn_test_server(harness.state.clone()).await;
+
+    let mut ws = remote_ws_open(&remote_ws_url(&base, SLUG), TOKEN).await;
+    match open_attachment(&mut ws).await {
+        ServerFrame::Welcome { version, .. } => assert_eq!(version, 5),
+        other => panic!("expected Welcome after the handshake, got {other:?}"),
+    }
+    let WireMessage::Binary(mut bytes) = codec().encode_client(&ClientFrame::Publish {
+        channel: "brenn:demo".to_string(),
+        attribution: None,
+        body: brenn_attach_proto::MessageBody::from_parts(Some("image/png"), &[0x89, 0x50])
+            .unwrap(),
+        urgency: brenn_attach_proto::Urgency::Normal,
+        correlation: Some(1),
+    }) else {
+        panic!("a v5 Publish is binary");
+    };
+    bytes.pop();
+    send_wire(&mut ws, WireMessage::Binary(bytes)).await;
+
+    // The session ends: whatever the transport reports, nothing but the close
+    // and liveness frames precede it.
+    while let Some(Ok(message)) = ws.next().await {
+        match message {
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) => continue,
+            other => panic!("expected the socket to close, got {other:?}"),
+        }
+    }
+
+    let events = harness.captured().await;
+    assert_eq!(events.len(), 1, "one violation, one event, got {events:?}");
+    let (source, detail) = &events[0];
+    assert!(
+        source.contains("attach_protocol_violation"),
+        "the event is the attach protocol violation, got source {source:?}"
+    );
+    assert!(
+        detail.contains("frame header and bodies disagree"),
+        "the detail names the violated rule, got {detail:?}"
     );
 }

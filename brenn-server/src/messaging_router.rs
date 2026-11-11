@@ -932,7 +932,7 @@ mod tests {
             assert_eq!(pushed.channel, "brenn:sched");
             assert_eq!(pushed.attribution.as_deref(), Some("protobar"));
             assert_eq!(pushed.entries.len(), 1);
-            assert_eq!(pushed.entries[0].body, "wake me");
+            assert_eq!(pushed.entries[0].body, "wake me".into());
             assert_eq!(
                 pushed.entries[0].deliver_after, 1_800_000_060_000,
                 "the release time travels as epoch milliseconds, the page's units"

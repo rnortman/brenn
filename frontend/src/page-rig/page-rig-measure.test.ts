@@ -69,6 +69,7 @@ const lines: string[] = [];
 
 afterAll(() => {
     page?.finish();
+    // TODO(page-rig-baseline-record): record these figures in a tracked file.
     console.log(
         [`page rig 0.1.0 state baseline (node ${process.version}, V8; not a browser):`, ...lines].join("\n"),
     );

@@ -47,7 +47,8 @@ pub use brenn_attach_client::subs::{
     ResumePolicy, SubscribeAck, SubscribeSettlement, SubscriptionDepths,
 };
 pub use brenn_attach_proto::{
-    BatchDeferredOp, BatchEntry, DeferredOpKind, DeferredViewEntry, PublishBatchOutcome,
+    BatchDeferredOp, BatchEntry, DeferredOpKind, DeferredViewEntry, MessageBody,
+    PublishBatchOutcome,
 };
 
 /// How long any awaited helper will pump before it gives up and panics.
@@ -61,7 +62,9 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// reads.
 ///
 /// `sender` is the peer's stamp, not the publisher's claim, which is why it is
-/// worth asserting on at all. The rest of the envelope is dropped here: a
+/// worth asserting on at all. `body` is the body as the wire delivered it: its
+/// bytes and content type under a version that carries them, its text alone
+/// under one that does not. The rest of the envelope is dropped here: a
 /// conformance run asserts on what the protocol decided, not on what a message
 /// carried.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,12 +73,30 @@ pub struct Delivery {
     /// The envelope sender the peer minted — bare for the attacher itself, or
     /// carrying the sub-identity an `attribution` named.
     pub sender: String,
-    pub body: String,
+    pub body: MessageBody,
     /// The delivery's span sequence, restarting at 1 with each subscription
     /// span.
     pub seq: u64,
     /// Messages this attachment lost on the channel before this one.
     pub dropped: u64,
+}
+
+impl Delivery {
+    /// The body's text, for the cases that published text.
+    ///
+    /// # Panics
+    ///
+    /// If the body is not text: a case reading text off a non-text delivery
+    /// has its own expectation wrong.
+    pub fn text(&self) -> &str {
+        self.body.as_text().unwrap_or_else(|| {
+            panic!(
+                "attach conformance: a delivery on {} holds {}, not text",
+                self.channel,
+                self.body.summary()
+            )
+        })
+    }
 }
 
 /// Why an attachment ended for good.
@@ -165,6 +186,8 @@ pub struct ClientConfig {
     pub credential: Credential,
     /// The build string put on this end's `Hello`, for the peer's logs.
     pub ident: String,
+    /// The protocol versions this end offers, within `SUPPORTED_VERSIONS`.
+    pub versions: VersionRange,
 }
 
 /// A non-browser attachment, driven by awaited assertions.
@@ -198,6 +221,7 @@ impl AttachClient {
             url,
             credential,
             ident,
+            versions,
         } = config;
         let connector = match credential {
             Credential::SessionCookie(token) => NativeConnector::new(token),
@@ -217,6 +241,7 @@ impl AttachClient {
                 // No close code means anything special to a conformance run:
                 // every peer close is an ordinary drop to reconnect from.
                 terminal_close_codes: Vec::new(),
+                versions,
             },
             connector,
         );
@@ -406,11 +431,15 @@ impl AttachClient {
 
     /// One flush carrying one buffered publish, parked at `deliver_after` when
     /// that is `Some`.
-    pub fn parking(channel: &str, body: &str, deliver_after: Option<u64>) -> FlushBatch {
+    pub fn parking(
+        channel: &str,
+        body: impl Into<MessageBody>,
+        deliver_after: Option<u64>,
+    ) -> FlushBatch {
         FlushBatch {
             entries: vec![BatchEntry {
                 channel: channel.to_string(),
-                body: body.to_string(),
+                body: body.into(),
                 urgency: Urgency::Normal,
                 deliver_after,
             }],
@@ -673,9 +702,12 @@ impl AttachClient {
                 // Every queued flush survives: this client states no contract of
                 // its own that a flush could stop satisfying between two
                 // attachments.
-                let steps =
-                    self.outboxes
-                        .on_attached(facts.max_body_bytes as usize, now, |_, _| true);
+                let steps = self.outboxes.on_attached(
+                    facts.codec(),
+                    facts.max_body_bytes as usize,
+                    now,
+                    |_, _| true,
+                );
                 frames.extend(self.take_outbox_steps(steps));
                 self.observed.push_back(Observation::Attached(facts));
                 self.emit(frames).await
@@ -757,12 +789,7 @@ impl AttachClient {
                             self.observed.push_back(Observation::Delivered(Delivery {
                                 channel: channel.clone(),
                                 sender: row.envelope.sender,
-                                body: row
-                                    .envelope
-                                    .body
-                                    .as_text()
-                                    .expect("a v4 row's body is text")
-                                    .to_owned(),
+                                body: row.envelope.body,
                                 seq: row.seq,
                                 dropped: row.dropped,
                             }));

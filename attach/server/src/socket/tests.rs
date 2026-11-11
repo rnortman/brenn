@@ -2,15 +2,23 @@
 //! and the writer against a sink of them.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 
-use brenn_attach_proto::{ClientFrame, VersionRange};
+use brenn_attach_proto::{ClientFrame, SUPPORTED_VERSIONS, VersionRange};
 use futures::stream;
 use uuid::Uuid;
 
 use super::*;
 use crate::test_support::{AttachCtxBuilder, TEST_BODY_BYTES, TestProfile};
+
+/// A client frame as the v4 text message it is written as.
+fn client_text(frame: &ClientFrame) -> Message {
+    let WireMessage::Text(text) = Codec::negotiated(4).encode_client(frame) else {
+        panic!("a v4 frame is text");
+    };
+    Message::Text(text.into())
+}
 
 /// A `Hello` from a peer speaking `[min, max]`.
 fn client_hello(min: u32, max: u32) -> Message {
@@ -18,14 +26,14 @@ fn client_hello(min: u32, max: u32) -> Message {
         versions: VersionRange { min, max },
         ident: "test-attacher".to_string(),
     };
-    Message::Text(serde_json::to_string(&frame).unwrap().into())
+    client_text(&frame)
 }
 
 /// A handshake over exactly these inbound messages, with a bound no test reaches
 /// except the one about the bound.
 async fn handshake(messages: Vec<Result<Message, axum::Error>>) -> Handshake {
     let mut stream = stream::iter(messages);
-    read_client_hello(&mut stream, Duration::from_secs(60)).await
+    read_client_hello(&mut stream, Duration::from_secs(60), SUPPORTED_VERSIONS).await
 }
 
 fn agreed(verdict: Handshake) -> u32 {
@@ -116,11 +124,68 @@ async fn a_first_frame_that_is_not_hello_is_a_violation() {
         retain_depth: 1,
         resume: None,
     };
-    let text = Message::Text(serde_json::to_string(&subscribe).unwrap().into());
+    let text = client_text(&subscribe);
     assert_eq!(
         violation(handshake(vec![Ok(text)]).await),
         "first client frame is not Hello"
     );
+}
+
+/// The first frame is classified by its `type` tag alone, since no version is
+/// in force to read the rest by: a malformed frame of another kind is still
+/// "not Hello".
+#[tokio::test]
+async fn a_malformed_first_frame_of_another_kind_is_not_hello() {
+    let text = Message::Text(r#"{"type":"Subscribe","channel":7}"#.into());
+    assert_eq!(
+        violation(handshake(vec![Ok(text)]).await),
+        "first client frame is not Hello"
+    );
+}
+
+/// The peer's range is negotiated against the range the route serves, not
+/// against everything this build speaks.
+#[tokio::test]
+async fn the_hello_negotiates_against_the_served_range() {
+    let served = VersionRange::exactly(SUPPORTED_VERSIONS.min);
+    let mut stream = stream::iter(vec![Ok(client_hello(served.min, served.max + 3))]);
+    assert_eq!(
+        agreed(read_client_hello(&mut stream, Duration::from_secs(60), served).await),
+        served.min
+    );
+    let mut stream = stream::iter(vec![Ok(client_hello(served.max + 1, served.max + 3))]);
+    assert!(matches!(
+        read_client_hello(&mut stream, Duration::from_secs(60), served).await,
+        Handshake::Incompatible(_)
+    ));
+}
+
+/// A remote route serves every supported version and the surface route one:
+/// each offer meets the served range at the highest version both hold, or at
+/// none.
+#[tokio::test]
+async fn each_offer_against_each_served_range() {
+    let both = SUPPORTED_VERSIONS;
+    let v4 = VersionRange::exactly(4);
+    let cases = [
+        (both, VersionRange::exactly(4), Some(4)),
+        (both, VersionRange::exactly(5), Some(5)),
+        (both, VersionRange { min: 4, max: 5 }, Some(5)),
+        (both, VersionRange { min: 6, max: 9 }, None),
+        (v4, VersionRange::exactly(5), None),
+        (v4, VersionRange { min: 4, max: 5 }, Some(4)),
+    ];
+    for (served, offered, expected) in cases {
+        let mut stream = stream::iter(vec![Ok(client_hello(offered.min, offered.max))]);
+        let outcome = read_client_hello(&mut stream, Duration::from_secs(60), served).await;
+        match expected {
+            Some(version) => assert_eq!(agreed(outcome), version, "{served:?} vs {offered:?}"),
+            None => assert!(
+                matches!(outcome, Handshake::Incompatible(_)),
+                "{served:?} vs {offered:?}"
+            ),
+        }
+    }
 }
 
 /// The `Hello` shape is frozen across every version, so junk here is a client
@@ -133,8 +198,8 @@ async fn unparseable_text_is_a_violation_that_never_echoes_it() {
     assert!(!detail.contains("CANARY"), "payload echoed: {detail}");
 }
 
-/// The protocol is JSON text frames; binary is not a frame this transport reads,
-/// at the handshake or after it.
+/// The `Hello` is a text frame in every version, so a binary message before it
+/// is not a handshake.
 #[tokio::test]
 async fn a_binary_frame_before_the_hello_is_a_violation() {
     assert_eq!(
@@ -185,15 +250,15 @@ async fn an_ordinary_read_error_before_the_hello_is_a_disconnect() {
 #[tokio::test(start_paused = true)]
 async fn silence_past_the_bound_is_a_violation() {
     let mut quiet = stream::pending::<Result<Message, axum::Error>>();
-    let verdict = read_client_hello(&mut quiet, Duration::from_secs(45)).await;
+    let verdict = read_client_hello(&mut quiet, Duration::from_secs(45), SUPPORTED_VERSIONS).await;
     assert_eq!(violation(verdict), "no Hello within 45s of upgrade");
 }
 
 #[test]
-fn the_server_hello_states_this_builds_range_and_ident() {
-    match server_hello("brenn-server-test") {
+fn the_server_hello_states_the_served_range_and_ident() {
+    match server_hello(VersionRange::exactly(4), "brenn-server-test") {
         ServerFrame::Hello { versions, ident } => {
-            assert_eq!(versions, SUPPORTED_VERSIONS);
+            assert_eq!(versions, VersionRange::exactly(4));
             assert_eq!(ident, "brenn-server-test");
         }
         _ => panic!("expected Hello"),
@@ -220,7 +285,7 @@ fn welcome_ctx(alert_granted: bool) -> (AttachSessionCtx, Uuid) {
 #[tokio::test]
 async fn welcome_states_the_transport_contract_of_this_attachment() {
     let (ctx, session_id) = welcome_ctx(false);
-    match welcome(&ctx, 1, 20) {
+    match welcome(&ctx, 4, 20) {
         ServerFrame::Welcome {
             version,
             participant_id,
@@ -230,14 +295,14 @@ async fn welcome_states_the_transport_contract_of_this_attachment() {
             max_frame_bytes,
             alert_granted,
         } => {
-            assert_eq!(version, 1);
+            assert_eq!(version, 4);
             assert_eq!(participant_id, "surface:deskbar");
             assert_eq!(id, session_id.simple().to_string());
             assert_eq!(heartbeat_secs, 20);
             assert_eq!(max_body_bytes, TEST_BODY_BYTES as u64);
             assert_eq!(
                 max_frame_bytes,
-                max_client_frame_bytes(TEST_BODY_BYTES) as u64
+                Codec::negotiated(4).max_client_frame_bytes(TEST_BODY_BYTES) as u64
             );
             assert!(!alert_granted);
         }
@@ -251,7 +316,7 @@ async fn welcome_states_the_transport_contract_of_this_attachment() {
 async fn welcome_advertises_the_profiles_alert_grant() {
     let (granted, _) = welcome_ctx(true);
     assert!(matches!(
-        welcome(&granted, 1, 20),
+        welcome(&granted, 4, 20),
         ServerFrame::Welcome {
             alert_granted: true,
             ..
@@ -317,16 +382,49 @@ impl Sink<Message> for TestSink {
     }
 }
 
-/// The frames the writer wrote, in order, as parsed `ServerFrame`s — liveness
-/// pings dropped.
+/// The writer under test, its session having agreed `version` (`None`: still
+/// negotiating).
+fn spawn_writer(
+    sink: TestSink,
+    rx: mpsc::Receiver<ServerFrame>,
+    close_rx: oneshot::Receiver<CloseReason>,
+    heartbeat: Duration,
+    version: Option<u32>,
+) -> (tokio::task::JoinHandle<()>, Arc<OnceLock<u32>>) {
+    let cell = Arc::new(OnceLock::new());
+    if let Some(version) = version {
+        cell.set(version).unwrap();
+    }
+    let writer = tokio::spawn(writer_task(
+        sink,
+        rx,
+        close_rx,
+        heartbeat,
+        Arc::clone(&cell),
+    ));
+    (writer, cell)
+}
+
+/// The frames the writer wrote, in order, decoded with the v4 codec — liveness
+/// pings and close frames dropped. A message the codec cannot decode fails the
+/// test.
 fn written_frames(written: &Arc<Mutex<Vec<Message>>>) -> Vec<ServerFrame> {
+    let codec = Codec::negotiated(4);
     written
         .lock()
         .expect("written poisoned")
         .iter()
-        .filter_map(|msg| match msg {
-            Message::Text(text) => Some(serde_json::from_str(text.as_str()).expect("ServerFrame")),
-            _ => None,
+        .filter_map(|msg| {
+            let wire = match msg {
+                Message::Text(text) => WireMessage::Text(text.as_str().to_string()),
+                Message::Binary(bytes) => WireMessage::Binary(bytes.to_vec()),
+                _ => return None,
+            };
+            Some(
+                codec
+                    .decode_server(wire)
+                    .unwrap_or_else(|err| panic!("the writer wrote an undecodable message: {err}")),
+            )
         })
         .collect()
 }
@@ -350,9 +448,11 @@ async fn the_writer_serializes_in_order_and_exits_when_the_session_drops_its_sen
     // A heartbeat far past the test's own lifetime: this test is about the frame
     // path, and an idle tick would add frames nobody enqueued.
     let (_close_tx, close_rx) = oneshot::channel();
-    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
+    let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), Some(4));
 
-    tx.send(server_hello("brenn-server-test")).await.unwrap();
+    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test"))
+        .await
+        .unwrap();
     tx.send(ServerFrame::Heartbeat).await.unwrap();
     drop(tx);
     writer.await.unwrap();
@@ -370,7 +470,7 @@ async fn an_idle_tick_writes_a_ping_and_a_heartbeat() {
     let (sink, written) = TestSink::new(SinkMode::Record);
     let (tx, rx) = mpsc::channel(4);
     let (_close_tx, close_rx) = oneshot::channel();
-    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(10)));
+    let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(10), Some(4));
 
     tokio::time::sleep(Duration::from_secs(11)).await;
     assert_eq!(written_pings(&written), 1);
@@ -390,9 +490,11 @@ async fn a_frame_written_since_the_tick_suppresses_the_idle_heartbeat() {
     let (sink, written) = TestSink::new(SinkMode::Record);
     let (tx, rx) = mpsc::channel(4);
     let (_close_tx, close_rx) = oneshot::channel();
-    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(10)));
+    let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(10), Some(4));
 
-    tx.send(server_hello("brenn-server-test")).await.unwrap();
+    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test"))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_secs(11)).await;
     assert_eq!(written_pings(&written), 1);
     assert!(
@@ -414,7 +516,7 @@ async fn a_sink_error_exits_the_writer() {
     let (sink, written) = TestSink::new(SinkMode::Fail);
     let (tx, rx) = mpsc::channel(4);
     let (_close_tx, close_rx) = oneshot::channel();
-    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
+    let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), Some(4));
 
     tx.send(ServerFrame::Heartbeat).await.unwrap();
     writer.await.unwrap();
@@ -430,7 +532,7 @@ async fn a_stalled_sink_exits_the_writer_after_the_watchdog() {
     let (sink, written) = TestSink::new(SinkMode::Stall);
     let (tx, rx) = mpsc::channel(4);
     let (_close_tx, close_rx) = oneshot::channel();
-    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(10)));
+    let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(10), Some(4));
 
     tx.send(ServerFrame::Heartbeat).await.unwrap();
     writer.await.unwrap();
@@ -457,7 +559,7 @@ async fn a_host_close_writes_the_close_frame_and_exits_the_writer() {
     let (sink, written) = TestSink::new(SinkMode::Record);
     let (tx, rx) = mpsc::channel(4);
     let (close_tx, close_rx) = oneshot::channel();
-    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
+    let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), Some(4));
 
     close_tx
         .send(CloseReason::new(3003, "surface retired"))
@@ -480,13 +582,15 @@ async fn a_host_close_flushes_what_was_already_queued_first() {
     let (tx, rx) = mpsc::channel(4);
     let (close_tx, close_rx) = oneshot::channel();
 
-    tx.send(server_hello("brenn-server-test")).await.unwrap();
+    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test"))
+        .await
+        .unwrap();
     tx.send(ServerFrame::Heartbeat).await.unwrap();
     close_tx
         .send(CloseReason::new(3002, "surface reconfigured"))
         .expect("receiver is alive");
 
-    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
+    let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), Some(4));
     writer.await.unwrap();
 
     assert!(matches!(
@@ -506,7 +610,7 @@ async fn dropping_the_close_sender_writes_no_close_frame() {
     let (sink, written) = TestSink::new(SinkMode::Record);
     let (tx, rx) = mpsc::channel(4);
     let (close_tx, close_rx) = oneshot::channel();
-    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
+    let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), Some(4));
 
     tx.send(ServerFrame::Heartbeat).await.unwrap();
     drop(close_tx);
@@ -539,7 +643,7 @@ async fn a_close_racing_the_senders_drop_still_writes_the_close_frame() {
             .expect("receiver is alive");
         drop(tx);
 
-        let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
+        let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), Some(4));
         writer.await.unwrap();
 
         assert_eq!(
@@ -548,4 +652,68 @@ async fn a_close_racing_the_senders_drop_still_writes_the_close_frame() {
             "attempt {attempt}: whichever arm won the tie, the peer is told why",
         );
     }
+}
+
+/// Before a version is in force there is no schema to write a `Heartbeat` in:
+/// an idle tick then writes the native ping alone, and the idle `Heartbeat`
+/// joins it once the opening sequence has set the version.
+#[tokio::test(start_paused = true)]
+async fn no_idle_heartbeat_is_written_before_a_version_is_in_force() {
+    let (sink, written) = TestSink::new(SinkMode::Record);
+    let (tx, rx) = mpsc::channel(4);
+    let (_close_tx, close_rx) = oneshot::channel();
+    let (writer, version) = spawn_writer(sink, rx, close_rx, Duration::from_secs(10), None);
+
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert_eq!(written_pings(&written), 1);
+    assert!(written_frames(&written).is_empty());
+
+    version.set(4).unwrap();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(written_pings(&written), 2);
+    assert!(matches!(
+        written_frames(&written).as_slice(),
+        [ServerFrame::Heartbeat]
+    ));
+
+    drop(tx);
+    writer.await.unwrap();
+}
+
+/// `Hello` is written in its frozen shell before any version is set.
+#[tokio::test]
+async fn the_hello_is_written_before_a_version_is_in_force() {
+    let (sink, written) = TestSink::new(SinkMode::Record);
+    let (tx, rx) = mpsc::channel(4);
+    let (_close_tx, close_rx) = oneshot::channel();
+    let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), None);
+
+    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test"))
+        .await
+        .unwrap();
+    drop(tx);
+    writer.await.unwrap();
+
+    let written = written.lock().expect("written poisoned");
+    let [Message::Text(text)] = written.as_slice() else {
+        panic!("expected one text message, got {written:?}");
+    };
+    assert_eq!(
+        WireMessage::Text(text.as_str().to_string()),
+        encode_server_hello(SUPPORTED_VERSIONS, "brenn-server-test")
+    );
+}
+
+/// Any other frame with no version set is a host bug: the writer panics rather
+/// than guess an encoding.
+#[tokio::test]
+async fn a_frame_before_a_version_is_in_force_panics_the_writer() {
+    let (sink, _written) = TestSink::new(SinkMode::Record);
+    let (tx, rx) = mpsc::channel(4);
+    let (_close_tx, close_rx) = oneshot::channel();
+    let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), None);
+
+    tx.send(ServerFrame::Heartbeat).await.unwrap();
+    let err = writer.await.unwrap_err();
+    assert!(err.is_panic());
 }

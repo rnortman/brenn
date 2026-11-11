@@ -25,7 +25,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use brenn_attach_proto::{ClientFrame, ServerFrame};
+use brenn_attach_proto::{ClientFrame, ServerFrame, encode_client_hello};
 use brenn_queue::ReleaseTime;
 use futures_util::{FutureExt, future, pin_mut, select_biased};
 
@@ -283,8 +283,7 @@ impl<C: TransportConnector> AttachDriver<C> {
             }
         };
         match woke {
-            Woke::Socket(TransportEvent::Text(text)) => IoEvent::Conn(ConnInput::TextFrame(text)),
-            Woke::Socket(TransportEvent::Binary(_)) => IoEvent::Conn(ConnInput::BinaryFrame),
+            Woke::Socket(TransportEvent::Message(msg)) => IoEvent::Conn(ConnInput::Frame(msg)),
             Woke::Socket(TransportEvent::Closed { code, reason }) => {
                 // The transport goes before the connection reacts, so no dead
                 // socket can be written to or read again. The code and reason ride
@@ -441,9 +440,18 @@ impl<C: TransportConnector> AttachDriver<C> {
                 ConnEffect::SetWakeup(deadline) => self.wakeup = deadline,
                 ConnEffect::SendFrame(frame) => match self.transport.as_mut() {
                     Some(transport) => {
-                        let text = serde_json::to_string(&frame)
-                            .expect("attach driver: a client frame serializes to JSON");
-                        if let Err(err) = transport.send_text(text).await {
+                        let message = match &frame {
+                            // Sent before a version exists, in its frozen shell.
+                            ClientFrame::Hello { versions, ident } => {
+                                encode_client_hello(*versions, ident)
+                            }
+                            frame => self
+                                .conn
+                                .codec()
+                                .expect("attach driver: a frame other than Hello off a negotiated attachment")
+                                .encode_client(frame),
+                        };
+                        if let Err(err) = transport.send(message).await {
                             tracing::debug!(%err, "attach driver: write failed, disconnecting");
                             self.transport = None;
                             transport_lost = true;

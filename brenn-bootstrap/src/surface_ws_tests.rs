@@ -17,11 +17,12 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use brenn_attach_proto::{
-    ClientFrame, SUPPORTED_VERSIONS, ServerFrame, SubscribeOutcome, Urgency, VersionRange,
-    max_client_frame_bytes,
+    ClientFrame, Codec, SUPPORTED_VERSIONS, ServerFrame, SubscribeOutcome, Urgency, VersionRange,
+    WireMessage,
 };
 use brenn_messaging::testutils::ephemeral_channel_entry;
 use brenn_obs::alerting::AlertDispatcher;
+use brenn_surface_schema::SURFACE_ATTACH_VERSION;
 use futures::{SinkExt, StreamExt};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
@@ -100,8 +101,9 @@ async fn next_server_frame(ws: &mut SurfaceWs) -> ServerFrame {
     loop {
         match tokio::time::timeout_at(deadline, ws.next()).await {
             Ok(Some(Ok(Message::Text(t)))) => {
-                let frame: ServerFrame =
-                    serde_json::from_str(t.as_str()).expect("server frame parses");
+                let frame = Codec::negotiated(4)
+                    .decode_server(WireMessage::Text(t.to_string()))
+                    .expect("server frame parses");
                 if matches!(frame, ServerFrame::Heartbeat) {
                     continue;
                 }
@@ -114,7 +116,9 @@ async fn next_server_frame(ws: &mut SurfaceWs) -> ServerFrame {
 }
 
 async fn send(ws: &mut SurfaceWs, frame: &ClientFrame) {
-    let text = serde_json::to_string(frame).expect("a client frame serializes");
+    let WireMessage::Text(text) = Codec::negotiated(4).encode_client(frame) else {
+        panic!("a v4 frame is text");
+    };
     ws.send(Message::text(text)).await.expect("send a frame");
 }
 
@@ -122,7 +126,9 @@ async fn send(ws: &mut SurfaceWs, frame: &ClientFrame) {
 /// ladder every other test here starts from.
 async fn open_attachment(ws: &mut SurfaceWs) -> ServerFrame {
     match next_server_frame(ws).await {
-        ServerFrame::Hello { versions, .. } => assert_eq!(versions, SUPPORTED_VERSIONS),
+        ServerFrame::Hello { versions, .. } => {
+            assert_eq!(versions, VersionRange::exactly(SURFACE_ATTACH_VERSION))
+        }
         other => panic!("expected the peer's Hello first, got {other:?}"),
     }
     send(
@@ -177,8 +183,9 @@ async fn drain_until_closed_observing(ws: &mut SurfaceWs) -> Option<CloseObserva
             Ok(None) | Ok(Some(Err(_))) => return Some(CloseObservation::Abrupt),
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)))) => continue,
             Ok(Some(Ok(Message::Text(t)))) => {
-                let frame: ServerFrame =
-                    serde_json::from_str(t.as_str()).expect("server frame parses");
+                let frame = Codec::negotiated(4)
+                    .decode_server(WireMessage::Text(t.to_string()))
+                    .expect("server frame parses");
                 assert!(
                     matches!(frame, ServerFrame::Heartbeat),
                     "violation path leaked a response frame before close: {frame:?}"
@@ -405,7 +412,7 @@ async fn surface_ws_welcome_carries_this_attachments_transport_facts() {
             max_frame_bytes,
             alert_granted,
         } => {
-            assert_eq!(version, SUPPORTED_VERSIONS.max);
+            assert_eq!(version, SURFACE_ATTACH_VERSION);
             assert_eq!(participant_id, "surface:deskbar");
             assert!(
                 Uuid::parse_str(&session_id).is_ok(),
@@ -415,7 +422,7 @@ async fn surface_ws_welcome_carries_this_attachments_transport_facts() {
             assert_eq!(max_body_bytes, TEST_MAX_BODY_BYTES as u64);
             assert_eq!(
                 max_frame_bytes,
-                max_client_frame_bytes(TEST_MAX_BODY_BYTES) as u64
+                Codec::negotiated(version).max_client_frame_bytes(TEST_MAX_BODY_BYTES) as u64
             );
             // Default-policy surface: the alert plane is deny-by-default.
             assert!(!alert_granted);
@@ -519,7 +526,7 @@ async fn surface_ws_a_publish_reaches_the_bus_and_comes_back_on_the_subscription
         &ClientFrame::Publish {
             channel: EPH_ADDR.to_string(),
             attribution: Some(COMPONENT.to_string()),
-            body: "round trip".to_string(),
+            body: "round trip".into(),
             urgency: Urgency::Normal,
             correlation: Some(7),
         },

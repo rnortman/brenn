@@ -1,5 +1,101 @@
 # TODOs
 
+## `page-rig-baseline-record`
+
+The node page rig's 0.1.0 string-path baseline is in no tracked file and not
+in the message of the commit that added the rig ("Add a node page rig running
+the real page kernel, glue and kinds"), where its design said it would be
+kept. The figures: `bazel test //frontend:page_rig_measure --test_output=all`,
+node v22.20.0, V8, not a browser, a single run on a development machine to be
+read as ratios, `Welcome` cap 4,194,304 B; time per activation of the retained
+base64-in-JSON state round trip, given as `state` mean / median / min ms, then
+`noop` on the same state-holder mean / median / min ms — 49,149 raw B (65,550
+stored, N 200): 6.629 / 6.319 / 5.769, then 5.453 / 5.343 / 5.254; 1,048,576
+raw B (1,398,122 stored, N 40): 113.839 / 113.541 / 111.988, then 101.263 /
+101.036 / 99.775; 3,000,000 raw B (4,000,018 stored, N 20): 324.884 / 324.578
+/ 321.125, then 288.560 / 288.048 / 284.965; `noop` on `keeper`, empty
+windows, N 500: 0.846 / 0.735 / 0.673. The third size is bounded by
+`MAX_PUBLISH_BYTES_PER_ACTIVATION` (4 MiB, `brenn-budget/src/lib.rs`), which
+rules out the 16 MiB first asked for. Done when the commit that times the
+surface host's byte path (`brenn:processor@0.2.0`) with the same target
+records both tables, size for size, in a tracked file, and removes this entry.
+Code site (`TODO(page-rig-baseline-record)`):
+`frontend/src/page-rig/page-rig-measure.test.ts`, where the figures are
+printed.
+
+## `byte-body-ceiling-per-activation`
+
+Owner ruling wanted: one activation's publishes are capped at 4 MiB in total
+by the constant `MAX_PUBLISH_BYTES_PER_ACTIVATION`
+(`brenn-budget/src/lib.rs`), and nothing else bounds a non-transportable
+channel's body by size, so under the byte-carrying contract
+`brenn:processor@0.2.0` the binary state a component can hold in one message
+on an `io` port tops out at 4 MiB raw (about 3,000,000 B today as base64), on
+the backend and on the surface. The binary-bus project's spec asks for
+"storing large state in binary" on a surface `io` port and routes large
+objects to blobs; nobody has ruled where one ends and the other begins.
+Options: (a) leave the constant — state above 4 MiB is a blob's job and waits
+for the blob slices; costs nothing now; (b) raise the constant — a larger
+host-memory backstop for every component on both hosts; (c) make it a
+per-channel or operator setting — new configuration surface, and the
+constant's own doc treats it as a fixed backstop. Under (b) or (c) the change
+belongs with the surface host's byte path. Code site
+(`TODO(byte-body-ceiling-per-activation)`): the constant.
+
+## `attach-v4-beside-v5`
+
+Owner ruling wanted: whether, and for how long, the remote route serves
+attach protocol v4 beside v5. From the release carrying this entry the server
+holds v4 and v5 sessions at once. The owner's spec for the binary bus asks for
+a dual period for the WIT component contract only; the dual service of two
+wire versions was chosen by the project's owner-proxy, against the
+repository's no-backward-compat default, because the remote route has no
+build-id gate and a daemon deploys on its own schedule
+(`brenn-server/src/routes/remote.rs`), and an out-of-tree daemon (the pod
+bridge) takes `brenn-attach-client` by pin. Questions: (1) Is v4 served at all
+past that release? Options: (a) until the known out-of-tree daemons have
+moved, then removed — needs someone to say what the pod pins; (b) to the same
+end as the string component contract's period (`dual-contract-period-length`);
+(c) a fixed number of releases or a date; (d) a hard cut — remove v4 at the
+next release; a v4 daemon then fails negotiation until rebuilt at a new pin,
+and the server's per-version reader and writer and the client crate's v4 codec
+go (about 450 lines are the remote route's dual service while the page is on
+v4; about 1,300 are removed when v4 goes, page included). The page is not part
+of the question: it moves to v5 in lockstep with the backend. (2) Blob
+transfer for remote attachers is not designed, and under the protocol's
+strict-schema rule ("Any schema change bumps the transport version") it is
+expected to arrive as a version 6 unless that design's growth rule for v5 says
+otherwise: when it does, is the oldest served version dropped, or are three
+served? (3) Where is a version's removal announced to daemon authors? Until
+ruled, v4 stays served, and no document or log line names a removal release.
+Code site (`TODO(attach-v4-beside-v5)`): `SUPPORTED_VERSIONS` in
+`attach/proto/src/lib.rs`.
+
+## `remote-send-budget-knob`
+
+Owner ruling wanted: a remote attacher's send budget is 256 tokens refilled
+one per 15 seconds, fixed in code and shared by all its sessions, so a remote
+sustains four messages a minute onto a durable channel and four `PublishBatch`
+entries a minute onto any channel, and no operator setting raises it; the
+connection bucket and the channel send rate beside it are operator settings.
+Options: leave it (durable channels and batches are not a remote's streaming
+carriers; ephemeral single publishes are); give the `remote` block a budget
+setting bounded as `publish_burst` is; or exempt ephemeral-only batches from
+the draw, as an ephemeral single publish is exempt. Code site
+(`TODO(remote-send-budget-knob)`): `brenn-messaging-boot/src/plan.rs`, where a
+remote's budget is assigned.
+
+## `attach-replay-pass-frame-size`
+
+A subscribe replay or a catch-up drain is written as one `Deliver` frame
+holding up to `max(push_depth, retain_depth)` rows, and no bound on that
+frame's size was found at either end short of the native client's library
+default (64 MiB a message). A subscription whose window times the body cap
+exceeds it would fail the transport on every reconnect. Needs a design:
+splitting a pass changes how many delivery points it is. Code site
+(`TODO(attach-replay-pass-frame-size)`): `send_pass` in
+`attach/server/src/subscription.rs`.
+
 ## `surface-byte-crossing-in-browser`
 
 The page's body crossing — guest, jco glue, `frontend/src/surface.ts`,
@@ -107,7 +203,7 @@ cycle".
 
 Owner ruling needed before the release that declares the byte-carrying
 component contract stable: how long the old `brenn:processor` string contract
-(and attach v4) stays supported after that release, and how out-of-tree
+stays supported after that release, and how out-of-tree
 authors are told. Options: a fixed number of releases; a date; or until the
 owner's known out-of-tree repositories have moved plus a warning period for
 unknown ones. The backend warns at boot and after a reload, naming every
@@ -117,7 +213,8 @@ header and `docs/component-packages.md` describe the period without a length.
 The period does not begin while 0.2.0 is marked provisional (see
 `binary-contract-version-mechanism`), so its length is counted from the
 release that declares 0.2.0 stable; the answer goes into the warning and
-those two texts. (Sizing spike report §5 OQ5 and §4.)
+those two texts. (Sizing spike report §5 OQ5 and §4.) Attach v4's period
+is asked separately, under `attach-v4-beside-v5`.
 
 ## `blob-handle-integrity`
 

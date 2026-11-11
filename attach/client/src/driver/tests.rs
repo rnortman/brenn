@@ -8,7 +8,7 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use brenn_attach_proto::{SUPPORTED_VERSIONS, VersionRange};
+use brenn_attach_proto::{Codec, MessageBody, SUPPORTED_VERSIONS, VersionRange, WireMessage};
 use futures_channel::mpsc;
 use futures_util::StreamExt;
 
@@ -27,20 +27,32 @@ fn config() -> ConnConfig {
         liveness_multiplier: 3,
         backoff_jitter_seed: 0,
         terminal_close_codes: vec![3001],
+        versions: SUPPORTED_VERSIONS,
     }
 }
 
+/// A server frame as the v4 text it is written as.
+fn server_text(frame: &ServerFrame) -> String {
+    let WireMessage::Text(text) = Codec::negotiated(4).encode_server(frame) else {
+        panic!("a v4 frame is text");
+    };
+    text
+}
+
 fn server_hello() -> String {
-    serde_json::to_string(&ServerFrame::Hello {
+    server_text(&ServerFrame::Hello {
         versions: SUPPORTED_VERSIONS,
         ident: "peer".to_string(),
     })
-    .unwrap()
 }
 
 fn welcome() -> String {
-    serde_json::to_string(&ServerFrame::Welcome {
-        version: SUPPORTED_VERSIONS.max,
+    welcome_at(SUPPORTED_VERSIONS.max)
+}
+
+fn welcome_at(version: u32) -> String {
+    server_text(&ServerFrame::Welcome {
+        version,
         participant_id: "attacher:demo".to_string(),
         session_id: "sess-1".to_string(),
         heartbeat_secs: 20,
@@ -48,7 +60,6 @@ fn welcome() -> String {
         max_frame_bytes: 8192,
         alert_granted: false,
     })
-    .unwrap()
 }
 
 // ── the scripted transport ────────────────────────────────────────────────
@@ -73,7 +84,7 @@ enum Plan {
 #[derive(Clone)]
 struct Controls {
     plans: Arc<Mutex<VecDeque<Plan>>>,
-    written: Arc<Mutex<Vec<String>>>,
+    written: Arc<Mutex<Vec<WireMessage>>>,
     connects: Arc<AtomicUsize>,
 }
 
@@ -144,14 +155,20 @@ impl Controls {
         }
     }
 
-    fn written(&self) -> Vec<String> {
+    fn written(&self) -> Vec<WireMessage> {
         self.written.lock().unwrap().clone()
     }
 
+    /// What the driver wrote, decoded with the codec it negotiated; a message
+    /// that does not decode fails the test.
     fn frames(&self) -> Vec<ClientFrame> {
         self.written()
-            .iter()
-            .map(|text| serde_json::from_str(text).expect("the driver writes client frames"))
+            .into_iter()
+            .map(|msg| {
+                Codec::negotiated(SUPPORTED_VERSIONS.max)
+                    .decode_client(msg)
+                    .unwrap_or_else(|err| panic!("the driver wrote an undecodable message: {err}"))
+            })
             .collect()
     }
 
@@ -162,7 +179,7 @@ impl Controls {
 
 struct ScriptedConnector {
     plans: Arc<Mutex<VecDeque<Plan>>>,
-    written: Arc<Mutex<Vec<String>>>,
+    written: Arc<Mutex<Vec<WireMessage>>>,
     connects: Arc<AtomicUsize>,
 }
 
@@ -205,18 +222,18 @@ impl TransportConnector for ScriptedConnector {
 
 struct ScriptedConnection {
     incoming: mpsc::UnboundedReceiver<TransportEvent>,
-    written: Arc<Mutex<Vec<String>>>,
+    written: Arc<Mutex<Vec<WireMessage>>>,
     closed: Arc<AtomicBool>,
     fail_writes: Arc<AtomicUsize>,
 }
 
 impl TransportConnection for ScriptedConnection {
-    async fn send_text(&mut self, text: String) -> Result<(), TransportError> {
+    async fn send(&mut self, message: WireMessage) -> Result<(), TransportError> {
         if self.fail_writes.load(Ordering::SeqCst) > 0 {
             self.fail_writes.fetch_sub(1, Ordering::SeqCst);
             return Err(TransportError::new("scripted write failed"));
         }
-        self.written.lock().unwrap().push(text);
+        self.written.lock().unwrap().push(message);
         Ok(())
     }
 
@@ -259,23 +276,43 @@ async fn attached_armable(
     Arc<AtomicBool>,
     Arc<AtomicUsize>,
 ) {
+    attached_on(controls, SUPPORTED_VERSIONS.max).await
+}
+
+/// [`attached_armable`] on `version`: the driver offers exactly that version
+/// and the peer's `Welcome` states it.
+async fn attached_on(
+    controls: &Controls,
+    version: u32,
+) -> (
+    AttachDriver<ScriptedConnector>,
+    mpsc::UnboundedSender<TransportEvent>,
+    Arc<AtomicBool>,
+    Arc<AtomicUsize>,
+) {
     let (feed, closed, fail_writes) = controls.succeed_failing_writes(0);
-    let mut driver = AttachDriver::new(config(), controls.connector());
+    let config = ConnConfig {
+        versions: VersionRange::exactly(version),
+        ..config()
+    };
+    let mut driver = AttachDriver::new(config, controls.connector());
     driver.start().await;
     let url = driver
         .take_pending_connect()
         .expect("a connect was asked for");
     let opened = driver.connect(&url).await;
     driver.on_input(opened).await;
-    feed.unbounded_send(TransportEvent::Text(server_hello()))
+    feed.unbounded_send(TransportEvent::Message(WireMessage::Text(server_hello())))
         .unwrap();
     let hello = driver.wait().await;
     let IoEvent::Conn(hello) = hello else {
         panic!("expected the peer hello");
     };
     driver.on_input(hello).await;
-    feed.unbounded_send(TransportEvent::Text(welcome()))
-        .unwrap();
+    feed.unbounded_send(TransportEvent::Message(WireMessage::Text(welcome_at(
+        version,
+    ))))
+    .unwrap();
     let IoEvent::Conn(welcome) = driver.wait().await else {
         panic!("expected the welcome");
     };
@@ -371,12 +408,12 @@ async fn a_plane_s_frame_is_handed_back_rather_than_consumed() {
     let controls = Controls::new();
     let (mut driver, feed, _closed) = attached(&controls).await;
 
-    let result = serde_json::to_string(&ServerFrame::PublishResult {
+    let result = server_text(&ServerFrame::PublishResult {
         correlation: Some(7),
         outcome: brenn_attach_proto::PublishOutcome::Ok,
-    })
-    .unwrap();
-    feed.unbounded_send(TransportEvent::Text(result)).unwrap();
+    });
+    feed.unbounded_send(TransportEvent::Message(WireMessage::Text(result)))
+        .unwrap();
     let IoEvent::Conn(input) = driver.wait().await else {
         panic!("expected the frame");
     };
@@ -397,8 +434,8 @@ async fn the_connection_s_own_frames_are_consumed_and_route_nothing() {
     let controls = Controls::new();
     let (mut driver, feed, _closed) = attached(&controls).await;
 
-    let heartbeat = serde_json::to_string(&ServerFrame::Heartbeat).unwrap();
-    feed.unbounded_send(TransportEvent::Text(heartbeat))
+    let heartbeat = server_text(&ServerFrame::Heartbeat);
+    feed.unbounded_send(TransportEvent::Message(WireMessage::Text(heartbeat)))
         .unwrap();
     let IoEvent::Conn(input) = driver.wait().await else {
         panic!("expected the heartbeat");
@@ -464,20 +501,78 @@ async fn a_transport_failure_carries_no_close_code() {
     );
 }
 
-/// The protocol is JSON text, so a binary frame is the peer's violation — and the
-/// one input this end is least entitled to swallow.
+/// A binary message is handed to the connection whole: the connection's codec,
+/// not the driver, decides whether it is a frame or the peer's violation.
 #[tokio::test]
 async fn a_binary_frame_reaches_the_connection_as_one() {
     let controls = Controls::new();
     let (mut driver, feed, _closed) = attached(&controls).await;
 
-    feed.unbounded_send(TransportEvent::Binary(vec![0]))
+    feed.unbounded_send(TransportEvent::Message(WireMessage::Binary(vec![0, 0xff])))
         .unwrap();
     assert_eq!(
         driver.wait().await,
-        IoEvent::Conn(ConnInput::BinaryFrame),
-        "the driver maps it rather than dropping it"
+        IoEvent::Conn(ConnInput::Frame(WireMessage::Binary(vec![0, 0xff]))),
+        "the driver passes its bytes through rather than dropping them"
     );
+}
+
+/// Before a version is agreed the driver writes the frozen `Hello` shell as
+/// text; once v5 is in force a body-carrying frame goes out as one binary
+/// message holding its body's bytes and type.
+#[tokio::test]
+async fn hello_is_written_as_text_and_a_v5_publish_as_binary() {
+    let controls = Controls::new();
+    let (mut driver, _feed, _closed, _) = attached_on(&controls, 5).await;
+    let body = MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, 0x00, 0xfe])
+        .expect("binary under a binary type");
+    let publish = ClientFrame::Publish {
+        channel: "brenn:frames".to_string(),
+        attribution: None,
+        body: body.clone(),
+        urgency: brenn_attach_proto::Urgency::Normal,
+        correlation: Some(7),
+    };
+    let step = driver.send(vec![publish.clone()]).await;
+    assert!(step.events.is_empty());
+
+    let written = controls.written();
+    let [hello, sent] = written.as_slice() else {
+        panic!("expected Hello then the publish, got {written:?}");
+    };
+    assert!(
+        matches!(hello, WireMessage::Text(_)),
+        "Hello is the frozen text shell, got {hello:?}"
+    );
+    assert!(
+        matches!(sent, WireMessage::Binary(_)),
+        "a v5 Publish is a binary message, got {sent:?}"
+    );
+    assert_eq!(
+        Codec::negotiated(5).decode_client(sent.clone()),
+        Ok(publish),
+        "and it decodes back with its body intact"
+    );
+}
+
+/// Under v4 a publish of a body v4 cannot write is the embedder's bug, and it
+/// is caught at the encoder, naming the version and the body.
+#[tokio::test]
+#[should_panic(
+    expected = "attach v4 cannot carry a client body that is not untyped text (image/jpeg, 2 bytes)"
+)]
+async fn a_body_v4_cannot_carry_panics_at_the_encoder() {
+    let controls = Controls::new();
+    let (mut driver, _feed, _closed, _) = attached_on(&controls, 4).await;
+    driver
+        .send(vec![ClientFrame::Publish {
+            channel: "brenn:frames".to_string(),
+            attribution: None,
+            body: MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8]).unwrap(),
+            urgency: brenn_attach_proto::Urgency::Normal,
+            correlation: Some(1),
+        }])
+        .await;
 }
 
 #[tokio::test]
@@ -753,16 +848,18 @@ async fn an_arrived_frame_outranks_an_expired_liveness_deadline() {
     let controls = Controls::new();
     let (mut driver, feed, _closed) = attached(&controls).await;
 
-    let heartbeat = serde_json::to_string(&ServerFrame::Heartbeat).unwrap();
-    feed.unbounded_send(TransportEvent::Text(heartbeat.clone()))
-        .unwrap();
+    let heartbeat = server_text(&ServerFrame::Heartbeat);
+    feed.unbounded_send(TransportEvent::Message(WireMessage::Text(
+        heartbeat.clone(),
+    )))
+    .unwrap();
     // 3 × 20s: the liveness deadline is now in the past, and the frame is already
     // sitting in the feed.
     tokio::time::advance(Duration::from_secs(61)).await;
 
     assert_eq!(
         driver.wait().await,
-        IoEvent::Conn(ConnInput::TextFrame(heartbeat))
+        IoEvent::Conn(ConnInput::Frame(WireMessage::Text(heartbeat)))
     );
 }
 
@@ -845,12 +942,12 @@ async fn an_incompatible_peer_is_terminal_without_a_refusal_frame() {
     let opened = driver.connect(&url).await;
     driver.on_input(opened).await;
 
-    let hello = serde_json::to_string(&ServerFrame::Hello {
+    let hello = server_text(&ServerFrame::Hello {
         versions: VersionRange { min: 7, max: 9 },
         ident: "future".to_string(),
-    })
-    .unwrap();
-    feed.unbounded_send(TransportEvent::Text(hello)).unwrap();
+    });
+    feed.unbounded_send(TransportEvent::Message(WireMessage::Text(hello)))
+        .unwrap();
     let IoEvent::Conn(input) = driver.wait().await else {
         panic!("expected the peer hello");
     };
@@ -878,13 +975,13 @@ async fn the_attachment_facts_reach_the_embedder_whole() {
     let url = driver.take_pending_connect().unwrap();
     let opened = driver.connect(&url).await;
     driver.on_input(opened).await;
-    feed.unbounded_send(TransportEvent::Text(server_hello()))
+    feed.unbounded_send(TransportEvent::Message(WireMessage::Text(server_hello())))
         .unwrap();
     let IoEvent::Conn(hello) = driver.wait().await else {
         panic!("expected the peer hello");
     };
     driver.on_input(hello).await;
-    feed.unbounded_send(TransportEvent::Text(welcome()))
+    feed.unbounded_send(TransportEvent::Message(WireMessage::Text(welcome())))
         .unwrap();
     let IoEvent::Conn(input) = driver.wait().await else {
         panic!("expected the welcome");

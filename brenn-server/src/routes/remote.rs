@@ -18,7 +18,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use brenn_attach_proto::max_client_frame_bytes;
+use brenn_attach_proto::{SUPPORTED_VERSIONS, max_transport_frame_bytes};
 use brenn_attach_server::profile::AttachProfile;
 use brenn_attach_server::registry::{AttachSessionHandle, PUSH_QUEUE_FRAMES, RegisterRejection};
 use brenn_attach_server::session::{AttachSessionParams, run_attach_session};
@@ -105,7 +105,11 @@ pub async fn remote_ws_handler(
         }
     };
 
-    let cap = max_client_frame_bytes(runtime.max_body_bytes);
+    // Every supported version is served here, so a deployed v4 daemon and a v5
+    // one attach alike. The read cap is set before a version is agreed: the
+    // largest of the served versions' caps; the session checks each message
+    // against the negotiated one's own.
+    let cap = max_transport_frame_bytes(SUPPORTED_VERSIONS, runtime.max_body_bytes);
     let heartbeat_secs = state.attach_heartbeat_secs;
     let ident = state.build_id.to_string();
     let alert_dispatcher = state.alert_dispatcher.clone();
@@ -127,6 +131,7 @@ pub async fn remote_ws_handler(
                 account,
                 ip,
                 max_body_bytes: runtime.max_body_bytes,
+                versions: SUPPORTED_VERSIONS,
                 heartbeat_secs,
                 store_incarnation: runtime.store_incarnation(),
                 ident,

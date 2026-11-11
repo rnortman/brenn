@@ -240,6 +240,96 @@ impl<'de> Deserialize<'de> for MessageEnvelope {
     }
 }
 
+/// An envelope's fields without its body, as read from the header shape: the
+/// `header` of a 0.2.0 `envelope` and of an attach v5 row.
+///
+/// The header shape is written from the envelope itself, as
+/// [`HeaderShape`]. This type is its reader, and the object is open on
+/// purpose: every key it does not know is ignored — including `body`, which
+/// this shape does not hold — so a writer may add keys a reader built before
+/// them skips. A missing optional field reads as absent; a missing required
+/// one is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct EnvelopeHeader {
+    message_id: uuid::Uuid,
+    source: String,
+    channel: String,
+    sender: String,
+    publish_ts: chrono::DateTime<chrono::Utc>,
+    reply_to: Option<String>,
+    delivery_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    deliver_after: Option<chrono::DateTime<chrono::Utc>>,
+    impetus: Option<Impetus>,
+    urgency: Urgency,
+    envelope_type: ChannelScheme,
+}
+
+impl MessageEnvelope {
+    /// This envelope's fields without its body, cloned.
+    pub fn header(&self) -> EnvelopeHeader {
+        // Destructured without `..`, so a field added to the envelope does not
+        // compile until the header holds it.
+        let MessageEnvelope {
+            message_id,
+            source,
+            channel,
+            sender,
+            publish_ts,
+            body: _,
+            reply_to,
+            delivery_deadline,
+            deliver_after,
+            impetus,
+            urgency,
+            envelope_type,
+        } = self;
+        EnvelopeHeader {
+            message_id: *message_id,
+            source: source.clone(),
+            channel: channel.clone(),
+            sender: sender.clone(),
+            publish_ts: *publish_ts,
+            reply_to: reply_to.clone(),
+            delivery_deadline: *delivery_deadline,
+            deliver_after: *deliver_after,
+            impetus: *impetus,
+            urgency: *urgency,
+            envelope_type: *envelope_type,
+        }
+    }
+
+    /// The envelope made of `header`'s fields and `body`.
+    pub fn from_header(header: EnvelopeHeader, body: MessageBody) -> MessageEnvelope {
+        let EnvelopeHeader {
+            message_id,
+            source,
+            channel,
+            sender,
+            publish_ts,
+            reply_to,
+            delivery_deadline,
+            deliver_after,
+            impetus,
+            urgency,
+            envelope_type,
+        } = header;
+        MessageEnvelope {
+            message_id,
+            source,
+            channel,
+            sender,
+            publish_ts,
+            body,
+            reply_to,
+            delivery_deadline,
+            deliver_after,
+            impetus,
+            urgency,
+            envelope_type,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +496,72 @@ mod tests {
         text.as_object_mut().unwrap().remove("body");
         let header: serde_json::Value = serde_json::from_str(&env.to_header_json()).unwrap();
         assert_eq!(header, text);
+    }
+
+    fn fully_populated(body: MessageBody) -> MessageEnvelope {
+        let at = |secs| DateTime::<Utc>::from_timestamp(secs, 0).unwrap();
+        MessageEnvelope {
+            message_id: Uuid::from_u128(0x0123_4567_89ab_cdef),
+            source: "src".to_string(),
+            channel: "ephemeral:chan".to_string(),
+            sender: "alice".to_string(),
+            publish_ts: at(1_700_000_000),
+            body,
+            reply_to: Some("brenn:replies".to_string()),
+            delivery_deadline: Some(at(1_700_000_100)),
+            deliver_after: Some(at(1_700_000_050)),
+            impetus: Some(Impetus::Replenish),
+            urgency: Urgency::High,
+            envelope_type: ChannelScheme::Ephemeral,
+        }
+    }
+
+    /// Every field survives the header shape, whatever the body; the body
+    /// rejoins the header whole.
+    #[test]
+    fn an_envelope_round_trips_through_its_header_and_body() {
+        let typed = MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+        for env in [
+            fully_populated(binary()),
+            fully_populated(typed),
+            envelope(MessageBody::text("x")),
+        ] {
+            let header: EnvelopeHeader = serde_json::from_str(&env.to_header_json()).unwrap();
+            assert_eq!(header, env.header());
+            assert_eq!(MessageEnvelope::from_header(header, env.body.clone()), env);
+        }
+    }
+
+    /// Absent optional fields read as absent; a key the reader does not know,
+    /// `body` included, is skipped.
+    #[test]
+    fn the_header_reader_ignores_unknown_keys() {
+        let env = envelope(MessageBody::text("x"));
+        let mut v: serde_json::Value = serde_json::from_str(&env.to_header_json()).unwrap();
+        v["blob"] = json!({"id": "abc", "len": 7});
+        v["body"] = json!("ignored");
+        v["content_type"] = json!("image/jpeg");
+        let header: EnvelopeHeader = serde_json::from_value(v).unwrap();
+        assert_eq!(header, env.header());
+    }
+
+    #[test]
+    fn the_header_reader_refuses_a_missing_required_field() {
+        let env = envelope(MessageBody::text("x"));
+        for key in [
+            "message_id",
+            "source",
+            "channel",
+            "sender",
+            "publish_ts",
+            "urgency",
+            "envelope_type",
+        ] {
+            let mut v: serde_json::Value = serde_json::from_str(&env.to_header_json()).unwrap();
+            v.as_object_mut().unwrap().remove(key);
+            let err = serde_json::from_value::<EnvelopeHeader>(v).unwrap_err();
+            assert!(err.to_string().contains(key), "{key}: {err}");
+        }
     }
 
     #[test]

@@ -27,8 +27,9 @@ use brenn_attach_conformance::{
     AttachClient, ClientConfig, Credential, DeferredOpKind, Observation, PublishBatchOutcome,
     PublishRequest, ResumePolicy, SubscriptionDepths,
 };
-use brenn_attach_proto::{PublishOutcome, Urgency};
+use brenn_attach_proto::{PublishOutcome, Urgency, VersionRange};
 use brenn_messaging::testutils::ephemeral_channel_entry;
+use brenn_surface_schema::SURFACE_ATTACH_VERSION;
 use std::time::Duration;
 
 use brenn_surface_server::test_fixtures::{COMPONENT, EPH_ADDR, EPH_NAME, deskbar_loop};
@@ -77,6 +78,7 @@ async fn build_rig(db: &brenn_db::Db, retain_depth: u64) -> Rig {
         ),
         credential: Credential::SessionCookie(token),
         ident: "attach-conformance".to_string(),
+        versions: VersionRange::exactly(SURFACE_ATTACH_VERSION),
     });
     Rig {
         client,
@@ -90,7 +92,7 @@ fn publish(body: &str) -> PublishRequest {
     PublishRequest {
         channel: EPH_ADDR.to_string(),
         attribution: Some(COMPONENT.to_string()),
-        body: body.to_string(),
+        body: body.into(),
         urgency: Urgency::Normal,
     }
 }
@@ -124,9 +126,8 @@ async fn a_non_browser_attacher_subscribes_publishes_and_resumes_across_a_severe
         "the attachment speaks as the principal, before any attribution"
     );
     assert_eq!(
-        facts.version,
-        brenn_attach_proto::SUPPORTED_VERSIONS.max,
-        "the only version either end speaks"
+        facts.version, SURFACE_ATTACH_VERSION,
+        "the version the surface route serves"
     );
     assert!(
         !facts.alert_granted,
@@ -143,7 +144,7 @@ async fn a_non_browser_attacher_subscribes_publishes_and_resumes_across_a_severe
 
     assert_eq!(rig.client.publish(publish("one")).await, PublishOutcome::Ok);
     let first = rig.client.next_delivery(EPH_ADDR).await;
-    assert_eq!(first.body, "one");
+    assert_eq!(first.text(), "one");
     assert_eq!(
         first.sender, "surface:deskbar#protobar",
         "the attribution mints the component's sub-identity, server-side"
@@ -171,7 +172,8 @@ async fn a_non_browser_attacher_subscribes_publishes_and_resumes_across_a_severe
     assert_eq!(rig.client.publish(publish("two")).await, PublishOutcome::Ok);
     let second = rig.client.next_delivery(EPH_ADDR).await;
     assert_eq!(
-        second.body, "two",
+        second.text(),
+        "two",
         "the stream continues past the resume point rather than repeating it"
     );
     assert_eq!(
@@ -204,7 +206,7 @@ async fn a_cursorless_subscription_is_replayed_the_retained_window_at_every_atta
         rig.client.publish(publish("state")).await,
         PublishOutcome::Ok
     );
-    assert_eq!(rig.client.next_delivery(EPH_ADDR).await.body, "state");
+    assert_eq!(rig.client.next_delivery(EPH_ADDR).await.text(), "state");
 
     rig.relay.sever();
     expect_detach(&mut rig.client).await;
@@ -216,7 +218,7 @@ async fn a_cursorless_subscription_is_replayed_the_retained_window_at_every_atta
         "no cursor is claimed, so the retained window comes again"
     );
     assert_eq!(
-        rig.client.next_delivery(EPH_ADDR).await.body,
+        rig.client.next_delivery(EPH_ADDR).await.text(),
         "state",
         "and the retained message is what arrives"
     );
@@ -281,7 +283,7 @@ async fn a_due_but_unreleased_entry_is_seeded_at_welcome_and_a_cancel_naming_it_
         .next_deferred_view(EPH_ADDR, Some(COMPONENT))
         .await;
     assert_eq!(parked.len(), 1, "one message is standing on the channel");
-    assert_eq!(parked[0].body, "tick");
+    assert_eq!(parked[0].body, "tick".into());
     assert_eq!(
         parked[0].deliver_after, deliver_after,
         "the mirror states the instant the attacher asked for"
@@ -401,7 +403,10 @@ async fn a_flush_offered_while_detached_is_sent_once_at_the_next_attachment() {
         .next_deferred_view(EPH_ADDR, Some(COMPONENT))
         .await;
     assert_eq!(
-        parked.iter().map(|e| e.body.as_str()).collect::<Vec<_>>(),
+        parked
+            .iter()
+            .map(|e| e.body.as_text().unwrap())
+            .collect::<Vec<_>>(),
         ["held"],
         "applied exactly once: a re-send would park it twice",
     );
@@ -455,7 +460,10 @@ async fn a_flush_past_a_registrants_depth_is_dropped_and_named() {
         .next_deferred_view(EPH_ADDR, Some(COMPONENT))
         .await;
     assert_eq!(
-        parked.iter().map(|e| e.body.as_str()).collect::<Vec<_>>(),
+        parked
+            .iter()
+            .map(|e| e.body.as_text().unwrap())
+            .collect::<Vec<_>>(),
         ["second"],
         "the cap dropped the oldest flush, and only the newest reached the peer",
     );

@@ -357,10 +357,19 @@ fn on_batch_result(
     outcome: PublishBatchOutcome,
     now: Millis,
 ) -> Result<Inbound, String> {
+    // The page attaches at v4, which cannot carry the non-text body this
+    // refusal answers, so a peer that sends it is not a conforming one.
+    if outcome == PublishBatchOutcome::TextOnlyChannel {
+        return Err(format!(
+            "PublishBatchResult {correlation} answered {outcome:?}, which a v4 attachment cannot \
+             earn"
+        ));
+    }
     let BatchAnswer {
         steps,
         registrant,
         lost,
+        outcome: _,
     } = page.outbound.on_batch_result(correlation, outcome, now)?;
     Ok(Inbound {
         steps,

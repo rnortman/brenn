@@ -292,6 +292,7 @@ pub struct AttachCtxBuilder {
     alert_dispatcher: Option<AlertDispatcher>,
     max_body_bytes: usize,
     session_id: Uuid,
+    version: u32,
 }
 
 impl AttachCtxBuilder {
@@ -303,7 +304,14 @@ impl AttachCtxBuilder {
             alert_dispatcher: None,
             max_body_bytes: TEST_BODY_BYTES,
             session_id: Uuid::nil(),
+            version: 4,
         }
+    }
+
+    /// The version the built context has negotiated; 4 unless stated.
+    pub fn version(mut self, version: u32) -> Self {
+        self.version = version;
+        self
     }
 
     /// A real `Messenger`, for the planes that read the store or publish.
@@ -354,9 +362,7 @@ impl AttachCtxBuilder {
             tx,
             // A built context stands for an attached session, which has agreed
             // a version.
-            negotiated_version: std::sync::OnceLock::from(
-                brenn_attach_proto::SUPPORTED_VERSIONS.max,
-            ),
+            negotiated_version: Arc::new(std::sync::OnceLock::from(self.version)),
         };
         (ctx, rx)
     }

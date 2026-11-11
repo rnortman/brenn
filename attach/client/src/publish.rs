@@ -30,8 +30,8 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use brenn_attach_proto::{
-    BatchDeferredOp, BatchEntry, ClientFrame, DeferredViewEntry, PublishBatchOutcome,
-    check_batch_legality,
+    BatchDeferredOp, BatchEntry, ClientFrame, Codec, DeferredOpKind, DeferredViewEntry,
+    MessageBody, PublishBatchOutcome,
 };
 use brenn_envelope::Urgency;
 
@@ -48,19 +48,41 @@ pub const RETRY_INTERVAL_MS: u64 = 1_000;
 
 /// One immediate publish, as the attacher hands it over.
 ///
-/// A struct rather than a parameter list: `channel` and `body` are both `String`
-/// and a transposition would typecheck and publish the address into the message.
+/// A struct rather than a parameter list, so the fields are named where one is
+/// built. Built through [`PublishRequest::new`] by code outside this repository:
+/// a field added later breaks a struct literal and not the constructor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRequest {
     pub channel: String,
     /// The sub-identity sending, or `None` for the attacher itself. Opaque here:
     /// the peer validates it against the set its own configuration declares.
     pub attribution: Option<String>,
-    pub body: String,
+    /// What the attachment's version can write is
+    /// [`AttachmentFacts::carries`](crate::AttachmentFacts::carries)'s answer;
+    /// a body it answers false for panics at the encoder.
+    pub body: MessageBody,
     /// Concrete on the wire, so the attacher resolves any per-channel default it
     /// configures before it gets here — the same value it would stamp onto an
     /// envelope it routes itself.
     pub urgency: Urgency,
+}
+
+impl PublishRequest {
+    /// A publish from the attacher itself.
+    pub fn new(channel: impl Into<String>, body: MessageBody, urgency: Urgency) -> Self {
+        Self {
+            channel: channel.into(),
+            attribution: None,
+            body,
+            urgency,
+        }
+    }
+
+    /// The same publish, sent under the sub-identity `attribution`.
+    pub fn attribution(mut self, attribution: impl Into<String>) -> Self {
+        self.attribution = Some(attribution.into());
+        self
+    }
 }
 
 /// Compose one [`ClientFrame::Publish`]. `correlation` of `None` asks for no
@@ -173,8 +195,8 @@ impl FlushBatch {
         self.entries.is_empty() && self.ops.is_empty()
     }
 
-    /// The serialized size of the `PublishBatch` frame this flush composes to
-    /// under `attribution`.
+    /// The encoded size, under `codec`, of the `PublishBatch` frame this flush
+    /// composes to under `attribution`.
     ///
     /// For an embedder re-checking a queued flush against an attachment's frame
     /// cap: the cap is per-attachment and derived from the body cap, so it shrinks
@@ -183,16 +205,20 @@ impl FlushBatch {
     ///
     /// Measured against the widest correlation the plane can mint, so the answer
     /// never understates the frame that goes out.
-    pub fn frame_bytes(&self, attribution: Option<&str>) -> usize {
-        let frame = ClientFrame::PublishBatch {
-            attribution: attribution.map(str::to_string),
-            correlation: u64::MAX,
-            publishes: self.entries.clone(),
-            deferred_ops: self.ops.clone(),
-        };
-        serde_json::to_string(&frame)
-            .expect("attach client: a PublishBatch frame serializes to JSON")
-            .len()
+    pub fn frame_bytes(&self, codec: Codec, attribution: Option<&str>) -> usize {
+        codec.batch_frame_bytes(attribution, &self.entries, &self.ops)
+    }
+
+    /// Whether `codec` can write every body this flush holds, entries and
+    /// edits alike.
+    fn carried_by(&self, codec: Codec) -> bool {
+        self.entries.iter().all(|entry| codec.carries(&entry.body))
+            && self.ops.iter().all(|op| match &op.op {
+                DeferredOpKind::Edit {
+                    body: Some(body), ..
+                } => codec.carries(body),
+                DeferredOpKind::Edit { body: None, .. } | DeferredOpKind::Cancel => true,
+            })
     }
 }
 
@@ -253,8 +279,13 @@ pub struct BatchAnswer<K> {
     /// there — the registrant deregistered (or deregistered and registered again
     /// under the same key) while its batch was outstanding, or the embedder took
     /// it terminal and discarded its queue. `None` in every other case, including
-    /// an ordinary refusal, which is re-parked.
+    /// an ordinary refusal, which is re-parked. Also the flush the peer
+    /// refused as [`PublishBatchOutcome::TextOnlyChannel`], which can never
+    /// succeed and so is never re-parked.
     pub lost: Option<FlushBatch>,
+    /// What the peer answered, so the embedder can tell a refusal from a
+    /// renounced flush.
+    pub outcome: PublishBatchOutcome,
 }
 
 /// One registrant's outbox.
@@ -345,11 +376,12 @@ pub struct Outboxes<K: Ord> {
     /// Stamped onto each outbox at registration, so two registrations under one
     /// key are distinguishable for as long as the attachment lives.
     next_generation: u64,
-    /// The live attachment's publish-body cap, or `None` while detached. Off an
-    /// attachment there is no wire to carry a flush, so everything queues — and
-    /// no cap to judge a batch against, since the cap is a fact of the
-    /// attachment and the next one may state a different number.
-    body_cap: Option<usize>,
+    /// The live attachment's codec and publish-body cap, or `None` while
+    /// detached. Off an attachment there is no wire to carry a flush, so
+    /// everything queues — and no law to judge a batch by, since the version
+    /// and the cap are facts of the attachment and the next one may state
+    /// different ones.
+    law: Option<(Codec, usize)>,
     retry_armed: bool,
 }
 
@@ -360,7 +392,7 @@ impl<K: Clone + Ord> Default for Outboxes<K> {
             pending: HashMap::new(),
             next_correlation: 0,
             next_generation: 0,
-            body_cap: None,
+            law: None,
             retry_armed: false,
         }
     }
@@ -556,20 +588,28 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// contract is not a trade worth making. A flush that fails it is dropped
     /// whole, counted like a cap drop.
     ///
+    /// Before `survives` is asked, a flush holding an entry or edit body that
+    /// `codec` cannot carry is dropped the same way. Such a flush may have been
+    /// queued with no attachment to ask, or under a previous attachment that
+    /// negotiated a version that carries it, and writing it would panic at the
+    /// encoder.
+    ///
     /// Only the surviving head of each outbox goes out here: the queue is ordered
     /// and carries at most one flush on the wire, so the rest leave as each
     /// result comes back.
     ///
-    /// `body_cap` is the attachment's advertised publish-body cap, which is also
-    /// the budget batch legality spends: every frame this plane composes until
-    /// the next detach is asserted against it.
+    /// `codec` is the attachment's, whose batch law every frame this plane
+    /// composes until the next detach is asserted against, and `body_cap` is
+    /// the attachment's advertised publish-body cap, which is the budget that
+    /// law spends.
     pub fn on_attached(
         &mut self,
+        codec: Codec,
         body_cap: usize,
         now: Millis,
         survives: impl Fn(&K, &FlushBatch) -> bool,
     ) -> OutboxSteps<K> {
-        self.body_cap = Some(body_cap);
+        self.law = Some((codec, body_cap));
         let mut steps = OutboxSteps::default();
         let keys: Vec<K> = self.registrants.keys().cloned().collect();
         for key in keys {
@@ -581,7 +621,7 @@ impl<K: Clone + Ord> Outboxes<K> {
                 .drain(..)
                 .collect();
             for batch in parked {
-                let kept = survives(&key, &batch);
+                let kept = batch.carried_by(codec) && survives(&key, &batch);
                 let outbox = self
                     .registrants
                     .get_mut(&key)
@@ -608,7 +648,7 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// wire — and each registrant's in-flight marker clears with the frame it
     /// named, so the next attachment starts free.
     pub fn on_detached(&mut self) -> OutboxSteps<K> {
-        self.body_cap = None;
+        self.law = None;
         self.pending.clear();
         for outbox in self.registrants.values_mut() {
             outbox.in_flight = None;
@@ -637,6 +677,11 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// registrant whose queue the embedder has discarded: it renounced this flush
     /// too, so the refusal hands it back as [`BatchAnswer::lost`] instead of
     /// putting a dead registrant's work back on the wire.
+    ///
+    /// A [`TextOnlyChannel`](PublishBatchOutcome::TextOnlyChannel) refusal is
+    /// the other way round: no retry can ever succeed, so the flush is dropped
+    /// and counted, named in [`OutboxSteps::dropped`], handed back as
+    /// [`BatchAnswer::lost`], and the registrant's next flush goes out.
     ///
     /// The answer is matched to the *registration* that sent it, not merely to
     /// its key. A key deregistered and registered again while its batch was
@@ -671,12 +716,15 @@ impl<K: Clone + Ord> Outboxes<K> {
             // but a refusal drops ok'd entries that were never applied anywhere.
             let lost = match outcome {
                 PublishBatchOutcome::Ok => None,
-                PublishBatchOutcome::RateLimited => Some(batch),
+                PublishBatchOutcome::RateLimited | PublishBatchOutcome::TextOnlyChannel => {
+                    Some(batch)
+                }
             };
             return Ok(BatchAnswer {
                 steps: OutboxSteps::default(),
                 registrant: key,
                 lost,
+                outcome,
             });
         }
         let outbox = self
@@ -702,12 +750,22 @@ impl<K: Clone + Ord> Outboxes<K> {
                     steps.dropped.extend(self.park(&key, batch, true).dropped);
                 }
             }
+            // Terminal for this flush: the body it carries will never be text, so
+            // a retry would be refused the same way forever. It is dropped and
+            // counted, handed back as lost, and the wire is free for the next.
+            PublishBatchOutcome::TextOnlyChannel => {
+                outbox.dropped += 1;
+                steps.dropped.push(key.clone());
+                lost = Some(batch);
+                steps.frames.extend(self.pump(&key));
+            }
         }
         steps.retry_wakeup = self.retry_wakeup(now);
         Ok(BatchAnswer {
             steps,
             registrant: key,
             lost,
+            outcome,
         })
     }
 
@@ -770,7 +828,7 @@ impl<K: Clone + Ord> Outboxes<K> {
 
     /// Whether a flush for `key` may go straight to the wire.
     fn wire_free_for(&self, key: &K) -> bool {
-        if self.body_cap.is_none() {
+        if self.law.is_none() {
             return false;
         }
         let outbox = self
@@ -810,7 +868,7 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// Send `key`'s outbox head if the wire is free for it. The one place a
     /// queued flush leaves the attacher.
     fn pump(&mut self, key: &K) -> Vec<ClientFrame> {
-        if self.body_cap.is_none() {
+        if self.law.is_none() {
             return Vec::new();
         }
         let outbox = self
@@ -838,10 +896,10 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// buffer-time gates exist to make this unreachable, and reaching it is a
     /// bug in them rather than anything the wire should see.
     fn batch_frame(&mut self, key: &K, batch: FlushBatch) -> ClientFrame {
-        let body_cap = self
-            .body_cap
+        let (codec, body_cap) = self
+            .law
             .expect("attach client: composing a batch off an attachment");
-        if let Err(illegal) = check_batch_legality(&batch.entries, &batch.ops, body_cap) {
+        if let Err(illegal) = codec.check_batch_legality(&batch.entries, &batch.ops, body_cap) {
             panic!("attach client: illegal PublishBatch — {illegal}");
         }
         let correlation = self.next_correlation;
@@ -898,7 +956,7 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// armed for it would only wake to sweep every registrant and do nothing —
     /// idle work at exactly the loaded moment that produced the queue.
     fn blocked(&self) -> bool {
-        self.body_cap.is_some()
+        self.law.is_some()
             && self
                 .registrants
                 .values()

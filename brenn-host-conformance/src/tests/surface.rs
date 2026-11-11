@@ -139,7 +139,7 @@ struct Surface {
 /// none.
 fn facts() -> AttachmentFacts {
     AttachmentFacts {
-        version: brenn_attach_proto::SUPPORTED_VERSIONS.max,
+        version: brenn_surface_schema::SURFACE_ATTACH_VERSION,
         participant_id: "surface:conf".to_string(),
         session_id: "s-conf".to_string(),
         heartbeat_secs: 20,

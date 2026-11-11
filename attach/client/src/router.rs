@@ -505,12 +505,8 @@ impl<P: PlanePolicy> LocalRouter<P> {
             .map(|parked| DeferredViewEntry {
                 message_id: parked.message.message_id,
                 // The body, not the envelope: what a publisher gets back is what
-                // it handed over, on either channel class. The v4 entry carries
-                // a body as its text.
-                body: parked
-                    .message
-                    .require_text_body("attach v4 DeferredView")
-                    .to_owned(),
+                // it handed over, on either channel class.
+                body: parked.message.body.clone(),
                 deliver_after: parked.release_at,
             })
             .collect()

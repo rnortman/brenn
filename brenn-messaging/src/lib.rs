@@ -1466,37 +1466,23 @@ impl Messenger {
         channel_address: &str,
         sender: &str,
     ) -> Vec<store::DeferredMessage> {
-        self.store_for_bound_output(channel_address)
-            .deferred_for_sender(sender)
+        self.deferred_view_if_present(channel_address, sender)
             .await
+            .unwrap_or_else(|| bound_output_missing(channel_address))
     }
 
-    /// Resolves a bound WASM output port's channel address to its retention store.
+    /// [`deferred_view_for_sender`](Self::deferred_view_for_sender) for a
+    /// channel that may not be in the directory: `None` when it is not.
     ///
-    /// The caller must have resolved `channel_address` from a bound output port;
-    /// an address not in the directory is a boot-validation gap, not a runtime
-    /// condition.
-    ///
-    /// # Panics
-    ///
-    /// If `channel_address` resolves to no channel.
-    fn store_for_bound_output(&self, channel_address: &str) -> Arc<dyn store::RetentionStore> {
-        self.store_for(&self.bound_output_entry(channel_address))
-    }
-
-    /// Resolves a bound WASM output port's channel address to its directory
-    /// entry.
-    ///
-    /// # Panics
-    ///
-    /// If `channel_address` resolves to no channel.
-    fn bound_output_entry(&self, channel_address: &str) -> Arc<ChannelEntry> {
-        self.directory.resolve(channel_address).unwrap_or_else(|| {
-            panic!(
-                "messaging: deferred operation requested for channel {channel_address:?} not in \
-                 the directory — a bound output port must resolve"
-            )
-        })
+    /// For a caller whose targets are provisioned at runtime, where an absent
+    /// channel is an ordinary race rather than a broken boot invariant.
+    pub async fn deferred_view_if_present(
+        &self,
+        channel_address: &str,
+        sender: &str,
+    ) -> Option<Vec<store::DeferredMessage>> {
+        let entry = self.directory.resolve(channel_address)?;
+        Some(self.store_for(&entry).deferred_for_sender(sender).await)
     }
 
     /// Cancel one of `sender`'s parked messages on `channel_address`, named by its
@@ -1523,9 +1509,27 @@ impl Messenger {
         message_uuid: Uuid,
         now: DateTime<Utc>,
     ) -> store::DeferralOutcome {
-        self.store_for_bound_output(channel_address)
-            .cancel_deferred(sender, message_uuid, now)
+        self.cancel_deferred_if_present(channel_address, sender, message_uuid, now)
             .await
+            .unwrap_or_else(|| bound_output_missing(channel_address))
+    }
+
+    /// [`cancel_deferred_for_sender`](Self::cancel_deferred_for_sender) for a
+    /// channel that may not be in the directory: `None` when it is not, and
+    /// nothing is touched.
+    pub async fn cancel_deferred_if_present(
+        &self,
+        channel_address: &str,
+        sender: &str,
+        message_uuid: Uuid,
+        now: DateTime<Utc>,
+    ) -> Option<store::DeferralOutcome> {
+        let entry = self.directory.resolve(channel_address)?;
+        Some(
+            self.store_for(&entry)
+                .cancel_deferred(sender, message_uuid, now)
+                .await,
+        )
     }
 
     /// Edit one of `sender`'s parked messages on `channel_address`, named by its
@@ -1549,13 +1553,37 @@ impl Messenger {
         release_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> store::DeferralOutcome {
-        let entry = self.bound_output_entry(channel_address);
+        self.edit_deferred_if_present(channel_address, sender, message_uuid, body, release_at, now)
+            .await
+            .unwrap_or_else(|| bound_output_missing(channel_address))
+    }
+
+    /// [`edit_deferred_for_sender`](Self::edit_deferred_for_sender) for a
+    /// channel that may not be in the directory: `None` when it is not, and
+    /// nothing is touched.
+    ///
+    /// # Panics
+    ///
+    /// If `body` is a non-text body and the channel is text-only
+    /// ([`ChannelEntry::assert_may_hold`]).
+    pub async fn edit_deferred_if_present(
+        &self,
+        channel_address: &str,
+        sender: &str,
+        message_uuid: Uuid,
+        body: Option<MessageBody>,
+        release_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Option<store::DeferralOutcome> {
+        let entry = self.directory.resolve(channel_address)?;
         if let Some(body) = &body {
             entry.assert_may_hold(body);
         }
-        self.store_for(&entry)
-            .edit_deferred(sender, message_uuid, body, release_at, now)
-            .await
+        Some(
+            self.store_for(&entry)
+                .edit_deferred(sender, message_uuid, body, release_at, now)
+                .await,
+        )
     }
 
     /// The ring behind a non-durable channel, for tests that drive its
@@ -3264,6 +3292,15 @@ fn window_depth(depth: &config::Depth, subscriber: &ParticipantId, channel_addre
             brenn_activation::WINDOW_DEPTH_CEILING,
         ),
     }
+}
+
+/// The panic of a deferred operation on a bound output port whose channel the
+/// directory does not hold: boot validation proves every bound output resolves.
+fn bound_output_missing(channel_address: &str) -> ! {
+    panic!(
+        "messaging: deferred operation requested for channel {channel_address:?} not in the \
+         directory — a bound output port must resolve"
+    )
 }
 
 #[cfg(test)]

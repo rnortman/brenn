@@ -9,7 +9,7 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::TimerChange;
 use brenn_attach_client::router::{RouteOutcome, RouteRequest};
 use brenn_attach_client::subs::Subscriptions;
-use brenn_attach_proto::{ClientFrame, DeferredOpKind};
+use brenn_attach_proto::{ClientFrame, DeferredOpKind, MessageBody};
 use brenn_envelope::Urgency;
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::{
@@ -229,7 +229,7 @@ impl Page {
         self.router
             .parked_for(&self.stores, NOTES, Origin::Sub(instance))
             .into_iter()
-            .map(|entry| entry.body)
+            .map(|entry| entry.body.as_text().expect("a page parks text").to_string())
             .collect()
     }
 }
@@ -270,7 +270,7 @@ fn a_transportable_entry_carries_its_captured_channel_and_resolved_urgency() {
     let (entries, ops) = batch_parts(&report.steps.frames[0]);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].channel, WIRE);
-    assert_eq!(entries[0].body, "hello");
+    assert_eq!(entries[0].body, MessageBody::from("hello"));
     assert_eq!(
         entries[0].urgency,
         Urgency::High,
@@ -336,7 +336,7 @@ fn a_transportable_edit_carries_its_replacement_body_and_release_time() {
     assert_eq!(
         ops[0].op,
         DeferredOpKind::Edit {
-            body: Some("rewritten".to_string()),
+            body: Some("rewritten".into()),
             deliver_after: Some(9_000),
         },
         "both halves of the edit reach the frame, and in the right fields"
@@ -380,7 +380,7 @@ fn a_flush_while_detached_queues_and_sends_nothing() {
         .on_attached(&page.bindings, &pages::facts(), NOW);
     assert_eq!(
         batch_parts(&steps.frames[0]).0[0].body,
-        "hello",
+        MessageBody::from("hello"),
         "the queued flush goes out when the attachment comes up"
     );
 }
@@ -429,7 +429,10 @@ fn both_classes_from_one_activation_commit_at_their_own_authority() {
 
     let (entries, _) = batch_parts(&report.steps.frames[0]);
     assert_eq!(
-        entries.iter().map(|e| e.body.as_str()).collect::<Vec<_>>(),
+        entries
+            .iter()
+            .map(|e| e.body.as_text().unwrap())
+            .collect::<Vec<_>>(),
         vec!["there"],
         "only the transportable entry rides the frame"
     );
@@ -451,7 +454,10 @@ fn each_class_commits_its_entries_in_call_order() {
 
     let (entries, _) = batch_parts(&report.steps.frames[0]);
     assert_eq!(
-        entries.iter().map(|e| e.body.as_str()).collect::<Vec<_>>(),
+        entries
+            .iter()
+            .map(|e| e.body.as_text().unwrap())
+            .collect::<Vec<_>>(),
         vec!["first", "second"],
         "the frame carries its entries in the order the component wrote them"
     );
@@ -693,7 +699,9 @@ fn a_refused_confined_edit_changes_nothing_and_reports_its_reason() {
             .into_iter()
             .map(|entry| entry.body)
             .collect::<Vec<_>>(),
-        vec![r#"{"v":1,"holder":"p1","since_stamp":0}"#.to_string()],
+        vec![MessageBody::from(
+            r#"{"v":1,"holder":"p1","since_stamp":0}"#
+        )],
         "a refused edit leaves the parked message alone"
     );
 }

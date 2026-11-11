@@ -17,7 +17,10 @@
 
 use std::time::Duration;
 
-use brenn_attach_proto::{ClientFrame, SUPPORTED_VERSIONS, ServerFrame, VersionRange, negotiate};
+use brenn_attach_proto::{
+    ClientFrame, Codec, HelloRead, MessageBody, SUPPORTED_VERSIONS, ServerFrame, VersionRange,
+    WireMessage, negotiate, read_server_hello,
+};
 
 use crate::Millis;
 
@@ -55,6 +58,23 @@ pub struct AttachmentFacts {
     pub max_body_bytes: u64,
     pub max_frame_bytes: u64,
     pub alert_granted: bool,
+}
+
+impl AttachmentFacts {
+    /// The codec of the attachment's negotiated version: its batch law and
+    /// frame cap, and how its frames are written.
+    pub fn codec(&self) -> Codec {
+        Codec::negotiated(self.version)
+    }
+
+    /// Whether this attachment's version can write `body` in a publish. Ask
+    /// before handing the planes a body: one this answers false for panics at
+    /// the encoder, naming the version and the body's content type and size.
+    /// A flush queued while detached is checked by the plane instead, when
+    /// the next attachment comes up ([`crate::publish::Outboxes::on_attached`]).
+    pub fn carries(&self, body: &MessageBody) -> bool {
+        self.codec().carries(body)
+    }
 }
 
 /// Something the embedder must know about the connection.
@@ -102,7 +122,8 @@ pub enum ConnEffect {
     CloseTransport,
     /// Arm the connection timer to fire at this deadline, or disarm it (`None`).
     SetWakeup(Option<Millis>),
-    /// Send a client frame; the driver serializes and writes it.
+    /// Send a client frame; the driver encodes and writes it — a `Hello` in
+    /// its frozen shell, anything else with [`Connection::codec`].
     SendFrame(ClientFrame),
     /// Hand an event to the embedder.
     Emit(ConnEvent),
@@ -142,11 +163,10 @@ pub enum ConnInput {
     /// `code` and `reason`) or a transport-level failure (`code: None`). Only
     /// ever from a socket that opened, per [`ConnectFailed`](ConnInput::ConnectFailed).
     Disconnected { code: Option<u16>, reason: String },
-    /// A text frame (JSON [`ServerFrame`]) arrived.
-    TextFrame(String),
-    /// A binary frame arrived. The protocol is JSON text, so this is always a
-    /// fatal protocol error.
-    BinaryFrame,
+    /// A websocket message arrived. While negotiating it is read as the peer's
+    /// `Hello`; afterwards it is decoded with the negotiated version's codec,
+    /// and one that does not decode is a fatal protocol error.
+    Frame(WireMessage),
     /// A precondition the connection cannot check for itself failed host-side.
     /// Terminal, carrying its own diagnosis into the ordinary fatal path.
     HostFatal { detail: String },
@@ -206,6 +226,10 @@ pub struct ConnConfig {
     /// A free-form build identifier put on this end's `Hello`. For the peer's
     /// logs only; never parsed by either end.
     pub ident: String,
+    /// The transport versions this end offers: non-empty and within
+    /// [`SUPPORTED_VERSIONS`]. The `Hello` states it, negotiation picks from it,
+    /// and an [`Incompatible`](ConnEvent::Incompatible) reports it as `ours`.
+    pub versions: VersionRange,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
     /// How long a connect-plus-handshake may take before the attempt is
@@ -235,6 +259,7 @@ pub struct ConnConfig {
 pub struct Connection {
     url: String,
     ident: String,
+    versions: VersionRange,
     initial_backoff_ms: u64,
     max_backoff_ms: u64,
     connect_timeout_ms: u64,
@@ -257,14 +282,29 @@ pub struct Connection {
 
 impl Connection {
     /// Build a connection and start its first attempt.
+    ///
+    /// # Panics
+    ///
+    /// On a zero liveness multiplier, or an offered range that is empty or
+    /// reaches outside [`SUPPORTED_VERSIONS`]: embedder bugs.
     pub fn start(config: ConnConfig, now: Millis) -> (Self, Vec<ConnEffect>) {
         assert!(
             config.liveness_multiplier > 0,
             "attach client: a liveness multiplier of zero tolerates no inbound silence"
         );
+        let versions = config.versions;
+        assert!(
+            SUPPORTED_VERSIONS.contains_range(versions),
+            "attach client: offered range {}..={} is empty or outside this build's {}..={}",
+            versions.min,
+            versions.max,
+            SUPPORTED_VERSIONS.min,
+            SUPPORTED_VERSIONS.max
+        );
         let mut conn = Self {
             url: config.url,
             ident: config.ident,
+            versions,
             initial_backoff_ms: duration_ms(config.initial_backoff),
             max_backoff_ms: duration_ms(config.max_backoff),
             connect_timeout_ms: duration_ms(config.connect_timeout),
@@ -296,6 +336,11 @@ impl Connection {
         self.version
     }
 
+    /// The codec of the negotiated version, once the handshake reached one.
+    pub fn codec(&self) -> Option<Codec> {
+        self.version.map(Codec::negotiated)
+    }
+
     /// Feed one input.
     pub fn on_input(&mut self, input: ConnInput, now: Millis) -> ConnStep {
         match (self.state, input) {
@@ -309,7 +354,7 @@ impl Connection {
                 // verdict from the two ranges.
                 self.state = ConnState::Negotiating;
                 ConnStep::effects(vec![ConnEffect::SendFrame(ClientFrame::Hello {
-                    versions: SUPPORTED_VERSIONS,
+                    versions: self.versions,
                     ident: self.ident.clone(),
                 })])
             }
@@ -320,15 +365,11 @@ impl Connection {
                 ConnState::Negotiating | ConnState::AwaitingWelcome | ConnState::Active,
                 ConnInput::Disconnected { code, reason },
             ) => ConnStep::effects(self.on_disconnected(code, reason, now)),
-            (ConnState::Negotiating, ConnInput::TextFrame(text)) => self.on_text_negotiating(&text),
-            (ConnState::AwaitingWelcome, ConnInput::TextFrame(text)) => {
-                self.on_text_awaiting_welcome(&text, now)
+            (ConnState::Negotiating, ConnInput::Frame(msg)) => self.on_frame_negotiating(&msg),
+            (ConnState::AwaitingWelcome, ConnInput::Frame(msg)) => {
+                self.on_frame_awaiting_welcome(msg, now)
             }
-            (ConnState::Active, ConnInput::TextFrame(text)) => self.on_text_active(&text, now),
-            (
-                ConnState::Negotiating | ConnState::AwaitingWelcome | ConnState::Active,
-                ConnInput::BinaryFrame,
-            ) => ConnStep::effects(self.go_fatal("unexpected binary frame from peer".to_string())),
+            (ConnState::Active, ConnInput::Frame(msg)) => self.on_frame_active(msg, now),
             (
                 ConnState::Connecting | ConnState::Negotiating | ConnState::AwaitingWelcome,
                 ConnInput::Tick,
@@ -371,8 +412,7 @@ impl Connection {
                 ConnInput::Opened
                 | ConnInput::ConnectFailed
                 | ConnInput::Disconnected { .. }
-                | ConnInput::TextFrame(_)
-                | ConnInput::BinaryFrame,
+                | ConnInput::Frame(_),
             ) => ConnStep::none(),
         }
     }
@@ -476,21 +516,27 @@ impl Connection {
         self.deadline
     }
 
-    /// A frame arrived while awaiting the peer's `Hello`. Only `Hello` is legal
-    /// here: nothing else can be trusted to mean what it says before both ends
-    /// know which schema is in force.
-    fn on_text_negotiating(&mut self, text: &str) -> ConnStep {
-        let frame = match parse_frame(text) {
-            Ok(frame) => frame,
-            Err(detail) => return ConnStep::effects(self.go_fatal(detail)),
+    /// A message arrived while awaiting the peer's `Hello`. Only `Hello` is
+    /// legal here: nothing else can be trusted to mean what it says before both
+    /// ends know which schema is in force, so it is read in the frozen shell
+    /// and anything else is named by its `type` tag alone.
+    fn on_frame_negotiating(&mut self, msg: &WireMessage) -> ConnStep {
+        let versions = match read_server_hello(msg) {
+            HelloRead::Hello { versions, .. } => versions,
+            // The kind and the parser's message are the trusted peer's, and
+            // this attacher's diagnostics are the only place they surface.
+            HelloRead::NotHello { kind } => {
+                return ConnStep::effects(self.go_fatal(format!(
+                    "expected Hello as the first server frame, got {kind}"
+                )));
+            }
+            HelloRead::Unparseable { detail } => {
+                return ConnStep::effects(
+                    self.go_fatal(format!("unparseable server frame: {detail}")),
+                );
+            }
         };
-        let ServerFrame::Hello { versions, .. } = frame else {
-            return ConnStep::effects(self.go_fatal(format!(
-                "expected Hello as the first server frame, got {}",
-                frame_type_name(&frame)
-            )));
-        };
-        match negotiate(SUPPORTED_VERSIONS, versions) {
+        match negotiate(self.versions, versions) {
             Some(version) => {
                 self.version = Some(version);
                 self.state = ConnState::AwaitingWelcome;
@@ -501,7 +547,7 @@ impl Connection {
                 ConnStep::effects(vec![
                     ConnEffect::CloseTransport,
                     ConnEffect::Emit(ConnEvent::Incompatible {
-                        ours: SUPPORTED_VERSIONS,
+                        ours: self.versions,
                         theirs: versions,
                     }),
                     ConnEffect::SetWakeup(None),
@@ -513,8 +559,8 @@ impl Connection {
     /// A frame arrived after a successful negotiation. Only `Welcome` is legal,
     /// and it must echo the version both ends computed — a peer that agreed one
     /// version and is speaking another is unreconcilable, not merely surprising.
-    fn on_text_awaiting_welcome(&mut self, text: &str, now: Millis) -> ConnStep {
-        let frame = match parse_frame(text) {
+    fn on_frame_awaiting_welcome(&mut self, msg: WireMessage, now: Millis) -> ConnStep {
+        let frame = match self.decode(msg) {
             Ok(frame) => frame,
             Err(detail) => return ConnStep::effects(self.go_fatal(detail)),
         };
@@ -576,8 +622,8 @@ impl Connection {
     /// A repeated handshake frame is fatal — there is no renegotiation, and a
     /// second `Welcome` would restate a contract the planes above have already
     /// built on.
-    fn on_text_active(&mut self, text: &str, now: Millis) -> ConnStep {
-        let frame = match parse_frame(text) {
+    fn on_frame_active(&mut self, msg: WireMessage, now: Millis) -> ConnStep {
+        let frame = match self.decode(msg) {
             Ok(frame) => frame,
             Err(detail) => return ConnStep::effects(self.go_fatal(detail)),
         };
@@ -597,18 +643,21 @@ impl Connection {
             },
         }
     }
-}
 
-/// Parse a server frame, or diagnose why it could not be.
-///
-/// The diagnosis includes serde's own message, which names the failing field and
-/// may quote the offending value. Safe here because the peer is the server this
-/// attacher already takes its whole contract from, the detail rides
-/// [`ConnEvent::Fatal`] into the attacher's own diagnostics, and a frame this
-/// end cannot parse is otherwise undiagnosable.
-fn parse_frame(text: &str) -> Result<ServerFrame, String> {
-    serde_json::from_str::<ServerFrame>(text)
-        .map_err(|err| format!("unparseable server frame: {err}"))
+    /// Decode a message with the negotiated version's codec, or diagnose why
+    /// it is not a frame of that version.
+    ///
+    /// The diagnosis includes the parser's own message, which names the failing
+    /// field and may quote the offending value. Safe here because the peer is
+    /// the server this attacher already takes its whole contract from, the
+    /// detail rides [`ConnEvent::Fatal`] into the attacher's own diagnostics,
+    /// and a frame this end cannot decode is otherwise undiagnosable.
+    fn decode(&self, msg: WireMessage) -> Result<ServerFrame, String> {
+        self.codec()
+            .expect("attach client: a frame is decoded only after the handshake agreed a version")
+            .decode_server(msg)
+            .map_err(|err| err.to_string())
+    }
 }
 
 /// The `type` tag of a server frame, for diagnostics.

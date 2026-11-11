@@ -10,7 +10,7 @@ use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::telemetry::ErrorReportDocument;
-use brenn_surface_schema::{ComponentEntry, LocalChannel, OutputBinding};
+use brenn_surface_schema::{ComponentEntry, LocalChannel, OutputBinding, SURFACE_ATTACH_VERSION};
 use uuid::Uuid;
 
 use super::*;
@@ -152,7 +152,7 @@ fn publish_parts(frame: &ClientFrame) -> (&str, Option<&str>, &str, Urgency, Opt
         } => (
             channel.as_str(),
             attribution.as_deref(),
-            body.as_str(),
+            body.as_text().expect("a page publishes text"),
             *urgency,
             *correlation,
         ),
@@ -170,7 +170,7 @@ fn batch_correlation(frame: &ClientFrame) -> u64 {
 fn entry(channel: &str, body: &str) -> BatchEntry {
     BatchEntry {
         channel: channel.to_string(),
-        body: body.to_string(),
+        body: body.into(),
         urgency: Urgency::Normal,
         deliver_after: None,
     }
@@ -197,7 +197,8 @@ fn op(channel: &str, message_id: u128, op: DeferredOpKind) -> BatchDeferredOp {
 fn facts(max_body_bytes: u64) -> AttachmentFacts {
     AttachmentFacts {
         max_body_bytes,
-        max_frame_bytes: brenn_attach_proto::max_client_frame_bytes(max_body_bytes as usize) as u64,
+        max_frame_bytes: brenn_attach_proto::Codec::negotiated(SURFACE_ATTACH_VERSION)
+            .max_client_frame_bytes(max_body_bytes as usize) as u64,
         ..pages::facts()
     }
 }
@@ -292,6 +293,33 @@ fn every_wire_outcome_maps_to_a_caller_status() {
             panic!("expected a port answer, got {answer:?}");
         };
         assert_eq!(status, expected);
+    }
+}
+
+/// The page attaches at v4, which cannot carry the body this refusal answers,
+/// whoever the publish was for.
+#[test]
+fn a_text_only_refusal_is_unreconcilable_at_v4() {
+    let bindings = wiring();
+    let mut outbound = SurfaceOutbound::new();
+    publish(&mut outbound, &bindings, "p1", "out", "a", 5);
+    outbound.publish_telemetry(&bindings, TelemetryKind::Status, "{}".to_string());
+    outbound
+        .report(
+            &bindings,
+            ErrorReport {
+                level: LogLevel::Error,
+                source: "kernel",
+                message: "boom",
+                subject: None,
+            },
+        )
+        .expect("the level clears the floor");
+    for correlation in [0, 1, 2] {
+        let err = outbound
+            .on_publish_result(Some(correlation), PublishOutcome::TextOnlyChannel)
+            .expect_err("a v4 attachment cannot earn the refusal");
+        assert!(err.contains("TextOnlyChannel"), "{err}");
     }
 }
 
@@ -963,7 +991,7 @@ fn a_flushs_control_ops_are_re_checked_like_its_entries() {
             OUT,
             1,
             DeferredOpKind::Edit {
-                body: Some("0123456789".to_string()),
+                body: Some("0123456789".into()),
                 deliver_after: None,
             },
         )],

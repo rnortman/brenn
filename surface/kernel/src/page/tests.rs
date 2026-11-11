@@ -202,7 +202,7 @@ fn flush_batch() -> FlushBatch {
     FlushBatch {
         entries: vec![BatchEntry {
             channel: OUT.to_string(),
-            body: r#"{"n":1}"#.to_string(),
+            body: r#"{"n":1}"#.into(),
             urgency: WireUrgency::Normal,
             deliver_after: None,
         }],
@@ -280,7 +280,7 @@ fn phase_one_clears_the_deferred_view_mirror() {
         Some("p1".to_string()),
         vec![DeferredViewEntry {
             message_id: Uuid::from_u128(1),
-            body: "{}".to_string(),
+            body: "{}".into(),
             deliver_after: 9_000,
         }],
     );

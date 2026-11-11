@@ -232,7 +232,7 @@ fn a_detach_disarms_the_retry_deadline_a_refused_flush_armed() {
         FlushBatch {
             entries: vec![brenn_attach_proto::BatchEntry {
                 channel: OUT.to_string(),
-                body: "{}".to_string(),
+                body: "{}".into(),
                 urgency: Urgency::Normal,
                 deliver_after: None,
             }],

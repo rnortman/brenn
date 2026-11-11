@@ -146,8 +146,9 @@ from Google and still not fit the bus. 393 216 bytes is the read limit with a
 half again for escaping and the envelope.
 
 What raising it costs: the cap is bus-wide, and other limits are derived from
-it. The attach client's frame cap (`max_client_frame_bytes`) is six times the
-cap plus 136 KiB, about 2.4 MiB at 393 216 bytes. The MQTT publish payload
+it. The attach client's frame cap (`Codec::max_client_frame_bytes`) is, for
+attach v4, six times the cap plus 136 KiB, about 2.4 MiB at 393 216 bytes; for
+attach v5, the cap plus 136 KiB, about 520 KiB. The MQTT publish payload
 cap and a guest component's publish and sync-reply caps equal it. The
 permitted growth of a fragment channel between reaps, which
 `docs/security-posture.md` bounds by default rate × `max_body_bytes` × the
