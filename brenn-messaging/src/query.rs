@@ -119,16 +119,19 @@ impl Messenger {
         let retained = self.store_for(entry).retained_tail(Depth::Unbounded).await;
         let search_lower = q.search.as_ref().map(|s| s.to_lowercase());
         // Filter on the borrowed `Arc` first; only clone the survivors so a
-        // selective query does not deep-copy the whole window.
+        // selective query does not deep-copy the whole window. A search matches
+        // text bodies only.
         let mut out: Vec<MessageEnvelope> = retained
             .iter()
             .filter(|e| q.before.is_none_or(|b| e.publish_ts < b))
             .filter(|e| q.after.is_none_or(|a| e.publish_ts > a))
             .filter(|e| q.sender.as_ref().is_none_or(|s| &e.sender == s))
             .filter(|e| {
-                search_lower
-                    .as_ref()
-                    .is_none_or(|s| e.body.to_lowercase().contains(s))
+                search_lower.as_ref().is_none_or(|s| {
+                    e.body
+                        .as_text()
+                        .is_some_and(|text| text.to_lowercase().contains(s))
+                })
             })
             .map(|arc| (**arc).clone())
             .collect();
@@ -311,7 +314,7 @@ pub mod tests {
             channel,
             "src",
             sender,
-            body,
+            &body.into(),
             Urgency::Low,
             crate::ChannelScheme::Brenn,
             None,
@@ -344,8 +347,8 @@ pub mod tests {
         };
         let result = run_query(&conn, channel_uuid, &q, Depth::Unbounded).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].body, "third");
-        assert_eq!(result[1].body, "second");
+        assert_eq!(result[0].body.as_text(), Some("third"));
+        assert_eq!(result[1].body.as_text(), Some("second"));
         // Channel address is resolved via SQL JOIN, not MessagingDirectory.
         assert_eq!(result[0].channel, canonical_address("test"));
     }
@@ -371,7 +374,7 @@ pub mod tests {
         };
         let result = run_query(&conn, channel_uuid, &q, Depth::Unbounded).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].body, "from-alice");
+        assert_eq!(result[0].body.as_text(), Some("from-alice"));
     }
 
     #[test]
@@ -395,7 +398,7 @@ pub mod tests {
         };
         let result = run_query(&conn, channel_uuid, &q, Depth::Unbounded).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].body, "the quick brown fox");
+        assert_eq!(result[0].body.as_text(), Some("the quick brown fox"));
     }
 
     #[test]
@@ -442,7 +445,7 @@ pub mod tests {
         };
         let result = run_query(&conn, channel_uuid, &q, Depth::Unbounded).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].body, "mid");
+        assert_eq!(result[0].body.as_text(), Some("mid"));
     }
 
     #[test]
@@ -466,7 +469,7 @@ pub mod tests {
         };
         let result = run_query(&conn, channel_uuid, &q, Depth::Unbounded).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].body, "no-reply");
+        assert_eq!(result[0].body.as_text(), Some("no-reply"));
         assert!(result[0].reply_to.is_none());
     }
 
@@ -1610,7 +1613,7 @@ pub mod tests {
         };
         let result = messenger.query(&q).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].body, "brenn-msg");
+        assert_eq!(result[0].body.as_text(), Some("brenn-msg"));
     }
 
     // Byte-identity tests: pin this crate's own query assembly — the ORDER BY /
@@ -1631,7 +1634,7 @@ pub mod tests {
         // Golden: the complete SQL string `load_window_snapshot` prepares.
         let golden = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
                       m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
-                      c.address, rc.address, m.envelope_type, m.impetus \
+                      c.address, rc.address, m.envelope_type, m.impetus, m.content_type \
                FROM messaging_messages m \
                JOIN messaging_channels c ON c.uuid = m.channel_uuid \
                LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid \
@@ -1661,7 +1664,7 @@ pub mod tests {
             channel: channel.to_string(),
             sender: sender.to_string(),
             publish_ts: ns_to_utc(ns),
-            body: body.to_string(),
+            body: body.into(),
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
@@ -1829,8 +1832,8 @@ pub mod tests {
                 .query(&build(canonical_address_for("chatter")))
                 .await
                 .unwrap();
-            let db_bodies: Vec<&str> = d.iter().map(|m| m.body.as_str()).collect();
-            let eph_bodies: Vec<&str> = e.iter().map(|m| m.body.as_str()).collect();
+            let db_bodies: Vec<&str> = d.iter().map(|m| m.body.as_text().unwrap()).collect();
+            let eph_bodies: Vec<&str> = e.iter().map(|m| m.body.as_text().unwrap()).collect();
             assert_eq!(
                 db_bodies, eph_bodies,
                 "durable vs non-durable disagree for shape \
@@ -1900,7 +1903,7 @@ pub mod tests {
         )
         .await;
         let result = m.query(&eph_query(None, None)).await.unwrap();
-        let bodies: Vec<&str> = result.iter().map(|e| e.body.as_str()).collect();
+        let bodies: Vec<&str> = result.iter().map(|e| e.body.as_text().unwrap()).collect();
         assert_eq!(bodies, vec!["third", "second", "first"]);
         assert_eq!(result[0].channel, "ephemeral:chatter");
     }
@@ -1919,7 +1922,7 @@ pub mod tests {
         .await;
         let result = m.query(&eph_query(Some("alice"), None)).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].body, "from-alice");
+        assert_eq!(result[0].body.as_text(), Some("from-alice"));
     }
 
     #[tokio::test]
@@ -1936,7 +1939,7 @@ pub mod tests {
         .await;
         let result = m.query(&eph_query(None, Some("fox"))).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].body, "the quick brown Fox");
+        assert_eq!(result[0].body.as_text(), Some("the quick brown Fox"));
     }
 
     #[tokio::test]
@@ -1957,7 +1960,7 @@ pub mod tests {
         q.after = Some(ns_to_utc(base + 1));
         let result = m.query(&q).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].body, "mid");
+        assert_eq!(result[0].body.as_text(), Some("mid"));
     }
 
     #[tokio::test]
@@ -1976,7 +1979,7 @@ pub mod tests {
         )
         .await;
         let result = m.query(&eph_query(None, None)).await.unwrap();
-        let bodies: Vec<&str> = result.iter().map(|e| e.body.as_str()).collect();
+        let bodies: Vec<&str> = result.iter().map(|e| e.body.as_text().unwrap()).collect();
         assert_eq!(bodies, vec!["m3", "m2"]);
     }
 
@@ -2034,7 +2037,7 @@ pub mod tests {
             1,
             "the old match survives count-limit clamping"
         );
-        assert_eq!(result[0].body, "m0");
+        assert_eq!(result[0].body.as_text(), Some("m0"));
     }
 
     /// The participant×channel matrix row for a conversation on a non-durable
@@ -2075,7 +2078,7 @@ pub mod tests {
             2,
             "the dynamic subscriber's resolved retain_depth clamps its read"
         );
-        assert_eq!(result[0].body, "m4", "newest first");
+        assert_eq!(result[0].body.as_text(), Some("m4"), "newest first");
     }
 
     #[tokio::test]
@@ -2142,7 +2145,7 @@ pub mod tests {
         };
         let result = messenger.query(&q).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].body, "confined");
+        assert_eq!(result[0].body.as_text(), Some("confined"));
         assert_eq!(result[0].channel, "local:box");
     }
 }

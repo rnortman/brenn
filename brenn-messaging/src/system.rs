@@ -629,7 +629,7 @@ mod tests {
             channel_uuid,
             "test",
             "wasm:someone",
-            body,
+            &body.into(),
             Urgency::Normal,
             ChannelScheme::Brenn,
             None,
@@ -645,7 +645,10 @@ mod tests {
     }
 
     fn bodies(batch: &[(MessageSeq, MessageEnvelope)]) -> Vec<String> {
-        batch.iter().map(|(_, env)| env.body.clone()).collect()
+        batch
+            .iter()
+            .map(|(_, env)| env.body.as_text().unwrap().to_owned())
+            .collect()
     }
 
     /// A system participant's positions are never torn down, and each is
@@ -684,7 +687,10 @@ mod tests {
             .expect("the channel the rows landed on");
         assert_eq!(address, "brenn:inbox/reqs");
         assert_eq!(
-            window.entries.last().map(|(_, env)| env.body.as_str()),
+            window
+                .entries
+                .last()
+                .map(|(_, env)| env.body.as_text().unwrap()),
             Some("latest"),
             "newest last"
         );
@@ -963,7 +969,7 @@ mod tests {
                     let tx = tx.clone();
                     async move {
                         for (_, env) in batch {
-                            tx.send(env.body).unwrap();
+                            tx.send(env.body.as_text().unwrap().to_owned()).unwrap();
                         }
                     }
                 })

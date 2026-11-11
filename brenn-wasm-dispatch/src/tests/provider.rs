@@ -169,7 +169,8 @@ impl Provider {
                 .await
                 .iter()
                 .map(|(_, env)| {
-                    let body: Value = serde_json::from_str(&env.body).expect("request is JSON");
+                    let body: Value =
+                        serde_json::from_str(env.body.as_text().unwrap()).expect("request is JSON");
                     body["id"].as_str().expect("request has an id").to_string()
                 })
                 .collect();

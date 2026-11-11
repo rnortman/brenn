@@ -434,7 +434,7 @@ impl AsyncTool for ProvidedTool {
             .publish_from_system(
                 TOOL_EXECUTOR_COMPONENT,
                 &address,
-                &body,
+                body.as_str().into(),
                 Urgency::Normal,
                 None,
             )
@@ -631,7 +631,9 @@ pub(crate) mod tests {
         brenn_messaging::testutils::owed_everywhere(messenger, &ParticipantId::for_wasm(PROVIDER))
             .await
             .iter()
-            .map(|(_, env)| serde_json::from_str(&env.body).expect("request body is JSON"))
+            .map(|(_, env)| {
+                serde_json::from_str(env.body.as_text().unwrap()).expect("request body is JSON")
+            })
             .collect()
     }
 

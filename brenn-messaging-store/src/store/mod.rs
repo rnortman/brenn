@@ -30,7 +30,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use brenn_envelope::{ChannelCapabilities, ChannelScheme, Impetus, MessageEnvelope, Urgency};
+use brenn_envelope::{
+    ChannelCapabilities, ChannelScheme, Impetus, MessageBody, MessageEnvelope, Urgency,
+};
 use brenn_queue::{GapReason, ReplayDecision, Resume, Retained};
 
 /// A park refused because the channel's deferred set is already at its cap.
@@ -67,7 +69,7 @@ pub struct NewMessage {
     /// Node identity of the publishing process.
     pub source: String,
     pub sender: String,
-    pub body: String,
+    pub body: MessageBody,
     pub urgency: Urgency,
     /// The address scheme recorded on the envelope. Follows the channel except
     /// on ingress-bridged channels, where it names the originating transport.
@@ -722,12 +724,12 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     ) -> DeferralOutcome;
 
     /// Replace a parked message's body, its release time, or both. `None`
-    /// leaves that field alone.
+    /// leaves that field alone. A new body replaces the content type with it.
     async fn edit_deferred(
         &self,
         sender: &str,
         message_uuid: Uuid,
-        body: Option<String>,
+        body: Option<MessageBody>,
         release_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> DeferralOutcome;

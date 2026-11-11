@@ -383,16 +383,16 @@ pub(crate) fn build_surface_docs(
         .iter()
         .chain(bindings.iter())
         .filter_map(|(address, body)| {
-            check_body_size(body, params.max_body_bytes).err().map(
-                |BodySizeExceeded { len, max }| {
+            check_body_size(&body.as_str().into(), params.max_body_bytes)
+                .err()
+                .map(|BodySizeExceeded { len, max }| {
                     format!(
                         "the document this reload would publish onto {address} is {len} bytes \
                          but [messaging] max_body_bytes is {max}; raise max_body_bytes above \
                          {len} (a restart — [messaging] is not convergible) or shrink what \
                          the document describes"
                     )
-                },
-            )
+                })
         })
         .collect();
     if !refusals.is_empty() {

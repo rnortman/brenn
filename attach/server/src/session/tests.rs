@@ -1039,7 +1039,7 @@ async fn seed(db: &Db, channel_uuid: Uuid, body: &str, ts_ns: i64) {
         channel_uuid,
         "test",
         "sender",
-        body,
+        &body.into(),
         brenn_lib::messaging::Urgency::Normal,
         brenn_lib::messaging::ChannelScheme::Brenn,
         None,

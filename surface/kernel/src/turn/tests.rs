@@ -146,7 +146,7 @@ fn park_notes(page: &mut SurfacePage, body: &str, release_at: u64, seed: u128) {
         RouteRequest {
             channel: NOTES,
             origin: Origin::Sub("p1"),
-            body: body.to_string(),
+            body: (body.to_string()).into(),
             stamp: stamp(seed),
             urgency: Urgency::Normal,
             deliver_after: Some(release_at),
@@ -193,7 +193,7 @@ fn retained(page: &SurfacePage, channel: &str) -> Vec<String> {
         .get(channel)
         .expect("the fixture hosts the channel")
         .retained()
-        .map(|(envelope, _)| envelope.body.clone())
+        .map(|(envelope, _)| envelope.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -812,7 +812,13 @@ fn a_ready_instance_is_handed_over_in_flight() {
         notes
             .new_envelopes()
             .iter()
-            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
+            .map(
+                |envelope| brenn_surface_test_fixtures::parse_envelope(envelope)
+                    .body
+                    .as_text()
+                    .unwrap()
+                    .to_owned()
+            )
             .collect::<Vec<_>>(),
         ["one"]
     );
@@ -916,7 +922,13 @@ fn a_sync_activation_carries_the_full_worldview_and_the_request() {
         notes
             .new_envelopes()
             .iter()
-            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
+            .map(
+                |envelope| brenn_surface_test_fixtures::parse_envelope(envelope)
+                    .body
+                    .as_text()
+                    .unwrap()
+                    .to_owned()
+            )
             .collect::<Vec<_>>(),
         ["queued"]
     );
@@ -932,7 +944,7 @@ fn a_sync_activation_carries_the_full_worldview_and_the_request() {
     assert_eq!(envelope.envelope_type, brenn_envelope::ChannelScheme::Local);
     assert_eq!(envelope.sender, "p2");
     assert_eq!(envelope.source, "p2");
-    assert_eq!(envelope.body, "{\"kind\":\"dismiss\"}");
+    assert_eq!(envelope.body.as_text(), Some("{\"kind\":\"dismiss\"}"));
     assert_eq!(envelope.urgency, Urgency::Normal);
     assert_eq!(envelope.message_id, stamp(0x59c).message_id);
     assert_eq!(envelope.deliver_after, None);
@@ -1269,7 +1281,13 @@ fn drain(page: &mut SurfacePage) -> Vec<(String, Vec<String>)> {
             .ports
             .iter()
             .flat_map(|window| window.new_envelopes())
-            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
+            .map(|envelope| {
+                brenn_surface_test_fixtures::parse_envelope(envelope)
+                    .body
+                    .as_text()
+                    .unwrap()
+                    .to_owned()
+            })
             .collect();
         taken.push((ready.instance.clone(), bodies));
         feed(

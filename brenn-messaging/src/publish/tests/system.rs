@@ -129,7 +129,7 @@ async fn publish_from_system_ok_stamps_system_sender_and_fans_out() {
     .await;
 
     let result = m
-        .publish_from_system(PUBLISHER, &addr, "hello", Urgency::Normal, None)
+        .publish_from_system(PUBLISHER, &addr, "hello".into(), Urgency::Normal, None)
         .await;
     assert!(
         matches!(
@@ -213,7 +213,7 @@ async fn publish_from_system_reaches_reserved_slash_channel() {
     .with_subscriber_registrations(crate::testutils::system_registrations(system_policies));
 
     let result = messenger
-        .publish_from_system(PUBLISHER, &channel_addr, "hi", Urgency::Normal, None)
+        .publish_from_system(PUBLISHER, &channel_addr, "hi".into(), Urgency::Normal, None)
         .await;
     assert!(
         matches!(result, PublishResult::Ok { .. }),
@@ -258,7 +258,7 @@ async fn publish_from_system_reaches_reserved_slash_channel() {
     )
     .with_subscriber_registrations(crate::testutils::system_registrations(denying));
     let denied = messenger2
-        .publish_from_system(PUBLISHER, &channel_addr, "hi", Urgency::Normal, None)
+        .publish_from_system(PUBLISHER, &channel_addr, "hi".into(), Urgency::Normal, None)
         .await;
     assert!(
         matches!(denied, PublishResult::AclDenied(_)),
@@ -284,7 +284,7 @@ async fn publish_from_system_ordinary_slash_channel_is_malformed() {
         .publish_from_system(
             PUBLISHER,
             &canonical_address("ordinary/thing"),
-            "hi",
+            "hi".into(),
             Urgency::Normal,
             None,
         )
@@ -309,7 +309,7 @@ async fn publish_from_system_missing_grant_is_missing_sender() {
     let (m, addr) = build_system_publish_messenger(policy, 65_536).await;
 
     let result = m
-        .publish_from_system(PUBLISHER, &addr, "hello", Urgency::Normal, None)
+        .publish_from_system(PUBLISHER, &addr, "hello".into(), Urgency::Normal, None)
         .await;
     assert!(
         matches!(result, PublishResult::MissingSender),
@@ -328,7 +328,7 @@ async fn publish_from_system_unknown_component_is_missing_sender() {
     .await;
 
     let result = m
-        .publish_from_system("ghost", &addr, "hello", Urgency::Normal, None)
+        .publish_from_system("ghost", &addr, "hello".into(), Urgency::Normal, None)
         .await;
     assert!(
         matches!(result, PublishResult::MissingSender),
@@ -348,7 +348,7 @@ async fn publish_from_system_out_of_acl_is_acl_denied() {
     .await;
 
     let result = m
-        .publish_from_system(PUBLISHER, &addr, "hello", Urgency::Normal, None)
+        .publish_from_system(PUBLISHER, &addr, "hello".into(), Urgency::Normal, None)
         .await;
     assert!(
         matches!(result, PublishResult::AclDenied(_)),
@@ -367,7 +367,7 @@ async fn publish_from_system_body_too_large() {
     .await;
 
     let result = m
-        .publish_from_system(PUBLISHER, &addr, "abcde", Urgency::Normal, None)
+        .publish_from_system(PUBLISHER, &addr, "abcde".into(), Urgency::Normal, None)
         .await;
     assert!(
         matches!(result, PublishResult::BodyTooLarge { len: 5, max: 4 }),

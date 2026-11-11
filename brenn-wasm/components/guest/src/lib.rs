@@ -43,7 +43,10 @@ pub use bindings::export;
 
 // ── re-exports ────────────────────────────────────────────────────────────────
 
-pub use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency, WebhookEnvelope};
+pub use brenn_envelope::{
+    BodyError, ChannelScheme, MessageBody, MessageEnvelope, Urgency, WebhookEnvelope,
+    is_text_content_type,
+};
 pub use serde;
 pub use serde_json;
 
@@ -326,7 +329,7 @@ impl Activation {
     pub fn gesture(&self) -> Option<Result<dom::Gesture, Error>> {
         let (port, request) = self.sync_request()?;
         Some(request.and_then(|envelope| {
-            serde_json::from_str(&envelope.body).map_err(|e| {
+            serde_json::from_str(envelope.text_body()?).map_err(|e| {
                 Error::malformed(format!("the gesture request on sync port {port:?}: {e}"))
             })
         }))
@@ -564,6 +567,12 @@ macro_rules! export_processor {
 // MQTT envelope types are not re-exported.
 /// Extension methods for `MessageEnvelope`.
 pub trait MessageEnvelopeExt {
+    /// The body's text.
+    ///
+    /// Returns `Err(MalformedEnvelope)` if the body is not text. Under the
+    /// 0.1.0 contract every body a component is handed is text.
+    fn text_body(&self) -> Result<&str, Error>;
+
     /// Deserialize the `body` field as `T`.
     ///
     /// Returns `Err(MalformedEnvelope)` with context on parse failure.
@@ -576,9 +585,18 @@ pub trait MessageEnvelopeExt {
     fn webhook_body(&self) -> Result<WebhookEnvelope, Error>;
 }
 
+// TODO(wasm-guest-tests-unrun): `text_body`, `json_body` and `webhook_body`
+// have no test on a text and a non-text body; this crate has no test target.
 impl MessageEnvelopeExt for MessageEnvelope {
+    fn text_body(&self) -> Result<&str, Error> {
+        self.body
+            .as_text()
+            .ok_or_else(|| Error::malformed(format!("body is not text: {}", self.body.summary())))
+    }
+
     fn json_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, Error> {
-        serde_json::from_str(&self.body).map_err(|e| Error::malformed(format!("body JSON: {e}")))
+        serde_json::from_str(self.text_body()?)
+            .map_err(|e| Error::malformed(format!("body JSON: {e}")))
     }
 
     fn webhook_body(&self) -> Result<WebhookEnvelope, Error> {
@@ -588,7 +606,7 @@ impl MessageEnvelopeExt for MessageEnvelope {
                 self.envelope_type
             )));
         }
-        serde_json::from_str(&self.body)
+        serde_json::from_str(self.text_body()?)
             .map_err(|e| Error::malformed(format!("webhook body JSON: {e}")))
     }
 }
@@ -921,8 +939,9 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> RetainedState<T> {
         };
         let envelope: MessageEnvelope = serde_json::from_str(raw)
             .map_err(|e| Error::malformed(format!("retained state envelope JSON: {e}")))?;
-        self.seen = Some(envelope.body.clone());
-        let value = serde_json::from_str(&envelope.body)
+        let text = envelope.text_body()?;
+        self.seen = Some(text.to_owned());
+        let value = serde_json::from_str(text)
             .map_err(|e| Error::malformed(format!("retained state body JSON: {e}")))?;
         Ok(Some(value))
     }
@@ -1669,7 +1688,7 @@ pub mod tools {
         pub fn tool_results(&self) -> Result<Vec<ToolResult>, Error> {
             self.reserved_window(brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT)?
                 .new_envelopes()
-                .map(|envelope| parse_result(&envelope?.body))
+                .map(|envelope| parse_result(crate::MessageEnvelopeExt::text_body(&envelope?)?))
                 .collect()
         }
     }
@@ -1799,7 +1818,7 @@ pub mod provides {
         pub fn tool_requests(&self) -> Result<Vec<ToolRequest>, Error> {
             self.reserved_window(brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT)?
                 .new_envelopes()
-                .map(|envelope| parse_request(&envelope?.body))
+                .map(|envelope| parse_request(crate::MessageEnvelopeExt::text_body(&envelope?)?))
                 .collect()
         }
     }

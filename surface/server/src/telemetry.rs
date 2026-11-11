@@ -77,7 +77,7 @@ async fn publish_stamp(
 ) {
     let body = disconnected_body(session, epoch, reason);
     match messenger
-        .publish_from_surface_platform(slug, channel, &body, Urgency::Normal)
+        .publish_from_surface_platform(slug, channel, body.as_str().into(), Urgency::Normal)
         .await
     {
         PublishResult::Ok { .. } => {}

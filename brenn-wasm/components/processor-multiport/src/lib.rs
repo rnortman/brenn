@@ -64,12 +64,12 @@ impl Processor for ProcessorMultiport {
             // disposition of a mount activation over a port with no backlog.
             for env in window.context_envelopes() {
                 let env = env?;
-                if env.body == "__err_on_context__" {
+                if env.body.as_text() == Some("__err_on_context__") {
                     return Err(Error::failed(
                         "processor-multiport: deliberate err on __err_on_context__ sentinel",
                     ));
                 }
-                if env.body == "__trap_on_context__" {
+                if env.body.as_text() == Some("__trap_on_context__") {
                     unreachable!(
                         "processor-multiport: deliberate trap on __trap_on_context__ sentinel"
                     );
@@ -77,18 +77,18 @@ impl Processor for ProcessorMultiport {
             }
             for env in window.new_envelopes() {
                 let env = env?;
-                if env.body == "__trap__" {
+                if env.body.as_text() == Some("__trap__") {
                     unreachable!("processor-multiport: deliberate trap on __trap__ sentinel");
                 }
-                if env.body == "__err__" {
+                if env.body.as_text() == Some("__err__") {
                     return Err(Error::failed(
                         "processor-multiport: deliberate err on __err__ sentinel",
                     ));
                 }
-                if env.body == "__reply__" {
+                if env.body.as_text() == Some("__reply__") {
                     answering = true;
                 }
-                if env.body == "__long_reply__" {
+                if env.body.as_text() == Some("__long_reply__") {
                     return Ok(Some("x".repeat(4096)));
                 }
             }

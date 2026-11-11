@@ -702,7 +702,32 @@ fail-closed and the data path surfaces unknowns; the approval gate authorizes
 every privileged action and what-runs equals what-was-approved; browser-
 contributed auto-approve patterns are validated and scoped; every CC-influenced
 sink (subprocess args, filesystem paths, markup) is guarded per the policies
-above.
+above; and no bus message body that is not text reaches a conversation's
+context or markup except as the §7.5 placeholder.
+
+### 7.5 Bus message bodies in a conversation's context
+
+A bus message body is bytes with an optional content type, and is *text* or
+*not text* by one rule (`is_text_content_type`; `docs/message-bus.md` §2.1.2).
+
+- **A text body reaches a conversation as text** — pushed batches,
+  `MessageChannelGet`, `BrennPendingList` and the `BrennMessageEdit` result —
+  with its `content_type` beside it when it has one.
+- **A body that is not text reaches a conversation only as a metadata
+  placeholder**: `{"binary": true, "content_type": …, "size": …}`. The legacy
+  UI's message card shows the same thing as one escaped line
+  (`binary body: <content type>, <size> bytes`).
+- **No path decodes, base64-encodes or lossily converts a body's bytes into a
+  conversation's context or into markup.** `from_utf8_lossy` and its kin are
+  not used on a body anywhere.
+- **The MQTT ingress placeholder** (`MqttPayloadBody::Binary`) is the same rule
+  applied at the transport edge: a broker payload that is not text arrives as
+  metadata, never as bytes.
+
+The reason is the model's context, not the wire: bytes shown to a model are
+either noise it will misread or an injection channel nobody reviewed, and a
+lossy decoding is both. A path that puts a non-text body's bytes, or any
+encoding of them, in front of a model is a finding.
 
 ---
 

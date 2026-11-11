@@ -358,7 +358,8 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
     let requests =
         brenn_messaging::testutils::owed_everywhere(&harness.messenger, &executor_sub).await;
     assert_eq!(requests.len(), 1, "one git-repo-pull request expected");
-    let req: serde_json::Value = serde_json::from_str(&requests[0].1.body).unwrap();
+    let req: serde_json::Value =
+        serde_json::from_str(requests[0].1.body.as_text().unwrap()).unwrap();
     assert_eq!(req["call_id"], "pull-1");
     assert_eq!(req["args"]["repos"][0], SLUG);
 
@@ -442,7 +443,8 @@ async fn call_id_sequence_is_monotonic_across_activations() {
     let call_ids: Vec<String> = requests
         .iter()
         .map(|(_, envelope)| {
-            let v: serde_json::Value = serde_json::from_str(&envelope.body).unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(envelope.body.as_text().unwrap()).unwrap();
             v["call_id"].as_str().unwrap().to_string()
         })
         .collect();

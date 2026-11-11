@@ -4,6 +4,24 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **BREAKING for component authors: `MessageEnvelope.body` is a
+  `MessageBody`.** A message body on the bus is now bytes with an optional
+  content type. Under the current component contract every body a component
+  is handed is still text, delivered exactly as before. Read it with
+  `envelope.text_body()?` or `body.as_text()`; `json_body` and
+  `webhook_body` are unchanged. `MessageEnvelope` no longer implements
+  `Serialize`; use `to_envelope_json`. Paid at the next `brenn-guest` pin
+  bump; no deployed component is affected. See
+  `docs/component-packages.md`.
+- The first start of this release rebuilds the message search index once,
+  before serving, so it takes longer on a large database. No stored message
+  is rewritten, and the previous release still opens the database.
+- A conversation shown a bus message with a content type sees
+  `content_type` beside the body, and a message whose body is not text sees
+  a `{"binary": true, "content_type": …, "size": …}` placeholder instead of
+  its bytes. Nothing can publish such a message yet; see
+  `docs/message-bus.md` §2.1.2.
+
 ## [0.34.0] — 2026-11-10
 
 - **`api_key_provider` changes now take effect on reload, without a

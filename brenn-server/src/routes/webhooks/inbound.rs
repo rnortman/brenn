@@ -1564,7 +1564,7 @@ mod tests {
 
         // Assert the envelope body is valid WebhookEnvelope JSON with credential
         // header masked and endpoint_slug correct.
-        let wh: WebhookEnvelope = serde_json::from_str(&envelope.body)
+        let wh: WebhookEnvelope = serde_json::from_str(envelope.body.as_text().unwrap())
             .expect("envelope.body must be valid WebhookEnvelope JSON");
         assert_eq!(wh.endpoint_slug, TEST_SLUG);
 

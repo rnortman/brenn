@@ -402,6 +402,30 @@ pub async fn insert_bus_message_from(
     envelope_type: ChannelScheme,
     ts_ns: i64,
 ) -> Uuid {
+    insert_bus_body_from(
+        messenger,
+        channel,
+        sender,
+        &body.into(),
+        envelope_type,
+        None,
+        ts_ns,
+    )
+    .await
+}
+
+/// [`insert_bus_message_from`] for a body of any kind, optionally parked until
+/// `deliver_after`: for a test that needs a typed or non-text body on a durable
+/// channel without a publish door that can produce one.
+pub async fn insert_bus_body_from(
+    messenger: &Messenger,
+    channel: &ChannelEntry,
+    sender: &str,
+    body: &brenn_lib::messaging::MessageBody,
+    envelope_type: ChannelScheme,
+    deliver_after: Option<chrono::DateTime<chrono::Utc>>,
+    ts_ns: i64,
+) -> Uuid {
     let conn = messenger.db().lock().await;
     insert_message(
         &conn,
@@ -413,7 +437,7 @@ pub async fn insert_bus_message_from(
         envelope_type,
         None,
         None,
-        None,
+        deliver_after,
         None,
         ts_ns,
     )
@@ -531,7 +555,7 @@ pub async fn insert_retain_only(
         channel.uuid,
         "test",
         "test-sender",
-        body,
+        &body.into(),
         Urgency::Low,
         envelope_type,
         None,

@@ -1261,7 +1261,7 @@ fn park_notes(page: &mut SurfacePage, release_at: u64) {
         RouteRequest {
             channel: NOTES,
             origin: Origin::Sub("p1"),
-            body: "{}".to_string(),
+            body: "{}".into(),
             stamp: MessageStamp {
                 message_id: Uuid::from_u128(0x900),
                 publish_ts: chrono::DateTime::from_timestamp(0, 0)

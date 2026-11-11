@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::test_support::bindings::imply_vocabularies;
 use brenn_attach_client::router::{GuardedBody, Origin, PlanePolicy};
-use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
+use brenn_envelope::{ChannelScheme, MessageBody, MessageEnvelope, Urgency};
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
@@ -108,7 +108,7 @@ fn envelope(channel: &str, body: String, publish_ts: DateTime<Utc>) -> MessageEn
         channel: channel.to_string(),
         sender: "surface:bar#chrome".to_string(),
         publish_ts,
-        body,
+        body: body.into(),
         reply_to: None,
         delivery_deadline: None,
         deliver_after: None,
@@ -120,7 +120,10 @@ fn envelope(channel: &str, body: String, publish_ts: DateTime<Utc>) -> MessageEn
 
 fn carried(guarded: GuardedBody) -> String {
     match guarded {
-        GuardedBody::Carry(body) => body,
+        GuardedBody::Carry(body) => body
+            .as_text()
+            .expect("a carried body here is text")
+            .to_owned(),
         GuardedBody::Refused(reason) => panic!("expected the body to carry, refused: {reason}"),
     }
 }
@@ -169,7 +172,7 @@ fn an_undefined_reserved_address_admits_nobody() {
 #[test]
 fn an_unguarded_plane_carries_the_body_through() {
     let planes = planes();
-    let body = carried(planes.guard(PLAIN_LOCAL, Origin::Sub("p1"), "{\"a\":1}".to_string()));
+    let body = carried(planes.guard(PLAIN_LOCAL, Origin::Sub("p1"), "{\"a\":1}".into()));
     assert_eq!(body, "{\"a\":1}");
 }
 
@@ -179,7 +182,7 @@ fn a_takeover_body_is_stamped_with_its_publisher() {
     let body = carried(planes.guard(
         LOCAL_TAKEOVER_CHANNEL,
         Origin::Sub("p1"),
-        takeover_body("chrome"),
+        takeover_body("chrome").into(),
     ));
     let parsed: TakeoverBody = serde_json::from_str(&body).expect("the stamped body parses");
     assert_eq!(
@@ -191,11 +194,8 @@ fn a_takeover_body_is_stamped_with_its_publisher() {
 #[test]
 fn an_unparseable_takeover_body_is_refused() {
     let planes = planes();
-    let reason = refused(planes.guard(
-        LOCAL_TAKEOVER_CHANNEL,
-        Origin::Sub("p1"),
-        "not json".to_string(),
-    ));
+    let reason =
+        refused(planes.guard(LOCAL_TAKEOVER_CHANNEL, Origin::Sub("p1"), "not json".into()));
     assert!(reason.contains("unparseable body"), "{reason}");
 }
 
@@ -211,7 +211,7 @@ fn a_takeover_body_keeps_its_mode_through_the_stamp() {
         instance: "chrome".to_string(),
     })
     .expect("the takeover body serializes");
-    let body = carried(planes.guard(LOCAL_TAKEOVER_CHANNEL, Origin::Sub("p1"), body));
+    let body = carried(planes.guard(LOCAL_TAKEOVER_CHANNEL, Origin::Sub("p1"), body.into()));
     let parsed: TakeoverBody = serde_json::from_str(&body).expect("the stamped body parses");
     assert_eq!(parsed.mode, TakeoverMode::Overlay);
     assert_eq!(parsed.instance, "p1");
@@ -225,7 +225,7 @@ fn a_takeover_body_without_a_mode_is_stamped_as_a_takeover() {
     let body = carried(planes.guard(
         LOCAL_TAKEOVER_CHANNEL,
         Origin::Sub("p1"),
-        r#"{"v":1,"action":"request","instance":"p1"}"#.to_string(),
+        r#"{"v":1,"action":"request","instance":"p1"}"#.into(),
     ));
     assert!(body.contains(r#""mode":"takeover""#), "{body}");
     let parsed: TakeoverBody = serde_json::from_str(&body).expect("the stamped body parses");
@@ -241,7 +241,7 @@ fn a_takeover_body_naming_a_victim_but_missing_a_field_is_refused() {
     let reason = refused(planes.guard(
         LOCAL_TAKEOVER_CHANNEL,
         Origin::Sub("p1"),
-        r#"{"action":"release","instance":"victim"}"#.to_string(),
+        r#"{"action":"release","instance":"victim"}"#.into(),
     ));
     assert!(reason.contains("unparseable body"), "{reason}");
     assert!(reason.contains("missing field `v`"), "{reason}");
@@ -260,7 +260,7 @@ fn a_takeover_body_with_an_unrecognised_version_still_stamps() {
         instance: "chrome".to_string(),
     })
     .expect("the takeover body serializes");
-    let body = carried(planes.guard(LOCAL_TAKEOVER_CHANNEL, Origin::Sub("p1"), body));
+    let body = carried(planes.guard(LOCAL_TAKEOVER_CHANNEL, Origin::Sub("p1"), body.into()));
     let parsed: TakeoverBody = serde_json::from_str(&body).expect("the stamped body parses");
     assert_eq!(parsed.v, 7);
     assert_eq!(parsed.instance, "p1");
@@ -273,7 +273,7 @@ fn the_kernel_may_not_state_a_takeover() {
     let _ = planes.guard(
         LOCAL_TAKEOVER_CHANNEL,
         Origin::Attacher,
-        takeover_body("p1"),
+        takeover_body("p1").into(),
     );
 }
 
@@ -284,7 +284,7 @@ fn the_kernel_may_not_report_an_overlay() {
     let _ = planes.guard(
         LOCAL_OVERLAY_STATE_CHANNEL,
         Origin::Attacher,
-        overlay_body(None),
+        overlay_body(None).into(),
     );
 }
 
@@ -294,7 +294,7 @@ fn only_chrome_may_report_the_overlay() {
     let reason = refused(planes.guard(
         LOCAL_OVERLAY_STATE_CHANNEL,
         Origin::Sub("p1"),
-        overlay_body(Some("p1")),
+        overlay_body(Some("p1")).into(),
     ));
     assert!(reason.contains("chrome instance"), "{reason}");
 }
@@ -305,9 +305,45 @@ fn an_unparseable_overlay_body_is_refused() {
     let reason = refused(planes.guard(
         LOCAL_OVERLAY_STATE_CHANNEL,
         Origin::Sub("chrome"),
-        "not json".to_string(),
+        "not json".into(),
     ));
     assert!(reason.contains("unparseable body"), "{reason}");
+}
+
+/// Both guarded planes carry JSON documents, so a body that is not text is
+/// refused as one that does not parse is, and nothing of it is carried.
+#[test]
+fn a_non_text_body_on_a_guarded_plane_is_refused_as_unparseable() {
+    let planes = planes();
+    for channel in [LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TAKEOVER_CHANNEL] {
+        let body = MessageBody::from_parts(Some("application/octet-stream"), &[0xff, 0x7b])
+            .expect("a well-formed binary body");
+        let reason = refused(planes.guard(channel, Origin::Sub("chrome"), body));
+        assert!(reason.contains("unparseable body"), "{channel}: {reason}");
+        assert!(
+            reason.contains("application/octet-stream, 2 bytes"),
+            "{channel}: {reason}"
+        );
+    }
+}
+
+/// The takeover stamp rewrites the document and keeps the content type its
+/// publisher gave it.
+#[test]
+fn a_typed_takeover_body_keeps_its_content_type_through_the_stamp() {
+    let planes = planes();
+    let body =
+        MessageBody::from_parts(Some("application/json"), takeover_body("chrome").as_bytes())
+            .expect("a well-formed typed text body");
+    match planes.guard(LOCAL_TAKEOVER_CHANNEL, Origin::Sub("p1"), body) {
+        GuardedBody::Carry(stamped) => {
+            assert_eq!(stamped.content_type(), Some("application/json"));
+            let parsed: TakeoverBody = serde_json::from_str(stamped.as_text().expect("still text"))
+                .expect("the stamped body parses");
+            assert_eq!(parsed.instance, "p1");
+        }
+        GuardedBody::Refused(reason) => panic!("expected the body to carry, refused: {reason}"),
+    }
 }
 
 #[test]
@@ -316,7 +352,7 @@ fn an_overlay_holder_the_surface_does_not_declare_is_refused() {
     let reason = refused(planes.guard(
         LOCAL_OVERLAY_STATE_CHANNEL,
         Origin::Sub("chrome"),
-        overlay_body(Some("ghost")),
+        overlay_body(Some("ghost")).into(),
     ));
     assert!(reason.contains("ghost"), "{reason}");
 }
@@ -331,7 +367,7 @@ fn chrome_reporting_a_declared_holder_or_a_release_is_carried() {
         let body = carried(planes.guard(
             LOCAL_OVERLAY_STATE_CHANNEL,
             Origin::Sub("chrome"),
-            overlay_body(holder),
+            overlay_body(holder).into(),
         ));
         assert_eq!(body, overlay_body(holder));
     }
@@ -344,7 +380,7 @@ fn guarding_the_overlay_before_the_wiring_arrives_panics() {
     let _ = planes.guard(
         LOCAL_OVERLAY_STATE_CHANNEL,
         Origin::Sub("chrome"),
-        overlay_body(None),
+        overlay_body(None).into(),
     );
 }
 

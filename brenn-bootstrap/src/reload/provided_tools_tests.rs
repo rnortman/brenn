@@ -330,7 +330,7 @@ async fn trigger(booted: &Booted) {
             brenn_messaging::PublishOrigin::Conversation { id: 1 },
             READER,
             "brenn:work",
-            r#"{"go":true}"#,
+            r#"{"go":true}"#.into(),
             brenn_messaging::Urgency::Normal,
             None,
             None,

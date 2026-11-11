@@ -17,6 +17,7 @@ brenn-envelope = { path = "../brenn-envelope" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
 brenn-queue = { version = "0.1.0", path = "../brenn-queue" }
 async-trait = "0.1.89"
+base64ct = { version = "1.8.3", features = ["alloc"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 indexmap = "2"
 rusqlite = { version = "0.41.1", features = ["bundled", "trace"] }

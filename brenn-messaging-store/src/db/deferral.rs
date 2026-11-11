@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use super::shared::parse_rfc3339;
 use brenn_db::format_ts_for_db;
-use brenn_lib::messaging::MessageEnvelope;
+use brenn_lib::messaging::{MessageBody, MessageEnvelope};
 
 /// A parked message on one channel, as its sender sees it.
 #[derive(Debug)]
@@ -38,7 +38,7 @@ pub struct DeferredLookup {
     pub release_at: DateTime<Utc>,
 }
 
-/// Columns 0-11 as `row_to_message_envelope` expects them, plus `m.id` at 12,
+/// Columns 0-12 as `row_to_message_envelope` expects them, plus `m.id` at 13,
 /// for the messages on one channel that are unreleased, optionally narrowed to
 /// those whose `deliver_after` stands in the `cmp` relation to `?2`.
 ///
@@ -56,7 +56,7 @@ fn deferred_select(cmp: Option<&str>) -> String {
     format!(
         "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                 m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                c.address, rc.address, m.envelope_type, m.impetus, m.id
+                c.address, rc.address, m.envelope_type, m.impetus, m.content_type, m.id
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
@@ -99,7 +99,7 @@ pub fn list_deferred_for_sender(
             |row| {
                 let deliver_after: String = row.get(6)?;
                 Ok(DeferredRow {
-                    message_id: row.get(12)?,
+                    message_id: row.get(13)?,
                     release_at: parse_release(&deliver_after),
                     envelope: super::bus::row_to_message_envelope(row)?,
                 })
@@ -250,7 +250,8 @@ pub fn delete_deferred(
     true
 }
 
-/// Replace a parked message's body, release time, or both.
+/// Replace a parked message's body, release time, or both. A new body replaces
+/// the content type with it, and may change the body's kind.
 ///
 /// Distinct from the general message edit path: a parked message has no
 /// delivered copies by definition, so there is no delivered-check to fail and
@@ -260,7 +261,7 @@ pub fn edit_deferred(
     conn: &Connection,
     channel_uuid: Uuid,
     message_id: i64,
-    body: Option<&str>,
+    body: Option<&MessageBody>,
     release_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> bool {
@@ -282,9 +283,10 @@ pub fn edit_deferred(
         return false;
     }
     if let Some(body) = body {
+        let (body_value, content_type) = super::body_columns(body);
         tx.execute(
-            "UPDATE messaging_messages SET body = ?1 WHERE id = ?2",
-            rusqlite::params![body, message_id],
+            "UPDATE messaging_messages SET body = ?1, content_type = ?2 WHERE id = ?3",
+            rusqlite::params![body_value, content_type, message_id],
         )
         .expect("messaging: update deferred body");
     }
@@ -366,7 +368,7 @@ pub fn release_due_for_channel(
                 // The row still carries the release time this call is about to
                 // clear; a released message is not a deferred one.
                 envelope.deliver_after = None;
-                Ok((row.get(12)?, envelope))
+                Ok((row.get(13)?, envelope))
             })
             .expect("query release_due_for_channel");
         for r in rows {

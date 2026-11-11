@@ -664,10 +664,13 @@ where
     Box::new(move |activation, buffer| {
         for window in &activation.ports {
             for envelope in window.new_envelopes() {
-                seen.0
-                    .lock()
-                    .unwrap()
-                    .push(brenn_surface_test_fixtures::parse_envelope(envelope).body);
+                seen.0.lock().unwrap().push(
+                    brenn_surface_test_fixtures::parse_envelope(envelope)
+                        .body
+                        .as_text()
+                        .unwrap()
+                        .to_owned(),
+                );
             }
         }
         act(activation, buffer)
@@ -702,7 +705,13 @@ fn windowing(windows: &Windows) -> ActivationEntry {
             .ports
             .iter()
             .flat_map(|window| window.new_envelopes())
-            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
+            .map(|envelope| {
+                brenn_surface_test_fixtures::parse_envelope(envelope)
+                    .body
+                    .as_text()
+                    .unwrap()
+                    .to_owned()
+            })
             .collect();
         windows.0.lock().unwrap().push(bodies);
         Ok(None)
@@ -807,7 +816,7 @@ fn toasts(page: &SurfacePage) -> Vec<String> {
         .expect("a page hosts its reserved planes from its first instant")
         .retained()
         .map(|(envelope, _)| {
-            serde_json::from_str::<ToastBody>(&envelope.body)
+            serde_json::from_str::<ToastBody>(envelope.body.as_text().unwrap())
                 .expect("the toast plane carries toast bodies")
                 .text
         })

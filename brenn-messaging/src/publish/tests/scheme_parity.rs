@@ -155,7 +155,7 @@ async fn send(m: &Messenger, slug: &str, addr: &str, body: &str) -> PublishResul
         PublishOrigin::Conversation { id: CONVERSATION },
         slug,
         addr,
-        body,
+        body.into(),
         Urgency::Normal,
         None,
         None,
@@ -187,7 +187,7 @@ async fn an_ephemeral_publish_lands_in_the_ring_and_fans_out() {
     let store = ring_store(&m, "ephemeral:eph-chan");
     let retained = store.retained_tail(10);
     assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0].envelope.body, "hi");
+    assert_eq!(retained[0].envelope.body.as_text(), Some("hi"));
     assert_eq!(retained[0].envelope.sender, "app:pub-app@test-source");
     assert_eq!(ring_store(&m, "ephemeral:eph-chan").publish_count(), 1);
 }
@@ -210,7 +210,7 @@ async fn a_local_publish_commits_to_the_confined_ring() {
         .expect("local channel resolves in the directory");
     let retained = m.ring_store_for(&entry).retained_tail(10);
     assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0].envelope.body, "hi");
+    assert_eq!(retained[0].envelope.body.as_text(), Some("hi"));
     assert_eq!(retained[0].envelope.sender, "app:pub-app@test-source");
     // The message landed on a channel that cannot leave the process: a confined
     // store issues no live receiver, so no serializer can ever be handed it.
@@ -251,7 +251,7 @@ async fn a_nondurable_option_probe_never_reveals_channel_existence() {
             PublishOrigin::Conversation { id: CONVERSATION },
             "no-grants",
             "ephemeral:eph-chan",
-            "hi",
+            "hi".into(),
             Urgency::Normal,
             Some("brenn:answers"),
             None,
@@ -418,7 +418,7 @@ async fn the_option_fields_are_carried_on_every_transportable_scheme() {
                 PublishOrigin::Conversation { id: CONVERSATION },
                 "pub-app",
                 &addr,
-                "hi",
+                "hi".into(),
                 Urgency::Normal,
                 Some(&reply_to),
                 None,
@@ -466,7 +466,7 @@ async fn an_unresolvable_reply_to_is_refused_on_every_scheme() {
                 PublishOrigin::Conversation { id: CONVERSATION },
                 "pub-app",
                 &addr,
-                "hi",
+                "hi".into(),
                 Urgency::Normal,
                 Some("brenn:no-such-answers"),
                 None,
@@ -499,7 +499,7 @@ async fn publish_deferred(
         PublishOrigin::Conversation { id: CONVERSATION },
         "pub-app",
         addr,
-        body,
+        body.into(),
         Urgency::Normal,
         None,
         Some(deliver_after),
@@ -552,7 +552,7 @@ async fn a_future_deliver_after_parks_and_then_releases_on_an_ephemeral_channel(
     );
     let tail = store.retained_tail(10);
     assert_eq!(tail.len(), 1);
-    assert_eq!(tail[0].envelope.body, "later");
+    assert_eq!(tail[0].envelope.body.as_text(), Some("later"));
     assert_eq!(store.deferred_len(), 0);
     assert_eq!(m.next_deferred_release().await, None);
 }
@@ -584,7 +584,7 @@ async fn the_release_pass_releases_a_confined_local_channels_parked_message() {
                 channel: "local:local-chan".into(),
                 sender: "app:pub-app@test-source".into(),
                 publish_ts: base,
-                body: "soon".to_string(),
+                body: "soon".into(),
                 reply_to: None,
                 delivery_deadline: None,
                 deliver_after: None,
@@ -607,7 +607,7 @@ async fn the_release_pass_releases_a_confined_local_channels_parked_message() {
     );
     let tail = store.retained_tail(10);
     assert_eq!(tail.len(), 1);
-    assert_eq!(tail[0].envelope.body, "soon");
+    assert_eq!(tail[0].envelope.body.as_text(), Some("soon"));
 }
 
 /// The retained window of any channel, read class-blind through its store.
@@ -616,7 +616,7 @@ async fn retained_bodies(m: &Messenger, addr: &str) -> Vec<String> {
         .retained_tail(crate::config::Depth::Bounded(10))
         .await
         .into_iter()
-        .map(|e| e.body.clone())
+        .map(|e| e.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -744,7 +744,7 @@ async fn a_released_ephemeral_message_enters_retention_at_the_release() {
         store
             .retained_tail(10)
             .iter()
-            .map(|r| r.envelope.body.as_str())
+            .map(|r| r.envelope.body.as_text().unwrap())
             .collect::<Vec<_>>(),
         vec!["later"],
         "the release is what puts it where a resume can see it"

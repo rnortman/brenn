@@ -241,7 +241,7 @@ async fn publish_transport_ingress_panics_on_malformed_envelope() {
             channel,
             "webhook:wh-test",
             "key1",
-            "not-valid-json-at-all",
+            "not-valid-json-at-all".into(),
             Urgency::Low,
         )
         .await;
@@ -270,7 +270,7 @@ async fn publish_transport_ingress_commits_without_inline_dispatch() {
             channel.clone(),
             "webhook:wh-test",
             "k",
-            valid_body,
+            valid_body.into(),
             Urgency::Normal,
         )
         .await;
@@ -305,7 +305,7 @@ async fn publish_transport_ingress_panics_on_malformed_mqtt_envelope() {
             channel,
             "mqtt:homeassistant:home/+/state",
             "homeassistant",
-            "not-valid-json-at-all",
+            "not-valid-json-at-all".into(),
             Urgency::Low,
         )
         .await;
@@ -323,7 +323,7 @@ async fn publish_transport_ingress_mqtt_stores_typed_row_and_pending_push() {
             channel.clone(),
             "mqtt:homeassistant:home/+/state",
             "homeassistant",
-            VALID_MQTT_BODY,
+            VALID_MQTT_BODY.into(),
             Urgency::Normal,
         )
         .await;

@@ -862,7 +862,10 @@ async fn retained_documents(
         lines.push(format!(
             "{} {}",
             entry.address,
-            narrowed(families.get(&entry.address).copied(), &newest.body),
+            narrowed(
+                families.get(&entry.address).copied(),
+                newest.body.as_text().unwrap()
+            ),
         ));
     }
     lines.sort();
@@ -1688,7 +1691,7 @@ async fn publish_work(messenger: &Arc<Messenger>) -> brenn_messaging::PublishRes
             brenn_messaging::PublishOrigin::Conversation { id: 1 },
             READER,
             "brenn:work",
-            "tick",
+            "tick".into(),
             brenn_messaging::Urgency::Normal,
             None,
             None,

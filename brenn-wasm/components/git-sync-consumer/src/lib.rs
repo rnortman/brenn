@@ -48,7 +48,7 @@
 mod spec;
 
 use crate::spec::{InPort, alert, config, log, store, tools};
-use brenn_guest::{Activation, Error, Processor, serde_json};
+use brenn_guest::{Activation, Error, MessageEnvelopeExt, Processor, serde_json};
 use serde::{Deserialize, Serialize};
 
 /// The async tool this consumer holds a grant for.
@@ -299,8 +299,8 @@ impl Processor for GitSyncConsumer {
             for result in window.new_envelopes() {
                 let env = result?;
                 match port {
-                    InPort::PushEvents => handle_push_event(&repo_map, &env.body)?,
-                    InPort::ToolResults => handle_tool_result(&env.body)?,
+                    InPort::PushEvents => handle_push_event(&repo_map, env.text_body()?)?,
+                    InPort::ToolResults => handle_tool_result(env.text_body()?)?,
                 }
             }
         }

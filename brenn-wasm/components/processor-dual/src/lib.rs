@@ -18,7 +18,9 @@
 // Does not import `store` (import-GC strips it; host links it regardless —
 // exercising the subset-instantiation property).
 
-use brenn_guest::{Activation, Error, Processor, Urgency, publish, publish_with_urgency};
+use brenn_guest::{
+    Activation, Error, MessageEnvelopeExt, Processor, Urgency, publish, publish_with_urgency,
+};
 
 struct ProcessorDual;
 
@@ -29,7 +31,7 @@ impl Processor for ProcessorDual {
             // JSON strings (for raw-passthrough publish in the default case).
             for (env_result, raw) in window.new_envelopes().zip(window.new_raw()) {
                 let env = env_result?;
-                let body = env.body.trim();
+                let body = env.text_body()?.trim();
                 if let Some(level) = body.strip_prefix("__urgency__:") {
                     // Directive: publish a fixed marker to "out1" with the
                     // named urgency. Integration test asserts the urgency field.

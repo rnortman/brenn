@@ -729,7 +729,7 @@ impl ReloadDriver {
         // Through the publisher's own gate, so prepare's verdict and the
         // publish-side verdict cannot drift apart at the boundary.
         if let Err(BodySizeExceeded { len, max }) =
-            check_body_size(&applied.body(), self.env.messenger.max_body_bytes())
+            check_body_size(&applied.body().into(), self.env.messenger.max_body_bytes())
         {
             return refused(
                 Some(sha),
@@ -1634,7 +1634,7 @@ impl ReloadDriver {
 /// body prepare proved publishable. The journal line above carries them in full
 /// either way.
 fn fit_session_lists(applied: &mut ReloadStatus, max: usize) {
-    if check_body_size(&applied.body(), max).is_ok() {
+    if check_body_size(&applied.body().into(), max).is_ok() {
         return;
     }
     let retired = applied.delta.sessions_retired.len();
@@ -1649,7 +1649,7 @@ fn fit_session_lists(applied: &mut ReloadStatus, max: usize) {
     applied.delta.sessions_retire_pending = vec![format!(
         "{pending} sessions retiring at turn end; names omitted"
     )];
-    if check_body_size(&applied.body(), max).is_ok() {
+    if check_body_size(&applied.body().into(), max).is_ok() {
         return;
     }
     applied.delta.sessions_retired.clear();
@@ -2925,7 +2925,8 @@ channel scratch at "ephemeral:scratch" {{
             // The query answers newest first; reverse to chronological order.
             .rev()
             .map(|envelope| {
-                serde_json::from_str(&envelope.body).expect("the retained body is the schema")
+                serde_json::from_str(envelope.body.as_text().unwrap())
+                    .expect("the retained body is the schema")
             })
             .collect()
     }
@@ -5267,7 +5268,7 @@ new sifter: Demo {{
                 brenn_messaging::PublishOrigin::Conversation { id: 1 },
                 READER,
                 "brenn:work",
-                r#"{"cmd":"get","key":"test-key"}"#,
+                r#"{"cmd":"get","key":"test-key"}"#.into(),
                 brenn_messaging::Urgency::Normal,
                 None,
                 None,
@@ -6065,7 +6066,7 @@ channel extra at "brenn:extra" {
                 brenn_messaging::PublishOrigin::Conversation { id: 1 },
                 READER,
                 RELOAD_ADDRESS,
-                "please",
+                "please".into(),
                 brenn_messaging::Urgency::Normal,
                 None,
                 None,
@@ -8772,7 +8773,7 @@ channel spill at "ephemeral:spill" {
             .expect("the fixture reader may read every address it is given")
             .into_iter()
             .next()
-            .map(|envelope| envelope.body)
+            .map(|envelope| envelope.body.as_text().unwrap().to_owned())
     }
 
     /// Whether the runtime table serves `slug`.
@@ -9663,7 +9664,7 @@ channel spill at "ephemeral:spill" {
                 .publish_from_surface_platform(
                     &slug,
                     &channel,
-                    "{}",
+                    "{}".into(),
                     brenn_messaging::Urgency::Normal,
                 )
                 .await

@@ -8,7 +8,7 @@
 
 mod spec;
 
-use brenn_guest::{Activation, Error, OutPort, Processor};
+use brenn_guest::{Activation, Error, MessageEnvelopeExt, OutPort, Processor};
 use heck::{ToKebabCase, ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
 use serde::Serialize;
 
@@ -52,8 +52,9 @@ impl Processor for ExampleCaser {
             spec::InPort::of(&window)?;
             for envelope in window.new_envelopes() {
                 let envelope = envelope?;
-                let cased = recase(&envelope.body);
-                spec::log::info(format!("recased {:?} as {}", envelope.body, cased.kebab));
+                let text = envelope.text_body()?;
+                let cased = recase(text);
+                spec::log::info(format!("recased {text:?} as {}", cased.kebab));
                 CASED.publish(&cased)?;
             }
         }

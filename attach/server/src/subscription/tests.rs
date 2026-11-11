@@ -177,7 +177,7 @@ async fn seed(db: &Db, channel_uuid: Uuid, body: &str, ts_ns: i64) {
         channel_uuid,
         "test",
         "sender",
-        body,
+        &body.into(),
         Urgency::Normal,
         ChannelScheme::Brenn,
         None,
@@ -1197,7 +1197,7 @@ async fn parity_commit(rig: &mut ParityRig, body: &str) {
                 .publish_prepaid(
                     &dest,
                     brenn_messaging::PrepaidEntry {
-                        body,
+                        body: body.into(),
                         urgency: brenn_lib::messaging::Urgency::Normal,
                         publish_ts: chrono::Utc::now(),
                     },
@@ -1244,7 +1244,10 @@ fn parity_lines(frame: &ServerFrame) -> Vec<String> {
                 // carries.
                 format!(
                     "deliver body={} span={} pos={} dropped={}",
-                    row.envelope.body, row.seq, state.resume.seq, row.dropped
+                    row.envelope.body.as_text().unwrap(),
+                    row.seq,
+                    state.resume.seq,
+                    row.dropped
                 )
             })
             .collect(),
@@ -1687,4 +1690,52 @@ async fn a_profile_with_boot_declared_entries_touches_the_directory_not_at_all()
     assert!(matches!(wire.open(&ctx, 2).await, FrameOutcome::Continue));
 
     assert!(directory_subscribers(&ctx, ADDR).is_empty());
+}
+
+/// One delivery pass over a single row carrying `body`, written to a fresh
+/// connection; returns the frames it queued.
+async fn send_one_row(body: brenn_lib::messaging::MessageBody) -> Vec<ServerFrame> {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx, _uuid) = attach(&db).await;
+    let mut wire = Wire::new(&ctx);
+    wire.cursors.start_span(ADDR, Uuid::from_u128(0xfeed), 0);
+    let row = PassRow {
+        envelope: brenn_envelope::testutils::fixture_envelope(ADDR, "row", body),
+        dropped: 0,
+        retained_seq: 1,
+    };
+    let outcome = send_pass(&ctx, &mut wire.cursors, ADDR, vec![row], &mut wire.counters).await;
+    assert!(matches!(outcome, FrameOutcome::Continue));
+    frames(&mut rx)
+}
+
+/// A v4 `Deliver` row carries a typed text body as exactly its text: the
+/// frame is the one an untyped body with the same text produces.
+#[tokio::test]
+async fn a_typed_text_body_is_delivered_as_its_text() {
+    let typed =
+        brenn_lib::messaging::MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+    let typed_frames = send_one_row(typed).await;
+    let untyped_frames = send_one_row("# hi".into()).await;
+    assert_eq!(typed_frames.len(), 1);
+    let typed_text = serde_json::to_string(&typed_frames[0]).unwrap();
+    assert_eq!(
+        typed_text,
+        serde_json::to_string(&untyped_frames[0]).unwrap()
+    );
+    assert!(typed_text.contains(r##""body":"# hi""##), "{typed_text}");
+    assert!(!typed_text.contains("content_type"), "{typed_text}");
+}
+
+/// A non-text body never reaches a v4 `Deliver` row: building it panics,
+/// naming the carrier.
+#[tokio::test]
+#[should_panic(expected = "attach v4 Deliver")]
+async fn a_non_text_body_panics_where_the_deliver_row_is_built() {
+    let body = brenn_lib::messaging::MessageBody::from_parts(
+        Some("application/octet-stream"),
+        &[0xff, 0x00],
+    )
+    .unwrap();
+    send_one_row(body).await;
 }

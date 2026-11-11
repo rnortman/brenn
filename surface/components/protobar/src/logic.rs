@@ -260,7 +260,11 @@ impl ProtobarState {
         self.check_port(port)?;
         let envelope: MessageEnvelope = serde_json::from_str(envelope_json)
             .map_err(|e| ContractViolation::BadEnvelope(e.to_string()))?;
-        match ParsedBody::parse(&envelope.body) {
+        let parsed = match envelope.body.as_text() {
+            Some(text) => ParsedBody::parse(text),
+            None => ParsedBody::Malformed("body is not text".to_string()),
+        };
+        match parsed {
             ParsedBody::Malformed(reason) => {
                 self.malformed += 1;
                 Ok(Ingest::Malformed(FaultReport::new(&envelope, reason)))

@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn sample_envelope_json_deserializes() {
         let envelope = sample_envelope("hello");
-        assert_eq!(envelope.body, "hello");
+        assert_eq!(envelope.body.as_text(), Some("hello"));
         assert_eq!(
             envelope.envelope_type,
             brenn_envelope::ChannelScheme::Ephemeral

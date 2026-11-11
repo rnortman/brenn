@@ -391,7 +391,12 @@ impl ModeClock {
         }
         let envelope: MessageEnvelope = serde_json::from_str(envelope_json)
             .map_err(|e| ContractViolation::BadEnvelope(e.to_string()))?;
-        match parse_config(&envelope.body) {
+        let parsed = envelope
+            .body
+            .as_text()
+            .ok_or_else(|| "body is not text".to_string())
+            .and_then(parse_config);
+        match parsed {
             Ok(config) => {
                 self.config = config;
                 Ok(ConfigOutcome::Accepted)

@@ -231,7 +231,7 @@ fn park(page: &mut SurfacePage, sender: &str) {
         RouteRequest {
             channel: NOTES,
             origin: Origin::Sub(sender),
-            body: "{}".to_string(),
+            body: "{}".into(),
             stamp,
             urgency: Urgency::Normal,
             deliver_after: Some(9_000),
@@ -342,13 +342,13 @@ fn phase_two_hands_the_wiring_to_the_plane_policy() {
     let carried = page.router.policy().guard(
         LOCAL_OVERLAY_STATE_CHANNEL,
         Origin::Sub("chrome"),
-        r#"{"v":1,"holder":"p1","since_stamp":0}"#.to_string(),
+        r#"{"v":1,"holder":"p1","since_stamp":0}"#.into(),
     );
     assert!(matches!(carried, GuardedBody::Carry(_)));
     let refused = page.router.policy().guard(
         LOCAL_OVERLAY_STATE_CHANNEL,
         Origin::Sub("chrome"),
-        r#"{"v":1,"holder":"ghost","since_stamp":0}"#.to_string(),
+        r#"{"v":1,"holder":"ghost","since_stamp":0}"#.into(),
     );
     assert!(matches!(refused, GuardedBody::Refused(_)));
 }

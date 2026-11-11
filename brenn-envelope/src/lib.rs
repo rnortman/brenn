@@ -27,12 +27,17 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub mod addressing;
+pub mod body;
 pub mod channel_model;
 pub mod chat;
 pub mod grants;
+pub mod shape;
 #[cfg(feature = "testutils")]
 pub mod testutils;
 pub mod tool_schema;
+
+pub use body::{BodyError, MessageBody, is_text_content_type};
+pub use shape::{BodyShape, ShapedEnvelope, TextShape, serialize_text_shape};
 
 // ---------------------------------------------------------------------------
 // Address scheme
@@ -657,9 +662,13 @@ impl Impetus {
 // MessageEnvelope
 // ---------------------------------------------------------------------------
 
-/// Canonical message envelope used by `MessageQueryChannel` output and the
-/// LLM-facing batch formatter.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Canonical message envelope: what a channel holds, a query returns and every
+/// subscriber is shown.
+///
+/// It has no `Serialize`: each contract that writes an envelope names its
+/// shape ([`MessageEnvelope::shaped`]); [`MessageEnvelope::to_envelope_json`]
+/// is the text shape. `Deserialize` reads the text shape only.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageEnvelope {
     pub message_id: Uuid,
     pub source: String,
@@ -667,43 +676,28 @@ pub struct MessageEnvelope {
     pub channel: String,
     pub sender: String,
     pub publish_ts: DateTime<Utc>,
-    pub body: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Bytes with an optional content type; text or not by
+    /// [`is_text_content_type`]. Each shape writes it its own way.
+    pub body: MessageBody,
+    /// Omitted from every shape when absent.
     pub reply_to: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Omitted from every shape when absent.
     pub delivery_deadline: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Omitted from every shape when absent.
     pub deliver_after: Option<DateTime<Utc>>,
     /// Carried user-interaction authority, or `None` — which is what nearly
-    /// every message carries. Skip-serialized when absent so an impetus-free
-    /// envelope carries no `impetus` key on the wire.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// every message carries. Omitted when absent, so an impetus-free envelope
+    /// carries no `impetus` key on the wire.
     pub impetus: Option<Impetus>,
     /// Sender-assigned urgency intent. Stored in `messaging_messages.urgency`.
     /// Controls per-subscriber `eager_wake` (via `WakeMin::wakes`) at insert time.
-    /// LLM-visible via serde kebab-case (`"very-low"` / `"low"` / `"normal"` / `"high"`).
+    /// LLM-visible in kebab-case (`"very-low"` / `"low"` / `"normal"` / `"high"`).
     pub urgency: Urgency,
     /// Stored transport type of the channel this message was published on.
     /// Authoritative for heading selection in `format.rs`.
     /// Additive to the LLM-facing JSON; the LLM is the maximally-adaptable
     /// consumer.
     pub envelope_type: ChannelScheme,
-}
-
-impl MessageEnvelope {
-    /// This envelope as the canonical JSON text a component is handed: the
-    /// `envelope-json` of `processor.wit`.
-    ///
-    /// The one lowering, called by every host that windows envelopes for a
-    /// guest, so the text a component reads is the same at every placement.
-    ///
-    /// # Panics
-    ///
-    /// If the envelope does not serialize. No field of this struct can refuse,
-    /// so a failure is a serde bug and the window would be wrong either way.
-    pub fn to_envelope_json(&self) -> String {
-        serde_json::to_string(self).expect("a MessageEnvelope serializes to JSON")
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -723,7 +717,7 @@ mod tests {
             channel: "brenn:test".to_string(),
             sender: "test-sender".to_string(),
             publish_ts: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
-            body: "hello".to_string(),
+            body: MessageBody::text("hello"),
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
@@ -1030,7 +1024,7 @@ mod tests {
     #[test]
     fn message_envelope_serde_roundtrip_minimal() {
         let env = make_envelope(Urgency::Normal, ChannelScheme::Brenn);
-        let s = serde_json::to_string(&env).unwrap();
+        let s = env.to_envelope_json();
         let env2: MessageEnvelope = serde_json::from_str(&s).unwrap();
         assert_eq!(env.message_id, env2.message_id);
         assert_eq!(env.urgency, env2.urgency);
@@ -1043,7 +1037,7 @@ mod tests {
         env.reply_to = Some("reply-id".to_string());
         env.delivery_deadline = Some(DateTime::<Utc>::from_timestamp(1_700_001_000, 0).unwrap());
         env.deliver_after = Some(DateTime::<Utc>::from_timestamp(1_699_999_000, 0).unwrap());
-        let s = serde_json::to_string(&env).unwrap();
+        let s = env.to_envelope_json();
         let env2: MessageEnvelope = serde_json::from_str(&s).unwrap();
         assert_eq!(env.reply_to, env2.reply_to);
         assert_eq!(env.delivery_deadline, env2.delivery_deadline);
@@ -1053,7 +1047,7 @@ mod tests {
     #[test]
     fn message_envelope_optional_fields_absent_when_none() {
         let env = make_envelope(Urgency::Normal, ChannelScheme::Brenn);
-        let v: Value = serde_json::to_value(&env).unwrap();
+        let v: Value = serde_json::from_str(&env.to_envelope_json()).unwrap();
         assert!(v.get("reply_to").is_none(), "reply_to should be absent");
         assert!(
             v.get("delivery_deadline").is_none(),
@@ -1074,7 +1068,7 @@ mod tests {
             channel: "brenn:chan".to_string(),
             sender: "alice".to_string(),
             publish_ts: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
-            body: "test body".to_string(),
+            body: MessageBody::text("test body"),
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
@@ -1082,7 +1076,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Brenn,
         };
-        let v: Value = serde_json::to_value(&env).unwrap();
+        let v: Value = serde_json::from_str(&env.to_envelope_json()).unwrap();
         assert_eq!(
             v["message_id"],
             json!("00000000-0000-0000-0000-000000000001")
@@ -1114,7 +1108,7 @@ mod tests {
     fn message_envelope_carries_impetus_through_a_roundtrip() {
         let mut env = make_envelope(Urgency::Normal, ChannelScheme::Brenn);
         env.impetus = Some(Impetus::Replenish);
-        let v: Value = serde_json::to_value(&env).unwrap();
+        let v: Value = serde_json::from_str(&env.to_envelope_json()).unwrap();
         assert_eq!(v["impetus"], json!("replenish"));
         let env2: MessageEnvelope = serde_json::from_value(v).unwrap();
         assert_eq!(env2.impetus, Some(Impetus::Replenish));
@@ -1125,7 +1119,7 @@ mod tests {
     #[test]
     fn an_impetus_free_envelope_carries_no_impetus_key() {
         let env = make_envelope(Urgency::Normal, ChannelScheme::Brenn);
-        let v: Value = serde_json::to_value(&env).unwrap();
+        let v: Value = serde_json::from_str(&env.to_envelope_json()).unwrap();
         assert!(v.get("impetus").is_none(), "impetus should be absent");
         // And the absent key decodes back to None without a `default` attribute.
         let env2: MessageEnvelope = serde_json::from_value(v).unwrap();

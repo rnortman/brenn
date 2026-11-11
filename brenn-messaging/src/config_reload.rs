@@ -538,7 +538,7 @@ pub async fn publish_status(messenger: &Messenger, status: &ReloadStatus) {
         .publish_from_system(
             CONFIG_RELOAD_COMPONENT,
             STATUS_ADDRESS,
-            &body,
+            body.into(),
             Urgency::Normal,
             None,
         )

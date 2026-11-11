@@ -432,7 +432,7 @@ impl MeetingState {
         let envelope = parse_delivery(port, &[AGENDA, ACKS], envelope_json)?;
 
         let outcome = if port == AGENDA {
-            match parse_snapshot(&envelope.body) {
+            match body_text(&envelope).and_then(parse_snapshot) {
                 Ok((meetings, warnings)) => {
                     self.meetings = meetings;
                     IngestOutcome::Accepted { warnings }
@@ -440,7 +440,7 @@ impl MeetingState {
                 Err(reason) => self.fault(&envelope, reason),
             }
         } else {
-            match parse_ack(&envelope.body) {
+            match body_text(&envelope).and_then(parse_ack) {
                 Ok(AckParse::Ack(target, action)) => {
                     self.store_ack(&target, action, envelope.publish_ts);
                     IngestOutcome::Accepted { warnings: vec![] }
@@ -706,6 +706,15 @@ fn parse_ts(field: &str, s: &str) -> Result<DateTime<Utc>, String> {
 
 /// Validate an agenda snapshot into meetings plus per-meeting override warnings
 /// (the meeting is kept with defaults), or a precise whole-snapshot fault reason.
+/// The body's text; a body that is not text is malformed like one that does
+/// not parse.
+fn body_text(envelope: &MessageEnvelope) -> Result<&str, String> {
+    envelope
+        .body
+        .as_text()
+        .ok_or_else(|| "body is not text".to_string())
+}
+
 fn parse_snapshot(body: &str) -> Result<(Vec<Meeting>, Vec<IngestWarning>), String> {
     let raw: RawSnapshot =
         serde_json::from_str(body).map_err(|e| format!("unparseable agenda: {e}"))?;

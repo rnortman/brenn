@@ -173,7 +173,7 @@ fn retained(page: &SurfacePage, channel: &str) -> Vec<String> {
         .get(channel)
         .expect("the fixture hosts the channel")
         .retained()
-        .map(|(envelope, _)| envelope.body.clone())
+        .map(|(envelope, _)| envelope.body.as_text().unwrap().to_owned())
         .collect()
 }
 

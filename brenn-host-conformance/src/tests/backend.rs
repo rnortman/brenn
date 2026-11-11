@@ -452,7 +452,7 @@ impl Backend {
         let entry = &self.channels[port];
         self.template
             .messenger
-            .publish_from_system(HOST, &entry.address, body, Urgency::Normal, None)
+            .publish_from_system(HOST, &entry.address, body.into(), Urgency::Normal, None)
             .await
     }
 }
@@ -500,7 +500,7 @@ impl Host for Backend {
         let result = self
             .template
             .messenger
-            .publish_from_system(HOST, &entry.address, body, Urgency::Normal, None)
+            .publish_from_system(HOST, &entry.address, body.into(), Urgency::Normal, None)
             .await;
         assert!(
             matches!(result, PublishResult::Ok { .. }),
@@ -566,7 +566,7 @@ impl Host for Backend {
             .entries
             .iter()
             .filter(|(seq, _)| self.read_through.is_none_or(|read| *seq > read))
-            .map(|(seq, envelope)| (*seq, envelope.body.clone()))
+            .map(|(seq, envelope)| (*seq, envelope.body.as_text().unwrap().to_owned()))
             .collect();
         if let Some((seq, _)) = fresh.last() {
             self.read_through = Some(*seq);

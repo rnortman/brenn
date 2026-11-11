@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use brenn_messaging::Messenger;
 use brenn_messaging::system::SystemInbox;
+use brenn_messaging::{MessageBody, Messenger};
 use tokio::sync::Notify;
 
 /// Attach the system participant `component` and hand the latest retained
@@ -18,7 +18,7 @@ pub(crate) async fn attach_and_seed(
     component: &'static str,
     messenger: Arc<Messenger>,
     notify: Arc<Notify>,
-    mut apply: impl FnMut(&str, &str),
+    mut apply: impl FnMut(&str, &MessageBody),
 ) -> SystemInbox {
     let inbox = SystemInbox::new(component, messenger, notify);
     inbox.attach().await;

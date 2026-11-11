@@ -187,7 +187,13 @@ mod tests {
 
     async fn publish(messenger: &Messenger, body: &str) {
         let outcome = messenger
-            .publish_from_system(PUBLISHER, &epoch_address(), body, Urgency::Normal, None)
+            .publish_from_system(
+                PUBLISHER,
+                &epoch_address(),
+                body.into(),
+                Urgency::Normal,
+                None,
+            )
             .await;
         assert!(
             matches!(outcome, brenn_messaging::PublishResult::Ok { .. }),

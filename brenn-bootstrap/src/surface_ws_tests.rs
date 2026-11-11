@@ -549,7 +549,7 @@ async fn surface_ws_a_publish_reaches_the_bus_and_comes_back_on_the_subscription
                 let [row] = rows.as_slice() else {
                     panic!("one live publish is a one-row pass, got {rows:?}");
                 };
-                assert_eq!(row.envelope.body, "round trip");
+                assert_eq!(row.envelope.body.as_text(), Some("round trip"));
                 assert_eq!(
                     row.envelope.sender, "surface:deskbar#protobar",
                     "the attribution mints the component's own sub-identity"
@@ -832,7 +832,7 @@ async fn surface_ws_an_auto_channel_carries_a_backend_publish_to_the_page() {
             "worker",
             &[WasmPublish {
                 channel_address: &address,
-                body: "from-the-backend",
+                body: "from-the-backend".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
@@ -846,7 +846,7 @@ async fn surface_ws_an_auto_channel_carries_a_backend_publish_to_the_page() {
             let [row] = rows.as_slice() else {
                 panic!("one backend publish is a one-row pass, got {rows:?}");
             };
-            assert_eq!(row.envelope.body, "from-the-backend");
+            assert_eq!(row.envelope.body.as_text(), Some("from-the-backend"));
         }
         other => panic!("expected Deliver on the auto channel, got {other:?}"),
     }

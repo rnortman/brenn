@@ -141,6 +141,61 @@ waiting for the old one; if that new block also reuses the old address, the boot
 refuses it rather than leaving a channel with no row of its own. Deleting the old
 row first is the way to start fresh at an address.
 
+### 2.1.2 What a message body is
+
+A message body is **bytes with an optional content type** (`MessageBody` in
+`brenn-envelope`). The channel holds them byte-exact; nothing on the bus
+decodes, re-encodes or guesses.
+
+- **No content type** means UTF-8 text of unstated type. This is what every
+  body was before bodies became bytes, and what every string-taking publish
+  door still produces.
+- **The text rule** (`is_text_content_type`). A body is *text* when its content
+  type is absent, or when its type is `text`, its type/subtype is
+  `application/json`, or its subtype ends in `+json` — and it carries no
+  `charset` parameter other than `utf-8` or `us-ascii`. Everything else is a
+  *non-text* body. `text/plain; charset=iso-8859-1` is therefore non-text, and
+  so is `application/octet-stream` holding bytes that happen to be valid UTF-8:
+  the kind follows the content type, never the bytes. A text body must be valid
+  UTF-8 or it cannot be constructed.
+- **The content type** is a media type (`type/subtype` plus `;`-separated
+  parameters, ASCII, at most 255 bytes). It is stored and returned verbatim
+  with the body, and it does not count toward the size cap.
+- **The size cap** (`max_body_bytes`) counts raw bytes, for text and non-text
+  bodies alike.
+- **Search** (`search` on a query, FTS on a durable channel, substring match on
+  a ring) covers text bodies only. A non-text body never matches a search and
+  is returned by a query without one like any other message.
+- **The rule is recorded at write time.** A durable channel stores a text body
+  as a TEXT value and a non-text body as a BLOB value in the same column, and
+  the full-text index covers the TEXT rows. Widening the text rule later
+  therefore ships with a migration of the rows it reclassifies.
+
+Who is shown the content type today:
+
+| Reader | Typed text body | Non-text body |
+|---|---|---|
+| Query API (`Messenger::query`), host code | text and type | bytes and type |
+| A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, `BrennMessageEdit`) | `"body": "…"`, then `"content_type": "…"` | `"body": {"binary": true, "content_type": "…", "size": N}` — a placeholder, never the bytes |
+| The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` |
+| 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never delivered: a host panic |
+| Attach v4 sessions (`Deliver`, `DeferredView`) | bare text, **no type** | never delivered: a host panic |
+
+The two string carriers lose a typed text body's *type*, never its content.
+They cannot carry a non-text body at all, and reaching one with it is a host
+bug. Nothing outside the host can yet publish a typed or non-text body: the
+WIT, the attach protocol and the conversation tools all take a string, so
+every body they produce is untyped text.
+
+**The archive line format.** An `archive` sink writes one JSON object per
+evicted message, one per line. The fields are the envelope's, in its order —
+`message_id`, `source`, `channel`, `sender`, `publish_ts`, the body entries,
+whichever of `reply_to`, `delivery_deadline`, `deliver_after` and `impetus` are
+present, then `urgency` and `envelope_type`. The body entries are `body` (a JSON string) for a
+text body, or `body_base64` for a non-text one, followed by `content_type` when
+the body has one. An untyped text body's line is exactly the line written
+before bodies became bytes.
+
 ### 2.2 Subscriptions
 
 A subscription carries two independent parameters. Their independence is the

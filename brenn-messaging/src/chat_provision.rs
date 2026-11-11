@@ -786,7 +786,7 @@ mod tests {
 
         for addr in [&out, &stream] {
             let result = m
-                .publish_from_conversation(7, APP, addr, "body", Urgency::Normal)
+                .publish_from_conversation(7, APP, addr, "body".into(), Urgency::Normal)
                 .await;
             assert!(
                 matches!(result, crate::publish::PublishResult::Ok { .. }),
@@ -915,7 +915,7 @@ mod tests {
                     conversation_id,
                     APP,
                     &chat_address("chat", APP, ChatLeaf::Out, conversation_id),
-                    "body",
+                    "body".into(),
                     Urgency::Normal,
                 )
                 .await;
@@ -966,7 +966,7 @@ mod tests {
                 7,
                 APP,
                 &chat_address("chat", APP, ChatLeaf::Out, 7),
-                "body",
+                "body".into(),
                 Urgency::Normal,
             )
             .await;
@@ -1045,7 +1045,7 @@ mod tests {
         }
 
         let result = m
-            .publish_from_conversation(7, APP, &address, "command", Urgency::Normal)
+            .publish_from_conversation(7, APP, &address, "command".into(), Urgency::Normal)
             .await;
         assert!(
             matches!(result, crate::publish::PublishResult::Ok { .. }),
@@ -1087,7 +1087,7 @@ mod tests {
             m.provision_conversation_chat_channels(&conn, APP, 7);
         }
         for body in ["first", "second", "third"] {
-            m.publish_from_conversation(7, APP, &address, body, Urgency::Normal)
+            m.publish_from_conversation(7, APP, &address, body.into(), Urgency::Normal)
                 .await;
         }
         let uuid = leaf_uuid(&m, 7, ChatLeaf::In);
@@ -1150,7 +1150,7 @@ mod tests {
             .expect("the conversation holds a position on its command channel")
             .new_entries()
             .iter()
-            .map(|(_, env)| env.body.clone())
+            .map(|(_, env)| env.body.as_text().unwrap().to_owned())
             .collect()
     }
 
@@ -1268,7 +1268,7 @@ mod tests {
         }
         let address = chat_address("chat", APP, ChatLeaf::In, 7);
         let result = m
-            .publish_from_conversation(7, APP, &address, "a command", Urgency::Normal)
+            .publish_from_conversation(7, APP, &address, "a command".into(), Urgency::Normal)
             .await;
         assert!(
             matches!(result, crate::publish::PublishResult::Ok { .. }),
@@ -1301,7 +1301,7 @@ mod tests {
             m.provision_conversation_chat_channels(&conn, APP, 7);
         }
         let address = chat_address("chat", APP, ChatLeaf::In, 7);
-        m.publish_from_conversation(7, APP, &address, "a quiet command", Urgency::Low)
+        m.publish_from_conversation(7, APP, &address, "a quiet command".into(), Urgency::Low)
             .await;
 
         m.wake_owed_subscribers(chrono::Utc::now()).await;
@@ -1332,7 +1332,7 @@ mod tests {
         }
         let address = chat_address("chat", APP, ChatLeaf::Wake, 7);
         let result = m
-            .publish_from_conversation(7, APP, &address, "", Urgency::VeryLow)
+            .publish_from_conversation(7, APP, &address, "".into(), Urgency::VeryLow)
             .await;
         assert!(
             matches!(result, crate::publish::PublishResult::Ok { .. }),
@@ -1356,7 +1356,7 @@ mod tests {
             insert_conversation(&conn, 7, APP);
             m.provision_conversation_chat_channels(&conn, APP, 7);
         }
-        m.publish_from_conversation(7, APP, &address, "a command", Urgency::Normal)
+        m.publish_from_conversation(7, APP, &address, "a command".into(), Urgency::Normal)
             .await;
 
         let report = m.reconcile_subscriber_cursors(&[]).await;
@@ -1422,7 +1422,7 @@ mod tests {
                 7,
                 APP,
                 &chat_address("chat", APP, leaf, 7),
-                "a command, and a record entry",
+                "a command, and a record entry".into(),
                 Urgency::Normal,
             )
             .await;
@@ -1483,7 +1483,7 @@ mod tests {
             Depth::Bounded(10),
         )
         .await;
-        m.publish_from_conversation(7, APP, &address, "a command", Urgency::Normal)
+        m.publish_from_conversation(7, APP, &address, "a command".into(), Urgency::Normal)
             .await;
 
         m.wake_owed_subscribers(chrono::Utc::now()).await;

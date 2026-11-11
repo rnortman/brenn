@@ -198,7 +198,7 @@ impl Page {
             RouteRequest {
                 channel: NOTES,
                 origin: Origin::Sub(instance),
-                body: body.to_string(),
+                body: (body.to_string()).into(),
                 stamp,
                 urgency: Urgency::Normal,
                 deliver_after: Some(release_at),
@@ -221,7 +221,7 @@ impl Page {
             .get(channel)
             .expect("the fixture hosts the channel")
             .retained()
-            .map(|(envelope, _)| envelope.body.clone())
+            .map(|(envelope, _)| envelope.body.as_text().unwrap().to_owned())
             .collect()
     }
 
@@ -651,7 +651,7 @@ fn a_refused_confined_edit_changes_nothing_and_reports_its_reason() {
         RouteRequest {
             channel: LOCAL_OVERLAY_STATE_CHANNEL,
             origin: Origin::Sub("chrome"),
-            body: r#"{"v":1,"holder":"p1","since_stamp":0}"#.to_string(),
+            body: r#"{"v":1,"holder":"p1","since_stamp":0}"#.into(),
             stamp,
             urgency: Urgency::Normal,
             deliver_after: Some(9_000),

@@ -283,7 +283,7 @@ impl Messenger {
         origin: PublishOrigin,
         sender_app_slug: &str,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
         reply_to: Option<&str>,
         deliver_after: Option<DateTime<Utc>>,
@@ -348,7 +348,7 @@ impl Messenger {
         scope: AttachScope<'_>,
         attribution: Option<&str>,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
     ) -> PublishResult {
         self.publish_core(
@@ -389,7 +389,7 @@ impl Messenger {
         &self,
         slug: &str,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
     ) -> PublishResult {
         self.publish_core(
@@ -426,7 +426,7 @@ impl Messenger {
         &self,
         component: &str,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
         reply_to: Option<&str>,
     ) -> PublishResult {
@@ -464,7 +464,7 @@ impl Messenger {
         conversation_id: i64,
         app_slug: &str,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
     ) -> PublishResult {
         self.publish_core(
@@ -606,7 +606,7 @@ impl Messenger {
         origin: PublishOrigin,
         principal: PublishPrincipal<'_>,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
         reply_to: Option<&str>,
         deliver_after: Option<DateTime<Utc>>,
@@ -718,7 +718,7 @@ impl Messenger {
         principal: PublishPrincipal<'_>,
         sender: &str,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
         reply_to: Option<&str>,
         deliver_after: Option<DateTime<Utc>>,
@@ -917,7 +917,7 @@ impl Messenger {
         }
 
         // 3. Body length.
-        if let Err(e) = check_body_size(body, self.defaults.max_body_bytes) {
+        if let Err(e) = check_body_size(&body, self.defaults.max_body_bytes) {
             return PublishResult::BodyTooLarge {
                 len: e.len,
                 max: e.max,
@@ -1067,7 +1067,7 @@ impl Messenger {
         let message = store::NewMessage {
             source: self.source.as_ref().to_owned(),
             sender: sender.to_owned(),
-            body: body.to_string(),
+            body: body.clone(),
             urgency,
             envelope_type: scheme,
             reply_to: reply_to_target,
@@ -1130,7 +1130,7 @@ impl Messenger {
                     channel.address.clone(),
                     sender.to_owned(),
                     publish_ts_ns,
-                    body.to_owned(),
+                    body,
                     reply_to.map(|s| s.to_owned()),
                     delivery_deadline,
                     deliver_after,
@@ -1175,8 +1175,8 @@ impl Messenger {
     /// `entry`'s attacher feed targets, or empty when no attached session holds
     /// a subscription for any of them.
     ///
-    /// The empty answer is the caller's licence to skip building the owned,
-    /// body-copying feed envelope at all, so the two questions are asked
+    /// The empty answer is the caller's licence to skip building the
+    /// owned feed envelope at all, so the two questions are asked
     /// together: a fan-out with no attached holder does nothing but allocate.
     ///
     /// The subscriber list is read from the directory here rather than taken from
@@ -1266,7 +1266,7 @@ fn surface_feed_envelope(
     channel: String,
     sender: String,
     publish_ts_ns: i64,
-    body: String,
+    body: super::MessageBody,
     reply_to: Option<String>,
     delivery_deadline: Option<DateTime<Utc>>,
     deliver_after: Option<DateTime<Utc>>,
@@ -1309,7 +1309,7 @@ impl Messenger {
         envelope_type: ChannelScheme,
         source: &str,
         sender: &str,
-        body: &str,
+        body: &super::MessageBody,
         urgency: super::Urgency,
         publish_ts_ns: i64,
         reply_to_uuid: Option<Uuid>,
@@ -1402,17 +1402,26 @@ impl Messenger {
         channel: Arc<super::ChannelEntry>,
         source: &str,
         sender: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: Urgency,
     ) {
         let publish_ts_ns = db::utc_to_ns(Utc::now());
+        let text = body.as_text().unwrap_or_else(|| {
+            panic!(
+                "publish_transport_ingress: host built a malformed envelope for channel '{}' — \
+                 the body is not text ({}); this is a host-internal bug, not an attacker \
+                 input",
+                channel.address,
+                body.summary()
+            )
+        });
 
         // Accept-side validation: deserialize the body JSON into the channel's
         // transport-typed struct to verify the host built a structurally valid
         // envelope. A deserialize failure is a host-internal bug — panic.
         match channel.transport_type {
             ChannelScheme::Webhook => {
-                serde_json::from_str::<super::WebhookEnvelope>(body).unwrap_or_else(|e| {
+                serde_json::from_str::<super::WebhookEnvelope>(text).unwrap_or_else(|e| {
                     panic!(
                         "publish_transport_ingress: host built a malformed WebhookEnvelope for \
                          channel '{}' — this is a host-internal bug, not an attacker input: {e}",
@@ -1421,7 +1430,7 @@ impl Messenger {
                 });
             }
             ChannelScheme::Mqtt => {
-                serde_json::from_str::<super::MqttEnvelope>(body).unwrap_or_else(|e| {
+                serde_json::from_str::<super::MqttEnvelope>(text).unwrap_or_else(|e| {
                     panic!(
                         "publish_transport_ingress: host built a malformed MqttEnvelope for \
                          channel '{}' — this is a host-internal bug, not an attacker input: {e}",
@@ -1452,7 +1461,7 @@ impl Messenger {
                 channel.transport_type,
                 source,
                 sender,
-                body,
+                &body,
                 urgency,
                 publish_ts_ns,
                 None, // no reply_to
@@ -1472,7 +1481,7 @@ impl Messenger {
 /// `body` is the message payload.
 pub struct WasmPublish<'a> {
     pub channel_address: &'a str,
-    pub body: &'a str,
+    pub body: super::MessageBody,
     /// Sender urgency intent for this publish.
     pub urgency: super::Urgency,
     /// Reply channel address, set only for async tool-call requests (the caller's
@@ -1600,7 +1609,7 @@ impl Messenger {
                     let message = store::NewMessage {
                         source: source.to_owned(),
                         sender: sender.clone(),
-                        body: publish.body.to_string(),
+                        body: publish.body.clone(),
                         urgency: publish.urgency,
                         envelope_type: scheme,
                         reply_to: reply_to_target,
@@ -1647,7 +1656,7 @@ impl Messenger {
                     ChannelScheme::Brenn,
                     source,
                     &sender,
-                    publish.body,
+                    &publish.body,
                     publish.urgency,
                     publish_ts_ns,
                     reply_to_target.as_ref().map(|target| target.uuid),
@@ -1669,7 +1678,7 @@ impl Messenger {
                             channel.address.clone(),
                             sender.clone(),
                             publish_ts_ns,
-                            publish.body.to_owned(),
+                            publish.body.clone(),
                             publish.reply_to.map(|s| s.to_owned()),
                             None,
                             None,
@@ -1791,7 +1800,7 @@ impl Messenger {
 /// from the *server's* output map.
 pub struct AttachBatchPublish<'a> {
     pub channel_address: &'a str,
-    pub body: &'a str,
+    pub body: super::MessageBody,
     pub urgency: super::Urgency,
     /// This entry's publish timestamp, assigned by the caller in call order
     /// across the whole flush — so call order is visible across the class
@@ -2029,7 +2038,7 @@ impl Messenger {
                 // config-wiring bug the single-publish path screams about, except
                 // that here there is no per-entry outcome to carry it back and an
                 // oversized row would already be committed with its siblings.
-                if let Err(e) = check_body_size(publish.body, self.defaults.max_body_bytes) {
+                if let Err(e) = check_body_size(&publish.body, self.defaults.max_body_bytes) {
                     panic!(
                         "publish_batch_from_attacher: entry body is {} bytes over the {} cap for \
                          {route} {slug:?} — the session handler rejects an over-cap entry as a \
@@ -2054,7 +2063,7 @@ impl Messenger {
                         ChannelScheme::Brenn,
                         source,
                         &sender,
-                        publish.body,
+                        &publish.body,
                         publish.urgency,
                         publish.publish_ts_ns,
                         None, // no reply_to — not exposed to attachers
@@ -2072,7 +2081,7 @@ impl Messenger {
                     ChannelScheme::Brenn,
                     source,
                     &sender,
-                    publish.body,
+                    &publish.body,
                     publish.urgency,
                     publish.publish_ts_ns,
                     None, // no reply_to — not exposed to attachers
@@ -2091,7 +2100,7 @@ impl Messenger {
                             channel.address.clone(),
                             sender.clone(),
                             publish.publish_ts_ns,
-                            publish.body.to_owned(),
+                            publish.body.clone(),
                             None,
                             None,
                             None,
@@ -2129,7 +2138,7 @@ impl Messenger {
                     self.resolve_prepaid(&sender_id, policy, publish.channel_address)
                 });
             let prepaid = PrepaidEntry {
-                body: publish.body,
+                body: publish.body.clone(),
                 urgency: publish.urgency,
                 publish_ts: db::ns_to_utc(publish.publish_ts_ns),
             };

@@ -67,7 +67,7 @@ pub fn sync_request(
         channel: sync_channel(port),
         sender: instance.to_string(),
         publish_ts,
-        body,
+        body: body.into(),
         reply_to: None,
         delivery_deadline: None,
         deliver_after: None,
@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(request.channel, "local:brenn/sync/resolve");
         assert_eq!(request.source, "kiosk-menu");
         assert_eq!(request.sender, "kiosk-menu");
-        assert_eq!(request.body, "{\"q\":\"pier\"}");
+        assert_eq!(request.body.as_text(), Some("{\"q\":\"pier\"}"));
         assert_eq!(request.envelope_type, ChannelScheme::Local);
         assert_eq!(request.urgency, Urgency::Normal);
         assert!(request.reply_to.is_none());

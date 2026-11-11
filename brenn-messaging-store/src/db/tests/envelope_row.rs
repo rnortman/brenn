@@ -19,7 +19,7 @@ fn select_envelope_base_matches_prerefactor_literal() {
     // is edited without updating `row_to_envelope`'s positional contract.
     let golden = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
                   m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
-                  c.address, rc.address, m.envelope_type, m.impetus \
+                  c.address, rc.address, m.envelope_type, m.impetus, m.content_type \
            FROM messaging_messages m \
            JOIN messaging_channels c ON c.uuid = m.channel_uuid \
            LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid ";
@@ -61,7 +61,7 @@ fn select_envelope_base_decodes_every_column_into_its_field() {
         channel_uuid,
         "row-source",
         "row-sender",
-        "row-body",
+        &"row-body".into(),
         Urgency::High,
         ChannelScheme::Brenn,
         Some(reply_uuid),
@@ -80,7 +80,7 @@ fn select_envelope_base_decodes_every_column_into_its_field() {
     assert_eq!(envelope.message_id, inserted.uuid);
     assert_eq!(envelope.source, "row-source");
     assert_eq!(envelope.sender, "row-sender");
-    assert_eq!(envelope.body, "row-body");
+    assert_eq!(envelope.body.as_text(), Some("row-body"));
     assert_eq!(envelope.channel, canonical_address("row-channel"));
     assert_eq!(
         envelope.reply_to,

@@ -148,7 +148,7 @@ impl Messenger {
             .publish_from_system(
                 CHAT_ROSTER_COMPONENT,
                 &address,
-                &body,
+                body.as_str().into(),
                 Urgency::Normal,
                 None,
             )

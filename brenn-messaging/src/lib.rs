@@ -1539,7 +1539,13 @@ impl Messenger {
         now: DateTime<Utc>,
     ) -> store::DeferralOutcome {
         self.store_for_bound_output(channel_address)
-            .edit_deferred(sender, message_uuid, body, release_at, now)
+            .edit_deferred(
+                sender,
+                message_uuid,
+                body.map(MessageBody::text),
+                release_at,
+                now,
+            )
             .await
     }
 
@@ -4262,7 +4268,7 @@ mod tests {
             let msg = NewMessage {
                 source: "node".to_string(),
                 sender: sender.to_string(),
-                body: body.to_string(),
+                body: body.into(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
                 reply_to: None,
@@ -4288,7 +4294,7 @@ mod tests {
             .await;
         let bodies: Vec<&str> = alice_view
             .iter()
-            .map(|d| d.envelope.body.as_str())
+            .map(|d| d.envelope.body.as_text().unwrap())
             .collect();
         assert_eq!(
             bodies,
@@ -4300,7 +4306,7 @@ mod tests {
             .deferred_view_for_sender(&ephemeral.address, bob.as_str())
             .await;
         assert_eq!(bob_view.len(), 1);
-        assert_eq!(bob_view[0].envelope.body, "bob-mid");
+        assert_eq!(bob_view[0].envelope.body.as_text(), Some("bob-mid"));
     }
 
     /// A router that records the deferred views the release sweep pushes and
@@ -4338,7 +4344,9 @@ mod tests {
                 slug.to_string(),
                 instance.to_string(),
                 channel.to_string(),
-                view.iter().map(|d| d.envelope.body.clone()).collect(),
+                view.iter()
+                    .map(|d| d.envelope.body.as_text().unwrap().to_owned())
+                    .collect(),
             ));
         }
 
@@ -4401,7 +4409,7 @@ mod tests {
             let msg = NewMessage {
                 source: "node".to_string(),
                 sender: sender.to_string(),
-                body: body.to_string(),
+                body: body.into(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
                 reply_to: None,
@@ -4480,7 +4488,7 @@ mod tests {
                     NewMessage {
                         source: "node".to_string(),
                         sender: agenda.as_str().to_string(),
-                        body: body.to_string(),
+                        body: body.into(),
                         urgency: Urgency::Normal,
                         envelope_type: ChannelScheme::Ephemeral,
                         reply_to: None,
@@ -4540,7 +4548,7 @@ mod tests {
             let msg = NewMessage {
                 source: "node".to_string(),
                 sender: sender.to_string(),
-                body: body.to_string(),
+                body: body.into(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
                 reply_to: None,
@@ -4575,7 +4583,10 @@ mod tests {
             .deferred_view_for_sender(&ephemeral.address, alice.as_str())
             .await;
         assert_eq!(alice_view.len(), 1);
-        assert_eq!(alice_view[0].envelope.body, "alice-rescheduled");
+        assert_eq!(
+            alice_view[0].envelope.body.as_text(),
+            Some("alice-rescheduled")
+        );
         assert_eq!(alice_view[0].release_at, now + Duration::seconds(90));
 
         let outcome = messenger
@@ -4929,7 +4940,7 @@ mod tests {
         let bodies: Vec<&str> = snapshot[0]
             .entries
             .iter()
-            .map(|(_, e)| e.body.as_str())
+            .map(|(_, e)| e.body.as_text().unwrap())
             .collect();
         assert_eq!(bodies, ["m2"], "the clamp serves the newest, as always");
 
@@ -4965,7 +4976,7 @@ mod tests {
                 store::NewMessage {
                     source: "node".to_string(),
                     sender: "tester".to_string(),
-                    body: "parked".to_string(),
+                    body: "parked".into(),
                     urgency: Urgency::Normal,
                     envelope_type: ChannelScheme::Brenn,
                     reply_to: None,
@@ -5014,7 +5025,7 @@ mod tests {
         let bodies: Vec<&str> = parked_snapshot[0]
             .entries
             .iter()
-            .map(|(_, e)| e.body.as_str())
+            .map(|(_, e)| e.body.as_text().unwrap())
             .collect();
         assert_eq!(
             bodies,
@@ -5034,7 +5045,7 @@ mod tests {
         let bodies: Vec<&str> = released_snapshot[0]
             .entries
             .iter()
-            .map(|(_, e)| e.body.as_str())
+            .map(|(_, e)| e.body.as_text().unwrap())
             .collect();
         assert_eq!(
             bodies,
@@ -5219,8 +5230,8 @@ mod tests {
         let snap = &snapshots[0];
         assert_eq!(snap.new_len(), 1, "push_depth=1 serves one message");
         assert_eq!(
-            snap.new_entries()[0].1.body,
-            "row-2",
+            snap.new_entries()[0].1.body.as_text(),
+            Some("row-2"),
             "the window serves the newest, not the oldest"
         );
 
@@ -6098,7 +6109,7 @@ mod tests {
             .append(store::NewMessage {
                 source: "test".to_string(),
                 sender: "alice".to_string(),
-                body: body.to_string(),
+                body: body.into(),
                 urgency,
                 envelope_type: ChannelScheme::Brenn,
                 reply_to: None,
@@ -6125,7 +6136,7 @@ mod tests {
             .append(store::NewMessage {
                 source: "test".to_string(),
                 sender: "alice".to_string(),
-                body: body.to_string(),
+                body: body.into(),
                 urgency: Urgency::Normal,
                 envelope_type: entry.transport_type,
                 reply_to: None,
@@ -6394,7 +6405,7 @@ mod tests {
                 store::NewMessage {
                     source: "test".to_string(),
                     sender: "alice".to_string(),
-                    body: "quiet, and late".to_string(),
+                    body: "quiet, and late".into(),
                     urgency: Urgency::Normal,
                     envelope_type: ChannelScheme::Brenn,
                     reply_to: None,
@@ -6892,7 +6903,7 @@ mod tests {
             channel: channel.to_string(),
             sender: "test-sender".to_string(),
             publish_ts: Utc::now(),
-            body: body.to_string(),
+            body: body.into(),
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
@@ -7375,7 +7386,7 @@ mod tests {
         store::NewMessage {
             source: "node".to_string(),
             sender: "test-sender".to_string(),
-            body: body.to_string(),
+            body: body.into(),
             urgency: Urgency::Normal,
             envelope_type: channel.transport_type,
             reply_to: None,

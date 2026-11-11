@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
 use brenn_lib::messaging::{ChannelScheme, MessageEnvelope, Urgency};
+use brenn_messaging::format::{ConversationEnvelopes, ConversationShape};
 use brenn_messaging::{
     CancelResult, ChannelListing, EditFields, EditResult, MessageQuery, PublishOrigin,
     PublishResult, QueryError, SubscriptionListing,
@@ -83,10 +84,10 @@ struct BrennMessageCancelOk {
 
 /// Response for `BrennPendingList`.
 ///
-/// Single field: messages.
+/// Single field: messages, in the conversation shape.
 #[derive(Serialize)]
 struct BrennPendingListResponse<'a> {
-    messages: &'a [MessageEnvelope],
+    messages: ConversationEnvelopes<'a>,
 }
 
 /// Success response for `MessageSubscribe`.
@@ -460,7 +461,7 @@ async fn execute_send(
             },
             &bridge.app_slug,
             to,
-            body,
+            body.into(),
             urgency,
             reply_to.as_deref(),
             deliver_after,
@@ -598,12 +599,23 @@ async fn execute_channel_get(
         calling_app_slug: bridge.app_slug.clone(),
     };
     match messenger.query(&q).await {
-        Ok(envelopes) => outcome_ok(&envelopes),
+        Ok(envelopes) => outcome_ok(&ConversationEnvelopes(&envelopes)),
         Err(QueryError::UnknownChannel(addr)) => {
             outcome_err(Cow::Owned(format!("unknown channel address {addr:?}")))
         }
         Err(QueryError::Fts(msg)) => outcome_err(Cow::Owned(format!("FTS query failed: {msg}"))),
     }
+}
+
+/// A successful `BrennMessageEdit`: the edited message in the conversation
+/// shape, plus `ok: true` for consistency with `BrennMessageCancel`.
+fn edit_ok_outcome(envelope: &MessageEnvelope) -> ToolOutcome {
+    let mut outcome_value = serde_json::to_value(envelope.shaped::<ConversationShape>())
+        .expect("the conversation shape serializes every body");
+    if let serde_json::Value::Object(ref mut map) = outcome_value {
+        map.insert("ok".to_string(), serde_json::Value::Bool(true));
+    }
+    ToolOutcome::Ok(outcome_value)
 }
 
 /// `BrennPendingList`.
@@ -633,11 +645,13 @@ async fn execute_pending_list(
             "BrennPendingList: malformed channel address; returning empty list"
         );
         let empty: &[MessageEnvelope] = &[];
-        return outcome_ok(&BrennPendingListResponse { messages: empty });
+        return outcome_ok(&BrennPendingListResponse {
+            messages: ConversationEnvelopes(empty),
+        });
     }
     let envelopes = messenger.list_pending(&bridge.app_slug, channel_str).await;
     outcome_ok(&BrennPendingListResponse {
-        messages: &envelopes,
+        messages: ConversationEnvelopes(&envelopes),
     })
 }
 
@@ -800,15 +814,7 @@ async fn execute_edit(
         );
     }
     match result {
-        EditResult::Ok { envelope } => {
-            let mut outcome_value =
-                serde_json::to_value(&envelope).expect("MessageEnvelope serialize");
-            // `ok: true` for consistency with BrennMessageCancel.
-            if let serde_json::Value::Object(ref mut map) = outcome_value {
-                map.insert("ok".to_string(), serde_json::Value::Bool(true));
-            }
-            ToolOutcome::Ok(outcome_value)
-        }
+        EditResult::Ok { envelope } => edit_ok_outcome(&envelope),
         EditResult::UnknownMessage => {
             outcome_err(Cow::Owned(format!("unknown message {message_uuid}")))
         }
@@ -3312,7 +3318,9 @@ mod tests {
     #[test]
     fn brenn_pending_list_response_empty_matches_reference() {
         let empty: &[brenn_lib::messaging::MessageEnvelope] = &[];
-        let resp = super::BrennPendingListResponse { messages: empty };
+        let resp = super::BrennPendingListResponse {
+            messages: ConversationEnvelopes(empty),
+        };
         let produced = serde_json::to_string(&resp)
             .expect("BrennPendingListResponse serialization is infallible");
         let reference = serde_json::json!({ "messages": [] }).to_string();
@@ -3338,7 +3346,7 @@ mod tests {
             channel: "brenn:test".to_string(),
             sender: "alice".to_string(),
             publish_ts,
-            body: "hello".to_string(),
+            body: "hello".into(),
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
@@ -3346,15 +3354,24 @@ mod tests {
             urgency: Urgency::Low,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
         };
-        let messages = vec![envelope.clone()];
+        let messages = vec![envelope];
         let resp = super::BrennPendingListResponse {
-            messages: &messages,
+            messages: ConversationEnvelopes(&messages),
         };
         let produced = serde_json::to_string(&resp)
             .expect("BrennPendingListResponse serialization is infallible");
         let produced_val: serde_json::Value =
             serde_json::from_str(&produced).expect("produced must be valid JSON");
-        let reference = serde_json::json!({ "messages": [envelope] });
+        let reference = serde_json::json!({ "messages": [{
+            "message_id": "550e8400-e29b-41d4-a716-446655440000",
+            "source": "brenn",
+            "channel": "brenn:test",
+            "sender": "alice",
+            "publish_ts": "2026-05-18T10:00:00Z",
+            "body": "hello",
+            "urgency": "low",
+            "envelope_type": "brenn",
+        }] });
         assert_eq!(produced_val, reference);
         // Verify at least one message entry round-tripped.
         let arr = produced_val["messages"].as_array().expect("messages array");
@@ -4174,7 +4191,7 @@ mod tests {
                 channel,
                 addr,
                 "home",
-                body,
+                body.into(),
                 brenn_lib::messaging::Urgency::Normal,
             )
             .await;
@@ -4471,5 +4488,158 @@ mod tests {
             }
         }
         assert_eq!(summaries, 1, "one card per hook call");
+    }
+
+    fn markdown_body() -> brenn_lib::messaging::MessageBody {
+        brenn_lib::messaging::MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap()
+    }
+
+    fn binary_body() -> brenn_lib::messaging::MessageBody {
+        brenn_lib::messaging::MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, 0xff])
+            .unwrap()
+    }
+
+    fn envelope_with(n: u128, body: brenn_lib::messaging::MessageBody) -> MessageEnvelope {
+        MessageEnvelope {
+            message_id: uuid::Uuid::from_u128(n),
+            source: "brenn".to_string(),
+            channel: "brenn:test".to_string(),
+            sender: "alice".to_string(),
+            publish_ts: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            body,
+            reply_to: None,
+            delivery_deadline: None,
+            deliver_after: None,
+            impetus: None,
+            urgency: brenn_lib::messaging::Urgency::Normal,
+            envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+        }
+    }
+
+    /// The body entries of one conversation-shaped message: `body` and, when
+    /// present, `content_type`.
+    fn body_entries(message: &serde_json::Value) -> (serde_json::Value, Option<serde_json::Value>) {
+        (
+            message["body"].clone(),
+            message.get("content_type").cloned(),
+        )
+    }
+
+    /// `MessageChannelGet` shows a typed text message as its text with the
+    /// type beside it, and a non-text message as the metadata placeholder.
+    #[tokio::test]
+    async fn message_channel_get_shows_types_and_the_binary_placeholder() {
+        let bridge = crate::active_bridge::ActiveBridge::test_new_for_mqtt_subscribe().await;
+        let addr = "mqtt:home:home/camera/still";
+        let sub = subscribe_result(
+            &bridge,
+            json!({ "address": addr, "push_depth": 0, "retain_depth": 5 }),
+        )
+        .await;
+        assert_eq!(sub["ok"], json!(true), "subscribe must succeed: {sub}");
+        let messenger = bridge.messenger().unwrap();
+        let channel = messenger
+            .directory()
+            .resolve(addr)
+            .expect("mqtt channel created by subscribe")
+            .clone();
+        let now = chrono::Utc::now();
+        for (offset, body) in [(0, markdown_body()), (1, binary_body())] {
+            brenn_messaging::testutils::insert_bus_body_from(
+                messenger,
+                &channel,
+                "home",
+                &body,
+                brenn_lib::messaging::ChannelScheme::Mqtt,
+                None,
+                brenn_messaging_store::db::utc_to_ns(now) + offset,
+            )
+            .await;
+        }
+
+        let req = post_tool_use_req(
+            MCP_MESSAGE_QUERY_CHANNEL_TOOL,
+            json!({ "address": addr, "limit": 10 }),
+        );
+        let out = match try_handle_messaging_tool(&bridge, &req).await {
+            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
+                updated_output: Some(out),
+            })) => out,
+            other => panic!("unexpected MessageChannelGet result: {other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let envelopes = v.as_array().expect("a JSON array of envelopes");
+        assert_eq!(envelopes.len(), 2, "{out}");
+        // Newest first.
+        assert_eq!(
+            body_entries(&envelopes[0]),
+            (
+                json!({ "binary": true, "content_type": "image/jpeg", "size": 3 }),
+                None
+            )
+        );
+        assert_eq!(
+            body_entries(&envelopes[1]),
+            (json!("# hi"), Some(json!("text/markdown")))
+        );
+    }
+
+    /// `BrennPendingList` lists each message in the conversation shape.
+    #[test]
+    fn brenn_pending_list_response_shows_types_and_the_binary_placeholder() {
+        let messages = vec![
+            envelope_with(1, "plain".into()),
+            envelope_with(2, markdown_body()),
+            envelope_with(3, binary_body()),
+        ];
+        let resp = super::BrennPendingListResponse {
+            messages: ConversationEnvelopes(&messages),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        let listed = v["messages"].as_array().unwrap();
+        assert_eq!(body_entries(&listed[0]), (json!("plain"), None));
+        assert_eq!(
+            body_entries(&listed[1]),
+            (json!("# hi"), Some(json!("text/markdown")))
+        );
+        assert_eq!(
+            body_entries(&listed[2]),
+            (
+                json!({ "binary": true, "content_type": "image/jpeg", "size": 3 }),
+                None
+            )
+        );
+    }
+
+    /// A successful `BrennMessageEdit` answers with the edited message in the
+    /// conversation shape plus `ok: true`.
+    #[test]
+    fn an_edit_result_is_conversation_shaped() {
+        let plain = edit_ok_outcome(&envelope_with(1, "plain".into()));
+        let ToolOutcome::Ok(plain) = plain else {
+            panic!("an edited message is a success");
+        };
+        assert_eq!(plain["ok"], json!(true));
+        assert_eq!(body_entries(&plain), (json!("plain"), None));
+
+        let ToolOutcome::Ok(typed) = edit_ok_outcome(&envelope_with(2, markdown_body())) else {
+            panic!("an edited message is a success");
+        };
+        assert_eq!(
+            body_entries(&typed),
+            (json!("# hi"), Some(json!("text/markdown")))
+        );
+
+        let ToolOutcome::Ok(binary) = edit_ok_outcome(&envelope_with(3, binary_body())) else {
+            panic!("an edited message is a success");
+        };
+        assert_eq!(
+            body_entries(&binary),
+            (
+                json!({ "binary": true, "content_type": "image/jpeg", "size": 3 }),
+                None
+            )
+        );
+        assert_eq!(binary["ok"], json!(true));
     }
 }

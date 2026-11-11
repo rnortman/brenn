@@ -299,7 +299,7 @@ async fn seed_push_row(
         DRAIN_TEST_CHANNEL_UUID,
         "test-drain-source",
         sender,
-        body,
+        &body.into(),
         brenn_lib::messaging::Urgency::Normal,
         brenn_lib::messaging::ChannelScheme::Brenn,
         None,

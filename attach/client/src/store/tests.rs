@@ -55,13 +55,17 @@ fn depths(push_depth: u64, retain_depth: u64) -> SubscriptionDepths {
 }
 
 fn bodies(window: &ServedWindow) -> Vec<&str> {
-    window.envelopes.iter().map(|e| e.body.as_str()).collect()
+    window
+        .envelopes
+        .iter()
+        .map(|e| e.body.as_text().unwrap())
+        .collect()
 }
 
 fn new_bodies(window: &ServedWindow) -> Vec<&str> {
     window.envelopes[window.new_from..]
         .iter()
-        .map(|e| e.body.as_str())
+        .map(|e| e.body.as_text().unwrap())
         .collect()
 }
 
@@ -78,7 +82,7 @@ fn insert_is_idempotent_by_message_id() {
     s.insert(env("a"));
     assert_eq!(
         s.retained()
-            .map(|(e, seq)| (e.body.as_str(), seq))
+            .map(|(e, seq)| (e.body.as_text().unwrap(), seq))
             .collect::<Vec<_>>(),
         vec![("a", 1)],
         "a re-presented message is not retained twice"
@@ -93,7 +97,7 @@ fn a_message_re_presented_after_eviction_is_taken_as_fresh() {
     fill(&mut s, &["a", "b", "a"]);
     assert_eq!(
         s.retained()
-            .map(|(e, seq)| (e.body.as_str(), seq))
+            .map(|(e, seq)| (e.body.as_text().unwrap(), seq))
             .collect::<Vec<_>>(),
         vec![("a", 3)]
     );
@@ -109,7 +113,7 @@ fn append_minted_retains_and_delivers_in_order() {
     assert!(s.append_minted(env("b")).is_empty());
     assert_eq!(
         s.retained()
-            .map(|(e, seq)| (e.body.as_str(), seq))
+            .map(|(e, seq)| (e.body.as_text().unwrap(), seq))
             .collect::<Vec<_>>(),
         vec![("a", 1), ("b", 2)]
     );
@@ -146,7 +150,7 @@ fn retained_reads_the_whole_window_oldest_first() {
     fill(&mut s, &["a", "b", "c"]);
     assert_eq!(
         s.retained()
-            .map(|(e, seq)| (e.body.as_str(), seq))
+            .map(|(e, seq)| (e.body.as_text().unwrap(), seq))
             .collect::<Vec<_>>(),
         vec![("b", 2), ("c", 3)]
     );
@@ -474,7 +478,7 @@ fn park(store: &mut ChannelStore<String>, sender: &str, body: &str, release_at: 
 fn parked_bodies(store: &ChannelStore<String>, sender: &str) -> Vec<String> {
     store
         .deferred_for_sender(sender)
-        .map(|e| e.message.body.clone())
+        .map(|e| e.message.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -501,7 +505,7 @@ fn a_release_enters_retention_as_an_ordinary_arrival() {
     assert!(s.release_due(4_999).released.is_empty(), "not due yet");
     let report = s.release_due(5_000);
     assert_eq!(report.released.len(), 1);
-    assert_eq!(report.released[0].message.body, "second");
+    assert_eq!(report.released[0].message.body.as_text(), Some("second"));
     assert_eq!(
         report.released[0].seq, 2,
         "the tail seq, as any arrival takes"
@@ -572,7 +576,7 @@ fn the_channel_wide_reads_span_senders() {
     assert_eq!(s.parked_senders().collect::<Vec<_>>(), [BOB, ALICE]);
     assert_eq!(
         s.parked()
-            .map(|(e, at)| (e.body.as_str(), at))
+            .map(|(e, at)| (e.body.as_text().unwrap(), at))
             .collect::<Vec<_>>(),
         [("theirs", 5_000), ("mine", 9_000)]
     );
@@ -613,7 +617,7 @@ fn an_edit_rewrites_the_body_the_release_time_or_both() {
             ALICE,
             id,
             DeferOp::Edit {
-                body: Some("final".to_string()),
+                body: Some("final".into()),
                 deliver_after: Some(9_000),
             },
             0,
@@ -622,7 +626,7 @@ fn an_edit_rewrites_the_body_the_release_time_or_both() {
     );
     assert_eq!(s.next_release(), Some(9_000));
     let released = s.release_due(9_000).released;
-    assert_eq!(released[0].message.body, "final");
+    assert_eq!(released[0].message.body.as_text(), Some("final"));
     assert_eq!(
         released[0].message.message_id, id,
         "an edit keeps the identity the caller named it by"
@@ -654,7 +658,7 @@ fn an_edit_that_states_no_body_moves_the_release_time_alone() {
         "the original release time is no longer owed"
     );
     let released = s.release_due(9_000).released;
-    assert_eq!(released[0].message.body, "draft");
+    assert_eq!(released[0].message.body.as_text(), Some("draft"));
 }
 
 /// A rewrite states no time, so the schedule the publisher set stands.
@@ -668,7 +672,7 @@ fn an_edit_that_states_no_time_rewrites_the_body_alone() {
             ALICE,
             id,
             DeferOp::Edit {
-                body: Some("final".to_string()),
+                body: Some("final".into()),
                 deliver_after: None,
             },
             0,
@@ -681,7 +685,7 @@ fn an_edit_that_states_no_time_rewrites_the_body_alone() {
         "the release time was not pulled forward"
     );
     let released = s.release_due(5_000).released;
-    assert_eq!(released[0].message.body, "final");
+    assert_eq!(released[0].message.body.as_text(), Some("final"));
 }
 
 /// The two failures, which mean opposite things: the release race any publisher
@@ -731,7 +735,8 @@ fn a_due_but_unswept_message_is_shown_and_reaches_nothing() {
     );
     let released = s.release_due(5_000).released;
     assert_eq!(
-        released[0].message.body, "due",
+        released[0].message.body.as_text(),
+        Some("due"),
         "the sweep still owes it, cancel or no cancel"
     );
 }

@@ -38,6 +38,7 @@ uuid = { version = "1.23.0", features = ["v4"] }
 
 [dev-dependencies]
 brenn-db = { version = "0.1.0", path = "../../brenn-db" }
+brenn-envelope = { path = "../../brenn-envelope", features = ["testutils"] }
 brenn-lib = { version = "0.1.0", path = "../../brenn-lib", features = ["testutils"] }
 brenn-messaging = { version = "0.1.0", path = "../../brenn-messaging", features = ["testutils"] }
 brenn-obs = { version = "0.1.0", path = "../../brenn-obs", features = ["testutils"] }

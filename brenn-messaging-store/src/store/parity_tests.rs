@@ -16,7 +16,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
-use brenn_envelope::{ChannelScheme, Urgency};
+use brenn_envelope::{ChannelScheme, MessageBody, Urgency};
 use brenn_queue::{GapReason, ReplayDecision};
 
 use crate::db::init_db_memory;
@@ -132,7 +132,7 @@ fn message(sender: &str, body: &str) -> NewMessage {
     NewMessage {
         source: "node".to_string(),
         sender: sender.to_string(),
-        body: body.to_string(),
+        body: body.into(),
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
         reply_to: None,
@@ -173,7 +173,7 @@ async fn retained_bodies(store: &dyn RetentionStore) -> Vec<String> {
         .retained_tail(Depth::Unbounded)
         .await
         .iter()
-        .map(|e| e.body.clone())
+        .map(|e| e.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -182,7 +182,7 @@ async fn deferred_bodies(store: &dyn RetentionStore, sender: &str) -> Vec<String
         .deferred_for_sender(sender)
         .await
         .iter()
-        .map(|d| d.envelope.body.clone())
+        .map(|d| d.envelope.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -230,7 +230,7 @@ async fn retained_tail_is_capped_by_the_requested_limit() {
             .retained_tail(Depth::Bounded(2))
             .await
             .iter()
-            .map(|e| e.body.clone())
+            .map(|e| e.body.as_text().unwrap().to_owned())
             .collect();
         assert_eq!(tail, vec!["b", "c"], "{}", store.address());
     }
@@ -330,7 +330,10 @@ async fn release_reports_messages_parked_without_targets() {
             .expect("within cap");
 
         let released = store.release_due(release_at).await.released;
-        let bodies: Vec<String> = released.iter().map(|r| r.envelope.body.clone()).collect();
+        let bodies: Vec<String> = released
+            .iter()
+            .map(|r| r.envelope.body.as_text().unwrap().to_owned())
+            .collect();
         assert_eq!(bodies, vec!["lonely", "watched"], "{}", store.address());
         assert!(
             released[0].envelope.message_id.eq(&lonely.message_uuid),
@@ -596,6 +599,71 @@ async fn cancel_of_an_unknown_message_is_a_no_op() {
     }
 }
 
+/// Bodies of every kind are retained, parked, released and edited byte-exact
+/// with their content type, and an edit may change a parked body's kind.
+#[tokio::test]
+async fn bodies_of_every_kind_round_trip_through_append_park_and_edit() {
+    let not_utf8 =
+        MessageBody::from_parts(Some("application/octet-stream"), &[0xff, 0x00, 0xfe, 0x80])
+            .unwrap();
+    let markdown = MessageBody::from_parts(Some("text/markdown"), b"# notes").unwrap();
+    let kinds = [MessageBody::text("plain"), markdown, not_utf8];
+
+    for store in stores(DEPTH).await {
+        for body in &kinds {
+            let mut msg = message_for(&*store, "alice", "");
+            msg.body = body.clone();
+            store.append(msg).await;
+        }
+        let retained: Vec<MessageBody> = store
+            .retained_tail(Depth::Unbounded)
+            .await
+            .iter()
+            .map(|e| e.body.clone())
+            .collect();
+        assert_eq!(retained, kinds, "{}", store.address());
+
+        // Each parked body is edited to the next kind round the list, so every
+        // kind is replaced by a different one.
+        for (i, body) in kinds.iter().enumerate() {
+            let mut msg = message_for(&*store, "alice", "");
+            msg.body = body.clone();
+            let parked = store
+                .park(msg, soon() + Duration::seconds(i as i64))
+                .await
+                .expect("within cap");
+            let replacement = kinds[(i + 1) % kinds.len()].clone();
+            assert_eq!(
+                store
+                    .edit_deferred("alice", parked.message_uuid, Some(replacement), None, now())
+                    .await,
+                DeferralOutcome::Applied,
+                "{}",
+                store.address()
+            );
+        }
+        let rotated: Vec<MessageBody> = (0..kinds.len())
+            .map(|i| kinds[(i + 1) % kinds.len()].clone())
+            .collect();
+        let deferred: Vec<MessageBody> = store
+            .deferred_for_sender("alice")
+            .await
+            .iter()
+            .map(|d| d.envelope.body.clone())
+            .collect();
+        assert_eq!(deferred, rotated, "{}", store.address());
+
+        let released: Vec<MessageBody> = store
+            .release_due(soon() + Duration::seconds(60))
+            .await
+            .released
+            .iter()
+            .map(|r| r.envelope.body.clone())
+            .collect();
+        assert_eq!(released, rotated, "{}", store.address());
+    }
+}
+
 #[tokio::test]
 async fn edit_replaces_the_body_and_reschedules() {
     for store in stores(DEPTH).await {
@@ -612,7 +680,7 @@ async fn edit_replaces_the_body_and_reschedules() {
                 .edit_deferred(
                     "alice",
                     parked.message_uuid,
-                    Some("edited".to_string()),
+                    Some("edited".into()),
                     Some(moved_to),
                     now(),
                 )
@@ -1718,7 +1786,7 @@ fn new_bodies(window: &SubscriberWindow) -> Vec<String> {
     window
         .new_entries()
         .iter()
-        .map(|(_, envelope)| envelope.body.clone())
+        .map(|(_, envelope)| envelope.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -1727,7 +1795,7 @@ fn window_bodies(window: &SubscriberWindow) -> Vec<String> {
     window
         .entries
         .iter()
-        .map(|(_, envelope)| envelope.body.clone())
+        .map(|(_, envelope)| envelope.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -2814,7 +2882,7 @@ fn replay_bodies(replay: &StoreReplay) -> Vec<String> {
     replay
         .messages
         .iter()
-        .map(|e| e.message.body.clone())
+        .map(|e| e.message.body.as_text().unwrap().to_owned())
         .collect()
 }
 

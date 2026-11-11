@@ -199,7 +199,7 @@ pub async fn handle_publish(
     let scope = ctx.profile.attach_scope();
     let outcome = match ctx
         .messenger
-        .publish_from_attacher(scope, attribution, channel, body, urgency)
+        .publish_from_attacher(scope, attribution, channel, body.into(), urgency)
         .await
     {
         PublishResult::Ok { .. } => {
@@ -531,7 +531,7 @@ pub async fn handle_publish_batch(
             prev_ts = Some(ts);
             AttachBatchPublish {
                 channel_address: entry.channel,
-                body: entry.body,
+                body: entry.body.into(),
                 urgency: entry.urgency,
                 publish_ts_ns: ts,
                 deliver_after: entry.deliver_after,
@@ -805,7 +805,10 @@ pub fn deferred_view_entries(parked: &[DeferredMessage]) -> Vec<DeferredViewEntr
         .iter()
         .map(|message| DeferredViewEntry {
             message_id: message.envelope.message_id,
-            body: message.envelope.body.clone(),
+            body: message
+                .envelope
+                .require_text_body("attach v4 DeferredView")
+                .to_owned(),
             deliver_after: u64::try_from(message.release_at.timestamp_millis()).expect(
                 "a parked release time was admitted from epoch milliseconds, so it is at or after \
                  the epoch",

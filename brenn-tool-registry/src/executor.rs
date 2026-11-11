@@ -447,7 +447,13 @@ async fn admit_and_dispatch(
     // a warning.
     let reply_addr = env.reply_to.clone();
 
-    let request: ToolRequest = match serde_json::from_str(&env.body) {
+    // A body that is not text cannot be a request; it takes the malformed
+    // path, named by its content type and size.
+    let parsed = match env.body.as_text() {
+        Some(text) => serde_json::from_str::<ToolRequest>(text).map_err(|e| e.to_string()),
+        None => Err(format!("body is not text ({})", env.body.summary())),
+    };
+    let request = match parsed {
         Ok(r) => r,
         Err(e) => {
             // Malformed body from an internal caller — a bug (post-auth bus
@@ -464,8 +470,10 @@ async fn admit_and_dispatch(
                 ),
             );
             if let Some(addr) = reply_addr {
-                let call_id = serde_json::from_str::<Value>(&env.body)
-                    .ok()
+                let call_id = env
+                    .body
+                    .as_text()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
                     .and_then(|v| v.get("call_id").and_then(Value::as_str).map(String::from))
                     .unwrap_or_default();
                 let body = build_result_body(
@@ -679,7 +687,7 @@ async fn publish_result(messenger: &Messenger, reply_addr: &str, body: &str) {
         .publish_from_system(
             TOOL_EXECUTOR_COMPONENT,
             reply_addr,
-            body,
+            body.into(),
             Urgency::Normal,
             None,
         )
@@ -1101,7 +1109,7 @@ mod tests {
             channel,
             "test",
             CALLER,
-            body,
+            &body.into(),
             Urgency::Normal,
             ChannelScheme::Brenn,
             reply_to_uuid,
@@ -1212,7 +1220,7 @@ mod tests {
         )
         .await;
         assert_eq!(rows.len(), 1, "exactly one result row on the caller inbox");
-        serde_json::from_str(&rows[0].1.body).expect("result body is JSON")
+        serde_json::from_str(rows[0].1.body.as_text().unwrap()).expect("result body is JSON")
     }
 
     #[tokio::test]
@@ -1275,7 +1283,7 @@ mod tests {
         .await;
         let results: Vec<Value> = rows
             .iter()
-            .map(|(_, env)| serde_json::from_str(&env.body).unwrap())
+            .map(|(_, env)| serde_json::from_str(env.body.as_text().unwrap()).unwrap())
             .collect();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0]["call_id"], "before");
@@ -1388,6 +1396,63 @@ mod tests {
                 .iter()
                 .any(|(t, _)| t.contains("malformed request")),
             "malformed-request alert should fire: {captured:?}",
+        );
+    }
+
+    /// A body that is not text cannot be a request: it takes the malformed
+    /// path, its alert names the body by content type and size, and the answer
+    /// is `invalid_args` with no call id to echo.
+    #[tokio::test]
+    async fn a_non_text_request_body_is_malformed() {
+        let h = harness().await;
+        {
+            let body = brenn_lib::messaging::MessageBody::from_parts(
+                Some("application/octet-stream"),
+                &[0xff, 0x00, 0x7b],
+            )
+            .unwrap();
+            let conn = h.messenger.db().lock().await;
+            insert_message(
+                &conn,
+                h.tools_uuid,
+                "test",
+                CALLER,
+                &body,
+                Urgency::Normal,
+                ChannelScheme::Brenn,
+                Some(h.results_uuid),
+                None,
+                None,
+                None,
+                utc_to_ns(Utc::now()),
+            );
+        }
+        let (alert, captured, handle) = make_capturing_alerter();
+        let tool = StubAsync::new(4, Duration::ZERO);
+        let seen = tool.seen_users.clone();
+        let exec = executor(
+            &h,
+            registry(tool),
+            caller_grants(vec![clause(&[("repo", "brenn")])]),
+            alert.clone(),
+        );
+
+        drain_and_join(&exec).await;
+
+        let result = read_result(&h).await;
+        assert_eq!(result["call_id"], "");
+        assert_eq!(result["outcome"]["err"]["kind"], "invalid_args");
+        assert!(seen.lock().unwrap().is_empty(), "the tool must not run");
+
+        drop(exec);
+        alert.flush().await;
+        drop(alert);
+        handle.await.unwrap();
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured.iter().any(|(t, b)| t.contains("malformed request")
+                && b.contains("application/octet-stream, 3 bytes")),
+            "the alert names the body by type and size: {captured:?}",
         );
     }
 
@@ -1982,8 +2047,8 @@ mod tests {
             .expect("the tool-results port is present in the activation");
         assert_eq!(port.channel_address, "brenn:tool-results/sync");
         assert_eq!(port.new_len(), 1, "the one result message is delivered");
-        let body: Value =
-            serde_json::from_str(&port.new_entries()[0].1.body).expect("result body is JSON");
+        let body: Value = serde_json::from_str(port.new_entries()[0].1.body.as_text().unwrap())
+            .expect("result body is JSON");
         assert_eq!(body["call_id"], "r1");
         assert_eq!(body["outcome"]["ok"]["echoed"]["repo"], "brenn");
     }
@@ -2049,7 +2114,9 @@ mod tests {
         )
         .await
         .iter()
-        .map(|(_, env)| serde_json::from_str(&env.body).expect("result body is JSON"))
+        .map(|(_, env)| {
+            serde_json::from_str(env.body.as_text().unwrap()).expect("result body is JSON")
+        })
         .collect()
     }
 

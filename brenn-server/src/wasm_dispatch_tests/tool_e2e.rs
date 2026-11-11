@@ -350,7 +350,7 @@ async fn execute_and_read_result(
         1,
         "exactly one result row on the consumer inbox"
     );
-    serde_json::from_str(&inbox_rows[0].1.body).expect("result body is JSON")
+    serde_json::from_str(inbox_rows[0].1.body.as_text().unwrap()).expect("result body is JSON")
 }
 
 /// Drain the guest on its result activation and return the v1 result it
@@ -364,7 +364,8 @@ async fn forwarded_result(harness: &ToolHarness, out_sub: &ParticipantId) -> ser
         "the guest must forward exactly one result to out (proving it was activated)"
     );
     let forwarded_envelope: serde_json::Value =
-        serde_json::from_str(&out_rows[0].1.body).expect("out body is an envelope JSON");
+        serde_json::from_str(out_rows[0].1.body.as_text().unwrap())
+            .expect("out body is an envelope JSON");
     serde_json::from_str(
         forwarded_envelope["body"]
             .as_str()

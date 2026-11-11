@@ -29,7 +29,7 @@ mod tests;
 use std::collections::BTreeSet;
 
 use brenn_attach_client::router::{GuardedBody, Origin, PlanePolicy};
-use brenn_envelope::MessageEnvelope;
+use brenn_envelope::{MessageBody, MessageEnvelope};
 use brenn_surface_schema::telemetry::OverlayReport;
 use brenn_surface_schema::{
     LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TAKEOVER_CHANNEL, OverlayStateBody, TakeoverBody,
@@ -158,7 +158,7 @@ impl PlanePolicy for SurfacePlanes {
     /// neither a takeover identity to stamp nor an overlay to report, so a
     /// kernel-minted body on either would be the kernel inventing telemetry
     /// about a component.
-    fn guard(&self, channel: &str, origin: Origin<'_>, body: String) -> GuardedBody {
+    fn guard(&self, channel: &str, origin: Origin<'_>, body: MessageBody) -> GuardedBody {
         let instance = match (channel, origin) {
             (LOCAL_OVERLAY_STATE_CHANNEL | LOCAL_TAKEOVER_CHANNEL, Origin::Sub(instance)) => {
                 instance
@@ -168,14 +168,27 @@ impl PlanePolicy for SurfacePlanes {
             }
             _ => return GuardedBody::Carry(body),
         };
+        // Both planes carry JSON documents; a body that is not text is refused
+        // as one that does not parse is.
+        let Some(text) = body.as_text() else {
+            return GuardedBody::Refused(format!(
+                "unparseable body: not text ({})",
+                body.summary()
+            ));
+        };
         if channel == LOCAL_OVERLAY_STATE_CHANNEL {
-            return match self.refuse_overlay_state(instance, &body) {
+            return match self.refuse_overlay_state(instance, text) {
                 Some(reason) => GuardedBody::Refused(reason),
                 None => GuardedBody::Carry(body),
             };
         }
-        match inject_takeover_instance(body, instance) {
-            Ok(body) => GuardedBody::Carry(body),
+        match inject_takeover_instance(text, instance) {
+            // The rewrite keeps the publisher's content type: it is the same
+            // JSON document with one field stamped.
+            Ok(stamped) => GuardedBody::Carry(
+                MessageBody::from_parts(body.content_type(), stamped.as_bytes())
+                    .expect("a re-serialized takeover body is UTF-8 under a text type"),
+            ),
             Err(reason) => GuardedBody::Refused(reason),
         }
     }
@@ -189,7 +202,11 @@ impl PlanePolicy for SurfacePlanes {
         if envelope.channel != LOCAL_OVERLAY_STATE_CHANNEL {
             return;
         }
-        let parsed: OverlayStateBody = serde_json::from_str(&envelope.body)
+        let text = envelope
+            .body
+            .as_text()
+            .expect("surface client: a body on the overlay plane was text when it was accepted");
+        let parsed: OverlayStateBody = serde_json::from_str(text)
             .expect("surface client: a body on the overlay plane parsed when it was accepted");
         // A holder the surface stopped declaring between the guard and here — a
         // parked report released after a wiring change — is skipped rather than
@@ -222,8 +239,8 @@ fn is_undefined_reserved(channel: &str) -> bool {
 /// stamp, so it is refused rather than carried: carrying it would make the
 /// anti-spoof guarantee depend on every reader's parser being at least as
 /// strict as this one, a cross-crate invariant nothing checks.
-fn inject_takeover_instance(body: String, instance: &str) -> Result<String, String> {
-    match serde_json::from_str::<TakeoverBody>(&body) {
+fn inject_takeover_instance(body: &str, instance: &str) -> Result<String, String> {
+    match serde_json::from_str::<TakeoverBody>(body) {
         Ok(mut parsed) => {
             parsed.instance = instance.to_string();
             Ok(serde_json::to_string(&parsed).expect("a TakeoverBody serializes to JSON"))

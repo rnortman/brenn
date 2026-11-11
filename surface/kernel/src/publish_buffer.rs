@@ -29,7 +29,7 @@ use brenn_budget::{
     ActivationGate, DeferRefusalKind, GateRefusal, PublishCheck, PublishRefusalKind,
     check_deliver_after, defer_refusal_kind, publish_refusal_kind,
 };
-use brenn_envelope::Urgency;
+use brenn_envelope::{MessageBody, Urgency};
 use brenn_surface_contract::{CallError, DeferError, PublishError};
 use uuid::Uuid;
 
@@ -510,7 +510,7 @@ impl PublishBuffer {
             port,
             index,
             DeferOp::Edit {
-                body,
+                body: body.map(MessageBody::text),
                 deliver_after,
             },
         )

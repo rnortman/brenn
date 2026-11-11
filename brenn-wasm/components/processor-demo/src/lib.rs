@@ -44,7 +44,7 @@ impl Processor for ProcessorDemo {
                     return Err(Error::failed("envelope missing non-empty 'channel' field"));
                 }
 
-                if env.body == "__trap__" {
+                if env.body.as_text() == Some("__trap__") {
                     unreachable!("processor-demo: deliberate trap on sentinel body __trap__");
                 }
 

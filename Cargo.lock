@@ -948,6 +948,7 @@ name = "brenn-messaging-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64ct",
  "brenn-db",
  "brenn-envelope",
  "brenn-lib",

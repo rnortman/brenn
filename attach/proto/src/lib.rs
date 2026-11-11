@@ -476,6 +476,8 @@ pub enum ServerFrame {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliverRow {
+    /// Written in the text shape: a v4 frame carries a body as its text.
+    #[serde(serialize_with = "brenn_envelope::serialize_text_shape")]
     pub envelope: MessageEnvelope,
     /// A delivery-time span sequence, assigned at socket-write time and strictly
     /// increasing per subscription-span (a span starts at each
@@ -795,7 +797,7 @@ mod tests {
             channel: "ephemeral:demo".to_string(),
             sender: "surface:deskbar".to_string(),
             publish_ts: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
-            body: "hello".to_string(),
+            body: "hello".into(),
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
@@ -1637,7 +1639,7 @@ mod tests {
             batch_charged_bytes(
                 &[BatchEntry {
                     channel: "ephemeral:x".to_string(),
-                    body: "hello".to_string(),
+                    body: "hello".into(),
                     urgency: Urgency::Normal,
                     deliver_after: None,
                 }],

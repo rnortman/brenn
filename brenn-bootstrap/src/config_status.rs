@@ -31,13 +31,14 @@ pub enum RetainedStatus {
     Body(String),
     /// No retained message; the string describes which case.
     Absent(String),
-    /// The store could not be read at all.
+    /// The store could not be read at all, or its newest status is not text.
     Error(String),
 }
 
 /// Print the retained body of `brenn:config.status` and return the process's
 /// exit status: 0 with a body, [`CONFIG_STATUS_ABSENT`] without one, 1 when the
-/// database could not be read as a brenn store at all.
+/// database could not be read as a brenn store at all or the newest status is
+/// not text.
 pub fn run_config_status(db: &Path) -> u8 {
     match retained_status(db) {
         RetainedStatus::Body(body) => {
@@ -85,7 +86,14 @@ pub fn retained_status(db: &Path) -> RetainedStatus {
 
     let tail = load_channel_retained_tail(&conn, uuid, Depth::Bounded(1));
     match tail.last() {
-        Some((_, envelope)) => RetainedStatus::Body(envelope.body.clone()),
+        Some((_, envelope)) => match envelope.body.as_text() {
+            Some(text) => RetainedStatus::Body(text.to_owned()),
+            None => RetainedStatus::Error(format!(
+                "Error: the newest message on {} is not text ({}), so it is not a reload outcome.",
+                brenn_messaging::config_reload::STATUS_ADDRESS,
+                envelope.body.summary(),
+            )),
+        },
         None => RetainedStatus::Absent(format!(
             "nothing to report: {} exists but retains no message. A process \
              publishes its outcome at boot, so this is a channel declared since \
@@ -242,5 +250,38 @@ mod tests {
             .expect_err("a read-only connection must refuse a write");
         drop(conn);
         assert_eq!(run_config_status(&path), 0);
+    }
+
+    /// A newest status that is not text is not a reload outcome: the read
+    /// fails, naming its type and size, rather than printing bytes to an
+    /// installer that parses stdout as JSON.
+    #[test]
+    fn a_non_text_newest_status_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = store(dir.path(), &[r#"{"outcome":"booted"}"#]);
+        {
+            let conn = brenn_db::open_connection(&path);
+            conn.execute(
+                "INSERT INTO messaging_messages
+                   (uuid, channel_uuid, source, sender, body, content_type, urgency,
+                    publish_ts_ns, created_at, retained_seq)
+                 SELECT ?1, uuid, 'system', 'system:config-reload', ?2, 'image/png',
+                        'normal', 2, '2026-09-06T00:00:00Z', 2
+                 FROM messaging_channels WHERE address = ?3",
+                rusqlite::params![
+                    Uuid::new_v4().as_bytes().to_vec(),
+                    vec![0x89_u8, b'P', b'N', b'G'],
+                    STATUS_ADDRESS
+                ],
+            )
+            .expect("insert a non-text status");
+        }
+        let RetainedStatus::Error(message) = retained_status(&path) else {
+            panic!("a non-text newest status must be an error");
+        };
+        assert!(message.contains(STATUS_ADDRESS), "{message}");
+        assert!(message.contains("image/png"), "{message}");
+        assert!(message.contains("4 bytes"), "{message}");
+        assert_eq!(run_config_status(&path), 1);
     }
 }

@@ -553,7 +553,10 @@ async fn a_goal_that_moves_again_before_the_lock_abandons_the_swap() {
     let held = bridge.session.lock().await;
     bridge.reconsider_profile();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(goal.apply(GOAL_ADDR, "third"), vec!["testapp".to_string()]);
+    assert_eq!(
+        goal.apply(GOAL_ADDR, &"third".into()),
+        vec!["testapp".to_string()]
+    );
     drop(held);
 
     tokio::time::sleep(Duration::from_millis(50)).await;

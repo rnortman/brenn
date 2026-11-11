@@ -50,7 +50,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
-use brenn_envelope::MessageEnvelope;
+use brenn_envelope::{MessageBody, MessageEnvelope};
 use brenn_queue::{OwnedDeferred, RingCore};
 use uuid::Uuid;
 
@@ -70,7 +70,7 @@ pub enum DeferOp {
     Cancel,
     /// Rewrite its body, its release time, or both, keeping its identity.
     Edit {
-        body: Option<String>,
+        body: Option<MessageBody>,
         deliver_after: Option<ReleaseTime>,
     },
 }

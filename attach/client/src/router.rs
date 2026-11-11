@@ -50,7 +50,7 @@
 
 use brenn_attach_proto::DeferredViewEntry;
 use brenn_envelope::{
-    ChannelScheme, MessageEnvelope, Urgency, is_local_channel, surface_sub_identity,
+    ChannelScheme, MessageBody, MessageEnvelope, Urgency, is_local_channel, surface_sub_identity,
 };
 use brenn_queue::{CursorOverflow, QuotaExceeded, ReleaseTime};
 use chrono::{DateTime, Utc};
@@ -96,7 +96,7 @@ pub enum Origin<'a> {
 pub enum GuardedBody {
     /// The body to carry onto the channel — rewritten where the plane rewrites
     /// it, the caller's own bytes everywhere else.
-    Carry(String),
+    Carry(MessageBody),
     /// Refused, with the reason to report. Nothing reaches the channel.
     Refused(String),
 }
@@ -125,7 +125,7 @@ pub trait PlanePolicy {
     /// plane's rules cannot be walked around by choosing a different one.
     /// Default: carry every body through, which is the right answer for a plane
     /// whose payload is nobody's contract but its readers'.
-    fn guard(&self, channel: &str, origin: Origin<'_>, body: String) -> GuardedBody {
+    fn guard(&self, channel: &str, origin: Origin<'_>, body: MessageBody) -> GuardedBody {
         let _ = (channel, origin);
         GuardedBody::Carry(body)
     }
@@ -145,7 +145,7 @@ pub trait PlanePolicy {
 pub struct RouteRequest<'a> {
     pub channel: &'a str,
     pub origin: Origin<'a>,
-    pub body: String,
+    pub body: MessageBody,
     pub stamp: MessageStamp,
     /// The publisher's override, else whatever default the embedder resolved for
     /// this destination.
@@ -505,8 +505,12 @@ impl<P: PlanePolicy> LocalRouter<P> {
             .map(|parked| DeferredViewEntry {
                 message_id: parked.message.message_id,
                 // The body, not the envelope: what a publisher gets back is what
-                // it handed over, on either channel class.
-                body: parked.message.body.clone(),
+                // it handed over, on either channel class. The v4 entry carries
+                // a body as its text.
+                body: parked
+                    .message
+                    .require_text_body("attach v4 DeferredView")
+                    .to_owned(),
                 deliver_after: parked.release_at,
             })
             .collect()

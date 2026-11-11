@@ -35,7 +35,7 @@ fn insert_message_round_trip() {
         channel_uuid,
         "src",
         "sender-x",
-        "hello",
+        &"hello".into(),
         Urgency::Normal,
         ChannelScheme::Brenn,
         None,
@@ -85,7 +85,7 @@ fn fts_search_via_match() {
         channel_uuid,
         "src",
         "sender",
-        "the quick brown fox",
+        &"the quick brown fox".into(),
         Urgency::Low,
         ChannelScheme::Brenn,
         None,
@@ -129,7 +129,7 @@ fn release_due_for_channel_positions_the_message_and_clears_its_hold() {
         channel_uuid,
         "src",
         "sender",
-        "deferred",
+        &"deferred".into(),
         Urgency::Normal,
         ChannelScheme::Brenn,
         None,
@@ -245,7 +245,7 @@ fn update_parked_message_propagates_body_to_fts() {
     );
 
     let fields = EditFieldsApplied {
-        body: Some("new unique phrase"),
+        body: Some(&"new unique phrase".into()),
         reply_to_uuid: None,
         deliver_after: None,
         delivery_deadline: None,
@@ -368,19 +368,22 @@ fn list_pending_messages_for_sender_filters_correctly() {
     // All of alice's pending.
     let all_alice = list_pending_messages_for_sender(&conn, "alice", None);
     assert_eq!(all_alice.len(), 2, "alice should have 2 pending");
-    let bodies: Vec<&str> = all_alice.iter().map(|e| e.body.as_str()).collect();
+    let bodies: Vec<&str> = all_alice
+        .iter()
+        .map(|e| e.body.as_text().unwrap())
+        .collect();
     assert!(bodies.contains(&"alice-chan-a"));
     assert!(bodies.contains(&"alice-chan-b"));
 
     // Alice filtered to chan-a.
     let alice_chan_a = list_pending_messages_for_sender(&conn, "alice", Some(ch_uuid_a));
     assert_eq!(alice_chan_a.len(), 1);
-    assert_eq!(alice_chan_a[0].body, "alice-chan-a");
+    assert_eq!(alice_chan_a[0].body.as_text(), Some("alice-chan-a"));
 
     // Bob's pending.
     let bob = list_pending_messages_for_sender(&conn, "bob", None);
     assert_eq!(bob.len(), 1);
-    assert_eq!(bob[0].body, "bob-chan-a");
+    assert_eq!(bob[0].body.as_text(), Some("bob-chan-a"));
 }
 
 #[test]
@@ -647,7 +650,7 @@ fn update_parked_message_panics_on_sender_mismatch() {
     );
     let (msg_id, _) = insert_msg(&conn, channel_uuid, "alice", "body", None);
     let fields = EditFieldsApplied {
-        body: Some("new body"),
+        body: Some(&"new body".into()),
         reply_to_uuid: None,
         deliver_after: None,
         delivery_deadline: None,
@@ -666,7 +669,7 @@ fn update_parked_message_panics_on_missing_row() {
     let db = init_db_memory();
     let conn = db.blocking_lock();
     let fields = EditFieldsApplied {
-        body: Some("body"),
+        body: Some(&"body".into()),
         reply_to_uuid: None,
         deliver_after: None,
         delivery_deadline: None,
@@ -1419,7 +1422,7 @@ fn append_msg(conn: &Connection, channel: Uuid, body: &str) -> i64 {
         channel,
         "src",
         "sender",
-        body,
+        &body.into(),
         Urgency::Low,
         ChannelScheme::Brenn,
         None,
@@ -1437,7 +1440,7 @@ fn park_msg(conn: &Connection, channel: Uuid, body: &str, release_at: DateTime<U
         channel,
         "src",
         "sender",
-        body,
+        &body.into(),
         Urgency::Low,
         ChannelScheme::Brenn,
         None,
@@ -1552,7 +1555,7 @@ fn a_release_pass_assigns_seqs_in_release_order() {
     // A released row is in the retained window, which is what the seq buys.
     let tail: Vec<String> = load_channel_retained_tail(&conn, a, Depth::Unbounded)
         .into_iter()
-        .map(|(_, e)| e.body)
+        .map(|(_, e)| e.body.as_text().unwrap().to_owned())
         .collect();
     assert_eq!(tail, vec!["a1", "early", "late"]);
 }
@@ -1564,7 +1567,7 @@ fn park_with_push(conn: &Connection, channel: Uuid, body: &str, release_at: Date
         channel,
         "src",
         "sender",
-        body,
+        &body.into(),
         Urgency::Low,
         ChannelScheme::Brenn,
         None,
@@ -1660,7 +1663,7 @@ fn message_retained_seq_reads_the_named_row_not_the_channel_high_water() {
         a,
         "src",
         "sender",
-        "first",
+        &"first".into(),
         Urgency::Low,
         ChannelScheme::Brenn,
         None,
@@ -1712,7 +1715,7 @@ fn message_retained_seq_panics_on_a_parked_row() {
         a,
         "src",
         "sender",
-        "parked",
+        &"parked".into(),
         Urgency::Low,
         ChannelScheme::Brenn,
         None,
@@ -1726,4 +1729,64 @@ fn message_retained_seq_panics_on_a_parked_row() {
         "the fixture row is really parked"
     );
     message_retained_seq(&conn, parked.uuid);
+}
+
+fn archive_line(body: brenn_lib::messaging::MessageBody) -> String {
+    let envelope = brenn_lib::messaging::MessageEnvelope {
+        message_id: Uuid::nil(),
+        source: "src".to_string(),
+        channel: "brenn:chan".to_string(),
+        sender: "alice".to_string(),
+        publish_ts: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+        body,
+        reply_to: None,
+        delivery_deadline: None,
+        deliver_after: None,
+        impetus: None,
+        urgency: Urgency::Normal,
+        envelope_type: ChannelScheme::Brenn,
+    };
+    serde_json::to_string(&envelope.shaped::<crate::db::bus::ArchiveShape>()).unwrap()
+}
+
+const ARCHIVE_HEAD: &str = r#"{"message_id":"00000000-0000-0000-0000-000000000000","source":"src","channel":"brenn:chan","sender":"alice","publish_ts":"2023-11-14T22:13:20Z","#;
+const ARCHIVE_TAIL: &str = r#""urgency":"normal","envelope_type":"brenn"}"#;
+
+#[test]
+fn archive_shape_of_an_untyped_text_body_is_the_text_shape() {
+    assert_eq!(
+        archive_line("hi".into()),
+        format!(r#"{ARCHIVE_HEAD}"body":"hi",{ARCHIVE_TAIL}"#)
+    );
+}
+
+#[test]
+fn archive_shape_keeps_a_text_bodys_content_type() {
+    let body = brenn_lib::messaging::MessageBody::from_parts(Some("text/csv"), b"a,b").unwrap();
+    assert_eq!(
+        archive_line(body),
+        format!(r#"{ARCHIVE_HEAD}"body":"a,b","content_type":"text/csv",{ARCHIVE_TAIL}"#)
+    );
+}
+
+#[test]
+fn archive_shape_writes_a_non_text_body_as_base64() {
+    use base64ct::Encoding as _;
+    let bytes = vec![0xff, 0x00, 0xfe, b'a'];
+    let body =
+        brenn_lib::messaging::MessageBody::from_parts(Some("application/octet-stream"), &bytes)
+            .unwrap();
+    let line = archive_line(body);
+    assert_eq!(
+        line,
+        format!(
+            r#"{ARCHIVE_HEAD}"body_base64":"/wD+YQ==","content_type":"application/octet-stream",{ARCHIVE_TAIL}"#
+        )
+    );
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert!(v.get("body").is_none());
+    assert_eq!(
+        base64ct::Base64::decode_vec(v["body_base64"].as_str().unwrap()).unwrap(),
+        bytes
+    );
 }

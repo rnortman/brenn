@@ -59,7 +59,9 @@ pub use tombstone::{Lookup, TombstonedRegistry};
 // pulling in all of brenn-lib's host dependencies. Re-exported here at the
 // paths every host caller already uses.
 pub use brenn_envelope::{
-    BRENN_ADDRESS_PREFIX, ChannelScheme, EPHEMERAL_ADDRESS_PREFIX, Impetus, LOCAL_ADDRESS_PREFIX,
-    MQTT_ADDRESS_PREFIX, MessageEnvelope, MqttEnvelope, MqttPayloadBody, PWA_PUSH_ADDRESS_PREFIX,
-    Urgency, WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope, utc_from_epoch_ms,
+    BRENN_ADDRESS_PREFIX, BodyError, BodyShape, ChannelScheme, EPHEMERAL_ADDRESS_PREFIX, Impetus,
+    LOCAL_ADDRESS_PREFIX, MQTT_ADDRESS_PREFIX, MessageBody, MessageEnvelope, MqttEnvelope,
+    MqttPayloadBody, PWA_PUSH_ADDRESS_PREFIX, ShapedEnvelope, TextShape, Urgency,
+    WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope, is_text_content_type, serialize_text_shape,
+    utc_from_epoch_ms,
 };

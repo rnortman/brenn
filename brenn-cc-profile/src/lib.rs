@@ -17,6 +17,7 @@ use std::sync::RwLock;
 use brenn_lib::config::{
     AppClaudeProfiles, ClaudeProfile, OUTRANKING_CREDENTIAL_VARS, SecretString,
 };
+use brenn_messaging::MessageBody;
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use tracing::{info, warn};
@@ -78,6 +79,8 @@ pub enum GoalError {
     /// A profile name this agent is not allowed to run under — either
     /// undeclared, or declared and granted to some other agent.
     NotAllowed(String),
+    /// The body is not text: its [`MessageBody::summary`].
+    NotText(String),
 }
 
 impl std::fmt::Display for GoalError {
@@ -87,6 +90,7 @@ impl std::fmt::Display for GoalError {
             GoalError::NotAllowed(name) => {
                 write!(f, "profile {name:?} is not in this agent's claude_profiles")
             }
+            GoalError::NotText(summary) => write!(f, "goal body is not text ({summary})"),
         }
     }
 }
@@ -98,6 +102,7 @@ impl GoalError {
         match self {
             GoalError::Empty => "empty",
             GoalError::NotAllowed(_) => "not-allowed",
+            GoalError::NotText(_) => "not-text",
         }
     }
 }
@@ -237,7 +242,7 @@ impl ProfileGoal {
     /// A body one app accepts another may refuse: acceptance is per agent,
     /// against that agent's own allowed set. A refusal alerts once per process
     /// per `(agent, reason)` and leaves that agent's previous goal standing.
-    pub fn apply(&self, addr: &str, body: &str) -> Vec<String> {
+    pub fn apply(&self, addr: &str, body: &MessageBody) -> Vec<String> {
         let Some(slugs) = self.channel_apps.get(addr) else {
             // The participant subscribes to exactly the declared goal channels,
             // so a body from anywhere else is a wiring bug rather than a
@@ -251,7 +256,11 @@ impl ProfileGoal {
                 .get(slug)
                 .unwrap_or_else(|| panic!("BUG: goal channel {addr:?} names unknown app {slug:?}"))
                 .allowed;
-            match accept(body, allowed) {
+            let accepted = match body.as_text() {
+                Some(text) => accept(text, allowed),
+                None => Err(GoalError::NotText(body.summary().to_string())),
+            };
+            match accepted {
                 Ok(name) => {
                     let mut current = self
                         .current
@@ -400,7 +409,7 @@ mod tests {
                 ("kb", app(&["main"], Some(addr))),
             ],
         );
-        assert_eq!(goal.apply(addr, "spare"), vec!["pa".to_string()]);
+        assert_eq!(goal.apply(addr, &"spare".into()), vec!["pa".to_string()]);
         assert_eq!(goal.current("pa").as_deref(), Some("spare"));
         // `kb` does not allow `spare`, so its previous goal stands.
         assert_eq!(goal.current("kb").as_deref(), Some("main"));
@@ -413,9 +422,27 @@ mod tests {
             &["main", "spare"],
             &[("pa", app(&["main", "spare"], Some(addr)))],
         );
-        assert!(goal.apply(addr, "main").is_empty());
-        assert_eq!(goal.apply(addr, "spare"), vec!["pa".to_string()]);
-        assert!(goal.apply(addr, " spare ").is_empty());
+        assert!(goal.apply(addr, &"main".into()).is_empty());
+        assert_eq!(goal.apply(addr, &"spare".into()), vec!["pa".to_string()]);
+        assert!(goal.apply(addr, &" spare ".into()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_text_leaves_the_goal_standing() {
+        let addr = "brenn:cc-profile.pa";
+        let (goal, _h) = goal_handle(
+            &["main", "spare"],
+            &[("pa", app(&["main", "spare"], Some(addr)))],
+        );
+        let bytes = MessageBody::from_parts(Some("image/png"), b"spare").unwrap();
+        assert!(goal.apply(addr, &bytes).is_empty());
+        assert_eq!(goal.current("pa").as_deref(), Some("main"));
+        let err = GoalError::NotText(bytes.summary().to_string());
+        assert_eq!(
+            err.to_string(),
+            "goal body is not text (image/png, 5 bytes)"
+        );
+        assert_eq!(err.tag(), "not-text");
     }
 
     #[tokio::test]
@@ -473,11 +500,11 @@ mod tests {
         let goal = ProfileGoal::new(profiles(&["main", "spare"]), apps, alerts);
 
         // `pa` may not run `spare`; `kb` may, and does.
-        goal.apply(addr, "spare");
+        goal.apply(addr, &"spare".into());
         // Same agent, same reason: already paged.
-        goal.apply(addr, "spare");
+        goal.apply(addr, &"spare".into());
         // A different reason, for both agents this time.
-        goal.apply(addr, "   ");
+        goal.apply(addr, &"   ".into());
 
         drop(goal);
         drainer.await.expect("alert drainer panicked");

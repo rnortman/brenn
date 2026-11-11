@@ -50,7 +50,7 @@ pub(super) fn insert_msg(
         channel_uuid,
         "src",
         sender,
-        body,
+        &body.into(),
         Urgency::Low, // Low is the mapping for old 'none' (no eager wake at default wake_min=Normal)
         brenn_lib::messaging::ChannelScheme::Brenn,
         None,

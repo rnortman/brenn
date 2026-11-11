@@ -764,7 +764,7 @@ async fn bodies(ctx: &AttachSessionCtx, channel: &str) -> Vec<String> {
         .await
         .messages
         .into_iter()
-        .map(|row| row.message.body.clone())
+        .map(|row| row.message.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -803,7 +803,7 @@ async fn a_batch_lands_in_call_order_with_strictly_increasing_stamps() {
     assert_eq!(
         retained
             .iter()
-            .map(|row| row.message.body.as_str())
+            .map(|row| row.message.body.as_text().unwrap())
             .collect::<Vec<_>>(),
         vec![r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#],
     );
@@ -1186,7 +1186,7 @@ async fn an_edit_op_rewrites_the_parked_body() {
         )
         .await;
     assert_eq!(parked.len(), 1);
-    assert_eq!(parked[0].envelope.body, r#"{"v":2}"#);
+    assert_eq!(parked[0].envelope.body.as_text().unwrap(), r#"{"v":2}"#);
 }
 
 /// An edit body is charged against the frame's byte budget like a published
@@ -1220,7 +1220,11 @@ async fn an_oversized_edit_body_kills_the_batch() {
             ParticipantId::for_surface_component(ATTACHER, SUB).as_str(),
         )
         .await;
-    assert_eq!(parked[0].envelope.body, r#"{"v":1}"#, "nothing applied");
+    assert_eq!(
+        parked[0].envelope.body.as_text().unwrap(),
+        r#"{"v":1}"#,
+        "nothing applied"
+    );
 }
 
 /// An op naming a message parked by another sender is a violation: the ids a
@@ -1391,7 +1395,8 @@ async fn an_edit_op_moves_the_release_time() {
         "the stored release time moved to the edit's"
     );
     assert_eq!(
-        parked[0].envelope.body, r#"{"v":1}"#,
+        parked[0].envelope.body.as_text(),
+        Some(r#"{"v":1}"#),
         "the body is untouched"
     );
     let view = one_view(&mut sibling);
@@ -1466,7 +1471,10 @@ async fn batch_stamps_order_across_the_substrate_split() {
             .await
             .messages
         {
-            stamped.push((row.message.publish_ts, row.message.body.clone()));
+            stamped.push((
+                row.message.publish_ts,
+                row.message.body.as_text().unwrap().to_owned(),
+            ));
         }
     }
     assert_eq!(stamped.len(), 4, "both classes carried their half");
@@ -1514,7 +1522,7 @@ async fn park_under(
             attribution,
             &[AttachBatchPublish {
                 channel_address: channel,
-                body,
+                body: body.into(),
                 urgency: Urgency::Normal,
                 publish_ts_ns: brenn_messaging_store::db::utc_to_ns(Utc::now()),
                 deliver_after: Some(release),
@@ -1697,4 +1705,31 @@ async fn a_seeding_target_the_profile_does_not_declare_panics() {
     let mut counters = SessionCounters::default();
 
     let _ = seed_deferred_views(&ctx, &mut counters).await;
+}
+
+fn parked_with(body: brenn_lib::messaging::MessageBody) -> DeferredMessage {
+    DeferredMessage {
+        release_at: chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+        envelope: Arc::new(brenn_envelope::testutils::fixture_envelope(
+            "brenn:out",
+            "parked",
+            body,
+        )),
+    }
+}
+
+/// A v4 `DeferredView` entry carries a typed text body as exactly its text.
+#[test]
+fn a_typed_text_body_is_viewed_as_its_text() {
+    let body =
+        brenn_lib::messaging::MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+    let entries = deferred_view_entries(&[parked_with(body)]);
+    assert_eq!(entries[0].body, "# hi");
+}
+
+#[test]
+#[should_panic(expected = "attach v4 DeferredView cannot carry a non-text body")]
+fn a_non_text_body_in_a_deferred_view_panics() {
+    let body = brenn_lib::messaging::MessageBody::from_parts(Some("image/png"), &[0x89]).unwrap();
+    deferred_view_entries(&[parked_with(body)]);
 }

@@ -1,5 +1,115 @@
 # TODOs
 
+## `binary-contract-version-mechanism`
+
+Owner ruling needed before the dual-contract backend slice is designed: which
+kind of "versioned" the byte-carrying component contract is. (c)
+`brenn:processor@0.2.0` re-declares only the envelope/activation records,
+`ports` and `receive`, with unchanged interfaces imported at `@0.1.0`: one
+host impl per unchanged interface, and after the period 0.1.0 lives on as the
+home of `log`, `store`, `dom` and the rest. (a) everything moves to 0.2.0:
+about 800–1,500 more lines of forwarding bindings for nine unchanged
+interfaces during the period, and 0.1.0 is deleted whole at its end. (b)
+additive inside 0.1.x: keeps `-bytes` names forever and can remove the string
+shapes only by breaking 0.1.x semver. All three were run or analysed in the
+sizing spike, which recommends (c). (Raised in the sizing spike's report, §5
+OQ1.)
+
+## `dual-contract-period-length`
+
+Owner ruling needed by the release that first serves both component contracts:
+how long the old `brenn:processor` string contract (and attach v4) stays
+supported, and how out-of-tree authors are told. Options: a fixed number of
+releases; a date; or until the owner's known out-of-tree repositories have
+moved plus a warning period for unknown ones. The boot warning for 0.1.0
+artifacts names the removal release, so it cannot be written without this.
+(Sizing spike report §5 OQ5 and §4.)
+
+## `blob-handle-integrity`
+
+Owner ruling needed before the blob conversation/tool slice is designed:
+whether a blob reference that crosses text (LLMs, JSON bodies) is a plain id
+or a host-tracked handle. Plain id: 128-bit random with a check character,
+validated for existence; authority is by possession, so any conversation that
+has seen an id can name it, including through injected text. Host-tracked: a
+reference is refused unless the host's bookkeeping says the holder may use it;
+about 1,000–1,500 more lines; closes forging and stale access but not an LLM
+forwarding a blob it legitimately holds. The order of the owner's words
+matters. First, in the project spec, written before the sizing spike: "If we
+do the bookkeeping for it (somehow; I haven't worked out how) then it couldn't
+get screwed up or 'forged'. I feel like that could get very complicated
+though; in fact LLMs are pretty good at copying IDs so I'm probably worrying
+about nothing." Then, after reading the spike report that posed this question,
+in the notes after cycle 1, the owner supplied the "how" the spec said was
+missing: "On the subject of the host-tracked handle registry: We have a
+potential lifetime solution there: The handle must currently exist in the
+retained buffer of one of the channels that it has access to, and it must have
+read a message containing the handle since conversation start or the last
+compaction, whichever is more recent. Otherwise it's not usable." The proxy
+that filed this entry reads the later words as the current ones and the
+earlier lean as superseded by them, though the owner called the rule
+"potential" and did not say "build it": unless the owner says otherwise here,
+the blob conversation/tool slice's design starts from the host-tracked form
+under that rule. To confirm: host-tracked under that rule, the rule being a
+starting point the design may refine; or plain id after all. Components get
+unforgeable WIT resources either way. The same note carries a design hint for
+that slice, to be read by its design: "An LLM typically would not hold on to
+one of these for long; it would very quickly forward it, or retrieve the bytes
+and write them to disk (or use a tool that does that without the bytes flowing
+through their context, more likely; e.g. the brenn-tool CLI they have could
+stream it to disk) for later use." (Sizing spike report §1 Q4.3 and §5 OQ2;
+the owner's notes after cycle 1.)
+
+## `blob-store-vs-no-state-store`
+
+Owner ruling needed before the blob store is designed: how a blob store sits
+beside `CLAUDE.md`'s "There is no separate state store, KV API, or config
+layer. Do not add one." The owner has since asked for blobs as a general
+mechanism (camera frames, drive files, component bundles, UI uploads), so the
+store is to be built; what is open is its boundary. The sizing spike's
+reading: a blob exists only as an attachment of a retained message and lives
+and dies with message retention, with no state of its own. The owner's words
+that bear on it, from the handle lifetime rule in the notes after cycle 1: a
+handle is usable only if it "must currently exist in the retained buffer of
+one of the channels that it has access to", and "An LLM typically would not
+hold on to one of these for long". That bounds the use of a blob reference by
+message retention, which is what the spike's reading assumes; it does not say
+in so many words when the bytes are deleted. Options: confirm the spike's
+reading, which the owner's handle rule fits, and have `CLAUDE.md` say so; or
+state a different boundary, for example blobs that outlive the messages naming
+them, which under the handle rule as written no handle could reach. (Sizing
+spike report §5 OQ4; the owner's notes after cycle 1.)
+
+## `llm-sees-binary-content`
+
+Owner ruling needed before the blob conversation/tool slice is designed:
+whether a conversation should ever see a binary body or attachment as what it
+is, for example an image as an image content block through a tool that renders
+a blob for the model. Options: metadata placeholders only (`{"binary": true,
+"content_type", "size"}`), extending the existing MQTT rule, which the
+byte-body core implements either way; or a rendering path, which is a product
+capability and a new prompt-injection surface (`docs/security-posture.md`, the
+prompt-injection section). (Sizing spike report §5 OQ6.) The
+`TODO(llm-sees-binary-content)` comment sits at the placeholder in
+`ConversationShape` in `brenn-messaging/src/format.rs`.
+
+## `blob-mutability`
+
+Mutable blobs are not built by the binary-bus project's blob slices, which
+make a blob immutable once sealed; the owner asked that the design not
+entrench against them. The owner's case: "A pipeline that contributes some new
+data or mutates some of the data at each step. If you want that to be
+zero-copy, you have to mutate the blob in place", with the condition that
+applications "should be allowed to gain a contract guarantee that their blob
+is in fact immutable or does not mutate underneath them", ranked "low
+priority; something we ideally do not entrench against right now", and "if
+entrenching against it buys us substantial benefits (simplicity for example)
+then I can be talked into it." Two things to do: the blob store and `blobs`
+interface designs say what they would cost to extend to in-place mutation, and
+name any choice that forecloses it with what it buys; and decide whether
+in-place mutable blobs are built at all. Done = the owner rules build or
+never, after the immutable design exists. (The owner's notes after cycle 1.)
+
 ## `kit-payload-reader-cannot-read-304`
 
 The provider kit's `read_api_payload` and `read_api_result` fail every 3xx
@@ -2425,9 +2535,18 @@ the pure-logic code into a host-buildable module the guest crate includes, or a
 wasm32 test rule (which is the same missing rule work `surface-wasm-test-in-ci`
 describes, without the browser half).
 
+The guest SDK has the same gap with no tests written: `brenn-guest`'s
+`MessageEnvelopeExt` (`text_body`, and `json_body` / `webhook_body` through it)
+has no test that it returns the text of a text body and `MalformedEnvelope` for
+a non-text one, because the crate is a wasm32-only `wasm_guest_library` whose
+`lib.rs` carries the `wit_bindgen::generate!` bindings. The non-text arm is
+unreachable from a running guest under the 0.1.0 contract (the host panics
+before lowering a non-text body), so only a unit test can reach it.
+
 Code sites (`TODO(wasm-guest-tests-unrun)`):
 `brenn-wasm/components/replay/BUILD.bazel` and
-`brenn-wasm/components/replay-generic/BUILD.bazel`, above the guest cdylib.
+`brenn-wasm/components/replay-generic/BUILD.bazel`, above the guest cdylib;
+`brenn-wasm/components/guest/src/lib.rs`, above `impl MessageEnvelopeExt`.
 
 
 ## `sw-registration-csp-blocked`

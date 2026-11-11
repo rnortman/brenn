@@ -305,7 +305,7 @@ impl MqttEventRouter for MqttEventRouterImpl {
                     channel,
                     &route.channel_address,
                     client_slug,
-                    &envelope_json,
+                    envelope_json.as_str().into(),
                     route.urgency,
                 )
                 .await;

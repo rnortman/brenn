@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use brenn_envelope::{ChannelCapabilities, MessageEnvelope};
+use brenn_envelope::{ChannelCapabilities, MessageBody, MessageEnvelope};
 use brenn_queue::{GapReason, QuotaExceeded, ReplayDecision};
 
 use crate::db;
@@ -584,7 +584,7 @@ impl RetentionStore for DbStore {
         &self,
         sender: &str,
         message_uuid: Uuid,
-        body: Option<String>,
+        body: Option<MessageBody>,
         release_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> DeferralOutcome {
@@ -606,7 +606,7 @@ impl RetentionStore for DbStore {
             &conn,
             self.channel_uuid,
             lookup.message_id,
-            body.as_deref(),
+            body.as_ref(),
             release_at,
             now,
         );

@@ -288,7 +288,11 @@ fn on_deliver(
         let mut configured = Vec::new();
         let mut unusable_document = None;
         for row in &rows {
-            match page.apply_config(&row.envelope.body, now) {
+            let applied = match row.envelope.body.as_text() {
+                Some(text) => page.apply_config(text, now),
+                None => Err("the configuration document is not text".to_string()),
+            };
+            match applied {
                 Ok(applied) => configured.push(applied),
                 Err(detail) => {
                     unusable_document = Some(detail);

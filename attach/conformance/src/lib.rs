@@ -757,7 +757,12 @@ impl AttachClient {
                             self.observed.push_back(Observation::Delivered(Delivery {
                                 channel: channel.clone(),
                                 sender: row.envelope.sender,
-                                body: row.envelope.body,
+                                body: row
+                                    .envelope
+                                    .body
+                                    .as_text()
+                                    .expect("a v4 row's body is text")
+                                    .to_owned(),
                                 seq: row.seq,
                                 dropped: row.dropped,
                             }));

@@ -164,6 +164,29 @@ bytes whichever field carried them. A component that matches `Answer` exhaustive
 — failing `internal`, if the API it calls never answers in bytes. The `testutil` fixtures gained `binary`, an answer carrying bytes, and
 `text_body`, a call's text body.
 
+Another cut of this kind in force now: **`MessageEnvelope.body` is a
+`MessageBody`**, bytes with an optional content type, re-exported from
+`brenn-guest` with `BodyError` and `is_text_content_type`.
+
+- Under the 0.1.0 contract the body is always text: the host never windows a
+  non-text body to a 0.1.0 component, and a typed text body arrives as exactly
+  its text, without its type. A kind reads it with `body.as_text()` or
+  `envelope.text_body()?`, and compares a sentinel as
+  `body.as_text() == Some("…")`.
+- `brenn_guest::MessageEnvelopeExt` gained `text_body(&self) -> Result<&str,
+  Error>`, which answers `Error::MalformedEnvelope` for a body that is not
+  text. `json_body` and `webhook_body` keep their signatures and read through
+  it.
+- `MessageEnvelope` no longer implements `Serialize`. A kind that built
+  `envelope-json` text, in a test for instance, calls `to_envelope_json`.
+  `Deserialize` reads the text shape and refuses a `content_type` or
+  `body_base64` key.
+- `RetainedState` is unchanged in signature and behaviour.
+
+The WIT, the `envelope-json` text and every runtime contract are byte-identical
+for the bodies a deployed component can meet, so no deployed artifact is
+affected; the cut is paid at the next pin bump.
+
 Freezing the macro vocabulary of a one-operator ecosystem buys nothing a pin
 does not already buy, which is why the two are split rather than held to one
 promise. `CHANGELOG.md` announces a cut to component authors in an entry

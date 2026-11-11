@@ -263,7 +263,13 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
         // `204` is returned by the HTTP handler only after this returns (durable enqueue
         // has completed). Never 204 if enqueue failed — the handler maps Err→500.
         messenger
-            .publish_transport_ingress(channel, &source, sender, &envelope_json, endpoint.urgency)
+            .publish_transport_ingress(
+                channel,
+                &source,
+                sender,
+                envelope_json.as_str().into(),
+                endpoint.urgency,
+            )
             .await;
         Ok(())
     }

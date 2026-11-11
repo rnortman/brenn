@@ -802,7 +802,10 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
             .enumerate()
             .map(|(i, dm)| ProcessorDeferredEntry {
                 index: i as u32,
-                payload: dm.envelope.body.clone(),
+                payload: dm
+                    .envelope
+                    .require_text_body("0.1.0 deferred-entry.payload")
+                    .to_owned(),
                 deliver_after: release_time_of(dm.release_at),
             })
             .collect();
@@ -899,7 +902,7 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
                     .iter()
                     .map(|p| WasmPublish {
                         channel_address: &p.channel_address,
-                        body: &p.payload,
+                        body: p.payload.as_str().into(),
                         urgency: processor_urgency_to_messaging(p.urgency),
                         reply_to: p.reply_to.as_deref(),
                         // Representability was validated at buffer time
@@ -1094,9 +1097,16 @@ fn fail_delivered_requests(
         .iter()
         .filter(|snap| snap.port == TOOL_REQUEST_INPUT_PORT)
         .flat_map(|snap| snap.new_entries())
-        .map(|(_, env)| match ProvidedRequest::parse(&env.body) {
-            Ok(request) => request.id,
-            Err(err) => panic!(
+        .map(|(_, env)| match env.body.as_text().map(ProvidedRequest::parse) {
+            Some(Ok(request)) => request.id,
+            None => panic!(
+                "BUG: wasm_dispatch: request {} on {}'s {TOOL_REQUEST_INPUT_PORT:?} port is not \
+                 text ({}) — the host builds every body on that channel",
+                env.message_id,
+                cfg.slug,
+                env.body.summary()
+            ),
+            Some(Err(err)) => panic!(
                 "BUG: wasm_dispatch: request {} on {}'s {TOOL_REQUEST_INPUT_PORT:?} port is not \
                  a provided-tool request ({err}) — the host builds every body on that channel",
                 env.message_id, cfg.slug

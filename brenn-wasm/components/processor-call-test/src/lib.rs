@@ -19,7 +19,7 @@
 // happens and the reply is published and not returned, because answering an
 // activation that asked nothing is a trap.
 
-use brenn_guest::{Activation, Error, Processor, calls::CallPort, publish};
+use brenn_guest::{Activation, Error, MessageEnvelopeExt, Processor, calls::CallPort, publish};
 
 /// The declared `call` port every call here goes out through. Spelled by hand
 /// rather than reached through a generated handle: this fixture has no
@@ -43,7 +43,8 @@ impl Processor for ProcessorCallTest {
         else {
             return Ok(None);
         };
-        let body = envelope?.body;
+        let envelope = envelope?;
+        let body = envelope.text_body()?;
 
         let answer = match body.strip_prefix(CALL) {
             Some(rest) => match ASK.call(rest)? {

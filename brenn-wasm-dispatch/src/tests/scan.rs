@@ -85,7 +85,7 @@ async fn order_preserving_partition_delivers_all_rows() {
         let got: Vec<String> = snap
             .new_entries()
             .iter()
-            .map(|(_, envelope)| envelope.body.clone())
+            .map(|(_, envelope)| envelope.body.as_text().unwrap().to_owned())
             .collect();
         let expected = expected_order
             .get(&snap.channel_address)

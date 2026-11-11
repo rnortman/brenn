@@ -119,8 +119,17 @@ fn render_status_badge(outcome: Option<&serde_json::Value>) -> String {
 
 /// Render an HTML chat-history card for a single received message.
 /// Used when an active bridge accepts a delivered message.
+///
+/// A text body is rendered as markdown. A non-text body is one fixed line
+/// naming its content type and size, never its bytes.
 pub fn format_message_html_single(env: &MessageEnvelope) -> String {
-    let body_html = render_markdown(&env.body);
+    let body_html = match env.body.as_text() {
+        Some(text) => render_markdown(text),
+        None => format!(
+            r#"<span class="brenn-msg-binary">{line}</span>"#,
+            line = html_escape(&format!("binary body: {}", env.body.summary())),
+        ),
+    };
     let publish_ts = env.publish_ts.to_rfc3339();
     format!(
         r#"<details class="brenn-message brenn-message-recv">
@@ -322,5 +331,40 @@ mod tests {
         // Two <details> elements present.
         let count = html.matches("brenn-message-recv").count();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn a_typed_text_body_renders_as_its_text() {
+        let typed = brenn_lib::messaging::MessageBody::from_parts(Some("text/markdown"), b"**hi**")
+            .unwrap();
+        let untyped = fake_envelope("**hi**");
+        let typed = MessageEnvelope {
+            body: typed,
+            ..untyped.clone()
+        };
+        assert_eq!(
+            format_message_html_single(&typed),
+            format_message_html_single(&untyped)
+        );
+    }
+
+    #[test]
+    fn a_non_text_body_renders_as_one_escaped_line() {
+        let body = brenn_lib::messaging::MessageBody::from_parts(
+            Some(r#"application/x-test; note="<b>""#),
+            &[b'<', b'i', b'>', 0xff],
+        )
+        .unwrap();
+        let html = format_message_html_single(&MessageEnvelope {
+            body,
+            ..fake_envelope("")
+        });
+        assert!(
+            html.contains(
+                r#"<div class="brenn-msg-body"><span class="brenn-msg-binary">binary body: application/x-test; note=&quot;&lt;b&gt;&quot;, 4 bytes</span></div>"#
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("<i>"), "{html}");
     }
 }

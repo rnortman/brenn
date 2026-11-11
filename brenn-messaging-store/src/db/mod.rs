@@ -50,6 +50,9 @@ pub use shared::{ns_to_utc, utc_to_ns};
 mod envelope_column;
 pub(crate) use envelope_column::EnvelopeTypeColumn;
 
+mod body_column;
+pub(crate) use body_column::{body_columns, read_body};
+
 mod types;
 pub use types::PendingPushRow;
 

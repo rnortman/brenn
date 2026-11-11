@@ -260,7 +260,10 @@ fn identify_self(chrome: &mut Chrome, new_raw: &[String]) {
     let Ok(envelope) = serde_json::from_str::<MessageEnvelope>(raw) else {
         return;
     };
-    let Ok(body) = serde_json::from_str::<SurfaceStateBody>(&envelope.body) else {
+    let Some(text) = envelope.body.as_text() else {
+        return;
+    };
+    let Ok(body) = serde_json::from_str::<SurfaceStateBody>(text) else {
         return;
     };
     for row in &body.instances {

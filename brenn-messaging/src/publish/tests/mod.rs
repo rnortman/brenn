@@ -1,3 +1,4 @@
+mod body_kinds;
 mod chat_roles;
 mod conversation;
 mod dispatch_row;
@@ -97,7 +98,7 @@ impl WakeRouter for CountingRouter {
         self.contexts
             .lock()
             .await
-            .push((envelope.body.clone(), retained_seq));
+            .push((envelope.body.as_text().unwrap().to_owned(), retained_seq));
     }
     fn spawn_eager_wake(&self, _key: &crate::SubscriberEntryKind, _subscriber: &ParticipantId) {
         self.eager_wakes.fetch_add(1, Ordering::SeqCst);

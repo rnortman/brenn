@@ -27,7 +27,7 @@ use chrono::{DateTime, Utc};
 use tracing::debug;
 use uuid::Uuid;
 
-use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageEnvelope, Urgency};
+use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageBody, MessageEnvelope, Urgency};
 use brenn_queue::{
     Advance, CursorOverflow, Deferred, DeferredId, OwnedDeferred, QuotaExceeded, Replay, Resume,
     RingCore,
@@ -650,7 +650,7 @@ impl RingStore {
         &self,
         sender: &str,
         message_uuid: Uuid,
-        body: Option<String>,
+        body: Option<MessageBody>,
         release_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> DeferralOutcome {
@@ -936,7 +936,7 @@ impl RetentionStore for RingStore {
         &self,
         sender: &str,
         message_uuid: Uuid,
-        body: Option<String>,
+        body: Option<MessageBody>,
         release_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> DeferralOutcome {
@@ -965,7 +965,7 @@ mod tests {
             channel: "ephemeral:room".to_string(),
             sender: sender.to_string(),
             publish_ts: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
-            body: body.to_string(),
+            body: body.into(),
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
@@ -1008,7 +1008,7 @@ mod tests {
         let bodies = window
             .new_entries()
             .iter()
-            .map(|e| e.message.body.clone())
+            .map(|e| e.message.body.as_text().unwrap().to_owned())
             .collect();
         let dropped = match window.advance_span() {
             Some((through, seen_floor)) => {
@@ -1141,7 +1141,7 @@ mod tests {
         let tail: Vec<String> = s
             .retained_tail(10)
             .iter()
-            .map(|m| m.envelope.body.clone())
+            .map(|m| m.envelope.body.as_text().unwrap().to_owned())
             .collect();
         assert_eq!(tail, vec!["b", "c"]);
         assert_eq!(s.newest_seq(), 3);
@@ -1204,7 +1204,10 @@ mod tests {
 
     /// The bodies of a retained window, oldest first.
     fn retained_bodies(window: &[RetainedMessage]) -> Vec<String> {
-        window.iter().map(|m| m.envelope.body.clone()).collect()
+        window
+            .iter()
+            .map(|m| m.envelope.body.as_text().unwrap().to_owned())
+            .collect()
     }
 
     /// The sequence numbers a replay answered with, oldest first.
@@ -1444,7 +1447,7 @@ mod tests {
             .release_due(at(9_000))
             .messages
             .iter()
-            .map(|m| m.envelope.body.clone())
+            .map(|m| m.envelope.body.as_text().unwrap().to_owned())
             .collect();
         assert_eq!(released, vec!["first", "second", "third"]);
     }
@@ -1482,7 +1485,7 @@ mod tests {
         let alice: Vec<String> = s
             .deferred_for_sender("alice")
             .iter()
-            .map(|d| d.envelope.body.clone())
+            .map(|d| d.envelope.body.as_text().unwrap().to_owned())
             .collect();
         assert_eq!(alice, vec!["a-soon", "a-late"]);
         assert_eq!(s.deferred_for_sender("bob").len(), 1);
@@ -1530,9 +1533,9 @@ mod tests {
             DeferralOutcome::Applied
         );
         let view = s.deferred_for_sender("alice");
-        assert_eq!(view[0].envelope.body, "edited");
+        assert_eq!(view[0].envelope.body.as_text(), Some("edited"));
         assert_eq!(view[0].release_at, at(500));
-        assert_eq!(view[1].envelope.body, "soon");
+        assert_eq!(view[1].envelope.body.as_text(), Some("soon"));
         assert_eq!(s.next_release(), Some(at(500)));
     }
 
@@ -1564,7 +1567,10 @@ mod tests {
             s.edit_deferred("alice", id, Some("edited".into()), None, now()),
             DeferralOutcome::WrongSender
         );
-        assert_eq!(s.deferred_for_sender("bob")[0].envelope.body, "b");
+        assert_eq!(
+            s.deferred_for_sender("bob")[0].envelope.body.as_text(),
+            Some("b")
+        );
         assert_eq!(s.deferred_len(), 1);
     }
 }

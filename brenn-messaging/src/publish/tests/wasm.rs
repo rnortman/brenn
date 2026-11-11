@@ -526,7 +526,7 @@ async fn wasm_and_app_subscriber_are_both_owed_the_message() {
             crate::PublishOrigin::Conversation { id: 1 },
             sender_app_slug,
             &canonical_address("wasm-app-fanout-ch"),
-            "hello-fanout",
+            "hello-fanout".into(),
             Urgency::Normal,
             None,
             None,
@@ -546,7 +546,7 @@ async fn wasm_and_app_subscriber_are_both_owed_the_message() {
     assert_eq!(
         wasm_owed
             .iter()
-            .map(|(_, e)| e.body.as_str())
+            .map(|(_, e)| e.body.as_text().unwrap())
             .collect::<Vec<_>>(),
         vec!["hello-fanout"],
         "the Wasm subscriber must be owed the message just published"
@@ -557,7 +557,7 @@ async fn wasm_and_app_subscriber_are_both_owed_the_message() {
     assert_eq!(
         app_owed
             .iter()
-            .map(|(_, e)| e.body.as_str())
+            .map(|(_, e)| e.body.as_text().unwrap())
             .collect::<Vec<_>>(),
         vec!["hello-fanout"],
         "the App subscriber's conversation must be owed the same message"
@@ -584,7 +584,7 @@ async fn wasm_subscriber_is_owed_the_published_message() {
             crate::PublishOrigin::Conversation { id: 1 },
             "sender-app",
             "brenn:wasm-test-channel",
-            "hello",
+            "hello".into(),
             Urgency::Normal,
             None,
             None,
@@ -605,7 +605,7 @@ async fn wasm_subscriber_is_owed_the_published_message() {
     let owed = crate::testutils::owed_everywhere(&m, &ParticipantId::for_wasm(slug)).await;
     assert_eq!(
         owed.iter()
-            .map(|(_, e)| e.body.as_str())
+            .map(|(_, e)| e.body.as_text().unwrap())
             .collect::<Vec<_>>(),
         vec!["hello"],
         "the WASM subscriber must be owed the message just published"
@@ -626,7 +626,7 @@ async fn wasm_subscriber_push_depth_zero_is_owed_nothing() {
             crate::PublishOrigin::Conversation { id: 1 },
             "sender-app",
             "brenn:wasm-test-channel",
-            "hello",
+            "hello".into(),
             Urgency::Normal,
             None,
             None,
@@ -741,14 +741,14 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
     let publishes = vec![
         WasmPublish {
             channel_address: &channel_addr,
-            body: "msg-a",
+            body: "msg-a".into(),
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: None,
         },
         WasmPublish {
             channel_address: &channel_addr,
-            body: "msg-b",
+            body: "msg-b".into(),
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: None,
@@ -808,7 +808,7 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
             .await;
     assert_eq!(
         owed.iter()
-            .map(|(_, e)| e.body.as_str())
+            .map(|(_, e)| e.body.as_text().unwrap())
             .collect::<Vec<_>>(),
         vec!["msg-a", "msg-b"],
         "the subscriber is owed both publishes, oldest first"
@@ -983,14 +983,14 @@ async fn publish_from_wasm_ephemeral_output_feeds_a_subscribing_surface() {
         &[
             WasmPublish {
                 channel_address: &addr,
-                body: "fed-now",
+                body: "fed-now".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
             },
             WasmPublish {
                 channel_address: &addr,
-                body: "parked",
+                body: "parked".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(chrono::Utc::now() + chrono::Duration::seconds(600)),
@@ -1001,9 +1001,54 @@ async fn publish_from_wasm_ephemeral_output_feeds_a_subscribing_surface() {
 
     let fed = router.fed.lock().await;
     assert_eq!(fed.len(), 1, "the immediate entry, and only it");
-    assert_eq!(fed[0].body, "fed-now");
+    assert_eq!(fed[0].body.as_text(), Some("fed-now"));
     assert_eq!(fed[0].sender, format!("wasm:{consumer_slug}"));
     assert_eq!(fed[0].envelope_type, ChannelScheme::Ephemeral);
+}
+
+/// A body is shared, not copied, from the flush entry to the ring and on to
+/// the attached session it is fed to: the three hold one allocation.
+#[tokio::test]
+async fn a_fed_body_shares_the_retained_bodys_allocation() {
+    let consumer_slug = "wasm-eph-sharer";
+    let (m, addr, _reply, router) = build_wasm_ephemeral_surface_messenger(consumer_slug).await;
+    let body = brenn_envelope::MessageBody::from_parts(
+        Some("application/octet-stream"),
+        &[0xff, 0x00, 0xfe],
+    )
+    .expect("a well-formed binary body");
+
+    m.publish_from_wasm(
+        consumer_slug,
+        &[WasmPublish {
+            channel_address: &addr,
+            body: body.clone(),
+            urgency: Urgency::Normal,
+            reply_to: None,
+            deliver_after: None,
+        }],
+    )
+    .await;
+
+    let fed = router.fed.lock().await;
+    assert_eq!(fed.len(), 1);
+    let retained = m
+        .ring_stores()
+        .get_by_address(&addr)
+        .expect("fixture channel")
+        .retained_tail(1);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(fed[0].body, body);
+    assert_eq!(
+        fed[0].body.as_bytes().as_ptr(),
+        body.as_bytes().as_ptr(),
+        "the fed body is the published allocation"
+    );
+    assert_eq!(
+        retained[0].envelope.body.as_bytes().as_ptr(),
+        body.as_bytes().as_ptr(),
+        "the retained body is the published allocation"
+    );
 }
 
 /// A WASM output port bound to an `ephemeral:` channel publishes through the
@@ -1018,7 +1063,7 @@ async fn publish_from_wasm_ephemeral_output_lands_in_the_ring() {
         consumer_slug,
         &[WasmPublish {
             channel_address: &ephemeral_addr,
-            body: "eph-body",
+            body: "eph-body".into(),
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: None,
@@ -1033,7 +1078,7 @@ async fn publish_from_wasm_ephemeral_output_lands_in_the_ring() {
         .clone();
     let retained = store.retained_tail(10);
     assert_eq!(retained.len(), 1, "ephemeral publish must land in the ring");
-    assert_eq!(retained[0].envelope.body, "eph-body");
+    assert_eq!(retained[0].envelope.body.as_text(), Some("eph-body"));
     assert_eq!(
         retained[0].envelope.sender,
         format!("wasm:{consumer_slug}"),
@@ -1066,14 +1111,14 @@ async fn publish_from_wasm_mixed_batch_commits_both_halves() {
         &[
             WasmPublish {
                 channel_address: &durable_addr,
-                body: "durable-body",
+                body: "durable-body".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
             },
             WasmPublish {
                 channel_address: &ephemeral_addr,
-                body: "eph-body",
+                body: "eph-body".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
@@ -1095,7 +1140,7 @@ async fn publish_from_wasm_mixed_batch_commits_both_halves() {
             .await;
     assert_eq!(
         owed.iter()
-            .map(|(_, e)| e.body.as_str())
+            .map(|(_, e)| e.body.as_text().unwrap())
             .collect::<Vec<_>>(),
         vec!["durable-body"],
         "the durable half leaves its subscriber owed that message and no other"
@@ -1109,7 +1154,7 @@ async fn publish_from_wasm_mixed_batch_commits_both_halves() {
         .clone();
     let retained = store.retained_tail(10);
     assert_eq!(retained.len(), 1, "the ephemeral output lands in the ring");
-    assert_eq!(retained[0].envelope.body, "eph-body");
+    assert_eq!(retained[0].envelope.body.as_text(), Some("eph-body"));
 }
 
 /// A WASM ephemeral output with a future `deliver_after` parks in the channel's
@@ -1125,7 +1170,7 @@ async fn publish_from_wasm_ephemeral_deferred_parks_then_releases() {
         consumer_slug,
         &[WasmPublish {
             channel_address: &ephemeral_addr,
-            body: "later",
+            body: "later".into(),
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: Some(release_at),
@@ -1157,7 +1202,7 @@ async fn publish_from_wasm_ephemeral_deferred_parks_then_releases() {
     );
     let retained = store.retained_tail(10);
     assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0].envelope.body, "later");
+    assert_eq!(retained[0].envelope.body.as_text(), Some("later"));
 }
 
 /// A WASM ephemeral output whose `deliver_after` is already in the past commits
@@ -1171,7 +1216,7 @@ async fn publish_from_wasm_ephemeral_past_deliver_after_is_immediate() {
         consumer_slug,
         &[WasmPublish {
             channel_address: &ephemeral_addr,
-            body: "now",
+            body: "now".into(),
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
@@ -1206,7 +1251,7 @@ async fn publish_from_wasm_durable_deferred_parks_the_row() {
         consumer_slug,
         &[WasmPublish {
             channel_address: &durable_addr,
-            body: "durable-later",
+            body: "durable-later".into(),
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: Some(release_at),
@@ -1243,21 +1288,21 @@ async fn the_durable_deferred_cap_refuses_a_wasm_park_and_the_flush_carries_on()
         &[
             WasmPublish {
                 channel_address: &durable_addr,
-                body: "first",
+                body: "first".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(release_at),
             },
             WasmPublish {
                 channel_address: &durable_addr,
-                body: "refused",
+                body: "refused".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(release_at),
             },
             WasmPublish {
                 channel_address: &durable_addr,
-                body: "immediate",
+                body: "immediate".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
@@ -1321,7 +1366,7 @@ async fn publish_from_wasm_unknown_channel_panics() {
     let (m, _, _router) = build_wasm_output_messenger(consumer_slug).await;
     let bad_publish = WasmPublish {
         channel_address: "brenn:nonexistent-channel",
-        body: "x",
+        body: "x".into(),
         urgency: Urgency::Normal,
         reply_to: None,
         deliver_after: None,
@@ -1346,7 +1391,7 @@ async fn publish_from_wasm_reply_to_resolves_to_channel_uuid() {
 
     let publishes = vec![WasmPublish {
         channel_address: &channel_addr,
-        body: "req",
+        body: "req".into(),
         urgency: Urgency::Normal,
         reply_to: Some(&channel_addr),
         deliver_after: None,
@@ -1377,7 +1422,7 @@ async fn publish_from_wasm_unknown_reply_to_panics() {
     let (m, channel_addr, _router) = build_wasm_output_messenger(consumer_slug).await;
     let publishes = vec![WasmPublish {
         channel_address: &channel_addr,
-        body: "req",
+        body: "req".into(),
         urgency: Urgency::Normal,
         reply_to: Some("brenn:tool-results/nonexistent"),
         deliver_after: None,
@@ -1397,7 +1442,7 @@ async fn publish_from_wasm_reply_to_reaches_a_ring_channel_as_an_address() {
         consumer_slug,
         &[WasmPublish {
             channel_address: &ephemeral_addr,
-            body: "req",
+            body: "req".into(),
             urgency: Urgency::Normal,
             reply_to: Some(&durable_addr),
             deliver_after: None,
@@ -1431,7 +1476,7 @@ async fn a_fed_ring_envelope_carries_the_resolved_reply_address() {
         consumer_slug,
         &[WasmPublish {
             channel_address: &addr,
-            body: "fed-now",
+            body: "fed-now".into(),
             urgency: Urgency::Normal,
             reply_to: Some(&reply_addr),
             deliver_after: None,
@@ -1460,7 +1505,7 @@ async fn publish_from_wasm_unknown_reply_to_on_a_ring_channel_panics() {
         consumer_slug,
         &[WasmPublish {
             channel_address: &ephemeral_addr,
-            body: "req",
+            body: "req".into(),
             urgency: Urgency::Normal,
             reply_to: Some("brenn:tool-results/nonexistent"),
             deliver_after: None,

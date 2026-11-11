@@ -350,7 +350,9 @@ impl ProviderRig {
                 assert_eq!(rows.len(), n, "{sub:?} is owed more than expected");
                 return rows
                     .iter()
-                    .map(|(_, env)| serde_json::from_str(&env.body).expect("a JSON body"))
+                    .map(|(_, env)| {
+                        serde_json::from_str(env.body.as_text().unwrap()).expect("a JSON body")
+                    })
                     .collect();
             }
             tokio::task::yield_now().await;

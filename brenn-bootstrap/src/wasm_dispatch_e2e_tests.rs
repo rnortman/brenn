@@ -813,7 +813,7 @@ async fn a_deferred_op_naming_another_senders_parked_message_panics() {
             other,
             &[WasmPublish {
                 channel_address: "brenn:e2e-out",
-                body: "not-yours",
+                body: "not-yours".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(Utc::now() + chrono::Duration::seconds(60)),
@@ -931,7 +931,7 @@ async fn append_ring_message(
         .append(NewMessage {
             source: "test".to_string(),
             sender: "publisher".to_string(),
-            body,
+            body: body.into(),
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Ephemeral,
             reply_to: None,
@@ -1364,7 +1364,7 @@ async fn owed_pairs(
     brenn_messaging::testutils::owed_everywhere(messenger, subscriber)
         .await
         .into_iter()
-        .map(|(address, envelope)| (address, envelope.body.clone()))
+        .map(|(address, envelope)| (address, envelope.body.as_text().unwrap().to_owned()))
         .collect()
 }
 
@@ -1583,7 +1583,7 @@ async fn a_third_party_publishing_to_an_anonymous_auto_channel_is_denied() {
             PublishOrigin::Conversation { id: 1 },
             "graf",
             &auto_address,
-            "intruder",
+            "intruder".into(),
             Urgency::Normal,
             None,
             None,

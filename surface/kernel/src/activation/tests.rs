@@ -188,7 +188,7 @@ impl Page {
             RouteRequest {
                 channel: LOCAL,
                 origin: Origin::Sub(instance),
-                body: body.to_string(),
+                body: (body.to_string()).into(),
                 stamp: MessageStamp {
                     message_id,
                     publish_ts: chrono::DateTime::from_timestamp(0, 0)
@@ -222,7 +222,13 @@ fn bodies(activation: &Activation, port: &str) -> Vec<String> {
         .expect("the activation windows the port")
         .envelopes
         .iter()
-        .map(|e| brenn_surface_test_fixtures::parse_envelope(e).body)
+        .map(|e| {
+            brenn_surface_test_fixtures::parse_envelope(e)
+                .body
+                .as_text()
+                .unwrap()
+                .to_owned()
+        })
         .collect()
 }
 
@@ -1377,4 +1383,49 @@ fn the_golden_activation_carries_every_window_shape() {
     let sync = window(GOLDEN_SYNC_PORT);
     assert_eq!(activation.sync.as_deref(), Some(GOLDEN_SYNC_PORT));
     assert_eq!(sync.envelopes.len(), 1);
+}
+
+/// Insert one envelope carrying `body` on `channel`.
+fn arrive_body(page: &mut Page, channel: &str, body: brenn_envelope::MessageBody) {
+    let mut envelope = env(channel, "placeholder");
+    envelope.body = body;
+    page.stores
+        .get_mut(channel)
+        .expect("the fixture hosts the channel")
+        .insert(envelope);
+}
+
+/// A typed text body is windowed as exactly its text: the `envelope-json` a
+/// component is handed has no place for the type.
+#[test]
+fn a_typed_text_body_is_windowed_as_its_text() {
+    let mut page = Page::standard();
+    let body = brenn_envelope::MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+    arrive_body(&mut page, WIRE, body);
+    let ready = page.assemble("p1");
+    let window = ready
+        .activation
+        .ports
+        .iter()
+        .find(|w| w.port == "in")
+        .expect("the activation windows the port");
+    assert!(
+        window.envelopes[0].contains(r##""body":"# hi""##),
+        "{}",
+        window.envelopes[0]
+    );
+    assert!(!window.envelopes[0].contains("content_type"));
+    assert_eq!(bodies(&ready.activation, "in"), ["# hi"]);
+}
+
+/// A non-text body is never lowered to `envelope-json`: building the window
+/// panics, naming the carrier.
+#[test]
+#[should_panic(expected = "0.1.0 envelope-json")]
+fn a_non_text_body_panics_where_the_window_is_built() {
+    let mut page = Page::standard();
+    let body =
+        brenn_envelope::MessageBody::from_parts(Some("application/octet-stream"), &[0xff]).unwrap();
+    arrive_body(&mut page, WIRE, body);
+    page.assemble("p1");
 }

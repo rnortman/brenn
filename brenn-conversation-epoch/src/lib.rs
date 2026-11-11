@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
+use brenn_messaging::MessageBody;
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use tracing::{info, warn};
@@ -31,6 +32,8 @@ pub enum EpochError {
     Empty,
     /// The trimmed body was this many bytes, more than [`MAX_EPOCH_BYTES`].
     TooLong(usize),
+    /// The body is not text: its [`MessageBody::summary`].
+    NotText(String),
 }
 
 impl std::fmt::Display for EpochError {
@@ -43,6 +46,7 @@ impl std::fmt::Display for EpochError {
                     "epoch is {n} bytes; at most {MAX_EPOCH_BYTES} are accepted"
                 )
             }
+            EpochError::NotText(summary) => write!(f, "epoch body is not text ({summary})"),
         }
     }
 }
@@ -54,6 +58,7 @@ impl EpochError {
         match self {
             EpochError::Empty => "empty",
             EpochError::TooLong(_) => "too-long",
+            EpochError::NotText(_) => "not-text",
         }
     }
 }
@@ -117,7 +122,7 @@ impl EpochGoal {
     ///
     /// A refusal alerts once per process per `(agent, reason)` and leaves the
     /// previous epoch standing.
-    pub fn apply(&self, addr: &str, body: &str) -> Vec<String> {
+    pub fn apply(&self, addr: &str, body: &MessageBody) -> Vec<String> {
         let Some(slugs) = self.channel_apps.get(addr) else {
             // The participant subscribes to exactly the declared epoch
             // channels, so a body from anywhere else is a wiring bug rather
@@ -128,7 +133,11 @@ impl EpochGoal {
             )
         };
         let mut changed = Vec::new();
-        match accept(body) {
+        let accepted = match body.as_text() {
+            Some(text) => accept(text),
+            None => Err(EpochError::NotText(body.summary().to_string())),
+        };
+        match accepted {
             Ok(epoch) => {
                 for slug in slugs {
                     let mut current = self
@@ -226,7 +235,10 @@ mod tests {
             ("cogsworth", addr),
             ("mrs-potts", "brenn:other.epoch"),
         ]);
-        assert_eq!(epochs.apply(addr, "1"), names(&["cogsworth", "lumiere"]));
+        assert_eq!(
+            epochs.apply(addr, &"1".into()),
+            names(&["cogsworth", "lumiere"])
+        );
         assert_eq!(epochs.current("cogsworth").as_deref(), Some("1"));
         assert_eq!(epochs.current("lumiere").as_deref(), Some("1"));
         assert_eq!(epochs.current("mrs-potts"), None);
@@ -236,26 +248,42 @@ mod tests {
     async fn apply_reports_nothing_when_the_epoch_is_unchanged() {
         let addr = "brenn:cogsworth.epoch";
         let (epochs, _h) = epoch_handle(&[("cogsworth", addr)]);
-        assert_eq!(epochs.apply(addr, "1"), names(&["cogsworth"]));
-        assert!(epochs.apply(addr, " 1 ").is_empty());
-        assert_eq!(epochs.apply(addr, "2"), names(&["cogsworth"]));
+        assert_eq!(epochs.apply(addr, &"1".into()), names(&["cogsworth"]));
+        assert!(epochs.apply(addr, &" 1 ".into()).is_empty());
+        assert_eq!(epochs.apply(addr, &"2".into()), names(&["cogsworth"]));
     }
 
     #[tokio::test]
     async fn a_refused_body_leaves_the_previous_epoch_standing() {
         let addr = "brenn:cogsworth.epoch";
         let (epochs, _h) = epoch_handle(&[("cogsworth", addr)]);
-        epochs.apply(addr, "1");
-        assert!(epochs.apply(addr, "").is_empty());
-        assert!(epochs.apply(addr, &"a".repeat(65)).is_empty());
+        epochs.apply(addr, &"1".into());
+        assert!(epochs.apply(addr, &"".into()).is_empty());
+        assert!(epochs.apply(addr, &"a".repeat(65).into()).is_empty());
         assert_eq!(epochs.current("cogsworth").as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_text_is_refused_naming_its_type_and_size() {
+        let addr = "brenn:cogsworth.epoch";
+        let (epochs, _h) = epoch_handle(&[("cogsworth", addr)]);
+        epochs.apply(addr, &"1".into());
+        let bytes = MessageBody::from_parts(Some("image/png"), b"2").unwrap();
+        assert!(epochs.apply(addr, &bytes).is_empty());
+        assert_eq!(epochs.current("cogsworth").as_deref(), Some("1"));
+        let err = EpochError::NotText(bytes.summary().to_string());
+        assert_eq!(
+            err.to_string(),
+            "epoch body is not text (image/png, 1 bytes)"
+        );
+        assert_eq!(err.tag(), "not-text");
     }
 
     #[tokio::test]
     #[should_panic(expected = "which no agent named as its epoch channel")]
     async fn apply_on_an_unbound_address_is_a_wiring_bug() {
         let (epochs, _h) = epoch_handle(&[("cogsworth", "brenn:cogsworth.epoch")]);
-        epochs.apply("brenn:nobody.epoch", "1");
+        epochs.apply("brenn:nobody.epoch", &"1".into());
     }
 
     #[test]
@@ -293,11 +321,11 @@ mod tests {
         ]);
         let epochs = EpochGoal::new(apps, alerts);
 
-        epochs.apply(addr, "");
+        epochs.apply(addr, &"".into());
         // Same agents, same reason: already paged.
-        epochs.apply(addr, "");
+        epochs.apply(addr, &"".into());
         // A different reason, for both agents.
-        epochs.apply(addr, &"a".repeat(65));
+        epochs.apply(addr, &"a".repeat(65).into());
 
         drop(epochs);
         drainer.await.expect("alert drainer panicked");

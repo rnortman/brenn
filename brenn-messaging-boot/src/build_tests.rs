@@ -2395,7 +2395,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         channel: "local:scratch".to_string(),
         sender: "test-sender".to_string(),
         publish_ts: chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
-        body: "ping".to_string(),
+        body: "ping".into(),
         reply_to: None,
         delivery_deadline: None,
         deliver_after: None,
@@ -2411,7 +2411,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         1,
         "the confined publish is delivered to the WASM consumer's ring cursor"
     );
-    assert_eq!(window.new_entries()[0].message.body, "ping");
+    assert_eq!(window.new_entries()[0].message.body.as_text(), Some("ping"));
 
     let conn = db_probe.lock().await;
     let rows: i64 = conn
@@ -2506,7 +2506,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
             "ticker",
             &[WasmPublish {
                 channel_address: &address,
-                body: "tick",
+                body: "tick".into(),
                 urgency: brenn_lib::messaging::Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
@@ -2522,7 +2522,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
         1,
         "the component's own publish is delivered back to it"
     );
-    assert_eq!(window.new_entries()[0].message.body, "tick");
+    assert_eq!(window.new_entries()[0].message.body.as_text(), Some("tick"));
     let first_seq = window.new_entries()[0].seq;
 
     // The timer idiom itself: a deferred self-publish parks, is invisible until
@@ -2534,7 +2534,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
             "ticker",
             &[WasmPublish {
                 channel_address: &address,
-                body: "wake",
+                body: "wake".into(),
                 urgency: brenn_lib::messaging::Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(due),
@@ -2561,7 +2561,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
         1,
         "the released wake reaches the same port that scheduled it"
     );
-    assert_eq!(window.new_entries()[0].message.body, "wake");
+    assert_eq!(window.new_entries()[0].message.body.as_text(), Some("wake"));
 }
 
 /// Naming an io_port's channel `brenn:` is the one line that buys durability, and
@@ -2876,7 +2876,7 @@ async fn warm_channel_with_messages(db: &brenn_db::Db, channel_uuid: uuid::Uuid,
             channel_uuid,
             "brenn://test",
             "test-sender",
-            &format!("body-{i}"),
+            &format!("body-{i}").into(),
             brenn_lib::messaging::Urgency::Normal,
             brenn_lib::messaging::ChannelScheme::Brenn,
             None,
@@ -2925,7 +2925,7 @@ async fn build_messaging_primes_a_new_durable_wasm_queue_from_the_retained_tail(
     )
     .await
     .into_iter()
-    .map(|(_, envelope)| envelope.body.clone())
+    .map(|(_, envelope)| envelope.body.as_text().unwrap().to_owned())
     .collect();
     assert_eq!(
         owed,
@@ -2968,7 +2968,7 @@ async fn build_messaging_does_not_reprime_a_surviving_durable_wasm_queue() {
     )
     .await
     .into_iter()
-    .map(|(_, envelope)| envelope.body.clone())
+    .map(|(_, envelope)| envelope.body.as_text().unwrap().to_owned())
     .collect();
     assert_eq!(
         owed,
@@ -3620,7 +3620,7 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
         env.sender
     );
     assert!(
-        env.body.contains("build-2"),
+        env.body.as_text().unwrap().contains("build-2"),
         "latest-wins: the newer boot's index doc is what a reader sees, got {:?}",
         env.body
     );
@@ -3631,7 +3631,7 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
         .publish_from_system(
             SURFACE_HELP_COMPONENT,
             "brenn:other",
-            "{}",
+            "{}".into(),
             Urgency::Normal,
             None,
         )
@@ -3718,8 +3718,9 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
         "the boot stamp is written under the surface's own identity, got {:?}",
         env.sender
     );
-    let stamp = brenn_surface_schema::telemetry::DisconnectedStamp::parse(&env.body)
-        .expect("the boot stamp is a valid disconnected stamp");
+    let stamp =
+        brenn_surface_schema::telemetry::DisconnectedStamp::parse(env.body.as_text().unwrap())
+            .expect("the boot stamp is a valid disconnected stamp");
     assert_eq!(stamp.reason, "server restart");
     assert_eq!(stamp.session, None, "a boot stamp precedes every session");
     assert_eq!(stamp.epoch, epoch);
@@ -3810,8 +3811,8 @@ async fn boot_bindings_document_is_published_and_pullable() {
         "the document is written under the reserved single-writer identity, got {:?}",
         env.sender
     );
-    let parsed =
-        BindingsDocument::parse(&env.body).expect("the retained body parses and validates");
+    let parsed = BindingsDocument::parse(env.body.as_text().unwrap())
+        .expect("the retained body parses and validates");
     let expected =
         brenn_surface_server::bindings_doc::build_bindings_document(&result.surfaces[0], &params);
     assert_eq!(
@@ -5007,7 +5008,7 @@ async fn build_messaging_mints_a_location_channel_per_registered_user() {
         .publish_from_system(
             DEVICE_LOCATION_COMPONENT,
             "brenn:device-location.alice",
-            "{}",
+            "{}".into(),
             brenn_messaging::Urgency::Normal,
             None,
         )

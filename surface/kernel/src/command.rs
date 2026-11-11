@@ -324,7 +324,7 @@ fn route_publish(
         RouteRequest {
             channel: &channel,
             origin: Origin::Sub(&instance),
-            body,
+            body: body.into(),
             stamp,
             urgency,
             deliver_after: None,
@@ -461,7 +461,7 @@ fn on_publish_control(
         RouteRequest {
             channel,
             origin: Origin::Attacher,
-            body,
+            body: body.into(),
             stamp,
             urgency: CONTROL_URGENCY,
             // The kernel states its planes now or not at all: a plane's reader

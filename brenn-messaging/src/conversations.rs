@@ -679,7 +679,7 @@ mod tests {
             channel_uuid,
             "test-source",
             sender,
-            body,
+            &body.into(),
             Urgency::Normal,
             ChannelScheme::Brenn,
             None,
@@ -715,7 +715,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["before"],
             "a message published before the position existed is unseen to it, so it is owed"
@@ -728,7 +728,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["after"]
         );
@@ -781,7 +781,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["from a peer", "from an app"],
             "only the conversation's own sender is filtered"
@@ -823,7 +823,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["after"]
         );
@@ -849,7 +849,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["first", "second", "third"],
             "channels are read one after another but the batch is in publish order"
@@ -884,7 +884,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["kept"],
             "the departed subscription is skipped, the rest is served"
@@ -945,7 +945,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["three"],
             "the clamp hands over the newest, not the oldest"
@@ -1091,7 +1091,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["mqtt-covered", "webhook-covered"],
             "each address is decided by its own transport's matchers"
@@ -1388,7 +1388,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["before-revocation", "during-revocation"],
             "a restored ACL is a window over the history the subscriber missed"
@@ -1522,7 +1522,7 @@ mod tests {
             .append(crate::store::NewMessage {
                 source: "test-source".to_string(),
                 sender: "someone".to_string(),
-                body: body.to_string(),
+                body: body.into(),
                 urgency: Urgency::Normal,
                 envelope_type: entry.transport_type,
                 reply_to: None,
@@ -1550,7 +1550,7 @@ mod tests {
             window
                 .new_entries()
                 .iter()
-                .map(|(_, envelope)| envelope.body.clone())
+                .map(|(_, envelope)| envelope.body.as_text().unwrap().to_owned())
                 .collect(),
         )
     }

@@ -371,7 +371,7 @@ impl Surface {
             .get(&channel)
             .expect("the report channel is declared by the adapter's document")
             .retained()
-            .map(|(envelope, seq)| (seq, envelope.body.clone()))
+            .map(|(envelope, seq)| (seq, envelope.body.as_text().unwrap().to_owned()))
             .collect();
         // The ring holds the newest `RING_DEPTH` entries, so a full one may have
         // evicted a report this adapter never returned, and the store cannot tell
@@ -535,7 +535,7 @@ impl Host for Surface {
             RouteRequest {
                 channel: &channel,
                 origin: Origin::Sub(EXTERNAL),
-                body: body.to_string(),
+                body: (body.to_string()).into(),
                 stamp: new_stamp(),
                 urgency: Urgency::Normal,
                 deliver_after: None,

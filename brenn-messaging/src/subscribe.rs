@@ -1067,7 +1067,7 @@ mod tests {
             .append(crate::store::NewMessage {
                 source: "node".to_string(),
                 sender: "test-sender".to_string(),
-                body: "hello".to_string(),
+                body: "hello".into(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
                 reply_to: None,
@@ -1082,7 +1082,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["hello"],
             "the ring window served the conversation its unseen suffix"
@@ -1916,7 +1916,7 @@ mod tests {
                 uuid,
                 "src",
                 "someone",
-                body,
+                &body.into(),
                 Urgency::Normal,
                 ChannelScheme::Brenn,
                 None,
@@ -1993,7 +1993,7 @@ mod tests {
                 uuid,
                 "src",
                 "someone",
-                "owed",
+                &"owed".into(),
                 Urgency::Normal,
                 ChannelScheme::Brenn,
                 None,
@@ -2098,7 +2098,7 @@ mod tests {
                 uuid,
                 "src",
                 "someone",
-                body,
+                &body.into(),
                 Urgency::Normal,
                 ChannelScheme::Brenn,
                 None,

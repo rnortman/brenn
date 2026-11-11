@@ -13,7 +13,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{ChannelScheme, MessageEnvelope, Urgency};
+use crate::{ChannelScheme, MessageBody, MessageEnvelope, Urgency};
 
 /// The activation clock every fixture here stamps. Fixed: a moving one would be
 /// a transcript that changes for no reason.
@@ -50,6 +50,16 @@ pub fn envelope(id: &str, body: &str) -> String {
 /// `envelope_type` is the channel's scheme, and a fixture that disagrees with
 /// itself is worse than no fixture.
 pub fn envelope_on(channel: &str, id: &str, body: &str) -> String {
+    fixture_envelope(channel, id, MessageBody::text(body)).to_envelope_json()
+}
+
+/// The fixture envelope itself, carrying any body, for a test of a host path
+/// that takes the struct rather than its text.
+///
+/// # Panics
+///
+/// As [`envelope_on`].
+pub fn fixture_envelope(channel: &str, id: &str, body: MessageBody) -> MessageEnvelope {
     let scheme = ChannelScheme::of(channel)
         .unwrap_or_else(|| panic!("fixture channel {channel:?} carries no scheme prefix"));
     MessageEnvelope {
@@ -58,7 +68,7 @@ pub fn envelope_on(channel: &str, id: &str, body: &str) -> String {
         channel: channel.to_string(),
         sender: "fixture".to_string(),
         publish_ts: publish_ts(),
-        body: body.to_string(),
+        body,
         reply_to: None,
         delivery_deadline: None,
         deliver_after: None,
@@ -66,7 +76,6 @@ pub fn envelope_on(channel: &str, id: &str, body: &str) -> String {
         urgency: Urgency::Normal,
         envelope_type: scheme,
     }
-    .to_envelope_json()
 }
 
 /// The fixed publish timestamp, [`NOW_MS`] read as an instant.
@@ -83,7 +92,7 @@ mod tests {
     fn a_fixture_frame_parses_as_the_envelope_it_was_built_from() {
         let text = envelope("delivery", "{\"n\":1}");
         let parsed: MessageEnvelope = serde_json::from_str(&text).expect("frame round-trips");
-        assert_eq!(parsed.body, "{\"n\":1}");
+        assert_eq!(parsed.body.as_text(), Some("{\"n\":1}"));
         assert_eq!(parsed.channel, FIXTURE_CHANNEL);
         assert_eq!(parsed.envelope_type, ChannelScheme::Brenn);
         assert_eq!(parsed.message_id, message_id("delivery"));

@@ -453,9 +453,9 @@ fn two_separate_frames_remain_two_windows() {
     let second = serve(&mut page, w());
 
     assert_eq!(first.envelopes.len() - first.new_from, 1);
-    assert_eq!(first.envelopes[first.new_from].body, "m1");
+    assert_eq!(first.envelopes[first.new_from].body.as_text(), Some("m1"));
     assert_eq!(second.envelopes.len() - second.new_from, 1);
-    assert_eq!(second.envelopes[second.new_from].body, "m2");
+    assert_eq!(second.envelopes[second.new_from].body.as_text(), Some("m2"));
 }
 
 /// The loss a pass reports is the peer's figure for the whole pass, carried on

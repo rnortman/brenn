@@ -1045,11 +1045,20 @@ fn fold_delivery(
     now_ms: u64,
     actions: &mut Vec<ChromeAction>,
 ) {
-    match serde_json::from_str::<MessageEnvelope>(raw) {
-        Ok(envelope) => actions.extend(fold(core, port, &envelope.body, now_ms)),
-        Err(err) => actions.push(ChromeAction::Log {
+    let envelope = match serde_json::from_str::<MessageEnvelope>(raw) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            return actions.push(ChromeAction::Log {
+                level: LogLevel::Error,
+                message: format!("chrome could not read a delivery on port {port:?}: {err}"),
+            });
+        }
+    };
+    match envelope.body.as_text() {
+        Some(text) => actions.extend(fold(core, port, text, now_ms)),
+        None => actions.push(ChromeAction::Log {
             level: LogLevel::Error,
-            message: format!("chrome could not read a delivery on port {port:?}: {err}"),
+            message: format!("chrome could not read a delivery on port {port:?}: body is not text"),
         }),
     }
 }
@@ -1495,10 +1504,7 @@ mod tests {
         let wrap = |bodies: &[String]| -> Vec<String> {
             bodies
                 .iter()
-                .map(|body| {
-                    serde_json::to_string(&brenn_surface_test_fixtures::sample_envelope(body))
-                        .expect("the sample envelope serializes")
-                })
+                .map(|body| brenn_surface_test_fixtures::sample_envelope(body).to_envelope_json())
                 .collect()
         };
         OwnedWindow {
@@ -1651,10 +1657,11 @@ mod tests {
         // An event-stream port folds every new message, so one skewed publisher
         // must cost its own message and nothing else in the window.
         let mut c = core();
-        let good = serde_json::to_string(&brenn_surface_test_fixtures::sample_envelope(
-            &toast_body(ToastSeverity::Warning, "still shown"),
+        let good = brenn_surface_test_fixtures::sample_envelope(&toast_body(
+            ToastSeverity::Warning,
+            "still shown",
         ))
-        .expect("the sample envelope serializes");
+        .to_envelope_json();
         let window = unwrapped_window(TOAST, &["not an envelope", &good]);
         let actions = fold_window(&mut c, &window.view(), NOW);
         assert!(only_error(&actions).contains(TOAST), "{actions:?}");

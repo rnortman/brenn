@@ -245,8 +245,9 @@ impl Messenger {
         };
 
         // 7. Apply to DB (inside a transaction with A3 re-check).
+        let body = fields.body.as_deref().map(super::MessageBody::text);
         let applied = EditFieldsApplied {
-            body: fields.body.as_deref(),
+            body: body.as_ref(),
             reply_to_uuid: reply_to_resolved,
             deliver_after: applied_deliver_after,
             delivery_deadline: fields.delivery_deadline,
@@ -549,7 +550,7 @@ mod tests {
                 crate::PublishOrigin::Conversation { id: 1 },
                 "pa-bob",
                 &canonical_address("pa-alice"),
-                body,
+                body.into(),
                 crate::Urgency::Normal,
                 None,
                 deliver_after,
@@ -1228,8 +1229,8 @@ mod tests {
         let _ = publish_one(&m, "sooner", Some(t1)).await;
         let list = m.list_pending("pa-bob", None).await;
         assert_eq!(list.len(), 2);
-        assert_eq!(list[0].body, "sooner");
-        assert_eq!(list[1].body, "later");
+        assert_eq!(list[0].body.as_text(), Some("sooner"));
+        assert_eq!(list[1].body.as_text(), Some("later"));
     }
 
     #[tokio::test]

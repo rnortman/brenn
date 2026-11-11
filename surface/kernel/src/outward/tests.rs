@@ -189,7 +189,7 @@ fn route_on(page: &mut SurfacePage, channel: &str, seed: u128, body: &str) {
         RouteRequest {
             channel,
             origin: Origin::Sub("p1"),
-            body: body.to_string(),
+            body: (body.to_string()).into(),
             stamp: stamp(seed),
             urgency: Urgency::Normal,
             deliver_after: None,
@@ -210,7 +210,7 @@ fn park_on(page: &mut SurfacePage, channel: &str, seed: u128, body: &str, releas
         RouteRequest {
             channel,
             origin: Origin::Sub("p1"),
-            body: body.to_string(),
+            body: (body.to_string()).into(),
             stamp: stamp(seed),
             urgency: Urgency::Normal,
             deliver_after: Some(release_at),
@@ -274,7 +274,7 @@ fn retained(page: &SurfacePage, channel: &str) -> Vec<String> {
         .get(channel)
         .expect("the fixture hosts the channel")
         .retained()
-        .map(|(envelope, _)| envelope.body.clone())
+        .map(|(envelope, _)| envelope.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -316,7 +316,11 @@ fn a_reader_owed_a_message_is_assembled_and_left_in_flight() {
         window
             .envelopes
             .iter()
-            .map(|e| brenn_surface_test_fixtures::parse_envelope(e).body)
+            .map(|e| brenn_surface_test_fixtures::parse_envelope(e)
+                .body
+                .as_text()
+                .unwrap()
+                .to_owned())
             .collect::<Vec<_>>(),
         vec!["hello".to_string()]
     );

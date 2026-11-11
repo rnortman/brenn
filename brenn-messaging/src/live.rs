@@ -13,7 +13,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
+use brenn_envelope::{ChannelScheme, MessageBody, MessageEnvelope, Urgency};
 use brenn_queue::{QuotaExceeded, ReplayDecision};
 
 /// Why a replay carries a gap (a discontinuity the consumer must be told about).
@@ -35,8 +35,8 @@ pub type Replay = ReplayDecision;
 /// A struct rather than a parameter list because the two entry points that take
 /// it — [`Messenger::publish_prepaid`] and [`Messenger::park_prepaid`] — must
 /// take *exactly* the same admitted entry.
-pub struct PrepaidEntry<'a> {
-    pub body: &'a str,
+pub struct PrepaidEntry {
+    pub body: MessageBody,
     pub urgency: Urgency,
     /// Assigned by the caller in call order across the whole flush, before it was
     /// split by class, so call order stays visible across the class boundary.
@@ -167,7 +167,7 @@ impl Messenger {
     pub async fn publish_prepaid(
         &self,
         dest: &PrepaidDestination,
-        entry: PrepaidEntry<'_>,
+        entry: PrepaidEntry,
     ) -> Appended {
         let envelope = self.prepaid_envelope(dest, entry);
         let appended = dest.store.append(envelope);
@@ -207,7 +207,7 @@ impl Messenger {
     pub fn park_prepaid(
         &self,
         dest: &PrepaidDestination,
-        entry: PrepaidEntry<'_>,
+        entry: PrepaidEntry,
         release_at: DateTime<Utc>,
     ) -> Result<Uuid, QuotaExceeded> {
         let envelope = self.prepaid_envelope(dest, entry);
@@ -221,17 +221,13 @@ impl Messenger {
     /// The mint stamps `deliver_after: None` on both paths: a parked message's
     /// release time belongs to the channel's deferred set, and the envelope a
     /// consumer eventually reads is the one that was minted here.
-    fn prepaid_envelope(
-        &self,
-        dest: &PrepaidDestination,
-        entry: PrepaidEntry<'_>,
-    ) -> MessageEnvelope {
+    fn prepaid_envelope(&self, dest: &PrepaidDestination, entry: PrepaidEntry) -> MessageEnvelope {
         let PrepaidEntry {
             body,
             urgency,
             publish_ts,
         } = entry;
-        if let Err(e) = check_body_size(body, self.defaults.max_body_bytes) {
+        if let Err(e) = check_body_size(&body, self.defaults.max_body_bytes) {
             panic!(
                 "prepaid publish: bound output {addr:?} carries a {len}-byte body over the \
                  {max}-byte cap — the caller rejects an over-cap entry as a violation before \
@@ -248,7 +244,7 @@ impl Messenger {
             channel: dest.entry.address.clone(),
             sender: dest.sender.as_str().into(),
             publish_ts,
-            body: body.to_string(),
+            body,
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
@@ -336,7 +332,7 @@ mod tests {
                 .publish_prepaid(
                     dest,
                     PrepaidEntry {
-                        body,
+                        body: body.into(),
                         urgency: Urgency::Normal,
                         publish_ts: Utc::now(),
                     },
@@ -376,7 +372,7 @@ mod tests {
             .park_prepaid(
                 &dest,
                 PrepaidEntry {
-                    body: "scheduled",
+                    body: "scheduled".into(),
                     urgency: Urgency::Normal,
                     publish_ts: now,
                 },
@@ -400,7 +396,7 @@ mod tests {
             released
                 .messages
                 .iter()
-                .map(|r| r.envelope.body.as_str())
+                .map(|r| r.envelope.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["scheduled"],
             "the release moves it onto the channel"
@@ -419,7 +415,7 @@ mod tests {
             messenger.park_prepaid(
                 &dest,
                 PrepaidEntry {
-                    body,
+                    body: body.into(),
                     urgency: Urgency::Normal,
                     publish_ts: Utc::now(),
                 },
@@ -439,7 +435,7 @@ mod tests {
                 .release_due(later)
                 .messages
                 .iter()
-                .map(|r| r.envelope.body.as_str())
+                .map(|r| r.envelope.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["first"],
             "the refusal left the schedule that was already there"

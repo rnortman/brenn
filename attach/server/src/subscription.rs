@@ -257,6 +257,9 @@ pub async fn send_pass(
                  dropped,
                  retained_seq,
              }| {
+                // A v4 frame carries a body as its text; checked here, where
+                // the row is built, rather than when the queued frame is written.
+                envelope.require_text_body("attach v4 Deliver");
                 let (seq, cursor) = cursors.next(channel, retained_seq);
                 DeliverRow {
                     envelope,

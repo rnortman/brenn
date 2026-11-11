@@ -75,7 +75,8 @@ use crate::spec::{
     port::{OUT, REPORT, TICK},
 };
 use brenn_guest::{
-    Activation, Error, Processor, defer_cancel, defer_edit, publish, publish_deferred,
+    Activation, Error, MessageEnvelopeExt, Processor, defer_cancel, defer_edit, publish,
+    publish_deferred,
 };
 
 #[derive(serde::Serialize)]
@@ -201,8 +202,9 @@ impl Processor for ProcessorTransplant {
             for result in window.new_envelopes() {
                 let env = result?;
                 ids.push(env.message_id.to_string());
-                match parse_marker(&env.body)? {
-                    None => markers.push(format!("{}:{}", window.port(), env.body)),
+                let body = env.text_body()?;
+                match parse_marker(body)? {
+                    None => markers.push(format!("{}:{}", window.port(), body)),
                     Some(
                         m @ (Marker::Err | Marker::Trap | Marker::Reply | Marker::Answer { .. }),
                     ) => sentinel = Some(m),
@@ -345,7 +347,7 @@ impl Processor for ProcessorTransplant {
                     "replied:{port}:mount={}:classified={classified}:request={}:\
                      bare-identity={bare_identity}:delivered=[{}]",
                     activation.sync_is(brenn_guest::MOUNT),
-                    request.body,
+                    request.text_body()?,
                     delivered.join(","),
                 )))
             }

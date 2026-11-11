@@ -102,7 +102,7 @@ impl Processor for ProcessorStoreRt {
         for window in activation.port_windows() {
             for env in window.new_envelopes() {
                 let env = env?;
-                if env.body == "__raii_rollback__" {
+                if env.body.as_text() == Some("__raii_rollback__") {
                     // RAII rollback test: begin tx, put sentinel, return Err.
                     // Transaction::drop handles rollback — no explicit call.
                     let tx = store::begin()?;

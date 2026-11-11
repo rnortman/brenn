@@ -226,7 +226,7 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
             PublishOrigin::Conversation { id: sender_conv_id },
             &job.owner_app_slug,
             &action_to,
-            &action_body,
+            action_body.as_str().into(),
             action_urgency,
             action_reply_to.as_deref(),
             None, // no deliver_after on automation fires
