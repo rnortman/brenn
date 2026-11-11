@@ -71,6 +71,7 @@ async fn build_system_publish_messenger(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::System(RECEIVER.to_string()),
@@ -186,6 +187,7 @@ async fn publish_from_system_reaches_reserved_slash_channel() {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![],
         transport_type: ChannelScheme::Brenn,
@@ -239,6 +241,7 @@ async fn publish_from_system_reaches_reserved_slash_channel() {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![],
         transport_type: ChannelScheme::Brenn,

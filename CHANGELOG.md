@@ -13,14 +13,60 @@ All notable changes to Brenn are documented here.
   `Serialize`; use `to_envelope_json`. Paid at the next `brenn-guest` pin
   bump; no deployed component is affected. See
   `docs/component-packages.md`.
-- The first start of this release rebuilds the message search index once,
-  before serving, so it takes longer on a large database. No stored message
-  is rewritten, and the previous release still opens the database.
 - A conversation shown a bus message with a content type sees
   `content_type` beside the body, and a message whose body is not text sees
   a `{"binary": true, "content_type": …, "size": …}` placeholder instead of
-  its bytes. Nothing can publish such a message yet; see
+  its bytes. The first thing that can publish such a message is a component
+  built against the byte-carrying contract, below; see
   `docs/message-bus.md` §2.1.2.
+- **For WASM component authors: a byte-carrying component contract,
+  `brenn:processor@0.2.0`, provisional.** The backend host now serves it
+  beside the string contract `brenn:processor@0.1.0`. A 0.2.0 component is
+  handed each message as an open JSON header plus the body's bytes and
+  content type, and publishes, parks, edits, calls and replies with bytes and
+  an optional content type; no base64 anywhere. The new WIT is
+  `brenn-wasm/wit/processor-0.2.wit`, read together with `processor.wit`. New
+  refusals a 0.2.0 guest can draw: `invalid-body`, `text-only-channel`,
+  `text-only-peer`. In a sync call between contracts, a 0.2.0 callee may
+  reply with a non-text body to anyone; a 0.1.0 caller handed such a reply
+  traps, and the callee is unaffected. The guest SDK and the surface host do
+  not serve 0.2.0 yet: a 0.2.0 component uses raw bindings, and a surface
+  kind built against 0.2.0 is withheld under a bundle mount. **0.2.0 is
+  provisional:** brenn makes no compatibility promise for it yet; it may be
+  replaced by a different contract or withdrawn in any release, with no dual
+  period; a component that must keep running across brenn releases stays on
+  0.1.0. The removal period of 0.1.0 has not begun and does not begin until a
+  later release declares the byte-carrying contract stable. **No existing
+  component is affected**: 0.1.0 artifacts, in-tree and out-of-tree, load and
+  run as before. See `docs/component-packages.md`, *Contract evolution*.
+- **For operators: `non_text` on channels and binding tails.** A channel
+  declared `non_text = true` may carry non-text bodies; every channel is
+  text-only by default, so no existing configuration changes meaning. A
+  consumer's binding tail may say `non_text = true`, which declares a link or
+  free `io` channel `non_text` and is checked against a declared channel. A
+  0.2.0 component's non-text publish to a text-only channel is refused to it,
+  and the backend writes one `warn!` per activation naming the component, the
+  port and the channel, so a missing declaration shows up in the log.
+  Refused, at `config-check`, boot or reload as each can be checked: a 0.1.0
+  component with any port on a `non_text` channel (at boot and reload, naming
+  the component, port and channel); a surface binding to a `non_text`
+  channel, a `non_text` key on any surface binding, and a `non_text` surface
+  config channel; redeclaring a durable channel text-only while it holds a
+  non-text message. A remote attacher subscribing to a `non_text` channel is
+  answered `Unavailable`, which is not a violation and feeds nothing to
+  fail2ban. See `docs/config-dsl.md` and `docs/message-bus.md` §2.1.
+- **Slower first start.** The first start of this release rebuilds the
+  message search index once and builds one new index on the message store,
+  both before serving, so it takes longer on a large database. No stored
+  message is rewritten, and the previous release still opens the database.
+- A surface kind built against `brenn:processor@0.2.0` is withheld under a
+  bundle mount, with an alert naming the contract; under brenn's own mount it
+  refuses to boot.
+- **Notice: the string component contract is to be removed.** When any
+  component built against `brenn:processor@0.1.0` is loaded, the backend
+  writes one `warn!` at boot and after each applied reload naming them. No
+  removal release is scheduled and nothing needs to change yet; the removal
+  period does not begin until the byte-carrying contract is declared stable.
 
 ## [0.34.0] — 2026-11-10
 

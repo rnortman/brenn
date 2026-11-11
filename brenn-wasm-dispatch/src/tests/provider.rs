@@ -118,6 +118,7 @@ async fn provider(slug: &str) -> Provider {
             wake_min: WakeMin::Normal,
         },
         amplification_mt: 1000,
+        non_text: false,
     };
     let cfg = WasmConsumerConfig {
         slug: slug.to_string(),

@@ -150,6 +150,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-processor-bytes-test"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "brenn-processor-call-test"
 version = "0.1.0"
 dependencies = [
@@ -221,6 +228,13 @@ name = "brenn-processor-provider-test"
 version = "0.1.0"
 dependencies = [
  "brenn-guest",
+]
+
+[[package]]
+name = "brenn-processor-stale-contract-test"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
 ]
 
 [[package]]

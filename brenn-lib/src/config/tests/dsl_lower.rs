@@ -127,6 +127,7 @@ fn channel_at(address: &str) -> ChannelConfigRaw {
         sink: None,
         wake_min: None,
         send_rate: None,
+        non_text: false,
     }
 }
 
@@ -230,6 +231,7 @@ fn attrless_subscription(port: &str, channel: &str) -> WasmConsumerSubscriptionR
         noise: None,
         wake_min: None,
         amplification: None,
+        non_text: false,
     }
 }
 
@@ -244,6 +246,7 @@ fn tick_io_port() -> WasmConsumerIoPortRaw {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 
@@ -3804,6 +3807,7 @@ new router: Router {
                         noise: Some(NoiseLevel::Metered),
                         wake_min: Some(WakeMin::Low),
                         amplification: Some(0.5),
+                        non_text: false,
                     },
                     WasmConsumerSubscriptionRaw {
                         port: "feed".to_string(),
@@ -3813,6 +3817,7 @@ new router: Router {
                         noise: None,
                         wake_min: None,
                         amplification: None,
+                        non_text: false,
                     },
                     WasmConsumerSubscriptionRaw {
                         port: "status".to_string(),
@@ -3822,6 +3827,7 @@ new router: Router {
                         noise: None,
                         wake_min: None,
                         amplification: None,
+                        non_text: false,
                     },
                     WasmConsumerSubscriptionRaw {
                         port: "hook".to_string(),
@@ -3831,6 +3837,7 @@ new router: Router {
                         noise: None,
                         wake_min: None,
                         amplification: None,
+                        non_text: false,
                     },
                 ],
                 outputs: vec![
@@ -3840,6 +3847,7 @@ new router: Router {
                         urgency: Some(Urgency::Low),
                         publish_per_activation: None,
                         publish_capacity: None,
+                        non_text: false,
                     },
                     WasmConsumerOutputRaw {
                         port: "outbound".to_string(),
@@ -3847,6 +3855,7 @@ new router: Router {
                         urgency: Some(Urgency::High),
                         publish_per_activation: Some(2.0),
                         publish_capacity: Some(3.5),
+                        non_text: false,
                     },
                 ],
                 io_ports: vec![
@@ -3860,6 +3869,7 @@ new router: Router {
                         urgency: None,
                         publish_per_activation: None,
                         publish_capacity: None,
+                        non_text: false,
                     },
                     WasmConsumerIoPortRaw {
                         port: "tick".to_string(),
@@ -3871,6 +3881,7 @@ new router: Router {
                         urgency: Some(Urgency::Low),
                         publish_per_activation: Some(1.0),
                         publish_capacity: Some(1.0),
+                        non_text: false,
                     },
                 ],
                 subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
@@ -4122,6 +4133,7 @@ new reserved: Reserved {
                     urgency: None,
                     publish_per_activation: None,
                     publish_capacity: None,
+                    non_text: false,
                 }],
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.utterance".to_string(),
@@ -4348,6 +4360,7 @@ new fan: Fan {
                     urgency: None,
                     publish_per_activation: None,
                     publish_capacity: None,
+                    non_text: false,
                 }],
                 subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
                 publish_acl: vec![ChannelMatcherRaw::Exact("alice-digests".to_string())],
@@ -4419,6 +4432,7 @@ new sink: Sink {
                     urgency: Some(Urgency::Low),
                     publish_per_activation: Some(1.0),
                     publish_capacity: Some(1.0),
+                    non_text: false,
                 }],
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.acks".to_string(),
@@ -4472,6 +4486,7 @@ new sink: Sink {
                     urgency: None,
                     publish_per_activation: None,
                     publish_capacity: None,
+                    non_text: false,
                 }],
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.acks".to_string(),
@@ -6702,6 +6717,7 @@ fn the_tool_result_inbox_port_never_reaches_the_lowered_consumer() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }]
     );
     assert_eq!(
@@ -6712,6 +6728,7 @@ fn the_tool_result_inbox_port_never_reaches_the_lowered_consumer() {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }]
     );
     assert_eq!(consumer.io_ports, vec![]);
@@ -6786,6 +6803,7 @@ fn a_link_lowers_to_its_endpoint_set() {
                     io_port: false,
                     push_depth: None,
                     retain_depth: None,
+                    non_text: false,
                 },
                 LinkEndpointRaw {
                     host: LinkHostRaw::Surface {
@@ -6798,6 +6816,7 @@ fn a_link_lowers_to_its_endpoint_set() {
                     io_port: false,
                     push_depth: Some(Depth::Bounded(8)),
                     retain_depth: Some(Depth::Bounded(16)),
+                    non_text: false,
                 },
                 LinkEndpointRaw {
                     host: LinkHostRaw::Surface {
@@ -6810,6 +6829,7 @@ fn a_link_lowers_to_its_endpoint_set() {
                     io_port: true,
                     push_depth: Some(Depth::Bounded(2)),
                     retain_depth: Some(Depth::Bounded(4)),
+                    non_text: false,
                 },
             ],
         }],

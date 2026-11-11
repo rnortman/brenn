@@ -12,10 +12,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
 use brenn_budget::MAX_PUBLISH_CALLS_PER_ACTIVATION;
 use brenn_wasm::{
-    ComponentGrant, MqttPublishFn, MqttPublishOutcome, ProcessorActivation, ProcessorComponent,
-    ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow,
+    ComponentGrant, MqttPublishFn, MqttPublishOutcome, ProcessorComponent, ProcessorLoadSpec,
+    ProcessorOutcome,
 };
 
 mod common;
@@ -93,7 +94,7 @@ fn mqtt_publish_broker_error_propagates_to_guest() {
         });
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(single_activation());
+    let outcome = comp.handle(common::host_activation(single_activation()));
 
     match outcome {
         ProcessorOutcome::Err(re) => {
@@ -130,7 +131,7 @@ fn mqtt_publish_not_permitted_propagates_to_guest() {
         });
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(single_activation());
+    let outcome = comp.handle(common::host_activation(single_activation()));
 
     match outcome {
         ProcessorOutcome::Err(re) => {
@@ -166,7 +167,7 @@ fn mqtt_publish_no_connector_propagates_to_guest() {
         });
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(single_activation());
+    let outcome = comp.handle(common::host_activation(single_activation()));
 
     match outcome {
         ProcessorOutcome::Err(re) => {
@@ -206,7 +207,7 @@ fn mqtt_publish_invalid_payload_propagates_to_guest() {
         });
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(single_activation());
+    let outcome = comp.handle(common::host_activation(single_activation()));
 
     match outcome {
         ProcessorOutcome::Err(re) => {
@@ -248,7 +249,7 @@ fn mqtt_publish_then_trap_does_not_roll_back_broker_send() {
     );
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(trap_after_publish_activation());
+    let outcome = comp.handle(common::host_activation(trap_after_publish_activation()));
 
     match outcome {
         ProcessorOutcome::Trap(_) => {
@@ -319,7 +320,7 @@ fn mqtt_publish_quota_exceeded_propagates_to_guest() {
     );
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(single_activation());
+    let outcome = comp.handle(common::host_activation(single_activation()));
 
     match outcome {
         ProcessorOutcome::Err(re) => {
@@ -416,7 +417,9 @@ fn publish_json_sends_json_under_the_json_content_type() {
     let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(activation_with_body("PUBLISH_JSON"));
+    let outcome = comp.handle(common::host_activation(activation_with_body(
+        "PUBLISH_JSON",
+    )));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "expected Ok; got {outcome:?}"
@@ -444,7 +447,9 @@ fn publish_text_sends_the_body_under_the_text_content_type() {
     let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(activation_with_body("PUBLISH_TEXT"));
+    let outcome = comp.handle(common::host_activation(activation_with_body(
+        "PUBLISH_TEXT",
+    )));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "expected Ok; got {outcome:?}"
@@ -498,7 +503,7 @@ fn the_sdk_classifies_and_renders_every_publish_failure() {
             .lock()
             .expect("the switchable callback's lock is never poisoned") = outcome.clone();
 
-        let result = comp.handle(activation_with_body("CLASSIFY"));
+        let result = comp.handle(common::host_activation(activation_with_body("CLASSIFY")));
 
         match result {
             ProcessorOutcome::Err(re) => {
@@ -521,7 +526,7 @@ fn the_sdk_classifies_a_quota_exhaustion_as_permanent() {
     let (callback, _seen) = recording_callback(MqttPublishOutcome::Ok);
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(activation_with_body("CLASSIFY"));
+    let outcome = comp.handle(common::host_activation(activation_with_body("CLASSIFY")));
 
     match outcome {
         ProcessorOutcome::Err(re) => {

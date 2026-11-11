@@ -1440,6 +1440,7 @@ mod tests {
                 noise: None,
                 wake_min: None,
                 amplification: None,
+                non_text: false,
             }],
             ..crate::test_fixtures::minimal_wasm_consumer()
         }

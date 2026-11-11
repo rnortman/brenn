@@ -7,7 +7,7 @@
 //! all, and nothing that drives the entry directly can tell which.
 
 use brenn_activation::sync::SyncAnswer;
-use brenn_envelope::ChannelScheme;
+use brenn_envelope::{ChannelScheme, MessageBody};
 
 use crate::{
     Host, InputBinding, MountSpec, Report, TrapDisposition, assert_fresh_memory, await_reports,
@@ -534,14 +534,14 @@ pub mod a_sync_call_is_an_activation_plus_a_reply {
         // activation *delivered*, the whole window list minus the request's own.
         assert_eq!(
             answer,
-            SyncAnswer::Ok(Some(format!(
+            SyncAnswer::Ok(Some(MessageBody::text(format!(
                 "replied:{}:mount=false:classified={}:request=__reply__:\
                  bare-identity=true:delivered=[{},{}]",
                 port::ASK,
                 port::ASK,
                 port::IN,
                 port::SAMPLED,
-            ))),
+            )))),
             "a sync call is answered with the reply its callee returned",
         );
 
@@ -713,7 +713,7 @@ pub mod an_oversize_reply_is_a_trap {
             .await;
         assert_eq!(
             at_cap,
-            SyncAnswer::Ok(Some("x".repeat(BODY_CAP as usize))),
+            SyncAnswer::Ok(Some(MessageBody::text("x".repeat(BODY_CAP as usize)))),
             "a reply of exactly the cap is admissible",
         );
         assert_eq!(

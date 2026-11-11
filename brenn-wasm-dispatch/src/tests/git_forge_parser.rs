@@ -58,6 +58,7 @@ async fn build_parser_setup(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(slug.to_string()),
@@ -86,6 +87,7 @@ async fn build_parser_setup(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(out_sub_slug.clone()),
@@ -179,6 +181,7 @@ async fn build_parser_setup(
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             },
             WasmInputPort {
                 port: "github".to_string(),
@@ -191,6 +194,7 @@ async fn build_parser_setup(
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             },
         ],
         outputs: vec![],

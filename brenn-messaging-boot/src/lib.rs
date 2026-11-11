@@ -900,6 +900,33 @@ pub(crate) fn validate_static_subscriptions_deliverable(
     );
 }
 
+/// One refusal per channel in `planned` that is text-only while its durable
+/// store already holds a non-text message, visible or parked; `held` is the
+/// store's answer to which channels hold one
+/// (`brenn_messaging_store::db::channels_holding_non_text_rows`).
+///
+/// Such a channel was declared `non_text`, took non-text bodies, and is now
+/// declared text-only. Its rows survive the restart or reload, so a reader
+/// that can only represent text could be bound to it by valid configuration
+/// and handed one. Only a durable store keeps rows across a declaration
+/// change: a ring is rebuilt empty when its channel's entry changes.
+pub fn text_only_channels_holding_non_text<'a>(
+    held: &[uuid::Uuid],
+    planned: impl IntoIterator<Item = &'a ChannelEntry>,
+) -> Vec<String> {
+    planned
+        .into_iter()
+        .filter(|entry| !entry.resolved_channel.non_text && held.contains(&entry.uuid))
+        .map(|entry| {
+            format!(
+                "config: channel {:?} is declared text-only, but its store holds messages whose \
+                 bodies are not text; declare it `non_text = true`, or give it a new address",
+                entry.address,
+            )
+        })
+        .collect()
+}
+
 /// True iff `build_messaging` will take its full path (and therefore requires
 /// a resolved `server_origin`). Both `build_messaging`'s early-return gate and
 /// `run_server`'s `any_messaging` MUST call this — it is the single source of
@@ -1116,6 +1143,18 @@ pub async fn build_messaging(
     let Some(mut plan) = plan else {
         return (MessagingResult::default(), PlanCarried::default());
     };
+    {
+        let held = brenn_messaging_store::db::channels_holding_non_text_rows(&*db.lock().await);
+        let refusals = text_only_channels_holding_non_text(
+            &held,
+            plan.directory.list().iter().map(|entry| &**entry),
+        );
+        assert!(
+            refusals.is_empty(),
+            "refusing to start:\n{}",
+            refusals.join("\n"),
+        );
+    }
     // Cloned: commit reads the ingress set too. The advisory is the caller's
     // alone (commit ignores it).
     let carried = PlanCarried {

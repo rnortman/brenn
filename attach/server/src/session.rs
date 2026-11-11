@@ -94,9 +94,26 @@ pub struct AttachSessionCtx {
     /// Outbound frame sender to the writer task. Owning it here means dropping
     /// the context at teardown closes the channel and exits the writer.
     pub tx: mpsc::Sender<ServerFrame>,
+    /// The transport version the two `Hello` frames agreed on. Set once, by the
+    /// opening sequence, before any frame handler runs; read through
+    /// [`AttachSessionCtx::version`].
+    pub(crate) negotiated_version: std::sync::OnceLock<u32>,
 }
 
 impl AttachSessionCtx {
+    /// The transport version this attachment speaks.
+    ///
+    /// # Panics
+    ///
+    /// Before the opening sequence agreed one. Every frame handler runs after
+    /// `Welcome`, so a handler reaching this unset is a host bug.
+    pub fn version(&self) -> u32 {
+        *self
+            .negotiated_version
+            .get()
+            .expect("a frame handler runs only after the opening sequence agreed a version")
+    }
+
     /// A protocol violation on this attachment, named by attacher and account.
     ///
     /// One spelling for every plane, so the security log line that feeds
@@ -460,6 +477,7 @@ where
         account,
         ip,
         tx,
+        negotiated_version: std::sync::OnceLock::new(),
     };
 
     let mut state = SessionState::new(ctx.profile.as_ref(), active_channels, store_incarnation);
@@ -590,6 +608,9 @@ where
         Handshake::Violation(rule) => return Opening::Closed(Some(ctx.violation_detail(rule))),
         Handshake::Disconnect => return Opening::Closed(None),
     };
+    ctx.negotiated_version
+        .set(version)
+        .expect("the opening sequence runs once per attachment");
 
     match send_frame(&ctx.tx, welcome(ctx, version, heartbeat_secs), counters).await {
         FrameOutcome::Continue => {}

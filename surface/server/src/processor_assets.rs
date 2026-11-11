@@ -65,6 +65,41 @@ const KNOWN_IMPORTS: [&str; 12] = [
     "dom", "page-dom",
 ];
 
+/// Why a record this server reads no further is not served: the outcome a
+/// caller withholds under a bundle's mount and refuses under brenn's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnservedRecord {
+    /// The schema version the record declares.
+    pub record_v: u32,
+    /// One sentence naming the cause and what the kind's author does about it.
+    pub reason: String,
+}
+
+/// The manifest import that marks a kind built against the byte-carrying
+/// component contract: the version-stripped name of the interface carrying
+/// that contract's activation. Manifest imports are recorded without
+/// versions, so the bare name is the whole test.
+fn byte_contract_marker_import() -> &'static str {
+    let marker = brenn_envelope::grants::ProcessorContract::V0_2_MARKER;
+    marker
+        .split_once('@')
+        .map_or(marker, |(interface, _version)| interface)
+}
+
+/// Why a kind built against the byte-carrying contract is not served here, in
+/// one sentence naming both contracts and what the author does about it.
+pub fn byte_contract_reason(kind: &str) -> String {
+    use brenn_envelope::grants::ProcessorContract;
+    format!(
+        "processor component {kind:?} is built against the component contract {}, but this \
+         brenn's surface host serves {} only. Build the kind against {} until a brenn whose \
+         surface host serves the byte-carrying contract is installed.",
+        ProcessorContract::V0_2,
+        ProcessorContract::V0_1,
+        ProcessorContract::V0_1,
+    )
+}
+
 /// The one promise every record makes, whatever version wrote it: an integer
 /// `v`. Parsed on its own, without `deny_unknown_fields`, so that a record from
 /// a version whose shape this server cannot read still answers which version it
@@ -194,8 +229,8 @@ pub fn validate_processor_kind_in(
 ///
 /// On a missing/unparseable manifest, a wrong schema version, a kind/directory
 /// mismatch, a missing listed file, a specification name that is not the one
-/// the kind derives, a backend-only import, or an import name no WIT interface
-/// defines.
+/// the kind derives, an import of the byte-carrying component contract, a
+/// backend-only import, or an import name no WIT interface defines.
 pub fn read_processor_record_in(
     cx: AssetContext,
     surface_root: &Path,
@@ -203,15 +238,18 @@ pub fn read_processor_record_in(
 ) -> ProcessorManifest {
     let AssetContext { when, verdict } = cx;
     read_processor_record_or_version_in(cx, surface_root, kind)
-        .unwrap_or_else(|found| panic!("{when}: {}{verdict}", version_mismatch_reason(kind, found)))
+        .unwrap_or_else(|unserved| panic!("{when}: {}{verdict}", unserved.reason))
 }
 
-/// The same read, with the version verdict handed back instead of panicked on.
+/// The same read, with the two verdicts that withhold a kind handed back
+/// instead of panicked on.
 ///
-/// `Err(v)` is the record's own `v`, for a record this server does not read.
-/// The caller decides what a version mismatch means where it found the tree: a
-/// broken install under brenn's own mount, or a bundle mid-upgrade under any
-/// other declared mount, which is withheld rather than fatal.
+/// `Err` is a record this server does not serve: one whose `v` it does not
+/// read, or one whose imports name the byte-carrying component contract, which
+/// the surface host does not serve. The caller decides what that means where
+/// it found the tree: a broken install under brenn's own mount, or a bundle
+/// authored on its own schedule under any other declared mount, which is
+/// withheld rather than fatal.
 ///
 /// # Panics
 ///
@@ -222,7 +260,7 @@ pub fn read_processor_record_or_version_in(
     cx: AssetContext,
     surface_root: &Path,
     kind: &str,
-) -> Result<ProcessorManifest, u32> {
+) -> Result<ProcessorManifest, UnservedRecord> {
     let AssetContext { when, verdict } = cx;
     let dir = kind_dir(surface_root, kind);
     let manifest_path = dir.join("manifest.json");
@@ -250,7 +288,10 @@ pub fn read_processor_record_or_version_in(
         )
     });
     if declared.v != MANIFEST_VERSION {
-        return Err(declared.v);
+        return Err(UnservedRecord {
+            record_v: declared.v,
+            reason: version_mismatch_reason(kind, declared.v),
+        });
     }
 
     let manifest: ProcessorManifest = serde_json::from_str(&raw).unwrap_or_else(|err| {
@@ -283,6 +324,18 @@ pub fn read_processor_record_or_version_in(
     }
 
     assert_spec_name_derives(cx, kind, &manifest);
+    // Asked before the profile check, which knows only the string contract's
+    // interfaces and would read a byte-carrying kind as toolchain drift.
+    if manifest
+        .imports
+        .iter()
+        .any(|import| import == byte_contract_marker_import())
+    {
+        return Err(UnservedRecord {
+            record_v: manifest.v,
+            reason: byte_contract_reason(kind),
+        });
+    }
     assert_import_profile(cx, kind, &manifest);
 
     Ok(manifest)

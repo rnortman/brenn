@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use brenn_activation::sync::{SyncAnswer, SyncRefusal};
+use brenn_envelope::MessageBody;
 use brenn_lib::messaging::config::ResolvedSurface;
 use brenn_lib::messaging::remote::ResolvedRemote;
 use brenn_lib::messaging::{
@@ -185,7 +186,7 @@ impl WakeRouterImpl {
         &self,
         slug: &str,
         port: &str,
-        body: String,
+        body: MessageBody,
         chain: &[String],
     ) -> SyncAnswer {
         let key = SubscriberEntryKind::Wasm(slug.to_string());
@@ -985,6 +986,7 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![SubscriberEntry {
                 kind: conv_key(),
@@ -1250,11 +1252,11 @@ mod tests {
         let served = tokio::spawn(async move {
             let request = requests.recv().await.expect("the call arrives");
             assert_eq!(request.port, "resolve");
-            assert_eq!(request.body, "{\"q\":\"pier\"}");
+            assert_eq!(request.body, MessageBody::text("{\"q\":\"pier\"}"));
             assert_eq!(request.chain, vec!["menu".to_string()]);
             request
                 .reply
-                .send(SyncAnswer::Ok(Some("answered".to_string())))
+                .send(SyncAnswer::Ok(Some(MessageBody::text("answered"))))
                 .expect("the caller is still waiting");
         });
 
@@ -1262,11 +1264,11 @@ mod tests {
             .sync_call(
                 "geo",
                 "resolve",
-                "{\"q\":\"pier\"}".to_string(),
+                MessageBody::text("{\"q\":\"pier\"}"),
                 &["menu".to_string()],
             )
             .await;
-        assert_eq!(answer, SyncAnswer::Ok(Some("answered".to_string())));
+        assert_eq!(answer, SyncAnswer::Ok(Some(MessageBody::text("answered"))));
         served.await.expect("the serving task finished");
     }
 
@@ -1277,7 +1279,7 @@ mod tests {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         assert_eq!(
             router
-                .sync_call("nobody", "resolve", String::new(), &[])
+                .sync_call("nobody", "resolve", MessageBody::text(""), &[])
                 .await,
             SyncAnswer::Refused(SyncRefusal::Unregistered)
         );
@@ -1297,7 +1299,9 @@ mod tests {
         );
         router.retire_delivery_binding(&wasm_key("geo"));
         assert_eq!(
-            router.sync_call("geo", "resolve", String::new(), &[]).await,
+            router
+                .sync_call("geo", "resolve", MessageBody::text(""), &[],)
+                .await,
             SyncAnswer::Refused(SyncRefusal::Unregistered)
         );
     }
@@ -1317,7 +1321,9 @@ mod tests {
         );
         drop(requests);
         assert_eq!(
-            router.sync_call("geo", "resolve", String::new(), &[]).await,
+            router
+                .sync_call("geo", "resolve", MessageBody::text(""), &[],)
+                .await,
             SyncAnswer::Refused(SyncRefusal::Unregistered)
         );
     }
@@ -1333,7 +1339,9 @@ mod tests {
             wasm_key("geo"),
             DeliveryBinding::ParkedNotify(Arc::new(tokio::sync::Notify::new())),
         );
-        let _ = router.sync_call("geo", "resolve", String::new(), &[]).await;
+        let _ = router
+            .sync_call("geo", "resolve", MessageBody::text(""), &[])
+            .await;
     }
 
     /// A `WasmConsumer` arm routes and shapes as `Parked`/`ParkedWake`: its
@@ -1608,6 +1616,7 @@ mod tests {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         };
         let entry = build_channel_entries(&[raw], &MessagingGlobalConfig::default())
             .pop()

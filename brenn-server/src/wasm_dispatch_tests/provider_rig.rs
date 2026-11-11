@@ -272,6 +272,7 @@ impl ProviderRig {
                                 wake_min: WakeMin::Normal,
                             },
                             amplification_mt: 1000,
+                            non_text: false,
                         },
                         inbox_input_port(setup.slug, &results_ch),
                     ],

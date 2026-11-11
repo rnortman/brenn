@@ -868,7 +868,7 @@ pub struct DescriptionChannelSet<'a> {
 ///   they are written forever, so unbounded retention is unbounded DB growth;
 ///   a config channel needs `retain_depth >= 1`, which on a non-durable channel
 ///   *is* its standing buffer, because the whole point is a retained replay to
-///   a surface that attaches later; and
+///   a surface that attaches later, and it may not be declared `non_text`; and
 /// - no surface binds its own config channel, in either direction.
 ///
 /// The returned set is the input to the single-writer half,
@@ -932,6 +932,7 @@ pub fn validate_surface_description_set<'a>(
             }
             DerivedKind::Config(_) => {
                 assert_config_retention_at_least_one(&channel.address, directory);
+                assert_config_channel_text_only(&channel.address, directory);
             }
         }
 
@@ -1080,6 +1081,22 @@ fn assert_config_retention_at_least_one(channel: &str, directory: &MessagingDire
          attach, so a \
          window of zero would leave every surface unconfigurable. Set retain_depth >= 1.",
         entry.resolved_channel.retain_depth,
+    );
+}
+
+/// Boot-assert: a surface config channel is not declared `non_text`.
+///
+/// It is the one channel a page receives that is not a binding, so the binding
+/// refusal does not cover it, and a page holds only text.
+fn assert_config_channel_text_only(channel: &str, directory: &MessagingDirectory) {
+    let entry = directory
+        .resolve(channel)
+        .expect("caller confirmed the channel resolves");
+    assert!(
+        !entry.resolved_channel.non_text,
+        "{CONFIG_REFUSAL}surface config channel {channel:?} is declared `non_text` — every \
+         surface replays it on attach, and a surface carries only text bodies. Remove \
+         `non_text` from its declaration.",
     );
 }
 

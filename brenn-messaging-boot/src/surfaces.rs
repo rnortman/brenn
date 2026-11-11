@@ -933,6 +933,16 @@ pub(crate) fn resolve_surfaces(
                          ingress paths)",
                         entry.transport_type,
                     );
+                    // A page holds only text: its components speak the string
+                    // contract and its wire frames are strings.
+                    assert!(
+                        !entry.resolved_channel.non_text,
+                        "config: [[surface]] {slug:?}: {direction} channel {channel:?} is \
+                         declared `non_text`, and a surface carries only text bodies — its \
+                         components are built against {}; bind the port to a text-only \
+                         channel",
+                        brenn_envelope::grants::ProcessorContract::V0_1,
+                    );
                 }
                 // `local:` — page-local pub/sub. There is nothing to look up:
                 // local channels are declared per-surface (the binding *is* the

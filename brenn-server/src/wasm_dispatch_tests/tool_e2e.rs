@@ -216,6 +216,7 @@ async fn tool_harness(
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             },
             inbox_input_port(slug, &inbox_channel),
         ],
@@ -259,6 +260,7 @@ fn out_channel(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(out_reader_slug.clone()),

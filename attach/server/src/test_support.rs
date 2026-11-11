@@ -208,6 +208,17 @@ pub async fn one_channel_messenger_at_standing(
     bare: &str,
     standing: Depth,
 ) -> (Arc<Messenger>, Uuid) {
+    one_channel_messenger_declared(db, bare, standing, false).await
+}
+
+/// [`one_channel_messenger_at_standing`] with the channel's `non_text`
+/// declaration stated.
+pub async fn one_channel_messenger_declared(
+    db: &Db,
+    bare: &str,
+    standing: Depth,
+    non_text: bool,
+) -> (Arc<Messenger>, Uuid) {
     let raw = ChannelConfigRaw {
         send_rate: None,
         uuid: Some(Uuid::new_v4().to_string()),
@@ -220,6 +231,7 @@ pub async fn one_channel_messenger_at_standing(
         noise: None,
         sink: None,
         wake_min: None,
+        non_text,
     };
     let entry = build_channel_entries(&[raw], &MessagingGlobalConfig::default())
         .pop()
@@ -340,6 +352,11 @@ impl AttachCtxBuilder {
             account: TEST_ACCOUNT.to_string(),
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             tx,
+            // A built context stands for an attached session, which has agreed
+            // a version.
+            negotiated_version: std::sync::OnceLock::from(
+                brenn_attach_proto::SUPPORTED_VERSIONS.max,
+            ),
         };
         (ctx, rx)
     }

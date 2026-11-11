@@ -67,6 +67,7 @@ fn surface_boot_directory() -> messaging::MessagingDirectory {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: brenn_lib::messaging::WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Surface("deskbar".to_string()),
@@ -165,6 +166,7 @@ fn system_boot_directory() -> messaging::MessagingDirectory {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: brenn_lib::messaging::WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::System("relay".to_string()),
@@ -278,6 +280,7 @@ fn ephem_with(
             noise,
             sink: Sink::Drop,
             wake_min: brenn_lib::messaging::WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![],
         transport_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
@@ -648,6 +651,34 @@ fn a_surface_output_on_a_tools_address_panics() {
     let mut raw = valid_surface_raw();
     raw.outputs[0].channel = Some("brenn:tools/git-repo-pull".to_string());
     resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// A surface input bound to a `non_text` channel is refused: a page holds only
+/// text.
+#[test]
+#[should_panic(
+    expected = "subscription channel \"ephemeral:protobar-demo\" is declared `non_text`, \
+                and a surface carries only text bodies"
+)]
+fn a_surface_input_on_a_non_text_channel_panics() {
+    let mut frames = ephem("protobar-demo");
+    frames.resolved_channel.non_text = true;
+    resolve_surfaces(
+        &[valid_surface_raw()],
+        &surface_dir_with(frames),
+        &test_globals(),
+    );
+}
+
+/// The output arm of the same refusal: no surface binding, in either
+/// direction, is on a `non_text` channel.
+#[test]
+#[should_panic(expected = "channel \"brenn:alerts\" is declared `non_text`")]
+fn a_surface_output_on_a_non_text_channel_panics() {
+    let mut alerts = brenn_entry("brenn:alerts");
+    alerts.resolved_channel.non_text = true;
+    let dir = dir_of(vec![alerts, ephem("protobar-demo")]);
+    resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
 }
 
 /// The fixture surface with `sidecar` answering `protobar`'s call.
@@ -3146,6 +3177,7 @@ fn surface_input_binding_on_a_built_retain_zero_channel_panics() {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         }],
         &globals,
     );

@@ -29,6 +29,7 @@ mod config_files;
 mod container;
 mod dsl_key_parity;
 mod dsl_lower;
+mod dsl_non_text;
 mod dsl_tail_parity;
 mod events;
 mod integrations;

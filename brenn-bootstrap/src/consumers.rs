@@ -15,7 +15,7 @@ use brenn_lib::wasm_package::Verified;
 use brenn_messaging::Messenger;
 use brenn_obs::alerting::AlertDispatcher;
 use tokio::sync::Notify;
-use tracing::info;
+use tracing::{info, warn};
 
 /// The environment-free half of a `[[wasm_consumer]]`'s `ProcessorLoadSpec`:
 /// everything derivable from the resolved consumer alone. The remaining fields
@@ -58,6 +58,7 @@ pub(crate) fn lower_consumer_load_parts(
                         fill_mt: o.budget.fill_mt,
                         capacity_mt: o.budget.capacity_mt,
                     },
+                    non_text: o.non_text,
                 },
             )
         })
@@ -90,7 +91,7 @@ pub(crate) fn lower_consumer_load_parts(
         .iter()
         .inspect(|g| {
             assert!(
-                g.wit_import().is_some(),
+                g.names_interface(),
                 "consumer {:?}: granted `{}`, which names no WIT interface and belongs to a \
                  page — a top-level consumer has no page, and the config front end refuses \
                  the word",
@@ -196,6 +197,94 @@ pub(crate) fn assert_store_parent_exists(slug: &str, store_path: &std::path::Pat
         store_path,
     );
 }
+
+/// Refuse a component whose contract carries only text when any port it binds,
+/// input or output, is on a channel declared `non_text`.
+///
+/// Output ports count as well as inputs: a component reads its own parked
+/// messages back through its deferred view, so a 0.1.0 build bound to an output
+/// a 0.2.0 build once parked a non-text body on would be handed that body as a
+/// string. The tool inboxes are system channels and never `non_text`.
+///
+/// Asked after the artifact is loaded, because the contract is a fact of the
+/// artifact's imports and the configuration does not state it.
+///
+/// # Panics
+///
+/// On the first such port, naming the component, the port, the channel and
+/// both contracts. At boot that stops the process before any consumer starts;
+/// at reload the panic is caught and the reload refused.
+pub(crate) fn assert_contract_carries_bound_channels(
+    consumer: &ResolvedWasmConsumer,
+    contract: brenn_wasm::ProcessorContract,
+) {
+    if contract.carries_non_text_bodies() {
+        return;
+    }
+    let inputs = consumer
+        .inputs
+        .iter()
+        .map(|i| ("input", &i.port, &i.sub.channel_address, i.non_text));
+    let outputs = consumer
+        .outputs
+        .iter()
+        .map(|o| ("output", &o.port, &o.channel_address, o.non_text));
+    if let Some((direction, port, channel, _)) =
+        inputs.chain(outputs).find(|(_, _, _, non_text)| *non_text)
+    {
+        panic!(
+            "consumer {:?}: its {direction} port {port:?} is bound to {channel}, a channel \
+             declared `non_text`, and the component is built against {}, which carries only \
+             text — bind the port to a text-only channel, or load a build of the component \
+             against {}",
+            consumer.slug,
+            brenn_wasm::ProcessorContract::V0_1,
+            brenn_wasm::ProcessorContract::V0_2,
+        );
+    }
+}
+
+/// The text of the notice [`warn_string_contract_components`] writes.
+pub(crate) const STRING_CONTRACT_NOTICE: &str = "components built against the string component \
+     contract brenn:processor@0.1.0 are loaded; brenn intends to remove that contract after a \
+     byte-carrying contract is declared stable, and no removal is scheduled; nothing needs to \
+     change yet";
+
+/// The slugs of the components in `running` built against the string
+/// contract, sorted.
+pub(crate) fn string_contract_slugs<'a>(
+    running: impl IntoIterator<Item = (&'a str, brenn_wasm::ProcessorContract)>,
+) -> Vec<&'a str> {
+    let mut slugs: Vec<&str> = running
+        .into_iter()
+        .filter_map(|(slug, contract)| match contract {
+            brenn_wasm::ProcessorContract::V0_1 => Some(slug),
+            brenn_wasm::ProcessorContract::V0_2 => None,
+        })
+        .collect();
+    slugs.sort_unstable();
+    slugs
+}
+
+/// Tell the operator, in one `warn!`, which running components are built
+/// against the string contract, when any are; nothing otherwise.
+///
+/// `running` must be the whole running set, so the line describes what is
+/// running. It names no removal release and asks for no rebuild, which is true while the
+/// byte-carrying contract is provisional. A log line and not an alert: it
+/// reaches the console and the diagnostic file and pages nobody.
+pub(crate) fn warn_string_contract_components<'a>(
+    running: impl IntoIterator<Item = (&'a str, brenn_wasm::ProcessorContract)>,
+) {
+    let slugs = string_contract_slugs(running);
+    if slugs.is_empty() {
+        return;
+    }
+    // TODO(dual-contract-period-length): the notice names the removal period
+    // once the owner has ruled on its length.
+    warn!(count = slugs.len(), slugs = ?slugs, "{STRING_CONTRACT_NOTICE}");
+}
+
 /// The process-wide services a consumer's load spec is wired to.
 ///
 /// One value for the whole walk: every field is a service the process built
@@ -390,6 +479,7 @@ pub(crate) fn load_consumer(
             sync_caller,
         },
     );
+    assert_contract_carries_bound_channels(consumer, component.contract());
     let store_path_present = consumer.store_path.is_some();
     info!(
         slug = %consumer.slug,
@@ -452,7 +542,10 @@ pub(crate) fn sync_caller_over(
 ) -> brenn_wasm::SyncCallerFn {
     let handle = tokio::runtime::Handle::current();
     Arc::new(
-        move |target_slug: &str, target_port: &str, body: String, chain: &[String]| {
+        move |target_slug: &str,
+              target_port: &str,
+              body: brenn_envelope::MessageBody,
+              chain: &[String]| {
             let router = router.clone();
             let target_slug = target_slug.to_string();
             let target_port = target_port.to_string();
@@ -899,6 +992,96 @@ mod tests {
             });
         let provider = consumer_provider(&consumer, &runtime).expect("a providing consumer");
         assert!(Arc::ptr_eq(&provider, &runtime));
+    }
+
+    /// [`tool_consumer`] with one input port on `brenn:frames` and one output
+    /// port on `brenn:digest`, each bound to a channel whose `non_text` is the
+    /// one given.
+    fn bound_consumer(
+        input_non_text: bool,
+        output_non_text: bool,
+    ) -> brenn_lib::messaging::config::ResolvedWasmConsumer {
+        use brenn_lib::messaging::config::{
+            ResolvedSubscription, WasmInputPort, WasmOutputPort, WasmSinkBudget,
+        };
+        use brenn_lib::messaging::{Depth, NoiseLevel, Urgency, WakeMin};
+        let mut consumer = tool_consumer(&[brenn_lib::messaging::ComponentGrant::Ports], &[]);
+        consumer.inputs.push(WasmInputPort {
+            port: "frames".to_string(),
+            sub: ResolvedSubscription {
+                channel_uuid: uuid::Uuid::from_u128(1),
+                channel_address: "brenn:frames".to_string(),
+                push_depth: Depth::Bounded(1),
+                retain_depth: Depth::Bounded(1),
+                noise: NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+            non_text: input_non_text,
+        });
+        consumer.outputs.push(WasmOutputPort {
+            port: "digest".to_string(),
+            channel_uuid: uuid::Uuid::from_u128(2),
+            channel_address: "brenn:digest".to_string(),
+            default_urgency: Urgency::Normal,
+            budget: WasmSinkBudget {
+                fill_mt: 1000,
+                capacity_mt: 1000,
+            },
+            non_text: output_non_text,
+        });
+        consumer
+    }
+
+    #[test]
+    fn a_string_contract_component_on_text_only_channels_passes() {
+        assert_contract_carries_bound_channels(
+            &bound_consumer(false, false),
+            brenn_wasm::ProcessorContract::V0_1,
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "its input port \"frames\" is bound to brenn:frames, a channel \
+                               declared `non_text`, and the component is built against \
+                               brenn:processor@0.1.0"
+    )]
+    fn a_string_contract_component_reading_a_non_text_channel_panics() {
+        assert_contract_carries_bound_channels(
+            &bound_consumer(true, false),
+            brenn_wasm::ProcessorContract::V0_1,
+        );
+    }
+
+    /// The deferred view hands a component its own parked bodies, so an
+    /// output port is a reader too.
+    #[test]
+    #[should_panic(expected = "its output port \"digest\" is bound to brenn:digest")]
+    fn a_string_contract_component_writing_a_non_text_channel_panics() {
+        assert_contract_carries_bound_channels(
+            &bound_consumer(false, true),
+            brenn_wasm::ProcessorContract::V0_1,
+        );
+    }
+
+    #[test]
+    fn a_byte_contract_component_binds_any_channel() {
+        assert_contract_carries_bound_channels(
+            &bound_consumer(true, true),
+            brenn_wasm::ProcessorContract::V0_2,
+        );
+    }
+
+    #[test]
+    fn the_string_contract_slugs_are_the_0_1_components_sorted() {
+        use brenn_wasm::ProcessorContract::{V0_1, V0_2};
+        assert_eq!(
+            string_contract_slugs([("zeta", V0_1), ("frames", V0_2), ("alpha", V0_1)]),
+            ["alpha", "zeta"],
+        );
+        assert!(string_contract_slugs([("frames", V0_2)]).is_empty());
+        assert!(string_contract_slugs(std::iter::empty()).is_empty());
     }
 
     /// The host-side half of `store_path` resolution: an existing parent

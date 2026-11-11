@@ -34,7 +34,7 @@ use brenn_lib::messaging::{ChannelEntry, MessageEnvelope};
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
 use brenn_messaging::{GapReason as BusGapReason, Replay};
 use brenn_messaging_store::store::{ResumeCursor, gap_suffix};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::cursor::{self, CursorState};
@@ -692,6 +692,28 @@ pub async fn handle_subscribe(
         );
         return super::session::send_frame(&ctx.tx, result, counters).await;
     };
+
+    // A channel declared `non_text` may hold bodies this session's frames
+    // cannot carry. The ask is conforming — the attacher cannot see the
+    // declaration — so it is answered `Unavailable` and opens nothing.
+    if entry.resolved_channel.non_text
+        && !brenn_attach_proto::carries_non_text_bodies(ctx.version())
+    {
+        let result = ServerFrame::SubscribeResult {
+            channel: channel.to_string(),
+            outcome: SubscribeOutcome::Unavailable,
+            replay_count: 0,
+            gap: None,
+        };
+        info!(
+            attacher = %ctx.profile.attacher().as_str(),
+            channel = %entry.address,
+            version = ctx.version(),
+            "attach subscribe: channel is declared non_text and this protocol version carries \
+             only text; answering Unavailable"
+        );
+        return super::session::send_frame(&ctx.tx, result, counters).await;
+    }
 
     // Activate before the store read: from here the router queues live rows. A
     // row the replay below also serves arrives at the live arm at or below the

@@ -2031,6 +2031,7 @@ mod tests {
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             send_rate: SendRate::default(),
+            non_text: false,
         };
         let (_wake, snapshot) = h
             .messenger

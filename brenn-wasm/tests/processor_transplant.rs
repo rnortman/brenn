@@ -19,10 +19,9 @@
 
 mod common;
 
+use brenn_activation::{DeferredEntry, DeferredWindow, ProcessorActivation, ProcessorPortWindow};
 use brenn_wasm::{
-    ComponentGrant, ProcessorActivation, ProcessorComponent, ProcessorDeferredEntry,
-    ProcessorDeferredOp, ProcessorDeferredWindow, ProcessorLoadSpec, ProcessorOutcome,
-    ProcessorPortWindow,
+    ComponentGrant, ProcessorComponent, ProcessorDeferredOp, ProcessorLoadSpec, ProcessorOutcome,
 };
 use std::collections::HashMap;
 
@@ -88,7 +87,7 @@ fn activation(template: &serde_json::Value, spec: &serde_json::Value) -> Process
         .as_array()
         .expect("activation has a deferred array")
         .iter()
-        .map(|window| ProcessorDeferredWindow {
+        .map(|window| DeferredWindow {
             port: window["port"]
                 .as_str()
                 .expect("deferred window port")
@@ -97,7 +96,7 @@ fn activation(template: &serde_json::Value, spec: &serde_json::Value) -> Process
                 .as_array()
                 .expect("deferred entries array")
                 .iter()
-                .map(|entry| ProcessorDeferredEntry {
+                .map(|entry| DeferredEntry {
                     index: entry["index"].as_u64().expect("entry index") as u32,
                     payload: entry["payload"]
                         .as_str()
@@ -139,13 +138,13 @@ fn op_entry(op: &ProcessorDeferredOp) -> serde_json::Value {
         ProcessorDeferredOp::Edit {
             port,
             index,
-            payload,
+            body,
             deliver_after,
         } => serde_json::json!({
             "op": "edit",
             "port": port,
             "index": index,
-            "payload": payload,
+            "payload": body.as_ref().map(|b| b.as_text().expect("a 0.1.0 edit body is text")),
             "deliver_after": deliver_after,
         }),
     }
@@ -171,9 +170,11 @@ fn transcript_entry(outcome: ProcessorOutcome) -> serde_json::Value {
             for p in &publishes {
                 let port = port_of(&p.channel_address);
                 match p.deliver_after {
-                    None => immediate.push(serde_json::json!({ "port": port, "body": p.payload })),
+                    None => immediate.push(
+                        serde_json::json!({ "port": port, "body": p.body.as_text().unwrap() }),
+                    ),
                     Some(when) => deferred.push(serde_json::json!({
-                        "port": port, "body": p.payload, "deliver_after": when
+                        "port": port, "body": p.body.as_text().unwrap(), "deliver_after": when
                     })),
                 }
             }
@@ -249,7 +250,9 @@ fn run_script(script: &serde_json::Value) -> Vec<serde_json::Value> {
         .as_array()
         .expect("activations array")
         .iter()
-        .map(|spec| transcript_entry(component.handle(activation(template, spec))))
+        .map(|spec| {
+            transcript_entry(component.handle(common::host_activation(activation(template, spec))))
+        })
         .collect()
 }
 

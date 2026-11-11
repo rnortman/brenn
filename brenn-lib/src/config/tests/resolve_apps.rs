@@ -75,6 +75,7 @@ fn document(dir: &Path, subscribe_matcher: &str) -> BrennConfig {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         }],
         apps: vec![AppConfigRaw {
             slug: "assistant".to_string(),

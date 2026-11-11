@@ -47,6 +47,9 @@ const ERRORS_BARE: &str = "demo-errors";
 /// An ephemeral channel, so a batch can straddle the substrate split.
 const EPH: &str = "ephemeral:demo-eph";
 const EPH_BARE: &str = "demo-eph";
+/// A channel declared `non_text`, which a v4 attacher may publish to.
+const FRAMES: &str = "brenn:demo-frames";
+const FRAMES_BARE: &str = "demo-frames";
 
 /// Bodies over this answer `BodyTooLarge`. Small enough that a test writes the
 /// oversize case as a literal.
@@ -57,15 +60,20 @@ const MAX_BODY: usize = 64;
 /// assertion.
 const SESSION_ID: Uuid = Uuid::from_u128(0x5e5_5104);
 
-/// The fixture's authority shape: the sub-identity publishes onto `OUT`, `EPH`
-/// and `ERRORS`, the bare identity onto `ERRORS` only, and `ERRORS` carries the
-/// diagnostics posture.
+/// The fixture's authority shape: the sub-identity publishes onto `OUT`, `EPH`,
+/// `FRAMES` and `ERRORS`, the bare identity onto `ERRORS` only, and `ERRORS`
+/// carries the diagnostics posture.
 fn profile() -> TestProfile {
     TestProfile {
         publishable: HashMap::from([
             (
                 Some(SUB.to_string()),
-                HashSet::from([OUT.to_string(), EPH.to_string(), ERRORS.to_string()]),
+                HashSet::from([
+                    OUT.to_string(),
+                    EPH.to_string(),
+                    FRAMES.to_string(),
+                    ERRORS.to_string(),
+                ]),
             ),
             (None, HashSet::from([ERRORS.to_string()])),
         ]),
@@ -104,6 +112,7 @@ fn channel_raw(address: &str) -> ChannelConfigRaw {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     }
 }
 
@@ -134,6 +143,10 @@ async fn attach_with_body_cap(
             channel_raw(OUT_BARE),
             channel_raw(ERRORS_BARE),
             channel_raw(EPH),
+            ChannelConfigRaw {
+                non_text: true,
+                ..channel_raw(FRAMES_BARE)
+            },
         ],
         &MessagingGlobalConfig::default(),
     );
@@ -156,6 +169,7 @@ async fn attach_with_body_cap(
         policy.acls.brenn_publish = vec![
             ChannelMatcher::Exact(OUT_BARE.to_string()),
             ChannelMatcher::Exact(ERRORS_BARE.to_string()),
+            ChannelMatcher::Exact(FRAMES_BARE.to_string()),
         ];
         policy.acls.ephemeral_publish = vec![ChannelMatcher::Exact(EPH_BARE.to_string())];
     }
@@ -1187,6 +1201,76 @@ async fn an_edit_op_rewrites_the_parked_body() {
         .await;
     assert_eq!(parked.len(), 1);
     assert_eq!(parked[0].envelope.body.as_text().unwrap(), r#"{"v":2}"#);
+}
+
+/// A v4 attacher may publish to a `non_text` channel, and what it parks and
+/// edits there is its own frames' strings: the stored bodies are untyped text
+/// and every restated view carries them as text.
+#[tokio::test]
+async fn a_v4_view_on_a_non_text_channel_after_a_publish_and_an_edit_is_text() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach(&db).await;
+    assert!(
+        ctx.messenger
+            .directory()
+            .resolve(FRAMES)
+            .expect("the fixture declares the channel")
+            .resolved_channel
+            .non_text
+    );
+    let mut counters = SessionCounters::default();
+    let (mut sibling, _guard) = sibling_view_queue(&ctx);
+
+    let later = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis() as u64;
+    let publishes = [
+        entry(FRAMES, r#"{"now":true}"#, None),
+        entry(FRAMES, r#"{"v":1}"#, Some(later)),
+    ];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+    let view = one_view(&mut sibling);
+    assert_eq!(view.channel, FRAMES);
+    assert_eq!(view.entries.len(), 1);
+    assert_eq!(view.entries[0].body, r#"{"v":1}"#);
+    let parked_id = view.entries[0].message_id;
+
+    let ops = [BatchDeferredOp {
+        channel: FRAMES.to_string(),
+        message_id: parked_id,
+        op: DeferredOpKind::Edit {
+            body: Some(r#"{"v":2}"#.to_string()),
+            deliver_after: None,
+        },
+    }];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &[], &ops), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+    let view = one_view(&mut sibling);
+    assert_eq!(view.entries.len(), 1);
+    assert_eq!(view.entries[0].message_id, parked_id);
+    assert_eq!(view.entries[0].body, r#"{"v":2}"#);
+
+    let parked = ctx
+        .messenger
+        .deferred_view_for_sender(FRAMES, sender_of(Some(SUB)).as_str())
+        .await;
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].envelope.body.content_type(), None);
+    assert_eq!(parked[0].envelope.body.as_text(), Some(r#"{"v":2}"#));
+    let retained = ctx
+        .messenger
+        .store_for_address(FRAMES)
+        .replay_from(None, Depth::Bounded(512))
+        .await
+        .messages;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].message.body.content_type(), None);
+    assert_eq!(retained[0].message.body.as_text(), Some(r#"{"now":true}"#));
 }
 
 /// An edit body is charged against the frame's byte budget like a published

@@ -48,6 +48,7 @@ use brenn_attach_client::Millis;
 use brenn_attach_client::conn::ConnEvent;
 use brenn_attach_client::router::MessageStamp;
 use brenn_attach_proto::ServerFrame;
+use brenn_envelope::MessageBody;
 
 use crate::activation::{ActivationOutcome, ReadyActivation};
 use crate::command::{self, Command};
@@ -204,7 +205,7 @@ impl SyncDispatch {
 /// though its own return said ok.
 pub fn answer_for(outcome: ActivationOutcome) -> SyncAnswer {
     match outcome {
-        ActivationOutcome::Ok(reply) => SyncAnswer::Ok(reply),
+        ActivationOutcome::Ok(reply) => SyncAnswer::Ok(reply.map(MessageBody::text)),
         ActivationOutcome::Err(err) => SyncAnswer::Err(err.message),
         ActivationOutcome::Trap(_) => SyncAnswer::Trap,
     }

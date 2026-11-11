@@ -238,6 +238,7 @@ fn channel(
         // bound to this channel are checked against at compile time, and no
         // runtime field carries it.
         doctype: _,
+        non_text,
     } = attrs;
     ChannelConfigRaw {
         uuid,
@@ -257,6 +258,7 @@ fn channel(
         send_rate: rate
             .as_ref()
             .and_then(|attr| send_rate(&attr.value, "send_rate", errors)),
+        non_text: opt_bool(non_text.as_ref(), "non_text", errors).unwrap_or_default(),
     }
 }
 
@@ -576,8 +578,11 @@ fn refuse_key(span: &Span, key: &str, what: &str, legal: &[&str], errors: &mut V
 
 /// `keys` without `masked`, in order: the legal set a refusal names when a
 /// family's raw struct has no field for one key of the tail it shares.
-fn keys_without(keys: &'static [&'static str], masked: &str) -> Vec<&'static str> {
-    keys.iter().copied().filter(|key| *key != masked).collect()
+fn keys_without(keys: &'static [&'static str], masked: &[&str]) -> Vec<&'static str> {
+    keys.iter()
+        .copied()
+        .filter(|key| !masked.contains(key))
+        .collect()
 }
 
 /// An optional token attr, through the enum's own `Deserialize`.
@@ -2829,6 +2834,7 @@ struct LoweredIn {
     noise: Option<NoiseLevel>,
     wake_min: Option<WakeMin>,
     amplification: Option<f64>,
+    non_text: bool,
 }
 
 fn in_tail(tail: &InTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredIn {
@@ -2838,6 +2844,7 @@ fn in_tail(tail: &InTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredIn {
         noise,
         wake_min,
         amplification,
+        non_text,
     } = tail;
     LoweredIn {
         push_depth: opt_depth(push_depth.as_ref(), "push_depth", errors),
@@ -2845,6 +2852,7 @@ fn in_tail(tail: &InTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredIn {
         noise: opt_token(noise.as_ref(), "noise", errors),
         wake_min: opt_token(wake_min.as_ref(), "wake_min", errors),
         amplification: opt_flt(amplification.as_ref(), "amplification", errors),
+        non_text: opt_bool(non_text.as_ref(), NON_TEXT_KEY, errors).unwrap_or_default(),
     }
 }
 
@@ -2853,6 +2861,7 @@ struct LoweredOut {
     urgency: Option<Urgency>,
     publish_per_activation: Option<f64>,
     publish_capacity: Option<f64>,
+    non_text: bool,
 }
 
 fn out_tail(tail: &OutTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredOut {
@@ -2860,6 +2869,7 @@ fn out_tail(tail: &OutTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredOut {
         urgency,
         publish_per_activation,
         publish_capacity,
+        non_text,
     } = tail;
     LoweredOut {
         urgency: opt_token(urgency.as_ref(), "urgency", errors),
@@ -2869,6 +2879,7 @@ fn out_tail(tail: &OutTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredOut {
             errors,
         ),
         publish_capacity: opt_flt(publish_capacity.as_ref(), "publish_capacity", errors),
+        non_text: opt_bool(non_text.as_ref(), NON_TEXT_KEY, errors).unwrap_or_default(),
     }
 }
 
@@ -2881,6 +2892,7 @@ struct LoweredIo {
     amplification: Option<f64>,
     publish_per_activation: Option<f64>,
     publish_capacity: Option<f64>,
+    non_text: bool,
 }
 
 fn io_tail(tail: &IoTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredIo {
@@ -2892,6 +2904,7 @@ fn io_tail(tail: &IoTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredIo {
         amplification,
         publish_per_activation,
         publish_capacity,
+        non_text,
     } = tail;
     LoweredIo {
         push_depth: opt_depth(push_depth.as_ref(), "push_depth", errors),
@@ -2905,15 +2918,20 @@ fn io_tail(tail: &IoTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredIo {
             errors,
         ),
         publish_capacity: opt_flt(publish_capacity.as_ref(), "publish_capacity", errors),
+        non_text: opt_bool(non_text.as_ref(), NON_TEXT_KEY, errors).unwrap_or_default(),
     }
 }
+
+/// The binding-tail key that says a port needs a channel that may carry
+/// non-text bodies.
+const NON_TEXT_KEY: &str = "non_text";
 
 const WEBHOOK_MASKED_KEY: &str = "noise";
 
 /// The keys of a `subscribe` tail that this family's raw struct has a field
 /// for, for the refusal a family-inappropriate key gets.
 static WEBHOOK_SUBSCRIPTION_KEYS: LazyLock<Vec<&'static str>> =
-    LazyLock::new(|| keys_without(SubscribeTail::KEYS, WEBHOOK_MASKED_KEY));
+    LazyLock::new(|| keys_without(SubscribeTail::KEYS, &[WEBHOOK_MASKED_KEY]));
 
 fn messaging_subscription(
     channel: String,
@@ -3152,6 +3170,7 @@ fn wasm_bindings(
                     &port,
                     (false, true, false),
                     (tail.push_depth, tail.retain_depth),
+                    tail.non_text,
                 );
                 out.subscriptions.push(WasmConsumerSubscriptionRaw {
                     channel: connected(binding.chan.as_ref(), channel, &port, &owner),
@@ -3161,6 +3180,7 @@ fn wasm_bindings(
                     noise: tail.noise,
                     wake_min: tail.wake_min,
                     amplification: tail.amplification,
+                    non_text: tail.non_text,
                 });
             }
             RTail::Out(tail) => {
@@ -3174,6 +3194,7 @@ fn wasm_bindings(
                     &port,
                     (true, false, false),
                     (None, None),
+                    tail.non_text,
                 );
                 out.outputs.push(WasmConsumerOutputRaw {
                     channel: connected(binding.chan.as_ref(), channel, &port, &owner),
@@ -3181,6 +3202,7 @@ fn wasm_bindings(
                     urgency: tail.urgency,
                     publish_per_activation: tail.publish_per_activation,
                     publish_capacity: tail.publish_capacity,
+                    non_text: tail.non_text,
                 });
             }
             RTail::Io(tail) => {
@@ -3194,6 +3216,7 @@ fn wasm_bindings(
                     &port,
                     (true, true, true),
                     (tail.push_depth, tail.retain_depth),
+                    tail.non_text,
                 );
                 match io_shape(binding.chan.as_ref(), channel) {
                     IoShape::Pair(address) => {
@@ -3205,6 +3228,7 @@ fn wasm_bindings(
                             noise: tail.noise,
                             wake_min: None,
                             amplification: tail.amplification,
+                            non_text: tail.non_text,
                         });
                         out.outputs.push(WasmConsumerOutputRaw {
                             channel: Some(address),
@@ -3212,6 +3236,7 @@ fn wasm_bindings(
                             urgency: tail.urgency,
                             publish_per_activation: tail.publish_per_activation,
                             publish_capacity: tail.publish_capacity,
+                            non_text: tail.non_text,
                         });
                     }
                     IoShape::Port(channel) => {
@@ -3225,6 +3250,7 @@ fn wasm_bindings(
                             urgency: tail.urgency,
                             publish_per_activation: tail.publish_per_activation,
                             publish_capacity: tail.publish_capacity,
+                            non_text: tail.non_text,
                         });
                     }
                 }
@@ -3253,6 +3279,7 @@ fn link_endpoint(
     port: &str,
     roles: (bool, bool, bool),
     window: (Option<Depth>, Option<Depth>),
+    non_text: bool,
 ) {
     let Some(RChanRef::Link(id)) = chan else {
         return;
@@ -3270,6 +3297,7 @@ fn link_endpoint(
         io_port,
         push_depth,
         retain_depth,
+        non_text,
     });
 }
 
@@ -3580,6 +3608,7 @@ fn surface_bindings(
                     &SURFACE_IN_KEYS,
                     errors,
                 );
+                refuse_surface_non_text(masked.non_text.take().as_ref(), &what, errors);
                 let tail = in_tail(&masked, errors);
                 link_endpoint(
                     endpoints,
@@ -3591,6 +3620,7 @@ fn surface_bindings(
                     &port,
                     (false, true, false),
                     (tail.push_depth, tail.retain_depth),
+                    false,
                 );
                 out.subscriptions.push(SurfaceSubscriptionRaw {
                     channel: connected(binding.chan.as_ref(), channel, &port, at.owner),
@@ -3603,7 +3633,9 @@ fn surface_bindings(
                 });
             }
             RTail::Out(tail) => {
-                let tail = out_tail(tail, errors);
+                let mut masked = tail.clone();
+                refuse_surface_non_text(masked.non_text.take().as_ref(), &what, errors);
+                let tail = out_tail(&masked, errors);
                 link_endpoint(
                     endpoints,
                     binding.chan.as_ref(),
@@ -3614,6 +3646,7 @@ fn surface_bindings(
                     &port,
                     (true, false, false),
                     (None, None),
+                    false,
                 );
                 out.outputs.push(SurfaceOutputRaw {
                     instance: at.instance.to_owned(),
@@ -3633,6 +3666,7 @@ fn surface_bindings(
                     &SURFACE_IO_KEYS,
                     errors,
                 );
+                refuse_surface_non_text(masked.non_text.take().as_ref(), &what, errors);
                 let tail = io_tail(&masked, errors);
                 link_endpoint(
                     endpoints,
@@ -3644,6 +3678,7 @@ fn surface_bindings(
                     &port,
                     (true, true, true),
                     (tail.push_depth, tail.retain_depth),
+                    false,
                 );
                 match io_shape(binding.chan.as_ref(), channel) {
                     IoShape::Pair(address) => {
@@ -3684,18 +3719,40 @@ fn surface_bindings(
     }
 }
 
-/// The one `in`/`io` tail key a surface binding does not read: a page's
-/// throughput is the page's, not a knob the binding sets.
+/// The `in`/`io` tail key a surface binding has no field for: a page's
+/// throughput is the page's, not a knob the binding sets. `non_text` is the
+/// other key no surface binding reads, refused with its own reason.
 const SURFACE_MASKED_KEY: &str = "amplification";
+
+/// A surface port that says it needs a channel that may carry non-text
+/// bodies, refused at its own value.
+///
+/// The surface host hands a component its messages as text and the page's
+/// wire carries only text, so no surface binding can be served such a
+/// channel. A port with no `channel` of its own — page-local, or a link with
+/// a surface endpoint — has no other place the need could be declared.
+fn refuse_surface_non_text(attr: Option<&Attr<RVal>>, what: &str, errors: &mut Vec<Diagnostic>) {
+    if let Some(attr) = attr {
+        errors.push(Diagnostic::at(
+            format!(
+                "{what} states `{NON_TEXT_KEY}`: a surface port carries only text — the \
+                 surface host serves the string component contract and the page's wire \
+                 carries text frames — so it can be bound to no channel that may carry \
+                 non-text bodies"
+            ),
+            attr.value.span().clone(),
+        ));
+    }
+}
 
 /// The `in` tail keys a surface binding reads, for the refusal that says
 /// `amplification` is not one of them.
 static SURFACE_IN_KEYS: LazyLock<Vec<&'static str>> =
-    LazyLock::new(|| keys_without(InTail::<()>::KEYS, SURFACE_MASKED_KEY));
+    LazyLock::new(|| keys_without(InTail::<()>::KEYS, &[SURFACE_MASKED_KEY, NON_TEXT_KEY]));
 
 /// The `io` tail keys a surface binding reads.
 static SURFACE_IO_KEYS: LazyLock<Vec<&'static str>> =
-    LazyLock::new(|| keys_without(IoTail::<()>::KEYS, SURFACE_MASKED_KEY));
+    LazyLock::new(|| keys_without(IoTail::<()>::KEYS, &[SURFACE_MASKED_KEY, NON_TEXT_KEY]));
 
 // ---------------------------------------------------------------------------
 // Remotes

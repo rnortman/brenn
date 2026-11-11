@@ -7,12 +7,13 @@
 //! Both hosts mint it — the wasmtime host on the backend, the kernel on the
 //! surface — and a component sees the same shape under either.
 //!
-//! An envelope is its canonical JSON text — the `envelope-json` of
-//! `processor.wit` — at both placements, and [`ProcessorActivation`] /
-//! [`ProcessorPortWindow`] are that one carrier, named here so neither host
-//! re-declares it. The generic parameter `E` survives only so this crate's own
-//! tests can window `&'static str` bodies; it has exactly one production
-//! instantiation.
+//! What crosses into a guest is an envelope as its canonical JSON text — the
+//! `envelope-json` of `processor.wit` — at both placements, and
+//! [`ProcessorActivation`] / [`ProcessorPortWindow`] are that one carrier, named
+//! here so neither host re-declares it. The parameters `E` (a window element)
+//! and `D` (a parked message) let the backend carry envelopes up to the point
+//! it lowers them for one component, and let this crate's own tests window
+//! `&'static str` bodies.
 //!
 //! This crate carries the *rules* as well as the shapes, and both hosts compile
 //! against it. A rule written on one host's side only is a rule the other host's
@@ -355,16 +356,20 @@ pub const WINDOW_DEPTH_CEILING: u64 = 1_000;
 /// order, whether or not it has new messages — a port with nothing new arrives
 /// as a pure-context window. A component must not assume `ports.len() == 1`, and
 /// must not assume a port's presence means that port is why it woke.
+///
+/// `E` is a window element and `D` a deferred entry's payload. Both hosts lower
+/// to the string instantiation, [`ProcessorActivation`]; a host that still has
+/// to choose a component's contract carries something richer up to that point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Activation<E> {
+pub struct Activation<E, D = String> {
     /// One window per bound input port, in config order.
     pub ports: Vec<PortWindow<E>>,
     /// One deferred-window per bound output port, in config order — the
     /// component's own parked (deferred) messages on each output channel, a
     /// snapshot at drain. Separate from `ports`: a future in/out port appears in
     /// both lists, additively.
-    pub deferred: Vec<DeferredWindow>,
+    pub deferred: Vec<DeferredWindow<D>>,
     /// The host's wall clock at drain, epoch milliseconds UTC. Lets a guest
     /// compute an absolute future instant (e.g. for a deferred publish) without
     /// holding a clock of its own. `None` when the host exposes no UTC wall
@@ -397,31 +402,31 @@ pub struct Activation<E> {
 /// own schedule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct DeferredWindow {
+pub struct DeferredWindow<D = String> {
     /// Logical output port name, as declared in config — never a raw channel
     /// address.
     pub port: String,
     /// This component's parked messages on the port's channel, soonest release
     /// first.
-    pub entries: Vec<DeferredEntry>,
+    pub entries: Vec<DeferredEntry<D>>,
 }
 
 /// One parked message in a [`DeferredWindow`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct DeferredEntry {
+pub struct DeferredEntry<D = String> {
     /// Position within the window's `entries` list (which is release-ordered).
     /// The handle a future cancel/edit names; snapshot-relative, valid only
     /// against the window it arrived in.
     pub index: u32,
-    /// The message body the component published, as handed to the deferred
-    /// publish — not an envelope.
+    /// The message the component parked. In the string instantiation this is
+    /// the body as handed to the deferred publish — not an envelope — so a
+    /// component gets back the same opaque string it handed the host.
     ///
-    /// A body rather than the activation's envelope type `E`: what a component
-    /// gets back here is the same opaque string it handed the host, so this half
-    /// of the activation carries the same shape on every hosting even where the
-    /// input windows do not.
-    pub payload: String,
+    /// A parameter of its own rather than the activation's envelope type `E`:
+    /// the string instantiation carries an envelope's JSON in a window and only
+    /// a body here.
+    pub payload: D,
     /// Scheduled release time, epoch milliseconds UTC.
     pub deliver_after: u64,
 }
@@ -537,7 +542,7 @@ impl<E> PortWindow<E> {
     }
 }
 
-impl<E> Activation<E> {
+impl<E, D> Activation<E, D> {
     /// Total messages lost to push overflow across every bound port since each
     /// port's previous activation.
     pub fn total_dropped(&self) -> u64 {
@@ -665,7 +670,7 @@ mod tests {
 
         // Every bound port every activation, config order — the ports vec is the
         // whole bound set, not just the ports that woke the instance.
-        let both = Activation {
+        let both: Activation<&str> = Activation {
             ports: vec![window, context_only],
             deferred: vec![],
             now: None,
@@ -709,7 +714,7 @@ mod tests {
         assert_eq!(all_new.new_envelopes(), &["n-1"]);
         assert_eq!(all_new.new_len(), 1);
 
-        let activation = Activation {
+        let activation: Activation<&str> = Activation {
             ports: vec![with_new, context_only, all_new],
             deferred: vec![],
             now: None,
@@ -733,7 +738,7 @@ mod tests {
                 dropped: 0,
             }
         }
-        let mut activation = Activation {
+        let mut activation: Activation<&str> = Activation {
             ports: vec![window("agenda", "snapshot"), window("ack", "dismiss")],
             deferred: vec![],
             now: None,
@@ -764,7 +769,7 @@ mod tests {
                 dropped: 0,
             }
         }
-        let mut activation = Activation {
+        let mut activation: Activation<&str> = Activation {
             ports: vec![window("agenda", "snapshot"), window("ack", "dismiss")],
             deferred: vec![],
             now: None,
@@ -798,7 +803,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "carries the one live request")]
     fn a_sync_window_with_two_requests_is_a_host_bug() {
-        let activation = Activation {
+        let activation: Activation<&str> = Activation {
             ports: vec![PortWindow {
                 port: "ack".to_string(),
                 envelopes: vec!["dismiss", "snooze"],
@@ -818,7 +823,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "carries the window of the port it names")]
     fn a_sync_port_with_no_window_is_a_host_bug() {
-        let activation = Activation {
+        let activation: Activation<&str> = Activation {
             ports: vec![PortWindow {
                 port: "agenda".to_string(),
                 envelopes: vec!["snapshot"],

@@ -1396,6 +1396,7 @@ mod tests {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }];
         let mut reader = consumer("reader", &[]);
         reader.subscriptions = vec![WasmConsumerSubscriptionRaw {
@@ -1406,6 +1407,7 @@ mod tests {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }];
         after.wasm_consumers = vec![producer, reader];
         after.links = vec![LinkConfigRaw {
@@ -1422,6 +1424,7 @@ mod tests {
                     io_port: false,
                     push_depth: None,
                     retain_depth: None,
+                    non_text: false,
                 },
                 LinkEndpointRaw {
                     host: LinkHostRaw::Wasm {
@@ -1433,6 +1436,7 @@ mod tests {
                     io_port: false,
                     push_depth: Some(Depth::Bounded(4)),
                     retain_depth: Some(Depth::Bounded(4)),
+                    non_text: false,
                 },
             ],
         }];
@@ -1493,6 +1497,7 @@ mod tests {
                     noise: None,
                     wake_min: None,
                     amplification: None,
+                    non_text: false,
                 }];
             listener.mqtt_subscribe_acl = vec![brenn_lib::access::raw::MqttSubMatcherRaw {
                 client: "ha".to_string(),

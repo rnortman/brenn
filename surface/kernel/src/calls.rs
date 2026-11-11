@@ -17,6 +17,7 @@
 //! against [`brenn_surface_contract::call_error_str`]'s vocabulary.
 
 use brenn_activation::sync::{CallDisposition, SyncAnswer, call_disposition};
+use brenn_envelope::MessageBody;
 
 use crate::contract::CallError;
 
@@ -36,16 +37,35 @@ use crate::contract::CallError;
 /// document is the only source of call wiring and it refused cycles at compile
 /// time, so a target that finds itself in its caller's chain means that check
 /// was bypassed.
+///
+/// On a non-text reply or a text-only-peer refusal: every instance on a page
+/// reads and writes text only, so neither can arise here.
 pub fn call_answer(
     caller: &str,
     port: &str,
     answer: SyncAnswer,
 ) -> Result<Option<String>, CallError> {
     match call_disposition(answer, caller, port) {
-        Ok(reply) => Ok(reply),
+        Ok(reply) => Ok(reply.map(|reply| page_reply_text(&reply).to_owned())),
         Err(CallDisposition::Failed) => Err(CallError::Failed),
         Err(CallDisposition::Refused) => Err(CallError::Refused),
+        Err(CallDisposition::TextOnlyPeer) => panic!(
+            "surface client: call by {caller} on port {port} was refused as a non-text request, \
+             which no instance on a page can make"
+        ),
     }
+}
+
+/// A sync reply on a page, as the text it always is.
+///
+/// # Panics
+///
+/// On a non-text body: every reply on a page was written by a page instance,
+/// whose contract carries only text.
+pub fn page_reply_text(reply: &MessageBody) -> &str {
+    reply
+        .as_text()
+        .unwrap_or_else(|| panic!("surface client: a sync reply on a page is not text ({reply:?})"))
 }
 
 #[cfg(test)]
@@ -57,7 +77,11 @@ mod tests {
     #[test]
     fn a_peers_reply_is_the_answer() {
         assert_eq!(
-            call_answer("menu", "lookup", SyncAnswer::Ok(Some("42".to_string()))),
+            call_answer(
+                "menu",
+                "lookup",
+                SyncAnswer::Ok(Some(MessageBody::text("42")))
+            ),
             Ok(Some("42".to_string()))
         );
         assert_eq!(

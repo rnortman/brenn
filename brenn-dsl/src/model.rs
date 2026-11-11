@@ -1141,6 +1141,10 @@ vocabulary! {
         /// a tuning — a tuning matches a family the system mints, so it names no
         /// single document contract.
         opt doctype: V,
+        /// Whether the channel may carry non-text bodies; absent is text-only.
+        /// Legal on a declaration, refused on a tuning — a system-minted family
+        /// is written and read by host code that parses text.
+        opt non_text: V,
     }
 
     /// A `surface` body's attrs.
@@ -1381,6 +1385,10 @@ vocabulary! {
         opt noise: Word,
         opt wake_min: Word,
         opt amplification: V,
+        /// The port needs a channel that may carry non-text bodies: the
+        /// declaration of a channel the bindings synthesize, a check against a
+        /// declared one. A consumer's alone; refused on a surface port.
+        opt non_text: V,
     }
 
     /// An `out` binding's tail: the union across the consumer and surface
@@ -1393,6 +1401,8 @@ vocabulary! {
         opt urgency: Word,
         opt publish_per_activation: V,
         opt publish_capacity: V,
+        /// As on an `in` tail.
+        opt non_text: V,
     }
 
     /// An `io` binding's tail: a port that reads and writes, so the union of
@@ -1412,6 +1422,8 @@ vocabulary! {
         opt amplification: V,
         opt publish_per_activation: V,
         opt publish_capacity: V,
+        /// As on an `in` tail.
+        opt non_text: V,
     }
 }
 
@@ -2655,7 +2667,12 @@ mod tests {
     fn a_vocabulary_states_its_keys_as_data() {
         assert_eq!(
             OutTail::<()>::KEYS,
-            ["urgency", "publish_per_activation", "publish_capacity"]
+            [
+                "urgency",
+                "publish_per_activation",
+                "publish_capacity",
+                "non_text"
+            ]
         );
         assert_eq!(
             SubscribeTail::KEYS,

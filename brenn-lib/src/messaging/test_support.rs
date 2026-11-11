@@ -101,6 +101,7 @@ pub fn test_channel_entry(name: &str, subscribers: Vec<SubscriberEntry>) -> Chan
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers,
         transport_type: ChannelScheme::Brenn,

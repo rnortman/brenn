@@ -901,6 +901,7 @@ mod tests {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         });
         candidate.wasm_consumers = vec![WasmConsumerConfigRaw::minimal(
             "sifter",

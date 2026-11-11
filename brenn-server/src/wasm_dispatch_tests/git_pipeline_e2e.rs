@@ -141,6 +141,7 @@ fn webhook_channel(endpoint_slug: &str) -> ChannelEntry {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(PARSER_SLUG.to_string()),
@@ -327,6 +328,7 @@ async fn build_pipeline() -> Pipeline {
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             },
             WasmInputPort {
                 port: "github".to_string(),
@@ -339,6 +341,7 @@ async fn build_pipeline() -> Pipeline {
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             },
         ],
         outputs: vec![],
@@ -420,6 +423,7 @@ async fn build_pipeline() -> Pipeline {
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             },
             inbox_input_port(CONSUMER_SLUG, &inbox_channel),
         ],

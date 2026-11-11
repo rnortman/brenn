@@ -724,6 +724,11 @@ A bus message body is bytes with an optional content type, and is *text* or
   applied at the transport edge: a broker payload that is not text arrives as
   metadata, never as bytes.
 
+The first producer of such bodies on the bus is a WASM component built against
+the byte-carrying contract `brenn:processor@0.2.0` (§8), publishing onto a
+channel declared `non_text`; a conversation subscribed to that channel is
+shown the placeholder, under this rule unchanged.
+
 The reason is the model's context, not the wire: bytes shown to a model are
 either noise it will misread or an injection channel nobody reviewed, and a
 lossy decoding is both. A path that puts a non-text body's bytes, or any
@@ -809,6 +814,20 @@ internally-originated.
   The boot panic remains the primary structural check; the read gate is what
   keeps enforcement from resting on that check holding forever. A delivery path
   that reads a channel without consulting the predicate is a finding.
+- **A guest built against the byte-carrying contract hands the host arbitrary
+  bytes and a content type.** Under `brenn:processor@0.2.0` a publish, a
+  deferred publish or edit, a sync call and a sync reply each carry a body of
+  bytes with an optional content type, not a string. The host validates the
+  content type's syntax and, for a text type, that the bytes are UTF-8, in one
+  place (`MessageBody::from_parts`), before the body reaches any gate that
+  spends; the size caps count raw bytes. The content type is the guest's
+  assertion and is **never checked against the bytes**: it carries exactly the
+  trust of the body it labels, and a downstream decision that treats it as
+  verified is a finding. A non-text body is admitted only onto a channel
+  declared `non_text`, and every reader that can only represent text — a 0.1.0
+  component, a surface, an attach v4 session — is refused at binding or at
+  subscribe rather than at delivery; a store write of a non-text body to a
+  text-only channel panics as a host bug.
 
 **What the reviewer verifies:** capabilities are deny-by-default and
 structurally enforced; no ambient access exists; every engine that compiles guest

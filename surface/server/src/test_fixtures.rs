@@ -135,6 +135,7 @@ fn channel_entry_at(
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     };
     build_channel_entries(&[raw], &MessagingGlobalConfig::default())
         .pop()

@@ -211,6 +211,16 @@ pub fn run_messaging_migrations(conn: &Connection) {
     )
     .expect("failed to create idx_messaging_messages_retained_seq");
 
+    // The rows whose body is a BLOB value, which are exactly the non-text bodies
+    // (`body_column`), by channel: what `channels_holding_non_text_rows` reads.
+    // Nearly every row is text, so the index holds nearly nothing.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messaging_messages_non_text_channel
+            ON messaging_messages(channel_uuid)
+            WHERE typeof(body) = 'blob';",
+    )
+    .expect("failed to create idx_messaging_messages_non_text_channel");
+
     // WASM consumer failure quarantine table.
     // One row per failed batch; used as the durable audit/replay surface for
     // per-batch dispositions that did not complete successfully.

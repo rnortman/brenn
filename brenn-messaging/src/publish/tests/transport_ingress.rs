@@ -64,6 +64,7 @@ async fn build_webhook_messenger(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::App("myapp".to_string()),
@@ -165,6 +166,7 @@ async fn build_mqtt_messenger(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::App("myapp".to_string()),

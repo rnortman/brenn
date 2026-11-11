@@ -72,6 +72,9 @@ struct Endpoint {
     /// The subscribing half's declared depths, `None` for a publish-only
     /// endpoint, which contributes nothing to the fold.
     depths: Option<(Depth, Depth)>,
+    /// Whether the port needs a channel that may carry non-text bodies. The
+    /// channel may carry them iff any endpoint says so.
+    non_text: bool,
 }
 
 /// The depths a subscribing endpoint contributes to its channel's fold.
@@ -111,6 +114,7 @@ fn wasm_io_endpoint(slug: &str, io: &WasmConsumerIoPortRaw) -> Endpoint {
         subscribes: true,
         io_port: true,
         depths: Some(depths),
+        non_text: io.non_text,
     }
 }
 
@@ -128,6 +132,8 @@ fn surface_io_endpoint(slug: &str, io: &SurfaceIoPortRaw) -> Endpoint {
         subscribes: true,
         io_port: true,
         depths: Some(depths),
+        // A surface port states no such need: its families have no field.
+        non_text: false,
     }
 }
 
@@ -144,6 +150,9 @@ struct PortDeclaration {
     push_depth: Option<Depth>,
     /// The subscribing declaration's `retain_depth`. See [`Self::push_depth`].
     retain_depth: Option<Depth>,
+    /// Whether any of the port's declarations says it needs a channel that may
+    /// carry non-text bodies.
+    non_text: bool,
 }
 
 impl PortDeclaration {
@@ -171,6 +180,9 @@ fn wasm_port_declaration(consumer: &WasmConsumerConfigRaw, port: &str) -> PortDe
             .or_else(|| out.and_then(|o| o.channel.clone())),
         push_depth,
         retain_depth,
+        non_text: io.is_some_and(|p| p.non_text)
+            || sub.is_some_and(|s| s.non_text)
+            || out.is_some_and(|o| o.non_text),
     }
 }
 
@@ -206,6 +218,7 @@ fn surface_port_declaration(
             .or_else(|| out.and_then(|o| o.channel.clone())),
         push_depth,
         retain_depth,
+        non_text: false,
     }
 }
 
@@ -314,6 +327,14 @@ fn assert_endpoint_declared(
              only a subscribing half has one, and this one would fold into nothing",
         );
     }
+    assert!(
+        raw.non_text == declaration.non_text,
+        "config: {label}: endpoint {reference:?} says non_text = {}, and its declaration says \
+         {} — the link's channel may carry non-text bodies iff a port bound to it says so, and \
+         the port's declaration is where it says it",
+        raw.non_text,
+        declaration.non_text,
+    );
 }
 
 /// The endpoint one link binding presents.
@@ -350,6 +371,7 @@ fn link_endpoint(label: &str, raw: &LinkEndpointRaw) -> Endpoint {
         subscribes: raw.subscribes,
         io_port: raw.io_port,
         depths,
+        non_text: raw.non_text,
     }
 }
 
@@ -471,6 +493,7 @@ pub(crate) fn wasm_io_bindings(
             // WASM subscription, so there is nothing to carry across.
             wake_min: None,
             amplification: io.amplification,
+            non_text: io.non_text,
         })
         .collect();
     let outputs = io_ports
@@ -481,6 +504,7 @@ pub(crate) fn wasm_io_bindings(
             urgency: io.urgency,
             publish_per_activation: io.publish_per_activation,
             publish_capacity: io.publish_capacity,
+            non_text: io.non_text,
         })
         .collect();
     (subscriptions, outputs)
@@ -917,6 +941,7 @@ fn synthesize_entry(
             noise: defaults.default_noise,
             sink,
             wake_min: defaults.default_wake_min,
+            non_text: endpoints.iter().any(|endpoint| endpoint.non_text),
         },
         subscribers: vec![],
         transport_type: placement.scheme,

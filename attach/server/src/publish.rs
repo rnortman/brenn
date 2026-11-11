@@ -748,7 +748,7 @@ async fn apply_deferred_op(
                     op.channel,
                     sender.as_str(),
                     op.message_id,
-                    body.clone(),
+                    body.clone().map(brenn_envelope::MessageBody::text),
                     *release_at,
                     now,
                 )

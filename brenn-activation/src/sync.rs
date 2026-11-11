@@ -12,7 +12,7 @@
 //! way on the other is a component model with two dialects, which is what this
 //! crate exists to refuse.
 
-use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
+use brenn_envelope::{ChannelScheme, MessageBody, MessageEnvelope, Urgency};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -57,7 +57,7 @@ pub fn sync_channel(port: &str) -> String {
 pub fn sync_request(
     instance: &str,
     port: &str,
-    body: String,
+    body: MessageBody,
     message_id: Uuid,
     publish_ts: DateTime<Utc>,
 ) -> MessageEnvelope {
@@ -67,7 +67,7 @@ pub fn sync_request(
         channel: sync_channel(port),
         sender: instance.to_string(),
         publish_ts,
-        body: body.into(),
+        body,
         reply_to: None,
         delivery_deadline: None,
         deliver_after: None,
@@ -90,9 +90,11 @@ pub fn sync_request(
 /// wrote it, and truncating it or answering an error in its place would hand
 /// the caller something the callee never said. An oversize request is a caller
 /// bug the host refuses to assemble.
+///
+/// The cap counts raw bytes, whatever the body's content type.
 #[must_use]
-pub fn within_body_cap(reply: &str, cap: usize) -> bool {
-    reply.len() <= cap
+pub fn within_body_cap(body: &[u8], cap: usize) -> bool {
+    body.len() <= cap
 }
 
 /// How one sync-call request finished, in the vocabulary both hosts answer in:
@@ -103,7 +105,7 @@ pub enum SyncAnswer {
     /// The entry returned ok, with the reply it answered with (or `None` if it
     /// answered without one). Its buffer flushed before this answer was handed
     /// back.
-    Ok(Option<String>),
+    Ok(Option<MessageBody>),
     /// The entry returned err, carrying its own sanitized account. The buffer was
     /// discarded and a failure counted; the callee keeps running.
     Err(String),
@@ -122,9 +124,10 @@ pub enum SyncAnswer {
 /// request through — never a configured outcome and never a state a conforming
 /// deployment reaches. The caller is told, and faults on it.
 ///
-/// Two of the four are unreachable on the backend, for the same kind of reason
-/// `Fatal` noise is: that host has no terminal instance state and no unwired
-/// mount to be in.
+/// Three of them are unreachable on the backend, for the same kind of reason
+/// `Fatal` noise is: that host has no terminal instance state, no unwired mount
+/// to be in and no unmounted `dom` instance. One is unreachable on the page,
+/// whose instances all read the string contract and whose bodies are all text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncRefusal {
     /// The target is already in flight in the caller's own chain. On the page
@@ -149,6 +152,10 @@ pub enum SyncRefusal {
     /// consumer's mount is its task's first statement, so a request can never
     /// overtake it.
     Unmounted,
+    /// The request body is not text and the target is built against a
+    /// component contract that carries only text, so it has no way to read the
+    /// request. Backend only — no body on a page is anything but text.
+    TextOnlyTarget,
 }
 
 impl SyncRefusal {
@@ -176,6 +183,10 @@ impl SyncRefusal {
                 "refused sync activation of {instance} on port {port}: the instance renders and \
                  its mount has not run yet"
             ),
+            Self::TextOnlyTarget => format!(
+                "refused sync activation of {instance} on port {port}: the request body is not \
+                 text and the instance's component contract carries only text"
+            ),
         }
     }
 }
@@ -200,6 +211,11 @@ pub enum CallDisposition {
     /// states a deployment or a mount pass moves through, and a component reading
     /// them apart would be reading host topology out of an error code.
     Refused,
+    /// The peer did not run because the request body is not text and the
+    /// peer's contract carries only text. Unlike the states folded into
+    /// [`Self::Refused`], this one is the caller's own doing and is told apart:
+    /// a caller that can send bytes can also send text.
+    TextOnlyPeer,
 }
 
 /// The peer's reply, or the disposition of an answer that carried none.
@@ -214,7 +230,7 @@ pub fn call_disposition(
     answer: SyncAnswer,
     caller: &str,
     port: &str,
-) -> Result<Option<String>, CallDisposition> {
+) -> Result<Option<MessageBody>, CallDisposition> {
     match answer {
         SyncAnswer::Ok(reply) => Ok(reply),
         SyncAnswer::Err(_) | SyncAnswer::Trap => Err(CallDisposition::Failed),
@@ -222,7 +238,13 @@ pub fn call_disposition(
             "call by {caller} on port {port} was refused re-entrant — the document's acyclicity \
              check was bypassed"
         ),
-        SyncAnswer::Refused(_) => Err(CallDisposition::Refused),
+        SyncAnswer::Refused(SyncRefusal::TextOnlyTarget) => Err(CallDisposition::TextOnlyPeer),
+        SyncAnswer::Refused(
+            SyncRefusal::Unregistered
+            | SyncRefusal::Failed
+            | SyncRefusal::Unwired
+            | SyncRefusal::Unmounted,
+        ) => Err(CallDisposition::Refused),
     }
 }
 
@@ -253,7 +275,7 @@ mod tests {
         let request = sync_request(
             "kiosk-menu",
             "resolve",
-            "{\"q\":\"pier\"}".to_string(),
+            MessageBody::text("{\"q\":\"pier\"}"),
             message_id,
             publish_ts,
         );
@@ -273,10 +295,12 @@ mod tests {
 
     #[test]
     fn a_body_is_within_the_cap_up_to_and_including_the_cap() {
-        assert!(within_body_cap("", 4));
-        assert!(within_body_cap("abc", 4));
-        assert!(within_body_cap("abcd", 4));
-        assert!(!within_body_cap("abcde", 4));
+        assert!(within_body_cap(b"", 4));
+        assert!(within_body_cap(b"abc", 4));
+        assert!(within_body_cap(b"abcd", 4));
+        assert!(!within_body_cap(b"abcde", 4));
+        // Raw bytes: four two-byte characters are eight bytes.
+        assert!(!within_body_cap("éééé".as_bytes(), 4));
     }
 
     /// Every refusal names the instance, the port and which one it was: the
@@ -290,6 +314,7 @@ mod tests {
             SyncRefusal::Failed,
             SyncRefusal::Unwired,
             SyncRefusal::Unmounted,
+            SyncRefusal::TextOnlyTarget,
         ] {
             let described = refusal.describe("geo", "resolve");
             assert!(described.contains("geo"), "{refusal:?}: {described}");
@@ -300,8 +325,12 @@ mod tests {
     #[test]
     fn a_peers_reply_is_the_disposition() {
         assert_eq!(
-            call_disposition(SyncAnswer::Ok(Some("42".to_string())), "menu", "lookup"),
-            Ok(Some("42".to_string()))
+            call_disposition(
+                SyncAnswer::Ok(Some(MessageBody::text("42"))),
+                "menu",
+                "lookup"
+            ),
+            Ok(Some(MessageBody::text("42")))
         );
         assert_eq!(
             call_disposition(SyncAnswer::Ok(None), "menu", "lookup"),
@@ -329,6 +358,18 @@ mod tests {
                 "{refusal:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_text_only_target_is_its_own_disposition() {
+        assert_eq!(
+            call_disposition(
+                SyncAnswer::Refused(SyncRefusal::TextOnlyTarget),
+                "menu",
+                "lookup"
+            ),
+            Err(CallDisposition::TextOnlyPeer)
+        );
     }
 
     #[test]

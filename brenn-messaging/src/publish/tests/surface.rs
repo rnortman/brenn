@@ -89,6 +89,7 @@ fn surface_channel_entry(subscribers: Vec<SubscriberEntry>) -> ChannelEntry {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers,
         transport_type: ChannelScheme::Brenn,

@@ -380,6 +380,7 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Webhook,
@@ -424,6 +425,7 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![SubscriberEntry {
                 kind: SubscriberEntryKind::App(app_slug.to_string()),
@@ -1009,6 +1011,7 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![SubscriberEntry {
                 kind: SubscriberEntryKind::App("myapp".to_string()),

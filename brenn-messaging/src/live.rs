@@ -237,6 +237,7 @@ impl Messenger {
                 max = e.max,
             );
         }
+        dest.entry.assert_may_hold(&body);
 
         MessageEnvelope {
             message_id: Uuid::new_v4(),

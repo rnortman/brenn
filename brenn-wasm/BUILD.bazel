@@ -20,6 +20,7 @@ COMPONENT_NAMES = [
     "google-gmail-organize",
     "google-gmail-read",
     "google-maps-tools",
+    "processor-bytes-test",
     "processor-call-test",
     "processor-config",
     "processor-demo",
@@ -30,6 +31,7 @@ COMPONENT_NAMES = [
     "processor-mqtt-test",
     "processor-multiport",
     "processor-provider-test",
+    "processor-stale-contract-test",
     "processor-store-rt",
     "processor-tool-test",
     "processor-transplant",
@@ -351,10 +353,22 @@ WASM_TEST_SUITES = [
         [],
         [],
     ),
+    (
+        "bytes_contract",
+        [
+            "processor-bytes-test",
+            "processor-exhaust",
+            "processor-stale-contract-test",
+        ],
+        [],
+        [],
+        [],
+    ),
     ("feature_envelope", ["processor-demo", "replay"], [], [], []),
     (
         "grants",
         [
+            "processor-bytes-test",
             "processor-config",
             "processor-demo",
             "processor-dual",

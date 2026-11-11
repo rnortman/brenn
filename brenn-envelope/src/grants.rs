@@ -87,6 +87,78 @@ pub enum ComponentGrant {
     PageDom,
 }
 
+/// The version of the `brenn:processor` component contract an artifact is
+/// built against.
+///
+/// Nothing records it but the artifact's own import names: a 0.2.0 artifact
+/// imports [`ProcessorContract::V0_2_MARKER`], because `receive`'s parameter
+/// type is defined there, and a 0.1.0 artifact never does. Every reader that
+/// holds an artifact's imports against a grant list detects the contract
+/// first and then asks [`ComponentGrant::wit_import`] under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProcessorContract {
+    /// The string contract: bodies cross the boundary as JSON text.
+    V0_1,
+    /// The byte-carrying contract: bodies cross as bytes and a content type.
+    V0_2,
+}
+
+impl ProcessorContract {
+    /// Both contracts, oldest first.
+    pub const ALL: [ProcessorContract; 2] = [ProcessorContract::V0_1, ProcessorContract::V0_2];
+
+    /// The interface whose import marks an artifact as 0.2.0.
+    pub const V0_2_MARKER: &'static str = "brenn:processor/bus@0.2.0";
+
+    /// The contract of an artifact importing `imports`.
+    ///
+    /// `same(import, name)` says whether an import names the interface `name`:
+    /// the loader matches by semver compatibility, the build-time parity gate
+    /// byte-for-byte, and each passes its own rule.
+    pub fn detect<'a>(
+        imports: impl IntoIterator<Item = &'a str>,
+        same: impl Fn(&str, &str) -> bool,
+    ) -> ProcessorContract {
+        if imports
+            .into_iter()
+            .any(|import| same(import, Self::V0_2_MARKER))
+        {
+            Self::V0_2
+        } else {
+            Self::V0_1
+        }
+    }
+
+    /// The interfaces an artifact of this contract may import with no grant:
+    /// they define types and no host functions.
+    ///
+    /// A 0.2.0 artifact may import `types@0.1.0` for the DOM vocabulary's
+    /// `node`, beside `bus@0.2.0`, which defines its activation.
+    pub fn type_only_imports(self) -> &'static [&'static str] {
+        match self {
+            Self::V0_1 => &["brenn:processor/types@0.1.0"],
+            Self::V0_2 => &[Self::V0_2_MARKER, "brenn:processor/types@0.1.0"],
+        }
+    }
+
+    /// Whether an artifact of this contract can be handed a non-text body.
+    pub fn carries_non_text_bodies(self) -> bool {
+        match self {
+            Self::V0_1 => false,
+            Self::V0_2 => true,
+        }
+    }
+}
+
+impl std::fmt::Display for ProcessorContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::V0_1 => "brenn:processor@0.1.0",
+            Self::V0_2 => "brenn:processor@0.2.0",
+        })
+    }
+}
+
 /// Where a component instance runs.
 ///
 /// Not a second vocabulary: the words are one enum, and this selects which of
@@ -140,8 +212,8 @@ impl ComponentGrant {
         Self::ALL.into_iter().find(|grant| grant.word() == word)
     }
 
-    /// The WIT interface this grant links, at the host's version, or `None` for
-    /// the one grant that links no interface.
+    /// The WIT interface this grant links under `contract`, or `None` for the
+    /// one grant that links no interface.
     ///
     /// The single statement of the grant→import correspondence. Three readers
     /// need it and none of them may hold a table of its own: the host's linker
@@ -150,27 +222,39 @@ impl ComponentGrant {
     /// imports; and the build-time parity check, which holds a specification's
     /// `requires` list equal to that same artifact's imports.
     ///
+    /// A word means the same capability under either contract. `ports` and
+    /// `calls` carry message bodies, so their interfaces are re-declared at
+    /// 0.2.0; every other interface keeps its 0.1.0 name under both.
+    ///
     /// `Takeover` is the exception for the reason it is everywhere else: it is
     /// consent to a binding, gated at the binding, with no interface behind it.
     ///
     /// The version suffix is the host's, so a reader comparing against a name
     /// scraped from an artifact built at a different version must strip both
     /// sides or match by semver rather than by bytes.
-    pub fn wit_import(self) -> Option<&'static str> {
-        Some(match self {
-            Self::Ports => "brenn:processor/ports@0.1.0",
-            Self::Store => "brenn:processor/store@0.1.0",
-            Self::Log => "brenn:processor/log@0.1.0",
-            Self::Alert => "brenn:processor/alert@0.1.0",
-            Self::Config => "brenn:processor/config@0.1.0",
-            Self::Mqtt => "brenn:processor/mqtt@0.1.0",
-            Self::Tools => "brenn:processor/tools@0.1.0",
-            Self::Calls => "brenn:processor/calls@0.1.0",
-            Self::Provides => "brenn:processor/provides@0.1.0",
-            Self::Dom => "brenn:processor/dom@0.1.0",
-            Self::PageDom => "brenn:processor/page-dom@0.1.0",
-            Self::Takeover => return None,
+    pub fn wit_import(self, contract: ProcessorContract) -> Option<&'static str> {
+        Some(match (self, contract) {
+            (Self::Ports, ProcessorContract::V0_1) => "brenn:processor/ports@0.1.0",
+            (Self::Ports, ProcessorContract::V0_2) => "brenn:processor/ports@0.2.0",
+            (Self::Calls, ProcessorContract::V0_1) => "brenn:processor/calls@0.1.0",
+            (Self::Calls, ProcessorContract::V0_2) => "brenn:processor/calls@0.2.0",
+            (Self::Store, _) => "brenn:processor/store@0.1.0",
+            (Self::Log, _) => "brenn:processor/log@0.1.0",
+            (Self::Alert, _) => "brenn:processor/alert@0.1.0",
+            (Self::Config, _) => "brenn:processor/config@0.1.0",
+            (Self::Mqtt, _) => "brenn:processor/mqtt@0.1.0",
+            (Self::Tools, _) => "brenn:processor/tools@0.1.0",
+            (Self::Provides, _) => "brenn:processor/provides@0.1.0",
+            (Self::Dom, _) => "brenn:processor/dom@0.1.0",
+            (Self::PageDom, _) => "brenn:processor/page-dom@0.1.0",
+            (Self::Takeover, _) => return None,
         })
+    }
+
+    /// Whether this grant links a WIT interface at all. The answer is the same
+    /// under either contract, which a test pins.
+    pub fn names_interface(self) -> bool {
+        self.wit_import(ProcessorContract::V0_1).is_some()
     }
 
     /// Why this host cannot implement this capability, where it cannot.
@@ -982,20 +1066,33 @@ mod tests {
     /// pass the compiler (the match is exhaustive but a new arm can return
     /// `None` by hand) and silently leave the build-time parity check unable to
     /// see it, so the totality is asserted rather than assumed.
+    ///
+    /// Under 0.2.0 the two body-carrying interfaces, `ports` and `calls`, are
+    /// at 0.2.0 and every other at 0.1.0.
     #[test]
     fn every_grant_but_takeover_links_an_interface() {
-        for grant in ComponentGrant::ALL {
-            let import = grant.wit_import();
-            if grant == ComponentGrant::Takeover {
-                assert_eq!(import, None, "takeover names no interface");
-                continue;
+        for contract in ProcessorContract::ALL {
+            for grant in ComponentGrant::ALL {
+                let import = grant.wit_import(contract);
+                if grant == ComponentGrant::Takeover {
+                    assert_eq!(import, None, "takeover names no interface");
+                    assert!(!grant.names_interface());
+                    continue;
+                }
+                assert!(grant.names_interface(), "{grant:?}");
+                let import = import.unwrap_or_else(|| panic!("{grant:?} links no interface"));
+                let version = match (contract, grant) {
+                    (ProcessorContract::V0_2, ComponentGrant::Ports | ComponentGrant::Calls) => {
+                        "0.2.0"
+                    }
+                    _ => "0.1.0",
+                };
+                assert_eq!(
+                    import,
+                    format!("brenn:processor/{}@{version}", grant.word()),
+                    "{grant:?}'s interface under {contract} is not named for its word"
+                );
             }
-            let import = import.unwrap_or_else(|| panic!("{grant:?} links no interface"));
-            assert_eq!(
-                import,
-                format!("brenn:processor/{}@0.1.0", grant.word()),
-                "{grant:?}'s interface is not named for its word"
-            );
         }
     }
 
@@ -1004,14 +1101,74 @@ mod tests {
     /// satisfy an artifact importing the shared interface.
     #[test]
     fn no_two_grants_link_the_same_interface() {
-        let mut imports: Vec<&str> = ComponentGrant::ALL
-            .iter()
-            .filter_map(|grant| grant.wit_import())
-            .collect();
-        let count = imports.len();
-        imports.sort_unstable();
-        imports.dedup();
-        assert_eq!(imports.len(), count, "two grants share an interface");
+        for contract in ProcessorContract::ALL {
+            let mut imports: Vec<&str> = ComponentGrant::ALL
+                .iter()
+                .filter_map(|grant| grant.wit_import(contract))
+                .collect();
+            let count = imports.len();
+            imports.sort_unstable();
+            imports.dedup();
+            assert_eq!(
+                imports.len(),
+                count,
+                "two grants share an interface under {contract}"
+            );
+        }
+    }
+
+    /// A grant's interface is never one a contract allows without a grant, so
+    /// an import is either a capability or a type-only import, never both.
+    #[test]
+    fn no_grant_links_a_type_only_interface() {
+        for contract in ProcessorContract::ALL {
+            for grant in ComponentGrant::ALL {
+                if let Some(import) = grant.wit_import(contract) {
+                    assert!(
+                        !contract.type_only_imports().contains(&import),
+                        "{grant:?} under {contract}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_contract_is_detected_by_the_bus_import() {
+        let exact = |import: &str, name: &str| import == name;
+        assert_eq!(
+            ProcessorContract::detect(
+                ["brenn:processor/types@0.1.0", "brenn:processor/ports@0.1.0"],
+                exact
+            ),
+            ProcessorContract::V0_1
+        );
+        assert_eq!(
+            ProcessorContract::detect(["brenn:processor/bus@0.2.0"], exact),
+            ProcessorContract::V0_2
+        );
+        assert_eq!(
+            ProcessorContract::detect([], exact),
+            ProcessorContract::V0_1
+        );
+        // The matching rule is the caller's: a byte-for-byte reader does not
+        // see a patch release of the marker, a semver reader does.
+        assert_eq!(
+            ProcessorContract::detect(["brenn:processor/bus@0.2.1"], exact),
+            ProcessorContract::V0_1
+        );
+        let unversioned =
+            |import: &str, name: &str| import.split('@').next() == name.split('@').next();
+        assert_eq!(
+            ProcessorContract::detect(["brenn:processor/bus@0.2.1"], unversioned),
+            ProcessorContract::V0_2
+        );
+    }
+
+    #[test]
+    fn contracts_display_as_their_package_names() {
+        assert_eq!(ProcessorContract::V0_1.to_string(), "brenn:processor@0.1.0");
+        assert_eq!(ProcessorContract::V0_2.to_string(), "brenn:processor@0.2.0");
     }
 
     #[test]

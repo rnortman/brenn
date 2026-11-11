@@ -538,7 +538,9 @@ impl DomHost {
         };
         let body = serde_json::to_string(&body).expect("dom: serializing a gesture body");
         match self.door.request(instance, port, body) {
-            SyncAnswer::Ok(Some(reply)) if cancels(&reply) => fired.prevent_default(),
+            SyncAnswer::Ok(Some(reply)) if cancels(crate::calls::page_reply_text(&reply)) => {
+                fired.prevent_default()
+            }
             // Anything else lets the event proceed: no reply, a reply that did not
             // ask, an err, a trap, or a refusal. Cancelling a user's gesture is an
             // act, and only an answer that asked for it gets one.

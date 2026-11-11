@@ -25,7 +25,8 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
-use brenn_wasm::{ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome};
+use brenn_activation::ProcessorActivation;
+use brenn_wasm::{ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome};
 
 mod common;
 
@@ -155,7 +156,7 @@ fn instantiation_fail_trap_arm_fires_on_memory_limit() {
         now: None,
         sync: None,
     };
-    let outcome = comp.handle_with_memory_limit(activation, 1);
+    let outcome = comp.handle_with_memory_limit(common::host_activation(activation), 1);
 
     match &outcome {
         ProcessorOutcome::Trap(msg) => {

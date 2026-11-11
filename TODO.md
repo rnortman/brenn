@@ -2,28 +2,73 @@
 
 ## `binary-contract-version-mechanism`
 
-Owner ruling needed before the dual-contract backend slice is designed: which
-kind of "versioned" the byte-carrying component contract is. (c)
-`brenn:processor@0.2.0` re-declares only the envelope/activation records,
-`ports` and `receive`, with unchanged interfaces imported at `@0.1.0`: one
-host impl per unchanged interface, and after the period 0.1.0 lives on as the
-home of `log`, `store`, `dom` and the rest. (a) everything moves to 0.2.0:
-about 800–1,500 more lines of forwarding bindings for nine unchanged
-interfaces during the period, and 0.1.0 is deleted whole at its end. (b)
-additive inside 0.1.x: keeps `-bytes` names forever and can remove the string
-shapes only by breaking 0.1.x semver. All three were run or analysed in the
-sizing spike, which recommends (c). (Raised in the sizing spike's report, §5
-OQ1.)
+Owner confirmation wanted: the byte-carrying component contract
+`brenn:processor@0.2.0` was built under mechanism (c) on a product-owner
+proxy's ruling, not the owner's. Under (c) 0.2.0 re-declares only the shapes
+that changed (the envelope and activation records, `ports`, `receive`, and
+`calls`), and every unchanged interface (`log`, `store`, `dom` and the rest)
+keeps its `@0.1.0` name for both contracts: one host impl per unchanged
+interface, an interface's version is the version at which its shape last
+changed, and `@0.1.0` names remain in the contract permanently — after the
+dual period the 0.1.0 package lives on as the home of the unchanged
+interfaces and only the string-carrying shapes are removed. The alternative
+(a) moves everything to 0.2.0: about 800–1,500 more lines of forwarding
+bindings during the period, repeated at every later contract change, and
+0.1.0 is deleted whole at the period's end. The question put to the owner:
+the spec says "it needs to be versioned and we need to temporarily support
+both WIT interfaces"; the proxy read "both WIT interfaces" as the
+string-carrying and the byte-carrying shapes, which (c) serves together only
+for the period; if it means the two contract versions, so that nothing named
+0.1.0 survives the period, only (a) delivers it, and whether permanent
+`@0.1.0` names are within "temporarily" is the owner's to say. The sizing
+spike ran both, recommended (c) as engineering, and left the meaning of
+"versioned" to the owner. Until when reversing is cheap: the headers of
+`processor.wit` and `processor-0.2.wit`, `docs/component-packages.md` and
+`CHANGELOG.md` mark 0.2.0 provisional — no compatibility promise, replaceable
+or withdrawable with no dual period, the 0.1.0 removal period not yet running
+— and 0.2.0 is not to be declared stable while this entry is open. While that
+marking stands, a brenn release carrying 0.2.0 freezes nothing and reversing
+to (a) is a rework of the contract's WIT and host bindings (the surface
+host's too, once built); a release whose texts drop the marking is the point
+of no cheap return, after which reversing is a third contract and a second
+dual period. Done = the owner confirms (c) or asks for (a); the entry is
+removed with the answer, and only after it may 0.2.0 be declared stable.
+Code site: the `TODO(binary-contract-version-mechanism)` comment at the
+provisional paragraph in `processor.wit`'s header. (Sizing spike report §5
+OQ1; ruled in the plan of the dual-contract backend cycle.)
+
+## `conversation-send-content-type`
+
+Owner ruling needed before the blob conversation/tool slice is designed:
+whether a conversation can state a content type on a message it publishes.
+After the byte-body core the conversation send and edit tools take a string
+body and no content type, so everything a conversation publishes is untyped
+text: a conversation is shown other senders' content types but cannot label
+its own markdown, CSV or JSON, and no planned slice of the binary-bus project
+adds it, while the project spec asks for "text that is not JSON" on the bus.
+Options: add an optional `content_type` argument to the conversation send and
+edit tools, validated by `MessageBody::from_parts`, which changes a tool
+contract with the model; or leave conversations publishing untyped text only,
+with typed bodies coming from components, attachers and transports. The
+byte-body core's design raised it and left it out as "a product decision
+nobody has asked for", and its design gate ruled it "never wanted in this
+cycle".
 
 ## `dual-contract-period-length`
 
-Owner ruling needed by the release that first serves both component contracts:
-how long the old `brenn:processor` string contract (and attach v4) stays
-supported, and how out-of-tree authors are told. Options: a fixed number of
-releases; a date; or until the owner's known out-of-tree repositories have
-moved plus a warning period for unknown ones. The boot warning for 0.1.0
-artifacts names the removal release, so it cannot be written without this.
-(Sizing spike report §5 OQ5 and §4.)
+Owner ruling needed before the release that declares the byte-carrying
+component contract stable: how long the old `brenn:processor` string contract
+(and attach v4) stays supported after that release, and how out-of-tree
+authors are told. Options: a fixed number of releases; a date; or until the
+owner's known out-of-tree repositories have moved plus a warning period for
+unknown ones. The backend warns at boot and after a reload, naming every
+loaded 0.1.0 artifact and deliberately naming no removal release; the
+`TODO(dual-contract-period-length)` comment sits at that warning, and the WIT
+header and `docs/component-packages.md` describe the period without a length.
+The period does not begin while 0.2.0 is marked provisional (see
+`binary-contract-version-mechanism`), so its length is counted from the
+release that declares 0.2.0 stable; the answer goes into the warning and
+those two texts. (Sizing spike report §5 OQ5 and §4.)
 
 ## `blob-handle-integrity`
 

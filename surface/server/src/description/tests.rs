@@ -101,6 +101,7 @@ fn directory_with_channels(bares: &[String], standing: Depth) -> MessagingDirect
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         })
         .collect();
     let entries = build_channel_entries(&raw, &MessagingGlobalConfig::default());
@@ -129,6 +130,17 @@ fn full_directory_with_config_retain(
     runtime_retain: Depth,
     config_retain: Depth,
 ) -> MessagingDirectory {
+    full_directory_with_config_channels(surfaces, runtime_retain, config_retain, false)
+}
+
+/// [`full_directory_with_config_retain`], with every config channel's
+/// `non_text` declaration stated.
+fn full_directory_with_config_channels(
+    surfaces: &[ResolvedSurface],
+    runtime_retain: Depth,
+    config_retain: Depth,
+    config_non_text: bool,
+) -> MessagingDirectory {
     let mut raw = full_directory_raw(surfaces, runtime_retain);
     for surface in surfaces {
         // Ephemeral: no uuid (derived from the address), no standing rung (the
@@ -149,6 +161,7 @@ fn full_directory_with_config_retain(
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: config_non_text,
         });
     }
     let entries = build_channel_entries(&raw, &MessagingGlobalConfig::default());
@@ -183,6 +196,7 @@ fn full_directory_raw(
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     };
     let boot_published = boot_published_bare_channels(PREFIX, surfaces)
         .into_iter()
@@ -1217,6 +1231,17 @@ fn validate_panics_when_a_config_channel_is_undeclared() {
 fn validate_panics_on_config_channel_that_retains_nothing() {
     let surfaces = multi_surface_config();
     let dir = full_directory_with_config_retain(&surfaces, Depth::Bounded(1), Depth::Bounded(0));
+    validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
+}
+
+/// Every surface replays its config channel on attach, and a page holds only
+/// text, so the channel may not be declared `non_text`.
+#[test]
+#[should_panic(expected = "is declared `non_text` — every surface replays it on attach")]
+fn validate_panics_on_a_non_text_config_channel() {
+    let surfaces = multi_surface_config();
+    let dir =
+        full_directory_with_config_channels(&surfaces, Depth::Bounded(1), Depth::Bounded(1), true);
     validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 

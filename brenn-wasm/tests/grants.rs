@@ -16,10 +16,14 @@ use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::sync::Arc;
 
-use brenn_envelope::grants::{ComponentGrant, ComponentHost};
+use brenn_activation::ProcessorActivation;
+use brenn_envelope::grants::{ComponentGrant, ComponentHost, ProcessorContract};
 use brenn_wasm::{
-    ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, capability_for_import,
+    ProcessorComponent, ProcessorLoadSpec, capability_for_import, check_component_imports,
 };
+
+const V0_1: ProcessorContract = ProcessorContract::V0_1;
+const V0_2: ProcessorContract = ProcessorContract::V0_2;
 
 mod common;
 
@@ -137,12 +141,12 @@ fn subset_grants_loads_and_invokes() {
         ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_log"), "log-subset")
     });
     // An empty activation (no new envelopes) returns Ok from the log fixture.
-    let outcome = comp.handle(ProcessorActivation {
+    let outcome = comp.handle(common::host_activation(ProcessorActivation {
         ports: vec![],
         deferred: vec![],
         now: None,
         sync: None,
-    });
+    }));
     assert!(
         matches!(outcome, brenn_wasm::ProcessorOutcome::Ok { .. }),
         "subset-granted component must invoke ok; got {outcome:?}"
@@ -208,12 +212,12 @@ fn degenerate_empty_grants_invoke_succeeds() {
         )
     });
     // Empty activation: no new envelopes → exhaust returns Ok (no spin).
-    let outcome = comp.handle(ProcessorActivation {
+    let outcome = comp.handle(common::host_activation(ProcessorActivation {
         ports: vec![],
         deferred: vec![],
         now: None,
         sync: None,
-    });
+    }));
     assert!(
         matches!(outcome, brenn_wasm::ProcessorOutcome::Ok { .. }),
         "zero-grant component with empty activation must invoke ok; got {outcome:?}"
@@ -232,7 +236,7 @@ fn superset_grants_loads() {
     let grants: BTreeSet<ComponentGrant> = ComponentGrant::ALL
         .into_iter()
         .filter(|grant| {
-            grant.wit_import().is_some() && grant.illegal_on(ComponentHost::TopLevel).is_none()
+            grant.names_interface() && grant.illegal_on(ComponentHost::TopLevel).is_none()
         })
         .collect();
     let db = tempfile::NamedTempFile::new().unwrap();
@@ -344,6 +348,7 @@ fn drift_guard_all_fixture_imports_recognized() {
         "brenn_processor_dual",
         "brenn_processor_multiport",
         "brenn_processor_store_rt",
+        "brenn_processor_bytes_test",
     ];
 
     for fixture in &fixtures {
@@ -351,9 +356,11 @@ fn drift_guard_all_fixture_imports_recognized() {
         let component = Component::from_file(&engine, &path)
             .unwrap_or_else(|e| panic!("drift guard: failed to load {fixture}: {e}"));
         let ct = component.component_type();
-        for (name, _item) in ct.imports(&engine) {
-            let recognized =
-                brenn_wasm::is_types_import(name) || capability_for_import(name).is_some();
+        let names: Vec<&str> = ct.imports(&engine).map(|(name, _)| name).collect();
+        let contract = brenn_wasm::detect_contract(names.iter().copied());
+        for name in names {
+            let recognized = brenn_wasm::is_types_import(name, contract)
+                || capability_for_import(name, contract).is_some();
             assert!(
                 recognized,
                 "drift guard: fixture {fixture:?} has unrecognized import {name:?} — \
@@ -372,28 +379,30 @@ fn drift_guard_all_fixture_imports_recognized() {
 /// back would be authority nothing acts on.
 #[test]
 fn capability_map_round_trip() {
-    for grant in ComponentGrant::ALL {
-        let Some(import) = grant.wit_import() else {
+    for contract in ProcessorContract::ALL {
+        for grant in ComponentGrant::ALL {
+            let Some(import) = grant.wit_import(contract) else {
+                assert_eq!(
+                    grant,
+                    ComponentGrant::Takeover,
+                    "`{}` links no interface; only `takeover` may",
+                    grant.word()
+                );
+                continue;
+            };
+            let recovered = capability_for_import(import, contract).unwrap_or_else(|| {
+                panic!(
+                    "capability_for_import failed for {} under {contract}: {import:?}",
+                    grant.word()
+                )
+            });
             assert_eq!(
                 grant,
-                ComponentGrant::Takeover,
-                "`{}` links no interface; only `takeover` may",
+                recovered,
+                "round-trip mismatch for capability {:?} under {contract}",
                 grant.word()
             );
-            continue;
-        };
-        let recovered = capability_for_import(import).unwrap_or_else(|| {
-            panic!(
-                "capability_for_import failed for {}: {import:?}",
-                grant.word()
-            )
-        });
-        assert_eq!(
-            grant,
-            recovered,
-            "round-trip mismatch for capability {:?}",
-            grant.word()
-        );
+        }
     }
 }
 
@@ -402,7 +411,7 @@ fn capability_map_round_trip() {
 fn semver_compat_patch_bump_resolves() {
     // Simulate a component built against 0.1.1 on a 0.1.0 host.
     let name_101 = "brenn:processor/ports@0.1.1";
-    let result = capability_for_import(name_101);
+    let result = capability_for_import(name_101, V0_1);
     assert_eq!(
         result,
         Some(ComponentGrant::Ports),
@@ -414,7 +423,7 @@ fn semver_compat_patch_bump_resolves() {
 #[test]
 fn semver_incompat_minor_bump_does_not_resolve() {
     let name_020 = "brenn:processor/ports@0.2.0";
-    let result = capability_for_import(name_020);
+    let result = capability_for_import(name_020, V0_1);
     assert_eq!(
         result, None,
         "0.2.0 must not resolve against 0.1.0 host (different minor under 0.x)"
@@ -425,7 +434,7 @@ fn semver_incompat_minor_bump_does_not_resolve() {
 #[test]
 fn semver_incompat_major_bump_does_not_resolve() {
     let name_100 = "brenn:processor/ports@1.0.0";
-    let result = capability_for_import(name_100);
+    let result = capability_for_import(name_100, V0_1);
     assert_eq!(
         result, None,
         "1.0.0 must not resolve against 0.1.0 host (different major)"
@@ -436,11 +445,11 @@ fn semver_incompat_major_bump_does_not_resolve() {
 #[test]
 fn is_types_import_patch_bump() {
     assert!(
-        brenn_wasm::is_types_import("brenn:processor/types@0.1.1"),
+        brenn_wasm::is_types_import("brenn:processor/types@0.1.1", V0_1),
         "types@0.1.1 must be recognized as types import (same major.minor)"
     );
     assert!(
-        !brenn_wasm::is_types_import("brenn:processor/types@0.2.0"),
+        !brenn_wasm::is_types_import("brenn:processor/types@0.2.0", V0_1),
         "types@0.2.0 must not be recognized as types import (different minor)"
     );
 }
@@ -486,7 +495,7 @@ fn semver_ge1_same_major_different_minor_resolves() {
 /// Semver rule: build metadata is stripped — @0.1.1+abc resolves against @0.1.0 host.
 #[test]
 fn semver_build_metadata_stripped_and_resolves() {
-    let result = capability_for_import("brenn:processor/ports@0.1.1+fork.1");
+    let result = capability_for_import("brenn:processor/ports@0.1.1+fork.1", V0_1);
     assert_eq!(
         result,
         Some(ComponentGrant::Ports),
@@ -497,7 +506,7 @@ fn semver_build_metadata_stripped_and_resolves() {
 /// Semver rule: prerelease versions do NOT resolve (explicitly rejected).
 #[test]
 fn semver_prerelease_does_not_resolve() {
-    let result = capability_for_import("brenn:processor/ports@0.1.1-rc.1");
+    let result = capability_for_import("brenn:processor/ports@0.1.1-rc.1", V0_1);
     assert_eq!(
         result, None,
         "0.1.1-rc.1 must not resolve (prerelease versions are incompatible per wasmtime rule)"
@@ -591,11 +600,11 @@ fn semver_mirror_matches_wasmtime_linker() {
 fn tools_capability_maps_and_is_in_all() {
     assert_eq!(ComponentGrant::Tools.word(), "tools");
     assert_eq!(
-        ComponentGrant::Tools.wit_import(),
+        ComponentGrant::Tools.wit_import(V0_1),
         Some("brenn:processor/tools@0.1.0")
     );
     assert_eq!(
-        capability_for_import("brenn:processor/tools@0.1.0"),
+        capability_for_import("brenn:processor/tools@0.1.0", V0_1),
         Some(ComponentGrant::Tools),
         "the canonical tools import must resolve to `tools`"
     );
@@ -603,6 +612,189 @@ fn tools_capability_maps_and_is_in_all() {
         ComponentGrant::ALL.contains(&ComponentGrant::Tools),
         "`tools` must be in the vocabulary so enforce_grants and capability_for_import see it"
     );
+}
+
+// ── contract detection and per-contract import sets ─────────────────────────
+
+fn grant_set(grants: &[ComponentGrant]) -> BTreeSet<ComponentGrant> {
+    grants.iter().copied().collect()
+}
+
+/// Every import a backend 0.2.0 artifact may carry, each under its grant.
+const V0_2_FULL: [&str; 10] = [
+    "brenn:processor/bus@0.2.0",
+    "brenn:processor/types@0.1.0",
+    "brenn:processor/ports@0.2.0",
+    "brenn:processor/calls@0.2.0",
+    "brenn:processor/store@0.1.0",
+    "brenn:processor/log@0.1.0",
+    "brenn:processor/alert@0.1.0",
+    "brenn:processor/config@0.1.0",
+    "brenn:processor/tools@0.1.0",
+    "brenn:processor/provides@0.1.0",
+];
+
+#[test]
+fn the_bus_import_marks_a_v0_2_artifact() {
+    assert_eq!(
+        brenn_wasm::detect_contract(["brenn:processor/types@0.1.0", "brenn:processor/ports@0.1.0"]),
+        V0_1
+    );
+    assert_eq!(
+        brenn_wasm::detect_contract(["brenn:processor/bus@0.2.0"]),
+        V0_2
+    );
+    // The loader's semver rule: a patch release of the marker is the same
+    // contract, and is then type-checked at link.
+    assert_eq!(
+        brenn_wasm::detect_contract(["brenn:processor/bus@0.2.1"]),
+        V0_2
+    );
+    assert_eq!(
+        brenn_wasm::detect_contract(["brenn:processor/bus@0.3.0"]),
+        V0_1
+    );
+}
+
+#[test]
+fn ports_and_calls_resolve_at_their_own_contracts_version_only() {
+    for grant in [ComponentGrant::Ports, ComponentGrant::Calls] {
+        let v1 = format!("brenn:processor/{}@0.1.0", grant.word());
+        let v2 = format!("brenn:processor/{}@0.2.0", grant.word());
+        assert_eq!(capability_for_import(&v1, V0_1), Some(grant));
+        assert_eq!(capability_for_import(&v2, V0_2), Some(grant));
+        assert_eq!(capability_for_import(&v1, V0_2), None, "{v1} under 0.2.0");
+        assert_eq!(capability_for_import(&v2, V0_1), None, "{v2} under 0.1.0");
+    }
+    // Every other interface keeps its 0.1.0 name under both.
+    assert_eq!(
+        capability_for_import("brenn:processor/store@0.1.0", V0_2),
+        Some(ComponentGrant::Store)
+    );
+}
+
+#[test]
+fn the_type_only_imports_are_per_contract() {
+    assert!(brenn_wasm::is_types_import(
+        "brenn:processor/types@0.1.0",
+        V0_1
+    ));
+    assert!(!brenn_wasm::is_types_import(
+        "brenn:processor/bus@0.2.0",
+        V0_1
+    ));
+    assert!(brenn_wasm::is_types_import(
+        "brenn:processor/types@0.1.0",
+        V0_2
+    ));
+    assert!(brenn_wasm::is_types_import(
+        "brenn:processor/bus@0.2.0",
+        V0_2
+    ));
+}
+
+#[test]
+fn a_fully_granted_v0_2_import_list_passes_and_reports_its_contract() {
+    let grants = grant_set(&[
+        ComponentGrant::Ports,
+        ComponentGrant::Calls,
+        ComponentGrant::Store,
+        ComponentGrant::Log,
+        ComponentGrant::Alert,
+        ComponentGrant::Config,
+        ComponentGrant::Tools,
+        ComponentGrant::Provides,
+    ]);
+    let (contract, imported) = check_component_imports("c", V0_2_FULL, &grants).unwrap();
+    assert_eq!(contract, V0_2);
+    assert_eq!(imported.len(), 8);
+}
+
+/// A 0.2.0 artifact with no capability at all still imports `bus`, for its
+/// activation, and that alone is no violation.
+#[test]
+fn a_v0_2_artifact_importing_only_its_types_passes_with_no_grants() {
+    let (contract, imported) =
+        check_component_imports("c", ["brenn:processor/bus@0.2.0"], &BTreeSet::new()).unwrap();
+    assert_eq!(contract, V0_2);
+    assert!(imported.is_empty());
+}
+
+#[test]
+fn a_v0_2_artifact_with_ports_ungranted_is_refused_by_name() {
+    let violations = check_component_imports(
+        "c",
+        ["brenn:processor/bus@0.2.0", "brenn:processor/ports@0.2.0"],
+        &BTreeSet::new(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        violations,
+        ["component \"c\" requires ungranted capability \"ports\""]
+    );
+}
+
+/// Each contract accepts exactly its own import set: the other contract's
+/// `ports`, and any `@0.3.0` name, are unrecognized under either, with the
+/// detected contract named.
+#[test]
+fn an_import_list_mixing_the_contracts_is_refused_by_name() {
+    let all = grant_set(&[ComponentGrant::Ports, ComponentGrant::Calls]);
+    let mixed = check_component_imports(
+        "c",
+        ["brenn:processor/bus@0.2.0", "brenn:processor/ports@0.1.0"],
+        &all,
+    )
+    .unwrap_err();
+    assert_eq!(
+        mixed,
+        [
+            "component \"c\" imports unrecognized interface \"brenn:processor/ports@0.1.0\" \
+             (component contract detected: brenn:processor@0.2.0)"
+        ]
+    );
+    let backwards = check_component_imports(
+        "c",
+        ["brenn:processor/types@0.1.0", "brenn:processor/calls@0.2.0"],
+        &all,
+    )
+    .unwrap_err();
+    assert_eq!(
+        backwards,
+        [
+            "component \"c\" imports unrecognized interface \"brenn:processor/calls@0.2.0\" \
+             (component contract detected: brenn:processor@0.1.0)"
+        ]
+    );
+    let both_ports = check_component_imports(
+        "c",
+        [
+            "brenn:processor/bus@0.2.0",
+            "brenn:processor/ports@0.2.0",
+            "brenn:processor/ports@0.1.0",
+        ],
+        &all,
+    )
+    .unwrap_err();
+    assert_eq!(both_ports.len(), 1, "{both_ports:?}");
+}
+
+#[test]
+fn an_import_list_matching_neither_contract_is_refused_by_name() {
+    let all = grant_set(&[ComponentGrant::Ports]);
+    for list in [
+        ["brenn:processor/types@0.1.0", "brenn:processor/ports@0.3.0"],
+        ["brenn:processor/bus@0.2.0", "brenn:processor/ports@0.3.0"],
+        ["brenn:processor/bus@0.3.0", "brenn:processor/ports@0.2.0"],
+    ] {
+        let violations = check_component_imports("c", list, &all).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .all(|v| v.contains("imports unrecognized interface")),
+            "{list:?}: {violations:?}"
+        );
+    }
 }
 
 /// The tool-host seam and the `Tools` grant must agree at load — a `Tools` grant

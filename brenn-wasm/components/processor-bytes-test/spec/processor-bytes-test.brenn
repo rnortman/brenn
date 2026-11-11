@@ -1,0 +1,18 @@
+/// The byte-carrying contract's test fixture. It is driven by text commands on
+/// `in` and publishes one report per activation on `report`: every window
+/// envelope it was handed (header, content type, bytes in hex), its deferred
+/// view, and the result of every command. `out`, `state` and `timer` are where
+/// its commands publish, park and edit bodies; `ask` is where a caller asks it
+/// for a reply, and `peer` is where it calls one.
+component ProcessorBytesTest {
+  abi = processor;
+  requires = [ports, calls];
+  in in;
+  optional in feed;
+  optional io state;
+  optional io timer;
+  sync ask;
+  call peer;
+  optional out out;
+  out report;
+}

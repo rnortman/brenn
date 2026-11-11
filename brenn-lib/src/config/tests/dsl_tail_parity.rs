@@ -136,6 +136,7 @@ fn an_in_tail_accounts_for_the_consumer_and_surface_families() {
         noise,
         wake_min,
         amplification,
+        non_text,
     });
     assert_tail_parity(
         "consumer subscription",
@@ -145,7 +146,8 @@ fn an_in_tail_accounts_for_the_consumer_and_surface_families() {
         &[],
     );
 
-    // A page's throughput is the page's, not a knob the binding sets.
+    // A page's throughput is the page's, not a knob the binding sets, and a
+    // surface port carries only text.
     let surface = field_names!(SurfaceSubscriptionRaw {
         channel,
         instance,
@@ -160,7 +162,7 @@ fn an_in_tail_accounts_for_the_consumer_and_surface_families() {
         &surface,
         InTail::<()>::KEYS,
         &["channel", "instance", "port"],
-        &["amplification"],
+        &["amplification", "non_text"],
     );
 }
 
@@ -172,6 +174,7 @@ fn an_out_tail_accounts_for_the_two_output_families() {
         urgency,
         publish_per_activation,
         publish_capacity,
+        non_text,
     });
     assert_tail_parity(
         "consumer output",
@@ -181,6 +184,7 @@ fn an_out_tail_accounts_for_the_two_output_families() {
         &[],
     );
 
+    // A surface port carries only text.
     let surface = field_names!(SurfaceOutputRaw {
         instance,
         port,
@@ -194,7 +198,7 @@ fn an_out_tail_accounts_for_the_two_output_families() {
         &surface,
         OutTail::<()>::KEYS,
         &["channel", "instance", "port"],
-        &[],
+        &["non_text"],
     );
 }
 
@@ -210,6 +214,7 @@ fn an_io_tail_accounts_for_the_two_io_families() {
         urgency,
         publish_per_activation,
         publish_capacity,
+        non_text,
     });
     assert_tail_parity(
         "consumer io port",
@@ -235,6 +240,6 @@ fn an_io_tail_accounts_for_the_two_io_families() {
         &surface,
         IoTail::<()>::KEYS,
         &["channel", "instance", "port"],
-        &["amplification"],
+        &["amplification", "non_text"],
     );
 }

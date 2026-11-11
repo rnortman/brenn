@@ -162,9 +162,11 @@ mod tests {
 
         let mut expected: Vec<(String, Family)> = [
             ("guest", Family::Sdk),
+            ("processor-bytes-test", Family::Raw),
             ("processor-exhaust", Family::Raw),
             ("processor-mem-exhaust", Family::Raw),
             ("processor-mqtt-test", Family::Raw),
+            ("processor-stale-contract-test", Family::Raw),
             ("processor-tool-test", Family::Raw),
             ("replay", Family::Raw),
             ("replay-fault-test", Family::Raw),

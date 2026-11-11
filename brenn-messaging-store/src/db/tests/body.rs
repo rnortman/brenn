@@ -580,6 +580,11 @@ fn a_database_from_before_byte_bodies_migrates_and_serves_its_rows_unchanged() {
         );
     }
     assert_index_consistent(&conn);
+    assert!(
+        object_sql(&conn, NON_TEXT_INDEX).contains("WHERE typeof(body) = 'blob'"),
+        "the non-text channel index is built on a migrated database"
+    );
+    assert!(channels_holding_non_text_rows(&conn).is_empty());
 
     let before = schema_snapshot(&conn);
     run_messaging_migrations(&conn);
@@ -596,4 +601,73 @@ fn a_database_from_before_byte_bodies_migrates_and_serves_its_rows_unchanged() {
     assert_eq!(by_uuid(&conn, row.uuid), binary(b"quebec"));
     assert!(fts_ids(&conn, "quebec").is_empty());
     assert_index_consistent(&conn);
+}
+
+const NON_TEXT_INDEX: &str = "idx_messaging_messages_non_text_channel";
+
+#[test]
+fn a_fresh_database_has_the_non_text_channel_index() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    assert!(
+        object_sql(&conn, NON_TEXT_INDEX).contains("WHERE typeof(body) = 'blob'"),
+        "the partial index over BLOB bodies"
+    );
+}
+
+/// The query names exactly the channels holding a non-text row, visible or
+/// parked, and a text row of any type does not count.
+#[test]
+fn channels_holding_non_text_rows_names_exactly_those_channels() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let untyped = channel(&conn, "untyped");
+    let typed = channel(&conn, "typed");
+    let visible = channel(&conn, "visible");
+    let parked = channel(&conn, "parked");
+    let both = channel(&conn, "both");
+    channel(&conn, "empty");
+
+    insert(&conn, untyped, &MessageBody::text("alpha"), None);
+    insert(&conn, typed, &markdown("# bravo"), None);
+    insert(&conn, visible, &binary(NOT_UTF8), None);
+    insert(&conn, visible, &MessageBody::text("charlie"), None);
+    insert(
+        &conn,
+        parked,
+        &binary(NOT_UTF8),
+        Some(Utc::now() + Duration::hours(1)),
+    );
+    insert(&conn, both, &binary(b"delta"), None);
+    insert(
+        &conn,
+        both,
+        &binary(b"echo"),
+        Some(Utc::now() + Duration::hours(1)),
+    );
+
+    let mut expected = vec![visible, parked, both];
+    expected.sort();
+    assert_eq!(channels_holding_non_text_rows(&conn), expected);
+}
+
+/// The planner reads the partial index rather than scanning the table.
+#[test]
+fn the_non_text_channel_query_uses_the_partial_index() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let plan: Vec<String> = conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::db::bootstrap::NON_TEXT_CHANNELS_SQL
+        ))
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(3))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        plan.iter().any(|step| step.contains(NON_TEXT_INDEX)),
+        "{plan:?}"
+    );
 }

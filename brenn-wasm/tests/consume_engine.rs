@@ -8,11 +8,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
 use brenn_wasm::{
     ComponentGrant, PROCESSOR_FUEL_MINIMUM, PROCESSOR_FUEL_PER_ENVELOPE, PROCESSOR_MAX_INSTANCES,
     PROCESSOR_MAX_MEMORIES, PROCESSOR_MAX_MEMORY_BYTES, PROCESSOR_MAX_TABLE_ELEMENTS,
-    PROCESSOR_MAX_TABLES, ProcessorActivation, ProcessorComponent, ProcessorLoadSpec,
-    ProcessorOutcome, ProcessorPortWindow, ProcessorUrgency,
+    PROCESSOR_MAX_TABLES, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
+    ProcessorUrgency,
 };
 use tracing_test::traced_test;
 
@@ -233,7 +234,7 @@ fn handle_ok_brenn_envelope_returns_ok_no_publish() {
     let comp = load_demo_with_out();
     let activation = single_port_activation("in", vec![envelope_json("brenn:test", "hello")], 0);
     assert!(
-        matches!(comp.handle(activation), ProcessorOutcome::Ok { publishes, .. } if publishes.is_empty())
+        matches!(comp.handle(common::host_activation(activation)), ProcessorOutcome::Ok { publishes, .. } if publishes.is_empty())
     );
 }
 
@@ -250,7 +251,7 @@ fn handle_ok_with_context_prefix() {
         2, // new_from=2: first two are context
     );
     assert!(matches!(
-        comp.handle(activation),
+        comp.handle(common::host_activation(activation)),
         ProcessorOutcome::Ok { .. }
     ));
 }
@@ -265,7 +266,7 @@ fn handle_no_new_envelopes_does_not_fail() {
         1, // new_from == len → no new
     );
     assert!(matches!(
-        comp.handle(activation),
+        comp.handle(common::host_activation(activation)),
         ProcessorOutcome::Ok { .. }
     ));
 }
@@ -279,7 +280,7 @@ fn handle_lowers_a_sync_call_activation() {
     let mut activation =
         single_port_activation("in", vec![envelope_json("brenn:test", "hello")], 0);
     activation.sync = Some("press".to_string());
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         // The demo fixture answers nothing, which is a conforming callee: a
         // sync-call activation may answer, it is not obliged to.
         ProcessorOutcome::Ok { reply, .. } => assert_eq!(reply, None),
@@ -312,12 +313,17 @@ fn webhook_envelope(inner_body: &str) -> String {
 fn handle_webhook_envelope_publishes_inner_body() {
     let comp = load_demo_with_out();
     let activation = single_port_activation("in", vec![webhook_envelope("hello-from-webhook")], 0);
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(publishes.len(), 1);
             assert_eq!(publishes[0].port, "out");
             assert_eq!(publishes[0].channel_address, "brenn:test-out");
-            assert_eq!(publishes[0].payload, "hello-from-webhook");
+            assert_eq!(publishes[0].body.as_text().unwrap(), "hello-from-webhook");
+            assert_eq!(
+                publishes[0].body.content_type(),
+                None,
+                "a 0.1.0 publish is untyped text"
+            );
         }
         other => panic!("expected Ok with one publish, got {other:?}"),
     }
@@ -355,7 +361,7 @@ fn loading_a_bound_port_outside_the_declared_vocabulary_panics() {
 fn handle_webhook_declared_unwired_port_succeeds_and_delivers_nothing() {
     let comp = load_demo_declaring_out_unwired();
     let activation = single_port_activation("in", vec![webhook_envelope("some-payload")], 0);
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Ok { publishes, .. } => {
             assert!(
                 publishes.is_empty(),
@@ -373,7 +379,7 @@ fn handle_webhook_declared_unwired_port_succeeds_and_delivers_nothing() {
 fn handle_webhook_undeclared_port_traps_the_activation() {
     let comp = load_demo_no_ports();
     let activation = single_port_activation("in", vec![webhook_envelope("some-payload")], 0);
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Trap(diagnostic) => {
             assert!(
                 diagnostic.contains("demo")
@@ -420,7 +426,10 @@ fn handle_webhook_bound_port_outside_output_acl_returns_processing_failed() {
     // `do_publish` level is pinned directly by the unit test
     // `do_publish_acl_deny_returns_not_permitted_and_buffers_nothing` in `lib.rs`.
     assert!(
-        matches!(comp.handle(activation), ProcessorOutcome::Err(_)),
+        matches!(
+            comp.handle(common::host_activation(activation)),
+            ProcessorOutcome::Err(_)
+        ),
         "a bound port whose channel is outside the output ACL must surface as Err(processing-failed) with no publish"
     );
 }
@@ -433,7 +442,7 @@ fn handle_webhook_bound_port_inside_output_acl_publishes() {
     let acl: brenn_wasm::OutputAclFn = Arc::new(|addr: &str| addr == "brenn:secret");
     let comp = load_demo_out_with_acl("brenn:secret", acl);
     let activation = single_port_activation("in", vec![webhook_envelope("allowed-payload")], 0);
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
                 publishes.len(),
@@ -441,7 +450,7 @@ fn handle_webhook_bound_port_inside_output_acl_publishes() {
                 "in-ACL channel must publish exactly once"
             );
             assert_eq!(publishes[0].channel_address, "brenn:secret");
-            assert_eq!(publishes[0].payload, "allowed-payload");
+            assert_eq!(publishes[0].body.as_text().unwrap(), "allowed-payload");
         }
         other => panic!("expected Ok with one publish for in-ACL channel, got {other:?}"),
     }
@@ -471,30 +480,12 @@ fn handle_oversized_payload_returns_processing_failed() {
         0,
     );
     assert!(
-        matches!(comp.handle(activation), ProcessorOutcome::Err(_)),
+        matches!(
+            comp.handle(common::host_activation(activation)),
+            ProcessorOutcome::Err(_)
+        ),
         "oversize payload must surface as Err(processing-failed)"
     );
-}
-
-// ── Err paths ─────────────────────────────────────────────────────────────────
-
-#[test]
-fn handle_malformed_json_returns_err() {
-    let comp = load_demo_with_out();
-    let activation = single_port_activation("in", vec!["not valid json".into()], 0);
-    assert!(matches!(comp.handle(activation), ProcessorOutcome::Err(_)));
-}
-
-#[test]
-fn handle_missing_channel_field_returns_processing_failed() {
-    let comp = load_demo_with_out();
-    // Valid JSON but no `channel` field → ProcessingFailed.
-    let activation = single_port_activation(
-        "in",
-        vec![r#"{"message_id":"abc","body":"hello"}"#.into()],
-        0,
-    );
-    assert!(matches!(comp.handle(activation), ProcessorOutcome::Err(_)));
 }
 
 // ── Trap path ─────────────────────────────────────────────────────────────────
@@ -505,7 +496,10 @@ fn handle_sentinel_body_traps_not_panics() {
     // Verifies that ProcessorComponent::handle returns Trap (not panic).
     let comp = load_demo_with_out();
     let activation = single_port_activation("in", vec![envelope_json("brenn:test", "__trap__")], 0);
-    assert!(matches!(comp.handle(activation), ProcessorOutcome::Trap(_)));
+    assert!(matches!(
+        comp.handle(common::host_activation(activation)),
+        ProcessorOutcome::Trap(_)
+    ));
 }
 
 #[test]
@@ -522,7 +516,10 @@ fn trap_discards_publish_buffer() {
         0,
     );
     assert!(
-        matches!(comp.handle(activation), ProcessorOutcome::Trap(_)),
+        matches!(
+            comp.handle(common::host_activation(activation)),
+            ProcessorOutcome::Trap(_)
+        ),
         "sentinel after publish must trap and discard the buffer"
     );
 }
@@ -551,13 +548,13 @@ fn two_webhook_envelopes_produce_two_buffered_publishes() {
         vec![webhook_envelope("body-1"), webhook_envelope("body-2")],
         0,
     );
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(publishes.len(), 2, "expected 2 publishes");
             assert_eq!(publishes[0].channel_address, "brenn:channel-a");
-            assert_eq!(publishes[0].payload, "body-1");
+            assert_eq!(publishes[0].body.as_text().unwrap(), "body-1");
             assert_eq!(publishes[1].channel_address, "brenn:channel-a");
-            assert_eq!(publishes[1].payload, "body-2");
+            assert_eq!(publishes[1].body.as_text().unwrap(), "body-2");
         }
         other => panic!("expected Ok with 2 publishes, got {other:?}"),
     }
@@ -584,6 +581,7 @@ fn load_demo_budgeted(
                 fill_mt,
                 capacity_mt,
             },
+            non_text: false,
         },
     );
     ProcessorComponent::load(ProcessorLoadSpec {
@@ -604,7 +602,10 @@ fn per_sink_budget_zero_rejects_publish() {
     let comp = load_demo_budgeted("brenn:test-out", 0, 0, 0);
     let activation = single_port_activation("in", vec![webhook_envelope("body")], 0);
     assert!(
-        matches!(comp.handle(activation), ProcessorOutcome::Err(_)),
+        matches!(
+            comp.handle(common::host_activation(activation)),
+            ProcessorOutcome::Err(_)
+        ),
         "a zero per-sink budget must reject the publish and surface as Err"
     );
 }
@@ -623,18 +624,21 @@ fn per_sink_carryover_accumulates_fractional_amplification() {
     let comp = load_demo_budgeted("brenn:test-out", 500, 0, 1_000_000);
     let a1 = single_port_activation("in", vec![webhook_envelope("first")], 0);
     assert!(
-        matches!(comp.handle(a1), ProcessorOutcome::Err(_)),
+        matches!(
+            comp.handle(common::host_activation(a1)),
+            ProcessorOutcome::Err(_)
+        ),
         "activation 1 grants only 500 mt (< 1000) — publish rejected"
     );
     let a2 = single_port_activation("in", vec![webhook_envelope("second")], 0);
-    match comp.handle(a2) {
+    match comp.handle(common::host_activation(a2)) {
         ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
                 publishes.len(),
                 1,
                 "carryover reaches 1000 mt ⇒ one publish"
             );
-            assert_eq!(publishes[0].payload, "second");
+            assert_eq!(publishes[0].body.as_text().unwrap(), "second");
         }
         other => panic!("activation 2 should publish via accumulated carryover, got {other:?}"),
     }
@@ -663,12 +667,18 @@ fn per_sink_no_refund_of_consumed_tokens_on_failure() {
         0,
     );
     assert!(
-        matches!(comp.handle(a1), ProcessorOutcome::Err(_)),
+        matches!(
+            comp.handle(common::host_activation(a1)),
+            ProcessorOutcome::Err(_)
+        ),
         "activation 1 grants exactly one token; the 2nd publish exhausts it and fails the activation"
     );
     let a2 = single_port_activation("in", vec![webhook_envelope("third")], 0);
     assert!(
-        matches!(comp.handle(a2), ProcessorOutcome::Err(_)),
+        matches!(
+            comp.handle(common::host_activation(a2)),
+            ProcessorOutcome::Err(_)
+        ),
         "the token consumed in activation 1 must not be refunded — activation 2 has only \
          500 mt (< 1000) and must be rejected; an Ok here would mean the token was resurrected"
     );
@@ -692,7 +702,10 @@ fn per_sink_capacity_clamp_bounds_carryover() {
     for body in ["idle-1", "idle-2"] {
         let idle = single_port_activation("in", vec![webhook_envelope(body)], 1);
         assert!(
-            matches!(comp.handle(idle), ProcessorOutcome::Ok { .. }),
+            matches!(
+                comp.handle(common::host_activation(idle)),
+                ProcessorOutcome::Ok { .. }
+            ),
             "an idle activation publishes nothing and only accumulates fill into carry"
         );
     }
@@ -708,7 +721,10 @@ fn per_sink_capacity_clamp_bounds_carryover() {
         0,
     );
     assert!(
-        matches!(comp.handle(spend), ProcessorOutcome::Err(_)),
+        matches!(
+            comp.handle(common::host_activation(spend)),
+            ProcessorOutcome::Err(_)
+        ),
         "clamped budget (2000 mt) allows two publishes; the third is rejected — without the \
          clamp the budget would be 3000 and all three would succeed"
     );
@@ -721,7 +737,7 @@ fn per_sink_capacity_clamp_bounds_carryover() {
 fn per_sink_suppression_emits_post_activation_warn() {
     let comp = load_demo_budgeted("brenn:test-out", 0, 0, 0);
     let activation = single_port_activation("in", vec![webhook_envelope("body")], 0);
-    let _ = comp.handle(activation);
+    let _ = comp.handle(common::host_activation(activation));
     assert!(
         logs_contain("wasm publish budget exceeded"),
         "the post-activation warn must fire on a suppressed publish"
@@ -745,7 +761,7 @@ fn multi_port_publishes_routed_independently() {
     // One brenn envelope → processor-dual publishes its JSON to "out1" then "out2".
     let payload = envelope_json("brenn:source", "hello");
     let activation = single_port_activation("in", vec![payload.clone()], 0);
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
                 publishes.len(),
@@ -758,14 +774,14 @@ fn multi_port_publishes_routed_independently() {
                 "first publish must resolve to out1's channel"
             );
             assert_eq!(publishes[0].port, "out1");
-            assert_eq!(publishes[0].payload, payload);
+            assert_eq!(publishes[0].body.as_text().unwrap(), payload);
             // out2 publish must resolve to brenn:channel-out2, not out1's address.
             assert_eq!(
                 publishes[1].channel_address, "brenn:channel-out2",
                 "second publish must resolve to out2's channel"
             );
             assert_eq!(publishes[1].port, "out2");
-            assert_eq!(publishes[1].payload, payload);
+            assert_eq!(publishes[1].body.as_text().unwrap(), payload);
         }
         other => panic!("expected Ok with 2 publishes, got {other:?}"),
     }
@@ -796,7 +812,7 @@ fn a_reply_to_an_activation_that_asked_nothing_traps() {
         now: None,
         sync: None,
     };
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Trap(message) => assert!(
             message.contains("asked nothing"),
             "trap must name the cause: {message}"
@@ -822,7 +838,7 @@ fn an_ordinary_activation_returns_the_only_ok_an_async_cause_admits() {
         now: None,
         sync: None,
     };
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(publishes.len(), 1, "multiport publishes its summary")
         }
@@ -856,11 +872,12 @@ fn a_reply_on_a_sync_call_activation_is_read() {
         now: None,
         sync: Some("ask".to_string()),
     };
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Ok {
             publishes, reply, ..
         } => {
             let reply = reply.expect("the callee answered");
+            let reply = reply.as_text().expect("the reply is text");
             assert!(
                 reply.contains("\"port\":\"in\""),
                 "the reply is the callee's own summary of what it was windowed: {reply}"
@@ -901,7 +918,7 @@ fn an_oversize_reply_traps_the_callee() {
         now: None,
         sync: Some("ask".to_string()),
     };
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Trap(message) => assert!(
             message.contains("reply cap"),
             "the trap must name the cap: {message}"
@@ -940,7 +957,7 @@ fn context_envelopes_count_matches_new_from() {
         now: None,
         sync: None,
     };
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
                 publishes.len(),
@@ -948,7 +965,8 @@ fn context_envelopes_count_matches_new_from() {
                 "multiport publishes exactly one summary"
             );
             let summary: serde_json::Value =
-                serde_json::from_str(&publishes[0].payload).expect("summary must be valid JSON");
+                serde_json::from_str(publishes[0].body.as_text().unwrap())
+                    .expect("summary must be valid JSON");
             let port_summary = &summary[0];
             assert_eq!(
                 port_summary["context_count"],
@@ -987,7 +1005,7 @@ fn publish_with_urgency_overrides_port_default() {
         vec![envelope_json("brenn:test", "__urgency__:high")],
         0,
     );
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
                 publishes.len(),
@@ -995,7 +1013,7 @@ fn publish_with_urgency_overrides_port_default() {
                 "directive path publishes exactly one message to out1"
             );
             assert_eq!(publishes[0].port, "out1");
-            assert_eq!(publishes[0].payload, "urgency-marker");
+            assert_eq!(publishes[0].body.as_text().unwrap(), "urgency-marker");
             assert_eq!(
                 publishes[0].urgency,
                 ProcessorUrgency::High,
@@ -1031,7 +1049,7 @@ fn publish_with_urgency_all_levels() {
             )],
             0,
         );
-        match comp.handle(activation) {
+        match comp.handle(common::host_activation(activation)) {
             ProcessorOutcome::Ok { publishes, .. } => {
                 assert_eq!(
                     publishes.len(),
@@ -1069,7 +1087,7 @@ fn host_invariant_violation_new_from_exceeds_len_returns_labeled_error() {
         now: None,
         sync: None,
     };
-    match comp.handle(activation) {
+    match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Err(e) => {
             let diag = format!("{e:?}");
             assert!(
@@ -1093,7 +1111,7 @@ fn host_invariant_violation_new_from_exceeds_len_returns_labeled_error() {
 fn fuel_exhausting_guest_traps_not_panics() {
     let comp = load_exhaust();
     let activation = single_port_activation("in", vec![envelope_json("brenn:test", "spin")], 0);
-    let outcome = comp.handle(activation);
+    let outcome = comp.handle(common::host_activation(activation));
     match &outcome {
         ProcessorOutcome::Trap(msg) => {
             assert!(
@@ -1113,7 +1131,7 @@ fn full_size_window_does_not_spuriously_trap_demo() {
         .map(|i| envelope_json("brenn:ch", &format!("msg-{i}")))
         .collect();
     let activation = single_port_activation("in", envelopes, 0);
-    let outcome = comp.handle(activation);
+    let outcome = comp.handle(common::host_activation(activation));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "demo component must succeed on a full-size window. got {outcome:?}"
@@ -1141,7 +1159,7 @@ fn full_size_window_leaves_fuel_headroom() {
     // Epoch deadline far beyond the ticker's reach for this activation, so fuel is the only
     // limit under test.
     let outcome = comp.handle_with_limits(
-        activation,
+        common::host_activation(activation),
         common::GENEROUS_EPOCH_TICKS,
         production_budget / 4,
     );
@@ -1163,7 +1181,7 @@ fn exhaust_component_ok_on_pure_context_window() {
         1, // new_from == envelopes.len() → no new entries → Ok
     );
     assert!(matches!(
-        comp.handle(activation),
+        comp.handle(common::host_activation(activation)),
         ProcessorOutcome::Ok { .. }
     ));
 }
@@ -1197,7 +1215,7 @@ fn memory_cap_excess_traps_deterministically() {
         vec![envelope_json("brenn:test", "trigger")],
         0, // new_from=0 → the single envelope is new → fixture attempts memory exhaust
     );
-    let outcome = comp.handle(activation);
+    let outcome = comp.handle(common::host_activation(activation));
     match &outcome {
         ProcessorOutcome::Trap(msg) => {
             // Assert the exact phrase `StoreLimits::memory_growing` raises, not just a
@@ -1225,7 +1243,7 @@ fn mem_exhaust_component_ok_on_pure_context_window() {
         1, // new_from == envelopes.len() → no new entries → Ok
     );
     assert!(matches!(
-        comp.handle(activation),
+        comp.handle(common::host_activation(activation)),
         ProcessorOutcome::Ok { .. }
     ));
 }
@@ -1460,12 +1478,12 @@ fn run_wat_processor(slug: &str, wat_src: &str) -> ProcessorOutcome {
         output_acl: common::allow_all(),
         ..ProcessorLoadSpec::minimal(wasm_file.path(), slug)
     });
-    comp.handle(ProcessorActivation {
+    comp.handle(common::host_activation(ProcessorActivation {
         ports: vec![],
         deferred: vec![],
         now: None,
         sync: None,
-    })
+    }))
 }
 
 /// A guest that grows a table past `PROCESSOR_MAX_TABLE_ELEMENTS` traps, and the
@@ -1555,7 +1573,7 @@ fn instance_cap_excess_traps_at_instantiation() {
 fn store_guest_round_trip_begin_put_commit_get() {
     let (comp, _db) = load_store_component("brenn_processor_store_rt", "store-rt");
     let activation = single_port_activation("in", vec![], 0);
-    let outcome = comp.handle(activation);
+    let outcome = comp.handle(common::host_activation(activation));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "store round-trip must succeed; got {outcome:?}"
@@ -1592,7 +1610,7 @@ fn store_raii_rollback_on_err_return_no_trap() {
         vec![envelope_json("brenn:test", "__raii_rollback__")],
         0,
     );
-    let outcome = comp.handle(activation);
+    let outcome = comp.handle(common::host_activation(activation));
     match &outcome {
         ProcessorOutcome::Err(e) => {
             let diag = format!("{e:?}");
@@ -1629,7 +1647,7 @@ fn guest_observes_correct_new_from_and_ordering() {
         1,
     );
     assert!(matches!(
-        comp.handle(activation),
+        comp.handle(common::host_activation(activation)),
         ProcessorOutcome::Ok { .. }
     ));
 }
@@ -1652,7 +1670,10 @@ fn quota_exceeded_count_cap_returns_err() {
     let envelopes: Vec<String> = (0..n).map(|i| webhook_envelope(&format!("p{i}"))).collect();
     let activation = single_port_activation("in", envelopes, 0);
     assert!(
-        matches!(comp.handle(activation), ProcessorOutcome::Err(_)),
+        matches!(
+            comp.handle(common::host_activation(activation)),
+            ProcessorOutcome::Err(_)
+        ),
         "publishing past the count cap must yield Err(processing-failed)"
     );
 }
@@ -1673,7 +1694,7 @@ fn epoch_deadline_spins_guest_traps() {
     // Fuel is set very high so the fuel cap does NOT trip first.
     let activation = single_port_activation("in", vec![envelope_json("brenn:test", "spin")], 0);
     let outcome = comp.handle_with_limits(
-        activation,
+        common::host_activation(activation),
         1,            // epoch_deadline: 1 tick — trips fast
         u64::MAX / 2, // fuel: effectively unlimited
     );

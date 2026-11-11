@@ -13,10 +13,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
 use brenn_wasm::{
-    ComponentGrant, ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
-    ProcessorPortWindow, ProcessorReceiveError, ProvidesCallError, ProvidesHost, QueuedToolRequest,
-    ToolCallError, ToolHost, ToolHostFn,
+    ComponentGrant, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome, ProcessorReceiveError,
+    ProvidesCallError, ProvidesHost, QueuedToolRequest, ToolCallError, ToolHost, ToolHostFn,
 };
 use serde_json::{Value, json};
 
@@ -251,7 +251,10 @@ fn activation(requests: &[Value], results: &[Value]) -> ProcessorActivation {
 #[test]
 fn an_echo_request_is_completed_through_the_seam() {
     let host = RecordingProvidesHost::pending(&["a"]);
-    let outcome = provider(&host).handle(activation(&[request("a", "echo")], &[]));
+    let outcome = provider(&host).handle(common::host_activation(activation(
+        &[request("a", "echo")],
+        &[],
+    )));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "{outcome:?}"
@@ -270,10 +273,10 @@ fn an_echo_request_is_completed_through_the_seam() {
 #[test]
 fn a_completion_survives_the_activation_failing_after_it() {
     let host = RecordingProvidesHost::pending(&["a", "b"]);
-    let outcome = provider(&host).handle(activation(
+    let outcome = provider(&host).handle(common::host_activation(activation(
         &[request("a", "echo"), request("b", "fail")],
         &[],
-    ));
+    )));
     assert!(matches!(outcome, ProcessorOutcome::Err(_)), "{outcome:?}");
     let completed: Vec<String> = host.completed().into_iter().map(|(id, _)| id).collect();
     assert_eq!(completed, ["a"]);
@@ -282,7 +285,10 @@ fn a_completion_survives_the_activation_failing_after_it() {
 #[test]
 fn call_async_for_rides_the_ok_flush_as_a_tool_request() {
     let host = RecordingProvidesHost::pending(&["a"]);
-    let outcome = provider(&host).handle(activation(&[request("a", "api")], &[]));
+    let outcome = provider(&host).handle(common::host_activation(activation(
+        &[request("a", "api")],
+        &[],
+    )));
     let ProcessorOutcome::Ok { publishes, .. } = outcome else {
         panic!("an api-mode activation returns ok, got {outcome:?}");
     };
@@ -296,7 +302,7 @@ fn call_async_for_rides_the_ok_flush_as_a_tool_request() {
         publishes[0].reply_to.as_deref(),
         Some("brenn:tool-results/provider")
     );
-    let body: Value = serde_json::from_str(&publishes[0].payload).unwrap();
+    let body: Value = serde_json::from_str(publishes[0].body.as_text().unwrap()).unwrap();
     assert_eq!(body["serving"], "a");
     assert!(
         host.completed().is_empty(),
@@ -311,14 +317,17 @@ fn call_async_for_rides_the_ok_flush_as_a_tool_request() {
 fn call_async_for_is_discarded_with_a_failed_activation() {
     let host = RecordingProvidesHost::pending(&["a", "b", "c"]);
     let component = provider(&host);
-    let outcome = component.handle(activation(
+    let outcome = component.handle(common::host_activation(activation(
         &[request("a", "api"), request("b", "fail")],
         &[],
-    ));
+    )));
     assert!(matches!(outcome, ProcessorOutcome::Err(_)), "{outcome:?}");
     assert_eq!(host.queued().len(), 1, "the call reached the seam");
 
-    let outcome = component.handle(activation(&[request("c", "echo")], &[]));
+    let outcome = component.handle(common::host_activation(activation(
+        &[request("c", "echo")],
+        &[],
+    )));
     let ProcessorOutcome::Ok { publishes, .. } = outcome else {
         panic!("the echo activation returns ok, got {outcome:?}");
     };
@@ -331,10 +340,10 @@ fn call_async_for_is_discarded_with_a_failed_activation() {
 #[test]
 fn an_api_request_no_longer_pending_is_dropped_without_failing_the_activation() {
     let host = RecordingProvidesHost::pending(&["live"]);
-    let outcome = provider(&host).handle(activation(
+    let outcome = provider(&host).handle(common::host_activation(activation(
         &[request("stale", "api"), request("live", "echo")],
         &[],
-    ));
+    )));
     let ProcessorOutcome::Ok { publishes, .. } = outcome else {
         panic!("a stale request must not fail the activation, got {outcome:?}");
     };
@@ -349,7 +358,10 @@ fn an_api_request_no_longer_pending_is_dropped_without_failing_the_activation() 
 #[test]
 fn a_refused_nested_call_completes_its_request_with_the_refusal() {
     let host = RecordingProvidesHost::refusing_nested(&["a"]);
-    let outcome = provider(&host).handle(activation(&[request("a", "api")], &[]));
+    let outcome = provider(&host).handle(common::host_activation(activation(
+        &[request("a", "api")],
+        &[],
+    )));
     let ProcessorOutcome::Ok { publishes, .. } = outcome else {
         panic!("a refused nested call is answered, not raised, got {outcome:?}");
     };
@@ -372,7 +384,7 @@ fn a_result_naming_its_request_completes_it() {
         "v": 1, "tool": "api-request", "call_id": "a",
         "outcome": { "ok": { "status": 200 } }, "serving": "a",
     });
-    let outcome = provider(&host).handle(activation(&[], &[result]));
+    let outcome = provider(&host).handle(common::host_activation(activation(&[], &[result])));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "{outcome:?}"
@@ -392,7 +404,7 @@ fn a_result_for_a_request_no_longer_pending_is_dropped() {
         "v": 1, "tool": "api-request", "call_id": "gone",
         "outcome": { "err": { "kind": "internal", "detail": "x" } }, "serving": "gone",
     });
-    let outcome = provider(&host).handle(activation(&[], &[result]));
+    let outcome = provider(&host).handle(common::host_activation(activation(&[], &[result])));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "{outcome:?}"
@@ -415,7 +427,8 @@ fn a_request_or_result_of_another_version_fails_the_activation() {
         (vec![], vec![result], "tool result"),
     ] {
         let host = RecordingProvidesHost::pending(&["a"]);
-        let outcome = provider(&host).handle(activation(&requests, &results));
+        let outcome =
+            provider(&host).handle(common::host_activation(activation(&requests, &results)));
         let ProcessorOutcome::Err(ProcessorReceiveError::MalformedEnvelope(detail)) = outcome
         else {
             panic!("a version-2 {what} must fail the activation, got {outcome:?}");
@@ -433,7 +446,10 @@ fn a_request_or_result_of_another_version_fails_the_activation() {
 #[test]
 fn an_invalid_outcome_refusal_reaches_the_guest_with_its_detail() {
     let host = RecordingProvidesHost::refusing_outcomes(&["a"], "value over cap");
-    let outcome = provider(&host).handle(activation(&[request("a", "echo")], &[]));
+    let outcome = provider(&host).handle(common::host_activation(activation(
+        &[request("a", "echo")],
+        &[],
+    )));
     let ProcessorOutcome::Err(ProcessorReceiveError::ProcessingFailed(detail)) = outcome else {
         panic!("the echo mode returns the refusal, got {outcome:?}");
     };
@@ -452,7 +468,10 @@ fn a_plain_call_async_from_a_provider_acts_for_no_one() {
         Some(host.clone()),
         Some(tools.clone() as ToolHostFn),
     );
-    let outcome = component.handle(activation(&[request("a", "plain")], &[]));
+    let outcome = component.handle(common::host_activation(activation(
+        &[request("a", "plain")],
+        &[],
+    )));
     let ProcessorOutcome::Ok { publishes, .. } = outcome else {
         panic!("a plain-mode activation returns ok, got {outcome:?}");
     };
@@ -462,7 +481,7 @@ fn a_plain_call_async_from_a_provider_acts_for_no_one() {
     );
     assert!(host.queued().is_empty());
     assert_eq!(publishes.len(), 1, "{publishes:?}");
-    let body: Value = serde_json::from_str(&publishes[0].payload).unwrap();
+    let body: Value = serde_json::from_str(publishes[0].body.as_text().unwrap()).unwrap();
     assert!(body.get("serving").is_none(), "{body}");
     assert_eq!(
         host.completed(),
@@ -473,7 +492,10 @@ fn a_plain_call_async_from_a_provider_acts_for_no_one() {
 #[test]
 fn complete_err_writes_the_kind_token_and_detail() {
     let host = RecordingProvidesHost::pending(&["a"]);
-    let outcome = provider(&host).handle(activation(&[request("a", "bogus")], &[]));
+    let outcome = provider(&host).handle(common::host_activation(activation(
+        &[request("a", "bogus")],
+        &[],
+    )));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "{outcome:?}"
@@ -494,7 +516,7 @@ fn a_request_carrying_an_unknown_field_is_served() {
     let host = RecordingProvidesHost::pending(&["a"]);
     let mut body = request("a", "echo");
     body["added_later"] = json!("x");
-    let outcome = provider(&host).handle(activation(&[body], &[]));
+    let outcome = provider(&host).handle(common::host_activation(activation(&[body], &[])));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "{outcome:?}"
@@ -512,7 +534,7 @@ fn a_missing_reserved_port_fails_the_activation() {
         (vec![window(REQUESTS, &[])], RESULTS),
     ] {
         let host = RecordingProvidesHost::pending(&[]);
-        let outcome = provider(&host).handle(activation_of(ports));
+        let outcome = provider(&host).handle(common::host_activation(activation_of(ports)));
         let ProcessorOutcome::Err(ProcessorReceiveError::MalformedEnvelope(detail)) = outcome
         else {
             panic!("an activation without `{missing}` must fail, got {outcome:?}");
@@ -524,7 +546,10 @@ fn a_missing_reserved_port_fails_the_activation() {
 #[test]
 fn completing_an_id_not_pending_is_refused_not_pending() {
     let host = RecordingProvidesHost::pending(&["a"]);
-    let outcome = provider(&host).handle(activation(&[request("a", "stale")], &[]));
+    let outcome = provider(&host).handle(common::host_activation(activation(
+        &[request("a", "stale")],
+        &[],
+    )));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "{outcome:?}"

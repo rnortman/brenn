@@ -128,6 +128,37 @@ pub fn channel_uuid_by_address(
     })
 }
 
+/// [`channels_holding_non_text_rows`]'s query.
+pub(crate) const NON_TEXT_CHANNELS_SQL: &str = "SELECT DISTINCT channel_uuid FROM \
+     messaging_messages WHERE typeof(body) = 'blob' AND channel_uuid IS NOT NULL \
+     ORDER BY channel_uuid";
+
+/// The uuid of every channel holding at least one message row whose body is
+/// not text, visible or parked, in ascending uuid order.
+///
+/// A non-text body is stored as a BLOB value and a text body as a TEXT value
+/// (`body_column`), so the storage class is the test; the partial index
+/// `idx_messaging_messages_non_text_channel` serves the read.
+///
+/// # Panics
+///
+/// On a database error or a `channel_uuid` that is not a uuid: the rows are
+/// host-written.
+pub fn channels_holding_non_text_rows(conn: &Connection) -> Vec<Uuid> {
+    let mut stmt = conn
+        .prepare(NON_TEXT_CHANNELS_SQL)
+        .expect("messaging: prepare the non-text channel query");
+    stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .expect("messaging: run the non-text channel query")
+        .map(|bytes| {
+            let bytes = bytes.expect("messaging: read a non-text channel uuid");
+            Uuid::from_slice(&bytes).unwrap_or_else(|e| {
+                panic!("messaging: a message row's channel_uuid is not a uuid ({bytes:?}): {e}")
+            })
+        })
+        .collect()
+}
+
 /// Load the channels for the given UUIDs from `messaging_channels`, decoded into
 /// [`ChannelEntry`] values, alongside a report of the rows that were present but
 /// not reconstructible.
@@ -295,6 +326,7 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -430,6 +462,7 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -516,6 +549,7 @@ mod tests {
                 noise: None,
                 sink: None,
                 wake_min: None,
+                non_text: false,
             }],
             &defaults,
         );

@@ -30,6 +30,7 @@ fn nondurable_channel(address: &str, depth: u64) -> brenn_lib::messaging::config
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     }
 }
 
@@ -369,6 +370,7 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
                 noise: NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -505,6 +507,7 @@ async fn build_messaging_keeps_a_dynamic_subscription_on_a_chat_channel() {
                 noise: NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -584,6 +587,7 @@ async fn build_messaging_holds_a_dynamic_subscription_dormant_while_its_block_is
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     };
     // The block that keeps messaging up when the declared one is commented out.
     let inert_block = nondurable_channel("ephemeral:inert", 1);
@@ -726,6 +730,7 @@ async fn build_messaging_prunes_a_dynamic_subscription_when_the_channel_row_is_d
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     };
     let inert_block = nondurable_channel("ephemeral:inert", 1);
     let with_block = BrennConfig {
@@ -838,6 +843,7 @@ async fn build_messaging_does_not_reconstruct_orphan_channel() {
                 noise: NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -921,6 +927,7 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
                 noise: NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -1064,6 +1071,7 @@ fn config_with_one_brenn_channel(address: &str) -> (brenn_lib::config::BrennConf
                 noise: None,
                 sink: None,
                 wake_min: None,
+                non_text: false,
             },
             surface_index_channel(),
         ],
@@ -1228,6 +1236,7 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1442,6 +1451,7 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1513,6 +1523,7 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1661,6 +1672,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
             noise: Some(NoiseLevel::Alarm),
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![brenn_lib::messaging::config::WasmConsumerOutputRaw {
             port: "out".to_string(),
@@ -1668,6 +1680,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         io_ports: vec![],
         config: None,
@@ -1748,6 +1761,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1824,6 +1838,7 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1914,6 +1929,7 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1970,6 +1986,7 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         }],
         surfaces: vec![SurfaceConfigRaw {
             grants: vec![AttachGrant::EphemeralSubscribe],
@@ -2160,6 +2177,7 @@ async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
@@ -2172,6 +2190,7 @@ async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("sensors".to_string())],
         ..minimal_wasm_consumer()
@@ -2245,6 +2264,7 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         }
     }
     fn sub(channel: &str, port: &str) -> WasmConsumerSubscriptionRaw {
@@ -2256,6 +2276,7 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
             noise: Some(NoiseLevel::Alarm),
             wake_min: None,
             amplification: None,
+            non_text: false,
         }
     }
 
@@ -2349,6 +2370,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
@@ -2361,6 +2383,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         local_subscribe_acl: vec![ChannelMatcherRaw::Exact("scratch".to_string())],
         ..minimal_wasm_consumer()
@@ -2462,6 +2485,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         ..minimal_wasm_consumer()
     }
@@ -2589,6 +2613,7 @@ async fn build_messaging_gives_a_named_brenn_io_port_channel_a_db_row() {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         ..minimal_wasm_consumer()
     }
@@ -2647,6 +2672,7 @@ async fn auto_channels_list_as_their_durability_says() {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "ticker".to_string(),
@@ -2672,6 +2698,7 @@ async fn auto_channels_list_as_their_durability_says() {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         }],
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
@@ -2838,6 +2865,7 @@ fn warm_brenn_priming_configs(
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     };
     let channel_only = BrennConfig {
         channels: vec![channel.clone(), surface_index_channel()],
@@ -2854,6 +2882,7 @@ fn warm_brenn_priming_configs(
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         subscribe_acl: vec![ChannelMatcherRaw::Exact(address.to_string())],
         ..minimal_wasm_consumer()
@@ -3033,6 +3062,7 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
@@ -3045,6 +3075,7 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("sensors".to_string())],
         ..minimal_wasm_consumer()
@@ -3559,6 +3590,7 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     };
 
     // No configured surfaces ⇒ derived boot-published set is just the index.
@@ -4132,6 +4164,7 @@ async fn a_tuning_block_reaches_every_system_channel_mint_site() {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         }
     };
     let mut config = BrennConfig {
@@ -4217,6 +4250,7 @@ async fn build_messaging_refuses_a_subscriber_above_the_channel_ceiling() {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         }],
         ..BrennConfig::default()
     };
@@ -4307,6 +4341,7 @@ fn tuning_raw(address: &str) -> brenn_lib::messaging::config::ChannelConfigRaw {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
     }
 }
 
@@ -4478,6 +4513,7 @@ fn io_port_at(address: &str) -> brenn_lib::config::BrennConfig {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         ..minimal_wasm_consumer()
     }
@@ -5017,4 +5053,26 @@ async fn build_messaging_mints_a_location_channel_per_registered_user() {
         matches!(published, brenn_messaging::PublishResult::Ok { .. }),
         "the writer publishes on a user's channel: {published:?}"
     );
+}
+
+/// One refusal per text-only channel the store holds a non-text row for; a
+/// `non_text` channel, and a channel the store holds none for, pass.
+#[test]
+fn text_only_channels_holding_non_text_names_exactly_those() {
+    use brenn_lib::messaging::test_support::test_channel_entry;
+
+    let plain = test_channel_entry("plain", vec![]);
+    let quiet = test_channel_entry("quiet", vec![]);
+    let mut frames = test_channel_entry("frames", vec![]);
+    frames.resolved_channel.non_text = true;
+    let held = [plain.uuid, frames.uuid, uuid::Uuid::new_v4()];
+
+    let refusals = text_only_channels_holding_non_text(&held, [&plain, &quiet, &frames]);
+
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].starts_with("config: channel \"brenn:plain\" is declared text-only"),
+        "{refusals:?}"
+    );
+    assert!(text_only_channels_holding_non_text(&[], [&plain]).is_empty());
 }

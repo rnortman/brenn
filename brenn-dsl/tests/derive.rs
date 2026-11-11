@@ -1325,6 +1325,19 @@ fn a_tuning_states_no_doctype() {
     );
 }
 
+#[test]
+fn a_tuning_states_no_non_text() {
+    let source = "channel at prefix \"mqtt:broker:alice/\" {\n    push_depth = 4;\n    \
+                  retain_depth = 16;\n    standing_retain_depth = 64;\n    \
+                  non_text = true;\n}\n";
+    assert_eq!(
+        derive_refusal(source),
+        "the block tuning `prefix mqtt:broker:alice/` states no non_text: a tuning matches a \
+         family the system mints, and every such family is written and read by host code that \
+         parses text — non_text belongs on a `channel` declaration"
+    );
+}
+
 // ── across module and assembly boundaries ────────────────────────────────────
 
 #[test]

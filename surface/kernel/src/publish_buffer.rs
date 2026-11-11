@@ -358,7 +358,7 @@ impl PublishBuffer {
     pub fn admit_call(&mut self, payload: &str) -> Result<(), CallError> {
         self.gate.charge_call().map_err(call_error)?;
         let cap = self.gate.max_body_bytes();
-        if !brenn_activation::sync::within_body_cap(payload, cap) {
+        if !brenn_activation::sync::within_body_cap(payload.as_bytes(), cap) {
             return Err(call_error(GateRefusal::BodyTooLarge {
                 len: payload.len(),
                 max: cap,

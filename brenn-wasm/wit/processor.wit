@@ -1,14 +1,32 @@
 package brenn:processor@0.1.0;
 
-/// External ABI — out-of-tree components are first-class consumers of this
-/// interface.
+/// The string component contract. External ABI — out-of-tree components are
+/// first-class consumers of this interface.
 ///
-/// Evolution is **additive-import-only**: a new capability is a new interface,
-/// and no existing shape moves. This is a runtime contract — a host links a
-/// component built against some earlier commit of this world, so a cut here is
-/// a boot refusal on a machine neither side chose. Breaking it is a deliberate
-/// coordinated event: every out-of-tree component is rebuilt against the new
-/// world before the host that needs it is released.
+/// This is a runtime contract: a host links a component built against some
+/// earlier commit of this world, so a cut here is a boot refusal on a machine
+/// neither side chose. A new capability is a new interface. A breaking change
+/// to a shape is a new version of the interfaces that change, and of no
+/// other: an interface's version is the version at which its shape last
+/// changed. A contract is told by the version of the interface carrying the
+/// activation: `types@0.1.0` for this string contract, `bus@0.2.0` for the
+/// byte-carrying contract, which `processor-0.2.wit` holds and which imports
+/// every interface whose shape it does not change from this file.
+///
+/// brenn releases first and serves the old and the new contract together for
+/// a period; components follow on their own schedule. The string contract is
+/// to be removed, at a release not yet named.
+///
+// TODO(binary-contract-version-mechanism): the contract mechanism awaits the
+// owner's confirmation before the paragraph below may declare 0.2.0 stable.
+/// PROVISIONAL. brenn makes no compatibility promise for
+/// `brenn:processor@0.2.0` yet: it may be replaced by a different contract or
+/// withdrawn in any brenn release, with no dual period. A component that must
+/// keep running across brenn releases stays on `brenn:processor@0.1.0`. The
+/// removal period of 0.1.0 has not begun, and it does not begin until brenn
+/// declares the byte-carrying contract stable, which a later release does by
+/// editing this paragraph in `processor.wit` and `processor-0.2.wit` and the
+/// matching one in `docs/component-packages.md`.
 ///
 /// `examples/component/` is the in-repository canary that a change to the
 /// world is complete on this side.
@@ -536,7 +554,9 @@ interface calls {
     /// runs to completion, and its ok flushes its buffer, before this returns —
     /// a caller that later errs or traps does not retract it (the same rule as
     /// `mqtt.mqtt-publish`). A `port` the specification does not declare traps
-    /// the activation, as in `ports.publish`.
+    /// the activation, as in `ports.publish`. A reply that is not text, which
+    /// only a peer built against a byte-carrying contract can give, traps the
+    /// activation too; the peer has run and its buffer is flushed.
     ///
     /// The peer's activation is an ordinary one plus a return obligation: it
     /// reads whatever its own bound ports hold, and its publishes go to its own

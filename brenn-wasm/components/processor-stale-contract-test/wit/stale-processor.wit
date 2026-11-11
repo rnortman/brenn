@@ -1,0 +1,53 @@
+package brenn:processor@0.2.0;
+
+/// A `brenn:processor@0.2.0` whose `bus.envelope` is not the host's: it has a
+/// field the host's does not. A component built against it imports the names
+/// the host links and is refused on the type of its `receive` export.
+interface bus {
+    record body {
+        content-type: option<string>,
+        bytes: list<u8>,
+    }
+
+    record envelope {
+        header: string,
+        body: body,
+        sequence: u64,
+    }
+
+    record port-window {
+        port: string,
+        envelopes: list<envelope>,
+        new-from: u32,
+        dropped: u32,
+    }
+
+    record deferred-entry {
+        index: u32,
+        body: body,
+        deliver-after: u64,
+    }
+
+    record deferred-window {
+        port: string,
+        entries: list<deferred-entry>,
+    }
+
+    record activation {
+        ports: list<port-window>,
+        deferred: list<deferred-window>,
+        now: option<u64>,
+        sync: option<string>,
+    }
+
+    variant receive-error {
+        malformed-envelope(string),
+        processing-failed(string),
+    }
+}
+
+world processor {
+    use bus.{activation, receive-error, body};
+
+    export receive: func(a: activation) -> result<option<body>, receive-error>;
+}

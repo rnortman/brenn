@@ -1429,6 +1429,7 @@ mod tests {
                     noise: NoiseLevel::Silent,
                     sink: Sink::Drop,
                     wake_min: brenn_lib::messaging::WakeMin::Normal,
+                    non_text: false,
                 },
                 subscribers: vec![SubscriberEntry {
                     kind: SubscriberEntryKind::App(TEST_APP_SLUG.to_string()),

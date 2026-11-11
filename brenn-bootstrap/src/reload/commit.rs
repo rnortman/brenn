@@ -88,22 +88,26 @@ pub(crate) struct CommitReport {
 
 /// Apply a prepared reload to the running process.
 ///
-/// Three checks run before the first mutation and can still decline. Two of
+/// Four checks run before the first mutation and can still decline. Two of
 /// them ask a question prepare asked whose answer can change between the two —
 /// whether a subscriber the plan cannot see has landed on a channel this walk
 /// would take away (a dynamic app subscription or an attach-minted surface
 /// entry arriving while prepare hashes and compiles the arriving components),
 /// and whether a changed agent's dynamic subscriptions still are what the
-/// re-merge classified. The third is asked here alone, because it reads the
-/// store: whether an arriving channel's address already belongs to a different
-/// channel row. Nothing has been touched yet at that point, so each is a
-/// refusal like any other.
+/// re-merge classified. The other two are asked here alone, because they read
+/// the store: whether an arriving channel's address already belongs to a
+/// different channel row, and whether a channel the candidate declares
+/// text-only already holds a non-text body. Nothing has been touched yet at
+/// that point, so each is a refusal like any other.
 ///
 /// # Panics
 ///
-/// On anything else that does not go through, including that same check asked
-/// once more after the departing consumers have stopped — by then the walk has
-/// begun and there is nothing to decline with. Every one of them is a host bug:
+/// When a check whose answer a departing consumer or surface can still change
+/// — the two prepare also asked, and the non-text one — is asked once more
+/// after the retirements and its answer has moved: by then the walk has begun
+/// and there is nothing to decline with.
+///
+/// On anything else that does not go through. Every one of them is a host bug:
 /// a consumer the delta names that the registry does not hold, a registration
 /// the plan does not carry, a channel the directory will not take. The
 /// alternative to panicking is a process running half of two documents; the
@@ -135,6 +139,10 @@ pub(crate) async fn apply(
     if !collisions.is_empty() {
         return Err(collisions);
     }
+    let held_non_text = text_only_channels_holding_non_text(env, plan).await;
+    if !held_non_text.is_empty() {
+        return Err(held_non_text);
+    }
 
     let channels = plan.directory.list();
     let planned = PlannedSubscribers::of(&channels);
@@ -163,6 +171,7 @@ pub(crate) async fn apply(
         "reload commit: a changed agent's dynamic subscriptions moved after the departing \
          consumers and surfaces had already stopped: {moved:?}",
     );
+    assert_no_text_only_channel_holds_non_text(env, plan).await;
     retire_agent_subscriptions(env, delta).await;
     describe_channels(env, delta).await;
     start_added_clients(env, delta).await;
@@ -314,6 +323,53 @@ async fn channel_rows_collide(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String>
             })
         })
         .collect()
+}
+
+/// Whether a channel the candidate declares text-only already holds a non-text
+/// message in its durable store; the same refusal a boot makes with a panic
+/// (`brenn_messaging_boot::text_only_channels_holding_non_text`).
+///
+/// Asked of the whole planned directory rather than the delta's arms: one
+/// indexed read, and no dependence on which arm a redeclared channel lands in.
+/// Asked before anything is touched, so it declines like any other refusal, and
+/// once more after the retirements, where it can only assert
+/// ([`assert_no_text_only_channel_holds_non_text`]).
+async fn text_only_channels_holding_non_text(env: &ReloadEnv, plan: &MessagingPlan) -> Vec<String> {
+    let held = {
+        let conn = env.messenger.db().lock().await;
+        brenn_messaging_store::db::channels_holding_non_text_rows(&conn)
+    };
+    if held.is_empty() {
+        return Vec::new();
+    }
+    brenn_messaging_boot::text_only_channels_holding_non_text(
+        &held,
+        plan.directory.list().iter().map(|entry| &**entry),
+    )
+}
+
+/// [`text_only_channels_holding_non_text`] asked again once the departing
+/// consumers and surfaces have stopped, panicking on a hit.
+///
+/// The only writers that can put a non-text body on a channel this reload makes
+/// text-only are byte-carrying consumers bound to it, and a changed declaration
+/// re-plans each of them, so each is among the departing. The retirement wait
+/// is unbounded and lets each finish its activation and flush or edit its
+/// buffer through the declaration it was started under, so a row can land
+/// after the up-front check said none. Past the retirements nothing can be
+/// declined; the alternative to dying here is a text-only channel holding a
+/// body its readers cannot represent.
+pub(super) async fn assert_no_text_only_channel_holds_non_text(
+    env: &ReloadEnv,
+    plan: &MessagingPlan,
+) {
+    let held = text_only_channels_holding_non_text(env, plan).await;
+    assert!(
+        held.is_empty(),
+        "reload commit: a non-text body landed on a channel this reload declares text-only \
+         while the departing consumers were stopping:\n{}",
+        held.join("\n"),
+    );
 }
 
 /// Step 3: take every changed agent off the channels the candidate no longer

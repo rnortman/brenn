@@ -4,7 +4,7 @@ use brenn_envelope::addressing::{PROVIDER_CONCURRENCY_CEILING, PROVIDER_CONCURRE
 use brenn_envelope::tool_schema::{INPUT_SCHEMA_SHAPE_REFUSAL, check_input_schema};
 use brenn_lib::messaging::config::{
     ActivationPacing, BACKEND_FATAL_NOISE_REFUSAL, DEFAULT_WASM_INPUT_AMPLIFICATION,
-    DEFAULT_WASM_PUBLISH_CAPACITY, DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth,
+    DEFAULT_WASM_PUBLISH_CAPACITY, DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth, ResolvedChannel,
     ResolvedSubscription, ResolvedWasmConsumer, WasmCallPort, WasmConsumerConfigRaw, WasmInputPort,
     WasmOutputPort, WasmSinkBudget, resolve_wasm_window_depth,
 };
@@ -504,6 +504,14 @@ pub(crate) fn resolve_wasm_consumers(
                     wake_min,
                 },
                 amplification_mt,
+                non_text: served_non_text(
+                    slug,
+                    kind,
+                    &sub.port,
+                    sub.non_text,
+                    &entry.resolved_channel,
+                    &entry.address,
+                ),
             });
         }
 
@@ -616,6 +624,14 @@ pub(crate) fn resolve_wasm_consumers(
                     fill_mt,
                     capacity_mt,
                 },
+                non_text: served_non_text(
+                    slug,
+                    kind,
+                    &out.port,
+                    out.non_text,
+                    &entry.resolved_channel,
+                    &entry.address,
+                ),
             });
         }
 
@@ -1013,6 +1029,32 @@ pub(crate) fn resolve_wasm_consumers(
     }
     check_call_targets(&result);
     result
+}
+
+/// The bound channel's `non_text`, after holding a port's stated need to it.
+///
+/// A port that says it needs a channel that may carry non-text bodies is the
+/// channel's declaration where the bindings synthesize the channel, and the
+/// fold has already made it so. On a declared channel it is a check: a
+/// configuration whose author stated the need is refused here, at plan,
+/// rather than at the first publish the channel refuses.
+fn served_non_text(
+    slug: &str,
+    kind: &str,
+    port: &str,
+    needs: bool,
+    channel: &ResolvedChannel,
+    address: &str,
+) -> bool {
+    let non_text = channel.non_text;
+    assert!(
+        !needs || non_text,
+        "[[wasm_consumer]] {slug:?}: {kind} port {port:?} states non_text = true, but its \
+         channel {:?} is declared text-only — declare the channel non_text = true, or drop \
+         non_text from the port",
+        address,
+    );
+    non_text
 }
 
 /// Hold every consumer's `call` bindings against the consumers the document

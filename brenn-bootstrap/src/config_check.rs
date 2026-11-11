@@ -2302,6 +2302,77 @@ observability {
         }
     }
 
+    /// A surface's config channel declared `non_text` is refused offline: the
+    /// four per-surface channels are declared by hand, as the stamp would,
+    /// with the declaration on the bindings channel.
+    #[test]
+    fn a_non_text_surface_config_channel_is_refused() {
+        let message = shipped_module_refusal(&described_root(
+            r#"
+channel panel_help at "brenn:surface.surface.panel.help" {
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+}
+channel panel_geometry at "brenn:surface.surface.panel.geometry" {
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+}
+channel panel_status at "brenn:surface.surface.panel.status" {
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+}
+channel panel_bindings at "ephemeral:surface.surface.panel.bindings" {
+    push_depth = 1;
+    retain_depth = 1;
+    non_text = true;
+}
+"#,
+            &format!("new commons: SurfaceCommons;\n{KIND_STAMPS}"),
+        ));
+        assert!(
+            message.contains(
+                "surface config channel \"ephemeral:surface.surface.panel.bindings\" is \
+                 declared `non_text`"
+            ),
+            "{message}"
+        );
+    }
+
+    /// A surface bound to a `non_text` channel is refused by the planner,
+    /// offline.
+    #[test]
+    fn a_surface_bound_to_a_non_text_channel_is_refused() {
+        let message = boot_gate_refusal(&format!(
+            r#"{preamble}
+channel frames at "brenn:alice.frames" {{
+    push_depth = 8;
+    retain_depth = 64;
+    standing_retain_depth = 64;
+    non_text = true;
+}}
+
+surface panel {{
+    grants = [subscribe];
+    new w: Widget {{
+        grants = [log];
+        in messages <- frames {{ push_depth = 4; }}
+    }}
+{CHROME}}}
+"#,
+            preamble = preamble("log")
+        ));
+        assert!(
+            message.contains(
+                "channel \"brenn:alice.frames\" is declared `non_text`, and a surface carries \
+                 only text bodies"
+            ),
+            "{message}"
+        );
+    }
+
     /// The per-kind half: a placed kind with no `KindDescription` stamp is
     /// refused naming its help and schema documents.
     #[test]

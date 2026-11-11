@@ -480,6 +480,17 @@ fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
                 attr.value.span().clone(),
             ));
         }
+        if let Some(attr) = &tuning.attrs.non_text {
+            errors.push(Diagnostic::at(
+                format!(
+                    "the block tuning `{label}` states no non_text: a tuning matches a \
+                     family the system mints, and every such family is written and read \
+                     by host code that parses text — non_text belongs on a `channel` \
+                     declaration"
+                ),
+                attr.value.span().clone(),
+            ));
+        }
     }
 }
 

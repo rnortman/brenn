@@ -17,9 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brenn_activation::sync::SyncAnswer;
+use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
+use brenn_envelope::MessageBody;
 use brenn_wasm::{
-    ComponentGrant, ProcessorActivation, ProcessorCallTarget, ProcessorComponent,
-    ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow, SyncCallerFn,
+    ComponentGrant, ProcessorCallTarget, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
+    SyncCallerFn,
 };
 
 mod common;
@@ -64,10 +66,12 @@ fn sync_activation(body: &str) -> ProcessorActivation {
 /// answering. The output port is declared and unbound, so the guest's publish is
 /// dropped rather than refused and the case is about the deadline alone.
 fn component_with_slow_peer(delay: Duration) -> ProcessorComponent {
-    let caller: SyncCallerFn = Arc::new(move |_slug: &str, _port: &str, body: String, _chain| {
-        std::thread::sleep(delay);
-        SyncAnswer::Ok(Some(format!("answer:{body}")))
-    });
+    let caller: SyncCallerFn =
+        Arc::new(move |_slug: &str, _port: &str, body: MessageBody, _chain| {
+            std::thread::sleep(delay);
+            let body = body.as_text().expect("a 0.1.0 caller sends text");
+            SyncAnswer::Ok(Some(MessageBody::text(format!("answer:{body}"))))
+        });
     let mut calls = HashMap::new();
     calls.insert(
         "ask".to_string(),
@@ -97,11 +101,15 @@ fn component_with_slow_peer(delay: Duration) -> ProcessorComponent {
 #[test]
 fn a_caller_blocked_past_the_deadline_does_not_trap_when_its_peer_answers() {
     let comp = component_with_slow_peer(PEER_DELAY);
-    let outcome = comp.handle_with_limits(sync_activation("call:leaf"), ONE_TICK, AMPLE_FUEL);
+    let outcome = comp.handle_with_limits(
+        common::host_activation(sync_activation("call:leaf")),
+        ONE_TICK,
+        AMPLE_FUEL,
+    );
     match outcome {
         ProcessorOutcome::Ok { reply, .. } => assert_eq!(
             reply,
-            Some("via:answer:leaf".to_string()),
+            Some(MessageBody::text("via:answer:leaf")),
             "the caller answered with what its peer replied"
         ),
         other => panic!(
@@ -119,7 +127,11 @@ fn a_caller_that_spends_its_own_budget_still_traps() {
     let comp = component_with_slow_peer(Duration::ZERO);
     // `handle_with_limits` arms zero ticks: the budget is spent before the guest
     // starts, so the first deadline the engine raises is the last.
-    let outcome = comp.handle_with_limits(sync_activation("call:leaf"), 0, AMPLE_FUEL);
+    let outcome = comp.handle_with_limits(
+        common::host_activation(sync_activation("call:leaf")),
+        0,
+        AMPLE_FUEL,
+    );
     assert!(
         matches!(outcome, ProcessorOutcome::Trap(_)),
         "an activation with no time left must trap, got {outcome:?}"

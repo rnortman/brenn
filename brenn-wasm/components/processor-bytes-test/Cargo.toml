@@ -1,0 +1,21 @@
+[package]
+name = "brenn-processor-bytes-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The macro generates this crate's bindings from the two-file 0.2.0 world at
+# expansion time; it tracks the tree's single wit-bindgen version.
+wit-bindgen = "0.60"
+
+# The world is the 0.2.0 one, read with the 0.1.0 file first because it
+# imports that package's unchanged interfaces.
+[package.metadata.component]
+package = "brenn:processor"
+target = { path = "../../wit/processor-0.2.wit", world = "brenn:processor/processor@0.2.0", resolve_with = ["../../wit/processor.wit"] }
+
+[package.metadata.component.dependencies]

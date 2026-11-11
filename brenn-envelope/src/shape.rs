@@ -106,6 +106,18 @@ impl BodyShape for TextShape {
     }
 }
 
+/// The header shape: nothing at the body's position.
+///
+/// The `header` of a 0.2.0 `envelope`, which carries the body beside it as a
+/// content type and bytes. Every body serializes, whatever it holds.
+pub struct HeaderShape;
+
+impl BodyShape for HeaderShape {
+    fn serialize_body<S: SerializeStruct>(_: &MessageBody, _: &mut S) -> Result<(), S::Error> {
+        Ok(())
+    }
+}
+
 /// `serialize_with` function writing an envelope field in the text shape.
 pub fn serialize_text_shape<S: Serializer>(
     envelope: &MessageEnvelope,
@@ -130,6 +142,17 @@ impl MessageEnvelope {
         self.require_text_body("0.1.0 envelope-json");
         serde_json::to_string(&self.shaped::<TextShape>())
             .expect("an envelope with a text body serializes to JSON")
+    }
+
+    /// This envelope without its body, as the JSON text a 0.2.0 component is
+    /// handed as an `envelope`'s `header`.
+    ///
+    /// Every envelope field but the body, in the order of every other shape,
+    /// so a field added to the envelope appears here with no further edit.
+    /// The object is open: a guest ignores a key it does not know.
+    pub fn to_header_json(&self) -> String {
+        serde_json::to_string(&self.shaped::<HeaderShape>())
+            .expect("an envelope header serializes to JSON")
     }
 
     /// The body's text, for a carrier whose contract is a string.
@@ -345,6 +368,44 @@ mod tests {
         }
         v["content_type"] = serde_json::Value::Null;
         assert!(serde_json::from_value::<MessageEnvelope>(v).is_err());
+    }
+
+    /// The header is every key of the text shape but `body`, in the same
+    /// order, and no body key at all, whatever the body holds.
+    #[test]
+    fn the_header_is_every_envelope_key_and_no_body() {
+        let at = |secs| DateTime::<Utc>::from_timestamp(secs, 0).unwrap();
+        let typed = MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+        for body in [MessageBody::text("hello"), typed, binary()] {
+            let mut env = envelope(body);
+            env.reply_to = Some("brenn:replies".to_string());
+            env.delivery_deadline = Some(at(1_700_000_100));
+            env.deliver_after = Some(at(1_700_000_050));
+            env.impetus = Some(Impetus::Replenish);
+            assert_eq!(
+                env.to_header_json(),
+                concat!(
+                    r#"{"message_id":"00000000-0000-0000-0000-000000000000","source":"src","#,
+                    r#""channel":"brenn:chan","sender":"alice","publish_ts":"2023-11-14T22:13:20Z","#,
+                    r#""reply_to":"brenn:replies","delivery_deadline":"2023-11-14T22:15:00Z","#,
+                    r#""deliver_after":"2023-11-14T22:14:10Z","impetus":"replenish","#,
+                    r#""urgency":"normal","envelope_type":"brenn"}"#
+                ),
+                "{}",
+                env.body.summary()
+            );
+        }
+    }
+
+    /// Absent optional fields are absent from the header, as from the text
+    /// shape: the two differ by the `body` key alone.
+    #[test]
+    fn the_header_is_the_text_shape_less_its_body() {
+        let env = envelope(MessageBody::text("x"));
+        let mut text: serde_json::Value = serde_json::from_str(&env.to_envelope_json()).unwrap();
+        text.as_object_mut().unwrap().remove("body");
+        let header: serde_json::Value = serde_json::from_str(&env.to_header_json()).unwrap();
+        assert_eq!(header, text);
     }
 
     #[test]

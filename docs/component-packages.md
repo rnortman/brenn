@@ -41,7 +41,12 @@ and the bundle are installed by different releases, so a cut in one of these is
 a boot refusal on somebody else's machine:
 
 - the WIT packages `brenn:processor` and `brenn:replay` — a new capability is a
-  new interface, and no existing shape moves;
+  new interface; a breaking change to a shape is a new version of the
+  interfaces that change and of no other, so an interface's version is the
+  version at which its shape last changed. brenn releases first and serves the
+  old and the new `brenn:processor` contract together for a period;
+  components follow on their own schedule (*The byte-carrying contract*,
+  below);
 - the **backend package record** (`package.json`, below) — `v` is the whole
   story, and a bump re-releases every bundle;
 - the **surface record** `processor/<kind>/manifest.json` v3 and the served
@@ -96,6 +101,87 @@ kind with no `provide` statement is unaffected. The request body (`{"v": 1, "id"
 and the tool-result body grow by added fields, which `brenn-guest` ignores; `v`
 moves only for a change a provider built against the older body would misread,
 and `brenn-guest` refuses a version it does not know.
+
+**The byte-carrying contract (provisional).** The backend host serves two
+`brenn:processor` contracts side by side. Under the string contract, `brenn:processor@0.1.0` (`brenn-wasm/wit/processor.wit`),
+a component is handed each message as `envelope-json` text and publishes
+`payload: string`. Under the byte-carrying contract, `brenn:processor@0.2.0`
+(`brenn-wasm/wit/processor-0.2.wit`), it is handed each message as a header
+and a body of bytes with an optional content type, and publishes, parks,
+edits, calls and replies with such a body. No base64 and no JSON string sits
+around a body on that path.
+
+The 0.2.0 package declares only the three interfaces whose shape differs:
+`bus` (the body, the envelope and the activation), `ports` and `calls`. Every
+other interface keeps its `@0.1.0` name under both contracts. An artifact's
+imports are therefore:
+
+| | 0.1.0 | 0.2.0 |
+|---|---|---|
+| carries the activation | `brenn:processor/types@0.1.0` | `brenn:processor/bus@0.2.0` (and `types@0.1.0`, only if it uses `node`) |
+| `ports`, `calls` grants | `ports@0.1.0`, `calls@0.1.0` | `ports@0.2.0`, `calls@0.2.0` |
+| every other grant | its `@0.1.0` interface | the same `@0.1.0` interface |
+
+A grant word means the same capability under either contract. A reader tells
+an artifact's contract from its imports (`wasm-tools component wit
+<artifact>`): one importing `brenn:processor/bus@0.2.0` is 0.2.0, any other is
+0.1.0. Nothing else records it: not the package record, not the spec, whose
+`abi` stays `processor`. The loader and the build-time parity gate accept
+exactly the detected contract's import set; an artifact mixing the two, or
+naming an interface at a version this brenn does not serve, is refused at load
+by name.
+
+PROVISIONAL. brenn makes no compatibility promise for
+`brenn:processor@0.2.0` yet: it may be replaced by a different contract or
+withdrawn in any brenn release, with no dual period. A component that must
+keep running across brenn releases stays on `brenn:processor@0.1.0`. The
+removal period of 0.1.0 has not begun, and it does not begin until brenn
+declares the byte-carrying contract stable, which a later release does by
+editing this paragraph in `processor.wit` and `processor-0.2.wit` and the
+matching one in `docs/component-packages.md`.
+
+The rule for any change to a provisional shape is that an artifact built
+against the superseded shape is refused at load, by name or by type, never
+misread: the loader holds every import to the contract's names, and wasmtime
+type-checks every import and the `receive` export when the component is
+linked. A shape whose meaning changes without a change of name or type would
+pass both, so it changes its name or its version with its meaning.
+
+What a 0.2.0 author relies on:
+
+- **The header is open.** `bus.envelope.header` is the canonical envelope as
+  JSON without its body. Keys are added over time, without a new contract
+  version; a guest ignores a key it does not know.
+- **A body is validated where it enters the host.** A content type must be a
+  well-formed media type; a text body (no content type, `text/*`,
+  `application/json` or a `+json` subtype, with no charset other than UTF-8
+  or US-ASCII) must be UTF-8. The size caps count raw bytes. The content type
+  is the sender's assertion and is never checked against the bytes.
+- **The refusals it can draw that a 0.1.0 component cannot:** `invalid-body`,
+  for a malformed content type or text that is not UTF-8, on a publish, an
+  edit or a call; `text-only-channel`, for a non-text body published, parked or
+  edited onto a channel not declared `non_text`; `text-only-peer`, for a
+  non-text body sent to a peer built against the string contract, which does
+  not run. A reply that is malformed or over the cap traps the replying
+  component, as an over-cap reply always has.
+- **A mixed sync pair.** A reply is judged against the replying component's
+  own contract only. A 0.2.0 component may reply to any caller with a
+  non-text body; its activation ends ok and its buffer flushes. A 0.1.0
+  caller cannot read that reply, so it is the *caller's* activation that
+  traps, naming its `call` port and the peer. A typed text reply reaches a
+  0.1.0 caller as its text, as a typed text message does on a channel.
+- **Not served yet:** the guest SDK (`brenn-guest`) builds against 0.1.0 only,
+  so a 0.2.0 component uses raw bindings over both WIT files, `processor.wit`
+  first, with the world `brenn:processor/processor@0.2.0`; and the surface
+  host serves 0.1.0 only. A surface kind whose manifest imports
+  `brenn:processor/bus` is **withheld** under a bundle mount, by the rule
+  above for a record it does not read, with a reason naming the contract, and
+  is a boot refusal under brenn's own mount.
+
+A backend that loads any 0.1.0 artifact says so in one `warn!` at boot and
+after each applied reload, naming them. It names no removal release: the
+length of the period is not decided, and it is counted from the release that
+declares 0.2.0 stable.
 
 One runtime contract is a **candidate for deletion**, recorded here so that a
 bundle author meets it before it happens rather than after: `brenn:replay` is
@@ -170,7 +256,9 @@ Another cut of this kind in force now: **`MessageEnvelope.body` is a
 
 - Under the 0.1.0 contract the body is always text: the host never windows a
   non-text body to a 0.1.0 component, and a typed text body arrives as exactly
-  its text, without its type. A kind reads it with `body.as_text()` or
+  its text, without its type. This is enforced at binding: a 0.1.0 component
+  with any input or output port on a channel declared `non_text` is refused
+  at boot and at reload. A kind reads it with `body.as_text()` or
   `envelope.text_body()?`, and compares a sentinel as
   `body.as_text() == Some("…")`.
 - `brenn_guest::MessageEnvelopeExt` gained `text_body(&self) -> Result<&str,

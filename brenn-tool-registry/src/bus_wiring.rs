@@ -155,6 +155,7 @@ pub fn inbox_input_port(slug: &str, ch: &ResolvedChannel) -> WasmInputPort {
         port: TOOL_RESULT_INPUT_PORT.to_string(),
         sub: inbox_subscription(slug, ch),
         amplification_mt: MILLITOKENS_PER_PUBLISH,
+        non_text: ch.non_text,
     }
 }
 
@@ -257,6 +258,7 @@ pub fn request_input_port(slug: &str, ch: &ResolvedChannel) -> WasmInputPort {
         port: TOOL_REQUEST_INPUT_PORT.to_string(),
         sub: request_inbox_subscription(slug, ch),
         amplification_mt: MILLITOKENS_PER_PUBLISH,
+        non_text: ch.non_text,
     }
 }
 

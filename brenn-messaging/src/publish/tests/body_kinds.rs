@@ -1,6 +1,7 @@
 //! Bodies of every kind through the publish ladder and back out through the
 //! query API: a non-text body and a typed text body, on a ring-backed channel
-//! and on a durable channel whose store is reopened between the two.
+//! and on a durable channel whose store is reopened between the two. Both
+//! channels are declared `non_text`.
 
 use super::super::*;
 use super::{CountingRouter, test_app_config};
@@ -8,7 +9,7 @@ use crate::config::{MessagingGlobalConfig, ResolvedMessagingConfig};
 use crate::format::format_messaging_event_single;
 use crate::query::MessageQuery;
 use crate::store::RingStores;
-use crate::testutils::{ephemeral_channel_entry, test_channel_entry};
+use crate::testutils::{declared_non_text, ephemeral_channel_entry, test_channel_entry};
 use crate::{MessagingDirectory, WakeRouter, canonical_address, db::upsert_channels};
 use brenn_envelope::grants::AppCapability;
 use brenn_envelope::{MessageBody, MessageEnvelope};
@@ -72,11 +73,11 @@ async fn messenger(path: Option<&Path>) -> Arc<Messenger> {
         None => crate::db::init_db_memory(),
     };
     // A fixed uuid, so the reopened store finds the same channel row.
-    let durable = ChannelEntry {
+    let durable = declared_non_text(ChannelEntry {
         uuid: DURABLE_UUID,
         ..test_channel_entry(DURABLE, vec![])
-    };
-    let ephemeral = ephemeral_channel_entry(EPHEMERAL_NAME, 8);
+    });
+    let ephemeral = declared_non_text(ephemeral_channel_entry(EPHEMERAL_NAME, 8));
     {
         let conn = db.lock().await;
         conn.execute(

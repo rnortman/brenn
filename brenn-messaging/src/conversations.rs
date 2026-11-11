@@ -615,6 +615,7 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![SubscriberEntry {
                 kind: SubscriberEntryKind::App(APP.to_string()),

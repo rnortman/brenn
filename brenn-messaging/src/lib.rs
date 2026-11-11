@@ -78,7 +78,7 @@ pub use query::{MessageQuery, QueryError};
 
 /// One port's slice of a multi-port activation snapshot.
 ///
-/// Coupled to [`brenn_wasm::ProcessorPortWindow`]; changes here must track
+/// Coupled to [`brenn_wasm::HostPortWindow`]; changes here must track
 /// changes there.
 pub struct PortSnapshot {
     /// Logical input port name (from config).
@@ -90,8 +90,9 @@ pub struct PortSnapshot {
     pub capabilities: brenn_envelope::ChannelCapabilities,
     /// The port's window, oldest first, each entry carrying the retention seq
     /// its store assigned it: seen context up to `new_from`, then what is new.
-    /// One read, so no message appears twice and no dedupe is needed.
-    pub entries: Vec<(store::MessageSeq, MessageEnvelope)>,
+    /// One read, so no message appears twice and no dedupe is needed. The
+    /// envelopes are the ones the store holds, shared rather than copied.
+    pub entries: Vec<(store::MessageSeq, Arc<MessageEnvelope>)>,
     /// Index of the first new entry, equal to `entries.len()` when the port was
     /// owed nothing this step — always the case for a sampled port
     /// (`push_depth = Bounded(0)`), whose window is all context.
@@ -113,12 +114,12 @@ impl PortSnapshot {
     }
 
     /// The new messages, oldest first.
-    pub fn new_entries(&self) -> &[(store::MessageSeq, MessageEnvelope)] {
+    pub fn new_entries(&self) -> &[(store::MessageSeq, Arc<MessageEnvelope>)] {
         &self.entries[self.new_from..]
     }
 
     /// The context ahead of the new boundary, oldest first.
-    pub fn context(&self) -> &[(store::MessageSeq, MessageEnvelope)] {
+    pub fn context(&self) -> &[(store::MessageSeq, Arc<MessageEnvelope>)] {
         &self.entries[..self.new_from]
     }
 
@@ -1480,13 +1481,22 @@ impl Messenger {
     ///
     /// If `channel_address` resolves to no channel.
     fn store_for_bound_output(&self, channel_address: &str) -> Arc<dyn store::RetentionStore> {
-        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+        self.store_for(&self.bound_output_entry(channel_address))
+    }
+
+    /// Resolves a bound WASM output port's channel address to its directory
+    /// entry.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel.
+    fn bound_output_entry(&self, channel_address: &str) -> Arc<ChannelEntry> {
+        self.directory.resolve(channel_address).unwrap_or_else(|| {
             panic!(
                 "messaging: deferred operation requested for channel {channel_address:?} not in \
                  the directory — a bound output port must resolve"
             )
-        });
-        self.store_for(&entry)
+        })
     }
 
     /// Cancel one of `sender`'s parked messages on `channel_address`, named by its
@@ -1528,24 +1538,23 @@ impl Messenger {
     /// # Panics
     ///
     /// If `channel_address` resolves to no channel (a bound output port must
-    /// resolve).
+    /// resolve), or if `body` is a non-text body and the channel is text-only
+    /// ([`ChannelEntry::assert_may_hold`]).
     pub async fn edit_deferred_for_sender(
         &self,
         channel_address: &str,
         sender: &str,
         message_uuid: Uuid,
-        body: Option<String>,
+        body: Option<MessageBody>,
         release_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> store::DeferralOutcome {
-        self.store_for_bound_output(channel_address)
-            .edit_deferred(
-                sender,
-                message_uuid,
-                body.map(MessageBody::text),
-                release_at,
-                now,
-            )
+        let entry = self.bound_output_entry(channel_address);
+        if let Some(body) = &body {
+            entry.assert_may_hold(body);
+        }
+        self.store_for(&entry)
+            .edit_deferred(sender, message_uuid, body, release_at, now)
             .await
     }
 
@@ -3164,11 +3173,7 @@ impl Messenger {
                 channel_address: sub.channel_address.clone(),
                 capabilities: store.capabilities(),
                 new_from: window.new_from,
-                entries: window
-                    .entries
-                    .into_iter()
-                    .map(|(seq, envelope)| (seq, (*envelope).clone()))
-                    .collect(),
+                entries: window.entries,
                 push_enabled: sub.push_depth.is_push_enabled(),
             });
         }
@@ -4573,7 +4578,7 @@ mod tests {
                 &ephemeral.address,
                 alice.as_str(),
                 alice_uuid,
-                Some("alice-rescheduled".to_string()),
+                Some(MessageBody::text("alice-rescheduled")),
                 Some(now + Duration::seconds(90)),
                 now,
             )
@@ -4932,6 +4937,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }];
         let (_wake, snapshot) = restarted
             .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
@@ -5016,6 +5022,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }];
 
         let (_wake, parked_snapshot) = messenger
@@ -5127,6 +5134,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }];
 
         let scan_before = messenger.pending_bus_pushes_scan_count();
@@ -5220,6 +5228,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }];
 
         let (_wake, snapshots) = messenger
@@ -5289,6 +5298,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }];
 
         let (wake, snapshots) = messenger
@@ -5354,6 +5364,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }];
 
         let (wake, snapshots) = messenger
@@ -5403,6 +5414,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }];
 
         let (wake, mount) = messenger
@@ -5452,6 +5464,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }];
 
         let (wake, _snapshots) = messenger
@@ -5498,6 +5511,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }];
 
         let (wake, snapshots) = messenger
@@ -5579,6 +5593,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         };
         let inputs = vec![port(&attached), port(&orphan)];
 
@@ -6933,6 +6948,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }
     }
 
@@ -7175,6 +7191,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }
     }
 
@@ -7319,6 +7336,7 @@ mod tests {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }];
         let (_wake, snap) = messenger
             .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
@@ -7832,6 +7850,7 @@ mod tests {
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             },
         ];
         let (_wake, snaps) = messenger

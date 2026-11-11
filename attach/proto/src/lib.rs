@@ -92,6 +92,16 @@ pub fn negotiate(a: VersionRange, b: VersionRange) -> Option<u32> {
     (agreed >= a.min.max(b.min)).then_some(agreed)
 }
 
+/// Whether `version`'s frames can carry a body that is not text.
+///
+/// False for every version this crate speaks: a body crosses the wire as a
+/// string. A server answers a subscribe to a channel declared `non_text`
+/// [`SubscribeOutcome::Unavailable`] for a session on such a version, so that
+/// nothing it cannot represent is ever delivered to it.
+pub const fn carries_non_text_bodies(_version: u32) -> bool {
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Client → server frames
 // ---------------------------------------------------------------------------
@@ -552,6 +562,10 @@ pub enum SubscribeOutcome {
     /// now: a profile whose channels are provisioned at runtime raced their
     /// coming and going.
     ///
+    /// Or the channel exists and cannot be served to this protocol version: it
+    /// is declared to carry bodies that are not text, and the session's
+    /// version carries only text ([`carries_non_text_bodies`]).
+    ///
     /// Non-fatal and disclosing nothing an operator did not authorize — the
     /// grant that admits the address is the operator's own statement that this
     /// attacher may know whether it is there. The subscription is not opened:
@@ -879,6 +893,13 @@ mod tests {
     #[test]
     fn the_wire_version_is_pinned_to_this_frame_shape() {
         assert_eq!(SUPPORTED_VERSIONS, VersionRange::exactly(4));
+    }
+
+    #[test]
+    fn no_supported_version_carries_non_text_bodies() {
+        for version in SUPPORTED_VERSIONS.min..=SUPPORTED_VERSIONS.max {
+            assert!(!carries_non_text_bodies(version), "v{version}");
+        }
     }
 
     #[test]

@@ -1524,6 +1524,62 @@ async fn a_granted_but_absent_channel_answers_unavailable() {
     );
 }
 
+/// **A `non_text` channel is not served to a version that carries only text.**
+/// The attacher cannot see the declaration, so the ask is conforming: answered
+/// `Unavailable`, not a violation, and nothing opens.
+#[tokio::test]
+async fn a_non_text_channel_answers_unavailable_to_a_text_only_version() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (messenger, _uuid) =
+        crate::test_support::one_channel_messenger_declared(&db, BARE, Depth::Unbounded, true)
+            .await;
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy.acls.brenn_subscribe = vec![ChannelMatcher::Exact(BARE.to_string())];
+    let facts = SubscriptionFacts {
+        push_depth: 8,
+        retain_depth: 8,
+    };
+    let profile = TestProfile {
+        subscribable: HashMap::from([(ADDR.to_string(), facts)]),
+        subscribe_burst: 16,
+        runtime_entry: Some(minted_entry(8, 8)),
+        ..TestProfile::new()
+    };
+    let (ctx, mut rx) = AttachCtxBuilder::new(profile)
+        .messenger(messenger)
+        .policy(policy)
+        .build();
+    assert!(!brenn_attach_proto::carries_non_text_bodies(ctx.version()));
+    let mut wire = Wire::new(&ctx);
+
+    let outcome = wire.subscribe(&ctx, ADDR, 4, 4, None).await;
+
+    assert!(matches!(outcome, FrameOutcome::Continue), "not a violation");
+    let written = frames(&mut rx);
+    assert_eq!(written.len(), 1, "one frame, and it is the refusal");
+    match &written[0] {
+        ServerFrame::SubscribeResult {
+            channel,
+            outcome,
+            replay_count,
+            gap,
+        } => {
+            assert_eq!(channel, ADDR);
+            assert!(matches!(outcome, SubscribeOutcome::Unavailable));
+            assert_eq!(*replay_count, 0);
+            assert!(gap.is_none());
+        }
+        other => panic!("expected a SubscribeResult, got {other:?}"),
+    }
+    assert!(!wire.active.is_active(ADDR), "nothing was opened");
+    assert_eq!(wire.position(ADDR), None, "no span was anchored");
+    assert!(
+        directory_subscribers(&ctx, ADDR).is_empty(),
+        "no runtime entry was minted"
+    );
+}
+
 /// **A malformed cursor still kills, absent channel or not.** The existence
 /// answer is the last thing a Subscribe can earn: every violation the frame
 /// carries is decided first, so a hostile client cannot launder one behind a

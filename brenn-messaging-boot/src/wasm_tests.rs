@@ -2245,3 +2245,76 @@ fn an_input_depth_only_difference_is_a_difference() {
     assert_eq!(before[0].policy, after[0].policy);
     assert_eq!(before[0].outputs, after[0].outputs);
 }
+
+// --- non_text ---
+
+/// `brenn:both-ch` as a channel that may carry non-text bodies.
+fn non_text_entry(addr: &str) -> ChannelEntry {
+    let mut entry = brenn_entry(addr);
+    entry.resolved_channel.non_text = true;
+    entry
+}
+
+/// A consumer with an input and an output named `total` on `brenn:both-ch`,
+/// each stating `needs` as its `non_text`.
+fn both_ch_consumer(needs: bool) -> WasmConsumerConfigRaw {
+    WasmConsumerConfigRaw {
+        slug: "frames".to_string(),
+        package: "a".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
+            "both-ch".to_string(),
+        )],
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            non_text: needs,
+            ..sub_raw("brenn:both-ch", "total")
+        }],
+        outputs: vec![WasmConsumerOutputRaw {
+            non_text: needs,
+            ..out_raw("total", "brenn:both-ch")
+        }],
+        ..minimal_wasm_consumer()
+    }
+}
+
+/// Each resolved port carries its bound channel's `non_text`, whether or not
+/// the port stated the need.
+#[test]
+fn resolved_ports_carry_the_bound_channels_non_text() {
+    for (non_text, needs) in [(true, true), (true, false), (false, false)] {
+        let entry = match non_text {
+            true => non_text_entry("brenn:both-ch"),
+            false => brenn_entry("brenn:both-ch"),
+        };
+        let resolved = resolve(&[both_ch_consumer(needs)], &dir_of(vec![entry]));
+        let c = &resolved[0];
+        assert_eq!(c.inputs[0].non_text, non_text, "input, needs = {needs}");
+        assert_eq!(c.outputs[0].non_text, non_text, "output, needs = {needs}");
+    }
+}
+
+/// A port that states the need, bound to a declared channel that does not
+/// meet it, is refused when the plan is built.
+#[test]
+#[should_panic(
+    expected = "[[wasm_consumer]] \"frames\": subscription port \"total\" states \
+                           non_text = true, but its channel \"brenn:both-ch\" is declared \
+                           text-only"
+)]
+fn a_non_text_input_on_a_text_only_channel_panics() {
+    let mut raw = both_ch_consumer(false);
+    raw.subscriptions[0].non_text = true;
+    resolve(&[raw], &dir_of(vec![brenn_entry("brenn:both-ch")]));
+}
+
+#[test]
+#[should_panic(
+    expected = "[[wasm_consumer]] \"frames\": output port \"total\" states \
+                           non_text = true, but its channel \"brenn:both-ch\" is declared \
+                           text-only"
+)]
+fn a_non_text_output_on_a_text_only_channel_panics() {
+    let mut raw = both_ch_consumer(false);
+    raw.outputs[0].non_text = true;
+    resolve(&[raw], &dir_of(vec![brenn_entry("brenn:both-ch")]));
+}

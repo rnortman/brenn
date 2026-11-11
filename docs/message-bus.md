@@ -99,6 +99,24 @@ are not transportable; `brenn:` (durable) and `ephemeral:` channels are. There
 is presently no durable and not-transportable channel type, but in principle
 there could be.
 
+A third, independent property is **`non_text`**: whether the channel may carry
+non-text bodies (§2.1.2). The default is text-only. A declared channel states
+it in its block (`non_text = true`); an auto channel takes it from the ports
+bound to it (§2.6); every system-minted channel is text-only. It is a static
+fact about the channel, read from configuration at every boot and never
+persisted, and it does not look at subscribers: a non-text publish to a
+text-only channel is refused at the publishing door, and a reader that can
+only represent text is refused when it is *bound* to a `non_text` channel, not
+when a message arrives. Text is allowed on a `non_text` channel; the
+declaration widens what the channel may carry and narrows nothing.
+
+A durable channel that holds a non-text message, visible or parked, cannot be
+redeclared text-only: boot and reload refuse it, naming the channel. The way
+out is to keep the declaration, or to give the channel a new address;
+retention removes the messages in time on a bounded channel, so on an
+unbounded durable channel the declaration is in practice permanent. A ring is
+rebuilt empty when its declaration changes, as for any other attribute.
+
 ### 2.1.1 Which schemes each placement may bind
 
 The two component placements — a top-level WASM consumer on the backend, and a
@@ -178,14 +196,24 @@ Who is shown the content type today:
 | Query API (`Messenger::query`), host code | text and type | bytes and type |
 | A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, `BrennMessageEdit`) | `"body": "…"`, then `"content_type": "…"` | `"body": {"binary": true, "content_type": "…", "size": N}` — a placeholder, never the bytes |
 | The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` |
-| 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never delivered: a host panic |
-| Attach v4 sessions (`Deliver`, `DeferredView`) | bare text, **no type** | never delivered: a host panic |
+| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | bytes and type | bytes and type |
+| 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload |
+| Attach v4 sessions (`Deliver`, `DeferredView`) | bare text, **no type** | never bound: a surface binding is refused at plan, a remote's subscribe is answered `Unavailable` |
 
 The two string carriers lose a typed text body's *type*, never its content.
-They cannot carry a non-text body at all, and reaching one with it is a host
-bug. Nothing outside the host can yet publish a typed or non-text body: the
-WIT, the attach protocol and the conversation tools all take a string, so
-every body they produce is untyped text.
+They cannot carry a non-text body at all, so they are kept off every channel
+declared `non_text` (§2.1) before any message flows, and a text-only channel
+never holds a non-text body. Reaching a string carrier with one anyway is a
+host bug and a panic.
+
+What can publish a typed or non-text body: a component built against the
+byte-carrying contract `brenn:processor@0.2.0`, through its publish, deferred
+publish, deferred edit and sync call, onto a channel declared `non_text` for a
+non-text body and onto any channel for a typed text one. A non-text body
+offered for a text-only channel is refused to that component
+(`text-only-channel`) and nothing is stored. What still cannot: a 0.1.0
+component, an attach session, a conversation and every host door that takes a
+string; every body they produce is untyped text.
 
 **The archive line format.** An `archive` sink writes one JSON object per
 evicted message, one per line. The fields are the envelope's, in its order —
@@ -306,6 +334,19 @@ whole of the callee's activation, and the call graph is acyclic by refusal at
 compile time. Anything that needs to cross a host boundary, survive a restart,
 fan out, or be retried is a message, not a call.
 
+Under the byte-carrying contract a call's request and its reply are message
+bodies — bytes with an optional content type — like any other. When the two
+ends speak different contracts, each end is held to its own:
+
+- A non-text request to a callee built against the string contract is refused
+  before the callee runs (`text-only-peer` to the caller). A typed text
+  request reaches it as its text.
+- A reply is judged against the callee's own contract only. A 0.2.0 callee
+  may reply with a non-text body to any caller; its activation ends ok and its
+  buffer flushes. A 0.1.0 caller cannot read that reply, so the *caller's*
+  activation traps, and the alert names the caller, whose wiring is the one to
+  change. A typed text reply reaches a 0.1.0 caller as its text.
+
 ### 2.5 State by retention
 
 Because channels persist independent of consumption, a retained channel *is* a
@@ -379,6 +420,16 @@ nothing else to derive from, and boot refuses a port that leaves either unwritte
 `sink`, `send_rate` and channel-level `noise` inherit the global defaults. A
 channel that needs channel-level tuning has outgrown auto declaration; write the
 `[[channel]]` block.
+
+`non_text` (§2.1) is folded the same way: a port states it on its binding tail,
+and an auto channel is `non_text` when any of its endpoints says so. This is
+how a component keeps binary state on its own `io` port with no declared
+channel: `io state { push_depth = 0; retain_depth = 1; non_text = true; }`.
+On a declared channel the same key on a port is a check, not a declaration: a
+port stating `non_text = true` bound to a channel that does not is refused
+when the plan is built, so `config-check` reports it. A surface binding may not state it, and a
+surface may not be bound to a `non_text` channel, until the surface host and
+the attach protocol carry bytes.
 
 **The timer-cap coupling.** A channel's `retain_depth` also caps its channel-wide
 deferred set, so on an auto channel the fold above is what bounds how many

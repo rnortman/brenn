@@ -1675,6 +1675,7 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![brenn_lib::messaging::SubscriberEntry {
                 kind: brenn_lib::messaging::SubscriberEntryKind::App(app_slug.to_string()),
@@ -2405,10 +2406,29 @@ mod tests {
             b"{\"v\":1}",
         )
         .unwrap();
-        let result = messenger
-            .publish_from_conversation(conversation_id, APP, &address, body, Urgency::Normal)
+        // Written into the inbox's store directly: the inbox is text-only, and
+        // every publish path refuses a non-text body for it. This is the
+        // reader's own handling of a row it cannot parse.
+        let inbox = messenger
+            .directory()
+            .resolve(&address)
+            .expect("the conversation's inbox");
+        messenger
+            .store_for(&inbox)
+            .append(brenn_messaging_store::store::NewMessage {
+                source: "test".to_string(),
+                sender: ParticipantId::for_conversation(conversation_id)
+                    .as_str()
+                    .to_string(),
+                body,
+                urgency: Urgency::Normal,
+                envelope_type: inbox.transport_type,
+                reply_to: None,
+                delivery_deadline: None,
+                impetus: None,
+                publish_ts_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap(),
+            })
             .await;
-        assert!(matches!(result, PublishResult::Ok { .. }), "{result:?}");
         drain_commands(&bridge, &bus, &commands, &[]).await;
 
         let events = record_bodies(&messenger, &db, conversation_id).await;

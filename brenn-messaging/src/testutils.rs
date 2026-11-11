@@ -211,6 +211,7 @@ pub fn wasm_channel_entry(
             noise: config::NoiseLevel::Silent,
             sink: config::Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(slug.to_string()),
@@ -257,11 +258,18 @@ pub fn ephemeral_channel_entry(name: &str, retain_depth: u64) -> ChannelEntry {
             noise: NoiseLevel::Silent,
             sink: config::Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![],
         transport_type: ChannelScheme::Ephemeral,
         mount: None,
     }
+}
+
+/// `entry`, declared `non_text`: it may hold bodies that are not text.
+pub fn declared_non_text(mut entry: ChannelEntry) -> ChannelEntry {
+    entry.resolved_channel.non_text = true;
+    entry
 }
 
 /// Build a `local:` `ChannelEntry` with the deterministic name-derived uuid —

@@ -161,6 +161,7 @@ fn channel(scheme: ChannelScheme, bare: &str, subscribers: Vec<SubscriberEntry>)
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers,
         transport_type: scheme,
@@ -306,6 +307,7 @@ impl Backend {
                         fill_mt: 1_000_000_000,
                         capacity_mt: 1_000_000_000,
                     },
+                    non_text: false,
                 },
             );
             outputs.push(WasmOutputPort {
@@ -317,6 +319,7 @@ impl Backend {
                     fill_mt: 1_000_000_000,
                     capacity_mt: 1_000_000_000,
                 },
+                non_text: false,
             });
         }
 
@@ -340,6 +343,7 @@ impl Backend {
                         wake_min: WakeMin::Normal,
                     },
                     amplification_mt: 1000,
+                    non_text: false,
                 }
             })
             .collect();
@@ -431,7 +435,7 @@ impl Backend {
         if sender
             .send(brenn_wasm_dispatch::SyncRequest {
                 port: port.to_string(),
-                body: body.to_string(),
+                body: brenn_envelope::MessageBody::text(body),
                 chain: Vec::new(),
                 reply,
             })

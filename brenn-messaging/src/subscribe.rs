@@ -788,6 +788,7 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -1673,6 +1674,7 @@ mod tests {
                 noise: None,
                 sink: None,
                 wake_min: None,
+                non_text: false,
             }],
             &global,
         );

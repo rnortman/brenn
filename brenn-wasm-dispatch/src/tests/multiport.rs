@@ -1024,6 +1024,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(out1_sub_slug.clone()),
@@ -1047,6 +1048,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(out2_sub_slug.clone()),
@@ -1151,6 +1153,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             },
             WasmInputPort {
                 port: "in1".to_string(),
@@ -1163,6 +1166,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             },
         ],
         outputs: vec![],

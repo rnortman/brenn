@@ -43,6 +43,7 @@ fn wasm_ep(slug: &str, port: &str) -> LinkEndpointRaw {
         io_port: false,
         push_depth: None,
         retain_depth: None,
+        non_text: false,
     }
 }
 
@@ -60,6 +61,7 @@ fn surface_ep(slug: &str, port: &str) -> LinkEndpointRaw {
         io_port: false,
         push_depth: None,
         retain_depth: None,
+        non_text: false,
     }
 }
 
@@ -202,6 +204,7 @@ fn io_raw(port: &str, push: u64, retain: u64) -> WasmConsumerIoPortRaw {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 
@@ -1706,4 +1709,103 @@ fn duplicate_channel_uuid_panics() {
     a.uuid = shared;
     b.uuid = shared;
     super::assert_unique_channel_uuids([a, b].iter());
+}
+
+// --- non_text ---
+
+/// A link's channel may carry non-text bodies iff one of its endpoints says
+/// so: here only the publishing half does, and the fold is an OR.
+#[test]
+fn a_link_is_non_text_iff_an_endpoint_says_so() {
+    for says in [false, true] {
+        let mut etl = publisher("etl");
+        etl.outputs[0].non_text = says;
+        let consumers = vec![etl, subscriber("indexer", 2, 6)];
+        let mut endpoints = etl_to_indexer(2, 6);
+        endpoints[0].non_text = says;
+        let wiring = lower_auto_wiring(&[link(endpoints)], &consumers, &[], &[], &globals());
+        let entry = &wiring.nondurable_entries()[0];
+        assert_eq!(entry.resolved_channel.non_text, says);
+
+        // Each side's resolved port carries the channel's answer, the
+        // subscriber's included though it stated nothing.
+        let mut entries = wiring.nondurable_entries().to_vec();
+        entries.push(brenn_entry("brenn:feed"));
+        let resolved = resolve_with_auto(&consumers, &dir_of(entries), &wiring);
+        assert_eq!(resolved[0].outputs[0].non_text, says);
+        assert_eq!(resolved[1].inputs[0].non_text, says);
+    }
+}
+
+/// The endpoint and the port's own declaration must agree, as they must on
+/// roles and window: the channel is folded from the one, the port's need is
+/// stated by the other.
+#[test]
+#[should_panic(
+    expected = "endpoint \"wasm:etl/out\" says non_text = true, and its declaration \
+                           says false"
+)]
+fn a_link_endpoint_disagreeing_with_its_declaration_on_non_text_panics() {
+    let consumers = vec![publisher("etl"), subscriber("indexer", 2, 6)];
+    let mut endpoints = etl_to_indexer(2, 6);
+    endpoints[0].non_text = true;
+    lower_auto_wiring(&[link(endpoints)], &consumers, &[], &[], &globals());
+}
+
+/// A free `io` port's own channel is declared by the port: retained binary
+/// state on a port with no channel block.
+#[test]
+fn a_free_io_port_is_non_text_iff_it_says_so() {
+    for says in [false, true] {
+        let mut consumer = timer_consumer("cam");
+        consumer.io_ports[0].non_text = says;
+        let wiring = lower_auto_wiring(&[], &[consumer.clone()], &[], &[], &globals());
+        let entry = &wiring.nondurable_entries()[0];
+        assert_eq!(entry.transport_type, ChannelScheme::Local);
+        assert_eq!(entry.resolved_channel.non_text, says);
+
+        let resolved = resolve_with_auto(
+            &[consumer],
+            &dir_of(wiring.nondurable_entries().to_vec()),
+            &wiring,
+        );
+        assert_eq!(resolved[0].inputs[0].non_text, says);
+        assert_eq!(resolved[0].outputs[0].non_text, says);
+    }
+}
+
+/// An `io` port on a literal `local:` address names an auto channel; the
+/// port's statement is its declaration there too.
+#[test]
+fn a_named_local_io_port_is_non_text_iff_it_says_so() {
+    for says in [false, true] {
+        let mut consumer = timer_consumer("cam");
+        consumer.io_ports[0].channel = Some("local:cam.state".to_string());
+        consumer.io_ports[0].non_text = says;
+        let wiring = lower_auto_wiring(&[], &[consumer], &[], &[], &globals());
+        let entry = &wiring.nondurable_entries()[0];
+        assert_eq!(entry.address, "local:cam.state");
+        assert_eq!(entry.resolved_channel.non_text, says);
+    }
+}
+
+/// A surface endpoint never says `non_text` and leaves the fold as the
+/// backend endpoints make it. Whether a surface may be bound to the result is
+/// the surface resolver's question, not the fold's.
+#[test]
+fn a_surface_endpoint_leaves_the_fold_to_the_backend_endpoints() {
+    let mut etl = publisher("etl");
+    etl.outputs[0].non_text = true;
+    let mut endpoint = wasm_pub("etl", "out");
+    endpoint.non_text = true;
+    let wiring = lower_auto_wiring(
+        &[link(vec![endpoint, surface_sub("desk", "tap", 2, 3)])],
+        &[etl],
+        &[surface_with_free_ports("desk")],
+        &[],
+        &globals(),
+    );
+    let entry = &wiring.nondurable_entries()[0];
+    assert_eq!(entry.transport_type, ChannelScheme::Ephemeral);
+    assert!(entry.resolved_channel.non_text);
 }

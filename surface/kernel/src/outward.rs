@@ -45,6 +45,7 @@ use brenn_attach_client::Millis;
 use brenn_attach_client::publish::OutboxSteps;
 use brenn_attach_client::router::{MessageStamp, ReleaseTimer, ReleasedChannel};
 use brenn_attach_proto::{AlertSeverity, ClientFrame, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES};
+use brenn_envelope::MessageBody;
 use brenn_envelope::grants::ComponentGrant;
 use brenn_surface_schema::{
     CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, ToastBody, ToastSeverity, ToastSource,
@@ -243,7 +244,7 @@ pub fn dispatch_sync(
     let request = sync_request(
         instance,
         port,
-        body.to_string(),
+        MessageBody::text(body),
         stamp.message_id,
         stamp.publish_ts,
     );
@@ -448,7 +449,7 @@ fn judge_reply(
     // by the address space it was built in, so a cap past `usize::MAX` is a cap
     // no reply can reach.
     let cap = usize::try_from(page.body_cap).unwrap_or(usize::MAX);
-    if !within_body_cap(reply, cap) {
+    if !within_body_cap(reply.as_bytes(), cap) {
         return ActivationOutcome::Trap(format!(
             "activation entry replied with {} bytes, over the {cap}-byte reply cap",
             reply.len(),

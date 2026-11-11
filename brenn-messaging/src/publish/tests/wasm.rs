@@ -317,6 +317,7 @@ async fn build_wasm_messenger(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(wasm_slug.to_string()),
@@ -410,6 +411,7 @@ async fn build_wasm_and_app_messenger(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![
             SubscriberEntry {
@@ -677,6 +679,7 @@ async fn build_wasm_output_messenger(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(subscriber_slug.to_string()),
@@ -847,6 +850,7 @@ async fn build_wasm_mixed_output_messenger_at_retain(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(subscriber_slug.to_string()),
@@ -1012,11 +1016,9 @@ async fn publish_from_wasm_ephemeral_output_feeds_a_subscribing_surface() {
 async fn a_fed_body_shares_the_retained_bodys_allocation() {
     let consumer_slug = "wasm-eph-sharer";
     let (m, addr, _reply, router) = build_wasm_ephemeral_surface_messenger(consumer_slug).await;
-    let body = brenn_envelope::MessageBody::from_parts(
-        Some("application/octet-stream"),
-        &[0xff, 0x00, 0xfe],
-    )
-    .expect("a well-formed binary body");
+    // Text: a surface is never bound to a channel that may hold anything else.
+    let body = brenn_envelope::MessageBody::from_parts(Some("text/markdown"), b"# shared")
+        .expect("a well-formed typed text body");
 
     m.publish_from_wasm(
         consumer_slug,

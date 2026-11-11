@@ -122,6 +122,7 @@ pub fn test_out_spec(channel_address: String) -> brenn_wasm::OutputPortSpec {
             fill_mt: 1_000_000_000,
             capacity_mt: 1_000_000_000,
         },
+        non_text: false,
     }
 }
 
@@ -160,6 +161,7 @@ pub fn brenn_channel(address: &str, sub_slug: &str) -> ChannelEntry {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(sub_slug.to_string()),
@@ -242,6 +244,7 @@ pub fn build_cfg(
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }],
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
@@ -321,6 +324,7 @@ pub async fn build_multi_channel_setup(
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         })
         .collect();
     let cfg = WasmConsumerConfig {
@@ -401,6 +405,7 @@ pub async fn build_multiport_setup_with_depths(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(out_sub_slug.clone()),
@@ -485,6 +490,7 @@ pub async fn build_multiport_setup_with_depths(
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             }
         })
         .collect();
@@ -587,6 +593,7 @@ pub async fn build_two_channel_setup(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(slug.to_string()),
@@ -614,6 +621,7 @@ pub async fn build_two_channel_setup(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(second_sub_slug.to_string()),
@@ -694,6 +702,7 @@ pub async fn build_two_channel_setup(
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }],
         outputs: vec![brenn_lib::messaging::config::WasmOutputPort {
             port: "out".to_string(),
@@ -704,6 +713,7 @@ pub async fn build_two_channel_setup(
                 fill_mt: 1_000_000,
                 capacity_mt: 1_000_000,
             },
+            non_text: false,
         }],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
@@ -737,6 +747,8 @@ mod mount;
 #[cfg(test)]
 mod multiport;
 #[cfg(test)]
+mod non_text;
+#[cfg(test)]
 mod pacing;
 #[cfg(test)]
 mod provider;
@@ -748,3 +760,5 @@ mod scan;
 mod stop;
 #[cfg(test)]
 mod sync;
+#[cfg(test)]
+mod sync_contracts;

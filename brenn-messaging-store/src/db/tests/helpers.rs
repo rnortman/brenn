@@ -16,6 +16,7 @@ pub(super) fn default_resolved_channel() -> ResolvedChannel {
         noise: NoiseLevel::Silent,
         sink: Sink::Drop,
         wake_min: WakeMin::Normal,
+        non_text: false,
     }
 }
 

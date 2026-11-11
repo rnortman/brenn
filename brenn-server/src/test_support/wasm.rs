@@ -42,6 +42,7 @@ pub fn wasm_subscriber_channel_entry(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(wasm_slug.to_string()),
@@ -134,6 +135,7 @@ pub async fn activation_new_messages(
             wake_min: WakeMin::Normal,
         },
         amplification_mt: 1_000,
+        non_text: false,
     }];
     // `Settled`: this asks what a *delivery* would serve. A mount activation
     // windows every allowed port whatever it holds, which would answer a
@@ -146,7 +148,7 @@ pub async fn activation_new_messages(
             snapshots
                 .iter()
                 .flat_map(|snapshot| snapshot.new_entries())
-                .map(|(_, envelope)| envelope.clone())
+                .map(|(_, envelope)| MessageEnvelope::clone(envelope))
                 .collect()
         })
         .unwrap_or_default()

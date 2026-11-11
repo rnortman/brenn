@@ -129,6 +129,7 @@ pub fn io_port_raw(
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 
@@ -357,6 +358,7 @@ pub(super) fn brenn_entry_with(
             noise,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![],
         transport_type: ChannelScheme::Brenn,
@@ -395,6 +397,7 @@ pub(super) fn sub_raw(channel: &str, port: &str) -> WasmConsumerSubscriptionRaw 
         noise: None,
         wake_min: None,
         amplification: None,
+        non_text: false,
     }
 }
 
@@ -408,6 +411,7 @@ pub(super) fn out_raw(port: &str, channel: &str) -> WasmConsumerOutputRaw {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 

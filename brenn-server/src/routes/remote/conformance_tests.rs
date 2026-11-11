@@ -636,6 +636,58 @@ async fn a_granted_channel_the_directory_lacks_is_unavailable_until_it_is_provis
     rig.client.close().await;
 }
 
+/// **A `non_text` channel is not served to a text-only wire, and asking is
+/// not a violation.**
+///
+/// The daemon cannot see the declaration, so its subscribe is conforming:
+/// answered `Unavailable`, opening nothing, capturing no security event. The
+/// same session subscribes a text-only channel as usual and may still publish
+/// text to the `non_text` one, since a declaration widens what a channel may
+/// carry.
+#[tokio::test]
+async fn a_non_text_channel_is_unavailable_to_a_v4_remote_which_may_still_publish_text_to_it() {
+    let db = crate::test_support::init_db_memory();
+    let mut frames = durable_at_standing(OUT_9_BARE, OUT_STANDING);
+    frames.resolved_channel.non_text = true;
+    let mut channels = fleet_channels();
+    channels.push(frames);
+    let mut rig = build_rig(&db, loopback, channels).await;
+    rig.client.attach().await;
+
+    let settlement = rig
+        .client
+        .subscribe_settlement(OUT_9, DEPTHS, ResumePolicy::Resume)
+        .await;
+    assert!(
+        matches!(settlement, SubscribeSettlement::Unavailable),
+        "a non_text channel to a v4 session, got {settlement:?}"
+    );
+    assert!(!rig.client.is_subscribed(OUT_9));
+    assert!(
+        remote_entry(&rig, OUT_9).is_none(),
+        "the refusal minted no directory entry"
+    );
+
+    rig.client
+        .subscribe(OUT_7, DEPTHS, ResumePolicy::Resume)
+        .await;
+    assert_eq!(
+        rig.client.publish(publish(OUT_9, "plain text")).await,
+        PublishOutcome::Ok
+    );
+    assert_eq!(
+        rig.client.publish(publish(OUT_7, "still served")).await,
+        PublishOutcome::Ok
+    );
+    assert_eq!(rig.client.next_delivery(OUT_7).await.body, "still served");
+    assert!(
+        rig.harness.captured().await.is_empty(),
+        "asking for a channel the wire cannot carry is not a security event"
+    );
+
+    rig.client.close().await;
+}
+
 /// **Outside the grants there is no oracle, only a closed socket.**
 ///
 /// An address no matcher covers and a granted name under a scheme it was not

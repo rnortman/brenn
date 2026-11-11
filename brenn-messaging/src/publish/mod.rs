@@ -1063,6 +1063,7 @@ impl Messenger {
         //    whether the deferred set is rows or a map, is the store's business
         //    and no caller's. The deferred cap is the store's too, so a durable
         //    schedule is refused at the same channel-wide bound a ring one is.
+        channel.assert_may_hold(&body);
         let store = self.store_for(&channel);
         let message = store::NewMessage {
             source: self.source.as_ref().to_owned(),
@@ -1316,6 +1317,7 @@ impl Messenger {
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
     ) -> InsertedMessage {
+        channel.assert_may_hold(body);
         insert_message_in_tx(
             tx,
             channel.uuid,
@@ -1599,6 +1601,7 @@ impl Messenger {
                 // Non-durable: skip the durable transaction machinery; ring
                 // append is deferred to after the lock.
                 if !entry.capabilities().durable {
+                    entry.assert_may_hold(&publish.body);
                     let scheme = ChannelScheme::of(channel_addr).unwrap_or_else(|| {
                         panic!(
                             "publish_from_wasm: channel {channel_addr:?} carries no scheme prefix \

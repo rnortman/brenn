@@ -320,6 +320,9 @@ pub struct ChannelConfigRaw {
     /// Per-`(sender, channel)` send-rate gate. `None` ⇒ inherit from global
     /// default. Class-uniform: every scheme is rate-gated.
     pub send_rate: Option<SendRate>,
+    /// Whether the channel may carry non-text bodies. Declaring role only: a
+    /// system-minted family is text-only, so a tuning block may not say so.
+    pub non_text: bool,
 }
 
 #[cfg(any(test, feature = "testutils"))]
@@ -353,6 +356,7 @@ impl ChannelConfigRaw {
             sink: None,
             wake_min: None,
             send_rate: None,
+            non_text: false,
         }
     }
 }
@@ -420,6 +424,9 @@ pub struct LinkEndpointRaw {
     pub push_depth: Option<Depth>,
     /// The subscribing half's retained window. Same rules as `push_depth`.
     pub retain_depth: Option<Depth>,
+    /// Whether the port needs a channel that may carry non-text bodies. The
+    /// link's channel may carry them iff any endpoint says so.
+    pub non_text: bool,
 }
 
 /// Which host a link endpoint's port lives on.
@@ -752,6 +759,7 @@ impl WasmConsumerConfigRaw {
                     noise: None,
                     wake_min: None,
                     amplification: None,
+                    non_text: false,
                 })
                 .collect(),
             outputs: vec![],
@@ -838,6 +846,10 @@ pub struct WasmConsumerSubscriptionRaw {
     /// supported via millitoken fixed point. Retained context envelopes contribute
     /// nothing — only newly-delivered envelopes grant tokens.
     pub amplification: Option<f64>,
+    /// Whether the port needs a channel that may carry non-text bodies. On a
+    /// synthesized channel it is the channel's declaration; on a declared
+    /// channel it is checked against the channel's own.
+    pub non_text: bool,
 }
 
 /// Per-output binding block inside `[[wasm_consumer]]`.
@@ -866,6 +878,9 @@ pub struct WasmConsumerOutputRaw {
     /// capacity clamp applied at the *start* of the next activation). `None` ⇒
     /// `DEFAULT_WASM_PUBLISH_CAPACITY` (1.0). Must be finite and `>= 0` when present.
     pub publish_capacity: Option<f64>,
+    /// Whether the port needs a channel that may carry non-text bodies. Same
+    /// semantics as [`WasmConsumerSubscriptionRaw::non_text`].
+    pub non_text: bool,
 }
 
 /// A combined input+output port on a `[[wasm_consumer]]`
@@ -950,6 +965,9 @@ pub struct WasmConsumerIoPortRaw {
     /// Max tokens carried between activations for the output half. `None` ⇒
     /// [`DEFAULT_WASM_PUBLISH_CAPACITY`].
     pub publish_capacity: Option<f64>,
+    /// Whether the port needs a channel that may carry non-text bodies. Same
+    /// semantics as [`WasmConsumerSubscriptionRaw::non_text`].
+    pub non_text: bool,
 }
 
 /// Per-MQTT-client egress budget override block inside `[[wasm_consumer]]`
@@ -1570,6 +1588,10 @@ pub struct ResolvedChannel {
     pub wake_min: WakeMin,
     /// Per-`(sender, this channel)` send-rate gate applied to every publish.
     pub send_rate: SendRate,
+    /// Whether the channel may carry non-text bodies. `false` is text-only: a
+    /// non-text body never enters it, and only a channel that says `false` may
+    /// be bound by a consumer that can represent nothing but text.
+    pub non_text: bool,
 }
 
 /// Resolved millitoken budget knobs for one WASM egress sink (output port or MQTT
@@ -1596,6 +1618,8 @@ pub struct WasmInputPort {
     /// (`MILLITOKENS_PER_PUBLISH` scale). Resolved from `amplification` (default 1.0
     /// ⇒ 1000).
     pub amplification_mt: u64,
+    /// The bound channel's [`ResolvedChannel::non_text`].
+    pub non_text: bool,
 }
 
 /// Resolved per-output port for a WASM consumer.
@@ -1613,6 +1637,8 @@ pub struct WasmOutputPort {
     /// Resolved per-sink publish token-bucket budget for this output port
     /// (`publish_per_activation` / `publish_capacity`, converted to millitokens).
     pub budget: WasmSinkBudget,
+    /// The bound channel's [`ResolvedChannel::non_text`].
+    pub non_text: bool,
 }
 
 /// One resolved `call` port: the caller's port, and the peer's port that
@@ -2248,6 +2274,7 @@ pub fn build_channel_entries(
             sink,
             wake_min,
             send_rate,
+            non_text: ch.non_text,
         };
         assert_depths_within_standing(&resolved, &format!("[[channel]] {canonical:?}"));
 
@@ -2614,6 +2641,12 @@ pub fn build_system_channel_tuning(
             "config: [[channel]] {label} tunes a system-minted channel and must not set \
              description — the endpoint/tool that mints the channel owns it",
         );
+        assert!(
+            !ch.non_text,
+            "config: [[channel]] {label} tunes a system-minted channel and must not set \
+             non_text — every system family is written and read by host code that parses \
+             text",
+        );
 
         let stated = |key: ChannelDepthKey, value: Option<Depth>| -> Depth {
             let required = depth_required(key, ChannelBlockRole::Tuning, TUNING_DURABILITY_IGNORED);
@@ -2794,6 +2827,9 @@ pub fn resolve_system_channel(
         send_rate: tuned
             .and_then(|t| t.send_rate)
             .unwrap_or(defaults.default_send_rate),
+        // Every system family is written and read by host code that parses
+        // text.
+        non_text: false,
     }
 }
 
@@ -3469,6 +3505,7 @@ mod tests {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         }
     }
 
@@ -3581,6 +3618,7 @@ mod tests {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         }
     }
 
@@ -3693,6 +3731,7 @@ channel demo at "ephemeral:protobar-demo" {
                 noise: Some(NoiseLevel::Metered),
                 sink: None,
                 wake_min: None,
+                non_text: false,
             }],
             &global_defaults(),
         );
@@ -4052,6 +4091,7 @@ channel demo at "ephemeral:protobar-demo" {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
         }
     }
 
@@ -4384,6 +4424,55 @@ channel demo at "ephemeral:protobar-demo" {
         let mut block = tuning_block("webhook:hook", 1, 8, 8);
         block.description = Some("mine now".to_string());
         tuning_of(&[block]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not set non_text")]
+    fn a_tuning_block_with_non_text_panics() {
+        let mut block = tuning_block("webhook:hook", 1, 8, 8);
+        block.non_text = true;
+        tuning_of(&[block]);
+    }
+
+    /// A declared channel is text-only unless its block says otherwise, on
+    /// every scheme.
+    #[test]
+    fn a_declared_channel_carries_its_non_text_declaration() {
+        let mut frames = raw_nondurable("ephemeral:frames");
+        frames.non_text = true;
+        let mut state = raw_channel("1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32", "state");
+        state.non_text = true;
+        let entries = build_channel_entries(
+            &[frames, raw_nondurable("local:notes"), state],
+            &global_defaults(),
+        );
+        let by_address = |address: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.address == address)
+                .unwrap_or_else(|| panic!("no entry at {address}"))
+                .resolved_channel
+                .non_text
+        };
+        assert!(by_address("ephemeral:frames"));
+        assert!(!by_address("local:notes"));
+        assert!(by_address("brenn:state"));
+    }
+
+    /// Every system-minted family is text-only, tuned or not.
+    #[test]
+    fn every_system_channel_is_text_only() {
+        let tuned = tuning_of(&[tuning_block("webhook:hook", 1, 8, 8)]);
+        for address in [
+            "webhook:hook",
+            "webhook:github",
+            "mqtt:home:sensors/temp",
+            "brenn:tools/git-repo-pull",
+            "brenn:tool-results/sync",
+        ] {
+            let ch = resolve_system_channel(address, &tuned, &global_defaults());
+            assert!(!ch.non_text, "{address}");
+        }
     }
 
     #[test]
@@ -5348,6 +5437,7 @@ new pfin: Finance();
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,
@@ -5400,6 +5490,7 @@ new pfin: Finance();
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,
@@ -5455,6 +5546,7 @@ new pfin: Finance();
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![],
             transport_type: crate::messaging::ChannelScheme::Brenn,
@@ -5567,6 +5659,7 @@ new pfin: Finance();
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![],
             transport_type: crate::messaging::ChannelScheme::Brenn,
@@ -5597,6 +5690,7 @@ new pfin: Finance();
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Webhook,
@@ -5915,6 +6009,7 @@ new router: Router { grants = []; subscribe_acls = []; io tick {} }
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,
@@ -6528,6 +6623,7 @@ new router: Router { grants = []; subscribe_acls = []; io tick {} }
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: Vec::new(),
             transport_type: ChannelScheme::Brenn,

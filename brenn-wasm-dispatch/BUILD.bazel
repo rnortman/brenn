@@ -33,12 +33,12 @@ rust_library(
 # messaging store. The suite timed out at `small` (60s) with 17 of 40 done, then
 # at `medium` (300s) with 37 of 48 done on the CI runner. `large` (900s).
 #
-# `data` is the four components these suites open, one fixture target each.
+# `data` is the six components these suites open, one fixture target each.
 # Runfiles are inputs to the test action, so every component named here is an
-# edge from a guest crate to this binary; the twelve that are not named cost
+# edge from a guest crate to this binary; the ones that are not named cost
 # nothing when they change.
 #
-# TODO(bazel-fixture-list-guard): which four those are was derived by reading
+# TODO(bazel-fixture-list-guard): which six those are was derived by reading
 # this crate's artifact-stem call sites, and nothing holds the list to them. A
 # component dropped from the tests keeps its edge here silently; one added
 # without its fixture fails loudly on a missing runfile.
@@ -49,6 +49,8 @@ rust_test(
     crate_features = ["testutils"],
     data = [
         "//brenn-wasm:fixture_git_forge_parser",
+        "//brenn-wasm:fixture_processor_bytes_test",
+        "//brenn-wasm:fixture_processor_call_test",
         "//brenn-wasm:fixture_processor_demo",
         "//brenn-wasm:fixture_processor_dual",
         "//brenn-wasm:fixture_processor_multiport",

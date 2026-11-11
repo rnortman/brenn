@@ -37,7 +37,7 @@ pub mod testutils;
 pub mod tool_schema;
 
 pub use body::{BodyError, MessageBody, is_text_content_type};
-pub use shape::{BodyShape, ShapedEnvelope, TextShape, serialize_text_shape};
+pub use shape::{BodyShape, HeaderShape, ShapedEnvelope, TextShape, serialize_text_shape};
 
 // ---------------------------------------------------------------------------
 // Address scheme

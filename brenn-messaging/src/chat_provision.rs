@@ -199,6 +199,7 @@ fn chat_channel_entry(
             noise,
             sink: defaults.default_sink,
             wake_min,
+            non_text: false,
         },
         subscribers,
         transport_type: scheme,

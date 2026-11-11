@@ -753,6 +753,7 @@ fn spanning_link_config() -> brenn_lib::config::BrennConfig {
                     io_port: true,
                     push_depth: Some(Depth::Bounded(4)),
                     retain_depth: Some(Depth::Bounded(4)),
+                    non_text: false,
                 },
                 LinkEndpointRaw {
                     host: LinkHostRaw::Surface {
@@ -765,6 +766,7 @@ fn spanning_link_config() -> brenn_lib::config::BrennConfig {
                     io_port: true,
                     push_depth: Some(Depth::Bounded(4)),
                     retain_depth: Some(Depth::Bounded(4)),
+                    non_text: false,
                 },
             ],
         }],

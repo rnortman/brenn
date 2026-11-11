@@ -44,11 +44,12 @@ use brenn_activation::WINDOW_DEPTH_CEILING;
 use brenn_activation::sync::CallDisposition;
 use brenn_common::sanitize_untrusted_str;
 use brenn_envelope::addressing::PROVIDER_CONCURRENCY_CEILING;
+use brenn_envelope::{BodyError, MessageBody, MessageEnvelope};
 
 /// The grant vocabulary, re-exported: what a load spec grants, what this host
 /// links and what an operator writes are one set of words, and a caller
 /// building a `ProcessorLoadSpec` names them without reaching past this crate.
-pub use brenn_envelope::grants::{ComponentGrant, ComponentHost};
+pub use brenn_envelope::grants::{ComponentGrant, ComponentHost, ProcessorContract};
 
 /// Grace period added on top of SKEW_WINDOW_MS when computing the `last` namespace prune cutoff.
 ///
@@ -686,6 +687,34 @@ mod processor_bindings {
     });
 }
 
+// Bindgen for the `brenn:processor@0.2.0` world. Every interface it imports at
+// `@0.1.0` is mapped onto the module above, so one host implementation serves
+// both contracts; only `bus`, `ports`, `calls` and the world are generated here.
+#[allow(dead_code)]
+mod processor_v0_2_bindings {
+    wasmtime::component::bindgen!({
+        world: "brenn:processor/processor@0.2.0",
+        path: ["wit/processor.wit", "wit/processor-0.2.wit"],
+        with: {
+            "brenn:processor/types@0.1.0": crate::processor_bindings::brenn::processor::types,
+            "brenn:processor/store@0.1.0": crate::processor_bindings::brenn::processor::store,
+            "brenn:processor/log@0.1.0": crate::processor_bindings::brenn::processor::log,
+            "brenn:processor/alert@0.1.0": crate::processor_bindings::brenn::processor::alert,
+            "brenn:processor/config@0.1.0": crate::processor_bindings::brenn::processor::config,
+            "brenn:processor/mqtt@0.1.0": crate::processor_bindings::brenn::processor::mqtt,
+            "brenn:processor/tools@0.1.0": crate::processor_bindings::brenn::processor::tools,
+            "brenn:processor/provides@0.1.0": crate::processor_bindings::brenn::processor::provides,
+            "brenn:processor/dom@0.1.0": crate::processor_bindings::brenn::processor::dom,
+            "brenn:processor/page-dom@0.1.0": crate::processor_bindings::brenn::processor::page_dom,
+        },
+        // Trappable for the reason the 0.1.0 counterparts are.
+        imports: {
+            "brenn:processor/ports@0.2.0": trappable,
+            "brenn:processor/calls@0.2.0": trappable,
+        },
+    });
+}
+
 use processor_bindings::ProcessorPre;
 use processor_bindings::brenn::processor::calls::CallError as CallWitError;
 use processor_bindings::brenn::processor::mqtt::MqttPublishError as MqttPublishWitError;
@@ -694,6 +723,9 @@ use processor_bindings::brenn::processor::ports::PublishError;
 use processor_bindings::brenn::processor::provides::CompleteError as CompleteWitError;
 use processor_bindings::brenn::processor::store::StoreError as ProcessorStoreError;
 use processor_bindings::brenn::processor::tools::ToolError as ToolWitError;
+use processor_v0_2_bindings::brenn::processor0_2_0::bus as bus_v0_2;
+use processor_v0_2_bindings::brenn::processor0_2_0::calls as calls_v0_2;
+use processor_v0_2_bindings::brenn::processor0_2_0::ports as ports_v0_2;
 
 // Re-export the receive-error type so callers can match on `ProcessorOutcome::Err(e)`.
 pub use processor_bindings::brenn::processor::types::ReceiveError as ProcessorReceiveError;
@@ -921,7 +953,7 @@ pub struct ProcessorCallTarget {
 /// Host callback performing one synchronous call to a peer component.
 ///
 /// The seam between this crate and whatever owns the other consumers: it takes
-/// the target slug and port, the request body, and the call chain the callee
+/// the target slug and port, the request body and the call chain the callee
 /// must be handed, and answers with [`SyncAnswer`]. Blocking is the caller's
 /// business — the guest is already stopped on the stack, and the backend runs
 /// every activation on a blocking thread.
@@ -931,8 +963,9 @@ pub struct ProcessorCallTarget {
 /// [`SyncAnswer`] variant, never a panic, because [`ProcessorData::do_call`]
 /// invokes it without a `catch_unwind` boundary. Same seam as
 /// [`MqttPublishFn`] and [`ToolHostFn`].
-pub type SyncCallerFn =
-    Arc<dyn Fn(&str, &str, String, &[String]) -> brenn_activation::sync::SyncAnswer + Send + Sync>;
+pub type SyncCallerFn = Arc<
+    dyn Fn(&str, &str, MessageBody, &[String]) -> brenn_activation::sync::SyncAnswer + Send + Sync,
+>;
 
 /// Cap + debug-escape a guest-controlled port name for safe logging, using the
 /// `{:?}`-quoted form.
@@ -1234,8 +1267,8 @@ pub struct ProcessorPublish {
     pub port: String,
     /// Resolved channel address (attenuation-resolved at buffer time).
     pub channel_address: String,
-    /// Message body (opaque string).
-    pub payload: String,
+    /// Message body.
+    pub body: MessageBody,
     /// Urgency for this publish: guest-supplied (via `publish-with-urgency`) or
     /// the port's configured default (via `publish`).
     pub urgency: ProcessorUrgency,
@@ -1262,12 +1295,13 @@ pub struct ProcessorPublish {
 pub enum ProcessorDeferredOp {
     /// Cancel the parked message at `index` in `port`'s deferred window.
     Cancel { port: String, index: u32 },
-    /// Edit the parked message at `index` in `port`'s deferred window. `payload`
-    /// and `deliver_after` are each `Some` to change, `None` to leave alone.
+    /// Edit the parked message at `index` in `port`'s deferred window. `body`
+    /// (content type and bytes together) and `deliver_after` are each `Some` to
+    /// change, `None` to leave alone.
     Edit {
         port: String,
         index: u32,
-        payload: Option<String>,
+        body: Option<MessageBody>,
         deliver_after: Option<u64>,
     },
 }
@@ -1310,6 +1344,9 @@ pub struct OutputPortSpec {
     pub default_urgency: ProcessorUrgency,
     /// Per-sink token-bucket budget for this port.
     pub budget: SinkBudget,
+    /// Whether the bound channel may carry non-text bodies. A non-text publish
+    /// or deferred edit on a port whose channel may not is refused.
+    pub non_text: bool,
 }
 
 /// Key identifying one egress sink for per-sink publish budgeting.
@@ -1337,9 +1374,9 @@ pub enum SinkKey {
 /// A caller's own `call` is weighed against the *caller's* budget, which is
 /// where a chain's amplification is bounded; granting the callee for being
 /// asked would let a pair of components mint budget by calling each other.
-fn compute_grant_input_mt(
+fn compute_grant_input_mt<E, D>(
     amplification_mt: &HashMap<String, u64>,
-    activation: &ProcessorActivation,
+    activation: &brenn_activation::Activation<E, D>,
 ) -> u64 {
     let sync = activation.sync.as_deref();
     let windows = activation
@@ -1358,29 +1395,157 @@ fn compute_grant_input_mt(
     }))
 }
 
-/// One port-window handed to `ProcessorComponent::handle`.
+/// One port-window handed to `ProcessorComponent::handle`: the window's
+/// messages as the envelopes the store holds, shared rather than copied.
 ///
-/// This host carries an envelope as its JSON text: that is what crosses the WIT
-/// boundary into the guest.
-pub type ProcessorPortWindow = brenn_activation::ProcessorPortWindow;
+/// Lowered to what crosses the WIT boundary inside `handle`, by the component's
+/// contract, which only this crate knows.
+pub type HostPortWindow = brenn_activation::PortWindow<Arc<MessageEnvelope>>;
 
-/// One output port's deferred-message view handed to `ProcessorComponent::handle`.
-///
-/// A parked message's payload is its body text — the same string the guest passed
-/// to `ports.publish-deferred` — on every host, so this type carries no envelope
-/// parameter.
-pub type ProcessorDeferredWindow = brenn_activation::DeferredWindow;
+/// One output port's deferred-message view handed to `ProcessorComponent::handle`:
+/// each parked message as its shared envelope, lowered inside `handle` like a
+/// window.
+pub type HostDeferredWindow = brenn_activation::DeferredWindow<Arc<MessageEnvelope>>;
 
-/// One entry in a [`ProcessorDeferredWindow`].
-pub type ProcessorDeferredEntry = brenn_activation::DeferredEntry;
+/// One entry in a [`HostDeferredWindow`].
+pub type HostDeferredEntry = brenn_activation::DeferredEntry<Arc<MessageEnvelope>>;
 
 /// Host-side activation handed to `ProcessorComponent::handle`.
 ///
-/// Contains one [`ProcessorPortWindow`] per bound input port, in config (`inputs`)
+/// Contains one [`HostPortWindow`] per bound input port, in config (`inputs`)
 /// order. Every bound port appears in every activation; ports without pending rows
 /// arrive as pure-context windows (`new_from == envelopes.len()`). Guests must not
 /// assume `ports.len() == 1`.
-pub type ProcessorActivation = brenn_activation::ProcessorActivation;
+pub type HostActivation = brenn_activation::Activation<Arc<MessageEnvelope>, Arc<MessageEnvelope>>;
+
+/// Lower a host activation to the `brenn:processor@0.1.0` carrier: each window
+/// envelope as its `envelope-json`, each parked message as its body text.
+///
+/// # Panics
+///
+/// On a non-text body in either place. Neither 0.1.0 carrier can represent one,
+/// and a 0.1.0 component bound where one can arrive is refused before it is
+/// delivered anything, so reaching it is a host bug.
+fn lower_v0_1(activation: HostActivation) -> brenn_activation::ProcessorActivation {
+    brenn_activation::Activation {
+        ports: activation
+            .ports
+            .into_iter()
+            .map(|pw| brenn_activation::PortWindow {
+                port: pw.port,
+                envelopes: pw.envelopes.iter().map(|e| e.to_envelope_json()).collect(),
+                new_from: pw.new_from,
+                dropped: pw.dropped,
+            })
+            .collect(),
+        deferred: activation
+            .deferred
+            .into_iter()
+            .map(|dw| brenn_activation::DeferredWindow {
+                port: dw.port,
+                entries: dw
+                    .entries
+                    .into_iter()
+                    .map(|e| brenn_activation::DeferredEntry {
+                        index: e.index,
+                        payload: e
+                            .payload
+                            .require_text_body("0.1.0 deferred-entry.payload")
+                            .to_owned(),
+                        deliver_after: e.deliver_after,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        now: activation.now,
+        sync: activation.sync,
+    }
+}
+
+/// `processor.wit` types `dropped` as u32 while the carrier counts in u64.
+/// Saturate: the guest reads this as a gap signal, and a saturated count still
+/// says "you lost more than you can count".
+fn saturate_dropped(dropped: u64) -> u32 {
+    u32::try_from(dropped).unwrap_or(u32::MAX)
+}
+
+/// A body as the `brenn:processor@0.2.0` carrier holds it. The bytes are copied
+/// once, out of the body's shared allocation into the record the lowering
+/// hands to guest memory.
+fn body_v0_2(body: &MessageBody) -> bus_v0_2::Body {
+    bus_v0_2::Body {
+        content_type: body.content_type().map(str::to_owned),
+        bytes: body.as_bytes().to_vec(),
+    }
+}
+
+/// Lower a host activation to the `brenn:processor@0.2.0` carrier: each window
+/// envelope as its header and body, each parked message as its body. Every body
+/// crosses byte-exact with its content type.
+fn lower_v0_2(activation: HostActivation) -> bus_v0_2::Activation {
+    bus_v0_2::Activation {
+        ports: activation
+            .ports
+            .into_iter()
+            .map(|pw| bus_v0_2::PortWindow {
+                port: pw.port,
+                envelopes: pw
+                    .envelopes
+                    .iter()
+                    .map(|e| bus_v0_2::Envelope {
+                        header: e.to_header_json(),
+                        body: body_v0_2(&e.body),
+                    })
+                    .collect(),
+                new_from: pw.new_from,
+                dropped: saturate_dropped(pw.dropped),
+            })
+            .collect(),
+        deferred: activation
+            .deferred
+            .into_iter()
+            .map(|dw| bus_v0_2::DeferredWindow {
+                port: dw.port,
+                entries: dw
+                    .entries
+                    .into_iter()
+                    .map(|e| bus_v0_2::DeferredEntry {
+                        index: e.index,
+                        body: body_v0_2(&e.payload.body),
+                        deliver_after: e.deliver_after,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        now: activation.now,
+        sync: activation.sync,
+    }
+}
+
+/// What `receive` returned, in either contract's terms: the guest's reply
+/// unbuilt, or its typed rejection.
+type Received = Result<Option<GuestBody>, ProcessorReceiveError>;
+
+/// A guest's sync reply as the body its caller is handed, or the trap message
+/// that ends the replying activation with nothing flushed.
+///
+/// The reply is judged against the replying component's own contract only:
+/// built by the rule every guest body is, and bounded by the same cap as a
+/// publish body, in raw bytes, so a callee cannot hand a caller more than it
+/// could have published. Truncating it or answering in its place would hand
+/// the caller something the callee never said.
+fn reply_body(reply: GuestBody, max_body_bytes: usize) -> Result<MessageBody, String> {
+    let body = reply
+        .build()
+        .map_err(|e| format!("receive replied with an invalid body: {e}"))?;
+    if !brenn_activation::sync::within_body_cap(body.as_bytes(), max_body_bytes) {
+        return Err(format!(
+            "receive replied with {} bytes, over the {max_body_bytes}-byte reply cap",
+            body.len()
+        ));
+    }
+    Ok(body)
+}
 
 /// Outcome of one `ProcessorComponent::handle` invocation.
 #[derive(Debug)]
@@ -1395,7 +1560,7 @@ pub enum ProcessorOutcome {
         /// `None` on every async activation — the world admits a reply only
         /// where a caller asked for it — and on a sync call the guest answered
         /// without one.
-        reply: Option<String>,
+        reply: Option<MessageBody>,
     },
     /// Guest returned `result::err` — typed batch rejection.
     Err(ProcessorReceiveError),
@@ -1444,6 +1609,13 @@ struct ProcessorData {
     /// the count drains into a single post-activation warn so the operator sees a
     /// budget being hit even when the guest swallows the error.
     publish_suppressed_by_sink: HashMap<SinkKey, u32>,
+    /// Per `(port, channel address)` count of non-text bodies refused this
+    /// activation because the bound channel is text-only — publishes, deferred
+    /// publishes and deferred edits. Drains into a single post-activation warn:
+    /// the channel is operator configuration, so a missing `non_text`
+    /// declaration must reach the operator even when the guest swallows the
+    /// error.
+    text_only_refusals: HashMap<(String, String), u32>,
     publish_buffer: Vec<ProcessorPublish>,
     /// Host callback for guest-originated alerts (via the `alert` WIT interface).
     alerter: Arc<dyn ProcessorAlerter>,
@@ -1550,12 +1722,184 @@ fn epoch_extension(own: std::time::Duration, budget: std::time::Duration) -> Opt
 ///
 /// The classification is [`brenn_budget::publish_refusal_kind`], shared with the
 /// surface kernel.
-fn publish_error(refusal: GateRefusal) -> PublishError {
+fn publish_error(refusal: GateRefusal) -> PublishRefusal {
     match publish_refusal_kind(refusal) {
         PublishRefusalKind::InvalidPayload(fault) => {
-            PublishError::InvalidPayload(fault.to_string())
+            PublishRefusal::InvalidPayload(fault.to_string())
         }
-        PublishRefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
+        PublishRefusalKind::QuotaExceeded => PublishRefusal::QuotaExceeded,
+    }
+}
+
+/// Why a publish was refused, in the host's own terms; each contract's `Host`
+/// impl spells it as its own `publish-error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublishRefusal {
+    NotPermitted,
+    InvalidPayload(String),
+    /// The guest's body is malformed (`BodyError`).
+    InvalidBody(String),
+    /// A non-text body for a port whose channel carries only text.
+    TextOnlyChannel,
+    QuotaExceeded,
+}
+
+impl PublishRefusal {
+    /// The refusal as a 0.1.0 guest reads it.
+    ///
+    /// # Panics
+    ///
+    /// On a body refusal: a 0.1.0 body is untyped text, which is always
+    /// well-formed and always text, so drawing one is a host bug.
+    fn into_v0_1(self) -> PublishError {
+        match self {
+            Self::NotPermitted => PublishError::NotPermitted,
+            Self::InvalidPayload(why) => PublishError::InvalidPayload(why),
+            Self::QuotaExceeded => PublishError::QuotaExceeded,
+            Self::InvalidBody(_) | Self::TextOnlyChannel => {
+                panic!("host invariant: a 0.1.0 publish drew {self:?}, which untyped text cannot")
+            }
+        }
+    }
+
+    fn into_v0_2(self) -> ports_v0_2::PublishError {
+        match self {
+            Self::NotPermitted => ports_v0_2::PublishError::NotPermitted,
+            Self::InvalidPayload(why) => ports_v0_2::PublishError::InvalidPayload(why),
+            Self::InvalidBody(why) => ports_v0_2::PublishError::InvalidBody(why),
+            Self::TextOnlyChannel => ports_v0_2::PublishError::TextOnlyChannel,
+            Self::QuotaExceeded => ports_v0_2::PublishError::QuotaExceeded,
+        }
+    }
+}
+
+/// Why a deferred control op was refused, in the host's own terms; each
+/// contract's `Host` impl spells it as its own `defer-error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeferRefusal {
+    OutOfRange,
+    QuotaExceeded,
+    InvalidDeliverAfter,
+    /// The guest's edit body is malformed (`BodyError`).
+    InvalidBody(String),
+    /// A non-text edit body for a port whose channel carries only text.
+    TextOnlyChannel,
+}
+
+impl DeferRefusal {
+    /// The refusal as a 0.1.0 guest reads it.
+    ///
+    /// # Panics
+    ///
+    /// On a body refusal, which untyped text cannot draw (see
+    /// [`PublishRefusal::into_v0_1`]).
+    fn into_v0_1(self) -> DeferError {
+        match self {
+            Self::OutOfRange => DeferError::OutOfRange,
+            Self::QuotaExceeded => DeferError::QuotaExceeded,
+            Self::InvalidDeliverAfter => DeferError::InvalidDeliverAfter,
+            Self::InvalidBody(_) | Self::TextOnlyChannel => {
+                panic!(
+                    "host invariant: a 0.1.0 deferred op drew {self:?}, which untyped text cannot"
+                )
+            }
+        }
+    }
+
+    fn into_v0_2(self) -> ports_v0_2::DeferError {
+        match self {
+            Self::OutOfRange => ports_v0_2::DeferError::OutOfRange,
+            Self::QuotaExceeded => ports_v0_2::DeferError::QuotaExceeded,
+            Self::InvalidDeliverAfter => ports_v0_2::DeferError::InvalidDeliverAfter,
+            Self::InvalidBody(why) => ports_v0_2::DeferError::InvalidBody(why),
+            Self::TextOnlyChannel => ports_v0_2::DeferError::TextOnlyChannel,
+        }
+    }
+}
+
+/// Why a peer call answered no reply, in the host's own terms; each contract's
+/// `Host` impl spells it as its own `call-error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallRefusal {
+    Unwired,
+    Refused,
+    Failed,
+    InvalidPayload(String),
+    /// The guest's request body is malformed (`BodyError`).
+    InvalidBody(String),
+    /// A non-text request to a peer whose contract carries only text.
+    TextOnlyPeer,
+    QuotaExceeded,
+}
+
+impl CallRefusal {
+    /// The refusal as a 0.1.0 guest reads it.
+    ///
+    /// # Panics
+    ///
+    /// On a body refusal, which untyped text cannot draw (see
+    /// [`PublishRefusal::into_v0_1`]).
+    fn into_v0_1(self) -> CallWitError {
+        match self {
+            Self::Unwired => CallWitError::Unwired,
+            Self::Refused => CallWitError::Refused,
+            Self::Failed => CallWitError::Failed,
+            Self::InvalidPayload(why) => CallWitError::InvalidPayload(why),
+            Self::QuotaExceeded => CallWitError::QuotaExceeded,
+            Self::InvalidBody(_) | Self::TextOnlyPeer => {
+                panic!("host invariant: a 0.1.0 call drew {self:?}, which untyped text cannot")
+            }
+        }
+    }
+
+    fn into_v0_2(self) -> calls_v0_2::CallError {
+        match self {
+            Self::Unwired => calls_v0_2::CallError::Unwired,
+            Self::Refused => calls_v0_2::CallError::Refused,
+            Self::Failed => calls_v0_2::CallError::Failed,
+            Self::InvalidPayload(why) => calls_v0_2::CallError::InvalidPayload(why),
+            Self::InvalidBody(why) => calls_v0_2::CallError::InvalidBody(why),
+            Self::TextOnlyPeer => calls_v0_2::CallError::TextOnlyPeer,
+            Self::QuotaExceeded => calls_v0_2::CallError::QuotaExceeded,
+        }
+    }
+}
+
+/// A body as a guest handed it, before any check has run.
+///
+/// The `Host` impls of both contracts pass this through unbuilt, so a body is
+/// judged at one step of each port function's order and by one rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuestBody {
+    /// A 0.1.0 payload: untyped text.
+    Text(String),
+    /// A 0.2.0 body: an optional content type and bytes.
+    Parts {
+        content_type: Option<String>,
+        bytes: Vec<u8>,
+    },
+}
+
+impl GuestBody {
+    /// The one place a guest's body becomes a [`MessageBody`]. Text cannot
+    /// fail; parts go through [`MessageBody::from_parts`].
+    fn build(self) -> Result<MessageBody, BodyError> {
+        match self {
+            Self::Text(text) => Ok(MessageBody::text(text)),
+            Self::Parts {
+                content_type,
+                bytes,
+            } => MessageBody::from_parts(content_type.as_deref(), &bytes),
+        }
+    }
+}
+
+impl From<bus_v0_2::Body> for GuestBody {
+    fn from(body: bus_v0_2::Body) -> Self {
+        Self::Parts {
+            content_type: body.content_type,
+            bytes: body.bytes,
+        }
     }
 }
 
@@ -1565,12 +1909,10 @@ fn publish_error(refusal: GateRefusal) -> PublishError {
 /// publish path above and with the surface kernel: a call's payload becomes the
 /// one envelope in the callee's window, so it is judged — and spelled to the
 /// guest — exactly as a published body is.
-fn call_error(refusal: GateRefusal) -> CallWitError {
+fn call_error(refusal: GateRefusal) -> CallRefusal {
     match publish_refusal_kind(refusal) {
-        PublishRefusalKind::InvalidPayload(fault) => {
-            CallWitError::InvalidPayload(fault.to_string())
-        }
-        PublishRefusalKind::QuotaExceeded => CallWitError::QuotaExceeded,
+        PublishRefusalKind::InvalidPayload(fault) => CallRefusal::InvalidPayload(fault.to_string()),
+        PublishRefusalKind::QuotaExceeded => CallRefusal::QuotaExceeded,
     }
 }
 
@@ -1578,10 +1920,10 @@ fn call_error(refusal: GateRefusal) -> CallWitError {
 ///
 /// The classification is [`brenn_budget::defer_refusal_kind`], shared with the
 /// surface kernel.
-fn defer_error(refusal: GateRefusal) -> DeferError {
+fn defer_error(refusal: GateRefusal) -> DeferRefusal {
     match defer_refusal_kind(refusal) {
-        DeferRefusalKind::InvalidDeliverAfter => DeferError::InvalidDeliverAfter,
-        DeferRefusalKind::QuotaExceeded => DeferError::QuotaExceeded,
+        DeferRefusalKind::InvalidDeliverAfter => DeferRefusal::InvalidDeliverAfter,
+        DeferRefusalKind::QuotaExceeded => DeferRefusal::QuotaExceeded,
     }
 }
 
@@ -1600,6 +1942,13 @@ fn undeclared_port_trap(slug: &str, port: &str) -> wasmtime::Error {
     ))
 }
 
+/// A `defer-edit` as the guest made it, before any check has run: the body as
+/// the guest handed it, and the new release time. Either may be absent.
+struct GuestEdit {
+    body: Option<GuestBody>,
+    deliver_after: Option<u64>,
+}
+
 impl ProcessorData {
     /// Inner publish implementation shared by `publish` and `publish_with_urgency`.
     ///
@@ -1616,10 +1965,10 @@ impl ProcessorData {
     fn do_publish(
         &mut self,
         port: String,
-        payload: String,
-        guest_urgency: Option<processor_bindings::brenn::processor::ports::Urgency>,
+        body: GuestBody,
+        guest_urgency: Option<ProcessorUrgency>,
         deliver_after: Option<u64>,
-    ) -> wasmtime::Result<Result<(), PublishError>> {
+    ) -> wasmtime::Result<Result<(), PublishRefusal>> {
         // Per-activation total-call budget (successful + failed).
         // Checked first to bound log-flood DoS from repeated unbound-port calls by
         // hostile out-of-tree components. Failed calls consume budget because they
@@ -1636,7 +1985,7 @@ impl ProcessorData {
         // below.
         let output_ports = Arc::clone(&self.output_ports);
         let Some(spec) = output_ports.get(&port) else {
-            return self.publish_unwired(port, payload, deliver_after);
+            return self.publish_unwired(port, body, deliver_after);
         };
         let channel_address = &spec.channel_address;
         let port_default_urgency = &spec.default_urgency;
@@ -1655,16 +2004,22 @@ impl ProcessorData {
                 channel = %channel_address,
                 "wasm publish: not-permitted — channel outside output ACL"
             );
-            return Ok(Err(PublishError::NotPermitted));
+            return Ok(Err(PublishRefusal::NotPermitted));
         }
-        use processor_bindings::brenn::processor::ports::Urgency as WitUrgency;
-        let urgency = match guest_urgency {
-            Some(WitUrgency::VeryLow) => ProcessorUrgency::VeryLow,
-            Some(WitUrgency::Low) => ProcessorUrgency::Low,
-            Some(WitUrgency::Normal) => ProcessorUrgency::Normal,
-            Some(WitUrgency::High) => ProcessorUrgency::High,
-            None => *port_default_urgency,
+        let urgency = guest_urgency.unwrap_or(*port_default_urgency);
+        let body = match body.build() {
+            Ok(body) => body,
+            Err(e) => return Ok(Err(PublishRefusal::InvalidBody(e.to_string()))),
         };
+        // A text-only channel never holds a non-text body; refused here, before
+        // anything is buffered or charged beyond the call.
+        if !body.is_text() && !spec.non_text {
+            *self
+                .text_only_refusals
+                .entry((port, spec.channel_address.clone()))
+                .or_insert(0) += 1;
+            return Ok(Err(PublishRefusal::TextOnlyChannel));
+        }
         // A bound port always has a seeded bucket, so the gate's miss panic is a
         // host invariant violation. Buffered async tool requests ride the entry
         // ceiling with the port publishes — both flush as bus publishes — so
@@ -1673,7 +2028,7 @@ impl ProcessorData {
         let sink_key = SinkKey::Port(port.clone());
         if let Err(refusal) = self.gate.admit_publish(PublishCheck {
             sink: &sink_key,
-            body_len: payload.len(),
+            body_len: body.len(),
             deliver_after,
             entry_addend: self.tool_request_buffer.len(),
         }) {
@@ -1685,7 +2040,7 @@ impl ProcessorData {
         self.publish_buffer.push(ProcessorPublish {
             port,
             channel_address: spec.channel_address.clone(),
-            payload,
+            body,
             urgency,
             reply_to: None,
             deliver_after,
@@ -1707,14 +2062,21 @@ impl ProcessorData {
     fn publish_unwired(
         &mut self,
         port: String,
-        payload: String,
+        body: GuestBody,
         deliver_after: Option<u64>,
-    ) -> wasmtime::Result<Result<(), PublishError>> {
+    ) -> wasmtime::Result<Result<(), PublishRefusal>> {
         if !self.declared_out_ports.contains(&port) {
             return Err(undeclared_port_trap(&self.slug, &port));
         }
+        // A malformed body is answered as on a wired port. The channel rule
+        // needs a channel, so a well-formed non-text body is dropped like any
+        // other.
+        let body = match body.build() {
+            Ok(body) => body,
+            Err(e) => return Ok(Err(PublishRefusal::InvalidBody(e.to_string()))),
+        };
         if let Err(refusal) = self.gate.admit_publish_without_sink(
-            payload.len(),
+            body.len(),
             deliver_after,
             self.tool_request_buffer.len(),
         ) {
@@ -1750,19 +2112,16 @@ impl ProcessorData {
     /// windows exist only for bound outputs — so every index is `OutOfRange`
     /// there, which is what the guest gets. A port outside the specification's
     /// vocabulary traps.
-    fn do_defer(&mut self, op: ProcessorDeferredOp) -> wasmtime::Result<Result<(), DeferError>> {
-        let (port, index) = match &op {
-            ProcessorDeferredOp::Cancel { port, index } => (port, *index),
-            ProcessorDeferredOp::Edit { port, index, .. } => (port, *index),
-        };
-        let (edit_deliver_after, edit_payload_len) = match &op {
-            ProcessorDeferredOp::Edit {
-                payload,
-                deliver_after,
-                ..
-            } => (*deliver_after, payload.as_ref().map(String::len)),
-            ProcessorDeferredOp::Cancel { .. } => (None, None),
-        };
+    ///
+    /// `edit` is `None` for a cancel. The op is built at the last step, once
+    /// every check has passed.
+    fn do_defer(
+        &mut self,
+        port: String,
+        index: u32,
+        edit: Option<GuestEdit>,
+    ) -> wasmtime::Result<Result<(), DeferRefusal>> {
+        let edit_deliver_after = edit.as_ref().and_then(|e| e.deliver_after);
         // Reject a non-representable value here, where the guest still holds the
         // error channel, against the same shared bound `do_publish` uses — a value
         // outside it would otherwise panic the host at flush (`instant_of`).
@@ -1782,18 +2141,61 @@ impl ProcessorData {
         // The port must be in the specification's declared vocabulary; a name
         // outside it is the component contradicting its own author, and the
         // activation ends here rather than at every call.
-        if !self.declared_out_ports.contains(port) {
-            return Err(undeclared_port_trap(&self.slug, port));
+        if !self.declared_out_ports.contains(&port) {
+            return Err(undeclared_port_trap(&self.slug, &port));
         }
         // Index must be within the deferred window this activation delivered for
         // the port. An absent port bound is 0 (no deferred entries delivered), so
         // any index is out of range there — which is also the whole of the answer
         // for a declared port the deployer did not wire.
-        let bound = self.deferred_index_bounds.get(port).copied().unwrap_or(0);
+        let bound = self.deferred_index_bounds.get(&port).copied().unwrap_or(0);
         if index >= bound {
-            return Ok(Err(DeferError::OutOfRange));
+            return Ok(Err(DeferRefusal::OutOfRange));
         }
-        if let Err(refusal) = self.gate.admit_op(edit_payload_len) {
+        let op = match edit {
+            None => ProcessorDeferredOp::Cancel { port, index },
+            Some(GuestEdit {
+                body,
+                deliver_after,
+            }) => {
+                let body = match body.map(GuestBody::build).transpose() {
+                    Ok(body) => body,
+                    Err(e) => return Ok(Err(DeferRefusal::InvalidBody(e.to_string()))),
+                };
+                if let Some(body) = &body
+                    && !body.is_text()
+                {
+                    // An index in range means the port carried a deferred
+                    // window, and only bound ports do.
+                    let spec = self.output_ports.get(&port).unwrap_or_else(|| {
+                        panic!(
+                            "host invariant: processor {}: deferred index in range on port {} \
+                             with no binding",
+                            self.slug,
+                            cap_guest_for_log(&port),
+                        )
+                    });
+                    if !spec.non_text {
+                        *self
+                            .text_only_refusals
+                            .entry((port, spec.channel_address.clone()))
+                            .or_insert(0) += 1;
+                        return Ok(Err(DeferRefusal::TextOnlyChannel));
+                    }
+                }
+                ProcessorDeferredOp::Edit {
+                    port,
+                    index,
+                    body,
+                    deliver_after,
+                }
+            }
+        };
+        let edit_body_len = match &op {
+            ProcessorDeferredOp::Edit { body, .. } => body.as_ref().map(MessageBody::len),
+            ProcessorDeferredOp::Cancel { .. } => None,
+        };
+        if let Err(refusal) = self.gate.admit_op(edit_body_len) {
             return Ok(Err(defer_error(refusal)));
         }
         self.deferred_op_buffer.push(op);
@@ -1818,8 +2220,8 @@ impl ProcessorData {
     fn do_call(
         &mut self,
         port: String,
-        payload: String,
-    ) -> wasmtime::Result<Result<Option<String>, CallWitError>> {
+        body: GuestBody,
+    ) -> wasmtime::Result<Result<Option<MessageBody>, CallRefusal>> {
         // A name the specification never declared is the component
         // contradicting the artifact it is hash-bound to.
         if !self.declared_call_ports.contains(&port) {
@@ -1835,19 +2237,25 @@ impl ProcessorData {
         if let Err(refusal) = self.gate.charge_call() {
             return Ok(Err(call_error(refusal)));
         }
-        // The payload becomes the one envelope in the callee's fabricated
-        // window, so it takes the same cap a publish body does.
+        // The body is judged after the trap and the charge and before every
+        // spending gate, as a published body is.
+        let body = match body.build() {
+            Ok(body) => body,
+            Err(e) => return Ok(Err(CallRefusal::InvalidBody(e.to_string()))),
+        };
+        // The body becomes the one envelope in the callee's fabricated window,
+        // so it takes the same cap a publish body does.
         let cap = self.gate.max_body_bytes();
-        if !brenn_activation::sync::within_body_cap(&payload, cap) {
+        if !brenn_activation::sync::within_body_cap(body.as_bytes(), cap) {
             return Ok(Err(call_error(GateRefusal::BodyTooLarge {
-                len: payload.len(),
+                len: body.len(),
                 max: cap,
             })));
         }
         // A declared port the deployer left unbound reaches nobody. That is a
         // deployment fact, not a guest bug, so it is answered and not trapped.
         let Some(target) = self.calls.get(&port) else {
-            return Ok(Err(CallWitError::Unwired));
+            return Ok(Err(CallRefusal::Unwired));
         };
         let target_slug = target.target_slug.clone();
         let target_port = target.target_port.clone();
@@ -1855,7 +2263,7 @@ impl ProcessorData {
         // The callback is `Some` iff the `Calls` capability is linked (the host
         // fn is unreachable otherwise). `.expect` is the structural backstop,
         // like `mqtt_publish` — linker gating is the real gate.
-        let caller = self.sync_caller.as_ref().expect(
+        let sync_caller = self.sync_caller.as_ref().expect(
             "calls.call host fn invoked without a sync_caller callback (Calls grant linked \
              but callback unset)",
         );
@@ -1864,7 +2272,7 @@ impl ProcessorData {
         // `blocked` so the epoch deadline measures this activation's own
         // running time and not a peer's queue position, pacing delay or run.
         let waited_from = Instant::now();
-        let answer = caller(&target_slug, &target_port, payload, &chain);
+        let answer = sync_caller(&target_slug, &target_port, body, &chain);
         self.blocked += waited_from.elapsed();
 
         // Which of the two words a non-reply is belongs to the answer's own
@@ -1875,8 +2283,9 @@ impl ProcessorData {
         Ok(
             match brenn_activation::sync::call_disposition(answer, &self.slug, &port) {
                 Ok(reply) => Ok(reply),
-                Err(CallDisposition::Failed) => Err(CallWitError::Failed),
-                Err(CallDisposition::Refused) => Err(CallWitError::Refused),
+                Err(CallDisposition::Failed) => Err(CallRefusal::Failed),
+                Err(CallDisposition::Refused) => Err(CallRefusal::Refused),
+                Err(CallDisposition::TextOnlyPeer) => Err(CallRefusal::TextOnlyPeer),
             },
         )
     }
@@ -2035,7 +2444,9 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
         port: String,
         payload: String,
     ) -> wasmtime::Result<Result<(), PublishError>> {
-        self.do_publish(port, payload, None, None)
+        Ok(self
+            .do_publish(port, GuestBody::Text(payload), None, None)?
+            .map_err(PublishRefusal::into_v0_1))
     }
 
     fn publish_with_urgency(
@@ -2044,7 +2455,16 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
         payload: String,
         urgency: processor_bindings::brenn::processor::ports::Urgency,
     ) -> wasmtime::Result<Result<(), PublishError>> {
-        self.do_publish(port, payload, Some(urgency), None)
+        use processor_bindings::brenn::processor::ports::Urgency as WitUrgency;
+        let urgency = match urgency {
+            WitUrgency::VeryLow => ProcessorUrgency::VeryLow,
+            WitUrgency::Low => ProcessorUrgency::Low,
+            WitUrgency::Normal => ProcessorUrgency::Normal,
+            WitUrgency::High => ProcessorUrgency::High,
+        };
+        Ok(self
+            .do_publish(port, GuestBody::Text(payload), Some(urgency), None)?
+            .map_err(PublishRefusal::into_v0_1))
     }
 
     fn publish_deferred(
@@ -2054,7 +2474,9 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
         deliver_after: u64,
     ) -> wasmtime::Result<Result<(), PublishError>> {
         // No clock read here; the host decides park-vs-immediate at flush.
-        self.do_publish(port, payload, None, Some(deliver_after))
+        Ok(self
+            .do_publish(port, GuestBody::Text(payload), None, Some(deliver_after))?
+            .map_err(PublishRefusal::into_v0_1))
     }
 
     fn defer_cancel(
@@ -2062,7 +2484,9 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
         port: String,
         index: u32,
     ) -> wasmtime::Result<Result<(), DeferError>> {
-        self.do_defer(ProcessorDeferredOp::Cancel { port, index })
+        Ok(self
+            .do_defer(port, index, None)?
+            .map_err(DeferRefusal::into_v0_1))
     }
 
     fn defer_edit(
@@ -2072,14 +2496,92 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
         payload: Option<String>,
         deliver_after: Option<u64>,
     ) -> wasmtime::Result<Result<(), DeferError>> {
-        self.do_defer(ProcessorDeferredOp::Edit {
-            port,
-            index,
-            payload,
-            deliver_after,
-        })
+        Ok(self
+            .do_defer(
+                port,
+                index,
+                Some(GuestEdit {
+                    body: payload.map(GuestBody::Text),
+                    deliver_after,
+                }),
+            )?
+            .map_err(DeferRefusal::into_v0_1))
     }
 }
+
+/// The `brenn:processor@0.2.0` `ports`: the same five entry points over bodies,
+/// trappable for the same reason. Each hands the guest's body to the shared
+/// port functions unbuilt.
+impl ports_v0_2::Host for ProcessorData {
+    fn publish(
+        &mut self,
+        port: String,
+        body: bus_v0_2::Body,
+    ) -> wasmtime::Result<Result<(), ports_v0_2::PublishError>> {
+        Ok(self
+            .do_publish(port, body.into(), None, None)?
+            .map_err(PublishRefusal::into_v0_2))
+    }
+
+    fn publish_with_urgency(
+        &mut self,
+        port: String,
+        body: bus_v0_2::Body,
+        urgency: ports_v0_2::Urgency,
+    ) -> wasmtime::Result<Result<(), ports_v0_2::PublishError>> {
+        let urgency = match urgency {
+            ports_v0_2::Urgency::VeryLow => ProcessorUrgency::VeryLow,
+            ports_v0_2::Urgency::Low => ProcessorUrgency::Low,
+            ports_v0_2::Urgency::Normal => ProcessorUrgency::Normal,
+            ports_v0_2::Urgency::High => ProcessorUrgency::High,
+        };
+        Ok(self
+            .do_publish(port, body.into(), Some(urgency), None)?
+            .map_err(PublishRefusal::into_v0_2))
+    }
+
+    fn publish_deferred(
+        &mut self,
+        port: String,
+        body: bus_v0_2::Body,
+        deliver_after: u64,
+    ) -> wasmtime::Result<Result<(), ports_v0_2::PublishError>> {
+        Ok(self
+            .do_publish(port, body.into(), None, Some(deliver_after))?
+            .map_err(PublishRefusal::into_v0_2))
+    }
+
+    fn defer_cancel(
+        &mut self,
+        port: String,
+        index: u32,
+    ) -> wasmtime::Result<Result<(), ports_v0_2::DeferError>> {
+        Ok(self
+            .do_defer(port, index, None)?
+            .map_err(DeferRefusal::into_v0_2))
+    }
+
+    fn defer_edit(
+        &mut self,
+        port: String,
+        index: u32,
+        body: Option<bus_v0_2::Body>,
+        deliver_after: Option<u64>,
+    ) -> wasmtime::Result<Result<(), ports_v0_2::DeferError>> {
+        Ok(self
+            .do_defer(
+                port,
+                index,
+                Some(GuestEdit {
+                    body: body.map(GuestBody::from),
+                    deliver_after,
+                }),
+            )?
+            .map_err(DeferRefusal::into_v0_2))
+    }
+}
+
+impl bus_v0_2::Host for ProcessorData {}
 
 /// Test-only conveniences for the publish and defer paths.
 ///
@@ -2093,15 +2595,35 @@ impl ProcessorData {
         &mut self,
         port: String,
         payload: String,
-        guest_urgency: Option<processor_bindings::brenn::processor::ports::Urgency>,
+        guest_urgency: Option<ProcessorUrgency>,
         deliver_after: Option<u64>,
-    ) -> Result<(), PublishError> {
-        self.do_publish(port, payload, guest_urgency, deliver_after)
+    ) -> Result<(), PublishRefusal> {
+        self.do_publish(port, GuestBody::Text(payload), guest_urgency, deliver_after)
             .expect("the port is in the component's declared vocabulary")
     }
 
-    fn do_defer_declared(&mut self, op: ProcessorDeferredOp) -> Result<(), DeferError> {
-        self.do_defer(op)
+    /// Takes the op a test expects buffered, so the test can compare the two;
+    /// an edit's body must be text, which is all a 0.1.0 guest can hand over.
+    fn do_defer_declared(&mut self, op: ProcessorDeferredOp) -> Result<(), DeferRefusal> {
+        let (port, index, edit) = match op {
+            ProcessorDeferredOp::Cancel { port, index } => (port, index, None),
+            ProcessorDeferredOp::Edit {
+                port,
+                index,
+                body,
+                deliver_after,
+            } => (
+                port,
+                index,
+                Some(GuestEdit {
+                    body: body.map(|b| {
+                        GuestBody::Text(b.as_text().expect("a test's edit body is text").to_owned())
+                    }),
+                    deliver_after,
+                }),
+            ),
+        };
+        self.do_defer(port, index, edit)
             .expect("the port is in the component's declared vocabulary")
     }
 }
@@ -2118,15 +2640,61 @@ fn bind_ports(data: &mut ProcessorData, ports: HashMap<String, OutputPortSpec>) 
 
 /// The one `calls` entry point is a trappable import: the outer
 /// `wasmtime::Result` is the host's own verdict on whether the activation may
-/// continue, and the inner result is what the guest sees. Only a call naming a
-/// port outside the component's declared vocabulary takes the outer `Err`.
+/// continue, and the inner result is what the guest sees. Two cases take the
+/// outer `Err`: a call naming a port outside the component's declared
+/// vocabulary, and a reply that is not text, which this contract cannot carry.
 impl processor_bindings::brenn::processor::calls::Host for ProcessorData {
     fn call(
         &mut self,
         port: String,
         payload: String,
     ) -> wasmtime::Result<Result<Option<String>, CallWitError>> {
-        self.do_call(port, payload)
+        let reply = match self.do_call(port.clone(), GuestBody::Text(payload))? {
+            Ok(reply) => reply,
+            Err(refusal) => return Ok(Err(refusal.into_v0_1())),
+        };
+        let Some(body) = reply else {
+            return Ok(Ok(None));
+        };
+        match body.as_text() {
+            Some(text) => Ok(Ok(Some(text.to_owned()))),
+            None => Err(non_text_reply_trap(self, &port, &body)),
+        }
+    }
+}
+
+/// The trap that ends a 0.1.0 caller's activation when its peer answered with
+/// a body the string contract cannot carry. The peer has already run and
+/// flushed; this component is the one whose wiring must change.
+fn non_text_reply_trap(data: &ProcessorData, port: &str, body: &MessageBody) -> wasmtime::Error {
+    let target = data.calls.get(port).unwrap_or_else(|| {
+        panic!(
+            "host invariant: call port {port:?} of {:?} was answered but is not wired",
+            data.slug
+        )
+    });
+    wasmtime::Error::msg(format!(
+        "processor {}: call port {} was answered by {:?} (sync port {:?}) with a non-text \
+         reply ({body:?}); the calling component is built against brenn:processor@0.1.0, \
+         which carries only text. The peer ran and its buffer was flushed",
+        data.slug,
+        cap_guest_for_log(port),
+        target.target_slug,
+        target.target_port,
+    ))
+}
+
+/// The 0.2.0 `calls` entry point: the request and the reply are bodies.
+impl calls_v0_2::Host for ProcessorData {
+    fn call(
+        &mut self,
+        port: String,
+        body: bus_v0_2::Body,
+    ) -> wasmtime::Result<Result<Option<bus_v0_2::Body>, calls_v0_2::CallError>> {
+        Ok(self
+            .do_call(port, body.into())?
+            .map(|reply| reply.as_ref().map(body_v0_2))
+            .map_err(CallRefusal::into_v0_2))
     }
 }
 
@@ -2354,7 +2922,7 @@ impl ProcessorData {
             publishes.push(ProcessorPublish {
                 port: TOOL_REQUEST_LOG_PORT.to_string(),
                 channel_address: req.channel,
-                payload: req.body_json,
+                body: MessageBody::text(req.body_json),
                 urgency: ProcessorUrgency::Normal,
                 reply_to: Some(req.reply_to),
                 deliver_after: None,
@@ -2654,12 +3222,67 @@ fn log_and_convert_store_error(slug: &str, op: &str, e: StoreError) -> Processor
 // Capability linking — the grant vocabulary, gated
 // ---------------------------------------------------------------------------
 
-/// Types-only import every component carries; never a grant, always permitted.
+/// Whether `name` is one of the type-only imports `contract` allows: never a
+/// grant, always permitted.
 ///
 /// Matched with the same semver rule as capabilities (see `capability_for_import`).
 /// Public for drift-guard tests.
-pub fn is_types_import(name: &str) -> bool {
-    semver_compat_match(name, "brenn:processor/types@0.1.0")
+pub fn is_types_import(name: &str, contract: ProcessorContract) -> bool {
+    contract
+        .type_only_imports()
+        .iter()
+        .any(|canonical| semver_compat_match(name, canonical))
+}
+
+/// The contract a component importing `names` is built against, detected by
+/// its activation interface under the loader's semver rule.
+pub fn detect_contract<'a>(names: impl IntoIterator<Item = &'a str>) -> ProcessorContract {
+    ProcessorContract::detect(names, semver_compat_match)
+}
+
+/// Check a component's import names against its grant set, under the contract
+/// the imports themselves declare.
+///
+/// Returns the detected contract and the granted capabilities the component
+/// imports, or every violation found: an ungranted capability, or a name that
+/// is neither a type-only import nor a capability of that contract. A name of
+/// the other contract is unrecognized, so an artifact mixing the two is
+/// refused by name.
+pub fn check_component_imports<'a>(
+    slug: &str,
+    names: impl IntoIterator<Item = &'a str> + Clone,
+    grants: &std::collections::BTreeSet<ComponentGrant>,
+) -> Result<(ProcessorContract, Vec<ComponentGrant>), Vec<String>> {
+    let contract = detect_contract(names.clone());
+    let mut violations: Vec<String> = Vec::new();
+    let mut imported_caps: Vec<ComponentGrant> = Vec::new();
+    for name in names {
+        if is_types_import(name, contract) {
+            // Type-only import: always permitted. Structural validation of the
+            // item kind (instance vs function vs value) is deferred to
+            // `instantiate_pre`, which is acceptable because no type-only
+            // interface carries functions in any current WIT version.
+        } else if let Some(cap) = capability_for_import(name, contract) {
+            if grants.contains(&cap) {
+                imported_caps.push(cap);
+            } else {
+                violations.push(format!(
+                    "component {slug:?} requires ungranted capability {cap_name:?}",
+                    cap_name = cap.word(),
+                ));
+            }
+        } else {
+            violations.push(format!(
+                "component {slug:?} imports unrecognized interface {name:?} \
+                 (component contract detected: {contract})",
+            ));
+        }
+    }
+    if violations.is_empty() {
+        Ok((contract, imported_caps))
+    } else {
+        Err(violations)
+    }
 }
 
 /// The fully qualified WIT interface names a component artifact imports, with any
@@ -2795,8 +3418,8 @@ pub fn semver_compat_match(actual: &str, canonical: &str) -> bool {
     }
 }
 
-/// The capability a WIT import name is, or `None` for a name the host links
-/// nothing for.
+/// The capability a WIT import name is under `contract`, or `None` for a name
+/// the host links nothing for under it.
 ///
 /// Matching is semver-compatible rather than exact-string — see
 /// [`semver_compat_match`] — because a component built against a compatible
@@ -2805,10 +3428,10 @@ pub fn semver_compat_match(actual: &str, canonical: &str) -> bool {
 /// The vocabulary is [`ComponentGrant`] itself: the words an operator writes,
 /// the words a specification requires and the interfaces this host links are
 /// one set, and the grant that names no interface simply never matches.
-pub fn capability_for_import(name: &str) -> Option<ComponentGrant> {
+pub fn capability_for_import(name: &str, contract: ProcessorContract) -> Option<ComponentGrant> {
     ComponentGrant::ALL.into_iter().find(|grant| {
         grant
-            .wit_import()
+            .wit_import(contract)
             .is_some_and(|canonical| semver_compat_match(name, canonical))
     })
 }
@@ -2817,15 +3440,47 @@ pub fn capability_for_import(name: &str) -> Option<ComponentGrant> {
 ///
 /// Deny-by-default is structural: a component importing an interface no grant
 /// added here fails `instantiate_pre`.
+///
+/// `Ports` and `Calls` link the implementation of `contract`'s own shape; every
+/// other word links the one implementation both contracts import.
 fn add_capability_to_linker(
+    grant: ComponentGrant,
+    contract: ProcessorContract,
+    linker: &mut Linker<ProcessorData>,
+) -> wasmtime::Result<()> {
+    match (grant, contract) {
+        (ComponentGrant::Ports, ProcessorContract::V0_1) => {
+            processor_bindings::brenn::processor::ports::add_to_linker::<_, HasSelf<ProcessorData>>(
+                linker,
+                |d| d,
+            )
+        }
+        (ComponentGrant::Ports, ProcessorContract::V0_2) => {
+            ports_v0_2::add_to_linker::<_, HasSelf<ProcessorData>>(linker, |d| d)
+        }
+        (ComponentGrant::Calls, ProcessorContract::V0_1) => {
+            processor_bindings::brenn::processor::calls::add_to_linker::<_, HasSelf<ProcessorData>>(
+                linker,
+                |d| d,
+            )
+        }
+        (ComponentGrant::Calls, ProcessorContract::V0_2) => {
+            calls_v0_2::add_to_linker::<_, HasSelf<ProcessorData>>(linker, |d| d)
+        }
+        (grant, _) => add_shared_capability_to_linker(grant, linker),
+    }
+}
+
+/// Add the host functions of a capability whose interface both contracts
+/// import at its `@0.1.0` name.
+fn add_shared_capability_to_linker(
     grant: ComponentGrant,
     linker: &mut Linker<ProcessorData>,
 ) -> wasmtime::Result<()> {
     match grant {
-        ComponentGrant::Ports => processor_bindings::brenn::processor::ports::add_to_linker::<
-            _,
-            HasSelf<ProcessorData>,
-        >(linker, |d| d),
+        ComponentGrant::Ports | ComponentGrant::Calls => {
+            unreachable!("`{}` links a per-contract interface", grant.word())
+        }
         ComponentGrant::Store => processor_bindings::brenn::processor::store::add_to_linker::<
             _,
             HasSelf<ProcessorData>,
@@ -2847,10 +3502,6 @@ fn add_capability_to_linker(
             HasSelf<ProcessorData>,
         >(linker, |d| d),
         ComponentGrant::Tools => processor_bindings::brenn::processor::tools::add_to_linker::<
-            _,
-            HasSelf<ProcessorData>,
-        >(linker, |d| d),
-        ComponentGrant::Calls => processor_bindings::brenn::processor::calls::add_to_linker::<
             _,
             HasSelf<ProcessorData>,
         >(linker, |d| d),
@@ -3037,13 +3688,28 @@ impl DeferredStore {
     }
 }
 
+/// A pre-instantiated component, typed by the contract its artifact declares.
+enum ContractPre {
+    V0_1(ProcessorPre<ProcessorData>),
+    V0_2(processor_v0_2_bindings::ProcessorPre<ProcessorData>),
+}
+
+impl ContractPre {
+    fn contract(&self) -> ProcessorContract {
+        match self {
+            Self::V0_1(_) => ProcessorContract::V0_1,
+            Self::V0_2(_) => ProcessorContract::V0_2,
+        }
+    }
+}
+
 /// Loaded, pre-linked processor component for bus consumption and publication.
 ///
-/// `ProcessorPre<ProcessorData>` is built once in `load`; per-call cost is
+/// The pre-instantiated handle is built once in `load`; per-call cost is
 /// instantiation + store-build + the single `receive` WIT call.
 pub struct ProcessorComponent {
     engine: Engine,
-    processor_pre: ProcessorPre<ProcessorData>,
+    processor_pre: ContractPre,
     /// `None` when the component does not have the `Store` grant. Present but
     /// unopened between [`load`](Self::load) and
     /// [`open_store`](Self::open_store).
@@ -3155,9 +3821,6 @@ impl ProcessorComponent {
         let engine = Engine::new(&cfg)
             .unwrap_or_else(|e| panic!("failed to initialize wasmtime engine for processor: {e}"));
 
-        // Conditional linking: only granted capabilities are added to the linker.
-        // Deny-by-default is structural — an ungranted import makes instantiate_pre fail.
-        let mut linker: Linker<ProcessorData> = Linker::new(&engine);
         for grant in &spec.grants {
             // Hosting legality first, from its one home: a page capability in a
             // backend load spec is a caller that built its grant set wrong,
@@ -3167,16 +3830,13 @@ impl ProcessorComponent {
                 panic!("component {}: {why}", spec.slug);
             }
             // Then the linker's own precondition. Every word legal here names an
-            // interface, and the map below has an arm only for words that do.
+            // interface, and the linker has an arm only for words that do.
             assert!(
-                grant.wit_import().is_some(),
+                grant.names_interface(),
                 "component {}: granted `{}`, which names no WIT interface",
                 spec.slug,
                 grant.word(),
             );
-            add_capability_to_linker(*grant, &mut linker).unwrap_or_else(|e| {
-                panic!("failed to add {} to processor linker: {e}", grant.word())
-            });
         }
 
         assert_seam_iff_grant(
@@ -3224,9 +3884,25 @@ impl ProcessorComponent {
         });
 
         // Import-reflection check: name each capability violation before
-        // instantiate_pre's opaque error. instantiate_pre remains as the
-        // structural backstop (defense in depth).
-        Self::enforce_grants(spec.slug, &engine, &component, &spec.grants);
+        // instantiate_pre's opaque error, and learn the contract the artifact is
+        // built against, which decides what is linked. instantiate_pre remains
+        // as the structural backstop (defense in depth).
+        let contract = Self::enforce_grants(spec.slug, &engine, &component, &spec.grants);
+
+        // Conditional linking: only granted capabilities are added to the
+        // linker, each in the shape of the component's own contract.
+        // Deny-by-default is structural — an ungranted import makes
+        // instantiate_pre fail.
+        let mut linker: Linker<ProcessorData> = Linker::new(&engine);
+        for grant in &spec.grants {
+            add_capability_to_linker(*grant, contract, &mut linker).unwrap_or_else(|e| {
+                panic!(
+                    "component {}: failed to add {} to the {contract} linker: {e}",
+                    spec.slug,
+                    grant.word()
+                )
+            });
+        }
 
         let instance_pre = linker.instantiate_pre(&component).unwrap_or_else(|e| {
             panic!(
@@ -3234,12 +3910,21 @@ impl ProcessorComponent {
                  (grant missing or WIT namespace mismatch): {e}"
             )
         });
-        let processor_pre = ProcessorPre::new(instance_pre).unwrap_or_else(|e| {
+        let export_check = |e: wasmtime::Error| -> ! {
             panic!(
                 "processor component pre-instantiation failed — export type-check failed \
                  (stale .wasm or WIT signature changed): {e}"
             )
-        });
+        };
+        let processor_pre = match contract {
+            ProcessorContract::V0_1 => ContractPre::V0_1(
+                ProcessorPre::new(instance_pre).unwrap_or_else(|e| export_check(e)),
+            ),
+            ProcessorContract::V0_2 => ContractPre::V0_2(
+                processor_v0_2_bindings::ProcessorPre::new(instance_pre)
+                    .unwrap_or_else(|e| export_check(e)),
+            ),
+        };
 
         // The file is not opened here: a store may be held by an instance of
         // this same consumer that is still running, and a host that loads a
@@ -3335,6 +4020,11 @@ impl ProcessorComponent {
         }
     }
 
+    /// The component contract the artifact was detected to be built against.
+    pub fn contract(&self) -> ProcessorContract {
+        self.processor_pre.contract()
+    }
+
     /// Reflect the component's declared imports against the grant set.
     ///
     /// Called at load, between `Component::from_file` and `linker.instantiate_pre`,
@@ -3347,50 +4037,33 @@ impl ProcessorComponent {
         engine: &Engine,
         component: &Component,
         grants: &std::collections::BTreeSet<ComponentGrant>,
-    ) {
+    ) -> ProcessorContract {
         let component_type = component.component_type();
-        let mut violations: Vec<String> = Vec::new();
-        let mut imported_caps: Vec<ComponentGrant> = Vec::new();
-
-        for (name, _item) in component_type.imports(engine) {
-            if is_types_import(name) {
-                // types-only import: always permitted. Structural validation of the
-                // item kind (instance vs function vs value) is deferred to
-                // `instantiate_pre` — a structurally-wrong types import would produce
-                // an opaque wasmtime error there, which is acceptable given the
-                // types interface carries no functions in any current WIT version.
-            } else if let Some(cap) = capability_for_import(name) {
-                if grants.contains(&cap) {
-                    imported_caps.push(cap);
-                } else {
-                    violations.push(format!(
-                        "component {slug:?} requires ungranted capability {cap_name:?}",
-                        cap_name = cap.word(),
-                    ));
-                }
-            } else {
-                violations.push(format!(
-                    "component {slug:?} imports unrecognized interface {name:?}",
-                ));
-            }
-        }
-
-        if !violations.is_empty() {
-            panic!(
-                "WASM component grant check failed:\n{}",
-                violations.join("\n")
+        let names: Vec<&str> = component_type
+            .imports(engine)
+            .map(|(name, _)| name)
+            .collect();
+        let (contract, imported_caps) =
+            check_component_imports(slug, names.iter().copied(), grants).unwrap_or_else(
+                |violations| {
+                    panic!(
+                        "WASM component grant check failed:\n{}",
+                        violations.join("\n")
+                    )
+                },
             );
-        }
 
         // Observability: log granted set and actually-imported capability set.
         let granted_names: Vec<&str> = grants.iter().map(|c| c.word()).collect();
         let imported_names: Vec<&str> = imported_caps.iter().map(|c| c.word()).collect();
         info!(
             slug = slug,
+            contract = %contract,
             granted = ?granted_names,
             imported = ?imported_names,
             "WASM component grant check passed",
         );
+        contract
     }
 
     /// Seed the per-sink activation budget map from persistent carryover plus
@@ -3437,6 +4110,7 @@ impl ProcessorComponent {
                 slug: Arc::clone(&self.slug),
                 gate: ActivationGate::new(self.max_payload_bytes, publish_budget_by_sink),
                 publish_suppressed_by_sink: HashMap::new(),
+                text_only_refusals: HashMap::new(),
                 publish_buffer: Vec::new(),
                 alerter: Arc::clone(&self.alerter),
                 output_acl: Arc::clone(&self.output_acl),
@@ -3509,7 +4183,7 @@ impl ProcessorComponent {
     /// buffered messages to flush), `ProcessorOutcome::Err` on a typed guest reject,
     /// and `ProcessorOutcome::Trap` on a guest trap or resource exhaustion — does NOT
     /// panic on a trap (contained, alerted by caller).
-    pub fn handle(&self, activation: ProcessorActivation) -> ProcessorOutcome {
+    pub fn handle(&self, activation: HostActivation) -> ProcessorOutcome {
         self.handle_in_chain(activation, Vec::new())
     }
 
@@ -3522,7 +4196,7 @@ impl ProcessorComponent {
     /// recognize a cycle the document was supposed to refuse.
     pub fn handle_in_chain(
         &self,
-        activation: ProcessorActivation,
+        activation: HostActivation,
         inbound_chain: Vec<String>,
     ) -> ProcessorOutcome {
         let total_envelopes: usize = activation.ports.iter().map(|pw| pw.envelopes.len()).sum();
@@ -3571,7 +4245,7 @@ impl ProcessorComponent {
     #[doc(hidden)]
     pub fn handle_with_limits(
         &self,
-        activation: ProcessorActivation,
+        activation: HostActivation,
         epoch_deadline: u64,
         fuel: u64,
     ) -> ProcessorOutcome {
@@ -3605,7 +4279,7 @@ impl ProcessorComponent {
     #[doc(hidden)]
     pub fn handle_with_memory_limit(
         &self,
-        activation: ProcessorActivation,
+        activation: HostActivation,
         memory_limit_bytes: usize,
     ) -> ProcessorOutcome {
         let total_envelopes: usize = activation.ports.iter().map(|pw| pw.envelopes.len()).sum();
@@ -3620,80 +4294,42 @@ impl ProcessorComponent {
         Self::invoke(store, activation, &self.processor_pre, &mut carry)
     }
 
-    /// Shared dispatch core: converts `activation` to WIT types, calls `receive`,
-    /// extracts publishes, and runs `cleanup_leaked_tx` unconditionally.
+    /// Shared dispatch core: lowers `activation` to the component's contract,
+    /// calls `receive`, extracts publishes, and runs `cleanup_leaked_tx`
+    /// unconditionally.
     ///
     /// `handle`, `handle_with_limits`, and `handle_with_memory_limit` all delegate
     /// here after building the `Store` with the appropriate settings.
     fn invoke(
         mut store: Store<ProcessorData>,
-        activation: ProcessorActivation,
-        processor_pre: &ProcessorPre<ProcessorData>,
+        activation: HostActivation,
+        processor_pre: &ContractPre,
         carry: &mut HashMap<SinkKey, u64>,
     ) -> ProcessorOutcome {
-        let activation_now = activation.now;
         // The sync-call activation is one shape on both hosts. What a backend
         // host has that a page does not is a *cause* — a browser gesture — and
         // that difference is upstream of here: this lowers whatever the caller
         // assembled, and a `some` means somebody is blocked on the reply.
         let activation_sync = activation.sync.clone();
-        let wit_ports: Vec<_> = activation
-            .ports
-            .into_iter()
-            .map(
-                |pw| processor_bindings::brenn::processor::types::PortWindow {
-                    port: pw.port,
-                    envelopes: pw.envelopes,
-                    new_from: pw.new_from,
-                    // `processor.wit` types `dropped` as u32 while the carrier
-                    // counts in u64. Saturate: the guest reads this as a gap
-                    // signal, and a saturated count still says "you lost more
-                    // than you can count".
-                    dropped: u32::try_from(pw.dropped).unwrap_or(u32::MAX),
-                },
-            )
-            .collect();
-        let mut deferred_index_bounds: HashMap<String, u32> =
-            HashMap::with_capacity(activation.deferred.len());
-        let wit_deferred: Vec<_> = activation
+        store.data_mut().deferred_index_bounds = activation
             .deferred
-            .into_iter()
-            .map(
-                |dw| processor_bindings::brenn::processor::types::DeferredWindow {
-                    port: dw.port,
-                    entries: dw
-                        .entries
-                        .into_iter()
-                        .map(
-                            |e| processor_bindings::brenn::processor::types::DeferredEntry {
-                                index: e.index,
-                                payload: e.payload,
-                                deliver_after: e.deliver_after,
-                            },
-                        )
-                        .collect(),
-                },
-            )
-            .inspect(|dw| {
-                deferred_index_bounds.insert(dw.port.clone(), dw.entries.len() as u32);
-            })
+            .iter()
+            .map(|dw| (dw.port.clone(), dw.entries.len() as u32))
             .collect();
-        store.data_mut().deferred_index_bounds = deferred_index_bounds;
-        let wit_activation = processor_bindings::brenn::processor::types::Activation {
-            ports: wit_ports,
-            deferred: wit_deferred,
-            now: activation_now,
-            sync: activation_sync.clone(),
+        let received = match processor_pre {
+            ContractPre::V0_1(pre) => Self::receive_v0_1(&mut store, pre, activation),
+            ContractPre::V0_2(pre) => Self::receive_v0_2(&mut store, pre, activation),
         };
-        let instance = match processor_pre.instantiate(&mut store) {
-            Ok(i) => i,
+        let received = match received {
+            Ok(received) => received,
             // Deliberately skips the carry writeback tail below: the guest never ran,
             // so its seeded budget (carry-clamp + fill + input grant) is forfeited and
             // the prior carry is retained untouched. This is the conservative direction
             // — a component that cannot even instantiate must not accumulate budget.
             Err(e) => return ProcessorOutcome::Trap(format!("instantiation failed: {e:#}")),
         };
-        let outcome = match instance.call_receive(&mut store, &wit_activation) {
+        let max_body_bytes = store.data().gate.max_body_bytes();
+        let outcome = match received {
             // A reply answers a sync-call activation and nothing else. A `some`
             // on an async one is a guest that answered a cause that asked
             // nothing, and reading its ok would flush a buffer built under a
@@ -3701,37 +4337,23 @@ impl ProcessorComponent {
             Ok(Ok(Some(_))) if activation_sync.is_none() => ProcessorOutcome::Trap(String::from(
                 "receive replied to an activation that asked nothing",
             )),
-            // A reply is bounded by the same cap as a publish body, so a callee
-            // cannot hand a caller more than it could have published. Over it is
-            // a trap of the callee, which is what wrote it; truncating it or
-            // answering in its place would hand the caller something the callee
-            // never said.
-            Ok(Ok(Some(reply)))
-                if !brenn_activation::sync::within_body_cap(
-                    &reply,
-                    store.data().gate.max_body_bytes(),
-                ) =>
-            {
-                ProcessorOutcome::Trap(format!(
-                    "receive replied with {} bytes, over the {}-byte reply cap",
-                    reply.len(),
-                    store.data().gate.max_body_bytes()
-                ))
-            }
-            Ok(Ok(reply)) => {
-                // All buffers flush together, on Ok only. On Err/Trap this arm is
-                // never taken, so the buffers drop with the store below — a trapped
-                // activation therefore fires no port publish, no tool call, and no
-                // deferred cancel/edit.
-                let data = store.data_mut();
-                let publishes = data.take_ok_publishes();
-                let deferred_ops = data.take_ok_deferred_ops();
-                ProcessorOutcome::Ok {
-                    publishes,
-                    deferred_ops,
-                    reply,
+            Ok(Ok(reply)) => match reply.map(|r| reply_body(r, max_body_bytes)).transpose() {
+                Err(trap) => ProcessorOutcome::Trap(trap),
+                Ok(reply) => {
+                    // All buffers flush together, on Ok only. On Err/Trap this arm is
+                    // never taken, so the buffers drop with the store below — a trapped
+                    // activation therefore fires no port publish, no tool call, and no
+                    // deferred cancel/edit.
+                    let data = store.data_mut();
+                    let publishes = data.take_ok_publishes();
+                    let deferred_ops = data.take_ok_deferred_ops();
+                    ProcessorOutcome::Ok {
+                        publishes,
+                        deferred_ops,
+                        reply,
+                    }
                 }
-            }
+            },
             Ok(Err(re)) => ProcessorOutcome::Err(re),
             Err(e) => ProcessorOutcome::Trap(format!("{e:#}")),
         };
@@ -3773,6 +4395,20 @@ impl ProcessorComponent {
                 );
             }
 
+            // Non-text bodies refused for a text-only bound channel: one warn per
+            // activation with the per-port counts, not one per refused call, so a
+            // frame publisher on an undeclared channel writes one line per
+            // activation. Every key names a bound port and its host-resolved
+            // channel, both operator configuration, safe to log verbatim.
+            if !data.text_only_refusals.is_empty() {
+                warn!(
+                    slug = %data.slug,
+                    refused = ?data.text_only_refusals,
+                    "wasm publish: non-text bodies refused — bound channel is text-only \
+                     (declare it non_text to carry them)"
+                );
+            }
+
             // Publishes to a declared-but-unwired port: one line per activation
             // with the count, not one per call. A drop is a legitimate
             // deployment, so this is `debug!` like its per-call sibling — but it
@@ -3795,6 +4431,77 @@ impl ProcessorComponent {
         }
 
         outcome
+    }
+
+    /// Instantiate a 0.1.0 component and call `receive` with the activation
+    /// lowered to the string carrier. The outer `Err` is an instantiation
+    /// failure; the inner one a trap.
+    fn receive_v0_1(
+        store: &mut Store<ProcessorData>,
+        pre: &ProcessorPre<ProcessorData>,
+        activation: HostActivation,
+    ) -> wasmtime::Result<wasmtime::Result<Received>> {
+        use processor_bindings::brenn::processor::types as wit;
+        let activation = lower_v0_1(activation);
+        let wit_activation = wit::Activation {
+            ports: activation
+                .ports
+                .into_iter()
+                .map(|pw| wit::PortWindow {
+                    port: pw.port,
+                    envelopes: pw.envelopes,
+                    new_from: pw.new_from,
+                    dropped: saturate_dropped(pw.dropped),
+                })
+                .collect(),
+            deferred: activation
+                .deferred
+                .into_iter()
+                .map(|dw| wit::DeferredWindow {
+                    port: dw.port,
+                    entries: dw
+                        .entries
+                        .into_iter()
+                        .map(|e| wit::DeferredEntry {
+                            index: e.index,
+                            payload: e.payload,
+                            deliver_after: e.deliver_after,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            now: activation.now,
+            sync: activation.sync,
+        };
+        let instance = pre.instantiate(&mut *store)?;
+        Ok(instance
+            .call_receive(&mut *store, &wit_activation)
+            .map(|r| r.map(|reply| reply.map(GuestBody::Text))))
+    }
+
+    /// Instantiate a 0.2.0 component and call `receive` with the activation
+    /// lowered to bodies: each envelope as its header, content type and bytes.
+    /// The outer `Err` is an instantiation failure; the inner one a trap.
+    fn receive_v0_2(
+        store: &mut Store<ProcessorData>,
+        pre: &processor_v0_2_bindings::ProcessorPre<ProcessorData>,
+        activation: HostActivation,
+    ) -> wasmtime::Result<wasmtime::Result<Received>> {
+        let wit_activation = lower_v0_2(activation);
+        let instance = pre.instantiate(&mut *store)?;
+        Ok(instance
+            .call_receive(&mut *store, &wit_activation)
+            .map(|r| {
+                r.map(|reply| reply.map(GuestBody::from))
+                    .map_err(|e| match e {
+                        bus_v0_2::ReceiveError::MalformedEnvelope(why) => {
+                            ProcessorReceiveError::MalformedEnvelope(why)
+                        }
+                        bus_v0_2::ReceiveError::ProcessingFailed(why) => {
+                            ProcessorReceiveError::ProcessingFailed(why)
+                        }
+                    })
+            }))
     }
 
     /// If a store transaction is still active after `call_receive` returns (trap or
@@ -4010,6 +4717,7 @@ mod processor_store_host_tests {
             channel_address: channel_address.to_string(),
             default_urgency: ProcessorUrgency::Normal,
             budget: generous_budget(),
+            non_text: false,
         }
     }
 
@@ -4027,6 +4735,7 @@ mod processor_store_host_tests {
             slug: Arc::from("test-slug"),
             gate: ActivationGate::new(1024, HashMap::new()),
             publish_suppressed_by_sink: HashMap::new(),
+            text_only_refusals: HashMap::new(),
             publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
@@ -4088,6 +4797,7 @@ mod processor_store_host_tests {
             slug: Arc::from("test-slug"),
             gate: ActivationGate::new(1024, budgets),
             publish_suppressed_by_sink: HashMap::new(),
+            text_only_refusals: HashMap::new(),
             publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl,
@@ -4180,8 +4890,8 @@ mod processor_store_host_tests {
         let unwired = data
             .do_publish_declared(UNWIRED_PORT.to_string(), oversize, None, None)
             .expect_err("and on an unwired one");
-        assert!(matches!(bound, PublishError::InvalidPayload(_)));
-        assert!(matches!(unwired, PublishError::InvalidPayload(_)));
+        assert!(matches!(bound, PublishRefusal::InvalidPayload(_)));
+        assert!(matches!(unwired, PublishRefusal::InvalidPayload(_)));
 
         // Unrepresentable deliver-after ⇒ invalid-payload on the publish path
         // (the WIT `publish-error` has no release-time variant), on both.
@@ -4197,8 +4907,8 @@ mod processor_store_host_tests {
                 Some(u64::MAX),
             )
             .expect_err("and on an unwired one");
-        assert!(matches!(bound, PublishError::InvalidPayload(_)));
-        assert!(matches!(unwired, PublishError::InvalidPayload(_)));
+        assert!(matches!(bound, PublishRefusal::InvalidPayload(_)));
+        assert!(matches!(unwired, PublishRefusal::InvalidPayload(_)));
 
         // The aggregate backstops ⇒ quota-exceeded. Drops charge the entry
         // ceiling, so filling it with drops refuses the next publish to either
@@ -4214,8 +4924,8 @@ mod processor_store_host_tests {
         let bound = data
             .do_publish_declared("out".to_string(), "x".to_string(), None, None)
             .expect_err("and it is the one ceiling both paths answer to");
-        assert!(matches!(unwired, PublishError::QuotaExceeded));
-        assert!(matches!(bound, PublishError::QuotaExceeded));
+        assert!(matches!(unwired, PublishRefusal::QuotaExceeded));
+        assert!(matches!(bound, PublishRefusal::QuotaExceeded));
     }
 
     /// A publish naming a port the component's specification never declared is a
@@ -4225,7 +4935,12 @@ mod processor_store_host_tests {
     fn an_undeclared_port_traps_the_activation() {
         let mut data = make_publish_data("brenn:allowed", Arc::new(|_| true));
         let trap = data
-            .do_publish(UNDECLARED_PORT.to_string(), "body".to_string(), None, None)
+            .do_publish(
+                UNDECLARED_PORT.to_string(),
+                GuestBody::Text("body".to_string()),
+                None,
+                None,
+            )
             .expect_err("an undeclared port must trap");
         let msg = format!("{trap}");
         assert!(
@@ -4250,14 +4965,19 @@ mod processor_store_host_tests {
             let _ = data.do_publish_declared(UNWIRED_PORT.to_string(), "x".to_string(), None, None);
         }
         let err = data
-            .do_publish(UNDECLARED_PORT.to_string(), "x".to_string(), None, None)
+            .do_publish(
+                UNDECLARED_PORT.to_string(),
+                GuestBody::Text("x".to_string()),
+                None,
+                None,
+            )
             .expect("a spent call ceiling answers before the vocabulary check")
             .expect_err("and it answers with a refusal");
-        assert!(matches!(err, PublishError::QuotaExceeded));
+        assert!(matches!(err, PublishRefusal::QuotaExceeded));
     }
 
     /// Output-ACL deny: a bound port whose channel is rejected by `output_acl`
-    /// returns `PublishError::NotPermitted` and buffers nothing. An unwired
+    /// returns `PublishRefusal::NotPermitted` and buffers nothing. An unwired
     /// declared port never reaches this gate — there is no channel to judge.
     #[test]
     fn do_publish_acl_deny_returns_not_permitted_and_buffers_nothing() {
@@ -4269,7 +4989,7 @@ mod processor_store_host_tests {
             .do_publish_declared("out".to_string(), "payload".to_string(), None, None)
             .expect_err("publish to a channel outside the output ACL must be denied");
         assert!(
-            matches!(err, PublishError::NotPermitted),
+            matches!(err, PublishRefusal::NotPermitted),
             "ACL deny must reuse NotPermitted (same as unbound port); got {err:?}"
         );
         // Denied publish: nothing reaches the buffer.
@@ -4308,7 +5028,7 @@ mod processor_store_host_tests {
         );
         let buffered = &data.publish_buffer[0];
         assert_eq!(buffered.channel_address, "brenn:allowed");
-        assert_eq!(buffered.payload, "payload");
+        assert_eq!(buffered.body.as_text(), Some("payload"));
         assert_eq!(
             data.gate.bytes(),
             "payload".len(),
@@ -4334,7 +5054,7 @@ mod processor_store_host_tests {
             )
             .expect_err("an unrepresentable deliver_after must be refused");
         assert!(
-            matches!(err, PublishError::InvalidPayload(_)),
+            matches!(err, PublishRefusal::InvalidPayload(_)),
             "unrepresentable deliver_after must be invalid-payload, got {err:?}"
         );
         assert_eq!(
@@ -4377,7 +5097,7 @@ mod processor_store_host_tests {
         let err = data
             .do_publish_declared("out".to_string(), "x".repeat(1025), None, None)
             .expect_err("a payload one byte over the cap must be refused");
-        let PublishError::InvalidPayload(detail) = &err else {
+        let PublishRefusal::InvalidPayload(detail) = &err else {
             panic!("an oversize payload must be invalid-payload, got {err:?}");
         };
         assert!(
@@ -4416,7 +5136,7 @@ mod processor_store_host_tests {
         data.do_defer_declared(ProcessorDeferredOp::Edit {
             port: "out".to_string(),
             index: 1,
-            payload: Some("new".to_string()),
+            body: Some(MessageBody::text("new")),
             deliver_after: Some(4_000_000_000_000),
         })
         .expect("index 1 is within the 2-entry window");
@@ -4433,7 +5153,7 @@ mod processor_store_host_tests {
             ProcessorDeferredOp::Edit {
                 port: "out".to_string(),
                 index: 1,
-                payload: Some("new".to_string()),
+                body: Some(MessageBody::text("new")),
                 deliver_after: Some(4_000_000_000_000),
             }
         );
@@ -4452,7 +5172,7 @@ mod processor_store_host_tests {
                 index: 1,
             })
             .expect_err("index 1 is out of a 1-entry window");
-        assert!(matches!(err, DeferError::OutOfRange));
+        assert!(matches!(err, DeferRefusal::OutOfRange));
         assert_eq!(data.deferred_op_buffer.len(), 0);
 
         // A bound port that carried no deferred window this activation admits no
@@ -4464,7 +5184,7 @@ mod processor_store_host_tests {
                 index: 0,
             })
             .expect_err("no delivered window ⇒ index 0 is out of range");
-        assert!(matches!(err, DeferError::OutOfRange));
+        assert!(matches!(err, DeferRefusal::OutOfRange));
     }
 
     /// A declared port the deployer did not wire has an empty deferred window —
@@ -4481,7 +5201,7 @@ mod processor_store_host_tests {
                 index: 0,
             })
             .expect_err("an unwired port delivered no window");
-        assert!(matches!(err, DeferError::OutOfRange));
+        assert!(matches!(err, DeferRefusal::OutOfRange));
         assert_eq!(data.deferred_op_buffer.len(), 0);
         // The edit twin answers identically, and its body is not charged: the
         // port is judged before anything about the op is.
@@ -4490,11 +5210,11 @@ mod processor_store_host_tests {
             .do_defer_declared(ProcessorDeferredOp::Edit {
                 port: UNWIRED_PORT.to_string(),
                 index: 0,
-                payload: Some("edited".to_string()),
+                body: Some(MessageBody::text("edited")),
                 deliver_after: None,
             })
             .expect_err("an unwired port delivered no window to edit either");
-        assert!(matches!(err, DeferError::OutOfRange));
+        assert!(matches!(err, DeferRefusal::OutOfRange));
         assert_eq!(data.deferred_op_buffer.len(), 0);
         assert_eq!(data.gate.bytes(), bytes_before);
     }
@@ -4505,10 +5225,7 @@ mod processor_store_host_tests {
     fn do_defer_on_an_undeclared_port_traps() {
         let mut data = make_defer_data(2);
         let trap = data
-            .do_defer(ProcessorDeferredOp::Cancel {
-                port: UNDECLARED_PORT.to_string(),
-                index: 0,
-            })
+            .do_defer(UNDECLARED_PORT.to_string(), 0, None)
             .expect_err("an undeclared port must trap the activation");
         let msg = format!("{trap}");
         assert!(
@@ -4518,12 +5235,14 @@ mod processor_store_host_tests {
         assert_eq!(data.deferred_op_buffer.len(), 0);
         // And the edit twin, so the two hosts' control-op arms stay mirrored.
         let trap = data
-            .do_defer(ProcessorDeferredOp::Edit {
-                port: UNDECLARED_PORT.to_string(),
-                index: 0,
-                payload: Some("edited".to_string()),
-                deliver_after: None,
-            })
+            .do_defer(
+                UNDECLARED_PORT.to_string(),
+                0,
+                Some(GuestEdit {
+                    body: Some(GuestBody::Text("edited".to_string())),
+                    deliver_after: None,
+                }),
+            )
             .expect_err("an undeclared port must trap the activation");
         let msg = format!("{trap}");
         assert!(
@@ -4542,18 +5261,18 @@ mod processor_store_host_tests {
             .do_defer_declared(ProcessorDeferredOp::Edit {
                 port: "out".to_string(),
                 index: 0,
-                payload: None,
+                body: None,
                 deliver_after: Some(u64::MAX),
             })
             .expect_err("an unrepresentable deliver_after must be refused");
-        assert!(matches!(err, DeferError::InvalidDeliverAfter));
+        assert!(matches!(err, DeferRefusal::InvalidDeliverAfter));
         assert_eq!(data.deferred_op_buffer.len(), 0);
 
         // A representable value buffers.
         data.do_defer_declared(ProcessorDeferredOp::Edit {
             port: "out".to_string(),
             index: 0,
-            payload: None,
+            body: None,
             deliver_after: Some(4_000_000_000_000),
         })
         .expect("a representable deliver_after must buffer");
@@ -4588,7 +5307,7 @@ mod processor_store_host_tests {
                 index: 0,
             })
             .expect_err("the shared call budget is exhausted by the publishes");
-        assert!(matches!(err, DeferError::QuotaExceeded));
+        assert!(matches!(err, DeferRefusal::QuotaExceeded));
         assert_eq!(
             data.deferred_op_buffer.len(),
             0,
@@ -4617,7 +5336,7 @@ mod processor_store_host_tests {
                 index: 0,
             })
             .expect_err("beyond the buffer ceiling");
-        assert!(matches!(err, DeferError::QuotaExceeded));
+        assert!(matches!(err, DeferRefusal::QuotaExceeded));
         assert_eq!(
             data.deferred_op_buffer.len(),
             MAX_PUBLISHES_PER_ACTIVATION,
@@ -4635,18 +5354,18 @@ mod processor_store_host_tests {
             .do_defer_declared(ProcessorDeferredOp::Edit {
                 port: "out".to_string(),
                 index: 0,
-                payload: Some("x".repeat(1025)),
+                body: Some(MessageBody::text("x".repeat(1025))),
                 deliver_after: None,
             })
             .expect_err("an edit payload one byte over the cap must be refused");
-        assert!(matches!(err, DeferError::QuotaExceeded));
+        assert!(matches!(err, DeferRefusal::QuotaExceeded));
         assert_eq!(data.deferred_op_buffer.len(), 0);
 
         // A payload exactly at the cap buffers, so only the cap refused above.
         data.do_defer_declared(ProcessorDeferredOp::Edit {
             port: "out".to_string(),
             index: 0,
-            payload: Some("x".repeat(1024)),
+            body: Some(MessageBody::text("x".repeat(1024))),
             deliver_after: None,
         })
         .expect("a payload exactly at the cap must buffer");
@@ -4666,14 +5385,16 @@ mod processor_store_host_tests {
         data.do_defer_declared(ProcessorDeferredOp::Edit {
             port: "out".to_string(),
             index: 0,
-            payload: Some("x".repeat(MAX_PUBLISH_BYTES_PER_ACTIVATION)),
+            body: Some(MessageBody::text(
+                "x".repeat(MAX_PUBLISH_BYTES_PER_ACTIVATION),
+            )),
             deliver_after: None,
         })
         .expect("the edit payload fills the aggregate exactly");
         let err = data
             .do_publish_declared("out".to_string(), "y".to_string(), None, None)
             .expect_err("a one-byte publish is refused by the aggregate the edit spent");
-        assert!(matches!(err, PublishError::QuotaExceeded));
+        assert!(matches!(err, PublishRefusal::QuotaExceeded));
         assert_eq!(data.publish_buffer.len(), 0);
         assert!(
             data.publish_suppressed_by_sink.is_empty(),
@@ -4695,11 +5416,11 @@ mod processor_store_host_tests {
             .do_defer_declared(ProcessorDeferredOp::Edit {
                 port: "out".to_string(),
                 index: 0,
-                payload: Some("y".to_string()),
+                body: Some(MessageBody::text("y")),
                 deliver_after: None,
             })
             .expect_err("a one-byte edit is refused by the aggregate the publish spent");
-        assert!(matches!(err, DeferError::QuotaExceeded));
+        assert!(matches!(err, DeferRefusal::QuotaExceeded));
         assert_eq!(data.deferred_op_buffer.len(), 0);
     }
 
@@ -4720,6 +5441,7 @@ mod processor_store_host_tests {
             slug: Arc::from("test-slug"),
             gate: ActivationGate::new(1024, HashMap::new()),
             publish_suppressed_by_sink: HashMap::new(),
+            text_only_refusals: HashMap::new(),
             publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
@@ -5079,6 +5801,7 @@ mod processor_store_host_tests {
             slug: Arc::from("test-slug"),
             gate: ActivationGate::new(1024, HashMap::new()),
             publish_suppressed_by_sink: HashMap::new(),
+            text_only_refusals: HashMap::new(),
             publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
@@ -5366,7 +6089,7 @@ mod processor_store_host_tests {
         let err = data
             .do_publish_declared("out".to_string(), "x".to_string(), None, None)
             .expect_err("the buffered async request holds the last entry slot");
-        assert!(matches!(err, PublishError::QuotaExceeded));
+        assert!(matches!(err, PublishRefusal::QuotaExceeded));
         assert_eq!(data.publish_buffer.len(), MAX_PUBLISHES_PER_ACTIVATION - 1);
     }
 
@@ -5424,7 +6147,7 @@ mod processor_store_host_tests {
         assert_eq!(publishes[0].reply_to, None);
         // Tool request second: on its request channel, body verbatim, reply_to set.
         assert_eq!(publishes[1].channel_address, "brenn:tools/git-repo-pull");
-        assert_eq!(publishes[1].payload, req.body_json);
+        assert_eq!(publishes[1].body.as_text(), Some(req.body_json.as_str()));
         assert_eq!(
             publishes[1].reply_to.as_deref(),
             Some("brenn:tool-results/sync")
@@ -5484,7 +6207,7 @@ mod processor_store_host_tests {
                 .do_publish_declared("out".to_string(), "payload".to_string(), None, None)
                 .expect_err("denied publish must return an error");
             assert!(
-                matches!(err, PublishError::NotPermitted),
+                matches!(err, PublishRefusal::NotPermitted),
                 "call {i} within budget must be NotPermitted (ACL deny), got {err:?}"
             );
         }
@@ -5494,7 +6217,7 @@ mod processor_store_host_tests {
             .do_publish_declared("out".to_string(), "payload".to_string(), None, None)
             .expect_err("over-budget publish must return an error");
         assert!(
-            matches!(err, PublishError::QuotaExceeded),
+            matches!(err, PublishRefusal::QuotaExceeded),
             "over-budget call must be QuotaExceeded (budget gate precedes ACL gate), got {err:?}"
         );
         assert!(
@@ -5503,13 +6226,139 @@ mod processor_store_host_tests {
         );
     }
 
+    /// A malformed 0.2.0 body.
+    fn malformed_body() -> GuestBody {
+        GuestBody::Parts {
+            content_type: Some("noslash".to_string()),
+            bytes: vec![0],
+        }
+    }
+
+    /// A well-formed non-text 0.2.0 body.
+    fn non_text_body() -> GuestBody {
+        GuestBody::Parts {
+            content_type: Some("image/png".to_string()),
+            bytes: vec![0x89, 0x50, 0xff],
+        }
+    }
+
+    /// Both body refusals sit after the call charge and before every spending
+    /// gate: each costs one call and nothing else.
+    #[test]
+    fn a_body_refusal_charges_the_call_and_nothing_else() {
+        let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
+        let sink = SinkKey::Port("out".to_string());
+        let refusal = data
+            .do_publish("out".to_string(), malformed_body(), None, None)
+            .expect("declared");
+        assert!(
+            matches!(refusal, Err(PublishRefusal::InvalidBody(_))),
+            "{refusal:?}"
+        );
+        let refusal = data
+            .do_publish("out".to_string(), non_text_body(), None, None)
+            .expect("declared");
+        assert_eq!(refusal, Err(PublishRefusal::TextOnlyChannel));
+        assert_eq!(data.gate.calls(), 2);
+        assert_eq!(data.gate.entries(), 0);
+        assert_eq!(data.gate.bytes(), 0);
+        assert_eq!(data.gate.sinks().get(&sink), Some(&TEST_GENEROUS_MT));
+        assert!(data.publish_buffer.is_empty());
+        assert_eq!(
+            data.text_only_refusals,
+            HashMap::from([(("out".to_string(), "brenn:out".to_string()), 1)]),
+            "only the text-only refusal is counted for the operator's warn"
+        );
+    }
+
+    #[test]
+    fn a_non_text_body_on_a_non_text_port_is_buffered() {
+        let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
+        let mut ports = HashMap::new();
+        ports.insert(
+            "out".to_string(),
+            OutputPortSpec {
+                non_text: true,
+                ..test_out_spec("brenn:out")
+            },
+        );
+        data.output_ports = Arc::new(ports);
+        data.do_publish("out".to_string(), non_text_body(), None, None)
+            .expect("declared")
+            .expect("a non-text channel takes a non-text body");
+        let published = &data.publish_buffer[0].body;
+        assert_eq!(published.content_type(), Some("image/png"));
+        assert_eq!(published.as_bytes(), [0x89, 0x50, 0xff]);
+        assert_eq!(data.gate.bytes(), 3, "the aggregate counts raw bytes");
+        assert!(data.text_only_refusals.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_body_past_the_call_budget_is_quota_exceeded() {
+        let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
+        for _ in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
+            data.do_publish("out".to_string(), malformed_body(), None, None)
+                .expect("declared")
+                .expect_err("malformed");
+        }
+        let refusal = data
+            .do_publish("out".to_string(), malformed_body(), None, None)
+            .expect("declared");
+        assert_eq!(refusal, Err(PublishRefusal::QuotaExceeded));
+    }
+
+    #[test]
+    fn an_edit_body_is_judged_after_the_index_and_charges_only_the_call() {
+        let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
+        data.deferred_index_bounds.insert("out".to_string(), 1);
+        let edit = |body| {
+            Some(GuestEdit {
+                body: Some(body),
+                deliver_after: None,
+            })
+        };
+        let refusal = data
+            .do_defer("out".to_string(), 5, edit(malformed_body()))
+            .expect("declared");
+        assert_eq!(refusal, Err(DeferRefusal::OutOfRange));
+        let refusal = data
+            .do_defer("out".to_string(), 0, edit(malformed_body()))
+            .expect("declared");
+        assert!(
+            matches!(refusal, Err(DeferRefusal::InvalidBody(_))),
+            "{refusal:?}"
+        );
+        let refusal = data
+            .do_defer("out".to_string(), 0, edit(non_text_body()))
+            .expect("declared");
+        assert_eq!(refusal, Err(DeferRefusal::TextOnlyChannel));
+        assert_eq!(data.gate.calls(), 3);
+        assert_eq!(data.gate.ops(), 0);
+        assert_eq!(data.gate.bytes(), 0);
+        assert!(data.deferred_op_buffer.is_empty());
+        assert_eq!(
+            data.text_only_refusals,
+            HashMap::from([(("out".to_string(), "brenn:out".to_string()), 1)]),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a 0.1.0 publish drew")]
+    fn a_body_refusal_has_no_0_1_spelling() {
+        let _ = PublishRefusal::TextOnlyChannel.into_v0_1();
+    }
+
     // ── per-sink publish token buckets ────────────────
 
     /// Helper: build a single-window activation with `envelopes.len()` total and
     /// `new_from` retained-context split.
-    fn window_activation(port: &str, total: usize, new_from: u32) -> ProcessorActivation {
-        ProcessorActivation {
-            ports: vec![ProcessorPortWindow {
+    fn window_activation(
+        port: &str,
+        total: usize,
+        new_from: u32,
+    ) -> brenn_activation::ProcessorActivation {
+        brenn_activation::ProcessorActivation {
+            ports: vec![brenn_activation::ProcessorPortWindow {
                 port: port.to_string(),
                 envelopes: (0..total).map(|i| i.to_string()).collect(),
                 new_from,
@@ -5528,15 +6377,15 @@ mod processor_store_host_tests {
         let amp = HashMap::from([("a".to_string(), 1000u64), ("b".to_string(), 500u64)]);
         // Window a: 5 envelopes, 2 retained ⇒ 3 new ⇒ 3000. Window b: 4 envelopes,
         // all new ⇒ 4 × 500 = 2000. A pure-context window contributes 0.
-        let act = ProcessorActivation {
+        let act = brenn_activation::ProcessorActivation {
             ports: vec![
-                ProcessorPortWindow {
+                brenn_activation::ProcessorPortWindow {
                     port: "a".to_string(),
                     envelopes: (0..5).map(|i| i.to_string()).collect(),
                     new_from: 2,
                     dropped: 0,
                 },
-                ProcessorPortWindow {
+                brenn_activation::ProcessorPortWindow {
                     port: "b".to_string(),
                     envelopes: (0..4).map(|i| i.to_string()).collect(),
                     new_from: 0,
@@ -5573,15 +6422,15 @@ mod processor_store_host_tests {
     #[test]
     fn a_sync_request_window_grants_no_budget() {
         let amp = HashMap::from([("a".to_string(), 1000u64)]);
-        let mut act = ProcessorActivation {
+        let mut act = brenn_activation::ProcessorActivation {
             ports: vec![
-                ProcessorPortWindow {
+                brenn_activation::ProcessorPortWindow {
                     port: "a".to_string(),
                     envelopes: (0..3).map(|i| i.to_string()).collect(),
                     new_from: 0,
                     dropped: 0,
                 },
-                ProcessorPortWindow {
+                brenn_activation::ProcessorPortWindow {
                     port: "ask".to_string(),
                     envelopes: vec!["the request".to_string()],
                     new_from: 0,
@@ -5643,7 +6492,7 @@ mod processor_store_host_tests {
         let err = data
             .do_publish_declared("out".to_string(), "p".to_string(), None, None)
             .expect_err("the N+2nd publish must be rejected");
-        assert!(matches!(err, PublishError::QuotaExceeded));
+        assert!(matches!(err, PublishRefusal::QuotaExceeded));
         assert_eq!(
             data.publish_suppressed_by_sink
                 .get(&SinkKey::Port("out".to_string())),
@@ -5672,6 +6521,7 @@ mod processor_store_host_tests {
             slug: Arc::from("test-slug"),
             gate: ActivationGate::new(1024, budgets),
             publish_suppressed_by_sink: HashMap::new(),
+            text_only_refusals: HashMap::new(),
             publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
@@ -5700,7 +6550,7 @@ mod processor_store_host_tests {
             .expect("A first publish ok");
         assert!(matches!(
             data.do_publish_declared("a".to_string(), "p".to_string(), None, None),
-            Err(PublishError::QuotaExceeded)
+            Err(PublishRefusal::QuotaExceeded)
         ));
         // B is unaffected.
         data.do_publish_declared("b".to_string(), "p".to_string(), None, None)
@@ -5901,6 +6751,77 @@ mod processor_store_host_tests {
 // shares with publishes, and the `SyncAnswer` → `call-error` mapping.
 
 #[cfg(test)]
+mod lowering_tests {
+    use std::sync::Arc;
+
+    use super::{HostActivation, MessageBody, MessageEnvelope, lower_v0_1};
+
+    fn envelope(body: MessageBody) -> Arc<MessageEnvelope> {
+        let parsed: MessageEnvelope = serde_json::from_str(
+            r#"{"message_id":"00000000-0000-0000-0000-000000000001","source":"test","channel":"brenn:in","sender":"test-sender","publish_ts":"2026-01-01T00:00:00Z","body":"","urgency":"normal","envelope_type":"brenn"}"#,
+        )
+        .expect("a literal envelope parses");
+        Arc::new(MessageEnvelope { body, ..parsed })
+    }
+
+    fn activation(window: MessageBody, parked: MessageBody) -> HostActivation {
+        brenn_activation::Activation {
+            ports: vec![brenn_activation::PortWindow {
+                port: "in".to_string(),
+                envelopes: vec![envelope(window)],
+                new_from: 0,
+                dropped: 7,
+            }],
+            deferred: vec![brenn_activation::DeferredWindow {
+                port: "out".to_string(),
+                entries: vec![brenn_activation::DeferredEntry {
+                    index: 0,
+                    payload: envelope(parked),
+                    deliver_after: 42,
+                }],
+            }],
+            now: Some(9),
+            sync: None,
+        }
+    }
+
+    fn jpeg() -> MessageBody {
+        MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, 0xff])
+            .expect("a jpeg body is well formed")
+    }
+
+    /// A window envelope crosses as its `envelope-json` and a parked message as
+    /// its body text; a typed text body as exactly its text, without its type.
+    #[test]
+    fn the_0_1_lowering_is_the_envelope_json_and_the_body_text() {
+        let markdown = MessageBody::from_parts(Some("text/markdown"), b"# hi")
+            .expect("a markdown body is well formed");
+        let lowered = lower_v0_1(activation(markdown.clone(), markdown.clone()));
+        assert_eq!(
+            lowered.ports[0].envelopes,
+            vec![envelope(markdown).to_envelope_json()]
+        );
+        assert_eq!(lowered.ports[0].dropped, 7);
+        assert_eq!(lowered.deferred[0].port, "out");
+        assert_eq!(lowered.deferred[0].entries[0].payload, "# hi");
+        assert_eq!(lowered.deferred[0].entries[0].deliver_after, 42);
+        assert_eq!(lowered.now, Some(9));
+    }
+
+    #[test]
+    #[should_panic(expected = "0.1.0 envelope-json")]
+    fn the_0_1_lowering_panics_on_a_non_text_window_body() {
+        let _ = lower_v0_1(activation(jpeg(), MessageBody::text("parked")));
+    }
+
+    #[test]
+    #[should_panic(expected = "0.1.0 deferred-entry.payload")]
+    fn the_0_1_lowering_panics_on_a_non_text_parked_body() {
+        let _ = lower_v0_1(activation(MessageBody::text("window"), jpeg()));
+    }
+}
+
+#[cfg(test)]
 mod epoch_extension_tests {
     use std::time::Duration;
 
@@ -5967,21 +6888,27 @@ mod processor_calls_host_tests {
 
     /// What the seam was asked, so a test can assert the host passed the target
     /// and the chain through unchanged.
-    type Seen = Arc<Mutex<Vec<(String, String, String, Vec<String>)>>>;
+    type Seen = Arc<Mutex<Vec<(String, String, MessageBody, Vec<String>)>>>;
 
     /// The `call-error` variant as a stable word, so a test can compare two
     /// without the bindgen type carrying an `Eq` it does not need in production.
-    fn word(answer: &Result<Option<String>, CallWitError>) -> String {
+    fn word(answer: &Result<Option<MessageBody>, CallRefusal>) -> String {
         match answer {
             Ok(None) => "ok".to_string(),
-            Ok(Some(reply)) => format!("ok:{reply}"),
-            Err(CallWitError::NotPermitted) => "not-permitted".to_string(),
-            Err(CallWitError::Unwired) => "unwired".to_string(),
-            Err(CallWitError::Refused) => "refused".to_string(),
-            Err(CallWitError::Failed) => "failed".to_string(),
-            Err(CallWitError::InvalidPayload(m)) => format!("invalid-payload:{m}"),
-            Err(CallWitError::QuotaExceeded) => "quota-exceeded".to_string(),
+            Ok(Some(reply)) => format!("ok:{}", reply.as_text().expect("a text reply")),
+            Err(CallRefusal::Unwired) => "unwired".to_string(),
+            Err(CallRefusal::Refused) => "refused".to_string(),
+            Err(CallRefusal::Failed) => "failed".to_string(),
+            Err(CallRefusal::InvalidPayload(m)) => format!("invalid-payload:{m}"),
+            Err(CallRefusal::InvalidBody(m)) => format!("invalid-body:{m}"),
+            Err(CallRefusal::TextOnlyPeer) => "text-only-peer".to_string(),
+            Err(CallRefusal::QuotaExceeded) => "quota-exceeded".to_string(),
         }
+    }
+
+    /// A 0.1.0 call: untyped text.
+    fn text(body: impl Into<String>) -> GuestBody {
+        GuestBody::Text(body.into())
     }
 
     /// A `ProcessorData` with one wired call port and one unbound declared one,
@@ -6018,6 +6945,7 @@ mod processor_calls_host_tests {
             slug: Arc::from("menu"),
             gate: ActivationGate::new(1024, HashMap::new()),
             publish_suppressed_by_sink: HashMap::new(),
+            text_only_refusals: HashMap::new(),
             publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
@@ -6048,7 +6976,7 @@ mod processor_calls_host_tests {
     fn a_port_the_specification_does_not_declare_traps_the_activation() {
         let (mut data, seen) = make_call_data(SyncAnswer::Ok(None));
         let err = data
-            .do_call("stranger".to_string(), "{}".to_string())
+            .do_call("stranger".to_string(), text("{}".to_string()))
             .expect_err("an undeclared call port ends the activation");
         assert!(err.to_string().contains("stranger"), "{err}");
         assert!(
@@ -6060,7 +6988,9 @@ mod processor_calls_host_tests {
     #[test]
     fn a_declared_port_the_document_left_unbound_answers_unwired() {
         let (mut data, seen) = make_call_data(SyncAnswer::Ok(None));
-        let answer = data.do_call(UNBOUND.to_string(), "{}".to_string()).unwrap();
+        let answer = data
+            .do_call(UNBOUND.to_string(), text("{}".to_string()))
+            .unwrap();
         assert_eq!(word(&answer), "unwired");
         assert!(
             seen.lock().unwrap().is_empty(),
@@ -6070,9 +7000,9 @@ mod processor_calls_host_tests {
 
     #[test]
     fn a_wired_port_reaches_its_peer_with_the_chain_this_activation_carries() {
-        let (mut data, seen) = make_call_data(SyncAnswer::Ok(Some("42".to_string())));
+        let (mut data, seen) = make_call_data(SyncAnswer::Ok(Some(MessageBody::text("42"))));
         let answer = data
-            .do_call(WIRED.to_string(), "{\"q\":1}".to_string())
+            .do_call(WIRED.to_string(), text("{\"q\":1}".to_string()))
             .unwrap();
         assert_eq!(word(&answer), "ok:42");
         assert_eq!(
@@ -6080,7 +7010,7 @@ mod processor_calls_host_tests {
             [(
                 "geo".to_string(),
                 "resolve".to_string(),
-                "{\"q\":1}".to_string(),
+                MessageBody::text("{\"q\":1}"),
                 vec!["menu".to_string()],
             )]
         );
@@ -6090,7 +7020,11 @@ mod processor_calls_host_tests {
     fn a_peer_that_answered_nothing_is_an_ok_with_no_reply() {
         let (mut data, _) = make_call_data(SyncAnswer::Ok(None));
         assert_eq!(
-            word(&data.do_call(WIRED.to_string(), String::new()).unwrap()),
+            word(
+                &data
+                    .do_call(WIRED.to_string(), text(String::new()))
+                    .unwrap()
+            ),
             "ok"
         );
     }
@@ -6107,7 +7041,11 @@ mod processor_calls_host_tests {
         ] {
             let (mut data, _) = make_call_data(answer.clone());
             assert_eq!(
-                word(&data.do_call(WIRED.to_string(), String::new()).unwrap()),
+                word(
+                    &data
+                        .do_call(WIRED.to_string(), text(String::new()))
+                        .unwrap()
+                ),
                 expected,
                 "{answer:?}"
             );
@@ -6118,7 +7056,7 @@ mod processor_calls_host_tests {
     #[should_panic(expected = "acyclicity check was bypassed")]
     fn a_re_entrant_refusal_reaching_the_mapping_is_a_host_panic() {
         let (mut data, _) = make_call_data(SyncAnswer::Refused(SyncRefusal::ReEntrant));
-        let _ = data.do_call(WIRED.to_string(), String::new());
+        let _ = data.do_call(WIRED.to_string(), text(String::new()));
     }
 
     /// The wait is charged to `blocked`, which is the whole of what keeps a
@@ -6143,7 +7081,9 @@ mod processor_calls_host_tests {
         let (mut data, _) = make_call_data(SyncAnswer::Ok(None));
         data.sync_caller = Some(caller);
         assert_eq!(data.blocked, std::time::Duration::ZERO);
-        let answer = data.do_call(WIRED.to_string(), String::new()).unwrap();
+        let answer = data
+            .do_call(WIRED.to_string(), text(String::new()))
+            .unwrap();
         assert_eq!(word(&answer), "ok");
         assert!(
             data.blocked >= std::time::Duration::from_millis(50),
@@ -6157,7 +7097,7 @@ mod processor_calls_host_tests {
         let (mut data, seen) = make_call_data(SyncAnswer::Ok(None));
         let cap = data.gate.max_body_bytes();
         let answer = data
-            .do_call(WIRED.to_string(), "x".repeat(cap + 1))
+            .do_call(WIRED.to_string(), text("x".repeat(cap + 1)))
             .unwrap();
         assert!(word(&answer).starts_with("invalid-payload:"), "{answer:?}");
         assert!(
@@ -6168,7 +7108,11 @@ mod processor_calls_host_tests {
         // reply side.
         let (mut data, _) = make_call_data(SyncAnswer::Ok(None));
         assert_eq!(
-            word(&data.do_call(WIRED.to_string(), "x".repeat(cap)).unwrap()),
+            word(
+                &data
+                    .do_call(WIRED.to_string(), text("x".repeat(cap)))
+                    .unwrap()
+            ),
             "ok"
         );
     }
@@ -6180,19 +7124,180 @@ mod processor_calls_host_tests {
     fn calls_share_the_activations_call_budget_with_publishes() {
         let (mut data, _) = make_call_data(SyncAnswer::Ok(None));
         // Drain the shared per-activation call budget through the call path.
-        while word(&data.do_call(WIRED.to_string(), String::new()).unwrap()) == "ok" {}
+        while word(
+            &data
+                .do_call(WIRED.to_string(), text(String::new()))
+                .unwrap(),
+        ) == "ok"
+        {}
         assert_eq!(
-            word(&data.do_call(WIRED.to_string(), String::new()).unwrap()),
+            word(
+                &data
+                    .do_call(WIRED.to_string(), text(String::new()))
+                    .unwrap()
+            ),
             "quota-exceeded",
         );
         assert!(
             matches!(
-                data.do_publish("out".to_string(), String::new(), None, None)
-                    .unwrap(),
-                Err(PublishError::QuotaExceeded)
+                data.do_publish(
+                    "out".to_string(),
+                    GuestBody::Text(String::new()),
+                    None,
+                    None
+                )
+                .unwrap(),
+                Err(PublishRefusal::QuotaExceeded)
             ),
             "a publish spends the counter the calls drained"
         );
+    }
+
+    /// A 0.2.0 body reaches the peer as it was given, and a non-text reply
+    /// comes back as a body.
+    #[test]
+    fn a_0_2_0_call_carries_bytes_both_ways() {
+        let reply = MessageBody::from_parts(Some("image/png"), &[0x89, 0x50]).unwrap();
+        let (mut data, seen) = make_call_data(SyncAnswer::Ok(Some(reply.clone())));
+        let request = GuestBody::Parts {
+            content_type: Some("application/octet-stream".to_string()),
+            bytes: vec![0xff, 0x00],
+        };
+        let answer = data.do_call(WIRED.to_string(), request).unwrap();
+        assert_eq!(answer, Ok(Some(reply)));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].2.content_type(), Some("application/octet-stream"));
+        assert_eq!(seen[0].2.as_bytes(), [0xff, 0x00]);
+    }
+
+    /// A malformed body is refused after the trap and the charge and before
+    /// the cap, the wiring and the peer: it costs one call and nothing else.
+    #[test]
+    fn a_malformed_body_is_invalid_body_and_charges_the_call_only() {
+        let malformed = || GuestBody::Parts {
+            content_type: None,
+            bytes: vec![0xff],
+        };
+        let (mut data, seen) = make_call_data(SyncAnswer::Ok(None));
+        let before = data.gate.calls();
+        for port in [WIRED, UNBOUND] {
+            let answer = data.do_call(port.to_string(), malformed()).unwrap();
+            assert!(word(&answer).starts_with("invalid-body:"), "{answer:?}");
+        }
+        assert_eq!(data.gate.calls(), before + 2);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the peer must not be asked"
+        );
+        // Undeclared still traps first.
+        data.do_call("stranger".to_string(), malformed())
+            .expect_err("an undeclared call port ends the activation whatever the body");
+    }
+
+    #[test]
+    fn a_malformed_body_past_the_call_budget_is_quota_exceeded() {
+        let (mut data, _) = make_call_data(SyncAnswer::Ok(None));
+        while word(&data.do_call(WIRED.to_string(), text("")).unwrap()) == "ok" {}
+        let answer = data
+            .do_call(
+                WIRED.to_string(),
+                GuestBody::Parts {
+                    content_type: Some("not a type".to_string()),
+                    bytes: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(word(&answer), "quota-exceeded");
+    }
+
+    /// The cap counts raw bytes of a non-text body as it does text.
+    #[test]
+    fn an_oversize_non_text_body_is_invalid_payload() {
+        let (mut data, seen) = make_call_data(SyncAnswer::Ok(None));
+        let cap = data.gate.max_body_bytes();
+        let body = |len| GuestBody::Parts {
+            content_type: Some("application/octet-stream".to_string()),
+            bytes: vec![0; len],
+        };
+        let answer = data.do_call(WIRED.to_string(), body(cap + 1)).unwrap();
+        assert!(word(&answer).starts_with("invalid-payload:"), "{answer:?}");
+        assert!(seen.lock().unwrap().is_empty());
+        let answer = data.do_call(WIRED.to_string(), body(cap)).unwrap();
+        assert_eq!(word(&answer), "ok");
+    }
+
+    #[test]
+    fn a_text_only_target_is_text_only_peer_to_a_0_2_0_caller() {
+        let (mut data, _) = make_call_data(SyncAnswer::Refused(SyncRefusal::TextOnlyTarget));
+        let request = GuestBody::Parts {
+            content_type: Some("application/octet-stream".to_string()),
+            bytes: vec![1],
+        };
+        let answer = data.do_call(WIRED.to_string(), request).unwrap();
+        assert!(
+            matches!(
+                answer.map_err(CallRefusal::into_v0_2),
+                Err(calls_v0_2::CallError::TextOnlyPeer)
+            ),
+            "a text-only target is the caller's own refusal"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a 0.1.0 call drew TextOnlyPeer")]
+    fn a_text_only_peer_refusal_for_a_0_1_0_caller_is_a_host_panic() {
+        let _ = CallRefusal::TextOnlyPeer.into_v0_1();
+    }
+
+    /// The 0.1.0 `calls.call` import, as the guest reaches it.
+    fn call_v0_1(
+        data: &mut ProcessorData,
+        port: &str,
+    ) -> wasmtime::Result<Result<Option<String>, CallWitError>> {
+        processor_bindings::brenn::processor::calls::Host::call(
+            data,
+            port.to_string(),
+            "{}".to_string(),
+        )
+    }
+
+    /// A peer may answer with a body the string contract cannot carry. The
+    /// caller is the end that cannot read it, so the caller's activation
+    /// traps, naming its own port, the peer and the reply.
+    #[test]
+    fn a_non_text_reply_traps_the_0_1_0_caller() {
+        let reply = MessageBody::from_parts(Some("image/png"), &[0x89, 0x50]).unwrap();
+        let (mut data, seen) = make_call_data(SyncAnswer::Ok(Some(reply)));
+        let err = call_v0_1(&mut data, WIRED).expect_err("a non-text reply ends the caller");
+        let msg = err.to_string();
+        for needle in [
+            "processor menu",
+            "\"lookup\"",
+            "\"geo\"",
+            "\"resolve\"",
+            "BinaryBody",
+            "image/png",
+            "brenn:processor@0.1.0",
+            "buffer was flushed",
+        ] {
+            assert!(msg.contains(needle), "{needle:?} missing from {msg}");
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1, "the peer was asked once");
+    }
+
+    /// A typed text reply reaches a 0.1.0 caller as its text; no reply is no
+    /// reply.
+    #[test]
+    fn a_text_reply_reaches_the_0_1_0_caller_as_its_text() {
+        let reply = MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+        let (mut data, _) = make_call_data(SyncAnswer::Ok(Some(reply)));
+        assert_eq!(
+            call_v0_1(&mut data, WIRED).unwrap().unwrap(),
+            Some("# hi".to_string())
+        );
+        let (mut data, _) = make_call_data(SyncAnswer::Ok(None));
+        assert_eq!(call_v0_1(&mut data, WIRED).unwrap().unwrap(), None);
     }
 }
 
@@ -6236,6 +7341,7 @@ mod processor_config_host_tests {
             slug: Arc::from("test-slug"),
             gate: ActivationGate::new(1024, HashMap::new()),
             publish_suppressed_by_sink: HashMap::new(),
+            text_only_refusals: HashMap::new(),
             publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),

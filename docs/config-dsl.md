@@ -1012,6 +1012,22 @@ frontier, so every durable (`brenn:`) channel must state it and every other
 scheme is refused for stating it. On a non-durable channel `retain_depth` is the
 whole retention story.
 
+`non_text = true` declares that the channel may carry non-text bodies
+(`docs/message-bus.md` §2.1, §2.1.2); absent or `false`, it is text-only:
+
+```
+channel frames at "ephemeral:cam.frames" { non_text = true; retain_depth = 4; }
+```
+
+Only a declaration states it: a tuning block is refused for it, because every
+system-minted family is text-only. A channel declared `non_text` may not be
+bound by a component built against the string contract
+`brenn:processor@0.1.0` — the component's load is refused at boot and at
+reload, naming the port and the channel — nor by a surface, nor served to an
+attach session; a remote asking for it is answered `Unavailable`. A durable
+channel holding a non-text message cannot later be declared text-only; give it
+a new address instead.
+
 The address prefix is the contract: it says the blast radius without consulting
 any subscriber table. Which prefixes exist, and what each one promises about
 durability and reach, is `ChannelScheme` in `brenn-envelope` — the enum the
@@ -1410,6 +1426,25 @@ names an instance, and the form takes no tail. Five rules, all compile errors:
 `io port { … }` with no arrow is a **free io** form: it claims the port and tunes
 it without connecting it, which is how a timer port gets an anonymous
 page-local ring. A claimed port counts as bound for the optionality check.
+
+A consumer's binding tail may also say `non_text = true`: *this port needs a
+channel that may carry non-text bodies*. On a channel the binding synthesizes —
+a link, a free `io`, an `io` on a literal `local:` address — it is the
+declaration, folded like the depths: the channel is `non_text` when any of its
+endpoints says so. This is how a component keeps binary state with no channel
+block:
+
+```
+new motion: Motion { grants = [ports]; io state { push_depth = 0; retain_depth = 1; non_text = true; } }
+```
+
+On a declared channel it is a check: a port saying `non_text = true` bound to
+a channel that does not is refused when the plan is built, naming the port and
+the channel, so `config-check` reports it. A packaged assembly may write it,
+so a kind that keeps binary state can ship the declaration with itself. A
+surface binding may not say it, in any direction, and a surface may not be
+bound to a `non_text` channel; both are refused at `config-check`, boot and
+reload, until the surface host serves the byte-carrying contract.
 
 A component placed inside a `surface` runs in the page. The same class placed at
 the top level runs in the backend, and is called a **consumer**:

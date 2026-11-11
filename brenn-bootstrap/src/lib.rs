@@ -935,6 +935,11 @@ pub async fn run_server(
             })
             .collect()
     };
+    consumers::warn_string_contract_components(
+        loaded_consumers
+            .iter()
+            .map(|(slug, loaded)| (slug.as_str(), loaded.component.contract())),
+    );
 
     // Register each loaded consumer's `Notify` and sync-request sender on the
     // WakeRouter as its WasmConsumer delivery binding. The router stores one

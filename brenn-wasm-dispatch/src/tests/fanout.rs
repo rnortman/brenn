@@ -233,6 +233,7 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }],
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
@@ -339,6 +340,7 @@ async fn webhook_message_invokes_consumer_with_webhook_envelope_type() {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(slug.to_string()),

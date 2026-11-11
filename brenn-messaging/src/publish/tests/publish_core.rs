@@ -843,6 +843,7 @@ fn bare_channel(name: &str) -> ChannelEntry {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         subscribers: vec![],
         transport_type: ChannelScheme::Brenn,

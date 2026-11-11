@@ -230,6 +230,7 @@ async fn consumer_harness(
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             },
             inbox_input_port(slug, &inbox_channel),
         ],

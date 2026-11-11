@@ -5156,7 +5156,7 @@ fn class_grants(class: &ComponentClass, errors: &mut Vec<Diagnostic>) -> Option<
     // requests the overlay hands its chrome no takeover plane to bind.
     for word in &optional {
         let imports =
-            ComponentGrant::parse(word.value()).is_some_and(|grant| grant.wit_import().is_some());
+            ComponentGrant::parse(word.value()).is_some_and(ComponentGrant::names_interface);
         if !imports {
             continue;
         }

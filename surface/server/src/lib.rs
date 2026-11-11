@@ -359,9 +359,10 @@ pub struct WithheldKind {
     pub root: std::path::PathBuf,
     /// The schema version the record declares.
     pub record_v: u32,
-    /// One sentence naming both versions and the migration. It is what the
-    /// alert carries, what the page manifest hands the kernel, and what the
-    /// kind's description documents state.
+    /// One sentence naming the cause (a record version, or a component contract,
+    /// this host does not serve) and the migration. It is what the alert
+    /// carries, what the page manifest hands the kernel, and what the kind's
+    /// description documents state.
     pub reason: String,
 }
 
@@ -738,14 +739,14 @@ pub fn validate_surface_assets_in(
         let manifest = match processor_assets::read_processor_record_or_version_in(cx, &root, &kind)
         {
             Ok(manifest) => manifest,
-            Err(record_v) => {
-                let reason = processor_assets::version_mismatch_reason(&kind, record_v);
+            Err(processor_assets::UnservedRecord { record_v, reason }) => {
                 // brenn's own surface tree travels in one tarball with the
                 // kernel and the binary and is installed as a sync, so a record
-                // the binary beside it cannot read is a broken install and
+                // the binary beside it cannot serve is a broken install and
                 // nothing an operator can converge. Under any other declared
-                // mount it is the ordinary middle of a rolling upgrade: the
-                // bundle is authored on its own schedule, and a host that
+                // mount it is the ordinary middle of a rolling upgrade, or a
+                // bundle built against a contract this host does not serve yet:
+                // the bundle is authored on its own schedule, and a host that
                 // cannot start until every third party has shipped is not
                 // deployable.
                 assert!(root != kernel.root, "{when}: {reason}{verdict}");
@@ -2045,6 +2046,68 @@ mod tests {
             &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
             &[],
         );
+    }
+
+    /// A kind built against the byte-carrying contract imports `bus`, which the
+    /// surface host does not serve: under a bundle's mount it is withheld with
+    /// that reason, and a string-contract kind beside it is served as before.
+    #[test]
+    fn a_byte_contract_kind_under_a_bundle_mount_is_withheld() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(brenn.path(), "chrome", &["types", "ports"], |_| {});
+        write_processor_tree(bundle.path(), "frames", &["bus", "ports"], |_| {});
+        write_processor_tree(bundle.path(), "fleet", &["types", "ports"], |_| {});
+
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[resolved_with_processor("deskbar", "frames")],
+        );
+
+        assert!(roots.kinds.contains_key("chrome"));
+        assert!(roots.kinds.contains_key("fleet"));
+        assert!(!roots.kinds.contains_key("frames"));
+        let held = roots.withheld_kind("frames").expect("frames is withheld");
+        assert_eq!(held.record_v, processor_assets::MANIFEST_VERSION);
+        assert_eq!(held.mount, "fleet-bundle");
+        assert_eq!(held.root, bundle.path());
+        assert_eq!(
+            held.reason,
+            processor_assets::byte_contract_reason("frames")
+        );
+        assert!(
+            held.reason.contains("\"frames\"")
+                && held.reason.contains("brenn:processor@0.2.0")
+                && held.reason.contains("serves brenn:processor@0.1.0 only")
+                && held
+                    .reason
+                    .contains("Build the kind against brenn:processor@0.1.0"),
+            "the reason names the kind, both contracts and the migration: {}",
+            held.reason
+        );
+        assert_eq!(roots.kind_root("frames"), None);
+    }
+
+    /// The same kind in brenn's own tree is a broken install, as a stale record
+    /// is there.
+    #[test]
+    #[should_panic(expected = "is built against the component contract brenn:processor@0.2.0")]
+    fn a_byte_contract_kind_under_brenns_own_mount_is_a_boot_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "frames", &["bus", "ports"], |_| {});
+        validate_one_root(dir.path(), &[resolved_with_processor("deskbar", "frames")]);
+    }
+
+    /// The record-only read refuses it by the same reason, so no reader of a
+    /// single kind serves it either.
+    #[test]
+    #[should_panic(expected = "this brenn's surface host serves brenn:processor@0.1.0 only")]
+    fn the_record_read_refuses_a_byte_contract_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_processor_tree(dir.path(), "frames", &["bus"], |_| {});
+        processor_assets::read_processor_record_in(AssetContext::BOOT, dir.path(), "frames");
     }
 
     /// A kind in neither map is still the configuration error it was: withheld

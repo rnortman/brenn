@@ -1,5 +1,5 @@
 {
-  "checksum": "ddfe793ae73340c9b3832113cf3ffe7158ef973117dc352ab61a42f3cb3931a5",
+  "checksum": "529a45f4fbc15258f93756979643fa2fac7d8b9c433c4bf82647846b79fff35d",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -612,6 +612,33 @@
       "license_ids": [],
       "license_file": null
     },
+    "brenn-processor-bytes-test 0.1.0": {
+      "name": "brenn-processor-bytes-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "wit-bindgen 0.60.0",
+              "target": "wit_bindgen"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
     "brenn-processor-call-test 0.1.0": {
       "name": "brenn-processor-call-test",
       "version": "0.1.0",
@@ -843,6 +870,33 @@
         "compile_data_glob": [
           "**"
         ],
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-stale-contract-test 0.1.0": {
+      "name": "brenn-processor-stale-contract-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "wit-bindgen 0.60.0",
+              "target": "wit_bindgen"
+            }
+          ],
+          "selects": {}
+        },
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -4344,6 +4398,7 @@
     "brenn-google-maps-tools 0.1.0": "brenn-wasm/components/google-maps-tools",
     "brenn-google-workspace 0.1.0": "brenn-wasm/components/host-crates/brenn-google-workspace",
     "brenn-guest 0.1.0": "brenn-wasm/components/guest",
+    "brenn-processor-bytes-test 0.1.0": "brenn-wasm/components/processor-bytes-test",
     "brenn-processor-call-test 0.1.0": "brenn-wasm/components/processor-call-test",
     "brenn-processor-config 0.1.0": "brenn-wasm/components/processor-config",
     "brenn-processor-demo 0.1.0": "brenn-wasm/components/processor-demo",
@@ -4354,6 +4409,7 @@
     "brenn-processor-mqtt-test 0.1.0": "brenn-wasm/components/processor-mqtt-test",
     "brenn-processor-multiport 0.1.0": "brenn-wasm/components/processor-multiport",
     "brenn-processor-provider-test 0.1.0": "brenn-wasm/components/processor-provider-test",
+    "brenn-processor-stale-contract-test 0.1.0": "brenn-wasm/components/processor-stale-contract-test",
     "brenn-processor-store-rt 0.1.0": "brenn-wasm/components/processor-store-rt",
     "brenn-processor-tool-test 0.1.0": "brenn-wasm/components/processor-tool-test",
     "brenn-processor-transplant 0.1.0": "brenn-wasm/components/processor-transplant",

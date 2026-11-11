@@ -473,6 +473,7 @@ mod tests {
                 noise: crate::config::NoiseLevel::Silent,
                 sink: crate::config::Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
             },
             subscribers: vec![crate::SubscriberEntry {
                 kind: crate::SubscriberEntryKind::App("target".to_string()),

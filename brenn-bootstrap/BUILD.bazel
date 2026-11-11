@@ -103,6 +103,9 @@ rust_test(
         # `brenn:processor/calls` into a chain and drives it through a real
         # router.
         "//brenn-wasm:fixture_processor_call_test",
+        # The contract-pairing reload cases roll a consumer back from this
+        # byte-carrying build to the demo's string build.
+        "//brenn-wasm:fixture_processor_bytes_test",
         "//brenn-wasm:fixture_processor_config",
         "//brenn-wasm:fixture_processor_demo",
         # The bundle-shaped reload case installs a second artifact under one

@@ -8,6 +8,7 @@ mod publish_core;
 mod scheme_parity;
 mod surface;
 mod system;
+mod text_only_backstop;
 mod transport_ingress;
 mod wasm;
 
@@ -262,6 +263,7 @@ pub(super) async fn build_messenger_with(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
         },
         // Subscribers populated below: pa-alice is push-enabled (Unbounded).
         subscribers: std::iter::once(SubscriberEntry {
