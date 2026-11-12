@@ -41,6 +41,8 @@ use crate::test_support::frames::{
 use crate::test_support::pages;
 
 use super::*;
+use brenn_envelope::grants::ProcessorContract;
+use brenn_surface_contract::Activation;
 
 const URL: &str = "wss://host/surface/bar/ws?build=b1";
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
@@ -484,9 +486,12 @@ impl Running {
     /// control plane as a test states it.
     fn send(&mut self, command: RunnerCommand) {
         match command {
+            // A native entry is on the string contract by its type, which the
+            // handle states for it.
             RunnerCommand::RegisterActivation {
                 instance,
                 entry,
+                contract: _,
                 mount,
             } => {
                 self.handle.register_activation(&instance, entry, mount);
@@ -763,7 +768,7 @@ fn publishing(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
     let (port, body) = (port.to_string(), body.to_string());
     entry(seen, move |_, buffer| {
         buffer
-            .publish(&port, body.clone())
+            .publish(&port, brenn_envelope::GuestBody::Text(body.clone()))
             .expect("the fixture binds the port it publishes on");
         Ok(None)
     })
@@ -787,7 +792,11 @@ fn deferring(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
         }
         let now = activation.now.expect("the page has a wall clock");
         buffer
-            .publish_deferred(&port, body.clone(), now + 20)
+            .publish_deferred(
+                &port,
+                brenn_envelope::GuestBody::Text(body.clone()),
+                now + 20,
+            )
             .expect("the fixture binds the port it publishes on");
         Ok(None)
     })
@@ -807,6 +816,7 @@ fn mount(running: &mut Running, instance: &str, entry: ActivationEntry) {
     running.send(RunnerCommand::RegisterActivation {
         instance: instance.to_string(),
         entry,
+        contract: ProcessorContract::V0_1,
         mount: false,
     });
 }
@@ -817,6 +827,7 @@ fn mount_rendering(running: &mut Running, instance: &str, entry: ActivationEntry
     running.send(RunnerCommand::RegisterActivation {
         instance: instance.to_string(),
         entry,
+        contract: ProcessorContract::V0_1,
         mount: true,
     });
 }
@@ -976,6 +987,7 @@ async fn a_mount_subscribes_its_channel_and_an_unmount_closes_it() {
     running.send(RunnerCommand::RegisterActivation {
         instance: "p1".to_string(),
         entry: Box::new(|_, _| Ok(None)),
+        contract: ProcessorContract::V0_1,
         mount: false,
     });
     wait_until(|| controls.subscribed().contains(&WIRE_ONE.to_string())).await;
@@ -1060,6 +1072,7 @@ async fn a_write_failure_mid_batch_drops_the_rest_of_it_and_reconnects() {
         running.send(RunnerCommand::RegisterActivation {
             instance: instance.to_string(),
             entry: Box::new(|_, _| Ok(None)),
+            contract: ProcessorContract::V0_1,
             mount: false,
         });
     }
@@ -1454,12 +1467,12 @@ async fn an_undeclared_publish_traps_and_takes_its_instance_terminal() {
     mount(
         &mut running,
         "p1",
-        Box::new(
-            |_, buffer| match buffer.publish("ghost", "hi".to_string()) {
+        Box::new(|_, buffer| {
+            match buffer.publish("ghost", brenn_envelope::GuestBody::Text("hi".to_string())) {
                 Err(PortFault::Undeclared(port)) => panic!("undeclared port {port}"),
                 other => panic!("expected a vocabulary violation, got {other:?}"),
-            },
-        ),
+            }
+        }),
     );
     ack(&controls, &feed, WIRE_ONE).await;
     feed.unbounded_send(TransportEvent::Message(WireMessage::Text(deliver(
@@ -1533,7 +1546,10 @@ async fn a_reply_to_an_async_activation_traps_at_the_completion() {
         "p1",
         Box::new(|_, buffer| {
             buffer
-                .publish("out", "never flushed".to_string())
+                .publish(
+                    "out",
+                    brenn_envelope::GuestBody::Text("never flushed".to_string()),
+                )
                 .expect("the fixture binds the port it publishes on");
             Ok(Some("{\"cancel\":true}".to_string()))
         }),
@@ -2341,7 +2357,7 @@ fn a_called_peers_effects_precede_the_callers_own_completion() {
         crate::outward::SyncCall {
             instance: "p1",
             port: "ask",
-            body: "{}",
+            body: &brenn_envelope::MessageBody::text("{}"),
             chain: &[],
         },
         brenn_attach_client::driver::new_stamp(),
@@ -2353,7 +2369,10 @@ fn a_called_peers_effects_precede_the_callers_own_completion() {
         .expect("p1 assembles a sync-call activation");
     ready
         .buffer
-        .publish("out", "the caller's own".to_string())
+        .publish(
+            "out",
+            brenn_envelope::GuestBody::Text("the caller's own".to_string()),
+        )
         .expect("p1 binds the wire output");
 
     let called = vec![Effect::PublishControl {

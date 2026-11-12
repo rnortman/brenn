@@ -1586,6 +1586,7 @@ impl ReloadDriver {
                 .iter()
                 .map(|(slug, running)| (slug.as_str(), running.component.contract())),
         );
+        crate::consumers::warn_string_contract_surface_kinds(&surface_roots, &plan.surfaces);
         fit_session_lists(&mut applied, self.env.messenger.max_body_bytes());
         // The one field that is not prepare's: the outcome was reached now, not
         // when it was decided. Fixed width, so the size prepare measured stands.
@@ -2832,6 +2833,7 @@ channel scratch at "ephemeral:scratch" {{
         // the operator's only unprompted notice of a withheld kind unreachable
         // from every test.
         crate::alert_withheld_kinds(&alert_dispatcher, &surface_roots);
+        crate::consumers::warn_string_contract_surface_kinds(&surface_roots, &plan.surfaces);
 
         // Without this the fresh side would read back whatever the database
         // it booted over still retained rather than what boot publishes.
@@ -6148,6 +6150,7 @@ channel spare at "brenn:spare" {
                             source_sha256: "s".to_string(),
                             spec_sha256: "p".to_string(),
                             cores: Vec::new(),
+                            contract: brenn_envelope::grants::ProcessorContract::V0_1,
                         },
                     )
                 })
@@ -9803,6 +9806,151 @@ channel spill at "ephemeral:spill" {
             after.withheld.keys().collect::<Vec<_>>(),
         );
         assert!(after.withheld.is_empty(), "{:?}", after.withheld);
+    }
+
+    /// The words the bundled byte-carrying `panel` requires and is granted:
+    /// the page's own two, and the two the bytes fixture imports. Its free
+    /// `io` port is what `ports` reaches.
+    const BYTES_PANEL_WORDS: &str = "dom, page-dom, ports, calls";
+
+    /// Install a bundled `panel` whose component is `component`, with the
+    /// record its build would write: the artifact's own import profile when it
+    /// is a real component, none for placeholder bytes.
+    fn write_bundled_bytes_panel_kind(
+        tree: &Tree,
+        kernel: &std::path::Path,
+        bundle: &std::path::Path,
+        component: Option<&str>,
+    ) {
+        let modules = tree.modules();
+        std::fs::create_dir_all(&modules).expect("a module root");
+        let spec = format!(
+            "component Panel {{\n    {}\n    in feed;\n    io memo;\n}}\n",
+            brenn_dsl::fixture_text::processor_header(BYTES_PANEL_WORDS),
+        );
+        std::fs::write(modules.join("panel.brenn"), &spec).expect("the class module is writable");
+        std::fs::create_dir_all(kernel).expect("brenn's own surface tree");
+        brenn_surface_server::test_fixtures::write_kernel_pair(kernel);
+        std::fs::create_dir_all(bundle).expect("the bundle's surface tree");
+        let (bytes, imports) = match component {
+            Some(file_name) => {
+                let staged = tempfile::tempdir().expect("a staging dir");
+                let path = staged.path().join(file_name);
+                let bytes = crate::consumers::fixture_artifact(file_name);
+                std::fs::write(&path, &bytes).expect("stage the artifact");
+                (bytes, brenn_wasm::processor_component_imports(&path))
+            }
+            None => (b"component-bytes-for-panel".to_vec(), Vec::new()),
+        };
+        brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+            bundle,
+            "panel",
+            &bytes,
+            spec.as_bytes(),
+            imports,
+            true,
+            |_| {},
+        );
+    }
+
+    /// The surface notice lines in `lines`, each of which must name the one
+    /// kind `panel`.
+    fn surface_notices(lines: &[&str]) -> Result<usize, String> {
+        let notices: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line.contains(crate::consumers::STRING_CONTRACT_SURFACE_NOTICE))
+            .collect();
+        if let Some(line) = notices.iter().find(|line| {
+            !(line.contains("WARN")
+                && line.contains("count=1")
+                && line.contains("kinds=[\"panel\"]"))
+        }) {
+            return Err(format!("the notice names one kind, \"panel\": {line}"));
+        }
+        Ok(notices.len())
+    }
+
+    /// **A served string-contract kind rebuilt on the byte-carrying contract
+    /// is reinstalled, and the page comes back for its new contract.** The
+    /// bundle replaces the kind's tree in place with a 0.2.0 artifact the
+    /// surface host serves; nothing in the document moves. The kind is
+    /// `Reinstalled`, its surface's pages close, and the served set carries
+    /// the new contract, which is what the page manifest hands the page. The
+    /// surface notice names the kind at boot and is silent after the reload,
+    /// when no instantiated kind is on the string contract.
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn a_kind_rebuilt_on_the_byte_contract_is_reinstalled_with_its_contract() {
+        let tree = Tree::new();
+        let kernel = tempfile::tempdir().expect("brenn's own surface tree");
+        let bundle = tempfile::tempdir().expect("a bundle surface tree");
+        write_bundled_bytes_panel_kind(&tree, kernel.path(), bundle.path(), None);
+        tree.write(
+            &surface_document("deskbar", "panel", "Panel", "")
+                .replace(
+                    "grants = [dom, page-dom];",
+                    &format!("grants = [{BYTES_PANEL_WORDS}];"),
+                )
+                .replace(
+                    "in feed <- deskbar_feed { push_depth = 2; }",
+                    "in feed <- deskbar_feed { push_depth = 2; }\n        \
+                     io memo { push_depth = 1; retain_depth = 2; }",
+                ),
+        );
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                surface_assets: Some(kernel.path().to_path_buf()),
+                surface_bundle: Some(bundle.path().to_path_buf()),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            serving_roots(&booted).kind_contract("panel"),
+            Some(brenn_wasm::ProcessorContract::V0_1)
+        );
+        logs_assert(|lines| match surface_notices(lines)? {
+            1 => Ok(()),
+            n => Err(format!("boot writes one notice, found {n}")),
+        });
+        let page = attach_a_session(&booted, "deskbar");
+
+        write_bundled_bytes_panel_kind(
+            &tree,
+            kernel.path(),
+            bundle.path(),
+            Some("brenn_processor_bytes_test.wasm"),
+        );
+        let held = serving_roots(&booted);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.kinds_changed, vec!["panel".to_string()]);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        let after = serving_roots(&booted);
+        assert!(
+            matches!(
+                held.kind_differences(&after).get("panel"),
+                Some(brenn_surface_server::KindDifference::Reinstalled { .. })
+            ),
+            "{:?}",
+            held.kind_differences(&after),
+        );
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            "the page has to come back for the kind's new contract",
+        );
+        assert_eq!(
+            after.kind_contract("panel"),
+            Some(brenn_wasm::ProcessorContract::V0_2)
+        );
+        logs_assert(|lines| match surface_notices(lines)? {
+            1 => Ok(()),
+            n => Err(format!("the reload adds no notice, found {n} in all")),
+        });
     }
 
     /// **A kind whose record goes stale under a running process is withheld,

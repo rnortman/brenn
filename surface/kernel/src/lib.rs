@@ -149,7 +149,7 @@ pub use entry::{KernelHandle, start};
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_test_util;
 
-pub use activation::{ActivationOutcome, ReadyActivation};
+pub use activation::{ActivationOutcome, PageActivation, ReadyActivation};
 pub use calls::call_answer;
 pub use front::{
     ActivationEntry, EventStream, InFlightPublish, InFlightStack, PublishReject, SurfaceGate,

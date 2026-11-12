@@ -38,3 +38,34 @@ export function expectedState(generated: Uint8Array, steps: number): string {
     view.setUint32(0, (view.getUint32(0, true) + steps) >>> 0, true);
     return `state:${bytes.length}:${fnv1a64(bytes)}`;
 }
+
+/** The width of `processor-page-bytes-test`'s hex counter. */
+const COUNTER_DIGITS = 8;
+
+/**
+ * The bytes `processor-page-bytes-test` generates for `state <len>` when it
+ * holds no state: printable ASCII, the counter `00000000` and then byte i
+ * being 32 + (i * 31 + 7) mod 95.
+ */
+export function generatedTextState(len: number): Uint8Array {
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = 32 + ((i * 31 + 7) % 95);
+    }
+    bytes.fill(0x30, 0, COUNTER_DIGITS);
+    return bytes;
+}
+
+/**
+ * The result word `processor-page-bytes-test` reports for the state of
+ * `generated.length` bytes, advanced `steps` times: each step adds one to the
+ * eight-digit lowercase hex counter at the front.
+ */
+export function expectedTextState(generated: Uint8Array, steps: number): string {
+    const bytes = generated.slice();
+    const counter = (steps >>> 0).toString(16).padStart(COUNTER_DIGITS, "0");
+    for (let i = 0; i < COUNTER_DIGITS; i++) {
+        bytes[i] = counter.charCodeAt(i);
+    }
+    return `state:${bytes.length}:${fnv1a64(bytes)}`;
+}

@@ -36,7 +36,7 @@ pub mod shape;
 pub mod testutils;
 pub mod tool_schema;
 
-pub use body::{BodyError, MessageBody, is_text_content_type};
+pub use body::{BodyError, GuestBody, MessageBody, is_text_content_type};
 pub use shape::{
     BodyShape, EnvelopeHeader, HeaderShape, ShapedEnvelope, TextShape, serialize_text_shape,
 };

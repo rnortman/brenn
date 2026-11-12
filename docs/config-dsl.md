@@ -1451,7 +1451,7 @@ the channel, so `config-check` reports it. A packaged assembly may write it,
 so a kind that keeps binary state can ship the declaration with itself. A
 surface binding may not say it, in any direction, and a surface may not be
 bound to a `non_text` channel; both are refused at `config-check`, boot and
-reload, until the surface host serves the byte-carrying contract.
+reload, until the page carries non-text bodies at rest and speaks attach v5.
 
 A component placed inside a `surface` runs in the page. The same class placed at
 the top level runs in the backend, and is called a **consumer**:

@@ -20,6 +20,7 @@ use uuid::Uuid;
 use super::*;
 use crate::registry::{Registrations, new_stores, reconcile_stores};
 use crate::test_support::{frames, pages};
+use brenn_envelope::grants::ProcessorContract;
 
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
 const WIRE: &str = "brenn:site.bar.in";
@@ -186,8 +187,14 @@ fn the_application_channels_wait_for_phase_two() {
 
     // Registered while the surface has no wiring: nothing to reconcile against.
     assert!(
-        regs.register("chrome", connect.bindings(), &mut stores, &mut subs)
-            .is_empty()
+        regs.register(
+            "chrome",
+            ProcessorContract::V0_1,
+            connect.bindings(),
+            &mut stores,
+            &mut subs
+        )
+        .is_empty()
     );
     assert_eq!(subs.refcount(WIRE), 0);
     assert!(!subs.is_active(WIRE));

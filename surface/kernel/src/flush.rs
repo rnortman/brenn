@@ -325,7 +325,7 @@ fn route_publishes<P: PlanePolicy>(
             // park-vs-immediate against its own clock.
             entries.push(BatchEntry {
                 channel,
-                body: body.into(),
+                body,
                 urgency,
                 deliver_after,
             });
@@ -339,7 +339,7 @@ fn route_publishes<P: PlanePolicy>(
             RouteRequest {
                 channel: &channel,
                 origin: Origin::Sub(instance),
-                body: body.into(),
+                body,
                 stamp,
                 urgency,
                 deliver_after,

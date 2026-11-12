@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use brenn_attach_client::store::ChannelStores;
 use brenn_attach_client::subs::{ResumePolicy, Subscriptions};
 use brenn_attach_proto::ClientFrame;
+use brenn_envelope::grants::ProcessorContract;
 use brenn_queue::CursorOverflow;
 use brenn_surface_schema::{RESERVED_LOCAL_CHANNELS, reserved_local_channel};
 use uuid::Uuid;
@@ -154,6 +155,9 @@ struct Registration {
     /// spelling — its own positions, its own scheduler state — so work minted for
     /// the previous one must not be applied to it.
     generation: u64,
+    /// The component contract the instance's artifact speaks — what it can be
+    /// handed and what it can answer.
+    contract: ProcessorContract,
     /// The transportable channels this instance holds a subscription reference
     /// on, one entry **per input binding** — so two ports of one instance on one
     /// channel hold two references on the one subscription they share.
@@ -173,9 +177,10 @@ struct Registration {
 }
 
 impl Registration {
-    fn new(generation: u64) -> Self {
+    fn new(generation: u64, contract: ProcessorContract) -> Self {
         Self {
             generation,
+            contract,
             subs: Vec::new(),
             failed: false,
         }
@@ -221,6 +226,12 @@ impl Registrations {
         self.entries.get(instance).map(|r| r.generation)
     }
 
+    /// The contract `instance` registered with, or `None` when it is not
+    /// registered.
+    pub fn contract(&self, instance: &str) -> Option<ProcessorContract> {
+        self.entries.get(instance).map(|r| r.contract)
+    }
+
     /// Every registered instance, in id order.
     pub fn instances(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
@@ -249,15 +260,17 @@ impl Registrations {
     pub fn register(
         &mut self,
         instance: &str,
+        contract: ProcessorContract,
         wiring: Option<&AppliedBindings>,
         stores: &mut SurfaceStores,
         subs: &mut Subscriptions,
     ) -> Vec<ClientFrame> {
         let generation = self.next_generation;
         self.next_generation += 1;
-        let prior = self
-            .entries
-            .insert(instance.to_string(), Registration::new(generation));
+        let prior = self.entries.insert(
+            instance.to_string(),
+            Registration::new(generation, contract),
+        );
         assert!(
             prior.is_none(),
             "surface client: instance {instance:?} registered twice"

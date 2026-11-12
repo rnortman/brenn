@@ -831,6 +831,7 @@ pub async fn run_server(
         &messaging_result.surfaces,
     );
     alert_withheld_kinds(&guard.alert_dispatcher, &surface_roots);
+    consumers::warn_string_contract_surface_kinds(&surface_roots, &messaging_result.surfaces);
 
     if let Some(messenger) = messenger {
         publish_boot_surface_documents(

@@ -38,34 +38,35 @@ use crate::contract::CallError;
 /// time, so a target that finds itself in its caller's chain means that check
 /// was bypassed.
 ///
-/// On a non-text reply or a text-only-peer refusal: every instance on a page
-/// reads and writes text only, so neither can arise here.
+/// The reply is the callee's body as it built it, typed or not and text or
+/// not; what a caller of the string contract does with a body it cannot read is
+/// [`v0_1_reply`]'s.
 pub fn call_answer(
     caller: &str,
     port: &str,
     answer: SyncAnswer,
-) -> Result<Option<String>, CallError> {
+) -> Result<Option<MessageBody>, CallError> {
     match call_disposition(answer, caller, port) {
-        Ok(reply) => Ok(reply.map(|reply| page_reply_text(&reply).to_owned())),
+        Ok(reply) => Ok(reply),
         Err(CallDisposition::Failed) => Err(CallError::Failed),
         Err(CallDisposition::Refused) => Err(CallError::Refused),
-        Err(CallDisposition::TextOnlyPeer) => panic!(
-            "surface client: call by {caller} on port {port} was refused as a non-text request, \
-             which no instance on a page can make"
-        ),
+        Err(CallDisposition::TextOnlyPeer) => Err(CallError::TextOnlyPeer),
     }
 }
 
-/// A sync reply on a page, as the text it always is.
-///
-/// # Panics
-///
-/// On a non-text body: every reply on a page was written by a page instance,
-/// whose contract carries only text.
-pub fn page_reply_text(reply: &MessageBody) -> &str {
-    reply
-        .as_text()
-        .unwrap_or_else(|| panic!("surface client: a sync reply on a page is not text ({reply:?})"))
+/// A peer's reply as a `brenn:processor@0.1.0` caller reads it: a text reply
+/// as its text, its content type dropped as on a channel, and a non-text reply
+/// as the trap it is for that caller — the callee already ran and flushed.
+pub fn v0_1_reply(caller: &str, port: &str, reply: &MessageBody) -> Result<String, String> {
+    match reply.as_text() {
+        Some(text) => Ok(text.to_owned()),
+        None => Err(format!(
+            "surface client: call port {port} of {caller} was answered with a non-text reply \
+             ({}); the calling component is built against brenn:processor@0.1.0, which carries \
+             only text. The peer ran and its buffer was flushed",
+            reply.summary()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -82,7 +83,13 @@ mod tests {
                 "lookup",
                 SyncAnswer::Ok(Some(MessageBody::text("42")))
             ),
-            Ok(Some("42".to_string()))
+            Ok(Some(MessageBody::text("42")))
+        );
+        let bytes = MessageBody::from_parts(Some("application/octet-stream"), &[0xff])
+            .expect("a byte body builds");
+        assert_eq!(
+            call_answer("menu", "lookup", SyncAnswer::Ok(Some(bytes.clone()))),
+            Ok(Some(bytes))
         );
         assert_eq!(
             call_answer("menu", "lookup", SyncAnswer::Ok(None)),
@@ -115,6 +122,36 @@ mod tests {
                 Err(CallError::Refused),
             );
         }
+    }
+
+    #[test]
+    fn a_non_text_request_to_a_text_only_peer_is_text_only_peer() {
+        assert_eq!(
+            call_answer(
+                "menu",
+                "lookup",
+                SyncAnswer::Refused(SyncRefusal::TextOnlyTarget)
+            ),
+            Err(CallError::TextOnlyPeer)
+        );
+    }
+
+    #[test]
+    fn a_string_contract_caller_reads_text_and_traps_on_bytes() {
+        assert_eq!(
+            v0_1_reply("menu", "lookup", &MessageBody::text("42")),
+            Ok("42".to_string())
+        );
+        let typed = MessageBody::from_parts(Some("text/csv"), b"a,b").expect("typed text builds");
+        assert_eq!(
+            v0_1_reply("menu", "lookup", &typed),
+            Ok("a,b".to_string()),
+            "typed text loses its type"
+        );
+        let bytes =
+            MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8]).expect("a byte body builds");
+        let trap = v0_1_reply("menu", "lookup", &bytes).expect_err("bytes trap the caller");
+        assert!(trap.contains("port lookup of menu") && trap.contains("non-text reply"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use brenn_surface_schema::{
 
 use super::*;
 use crate::test_support::bindings::imply_vocabularies;
+use brenn_envelope::grants::ProcessorContract;
 
 const WIRE: &str = "brenn:site.bar.in";
 const OTHER_WIRE: &str = "ephemeral:site.bar.signal";
@@ -317,7 +318,10 @@ fn registering_before_the_first_document_holds_nothing() {
     let mut stores = new_stores(EPOCH);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    assert!(regs.register("p1", None, &mut stores, &mut subs).is_empty());
+    assert!(
+        regs.register("p1", ProcessorContract::V0_1, None, &mut stores, &mut subs)
+            .is_empty()
+    );
     assert!(regs.is_registered("p1"));
     assert!(subs.held_channels().is_empty());
 }
@@ -329,7 +333,13 @@ fn a_registration_takes_a_position_per_binding_and_one_subscription() {
     let mut subs = plane();
     let mut regs = Registrations::new();
 
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert_eq!(
         subscribed(&frames),
         vec![(WIRE, 8, 9)],
@@ -349,9 +359,21 @@ fn two_instances_on_one_channel_share_one_subscription() {
     let mut subs = plane();
     let mut regs = Registrations::new();
 
-    let first = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let first = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &first);
-    let second = regs.register("p2", Some(&bindings), &mut stores, &mut subs);
+    let second = regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert!(
         subscribed(&second).is_empty(),
         "the channel is already open; the second instance only takes a reference"
@@ -374,7 +396,13 @@ fn a_position_coming_into_existence_is_primed_from_the_retained_tail() {
         .insert(env(WIRE, "published before it bound"));
     let mut subs = plane();
     let mut regs = Registrations::new();
-    regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
 
     let store = stores.get_mut(WIRE).expect("wire store");
     for port in ["in", "aux"] {
@@ -396,7 +424,13 @@ fn a_depth_zero_binding_holds_no_position_and_still_subscribes() {
     let mut subs = plane();
     let mut regs = Registrations::new();
 
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert_eq!(
         subscribed(&frames),
         vec![(WIRE, 0, 5)],
@@ -414,7 +448,13 @@ fn a_second_reconcile_changes_nothing_and_re_primes_nothing() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     let store = stores.get_mut(WIRE).expect("wire store");
@@ -449,7 +489,13 @@ fn a_binding_that_vanished_loses_its_position_and_its_reference() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     // `p1/aux` gone, the rest of the wiring — and so the channel's fold —
@@ -475,7 +521,13 @@ fn the_last_binding_off_a_channel_closes_its_subscription() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     let unwired = applied(vec![subscription("p2", "theme", LOCAL_THEME_CHANNEL, 1, 0)]);
@@ -495,7 +547,13 @@ fn a_port_rebound_to_another_channel_moves_its_position() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     let rebound = applied(vec![subscription("p1", "in", OTHER_WIRE, 4, 0)]);
@@ -516,7 +574,13 @@ fn a_changed_fold_closes_the_subscription_and_states_it_afresh() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     let deeper = applied(vec![subscription("p1", "in", WIRE, 4, 6)]);
@@ -540,7 +604,13 @@ fn a_changed_fold_restates_a_subscription_still_awaiting_its_result() {
     let mut regs = Registrations::new();
     // Deliberately unanswered: a second document can arrive before the first
     // document's subscribes come back.
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert_eq!(subscribed(&frames), vec![(WIRE, 4, 0)]);
 
     let deeper = applied(vec![subscription("p1", "in", WIRE, 4, 6)]);
@@ -578,8 +648,20 @@ fn a_changed_fold_restates_a_pending_channel_two_instances_hold() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    regs.register("p1", Some(&bindings), &mut stores, &mut subs);
-    regs.register("p2", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
+    regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert_eq!(subs.refcount(WIRE), 2);
 
     // Both holders are released before either is retaken, so the restatement is
@@ -603,9 +685,21 @@ fn deregistration_drops_the_positions_and_releases_the_references() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
-    let frames = regs.register("p2", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     let frames = regs.deregister("p1", &mut stores, &mut subs);
@@ -633,9 +727,21 @@ fn a_failed_instance_loses_its_positions_and_keeps_its_references() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
-    regs.register("p2", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
 
     assert!(regs.fail("p1", &mut stores), "the transition is reported");
     assert!(!regs.fail("p1", &mut stores), "and reported once");
@@ -666,9 +772,21 @@ fn a_failed_instances_references_are_diffed_against_a_changed_document() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
-    regs.register("p2", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert!(regs.fail("p1", &mut stores), "the transition is reported");
     assert_eq!(subs.refcount(WIRE), 3);
 
@@ -705,8 +823,20 @@ fn registering_an_instance_twice_panics() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    regs.register("p1", Some(&bindings), &mut stores, &mut subs);
-    regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
+    regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
 }
 
 #[test]
@@ -735,7 +865,13 @@ fn reconciling_before_the_stores_panics() {
     let mut stores = new_stores(EPOCH);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
 }
 
 #[test]
@@ -745,7 +881,13 @@ fn an_instance_the_document_never_wires_holds_nothing() {
     let mut subs = plane();
     let mut regs = Registrations::new();
 
-    let frames = regs.register("chrome", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "chrome",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert!(frames.is_empty());
     assert!(subs.held_channels().is_empty());
     assert!(regs.instances().eq(["chrome"]));

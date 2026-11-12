@@ -285,6 +285,48 @@ pub(crate) fn warn_string_contract_components<'a>(
     warn!(count = slugs.len(), slugs = ?slugs, "{STRING_CONTRACT_NOTICE}");
 }
 
+/// The text of the notice [`warn_string_contract_surface_kinds`] writes.
+pub(crate) const STRING_CONTRACT_SURFACE_NOTICE: &str = "surface component kinds built against \
+     the string component contract brenn:processor@0.1.0 are instantiated; brenn intends to \
+     remove that contract after a byte-carrying contract is declared stable, and no removal is \
+     scheduled; nothing needs to change yet";
+
+/// The served kinds on the string contract that some surface in `surfaces`
+/// instantiates, sorted and deduplicated. A withheld kind is not served and
+/// is not listed.
+pub(crate) fn string_contract_surface_kinds<'a>(
+    roots: &brenn_surface_server::SurfaceRoots,
+    surfaces: &'a [brenn_lib::messaging::config::ResolvedSurface],
+) -> Vec<&'a str> {
+    let mut kinds: Vec<&str> = surfaces
+        .iter()
+        .flat_map(|surface| &surface.components)
+        .map(|component| component.kind.as_str())
+        .filter(|kind| roots.kind_contract(kind) == Some(brenn_wasm::ProcessorContract::V0_1))
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    kinds
+}
+
+/// Tell the operator, in one `warn!`, which instantiated surface kinds are
+/// built against the string contract, when any are; nothing otherwise.
+///
+/// `surfaces` must be every configured surface, so the line describes what
+/// pages run.
+pub(crate) fn warn_string_contract_surface_kinds(
+    roots: &brenn_surface_server::SurfaceRoots,
+    surfaces: &[brenn_lib::messaging::config::ResolvedSurface],
+) {
+    let kinds = string_contract_surface_kinds(roots, surfaces);
+    if kinds.is_empty() {
+        return;
+    }
+    // TODO(dual-contract-period-length): the notice names the removal period
+    // once the owner has ruled on its length.
+    warn!(count = kinds.len(), kinds = ?kinds, "{STRING_CONTRACT_SURFACE_NOTICE}");
+}
+
 /// The process-wide services a consumer's load spec is wired to.
 ///
 /// One value for the whole walk: every field is a service the process built
@@ -1082,6 +1124,38 @@ mod tests {
         );
         assert!(string_contract_slugs([("frames", V0_2)]).is_empty());
         assert!(string_contract_slugs(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn the_string_contract_surface_kinds_are_the_instantiated_0_1_kinds_sorted() {
+        use brenn_surface_server::fixtures_config::SurfaceFixture;
+        use brenn_wasm::ProcessorContract::{V0_1, V0_2};
+        let root =
+            |contract| brenn_surface_server::KindRoot::for_test_with_contract("/s", contract);
+        let roots = brenn_surface_server::SurfaceRoots {
+            kernel: None,
+            withheld: Default::default(),
+            kinds: [
+                ("zeta".to_string(), root(V0_1)),
+                ("frames".to_string(), root(V0_2)),
+                ("alpha".to_string(), root(V0_1)),
+                ("idle".to_string(), root(V0_1)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let surfaces = [
+            SurfaceFixture::new("one", "zeta").build(),
+            SurfaceFixture::new("two", "alpha").build(),
+            SurfaceFixture::new("three", "frames").build(),
+            SurfaceFixture::new("four", "zeta").build(),
+        ];
+        assert_eq!(
+            string_contract_surface_kinds(&roots, &surfaces),
+            ["alpha", "zeta"]
+        );
+        assert!(string_contract_surface_kinds(&roots, &surfaces[2..3]).is_empty());
+        assert!(string_contract_surface_kinds(&roots, &[]).is_empty());
     }
 
     /// The host-side half of `store_path` resolution: an existing parent

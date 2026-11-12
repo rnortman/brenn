@@ -501,6 +501,7 @@ use std::collections::{BTreeSet, HashMap};
 /// test refuse anything.
 fn frame_buffer() -> PublishBuffer {
     PublishBuffer::new(
+        "p1",
         HashMap::from([(
             "notes".to_string(),
             OutputSpec {
@@ -548,18 +549,27 @@ fn a_publish_joins_the_innermost_frame_and_no_other() {
     stack.push("p2", frame_buffer());
     assert!(
         stack
-            .with_innermost("p1", |buffer| buffer.publish("notes", "outer".to_string()))
+            .with_innermost("p1", |buffer| buffer.publish(
+                "notes",
+                brenn_envelope::GuestBody::Text("outer".to_string())
+            ))
             .is_none(),
         "a caller blocked in a call of its own is not the entry on the stack"
     );
     assert_eq!(
-        stack.with_innermost("p2", |buffer| buffer.publish("notes", "inner".to_string())),
+        stack.with_innermost("p2", |buffer| buffer.publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("inner".to_string())
+        )),
         Some(Ok(())),
     );
     let (buffer, _) = stack.pop_of("p2");
     assert_eq!(buffer.len(), 1, "the callee's publish is the callee's");
     assert_eq!(
-        stack.with_innermost("p1", |buffer| buffer.publish("notes", "outer".to_string())),
+        stack.with_innermost("p1", |buffer| buffer.publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("outer".to_string())
+        )),
         Some(Ok(())),
         "the caller is the top again once its callee returned"
     );
@@ -573,7 +583,9 @@ fn a_call_is_admitted_only_from_the_frame_on_top() {
     let mut stack = InFlightStack::default();
     assert!(
         stack
-            .with_innermost("p1", |buffer| buffer.admit_call("x"))
+            .with_innermost("p1", |buffer| buffer
+                .admit_call(brenn_envelope::GuestBody::Text("x".to_string()))
+                .map(|_| ()))
             .is_none(),
         "no activation is in flight"
     );
@@ -581,12 +593,16 @@ fn a_call_is_admitted_only_from_the_frame_on_top() {
     stack.push("p2", frame_buffer());
     assert!(
         stack
-            .with_innermost("p1", |buffer| buffer.admit_call("x"))
+            .with_innermost("p1", |buffer| buffer
+                .admit_call(brenn_envelope::GuestBody::Text("x".to_string()))
+                .map(|_| ()))
             .is_none(),
         "a caller already blocked in a call may not spend its budget again"
     );
     assert_eq!(
-        stack.with_innermost("p2", |buffer| buffer.admit_call("x")),
+        stack.with_innermost("p2", |buffer| buffer
+            .admit_call(brenn_envelope::GuestBody::Text("x".to_string()))
+            .map(|_| ())),
         Some(Ok(())),
     );
 }
@@ -652,15 +668,17 @@ fn an_invocation_hands_back_its_callees_effects_with_its_own_buffer() {
         // caller's frame.
         let (_, callee_buffer, callee_effects) =
             invoke_over_stack(&slot, "p2", frame_buffer(), || {
-                slot.borrow_mut()
-                    .with_innermost("p2", |buffer| buffer.publish("notes", "peer".to_string()));
+                slot.borrow_mut().with_innermost("p2", |buffer| {
+                    buffer.publish("notes", brenn_envelope::GuestBody::Text("peer".to_string()))
+                });
                 ActivationOutcome::Ok(None)
             });
         assert_eq!(callee_buffer.len(), 1, "the peer's publish is the peer's");
         assert!(callee_effects.is_empty(), "the peer called nobody");
         slot.borrow_mut().stash(vec![effect("peer-committed")]);
-        slot.borrow_mut()
-            .with_innermost("p1", |buffer| buffer.publish("notes", "mine".to_string()));
+        slot.borrow_mut().with_innermost("p1", |buffer| {
+            buffer.publish("notes", brenn_envelope::GuestBody::Text("mine".to_string()))
+        });
         ActivationOutcome::Ok(None)
     });
     assert!(matches!(outcome, ActivationOutcome::Ok(None)));

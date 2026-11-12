@@ -176,6 +176,35 @@ impl From<String> for MessageBody {
     }
 }
 
+/// A body as a component handed it, before any check has run.
+///
+/// Both component hosts pass this through their port functions unbuilt, so a
+/// body is judged at one step of each function's order and by one rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestBody {
+    /// A `brenn:processor@0.1.0` payload: untyped text.
+    Text(String),
+    /// A `brenn:processor@0.2.0` body: an optional content type and bytes.
+    Parts {
+        content_type: Option<String>,
+        bytes: Vec<u8>,
+    },
+}
+
+impl GuestBody {
+    /// The one place a component's body becomes a [`MessageBody`]. Text
+    /// cannot fail; parts go through [`MessageBody::from_parts`].
+    pub fn build(self) -> Result<MessageBody, BodyError> {
+        match self {
+            Self::Text(text) => Ok(MessageBody::text(text)),
+            Self::Parts {
+                content_type,
+                bytes,
+            } => MessageBody::from_parts(content_type.as_deref(), &bytes),
+        }
+    }
+}
+
 // A non-text body prints its content type and length, never its bytes, so a
 // log line cannot carry them. Untyped text prints as a `String` does.
 impl fmt::Debug for MessageBody {
@@ -637,5 +666,44 @@ mod tests {
             err.to_string(),
             "body typed \"text/csv\" is not valid UTF-8"
         );
+    }
+
+    #[test]
+    fn a_guest_body_builds_through_from_parts() {
+        assert_eq!(
+            GuestBody::Text("hi".to_owned()).build(),
+            Ok(MessageBody::text("hi"))
+        );
+        let typed = GuestBody::Parts {
+            content_type: Some("text/csv".to_owned()),
+            bytes: b"a,b".to_vec(),
+        };
+        assert_eq!(
+            typed.build(),
+            MessageBody::from_parts(Some("text/csv"), b"a,b")
+        );
+        let binary = GuestBody::Parts {
+            content_type: Some("image/jpeg".to_owned()),
+            bytes: vec![0xff, 0xd8],
+        };
+        let built = binary.build().expect("a typed binary body builds");
+        assert!(!built.is_text());
+        assert_eq!(built.as_bytes(), &[0xff, 0xd8]);
+        let untyped_bytes = GuestBody::Parts {
+            content_type: None,
+            bytes: vec![0xff],
+        };
+        assert_eq!(
+            untyped_bytes.build(),
+            Err(BodyError::NotUtf8 { content_type: None })
+        );
+        let malformed = GuestBody::Parts {
+            content_type: Some("text/".to_owned()),
+            bytes: Vec::new(),
+        };
+        assert!(matches!(
+            malformed.build(),
+            Err(BodyError::InvalidContentType { .. })
+        ));
     }
 }

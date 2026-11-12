@@ -329,6 +329,11 @@
 pub mod schedule;
 pub mod sync;
 
+use std::borrow::Borrow;
+use std::sync::Arc;
+
+use brenn_envelope::{MessageBody, MessageEnvelope};
+
 /// The deepest window either host will serve on one port of a component
 /// activation, for both `push_depth` (the new portion) and `retain_depth` (the
 /// retained context).
@@ -357,9 +362,9 @@ pub const WINDOW_DEPTH_CEILING: u64 = 1_000;
 /// as a pure-context window. A component must not assume `ports.len() == 1`, and
 /// must not assume a port's presence means that port is why it woke.
 ///
-/// `E` is a window element and `D` a deferred entry's payload. Both hosts lower
-/// to the string instantiation, [`ProcessorActivation`]; a host that still has
-/// to choose a component's contract carries something richer up to that point.
+/// `E` is a window element and `D` a deferred entry's payload. Each host
+/// carries envelopes and bodies up to the component's entry and lowers there,
+/// per contract; [`ProcessorActivation`] is the string contract's form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Activation<E, D = String> {
@@ -540,6 +545,99 @@ impl<E> PortWindow<E> {
             self.port, new_len
         ))
     }
+}
+
+/// A window's [`PortWindow::dropped`] as the `u32` both contracts' WIT type it,
+/// saturated: the guest reads it as a gap signal, and a saturated count still
+/// says "you lost more than you can count".
+pub fn saturate_dropped(dropped: u64) -> u32 {
+    u32::try_from(dropped).unwrap_or(u32::MAX)
+}
+
+/// A deferred entry's payload as the body the component parked. The backend
+/// carries the parked envelope, the page the body alone.
+pub trait ParkedBody {
+    /// The body the component handed the deferred publish (or its edit).
+    fn parked_body(&self) -> &MessageBody;
+}
+
+impl ParkedBody for MessageBody {
+    fn parked_body(&self) -> &MessageBody {
+        self
+    }
+}
+
+impl ParkedBody for Arc<MessageEnvelope> {
+    fn parked_body(&self) -> &MessageBody {
+        &self.body
+    }
+}
+
+impl<E: Borrow<MessageEnvelope>, D: ParkedBody> Activation<E, D> {
+    /// This activation lowered to the `brenn:processor@0.1.0` carrier, the one
+    /// rule both hosts lower by: each window envelope as its `envelope-json`,
+    /// each parked body as its text. A typed text body reads as its bare text,
+    /// its content type dropped; `dropped` is carried unsaturated.
+    ///
+    /// # Panics
+    ///
+    /// On a non-text body in a window or a deferred entry: neither 0.1.0
+    /// carrier can represent one. Each host refuses such a body before it can
+    /// reach a 0.1.0 component, so reaching this is a host bug.
+    pub fn lower_v0_1(&self) -> ProcessorActivation {
+        Activation {
+            ports: self
+                .ports
+                .iter()
+                .map(|window| PortWindow {
+                    port: window.port.clone(),
+                    // TODO(surface-envelope-json-memo): a served window is
+                    // retained context followed by what is new, so the retained
+                    // prefix is re-encoded on every activation and once per
+                    // subscribing instance.
+                    envelopes: window
+                        .envelopes
+                        .iter()
+                        .map(|envelope| envelope.borrow().to_envelope_json())
+                        .collect(),
+                    new_from: window.new_from,
+                    dropped: window.dropped,
+                })
+                .collect(),
+            deferred: self
+                .deferred
+                .iter()
+                .map(|window| DeferredWindow {
+                    port: window.port.clone(),
+                    entries: window
+                        .entries
+                        .iter()
+                        .map(|entry| DeferredEntry {
+                            index: entry.index,
+                            payload: v0_1_parked_text(entry.payload.parked_body()).to_owned(),
+                            deliver_after: entry.deliver_after,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            now: self.now,
+            sync: self.sync.clone(),
+        }
+    }
+}
+
+/// A parked body as the 0.1.0 `deferred-entry.payload` text.
+///
+/// # Panics
+///
+/// On a non-text body; see [`Activation::lower_v0_1`].
+fn v0_1_parked_text(body: &MessageBody) -> &str {
+    body.as_text().unwrap_or_else(|| {
+        panic!(
+            "0.1.0 deferred-entry.payload cannot carry a non-text body ({})",
+            body.summary()
+        )
+    })
 }
 
 impl<E, D> Activation<E, D> {
@@ -902,5 +1000,138 @@ mod tests {
         assert!(report.contains("\"layout\""), "{report}");
         assert!(report.contains('3'), "{report}");
         assert!(report.contains("push_depth"), "{report}");
+    }
+
+    fn envelope(body: MessageBody) -> MessageEnvelope {
+        let publish_ts = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("a literal timestamp parses")
+            .with_timezone(&chrono::Utc);
+        sync::sync_request("p1", "in", body, uuid::Uuid::nil(), publish_ts)
+    }
+
+    /// The activation each host carries to its entry, as the backend's
+    /// elements: a shared envelope in the window and the parked envelope.
+    fn backend_activation(
+        window: MessageBody,
+        parked: MessageBody,
+    ) -> Activation<Arc<MessageEnvelope>, Arc<MessageEnvelope>> {
+        Activation {
+            ports: vec![PortWindow {
+                port: "in".to_string(),
+                envelopes: vec![Arc::new(envelope(window))],
+                new_from: 0,
+                dropped: 7,
+            }],
+            deferred: vec![DeferredWindow {
+                port: "out".to_string(),
+                entries: vec![DeferredEntry {
+                    index: 0,
+                    payload: Arc::new(envelope(parked)),
+                    deliver_after: 42,
+                }],
+            }],
+            now: Some(9),
+            sync: Some("in".to_string()),
+        }
+    }
+
+    /// The same activation as the page's elements: the envelope itself and the
+    /// parked body alone.
+    fn page_activation(
+        window: MessageBody,
+        parked: MessageBody,
+    ) -> Activation<MessageEnvelope, MessageBody> {
+        let backend = backend_activation(window, parked);
+        Activation {
+            ports: backend
+                .ports
+                .iter()
+                .map(|w| PortWindow {
+                    port: w.port.clone(),
+                    envelopes: w.envelopes.iter().map(|e| (**e).clone()).collect(),
+                    new_from: w.new_from,
+                    dropped: w.dropped,
+                })
+                .collect(),
+            deferred: backend
+                .deferred
+                .iter()
+                .map(|w| DeferredWindow {
+                    port: w.port.clone(),
+                    entries: w
+                        .entries
+                        .iter()
+                        .map(|e| DeferredEntry {
+                            index: e.index,
+                            payload: e.payload.body.clone(),
+                            deliver_after: e.deliver_after,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            now: backend.now,
+            sync: backend.sync,
+        }
+    }
+
+    fn jpeg() -> MessageBody {
+        MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, 0xff])
+            .expect("a jpeg body is well formed")
+    }
+
+    /// A window envelope lowers to its `envelope-json` and a parked body to its
+    /// text, a typed text body to exactly its text without its type; both
+    /// hosts' element types lower to the same carrier.
+    #[test]
+    fn the_0_1_lowering_is_the_envelope_json_and_the_body_text_on_both_hosts() {
+        let markdown = MessageBody::from_parts(Some("text/markdown"), b"# hi")
+            .expect("a markdown body is well formed");
+        let lowered = backend_activation(markdown.clone(), markdown.clone()).lower_v0_1();
+        assert_eq!(
+            lowered,
+            Activation {
+                ports: vec![PortWindow {
+                    port: "in".to_string(),
+                    envelopes: vec![envelope(markdown.clone()).to_envelope_json()],
+                    new_from: 0,
+                    dropped: 7,
+                }],
+                deferred: vec![DeferredWindow {
+                    port: "out".to_string(),
+                    entries: vec![DeferredEntry {
+                        index: 0,
+                        payload: "# hi".to_string(),
+                        deliver_after: 42,
+                    }],
+                }],
+                now: Some(9),
+                sync: Some("in".to_string()),
+            }
+        );
+        assert_eq!(
+            page_activation(markdown.clone(), markdown).lower_v0_1(),
+            lowered
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "0.1.0 envelope-json")]
+    fn the_0_1_lowering_panics_on_a_non_text_window_body() {
+        let _ = page_activation(jpeg(), MessageBody::text("parked")).lower_v0_1();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "0.1.0 deferred-entry.payload cannot carry a non-text body (image/jpeg, 3 bytes)"
+    )]
+    fn the_0_1_lowering_panics_on_a_non_text_parked_body() {
+        let _ = backend_activation(MessageBody::text("window"), jpeg()).lower_v0_1();
+    }
+
+    #[test]
+    fn dropped_saturates_to_the_wit_u32() {
+        assert_eq!(saturate_dropped(7), 7);
+        assert_eq!(saturate_dropped(u64::from(u32::MAX)), u32::MAX);
+        assert_eq!(saturate_dropped(u64::from(u32::MAX) + 1), u32::MAX);
     }
 }

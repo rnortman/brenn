@@ -26,6 +26,7 @@ use crate::test_support::pages;
 use crate::test_support::pages::PRINCIPAL;
 
 use super::*;
+use brenn_envelope::grants::ProcessorContract;
 
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
 const WIRE: &str = "brenn:site.bar.in";
@@ -131,8 +132,13 @@ fn attach(page: &mut SurfacePage) -> Vec<ClientFrame> {
 fn configured(w: W) -> SurfacePage {
     let mut page = page();
     attach(&mut page);
-    page.registrations
-        .register("p1", None, &mut page.stores, &mut page.subs);
+    page.registrations.register(
+        "p1",
+        ProcessorContract::V0_1,
+        None,
+        &mut page.stores,
+        &mut page.subs,
+    );
     page.schedules.track("p1", false);
     let applied = page
         .apply_config(&body(w), NOW)
@@ -311,8 +317,13 @@ fn the_config_ack_is_the_connect_states_answer() {
 fn phase_two_puts_the_wiring_in_force_and_subscribes_what_it_binds() {
     let mut page = page();
     attach(&mut page);
-    page.registrations
-        .register("p1", None, &mut page.stores, &mut page.subs);
+    page.registrations.register(
+        "p1",
+        ProcessorContract::V0_1,
+        None,
+        &mut page.stores,
+        &mut page.subs,
+    );
     let applied = page
         .apply_config(&body(W::default()), NOW)
         .expect("the fixture document applies");

@@ -13,7 +13,8 @@ use brenn_attach_client::router::{MessageStamp, Origin, ReleaseTimer, RouteOutco
 use brenn_attach_proto::{
     BatchEntry, ClientFrame, PublishBatchOutcome, PublishOutcome, SubscribeOutcome,
 };
-use brenn_envelope::Urgency;
+use brenn_envelope::grants::ProcessorContract;
+use brenn_envelope::{GuestBody, MessageBody, Urgency};
 use brenn_surface_contract::MOUNT_SYNC_PORT;
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::telemetry::{InstanceReport, StatusCounters};
@@ -242,6 +243,7 @@ fn frames(effects: &[Effect]) -> Vec<&ClientFrame> {
 /// An empty buffer, for a completion that published nothing.
 fn empty_buffer() -> PublishBuffer {
     PublishBuffer::new(
+        "p1",
         Default::default(),
         Default::default(),
         Default::default(),
@@ -669,6 +671,7 @@ fn a_registration_before_the_first_document_subscribes_nothing() {
         &mut page,
         Input::ActivationRegistered {
             instance: "p1".to_string(),
+            contract: ProcessorContract::V0_1,
         },
     );
     assert!(effects.is_empty());
@@ -686,6 +689,7 @@ fn a_registration_under_a_document_subscribes_and_opens_an_outbox() {
         &mut page,
         Input::ActivationRegistered {
             instance: "p1".to_string(),
+            contract: ProcessorContract::V0_1,
         },
     );
     assert!(matches!(
@@ -703,6 +707,7 @@ fn an_instance_no_document_declares_gets_no_outbox() {
         &mut page,
         Input::ActivationRegistered {
             instance: "stranger".to_string(),
+            contract: ProcessorContract::V0_1,
         },
     );
     assert!(effects.is_empty());
@@ -764,6 +769,7 @@ fn registering_one_instance_twice_is_a_bug() {
         &mut page,
         Input::ActivationRegistered {
             instance: "p1".to_string(),
+            contract: ProcessorContract::V0_1,
         },
     );
 }
@@ -812,13 +818,7 @@ fn a_ready_instance_is_handed_over_in_flight() {
         notes
             .new_envelopes()
             .iter()
-            .map(
-                |envelope| brenn_surface_test_fixtures::parse_envelope(envelope)
-                    .body
-                    .as_text()
-                    .unwrap()
-                    .to_owned()
-            )
+            .map(|envelope| envelope.body.as_text().unwrap().to_owned())
             .collect::<Vec<_>>(),
         ["one"]
     );
@@ -860,7 +860,7 @@ fn sync_chained(
         SyncCall {
             instance,
             port,
-            body,
+            body: &MessageBody::text(body),
             chain,
         },
         stamp(0x59c),
@@ -885,6 +885,48 @@ fn admitted(answer: SyncDispatch) -> ReadyActivation {
         SyncDispatch::Ready(ready) => *ready,
         other => panic!("the request was not admitted: {other:?}"),
     }
+}
+
+/// A request body the target's contract cannot read is refused before anything
+/// is assembled: the target does not run, so it is not in flight and is owed
+/// nothing. A typed text request is not refused — the target reads its text.
+#[test]
+fn a_non_text_request_to_a_string_contract_target_is_refused_before_assembly() {
+    let mut page = page();
+    let bytes = MessageBody::from_parts(Some("application/octet-stream"), &[0xff, 0x00])
+        .expect("a byte body builds");
+    let (answer, _) = dispatch_sync(
+        &mut page,
+        SyncCall {
+            instance: "p2",
+            port: "ack",
+            body: &bytes,
+            chain: &[],
+        },
+        stamp(0x5a1),
+        NOW,
+        NOW_MS,
+    );
+    assert_eq!(refusal(answer), SyncRefusal::TextOnlyTarget);
+    assert!(!page.schedules.in_flight("p2"), "the target did not run");
+
+    let typed = MessageBody::from_parts(Some("text/csv"), b"a,b").expect("typed text builds");
+    let (answer, _) = dispatch_sync(
+        &mut page,
+        SyncCall {
+            instance: "p2",
+            port: "ack",
+            body: &typed,
+            chain: &[],
+        },
+        stamp(0x5a2),
+        NOW,
+        NOW_MS,
+    );
+    let ready = admitted(answer);
+    let lowered = ready.activation.lower_v0_1();
+    let request = lowered.ports.last().expect("the request window");
+    assert!(request.envelopes[0].contains(r#""body":"a,b""#));
 }
 
 /// The whole point of "not something special": the handler sees its full normal
@@ -922,13 +964,7 @@ fn a_sync_activation_carries_the_full_worldview_and_the_request() {
         notes
             .new_envelopes()
             .iter()
-            .map(
-                |envelope| brenn_surface_test_fixtures::parse_envelope(envelope)
-                    .body
-                    .as_text()
-                    .unwrap()
-                    .to_owned()
-            )
+            .map(|envelope| envelope.body.as_text().unwrap().to_owned())
             .collect::<Vec<_>>(),
         ["queued"]
     );
@@ -939,7 +975,6 @@ fn a_sync_activation_carries_the_full_worldview_and_the_request() {
     let [envelope] = &request.envelopes[..] else {
         panic!("a sync window is exactly the one live request: {request:?}");
     };
-    let envelope = brenn_surface_test_fixtures::parse_envelope(envelope);
     assert_eq!(envelope.channel, "local:brenn/sync/ack");
     assert_eq!(envelope.envelope_type, brenn_envelope::ChannelScheme::Local);
     assert_eq!(envelope.sender, "p2");
@@ -1010,14 +1045,17 @@ fn a_sync_reply_commits_the_buffer_and_an_err_discards_it() {
     let mut ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
     ready
         .buffer
-        .publish("notes", "from the gesture".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("from the gesture".to_string()),
+        )
         .expect("p1 binds the page-local channel");
     feed(
         &mut page,
         Input::ActivationDone(Box::new(Completed {
             instance: ready.instance,
             generation: ready.generation,
-            outcome: ActivationOutcome::Ok(Some("{\"cancel\":true}".to_string())),
+            outcome: ActivationOutcome::Ok(Some(GuestBody::Text("{\"cancel\":true}".to_string()))),
             buffer: ready.buffer,
             stamps: vec![stamp(0x9c4)],
         })),
@@ -1027,7 +1065,10 @@ fn a_sync_reply_commits_the_buffer_and_an_err_discards_it() {
     let mut ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
     ready
         .buffer
-        .publish("notes", "never routed".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("never routed".to_string()),
+        )
         .expect("p1 binds the page-local channel");
     feed(
         &mut page,
@@ -1281,13 +1322,7 @@ fn drain(page: &mut SurfacePage) -> Vec<(String, Vec<String>)> {
             .ports
             .iter()
             .flat_map(|window| window.new_envelopes())
-            .map(|envelope| {
-                brenn_surface_test_fixtures::parse_envelope(envelope)
-                    .body
-                    .as_text()
-                    .unwrap()
-                    .to_owned()
-            })
+            .map(|envelope| envelope.body.as_text().unwrap().to_owned())
             .collect();
         taken.push((ready.instance.clone(), bodies));
         feed(
@@ -1492,6 +1527,7 @@ fn a_re_registration_owes_a_fresh_mount_activation() {
         &mut page,
         Input::ActivationRegistered {
             instance: "p1".to_string(),
+            contract: ProcessorContract::V0_1,
         },
     );
     assert!(page.schedules.owes_mount_activation("p1"));
@@ -1526,13 +1562,26 @@ fn complete_ok(
     ready: ReadyActivation,
     reply: Option<&str>,
 ) -> (ActivationOutcome, Vec<Effect>) {
+    complete_with(
+        page,
+        ready,
+        reply.map(|reply| GuestBody::Text(reply.to_string())),
+    )
+}
+
+/// [`complete_ok`] with the reply as the component's body, before it is built.
+fn complete_with(
+    page: &mut SurfacePage,
+    ready: ReadyActivation,
+    reply: Option<GuestBody>,
+) -> (ActivationOutcome, Vec<Effect>) {
     let stamps = flush_stamps(ready.buffer.len());
     complete(
         page,
         Completed {
             instance: ready.instance,
             generation: ready.generation,
-            outcome: ActivationOutcome::Ok(reply.map(str::to_string)),
+            outcome: ActivationOutcome::Ok(reply),
             buffer: ready.buffer,
             stamps,
         },
@@ -1572,7 +1621,60 @@ fn a_reply_on_a_sync_activation_is_read() {
     let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
 
     let (ruled, _) = complete_ok(&mut page, ready, Some("answered"));
-    assert_eq!(ruled, ActivationOutcome::Ok(Some("answered".to_string())));
+    assert_eq!(
+        ruled,
+        ActivationOutcome::Ok(Some(MessageBody::text("answered")))
+    );
+    assert!(!page.registrations.is_failed("p2"));
+}
+
+/// A callee the page stopped activating while its sync activation ran flushed
+/// nothing, so its reply is not the caller's: the caller is answered a trap.
+#[test]
+fn a_reply_from_a_callee_gone_mid_flight_is_answered_as_a_trap() {
+    let mut page = page();
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+    feed(
+        &mut page,
+        Input::ActivationDeregistered {
+            instance: "p2".to_string(),
+        },
+    );
+
+    let (ruled, _) = complete_ok(&mut page, ready, Some("answered"));
+    assert_eq!(answer_for(ruled), SyncAnswer::Trap);
+}
+
+/// A reply the component built malformed is the callee's trap, judged before
+/// the cap; a well-formed typed or non-text reply is read with its type.
+#[test]
+fn a_malformed_reply_is_a_trap_and_a_typed_one_is_read() {
+    let mut page = page();
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+    let malformed = GuestBody::Parts {
+        content_type: Some("text/plain".to_string()),
+        bytes: vec![0xff],
+    };
+    let (ruled, _) = complete_with(&mut page, ready, Some(malformed));
+    assert!(
+        matches!(&ruled, ActivationOutcome::Trap(detail) if detail.contains("receive replied with an invalid body")),
+        "the completion reclassified the ok: {ruled:?}",
+    );
+    assert!(page.registrations.is_failed("p2"));
+
+    let mut page = self::page();
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+    let bytes = GuestBody::Parts {
+        content_type: Some("image/png".to_string()),
+        bytes: vec![0x89, 0x50],
+    };
+    let (ruled, _) = complete_with(&mut page, ready, Some(bytes));
+    assert_eq!(
+        ruled,
+        ActivationOutcome::Ok(Some(
+            MessageBody::from_parts(Some("image/png"), &[0x89, 0x50]).expect("a byte body builds")
+        ))
+    );
     assert!(!page.registrations.is_failed("p2"));
 }
 
@@ -1586,7 +1688,7 @@ fn a_reply_of_exactly_the_body_cap_is_read() {
 
     let reply = "x".repeat(pages::BODY_CAP as usize);
     let (ruled, _) = complete_ok(&mut page, ready, Some(&reply));
-    assert_eq!(ruled, ActivationOutcome::Ok(Some(reply)));
+    assert_eq!(ruled, ActivationOutcome::Ok(Some(MessageBody::text(reply))));
     assert!(!page.registrations.is_failed("p2"));
 }
 
@@ -1617,7 +1719,10 @@ fn a_trapped_reply_discards_the_buffer() {
     let mut ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
     ready
         .buffer
-        .publish("notes", "never routed".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("never routed".to_string()),
+        )
         .expect("p1 binds the page-local channel");
 
     let oversize = "x".repeat(pages::BODY_CAP as usize + 1);

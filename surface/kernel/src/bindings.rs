@@ -31,12 +31,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use brenn_attach_client::subs::SubscriptionDepths;
-use brenn_envelope::channel_capabilities;
+use brenn_attach_proto::Codec;
 use brenn_envelope::grants::ComponentGrant;
+use brenn_envelope::{MessageBody, channel_capabilities};
 use brenn_surface_schema::bindings::{BindingsDocument, BindingsError, PlatformSection};
 use brenn_surface_schema::{
     Binding, CallBinding, ComponentEntry, LocalChannel, OutputBinding, RESERVED_LOCAL_CHANNELS,
-    surface_bindable_address,
+    SURFACE_ATTACH_VERSION, surface_bindable_address,
 };
 
 use crate::logic::GrantSet;
@@ -59,6 +60,38 @@ pub(crate) fn channel_is_transportable(channel: &str) -> bool {
     channel_capabilities(channel)
         .expect("every surface-bindable scheme carries capabilities")
         .transportable
+}
+
+/// Why a well-formed body may not be published onto a channel from the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarriageRefusal {
+    /// The body is not text, and no channel a page reaches carries a non-text
+    /// body.
+    TextOnlyChannel,
+    /// The channel leaves the page, and the attach version the page speaks
+    /// carries only untyped text.
+    WireCarriesUntypedTextOnly,
+}
+
+/// Whether `channel` may carry `body` when published from the page: `None` if
+/// it may, else why not.
+///
+/// The one rule every publish and edit body from a component passes before it
+/// is buffered, so no body reaches a store or the wire encoder that either
+/// cannot hold. The channel is an argument to both arms: a page-local channel
+/// will answer the first by its own declaration once one can state it.
+pub(crate) fn carriage_refusal(channel: &str, body: &MessageBody) -> Option<CarriageRefusal> {
+    if !body.is_text() {
+        return Some(CarriageRefusal::TextOnlyChannel);
+    }
+    // Under attach v4 this refuses exactly a typed text body. At v5 the codec
+    // carries every body and this arm stops firing; it is then to be deleted
+    // with `PublishError::InvalidBody`'s second meaning.
+    if channel_is_transportable(channel) && !Codec::negotiated(SURFACE_ATTACH_VERSION).carries(body)
+    {
+        return Some(CarriageRefusal::WireCarriesUntypedTextOnly);
+    }
+    None
 }
 
 /// One surface's wiring, ready to run on.

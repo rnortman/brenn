@@ -443,8 +443,9 @@ vitest_bin.vitest_test(
     target_compatible_with = HOST_ONLY,
 )
 
-# The 0.1.0 base64 state baseline at three sizes: timings printed, nothing
-# asserted on time. Run by hand with `bazel test --test_output=all`.
+# The state workload at three sizes on each contract — 0.1.0 base64 in JSON,
+# 0.2.0 UTF-8 bytes — in one run: timings printed, nothing asserted on time.
+# Run by hand with `bazel test --test_output=all`.
 vitest_bin.vitest_test(
     name = "page_rig_measure",
     size = "large",

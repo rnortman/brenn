@@ -3724,11 +3724,16 @@ fn surface_bindings(
 /// other key no surface binding reads, refused with its own reason.
 const SURFACE_MASKED_KEY: &str = "amplification";
 
+// `refuse_surface_non_text` gives attach v4's text-only wire as its reason;
+// moving the page's attach version stops the build here until that reason is
+// rewritten.
+const _: () = assert!(brenn_surface_schema::SURFACE_ATTACH_VERSION == 4);
+
 /// A surface port that says it needs a channel that may carry non-text
 /// bodies, refused at its own value.
 ///
-/// The surface host hands a component its messages as text and the page's
-/// wire carries only text, so no surface binding can be served such a
+/// The page does not yet hold non-text bodies at rest, and its wire is attach
+/// v4, which carries text only, so no surface binding can be served such a
 /// channel. A port with no `channel` of its own — page-local, or a link with
 /// a surface endpoint — has no other place the need could be declared.
 fn refuse_surface_non_text(attr: Option<&Attr<RVal>>, what: &str, errors: &mut Vec<Diagnostic>) {
@@ -3736,8 +3741,8 @@ fn refuse_surface_non_text(attr: Option<&Attr<RVal>>, what: &str, errors: &mut V
         errors.push(Diagnostic::at(
             format!(
                 "{what} states `{NON_TEXT_KEY}`: a surface port carries only text — the \
-                 surface host serves the string component contract and the page's wire \
-                 carries text frames — so it can be bound to no channel that may carry \
+                 page does not yet hold non-text bodies at rest, and its wire is attach v4, \
+                 which carries text only — so it can be bound to no channel that may carry \
                  non-text bodies"
             ),
             attr.value.span().clone(),

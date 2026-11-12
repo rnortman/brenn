@@ -1,11 +1,57 @@
 # TODOs
 
+## `efficiency-surface-type-check-recompiles-every-kind-every-scan`
+
+Every surface asset scan — at boot and at every reload, inline in the
+reload's prepare — runs `brenn_wasm::check_surface_component` on every
+`brenn:processor@0.2.0` kind any declared mount offers, instantiated or
+not: a full compile of the artifact under a freshly built wasmtime
+`Engine`. A reload that changes nothing about a kind compiles it again, so
+reload and boot latency grow by one compile per offered 0.2.0 kind (0.66 s
+for a 66 KB fixture in an unoptimized build; no optimized figure taken).
+No in-tree kind is on 0.2.0 yet; the cost arrives as bundles migrate.
+Each check logs `elapsed_ms` on "surface provisional-contract artifact
+checked". Needed: a decision on the memo's key and its soundness. The
+record's `source_sha256` is the cheap key, but at kind grain it is the
+record's word, not a hash of the artifact (the artifact is hashed only
+for instantiated kinds, in `verify_processor_artifacts_in`), and this
+check is the only thing that keeps a page from silently misreading a
+stale provisional artifact; so either an argument that a verdict reused
+on the record's word cannot reach a page unverified, or a hash pass the
+memo pays for. Building the check's `Engine` once per scan is the smaller
+step. Code site: `surface/server/src/processor_assets.rs`, at the
+`check_surface_component` call in `read_processor_record_or_version_in`.
+Done when an unchanged 0.2.0 artifact is not recompiled by a reload.
+
+## `stale-contract-import-side-fixture`
+
+The refusal of a stale provisional `brenn:processor@0.2.0` artifact is
+pinned by a fixture on the export side only, on both hosts. The one stale
+fixture, `brenn-wasm/components/processor-stale-contract-test`, changes
+`bus.envelope`, which the backend host (`ProcessorComponent::load`) and
+the surface server's check (`brenn_wasm::check_surface_component`) both
+catch on the type of the `receive` export. That the same two refuse an
+artifact whose *imported* `ports@0.2.0` or `calls@0.2.0` function differs
+from the host's rests on a reading of wasmtime's `instantiate_pre` and on
+no test. On a page nothing else stands behind the check: the jco glue
+does not type-check, so an artifact the check wrongly lets through is
+misread silently, which the contract's header says cannot happen
+(`brenn-wasm/wit/processor-0.2.wit`). Needed: a second stale fixture
+whose `ports@0.2.0` (or `calls@0.2.0`) function signature differs from
+the host's in a way the `receive` export's type does not show, so only
+the import side can refuse it; a test on the backend host and a test on
+the surface server's check. Done when both tests refuse it by type — the
+backend at load, the surface check at its import-type stage. Code site
+(`TODO(stale-contract-import-side-fixture)`): `brenn-wasm/src/lib.rs`,
+the import-type step of `check_surface_component`.
+
 ## `page-rig-baseline-record`
 
-The node page rig's 0.1.0 string-path baseline is in no tracked file and not
-in the message of the commit that added the rig ("Add a node page rig running
-the real page kernel, glue and kinds"), where its design said it would be
-kept. The figures: `bazel test //frontend:page_rig_measure --test_output=all`,
+The node page rig has no timing of binary state at rest on a page-local `io`
+port under `brenn:processor@0.2.0`, the like-for-like of the 0.1.0
+string-path baseline, which waits on page-local channels that may carry
+non-text bodies; the 0.1.0 baseline and the 0.2.0 UTF-8 figures below are
+kept for that comparison. The figures: `bazel test //frontend:page_rig_measure --test_output=all`,
 node v22.20.0, V8, not a browser, a single run on a development machine to be
 read as ratios, `Welcome` cap 4,194,304 B; time per activation of the retained
 base64-in-JSON state round trip, given as `state` mean / median / min ms, then
@@ -16,9 +62,23 @@ raw B (1,398,122 stored, N 40): 113.839 / 113.541 / 111.988, then 101.263 /
 / 321.125, then 288.560 / 288.048 / 284.965; `noop` on `keeper`, empty
 windows, N 500: 0.846 / 0.735 / 0.673. The third size is bounded by
 `MAX_PUBLISH_BYTES_PER_ACTIVATION` (4 MiB, `brenn-budget/src/lib.rs`), which
-rules out the 16 MiB first asked for. Done when the commit that times the
-surface host's byte path (`brenn:processor@0.2.0`) with the same target
-records both tables, size for size, in a tracked file, and removes this entry.
+rules out the 16 MiB first asked for. The surface host's
+`brenn:processor@0.2.0` crossing, timed by the same target in one run beside
+the 0.1.0 workload — UTF-8 body, `text/plain`, on a page-local `io` port;
+node, not a browser; not the binary-at-rest comparison — `state` then `noop`,
+mean / median / min ms: 49,149 raw B (N 200): 1.030 / 0.934 / 0.902, then
+0.921 / 0.806 / 0.764; 1,048,576 raw B (N 40): 4.071 / 4.047 / 3.270, then
+1.724 / 1.540 / 1.239; 3,000,000 raw B (N 20): 9.800 / 9.587 / 8.403, then
+3.408 / 3.227 / 2.211. The same run's 0.1.0 figures: 49,149 raw B: 6.140 /
+5.963 / 5.839, then 5.474 / 5.363 / 5.280; 1,048,576 raw B: 112.749 / 112.227
+/ 109.764, then 100.231 / 98.698 / 97.617; 3,000,000 raw B: 320.052 / 318.139
+/ 314.110, then 287.400 / 283.131 / 279.846; `noop` on `keeper`: 0.916 / 0.850
+/ 0.792. The UTF-8 figures do not close this entry. Done when a commit that
+times binary state at rest on a page-local `io` port under
+`brenn:processor@0.2.0` — a non-UTF-8 body on a page-local channel that may
+carry non-text bodies, which the page does not serve yet — with the same
+target records those figures beside the 0.1.0 table, size for size, in a
+tracked file, and removes this entry.
 Code site (`TODO(page-rig-baseline-record)`):
 `frontend/src/page-rig/page-rig-measure.test.ts`, where the figures are
 printed.
@@ -107,14 +167,15 @@ its default kernel init and its streaming compile run there, but against
 node's implementations and a `fetch` that answers from disk. No test runs
 the crossing in a real browser: no spec in `e2e/` binds a `local:`
 channel. The binary-bus project accepts the surface host's byte path
-(`brenn:processor@0.2.0`) on that rig, so "a surface component stores
-large binary state on an `io` port" is shown in node, not in a page, and
-its timings are V8 under node. A difference between the two in the
+(`brenn:processor@0.2.0`) on that rig: text and typed-text bodies cross
+it, and a non-text body crosses only in a sync call or its reply, since a
+page-local channel carries text only. That is shown in node, not in a
+page, and its timings are V8 under node. A difference between the two in the
 engine, a real network fetch, a real socket or a real `Window` would be
 found by an out-of-tree component. Done when a spec in the `make e2e`
 suite runs a kind's retained round trip on a page-local `io` port in
-Chromium, the body compared byte for byte — a non-UTF-8 body once the
-surface host serves 0.2.0 — and records the time per activation at the
+Chromium, the body compared byte for byte — a non-UTF-8 body once
+page-local channels may carry non-text bodies — and records the time per activation at the
 rig's sizes; or when the owner rules that the node rig is enough and
 removes this entry. Facts that bear on it: `make e2e` is operator-run
 ("before tagging a release, and after any change under `surface/`",
@@ -126,24 +187,6 @@ Chromium spec here runs a transpiled guest in a browser engine too.
 
 Code site (`TODO(surface-byte-crossing-in-browser)`):
 `frontend/src/page-rig/globals.ts`, at the install function.
-
-## `surface-publish-refusal-diagnostic`
-
-A page-hosted component whose publish is refused as `invalid-payload` is
-handed a fixed diagnostic, "payload refused by the page host", where the
-backend's says what was wrong (the body's length and the cap). The page's
-kernel answers its port exports with a bare variant name
-(`surface/kernel/src/entry.rs`, `port_answer`) and drops the fault's text
-before the seam (`surface/kernel/src/publish_buffer.rs`,
-`publish_error`), so the glue has nothing better to pass on. Done when
-the kernel's port exports carry a payload-bearing variant's text to the
-guest, as `call_error_thrown` already does for `calls`, and the glue
-passes it through. It is a change to the kernel-to-glue answer vocabulary
-and belongs with the byte contract's port errors, which add more
-payload-bearing variants.
-
-Code site (`TODO(surface-publish-refusal-diagnostic)`): the thrower in
-`processorImports`, `frontend/src/surface.ts`.
 
 ## `binary-contract-version-mechanism`
 
@@ -3053,7 +3096,9 @@ of the `Option<View>`/`expect`/mount-arm idiom deleted.
 ## `surface-envelope-json-memo`
 
 A served window is retained context followed by what is new, so encoding
-envelopes at window assembly re-encodes the retained prefix on every activation,
+envelopes where an activation is lowered for its guest — the whole envelope for
+a 0.1.0 instance, its header for a 0.2.0 one — re-encodes the retained prefix
+on every activation,
 and re-encodes the same envelope once per subscribing instance. The envelope was
 itself decoded from JSON at frame parse and that wire text was discarded. The
 steady-state cost per envelope is one decode plus (retain_depth × activations ×
@@ -3070,8 +3115,10 @@ entry and `ServedWindow`, which is vocabulary shared with the non-surface attach
 client and which the envelope-lowering design deliberately left holding decoded
 envelopes — so it wants a design cycle, not a drive-by.
 
-Code site (`TODO(surface-envelope-json-memo)`):
-`surface/kernel/src/activation.rs`, at `window_ports`.
+Code sites (`TODO(surface-envelope-json-memo)`):
+`brenn-activation/src/lib.rs`, at `Activation::lower_v0_1`'s
+`to_envelope_json`, and `surface/kernel/src/dom.rs`, at `activation_to_js`'s
+`to_header_json`.
 
 Done = an envelope is encoded once per page lifetime, and a wider retain depth
 costs no extra encoding.

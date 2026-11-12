@@ -617,3 +617,65 @@ fn a_component_built_against_a_changed_bus_is_refused_on_the_type() {
         "{why}"
     );
 }
+
+#[test]
+fn the_surface_check_accepts_a_component_built_against_the_hosts_shapes() {
+    let bytes = artifact_bytes("brenn_processor_bytes_test");
+    brenn_wasm::check_surface_component(&bytes).expect("the bytes fixture is served");
+}
+
+/// The surface check refuses the stale artifact where the backend load does:
+/// on the type of its `receive` export, after its names passed.
+#[test]
+fn the_surface_check_refuses_a_component_built_against_a_changed_bus_on_the_type() {
+    let bytes = artifact_bytes("brenn_processor_stale_contract_test");
+    let refusal = brenn_wasm::check_surface_component(&bytes)
+        .expect_err("the stale artifact must be refused");
+    assert_eq!(
+        refusal.stage,
+        brenn_wasm::SurfaceComponentStage::ExportType,
+        "{refusal}"
+    );
+    assert!(
+        refusal
+            .detail
+            .contains("type-checking export func `receive`"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn the_surface_check_refuses_a_string_contract_component_by_name() {
+    let bytes = artifact_bytes("brenn_processor_exhaust");
+    let refusal =
+        brenn_wasm::check_surface_component(&bytes).expect_err("a 0.1.0 artifact is refused");
+    assert_eq!(
+        refusal.stage,
+        brenn_wasm::SurfaceComponentStage::Name,
+        "{refusal}"
+    );
+    assert!(
+        refusal.detail.contains(ProcessorContract::V0_2_MARKER),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn the_surface_check_refuses_a_file_that_is_not_a_component_by_name() {
+    let refusal = brenn_wasm::check_surface_component(b"not a component")
+        .expect_err("bytes that are not a component are refused");
+    assert_eq!(
+        refusal.stage,
+        brenn_wasm::SurfaceComponentStage::Name,
+        "{refusal}"
+    );
+    assert!(
+        refusal.detail.contains("not a loadable component"),
+        "{refusal}"
+    );
+}
+
+fn artifact_bytes(name: &str) -> Vec<u8> {
+    let path = common::artifact_path(name);
+    std::fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+}

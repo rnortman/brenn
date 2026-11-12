@@ -749,6 +749,11 @@ fn survives(
 /// to bound it: the number that governs is the one the peer stated on this
 /// attachment, and a peer built against a different derivation would state a
 /// different one.
+///
+/// Both measures encode every body, and the v4 encoder panics on one that is
+/// not untyped text. None reaches it: a component's publish or edit on a
+/// channel that leaves the page passed [`crate::bindings::carriage_refusal`],
+/// which refuses every body this attachment's codec cannot carry.
 fn fits_the_caps(instance: &str, batch: &FlushBatch, facts: &AttachmentFacts) -> bool {
     let codec = facts.codec();
     codec

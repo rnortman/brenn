@@ -26,6 +26,8 @@ export interface Template {
 export interface KitInstance {
     instance: string;
     kind: string;
+    /** The contract `kind` is built against, as the server would state it. */
+    contract: string;
     command_channel: string;
 }
 
@@ -38,8 +40,19 @@ export interface KitPage {
     instances: KitInstance[];
     report_channel: string;
     feed_channel: string;
-    /** The instances with a `state` io port, each on a page-local channel of its own. */
+    /** The wire channel `b-keeper`'s `feed` port reads, on a page that runs it. */
+    bytes_feed_channel: string;
+    /** The wire channel `b-keeper`'s `out` port is bound to. */
+    bytes_out_channel: string;
+    /** The page-local channel `b-keeper` keeps typed bodies on and `plain` reads. */
+    shared_channel: string;
+    /**
+     * The `brenn:processor@0.1.0` instances with a `state` io port, each on a
+     * page-local channel of its own.
+     */
     state_instances: string[];
+    /** The same, on `brenn:processor@0.2.0`. */
+    bytes_state_instances: string[];
     status_channel: string;
     max_body_bytes: number;
     ladder: { hello: Json; welcome: Json; config_deliver: Json };
@@ -233,6 +246,8 @@ export interface WirePublish {
     body: string;
     /** The publishing instance the frame names, or null for the page's own. */
     attribution: string | null;
+    /** The client frame that carried it. */
+    frame: "Publish" | "PublishBatch";
 }
 
 /** The handlers and members of a browser `WebSocket` the kernel uses. */
@@ -394,7 +409,7 @@ export class Peer {
                 return;
             }
             case "Publish":
-                this.record(frame.channel, frame.body, frame.attribution);
+                this.record(frame.type, frame.channel, frame.body, frame.attribution);
                 if (frame.correlation !== null) {
                     this.sendSoon(fill(answers.publish_result, { correlation: frame.correlation }));
                 }
@@ -407,7 +422,7 @@ export class Peer {
                     );
                 }
                 for (const p of frame.publishes) {
-                    this.record(p.channel, p.body, frame.attribution);
+                    this.record(frame.type, p.channel, p.body, frame.attribution);
                 }
                 this.sendSoon(
                     fill(answers.publish_batch_result, { correlation: frame.correlation }),
@@ -416,7 +431,12 @@ export class Peer {
         }
     }
 
-    private record(channel: string, body: string, attribution: string | null): void {
-        this.published.push({ order: this.nextOrder++, channel, body, attribution });
+    private record(
+        frame: WirePublish["frame"],
+        channel: string,
+        body: string,
+        attribution: string | null,
+    ): void {
+        this.published.push({ order: this.nextOrder++, channel, body, attribution, frame });
     }
 }

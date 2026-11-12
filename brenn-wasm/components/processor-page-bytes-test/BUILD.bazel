@@ -1,0 +1,25 @@
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "wasm_component", "wasm_guest_cdylib")
+
+policy_srcs()
+
+# Staged for the page host by `//surface:processor-page-bytes-test_assets`, which
+# also holds the specification to the artifact's imports.
+exports_files(["spec/processor-page-bytes-test.brenn"])
+
+# Bindings come from `wit_bindgen::generate!` over the 0.2.0 world, which reads
+# both WIT files at macro-expansion time.
+wasm_guest_cdylib(
+    name = "brenn-processor-page-bytes-test",
+    compile_data = ["//brenn-wasm:wit"],
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+wasm_component(
+    name = "component",
+    module = ":brenn-processor-page-bytes-test",
+    visibility = ["//visibility:public"],
+)

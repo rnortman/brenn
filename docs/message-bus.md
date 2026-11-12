@@ -200,7 +200,7 @@ Who is shown the content type today:
 | Query API (`Messenger::query`), host code | text and type | bytes and type |
 | A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, `BrennMessageEdit`) | `"body": "…"`, then `"content_type": "…"` | `"body": {"binary": true, "content_type": "…", "size": N}` — a placeholder, never the bytes |
 | The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` |
-| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | bytes and type | bytes and type |
+| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | bytes and type; on a page, a body that arrived over the wire has no type, since the page's wire is attach v4 (below), while page-local typed text keeps its type | bytes and type on the backend; on a page, never at rest (a surface binding is refused at plan), only in a sync call or reply |
 | 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload |
 | Attach v4 sessions (`Deliver`, `DeferredView`) | bare text, **no type** | never bound: a surface binding is refused at plan, a remote's subscribe is answered `Unavailable`; left out of a deferred view |
 | Attach v5 sessions (`Deliver`, `DeferredView`) | text and type | bytes and type |
@@ -487,8 +487,13 @@ channel: `io state { push_depth = 0; retain_depth = 1; non_text = true; }`.
 On a declared channel the same key on a port is a check, not a declaration: a
 port stating `non_text = true` bound to a channel that does not is refused
 when the plan is built, so `config-check` reports it. A surface binding may not state it, and a
-surface may not be bound to a `non_text` channel, until the surface host
-carries bytes and the page speaks attach v5. A remote attacher on v5 is served
+surface may not be bound to a `non_text` channel, until the page carries
+non-text bodies at rest and speaks attach v5. The surface host does serve
+`brenn:processor@0.2.0`: a page-hosted 0.2.0 kind keeps typed text on a
+page-local channel with its type and passes any body in a sync call between
+0.2.0 kinds, but a port bound to a channel that leaves the page carries
+untyped text only: a typed text body there is refused with `invalid-body`,
+and a non-text body with `text-only-channel`, as on any text-only channel. A remote attacher on v5 is served
 a `non_text` channel; one on v4 is answered `Unavailable`.
 
 **The timer-cap coupling.** A channel's `retain_depth` also caps its channel-wide

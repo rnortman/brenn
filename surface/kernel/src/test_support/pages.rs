@@ -10,6 +10,7 @@
 use brenn_attach_client::Millis;
 use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_proto::SubscribeOutcome;
+use brenn_envelope::grants::ProcessorContract;
 use brenn_surface_schema::bindings::BindingsDocument;
 use uuid::Uuid;
 
@@ -65,8 +66,13 @@ pub(crate) fn attached_page(
 /// requires — a fixture holding one without the other is a page no pass can drive.
 pub(crate) fn mount(page: &mut SurfacePage, instances: &[&str]) {
     for instance in instances {
-        page.registrations
-            .register(instance, None, &mut page.stores, &mut page.subs);
+        page.registrations.register(
+            instance,
+            ProcessorContract::V0_1,
+            None,
+            &mut page.stores,
+            &mut page.subs,
+        );
         page.schedules.track(instance, false);
     }
 }

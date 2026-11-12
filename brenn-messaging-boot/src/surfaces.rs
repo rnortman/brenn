@@ -933,15 +933,16 @@ pub(crate) fn resolve_surfaces(
                          ingress paths)",
                         entry.transport_type,
                     );
-                    // A page holds only text: its components speak the string
-                    // contract and its wire frames are strings.
+                    // The reason below is attach v4's text-only wire; moving
+                    // the page's attach version stops the build here until it
+                    // is rewritten.
+                    const _: () = assert!(brenn_surface_schema::SURFACE_ATTACH_VERSION == 4);
                     assert!(
                         !entry.resolved_channel.non_text,
                         "config: [[surface]] {slug:?}: {direction} channel {channel:?} is \
-                         declared `non_text`, and a surface carries only text bodies — its \
-                         components are built against {}; bind the port to a text-only \
-                         channel",
-                        brenn_envelope::grants::ProcessorContract::V0_1,
+                         declared `non_text`, and a surface carries only text bodies — the page \
+                         does not yet hold non-text bodies at rest, and its wire is attach v4, \
+                         which carries text only; bind the port to a text-only channel"
                     );
                 }
                 // `local:` — page-local pub/sub. There is nothing to look up:

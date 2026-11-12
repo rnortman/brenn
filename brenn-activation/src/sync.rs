@@ -126,8 +126,7 @@ pub enum SyncAnswer {
 ///
 /// Three of them are unreachable on the backend, for the same kind of reason
 /// `Fatal` noise is: that host has no terminal instance state, no unwired mount
-/// to be in and no unmounted `dom` instance. One is unreachable on the page,
-/// whose instances all read the string contract and whose bodies are all text.
+/// to be in and no unmounted `dom` instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncRefusal {
     /// The target is already in flight in the caller's own chain. On the page
@@ -154,7 +153,7 @@ pub enum SyncRefusal {
     Unmounted,
     /// The request body is not text and the target is built against a
     /// component contract that carries only text, so it has no way to read the
-    /// request. Backend only — no body on a page is anything but text.
+    /// request.
     TextOnlyTarget,
 }
 

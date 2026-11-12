@@ -42,7 +42,8 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::driver::{flush_stamps, new_stamp};
 use brenn_attach_client::router::{Origin, RouteOutcome, RouteRequest};
 use brenn_attach_proto::SubscribeOutcome;
-use brenn_envelope::Urgency;
+use brenn_envelope::grants::ProcessorContract;
+use brenn_envelope::{GuestBody, MessageBody, Urgency};
 use brenn_page_harness::{Kind, Page, types};
 use brenn_surface_contract::ActivationError;
 use brenn_surface_kernel::ActivationOutcome;
@@ -337,7 +338,7 @@ impl Surface {
             SyncCall {
                 instance: PROBE,
                 port,
-                body,
+                body: &MessageBody::text(body),
                 // A native caller is nobody's callee.
                 chain: &[],
             },
@@ -413,10 +414,10 @@ fn invoke(kind: &Kind, config: &BTreeMap<String, String>, ready: ReadyActivation
         ..
     } = ready;
     let mut harness = kind.instantiate(Page::with_config(config.clone()));
-    let answer = harness.receive(&to_wit(&activation));
+    let answer = harness.receive(&to_wit(&activation.lower_v0_1()));
 
     let outcome = match answer {
-        Ok(Ok(reply)) => ActivationOutcome::Ok(reply),
+        Ok(Ok(reply)) => ActivationOutcome::Ok(reply.map(GuestBody::Text)),
         Ok(Err(error)) => ActivationOutcome::Err(ActivationError {
             // Both arms are one fact to the page — the activation returned err —
             // and the text is the component's own account of it, never parsed.
@@ -454,13 +455,13 @@ fn replay(page: &mut Page, buffer: &mut PublishBuffer) -> usize {
     let mut accepted = 0;
     for (port, body) in std::mem::take(&mut page.published) {
         buffer
-            .publish(&port, body)
+            .publish(&port, GuestBody::Text(body))
             .unwrap_or_else(|fault| panic!("the probe's publish on {port} was refused: {fault:?}"));
         accepted += 1;
     }
     for (port, body, deliver_after) in std::mem::take(&mut page.parked) {
         buffer
-            .publish_deferred(&port, body, deliver_after)
+            .publish_deferred(&port, GuestBody::Text(body), deliver_after)
             .unwrap_or_else(|fault| panic!("the probe's park on {port} was refused: {fault:?}"));
         accepted += 1;
     }
@@ -482,7 +483,7 @@ fn to_wit(activation: &brenn_surface_contract::Activation) -> types::Activation 
                 // Saturating: the carrier counts in u64 and the world types
                 // this u32, and a saturated count still says "you lost more
                 // than you can count".
-                dropped: u32::try_from(window.dropped).unwrap_or(u32::MAX),
+                dropped: brenn_activation::saturate_dropped(window.dropped),
             })
             .collect(),
         deferred: activation
@@ -520,6 +521,7 @@ impl Host for Surface {
         self.registered = true;
         self.feed(Input::ActivationRegistered {
             instance: PROBE.to_string(),
+            contract: ProcessorContract::V0_1,
         });
     }
 
@@ -558,6 +560,7 @@ impl Host for Surface {
         tokio::time::sleep(idle).await;
         self.feed(Input::ActivationRegistered {
             instance: PROBE.to_string(),
+            contract: ProcessorContract::V0_1,
         });
     }
 

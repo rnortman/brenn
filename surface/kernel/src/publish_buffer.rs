@@ -29,13 +29,13 @@ use brenn_budget::{
     ActivationGate, DeferRefusalKind, GateRefusal, PublishCheck, PublishRefusalKind,
     check_deliver_after, defer_refusal_kind, publish_refusal_kind,
 };
-use brenn_envelope::{MessageBody, Urgency};
+use brenn_envelope::{GuestBody, MessageBody, Urgency};
 use brenn_surface_contract::{CallError, DeferError, PublishError};
 use uuid::Uuid;
 
 use brenn_attach_client::store::DeferOp;
 
-use crate::bindings::channel_is_transportable;
+use crate::bindings::{CarriageRefusal, carriage_refusal, channel_is_transportable};
 use crate::outbound::truncate_report_field;
 
 /// The byte cap on a guest-supplied port name reaching a diagnostic. The name is
@@ -83,9 +83,27 @@ fn port_for_report(port: &str) -> String {
 /// backend host.
 fn publish_error(refusal: GateRefusal) -> PublishFault {
     PortFault::Refused(match publish_refusal_kind(refusal) {
-        PublishRefusalKind::InvalidPayload(_) => PublishError::InvalidPayload,
+        PublishRefusalKind::InvalidPayload(fault) => {
+            PublishError::InvalidPayload(fault.to_string())
+        }
         PublishRefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
     })
+}
+
+/// The diagnostic a component is handed for a typed text body on a port bound
+/// to a channel that leaves the page.
+pub const WIRE_CARRIES_UNTYPED_TEXT_ONLY: &str = "this port is bound to a channel that leaves \
+the page, and this brenn's page carries only untyped text off the page: publish without a \
+content type, or bind the port to a page-local channel";
+
+/// A component body built into the body the buffer holds, or the refusal its
+/// malformation draws, spelled by `invalid_body`.
+fn build_body<E>(
+    body: GuestBody,
+    invalid_body: impl FnOnce(String) -> E,
+) -> Result<MessageBody, PortFault<E>> {
+    body.build()
+        .map_err(|e| PortFault::Refused(invalid_body(e.to_string())))
 }
 
 /// A gate verdict as the component sees it on the peer-call path.
@@ -122,7 +140,7 @@ pub(crate) struct BufferedPublish {
     /// the resolution that authorized the publish is the one that must route it,
     /// and a `Welcome` can land between the two.
     pub channel: String,
-    pub body: String,
+    pub body: MessageBody,
     /// The resolved urgency: the caller's override, else the port's configured
     /// default. Resolved here for `local:` entries (the router applies no default
     /// of its own); wire entries carry the raw override on the frame and let the
@@ -160,6 +178,15 @@ pub(crate) struct BufferedDeferOp {
     /// The parked message's identity, from the snapshot the component read.
     pub message_id: Uuid,
     pub kind: DeferOp,
+}
+
+/// A control op as the component asked for it, its edit body unbuilt.
+enum DeferInput {
+    Cancel,
+    Edit {
+        body: Option<GuestBody>,
+        deliver_after: Option<u64>,
+    },
 }
 
 /// What became of a publish the buffer accepted.
@@ -211,6 +238,8 @@ pub(crate) struct OutputSpec {
 /// activation, and a buffer nobody seeded would silently enforce nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishBuffer {
+    /// The instance whose activation this buffer serves, for its log lines.
+    instance: String,
     /// This instance's bound outputs, keyed by port. An unknown key is not
     /// automatically a refusal: it is judged against
     /// [`declared_out_ports`](Self::declared_out_ports) first.
@@ -255,6 +284,7 @@ impl PublishBuffer {
     /// the page's address space saturates to `usize::MAX` — the activation's own
     /// byte aggregate is the binding limit long before that.
     pub(crate) fn new(
+        instance: &str,
         outputs: HashMap<String, OutputSpec>,
         declared_out_ports: Arc<BTreeSet<String>>,
         sink_mt: HashMap<String, u64>,
@@ -262,6 +292,7 @@ impl PublishBuffer {
         deferred: HashMap<String, Vec<Uuid>>,
     ) -> Self {
         Self {
+            instance: instance.to_owned(),
             outputs,
             declared_out_ports,
             gate: ActivationGate::new(
@@ -354,23 +385,30 @@ impl PublishBuffer {
     /// and whether the deployer wired it, are facts about the document rather
     /// than about the budget, and they are decided at the seam on either side of
     /// this call — the first before it (a trap), the second after it (`unwired`).
-    /// The backend's `do_call` charges in the same order for the same reasons.
-    pub fn admit_call(&mut self, payload: &str) -> Result<(), CallError> {
+    /// The order — charge, build, cap — must match the backend's call path, so
+    /// a call is refused for the same reason on either host. A call has no
+    /// channel, so no carriage rule applies.
+    ///
+    /// Answers the built request body.
+    pub fn admit_call(&mut self, body: GuestBody) -> Result<MessageBody, CallError> {
         self.gate.charge_call().map_err(call_error)?;
+        let body = body
+            .build()
+            .map_err(|err| CallError::InvalidBody(err.to_string()))?;
         let cap = self.gate.max_body_bytes();
-        if !brenn_activation::sync::within_body_cap(payload.as_bytes(), cap) {
+        if !brenn_activation::sync::within_body_cap(body.as_bytes(), cap) {
             return Err(call_error(GateRefusal::BodyTooLarge {
-                len: payload.len(),
+                len: body.len(),
                 max: cap,
             }));
         }
-        Ok(())
+        Ok(body)
     }
 
     /// Publish `body` from this instance's output `port`, at the port's
     /// configured default urgency. Buffered, not sent: it reaches the router or
     /// the wire only if this activation returns ok.
-    pub fn publish(&mut self, port: &str, body: String) -> Result<(), PublishFault> {
+    pub fn publish(&mut self, port: &str, body: GuestBody) -> Result<(), PublishFault> {
         self.publish_inner(port, body, None, None)
     }
 
@@ -384,7 +422,7 @@ impl PublishBuffer {
     pub fn publish_deferred(
         &mut self,
         port: &str,
-        body: String,
+        body: GuestBody,
         deliver_after: u64,
     ) -> Result<(), PublishFault> {
         self.publish_inner(port, body, None, Some(deliver_after))
@@ -395,7 +433,7 @@ impl PublishBuffer {
     pub fn publish_with_urgency(
         &mut self,
         port: &str,
-        body: String,
+        body: GuestBody,
         urgency: Urgency,
     ) -> Result<(), PublishFault> {
         self.publish_inner(port, body, Some(urgency), None)
@@ -403,15 +441,16 @@ impl PublishBuffer {
 
     /// The publish path both entry points share.
     ///
-    /// The gate's publish order, with the page's one host-data check at its
-    /// documented position: the call ceiling first (so a component looping on
+    /// The gate's publish order, with the page's host-data checks at their
+    /// documented positions: the call ceiling first (so a component looping on
     /// rejections pays for them), then the port — three-way, per
-    /// [`Self::publish_unwired`] — then everything the gate judges, which it
-    /// charges only on acceptance.
+    /// [`Self::publish_unwired`] — then the body (`invalid-body`), then whether
+    /// the channel may carry it ([`carriage_refusal`]), then everything the gate
+    /// judges, which it charges only on acceptance.
     fn publish_inner(
         &mut self,
         port: &str,
-        body: String,
+        body: GuestBody,
         urgency_override: Option<Urgency>,
         deliver_after: Option<u64>,
     ) -> Result<(), PublishFault> {
@@ -420,8 +459,16 @@ impl PublishBuffer {
         // the gate: a refused publish copies neither the port name nor the
         // channel, and only an accepted one owns them.
         let Some((sink, spec)) = self.outputs.get_key_value(port) else {
-            return self.publish_unwired(port, &body, deliver_after);
+            return self.publish_unwired(port, body, deliver_after);
         };
+        let body = build_body(body, PublishError::InvalidBody)?;
+        self.judge_carriage(
+            port,
+            &spec.channel,
+            &body,
+            PublishError::TextOnlyChannel,
+            PublishError::InvalidBody,
+        )?;
         let urgency = urgency_override.unwrap_or(spec.default_urgency);
         // The wire batch budget, before the gate charges anything: the gate
         // charges on acceptance and `take` asserts its count against this
@@ -470,15 +517,18 @@ impl PublishBuffer {
     /// what exists to serve a sink is skipped: the per-sink bucket, the wire
     /// batch budget, the buffer and the carry. Answering `Ok` where a bound port
     /// answers `invalid-payload` would hand the component its own wiring back.
+    /// The body is built, so a malformed one draws `invalid-body` here too; with
+    /// no channel there is nothing to judge its carriage against.
     fn publish_unwired(
         &mut self,
         port: &str,
-        body: &str,
+        body: GuestBody,
         deliver_after: Option<u64>,
     ) -> Result<(), PublishFault> {
         if !self.declared_out_ports.contains(port) {
             return Err(PortFault::Undeclared(port_for_report(port)));
         }
+        let body = build_body(body, PublishError::InvalidBody)?;
         self.gate
             .admit_publish_without_sink(body.len(), deliver_after, 0)
             .map_err(publish_error)?;
@@ -490,7 +540,7 @@ impl PublishBuffer {
     ///
     /// Buffered like a publish, so an err or trap cancels nothing.
     pub fn defer_cancel(&mut self, port: &str, index: u32) -> Result<(), DeferFault> {
-        self.defer_inner(port, index, DeferOp::Cancel)
+        self.defer_inner(port, index, DeferInput::Cancel)
     }
 
     /// Rewrite one message this instance has parked on `port`'s channel — its
@@ -503,14 +553,14 @@ impl PublishBuffer {
         &mut self,
         port: &str,
         index: u32,
-        body: Option<String>,
+        body: Option<GuestBody>,
         deliver_after: Option<u64>,
     ) -> Result<(), DeferFault> {
         self.defer_inner(
             port,
             index,
-            DeferOp::Edit {
-                body: body.map(MessageBody::text),
+            DeferInput::Edit {
+                body,
                 deliver_after,
             },
         )
@@ -522,8 +572,9 @@ impl PublishBuffer {
     /// documented positions: representability first (a fact about the argument,
     /// not about any budget, and so the one refusal here that draws no call
     /// slot), then the shared call count, then the port and the snapshot
-    /// index — the two answers only this buffer holds — then the gate's op
-    /// ceiling and edit-body rules.
+    /// index — the two answers only this buffer holds — then an edit body's
+    /// build (`invalid-body`) and carriage ([`carriage_refusal`]), then the
+    /// gate's op ceiling and edit-body rules.
     ///
     /// The port is judged three ways as it is on the publish path, but the
     /// declared-unwired arm needs no drop semantics of its own: a port with no
@@ -535,10 +586,10 @@ impl PublishBuffer {
     /// hygiene: a page edit travels to the server as a control op, where an
     /// oversize body is a protocol violation that kills the connection, so
     /// refusing it here keeps a conforming kernel from ever wiring one.
-    fn defer_inner(&mut self, port: &str, index: u32, kind: DeferOp) -> Result<(), DeferFault> {
-        let edit_deliver_after = match &kind {
-            DeferOp::Edit { deliver_after, .. } => *deliver_after,
-            DeferOp::Cancel => None,
+    fn defer_inner(&mut self, port: &str, index: u32, input: DeferInput) -> Result<(), DeferFault> {
+        let edit_deliver_after = match &input {
+            DeferInput::Edit { deliver_after, .. } => *deliver_after,
+            DeferInput::Cancel => None,
         };
         check_deliver_after(edit_deliver_after).map_err(defer_error)?;
         self.gate.charge_call().map_err(defer_error)?;
@@ -554,6 +605,30 @@ impl PublishBuffer {
             .and_then(|ids| ids.get(index as usize))
         else {
             return Err(PortFault::Refused(DeferError::OutOfRange));
+        };
+        let kind = match input {
+            DeferInput::Cancel => DeferOp::Cancel,
+            DeferInput::Edit {
+                body,
+                deliver_after,
+            } => {
+                let body = body
+                    .map(|body| build_body(body, DeferError::InvalidBody))
+                    .transpose()?;
+                if let Some(body) = &body {
+                    self.judge_carriage(
+                        port,
+                        &spec.channel,
+                        body,
+                        DeferError::TextOnlyChannel,
+                        DeferError::InvalidBody,
+                    )?;
+                }
+                DeferOp::Edit {
+                    body,
+                    deliver_after,
+                }
+            }
         };
         let edit_body_len = match &kind {
             DeferOp::Edit {
@@ -577,6 +652,50 @@ impl PublishBuffer {
             kind,
         });
         Ok(())
+    }
+
+    /// Whether `channel` may carry `body` ([`carriage_refusal`]), as the
+    /// refusal the publish and edit paths both answer: `text_only` for a
+    /// non-text body on a text-only channel, `invalid_body` with
+    /// [`WIRE_CARRIES_UNTYPED_TEXT_ONLY`] for a typed text body bound for the
+    /// wire. Each refusal is logged.
+    fn judge_carriage<E>(
+        &self,
+        port: &str,
+        channel: &str,
+        body: &MessageBody,
+        text_only: E,
+        invalid_body: impl FnOnce(String) -> E,
+    ) -> Result<(), PortFault<E>> {
+        let Some(refusal) = carriage_refusal(channel, body) else {
+            return Ok(());
+        };
+        self.log_carriage_refusal(port, channel, body, refusal);
+        Err(PortFault::Refused(match refusal {
+            CarriageRefusal::TextOnlyChannel => text_only,
+            CarriageRefusal::WireCarriesUntypedTextOnly => {
+                invalid_body(WIRE_CARRIES_UNTYPED_TEXT_ONLY.to_owned())
+            }
+        }))
+    }
+
+    /// One line per body refused for its carriage. The per-activation call
+    /// ceiling bounds how many one activation can write.
+    fn log_carriage_refusal(
+        &self,
+        port: &str,
+        channel: &str,
+        body: &MessageBody,
+        refusal: CarriageRefusal,
+    ) {
+        tracing::info!(
+            instance = %self.instance,
+            port = %port_for_report(port),
+            channel,
+            body = %body.summary(),
+            ?refusal,
+            "surface client: refused a component body its port's channel cannot carry"
+        );
     }
 
     /// How many publishes were accepted. Read by the driver to mint one envelope
@@ -627,6 +746,18 @@ mod tests {
     use super::*;
 
     const WIRE: &str = "brenn:site.bar.out";
+
+    fn text(body: impl Into<String>) -> GuestBody {
+        GuestBody::Text(body.into())
+    }
+
+    fn parts(content_type: Option<&str>, bytes: &[u8]) -> GuestBody {
+        GuestBody::Parts {
+            content_type: content_type.map(str::to_owned),
+            bytes: bytes.to_vec(),
+        }
+    }
+
     const LOCAL: &str = "local:page/notes";
 
     fn spec(channel: &str) -> OutputSpec {
@@ -664,6 +795,7 @@ mod tests {
             ("notes".to_string(), 1_000_000),
         ]);
         PublishBuffer::new(
+            "keeper",
             outputs,
             vocabulary(),
             sink_mt,
@@ -676,16 +808,50 @@ mod tests {
     fn a_call_payload_is_capped_exactly_as_a_published_body_is() {
         let mut buf = buffer(8);
         assert_eq!(
-            buf.admit_call(&"a".repeat(8)),
+            buf.admit_call(GuestBody::Text("a".repeat(8))).map(|_| ()),
             Ok(()),
             "the cap is inclusive"
         );
         assert_eq!(
-            buf.admit_call(&"a".repeat(9)),
+            buf.admit_call(GuestBody::Text("a".repeat(9))).map(|_| ()),
             Err(CallError::InvalidPayload(
                 "payload 9 bytes exceeds max 8".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn a_call_body_is_built_after_the_charge_and_before_the_cap() {
+        let mut buf = buffer(4);
+        let malformed = GuestBody::Parts {
+            content_type: None,
+            bytes: vec![0xff],
+        };
+        assert!(
+            matches!(buf.admit_call(malformed), Err(CallError::InvalidBody(_))),
+            "an untyped body that is not UTF-8 does not build"
+        );
+        let oversize_malformed = GuestBody::Parts {
+            content_type: Some("text/csv".to_string()),
+            bytes: vec![0xff; 9],
+        };
+        assert!(
+            matches!(
+                buf.admit_call(oversize_malformed),
+                Err(CallError::InvalidBody(_))
+            ),
+            "the build is judged before the cap"
+        );
+        let bytes = GuestBody::Parts {
+            content_type: Some("application/octet-stream".to_string()),
+            bytes: vec![0xff, 0x00],
+        };
+        let built = buf
+            .admit_call(bytes)
+            .expect("a well-formed body is admitted");
+        assert_eq!(built.as_bytes(), &[0xff, 0x00]);
+        assert_eq!(built.content_type(), Some("application/octet-stream"));
+        assert!(!built.is_text());
     }
 
     #[test]
@@ -695,8 +861,8 @@ mod tests {
         let mut buf = buffer(64);
         let mut calls = 0;
         loop {
-            match buf.admit_call("x") {
-                Ok(()) => calls += 1,
+            match buf.admit_call(GuestBody::Text("x".to_string())) {
+                Ok(_) => calls += 1,
                 Err(CallError::QuotaExceeded) => break,
                 Err(other) => panic!("unexpected call refusal: {other:?}"),
             }
@@ -704,7 +870,7 @@ mod tests {
         }
         assert!(calls > 0, "the fixture must admit at least one call");
         assert_eq!(
-            buf.publish("notes", "y".to_string()),
+            buf.publish("notes", text("y")),
             Err(PortFault::Refused(PublishError::QuotaExceeded)),
             "the calls spent the publish family's own ceiling"
         );
@@ -717,9 +883,9 @@ mod tests {
     #[test]
     fn a_publish_that_would_overrun_the_batch_budget_is_refused_at_the_call() {
         let mut buf = buffer(64);
-        assert_eq!(buf.publish("out", "a".repeat(20)), Ok(()));
+        assert_eq!(buf.publish("out", text("a".repeat(20))), Ok(()));
         assert_eq!(
-            buf.publish("out", "b".repeat(20)),
+            buf.publish("out", text("b".repeat(20))),
             Err(PortFault::Refused(PublishError::QuotaExceeded)),
             "18 channel bytes + 20 body bytes, twice, is 76 against a 64-byte budget"
         );
@@ -735,7 +901,7 @@ mod tests {
         let mut buf = buffer(cap as u64);
         // Publish until refused, then check the survivors against the law.
         for i in 0..64 {
-            if buf.publish("out", format!("body-{i}")).is_err() {
+            if buf.publish("out", text(format!("body-{i}"))).is_err() {
                 break;
             }
         }
@@ -746,7 +912,7 @@ mod tests {
             .into_iter()
             .map(|p| BatchEntry {
                 channel: p.channel,
-                body: p.body.into(),
+                body: p.body,
                 urgency: p.urgency,
                 deliver_after: p.deliver_after,
             })
@@ -764,7 +930,7 @@ mod tests {
     fn a_body_at_the_cap_on_a_wire_port_is_refused_for_the_channel_bytes() {
         let mut buf = buffer(64);
         assert_eq!(
-            buf.publish("out", "a".repeat(64)),
+            buf.publish("out", text("a".repeat(64))),
             Err(PortFault::Refused(PublishError::QuotaExceeded))
         );
     }
@@ -776,8 +942,11 @@ mod tests {
     fn an_oversize_body_is_still_an_invalid_payload() {
         let mut buf = buffer(64);
         assert_eq!(
-            buf.publish("out", "a".repeat(65)),
-            Err(PortFault::Refused(PublishError::InvalidPayload))
+            buf.publish("out", text("a".repeat(65))),
+            Err(PortFault::Refused(PublishError::InvalidPayload(
+                "payload 65 bytes exceeds max 64".to_string()
+            ))),
+            "the refusal carries the gate's account"
         );
     }
 
@@ -787,11 +956,11 @@ mod tests {
     fn confined_publishes_are_not_charged_against_the_batch_budget() {
         let mut buf = buffer(64);
         for i in 0..8 {
-            assert_eq!(buf.publish("notes", format!("note-{i}")), Ok(()));
+            assert_eq!(buf.publish("notes", text(format!("note-{i}"))), Ok(()));
         }
         assert_eq!(buf.len(), 8);
         // And the wire port still has its whole budget.
-        assert_eq!(buf.publish("out", "a".repeat(40)), Ok(()));
+        assert_eq!(buf.publish("out", text("a".repeat(40))), Ok(()));
     }
 
     /// The middle arm of the three-way rule: a port the specification declares
@@ -800,7 +969,7 @@ mod tests {
     #[test]
     fn a_declared_unwired_port_drops_the_message_and_answers_ok() {
         let mut buf = buffer(1_024);
-        assert_eq!(buf.publish(UNWIRED, "hi".into()), Ok(()));
+        assert_eq!(buf.publish(UNWIRED, text("hi")), Ok(()));
         assert_eq!(buf.len(), 0, "a drop buffers nothing");
         let flush = buf.take();
         assert!(flush.publishes.is_empty());
@@ -821,23 +990,33 @@ mod tests {
         // both regressed to `Ok` would agree with each other and lose the
         // guarantee.
         assert_eq!(
-            unwired.publish(UNWIRED, "a".repeat(65)),
-            Err(PortFault::Refused(PublishError::InvalidPayload)),
+            unwired.publish(UNWIRED, text("a".repeat(65))),
+            Err(PortFault::Refused(PublishError::InvalidPayload(
+                "payload 65 bytes exceeds max 64".to_string()
+            ))),
             "an oversize body is invalid-payload on the unwired port"
         );
         assert_eq!(
-            bound.publish("out", "a".repeat(65)),
-            Err(PortFault::Refused(PublishError::InvalidPayload)),
+            bound.publish("out", text("a".repeat(65))),
+            Err(PortFault::Refused(PublishError::InvalidPayload(
+                "payload 65 bytes exceeds max 64".to_string()
+            ))),
             "and the same on the bound port beside it"
         );
         assert_eq!(
-            unwired.publish_deferred(UNWIRED, "hi".into(), u64::MAX),
-            Err(PortFault::Refused(PublishError::InvalidPayload)),
+            unwired.publish_deferred(UNWIRED, text("hi"), u64::MAX),
+            Err(PortFault::Refused(PublishError::InvalidPayload(format!(
+                "deliver_after {} ms is not a representable timestamp",
+                u64::MAX
+            )))),
             "an unrepresentable release time is an invalid payload on the unwired port"
         );
         assert_eq!(
-            bound.publish_deferred("out", "hi".into(), u64::MAX),
-            Err(PortFault::Refused(PublishError::InvalidPayload)),
+            bound.publish_deferred("out", text("hi"), u64::MAX),
+            Err(PortFault::Refused(PublishError::InvalidPayload(format!(
+                "deliver_after {} ms is not a representable timestamp",
+                u64::MAX
+            )))),
             "and the same on the bound port beside it"
         );
     }
@@ -848,7 +1027,7 @@ mod tests {
     #[test]
     fn a_declared_unwired_port_drops_a_deferred_publish_and_answers_ok() {
         let mut buf = buffer(1_024);
-        assert_eq!(buf.publish_deferred(UNWIRED, "hi".into(), 60_000), Ok(()));
+        assert_eq!(buf.publish_deferred(UNWIRED, text("hi"), 60_000), Ok(()));
         assert_eq!(buf.len(), 0, "a drop buffers nothing");
         assert_eq!(buf.dropped(), 1);
         let flush = buf.take();
@@ -863,10 +1042,10 @@ mod tests {
     fn a_dropped_publish_spends_the_entry_ceiling() {
         let mut buf = buffer(1_024);
         for _ in 0..brenn_budget::MAX_PUBLISHES_PER_ACTIVATION {
-            assert_eq!(buf.publish(UNWIRED, "hi".into()), Ok(()));
+            assert_eq!(buf.publish(UNWIRED, text("hi")), Ok(()));
         }
         assert_eq!(
-            buf.publish("notes", "hi".into()),
+            buf.publish("notes", text("hi")),
             Err(PortFault::Refused(PublishError::QuotaExceeded)),
             "the drops filled the ceiling a bound publish answers to"
         );
@@ -880,13 +1059,15 @@ mod tests {
     fn the_buffer_counts_the_publishes_it_dropped() {
         let mut buf = buffer(64);
         assert_eq!(buf.dropped(), 0);
-        assert_eq!(buf.publish("out", "hi".into()), Ok(()));
+        assert_eq!(buf.publish("out", text("hi")), Ok(()));
         assert_eq!(buf.dropped(), 0, "a bound publish is queued, not dropped");
-        assert_eq!(buf.publish(UNWIRED, "hi".into()), Ok(()));
+        assert_eq!(buf.publish(UNWIRED, text("hi")), Ok(()));
         assert_eq!(buf.dropped(), 1);
         assert_eq!(
-            buf.publish(UNWIRED, "a".repeat(65)),
-            Err(PortFault::Refused(PublishError::InvalidPayload)),
+            buf.publish(UNWIRED, text("a".repeat(65))),
+            Err(PortFault::Refused(PublishError::InvalidPayload(
+                "payload 65 bytes exceeds max 64".to_string()
+            ))),
             "an oversize body is refused before anything is dropped"
         );
         assert_eq!(buf.dropped(), 1);
@@ -905,11 +1086,11 @@ mod tests {
     fn an_undeclared_port_is_a_violation_not_a_refusal() {
         let mut buf = buffer(1_024);
         assert_eq!(
-            buf.publish(UNDECLARED, "hi".into()),
+            buf.publish(UNDECLARED, text("hi")),
             Err(PortFault::Undeclared("\"ghost\"".to_string()))
         );
         assert_eq!(
-            buf.publish_deferred(UNDECLARED, "hi".into(), 1),
+            buf.publish_deferred(UNDECLARED, text("hi"), 1),
             Err(PortFault::Undeclared("\"ghost\"".to_string()))
         );
         assert_eq!(buf.len(), 0);
@@ -921,7 +1102,7 @@ mod tests {
     fn a_hostile_port_name_is_capped_and_escaped_in_the_diagnostic() {
         let mut buf = buffer(1_024);
         let hostile = format!("\u{1b}[31m{}", "x".repeat(MAX_PORT_NAME_REPORT_BYTES * 2));
-        let Err(PortFault::Undeclared(report)) = buf.publish(&hostile, "hi".into()) else {
+        let Err(PortFault::Undeclared(report)) = buf.publish(&hostile, text("hi")) else {
             panic!("an undeclared port is a violation");
         };
         assert!(
@@ -938,10 +1119,10 @@ mod tests {
     fn the_call_ceiling_answers_before_the_vocabulary_does() {
         let mut buf = buffer(1_024);
         for _ in 0..brenn_budget::MAX_PUBLISH_CALLS_PER_ACTIVATION {
-            let _ = buf.publish(UNDECLARED, "hi".into());
+            let _ = buf.publish(UNDECLARED, text("hi"));
         }
         assert_eq!(
-            buf.publish(UNDECLARED, "hi".into()),
+            buf.publish(UNDECLARED, text("hi")),
             Err(PortFault::Refused(PublishError::QuotaExceeded))
         );
     }
@@ -957,7 +1138,7 @@ mod tests {
             Err(PortFault::Refused(DeferError::OutOfRange))
         );
         assert_eq!(
-            buf.defer_edit(UNWIRED, 0, Some("x".into()), None),
+            buf.defer_edit(UNWIRED, 0, Some(text("x")), None),
             Err(PortFault::Refused(DeferError::OutOfRange))
         );
     }
@@ -978,6 +1159,7 @@ mod tests {
     #[test]
     fn control_ops_spend_the_same_budget_as_publishes() {
         let mut buf = PublishBuffer::new(
+            "keeper",
             HashMap::from([("out".to_string(), spec(WIRE))]),
             vocabulary(),
             HashMap::from([("out".to_string(), 1_000_000)]),
@@ -989,9 +1171,205 @@ mod tests {
         );
         assert_eq!(buf.defer_cancel("out", 0), Ok(()));
         assert_eq!(
-            buf.defer_edit("out", 1, Some("x".repeat(30)), None),
+            buf.defer_edit("out", 1, Some(text("x".repeat(30))), None),
             Err(PortFault::Refused(DeferError::QuotaExceeded)),
             "18 + 18 + 30 charged bytes against a 64-byte budget"
         );
+    }
+
+    /// A buffer whose two bound ports each hold one parked message.
+    fn buffer_with_parked() -> PublishBuffer {
+        PublishBuffer::new(
+            "keeper",
+            HashMap::from([
+                ("out".to_string(), spec(WIRE)),
+                ("notes".to_string(), spec(LOCAL)),
+            ]),
+            vocabulary(),
+            HashMap::from([
+                ("out".to_string(), 1_000_000),
+                ("notes".to_string(), 1_000_000),
+            ]),
+            1_024,
+            HashMap::from([
+                ("out".to_string(), vec![Uuid::from_u128(1)]),
+                ("notes".to_string(), vec![Uuid::from_u128(2)]),
+            ]),
+        )
+    }
+
+    const NOT_UTF8: &str = "untyped body is not valid UTF-8";
+
+    fn wire_refusal<E>(variant: impl FnOnce(String) -> E) -> Result<(), PortFault<E>> {
+        Err(PortFault::Refused(variant(
+            WIRE_CARRIES_UNTYPED_TEXT_ONLY.to_owned(),
+        )))
+    }
+
+    #[test]
+    fn a_malformed_body_is_invalid_body_on_every_port_after_the_port_check() {
+        let mut buf = buffer(1_024);
+        let malformed = || parts(None, &[0xff]);
+        assert_eq!(
+            buf.publish(UNDECLARED, malformed()),
+            Err(PortFault::Undeclared("\"ghost\"".to_string())),
+            "the port is judged before the body"
+        );
+        for port in ["out", "notes", UNWIRED] {
+            assert_eq!(
+                buf.publish(port, malformed()),
+                Err(PortFault::Refused(PublishError::InvalidBody(
+                    NOT_UTF8.to_owned()
+                ))),
+                "{port}"
+            );
+        }
+        assert_eq!(
+            buf.publish("notes", parts(Some("text/"), b"x")),
+            Err(PortFault::Refused(PublishError::InvalidBody(
+                "invalid content type \"text/\": missing subtype".to_owned()
+            )))
+        );
+        assert_eq!(buf.len(), 0, "a refused body buffers nothing");
+        assert_eq!(buf.dropped(), 0, "and drops nothing");
+    }
+
+    #[test]
+    fn a_non_text_body_is_refused_on_every_bound_channel() {
+        let mut buf = buffer(1_024);
+        for port in ["out", "notes"] {
+            assert_eq!(
+                buf.publish(port, parts(Some("image/jpeg"), &[0xff, 0xd8])),
+                Err(PortFault::Refused(PublishError::TextOnlyChannel)),
+                "{port}"
+            );
+            assert_eq!(
+                buf.publish_deferred(port, parts(Some("image/jpeg"), &[0xff]), 60_000),
+                Err(PortFault::Refused(PublishError::TextOnlyChannel)),
+                "{port}, deferred"
+            );
+        }
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn typed_text_stays_on_the_page_and_keeps_its_type() {
+        let mut buf = buffer(1_024);
+        assert_eq!(
+            buf.publish("out", parts(Some("text/csv"), b"a,b")),
+            wire_refusal(PublishError::InvalidBody),
+            "the page's wire carries untyped text only"
+        );
+        assert_eq!(
+            buf.publish_with_urgency("out", parts(Some("text/csv"), b"a,b"), Urgency::High),
+            wire_refusal(PublishError::InvalidBody)
+        );
+        assert_eq!(buf.len(), 0, "the refused publish buffers nothing");
+        assert_eq!(
+            buf.publish("notes", parts(Some("text/csv"), b"a,b")),
+            Ok(())
+        );
+        assert_eq!(
+            buf.publish("out", parts(None, b"plain")),
+            Ok(()),
+            "untyped parts are untyped text, which the wire carries"
+        );
+        let flushed = buf.take().publishes;
+        assert_eq!(flushed.len(), 2);
+        assert_eq!(flushed[0].body.content_type(), Some("text/csv"));
+        assert_eq!(flushed[0].body.as_text(), Some("a,b"));
+        assert_eq!(flushed[1].body, MessageBody::text("plain"));
+    }
+
+    #[test]
+    fn the_body_is_judged_before_its_carriage_and_both_before_the_cap() {
+        let mut buf = buffer(8);
+        let oversize = vec![0xff; 9];
+        assert_eq!(
+            buf.publish("notes", parts(None, &oversize)),
+            Err(PortFault::Refused(PublishError::InvalidBody(
+                NOT_UTF8.to_owned()
+            ))),
+            "malformed before oversize"
+        );
+        assert_eq!(
+            buf.publish("notes", parts(Some("image/png"), &oversize)),
+            Err(PortFault::Refused(PublishError::TextOnlyChannel)),
+            "uncarriable before oversize"
+        );
+        assert_eq!(
+            buf.publish("out", parts(Some("text/csv"), &[b'a'; 9])),
+            wire_refusal(PublishError::InvalidBody),
+            "the wire's refusal before oversize"
+        );
+    }
+
+    #[test]
+    fn a_declared_unwired_port_builds_the_body_and_judges_no_carriage() {
+        let mut buf = buffer(1_024);
+        assert_eq!(
+            buf.publish(UNWIRED, parts(Some("image/jpeg"), &[0xff])),
+            Ok(()),
+            "a sink with no channel has nothing to judge carriage against"
+        );
+        assert_eq!(buf.dropped(), 1);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn a_refused_body_spends_its_call() {
+        let mut buf = buffer(1_024);
+        for _ in 0..brenn_budget::MAX_PUBLISH_CALLS_PER_ACTIVATION {
+            assert_eq!(
+                buf.publish("notes", parts(Some("image/jpeg"), &[0xff])),
+                Err(PortFault::Refused(PublishError::TextOnlyChannel))
+            );
+        }
+        assert_eq!(
+            buf.publish("notes", text("hi")),
+            Err(PortFault::Refused(PublishError::QuotaExceeded))
+        );
+    }
+
+    #[test]
+    fn an_edit_body_is_built_and_judged_after_the_index() {
+        let mut buf = buffer_with_parked();
+        assert_eq!(
+            buf.defer_edit("notes", 1, Some(parts(None, &[0xff])), None),
+            Err(PortFault::Refused(DeferError::OutOfRange)),
+            "the index is judged before the body"
+        );
+        assert_eq!(
+            buf.defer_edit("notes", 0, Some(parts(None, &[0xff])), None),
+            Err(PortFault::Refused(DeferError::InvalidBody(
+                NOT_UTF8.to_owned()
+            )))
+        );
+        assert_eq!(
+            buf.defer_edit("notes", 0, Some(parts(Some("image/jpeg"), &[0xff])), None),
+            Err(PortFault::Refused(DeferError::TextOnlyChannel))
+        );
+        assert_eq!(
+            buf.defer_edit("out", 0, Some(parts(Some("image/jpeg"), &[0xff])), None),
+            Err(PortFault::Refused(DeferError::TextOnlyChannel))
+        );
+        assert_eq!(
+            buf.defer_edit("out", 0, Some(parts(Some("text/csv"), b"a,b")), None),
+            wire_refusal(DeferError::InvalidBody)
+        );
+        assert_eq!(
+            buf.defer_edit("notes", 0, Some(parts(Some("text/csv"), b"a,b")), None),
+            Ok(())
+        );
+        assert_eq!(buf.defer_edit("out", 0, None, Some(60_000)), Ok(()));
+        let ops = buf.take().defer_ops;
+        assert_eq!(ops.len(), 2, "only the accepted edits are buffered");
+        let DeferOp::Edit {
+            body: Some(body), ..
+        } = &ops[0].kind
+        else {
+            panic!("the first accepted op is the typed edit: {:?}", ops[0].kind);
+        };
+        assert_eq!(body.content_type(), Some("text/csv"));
     }
 }

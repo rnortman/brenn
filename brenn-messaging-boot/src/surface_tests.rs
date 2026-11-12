@@ -658,7 +658,8 @@ fn a_surface_output_on_a_tools_address_panics() {
 #[test]
 #[should_panic(
     expected = "subscription channel \"ephemeral:protobar-demo\" is declared `non_text`, \
-                and a surface carries only text bodies"
+                and a surface carries only text bodies — the page does not yet hold non-text \
+                bodies at rest, and its wire is attach v4, which carries text only"
 )]
 fn a_surface_input_on_a_non_text_channel_panics() {
     let mut frames = ephem("protobar-demo");

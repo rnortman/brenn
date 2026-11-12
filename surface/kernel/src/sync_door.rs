@@ -51,6 +51,7 @@ use futures_channel::mpsc;
 
 use brenn_attach_client::driver::{flush_stamps, new_stamp};
 use brenn_attach_client::transport::clock::{Clock, epoch_ms, wall_now};
+use brenn_envelope::MessageBody;
 
 use crate::activation::ReadyActivation;
 use crate::front::InFlightSlot;
@@ -120,7 +121,7 @@ impl SyncDoor {
     /// page is already mutated by the time the effects are offered, so dropping
     /// them would leave a page whose state nothing on screen or on the wire
     /// reflects.
-    pub fn request(&self, instance: &str, port: &str, body: String) -> SyncAnswer {
+    pub fn request(&self, instance: &str, port: &str, body: MessageBody) -> SyncAnswer {
         // One reading for the whole stretch, as the loop's own activation pass
         // takes: assembly, the request envelope's `publish_ts` and the completion
         // are one commit and must agree about when now was.
@@ -249,7 +250,7 @@ impl SyncDoor {
     /// If no activation is on the stack. A call reaching the door outside one is
     /// refused at the seam (`not-permitted`), so arriving here means the seam's
     /// admission was bypassed.
-    pub fn call(&self, caller: &str, port: &str, payload: String) -> Option<SyncAnswer> {
+    pub fn call(&self, caller: &str, port: &str, body: MessageBody) -> Option<SyncAnswer> {
         let (target_instance, target_port) = {
             let page = self.page.borrow();
             let target = page.connect.bindings()?.call_target(caller, port)?;
@@ -266,7 +267,7 @@ impl SyncDoor {
             SyncCall {
                 instance: &target_instance,
                 port: &target_port,
-                body: &payload,
+                body: &body,
                 chain: &chain,
             },
             new_stamp(),

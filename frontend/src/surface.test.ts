@@ -17,10 +17,13 @@ import {
     cappedReload,
     installGlobalHandlers,
     loadKernel,
+    activationEntryBytes,
+    type Body,
     type ManifestComponent,
     processorStartInstances,
     startProcessors,
     type ModuleImporter,
+    type PortRefusal,
     readSurfaceManifest,
     renderStaticFailure,
     resetReloadCount,
@@ -373,6 +376,7 @@ describe("surface bootstrap page-input reads", () => {
                                 kind: "echo-stub",
                                 module: "/surface-static/brenn_echo_stub.js?v=build-xyz&instance=echo-stub",
                                 cores: ["/surface-static/echo-stub.core.wasm?v=build-xyz"],
+                                contract: "brenn:processor@0.1.0",
                             },
                         ],
                         withheld: [],
@@ -390,6 +394,7 @@ describe("surface bootstrap page-input reads", () => {
                 kind: "echo-stub",
                 module: "/surface-static/brenn_echo_stub.js?v=build-xyz&instance=echo-stub",
                 cores: ["/surface-static/echo-stub.core.wasm?v=build-xyz"],
+                contract: "brenn:processor@0.1.0",
             },
         ]);
     });
@@ -431,7 +436,12 @@ describe("surface bootstrap page-input reads", () => {
                     JSON.stringify({
                         kernel: "/surface-static/brenn_surface_kernel.js?v=b",
                         components: [
-                            { instance: "i", kind: "k", module: "/k.js" },
+                            {
+                                instance: "i",
+                                kind: "k",
+                                module: "/k.js",
+                                contract: "brenn:processor@0.1.0",
+                            },
                         ],
                         withheld: [],
                     }),
@@ -472,6 +482,25 @@ describe("surface bootstrap page-input reads", () => {
         expect(readSurfaceManifest()).toBeNull();
     });
 
+    it("manifest whose component entry names no contract → static failure", () => {
+        // The glue cannot tell the contracts apart, so a page that does not say
+        // which one an instance is on cannot build its import table at all.
+        expectConsoleError(/surface bootstrap failure/);
+        setPage(
+            METAS +
+                manifestScript(
+                    JSON.stringify({
+                        kernel: "/surface-static/brenn_surface_kernel.js?v=b",
+                        components: [
+                            { instance: "i", kind: "k", module: "/k.js", cores: [] },
+                        ],
+                        withheld: [],
+                    }),
+                ),
+        );
+        expect(readSurfaceManifest()).toBeNull();
+    });
+
     it("manifest with a malformed component entry → static failure, returns null", () => {
         expectConsoleError(/surface bootstrap failure/);
         setPage(
@@ -480,7 +509,13 @@ describe("surface bootstrap page-input reads", () => {
                     JSON.stringify({
                         kernel: "/surface-static/brenn_surface_kernel.js?v=b",
                         components: [
-                            { instance: "i", kind: 1, module: "x", cores: [] },
+                            {
+                                instance: "i",
+                                kind: 1,
+                                module: "x",
+                                cores: [],
+                                contract: "brenn:processor@0.1.0",
+                            },
                         ],
                         withheld: [],
                     }),
@@ -525,6 +560,7 @@ describe("surface bootstrap module loading", () => {
                     kind: "echo-stub",
                     module: "/x.js",
                     cores: [],
+                    contract: "brenn:processor@0.1.0",
                 },
             ]).kernel,
             importModule,
@@ -795,13 +831,16 @@ describe("surface processor bring-up", () => {
             default: async () => {},
             start: vi.fn(),
             brenn_processor_publish: vi.fn(
-                (_i: string, _p: string, _b: string, _u?: string) => "",
+                (_i: string, _p: string, _b: string, _u?: string) =>
+                    undefined as PortRefusal | undefined,
             ),
             brenn_processor_publish_deferred: vi.fn(
-                (_i: string, _p: string, _b: string, _d: bigint) => "",
+                (_i: string, _p: string, _b: string, _d: bigint) =>
+                    undefined as PortRefusal | undefined,
             ),
             brenn_processor_defer_cancel: vi.fn(
-                (_i: string, _p: string, _x: number) => "",
+                (_i: string, _p: string, _x: number) =>
+                    undefined as PortRefusal | undefined,
             ),
             brenn_processor_defer_edit: vi.fn(
                 (
@@ -810,11 +849,32 @@ describe("surface processor bring-up", () => {
                     _x: number,
                     _b?: string,
                     _d?: bigint,
-                ) => "",
+                ) => undefined as PortRefusal | undefined,
             ),
             brenn_processor_call: vi.fn(
                 (_i: string, _p: string, _y: string) =>
                     undefined as string | undefined,
+            ),
+            brenn_processor_publish_body: vi.fn(
+                (_i: string, _p: string, _b: Body, _u?: string) =>
+                    undefined as PortRefusal | undefined,
+            ),
+            brenn_processor_publish_deferred_body: vi.fn(
+                (_i: string, _p: string, _b: Body, _d: bigint) =>
+                    undefined as PortRefusal | undefined,
+            ),
+            brenn_processor_defer_edit_body: vi.fn(
+                (
+                    _i: string,
+                    _p: string,
+                    _x: number,
+                    _b?: Body,
+                    _d?: bigint,
+                ) => undefined as PortRefusal | undefined,
+            ),
+            brenn_processor_call_body: vi.fn(
+                (_i: string, _p: string, _b: Body) =>
+                    undefined as Body | undefined,
             ),
             brenn_processor_log: vi.fn(),
             brenn_processor_alert: vi.fn(),
@@ -822,7 +882,7 @@ describe("surface processor bring-up", () => {
                 (_i: string, _k: string) => undefined,
             ),
             brenn_processor_register: vi.fn(
-                (_i: string, _e: (a: string) => unknown) => true,
+                (_i: string, _e: (a: never) => unknown, _c: string) => true,
             ),
             brenn_processor_load_failed: vi.fn((_i: string, _d: string) => {}),
             brenn_processor_withheld: vi.fn((_i: string, _r: string) => {}),
@@ -984,6 +1044,7 @@ describe("surface processor bring-up", () => {
             // The core-URL path is pinned by its own cases below.
             module: PROC_MODULE,
             cores: [],
+            contract: "brenn:processor@0.1.0",
         };
     }
 
@@ -1006,6 +1067,7 @@ describe("surface processor bring-up", () => {
         if (call === undefined) {
             throw new Error(`no activation entry registered for ${instance}`);
         }
+        expect(call[2]).toBe("brenn:processor@0.1.0");
         return call[1] as (activation: string) => unknown;
     }
 
@@ -1036,6 +1098,141 @@ describe("surface processor bring-up", () => {
         expect(instantiate).toHaveBeenCalledTimes(4);
         expect(receive).toHaveBeenCalledTimes(4);
         expect(importModule).toHaveBeenCalledTimes(1);
+    });
+
+    it("brings a 0.2.0 instance up on the byte import table and entry", async () => {
+        const kernel = fakeKernel();
+        let imports: Record<string, Record<string, unknown>> = {};
+        const receive = vi.fn((_a: unknown): Body | undefined => ({
+            contentType: "application/octet-stream",
+            bytes: new Uint8Array([0xff, 0x00]),
+        }));
+        const instantiate = vi.fn(
+            (_g: unknown, table: Record<string, Record<string, unknown>>) => {
+                imports = table;
+                return { receive };
+            },
+        );
+        const importModule = vi.fn(async () => ({ instantiate }));
+
+        await startProcessors(
+            kernel as unknown as Parameters<typeof startProcessors>[0],
+            manifest([
+                { ...processorEntry("b1"), contract: "brenn:processor@0.2.0" },
+            ]),
+            ["b1"],
+            importModule as unknown as ModuleImporter,
+        );
+
+        const call = kernel.brenn_processor_register.mock.calls[0];
+        expect(call?.[0]).toBe("b1");
+        expect(call?.[2]).toBe("brenn:processor@0.2.0");
+        const entry = call?.[1] as unknown as (a: unknown) => unknown;
+        // The record goes to `receive` as the kernel built it, and the reply
+        // comes back as the glue's own object.
+        const activation = { ports: [], deferred: [], now: undefined, sync: "ask" };
+        const answer = entry(activation);
+        expect(receive).toHaveBeenCalledWith(activation);
+        expect(answer).toEqual({ reply: receive.mock.results[0]?.value });
+
+        const body: Body = { contentType: "text/csv", bytes: new Uint8Array([0x61]) };
+        const ports = imports["brenn:processor/ports"] as Record<
+            string,
+            (...args: unknown[]) => unknown
+        >;
+        const calls = imports["brenn:processor/calls"] as Record<
+            string,
+            (...args: unknown[]) => unknown
+        >;
+        ports.publish?.("memo", body);
+        ports.publishWithUrgency?.("memo", body, "high");
+        ports.publishDeferred?.("timer", body, 5n);
+        ports.deferEdit?.("timer", 0, body, undefined);
+        calls.call?.("peer", body);
+        expect(kernel.brenn_processor_publish_body.mock.calls).toEqual([
+            ["b1", "memo", body, undefined],
+            ["b1", "memo", body, "high"],
+        ]);
+        expect(kernel.brenn_processor_publish_deferred_body).toHaveBeenCalledWith(
+            "b1",
+            "timer",
+            body,
+            5n,
+        );
+        expect(kernel.brenn_processor_defer_edit_body).toHaveBeenCalledWith(
+            "b1",
+            "timer",
+            0,
+            body,
+            undefined,
+        );
+        expect(kernel.brenn_processor_call_body).toHaveBeenCalledWith(
+            "b1",
+            "peer",
+            body,
+        );
+        expect(kernel.brenn_processor_publish).not.toHaveBeenCalled();
+        expect(kernel.brenn_processor_call).not.toHaveBeenCalled();
+        // The interfaces both contracts share are the same entries.
+        expect(Object.keys(imports).sort()).toEqual([
+            "brenn:processor/alert",
+            "brenn:processor/calls",
+            "brenn:processor/config",
+            "brenn:processor/dom",
+            "brenn:processor/log",
+            "brenn:processor/page-dom",
+            "brenn:processor/ports",
+        ]);
+
+        kernel.brenn_processor_publish_body.mockReturnValueOnce({
+            tag: "invalid-body",
+            val: "why",
+        });
+        expect(() => ports.publish?.("memo", body)).toThrow(
+            expect.objectContaining({
+                payload: { tag: "invalid-body", val: "why" },
+            }),
+        );
+    });
+
+    it("fails an instance whose contract the page does not know", async () => {
+        expectConsoleError(/instance 'x1'.*unknown component contract/);
+        const kernel = fakeKernel();
+        const importModule = vi.fn(async () => ({ instantiate: vi.fn() }));
+
+        await startProcessors(
+            kernel as unknown as Parameters<typeof startProcessors>[0],
+            manifest([
+                { ...processorEntry("x1"), contract: "brenn:processor@9.9.9" },
+            ]),
+            ["x1"],
+            importModule as unknown as ModuleImporter,
+        );
+
+        expect(kernel.brenn_processor_register).not.toHaveBeenCalled();
+        expect(kernel.brenn_processor_load_failed).toHaveBeenCalledWith(
+            "x1",
+            expect.stringContaining(
+                "unknown component contract 'brenn:processor@9.9.9'",
+            ),
+        );
+    });
+
+    it("a 0.2.0 entry tells a returned err from a trap by its payload", () => {
+        const err = activationEntryBytes({
+            receive: () => {
+                throw { payload: { tag: "processing-failed", val: "nope" } };
+            },
+        });
+        expect(err({})).toBe("processing-failed: nope");
+        const trap = activationEntryBytes({
+            receive: () => {
+                throw new Error("unreachable");
+            },
+        });
+        expect(() => trap({})).toThrow("unreachable");
+        const none = activationEntryBytes({ receive: () => undefined });
+        expect(none({})).toBeUndefined();
     });
 
     it("compiles each kind's cores once and answers the glue by basename", async () => {
@@ -1352,7 +1549,8 @@ describe("surface processor bring-up", () => {
     it("delegates the deferred family and throws its refusals as defer-error", async () => {
         const kernel = fakeKernel();
         kernel.brenn_processor_defer_cancel = vi.fn(
-            (_i: string, _p: string, _x: number) => "out-of-range",
+            (_i: string, _p: string, _x: number) =>
+                ({ tag: "out-of-range" }) as PortRefusal | undefined,
         );
         let captured: Record<string, Record<string, unknown>> | undefined;
         const importModule = vi.fn(async () => ({
@@ -1420,10 +1618,7 @@ describe("surface processor bring-up", () => {
         // kernel's answer rather than a fixed set of its own.
         expect(() => ports.deferCancel("out", 7)).toThrowError(
             expect.objectContaining({
-                payload: {
-                    tag: "out-of-range",
-                    val: "payload refused by the page host",
-                },
+                payload: { tag: "out-of-range" },
             }) as Error,
         );
     });
@@ -1432,7 +1627,7 @@ describe("surface processor bring-up", () => {
         const kernel = fakeKernel();
         kernel.brenn_processor_publish = vi.fn(
             (_i: string, _p: string, _b: string, _u?: string) =>
-                "quota-exceeded",
+                ({ tag: "quota-exceeded" }) as PortRefusal | undefined,
         );
         let captured: Record<string, Record<string, unknown>> | undefined;
         const importModule = vi.fn(async () => ({
@@ -1460,24 +1655,24 @@ describe("surface processor bring-up", () => {
         // is the WIT variant name the guest sees.
         expect(() => ports.publish("out", "{}")).toThrowError(
             expect.objectContaining({
-                payload: {
-                    tag: "quota-exceeded",
-                    val: "payload refused by the page host",
-                },
+                payload: { tag: "quota-exceeded" },
             }) as Error,
         );
 
-        // Every thrown variant carries a string `val`, so a refusal whose WIT
-        // variant has a payload (`invalid-payload`) lowers instead of trapping.
+        // A refusal whose WIT variant has a payload carries the kernel's own
+        // account of it through to the guest, untouched.
         kernel.brenn_processor_publish = vi.fn(
             (_i: string, _p: string, _b: string, _u?: string) =>
-                "invalid-payload",
+                ({
+                    tag: "invalid-payload",
+                    val: "payload 9 bytes exceeds max 8",
+                }) as PortRefusal | undefined,
         );
         expect(() => ports.publish("out", "{}")).toThrowError(
             expect.objectContaining({
                 payload: {
                     tag: "invalid-payload",
-                    val: "payload refused by the page host",
+                    val: "payload 9 bytes exceeds max 8",
                 },
             }) as Error,
         );
@@ -1674,12 +1869,14 @@ describe("surface processor bring-up", () => {
                         kind: "counter",
                         module: "/missing.js",
                         cores: [],
+                        contract: "brenn:processor@0.1.0",
                     },
                     {
                         instance: "bad",
                         kind: "counter",
                         module: PROC_MODULE,
                         cores: ["/bad.core.wasm?v=b"],
+                        contract: "brenn:processor@0.1.0",
                     },
                     processorEntry("refused"),
                 ]),

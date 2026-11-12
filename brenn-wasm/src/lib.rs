@@ -44,7 +44,7 @@ use brenn_activation::WINDOW_DEPTH_CEILING;
 use brenn_activation::sync::CallDisposition;
 use brenn_common::sanitize_untrusted_str;
 use brenn_envelope::addressing::PROVIDER_CONCURRENCY_CEILING;
-use brenn_envelope::{BodyError, MessageBody, MessageEnvelope};
+use brenn_envelope::{GuestBody, MessageBody, MessageEnvelope};
 
 /// The grant vocabulary, re-exported: what a load spec grants, what this host
 /// links and what an operator writes are one set of words, and a caller
@@ -1418,57 +1418,6 @@ pub type HostDeferredEntry = brenn_activation::DeferredEntry<Arc<MessageEnvelope
 /// assume `ports.len() == 1`.
 pub type HostActivation = brenn_activation::Activation<Arc<MessageEnvelope>, Arc<MessageEnvelope>>;
 
-/// Lower a host activation to the `brenn:processor@0.1.0` carrier: each window
-/// envelope as its `envelope-json`, each parked message as its body text.
-///
-/// # Panics
-///
-/// On a non-text body in either place. Neither 0.1.0 carrier can represent one,
-/// and a 0.1.0 component bound where one can arrive is refused before it is
-/// delivered anything, so reaching it is a host bug.
-fn lower_v0_1(activation: HostActivation) -> brenn_activation::ProcessorActivation {
-    brenn_activation::Activation {
-        ports: activation
-            .ports
-            .into_iter()
-            .map(|pw| brenn_activation::PortWindow {
-                port: pw.port,
-                envelopes: pw.envelopes.iter().map(|e| e.to_envelope_json()).collect(),
-                new_from: pw.new_from,
-                dropped: pw.dropped,
-            })
-            .collect(),
-        deferred: activation
-            .deferred
-            .into_iter()
-            .map(|dw| brenn_activation::DeferredWindow {
-                port: dw.port,
-                entries: dw
-                    .entries
-                    .into_iter()
-                    .map(|e| brenn_activation::DeferredEntry {
-                        index: e.index,
-                        payload: e
-                            .payload
-                            .require_text_body("0.1.0 deferred-entry.payload")
-                            .to_owned(),
-                        deliver_after: e.deliver_after,
-                    })
-                    .collect(),
-            })
-            .collect(),
-        now: activation.now,
-        sync: activation.sync,
-    }
-}
-
-/// `processor.wit` types `dropped` as u32 while the carrier counts in u64.
-/// Saturate: the guest reads this as a gap signal, and a saturated count still
-/// says "you lost more than you can count".
-fn saturate_dropped(dropped: u64) -> u32 {
-    u32::try_from(dropped).unwrap_or(u32::MAX)
-}
-
 /// A body as the `brenn:processor@0.2.0` carrier holds it. The bytes are copied
 /// once, out of the body's shared allocation into the record the lowering
 /// hands to guest memory.
@@ -1498,7 +1447,7 @@ fn lower_v0_2(activation: HostActivation) -> bus_v0_2::Activation {
                     })
                     .collect(),
                 new_from: pw.new_from,
-                dropped: saturate_dropped(pw.dropped),
+                dropped: brenn_activation::saturate_dropped(pw.dropped),
             })
             .collect(),
         deferred: activation
@@ -1861,35 +1810,6 @@ impl CallRefusal {
             Self::InvalidBody(why) => calls_v0_2::CallError::InvalidBody(why),
             Self::TextOnlyPeer => calls_v0_2::CallError::TextOnlyPeer,
             Self::QuotaExceeded => calls_v0_2::CallError::QuotaExceeded,
-        }
-    }
-}
-
-/// A body as a guest handed it, before any check has run.
-///
-/// The `Host` impls of both contracts pass this through unbuilt, so a body is
-/// judged at one step of each port function's order and by one rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GuestBody {
-    /// A 0.1.0 payload: untyped text.
-    Text(String),
-    /// A 0.2.0 body: an optional content type and bytes.
-    Parts {
-        content_type: Option<String>,
-        bytes: Vec<u8>,
-    },
-}
-
-impl GuestBody {
-    /// The one place a guest's body becomes a [`MessageBody`]. Text cannot
-    /// fail; parts go through [`MessageBody::from_parts`].
-    fn build(self) -> Result<MessageBody, BodyError> {
-        match self {
-            Self::Text(text) => Ok(MessageBody::text(text)),
-            Self::Parts {
-                content_type,
-                bytes,
-            } => MessageBody::from_parts(content_type.as_deref(), &bytes),
         }
     }
 }
@@ -3319,6 +3239,143 @@ pub fn processor_component_imports(component_path: &Path) -> Vec<String> {
     )
 }
 
+/// The stage at which [`check_surface_component`] refused an artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceComponentStage {
+    /// The artifact is not a component, is not on `brenn:processor@0.2.0`, or
+    /// imports an interface name the surface host does not serve under it.
+    Name,
+    /// A function the artifact imports from a provisional interface does not
+    /// have the host's type.
+    ImportType,
+    /// The artifact's `receive` export does not have the host's type.
+    ExportType,
+}
+
+impl std::fmt::Display for SurfaceComponentStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Name => "by import name",
+            Self::ImportType => "by import type",
+            Self::ExportType => "by export type",
+        })
+    }
+}
+
+/// Why a surface kind's component is not one this host serves as
+/// `brenn:processor@0.2.0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceComponentRefusal {
+    /// Which check refused it.
+    pub stage: SurfaceComponentStage,
+    /// wasmtime's account, or the offending import name.
+    pub detail: String,
+}
+
+impl std::fmt::Display for SurfaceComponentRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refused {}: {}", self.stage, self.detail)
+    }
+}
+
+/// The versioned interface names a surface host serves under
+/// `brenn:processor@0.2.0`: the type-only imports and every interface a grant
+/// legal on a surface links under that contract.
+fn surface_v0_2_import_names() -> Vec<&'static str> {
+    let contract = ProcessorContract::V0_2;
+    let linked = ComponentGrant::ALL
+        .into_iter()
+        .filter(|grant| grant.illegal_on(ComponentHost::Surface).is_none())
+        .filter_map(move |grant| grant.wit_import(contract));
+    contract
+        .type_only_imports()
+        .iter()
+        .copied()
+        .chain(linked)
+        .collect()
+}
+
+/// Whether a surface kind's component is built against the shapes this host
+/// serves as `brenn:processor@0.2.0`: its import names, the types of the
+/// `ports` and `calls` functions it imports, and the type of its `receive`
+/// export. Compiles the component from `bytes`, the artifact's contents, and
+/// instantiates nothing. The caller reads the file, so an I/O failure is its to
+/// name and never a refusal.
+///
+/// The page's transpiled glue is generated from the artifact's own types and
+/// checks nothing against the host, so this is where an artifact built against
+/// a superseded shape of the provisional contract is refused rather than
+/// misread.
+pub fn check_surface_component(bytes: &[u8]) -> Result<(), SurfaceComponentRefusal> {
+    let refuse = |stage, detail: String| SurfaceComponentRefusal { stage, detail };
+    let mut cfg = Config::new();
+    pin_guest_feature_envelope(&mut cfg);
+    let engine = Engine::new(&cfg).unwrap_or_else(|e| {
+        panic!("failed to initialize wasmtime engine for a surface check: {e}")
+    });
+    let component = Component::new(&engine, bytes).map_err(|e| {
+        refuse(
+            SurfaceComponentStage::Name,
+            format!("the artifact is not a loadable component: {e}"),
+        )
+    })?;
+
+    let component_type = component.component_type();
+    let names: Vec<&str> = component_type
+        .imports(&engine)
+        .map(|(name, _)| name)
+        .collect();
+    if detect_contract(names.iter().copied()) != ProcessorContract::V0_2 {
+        return Err(refuse(
+            SurfaceComponentStage::Name,
+            format!(
+                "it does not import {}, so it is not built against {}",
+                ProcessorContract::V0_2_MARKER,
+                ProcessorContract::V0_2,
+            ),
+        ));
+    }
+    let served = surface_v0_2_import_names();
+    if let Some(name) = names.iter().find(|name| {
+        !served
+            .iter()
+            .any(|canonical| semver_compat_match(name, canonical))
+    }) {
+        return Err(refuse(
+            SurfaceComponentStage::Name,
+            format!(
+                "it imports {name:?}, which a surface host does not serve under {}; served: {}",
+                ProcessorContract::V0_2,
+                served.join(", "),
+            ),
+        ));
+    }
+
+    // TODO(stale-contract-import-side-fixture): no fixture on either host
+    // pins a refusal at this stage; only the export stage has one.
+    //
+    // The two provisional interfaces are linked with the backend's statically
+    // typed definitions, so `instantiate_pre` type-checks each function the
+    // artifact imports from them. Every other interface is stubbed untyped:
+    // those are not provisional, and no backend definition of `dom` exists to
+    // link.
+    let mut linker: Linker<ProcessorData> = Linker::new(&engine);
+    ports_v0_2::add_to_linker::<_, HasSelf<ProcessorData>>(&mut linker, |d| d)
+        .unwrap_or_else(|e| panic!("failed to add the 0.2.0 ports to a surface check: {e}"));
+    calls_v0_2::add_to_linker::<_, HasSelf<ProcessorData>>(&mut linker, |d| d)
+        .unwrap_or_else(|e| panic!("failed to add the 0.2.0 calls to a surface check: {e}"));
+    linker
+        .define_unknown_imports_as_traps(&component)
+        .map_err(|e| refuse(SurfaceComponentStage::ImportType, format!("{e:#}")))?;
+    let instance_pre = linker
+        .instantiate_pre(&component)
+        .map_err(|e| refuse(SurfaceComponentStage::ImportType, format!("{e:#}")))?;
+
+    processor_v0_2_bindings::ProcessorPre::new(instance_pre)
+        .map(|_| ())
+        .map_err(|e| refuse(SurfaceComponentStage::ExportType, format!("{e:#}")))
+}
+
 /// Version-strip, sort, and dedup a component's raw import names into the
 /// manifest profile shape.
 ///
@@ -3338,7 +3395,7 @@ fn normalize_import_names<'a>(raw: impl Iterator<Item = &'a str>) -> Vec<String>
 ///
 /// Splits at the *first* `@`: a legal WIT name carries at most one, after the
 /// interface segment, so there is no second occurrence to preserve.
-fn strip_import_version(name: &str) -> &str {
+pub fn strip_import_version(name: &str) -> &str {
     name.split_once('@').map_or(name, |(base, _)| base)
 }
 
@@ -4442,7 +4499,7 @@ impl ProcessorComponent {
         activation: HostActivation,
     ) -> wasmtime::Result<wasmtime::Result<Received>> {
         use processor_bindings::brenn::processor::types as wit;
-        let activation = lower_v0_1(activation);
+        let activation = activation.lower_v0_1();
         let wit_activation = wit::Activation {
             ports: activation
                 .ports
@@ -4451,7 +4508,7 @@ impl ProcessorComponent {
                     port: pw.port,
                     envelopes: pw.envelopes,
                     new_from: pw.new_from,
-                    dropped: saturate_dropped(pw.dropped),
+                    dropped: brenn_activation::saturate_dropped(pw.dropped),
                 })
                 .collect(),
             deferred: activation
@@ -6749,77 +6806,6 @@ mod processor_store_host_tests {
 // Direct trait-impl tests for `do_call` on ProcessorData: the host's three
 // dispositions for a named port (trap, `unwired`, reach the peer), the budget it
 // shares with publishes, and the `SyncAnswer` → `call-error` mapping.
-
-#[cfg(test)]
-mod lowering_tests {
-    use std::sync::Arc;
-
-    use super::{HostActivation, MessageBody, MessageEnvelope, lower_v0_1};
-
-    fn envelope(body: MessageBody) -> Arc<MessageEnvelope> {
-        let parsed: MessageEnvelope = serde_json::from_str(
-            r#"{"message_id":"00000000-0000-0000-0000-000000000001","source":"test","channel":"brenn:in","sender":"test-sender","publish_ts":"2026-01-01T00:00:00Z","body":"","urgency":"normal","envelope_type":"brenn"}"#,
-        )
-        .expect("a literal envelope parses");
-        Arc::new(MessageEnvelope { body, ..parsed })
-    }
-
-    fn activation(window: MessageBody, parked: MessageBody) -> HostActivation {
-        brenn_activation::Activation {
-            ports: vec![brenn_activation::PortWindow {
-                port: "in".to_string(),
-                envelopes: vec![envelope(window)],
-                new_from: 0,
-                dropped: 7,
-            }],
-            deferred: vec![brenn_activation::DeferredWindow {
-                port: "out".to_string(),
-                entries: vec![brenn_activation::DeferredEntry {
-                    index: 0,
-                    payload: envelope(parked),
-                    deliver_after: 42,
-                }],
-            }],
-            now: Some(9),
-            sync: None,
-        }
-    }
-
-    fn jpeg() -> MessageBody {
-        MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, 0xff])
-            .expect("a jpeg body is well formed")
-    }
-
-    /// A window envelope crosses as its `envelope-json` and a parked message as
-    /// its body text; a typed text body as exactly its text, without its type.
-    #[test]
-    fn the_0_1_lowering_is_the_envelope_json_and_the_body_text() {
-        let markdown = MessageBody::from_parts(Some("text/markdown"), b"# hi")
-            .expect("a markdown body is well formed");
-        let lowered = lower_v0_1(activation(markdown.clone(), markdown.clone()));
-        assert_eq!(
-            lowered.ports[0].envelopes,
-            vec![envelope(markdown).to_envelope_json()]
-        );
-        assert_eq!(lowered.ports[0].dropped, 7);
-        assert_eq!(lowered.deferred[0].port, "out");
-        assert_eq!(lowered.deferred[0].entries[0].payload, "# hi");
-        assert_eq!(lowered.deferred[0].entries[0].deliver_after, 42);
-        assert_eq!(lowered.now, Some(9));
-    }
-
-    #[test]
-    #[should_panic(expected = "0.1.0 envelope-json")]
-    fn the_0_1_lowering_panics_on_a_non_text_window_body() {
-        let _ = lower_v0_1(activation(jpeg(), MessageBody::text("parked")));
-    }
-
-    #[test]
-    #[should_panic(expected = "0.1.0 deferred-entry.payload")]
-    fn the_0_1_lowering_panics_on_a_non_text_parked_body() {
-        let _ = lower_v0_1(activation(MessageBody::text("window"), jpeg()));
-    }
-}
 
 #[cfg(test)]
 mod epoch_extension_tests {

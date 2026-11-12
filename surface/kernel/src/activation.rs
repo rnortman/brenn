@@ -48,14 +48,13 @@ mod tests;
 use std::collections::{BTreeMap, HashMap};
 
 use brenn_activation::schedule::{MountDebt, readiness};
+use brenn_activation::{Activation, DeferredEntry, DeferredWindow, PortWindow};
 use brenn_attach_client::publish::DeferredViews;
 use brenn_attach_client::router::{LocalRouter, Origin, PlanePolicy};
 use brenn_attach_client::subs::SubscriptionDepths;
-use brenn_envelope::MessageEnvelope;
+use brenn_envelope::{GuestBody, MessageBody, MessageEnvelope};
 use brenn_queue::CursorOverflow;
-use brenn_surface_contract::{
-    Activation, ActivationError, DeferredEntry, DeferredWindow, PortWindow,
-};
+use brenn_surface_contract::ActivationError;
 use brenn_surface_schema::NoiseLevel;
 use uuid::Uuid;
 
@@ -165,6 +164,12 @@ pub struct ActivationCtx<'a, P> {
     pub now_ms: u64,
 }
 
+/// One activation as the page assembles it: the store's envelopes in every
+/// window and each parked message's body, lowered for the guest's contract only
+/// where the entry is called ([`Activation::lower_v0_1`], and the wasm build's JS
+/// crossing).
+pub type PageActivation = Activation<MessageEnvelope, MessageBody>;
+
 /// How an invoked activation entry finished.
 ///
 /// Three outcomes, not two, because err and trap are different facts about the
@@ -176,15 +181,18 @@ pub struct ActivationCtx<'a, P> {
 /// The kernel never parses it — every err is treated identically — but it is the
 /// only answer anyone has to "failed *how*?", so it rides through to the
 /// diagnostic event rather than being dropped at the boundary that observed it.
+///
+/// `R` is the reply: the component's own [`GuestBody`] as the entry returned
+/// it, and the [`MessageBody`] it built into once the completion ruled on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActivationOutcome {
+pub enum ActivationOutcome<R = MessageBody> {
     /// Returned ok, with the reply a sync-call activation's entry answered its
     /// caller with. The buffer flushes atomically, in call order.
     ///
     /// `None` is ordinary completion and the only shape an async activation can
     /// finish in — a reply nobody asked for is a contract break, caught at the
     /// completion, which is the one seam every invocation of this page reaches.
-    Ok(Option<String>),
+    Ok(Option<R>),
     /// Returned err, with the component's description of why. The buffer is
     /// discarded and a failure is counted; the instance keeps running and keeps
     /// being delivered. A failed activation is not a death — backend parity.
@@ -194,6 +202,24 @@ pub enum ActivationOutcome {
     /// poisoned, so nothing further is delivered to it. Terminal for that one
     /// instance, never page death.
     Trap(String),
+}
+
+impl ActivationOutcome<GuestBody> {
+    /// The outcome with its reply built into a [`MessageBody`]. A reply that does
+    /// not build is the component's malformed answer, and a trap.
+    pub fn built(self) -> ActivationOutcome {
+        match self {
+            Self::Ok(None) => ActivationOutcome::Ok(None),
+            Self::Ok(Some(reply)) => match reply.build() {
+                Ok(body) => ActivationOutcome::Ok(Some(body)),
+                Err(err) => {
+                    ActivationOutcome::Trap(format!("receive replied with an invalid body: {err}"))
+                }
+            },
+            Self::Err(err) => ActivationOutcome::Err(err),
+            Self::Trap(reason) => ActivationOutcome::Trap(reason),
+        }
+    }
 }
 
 /// One activation, ready to invoke: which instance, what it sees, the buffer its
@@ -209,7 +235,7 @@ pub struct ReadyActivation {
     /// instance unmounted and mounted again under the same id is a different
     /// component with the same spelling.
     pub generation: u64,
-    pub activation: Activation,
+    pub activation: PageActivation,
     pub buffer: PublishBuffer,
     pub drops: DropVerdicts,
 }
@@ -652,7 +678,7 @@ impl Schedules {
             // context, and nothing can have been passed unserved.
             ports.push(PortWindow {
                 port: port.to_string(),
-                envelopes: vec![request.to_envelope_json()],
+                envelopes: vec![request],
                 new_from: 0,
                 dropped: 0,
             });
@@ -779,7 +805,7 @@ impl Schedules {
     fn seed_buffer<P>(
         &self,
         instance: &str,
-        ports: &[PortWindow],
+        ports: &[PortWindow<MessageEnvelope>],
         deferred_ids: HashMap<String, Vec<Uuid>>,
         ctx: &ActivationCtx<'_, P>,
     ) -> PublishBuffer {
@@ -816,6 +842,7 @@ impl Schedules {
             );
         }
         PublishBuffer::new(
+            instance,
             outputs,
             ctx.bindings.declared_out_ports(instance),
             sink_mt,
@@ -888,7 +915,7 @@ fn binding_noise(bindings: &AppliedBindings, instance: &str, port: &str) -> Opti
 fn window_ports<P>(
     instance: &str,
     ctx: &mut ActivationCtx<'_, P>,
-) -> (Vec<PortWindow>, Vec<DropCharge>) {
+) -> (Vec<PortWindow<MessageEnvelope>>, Vec<DropCharge>) {
     // Lifted out first so the loop below can borrow the stores; cloning the whole
     // table instead would make every activation pay for every sibling's wiring.
     let inputs: Vec<(String, String, SubscriptionDepths, NoiseLevel)> = ctx
@@ -932,21 +959,13 @@ fn window_ports<P>(
                 announced: served.dropped,
             });
         }
-        // The kernel holds decoded envelopes upstream of windowing and encodes
-        // here, at the one point a window is built, so a component is handed the
-        // `envelope-json` its world declares rather than a nested object.
-        // TODO(surface-envelope-json-memo): a served window is retained context
-        // followed by what is new, so the retained prefix is re-encoded on every
-        // activation and once per subscribing instance.
+        // Cloning an envelope shares its body's bytes; the encoding a guest reads
+        // is made where the entry is called, by its contract.
         ports.push(PortWindow {
             port,
             new_from: u32::try_from(served.new_from)
                 .expect("surface client: a window's depth is a config-bounded page-memory value"),
-            envelopes: served
-                .envelopes
-                .iter()
-                .map(MessageEnvelope::to_envelope_json)
-                .collect(),
+            envelopes: served.envelopes,
             dropped: served.dropped,
         });
     }
@@ -967,7 +986,7 @@ fn window_ports<P>(
 fn deferred_windows<P: PlanePolicy>(
     instance: &str,
     ctx: &ActivationCtx<'_, P>,
-) -> (Vec<DeferredWindow>, HashMap<String, Vec<Uuid>>) {
+) -> (Vec<DeferredWindow<MessageBody>>, HashMap<String, Vec<Uuid>>) {
     let mut windows = Vec::new();
     let mut ids = HashMap::new();
     for binding in ctx.bindings.outputs_of(instance) {
@@ -980,7 +999,7 @@ fn deferred_windows<P: PlanePolicy>(
             ctx.router
                 .parked_for(&*ctx.stores, &binding.channel, Origin::Sub(instance))
         };
-        let (entries, port_ids): (Vec<DeferredEntry>, Vec<Uuid>) = parked
+        let (entries, port_ids): (Vec<DeferredEntry<MessageBody>>, Vec<Uuid>) = parked
             .into_iter()
             .enumerate()
             .map(|(index, entry)| {
@@ -990,18 +1009,8 @@ fn deferred_windows<P: PlanePolicy>(
                             "surface client: a deferred set is bounded by its channel's depth",
                         ),
                         // The body, not the envelope: what a component gets back
-                        // is what it handed over, on every hosting. The 0.1.0
-                        // payload is a string; a page never holds a non-text
-                        // parked body, since the page is on v4 and a page-local
-                        // non-text body is refused before it is buffered.
-                        payload: match entry.body.as_text() {
-                            Some(text) => text.to_owned(),
-                            None => panic!(
-                                "surface client: the 0.1.0 deferred-entry payload cannot carry a \
-                                 non-text body ({})",
-                                entry.body.summary()
-                            ),
-                        },
+                        // is what it handed over, on every hosting.
+                        payload: entry.body,
                         deliver_after: entry.deliver_after,
                     },
                     entry.message_id,

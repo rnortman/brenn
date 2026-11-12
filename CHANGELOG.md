@@ -4,6 +4,23 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **For WASM component authors: the surface host serves the provisional
+  `brenn:processor@0.2.0` beside 0.1.0.** A page-hosted 0.2.0 kind is handed
+  each message as a header plus the body's bytes and content type, as on the
+  backend. On a page it carries typed text on a page-local channel with its
+  type, and any body in a sync call and reply between two 0.2.0 kinds. A port
+  bound to a channel that leaves the page carries untyped text only: a typed
+  text body there is refused with `invalid-body`, a non-text one with
+  `text-only-channel`. No non-text body is held at rest on any channel a
+  surface binds yet. The server type-checks a 0.2.0 surface kind's artifact
+  against the shapes it serves: one built against a superseded shape is
+  withheld under a bundle mount and a boot refusal under brenn's own. The
+  page manifest names each kind's contract. A brenn whose surfaces
+  instantiate any 0.1.0 kind names those kinds in one `warn!` at boot and
+  after each applied reload.
+- A page-hosted component's refused publish, edit or call now hands the
+  guest the refusal's diagnostic (`invalid-payload`, `invalid-body`), as the
+  backend does.
 - A page-hosted component's oversize publish is refused with
   `invalid-payload` and no longer terminates the instance. Before, the
   refusal reached a `brenn:processor@0.1.0` guest with no payload, the
@@ -34,9 +51,8 @@ All notable changes to Brenn are documented here.
   refusals a 0.2.0 guest can draw: `invalid-body`, `text-only-channel`,
   `text-only-peer`. In a sync call between contracts, a 0.2.0 callee may
   reply with a non-text body to anyone; a 0.1.0 caller handed such a reply
-  traps, and the callee is unaffected. The guest SDK and the surface host do
-  not serve 0.2.0 yet: a 0.2.0 component uses raw bindings, and a surface
-  kind built against 0.2.0 is withheld under a bundle mount. **0.2.0 is
+  traps, and the callee is unaffected. The guest SDK does not serve 0.2.0
+  yet: a 0.2.0 component uses raw bindings. **0.2.0 is
   provisional:** brenn makes no compatibility promise for it yet; it may be
   replaced by a different contract or withdrawn in any release, with no dual
   period; a component that must keep running across brenn releases stays on

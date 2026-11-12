@@ -126,7 +126,10 @@ interface ports {
         /// string.
         invalid-payload(string),
         /// The body is malformed: the content type is not a well-formed media
-        /// type, or a text body is not UTF-8. Diagnostic string.
+        /// type, or a text body is not UTF-8. On a surface, also a well-formed
+        /// typed text body on a port bound to a channel that leaves the page,
+        /// whose wire carries untyped text only; the diagnostic says which.
+        /// Diagnostic string.
         invalid-body(string),
         /// The body is not text and the channel bound to `port` is not
         /// declared to carry non-text bodies. Nothing is buffered.
@@ -147,7 +150,9 @@ interface ports {
     ///
     /// The checks run in a fixed order: the call budget; the port (undeclared
     /// traps); the output ACL; the body (`invalid-body`); whether the channel
-    /// may carry it (`text-only-channel`); then the size cap and budgets. A
+    /// may carry it (`text-only-channel`; on a surface, `invalid-body` for a
+    /// typed text body on a port bound to a channel that leaves the page, as
+    /// that variant says); then the size cap and budgets. A
     /// declared, unwired port checks the body but has no channel to judge it
     /// against.
     publish: func(port: string, body: body) -> result<_, publish-error>;

@@ -197,8 +197,8 @@ fn a_link_endpoint_carries_its_bindings_non_text() {
 fn surface_refusal(port: &str) -> String {
     format!(
         "the `{port}` port of instance `widget` of surface `alice_pod` states `non_text`: a \
-         surface port carries only text — the surface host serves the string component \
-         contract and the page's wire carries text frames — so it can be bound to no channel \
+         surface port carries only text — the page does not yet hold non-text bodies at rest, \
+         and its wire is attach v4, which carries text only — so it can be bound to no channel \
          that may carry non-text bodies"
     )
 }

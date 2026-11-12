@@ -40,6 +40,7 @@ function manifest(): SurfaceManifest {
         module: KIND_MODULE,
         // The core-URL path is pinned in `surface.test.ts`.
         cores: [],
+        contract: "brenn:processor@0.1.0",
     };
     return {
         kernel: "/surface-static/brenn_surface_kernel.js?v=b",

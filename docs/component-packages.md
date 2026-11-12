@@ -170,13 +170,33 @@ What a 0.2.0 author relies on:
   caller cannot read that reply, so it is the *caller's* activation that
   traps, naming its `call` port and the peer. A typed text reply reaches a
   0.1.0 caller as its text, as a typed text message does on a channel.
+- **On a surface.** The surface host serves 0.2.0 beside 0.1.0, provisional
+  as on the backend; the page manifest names each kind's contract and the
+  page brings each instance up on its own contract's imports. What a
+  page-hosted 0.2.0 kind carries today:
+  - typed text on a page-local (`local:`) channel, with its type;
+  - any body, text or not, typed or not, in a sync call and its reply between
+    two 0.2.0 kinds;
+  - untyped text only on a port bound to a channel that leaves the page. A
+    typed text body there is refused with `invalid-body`, whose diagnostic
+    says the page's wire carries untyped text only; nothing is sent. A
+    non-text body is `text-only-channel`, as on any text-only channel;
+  - no non-text body at rest on any channel yet: a surface binding may not
+    state `non_text` (`docs/message-bus.md` §2.1).
+
+  The server holds a 0.2.0 kind's artifact to the shapes it serves before
+  serving it, because the page's transpiled glue checks nothing against the
+  host: the server holds its import names to the ones a surface host
+  serves, and wasmtime type-checks its `ports` and `calls` imports and its
+  `receive` export. An artifact built against a superseded
+  provisional shape is **withheld** under a bundle mount, by the rule above
+  for a record it does not read, with a reason naming the kind, the contract
+  and the check's account; under brenn's own mount it is a boot refusal. An
+  artifact the server cannot read is a broken install and fatal under any
+  mount.
 - **Not served yet:** the guest SDK (`brenn-guest`) builds against 0.1.0 only,
   so a 0.2.0 component uses raw bindings over both WIT files, `processor.wit`
-  first, with the world `brenn:processor/processor@0.2.0`; and the surface
-  host serves 0.1.0 only. A surface kind whose manifest imports
-  `brenn:processor/bus` is **withheld** under a bundle mount, by the rule
-  above for a record it does not read, with a reason naming the contract, and
-  is a boot refusal under brenn's own mount.
+  first, with the world `brenn:processor/processor@0.2.0`.
 
 A backend that loads any 0.1.0 artifact says so in one `warn!` at boot and
 after each applied reload, naming them. It names no removal release: the

@@ -396,3 +396,35 @@ fn the_parsed_document_is_kept() {
     assert_eq!(applied.document().v, BINDINGS_DOCUMENT_VERSION);
     assert_eq!(applied.document().subscriptions.len(), 3);
 }
+
+#[test]
+fn carriage_refusal_judges_the_body_against_the_channel() {
+    use super::{CarriageRefusal, carriage_refusal};
+    use brenn_envelope::MessageBody;
+
+    const LOCAL: &str = "local:page/notes";
+    let untyped = MessageBody::text("a,b");
+    let typed = MessageBody::from_parts(Some("text/csv"), b"a,b").expect("typed text");
+    let binary = MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8]).expect("binary");
+
+    for channel in [LOCAL, WIRE, OTHER_WIRE] {
+        assert_eq!(carriage_refusal(channel, &untyped), None, "{channel}");
+    }
+    assert_eq!(carriage_refusal(LOCAL, &typed), None);
+    for channel in [WIRE, OTHER_WIRE] {
+        assert_eq!(
+            carriage_refusal(channel, &typed),
+            Some(CarriageRefusal::WireCarriesUntypedTextOnly),
+            "{channel}"
+        );
+    }
+    // A non-text body goes nowhere, and its refusal names the body, not the
+    // wire, on a wire channel too.
+    for channel in [LOCAL, WIRE, OTHER_WIRE] {
+        assert_eq!(
+            carriage_refusal(channel, &binary),
+            Some(CarriageRefusal::TextOnlyChannel),
+            "{channel}"
+        );
+    }
+}

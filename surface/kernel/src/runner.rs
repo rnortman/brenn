@@ -86,9 +86,11 @@ use brenn_attach_client::TransportConnector;
 use brenn_attach_client::conn::ConnConfig;
 use brenn_attach_client::driver::{AttachDriver, DriverStep, IoEvent};
 use brenn_attach_client::transport::clock::{checked_epoch_ms, epoch_ms, wall_now};
-use brenn_surface_contract::{Activation, MOUNT_SYNC_PORT};
+use brenn_envelope::grants::ProcessorContract;
+use brenn_envelope::{GuestBody, MessageBody};
+use brenn_surface_contract::MOUNT_SYNC_PORT;
 
-use crate::activation::{ActivationOutcome, ReadyActivation};
+use crate::activation::{ActivationOutcome, PageActivation, ReadyActivation};
 use crate::command::Command;
 use crate::front::{
     ActivationEntry, AlertCommand, EFFECTS_CHANNEL_CAPACITY, FrontChannels, PublishCommand,
@@ -118,9 +120,13 @@ pub enum RunnerCommand {
     ///
     /// `mount` is the rendering instance's first call: the loop invokes the
     /// entry once on the reserved mount port as soon as it is installed.
+    ///
+    /// `contract` is the one the entry speaks, which the page's decisions about
+    /// what this instance can be handed read.
     RegisterActivation {
         instance: String,
         entry: ActivationEntry,
+        contract: ProcessorContract,
         mount: bool,
     },
     /// Withdraw `instance`'s activation entry.
@@ -248,7 +254,7 @@ struct Invoked {
     instance: String,
     /// Which registration of that instance ran, carried back on the completion.
     generation: u64,
-    outcome: ActivationOutcome,
+    outcome: ActivationOutcome<GuestBody>,
     buffer: PublishBuffer,
     /// The committed turns of the peers this activation called, in the order the
     /// page took them. Empty for an activation that called nobody, and always
@@ -758,12 +764,13 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     ///
     /// Answers the effects and whether the mount is still owed.
     fn mount_activation(&self, instance: &str, now: Millis, now_ms: u64) -> (Vec<Effect>, bool) {
+        let body = MessageBody::text(MOUNT_REQUEST_BODY);
         let (dispatch, mut effects) = turn::dispatch_sync(
             &mut self.page.borrow_mut(),
             crate::outward::SyncCall {
                 instance,
                 port: MOUNT_SYNC_PORT,
-                body: MOUNT_REQUEST_BODY,
+                body: &body,
                 // The mount is the page's own cause, not a peer's: nothing is on
                 // the stack above it, so it is judged by the page-wide
                 // re-entrancy rule like a gesture.
@@ -863,9 +870,9 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     fn invoke(
         &self,
         instance: &str,
-        activation: &Activation,
+        activation: &PageActivation,
         buffer: PublishBuffer,
-    ) -> (ActivationOutcome, PublishBuffer, Vec<Effect>) {
+    ) -> (ActivationOutcome<GuestBody>, PublishBuffer, Vec<Effect>) {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let entries = self.entries.borrow();
@@ -1028,6 +1035,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             RunnerCommand::RegisterActivation {
                 instance,
                 entry,
+                contract,
                 mount,
             } => {
                 // Stored before the page is told, so an activation dispatched on
@@ -1037,6 +1045,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                 self.entries.borrow_mut().insert(instance.clone(), entry);
                 self.turn(Input::ActivationRegistered {
                     instance: instance.clone(),
+                    contract,
                 })
                 .await;
                 if mount {
@@ -1247,7 +1256,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
 /// an activation whose entry vanished did not return ok. The page absorbs this
 /// one anyway (the mount is gone, so the generation no longer matches), which is
 /// what makes reporting it as a trap free of consequence beyond the log.
-fn missing_entry_trap() -> ActivationOutcome {
+fn missing_entry_trap() -> ActivationOutcome<GuestBody> {
     ActivationOutcome::Trap(
         "activation entry deregistered between assembly and invocation".to_string(),
     )
@@ -1260,9 +1269,9 @@ pub(crate) fn invoke_shared(
     entries: &SharedEntries,
     slot: &crate::front::InFlightSlot,
     instance: &str,
-    activation: &Activation,
+    activation: &PageActivation,
     buffer: PublishBuffer,
-) -> (ActivationOutcome, PublishBuffer, Vec<Effect>) {
+) -> (ActivationOutcome<GuestBody>, PublishBuffer, Vec<Effect>) {
     let entries = entries.borrow();
     match entries.get(instance) {
         Some(entry) => invoke_wasm(entry, activation, slot, instance, buffer),
@@ -1292,17 +1301,19 @@ pub(crate) fn invoke_shared(
 #[cfg(not(target_arch = "wasm32"))]
 fn invoke_native(
     entry: &ActivationEntry,
-    activation: &Activation,
+    activation: &PageActivation,
     mut buffer: PublishBuffer,
-) -> (ActivationOutcome, PublishBuffer) {
+) -> (ActivationOutcome<GuestBody>, PublishBuffer) {
+    // Every native entry is on the string contract.
+    let activation = activation.lower_v0_1();
     // `AssertUnwindSafe`: the buffer may be left half-filled by a panicking entry,
     // which is exactly the state the trap path is built for — the page discards it
     // whole. Nothing observes a partially-published buffer.
     let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        entry(activation, &mut buffer)
+        entry(&activation, &mut buffer)
     }));
     let outcome = match called {
-        Ok(Ok(reply)) => ActivationOutcome::Ok(reply),
+        Ok(Ok(reply)) => ActivationOutcome::Ok(reply.map(GuestBody::Text)),
         Ok(Err(err)) => ActivationOutcome::Err(err),
         Err(payload) => ActivationOutcome::Trap(unwind_message(payload)),
     };
@@ -1342,11 +1353,11 @@ fn unwind_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(target_arch = "wasm32")]
 fn invoke_wasm(
     entry: &ActivationEntry,
-    activation: &Activation,
+    activation: &PageActivation,
     slot: &crate::front::InFlightSlot,
     instance: &str,
     buffer: PublishBuffer,
-) -> (ActivationOutcome, PublishBuffer, Vec<Effect>) {
+) -> (ActivationOutcome<GuestBody>, PublishBuffer, Vec<Effect>) {
     crate::front::invoke_over_stack(slot, instance, buffer, || entry(activation))
 }
 

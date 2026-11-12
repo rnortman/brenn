@@ -64,6 +64,11 @@ struct ManifestComponent {
     /// fetch, and the page has to have compiled every core before the first
     /// activation.
     cores: Vec<String>,
+    /// The component contract the kind's artifact is built against, as its
+    /// displayed name (`brenn:processor@0.1.0` or `brenn:processor@0.2.0`). The
+    /// page builds the instance's imports and activation entry in that
+    /// contract's shape and registers the instance under it.
+    contract: String,
 }
 
 /// The transpiled module URL for one declared instance.
@@ -149,6 +154,10 @@ pub async fn surface_page(
             kind: entry.kind.clone(),
             module: module_url(entry, build_id),
             cores: core_urls(&entry.kind, &roots, build_id),
+            contract: roots
+                .kind_contract(&entry.kind)
+                .expect("a served kind has a root, and every root carries its contract")
+                .to_string(),
         });
     }
     let manifest = SurfaceManifest {
@@ -517,6 +526,10 @@ mod tests {
             "missing manifest component instance: {body}"
         );
         assert!(
+            body.contains(r#""contract":"brenn:processor@0.1.0""#),
+            "missing manifest component contract: {body}"
+        );
+        assert!(
             body.contains(r#""kind":"echo-stub""#),
             "missing manifest component kind: {body}"
         );
@@ -546,6 +559,31 @@ mod tests {
         assert!(
             body.contains(r#"<body data-skin="bench" data-theme="dark">"#),
             "missing body data-skin/data-theme stamps: {body}"
+        );
+    }
+
+    /// A kind on the byte-carrying contract is named so in the manifest, which
+    /// is what selects its import table and entry on the page.
+    #[tokio::test]
+    async fn the_manifest_names_a_byte_contract_kinds_contract() {
+        let (router, _db, token, state) = surface_router_with_state(deskbar(vec![])).await;
+        state.set_surface_roots(std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
+            withheld: Default::default(),
+            kernel: Some(brenn_surface_server::KernelRoot::for_test("/surface")),
+            kinds: [(
+                "echo-stub".to_string(),
+                brenn_surface_server::KindRoot::for_test_with_contract(
+                    "/surface",
+                    brenn_envelope::grants::ProcessorContract::V0_2,
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        }));
+        let body = body_string(get_surface(&router, "deskbar", &token).await.into_body()).await;
+        assert!(
+            body.contains(r#""contract":"brenn:processor@0.2.0""#),
+            "missing the 0.2.0 contract: {body}"
         );
     }
 

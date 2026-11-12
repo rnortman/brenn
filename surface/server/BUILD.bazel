@@ -17,6 +17,7 @@ FIRST_PARTY_DEPS = [
     "//brenn-lib",
     "//brenn-messaging",
     "//brenn-messaging-store",
+    "//brenn-wasm",
     "//surface/contract",
     "//surface/schema",
 ]
@@ -50,7 +51,9 @@ rust_test(
     crate = ":server",
     crate_features = ["testutils"],
     # One asset-validation test reads the shipped store-rt component to pin its
-    # own premise — that the artifact really does import `brenn:processor/store`.
+    # own premise — that the artifact really does import `brenn:processor/store`;
+    # the byte-contract tests install the bytes fixture and the stale one as
+    # kinds, so the type check runs over real artifacts.
     # Tests reach guest components at `brenn-wasm/target/components/`, relative
     # to the runfiles root. The emitter-parity test reaches the record emitter
     # and the library it sources the same way, and hands what it writes to the
@@ -58,15 +61,15 @@ rust_test(
     # hand-held against the source, like the other fifteen.
     data = [
         "//bazel/wasm:wit_lib.sh",
+        "//brenn-wasm:fixture_processor_bytes_test",
+        "//brenn-wasm:fixture_processor_stale_contract_test",
         "//brenn-wasm:fixture_processor_store_rt",
         "//surface:emit-processor-manifest.sh",
     ],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     target_compatible_with = HOST_ONLY,
-    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS + [
-        "//brenn-wasm",
-    ],
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
 )
 
 rust_doc_test(

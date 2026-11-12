@@ -159,6 +159,30 @@ impl std::fmt::Display for ProcessorContract {
     }
 }
 
+/// A string that names no [`ProcessorContract`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownProcessorContract(pub String);
+
+impl std::fmt::Display for UnknownProcessorContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown component contract {:?}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownProcessorContract {}
+
+/// The inverse of `Display`: exactly the displayed strings parse.
+impl std::str::FromStr for ProcessorContract {
+    type Err = UnknownProcessorContract;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|contract| contract.to_string() == s)
+            .ok_or_else(|| UnknownProcessorContract(s.to_owned()))
+    }
+}
+
 /// Where a component instance runs.
 ///
 /// Not a second vocabulary: the words are one enum, and this selects which of
@@ -1169,6 +1193,25 @@ mod tests {
     fn contracts_display_as_their_package_names() {
         assert_eq!(ProcessorContract::V0_1.to_string(), "brenn:processor@0.1.0");
         assert_eq!(ProcessorContract::V0_2.to_string(), "brenn:processor@0.2.0");
+    }
+
+    #[test]
+    fn a_contract_parses_from_exactly_its_display() {
+        for contract in ProcessorContract::ALL {
+            assert_eq!(contract.to_string().parse(), Ok(contract));
+        }
+        for unknown in [
+            "",
+            "brenn:processor@0.3.0",
+            "brenn:processor/bus@0.2.0",
+            " brenn:processor@0.1.0",
+            "BRENN:PROCESSOR@0.1.0",
+        ] {
+            assert_eq!(
+                unknown.parse::<ProcessorContract>(),
+                Err(UnknownProcessorContract(unknown.to_owned()))
+            );
+        }
     }
 
     #[test]

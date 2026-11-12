@@ -11,14 +11,19 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { REPO_ROOT } from "../test-helpers/transpiled-processor.js";
 import { Failures, type ParkedTimer, type RigTimers, installGlobals, tick } from "./globals.js";
-import { type Kit, type KitPage, Peer } from "./peer.js";
+import { type Kit, type KitPage, Peer, type WirePublish } from "./peer.js";
 
 const STATIC_ROOT = resolve(REPO_ROOT, "surface/page-rig-dist");
 const KIT_PATH = resolve(REPO_ROOT, "surface/test-fixtures/peer/page_rig_kit.json");
 
-/** One report the fixture kind published, attributed to its instance. */
-export interface Report {
+/** The two fixture kinds' contracts, as the kit states them. */
+export const STRING_CONTRACT = "brenn:processor@0.1.0";
+export const BYTES_CONTRACT = "brenn:processor@0.2.0";
+
+/** One report `processor-page-test` published, attributed to its instance. */
+export interface StringReport {
     instance: string;
+    contract: typeof STRING_CONTRACT;
     windows: {
         port: string;
         new_from: number;
@@ -34,18 +39,74 @@ export interface Report {
     sync: string | null;
 }
 
-/** Parse one report body, naming the instance and the body when it is not JSON. */
-function parseReport(instance: string, body: string): Report {
-    let parsed: Omit<Report, "instance">;
+/** One envelope as `processor-page-bytes-test` reports it. */
+export interface BytesEnvelope {
+    /** The envelope without its body, parsed from the header JSON. */
+    header: Record<string, unknown>;
+    content_type: string | null;
+    hex: string;
+}
+
+/** One report `processor-page-bytes-test` published, attributed to its instance. */
+export interface BytesReport {
+    instance: string;
+    contract: typeof BYTES_CONTRACT;
+    windows: {
+        port: string;
+        new_from: number;
+        dropped: number;
+        envelopes: BytesEnvelope[];
+    }[];
+    deferred: {
+        port: string;
+        entries: {
+            index: number;
+            content_type: string | null;
+            hex: string;
+            deliver_after: number;
+        }[];
+    }[];
+    results: string[];
+    sync: string | null;
+}
+
+/** A report from either fixture kind, told apart by its instance's contract. */
+export type Report = StringReport | BytesReport;
+
+/**
+ * Parse one report body from `instance`, of the shape its contract's fixture
+ * publishes, naming the instance and the body when it is not JSON.
+ */
+function parseReport(instance: string, contract: string, body: string): Report {
+    if (contract !== STRING_CONTRACT && contract !== BYTES_CONTRACT) {
+        throw new Error(`'${instance}' is on contract '${contract}', which no rig fixture is`);
+    }
+    let parsed: Omit<Report, "instance" | "contract">;
     try {
-        parsed = JSON.parse(body) as Omit<Report, "instance">;
+        parsed = JSON.parse(body) as Omit<Report, "instance" | "contract">;
     } catch (err) {
         throw new Error(
             `'${instance}' published a report that is not JSON (${String(err)}): ` +
                 JSON.stringify(body.slice(0, 200)),
         );
     }
-    return { instance, ...parsed };
+    return { instance, contract, ...parsed } as Report;
+}
+
+/** `report`, which must be a `processor-page-test` report. */
+export function stringReport(report: Report): StringReport {
+    if (report.contract !== STRING_CONTRACT) {
+        throw new Error(`'${report.instance}' is on ${report.contract}, not ${STRING_CONTRACT}`);
+    }
+    return report;
+}
+
+/** `report`, which must be a `processor-page-bytes-test` report. */
+export function bytesReport(report: Report): BytesReport {
+    if (report.contract !== BYTES_CONTRACT) {
+        throw new Error(`'${report.instance}' is on ${report.contract}, not ${BYTES_CONTRACT}`);
+    }
+    return report;
 }
 
 /**
@@ -80,6 +141,8 @@ export interface Page {
     deliver(channel: string, body: string): Promise<Report[]>;
     /** Every report `instance` has published, oldest first. */
     reports(instance: string): Report[];
+    /** Every body the kernel published to the wire on `channel`, oldest first. */
+    wire(channel: string): WirePublish[];
     /** The rows of the newest status document the kernel published. */
     status(): StatusRow[];
     /** Wait until the page is quiescent; rethrow the first recorded failure. */
@@ -121,13 +184,14 @@ function kindRecord(kind: string): KindRecord {
 
 /**
  * The page manifest in the shape the backend serves it: the kernel URL, and per
- * instance its kind's module and every core the transpile emitted other than
- * the component artifact itself, each stamped with the build id.
+ * instance its kind's module, every core the transpile emitted other than the
+ * component artifact itself, each stamped with the build id, and the contract
+ * the kit states for it — stated as the server would, not derived here.
  */
 function pageManifest(page: KitPage): string {
     const stamp = `?v=${page.build_id}`;
     const records = new Map<string, KindRecord>();
-    const components = page.instances.map(({ instance, kind }) => {
+    const components = page.instances.map(({ instance, kind, contract }) => {
         let record = records.get(kind);
         if (record === undefined) {
             record = kindRecord(kind);
@@ -141,6 +205,7 @@ function pageManifest(page: KitPage): string {
             cores: record.files
                 .filter((f) => f.endsWith(".wasm") && f !== `${kind}.component.wasm`)
                 .map((f) => `${dir}${f}${stamp}`),
+            contract,
         };
     });
     return JSON.stringify({
@@ -213,10 +278,17 @@ export async function openPage(name: string): Promise<Page> {
 
     await surface.bootstrap(importStatic);
 
+    const contractOf = (instance: string): string => {
+        const entry = facts.instances.find((i) => i.instance === instance);
+        if (entry === undefined) {
+            throw new Error(`a report is attributed to '${instance}', which page '${name}' does not run`);
+        }
+        return entry.contract;
+    };
     const reportsOf = (instance: string): Report[] =>
         peer.published
             .filter((p) => p.channel === facts.report_channel && p.attribution === instance)
-            .map((p) => parseReport(instance, p.body));
+            .map((p) => parseReport(instance, contractOf(instance), p.body));
     const reportsSince = (order: number): Report[] =>
         peer.published
             .filter((p) => p.order >= order && p.channel === facts.report_channel)
@@ -224,7 +296,7 @@ export async function openPage(name: string): Promise<Page> {
                 if (p.attribution === null) {
                     throw new Error(`an unattributed report reached the peer: ${p.body}`);
                 }
-                return parseReport(p.attribution, p.body);
+                return parseReport(p.attribution, contractOf(p.attribution), p.body);
             });
 
     const latestStatus = (): StatusRow[] | null => {
@@ -287,6 +359,7 @@ export async function openPage(name: string): Promise<Page> {
             return reportsSince(from);
         },
         reports: reportsOf,
+        wire: (channel) => peer.published.filter((p) => p.channel === channel),
         status() {
             const rows = latestStatus();
             if (rows === null) {
