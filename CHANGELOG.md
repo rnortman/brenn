@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.35.0] — 2026-11-12
+
 - **Claude profiles can be API keys.** A `claude_profile` that states
   `api_key_file` is a key profile: Claude Code is spawned with the key in
   `ANTHROPIC_API_KEY` instead of a token in `CLAUDE_CODE_OAUTH_TOKEN`, and an
