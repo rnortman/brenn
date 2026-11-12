@@ -81,7 +81,13 @@ async fn rate_limit_utilization_allowed_no_alert() {
     };
     // "allowed" gate returns early before touching downstream fields.
     // No schema-drift alert fires — all observed fields are present.
-    handle_rate_limit_utilization(&evt, &dispatcher);
+    handle_rate_limit_utilization(
+        evt.rate_limit_info
+            .as_ref()
+            .map(crate::active_bridge::limit::RateLimitInfo::of)
+            .as_ref(),
+        &dispatcher,
+    );
     assert_eq!(
         alert_count.load(Ordering::SeqCst),
         0,
@@ -111,7 +117,13 @@ async fn rate_limit_utilization_warning_all_fields_no_alert() {
     };
     // All four schema fields present — all observe calls return true,
     // warn!() branch fires. No schema-drift alert (no missing fields).
-    handle_rate_limit_utilization(&evt, &dispatcher);
+    handle_rate_limit_utilization(
+        evt.rate_limit_info
+            .as_ref()
+            .map(crate::active_bridge::limit::RateLimitInfo::of)
+            .as_ref(),
+        &dispatcher,
+    );
     assert_eq!(
         alert_count.load(Ordering::SeqCst),
         0,
@@ -148,7 +160,14 @@ async fn rate_limit_utilization_warning_missing_fields_schema_drift() {
         })),
         extra: serde_json::Value::Object(Default::default()),
     };
-    handle_rate_limit_utilization(&prime_evt, &dispatcher);
+    handle_rate_limit_utilization(
+        prime_evt
+            .rate_limit_info
+            .as_ref()
+            .map(crate::active_bridge::limit::RateLimitInfo::of)
+            .as_ref(),
+        &dispatcher,
+    );
     // No alerts on presence — asserts that the priming call is clean.
     tokio::task::yield_now().await;
     let count_after_prime = alert_count.load(Ordering::SeqCst);
@@ -163,7 +182,14 @@ async fn rate_limit_utilization_warning_missing_fields_schema_drift() {
         })),
         extra: serde_json::Value::Object(Default::default()),
     };
-    handle_rate_limit_utilization(&missing_evt, &dispatcher);
+    handle_rate_limit_utilization(
+        missing_evt
+            .rate_limit_info
+            .as_ref()
+            .map(crate::active_bridge::limit::RateLimitInfo::of)
+            .as_ref(),
+        &dispatcher,
+    );
     tokio::task::yield_now().await;
     let total = alert_count.load(Ordering::SeqCst);
 
@@ -197,7 +223,13 @@ async fn rate_limit_utilization_none_rate_limit_info_no_alerts() {
         rate_limit_info: None,
         extra: serde_json::Value::Object(Default::default()),
     };
-    handle_rate_limit_utilization(&evt, &dispatcher);
+    handle_rate_limit_utilization(
+        evt.rate_limit_info
+            .as_ref()
+            .map(crate::active_bridge::limit::RateLimitInfo::of)
+            .as_ref(),
+        &dispatcher,
+    );
     assert_eq!(
         alert_count.load(Ordering::SeqCst),
         0,

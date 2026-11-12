@@ -15,6 +15,7 @@ use brenn_lib::access::acl::{AclSet, MqttClientMatcher};
 use brenn_lib::access::{AppPolicy, GrantSet};
 use brenn_lib::mqtt::address::MqttAddress;
 use brenn_lib::mqtt::config::TlsVersionMin;
+use brenn_mqtt::PublishProps;
 use brenn_mqtt::broker_gate;
 use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
 use brenn_mqtt::payload::InboundPayload;
@@ -24,7 +25,7 @@ use brenn_mqtt::test_support::client::wait_for_filter_acked;
 use common::{
     AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, SpawnedClient, TcpRelay,
     await_puback, broker_auth, broker_tls13, certs, direct_publisher_acked, direct_subscriber,
-    log_records_disconnect, log_records_disconnect_before_reconnect,
+    direct_subscriber_publish, log_records_disconnect, log_records_disconnect_before_reconnect,
     log_records_publish_to_subscriber, log_records_unsubscribe, recv_delivery, session_client_id,
     spawn_client, spawn_client_tls13, spawn_client_with_config, subscribe_live_confirmed,
     test_client_config, wait_for_health,
@@ -70,9 +71,11 @@ async fn publish_qos1_text_delivers() {
             &handle,
             "brenn/itest/test2/state".to_string(),
             b"online".to_vec(),
-            None,
-            1,
-            true,
+            PublishProps {
+                qos: 1,
+                retain: true,
+                ..Default::default()
+            },
         )
         .await
         .expect("publish retained failed");
@@ -108,9 +111,11 @@ async fn publish_binary_content_type_delivers() {
         &handle,
         "brenn/itest/test3/bin".to_string(),
         payload_bytes.clone(),
-        Some("application/octet-stream".to_string()),
-        1,
-        false,
+        PublishProps {
+            content_type: Some("application/octet-stream".to_string()),
+            qos: 1,
+            ..Default::default()
+        },
     )
     .await
     .expect("publish binary failed");
@@ -120,6 +125,81 @@ async fn publish_binary_content_type_delivers() {
         .expect("no binary message within 2s")
         .expect("channel closed");
     assert_eq!(payload, payload_bytes, "unexpected payload: {payload:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Message expiry reaches the subscriber, with and without a content type
+// ---------------------------------------------------------------------------
+
+/// Publish on `slug` with `message_expiry_s = 60` and the given content type,
+/// and return the properties of the PUBLISH a separate subscriber receives.
+async fn publish_expiring_and_receive(
+    slug: &str,
+    content_type: Option<String>,
+) -> rumqttc::mqttbytes::v5::PublishProperties {
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+    let SpawnedClient { svc, handle, .. } = spawn_client(slug, &harness, ca.clone(), vec![]).await;
+    let topic = format!("brenn/itest/{slug}/expiring");
+    let mut deliver_rx = direct_subscriber_publish(harness.port, ca, &topic).await;
+
+    let outcome = svc
+        .publish_on_handle(
+            &handle,
+            topic,
+            b"alive".to_vec(),
+            PublishProps {
+                content_type,
+                qos: 1,
+                retain: true,
+                message_expiry_s: Some(60),
+            },
+        )
+        .await
+        .expect("expiring publish failed");
+    assert!(
+        matches!(outcome, brenn_mqtt::state::PubackOutcome::Success),
+        "expiring publish outcome: {outcome:?}"
+    );
+
+    let publish = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
+        .await
+        .expect("no message within 2s after expiring publish")
+        .expect("channel closed");
+    assert_eq!(&publish.payload[..], b"alive");
+    publish
+        .properties
+        .expect("expiring publish arrived without properties")
+}
+
+/// The broker forwards the remaining lifetime, so the received interval is at
+/// most the one sent and, two seconds into a 60 s lifetime, well above zero.
+fn assert_expiry_near_60(props: &rumqttc::mqttbytes::v5::PublishProperties) {
+    let expiry = props
+        .message_expiry_interval
+        .expect("message_expiry_interval missing on the received publish");
+    assert!(
+        (55..=60).contains(&expiry),
+        "message_expiry_interval {expiry} not in 55..=60"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publish_message_expiry_without_content_type() {
+    broker_gate!();
+
+    let props = publish_expiring_and_receive("exp1", None).await;
+    assert_expiry_near_60(&props);
+    assert_eq!(props.content_type, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publish_message_expiry_with_content_type() {
+    broker_gate!();
+
+    let props = publish_expiring_and_receive("exp2", Some("application/json".to_string())).await;
+    assert_expiry_near_60(&props);
+    assert_eq!(props.content_type.as_deref(), Some("application/json"));
 }
 
 // ---------------------------------------------------------------------------
@@ -163,9 +243,10 @@ async fn disconnect_returns_not_connected_promptly() {
             &handle,
             "brenn/itest/test6/probe".to_string(),
             b"x".to_vec(),
-            None,
-            1,
-            false,
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
         )
         .await;
     let elapsed = start.elapsed();
@@ -200,9 +281,7 @@ async fn qos0_publish_returns_success_and_delivers() {
             &handle,
             "brenn/itest/test8/topic".to_string(),
             b"qos0-payload".to_vec(),
-            None,
-            0,
-            false,
+            PublishProps::default(),
         )
         .await;
     assert!(
@@ -240,9 +319,10 @@ async fn tls13_connect_publish_delivers() {
         &handle,
         "brenn/itest/tls13/state".to_string(),
         b"tls13-hello".to_vec(),
-        None,
-        1,
-        false,
+        PublishProps {
+            qos: 1,
+            ..Default::default()
+        },
     )
     .await
     .expect("tls13 publish failed");
@@ -326,9 +406,10 @@ async fn self_publish_echoes_back_on_same_session() {
         &handle,
         echo_topic.to_string(),
         b"echoed".to_vec(),
-        None,
-        1,
-        false,
+        PublishProps {
+            qos: 1,
+            ..Default::default()
+        },
     )
     .await
     .expect("self-publish failed");
@@ -379,9 +460,10 @@ async fn wasm_egress_publish_reaches_broker() {
         &policy,
         &addr,
         b"wasm-egress".to_vec(),
-        None,
-        1,
-        false,
+        PublishProps {
+            qos: 1,
+            ..Default::default()
+        },
         SendBudget::None,
     )
     .await;
@@ -418,9 +500,10 @@ async fn wasm_egress_broker_rejected_maps_reason() {
             &policy,
             &addr,
             b"denied".to_vec(),
-            None,
-            1,
-            false,
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
             SendBudget::None,
         ),
     )
@@ -465,9 +548,10 @@ async fn wasm_egress_acl_denied() {
         &policy,
         &addr,
         b"x".to_vec(),
-        None,
-        1,
-        false,
+        PublishProps {
+            qos: 1,
+            ..Default::default()
+        },
         SendBudget::None,
     )
     .await;
@@ -919,9 +1003,10 @@ async fn reconnect_reasserts_filters_and_fails_pending_publish() {
                 &handle_task,
                 pub_topic.to_string(),
                 b"stalled".to_vec(),
-                None,
-                1,
-                false,
+                PublishProps {
+                    qos: 1,
+                    ..Default::default()
+                },
             )
             .await
     });

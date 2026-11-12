@@ -28,7 +28,7 @@ rust_library(
     deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
 )
 
-# 142 tests: in-memory sqlite over the subscription DAOs, the publish fan-out
+# Tests: in-memory sqlite over the subscription DAOs, the publish fan-out
 # driven through a stub poster, and the pure URL-validation suite. The whole
 # binary finishes in about a second locally, so `small` (60s) keeps a wide
 # margin on a cold 4-vCPU runner.

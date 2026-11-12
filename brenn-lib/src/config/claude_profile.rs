@@ -1,19 +1,22 @@
-//! Claude account profiles: a name bound to a `claude setup-token` token.
+//! Claude account profiles: a name bound to a credential file — a
+//! `claude setup-token` token or an Anthropic API key.
 //!
 //! An account, to Claude Code, is an environment variable —
-//! `CLAUDE_CODE_OAUTH_TOKEN` outranks the `/login` credential in the shared
-//! `~/.claude`. So a profile is a name bound to a token file, the shared config
-//! root is never touched, and switching accounts is spawning a process with a
-//! different value in that variable.
+//! `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`, either of which outranks
+//! the `/login` credential in the shared `~/.claude`. So a profile is a name
+//! bound to a credential file, the shared config root is never touched, and
+//! switching accounts is spawning a process with a different value in that
+//! variable.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use brenn_envelope::agent::AccountKind;
 use chrono::NaiveDate;
 
 use super::secret::{SecretString, load_secret_file_private};
 
-/// The file name a `claude_profile` block without a `token_file` looks for
+/// The file name a `claude_profile` block without a credential file looks for
 /// under `claude_defaults.profile_token_dir`.
 pub fn default_token_file_name(profile: &str) -> String {
     format!("claude-profile-{profile}.token")
@@ -22,14 +25,24 @@ pub fn default_token_file_name(profile: &str) -> String {
 /// The environment variable Claude Code reads a `claude setup-token` token from.
 pub const CLAUDE_OAUTH_TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
+/// The environment variable Claude Code reads an Anthropic API key from.
+pub const ANTHROPIC_API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
+
+/// The `result` text a key profile's refused turn is recognised by when the
+/// profile states no `exhausted_markers`.
+pub const DEFAULT_EXHAUSTED_MARKERS: [&str; 1] = ["credit balance is too low"];
+
 /// The credential-selecting environment variables no profiled agent may carry
 /// from anywhere but its profile: the five Claude Code ranks *above* the token,
-/// plus the token variable itself. Any of them wins silently over the profile,
-/// so every place Brenn can see one refuses to run — an agent's own `env` at
-/// lowering, an integration's contribution at the spawn config build, and the
-/// server's own environment (which a bare child inherits wholesale) at boot.
+/// plus the token variable itself. Any of them could win silently over the
+/// profile, or sit beside it as a second credential, so every place Brenn can
+/// see one refuses to run — an agent's own `env` at lowering, an integration's
+/// contribution at the spawn config build, and the server's own environment
+/// (which a bare child inherits wholesale) at boot. The rule is the same for a
+/// key profile: a profiled agent has exactly one credential in its
+/// environment, the one its profile put there.
 pub const OUTRANKING_CREDENTIAL_VARS: [&str; 6] = [
-    "ANTHROPIC_API_KEY",
+    ANTHROPIC_API_KEY_VAR,
     "ANTHROPIC_AUTH_TOKEN",
     CLAUDE_OAUTH_TOKEN_VAR,
     "CLAUDE_CODE_USE_BEDROCK",
@@ -39,25 +52,65 @@ pub const OUTRANKING_CREDENTIAL_VARS: [&str; 6] = [
 
 const EXPIRY_WARNING_DAYS: i64 = 30;
 
+/// Where a profile's credential is read from, by kind, with what only that kind
+/// states.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClaudeCredentialFile {
+    /// A `claude setup-token` token file.
+    OauthToken(PathBuf),
+    /// An Anthropic API key file.
+    ApiKey {
+        path: PathBuf,
+        settings: KeyProfileSettings,
+    },
+}
+
+impl ClaudeCredentialFile {
+    /// The host path, whichever the kind.
+    pub fn path(&self) -> &Path {
+        match self {
+            ClaudeCredentialFile::OauthToken(path) | ClaudeCredentialFile::ApiKey { path, .. } => {
+                path
+            }
+        }
+    }
+}
+
+/// What only an API-key profile states: how its spend is accounted and how a
+/// refused turn is recognised.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyProfileSettings {
+    /// The month's spend the operator budgets for this key. Finite and above
+    /// zero. Reported, never enforced: the Platform spend limit is the hard
+    /// stop.
+    pub budget_usd: Option<f64>,
+    /// The zone whose calendar month is the accounting period.
+    pub reset_tz: chrono_tz::Tz,
+    /// Substrings, matched ASCII case-insensitively, of the `result` text of a
+    /// turn refused for lack of credit. Non-empty, no marker empty.
+    pub exhausted_markers: Vec<String>,
+}
+
 /// One `claude_profile` block, as the document states it.
 ///
 /// The path is final by the time this exists: lowering has already applied the
-/// `profile_token_dir` convention to a block that stated no `token_file`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `profile_token_dir` convention to a block that stated no credential file.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClaudeProfileRaw {
-    /// Host path to the token file. 0600, one line.
-    pub token_file: PathBuf,
-    /// The date the operator recorded the token as ceasing to work. Brenn
-    /// cannot read a token's lifetime — the value is opaque — so this is the
-    /// operator's note to itself and the only expiry signal there is.
+    /// Host path to the credential file, by kind. 0600, one line.
+    pub credential: ClaudeCredentialFile,
+    /// The date the operator recorded the credential as ceasing to work. Brenn
+    /// cannot read a credential's lifetime — the value is opaque — so this is
+    /// the operator's note to itself and the only expiry signal there is.
     pub expires: Option<NaiveDate>,
 }
 
 /// Which accounts one agent may run under, and where its goal comes from.
 ///
 /// Present exactly when the agent states `claude_profiles`. Absent, the agent
-/// gets no token at spawn and authenticates with whatever `/login` left in its
-/// home — which is every agent in every deployment that declares no profiles.
+/// gets no credential at spawn and authenticates with whatever `/login` left in
+/// its home — which is every agent in every deployment that declares no
+/// profiles.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppClaudeProfiles {
     /// Declared profile names, in preference order. Non-empty, without
@@ -70,17 +123,63 @@ pub struct AppClaudeProfiles {
     pub goal: Option<String>,
 }
 
-/// One profile with its token in hand.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A profile's credential, in hand, by kind, with what only that kind states.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClaudeCredential {
+    OauthToken(SecretString),
+    ApiKey {
+        secret: SecretString,
+        settings: KeyProfileSettings,
+    },
+}
+
+impl ClaudeCredential {
+    /// The environment variable Claude Code reads this credential from.
+    pub fn env_var(&self) -> &'static str {
+        match self {
+            ClaudeCredential::OauthToken(_) => CLAUDE_OAUTH_TOKEN_VAR,
+            ClaudeCredential::ApiKey { .. } => ANTHROPIC_API_KEY_VAR,
+        }
+    }
+
+    /// The account kind, whose wire word is `subscription` or `api-key`.
+    pub fn kind(&self) -> AccountKind {
+        match self {
+            ClaudeCredential::OauthToken(_) => AccountKind::Subscription,
+            ClaudeCredential::ApiKey { .. } => AccountKind::ApiKey,
+        }
+    }
+
+    /// The secret, whichever the kind.
+    pub fn secret(&self) -> &SecretString {
+        match self {
+            ClaudeCredential::OauthToken(secret) | ClaudeCredential::ApiKey { secret, .. } => {
+                secret
+            }
+        }
+    }
+
+    /// An API key's settings; `None` for a token.
+    pub fn key_settings(&self) -> Option<&KeyProfileSettings> {
+        match self {
+            ClaudeCredential::OauthToken(_) => None,
+            ClaudeCredential::ApiKey { settings, .. } => Some(settings),
+        }
+    }
+}
+
+/// One profile with its credential in hand.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClaudeProfile {
-    pub token: SecretString,
+    pub credential: ClaudeCredential,
     pub expires: Option<NaiveDate>,
 }
 
-/// Load every declared profile's token.
+/// Load every declared profile's credential.
 ///
-/// A declared profile whose token is missing, empty, unreadable, or readable by
-/// any other local account is a misconfiguration, not a runtime condition.
+/// A declared profile whose credential file is missing, empty, unreadable, or
+/// readable by any other local account is a misconfiguration, not a runtime
+/// condition.
 ///
 /// # Panics
 ///
@@ -92,11 +191,19 @@ pub fn load_claude_profiles(
     raw.iter()
         .map(|(name, profile)| {
             let label = format!("claude_profile `{name}`");
-            let token = SecretString::new(load_secret_file_private(&label, &profile.token_file));
+            let secret =
+                SecretString::new(load_secret_file_private(&label, profile.credential.path()));
+            let credential = match &profile.credential {
+                ClaudeCredentialFile::OauthToken(_) => ClaudeCredential::OauthToken(secret),
+                ClaudeCredentialFile::ApiKey { settings, .. } => ClaudeCredential::ApiKey {
+                    secret,
+                    settings: settings.clone(),
+                },
+            };
             (
                 name.clone(),
                 ClaudeProfile {
-                    token,
+                    credential,
                     expires: profile.expires,
                 },
             )
@@ -108,24 +215,29 @@ pub fn load_claude_profiles(
 ///
 /// A date already past or within thirty days of `today` is worth a human's
 /// attention; anything further out is not, and a profile with no date recorded
-/// says nothing either way.
+/// says nothing either way. The remedy named is the one for the profile's
+/// credential kind.
 pub fn expiry_warning(name: &str, profile: &ClaudeProfile, today: NaiveDate) -> Option<String> {
     let expires = profile.expires?;
     let days = (expires - today).num_days();
     if days > EXPIRY_WARNING_DAYS {
         return None;
     }
+    let remedy = match profile.credential {
+        ClaudeCredential::OauthToken(_) => {
+            "Mint a new token with `claude setup-token` and overwrite its token file."
+        }
+        ClaudeCredential::ApiKey { .. } => {
+            "Rotate the key on the Anthropic Platform console and overwrite its key file."
+        }
+    };
     Some(if days < 0 {
         format!(
-            "Claude profile `{name}` expired on {expires} ({} days ago). \
-             Mint a new token with `claude setup-token` and overwrite its token file.",
+            "Claude profile `{name}` expired on {expires} ({} days ago). {remedy}",
             -days,
         )
     } else {
-        format!(
-            "Claude profile `{name}` expires on {expires} (in {days} days). \
-             Mint a new token with `claude setup-token` and overwrite its token file.",
-        )
+        format!("Claude profile `{name}` expires on {expires} (in {days} days). {remedy}")
     })
 }
 
@@ -133,9 +245,9 @@ pub fn expiry_warning(name: &str, profile: &ClaudeProfile, today: NaiveDate) -> 
 /// `(profile name, warning)` in name order.
 ///
 /// One entry per profile that is past its recorded date or inside the warning
-/// window, and none for the rest — a token is opaque, so a date the operator
-/// wrote down is the only expiry signal there is, and it is worth exactly one
-/// alert per profile at boot.
+/// window, and none for the rest — a credential is opaque, so a date the
+/// operator wrote down is the only expiry signal there is, and it is worth
+/// exactly one alert per profile at boot.
 pub fn expiry_alerts(
     profiles: &std::collections::BTreeMap<String, ClaudeProfile>,
     today: NaiveDate,
@@ -156,8 +268,26 @@ mod tests {
 
     fn profile(expires: Option<&str>) -> ClaudeProfile {
         ClaudeProfile {
-            token: SecretString::new("tok".to_string()),
+            credential: ClaudeCredential::OauthToken(SecretString::new("tok".to_string())),
             expires: expires.map(|date| date.parse().unwrap()),
+        }
+    }
+
+    fn key_profile(expires: Option<&str>) -> ClaudeProfile {
+        ClaudeProfile {
+            credential: ClaudeCredential::ApiKey {
+                secret: SecretString::new("sk".to_string()),
+                settings: settings(),
+            },
+            expires: expires.map(|date| date.parse().unwrap()),
+        }
+    }
+
+    fn settings() -> KeyProfileSettings {
+        KeyProfileSettings {
+            budget_usd: None,
+            reset_tz: chrono_tz::UTC,
+            exhausted_markers: vec![DEFAULT_EXHAUSTED_MARKERS[0].to_string()],
         }
     }
 
@@ -223,12 +353,15 @@ mod tests {
         let raw = BTreeMap::from([(
             "main".to_string(),
             ClaudeProfileRaw {
-                token_file: file.path().to_path_buf(),
+                credential: ClaudeCredentialFile::OauthToken(file.path().to_path_buf()),
                 expires: Some("2027-09-01".parse().unwrap()),
             },
         )]);
         let loaded = load_claude_profiles(&raw);
-        assert_eq!(loaded["main"].token.expose(), "sk-ant-oat01-abc");
+        assert_eq!(
+            loaded["main"].credential,
+            ClaudeCredential::OauthToken(SecretString::new("sk-ant-oat01-abc".to_string()))
+        );
         assert_eq!(loaded["main"].expires, Some("2027-09-01".parse().unwrap()));
     }
 
@@ -238,7 +371,9 @@ mod tests {
         let raw = BTreeMap::from([(
             "gone".to_string(),
             ClaudeProfileRaw {
-                token_file: PathBuf::from("/nonexistent/claude-profile-gone.token"),
+                credential: ClaudeCredentialFile::OauthToken(PathBuf::from(
+                    "/nonexistent/claude-profile-gone.token",
+                )),
                 expires: None,
             },
         )]);
@@ -256,10 +391,102 @@ mod tests {
         let raw = BTreeMap::from([(
             "loose".to_string(),
             ClaudeProfileRaw {
-                token_file: file.path().to_path_buf(),
+                credential: ClaudeCredentialFile::OauthToken(file.path().to_path_buf()),
                 expires: None,
             },
         )]);
+        load_claude_profiles(&raw);
+    }
+
+    #[test]
+    fn a_token_profile_names_setup_token_as_the_remedy() {
+        let warning = expiry_warning("main", &profile(Some("2026-09-20")), today()).unwrap();
+        assert!(warning.contains("claude setup-token"), "{warning}");
+        assert!(!warning.contains("Platform"), "{warning}");
+    }
+
+    #[test]
+    fn a_key_profile_names_the_platform_console_as_the_remedy() {
+        let warning = expiry_warning("work", &key_profile(Some("2026-08-01")), today()).unwrap();
+        assert!(warning.contains("expired on 2026-08-01"), "{warning}");
+        assert!(warning.contains("Anthropic Platform console"), "{warning}");
+        assert!(warning.contains("key file"), "{warning}");
+        assert!(!warning.contains("setup-token"), "{warning}");
+    }
+
+    #[test]
+    fn each_credential_kind_has_its_variable_and_wire_word() {
+        let token = ClaudeCredential::OauthToken(SecretString::new("t".to_string()));
+        let key = ClaudeCredential::ApiKey {
+            secret: SecretString::new("k".to_string()),
+            settings: settings(),
+        };
+        assert_eq!(token.env_var(), "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(key.env_var(), "ANTHROPIC_API_KEY");
+        assert_eq!(token.kind(), AccountKind::Subscription);
+        assert_eq!(key.kind(), AccountKind::ApiKey);
+        assert_eq!(key.secret().expose(), "k");
+        assert_eq!(token.key_settings(), None);
+        assert_eq!(key.key_settings(), Some(&settings()));
+    }
+
+    #[cfg(unix)]
+    fn private_file(contents: &[u8], mode: u32) -> tempfile::NamedTempFile {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(contents).unwrap();
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        file
+    }
+
+    #[cfg(unix)]
+    fn key_raw(path: PathBuf) -> ClaudeProfileRaw {
+        ClaudeProfileRaw {
+            credential: ClaudeCredentialFile::ApiKey {
+                path,
+                settings: KeyProfileSettings {
+                    budget_usd: Some(50.0),
+                    reset_tz: chrono_tz::America::Chicago,
+                    exhausted_markers: vec!["credit balance is too low".to_string()],
+                },
+            },
+            expires: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_a_key_profile_reads_the_key_and_keeps_its_settings() {
+        let file = private_file(b"sk-ant-api03-abc\n", 0o600);
+        let raw = BTreeMap::from([("work".to_string(), key_raw(file.path().to_path_buf()))]);
+        let loaded = load_claude_profiles(&raw);
+        let ClaudeCredentialFile::ApiKey { settings, .. } = &raw["work"].credential else {
+            unreachable!("key_raw builds an API-key profile");
+        };
+        assert_eq!(
+            loaded["work"].credential,
+            ClaudeCredential::ApiKey {
+                secret: SecretString::new("sk-ant-api03-abc".to_string()),
+                settings: settings.clone(),
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "group/world-accessible")]
+    fn a_group_readable_key_file_panics() {
+        let file = private_file(b"sk-ant-api03-abc\n", 0o640);
+        let raw = BTreeMap::from([("work".to_string(), key_raw(file.path().to_path_buf()))]);
+        load_claude_profiles(&raw);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "is empty")]
+    fn an_empty_key_file_panics() {
+        let file = private_file(b"\n", 0o600);
+        let raw = BTreeMap::from([("work".to_string(), key_raw(file.path().to_path_buf()))]);
         load_claude_profiles(&raw);
     }
 }

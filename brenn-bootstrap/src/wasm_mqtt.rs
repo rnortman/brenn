@@ -40,9 +40,7 @@ pub(crate) fn make_wasm_mqtt_publish_fn(
         move |client: String,
               topic: String,
               payload: Vec<u8>,
-              content_type: Option<String>,
-              qos: u8,
-              retain: bool|
+              props: brenn_wasm::MqttPublishProps|
               -> brenn_wasm::MqttPublishOutcome {
             use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
             // Input validation owned by the caller: build and parse
@@ -67,14 +65,24 @@ pub(crate) fn make_wasm_mqtt_publish_fn(
             // (`ActivationPacer`), not here: one activation-level knob paces every
             // egress path this component has (MQTT, bus, webhooks), so the host fn
             // itself intentionally stays limiter-free.
+            let brenn_wasm::MqttPublishProps {
+                content_type,
+                qos,
+                retain,
+                message_expiry_s,
+            } = props;
+            let props = brenn_mqtt::PublishProps {
+                content_type,
+                qos,
+                retain,
+                message_expiry_s,
+            };
             let result = tokio::runtime::Handle::current().block_on(enforce_and_publish(
                 &svc,
                 &policy,
                 &addr,
                 payload,
-                content_type,
-                qos,
-                retain,
+                props,
                 SendBudget::None,
             ));
             match result {
@@ -214,7 +222,11 @@ mod tests {
         let f = f.clone();
         let client = client.to_string();
         let topic = topic.to_string();
-        tokio::task::spawn_blocking(move || f(client, topic, b"x".to_vec(), None, 1, false))
+        let props = brenn_wasm::MqttPublishProps {
+            qos: 1,
+            ..Default::default()
+        };
+        tokio::task::spawn_blocking(move || f(client, topic, b"x".to_vec(), props))
             .await
             .expect("spawn_blocking join failed")
     }

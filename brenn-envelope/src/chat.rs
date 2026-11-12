@@ -65,38 +65,9 @@ pub fn legacy_ws_sender(username: &str) -> String {
     format!("{LEGACY_WS_SENDER}{username}")
 }
 
-/// Why a chat body could not be turned into a message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChatDecodeError {
-    /// The body is not parseable JSON.
-    NotJson(String),
-    /// The body parsed but is not a JSON object.
-    NotAnObject,
-    /// No `v` field, or its value is not a non-negative integer.
-    MissingVersion,
-    /// The `v` field names a protocol version this build does not implement.
-    UnsupportedVersion(u64),
-    /// The body is a versioned JSON object but does not match the target
-    /// vocabulary (unknown `type`, missing or ill-typed field).
-    Payload(String),
-}
-
-impl core::fmt::Display for ChatDecodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NotJson(e) => write!(f, "body is not JSON: {e}"),
-            Self::NotAnObject => write!(f, "body is not a JSON object"),
-            Self::MissingVersion => write!(f, "body has no integer `v` field"),
-            Self::UnsupportedVersion(v) => write!(
-                f,
-                "body declares protocol version {v}, this build implements {CHAT_PROTOCOL_VERSION}"
-            ),
-            Self::Payload(e) => write!(f, "body does not match the message schema: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ChatDecodeError {}
+/// Why a chat body could not be turned into a message: the shared versioned
+/// codec's error.
+pub type ChatDecodeError = crate::versioned::VersionedDecodeError;
 
 /// Serialize a chat message into an envelope body, stamping
 /// `"v": CHAT_PROTOCOL_VERSION`.
@@ -106,18 +77,7 @@ impl std::error::Error for ChatDecodeError {}
 /// Panics if `message` does not serialize to a JSON object. Every type in this
 /// module does; a caller passing something else is a programming error.
 pub fn encode<T: Serialize>(message: &T) -> String {
-    #[derive(Serialize)]
-    struct Versioned<'a, T> {
-        v: u32,
-        #[serde(flatten)]
-        message: &'a T,
-    }
-
-    serde_json::to_string(&Versioned {
-        v: CHAT_PROTOCOL_VERSION,
-        message,
-    })
-    .expect("chat message serializes to a JSON object")
+    crate::versioned::encode(CHAT_PROTOCOL_VERSION, message)
 }
 
 /// Parse an envelope body into a chat message, requiring a `v` field equal to
@@ -128,17 +88,7 @@ pub fn encode<T: Serialize>(message: &T) -> String {
 /// [`ChatStreamEvent`] absorb it as their `Unknown` variant, [`ChatCommand`]
 /// rejects it as [`ChatDecodeError::Payload`].
 pub fn decode<T: DeserializeOwned>(body: &str) -> Result<T, ChatDecodeError> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| ChatDecodeError::NotJson(e.to_string()))?;
-    let object = value.as_object().ok_or(ChatDecodeError::NotAnObject)?;
-    let version = object
-        .get("v")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(ChatDecodeError::MissingVersion)?;
-    if version != u64::from(CHAT_PROTOCOL_VERSION) {
-        return Err(ChatDecodeError::UnsupportedVersion(version));
-    }
-    serde_json::from_value(value).map_err(|e| ChatDecodeError::Payload(e.to_string()))
+    crate::versioned::decode(CHAT_PROTOCOL_VERSION, body)
 }
 
 // ── Channel addresses ──────────────────────────────────────────────────────
@@ -961,23 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn version_and_framing_failures_are_distinguished() {
-        assert!(matches!(
-            decode::<ChatCommand>("not json"),
-            Err(ChatDecodeError::NotJson(_))
-        ));
-        assert_eq!(
-            decode::<ChatCommand>("[1,2,3]"),
-            Err(ChatDecodeError::NotAnObject)
-        );
-        assert_eq!(
-            decode::<ChatCommand>(r#"{"type":"compact"}"#),
-            Err(ChatDecodeError::MissingVersion)
-        );
-        assert_eq!(
-            decode::<ChatCommand>(r#"{"v":"1","type":"compact"}"#),
-            Err(ChatDecodeError::MissingVersion)
-        );
+    fn a_bumped_version_is_refused_before_the_vocabulary() {
         assert_eq!(
             decode::<ChatCommand>(r#"{"v":2,"type":"compact"}"#),
             Err(ChatDecodeError::UnsupportedVersion(2))

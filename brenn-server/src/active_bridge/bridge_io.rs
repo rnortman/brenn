@@ -140,6 +140,11 @@ impl ActiveBridge {
 
     /// Broadcast a message to all subscribed WS connections.
     pub(crate) fn broadcast(&self, msg: WsServerMessage) {
+        // Every state change passes here, so this is where the reporter sees it.
+        if let WsServerMessage::Status { state } = &msg {
+            self.agent_status
+                .session_state(self.conversation_id, super::bus_chat::cc_state(*state));
+        }
         // send() fails only when there are zero receivers. This is expected —
         // the bridge stays alive even with no tabs connected (CC keeps running).
         if self.event_tx.send(msg).is_err() {

@@ -98,6 +98,10 @@ pub(in crate::active_bridge) struct TestBridgeConfig {
     /// Which profile each profiled app should run under. `None` (default) makes
     /// the bridge unprofiled and therefore never stale.
     pub cc_profiles: Option<Arc<brenn_cc_profile::ProfileGoal>>,
+    /// The agent-status reporter. `None` (default) starts one over the
+    /// profiles of `cc_profiles` (none when that is `None`) that publishes
+    /// nothing.
+    pub agent_status: Option<crate::agent_status::AgentStatusReporter>,
     /// The swap's contact with the world. `None` (default) is right for every
     /// bridge that never swaps — any app with no `claude_profiles`.
     pub swap_host: Option<Arc<dyn super::profile_swap::ProfileSwapHost>>,
@@ -135,6 +139,7 @@ impl Default for TestBridgeConfig {
             apps: None,
             cc_event_tx: None,
             cc_profiles: None,
+            agent_status: None,
             swap_host: None,
             epoch_reconciler: None,
             spawned_epoch: None,
@@ -564,6 +569,7 @@ impl ActiveBridge {
             apps,
             cc_event_tx,
             cc_profiles,
+            agent_status,
             swap_host,
             epoch_reconciler,
             spawned_epoch,
@@ -669,6 +675,15 @@ impl ActiveBridge {
             chat_adapter_handle: std::sync::Mutex::new(None),
             died_handled: AtomicBool::new(false),
             cc_profile: std::sync::Mutex::new(None),
+            agent_status: agent_status
+                .unwrap_or_else(|| {
+                    let profiles = cc_profiles
+                        .as_ref()
+                        .map(|goal| goal.profiles().clone())
+                        .unwrap_or_default();
+                    crate::agent_status::AgentStatusReporter::start(&profiles, None)
+                })
+                .for_bridge(),
             cc_profiles,
             swap_host,
             reload_stale: AtomicBool::new(false),

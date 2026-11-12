@@ -78,6 +78,58 @@ fn note_background_hold(
 use super::ActiveBridge;
 use super::bridge_io::persist_incoming_message_sync;
 
+/// Report a `result` frame to the agent-status reporter when it is a turn: it
+/// carries `total_cost_usd`, or it is an API key's refusal. Any other frame
+/// without a cost is not a model turn, so it charges nothing, counts nothing
+/// and clears no flag. `cost` is this frame's per-turn delta, 0 when it
+/// carried none.
+fn report_turn(bridge: &ActiveBridge, result: &ResultMessage, cost: f64) {
+    let profile = bridge.cc_profile_name();
+    let is_error = result.is_error == Some(true);
+    let refusal = profile.as_deref().and_then(|name| {
+        let facts = bridge.agent_status.profile(name);
+        let refused = facts.kind == brenn_envelope::agent::AccountKind::ApiKey
+            && super::limit::is_key_refusal(
+                is_error,
+                result.result.as_deref(),
+                &facts.exhausted_markers,
+            );
+        refused.then(|| {
+            super::limit::key_refusal_flag(
+                result.result.as_deref().unwrap_or_default(),
+                &bridge.conversation_id.to_string(),
+                crate::agent_status::now_ms(),
+            )
+        })
+    });
+    if result.total_cost_usd.is_none() && refusal.is_none() {
+        return;
+    }
+    if let Some(flag) = &refusal {
+        warn!(
+            conversation_id = bridge.conversation_id,
+            cc_profile = ?profile,
+            message = ?flag.message,
+            "API-key profile refused a turn; flagging the account"
+        );
+    }
+    let model = bridge
+        .active_model_slug
+        .lock()
+        .expect("active_model_slug lock")
+        .clone();
+    bridge.agent_status.turn_completed(
+        bridge.conversation_id,
+        profile,
+        brenn_cc_profile::TurnOutcome {
+            cost,
+            is_error,
+            refusal,
+        },
+        model,
+    );
+}
+
 pub(in crate::active_bridge) async fn handle_turn_completed(
     bridge: &Arc<ActiveBridge>,
     result: &brenn_cc::protocol::incoming::ResultMessage,
@@ -196,6 +248,8 @@ pub(in crate::active_bridge) async fn handle_turn_completed(
         last_24h = brenn_db::cost_samples::sum_since(&conn, cutoff);
     }
     // DB lock released; no further DB access on this path.
+
+    report_turn(bridge, result, last_turn);
 
     // --- Stream-derived context broadcast (after scope: depends on model_window_updated) ---
     // Broadcast ContextUsage only when the authoritative window size is

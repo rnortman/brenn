@@ -1,0 +1,63 @@
+/// The agent-status channels, declared as a set. Their presence is what turns
+/// the facility on: the host builds the `system:agent-status` participant iff
+/// this document declares all three, and refuses to boot on some without the
+/// rest.
+///
+/// The addresses are fixed rather than parameterized: a consumer, in tree or
+/// out, has to know them without reading configuration. Nothing else about them
+/// is brenn's: the deployment stamps them, sizes them, and grants other
+/// principals access to them with ordinary ACLs.
+///
+/// `sessions` is a **state** channel: a snapshot of every conversation with a
+/// running Claude Code process, each snapshot subsuming the one before it. It
+/// is ephemeral because no process survives a restart, and a stale snapshot
+/// after one is worse than none; an empty channel reads as "no sessions". On a
+/// non-durable channel the retained window is the standing buffer, so
+/// `retain_depth = 1` is what a consumer that starts later reads.
+///
+/// `ended` is a **fact** channel: one message per run of a session that ended,
+/// which no later message subsumes. Durable, so a consumer down across a
+/// restart still finds the facts in its window. Size `ended_retain` for the
+/// longest consumer outage to survive, counted in session ends.
+///
+/// `accounts` is a **state** channel and durable: it is the account ledger's
+/// storage, read back once at boot. `retain_depth = 1` is the state itself; a
+/// `standing_retain_depth` of zero is refused at boot, since it would lose
+/// every profile's spend at restart.
+///
+/// The reporter publishes every state change of every session, and a publish
+/// the bus refuses ends the process, the send-rate gate's refusal included.
+/// The channels state their own `send_rate`, so the host's
+/// `default_send_rate` does not reach them. Boot refuses any of the three
+/// below 240 in a burst and 30 a second sustained. A host whose sessions change
+/// state faster than that declares the three channels itself, with a higher
+/// rate.
+///
+/// TODO(agent-status-self-wake): A subscriber's own activity is in these
+/// snapshots. An LLM agent that subscribes with a nonzero `push_depth` to
+/// `sessions`, or to `accounts` while
+/// it runs under an API-key profile, is woken by the snapshot its own last turn
+/// caused, and so runs turns back to back with nobody asking, each one billed.
+/// Such an agent reads them retained, with `push_depth = 0`.
+assembly AgentStatus(ended_retain: Int = 64, accounts_standing: Int = 4) {
+  channel sessions at "ephemeral:agent.sessions" {
+    description = "Running Claude Code sessions (retained: the current set)";
+    push_depth = 1;
+    retain_depth = 1;
+    send_rate = { burst = 240, refill_interval_secs = 1, refill = 30 };
+  }
+  channel ended at "brenn:agent.ended" {
+    description = "Claude Code session runs that ended";
+    push_depth = ended_retain;
+    retain_depth = ended_retain;
+    standing_retain_depth = ended_retain;
+    send_rate = { burst = 240, refill_interval_secs = 1, refill = 30 };
+  }
+  channel accounts at "brenn:agent.accounts" {
+    description = "Claude accounts: spend and refusal flags (retained: the ledger)";
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = accounts_standing;
+    send_rate = { burst = 240, refill_interval_secs = 1, refill = 30 };
+  }
+}

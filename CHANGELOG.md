@@ -4,6 +4,69 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Claude profiles can be API keys.** A `claude_profile` that states
+  `api_key_file` is a key profile: Claude Code is spawned with the key in
+  `ANTHROPIC_API_KEY` instead of a token in `CLAUDE_CODE_OAUTH_TOKEN`, and an
+  agent's `claude_profiles` may list token and key profiles together and
+  switch between them like any two profiles. To turn it on, declare a
+  `claude_profile` with `api_key_file` (a 0600, one-line file) and list it in
+  an agent's `claude_profiles`; `budget_usd`, `reset_tz` and
+  `exhausted_markers` are optional and apply to key profiles only.
+  - The credential-variable guards apply to key profiles unchanged: none of
+    the six credential variables may reach a profiled agent from its `env`,
+    an integration, or (for a bare agent) the server's environment.
+  - `--bare` with `claude_profiles` stays a config error for either kind; the
+    message no longer names only the token.
+  - The `expires` warning names the remedy for the profile's kind.
+- **Agent sessions and Claude accounts on the bus.** Brenn keeps a ledger
+  per configured profile — a key profile's month-to-date spend and turn
+  count, and the refusal flags observed on either kind — and publishes it,
+  with the running Claude Code sessions, on three channels:
+  `ephemeral:agent.sessions` (state: every running session),
+  `brenn:agent.ended` (fact: one per run that ended) and
+  `brenn:agent.accounts` (state: the ledger, read back at boot). To turn it on,
+  declare all three — stamp `AgentStatus()` from the new `@agent-status`
+  library module — and grant consumers access with ordinary ACLs. Declaring
+  some without the rest is refused at boot. The bodies are
+  `brenn_envelope::agent`'s; `docs/message-bus.md` §2.9 and
+  `docs/claude-accounts.md` describe them.
+  - A refused turn is recognised: a `rejected` `rate_limit_event` flags the
+    subscription bucket it names until its reset; under a key profile, an
+    error turn matching `exhausted_markers` flags the account until a turn
+    succeeds or the month rolls over. Brenn never publishes `cleared_at`.
+  - The channels need a send rate of at least 240 in a burst and 30 a
+    second sustained. The `AgentStatus` assembly states it, so
+    `[messaging] default_send_rate` does not reach them; boot refuses any of
+    the three below that. A publish refused at runtime, by the rate gate or
+    otherwise, stops the server.
+  - A conversation that subscribes to `ephemeral:agent.sessions`, or to
+    `brenn:agent.accounts` while it runs under a key, should bind with
+    `push_depth = 0`: otherwise it is woken by its own turns, back to back,
+    and under a key each one is billed.
+  - Boot refuses to start when the retained `brenn:agent.accounts` message
+    was written by anyone but `system:agent-status`; remove that principal's
+    publish grant and clear the channel.
+- **`allowed_warning` no longer reports "Rate limited".** A
+  `rate_limit_event` whose status is `allowed_warning` used to broadcast a
+  rate-limit error to the conversation although the turn was allowed; it now
+  logs the utilisation warning only. Only `rejected` broadcasts the error. An
+  unrecognised status is logged and raises one Warning alert per process, and
+  is not shown as an error.
+- **Components can publish MQTT messages that expire.** The
+  `brenn:processor/mqtt` interface gains `mqtt-publish-expiring`:
+  `mqtt-publish` plus the MQTT 5 message-expiry interval, in seconds, with the
+  same grant, budgets and errors. A retained message published with it stops
+  being retained when the interval runs out, so a component can publish a
+  liveness record that disappears from the broker when the component stops
+  refreshing it. A zero interval is refused as `invalid-payload`. In
+  `brenn-guest`, `mqtt::try_publish_expiring` and `mqtt::publish_text_expiring`
+  call it.
+  - Compatibility: additive, with no package version bump. A component built
+    before this keeps linking, because a component imports only the functions
+    it calls and `mqtt-publish` is unchanged. A component that calls the new
+    function does not link on an older Brenn. No shim in either direction.
+  - The LLM `MqttSend` tool is unchanged and sends no expiry.
+
 ## [0.34.0] — 2026-11-10
 
 - **`api_key_provider` changes now take effect on reload, without a

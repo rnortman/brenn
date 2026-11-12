@@ -10,8 +10,11 @@
 
 use std::any::Any;
 use std::cell::Cell;
-use std::panic::{PanicHookInfo, UnwindSafe};
+use std::future::Future;
+use std::panic::{AssertUnwindSafe, PanicHookInfo, UnwindSafe};
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
 
 /// The prefix a panic message carries when it refuses operator configuration.
 ///
@@ -96,6 +99,47 @@ pub fn catch_quietly<R, F: FnOnce() -> R + UnwindSafe>(f: F) -> Result<R, Box<dy
 pub fn unexpected_panics() -> u64 {
     install_hook();
     UNEXPECTED_PANICS.with(Cell::get)
+}
+
+/// Run `task`, aborting the process if polling it panics.
+///
+/// A panic in a spawned tokio task unwinds that task alone and leaves the
+/// process serving without it. For a task the process cannot run correctly
+/// without, spawn it through this: the panic then becomes process death, and
+/// systemd restarts. The panic hook has already logged and alerted by the time
+/// the panic is caught here, so the evidence is out first; `message` is logged
+/// at `error` just before the abort.
+///
+/// Only a panic raised while polling `task` aborts. Dropping the task — runtime
+/// teardown, or a test's runtime unwinding after its own assertion failed — is
+/// not one, and a `catch_unwind` inside `task` still catches what it catches.
+pub async fn abort_on_panic<F: Future>(message: &'static str, task: F) -> F::Output {
+    AbortOnPanic {
+        message,
+        task: Box::pin(task),
+    }
+    .await
+}
+
+struct AbortOnPanic<F> {
+    message: &'static str,
+    task: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for AbortOnPanic<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let message = self.message;
+        let task = self.task.as_mut();
+        match std::panic::catch_unwind(AssertUnwindSafe(|| task.poll(cx))) {
+            Ok(poll) => poll,
+            Err(_) => {
+                tracing::error!("{message}");
+                std::process::abort();
+            }
+        }
+    }
 }
 
 /// The text of a panic payload, if it carries any.

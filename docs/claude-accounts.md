@@ -10,14 +10,17 @@ flows.
 
 ## What an account is
 
-An account is an environment variable: `claude setup-token` mints a long-lived
-OAuth token, and Claude Code reads it from `CLAUDE_CODE_OAUTH_TOKEN`. A
-**profile** is a name bound to one such token file. Nothing in the config root
+An account is an environment variable, of one of two kinds. For a subscription,
+`claude setup-token` mints a long-lived OAuth token, and Claude Code reads it
+from `CLAUDE_CODE_OAUTH_TOKEN`. For pay-as-you-go use, an Anthropic API key,
+which Claude Code reads from `ANTHROPIC_API_KEY`. A **profile** is a name bound
+to one such credential file — a **token profile** or a **key profile**. Nothing
+in the config root
 is swapped, symlinked, or moved
 ([reference](config-dsl.md#claude-accounts)), so session transcripts, settings,
 plugins and history are shared across accounts — which is why a conversation
 survives a change of account: Brenn resumes it by session id under the new
-token.
+credential, whichever its kind.
 
 The consequence is that an account is fixed for the life of a Claude Code
 process. Changing one means replacing the process, which Brenn does at a turn
@@ -71,23 +74,55 @@ boundary — never in the middle of a turn.
 
 4. Restart the server. Tokens are read once, at startup; there is no reload.
 
+### Adding an API key
+
+A key profile is added the same way, with three differences.
+
+1. Create the key on the Anthropic Platform console, and set a spend limit
+   there: that limit is the only hard stop on what the key can spend. Brenn
+   reports a key's spend; it never refuses to run under a key.
+2. Write the key to its own file with the same `umask 077` form as a token.
+   There is no naming convention for key files; the profile states the path.
+3. Declare it with `api_key_file`, and optionally the month's budget, the zone
+   whose month is the accounting period, and the text of a refused turn:
+
+   ```
+   claude_profile work-key {
+     api_key_file = "/home/brenn/.brenn-secrets/claude-profile-work-key.key";
+     budget_usd = 50.0;
+     reset_tz = "America/Chicago";
+   }
+   ```
+
+   Every attribute and its default is in
+   [the reference](config-dsl.md#claude-accounts). An agent's `claude_profiles`
+   may list token and key profiles together, in any order.
+
+**Check that the key is what gets billed.** Which credential Claude Code bills
+when an API key is set beside a `/login` in the agent's home is Claude Code's
+behaviour, and Brenn has not established it. Before relying on a key profile,
+run one turn under it and confirm the charge on the Platform console. If the
+charge is not there, Claude Code billed some other credential (see
+[When the account is not the account](#when-the-account-is-not-the-account)).
+
 Listing an agent's accounts in preference order is the whole configuration for
 an agent that never switches, and an agent with no `claude_profiles` is
 untouched by any of this — both rules, and what happens to entries that are not
 declared profiles, are in [the reference](config-dsl.md#claude-accounts).
 
-## Rotating or replacing a token
+## Rotating or replacing a token or key
 
 Overwrite the file with the same `umask 077` form used above, update `expires`
 if you record it, and restart. If you did edit the file in place at any point,
 list the secrets directory and delete whatever your editor left beside the
-token; nothing in Brenn looks at those. Revoking the old token at the Anthropic console is a separate act and
-Brenn cannot see it; a revoked token surfaces as failing turns for the agents
-using it.
+token; nothing in Brenn looks at those. Revoking the old token or key at the
+Anthropic console is a separate act and Brenn cannot see it; a revoked credential
+surfaces as failing turns for the agents using it.
 
-`expires` is a date you write down, not something Brenn reads out of the token.
-Its one effect is a Warning alert at startup when the recorded date is past or
-within 30 days; omitting it is fine and costs you that warning
+`expires` is a date you write down, not something Brenn reads out of the
+credential. Its one effect is a Warning alert at startup when the recorded date
+is past or within 30 days, naming the remedy for the profile's kind; omitting it
+is fine and costs you that warning
 ([reference](config-dsl.md#claude-accounts)).
 
 ## Switching an agent to another account
@@ -209,6 +244,69 @@ agent's previous goal stands
 channel and their allowed sets differ, one may accept what another rejects; the
 alert names the agent.
 
+## Spend, refusals and the account ledger
+
+Brenn keeps a **ledger** with one record per configured profile. To publish it,
+and the running sessions beside it, declare the three agent-status channels —
+stamp `AgentStatus()` from the `@agent-status` library module:
+
+```
+use @agent-status::*;
+
+new agent_status: AgentStatus();
+```
+
+`ephemeral:agent.sessions` lists every conversation with a running Claude Code
+process and the account it runs under; `brenn:agent.ended` carries one fact per
+run that ended; `brenn:agent.accounts` is the ledger. All three or none. Their
+bodies, the send rate they need, and the rules for a reader are in
+[the bus documentation](message-bus.md), §2.9. Without the channels the ledger
+is still kept in memory and nothing is published.
+
+**What a key profile's record counts.** Each turn that reports a cost adds it
+to `usd` and counts one in `turns`, for the calendar month in the profile's
+`reset_tz`; at the month's turn the record starts again at zero. A `result`
+that is not a model turn and carries no cost is not counted. `budget_usd` is
+reported beside the spend and enforces nothing: the spend limit on the Platform
+console is the stop, and the console, not the ledger, is the authority on what
+the key cost. Spend by anything else holding the key is not in the ledger.
+
+**What a subscription profile's record counts.** No money: its period is `-`
+and `usd` is 0. It carries flags only.
+
+**Flags.** A flag says that the account refused a turn.
+
+- Under a subscription profile, a `rate_limit_event` whose status is `rejected`
+  flags the refused bucket — `five_hour`, `general`, or `fable` for a
+  model-specific limit — until the reset time Claude Code reports, or for an
+  hour when it reports none. A flag past its time leaves the record.
+- Under a key profile, a turn that ends in an error whose text contains one of
+  the profile's `exhausted_markers` (any case) flags the whole account. The flag
+  leaves the record when a later turn under the key succeeds, or at the month's
+  rollover. If a spent key produces failing turns and no flag, the default
+  marker does not match what Claude Code said: the failing turn's text is in
+  the conversation history, and `exhausted_markers` takes it.
+
+An agent with no `claude_profiles` raises no flag; there is no account to name.
+
+**Brenn never publishes `cleared_at`.** In the `claude-usage-mqtt` agent tree,
+`cleared_at` is an operator's clear and lifts every publisher's flags on the
+account. A successful turn is not an operator, so Brenn withdraws its own flag
+and nothing else. A key that `ccc` also spends, and that `ccc` flagged, stays
+flagged in `ccc`'s record until it is cleared with `ccc`. In the other
+direction, a `cleared_at` published there does not reach Brenn's ledger: after
+topping up a key, publish it as the agent's goal by hand and let a turn run
+under it.
+
+**The ledger survives a restart** because `brenn:agent.accounts` is durable:
+at boot the retained record is read back, records of profiles no longer
+configured, or configured as the other kind, are dropped, and the month is
+rolled. Clearing the channel starts every profile at zero. Boot refuses to
+start when the retained message was published by anyone but
+`system:agent-status` — whoever wrote it chose the spend and flags Brenn would
+adopt. Remove that principal's publish grant on the channel and clear the
+channel, which starts every profile at zero.
+
 ## Removing a profile
 
 Delete the `claude_profile` block and the agents' references to it, then
@@ -217,17 +315,20 @@ startup with a Warning and the agent seeds to the first entry of its
 `claude_profiles`. The stale retained message stays on the channel until
 something publishes over it, which is harmless.
 
-Deleting a profile whose token file remains on disk leaves a live credential
-lying around; remove the file too.
+Deleting a profile whose token or key file remains on disk leaves a live
+credential lying around; remove the file too.
 
 ## When the account is not the account
 
 Claude Code ranks several credentials above `CLAUDE_CODE_OAUTH_TOKEN`. If one of
 them is present, Claude Code uses it, silently, and the profile a conversation
-claims to run under is a lie — the spend lands on some other account. This
-section is the one prose home for that list; the set Brenn checks for is the
-`OUTRANKING_CREDENTIAL_VARS` constant in `brenn-lib`, and it should be
-the same six names:
+claims to run under is a lie — the spend lands on some other account. For a key
+profile some of them rank below the key rather than above it, but any of them
+beside the key is a second credential in the environment, so Brenn applies one
+rule to both kinds: a profiled agent's environment holds exactly the credential
+its profile put there. This section is the one prose home for that list; the
+set Brenn checks for is the `OUTRANKING_CREDENTIAL_VARS` constant in
+`brenn-lib`, and it should be the same six names:
 
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
 `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`.
@@ -249,19 +350,24 @@ Brenn refuses the cases it can see:
   loaded. Without profiles the keys are allowed — nothing claims which account
   such an agent runs under.
 - **`--bare`.** `cc_extra_args` containing `--bare` together with
-  `claude_profiles` is a config error: under `--bare` Claude Code ignores the
-  token entirely.
+  `claude_profiles` is a config error, whatever the kinds of the profiles:
+  under `--bare` Claude Code does not use the token, and Brenn has not
+  established what it bills when handed an API key.
 
-Two it cannot see, which are yours to keep clean:
+Three it cannot see, which are yours to keep clean:
 
 - `apiKeyHelper` in the `settings.json` of the agent's home.
+- For a key profile, the `/login` credential in the agent's home, if Claude Code
+  prefers it to the key — the check under
+  [Adding an API key](#adding-an-api-key) is how you find out.
 - A credential variable baked into a container image.
 
-Neither produces any signal from inside Brenn. Check them when you build a home
+None of them produces any signal from inside Brenn. Check them when you build a home
 or an image, not when the bill arrives.
 
 The token's exposure inside the sandbox — CC's own tools can read their process
 environment — is an accepted risk with its reasoning written out in
 [the security posture](security-posture.md), §7.1a. The short version: treat a
-profile's token file as a durable secret, because unlike a `/login` credential
-it is minted for a year and revoked only out of band.
+profile's token or key file as a durable secret, because unlike a `/login`
+credential it is minted for a year — a key, until revoked — and revoked only out
+of band.

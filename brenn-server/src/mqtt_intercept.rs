@@ -11,6 +11,7 @@ use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, Ap
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::mqtt::address::parse_topic_name;
+use brenn_mqtt::PublishProps;
 use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
 use brenn_mqtt::payload::decode_outbound_body;
 use brenn_obs::security::{DenialKind, SecurityEventType, signal_publish_denial};
@@ -190,9 +191,12 @@ async fn execute_send(
         &policy,
         &addr,
         outbound.bytes,
-        outbound.content_type,
-        qos,
-        retain,
+        PublishProps {
+            content_type: outbound.content_type,
+            qos,
+            retain,
+            message_expiry_s: None,
+        },
         SendBudget::Conversation {
             db: bridge.db(),
             conversation_id: bridge.conversation_id,

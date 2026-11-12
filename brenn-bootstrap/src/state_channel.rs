@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
+use brenn_envelope::MessageEnvelope;
 use brenn_messaging::Messenger;
 use brenn_messaging::system::SystemInbox;
 use tokio::sync::Notify;
 
 /// Attach the system participant `component` and hand the latest retained
-/// message on each of its channels to `apply(address, body)`.
+/// message on each of its channels to `apply(address, envelope)`.
 ///
 /// The retained state is learned by a *read*, not by delivery: a system
 /// subscriber's position is durable, so after the first boot the retained
@@ -18,7 +19,7 @@ pub(crate) async fn attach_and_seed(
     component: &'static str,
     messenger: Arc<Messenger>,
     notify: Arc<Notify>,
-    mut apply: impl FnMut(&str, &str),
+    mut apply: impl FnMut(&str, &MessageEnvelope),
 ) -> SystemInbox {
     let inbox = SystemInbox::new(component, messenger, notify);
     inbox.attach().await;
@@ -26,7 +27,7 @@ pub(crate) async fn attach_and_seed(
         // Newest last, new or context alike: the channel carries state, so only
         // the latest message means anything.
         if let Some((_, envelope)) = window.entries.last() {
-            apply(&address, &envelope.body);
+            apply(&address, envelope);
         }
     }
     inbox

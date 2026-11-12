@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use brenn_cc::error::CcError;
 use brenn_cc::session::{CcSession, InitAckInfo, ModelOption, OutgoingEnvelope};
-use brenn_lib::config::{AppClaudeProfiles, ClaudeProfile, SecretString};
+use brenn_lib::config::{AppClaudeProfiles, ClaudeCredential, ClaudeProfile, SecretString};
 use brenn_obs::alerting::noop_alert_dispatcher;
 use brenn_ws_types::{CcState, WsServerMessage};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -44,7 +44,9 @@ fn goal_handle(
             (
                 (*name).to_string(),
                 ClaudeProfile {
-                    token: SecretString::new(format!("token-for-{name}")),
+                    credential: ClaudeCredential::OauthToken(SecretString::new(format!(
+                        "token-for-{name}"
+                    ))),
                     expires: None,
                 },
             )
@@ -813,7 +815,7 @@ async fn a_respawn_mounts_the_bridges_tool_socket() {
         conversation_id: 7,
         profile: brenn_cc_profile::ResolvedProfile {
             name: "main".to_string(),
-            token: SecretString::new("token".to_string()),
+            credential: ClaudeCredential::OauthToken(SecretString::new("token".to_string())),
         },
         model: None,
         resume_session_id: None,

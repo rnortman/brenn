@@ -627,7 +627,10 @@ pub async fn drain_step_sync(
 }
 
 async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Cause) {
-    // Step 1: assemble multi-port snapshot (single scan, T₀ hermetic).
+    // Step 1: assemble the multi-port snapshot. It is fixed before the guest
+    // runs, but the ports are windowed one after another, not at one instant:
+    // a publish landing between two port reads can be in the later port's
+    // window and missing from the earlier one's.
     // The gate returns None when the debt is settled and no triggering input has
     // pending rows → no activation. A request has no gate in front of it: the
     // caller is already blocked, every allowed port is windowed as an owed

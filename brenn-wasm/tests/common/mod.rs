@@ -103,7 +103,7 @@ pub fn noop_alerter() -> Arc<dyn ProcessorAlerter> {
 /// superset-grants load test) — the `load` invariant requires a `Some` callback
 /// whenever the `Mqtt` grant is present.
 pub fn ok_mqtt_publish() -> MqttPublishFn {
-    Arc::new(|_client, _topic, _payload, _content_type, _qos, _retain| MqttPublishOutcome::Ok)
+    Arc::new(|_client, _topic, _payload, _props| MqttPublishOutcome::Ok)
 }
 
 /// `ToolHost` that reports every tool as unknown/ungranted.

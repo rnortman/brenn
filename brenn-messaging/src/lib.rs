@@ -17,6 +17,7 @@
 //! `brenn-messaging-store`, below; this crate holds what is left — `Messenger`
 //! and its `impl` blocks.
 
+pub mod agent_status;
 pub mod chat_provision;
 pub mod chat_roster;
 pub mod config_reload;

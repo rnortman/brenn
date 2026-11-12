@@ -607,9 +607,12 @@ dependencies = [
 name = "brenn-cc-profile"
 version = "0.1.0"
 dependencies = [
+ "brenn-envelope",
  "brenn-lib",
  "brenn-messaging",
  "brenn-obs",
+ "chrono",
+ "chrono-tz",
  "tokio",
  "tracing",
 ]

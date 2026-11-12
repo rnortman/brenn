@@ -24,18 +24,32 @@ use tracing_subscriber::layer::SubscriberExt as _;
 // it — reach it via the (descendant-visible) `delivery` submodule directly.
 use super::super::delivery::PUBLISH_WIDE_CAP_OVERRIDE_MS;
 
-/// RAII guard that resets `PUBLISH_WIDE_CAP_OVERRIDE_MS` to `u64::MAX` on drop,
-/// ensuring test cap overrides do not leak to subsequent tests in the process.
-struct CapOverride;
+/// Held by every live `CapOverride`. Guards no data; it only serialises the
+/// tests that override the process-wide cap.
+static CAP_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard over `PUBLISH_WIDE_CAP_OVERRIDE_MS`: while it lives, no other
+/// cap-overriding test in the process runs, and on drop the override is
+/// cleared before the next such test can set its own.
+struct CapOverride {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
 
 impl CapOverride {
     fn set(ms: u64) -> Self {
+        // A poisoned lock only means another cap test panicked; that test
+        // reports its own failure, and the mutex guards no state to repair.
+        let _lock = CAP_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         PUBLISH_WIDE_CAP_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
-        Self
+        Self { _lock }
     }
 }
 
 impl Drop for CapOverride {
+    // `drop` runs before the `_lock` field is dropped, so the override is
+    // cleared while the lock is still held.
     fn drop(&mut self) {
         PUBLISH_WIDE_CAP_OVERRIDE_MS.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }
@@ -62,12 +76,19 @@ struct CapCapture {
 /// that all `tracing::warn!` calls from spawned tasks fire on the test thread,
 /// where this thread-local default applies.
 ///
+/// tracing caches each callsite's interest process-wide when the callsite is
+/// first hit. If this scoped capture were the only live dispatcher, a thread
+/// without a capture reaching a callsite first would cache `never` for every
+/// thread and this capture would miss the event; the global registry
+/// installed first keeps the capture from ever being the only dispatcher.
+///
 // Note: a near-identical scoped-tracing-capture pattern exists at
 // `brenn/src/active_bridge/compaction.rs::capture_trigger_label` —
 // different API shape (closure-wrapper there vs guard-struct here)
 // and different captured fields. If you find yourself about to add
 // a third one, talk to these first.
 fn install_scoped_cap_capture() -> CapCapture {
+    install_global_registry_once();
     let cap_sink = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
     let panic_sink = Arc::new(std::sync::Mutex::new(Vec::<(i64, String)>::new()));
     let layer = PublishWideCapLayer {
@@ -81,6 +102,18 @@ fn install_scoped_cap_capture() -> CapCapture {
         panic_sink,
         _guard,
     }
+}
+
+/// Install a bare `tracing_subscriber::registry()` as the process-wide
+/// default, once. It answers `always` for every callsite and discards every
+/// event. Nothing else in this test binary installs a global subscriber, so a
+/// failure here means that has changed.
+fn install_global_registry_once() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry())
+            .expect("no other global tracing subscriber in the brenn-pwa-push test binary");
+    });
 }
 
 /// Layer that captures `aborted_count` and `(subscription_id, panic_payload)`
@@ -145,6 +178,31 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PublishWideCapLaye
             self.panic_sink.lock().unwrap().push((sub_id, payload));
         }
     }
+}
+
+/// Emits a warn from a callsite no other test reaches, with an `aborted_count`
+/// typed as the production cap warn types it.
+fn emit_own_aborted_count_warn() {
+    tracing::warn!(aborted_count = 7_usize, "callsite-interest probe");
+}
+
+/// A capture-less thread registering a callsite first must not hide that
+/// callsite's later events from a scoped capture on another thread.
+#[test]
+fn scoped_capture_survives_callsite_registered_on_other_thread() {
+    let cap = install_scoped_cap_capture();
+
+    std::thread::spawn(emit_own_aborted_count_warn)
+        .join()
+        .expect("probe thread must not panic");
+    emit_own_aborted_count_warn();
+
+    let events = cap.cap_sink.lock().unwrap().clone();
+    assert_eq!(
+        events,
+        vec![7],
+        "the test thread's event must reach its capture, and only that one"
+    );
 }
 
 /// `BEGIN` and `COMMIT` statement counts on one `Db` connection, shared with

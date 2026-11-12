@@ -97,6 +97,19 @@ and the tool-result body grow by added fields, which `brenn-guest` ignores; `v`
 moves only for a change a provider built against the older body would misread,
 and `brenn-guest` refuses a version it does not know.
 
+A third additive change in force: **`mqtt-publish-expiring`**, a new function
+in the existing `brenn:processor/mqtt` interface. It is `mqtt-publish` plus the
+MQTT 5 message-expiry interval, under the same `mqtt` grant, budgets and
+errors; a zero interval is `invalid-payload`. Unlike `calls` and `provides` it
+is not a new interface, and it took the route `ports.publish-with-urgency`
+took: a new function beside an unchanged one, with no package version bump and
+no new grant word. A component imports only the functions it calls, so a
+bundle built before it links as it did, and one that calls `mqtt-publish` alone
+is unaffected. A kind that calls the new function needs a brenn new enough to
+link it, by the same ordering rule as `calls`. No shim exists in either
+direction. `brenn-guest` reaches it through `mqtt::try_publish_expiring` and
+`mqtt::publish_text_expiring`.
+
 One runtime contract is a **candidate for deletion**, recorded here so that a
 bundle author meets it before it happens rather than after: `brenn:replay` is
 the one world native backend code calls synchronously per request, and the

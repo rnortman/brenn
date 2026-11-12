@@ -747,6 +747,27 @@ pub enum MqttPublishOutcome {
     BrokerRejected(String),
 }
 
+/// The per-publish MQTT properties a guest supplies, as received over the WIT
+/// boundary.
+///
+/// Like [`MqttPublishOutcome`], this is the `brenn-wasm`-local shape at the
+/// [`MqttPublishFn`] seam; the binary crate maps it onto the egress pipeline's
+/// own properties type. `Default` is QoS 0, not retained, with no content type
+/// and no expiry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MqttPublishProps {
+    /// MQTT 5 content type; `None` sends none.
+    pub content_type: Option<String>,
+    /// Delivery QoS as the guest sent it; `do_mqtt_publish` refuses any value
+    /// above 2 before the callback runs.
+    pub qos: u8,
+    /// Whether the broker retains the message.
+    pub retain: bool,
+    /// MQTT 5 message-expiry interval in seconds: `None` for `mqtt-publish`,
+    /// a non-zero `Some` for `mqtt-publish-expiring`.
+    pub message_expiry_s: Option<u32>,
+}
+
 /// Host callback performing a synchronous MQTT publish for the `mqtt` interface.
 ///
 /// `brenn-wasm` cannot depend on `brenn-lib` (where the shared enforcement
@@ -755,8 +776,8 @@ pub enum MqttPublishOutcome {
 /// and internally calls `enforce_and_publish`, mapping the result into
 /// `MqttPublishOutcome`. Same seam as `OutputAclFn` / `ProcessorAlerter`.
 ///
-/// Arguments are the guest-supplied `(client, topic, payload, content_type, qos,
-/// retain)` exactly as received over the WIT boundary; the closure owns address
+/// Arguments are the guest-supplied `(client, topic, payload, props)` exactly as
+/// received over the WIT boundary; the closure owns address
 /// parsing/validation (mapping a failure to `MqttPublishOutcome::InvalidPayload`)
 /// and the call to the shared enforcement pipeline.
 ///
@@ -771,9 +792,8 @@ pub enum MqttPublishOutcome {
 /// likewise handle every guest input total. Callers with no MQTT egress pass `None`
 /// (the `Mqtt` capability is then never linked, so the host fn is unreachable; the
 /// `None` is a structural backstop).
-pub type MqttPublishFn = Arc<
-    dyn Fn(String, String, Vec<u8>, Option<String>, u8, bool) -> MqttPublishOutcome + Send + Sync,
->;
+pub type MqttPublishFn =
+    Arc<dyn Fn(String, String, Vec<u8>, MqttPublishProps) -> MqttPublishOutcome + Send + Sync>;
 
 /// Failure modes returned across the `ToolHost` seam.
 ///
@@ -1881,7 +1901,8 @@ impl ProcessorData {
         )
     }
 
-    /// Synchronous MQTT publish (the `mqtt.mqtt-publish` import).
+    /// Synchronous MQTT publish (the `mqtt.mqtt-publish` import, and
+    /// `mqtt.mqtt-publish-expiring` with `message_expiry_s` set).
     ///
     /// Unlike `do_publish` (buffered, flushed at activation end), this reaches
     /// the broker inline and returns its outcome — no store-and-forward.
@@ -1895,9 +1916,7 @@ impl ProcessorData {
         client: String,
         topic: String,
         payload: Vec<u8>,
-        content_type: Option<String>,
-        qos: u8,
-        retain: bool,
+        props: MqttPublishProps,
     ) -> Result<(), MqttPublishWitError> {
         // Per-activation total-call budget, shared with `do_publish`. Bumped and
         // checked first (anti-flood) — a failed call consumes budget too, exactly
@@ -1919,10 +1938,18 @@ impl ProcessorData {
         // which returns `MqttError::NotConnected` → mapped to `broker(...)` (the
         // documented MAY-retry variant) — a guest following the retry contract
         // would loop forever on an unfixable bug. Reject it here as permanent.
-        if qos > 2 {
+        if props.qos > 2 {
             return Err(MqttPublishWitError::InvalidPayload(format!(
-                "invalid qos {qos}: must be 0, 1, or 2"
+                "invalid qos {}: must be 0, 1, or 2",
+                props.qos
             )));
+        }
+        // A zero expiry interval would have the broker drop the message on
+        // receipt; it is a guest bug, refused as permanent.
+        if props.message_expiry_s == Some(0) {
+            return Err(MqttPublishWitError::InvalidPayload(
+                "message-expiry-s must be at least 1".to_string(),
+            ));
         }
         // Per-message payload size cap: a hostile guest holding the `mqtt` grant
         // must not emit arbitrary-size broker publishes. The per-activation byte
@@ -1957,7 +1984,7 @@ impl ProcessorData {
             .as_ref()
             .expect("mqtt-publish host fn invoked without an mqtt_publish callback (Mqtt grant linked but callback unset)");
 
-        match cb(client, topic, payload, content_type, qos, retain) {
+        match cb(client, topic, payload, props) {
             MqttPublishOutcome::Ok => Ok(()),
             MqttPublishOutcome::NotPermitted => {
                 // Security-relevant: an operator policy actively blocking a WASM
@@ -2142,7 +2169,41 @@ impl processor_bindings::brenn::processor::mqtt::Host for ProcessorData {
         qos: u8,
         retain: bool,
     ) -> Result<(), MqttPublishWitError> {
-        self.do_mqtt_publish(client, topic, payload, content_type, qos, retain)
+        self.do_mqtt_publish(
+            client,
+            topic,
+            payload,
+            MqttPublishProps {
+                content_type,
+                qos,
+                retain,
+                message_expiry_s: None,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mqtt_publish_expiring(
+        &mut self,
+        client: String,
+        topic: String,
+        payload: Vec<u8>,
+        content_type: Option<String>,
+        qos: u8,
+        retain: bool,
+        message_expiry_s: u32,
+    ) -> Result<(), MqttPublishWitError> {
+        self.do_mqtt_publish(
+            client,
+            topic,
+            payload,
+            MqttPublishProps {
+                content_type,
+                qos,
+                retain,
+                message_expiry_s: Some(message_expiry_s),
+            },
+        )
     }
 }
 
@@ -4707,9 +4768,7 @@ mod processor_store_host_tests {
 
     /// Build a `ProcessorData` whose MQTT-publish callback returns `outcome`.
     fn make_mqtt_data(outcome: MqttPublishOutcome) -> ProcessorData {
-        let cb: MqttPublishFn = Arc::new(
-            move |_client, _topic, _payload, _content_type, _qos, _retain| outcome.clone(),
-        );
+        let cb: MqttPublishFn = Arc::new(move |_client, _topic, _payload, _props| outcome.clone());
         ProcessorData {
             resource_table: ResourceTable::new(),
             limits: StoreLimitsBuilder::new().build(),
@@ -4751,15 +4810,25 @@ mod processor_store_host_tests {
     fn do_mqtt_publish_maps_each_outcome() {
         // Ok → Ok(()).
         let mut ok = make_mqtt_data(MqttPublishOutcome::Ok);
-        ok.do_mqtt_publish("home".into(), "t".into(), vec![1], None, 0, false)
-            .expect("Ok outcome must map to Ok(())");
+        ok.do_mqtt_publish(
+            "home".into(),
+            "t".into(),
+            vec![1],
+            MqttPublishProps::default(),
+        )
+        .expect("Ok outcome must map to Ok(())");
         assert_eq!(ok.gate.calls(), 1, "a call consumes the shared budget");
 
         // NotPermitted → not-permitted.
         let mut np = make_mqtt_data(MqttPublishOutcome::NotPermitted);
         assert!(
             matches!(
-                np.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false),
+                np.do_mqtt_publish(
+                    "home".into(),
+                    "t".into(),
+                    vec![],
+                    MqttPublishProps::default()
+                ),
                 Err(MqttPublishWitError::NotPermitted)
             ),
             "NotPermitted must map to not-permitted"
@@ -4768,57 +4837,84 @@ mod processor_store_host_tests {
         // NoConnector → no-connector.
         let mut nc = make_mqtt_data(MqttPublishOutcome::NoConnector);
         assert!(matches!(
-            nc.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false),
+            nc.do_mqtt_publish(
+                "home".into(),
+                "t".into(),
+                vec![],
+                MqttPublishProps::default()
+            ),
             Err(MqttPublishWitError::NoConnector)
         ));
 
         // InvalidPayload(reason) → invalid-payload(reason), preserving the string.
         let mut ip = make_mqtt_data(MqttPublishOutcome::InvalidPayload("bad topic".into()));
-        match ip.do_mqtt_publish("home".into(), "t#".into(), vec![], None, 0, false) {
+        match ip.do_mqtt_publish(
+            "home".into(),
+            "t#".into(),
+            vec![],
+            MqttPublishProps::default(),
+        ) {
             Err(MqttPublishWitError::InvalidPayload(s)) => assert_eq!(s, "bad topic"),
             other => panic!("expected invalid-payload, got {other:?}"),
         }
 
         // Broker(reason) → broker(reason).
         let mut br = make_mqtt_data(MqttPublishOutcome::Broker("disconnected".into()));
-        match br.do_mqtt_publish("home".into(), "t".into(), vec![], None, 1, false) {
+        match br.do_mqtt_publish(
+            "home".into(),
+            "t".into(),
+            vec![],
+            MqttPublishProps {
+                qos: 1,
+                ..Default::default()
+            },
+        ) {
             Err(MqttPublishWitError::Broker(s)) => assert_eq!(s, "disconnected"),
             other => panic!("expected broker, got {other:?}"),
         }
 
         // BrokerRejected(reason) → broker-rejected(reason).
         let mut rj = make_mqtt_data(MqttPublishOutcome::BrokerRejected("not authorized".into()));
-        match rj.do_mqtt_publish("home".into(), "t".into(), vec![], None, 1, false) {
+        match rj.do_mqtt_publish(
+            "home".into(),
+            "t".into(),
+            vec![],
+            MqttPublishProps {
+                qos: 1,
+                ..Default::default()
+            },
+        ) {
             Err(MqttPublishWitError::BrokerRejected(s)) => assert_eq!(s, "not authorized"),
             other => panic!("expected broker-rejected, got {other:?}"),
         }
     }
 
     /// The callback receives the guest-supplied arguments verbatim (client,
-    /// topic, payload, content-type, qos, retain) — the host fn forwards, it does
+    /// topic, payload and every publish property) — the host fn forwards, it does
     /// not reinterpret.
     #[test]
     fn do_mqtt_publish_forwards_guest_args() {
-        // (client, topic, payload, content_type, qos, retain) captured by the cb.
-        type SeenArgs = (String, String, Vec<u8>, Option<String>, u8, bool);
+        type SeenArgs = (String, String, Vec<u8>, MqttPublishProps);
         let seen: Arc<Mutex<Option<SeenArgs>>> = Arc::new(Mutex::new(None));
         let seen_cb = Arc::clone(&seen);
-        let cb: MqttPublishFn =
-            Arc::new(move |client, topic, payload, content_type, qos, retain| {
-                *seen_cb.lock().unwrap() =
-                    Some((client, topic, payload, content_type, qos, retain));
-                MqttPublishOutcome::Ok
-            });
+        let cb: MqttPublishFn = Arc::new(move |client, topic, payload, props| {
+            *seen_cb.lock().unwrap() = Some((client, topic, payload, props));
+            MqttPublishOutcome::Ok
+        });
         let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
         data.mqtt_publish = Some(cb);
 
+        let props = MqttPublishProps {
+            content_type: Some("application/json".into()),
+            qos: 2,
+            retain: true,
+            message_expiry_s: Some(90),
+        };
         data.do_mqtt_publish(
             "home".into(),
             "sensors/temp".into(),
             vec![9, 8, 7],
-            Some("application/json".into()),
-            2,
-            true,
+            props.clone(),
         )
         .expect("Ok");
 
@@ -4826,9 +4922,38 @@ mod processor_store_host_tests {
         assert_eq!(got.0, "home");
         assert_eq!(got.1, "sensors/temp");
         assert_eq!(got.2, vec![9, 8, 7]);
-        assert_eq!(got.3, Some("application/json".to_string()));
-        assert_eq!(got.4, 2);
-        assert!(got.5);
+        assert_eq!(got.3, props);
+    }
+
+    /// A zero message-expiry interval is a permanent `invalid-payload`, and the
+    /// callback is never reached.
+    #[test]
+    fn do_mqtt_publish_rejects_zero_expiry_as_invalid_payload() {
+        let called = Arc::new(Mutex::new(false));
+        let called_cb = Arc::clone(&called);
+        let cb: MqttPublishFn = Arc::new(move |_c, _t, _p, _props| {
+            *called_cb.lock().unwrap() = true;
+            MqttPublishOutcome::Ok
+        });
+        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
+        data.mqtt_publish = Some(cb);
+        match data.do_mqtt_publish(
+            "home".into(),
+            "t".into(),
+            vec![1],
+            MqttPublishProps {
+                qos: 1,
+                retain: true,
+                message_expiry_s: Some(0),
+                ..Default::default()
+            },
+        ) {
+            Err(MqttPublishWitError::InvalidPayload(msg)) => {
+                assert!(msg.contains("message-expiry-s"), "msg: {msg}");
+            }
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
+        assert!(!*called.lock().unwrap(), "callback must not be reached");
     }
 
     /// The per-activation call-count budget is *shared* with `do_publish`:
@@ -4856,15 +4981,25 @@ mod processor_store_host_tests {
                 .expect("under budget");
         }
         for _ in half..MAX_PUBLISH_CALLS_PER_ACTIVATION {
-            data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false)
-                .expect("under budget");
+            data.do_mqtt_publish(
+                "home".into(),
+                "t".into(),
+                vec![],
+                MqttPublishProps::default(),
+            )
+            .expect("under budget");
         }
         assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION);
         // One more — over the shared cap — must be quota-exceeded, even though the
         // callback would otherwise return Ok.
         assert!(
             matches!(
-                data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false),
+                data.do_mqtt_publish(
+                    "home".into(),
+                    "t".into(),
+                    vec![],
+                    MqttPublishProps::default()
+                ),
                 Err(MqttPublishWitError::QuotaExceeded)
             ),
             "mqtt-publish past the shared call cap must be quota-exceeded"
@@ -4881,7 +5016,12 @@ mod processor_store_host_tests {
             data.gate.charge_call().expect("under the cap");
         }
         assert!(matches!(
-            data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false),
+            data.do_mqtt_publish(
+                "home".into(),
+                "t".into(),
+                vec![],
+                MqttPublishProps::default()
+            ),
             Err(MqttPublishWitError::QuotaExceeded)
         ));
         assert_eq!(
@@ -4902,8 +5042,13 @@ mod processor_store_host_tests {
     fn do_mqtt_publish_call_budget_boundary_mqtt_only() {
         let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
         for i in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
-            data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false)
-                .unwrap_or_else(|e| panic!("call {i} within budget must be Ok, got {e:?}"));
+            data.do_mqtt_publish(
+                "home".into(),
+                "t".into(),
+                vec![],
+                MqttPublishProps::default(),
+            )
+            .unwrap_or_else(|e| panic!("call {i} within budget must be Ok, got {e:?}"));
         }
         assert_eq!(
             data.gate.calls(),
@@ -4912,7 +5057,12 @@ mod processor_store_host_tests {
         );
         assert!(
             matches!(
-                data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false),
+                data.do_mqtt_publish(
+                    "home".into(),
+                    "t".into(),
+                    vec![],
+                    MqttPublishProps::default()
+                ),
                 Err(MqttPublishWitError::QuotaExceeded)
             ),
             "the first call past the cap must be quota-exceeded"
@@ -4929,14 +5079,22 @@ mod processor_store_host_tests {
         // The callback would return Ok — proving the rejection happens before it.
         let cb_invoked = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&cb_invoked);
-        let cb: MqttPublishFn = Arc::new(move |_c, _t, _p, _ct, _q, _r| {
+        let cb: MqttPublishFn = Arc::new(move |_c, _t, _p, _props| {
             *flag.lock().unwrap() = true;
             MqttPublishOutcome::Ok
         });
         let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
         data.mqtt_publish = Some(cb);
 
-        match data.do_mqtt_publish("home".into(), "t".into(), vec![1], None, 3, false) {
+        match data.do_mqtt_publish(
+            "home".into(),
+            "t".into(),
+            vec![1],
+            MqttPublishProps {
+                qos: 3,
+                ..Default::default()
+            },
+        ) {
             Err(MqttPublishWitError::InvalidPayload(s)) => {
                 assert!(s.contains("qos"), "reason should mention qos, got {s:?}")
             }
@@ -4959,7 +5117,7 @@ mod processor_store_host_tests {
     fn do_mqtt_publish_rejects_oversize_payload_as_invalid_payload() {
         let cb_invoked = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&cb_invoked);
-        let cb: MqttPublishFn = Arc::new(move |_c, _t, _p, _ct, _q, _r| {
+        let cb: MqttPublishFn = Arc::new(move |_c, _t, _p, _props| {
             *flag.lock().unwrap() = true;
             MqttPublishOutcome::Ok
         });
@@ -4967,7 +5125,12 @@ mod processor_store_host_tests {
         data.mqtt_publish = Some(cb);
 
         let oversize = vec![0u8; 1025];
-        match data.do_mqtt_publish("home".into(), "t".into(), oversize, None, 0, false) {
+        match data.do_mqtt_publish(
+            "home".into(),
+            "t".into(),
+            oversize,
+            MqttPublishProps::default(),
+        ) {
             Err(MqttPublishWitError::InvalidPayload(s)) => {
                 assert!(
                     s.contains("exceeds max"),
@@ -4983,7 +5146,12 @@ mod processor_store_host_tests {
         // A payload exactly at the cap is accepted (boundary: `>` not `>=`).
         let mut at_cap = make_mqtt_data(MqttPublishOutcome::Ok);
         at_cap
-            .do_mqtt_publish("home".into(), "t".into(), vec![0u8; 1024], None, 0, false)
+            .do_mqtt_publish(
+                "home".into(),
+                "t".into(),
+                vec![0u8; 1024],
+                MqttPublishProps::default(),
+            )
             .expect("a payload exactly at max_payload_bytes must be accepted");
     }
 
@@ -4996,7 +5164,12 @@ mod processor_store_host_tests {
     #[test]
     fn do_mqtt_publish_not_permitted_emits_warn() {
         let mut np = make_mqtt_data(MqttPublishOutcome::NotPermitted);
-        let _ = np.do_mqtt_publish("blocked-client".into(), "t".into(), vec![], None, 0, false);
+        let _ = np.do_mqtt_publish(
+            "blocked-client".into(),
+            "t".into(),
+            vec![],
+            MqttPublishProps::default(),
+        );
         assert!(
             logs_contain("not-permitted"),
             "a not-permitted MQTT publish must emit a warn! naming the denial"
@@ -5725,7 +5898,12 @@ mod processor_store_host_tests {
             HashMap::from([(SinkKey::MqttClient("home".to_string()), 2000u64)]),
         );
         for _ in 0..2 {
-            let r = data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false);
+            let r = data.do_mqtt_publish(
+                "home".into(),
+                "t".into(),
+                vec![],
+                MqttPublishProps::default(),
+            );
             assert!(
                 matches!(r, Err(MqttPublishWitError::Broker(_))),
                 "broker error still charges"
@@ -5733,7 +5911,12 @@ mod processor_store_host_tests {
         }
         // Third attempt: budget exhausted ⇒ quota-exceeded (before the callback).
         assert!(matches!(
-            data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false),
+            data.do_mqtt_publish(
+                "home".into(),
+                "t".into(),
+                vec![],
+                MqttPublishProps::default()
+            ),
             Err(MqttPublishWitError::QuotaExceeded)
         ));
         assert_eq!(
@@ -5750,8 +5933,13 @@ mod processor_store_host_tests {
         let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
         // No budget entry for "home".
         for _ in 0..50 {
-            data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false)
-                .expect("no per-sink limit when the client has no bucket");
+            data.do_mqtt_publish(
+                "home".into(),
+                "t".into(),
+                vec![],
+                MqttPublishProps::default(),
+            )
+            .expect("no per-sink limit when the client has no bucket");
         }
         assert!(data.publish_suppressed_by_sink.is_empty());
     }

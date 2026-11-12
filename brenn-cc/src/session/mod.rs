@@ -2091,31 +2091,34 @@ mod tests {
     }
 
     /// The whole point of the `-e NAME` form: podman copies the value from its
-    /// own environment, so the token is not in `/proc/<pid>/cmdline`.
+    /// own environment, so the credential is not in `/proc/<pid>/cmdline`.
+    /// Both credential variables a profile can hand over take that form.
     #[tokio::test]
     async fn container_command_names_the_secret_var_without_its_value() {
-        let mut config = container_config();
-        config.secret_env_vars = vec![(
-            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
-            SecretString::new("sk-ant-oat-secret".to_string()),
-        )];
-        let cmd = build_spawn_command(&config);
-        let idx = cmd
-            .args
-            .iter()
-            .position(|a| a == "CLAUDE_CODE_OAUTH_TOKEN")
-            .expect("the variable is named on the podman command line");
-        assert_eq!(cmd.args[idx - 1], "-e");
-        assert!(
-            !cmd.args[idx].contains('='),
-            "the `-e NAME` form carries no value: {:?}",
-            cmd.args[idx]
-        );
-        assert!(
-            !cmd.args.iter().any(|a| a.contains("sk-ant-oat-secret")),
-            "no argument may carry the token bytes: {:?}",
-            cmd.args
-        );
+        for var in ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+            let mut config = container_config();
+            config.secret_env_vars = vec![(
+                var.to_string(),
+                SecretString::new("sk-ant-secret".to_string()),
+            )];
+            let cmd = build_spawn_command(&config);
+            let idx = cmd
+                .args
+                .iter()
+                .position(|a| a == var)
+                .expect("the variable is named on the podman command line");
+            assert_eq!(cmd.args[idx - 1], "-e");
+            assert!(
+                !cmd.args[idx].contains('='),
+                "the `-e NAME` form carries no value: {:?}",
+                cmd.args[idx]
+            );
+            assert!(
+                !cmd.args.iter().any(|a| a.contains("sk-ant-secret")),
+                "no argument may carry the credential bytes: {:?}",
+                cmd.args
+            );
+        }
     }
 
     #[tokio::test]

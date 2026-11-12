@@ -43,9 +43,10 @@ pub(crate) fn publish_wide_cap() -> Duration {
     PUBLISH_WIDE_CAP
 }
 
-/// Override for `publish_wide_cap()` in tests, stored as milliseconds.
-/// `u64::MAX` means "not overridden". Each test sets atomically; no
-/// first-writer-wins problem unlike `OnceLock`.
+/// Process-wide override for `publish_wide_cap()` in tests, in milliseconds;
+/// `u64::MAX` means "not overridden". Tests set it only through the fanout
+/// tests' `CapOverride` guard, which lets one overriding test run at a time
+/// and clears the override when that test ends.
 #[cfg(test)]
 pub(crate) static PUBLISH_WIDE_CAP_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);

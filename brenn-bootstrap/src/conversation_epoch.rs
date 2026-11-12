@@ -88,8 +88,8 @@ pub(crate) async fn attach_and_seed(
         CONVERSATION_EPOCH_COMPONENT,
         messenger,
         notify,
-        |address, body| {
-            epochs.apply(address, body);
+        |address, envelope| {
+            epochs.apply(address, &envelope.body);
         },
     )
     .await

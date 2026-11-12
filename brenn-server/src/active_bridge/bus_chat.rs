@@ -1264,7 +1264,7 @@ fn expect_live(text: Option<String>, variant: &str) -> String {
 }
 
 /// Mirror the legacy session state onto the protocol's.
-fn cc_state(state: brenn_ws_types::CcState) -> chat::CcState {
+pub(in crate::active_bridge) fn cc_state(state: brenn_ws_types::CcState) -> chat::CcState {
     use brenn_ws_types::CcState as Ws;
     match state {
         Ws::Idle => chat::CcState::Idle,

@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, info, warn};
 
+use brenn_lib::panic_util::abort_on_panic;
 use brenn_messaging::Messenger;
 use brenn_messaging::config_reload::CONFIG_RELOAD_COMPONENT;
 use brenn_messaging::system::SystemInbox;
@@ -45,41 +46,6 @@ use super::driver::{ReloadDriver, TriggerSource};
 /// not so that requests accumulate. Anything past this depth is asking for a
 /// reload the trigger ahead of it is already going to perform.
 pub(crate) const TRIGGER_QUEUE_DEPTH: usize = 8;
-
-/// Aborts the process if the reload driver task unwinds.
-///
-/// The rule is that the driver task never survives a panic. Every panic it can
-/// reach is a host bug — prepare turns the panics a *document* can provoke into
-/// refusals, and commit is past everything that could decline — and a panicking
-/// task unwinds that task alone. What that leaves is a process whose reload
-/// facility is silently dead: the directory, registry and bindings wherever the
-/// walk stopped if it panicked mid-commit, or an intact process converging to
-/// nothing forever if it panicked anywhere else, with a retained status that may
-/// now name a document the process does not project. Both are a process
-/// tolerating a known bug in one of its subsystems, which this backend does not
-/// do. So the unwind becomes process death: systemd restarts, and the next boot
-/// reads the document on disk and publishes its hash.
-///
-/// The panic hook has already run by the time this drops — it logs and alerts
-/// synchronously — so the operator's evidence is out before the process goes.
-/// Only an unwind: a future dropped during runtime teardown is a process on its
-/// way out already, and `SIGTERM` mid-reload is the design's own accepted case.
-/// The `catch_unwind` classifiers inside prepare are unaffected: they unwind
-/// frames beneath this guard, not its own.
-struct AbortOnUnwind;
-
-impl Drop for AbortOnUnwind {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            return;
-        }
-        tracing::error!(
-            "the reload driver task panicked; aborting rather than serving a process whose \
-             reload facility is dead or whose retained status is false"
-        );
-        std::process::abort();
-    }
-}
 
 /// A handle either door uses to ask for a reload.
 #[derive(Clone)]
@@ -116,7 +82,7 @@ impl ReloadRequests {
 /// one.
 ///
 /// Process-lifetime, and not one of the tasks whose death is tolerated: it runs
-/// under [`AbortOnUnwind`], so a panic anywhere in it takes the process down for
+/// under [`abort_on_panic`], so a panic anywhere in it takes the process down for
 /// systemd to restart rather than leaving a facility that converges nothing.
 pub(crate) fn spawn_driver(driver: ReloadDriver) -> ReloadRequests {
     let (requests, rx) = trigger_channel();
@@ -137,9 +103,18 @@ pub(crate) fn trigger_channel() -> (ReloadRequests, mpsc::Receiver<TriggerSource
 
 /// Run one driver over an existing trigger queue.
 pub(crate) fn spawn_driver_on(mut driver: ReloadDriver, mut rx: mpsc::Receiver<TriggerSource>) {
-    drop(tokio::spawn(async move {
-        // Named, never `let _`, which would drop it at once and cover nothing.
-        let _abort_on_unwind = AbortOnUnwind;
+    // The driver never survives a panic. Every panic it can reach is a host bug
+    // — prepare turns the panics a *document* can provoke into refusals, and
+    // commit is past everything that could decline — and a panicking task
+    // unwinds that task alone, leaving a process whose reload facility is
+    // silently dead: the directory, registry and bindings wherever the walk
+    // stopped, or an intact process converging to nothing forever, with a
+    // retained status that may name a document the process does not project.
+    // So the panic is process death: systemd restarts, and the next boot reads
+    // the document on disk and publishes its hash. `SIGTERM` mid-reload drops
+    // the task without a panic, which is the accepted case. The `catch_unwind`
+    // classifiers inside prepare catch beneath this and are unaffected.
+    let driver_task = async move {
         // The one trigger carried over from the reload that just ran, standing
         // for every request that arrived while it did.
         let mut pending: Option<TriggerSource> = None;
@@ -173,7 +148,12 @@ pub(crate) fn spawn_driver_on(mut driver: ReloadDriver, mut rx: mpsc::Receiver<T
             }
         }
         info!("reload driver: every door is closed; the driver task is done");
-    }));
+    };
+    drop(tokio::spawn(abort_on_panic(
+        "the reload driver task panicked; aborting rather than serving a process whose reload \
+         facility is dead or whose retained status is false",
+        driver_task,
+    )));
 }
 
 /// Open the bus door: the facility's participant drains its request channel and

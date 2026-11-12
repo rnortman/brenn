@@ -1921,14 +1921,20 @@ vocabulary! {
         opt profile_token_dir: V,
     }
 
-    /// A `claude_profile` block: one Claude account, as a token file.
+    /// A `claude_profile` block: one Claude account, as a token file or an
+    /// API key file.
     ///
     /// Every key optional, so the block-less form `claude_profile main;` states
-    /// a whole profile — the token path then follows the
-    /// `claude_defaults.profile_token_dir` convention.
+    /// a whole profile — a token profile whose path follows the
+    /// `claude_defaults.profile_token_dir` convention. `api_key_file` makes
+    /// it a key profile, the only kind the last three keys apply to.
     struct ClaudeProfileAttrs<V> {
         opt token_file: V,
+        opt api_key_file: V,
         opt expires: V,
+        opt budget_usd: V,
+        opt reset_tz: V,
+        opt exhausted_markers: V,
     }
 
     /// An `oauth_provider` block: one authorization server Brenn connects

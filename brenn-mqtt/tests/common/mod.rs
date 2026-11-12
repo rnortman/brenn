@@ -268,6 +268,24 @@ pub async fn direct_subscriber(
     ca_pem: Vec<u8>,
     topic: &str,
 ) -> mpsc::Receiver<Vec<u8>> {
+    let mut publish_rx = direct_subscriber_publish(broker_port, ca_pem, topic).await;
+    let (deliver_tx, deliver_rx) = mpsc::channel::<Vec<u8>>(1);
+    tokio::spawn(async move {
+        if let Some(p) = publish_rx.recv().await {
+            deliver_tx.send(p.payload.to_vec()).await.ok();
+        }
+    });
+    deliver_rx
+}
+
+/// [`direct_subscriber`], handing over the whole received PUBLISH packet so a
+/// test can read its properties (content type, message expiry) as well as its
+/// payload.
+pub async fn direct_subscriber_publish(
+    broker_port: u16,
+    ca_pem: Vec<u8>,
+    topic: &str,
+) -> mpsc::Receiver<rumqttc::mqttbytes::v5::Publish> {
     let client_id = format!("brenn-direct-sub-{}", uuid_v4_simple());
     let mut opts = MqttOptions::new(client_id, ("127.0.0.1", broker_port));
     opts.set_clean_start(true);
@@ -288,14 +306,14 @@ pub async fn direct_subscriber(
     )
     .await;
 
-    let (deliver_tx, deliver_rx) = mpsc::channel::<Vec<u8>>(1);
+    let (deliver_tx, deliver_rx) = mpsc::channel::<rumqttc::mqttbytes::v5::Publish>(1);
     tokio::spawn(async move {
         // Keep the client alive so the eventloop keeps servicing the connection.
         let _client = client;
         loop {
             match eventloop.poll().await {
                 Ok(rumqttc::Event::Incoming(rumqttc::Incoming::Publish(p))) => {
-                    deliver_tx.send(p.payload.to_vec()).await.ok();
+                    deliver_tx.send(p).await.ok();
                     return; // one publish is all we need
                 }
                 Ok(_) => {}

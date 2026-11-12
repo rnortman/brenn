@@ -5,6 +5,7 @@
 //! It sits above `brenn-server` so that an edit to the wiring — or to the tests
 //! that boot the wired system — does not re-run the crate below it.
 
+mod agent_status;
 mod apps;
 mod automation;
 mod cc_profile;
@@ -414,6 +415,18 @@ pub(crate) async fn publish_boot_surface_documents(
         messenger, prefix, surfaces, epoch,
     )
     .await;
+}
+
+/// The parked-notify binding `run_server` registered for the system
+/// participant `component`, if that participant subscribes to anything.
+fn system_notifier(
+    notifiers: &[(&'static str, std::sync::Arc<tokio::sync::Notify>)],
+    component: &str,
+) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+    notifiers
+        .iter()
+        .find(|(name, _)| *name == component)
+        .map(|(_, notify)| notify.clone())
 }
 
 pub async fn run_server(
@@ -985,29 +998,28 @@ pub async fn run_server(
     let tool_executor_wiring: Option<(
         std::sync::Arc<tokio::sync::Notify>,
         std::sync::Arc<brenn_tool_registry::ToolCallerGrants>,
-    )> = system_notifiers
-        .iter()
-        .find(|(component, _)| *component == brenn_tool_registry::TOOL_EXECUTOR_COMPONENT)
-        .map(|(_, notify)| {
-            (
-                notify.clone(),
-                std::sync::Arc::new(brenn_tool_registry::ToolCallerGrants::new(
-                    planned_tool_caller_grants,
-                )),
-            )
-        });
+    )> = system_notifier(
+        &system_notifiers,
+        brenn_tool_registry::TOOL_EXECUTOR_COMPONENT,
+    )
+    .map(|notify| {
+        (
+            notify,
+            std::sync::Arc::new(brenn_tool_registry::ToolCallerGrants::new(
+                planned_tool_caller_grants,
+            )),
+        )
+    });
 
     // Taken before the executor's pair is moved into its task: the reload
     // facility needs the grant table and its own drain-loop `Notify`.
     let reload_tool_caller_grants = tool_executor_wiring
         .as_ref()
         .map(|(_, grants)| grants.clone());
-    let reload_notify = system_notifiers
-        .iter()
-        .find(|(component, _)| {
-            *component == brenn_messaging::config_reload::CONFIG_RELOAD_COMPONENT
-        })
-        .map(|(_, notify)| notify.clone());
+    let reload_notify = system_notifier(
+        &system_notifiers,
+        brenn_messaging::config_reload::CONFIG_RELOAD_COMPONENT,
+    );
 
     // Register the remaining delivery bindings: every configured app delivers
     // inline through its conversation bridge, and every surface and remote fans
@@ -1044,6 +1056,19 @@ pub async fn run_server(
             .expect("messenger is Some whenever the router is Some (both built together)");
         assert_every_subscriber_wired(messenger, router);
     }
+
+    // Agent status: the reporter and its account ledger, seeded from the
+    // retained accounts body here, above the `AppState` literal, for the reason
+    // the profile goals below are read here — every spawn path is below it.
+    let (agent_status, agent_status_inbox) = agent_status::boot(
+        &claude_profiles,
+        messaging_result.messenger.clone(),
+        system_notifier(
+            &system_notifiers,
+            brenn_messaging::agent_status::AGENT_STATUS_COMPONENT,
+        ),
+    )
+    .await;
 
     // Claude account profiles. Every profiled agent starts on the first entry of
     // its `claude_profiles`; a goal channel then moves it.
@@ -1083,14 +1108,14 @@ pub async fn run_server(
                 let messenger = messaging_result.messenger.clone().expect(
                     "a claude_profile_goal names a declared durable channel, so messaging is on",
                 );
-                let notify = system_notifiers
-                    .iter()
-                    .find(|(component, _)| *component == brenn_cc_profile::CC_PROFILE_COMPONENT)
-                    .map(|(_, notify)| notify.clone())
-                    .expect(
-                        "the cc-profile spec is pushed exactly when a goal channel is named, and \
+                let notify = system_notifier(
+                    &system_notifiers,
+                    brenn_cc_profile::CC_PROFILE_COMPONENT,
+                )
+                .expect(
+                    "the cc-profile spec is pushed exactly when a goal channel is named, and \
                          every subscribing spec gets a parked-notify binding",
-                    );
+                );
                 inbox = Some(cc_profile::attach_and_seed(&goal, messenger, notify).await);
             }
             (Some(goal), inbox)
@@ -1152,6 +1177,7 @@ pub async fn run_server(
         attach_registry: brenn_attach_server::registry::AttachRegistry::default(),
         attach_heartbeat_secs: brenn_surface_server::HEARTBEAT_SECS,
         cc_profiles: cc_profiles.clone(),
+        agent_status,
         epoch_reconciler: epoch_reconciler.clone(),
         oauth: oauth_service,
     };
@@ -1276,6 +1302,10 @@ pub async fn run_server(
                 .spawn(),
             );
             info!("tool_registry: async tool executor task spawned");
+        }
+
+        if let Some(inbox) = agent_status_inbox {
+            agent_status::spawn_accounts_drain(inbox);
         }
 
         if let Some(inbox) = cc_profile_inbox {

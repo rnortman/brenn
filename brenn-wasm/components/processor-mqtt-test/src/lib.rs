@@ -35,7 +35,9 @@
 // Three further shapes route through the guest SDK (`brenn_guest::mqtt`) rather
 // than the raw import, keyed on their own body sentinels: `PUBLISH_JSON` and
 // `PUBLISH_TEXT` send once through the wrappers that choose a content type, so
-// the host reads what the SDK chose off the callback's arguments; `CLASSIFY`
+// the host reads what the SDK chose off the callback's arguments
+// (`PUBLISH_TEXT_EXPIRING` and `PUBLISH_ZERO_EXPIRY` do the same through the
+// expiring wrappers, the second against the host's zero-expiry refusal); `CLASSIFY`
 // runs the bounded loop through the SDK and reports how it classified and
 // rendered the first failure.
 //
@@ -79,6 +81,15 @@ const PUBLISH_JSON: &str = "PUBLISH_JSON";
 
 /// Sentinel selecting `brenn_guest::mqtt::publish_text`.
 const PUBLISH_TEXT: &str = "PUBLISH_TEXT";
+
+/// Sentinel selecting `brenn_guest::mqtt::publish_text_expiring`, retained,
+/// QoS 1, with a 90-second message expiry. Checked before `PUBLISH_TEXT`, which
+/// it contains.
+const PUBLISH_TEXT_EXPIRING: &str = "PUBLISH_TEXT_EXPIRING";
+
+/// Sentinel selecting `brenn_guest::mqtt::try_publish_expiring` with a zero
+/// expiry, which the host refuses; the failure is reported by its rendering.
+const PUBLISH_ZERO_EXPIRY: &str = "PUBLISH_ZERO_EXPIRY";
 
 /// Sentinel selecting the classification path: publish through the SDK until
 /// something fails, then report how the SDK classified and rendered that
@@ -149,6 +160,37 @@ impl Guest for ProcessorMqttTest {
             ) {
                 Ok(()) => Ok(None),
                 Err(e) => Err(ReceiveError::ProcessingFailed(e.to_string())),
+            };
+        }
+        if first_new.is_some_and(|s| s.contains(PUBLISH_TEXT_EXPIRING)) {
+            let body = first_new.expect("the sentinel came from a body").as_str();
+            return match brenn_guest::mqtt::publish_text_expiring(
+                "test-client",
+                "test/topic",
+                body,
+                1,
+                true,
+                90,
+            ) {
+                Ok(()) => Ok(None),
+                Err(e) => Err(ReceiveError::ProcessingFailed(e.to_string())),
+            };
+        }
+        if first_new.is_some_and(|s| s.contains(PUBLISH_ZERO_EXPIRY)) {
+            return match brenn_guest::mqtt::try_publish_expiring(
+                "test-client",
+                "test/topic",
+                &payload,
+                None,
+                1,
+                true,
+                0,
+            ) {
+                Ok(()) => Ok(None),
+                Err(brenn_guest::mqtt::PublishError::InvalidPayload(m)) => Err(
+                    ReceiveError::ProcessingFailed(format!("InvalidPayload:{m}")),
+                ),
+                Err(e) => Err(ReceiveError::ProcessingFailed(format!("other:{e:?}"))),
             };
         }
         if first_new.is_some_and(|s| s.contains(PUBLISH_TEXT)) {

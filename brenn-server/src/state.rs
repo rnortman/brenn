@@ -180,6 +180,10 @@ pub struct AppState {
     /// that says so. `None` when no agent declares `claude_profiles`. Built
     /// once at boot, moved thereafter only by the goal channel.
     pub cc_profiles: Option<Arc<brenn_cc_profile::ProfileGoal>>,
+    /// Reports running sessions and account state; publishes them when the
+    /// agent-status channels are declared. Always present: with no channels
+    /// it still tracks sessions and keeps the account ledger.
+    pub agent_status: crate::agent_status::AgentStatusReporter,
     /// Supersedes an epoch agent's conversation whose epoch is stale, and
     /// holds the epoch handle the conversation-epoch drain moves. `None` when
     /// no agent names a `conversation_epoch`. Built once at boot.
@@ -766,6 +770,7 @@ impl AppState {
                 automation_engine: self.automation_engine.clone(),
                 usage_session_gap_secs: self.usage_session_gap_secs,
                 cc_profiles: self.cc_profiles.clone(),
+                agent_status: self.agent_status.clone(),
                 epoch_reconciler: self.epoch_reconciler.clone(),
                 swap_host_seed: self.swap_host_seed(),
             })
@@ -970,6 +975,10 @@ impl AppState {
             attach_registry: Default::default(),
             attach_heartbeat_secs: 1,
             cc_profiles: None,
+            agent_status: crate::agent_status::AgentStatusReporter::start(
+                &std::collections::BTreeMap::new(),
+                None,
+            ),
             epoch_reconciler: None,
             oauth: None,
             // These two fields, and the wake stubs that read them, exist only

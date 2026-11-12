@@ -1,0 +1,6 @@
+// The agent-status facility, stamped as a deployment stamps it.
+// `library_module_test` imports `@agent-status` and stamps nothing, so without
+// this the assembly's body is first resolved at a deployment's boot.
+use @agent-status::*;
+
+new agent_status: AgentStatus();

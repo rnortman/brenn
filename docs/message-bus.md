@@ -564,6 +564,61 @@ publishes `booted` with `generation: 0`, so the retained state always describes
 the process now running, and `generation` counts applied reloads since that
 boot. What a reload will and will not converge is `docs/config-dsl.md`.
 
+### 2.9 The agent-status channels
+
+Three channels carry what the host knows about its Claude Code sessions and the
+Claude accounts they spend, and like the reload pair they are **declared, not
+minted**. A deployment stamps `AgentStatus()` from brenn's `@agent-status`
+library module, or declares the three itself. All three, or none: a document
+declaring some without the rest is refused at boot.
+
+| address | kind | body |
+|---|---|---|
+| `ephemeral:agent.sessions` | state, in memory; `retain_depth` at least 1 | `AgentSessions`: every conversation with a running Claude Code process — its app, state, account, model and the cost of this run. Each snapshot subsumes the one before. Empty after a restart, which reads as "no sessions". |
+| `brenn:agent.ended` | fact, durable; a window sized for the longest consumer outage | `AgentSessionEnded`: one per run of a session that ended, with its duration and whether the end was intentional. A conversation that wakes again runs under the same id. |
+| `brenn:agent.accounts` | state, durable; `standing_retain_depth` at least 1 | `AgentAccounts`: every configured Claude profile, with the month's spend and turn count for an API-key profile and the refusal flags observed on either kind. This is the account ledger's storage, read back at boot. |
+
+The bodies are the JSON types of `brenn_envelope::agent`, each carrying `v`;
+instants are epoch milliseconds. The participant writing them is
+`system:agent-status`, and other principals reach the channels with ordinary
+ACLs. What the ledger counts and how a flag leaves it is
+`docs/claude-accounts.md`.
+
+**Matching an end to a snapshot.** When a run ends, brenn publishes the
+sessions snapshot that no longer lists it before the run's `agent.ended` fact.
+A reader's ports are read one after another, not at one instant, so a reader
+bound to both channels can hold the ended fact beside an older snapshot that
+still lists the run. The pair `conversation_id`, `started_at_ms` identifies a
+run on both channels; match on it.
+
+**The rate.** A system publish draws on no send budget but passes the
+per-(sender, channel) send-rate gate. The channels need at least 240 in a burst
+and 30 a second sustained. The `AgentStatus` assembly writes that rate on each
+channel, so `[messaging] default_send_rate` does not reach them; a hand-written
+declaration that states no `send_rate` takes the default, and boot refuses any
+of the three below the floor. The sessions channel takes a publish per session
+start, per change of a session's state, per costed turn and per end — three to
+six per turn of one conversation — and is the one that scales with the host;
+`agent.ended` takes one per ended run, and `agent.accounts` one per costed turn
+under a key and one per flag raised or dropped. A host busier than its declared
+rate must declare a higher one.
+
+**A refused publish.** Any publish the bus refuses on these channels ends the
+server process, the send-rate gate's refusal included: a dropped snapshot would
+leave false state on the bus, or a ledger that was not stored.
+
+**Do not wake on your own activity.** A subscriber's own activity is in these
+snapshots. Subscribe with `push_depth = 0` and read on your own schedule, or
+expect to be woken by your own turns: a conversation that pushes on the
+sessions channel, or on the accounts channel while it runs under an API-key
+profile, runs turns back to back with nobody asking, and on a key each one is
+billed.
+
+**The writer.** A reader believes only envelopes whose `sender` is
+`system:agent-status`. An operator's `acl publish` matcher can let another
+principal write these channels; nobody else should hold it, and Brenn refuses
+to boot when the retained accounts message was written by anyone else.
+
 ## 3. Signals and facts
 
 The model's real demand on its user is a question it forces at design time:

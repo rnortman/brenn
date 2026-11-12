@@ -85,7 +85,8 @@ use super::automation::AutomationGlobalConfig;
 use super::brenn::BrennConfig;
 use super::claude_defaults::ClaudeDefaultsConfig;
 use super::claude_profile::{
-    AppClaudeProfiles, CLAUDE_OAUTH_TOKEN_VAR, ClaudeProfileRaw, OUTRANKING_CREDENTIAL_VARS,
+    AppClaudeProfiles, CLAUDE_OAUTH_TOKEN_VAR, ClaudeCredentialFile, ClaudeProfileRaw,
+    DEFAULT_EXHAUSTED_MARKERS, KeyProfileSettings, OUTRANKING_CREDENTIAL_VARS,
     default_token_file_name,
 };
 use super::container::{ContainerConfig, default_container_home};
@@ -739,6 +740,36 @@ impl<'a> Body<'a> {
         keep(expect_str(value, key), errors)
     }
 
+    /// A string with its own token's span.
+    fn spanned_str(
+        &mut self,
+        key: &'static str,
+        errors: &mut Vec<Diagnostic>,
+    ) -> Option<(String, Span)> {
+        let value = self.take(key)?;
+        keep(expect_str(value, key), errors).map(|text| (text, value.span().clone()))
+    }
+
+    /// A number with its own token's span; an integer widens.
+    fn spanned_flt(
+        &mut self,
+        key: &'static str,
+        errors: &mut Vec<Diagnostic>,
+    ) -> Option<(f64, Span)> {
+        let value = self.take(key)?;
+        keep(expect_flt(value, key), errors).map(|number| (number, value.span().clone()))
+    }
+
+    /// A string list with the list's own span.
+    fn spanned_strings(
+        &mut self,
+        key: &'static str,
+        errors: &mut Vec<Diagnostic>,
+    ) -> Option<(Vec<String>, Span)> {
+        let value = self.take(key)?;
+        expect_strings(value, key, errors).map(|list| (list, value.span().clone()))
+    }
+
     fn required_str(&mut self, key: &'static str, errors: &mut Vec<Diagnostic>) -> Option<String> {
         Some(self.required_spanned_str(key, errors)?.0)
     }
@@ -966,9 +997,16 @@ struct Sections {
 
 /// One `claude_profile` block's body, held until the token-path convention can
 /// be applied to it.
+///
+/// The three key-only attrs keep their own spans, for a refusal that underlines
+/// the value rather than the block.
 struct StatedProfile {
     token_file: Option<PathBuf>,
+    api_key_file: Option<PathBuf>,
     expires: Option<chrono::NaiveDate>,
+    budget_usd: Option<(f64, Span)>,
+    reset_tz: Option<(String, Span)>,
+    exhausted_markers: Option<(Vec<String>, Span)>,
     at: Span,
 }
 
@@ -1030,7 +1068,11 @@ fn sections(list: &[RSection], errors: &mut Vec<Diagnostic>) -> Sections {
                     name,
                     StatedProfile {
                         token_file: body.path("token_file", errors),
+                        api_key_file: body.path("api_key_file", errors),
                         expires: body.date("expires", errors),
+                        budget_usd: body.spanned_flt("budget_usd", errors),
+                        reset_tz: body.spanned_str("reset_tz", errors),
+                        exhausted_markers: body.spanned_strings("exhausted_markers", errors),
                         at: section.kindword.span().clone(),
                     },
                 );
@@ -1354,13 +1396,14 @@ fn claude_defaults(body: &mut Body, errors: &mut Vec<Diagnostic>) -> ClaudeDefau
     }
 }
 
-/// Every `claude_profile` block with its token path settled.
+/// Every `claude_profile` block with its credential path settled.
 ///
 /// The convention — `<profile_token_dir>/claude-profile-<name>.token` — is
 /// applied here rather than at the block, because the block may be written
-/// above the `claude_defaults` section that states the directory.
+/// above the `claude_defaults` section that states the directory. It names a
+/// token file: a key profile always states its `api_key_file`.
 ///
-/// Two profiles resolving to one token path is refused: two names for one
+/// Two profiles resolving to one credential path is refused: two names for one
 /// account is a mistake, and the two would then be indistinguishable everywhere
 /// a profile name is meant to identify an account.
 fn claude_profiles(
@@ -1371,42 +1414,185 @@ fn claude_profiles(
     let mut profiles = BTreeMap::new();
     let mut by_path: BTreeMap<PathBuf, String> = BTreeMap::new();
     for (name, profile) in stated {
-        let token_file = match (profile.token_file, token_dir) {
-            (Some(written), _) => written,
-            (None, Some(dir)) => dir.join(default_token_file_name(&name)),
-            (None, None) => {
+        /// Which credential file the block settled on, before its kind's
+        /// attributes are checked.
+        enum Settled {
+            Token(PathBuf),
+            Key(PathBuf),
+        }
+        let settled = match (profile.token_file, profile.api_key_file, token_dir) {
+            (Some(_), Some(_), _) => {
                 errors.push(Diagnostic::at(
                     format!(
-                        "`claude_profile {name}` states no `token_file` and \
+                        "`claude_profile {name}` states both `token_file` and `api_key_file`; \
+                         a profile is one credential, so state one of the two"
+                    ),
+                    profile.at.clone(),
+                ));
+                continue;
+            }
+            (None, Some(path), _) => Settled::Key(path),
+            (Some(written), None, _) => Settled::Token(written),
+            (None, None, Some(dir)) => Settled::Token(dir.join(default_token_file_name(&name))),
+            (None, None, None) => {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`claude_profile {name}` states no `token_file` or `api_key_file`, and \
                          `claude_defaults.profile_token_dir` is not set, so there is no \
-                         path to read its token from; state one of the two"
+                         path to read its credential from; state one of the three"
                     ),
                     profile.at.clone(),
                 ));
                 continue;
             }
         };
-        if let Some(earlier) = by_path.get(&token_file) {
+        let credential = match settled {
+            Settled::Key(path) => {
+                let Some(settings) = key_profile_settings(
+                    &name,
+                    profile.budget_usd,
+                    profile.reset_tz,
+                    profile.exhausted_markers,
+                    errors,
+                ) else {
+                    continue;
+                };
+                ClaudeCredentialFile::ApiKey { path, settings }
+            }
+            Settled::Token(path) => {
+                let key_only = [
+                    ("budget_usd", profile.budget_usd.map(|(_, at)| at)),
+                    ("reset_tz", profile.reset_tz.map(|(_, at)| at)),
+                    (
+                        "exhausted_markers",
+                        profile.exhausted_markers.map(|(_, at)| at),
+                    ),
+                ];
+                let mut refused = false;
+                for (attr, at) in key_only {
+                    if let Some(at) = at {
+                        errors.push(Diagnostic::at(
+                            format!(
+                                "`claude_profile {name}` is a token profile, and `{attr}` \
+                                 applies only to an API-key profile (one that states \
+                                 `api_key_file`)"
+                            ),
+                            at,
+                        ));
+                        refused = true;
+                    }
+                }
+                if refused {
+                    continue;
+                }
+                ClaudeCredentialFile::OauthToken(path)
+            }
+        };
+        let path = credential.path().to_path_buf();
+        if let Some(earlier) = by_path.get(&path) {
             errors.push(Diagnostic::at(
                 format!(
-                    "`claude_profile {name}` reads the same token file as `claude_profile \
-                     {earlier}` ({}); two names for one account is a mistake",
-                    token_file.display()
+                    "`claude_profile {name}` reads the same credential file as \
+                     `claude_profile {earlier}` ({}); two names for one account is a mistake",
+                    path.display()
                 ),
                 profile.at.clone(),
             ));
             continue;
         }
-        by_path.insert(token_file.clone(), name.clone());
+        by_path.insert(path, name.clone());
         profiles.insert(
             name,
             ClaudeProfileRaw {
-                token_file,
+                credential,
                 expires: profile.expires,
             },
         );
     }
     profiles
+}
+
+/// An API-key profile's accounting and refusal settings, defaults applied.
+///
+/// `None` where any of them was refused; each refusal underlines the value
+/// that earned it.
+fn key_profile_settings(
+    name: &str,
+    budget_usd: Option<(f64, Span)>,
+    reset_tz: Option<(String, Span)>,
+    exhausted_markers: Option<(Vec<String>, Span)>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<KeyProfileSettings> {
+    let before = errors.len();
+    let budget_usd = budget_usd.and_then(|(budget, at)| {
+        if budget.is_finite() && budget > 0.0 {
+            Some(budget)
+        } else {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`claude_profile {name}`: `budget_usd` is {budget}; a budget is a finite \
+                     number of dollars above zero. Omit it for a key with no budget"
+                ),
+                at,
+            ));
+            None
+        }
+    });
+    let reset_tz = match reset_tz {
+        None => Some(chrono_tz::UTC),
+        Some((zone, at)) => match zone.parse::<chrono_tz::Tz>() {
+            Ok(tz) => Some(tz),
+            Err(_) => {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`claude_profile {name}`: `reset_tz` is {zone:?}, which is not an \
+                         IANA time zone name (e.g. \"America/Chicago\" or \"UTC\")"
+                    ),
+                    at,
+                ));
+                None
+            }
+        },
+    };
+    let exhausted_markers = match exhausted_markers {
+        None => Some(
+            DEFAULT_EXHAUSTED_MARKERS
+                .iter()
+                .map(|marker| (*marker).to_string())
+                .collect(),
+        ),
+        Some((markers, at)) => {
+            if markers.is_empty() {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`claude_profile {name}`: `exhausted_markers` is empty, so no refused \
+                         turn could be recognised. Omit it for the default"
+                    ),
+                    at,
+                ));
+                None
+            } else if markers.iter().any(String::is_empty) {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`claude_profile {name}`: `exhausted_markers` holds an empty marker, \
+                         which every turn's text would contain"
+                    ),
+                    at,
+                ));
+                None
+            } else {
+                Some(markers)
+            }
+        }
+    };
+    if errors.len() != before {
+        return None;
+    }
+    Some(KeyProfileSettings {
+        budget_usd,
+        reset_tz: reset_tz?,
+        exhausted_markers: exhausted_markers?,
+    })
 }
 
 /// One `oauth_provider` block.
@@ -1987,8 +2173,9 @@ fn apps(
 /// The four agent attrs the Claude-account lowering reads together.
 ///
 /// `cc_extra_args` rides along because `--bare` and a profile are mutually
-/// exclusive: under `--bare` Claude Code ignores `CLAUDE_CODE_OAUTH_TOKEN` and
-/// bills the home's login instead, so the profile would be a lie. `env` rides
+/// exclusive: under `--bare` Claude Code does not use `CLAUDE_CODE_OAUTH_TOKEN`,
+/// and what it bills when handed an API key is unestablished, so the profile
+/// could be a lie whatever its kind. `env` rides
 /// along for the same reason: an outranking credential in it and a profile are
 /// mutually exclusive.
 struct StatedAppProfiles<'a> {
@@ -2061,10 +2248,10 @@ fn app_claude_profiles(
         && stated.cc_extra_args.iter().any(|arg| arg == "--bare")
     {
         errors.push(Diagnostic::at(
-            "`cc_extra_args` passes `--bare`, under which Claude Code ignores \
-             `CLAUDE_CODE_OAUTH_TOKEN` and authenticates with whatever `/login` left in \
-             the agent's home: the profile this agent runs under would be a lie. Drop one \
-             of the two"
+            "`cc_extra_args` passes `--bare`, under which Claude Code does not use \
+             `CLAUDE_CODE_OAUTH_TOKEN`, and Brenn has not established what it bills when \
+             handed an API key: the profile this agent runs under could be a lie, whatever \
+             its kind. Drop one of the two"
                 .to_string(),
             at.value.span().clone(),
         ));
@@ -2080,10 +2267,10 @@ fn app_claude_profiles(
             if OUTRANKING_CREDENTIAL_VARS.contains(&key.as_str()) {
                 errors.push(Diagnostic::at(
                     format!(
-                        "`env` sets `{key}`, which Claude Code ranks above \
-                         `{CLAUDE_OAUTH_TOKEN_VAR}`: the profile this agent runs under \
-                         would name one account while Claude Code billed another. Drop \
-                         the variable or the `claude_profiles`"
+                        "`env` sets `{key}`, a credential variable that could win over or \
+                         sit beside the profile's credential: the profile this agent runs \
+                         under would name one account while Claude Code billed another. \
+                         Drop the variable or the `claude_profiles`"
                     ),
                     at.value.span().clone(),
                 ));

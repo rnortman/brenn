@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use brenn_budget::MAX_PUBLISH_CALLS_PER_ACTIVATION;
 use brenn_wasm::{
-    ComponentGrant, MqttPublishFn, MqttPublishOutcome, ProcessorActivation, ProcessorComponent,
-    ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow,
+    ComponentGrant, MqttPublishFn, MqttPublishOutcome, MqttPublishProps, ProcessorActivation,
+    ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow,
 };
 
 mod common;
@@ -87,10 +87,9 @@ fn load_mqtt_test(mqtt_publish: MqttPublishFn) -> ProcessorComponent {
 /// propagates the broker outcome inline.
 #[test]
 fn mqtt_publish_broker_error_propagates_to_guest() {
-    let callback: MqttPublishFn =
-        Arc::new(|_client, _topic, _payload, _content_type, _qos, _retain| {
-            MqttPublishOutcome::Broker("test-broker-error".to_string())
-        });
+    let callback: MqttPublishFn = Arc::new(|_client, _topic, _payload, _props| {
+        MqttPublishOutcome::Broker("test-broker-error".to_string())
+    });
     let comp = load_mqtt_test(callback);
 
     let outcome = comp.handle(single_activation());
@@ -125,9 +124,7 @@ fn mqtt_publish_broker_error_propagates_to_guest() {
 #[test]
 fn mqtt_publish_not_permitted_propagates_to_guest() {
     let callback: MqttPublishFn =
-        Arc::new(|_client, _topic, _payload, _content_type, _qos, _retain| {
-            MqttPublishOutcome::NotPermitted
-        });
+        Arc::new(|_client, _topic, _payload, _props| MqttPublishOutcome::NotPermitted);
     let comp = load_mqtt_test(callback);
 
     let outcome = comp.handle(single_activation());
@@ -161,9 +158,7 @@ fn mqtt_publish_not_permitted_propagates_to_guest() {
 #[test]
 fn mqtt_publish_no_connector_propagates_to_guest() {
     let callback: MqttPublishFn =
-        Arc::new(|_client, _topic, _payload, _content_type, _qos, _retain| {
-            MqttPublishOutcome::NoConnector
-        });
+        Arc::new(|_client, _topic, _payload, _props| MqttPublishOutcome::NoConnector);
     let comp = load_mqtt_test(callback);
 
     let outcome = comp.handle(single_activation());
@@ -200,10 +195,9 @@ fn mqtt_publish_no_connector_propagates_to_guest() {
 /// guest). Reuses the `processor-mqtt-test` fixture + `load_mqtt_test` helper.
 #[test]
 fn mqtt_publish_invalid_payload_propagates_to_guest() {
-    let callback: MqttPublishFn =
-        Arc::new(|_client, _topic, _payload, _content_type, _qos, _retain| {
-            MqttPublishOutcome::InvalidPayload("wildcard not allowed in publish topic".to_string())
-        });
+    let callback: MqttPublishFn = Arc::new(|_client, _topic, _payload, _props| {
+        MqttPublishOutcome::InvalidPayload("wildcard not allowed in publish topic".to_string())
+    });
     let comp = load_mqtt_test(callback);
 
     let outcome = comp.handle(single_activation());
@@ -240,12 +234,10 @@ fn mqtt_publish_invalid_payload_propagates_to_guest() {
 fn mqtt_publish_then_trap_does_not_roll_back_broker_send() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_cb = Arc::clone(&calls);
-    let callback: MqttPublishFn = Arc::new(
-        move |_client, _topic, _payload, _content_type, _qos, _retain| {
-            calls_cb.fetch_add(1, Ordering::SeqCst);
-            MqttPublishOutcome::Ok
-        },
-    );
+    let callback: MqttPublishFn = Arc::new(move |_client, _topic, _payload, _props| {
+        calls_cb.fetch_add(1, Ordering::SeqCst);
+        MqttPublishOutcome::Ok
+    });
     let comp = load_mqtt_test(callback);
 
     let outcome = comp.handle(trap_after_publish_activation());
@@ -311,12 +303,10 @@ fn mqtt_publish_quota_exceeded_propagates_to_guest() {
     // cause — the substring check alone would still pass in that case (test-4).
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_cb = Arc::clone(&calls);
-    let callback: MqttPublishFn = Arc::new(
-        move |_client, _topic, _payload, _content_type, _qos, _retain| {
-            calls_cb.fetch_add(1, Ordering::SeqCst);
-            MqttPublishOutcome::Ok
-        },
-    );
+    let callback: MqttPublishFn = Arc::new(move |_client, _topic, _payload, _props| {
+        calls_cb.fetch_add(1, Ordering::SeqCst);
+        MqttPublishOutcome::Ok
+    });
     let comp = load_mqtt_test(callback);
 
     let outcome = comp.handle(single_activation());
@@ -364,11 +354,11 @@ fn activation_with_body(body: &str) -> ProcessorActivation {
 }
 
 /// Every argument one `mqtt-publish` call reached the host with.
-type PublishArgs = (String, String, Vec<u8>, Option<String>, u8, bool);
+type PublishArgs = (String, String, Vec<u8>, MqttPublishProps);
 
 /// A callback that records its arguments and reports `outcome`.
 ///
-/// The content type is `_content_type` in every other test here, so nothing
+/// The properties are `_props` in every other test here, so nothing
 /// reads what a guest sends it. These paths are about exactly that: the SDK
 /// wrappers choose the content type and encode the payload, and a wrong choice
 /// is invisible in the outcome.
@@ -377,14 +367,13 @@ fn recording_callback(
 ) -> (MqttPublishFn, Arc<std::sync::Mutex<Vec<PublishArgs>>>) {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen_cb = Arc::clone(&seen);
-    let callback: MqttPublishFn =
-        Arc::new(move |client, topic, payload, content_type, qos, retain| {
-            seen_cb
-                .lock()
-                .expect("the recording callback's lock is never poisoned")
-                .push((client, topic, payload, content_type, qos, retain));
-            outcome.clone()
-        });
+    let callback: MqttPublishFn = Arc::new(move |client, topic, payload, props| {
+        seen_cb
+            .lock()
+            .expect("the recording callback's lock is never poisoned")
+            .push((client, topic, payload, props));
+        outcome.clone()
+    });
     (callback, seen)
 }
 
@@ -396,7 +385,7 @@ fn recording_callback(
 fn switchable_callback() -> (MqttPublishFn, Arc<std::sync::Mutex<MqttPublishOutcome>>) {
     let cell = Arc::new(std::sync::Mutex::new(MqttPublishOutcome::Ok));
     let cell_cb = Arc::clone(&cell);
-    let callback: MqttPublishFn = Arc::new(move |_client, _topic, _payload, _ct, _qos, _retain| {
+    let callback: MqttPublishFn = Arc::new(move |_client, _topic, _payload, _props| {
         cell_cb
             .lock()
             .expect("the switchable callback's lock is never poisoned")
@@ -424,12 +413,16 @@ fn publish_json_sends_json_under_the_json_content_type() {
 
     let calls = seen.lock().expect("not poisoned");
     assert_eq!(calls.len(), 1, "{calls:?}");
-    let (client, topic, payload, content_type, qos, retain) = &calls[0];
+    let (client, topic, payload, props) = &calls[0];
     assert_eq!(client, "test-client");
     assert_eq!(topic, "test/topic");
-    assert_eq!(content_type.as_deref(), Some("application/json"));
-    assert_eq!(*qos, 0);
-    assert!(!*retain);
+    assert_eq!(
+        *props,
+        MqttPublishProps {
+            content_type: Some("application/json".to_string()),
+            ..Default::default()
+        }
+    );
     // The fixture publishes the envelope it was handed, so the payload is that
     // envelope as a JSON string — which is the point: it came back out of
     // `serde_json`, not out of a `Debug` rendering.
@@ -452,12 +445,71 @@ fn publish_text_sends_the_body_under_the_text_content_type() {
 
     let calls = seen.lock().expect("not poisoned");
     assert_eq!(calls.len(), 1, "{calls:?}");
-    let (_, _, payload, content_type, _, _) = &calls[0];
-    assert_eq!(content_type.as_deref(), Some("text/plain"));
+    let (_, _, payload, props) = &calls[0];
+    assert_eq!(props.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(props.message_expiry_s, None);
     assert_eq!(
         payload.as_slice(),
         envelope_with_body("PUBLISH_TEXT").as_bytes(),
         "the text wrapper sends the bytes it was given, unencoded"
+    );
+}
+
+/// `mqtt::publish_text_expiring` reaches the host through
+/// `mqtt-publish-expiring`: the expiry arrives beside the text content type,
+/// QoS and retain flag the guest chose.
+#[test]
+fn publish_text_expiring_sends_the_expiry() {
+    let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
+    let comp = load_mqtt_test(callback);
+
+    let outcome = comp.handle(activation_with_body("PUBLISH_TEXT_EXPIRING"));
+    assert!(
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
+        "expected Ok; got {outcome:?}"
+    );
+
+    let calls = seen.lock().expect("not poisoned");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let (client, topic, payload, props) = &calls[0];
+    assert_eq!(client, "test-client");
+    assert_eq!(topic, "test/topic");
+    assert_eq!(
+        *props,
+        MqttPublishProps {
+            content_type: Some("text/plain".to_string()),
+            qos: 1,
+            retain: true,
+            message_expiry_s: Some(90),
+        }
+    );
+    assert_eq!(
+        payload.as_slice(),
+        envelope_with_body("PUBLISH_TEXT_EXPIRING").as_bytes()
+    );
+}
+
+/// A zero expiry from a guest is refused by the host as `invalid-payload`
+/// before the callback runs.
+#[test]
+fn publish_expiring_with_zero_expiry_is_invalid_payload() {
+    let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
+    let comp = load_mqtt_test(callback);
+
+    let outcome = comp.handle(activation_with_body("PUBLISH_ZERO_EXPIRY"));
+    match outcome {
+        ProcessorOutcome::Err(re) => {
+            let msg = re.to_string();
+            assert!(
+                msg.contains("InvalidPayload:") && msg.contains("message-expiry-s"),
+                "unexpected error: {msg}"
+            );
+        }
+        other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
+    }
+    assert!(
+        seen.lock().expect("not poisoned").is_empty(),
+        "the callback must not be reached"
     );
 }
 

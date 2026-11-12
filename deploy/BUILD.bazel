@@ -24,6 +24,7 @@ policy_srcs()
 # `//bazel/release/tests:config_specs_accounted_test`, which reads the names
 # below.
 BRENN_LIBRARY_MODULES = [
+    "//:config/specs/agent-status.brenn",
     "//:config/specs/config-reload.brenn",
     "//:config/specs/surface-description.brenn",
 ]
@@ -44,6 +45,13 @@ config_fit_test(
     name = "config_reload_fit_test",
     config = "fit/config-reload.brenn",
     modules = ["//:config/specs/config-reload.brenn"],
+)
+
+# The agent-status facility, stamped, for the same reason.
+config_fit_test(
+    name = "agent_status_fit_test",
+    config = "fit/agent-status.brenn",
+    modules = ["//:config/specs/agent-status.brenn"],
 )
 
 # One process, one document, one facility: the addresses are fixed, so a second

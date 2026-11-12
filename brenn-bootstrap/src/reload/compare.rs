@@ -1331,7 +1331,9 @@ mod tests {
             config.claude_profiles.insert(
                 "work".to_string(),
                 brenn_lib::config::ClaudeProfileRaw {
-                    token_file: std::path::PathBuf::from(token_file),
+                    credential: brenn_lib::config::ClaudeCredentialFile::OauthToken(
+                        std::path::PathBuf::from(token_file),
+                    ),
                     expires: None,
                 },
             );

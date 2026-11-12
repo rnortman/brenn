@@ -1,5 +1,58 @@
 # TODOs
 
+## `agent-status-self-wake`
+
+A conversation that subscribes with a `push_depth` above zero to
+`ephemeral:agent.sessions`, or to `brenn:agent.accounts` while it runs
+under an API-key profile, is woken by its own turns. Each turn changes the
+snapshot (the session's state and cost, the key's spend), the changed
+snapshot is a new message, and the new message activates the subscriber,
+whose turn changes the snapshot again. Nothing bounds the loop: each turn
+the subscriber runs causes its next, as fast as turns complete, and under
+a key every lap is billed. The channels' send rate is not a bound: it
+limits what `system:agent-status` publishes across the whole host, and a
+publish it refuses stops the server. The only defence
+today is documentation: the `AgentStatus` assembly's comment and
+`docs/message-bus.md` tell such a subscriber to bind with
+`push_depth = 0` and read on its own schedule. An agent that watches the
+other agents is the obvious consumer of these channels, so the hazard
+should not rest on a reader having seen a warning. Needs a design, because
+every candidate changes delivery for all consumers of the channels,
+out-of-tree ones included, and the route is open: refuse such a
+subscription when the config is lowered; publish these snapshots at an
+urgency that does not wake a dormant conversation; keep a subscriber's own
+session out of what activates it; or something else. Done = a conversation
+subscribed with push to either channel is not activated by a snapshot
+whose only change is its own activity, or cannot be configured that way,
+with a test; and the warning in the assembly comment and in
+`docs/message-bus.md` is replaced by a description of the guard. The
+`TODO(agent-status-self-wake)` comment sits in
+`config/specs/agent-status.brenn`, on the paragraph of the assembly's
+comment that warns of the loop.
+
+## `claude-key-flag-operator-clear`
+
+An operator cannot tell Brenn that a flagged API-key profile works again.
+An account-wide `exhausted` flag on a key profile leaves the account
+ledger only when a turn succeeds under that key or when the accounting
+period rolls over (`AccountLedger::turn` and `AccountLedger::roll` in
+`brenn-cc-profile`). After topping a key up, the operator's only move is
+to publish the profile as an agent's goal by hand and have a turn run
+under it. A profile switcher that reads `brenn:agent.accounts` may move
+the agent off the flagged key again before that turn runs, so the
+recovery is bounded by the switcher's patience and is not deterministic.
+An operator's `cleared_at` published into the `claude-usage-mqtt` agent
+tree through another tool does not reach Brenn's ledger either. Needs a
+design: what carries the clear (a declared request channel with its own
+ACL, read by `system:agent-status`, is the bus-shaped answer); whether
+Brenn then also reports it outward as `cleared_at`; and whether a
+`cleared_at` seen in the agent tree should lift Brenn's own flag. Done =
+an operator action removes a named key profile's `exhausted` flag from
+`brenn:agent.accounts` without a turn running under the key, with a test,
+and `docs/claude-accounts.md` describes the action. The
+`TODO(claude-key-flag-operator-clear)` comment sits in
+`AccountLedger::turn`, where a successful turn removes the flag.
+
 ## `kit-payload-reader-cannot-read-304`
 
 The provider kit's `read_api_payload` and `read_api_result` fail every 3xx

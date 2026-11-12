@@ -269,6 +269,8 @@ pub struct ActiveBridge {
     /// Which profile each profiled app should run under. `None` when no agent
     /// declared `claude_profiles`. Read to decide whether this bridge is stale.
     pub(in crate::active_bridge) cc_profiles: Option<Arc<brenn_cc_profile::ProfileGoal>>,
+    /// Where this conversation's session, turns and refusals are reported.
+    pub(in crate::active_bridge) agent_status: crate::agent_status::AgentStatusReporter,
     /// How a swap reaches the world: the replacement spawn and the model cache.
     /// `None` on test bridges that never spawned a process.
     pub(in crate::active_bridge) swap_host: Option<Arc<dyn super::profile_swap::ProfileSwapHost>>,
@@ -386,6 +388,8 @@ pub struct SpawnContext<'a> {
     /// spawn runs under is this handle resolved against `app_config.slug`, and
     /// a live bridge compares against it to tell it is on the wrong one.
     pub cc_profiles: Option<Arc<brenn_cc_profile::ProfileGoal>>,
+    /// Where the bridge reports its session, turns and refusals.
+    pub agent_status: crate::agent_status::AgentStatusReporter,
     /// The epoch reconciler, when any agent names an epoch channel. `spawn_new`
     /// keeps it only for an agent that names one itself.
     pub epoch_reconciler: Option<Arc<crate::conversation_epoch::EpochReconciler>>,
@@ -480,6 +484,7 @@ impl ActiveBridge {
             automation_engine,
             usage_session_gap_secs,
             cc_profiles,
+            agent_status,
             epoch_reconciler,
             swap_host_seed,
         } = ctx;
@@ -676,6 +681,7 @@ impl ActiveBridge {
             died_handled: AtomicBool::new(false),
             cc_profile: std::sync::Mutex::new(cc_profile.map(|p| p.name)),
             cc_profiles,
+            agent_status: agent_status.for_bridge(),
             // Only a bridge that can go stale gets one. An app with no
             // `claude_profiles` never resolves a profile, so it can never swap.
             swap_host: swap_host_profiled.then(|| {

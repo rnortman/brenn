@@ -38,6 +38,6 @@ pub use connection::{
 pub use egress::{MqttEgressError, SendBudget, enforce_and_publish};
 pub use payload::{InboundPayload, OutboundPayload, classify_inbound, decode_outbound_body};
 pub use service::{
-    IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService,
+    IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService, PublishProps,
 };
 pub use state::{ConnectorHealthLabel, IngressSubscription, MqttClientHandle, SubAckOutcome};

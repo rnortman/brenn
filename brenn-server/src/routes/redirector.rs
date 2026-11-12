@@ -238,6 +238,10 @@ mod tests {
             attach_registry: Default::default(),
             attach_heartbeat_secs: 1,
             cc_profiles: None,
+            agent_status: crate::agent_status::AgentStatusReporter::start(
+                &std::collections::BTreeMap::new(),
+                None,
+            ),
             epoch_reconciler: None,
             oauth: None,
             test_wake_bridge: Default::default(),

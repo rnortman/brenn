@@ -280,11 +280,14 @@ messaging { max_body_bytes = 393216; }
 ### Claude accounts
 
 A `claude_profile` block binds a name to one Claude account. The account is a
-token file: `claude setup-token` mints a long-lived OAuth token on any machine
-with a browser, and Claude Code reads it from `CLAUDE_CODE_OAUTH_TOKEN`, which
-outranks whatever `/login` left in the shared `~/.claude`. So switching accounts
-is spawning a process with a different value in that variable, and nothing in
-the config root is swapped, symlinked, or moved.
+credential file of one of two kinds. A **token profile** reads a token file:
+`claude setup-token` mints a long-lived OAuth token on any machine with a
+browser, and Claude Code reads it from `CLAUDE_CODE_OAUTH_TOKEN`. A **key
+profile** reads an Anthropic API key, which Claude Code reads from
+`ANTHROPIC_API_KEY`. Either variable outranks whatever `/login` left in the
+shared `~/.claude`. So switching accounts — between token profiles, key
+profiles, or one of each — is spawning a process with a different credential in
+its environment, and nothing in the config root is swapped, symlinked, or moved.
 
 ```
 claude_defaults {
@@ -294,6 +297,13 @@ claude_defaults {
 claude_profile main;
 claude_profile spare { expires = "2027-09-01"; }
 claude_profile legacy { token_file = "/srv/old-secrets/claude-legacy.token"; }
+
+claude_profile work-key {
+  api_key_file = "/home/brenn/.brenn-secrets/claude-profile-work-key.key";
+  budget_usd = 50.0;
+  reset_tz = "America/Chicago";
+  exhausted_markers = ["credit balance is too low"];
+}
 ```
 
 - `token_file` — the host path to the token, 0600, one line. Omitted, the path
@@ -301,11 +311,29 @@ claude_profile legacy { token_file = "/srv/old-secrets/claude-legacy.token"; }
   profile with neither is refused naming both ways out, and two profiles
   resolving to one path are refused because two names for one account is a
   mistake.
-- `expires` — an ISO date the operator records as the token's last good day. The
-  token is opaque and Brenn cannot read its lifetime; the date buys one warning
-  at boot when it is near or past, and nothing else reads it.
+- `api_key_file` — the host path to an API key, with the token file's rules:
+  0600, one line. Stating it makes the profile a key profile. It and
+  `token_file` are mutually exclusive, and the `profile_token_dir` convention
+  never applies to a key profile. Two profiles reading one file are refused
+  whatever their kinds.
+- `expires` — an ISO date the operator records as the credential's last good
+  day, on either kind. The credential is opaque and Brenn cannot read its
+  lifetime; the date buys one warning at boot when it is near or past, naming
+  the remedy for the profile's kind, and nothing else reads it.
 
-Every declared profile's token is read at startup. Missing, empty, unreadable,
+Three more keys apply to a key profile only, and are refused on a token
+profile:
+
+- `budget_usd` — the month's spend the operator budgets for the key, a number
+  above zero. Brenn reports it beside the key's spend and never enforces it;
+  the hard stop on a key is the spend limit set on the Anthropic Platform.
+- `reset_tz` — the IANA zone whose calendar month is the key's accounting
+  period. Default `"UTC"`.
+- `exhausted_markers` — substrings, matched case-insensitively, of the text of
+  a failed turn that mean the key is out of credit. Non-empty, no marker empty.
+  Default `["credit balance is too low"]`.
+
+Every declared profile's credential is read at startup. Missing, empty, unreadable,
 or group/world-readable stops the process naming the profile — the same posture
 remote bearer tokens take.
 
@@ -349,14 +377,18 @@ alert; its previous goal stands. The `doctype` binds nothing in-tree — no port
 declares it — but it is the tag a goal-publishing component's port will carry,
 so goal channels state `brenn.cc-profile.goal@1`.
 
-`cc_extra_args = ["--bare"]` together with `claude_profiles` is refused: under
-`--bare` Claude Code ignores `CLAUDE_CODE_OAUTH_TOKEN` and bills whatever
-`/login` left in the home, so the account the agent claims to run under would be
-a lie. An agent `env` naming any of the six outranking credential variables
-together with `claude_profiles` is refused for the same reason.
+`cc_extra_args = ["--bare"]` together with `claude_profiles` is refused,
+whatever the kinds of the profiles: under `--bare` Claude Code does not use
+`CLAUDE_CODE_OAUTH_TOKEN`, and Brenn has not established what it bills when
+handed an API key, so the account the agent claims to run under could be a lie.
+An agent `env` naming any of the six credential variables together with
+`claude_profiles` is refused for the same reason, for either kind: a profiled
+agent's environment holds exactly one credential, the one its profile put
+there.
 
-Minting a token, rotating one, publishing a goal by hand, and the two ways an
-outranking credential can make the account a lie without Brenn noticing are in
+Minting a token, creating a key file, rotating either, publishing a goal by
+hand, and the two ways an outranking credential can make the account a lie
+without Brenn noticing are in
 [the Claude accounts guide](claude-accounts.md).
 
 ### OAuth providers and the credential vault

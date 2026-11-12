@@ -624,6 +624,16 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
     if let Some(spec) = brenn_messaging::config_reload::config_reload_spec(&all_entries) {
         system_participants.push(spec);
     }
+    // Declared, not minted, and all three or none. The sessions channel is
+    // `ephemeral:`, so it is looked up among the non-durable channels too.
+    let declared: Vec<ChannelEntry> = all_entries
+        .iter()
+        .chain(nondurable_channels.iter())
+        .cloned()
+        .collect();
+    if let Some(spec) = brenn_messaging::agent_status::agent_status_spec(&declared) {
+        system_participants.push(spec);
+    }
     brenn_messaging::system::fold_spec_subscriptions(&mut all_entries, &system_participants);
 
     // The non-durable channels join `all_entries` here, after the WASM and
@@ -1025,6 +1035,124 @@ mod tests {
                 .iter()
                 .any(|spec| spec.component == CONFIG_RELOAD_COMPONENT)
         );
+    }
+
+    /// The three agent-status channels as an operator declares them; the
+    /// sessions channel is ephemeral.
+    fn agent_status_channels() -> Vec<brenn_lib::messaging::config::ChannelConfigRaw> {
+        use brenn_messaging::agent_status::{ACCOUNTS_ADDRESS, ENDED_ADDRESS, SESSIONS_ADDRESS};
+        vec![
+            brenn_lib::messaging::config::ChannelConfigRaw {
+                uuid: None,
+                standing_retain_depth: None,
+                ..durable_channel(SESSIONS_ADDRESS, Depth::Bounded(1))
+            },
+            durable_channel(ENDED_ADDRESS, Depth::Bounded(64)),
+            durable_channel(ACCOUNTS_ADDRESS, Depth::Bounded(1)),
+        ]
+    }
+
+    /// The three declared channels activate `system:agent-status`, which lands
+    /// on the accounts channel as its one subscriber — the ephemeral sessions
+    /// channel is found even though it joins the directory late.
+    #[test]
+    fn the_declared_agent_status_channels_activate_the_participant() {
+        use brenn_lib::messaging::SubscriberEntryKind;
+        use brenn_messaging::agent_status::{
+            ACCOUNTS_ADDRESS, AGENT_STATUS_COMPONENT, ENDED_ADDRESS, SESSIONS_ADDRESS,
+        };
+
+        let mut config = BrennConfig::default();
+        config
+            .channels
+            .push(durable_channel("brenn:surface.index", Depth::Unbounded));
+        config.channels.extend(agent_status_channels());
+        let plan = plan_of(&config);
+
+        let spec = plan
+            .system_participants
+            .iter()
+            .find(|spec| spec.component == AGENT_STATUS_COMPONENT)
+            .expect("the three channels are declared, so the participant exists");
+        assert_eq!(spec.subscriptions, vec![ACCOUNTS_ADDRESS.to_string()]);
+        let entries = plan.directory.list();
+        let subscribed = |address: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.address == address)
+                .unwrap_or_else(|| panic!("{address} is a declared entry"))
+                .subscribers
+                .iter()
+                .any(|sub| matches!(
+                    &sub.kind,
+                    SubscriberEntryKind::System(component) if component == AGENT_STATUS_COMPONENT
+                ))
+        };
+        assert!(subscribed(ACCOUNTS_ADDRESS));
+        assert!(!subscribed(SESSIONS_ADDRESS));
+        assert!(!subscribed(ENDED_ADDRESS));
+    }
+
+    /// Without the channels there is no participant.
+    #[test]
+    fn a_document_without_the_agent_status_channels_has_no_participant() {
+        use brenn_messaging::agent_status::AGENT_STATUS_COMPONENT;
+
+        let mut config = BrennConfig::default();
+        config
+            .channels
+            .push(durable_channel("brenn:surface.index", Depth::Unbounded));
+        assert!(
+            !plan_of(&config)
+                .system_participants
+                .iter()
+                .any(|spec| spec.component == AGENT_STATUS_COMPONENT)
+        );
+    }
+
+    /// The shipped `AgentStatus` assembly, stamped as a deployment stamps it,
+    /// plans: each of its channels states a send rate the participant's floor
+    /// accepts, so no deployment that stamps it is refused at boot.
+    #[test]
+    fn the_shipped_agent_status_assembly_meets_the_send_rate_floor() {
+        use brenn_messaging::agent_status::AGENT_STATUS_COMPONENT;
+
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let root = dir.path().join("main.brenn");
+        std::fs::write(
+            &root,
+            "use @agent-status::*;\n\nnew agent_status: AgentStatus();\n",
+        )
+        .expect("write the root document");
+        let inputs =
+            brenn_lib::config::DocumentInputs::with_modules(root, repo.join("config/specs"));
+        let mut config = brenn_lib::config::check_config(&inputs)
+            .unwrap_or_else(|report| panic!("the stamped assembly must load: {report}"))
+            .config;
+        config
+            .channels
+            .push(durable_channel("brenn:surface.index", Depth::Unbounded));
+        assert!(
+            plan_of(&config)
+                .system_participants
+                .iter()
+                .any(|spec| spec.component == AGENT_STATUS_COMPONENT)
+        );
+    }
+
+    /// Two of three is a refusal at plan time, naming what is missing.
+    #[test]
+    #[should_panic(expected = "ephemeral:agent.sessions")]
+    fn agent_status_without_the_sessions_channel_is_refused_by_the_planner() {
+        let mut config = BrennConfig::default();
+        config
+            .channels
+            .push(durable_channel("brenn:surface.index", Depth::Unbounded));
+        config
+            .channels
+            .extend(agent_status_channels().into_iter().skip(1));
+        plan_of(&config);
     }
 
     /// Half a facility is a refusal at plan time, which is a boot panic and, on

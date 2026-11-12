@@ -19,6 +19,7 @@ mod idle_hooks;
 mod impetus_pool;
 mod lifecycle;
 mod lifetime;
+mod limit;
 mod mcp_constants;
 mod permission_sync;
 mod profile_swap;

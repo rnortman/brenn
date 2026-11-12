@@ -96,6 +96,15 @@ pub(in crate::active_bridge) async fn handle_initialized(
     // Capture CC version for model_window_cache upserts.
     *bridge.cc_version.lock().expect("cc_version lock") = info.claude_code_version.clone();
 
+    bridge.agent_status.session_initialized(
+        bridge.conversation_id,
+        &bridge.app_slug,
+        &info.session_id,
+        &info.model,
+        &host_cwd,
+        bridge.cc_profile_name(),
+    );
+
     let conn = bridge.db.lock().await;
     conversation::set_cc_session_id(&conn, bridge.conversation_id, &info.session_id);
     conversation::set_init_metadata(&conn, bridge.conversation_id, &info.model, &host_cwd);

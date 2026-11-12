@@ -26,7 +26,9 @@ use crate::config::attachment::{
 };
 use crate::config::automation::AutomationGlobalConfig;
 use crate::config::claude_defaults::ClaudeDefaultsConfig;
-use crate::config::claude_profile::{AppClaudeProfiles, ClaudeProfileRaw};
+use crate::config::claude_profile::{
+    AppClaudeProfiles, ClaudeCredentialFile, ClaudeProfileRaw, KeyProfileSettings,
+};
 use crate::config::container::{ContainerConfig, default_container_home};
 use crate::config::events::EventsConfig;
 use crate::config::hooks::{PostPullHooksConfig, StartHooksConfig, StartupHooksConfig};
@@ -918,6 +920,14 @@ claude_profile spare { expires = "2027-09-01"; }
 
 claude_profile legacy { token_file = "/srv/old-secrets/claude-legacy.token"; }
 
+claude_profile work-key {
+    api_key_file = "/home/alice/.secrets/claude-profile-work-key.key";
+    expires = "2027-10-01";
+    budget_usd = 50.5;
+    reset_tz = "America/Chicago";
+    exhausted_markers = ["credit balance is too low", "billing"];
+}
+
 oauth_provider google {
     app_name = "Alice's Brenn";
     client_secret_file = "/etc/brenn/google/client_secret.json";
@@ -1135,25 +1145,34 @@ container cc {
             claude_profiles: BTreeMap::from([
                 (
                     "main".to_string(),
-                    ClaudeProfileRaw {
-                        token_file: PathBuf::from("/home/alice/.secrets/claude-profile-main.token"),
-                        expires: None,
-                    },
+                    token_profile("/home/alice/.secrets/claude-profile-main.token", None),
                 ),
                 (
                     "spare".to_string(),
-                    ClaudeProfileRaw {
-                        token_file: PathBuf::from(
-                            "/home/alice/.secrets/claude-profile-spare.token",
-                        ),
-                        expires: Some("2027-09-01".parse().expect("an ISO date")),
-                    },
+                    token_profile(
+                        "/home/alice/.secrets/claude-profile-spare.token",
+                        Some("2027-09-01"),
+                    ),
                 ),
                 (
                     "legacy".to_string(),
+                    token_profile("/srv/old-secrets/claude-legacy.token", None),
+                ),
+                (
+                    "work-key".to_string(),
                     ClaudeProfileRaw {
-                        token_file: PathBuf::from("/srv/old-secrets/claude-legacy.token"),
-                        expires: None,
+                        credential: ClaudeCredentialFile::ApiKey {
+                            path: PathBuf::from("/home/alice/.secrets/claude-profile-work-key.key"),
+                            settings: KeyProfileSettings {
+                                budget_usd: Some(50.5),
+                                reset_tz: chrono_tz::America::Chicago,
+                                exhausted_markers: vec![
+                                    "credit balance is too low".to_string(),
+                                    "billing".to_string(),
+                                ],
+                            },
+                        },
+                        expires: Some("2027-10-01".parse().expect("an ISO date")),
                     },
                 ),
             ]),
@@ -6827,6 +6846,25 @@ fn profiles_of(document: &str) -> BTreeMap<String, ClaudeProfileRaw> {
     config_from_dsl(document).claude_profiles
 }
 
+/// A token profile at `path`, as lowering settles it.
+fn token_profile(path: &str, expires: Option<&str>) -> ClaudeProfileRaw {
+    ClaudeProfileRaw {
+        credential: ClaudeCredentialFile::OauthToken(PathBuf::from(path)),
+        expires: expires.map(|date| date.parse().expect("an ISO date")),
+    }
+}
+
+/// The settings of the API-key profile `name`.
+fn key_settings<'a>(
+    profiles: &'a BTreeMap<String, ClaudeProfileRaw>,
+    name: &str,
+) -> &'a KeyProfileSettings {
+    match &profiles[name].credential {
+        ClaudeCredentialFile::ApiKey { settings, .. } => settings,
+        ClaudeCredentialFile::OauthToken(_) => panic!("`{name}` is a token profile"),
+    }
+}
+
 /// The body-less form states a whole profile: the name is the identity and the
 /// path follows the convention.
 #[test]
@@ -6841,10 +6879,7 @@ claude_profile main;
         ),
         BTreeMap::from([(
             "main".to_string(),
-            ClaudeProfileRaw {
-                token_file: PathBuf::from("/home/alice/.secrets/claude-profile-main.token"),
-                expires: None,
-            },
+            token_profile("/home/alice/.secrets/claude-profile-main.token", None),
         )]),
     );
 }
@@ -6861,8 +6896,10 @@ claude_defaults { profile_token_dir = "/home/alice/.secrets"; }
 "#,
     );
     assert_eq!(
-        profiles["main"].token_file,
-        PathBuf::from("/home/alice/.secrets/claude-profile-main.token"),
+        profiles["main"].credential,
+        ClaudeCredentialFile::OauthToken(PathBuf::from(
+            "/home/alice/.secrets/claude-profile-main.token"
+        )),
     );
 }
 
@@ -6877,8 +6914,8 @@ claude_profile legacy { token_file = "/srv/old-secrets/claude-legacy.token"; }
 "#,
     );
     assert_eq!(
-        profiles["legacy"].token_file,
-        PathBuf::from("/srv/old-secrets/claude-legacy.token"),
+        profiles["legacy"].credential,
+        ClaudeCredentialFile::OauthToken(PathBuf::from("/srv/old-secrets/claude-legacy.token")),
     );
 }
 
@@ -6930,7 +6967,7 @@ claude_profile spare { token_file = "/home/alice/.secrets/claude.token"; }
 "#,
     );
     assert!(
-        diagnostic.message.contains("same token file"),
+        diagnostic.message.contains("same credential file"),
         "{}",
         diagnostic.render(),
     );
@@ -6950,7 +6987,172 @@ claude_profile spare { token_file = "/home/alice/.secrets/claude-profile-main.to
 "#,
     );
     assert!(
-        diagnostic.message.contains("same token file"),
+        diagnostic.message.contains("same credential file"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// A key profile states its key file; everything else it may state has a
+/// default.
+#[test]
+fn a_key_profile_lowers_with_its_defaults() {
+    let profiles = profiles_of(
+        r#"claude_profile work-key { api_key_file = "/home/alice/.secrets/work.key"; }"#,
+    );
+    assert_eq!(
+        profiles["work-key"],
+        ClaudeProfileRaw {
+            credential: ClaudeCredentialFile::ApiKey {
+                path: PathBuf::from("/home/alice/.secrets/work.key"),
+                settings: KeyProfileSettings {
+                    budget_usd: None,
+                    reset_tz: chrono_tz::UTC,
+                    exhausted_markers: vec!["credit balance is too low".to_string()],
+                },
+            },
+            expires: None,
+        },
+    );
+}
+
+/// The token-dir convention names a token file; it never turns a key profile
+/// into a token profile.
+#[test]
+fn a_key_profile_ignores_the_token_dir_convention() {
+    let profiles = profiles_of(
+        r#"
+claude_defaults { profile_token_dir = "/home/alice/.secrets"; }
+
+claude_profile work-key { api_key_file = "/srv/keys/work.key"; budget_usd = 20; }
+"#,
+    );
+    assert_eq!(
+        profiles["work-key"].credential.path(),
+        std::path::Path::new("/srv/keys/work.key"),
+    );
+    assert_eq!(key_settings(&profiles, "work-key").budget_usd, Some(20.0),);
+}
+
+#[test]
+fn a_profile_naming_both_files_is_refused() {
+    let diagnostic =
+        refusal(r#"claude_profile both { token_file = "/s/t"; api_key_file = "/s/k"; }"#);
+    assert!(
+        diagnostic.message.contains("token_file")
+            && diagnostic.message.contains("api_key_file")
+            && diagnostic.message.contains("one credential"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// The accounting attrs mean nothing for a subscription, so stating one on a
+/// token profile is a mistake, whether the path is written or conventional.
+#[test]
+fn key_only_attrs_on_a_token_profile_are_refused() {
+    for attr in [
+        "budget_usd = 5.0;",
+        r#"reset_tz = "UTC";"#,
+        r#"exhausted_markers = ["x"];"#,
+    ] {
+        for body in [format!(r#"token_file = "/s/t"; {attr}"#), attr.to_string()] {
+            let document = format!(
+                "claude_defaults {{ profile_token_dir = \"/s\"; }}\n\nclaude_profile main {{ {body} }}\n"
+            );
+            let diagnostic = sole_refusal(&document);
+            let key = attr.split(' ').next().expect("the attr's key");
+            assert!(
+                diagnostic.message.contains(key) && diagnostic.message.contains("API-key profile"),
+                "{body}: {}",
+                diagnostic.render(),
+            );
+        }
+    }
+}
+
+#[test]
+fn a_budget_that_is_not_a_positive_amount_is_refused() {
+    for budget in ["0", "0.0", "-5.0"] {
+        let diagnostic = refusal(&format!(
+            r#"claude_profile k {{ api_key_file = "/s/k"; budget_usd = {budget}; }}"#
+        ));
+        assert!(
+            diagnostic.message.contains("budget_usd") && diagnostic.message.contains("above zero"),
+            "{budget}: {}",
+            diagnostic.render(),
+        );
+    }
+}
+
+#[test]
+fn a_budget_that_is_not_a_number_is_refused() {
+    let diagnostic =
+        refusal(r#"claude_profile k { api_key_file = "/s/k"; budget_usd = "fifty"; }"#);
+    assert!(
+        diagnostic.message.contains("budget_usd") && diagnostic.message.contains("a number"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+#[test]
+fn an_unknown_reset_zone_is_refused() {
+    let diagnostic =
+        refusal(r#"claude_profile k { api_key_file = "/s/k"; reset_tz = "Mars/Olympus"; }"#);
+    assert!(
+        diagnostic.message.contains("reset_tz") && diagnostic.message.contains("Mars/Olympus"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+#[test]
+fn a_reset_zone_lowers_as_the_zone() {
+    let profiles =
+        profiles_of(r#"claude_profile k { api_key_file = "/s/k"; reset_tz = "Europe/Berlin"; }"#);
+    assert_eq!(
+        key_settings(&profiles, "k").reset_tz,
+        chrono_tz::Europe::Berlin,
+    );
+}
+
+#[test]
+fn an_empty_marker_list_is_refused() {
+    let diagnostic =
+        refusal(r#"claude_profile k { api_key_file = "/s/k"; exhausted_markers = []; }"#);
+    assert!(
+        diagnostic.message.contains("exhausted_markers") && diagnostic.message.contains("empty"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+#[test]
+fn an_empty_marker_is_refused() {
+    let diagnostic = refusal(
+        r#"claude_profile k { api_key_file = "/s/k"; exhausted_markers = ["too low", ""]; }"#,
+    );
+    assert!(
+        diagnostic.message.contains("empty marker"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// The collision check spans kinds: a key profile and a token profile reading
+/// one file are two names for one credential.
+#[test]
+fn a_key_file_shared_with_a_token_profile_is_refused() {
+    let diagnostic = refusal(
+        r#"
+claude_profile main { token_file = "/s/shared"; }
+
+claude_profile work { api_key_file = "/s/shared"; }
+"#,
+    );
+    assert!(
+        diagnostic.message.contains("same credential file"),
         "{}",
         diagnostic.render(),
     );
@@ -7292,22 +7494,32 @@ new alice: Assistant();
     );
 }
 
-/// Under `--bare` Claude Code ignores the token and bills whatever `/login`
-/// left in the home, so the profile the agent claims to run under would be a
-/// lie.
+/// Under `--bare` Claude Code does not use the token, and what it bills when
+/// handed a key is unestablished, so the profile the agent claims to run under
+/// could be a lie — whatever the kinds of the profiles it may use.
 #[test]
-fn a_bare_agent_with_accounts_is_refused() {
-    let diagnostic = profile_refusal(
-        r#"
-    claude_profiles = ["main"];
+fn a_bare_agent_with_accounts_is_refused_whatever_their_kinds() {
+    for allowed in [r#"["main"]"#, r#"["work"]"#, r#"["work", "main"]"#] {
+        let diagnostic = sole_refusal(&format!(
+            r#"
+claude_profile main {{ token_file = "/s/main"; }}
+
+claude_profile work {{ api_key_file = "/s/work"; }}
+
+agent Assistant() {{
+    claude_profiles = {allowed};
     cc_extra_args = ["--bare"];
-"#,
-    );
-    assert!(
-        diagnostic.message.contains("--bare"),
-        "{}",
-        diagnostic.render(),
-    );
+}}
+
+new alice: Assistant();
+"#
+        ));
+        assert!(
+            diagnostic.message.contains("--bare") && diagnostic.message.contains("API key"),
+            "{allowed}: {}",
+            diagnostic.render(),
+        );
+    }
 }
 
 /// Each outranking credential is refused individually. The token variable

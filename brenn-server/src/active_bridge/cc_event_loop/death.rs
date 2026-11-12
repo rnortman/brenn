@@ -100,5 +100,9 @@ pub(in crate::active_bridge) async fn reset_dead_session(
     bridge.broadcast(WsServerMessage::Status {
         state: CcState::Error,
     });
+    // After the `Error` status, so the ended run carries it.
+    bridge
+        .agent_status
+        .session_ended(bridge.conversation_id, false);
     bridge.died_handled.store(true, Ordering::SeqCst);
 }

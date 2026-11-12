@@ -1,5 +1,6 @@
 use super::*;
 
+mod agent_status;
 mod death;
 mod drain;
 mod initialized;

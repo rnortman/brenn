@@ -611,6 +611,17 @@ short-lived and refreshed. So:
   which of those Brenn refuses, are in
   [the Claude accounts guide](claude-accounts.md#when-the-account-is-not-the-account).
 
+**A key profile.** Under a key profile the same variable position holds an
+Anthropic API key, `ANTHROPIC_API_KEY`, with the same exposure: CC's tools can
+read it, and every process CC starts inherits it. A key is worse than a token in
+one respect: it spends money directly, with no plan quota between a leak and the
+bill, and it lives until revoked. Spend through the key by anything other than
+Brenn's own turns — a descendant process calling the API itself, or the key
+copied out — is invisible to Brenn's account ledger, which counts only the cost
+Claude Code reports for each turn. The control is the spend limit set on the key
+at the Anthropic Platform console; the ledger and its `budget_usd` are reporting,
+not enforcement.
+
 ### 7.2 CC's output stream (B3)
 
 CC's output is parsed and acted upon. The control path (where CC asks the backend
@@ -901,7 +912,7 @@ compile time, because a document whose `call` graph has a cycle is refused.
 
 A call is charged against the caller's shared per-activation call ceiling
 (`MAX_PUBLISH_CALLS_PER_ACTIVATION`, 512 — one counter over `ports.publish`,
-`mqtt.mqtt-publish` and `calls.call`) and its payload against the publish-body
+`mqtt.mqtt-publish`, `mqtt.mqtt-publish-expiring` and `calls.call`) and its payload against the publish-body
 cap; an oversize reply traps the callee. **What that bounds is how many peer
 activations one activation raises, not what one of them costs.** A call is one
 whole, uncoalesced activation of the peer under the peer's own ceilings —

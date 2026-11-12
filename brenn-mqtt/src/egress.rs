@@ -13,7 +13,7 @@
 //! takes typed, pre-validated inputs and returns a typed [`MqttEgressError`] each
 //! caller maps to its own response format.
 
-use crate::service::MqttService;
+use crate::service::{MqttService, PublishProps};
 use crate::state::PubackOutcome;
 use brenn_db::Db;
 use brenn_lib::access::AppPolicy;
@@ -111,18 +111,16 @@ pub enum MqttEgressError {
 ///
 /// Preconditions: `addr` is an already-parsed, already-wildcard-
 /// validated [`MqttAddress`] (the caller owns `parse_topic_name`); `payload` and
-/// `content_type` are already decoded. ACL-deny logging belongs to the caller,
-/// which has the caller-identifying context — this function does not
-/// log.
-#[allow(clippy::too_many_arguments)]
+/// `props.content_type` are already decoded. `props` passes through to the
+/// broker unchanged. ACL-deny logging
+/// belongs to the caller, which has the caller-identifying context — this
+/// function does not log.
 pub async fn enforce_and_publish(
     svc: &MqttService,
     policy: &AppPolicy,
     addr: &MqttAddress,
     payload: Vec<u8>,
-    content_type: Option<String>,
-    qos: u8,
-    retain: bool,
+    props: PublishProps,
     budget: SendBudget<'_>,
 ) -> Result<(), MqttEgressError> {
     // 1. ACL (layer-1 grant + layer-2 per-client matcher). Deny-by-default: an
@@ -172,14 +170,7 @@ pub async fn enforce_and_publish(
     // 4. Publish straight to the broker (synchronous; QoS ≥ 1 awaits the ack). No
     //    store-and-forward — the broker outcome propagates inline.
     match svc
-        .publish_on_handle(
-            &handle,
-            addr.topic.clone(),
-            payload,
-            content_type,
-            qos,
-            retain,
-        )
+        .publish_on_handle(&handle, addr.topic.clone(), payload, props)
         .await
     {
         Ok(PubackOutcome::Success) => Ok(()),
@@ -248,9 +239,10 @@ mod tests {
             &policy,
             &addr("office", "cmd/light"),
             b"on".to_vec(),
-            None,
-            1,
-            false,
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
             SendBudget::Conversation {
                 db: &db,
                 conversation_id: 1,
@@ -286,9 +278,10 @@ mod tests {
             &policy,
             &addr("home", "cmd/light"),
             b"on".to_vec(),
-            None,
-            1,
-            false,
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
             SendBudget::Conversation {
                 db: &db,
                 conversation_id: 1,
@@ -320,9 +313,10 @@ mod tests {
             &policy,
             &addr("home", "cmd/light"),
             b"on".to_vec(),
-            None,
-            1,
-            false,
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
             SendBudget::Conversation {
                 db: &db,
                 conversation_id: 1,
@@ -364,9 +358,10 @@ mod tests {
             &policy,
             &addr("home", "cmd/light"),
             b"on".to_vec(),
-            None,
-            1,
-            false,
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
             SendBudget::Conversation {
                 db: &db,
                 conversation_id: 1,
@@ -399,9 +394,10 @@ mod tests {
             &policy,
             &addr("home", "cmd/light"),
             b"on".to_vec(),
-            None,
-            1,
-            false,
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
             SendBudget::Conversation {
                 db: &db,
                 conversation_id: 1,
@@ -451,9 +447,10 @@ mod tests {
             &policy,
             &addr("home", "cmd/light"),
             b"on".to_vec(),
-            None,
-            1,
-            false,
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
             SendBudget::None,
         )
         .await;
@@ -477,9 +474,10 @@ mod tests {
             &policy,
             &addr("office", "cmd/light"),
             b"on".to_vec(),
-            None,
-            1,
-            false,
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
             SendBudget::None,
         )
         .await;

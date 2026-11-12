@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use brenn_cc::protocol::outgoing::{HookMatcher, HooksConfig};
 use brenn_cc::session::CcSessionConfig;
-use brenn_lib::config::{CLAUDE_OAUTH_TOKEN_VAR, OUTRANKING_CREDENTIAL_VARS};
+use brenn_lib::config::OUTRANKING_CREDENTIAL_VARS;
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_obs::transcript::TranscriptWriter;
 use tracing::info;
@@ -167,14 +167,15 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
                  share one slice); one would silently override the other",
                 app_config.slug,
             );
-            // Claude Code ranks each of these above `CLAUDE_CODE_OAUTH_TOKEN`,
-            // so one of them in the environment would silently bill a different
-            // account than the profile names and every per-profile figure would
-            // be a lie.
+            // Each of these could win over the profile's credential in Claude
+            // Code's precedence, or sit beside it as a second credential, so
+            // one of them in the environment could silently bill a different
+            // account than the profile names and every per-profile figure
+            // would be a lie.
             assert!(
                 cc_profile.is_none() || !OUTRANKING_CREDENTIAL_VARS.contains(&key.as_str()),
-                "BUG: env var {key:?} outranks {CLAUDE_OAUTH_TOKEN_VAR} in Claude Code's \
-                 credential precedence, and app {:?} runs under a claude_profile — the \
+                "BUG: env var {key:?} is a credential variable that could override the \
+                 profile's credential, and app {:?} runs under a claude_profile — the \
                  profile would name one account while CC used another",
                 app_config.slug,
             );
@@ -265,7 +266,12 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
         },
         secret_env_vars: cc_profile
             .into_iter()
-            .map(|p| (CLAUDE_OAUTH_TOKEN_VAR.to_string(), p.token))
+            .map(|p| {
+                (
+                    p.credential.env_var().to_string(),
+                    p.credential.secret().clone(),
+                )
+            })
             .collect(),
         shutting_down: None,
         server_shutting_down: Some(server_shutting_down),
@@ -740,12 +746,45 @@ mod tests {
         profile: &str,
         token: &str,
     ) -> CcSessionConfig {
+        run_build_cc_session_config_with_credential(
+            app_config,
+            profile,
+            brenn_lib::config::ClaudeCredential::OauthToken(brenn_lib::config::SecretString::new(
+                token.to_string(),
+            )),
+        )
+    }
+
+    fn run_build_cc_session_config_with_key(
+        app_config: &brenn_lib::config::AppConfig,
+        profile: &str,
+        key: &str,
+    ) -> CcSessionConfig {
+        run_build_cc_session_config_with_credential(
+            app_config,
+            profile,
+            brenn_lib::config::ClaudeCredential::ApiKey {
+                secret: brenn_lib::config::SecretString::new(key.to_string()),
+                settings: brenn_lib::config::KeyProfileSettings {
+                    budget_usd: None,
+                    reset_tz: chrono_tz::UTC,
+                    exhausted_markers: vec!["credit balance is too low".to_string()],
+                },
+            },
+        )
+    }
+
+    fn run_build_cc_session_config_with_credential(
+        app_config: &brenn_lib::config::AppConfig,
+        profile: &str,
+        credential: brenn_lib::config::ClaudeCredential,
+    ) -> CcSessionConfig {
         run_build_cc_session_config_inner(
             app_config,
             chrono_tz::UTC,
             Some(brenn_cc_profile::ResolvedProfile {
                 name: profile.to_string(),
-                token: brenn_lib::config::SecretString::new(token.to_string()),
+                credential,
             }),
         )
     }
@@ -1287,7 +1326,7 @@ mod tests {
     /// An integration emitting a credential variable that outranks the token
     /// would silently bill a different account than the profile names.
     #[tokio::test]
-    #[should_panic(expected = "outranks CLAUDE_CODE_OAUTH_TOKEN")]
+    #[should_panic(expected = "could override the profile's credential")]
     async fn build_cc_session_config_panics_on_outranking_integration_env_key() {
         use std::sync::Arc;
         let mut app = minimal_test_app_config();
@@ -1325,7 +1364,7 @@ mod tests {
     /// An agent `env` carrying an outranking credential on a profiled agent is
     /// refused at lowering; the spawn backstop covers it too.
     #[tokio::test]
-    #[should_panic(expected = "outranks CLAUDE_CODE_OAUTH_TOKEN")]
+    #[should_panic(expected = "could override the profile's credential")]
     async fn build_cc_session_config_panics_when_agent_env_outranks_the_profile() {
         let mut app = minimal_test_app_config();
         app.env = std::collections::BTreeMap::from([(
@@ -1395,5 +1434,74 @@ mod tests {
             spawn.extra_args
         );
         assert_eq!(cfg.secret_env_vars.len(), 1);
+    }
+
+    /// A key profile hands Claude Code exactly its key, under the key's own
+    /// variable, on the secret path and nowhere else.
+    #[tokio::test]
+    async fn build_cc_session_config_puts_the_profile_key_in_secret_env_vars() {
+        let cfg = run_build_cc_session_config_with_key(
+            &minimal_test_app_config(),
+            "work-key",
+            "sk-ant-api03-key",
+        );
+        assert_eq!(cfg.secret_env_vars.len(), 1);
+        assert_eq!(cfg.secret_env_vars[0].0, "ANTHROPIC_API_KEY");
+        assert_eq!(cfg.secret_env_vars[0].1.expose(), "sk-ant-api03-key");
+        assert!(
+            !cfg.env_vars
+                .iter()
+                .any(|(k, v)| k == "ANTHROPIC_API_KEY" || v.contains("sk-ant-api03-key")),
+            "the key must not travel the plain env-var path"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_cc_session_config_containerized_keeps_the_key_off_the_podman_args() {
+        let mut app = minimal_test_app_config();
+        app.container_spawn = Some(test_container("/host/wd", "/home/user/wd"));
+        let cfg = run_build_cc_session_config_with_key(&app, "work-key", "sk-ant-api03-key");
+        let spawn = cfg.container.as_ref().expect("containerized");
+        assert!(
+            !spawn
+                .extra_args
+                .iter()
+                .any(|a| a.contains("sk-ant-api03-key")),
+            "no podman argument may carry the key bytes: {:?}",
+            spawn.extra_args
+        );
+        assert_eq!(cfg.secret_env_vars.len(), 1);
+    }
+
+    /// The guard is uniform across kinds: every one of the six credential
+    /// variables is refused beside a key profile, `ANTHROPIC_API_KEY` itself
+    /// included, so the agent's environment holds the profile's key and no
+    /// other credential.
+    #[test]
+    fn every_credential_variable_panics_beside_a_key_profile() {
+        for var in OUTRANKING_CREDENTIAL_VARS {
+            let outcome = std::panic::catch_unwind(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let mut app = minimal_test_app_config();
+                    app.env =
+                        std::collections::BTreeMap::from([(var.to_string(), "x".to_string())]);
+                    run_build_cc_session_config_with_key(&app, "work-key", "sk-ant-api03-key");
+                });
+            });
+            let payload = outcome.expect_err(var);
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or_default();
+            assert!(
+                message.contains("could override the profile's credential"),
+                "{var}: {message}"
+            );
+        }
     }
 }

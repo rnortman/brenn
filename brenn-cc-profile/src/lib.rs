@@ -1,21 +1,25 @@
 //! Claude account profiles at runtime.
 //!
-//! An account, to Claude Code, is the value of `CLAUDE_CODE_OAUTH_TOKEN`, and a
-//! profile is a name bound to one. Which profile an agent runs under is state,
+//! An account, to Claude Code, is the value of `CLAUDE_CODE_OAUTH_TOKEN` or
+//! `ANTHROPIC_API_KEY`, and a profile is a name bound to one. Which profile an agent runs under is state,
 //! not a request: the latest message on the agent's goal channel names it, and
 //! this crate holds what that latest message said.
 //!
 //! Nothing here decides anything. [`ProfileGoal::apply`] takes what a publisher
 //! said, checks it against the agent's declared set, and remembers it;
-//! [`ProfileGoal::resolve`] hands the spawn path the token to put in the
+//! [`ProfileGoal::resolve`] hands the spawn path the credential to put in the
 //! environment. The deciding lives in a policy component on the other side of
 //! the channel.
+
+pub mod ledger;
+
+pub use ledger::{AccountLedger, TurnOutcome};
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 use brenn_lib::config::{
-    AppClaudeProfiles, ClaudeProfile, OUTRANKING_CREDENTIAL_VARS, SecretString,
+    AppClaudeProfiles, ClaudeCredential, ClaudeProfile, OUTRANKING_CREDENTIAL_VARS,
 };
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
@@ -26,7 +30,8 @@ use tracing::{info, warn};
 pub const CC_PROFILE_COMPONENT: &str = "cc-profile";
 
 /// Refuse to boot when the server's own environment carries a credential that
-/// outranks the token and any **bare** agent runs under a profile.
+/// could win over or sit beside a profile's credential and any **bare** agent
+/// runs under a profile.
 ///
 /// A bare child inherits the server's environment through additive `envs`, so
 /// the variable would be there and would win: the profile would name one
@@ -61,8 +66,9 @@ pub fn refuse_outranking_env(
     for var in OUTRANKING_CREDENTIAL_VARS {
         assert!(
             lookup(var).is_none(),
-            "config: the server's environment carries {var}, which Claude Code reads ahead of \
-             the profile's token, and these bare agents run under a claude_profile: {}. A bare \
+            "config: the server's environment carries {var}, a credential variable that could \
+             win over or sit beside the profile's credential, and these bare agents run under a \
+             claude_profile: {}. A bare \
              child inherits this variable, so the profile would name one account and CC would \
              use another. Unset it, or containerize those agents.",
             bare_profiled.join(", "),
@@ -117,11 +123,11 @@ pub fn accept(body: &str, allowed: &[String]) -> Result<String, GoalError> {
     Ok(name.to_string())
 }
 
-/// A profile with its token in hand, as the spawn path wants it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A profile with its credential in hand, as the spawn path wants it.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedProfile {
     pub name: String,
-    pub token: SecretString,
+    pub credential: ClaudeCredential,
 }
 
 /// The live goal state: which profile each app should run under right now.
@@ -130,7 +136,7 @@ pub struct ResolvedProfile {
 /// [`apply`](Self::apply) as goals arrive. Read by the spawn path through
 /// [`resolve`](Self::resolve).
 pub struct ProfileGoal {
-    /// Every declared profile, with its token.
+    /// Every declared profile, with its credential.
     profiles: BTreeMap<String, ClaudeProfile>,
     /// Per app slug, the accounts it may run under and where its goal comes
     /// from. Only apps that declared `claude_profiles` appear.
@@ -190,14 +196,19 @@ impl ProfileGoal {
         }
     }
 
+    /// Every declared profile, by name.
+    pub fn profiles(&self) -> &BTreeMap<String, ClaudeProfile> {
+        &self.profiles
+    }
+
     /// Every distinct goal channel address, ascending. The set the system
     /// participant subscribes to.
     pub fn goal_addresses(&self) -> Vec<String> {
         self.channel_apps.keys().cloned().collect()
     }
 
-    /// The profile `app_slug` should run under, with its token. `None` for an
-    /// app that declared no `claude_profiles` — it gets no token and
+    /// The profile `app_slug` should run under, with its credential. `None`
+    /// for an app that declared no `claude_profiles` — it gets no credential and
     /// authenticates with whatever `/login` left in its home.
     ///
     /// # Panics
@@ -217,12 +228,12 @@ impl ProfileGoal {
         });
         Some(ResolvedProfile {
             name,
-            token: profile.token.clone(),
+            credential: profile.credential.clone(),
         })
     }
 
     /// The profile name `app_slug` should run under, without touching its
-    /// token.
+    /// credential.
     pub fn current(&self, app_slug: &str) -> Option<String> {
         self.current
             .read()
@@ -295,6 +306,8 @@ pub fn cc_profile_spec(goal_addrs: &[String]) -> SystemParticipantSpec {
 
 #[cfg(test)]
 mod tests {
+    use brenn_lib::config::SecretString;
+
     use super::*;
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -303,7 +316,7 @@ mod tests {
 
     fn profile(token: &str) -> ClaudeProfile {
         ClaudeProfile {
-            token: SecretString::new(token.to_string()),
+            credential: ClaudeCredential::OauthToken(SecretString::new(token.to_string())),
             expires: None,
         }
     }
@@ -378,7 +391,8 @@ mod tests {
         assert_eq!(goal.current("pa").as_deref(), Some("spare"));
         assert_eq!(goal.current("kb").as_deref(), Some("main"));
         assert_eq!(
-            goal.resolve("pa").map(|r| r.token.expose().to_string()),
+            goal.resolve("pa")
+                .map(|r| r.credential.secret().expose().to_string()),
             Some("token-spare".to_string())
         );
     }

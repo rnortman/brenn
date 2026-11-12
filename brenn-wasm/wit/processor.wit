@@ -505,6 +505,23 @@ interface mqtt {
         qos: u8,
         retain: bool,
     ) -> result<_, mqtt-publish-error>;
+
+    /// `mqtt-publish` plus the MQTT 5 message-expiry interval: the broker
+    /// discards the message `message-expiry-s` seconds after it receives it,
+    /// and a retained message stops being retained then. Same grant, budgets,
+    /// errors and synchrony as `mqtt-publish`. `message-expiry-s = 0` is
+    /// refused as `invalid-payload`. Existing components compiled without this
+    /// import keep working (additive WIT ABI — no package version bump); a
+    /// component that imports it does not link on a host that predates it.
+    mqtt-publish-expiring: func(
+        client: string,
+        topic: string,
+        payload: list<u8>,
+        content-type: option<string>,
+        qos: u8,
+        retain: bool,
+        message-expiry-s: u32,
+    ) -> result<_, mqtt-publish-error>;
 }
 
 interface calls {

@@ -27,12 +27,14 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub mod addressing;
+pub mod agent;
 pub mod channel_model;
 pub mod chat;
 pub mod grants;
 #[cfg(feature = "testutils")]
 pub mod testutils;
 pub mod tool_schema;
+pub mod versioned;
 
 // ---------------------------------------------------------------------------
 // Address scheme

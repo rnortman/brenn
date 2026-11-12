@@ -25,6 +25,23 @@ use brenn_lib::messaging::Urgency;
 use brenn_lib::mqtt::config::MqttClientConfig;
 use brenn_lib::mqtt::error::MqttError;
 
+/// The per-publish MQTT properties of one outbound message.
+///
+/// `Default` is QoS 0, not retained, with no content type and no expiry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublishProps {
+    /// MQTT 5 content type; `None` sends none.
+    pub content_type: Option<String>,
+    /// Delivery QoS. Only 0, 1 and 2 are valid; any other value is refused at
+    /// publish as `MqttError::NotConnected`.
+    pub qos: u8,
+    /// Whether the broker retains the message for later subscribers.
+    pub retain: bool,
+    /// MQTT 5 message-expiry interval in seconds; `None` sends none, and the
+    /// broker keeps the message until it is replaced.
+    pub message_expiry_s: Option<u32>,
+}
+
 // ---------------------------------------------------------------------------
 // MqttEventRouter trait
 // ---------------------------------------------------------------------------
@@ -511,13 +528,17 @@ impl MqttService {
         handle: &Arc<MqttClientHandle>,
         topic: String,
         payload: Vec<u8>,
-        content_type: Option<String>,
-        qos: u8,
-        retain: bool,
+        props: PublishProps,
     ) -> Result<PubackOutcome, MqttError> {
         use rumqttc::PublishProperties;
         use rumqttc::mqttbytes::QoS;
 
+        let PublishProps {
+            content_type,
+            qos,
+            retain,
+            message_expiry_s,
+        } = props;
         let rumq_qos = match qos {
             0 => QoS::AtMostOnce,
             1 => QoS::AtLeastOnce,
@@ -530,10 +551,12 @@ impl MqttService {
             }
         };
 
-        let properties = content_type.map(|ct| PublishProperties {
-            content_type: Some(ct),
-            ..Default::default()
-        });
+        let properties =
+            (content_type.is_some() || message_expiry_s.is_some()).then(|| PublishProperties {
+                content_type,
+                message_expiry_interval: message_expiry_s,
+                ..Default::default()
+            });
 
         // Lock client + pending together to maintain FIFO submission order.
         let client_guard = handle.client.lock().await;
@@ -1010,9 +1033,10 @@ mod tests {
                 &handle,
                 "test/topic".to_string(),
                 b"hello".to_vec(),
-                None,
-                1,
-                false,
+                PublishProps {
+                    qos: 1,
+                    ..Default::default()
+                },
             )
             .await;
         assert!(matches!(result, Err(MqttError::NotConnected { .. })));

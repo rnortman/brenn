@@ -11,6 +11,7 @@
 //! `pub` behind `testutils` for the same reason.
 
 pub mod active_bridge;
+pub mod agent_status;
 mod automation_intercept;
 mod cc_schema_drift;
 mod client_ip;

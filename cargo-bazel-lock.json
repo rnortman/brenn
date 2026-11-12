@@ -1,5 +1,5 @@
 {
-  "checksum": "da951dc78510295900d451cb877df1c61b951441d8125f1121cdea7ea40c8314",
+  "checksum": "b0dbc454202fefb7de37f7dcce0d64b8956faf84df66843774d832362d27559e",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -3106,6 +3106,14 @@
         ],
         "deps": {
           "common": [
+            {
+              "id": "chrono 0.4.45",
+              "target": "chrono"
+            },
+            {
+              "id": "chrono-tz 0.10.4",
+              "target": "chrono_tz"
+            },
             {
               "id": "tracing 0.1.44",
               "target": "tracing"

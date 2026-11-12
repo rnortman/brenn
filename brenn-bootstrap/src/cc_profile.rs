@@ -26,8 +26,8 @@ pub(crate) async fn attach_and_seed(
         CC_PROFILE_COMPONENT,
         messenger,
         notify,
-        |address, body| {
-            goal.apply(address, body);
+        |address, envelope| {
+            goal.apply(address, &envelope.body);
         },
     )
     .await
@@ -67,7 +67,7 @@ mod tests {
     use std::time::Duration;
 
     use brenn_cc_profile::cc_profile_spec;
-    use brenn_lib::config::{AppClaudeProfiles, ClaudeProfile, SecretString};
+    use brenn_lib::config::{AppClaudeProfiles, ClaudeCredential, ClaudeProfile, SecretString};
     use brenn_lib::messaging::config::MessagingGlobalConfig;
     use brenn_lib::messaging::{ChannelEntry, ChannelScheme, MessagingDirectory};
     use brenn_messaging::query::NoopWakeRouter;
@@ -96,7 +96,9 @@ mod tests {
                 (
                     name.to_string(),
                     ClaudeProfile {
-                        token: SecretString::new(format!("token-{name}")),
+                        credential: ClaudeCredential::OauthToken(SecretString::new(format!(
+                            "token-{name}"
+                        ))),
                         expires: None,
                     },
                 )

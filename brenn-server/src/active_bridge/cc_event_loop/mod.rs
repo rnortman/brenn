@@ -26,6 +26,7 @@ use death::reset_session_runtime_state;
 pub(in crate::active_bridge) use death::{reset_dead_session, session_stderr_tail};
 pub(super) use drain::drain_pending_events;
 pub(in crate::active_bridge) use initialized::handle_initialized;
+use rate_limit::handle_rate_limit_status;
 pub(in crate::active_bridge) use rate_limit::handle_rate_limit_utilization;
 use status::{handle_compact_boundary, handle_status_change};
 pub(in crate::active_bridge) use streaming::handle_assistant_message;
@@ -176,23 +177,13 @@ pub(super) async fn cc_event_loop(
                 }
             }
             SessionEvent::RateLimit(evt) => {
-                let is_limited = evt
+                let info = evt
                     .rate_limit_info
                     .as_ref()
-                    .and_then(|info| info.get("status"))
-                    .and_then(|s| s.as_str())
-                    .is_some_and(|s| s != "allowed");
-
-                if is_limited {
-                    warn!("CC rate limited");
-                    bridge.broadcast(WsServerMessage::Error {
-                        message: "Rate limited by Claude API".to_string(),
-                    });
-                } else {
-                    info!("CC rate limit status: allowed");
-                }
+                    .map(super::limit::RateLimitInfo::of);
+                handle_rate_limit_status(&bridge, info.as_ref(), &alert_dispatcher);
                 // Log utilization from allowed_warning events; no frontend consumer.
-                handle_rate_limit_utilization(&evt, &alert_dispatcher);
+                handle_rate_limit_utilization(info.as_ref(), &alert_dispatcher);
                 // Persist to the diagnostic log. RateLimit events are not broadcast
                 // to the frontend so the returned seq is not forwarded.
                 let _rate_limit_seq = persist_incoming_message(
@@ -293,6 +284,13 @@ pub(super) async fn cc_event_loop(
                     // Error + error broadcasts + died_handled.
                     reset_dead_session(&bridge, format!("CC session died: {err}")).await;
                 }
+                // The run ended. After `reset_dead_session` (which reports the
+                // unexpected end itself) or a watchdog that got here first,
+                // this is a no-op: this bridge's run is no longer tracked, and
+                // a successor bridge's run is not this one.
+                bridge
+                    .agent_status
+                    .session_ended(bridge.conversation_id, shutdown_reason.is_intentional());
                 // Every `Died` that is not the swap's ends the loop. The bridge
                 // holds a clone of the event sender so a swap can hand it to the
                 // replacement process, which means "channel closed ⇒ process

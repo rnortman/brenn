@@ -411,13 +411,15 @@ impl Messenger {
         .await
     }
 
-    /// Publish a durable (`brenn:`) message on behalf of an in-process
-    /// system-substrate component (e.g. the tool executor publishing a result
-    /// to a caller's `brenn:tool-results/<slug>` inbox).
+    /// Publish a message on a `brenn:` or `ephemeral:` channel on behalf of an
+    /// in-process system-substrate component (e.g. the tool executor
+    /// publishing a result to a caller's `brenn:tool-results/<slug>` inbox).
     ///
     /// Runs the identical `publish_core` gate sequence as `publish` — same
-    /// address-shape, directory, `MessagingPublish` grant, `brenn_publish` ACL,
-    /// and body-cap gates — differing only in the layer-1 authority source
+    /// address-shape, directory, publish-grant, ACL and body-cap gates, the
+    /// grant and ACL family being the ones for the channel's scheme
+    /// (`MessagingPublish` and `brenn_publish`, or `EphemeralPublish` and
+    /// `ephemeral_publish`) — differing only in the layer-1 authority source
     /// (`system_policies`, keyed by component name) and the stored principal
     /// (`for_system(component)`). `System` origin: no send budget. There is no
     /// ACL bypass — a system component publishes only where its code-built

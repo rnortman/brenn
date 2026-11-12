@@ -1495,6 +1495,57 @@ pub mod mqtt {
             .map_err(|e| mqtt_err(client, topic, e))
     }
 
+    /// [`try_publish`] with an MQTT 5 message-expiry interval: the broker
+    /// discards the message `message_expiry_s` seconds after receiving it, and
+    /// a retained message stops being retained then. Zero is refused as
+    /// `invalid-payload`.
+    ///
+    /// Imports `mqtt-publish-expiring`, which a host that predates it does not
+    /// provide: a component calling this does not link there.
+    pub fn try_publish_expiring(
+        client: &str,
+        topic: &str,
+        payload: &[u8],
+        content_type: Option<&str>,
+        qos: u8,
+        retain: bool,
+        message_expiry_s: u32,
+    ) -> Result<(), PublishError> {
+        raw::mqtt_publish_expiring(
+            client,
+            topic,
+            payload,
+            content_type,
+            qos,
+            retain,
+            message_expiry_s,
+        )
+    }
+
+    /// Publish a UTF-8 body as `text/plain` with a message-expiry interval
+    /// (see [`try_publish_expiring`]).
+    ///
+    /// Diagnostic on error: `"mqtt publish {client}/{topic}: {variant}"`.
+    pub fn publish_text_expiring(
+        client: &str,
+        topic: &str,
+        body: &str,
+        qos: u8,
+        retain: bool,
+        message_expiry_s: u32,
+    ) -> Result<(), Error> {
+        try_publish_expiring(
+            client,
+            topic,
+            body.as_bytes(),
+            Some("text/plain"),
+            qos,
+            retain,
+            message_expiry_s,
+        )
+        .map_err(|e| mqtt_err(client, topic, e))
+    }
+
     /// Publish a UTF-8 body as `text/plain`.
     pub fn publish_text(
         client: &str,
