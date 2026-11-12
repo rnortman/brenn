@@ -7,10 +7,10 @@
 // - 0.1.0, the transpiled `processor-page-test` kind, with the state carried
 //   the way a 0.1.0 kind must carry binary — base64 inside a JSON body on a
 //   page-local `io` port;
-// - 0.2.0, the transpiled `processor-page-bytes-test` kind, with a UTF-8 state
-//   of the same raw size carried as a `text/plain` body on a page-local `io`
-//   port: bytes across the crossing, no encoding. Not binary at rest, which a
-//   page-local channel does not carry yet.
+// - 0.2.0, the transpiled `processor-page-bytes-test` kind, with the same raw
+//   bytes and step held bare, as an `application/octet-stream` body on a
+//   page-local `io` port declared `non_text`: bytes across the crossing and at
+//   rest, no encoding.
 //
 // Timings are printed, never asserted.
 //
@@ -20,7 +20,7 @@
 
 import { afterAll, describe, expect, it } from "vitest";
 import { type Page, type Report, only, openPage } from "./page.js";
-import { expectedState, expectedTextState, generatedState, generatedTextState } from "./state.js";
+import { expectedState, generatedState } from "./state.js";
 
 /** Raw state sizes, with the iterations timed and the untimed warm-up at each. */
 const SIZES = [
@@ -78,8 +78,6 @@ const lines: string[] = [];
 
 afterAll(() => {
     page?.finish();
-    // TODO(page-rig-baseline-record): time binary state at rest here and record it
-    // beside these figures in the tracker entry.
     console.log(
         [`page rig state workload (node ${process.version}, V8; not a browser):`, ...lines].join("\n"),
     );
@@ -104,11 +102,11 @@ const WORKLOADS: Workload[] = [
         expected: expectedState,
     },
     {
-        label: "0.2.0 UTF-8 text/plain",
+        label: "0.2.0 binary at rest",
         holders: (p) => p.facts.bytes_state_instances,
         stored: (raw) => raw,
-        generated: generatedTextState,
-        expected: expectedTextState,
+        generated: generatedState,
+        expected: expectedState,
     },
 ];
 

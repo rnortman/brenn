@@ -173,16 +173,21 @@ What a 0.2.0 author relies on:
 - **On a surface.** The surface host serves 0.2.0 beside 0.1.0, provisional
   as on the backend; the page manifest names each kind's contract and the
   page brings each instance up on its own contract's imports. What a
-  page-hosted 0.2.0 kind carries today:
-  - typed text on a page-local (`local:`) channel, with its type;
+  page-hosted 0.2.0 kind carries today, shown on the node rig and not yet run
+  in a browser:
+  - any body, text or not, with its type, on a page-local channel declared
+    `non_text` — a surface binding tail states `non_text = true` where its
+    channel stays on the page (`docs/message-bus.md` §2.6) — published,
+    parked, edited and read back byte for byte;
+  - typed text on any page-local (`local:`) channel, with its type; a
+    non-text body on a page-local channel not declared `non_text` is
+    `text-only-channel`;
   - any body, text or not, typed or not, in a sync call and its reply between
     two 0.2.0 kinds;
   - untyped text only on a port bound to a channel that leaves the page. A
     typed text body there is refused with `invalid-body`, whose diagnostic
     says the page's wire carries untyped text only; nothing is sent. A
-    non-text body is `text-only-channel`, as on any text-only channel;
-  - no non-text body at rest on any channel yet: a surface binding may not
-    state `non_text` (`docs/message-bus.md` §2.1).
+    non-text body is `text-only-channel`, as on any text-only channel.
 
   The server holds a 0.2.0 kind's artifact to the shapes it serves before
   serving it, because the page's transpiled glue checks nothing against the
@@ -278,7 +283,8 @@ Another cut of this kind in force now: **`MessageEnvelope.body` is a
   non-text body to a 0.1.0 component, and a typed text body arrives as exactly
   its text, without its type. This is enforced at binding: a 0.1.0 component
   with any input or output port on a channel declared `non_text` is refused
-  at boot and at reload. A kind reads it with `body.as_text()` or
+  at boot and at reload — a consumer, and a served surface instance bound to
+  a page-local channel declared `non_text`. A kind reads it with `body.as_text()` or
   `envelope.text_body()?`, and compares a sentinel as
   `body.as_text() == Some("…")`.
 - `brenn_guest::MessageEnvelopeExt` gained `text_body(&self) -> Result<&str,

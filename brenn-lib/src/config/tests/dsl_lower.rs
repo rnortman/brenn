@@ -311,6 +311,7 @@ fn surface_input(instance: &str, port: &str, channel: &str) -> SurfaceSubscripti
         retain_depth: None,
         noise: None,
         wake_min: None,
+        non_text: false,
     }
 }
 
@@ -323,6 +324,7 @@ fn surface_output(instance: &str, port: &str, channel: &str) -> SurfaceOutputRaw
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 
@@ -338,6 +340,7 @@ fn surface_io_port(instance: &str, port: &str) -> SurfaceIoPortRaw {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 
@@ -5384,7 +5387,7 @@ surface alice_pod {
     assert_eq!(
         refusal.message,
         "`amplification` is not a key of the `heard` port of instance `widget` of surface \
-         `alice_pod`; expected `push_depth`, `retain_depth`, `noise` or `wake_min`"
+         `alice_pod`; expected `push_depth`, `retain_depth`, `noise`, `wake_min` or `non_text`"
     );
     assert_eq!(
         refusal.line_col(),
@@ -5429,7 +5432,7 @@ surface alice_pod {
         refusal.message,
         "`amplification` is not a key of the `tick` port of instance `widget` of surface \
          `alice_pod`; expected `push_depth`, `retain_depth`, `noise`, `urgency`, \
-         `publish_per_activation` or `publish_capacity`"
+         `publish_per_activation`, `publish_capacity` or `non_text`"
     );
     assert_eq!(
         refusal.line_col(),

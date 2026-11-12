@@ -220,6 +220,7 @@ fn surface_io_raw(port: &str, push: u64, retain: u64) -> SurfaceIoPortRaw {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 
@@ -260,6 +261,7 @@ fn surface_with_free_ports(slug: &str) -> SurfaceConfigRaw {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         ..minimal_surface_raw()
     }
@@ -1655,6 +1657,7 @@ fn surface_io_port_name_colliding_with_a_free_output_panics() {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }];
     let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &globals());
     resolve_surfaces_with_auto(&surfaces, &dir_of(vec![]), &globals(), &wiring);
@@ -1789,9 +1792,10 @@ fn a_named_local_io_port_is_non_text_iff_it_says_so() {
     }
 }
 
-/// A surface endpoint never says `non_text` and leaves the fold as the
-/// backend endpoints make it. Whether a surface may be bound to the result is
-/// the surface resolver's question, not the fold's.
+/// A link whose only `non_text` endpoint is the backend's: the fold makes the
+/// spanning channel `non_text` from the backend side alone. Whether a surface
+/// may be bound to the result is the surface resolver's question, not the
+/// fold's.
 #[test]
 fn a_surface_endpoint_leaves_the_fold_to_the_backend_endpoints() {
     let mut etl = publisher("etl");
@@ -1808,4 +1812,134 @@ fn a_surface_endpoint_leaves_the_fold_to_the_backend_endpoints() {
     let entry = &wiring.nondurable_entries()[0];
     assert_eq!(entry.transport_type, ChannelScheme::Ephemeral);
     assert!(entry.resolved_channel.non_text);
+}
+
+/// A surface's own two ports on one page-local link: the surface endpoint's
+/// statement passes parity with its declaration, no server entry is
+/// synthesized, and the page ring's fact is folded from the bindings — which
+/// for a page-local link are exactly its endpoints.
+#[test]
+fn a_page_local_link_is_non_text_iff_a_surface_endpoint_says_so() {
+    for says in [false, true] {
+        let mut surfaces = vec![surface_with_free_ports("deskbar")];
+        surfaces[0].outputs[0].non_text = says;
+        let mut publisher = surface_pub("deskbar", "out");
+        publisher.non_text = says;
+        let wiring = lower_auto_wiring(
+            &[link(vec![publisher, surface_sub("deskbar", "tap", 2, 3)])],
+            &[],
+            &surfaces,
+            &[],
+            &globals(),
+        );
+        assert!(wiring.nondurable_entries().is_empty());
+        let address = wiring
+            .surface_channel("deskbar", "protobar", "tap")
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            wiring.surface_channel("deskbar", "protobar", "out"),
+            Some(address.as_str())
+        );
+        let resolved = resolve_surfaces_with_auto(&surfaces, &dir_of(vec![]), &globals(), &wiring);
+        let surface = &resolved[0];
+        assert_eq!(surface.local_channels.len(), 1);
+        assert_eq!(surface.local_channels[0].address, address);
+        assert_eq!(surface.local_channels[0].non_text, says);
+    }
+}
+
+/// A surface endpoint stating `non_text` disagrees with a declaration that
+/// does not, as a backend endpoint would.
+#[test]
+#[should_panic(expected = "says non_text = true, and its declaration says false")]
+fn a_surface_endpoint_disagreeing_with_its_declaration_on_non_text_panics() {
+    let mut publisher = surface_pub("deskbar", "out");
+    publisher.non_text = true;
+    lower_auto_wiring(
+        &[link(vec![publisher, surface_sub("deskbar", "tap", 2, 3)])],
+        &[],
+        &[surface_with_free_ports("deskbar")],
+        &[],
+        &globals(),
+    );
+}
+
+/// A surface port stating `non_text` on a link with a backend endpoint: the
+/// link's channel is `ephemeral:` and leaves the page, so the surface resolver
+/// refuses the statement.
+#[test]
+#[should_panic(expected = "states `non_text`, but its channel \"ephemeral:")]
+fn a_surface_endpoint_stating_non_text_on_a_spanning_link_panics() {
+    let mut surfaces = vec![surface_with_free_ports("deskbar")];
+    surfaces[0].subscriptions.clear();
+    surfaces[0].outputs[0].non_text = true;
+    let mut publisher = surface_pub("deskbar", "out");
+    publisher.non_text = true;
+    let consumers = [subscriber("indexer", 2, 6)];
+    let wiring = lower_auto_wiring(
+        &[link(vec![
+            publisher,
+            wasm_sub("indexer", "tap", Depth::Bounded(2), Depth::Bounded(6)),
+        ])],
+        &consumers,
+        &surfaces,
+        &[],
+        &globals(),
+    );
+    let entries = wiring.nondurable_entries().to_vec();
+    assert!(entries[0].resolved_channel.non_text);
+    resolve_surfaces_with_auto(&surfaces, &dir_of(entries), &globals(), &wiring);
+}
+
+/// A free surface `io` port's page ring is declared by the port.
+#[test]
+fn a_free_surface_io_port_is_non_text_iff_it_says_so() {
+    for says in [false, true] {
+        let mut surfaces = vec![surface_with_io_port("deskbar")];
+        surfaces[0].io_ports[0].non_text = says;
+        let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &globals());
+        let resolved = resolve_surfaces_with_auto(&surfaces, &dir_of(vec![]), &globals(), &wiring);
+        let surface = &resolved[0];
+        assert_eq!(surface.local_channels.len(), 1);
+        assert_eq!(surface.local_channels[0].non_text, says);
+    }
+}
+
+/// A surface `io` port named at an `ephemeral:` address leaves the page.
+#[test]
+#[should_panic(expected = "states `non_text`, but its channel \"ephemeral:deskbar.loop\"")]
+fn a_surface_io_port_stating_non_text_at_an_ephemeral_address_panics() {
+    let mut surfaces = vec![surface_with_io_port("deskbar")];
+    surfaces[0].io_ports[0].channel = Some("ephemeral:deskbar.loop".to_string());
+    surfaces[0].io_ports[0].non_text = true;
+    let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &globals());
+    let entries = wiring.nondurable_entries().to_vec();
+    resolve_surfaces_with_auto(&surfaces, &dir_of(entries), &globals(), &wiring);
+}
+
+/// A server-realm `local:` channel declared `non_text` lends nothing to a page
+/// ring of the same spelling: the page ring's fact is the surface bindings'.
+#[test]
+fn a_backend_local_channels_non_text_does_not_reach_a_page_ring() {
+    let mut consumers = vec![timer_consumer("etl")];
+    consumers[0].io_ports[0].channel = Some("local:etl.tick".to_string());
+    consumers[0].io_ports[0].non_text = true;
+    let mut surfaces = vec![minimal_surface_raw()];
+    surfaces[0].subscriptions = vec![local_sub_raw("local:etl.tick", "protobar", "snoop")];
+    let wiring = lower_auto_wiring(&[], &consumers, &surfaces, &[], &globals());
+    assert!(
+        wiring
+            .nondurable_entries()
+            .iter()
+            .any(|entry| entry.address == "local:etl.tick" && entry.resolved_channel.non_text),
+        "the backend io_port declares its server ring `non_text`",
+    );
+    let resolved = resolve_surfaces_with_auto(&surfaces, &dir_of(vec![]), &globals(), &wiring);
+    let page_ring = resolved[0]
+        .local_channels
+        .iter()
+        .find(|channel| channel.address == "local:etl.tick")
+        .expect("the surface binding declares its own page ring");
+    assert!(!page_ring.non_text);
 }

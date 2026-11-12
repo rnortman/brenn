@@ -24,13 +24,13 @@ use brenn_envelope::is_local_channel;
 
 use crate::{
     Binding, CallBinding, ComponentEntry, LocalChannel, LogLevel, OutputBinding,
-    reserved_local_channel, surface_bindable_address,
+    is_reserved_local_namespace, reserved_local_channel, surface_bindable_address,
 };
 
 /// The body-schema version stamped on every bindings document. Bumped whenever
 /// the document's shape changes; a reader that does not recognize the value
 /// refuses the document rather than guessing at its fields.
-pub const BINDINGS_DOCUMENT_VERSION: u32 = 5;
+pub const BINDINGS_DOCUMENT_VERSION: u32 = 6;
 
 /// Lowest admissible [`PlatformSection::status_interval_secs`]. The status
 /// channel is a heartbeat, not a meter: below this the kernel would write
@@ -334,6 +334,21 @@ impl BindingsDocument {
                 ));
             }
         }
+        // Only an unreserved page-local store may hold a non-text body. A
+        // transportable channel crosses attach v4, which carries text only, and
+        // the kernel and chrome read every reserved plane as text; a declaration
+        // on either would admit a body that some reader cannot represent.
+        for lc in &self.local_channels {
+            if lc.non_text
+                && (!is_local_channel(&lc.channel) || is_reserved_local_namespace(&lc.channel))
+            {
+                return Err(format!(
+                    "bindings document declares {} `non_text`, which only an unreserved \
+                     page-local channel may be",
+                    lc.channel
+                ));
+            }
+        }
         // Inputs and outputs are separate structs (an output carries a default
         // urgency an input has nothing to say about), and the channel rules read
         // only the address — so walk the channels, not the bindings.
@@ -592,6 +607,7 @@ mod tests {
                 ring_depth: reserved_local_channel(LOCAL_THEME_CHANNEL)
                     .expect("the theme plane is reserved")
                     .ring_depth,
+                non_text: false,
             }],
             calls: vec![],
             chrome_instance: "chrome".to_string(),
@@ -757,6 +773,81 @@ mod tests {
         assert_ne!(before, after.to_body());
     }
 
+    /// [`doc`] with a page-local `notes` channel declared `non_text`, bound
+    /// by `p1`'s output.
+    fn doc_with_non_text_channel() -> BindingsDocument {
+        let mut doc = doc();
+        doc.outputs.push(OutputBinding {
+            port: "alt".to_string(),
+            ..output("p1", "local:bar/notes")
+        });
+        doc.local_channels.push(LocalChannel {
+            channel: "local:bar/notes".to_string(),
+            ring_depth: 1,
+            non_text: true,
+        });
+        doc
+    }
+
+    #[test]
+    fn a_non_text_channel_round_trips_through_its_body() {
+        let doc = doc_with_non_text_channel();
+        let body = doc.to_body();
+        assert!(body.contains(r#""non_text":true"#), "{body}");
+        assert_eq!(BindingsDocument::parse(&body).unwrap(), doc);
+    }
+
+    /// The flag has no default: a body without it was written by another build
+    /// and is refused at the parse, not read as text-only.
+    #[test]
+    fn a_local_channel_without_the_flag_fails_the_parse() {
+        let body = doc().to_body();
+        let stripped = body.replacen(r#","non_text":false"#, "", 1);
+        assert_ne!(stripped, body, "the fixture carries a flag to strip");
+        let err = BindingsDocument::parse(&stripped).expect_err("the flag is required");
+        assert!(err.contains("non_text"), "unexpected: {err}");
+    }
+
+    /// A version-5 document is another build's and is refused whatever it
+    /// holds.
+    #[test]
+    fn rejects_a_version_5_document() {
+        let mut doc = doc();
+        doc.v = 5;
+        let err = BindingsDocument::parse(&doc.to_body()).expect_err("version 5 is refused");
+        assert!(err.contains("schema version 5"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_non_text_on_a_reserved_plane() {
+        let mut doc = doc();
+        doc.local_channels[0].non_text = true;
+        let err = doc
+            .validate()
+            .expect_err("the kernel and chrome read a reserved plane as text");
+        assert!(
+            err.contains(LOCAL_THEME_CHANNEL) && err.contains("unreserved page-local"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A transportable address in the table is refused for `non_text` by the
+    /// rule on the flag itself, whatever else is wrong with it.
+    #[test]
+    fn rejects_non_text_on_a_transportable_entry() {
+        let mut doc = doc();
+        doc.local_channels.push(LocalChannel {
+            channel: "ephemeral:site.bar.notes".to_string(),
+            ring_depth: 1,
+            non_text: true,
+        });
+        let err = doc.validate().expect_err("attach v4 carries text only");
+        assert!(
+            err.contains("ephemeral:site.bar.notes") && err.contains("unreserved page-local"),
+            "unexpected: {err}"
+        );
+    }
+
     #[test]
     fn rejects_an_unreadable_version() {
         let mut doc = doc();
@@ -910,10 +1001,12 @@ mod tests {
         doc.local_channels.push(LocalChannel {
             channel: "local:bar/notes".to_string(),
             ring_depth: 4,
+            non_text: false,
         });
         doc.local_channels.push(LocalChannel {
             channel: "local:bar/notes".to_string(),
             ring_depth: 8,
+            non_text: false,
         });
         let err = doc
             .validate()

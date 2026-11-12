@@ -36,7 +36,9 @@ use brenn_surface_schema::{ComponentGrant, SURFACE_ATTACH_VERSION};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::bindings::{call, component_with_grants, doc, local, output, subscription};
+use crate::bindings::{
+    call, component_with_grants, doc, local, local_non_text, output, subscription,
+};
 use crate::frames::{deliver, row, server_hello, welcome};
 
 /// The rig's surface slug.
@@ -60,6 +62,9 @@ pub const MEMO_CHANNEL: &str = "local:rig/memo";
 pub const TIMER_CHANNEL: &str = "local:rig/timer";
 /// The page-local channel behind `b-keeper`'s `memo` io port, read by `plain`.
 pub const SHARED_CHANNEL: &str = "local:rig/shared";
+/// The page-local channel behind `b-keeper`'s `timer` io port, declared
+/// `non_text`.
+pub const BYTES_TIMER_CHANNEL: &str = "local:rig/b-timer";
 /// The wire channel `b-keeper`'s `out` port is bound to.
 pub const BYTES_OUT_CHANNEL: &str = "ephemeral:rig.bytes-out";
 /// The wire channel `b-keeper`'s `feed` port is subscribed to.
@@ -102,7 +107,8 @@ pub struct Cast {
 
 /// The instances of the `cases` page that cross the two contracts:
 ///
-/// - `b-keeper` keeps typed bodies on [`SHARED_CHANNEL`], publishes on the wire
+/// - `b-keeper` keeps typed bodies on [`SHARED_CHANNEL`], which is text-only,
+///   and non-text bodies on [`BYTES_TIMER_CHANNEL`], publishes on the wire
 ///   channel [`BYTES_OUT_CHANNEL`], reads the wire channel
 ///   [`BYTES_FEED_CHANNEL`] and calls `b-responder`;
 /// - `b-responder` answers calls on `ask`;
@@ -198,13 +204,18 @@ pub fn document(cast: Cast) -> BindingsDocument {
     subscriptions.push(subscription("reader", "feed", MEMO_CHANNEL, 1, 1));
     // `responder`: the callee's end, and a wire channel the peer delivers on.
     subscriptions.push(subscription("responder", "feed", FEED_CHANNEL, 1, 1));
-    // Each state-holder: the state workload's io port, on a channel of its own.
+    // Each state-holder: the state workload's io port, on a channel of its own,
+    // declared `non_text` for a holder whose contract carries non-text bodies.
     let mut locals = vec![local(MEMO_CHANNEL, 1), local(TIMER_CHANNEL, 1)];
-    for (stater, _) in staters.all() {
+    for (stater, kind) in staters.all() {
         let channel = state_channel(stater);
         outputs.push(output(stater, "state", &channel));
         subscriptions.push(subscription(stater, "state", &channel, 0, 1));
-        locals.push(local(&channel, 1));
+        locals.push(if kind_contract(kind).carries_non_text_bodies() {
+            local_non_text(&channel, 1)
+        } else {
+            local(&channel, 1)
+        });
     }
     let mut calls = vec![call("keeper", "peer", "responder", "ask")];
     let crosses = |instance: &str| cast.crossers.iter().any(|(i, _)| *i == instance);
@@ -214,6 +225,9 @@ pub fn document(cast: Cast) -> BindingsDocument {
         outputs.push(output("b-keeper", "out", BYTES_OUT_CHANNEL));
         subscriptions.push(subscription("b-keeper", "feed", BYTES_FEED_CHANNEL, 1, 1));
         locals.push(local(SHARED_CHANNEL, 1));
+        outputs.push(output("b-keeper", "timer", BYTES_TIMER_CHANNEL));
+        subscriptions.push(subscription("b-keeper", "timer", BYTES_TIMER_CHANNEL, 0, 1));
+        locals.push(local_non_text(BYTES_TIMER_CHANNEL, 1));
         calls.push(call("b-keeper", "peer", "b-responder", "ask"));
     }
     if crosses("plain") {
@@ -282,6 +296,7 @@ fn page(max_body_bytes: u64, cast: Cast) -> Value {
         "bytes_feed_channel": BYTES_FEED_CHANNEL,
         "bytes_out_channel": BYTES_OUT_CHANNEL,
         "shared_channel": SHARED_CHANNEL,
+        "bytes_timer_channel": BYTES_TIMER_CHANNEL,
         "state_instances": staters.string,
         "bytes_state_instances": staters.bytes,
         "status_channel": document.platform.status_channel,
@@ -688,6 +703,10 @@ mod tests {
         assert_eq!(bound("b-keeper", "memo"), SHARED_CHANNEL);
         assert_eq!(bound("plain", "feed"), SHARED_CHANNEL);
         assert_eq!(bound("b-keeper", "feed"), BYTES_FEED_CHANNEL);
+        assert_eq!(bound("b-keeper", "timer"), BYTES_TIMER_CHANNEL);
+        assert!(doc.outputs.iter().any(|o| o.instance == "b-keeper"
+            && o.port == "timer"
+            && o.channel == BYTES_TIMER_CHANNEL));
         assert!(doc.outputs.iter().any(|o| o.instance == "b-keeper"
             && o.port == "out"
             && o.channel == BYTES_OUT_CHANNEL));
@@ -706,6 +725,57 @@ mod tests {
             document(MEASURE_CAST).calls.len() == 1,
             "the measure page crosses nothing"
         );
+    }
+
+    /// Which page-local channels each page declares `non_text`: `b-keeper`'s
+    /// `timer` and every 0.2.0 state-holder's channel, and nothing a 0.1.0
+    /// instance is bound to.
+    #[test]
+    fn each_page_declares_non_text_only_where_a_0_2_0_holder_keeps_bytes() {
+        let declared = |cast: Cast| -> Vec<String> {
+            document(cast)
+                .local_channels
+                .into_iter()
+                .filter(|l| l.non_text)
+                .map(|l| l.channel)
+                .collect()
+        };
+        assert_eq!(declared(CASES_CAST), [BYTES_TIMER_CHANNEL]);
+        assert_eq!(
+            declared(MEASURE_CAST),
+            ["b-stater-1", "b-stater-2", "b-stater-3"].map(state_channel)
+        );
+        let cases = document(CASES_CAST);
+        assert!(
+            cases
+                .local_channels
+                .iter()
+                .any(|l| l.channel == SHARED_CHANNEL && !l.non_text),
+            "the shared channel stays text-only"
+        );
+        for doc in [cases, document(MEASURE_CAST)] {
+            let string_instances: Vec<&str> = doc
+                .components
+                .iter()
+                .filter(|c| c.kind == STRING_KIND)
+                .map(|c| c.instance.as_str())
+                .collect();
+            let bound = doc
+                .subscriptions
+                .iter()
+                .map(|b| (&b.instance, &b.channel))
+                .chain(doc.outputs.iter().map(|o| (&o.instance, &o.channel)));
+            for (instance, channel) in bound {
+                if string_instances.contains(&instance.as_str()) {
+                    assert!(
+                        !doc.local_channels
+                            .iter()
+                            .any(|l| &l.channel == channel && l.non_text),
+                        "0.1.0 {instance} is bound to the non_text channel {channel}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

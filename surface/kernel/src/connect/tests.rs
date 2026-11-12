@@ -97,6 +97,7 @@ fn doc(kind: &str) -> BindingsDocument {
             ring_depth: reserved_local_channel(LOCAL_THEME_CHANNEL)
                 .map(|r| r.ring_depth)
                 .expect("the theme plane is reserved"),
+            non_text: false,
         }],
         chrome_instance: "chrome".to_string(),
         platform: PlatformSection {

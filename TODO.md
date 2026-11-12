@@ -45,44 +45,6 @@ backend at load, the surface check at its import-type stage. Code site
 (`TODO(stale-contract-import-side-fixture)`): `brenn-wasm/src/lib.rs`,
 the import-type step of `check_surface_component`.
 
-## `page-rig-baseline-record`
-
-The node page rig has no timing of binary state at rest on a page-local `io`
-port under `brenn:processor@0.2.0`, the like-for-like of the 0.1.0
-string-path baseline, which waits on page-local channels that may carry
-non-text bodies; the 0.1.0 baseline and the 0.2.0 UTF-8 figures below are
-kept for that comparison. The figures: `bazel test //frontend:page_rig_measure --test_output=all`,
-node v22.20.0, V8, not a browser, a single run on a development machine to be
-read as ratios, `Welcome` cap 4,194,304 B; time per activation of the retained
-base64-in-JSON state round trip, given as `state` mean / median / min ms, then
-`noop` on the same state-holder mean / median / min ms — 49,149 raw B (65,550
-stored, N 200): 6.629 / 6.319 / 5.769, then 5.453 / 5.343 / 5.254; 1,048,576
-raw B (1,398,122 stored, N 40): 113.839 / 113.541 / 111.988, then 101.263 /
-101.036 / 99.775; 3,000,000 raw B (4,000,018 stored, N 20): 324.884 / 324.578
-/ 321.125, then 288.560 / 288.048 / 284.965; `noop` on `keeper`, empty
-windows, N 500: 0.846 / 0.735 / 0.673. The third size is bounded by
-`MAX_PUBLISH_BYTES_PER_ACTIVATION` (4 MiB, `brenn-budget/src/lib.rs`), which
-rules out the 16 MiB first asked for. The surface host's
-`brenn:processor@0.2.0` crossing, timed by the same target in one run beside
-the 0.1.0 workload — UTF-8 body, `text/plain`, on a page-local `io` port;
-node, not a browser; not the binary-at-rest comparison — `state` then `noop`,
-mean / median / min ms: 49,149 raw B (N 200): 1.030 / 0.934 / 0.902, then
-0.921 / 0.806 / 0.764; 1,048,576 raw B (N 40): 4.071 / 4.047 / 3.270, then
-1.724 / 1.540 / 1.239; 3,000,000 raw B (N 20): 9.800 / 9.587 / 8.403, then
-3.408 / 3.227 / 2.211. The same run's 0.1.0 figures: 49,149 raw B: 6.140 /
-5.963 / 5.839, then 5.474 / 5.363 / 5.280; 1,048,576 raw B: 112.749 / 112.227
-/ 109.764, then 100.231 / 98.698 / 97.617; 3,000,000 raw B: 320.052 / 318.139
-/ 314.110, then 287.400 / 283.131 / 279.846; `noop` on `keeper`: 0.916 / 0.850
-/ 0.792. The UTF-8 figures do not close this entry. Done when a commit that
-times binary state at rest on a page-local `io` port under
-`brenn:processor@0.2.0` — a non-UTF-8 body on a page-local channel that may
-carry non-text bodies, which the page does not serve yet — with the same
-target records those figures beside the 0.1.0 table, size for size, in a
-tracked file, and removes this entry.
-Code site (`TODO(page-rig-baseline-record)`):
-`frontend/src/page-rig/page-rig-measure.test.ts`, where the figures are
-printed.
-
 ## `byte-body-ceiling-per-activation`
 
 Owner ruling wanted: one activation's publishes are capped at 4 MiB in total
@@ -168,22 +130,56 @@ node's implementations and a `fetch` that answers from disk. No test runs
 the crossing in a real browser: no spec in `e2e/` binds a `local:`
 channel. The binary-bus project accepts the surface host's byte path
 (`brenn:processor@0.2.0`) on that rig: text and typed-text bodies cross
-it, and a non-text body crosses only in a sync call or its reply, since a
-page-local channel carries text only. That is shown in node, not in a
-page, and its timings are V8 under node. A difference between the two in the
+it, a non-text body crosses in a sync call or its reply, and a non-text body
+also rests on a page-local channel declared `non_text`, stored and read back
+byte for byte, and timed there against 0.1.0's base64 in JSON
+(`docs/page-rig-timings.md`). That is shown in node, not in a page, and its
+timings are V8 under node. A difference between the two in the
 engine, a real network fetch, a real socket or a real `Window` would be
 found by an out-of-tree component. Done when a spec in the `make e2e`
 suite runs a kind's retained round trip on a page-local `io` port in
-Chromium, the body compared byte for byte — a non-UTF-8 body once
-page-local channels may carry non-text bodies — and records the time per activation at the
-rig's sizes; or when the owner rules that the node rig is enough and
-removes this entry. Facts that bear on it: `make e2e` is operator-run
+Chromium, the body compared byte for byte — a non-UTF-8 body, on a
+page-local `io` port declared `non_text` — and records the time per
+activation at the rig's sizes; or when the owner rules that the node rig is
+enough and removes this entry. Facts that bear on it: `make e2e` is operator-run
 ("before tagging a release, and after any change under `surface/`",
 `e2e-in-ci`) and no gate runs it; no browser is installed where the agent
 cycles run, so a spec written there lands unrun unless Playwright's
 chromium is provisioned first. `processor-transplant-browser-engine` tracks
 the same missing engine for the transplant parity test's guest; the
 Chromium spec here runs a transpiled guest in a browser engine too.
+
+The question for the owner. The owner asked that the binary bus "work on the
+browser side (the surface)", where the component with the large binary state
+runs. The binary-bus project has delivered that use case — binary state on a
+page-local `io` port, no base64 — in node only, and has no slice that runs it
+in a browser: its agent cycles have no browser, and it did not write a spec
+that would land unrun. Nothing in the project waits to be built before the
+spec can be written. This entry therefore waits on the owner, who has three
+ways to close it:
+
+(a) Provision a browser for the cycles — Playwright's Chromium installed
+where the agent cycles run (`cd e2e && npm ci && npx playwright install
+chromium`), recorded by editing this entry to say so. The project then takes a
+cycle that writes the spec, runs it under `make e2e`, and records browser
+timings beside the node ones. Cost: one cycle, and a browser in the agents'
+environment.
+
+(b) Run it by hand — the owner asks for the spec written unrun and runs
+`make e2e` themself, as the suite is run today before a release. Cost: a spec
+whose first run, and any repair it needs, is the owner's.
+
+(c) Rule the node rig enough and remove this entry. Then the first run of
+binary state on an `io` port in a real browser is an out-of-tree surface
+component's, after it moves to `brenn:processor@0.2.0`; a difference between
+node and a browser in the engine, `fetch`, the socket or `Window` is found
+there.
+
+Until one of these, the project does not declare `brenn:processor@0.2.0`
+stable: that declaration is what tells out-of-tree surface components to move,
+and it should not be made on a surface byte path no browser has run. That
+sequencing is the binary-bus project's own ruling, not the owner's; the owner
+may overrule it here.
 
 Code site (`TODO(surface-byte-crossing-in-browser)`):
 `frontend/src/page-rig/globals.ts`, at the install function.
@@ -1305,6 +1301,13 @@ who later publishes onto the declared channel spends a session on a config that
 is green everywhere and never moves the display. The in-tree placeholders were
 written that way once and are now `ephemeral:`, so nothing in this repository
 exhibits it — the hole is what an out-of-tree author walks into.
+
+The joined document is wrong in a second way: a server-realm `local:`
+declaration stating `non_text`, handed to a surface binding by handle, does
+not make the page ring carry non-text bodies. The page ring's declaration is
+the surface binding tail's alone, so the page refuses a non-text publish there
+as `text-only-channel` while the declaration the operator wrote says
+otherwise.
 
 The DSL already refuses the mirror case: a literal address spelling a channel
 the same authority root declares is refused as "one-spelling", because two

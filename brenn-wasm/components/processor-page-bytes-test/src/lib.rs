@@ -31,7 +31,7 @@
 //                                   `ok:<content-type>:<hex>` or the
 //                                   call-error's word
 //   reply <content-type> <hex>      the sync reply
-//   state <raw-len>                 the UTF-8 state workload
+//   state <raw-len>                 the binary state workload
 //   fail                            end the activation with an error
 //
 // A publish, defer-op or call result is `ok` or the error variant's word; a
@@ -43,12 +43,14 @@
 // command lines, so a caller on either contract can ask for any reply with
 // `reply`. The request window is reported like any other window.
 //
-// `state <raw-len>` reads the newest envelope in the `state` window. With none,
-// it creates `raw-len` bytes of printable ASCII: an eight-digit hex counter
-// `00000000`, then byte i being 32 + (i * 31 + 7) mod 95. With one, it checks
-// the body's length is `raw-len` and adds one to the counter. Either way it
-// publishes the bytes on `state` as `text/plain` and reports
-// `state:<len>:<FNV-1a 64 of the bytes, hex>`. A `raw-len` under eight is an
+// `state <raw-len>` reads the newest envelope in the `state` window: the same
+// raw bytes and step as `processor-page-test`'s workload, held bare rather than
+// base64 in JSON. With none, it creates `raw-len` bytes, byte i being
+// (i * 31 + 7) mod 256 — every byte value, so not UTF-8. With one, it checks
+// the body's length is `raw-len` and adds one to the little-endian `u32` in
+// bytes 0..4. Either way it publishes the bytes on `state` as
+// `application/octet-stream` and reports
+// `state:<len>:<FNV-1a 64 of the bytes, hex>`. A `raw-len` under four is an
 // error.
 
 // The generated `receive` lowering takes one flattened argument per canonical-ABI
@@ -76,9 +78,9 @@ const STATE_PORT: &str = "state";
 /// The output port the report is published on.
 const REPORT_PORT: &str = "report";
 /// The content type the state workload publishes under.
-const STATE_CONTENT_TYPE: &str = "text/plain";
-/// The width of the state workload's hex counter.
-const COUNTER_DIGITS: usize = 8;
+const STATE_CONTENT_TYPE: &str = "application/octet-stream";
+/// The width of the state workload's little-endian counter.
+const COUNTER_BYTES: usize = 4;
 
 impl Guest for PageBytesTest {
     fn receive(a: Activation) -> Result<Option<Body>, ReceiveError> {
@@ -230,19 +232,13 @@ fn run(
 /// The state workload: create or advance the stored state and publish it back.
 fn state(raw_len: usize, stored: Option<&Body>) -> Result<String, ReceiveError> {
     let failed = |what: &str| ReceiveError::ProcessingFailed(format!("state: {what}"));
-    if raw_len < COUNTER_DIGITS {
+    if raw_len < COUNTER_BYTES {
         return Err(failed(&format!(
-            "raw-len {raw_len} is under {COUNTER_DIGITS}"
+            "raw-len {raw_len} is under {COUNTER_BYTES}"
         )));
     }
     let bytes = match stored {
-        None => {
-            let mut bytes: Vec<u8> = (0..raw_len)
-                .map(|i| 32 + ((i * 31 + 7) % 95) as u8)
-                .collect();
-            bytes[..COUNTER_DIGITS].fill(b'0');
-            bytes
-        }
+        None => (0..raw_len).map(|i| ((i * 31 + 7) % 256) as u8).collect(),
         Some(body) => {
             if body.bytes.len() != raw_len {
                 return Err(failed(&format!(
@@ -251,12 +247,11 @@ fn state(raw_len: usize, stored: Option<&Body>) -> Result<String, ReceiveError> 
                 )));
             }
             let mut bytes = body.bytes.clone();
-            let counter = std::str::from_utf8(&bytes[..COUNTER_DIGITS])
-                .ok()
-                .and_then(|digits| u32::from_str_radix(digits, 16).ok())
-                .ok_or_else(|| failed("the counter is not hex"))?;
-            let next = format!("{:08x}", counter.wrapping_add(1));
-            bytes[..COUNTER_DIGITS].copy_from_slice(next.as_bytes());
+            let head: [u8; COUNTER_BYTES] = bytes[..COUNTER_BYTES]
+                .try_into()
+                .expect("the length was checked against raw-len");
+            let counter = u32::from_le_bytes(head).wrapping_add(1);
+            bytes[..COUNTER_BYTES].copy_from_slice(&counter.to_le_bytes());
             bytes
         }
     };

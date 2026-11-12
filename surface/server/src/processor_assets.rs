@@ -606,6 +606,66 @@ pub fn assert_imports_granted(
     }
 }
 
+/// Refuse an instance whose kind's contract carries only text when any port it
+/// binds, input or output, is on a page-local channel declared `non_text`.
+///
+/// The backend's rule for a consumer, asked of a surface instance. Outputs
+/// count as well as inputs: an instance reads its own parked messages back
+/// through its deferred view, so a 0.1.0 build bound to an output another
+/// binding declared `non_text` could be handed a non-text body as a string —
+/// and the page kernel's lowering panics on that. `call` and `sync` ports are
+/// bound to no channel and are not examined.
+///
+/// Asked after the kind's record is read, because the contract is a fact of
+/// the artifact and the configuration does not state it; the caller skips an
+/// instance of a withheld kind, which is not served.
+///
+/// # Panics
+///
+/// On the first such port, naming the surface, the instance, the port, the
+/// channel, the kind and both contracts.
+pub fn assert_contract_carries_bound_channels(
+    cx: AssetContext,
+    surface: &brenn_lib::messaging::config::ResolvedSurface,
+    instance: &str,
+    kind: &str,
+    contract: brenn_envelope::grants::ProcessorContract,
+) {
+    if contract.carries_non_text_bodies() {
+        return;
+    }
+    let AssetContext { when, verdict } = cx;
+    let non_text = |channel: &str| {
+        surface
+            .local_channels
+            .iter()
+            .any(|c| c.non_text && c.address == channel)
+    };
+    let inputs = surface
+        .subscriptions
+        .iter()
+        .filter(|b| b.instance == instance)
+        .map(|b| ("input", &b.port, &b.channel_address));
+    let outputs = surface
+        .outputs
+        .iter()
+        .filter(|b| b.instance == instance)
+        .map(|b| ("output", &b.port, &b.channel_address));
+    if let Some((direction, port, channel)) = inputs
+        .chain(outputs)
+        .find(|(_, _, channel)| non_text(channel))
+    {
+        panic!(
+            "{when}: [[surface]] {:?}: component {instance:?}'s {direction} port {port:?} is \
+             bound to {channel}, a page-local channel declared `non_text`, and its kind {kind:?} \
+             is built against {contract}, which carries only text — drop `non_text` from the \
+             ports bound to that channel, or install a build of the kind against {}.{verdict}",
+            surface.slug,
+            brenn_envelope::grants::ProcessorContract::V0_2,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

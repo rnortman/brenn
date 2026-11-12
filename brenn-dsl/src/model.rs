@@ -1387,7 +1387,8 @@ vocabulary! {
         opt amplification: V,
         /// The port needs a channel that may carry non-text bodies: the
         /// declaration of a channel the bindings synthesize, a check against a
-        /// declared one. A consumer's alone; refused on a surface port.
+        /// declared one. On a surface port, legal only where the port's channel
+        /// is page-local.
         opt non_text: V,
     }
 

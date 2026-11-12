@@ -65,6 +65,7 @@ fn doc(outputs: Vec<OutputBinding>, error: Option<(&str, LogLevel)>) -> Bindings
         local_channels: vec![LocalChannel {
             channel: NOTES.to_string(),
             ring_depth: 4,
+            non_text: false,
         }],
         chrome_instance: "chrome".to_string(),
         platform: PlatformSection {

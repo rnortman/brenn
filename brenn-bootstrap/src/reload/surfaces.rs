@@ -610,6 +610,40 @@ mod tests {
         assert!(selection.kinds.is_empty());
     }
 
+    /// A surface whose only difference is one page-local channel's `non_text`
+    /// is changed, whichever way the declaration flipped, and is unchanged
+    /// when it did not flip.
+    #[test]
+    fn a_flipped_local_channel_non_text_changes_the_surface_each_way() {
+        let with = |non_text: bool| {
+            let mut surface = of_kind("wall", "chart");
+            surface
+                .local_channels
+                .push(brenn_lib::messaging::config::ResolvedLocalChannel {
+                    address: "local:wall.state".to_string(),
+                    ring_depth: 1,
+                    non_text,
+                });
+            vec![surface]
+        };
+        for (before, after) in [(false, true), (true, false)] {
+            let delta = value_delta(&with(before), &with(after));
+            assert!(delta.added.is_empty() && delta.removed.is_empty());
+            assert_eq!(slugs_changed(&delta), vec!["wall"], "{before} -> {after}");
+        }
+        for same in [false, true] {
+            assert!(value_delta(&with(same), &with(same)).is_empty());
+        }
+    }
+
+    fn slugs_changed(delta: &SurfaceDelta) -> Vec<&str> {
+        delta
+            .changed
+            .iter()
+            .map(|change| change.new.slug.as_str())
+            .collect()
+    }
+
     /// A surface that swapped kinds selects the kind it took up. The vacated
     /// kind is selected only when the candidate still has it — a kind no
     /// candidate surface mounts derives no channels to publish onto.

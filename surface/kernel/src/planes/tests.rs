@@ -43,14 +43,17 @@ fn doc(instances: &[&str]) -> BindingsDocument {
             LocalChannel {
                 channel: LOCAL_TAKEOVER_CHANNEL.to_string(),
                 ring_depth: 1,
+                non_text: false,
             },
             LocalChannel {
                 channel: LOCAL_OVERLAY_STATE_CHANNEL.to_string(),
                 ring_depth: 1,
+                non_text: false,
             },
             LocalChannel {
                 channel: PLAIN_LOCAL.to_string(),
                 ring_depth: 3,
+                non_text: false,
             },
         ],
         chrome_instance: "chrome".to_string(),

@@ -102,7 +102,9 @@ there could be.
 A third, independent property is **`non_text`**: whether the channel may carry
 non-text bodies (§2.1.2). The default is text-only. A declared channel states
 it in its block (`non_text = true`); an auto channel takes it from the ports
-bound to it (§2.6); every system-minted channel is text-only. It is a static
+bound to it (§2.6); a surface's page-local channel takes it from the surface
+bindings on its address, and is `non_text` when any of them says so (§2.6);
+every system-minted channel is text-only. It is a static
 fact about the channel, read from configuration at every boot and never
 persisted, and it does not look at subscribers: a non-text publish to a
 text-only channel is refused at the publishing door, and a reader that can
@@ -200,15 +202,19 @@ Who is shown the content type today:
 | Query API (`Messenger::query`), host code | text and type | bytes and type |
 | A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, `BrennMessageEdit`) | `"body": "…"`, then `"content_type": "…"` | `"body": {"binary": true, "content_type": "…", "size": N}` — a placeholder, never the bytes |
 | The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` |
-| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | bytes and type; on a page, a body that arrived over the wire has no type, since the page's wire is attach v4 (below), while page-local typed text keeps its type | bytes and type on the backend; on a page, never at rest (a surface binding is refused at plan), only in a sync call or reply |
-| 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload |
-| Attach v4 sessions (`Deliver`, `DeferredView`) | bare text, **no type** | never bound: a surface binding is refused at plan, a remote's subscribe is answered `Unavailable`; left out of a deferred view |
+| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | bytes and type; on a page, a body that arrived over the wire has no type, since the page's wire is attach v4 (below), while page-local typed text keeps its type | bytes and type on the backend; on a page, at rest only on a page-local channel declared `non_text` (shown on the node rig, not yet in a browser), and in a sync call or reply |
+| 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload, on the backend and on a page |
+| Attach v4 sessions (`Deliver`, `DeferredView`) | bare text, **no type** | never bound: a surface binding to a `non_text` channel that leaves the page is refused at plan (a page-local channel never crosses the wire), a remote's subscribe is answered `Unavailable`; left out of a deferred view |
 | Attach v5 sessions (`Deliver`, `DeferredView`) | text and type | bytes and type |
 
 The two string carriers lose a typed text body's *type*, never its content.
 They cannot carry a non-text body at all, so they are kept off every channel
-declared `non_text` (§2.1) before any message flows, and a text-only channel
-never holds a non-text body. Reaching a string carrier with one anyway is a
+declared `non_text` (§2.1) before any message flows — on a page as on the
+backend, where a served 0.1.0 instance bound to a page-local `non_text`
+channel is refused at boot and at reload — and a text-only channel never holds
+a non-text body. On a page that applies a bindings document withdrawing a
+channel's declaration, the kernel empties that channel's store if it holds a
+non-text body, retained or parked, before any reader sees it. Reaching a string carrier with one anyway is a
 host bug and a panic.
 
 One exception is cut rather than refused. A remote may hold a v4 and a v5
@@ -486,14 +492,26 @@ how a component keeps binary state on its own `io` port with no declared
 channel: `io state { push_depth = 0; retain_depth = 1; non_text = true; }`.
 On a declared channel the same key on a port is a check, not a declaration: a
 port stating `non_text = true` bound to a channel that does not is refused
-when the plan is built, so `config-check` reports it. A surface binding may not state it, and a
-surface may not be bound to a `non_text` channel, until the page carries
-non-text bodies at rest and speaks attach v5. The surface host does serve
-`brenn:processor@0.2.0`: a page-hosted 0.2.0 kind keeps typed text on a
-page-local channel with its type and passes any body in a sync call between
-0.2.0 kinds, but a port bound to a channel that leaves the page carries
-untyped text only: a typed text body there is refused with `invalid-body`,
-and a non-text body with `text-only-channel`, as on any text-only channel. A remote attacher on v5 is served
+when the plan is built, so `config-check` reports it.
+
+On a surface the key declares a page-local channel: a surface binding tail
+may state it only where its channel stays on the page — a `local:` address
+outside the reserved `local:brenn/` planes, a free `io` port, or a link whose
+endpoints are all on that surface — and the page ring is `non_text` when any
+surface binding on its address says so. A server-realm `channel` declaration
+at a `local:` address is never read for it. Stated on a binding whose channel
+leaves the page (a declared `ephemeral:` or `brenn:` channel, or a link with
+an endpoint off the surface), or on a reserved plane, it is refused when the
+plan is built; so is a surface bound to a declared `non_text` channel, since
+the page's wire is attach v4, which carries text only. On a declared page-local
+channel a page-hosted `brenn:processor@0.2.0` kind publishes, parks and edits
+non-text bodies, and reads them back byte for byte with their content type —
+shown on the node rig; no browser has run it yet. A page-hosted 0.2.0 kind
+also keeps typed text on any page-local channel with its type and passes any
+body in a sync call between 0.2.0 kinds; a port bound to a channel that
+leaves the page carries untyped text only: a typed text body there is refused
+with `invalid-body`, and a non-text body with `text-only-channel`, as on any
+text-only channel. A remote attacher on v5 is served
 a `non_text` channel; one on v4 is answered `Unavailable`.
 
 **The timer-cap coupling.** A channel's `retain_depth` also caps its channel-wide

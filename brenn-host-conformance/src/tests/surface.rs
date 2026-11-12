@@ -190,6 +190,7 @@ fn document(spec: &MountSpec) -> BindingsDocument {
         .map(|channel| LocalChannel {
             channel,
             ring_depth: RING_DEPTH,
+            non_text: false,
         })
         .collect();
     let mut declared_out_ports: Vec<String> =

@@ -4,6 +4,22 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **For operators and WASM component authors: `non_text` on a surface's
+  page-local channels.** A surface binding tail (`in`, `out`, `io`) may now
+  state `non_text = true` where its channel stays on the page — a `local:`
+  address outside the reserved `local:brenn/` planes, a free `io` port, or a
+  link whose endpoints are all on that surface; the page ring is `non_text`
+  when any surface binding on its address says so. A page-hosted
+  `brenn:processor@0.2.0` kind then publishes, parks, edits and reads back
+  non-text bodies there with their content type — binary state on an `io`
+  port with no base64. Shown on the node rig only; no browser has run it yet.
+  A served surface instance whose kind is built against
+  `brenn:processor@0.1.0`, bound by input or output to such a channel, is
+  refused at boot and at reload, naming the port and the channel. The key is
+  still refused on a surface binding whose channel leaves the page and on a
+  reserved plane. The surface bindings document's version moved to 6: a page
+  older than its server reloads, as at every version move. Node-rig timings
+  against 0.1.0's base64 in JSON are in `docs/page-rig-timings.md`.
 - **For WASM component authors: the surface host serves the provisional
   `brenn:processor@0.2.0` beside 0.1.0.** A page-hosted 0.2.0 kind is handed
   each message as a header plus the body's bytes and content type, as on the
@@ -11,9 +27,9 @@ All notable changes to Brenn are documented here.
   type, and any body in a sync call and reply between two 0.2.0 kinds. A port
   bound to a channel that leaves the page carries untyped text only: a typed
   text body there is refused with `invalid-body`, a non-text one with
-  `text-only-channel`. No non-text body is held at rest on any channel a
-  surface binds yet. The server type-checks a 0.2.0 surface kind's artifact
-  against the shapes it serves: one built against a superseded shape is
+  `text-only-channel`; a non-text body is held at rest only on a page-local
+  channel declared `non_text` (above). The server type-checks a 0.2.0
+  surface kind's artifact against the shapes it serves: one built against a superseded shape is
   withheld under a bundle mount and a boot refusal under brenn's own. The
   page manifest names each kind's contract. A brenn whose surfaces
   instantiate any 0.1.0 kind names those kinds in one `warn!` at boot and
@@ -70,9 +86,10 @@ All notable changes to Brenn are documented here.
   port and the channel, so a missing declaration shows up in the log.
   Refused, at `config-check`, boot or reload as each can be checked: a 0.1.0
   component with any port on a `non_text` channel (at boot and reload, naming
-  the component, port and channel); a surface binding to a `non_text`
-  channel, a `non_text` key on any surface binding, and a `non_text` surface
-  config channel; redeclaring a durable channel text-only while it holds a
+  the component, port and channel); a surface binding to a declared
+  `non_text` channel, a `non_text` key on a surface binding whose channel
+  leaves the page or is a reserved plane, and a `non_text` surface config
+  channel; redeclaring a durable channel text-only while it holds a
   non-text message, and, on reload only, while a `remote`'s publish ACL covers
   it (restart instead). A remote attacher on attach protocol v4 subscribing to a
   `non_text` channel is answered `Unavailable`, which is not a violation and

@@ -507,6 +507,7 @@ fn frame_buffer() -> PublishBuffer {
             OutputSpec {
                 channel: NOTES.to_string(),
                 default_urgency: Urgency::Normal,
+                non_text: false,
             },
         )]),
         Arc::new(BTreeSet::from(["notes".to_string()])),

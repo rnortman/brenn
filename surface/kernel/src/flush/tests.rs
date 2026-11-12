@@ -184,6 +184,7 @@ impl Page {
                 OutputSpec {
                     channel: binding.channel.clone(),
                     default_urgency: binding.urgency,
+                    non_text: self.bindings.carries_non_text(&binding.channel),
                 },
             );
             sink_mt.insert(binding.port.clone(), 1_000_000);

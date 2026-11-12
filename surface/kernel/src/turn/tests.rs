@@ -20,7 +20,7 @@ use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::telemetry::{InstanceReport, StatusCounters};
 use brenn_surface_schema::{
     Binding, CONTROL_PLANE_VERSION, ComponentGrant, InstanceState, LOCAL_OVERLAY_STATE_CHANNEL,
-    LinkState, NoiseLevel, OverlayStateBody,
+    LinkState, LocalChannel, NoiseLevel, OverlayStateBody,
 };
 use uuid::Uuid;
 
@@ -1904,4 +1904,232 @@ fn a_refused_first_document_is_refused_again_on_reconnect_and_a_readable_one_con
         page.bindings().is_some(),
         "the readable document is in force"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A page-local channel declared `non_text`
+// ---------------------------------------------------------------------------
+
+/// `p1` writes `NOTES` at ring depth 2, declared `non_text` or not; with
+/// `reader`, the 0.1.0 instance `p2` reads it, one new message with two of
+/// context.
+fn blob_doc(non_text: bool, reader: bool) -> BindingsDocument {
+    let subscriptions = if reader {
+        vec![fixtures::subscription("p2", "notes", NOTES, 1, 2)]
+    } else {
+        Vec::new()
+    };
+    fixtures::doc(
+        vec![
+            fixtures::component("p1"),
+            fixtures::component("p2"),
+            fixtures::component(fixtures::CHROME),
+        ],
+        subscriptions,
+        vec![output("p1", "notes", NOTES)],
+        vec![LocalChannel {
+            non_text,
+            ..fixtures::local(NOTES, 2)
+        }],
+    )
+}
+
+fn octets(bytes: &[u8]) -> GuestBody {
+    GuestBody::Parts {
+        content_type: Some("application/octet-stream".to_string()),
+        bytes: bytes.to_vec(),
+    }
+}
+
+/// Route one of `p1`'s non-text bodies onto `NOTES` directly, parked when
+/// `release_at` is given.
+fn route_octets(page: &mut SurfacePage, bytes: &[u8], release_at: Option<u64>, seed: u128) {
+    let outcome = page.router.route(
+        &mut page.stores,
+        RouteRequest {
+            channel: NOTES,
+            origin: Origin::Sub("p1"),
+            body: MessageBody::from_parts(Some("application/octet-stream"), bytes)
+                .expect("a byte body builds"),
+            stamp: stamp(seed),
+            urgency: Urgency::Normal,
+            deliver_after: release_at,
+        },
+    );
+    match release_at {
+        Some(_) => assert!(matches!(outcome, RouteOutcome::Parked { .. })),
+        None => assert!(matches!(outcome, RouteOutcome::Routed { .. })),
+    }
+}
+
+/// `p1` alone mounted under `document` and owed its mount activation, handed
+/// over with a buffer seeded under `document`.
+fn p1_in_flight(document: &BindingsDocument, park_text: bool) -> (SurfacePage, ReadyActivation) {
+    let mut page = pages::mounting_page(CONFIG, EPOCH, pages::facts(), &["p1"], document, NOW);
+    if park_text {
+        park_notes(&mut page, "later", 9_000, 0xb0a);
+    }
+    let (ready, _) = dispatch(&mut page, NOW, NOW_MS);
+    let ready = ready.expect("p1 is owed its mount activation");
+    assert_eq!(ready.instance, "p1");
+    (page, ready)
+}
+
+fn commit_across(page: &mut SurfacePage, ready: ReadyActivation, stamps: Vec<MessageStamp>) {
+    feed(
+        page,
+        Input::ActivationDone(Box::new(Completed {
+            instance: ready.instance,
+            generation: ready.generation,
+            outcome: ActivationOutcome::Ok(None),
+            buffer: ready.buffer,
+            stamps,
+        })),
+    );
+}
+
+#[test]
+fn a_redelivered_document_differing_only_in_non_text_changes_the_wiring() {
+    let mut page = pages::attached_page(CONFIG, EPOCH, pages::facts());
+    feed(
+        &mut page,
+        config_delivery(&blob_doc(true, true).to_body(), 1),
+    );
+    let effects = feed(
+        &mut page,
+        config_delivery(&blob_doc(false, true).to_body(), 2),
+    );
+    assert!(
+        events(&effects)
+            .iter()
+            .any(|event| matches!(event, Event::WiringChanged)),
+        "{effects:?}"
+    );
+    assert!(
+        !page
+            .bindings()
+            .expect("the second document is in force")
+            .carries_non_text(NOTES)
+    );
+}
+
+/// The store invariant across a flip off: what the declaration admitted goes,
+/// its parked sender is charged, and a 0.1.0 reader the new document binds
+/// there is primed onto an empty store and lowers its next activation.
+#[test]
+fn withdrawing_the_declaration_empties_a_store_holding_non_text() {
+    let mut page = page_with(&blob_doc(true, false));
+    route_octets(&mut page, &[0xff, 0x00], None, 0xb01);
+    route_octets(&mut page, &[0xfe], Some(9_000), 0xb02);
+    assert_eq!(page.schedules.deferred_dropped("p1"), 0);
+
+    let applied = page
+        .apply_config(&blob_doc(false, true).to_body(), NOW)
+        .expect("the undeclaring document applies");
+    assert!(applied.wiring_changed);
+
+    let store = page.stores.get(NOTES).expect("recreated");
+    assert_eq!(store.retained().count(), 0);
+    assert_eq!(store.parked().count(), 0);
+    assert_eq!(
+        page.schedules.deferred_dropped("p1"),
+        1,
+        "the lost schedule is charged to the instance that parked it"
+    );
+    assert!(!store.has_deliverable(&BindingKey::new("p2", "notes")));
+    let (ready, _) = dispatch(&mut page, NOW, NOW_MS);
+    assert!(ready.is_none(), "nothing is owed");
+
+    feed(&mut page, publish_cmd("p1", "notes", "fresh", 0xb03));
+    let (ready, _) = dispatch(&mut page, NOW, NOW_MS);
+    let ready = ready.expect("p2 reads what p1 just wrote");
+    assert_eq!(ready.instance, "p2");
+    let lowered = ready.activation.lower_v0_1();
+    let notes = lowered
+        .ports
+        .iter()
+        .find(|window| window.port == "notes")
+        .expect("p2 binds the channel");
+    assert_eq!(notes.envelopes.len(), 1, "only the text published since");
+    assert!(notes.envelopes[0].contains(r#""body":"fresh""#));
+}
+
+#[test]
+fn withdrawing_the_declaration_drops_a_store_whose_only_non_text_body_is_parked() {
+    let mut page = page_with(&blob_doc(true, false));
+    route_octets(&mut page, &[0xfe], Some(9_000), 0xb04);
+
+    page.apply_config(&blob_doc(false, true).to_body(), NOW)
+        .expect("the undeclaring document applies");
+
+    let store = page.stores.get(NOTES).expect("recreated");
+    assert_eq!(store.parked().count(), 0);
+    assert_eq!(page.schedules.deferred_dropped("p1"), 1);
+    on_input(&mut page, Input::ReleaseDue, NOW, 9_000);
+    let store = page.stores.get(NOTES).expect("recreated");
+    assert_eq!(store.retained().count(), 0, "nothing was released");
+    assert!(!store.has_deliverable(&BindingKey::new("p2", "notes")));
+    let (ready, _) = dispatch(&mut page, NOW, 9_000);
+    assert!(ready.is_none(), "nothing is owed to p2");
+}
+
+#[test]
+#[should_panic(
+    expected = "the buffer was judged under a bindings document other than the one in force"
+)]
+fn a_non_text_publish_committed_after_its_declaration_is_withdrawn_panics() {
+    let (mut page, mut ready) = p1_in_flight(&blob_doc(true, false), false);
+    ready
+        .buffer
+        .publish("notes", octets(&[0xff]))
+        .expect("the declared channel admits it");
+    // A frame between dispatch and completion: no driver in the tree does this.
+    page.apply_config(&blob_doc(false, false).to_body(), NOW)
+        .expect("the undeclaring document applies");
+    commit_across(&mut page, ready, vec![stamp(0xb11)]);
+}
+
+#[test]
+#[should_panic(
+    expected = "the buffer was judged under a bindings document other than the one in force"
+)]
+fn a_non_text_edit_committed_after_its_declaration_is_withdrawn_panics() {
+    let (mut page, mut ready) = p1_in_flight(&blob_doc(true, false), true);
+    ready
+        .buffer
+        .defer_edit("notes", 0, Some(octets(&[0xff])), None)
+        .expect("the declared channel admits it");
+    page.apply_config(&blob_doc(false, false).to_body(), NOW)
+        .expect("the undeclaring document applies");
+    commit_across(&mut page, ready, Vec::new());
+}
+
+#[test]
+fn a_text_buffer_commits_across_a_withdrawn_declaration() {
+    let (mut page, mut ready) = p1_in_flight(&blob_doc(true, false), true);
+    ready
+        .buffer
+        .publish("notes", GuestBody::Text("plain".to_string()))
+        .expect("bound");
+    ready
+        .buffer
+        .defer_edit(
+            "notes",
+            0,
+            Some(GuestBody::Text("edited".to_string())),
+            None,
+        )
+        .expect("in the window");
+    page.apply_config(&blob_doc(false, false).to_body(), NOW)
+        .expect("the undeclaring document applies");
+    commit_across(&mut page, ready, vec![stamp(0xb12)]);
+    assert_eq!(retained(&page, NOTES), ["plain"]);
+    let parked: Vec<String> = page
+        .stores
+        .get(NOTES)
+        .expect("kept: it holds only text")
+        .parked()
+        .map(|(envelope, _)| envelope.body.as_text().unwrap().to_owned())
+        .collect();
+    assert_eq!(parked, ["edited"]);
 }

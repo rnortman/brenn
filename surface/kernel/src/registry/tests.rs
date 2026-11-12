@@ -69,6 +69,7 @@ fn doc(subscriptions: Vec<Binding>) -> BindingsDocument {
             ring_depth: reserved_local_channel(LOCAL_THEME_CHANNEL)
                 .expect("the theme plane is reserved")
                 .ring_depth,
+            non_text: false,
         }],
         chrome_instance: "chrome".to_string(),
         platform: PlatformSection {
@@ -291,6 +292,7 @@ fn a_dropped_store_reports_the_schedules_that_died_with_it() {
     doc.local_channels.push(LocalChannel {
         channel: plain.to_string(),
         ring_depth: 4,
+        non_text: false,
     });
     let with_plain = AppliedBindings::apply(&doc.to_body()).expect("applies");
     reconcile_stores(&with_plain, &mut stores);
@@ -311,6 +313,202 @@ fn a_dropped_store_reports_the_schedules_that_died_with_it() {
         )],
         "one entry per parked message, naming who parked it"
     );
+}
+
+const BLOB: &str = "local:site.blob";
+
+/// The standard wiring plus `BLOB` at depth 4, declared `non_text` or not, with
+/// `p2` reading it.
+fn applied_with_blob(non_text: bool) -> AppliedBindings {
+    let mut doc = doc(vec![subscription("p2", "blob", BLOB, 2, 2)]);
+    doc.local_channels.push(LocalChannel {
+        channel: BLOB.to_string(),
+        ring_depth: 4,
+        non_text,
+    });
+    AppliedBindings::apply(&doc.to_body()).expect("applies")
+}
+
+/// An envelope whose body is not text.
+fn bytes_env(channel: &str, bytes: &[u8]) -> MessageEnvelope {
+    MessageEnvelope {
+        body: brenn_envelope::MessageBody::from_parts(Some("application/octet-stream"), bytes)
+            .expect("a well-formed byte body"),
+        ..env(channel, &format!("{bytes:?}"))
+    }
+}
+
+fn blob_store(stores: &SurfaceStores) -> &brenn_attach_client::store::ChannelStore<BindingKey> {
+    stores.get(BLOB).expect("the blob channel has a store")
+}
+
+#[test]
+fn a_store_holding_non_text_is_recreated_empty_when_its_channel_stops_declaring_it() {
+    let declared = applied_with_blob(true);
+    let mut stores = stores_for(&declared);
+    let mut subs = plane();
+    let mut regs = Registrations::new();
+    regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&declared),
+        &mut stores,
+        &mut subs,
+    );
+    let store = stores.get_mut(BLOB).expect("blob store");
+    store.insert(bytes_env(BLOB, &[0xff, 0x00]));
+    store.insert(env(BLOB, "text beside it"));
+    store
+        .park("surface:bar#p1", bytes_env(BLOB, &[0xfe]), 9_000)
+        .expect("within the cap");
+
+    let undeclared = applied_with_blob(false);
+    let report = reconcile_stores(&undeclared, &mut stores);
+    regs.reconcile(&undeclared, &mut stores, &mut subs);
+
+    assert_eq!(
+        report.lost_schedules,
+        vec![(BLOB.to_string(), vec!["surface:bar#p1".to_string()])],
+        "the parked sender is reported as for a removed channel"
+    );
+    assert_eq!(
+        report.retired,
+        vec![(
+            BLOB.to_string(),
+            vec![CursorOverflow {
+                subscriber: BindingKey::new("p2", "blob"),
+                evicted: 2,
+            }],
+        )],
+        "the surviving reader is charged for the two messages it was owed"
+    );
+    let store = blob_store(&stores);
+    assert_eq!(store.retained().count(), 0, "dropped whole, text included");
+    assert_eq!(store.parked().count(), 0);
+    assert_eq!(store.depth(), 4, "recreated at the document's depth");
+    assert!(
+        !store.has_deliverable(&BindingKey::new("p2", "blob")),
+        "the reader is primed onto an empty store"
+    );
+}
+
+#[test]
+fn a_store_whose_only_non_text_body_is_parked_is_recreated_empty() {
+    let mut stores = stores_for(&applied_with_blob(true));
+    let store = stores.get_mut(BLOB).expect("blob store");
+    store.insert(env(BLOB, "text only in the ring"));
+    store
+        .park("surface:bar#p1", bytes_env(BLOB, &[0xfe]), 9_000)
+        .expect("within the cap");
+
+    let report = reconcile_stores(&applied_with_blob(false), &mut stores);
+
+    assert_eq!(
+        report.lost_schedules,
+        vec![(BLOB.to_string(), vec!["surface:bar#p1".to_string()])]
+    );
+    let store = blob_store(&stores);
+    assert_eq!(store.retained().count(), 0, "dropped whole, text included");
+    assert_eq!(
+        store.parked().count(),
+        0,
+        "the non-text schedule went with it"
+    );
+}
+
+#[test]
+fn a_removed_channel_holding_non_text_is_dropped_as_removed() {
+    let declared = applied_with_blob(true);
+    let mut stores = stores_for(&declared);
+    let mut subs = plane();
+    let mut regs = Registrations::new();
+    regs.register(
+        "p2",
+        ProcessorContract::V0_2,
+        Some(&declared),
+        &mut stores,
+        &mut subs,
+    );
+    let store = stores.get_mut(BLOB).expect("blob store");
+    store.insert(bytes_env(BLOB, &[0xff]));
+    store
+        .park("surface:bar#p1", bytes_env(BLOB, &[0xfe]), 9_000)
+        .expect("within the cap");
+
+    let report = reconcile_stores(&applied(standard()), &mut stores);
+
+    assert!(
+        stores.get(BLOB).is_none(),
+        "no binding names it, so no store"
+    );
+    assert_eq!(
+        report.lost_schedules,
+        vec![(BLOB.to_string(), vec!["surface:bar#p1".to_string()])]
+    );
+    assert!(
+        report.retired.is_empty(),
+        "the binding went with the channel, so nothing survives to be owed: {:?}",
+        report.retired
+    );
+}
+
+#[test]
+fn a_store_holding_only_text_survives_a_change_of_declaration() {
+    let mut stores = stores_for(&applied_with_blob(true));
+    let store = stores.get_mut(BLOB).expect("blob store");
+    store.insert(env(BLOB, "one"));
+    store.insert(env(BLOB, "two"));
+    store
+        .park("surface:bar#p1", env(BLOB, "later"), 9_000)
+        .expect("within the cap");
+    let before: Vec<u64> = blob_store(&stores).retained().map(|(_, seq)| seq).collect();
+
+    let report = reconcile_stores(&applied_with_blob(false), &mut stores);
+
+    assert!(report.lost_schedules.is_empty());
+    let store = blob_store(&stores);
+    assert_eq!(
+        store
+            .retained()
+            .map(|(envelope, seq)| (envelope.body.as_text().unwrap().to_owned(), seq))
+            .collect::<Vec<_>>(),
+        vec![
+            ("one".to_string(), before[0]),
+            ("two".to_string(), before[1])
+        ],
+        "contents and positions intact"
+    );
+    assert_eq!(store.parked().count(), 1);
+}
+
+#[test]
+fn reapplying_a_declaring_document_keeps_a_non_text_store() {
+    let declared = applied_with_blob(true);
+    let mut stores = stores_for(&declared);
+    let store = stores.get_mut(BLOB).expect("blob store");
+    store.insert(bytes_env(BLOB, &[0xff]));
+    store
+        .park("surface:bar#p1", bytes_env(BLOB, &[0xfe]), 9_000)
+        .expect("within the cap");
+
+    let report = reconcile_stores(&applied_with_blob(true), &mut stores);
+
+    assert!(report.lost_schedules.is_empty());
+    let store = blob_store(&stores);
+    assert_eq!(store.retained().count(), 1);
+    assert_eq!(store.parked().count(), 1);
+}
+
+#[test]
+#[should_panic(expected = "reserved plane local:brenn/theme holds a non-text body")]
+fn a_non_text_body_on_a_reserved_plane_panics_the_reconcile() {
+    let bindings = applied(standard());
+    let mut stores = stores_for(&bindings);
+    stores
+        .get_mut(LOCAL_THEME_CHANNEL)
+        .expect("theme store")
+        .insert(bytes_env(LOCAL_THEME_CHANNEL, &[0xff]));
+    reconcile_stores(&bindings, &mut stores);
 }
 
 #[test]

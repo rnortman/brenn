@@ -132,8 +132,7 @@ fn surface_io_endpoint(slug: &str, io: &SurfaceIoPortRaw) -> Endpoint {
         subscribes: true,
         io_port: true,
         depths: Some(depths),
-        // A surface port states no such need: its families have no field.
-        non_text: false,
+        non_text: io.non_text,
     }
 }
 
@@ -218,7 +217,9 @@ fn surface_port_declaration(
             .or_else(|| out.and_then(|o| o.channel.clone())),
         push_depth,
         retain_depth,
-        non_text: false,
+        non_text: io.is_some_and(|p| p.non_text)
+            || sub.is_some_and(|s| s.non_text)
+            || out.is_some_and(|o| o.non_text),
     }
 }
 
@@ -525,6 +526,7 @@ pub(crate) fn surface_io_bindings(
             retain_depth: io.retain_depth,
             noise: io.noise,
             wake_min: None,
+            non_text: io.non_text,
         })
         .collect();
     let outputs = io_ports
@@ -536,6 +538,7 @@ pub(crate) fn surface_io_bindings(
             urgency: io.urgency,
             publish_per_activation: io.publish_per_activation,
             publish_capacity: io.publish_capacity,
+            non_text: io.non_text,
         })
         .collect();
     (subscriptions, outputs)

@@ -84,6 +84,17 @@ const WIRE_DIAGNOSTIC =
     "only untyped text off the page: publish without a content type, or bind the port to a " +
     "page-local channel";
 
+function bytesDeferredOf(
+    report: Report,
+    port: string,
+): BytesReport["deferred"][number]["entries"] {
+    const window = bytesReport(report).deferred.find((w) => w.port === port);
+    if (window === undefined) {
+        throw new Error(`${report.instance}'s report has no '${port}' deferred window`);
+    }
+    return window.entries;
+}
+
 function deferredOf(report: Report, port: string): StringReport["deferred"][number]["entries"] {
     const window = stringReport(report).deferred.find((w) => w.port === port);
     if (window === undefined) {
@@ -312,6 +323,70 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         const memo = bytesWindowOf(only(await rig().command("b-keeper", "noop"), "b-keeper"), "memo");
         expect(memo.envelopes.map((e) => [e.content_type, e.hex])).toEqual([["text/csv", hexOf(CSV)]]);
         expect(rig().reports("plain")).toHaveLength(plainBefore);
+    });
+
+    it("refuses a non-text deferred publish and a non-text edit on an undeclared channel", async () => {
+        const deferred = only(
+            await rig().command("b-keeper", `defer memo application/octet-stream ${NOT_UTF8} ${FAR_FUTURE_MS}`),
+            "b-keeper",
+        );
+        expect(deferred.results).toEqual(["text-only-channel"]);
+
+        const parked = only(
+            await rig().command("b-keeper", `defer memo text/csv ${hexOf(CSV)} ${FAR_FUTURE_MS}`),
+            "b-keeper",
+        );
+        expect(parked.results).toEqual(["ok"]);
+        const edited = only(
+            await rig().command("b-keeper", `edit memo 0 application/octet-stream ${NOT_UTF8}`),
+            "b-keeper",
+        );
+        expect(edited.results).toEqual(["text-only-channel"]);
+        const viewed = only(await rig().command("b-keeper", "noop"), "b-keeper");
+        expect(bytesDeferredOf(viewed, "memo").map((e) => [e.content_type, e.hex])).toEqual([
+            ["text/csv", hexOf(CSV)],
+        ]);
+
+        const cancelled = only(await rig().command("b-keeper", "cancel memo 0"), "b-keeper");
+        expect(cancelled.results).toEqual(["ok"]);
+    });
+
+    it("keeps a non-UTF-8 body on a channel declared non_text and hands it back with its type", async () => {
+        const published = only(
+            await rig().command("b-keeper", `publish timer application/octet-stream ${NOT_UTF8}`),
+            "b-keeper",
+        );
+        expect(published.results).toEqual(["ok"]);
+
+        const timer = bytesWindowOf(only(await rig().command("b-keeper", "noop"), "b-keeper"), "timer");
+        expect(timer.envelopes.map((e) => [e.content_type, e.hex])).toEqual([
+            ["application/octet-stream", NOT_UTF8],
+        ]);
+        expect(timer.envelopes[0]?.header["channel"]).toBe(rig().facts.bytes_timer_channel);
+    });
+
+    it("parks, edits and cancels a non-UTF-8 body on a channel declared non_text", async () => {
+        const parked = only(
+            await rig().command("b-keeper", `defer timer application/octet-stream ${NOT_UTF8} ${FAR_FUTURE_MS}`),
+            "b-keeper",
+        );
+        expect(parked.results).toEqual(["ok"]);
+        const viewed = only(await rig().command("b-keeper", "noop"), "b-keeper");
+        expect(
+            bytesDeferredOf(viewed, "timer").map((e) => [e.index, e.content_type, e.hex, e.deliver_after]),
+        ).toEqual([[0, "application/octet-stream", NOT_UTF8, FAR_FUTURE_MS]]);
+
+        const edited = only(await rig().command("b-keeper", "edit timer 0 image/jpeg ffd8ff"), "b-keeper");
+        expect(edited.results).toEqual(["ok"]);
+        const afterEdit = only(await rig().command("b-keeper", "noop"), "b-keeper");
+        expect(
+            bytesDeferredOf(afterEdit, "timer").map((e) => [e.index, e.content_type, e.hex, e.deliver_after]),
+        ).toEqual([[0, "image/jpeg", "ffd8ff", FAR_FUTURE_MS]]);
+
+        const cancelled = only(await rig().command("b-keeper", "cancel timer 0"), "b-keeper");
+        expect(cancelled.results).toEqual(["ok"]);
+        const afterCancel = only(await rig().command("b-keeper", "noop"), "b-keeper");
+        expect(bytesDeferredOf(afterCancel, "timer")).toEqual([]);
     });
 
     it("refuses an untyped body that is not UTF-8 as invalid-body with its reason", async () => {

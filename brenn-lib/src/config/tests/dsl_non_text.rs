@@ -1,11 +1,12 @@
 //! Lowering `non_text`: on a channel declaration, on each consumer binding
-//! tail and the link endpoints those bindings present, and its refusal on
-//! every surface binding.
+//! tail and the link endpoints those bindings present, and on surface binding
+//! tails — carried where the port's channel is page-local, refused where its
+//! address leaves the page or is a reserved plane.
 
 use brenn_dsl::{processor_needs, surface_any};
 
 use crate::config::{config_from_dsl, sole_refusal};
-use crate::messaging::config::LinkHostRaw;
+use crate::messaging::config::{LinkHostRaw, SurfaceConfigRaw};
 
 /// A channel says whether it may carry non-text bodies; saying nothing is
 /// text-only.
@@ -192,19 +193,127 @@ fn a_link_endpoint_carries_its_bindings_non_text() {
     );
 }
 
-/// The refusal every surface binding draws for `non_text`, whatever its
-/// direction.
-fn surface_refusal(port: &str) -> String {
+/// Each surface tail carries `non_text` where the port's channel is
+/// page-local: an `in` and an `out` on a literal `local:` address, a free `io`,
+/// an `io` on a handle to a `local:` declaration (both halves of the pair),
+/// and a link-bound port, whose endpoint carries it too. A tail that says
+/// nothing is `false`.
+#[test]
+fn every_surface_tail_carries_its_non_text_where_the_channel_is_page_local() {
+    let document = format!(
+        concat!(
+            r#"
+channel scratch at "local:alice-pod.scratch" {{
+    push_depth = 1;
+    retain_depth = 4;
+}}
+
+// ── packaged ──
+component Widget {{
+    {}
+    in heard;
+    in quiet;
+    out said;
+    io state;
+    io shared;
+    out relayed;
+}}
+component Gauge {{
+    {}
+    in relayed;
+}}
+// ── packaged ──
+
+link relay;
+
+surface alice_pod {{
+    grants = [];
+
+    new widget: Widget {{
+        chrome = true;
+        grants = [ports];
+        in heard <- "local:alice-pod.frames" {{ push_depth = 1; non_text = true; }}
+        in quiet <- "local:alice-pod.notes" {{ push_depth = 1; }}
+        out said -> "local:alice-pod.frames" {{ non_text = true; }}
+        io state {{ push_depth = 0; retain_depth = 1; non_text = true; }}
+        io shared <-> scratch {{ push_depth = 1; retain_depth = 2; non_text = true; }}
+        out relayed -> relay {{ non_text = true; }}
+    }}
+    new gauge: Gauge {{
+        chrome = false;
+        grants = [];
+        in relayed <- relay {{ push_depth = 1; retain_depth = 1; }}
+    }}
+}}
+"#
+        ),
+        processor_needs!("ports"),
+        processor_needs!(""),
+    );
+    let config = config_from_dsl(&document);
+    let surface: &SurfaceConfigRaw = &config.surfaces[0];
+    let subscriptions: Vec<(&str, &str, bool)> = surface
+        .subscriptions
+        .iter()
+        .map(|sub| (sub.instance.as_str(), sub.port.as_str(), sub.non_text))
+        .collect();
+    assert_eq!(
+        subscriptions,
+        vec![
+            ("widget", "heard", true),
+            ("widget", "quiet", false),
+            ("widget", "shared", true),
+            ("gauge", "relayed", false),
+        ]
+    );
+    let outputs: Vec<(&str, bool)> = surface
+        .outputs
+        .iter()
+        .map(|out| (out.port.as_str(), out.non_text))
+        .collect();
+    assert_eq!(
+        outputs,
+        vec![("said", true), ("shared", true), ("relayed", true)]
+    );
+    let io_ports: Vec<(&str, bool)> = surface
+        .io_ports
+        .iter()
+        .map(|io| (io.port.as_str(), io.non_text))
+        .collect();
+    assert_eq!(io_ports, vec![("state", true)]);
+    let endpoints: Vec<(String, bool)> = config.links[0]
+        .endpoints
+        .iter()
+        .map(|endpoint| {
+            let LinkHostRaw::Surface { instance, .. } = &endpoint.host else {
+                panic!("every endpoint here is a surface port");
+            };
+            (format!("{instance}/{}", endpoint.port), endpoint.non_text)
+        })
+        .collect();
+    assert_eq!(
+        endpoints,
+        vec![
+            ("widget/relayed".to_string(), true),
+            ("gauge/relayed".to_string(), false),
+        ]
+    );
+}
+
+/// The refusal a surface binding draws for `non_text` on an address that
+/// leaves the page.
+fn leaves_the_page(port: &str, address: &str) -> String {
     format!(
-        "the `{port}` port of instance `widget` of surface `alice_pod` states `non_text`: a \
-         surface port carries only text — the page does not yet hold non-text bodies at rest, \
-         and its wire is attach v4, which carries text only — so it can be bound to no channel \
-         that may carry non-text bodies"
+        "the `{port}` port of instance `widget` of surface `alice_pod` states `non_text`, and \
+         its channel {address} leaves the page: the page's wire is attach v4, which carries \
+         text only. A surface port may state `non_text` only where its channel is page-local \
+         — a `local:` address, a free `io` port, or a link whose endpoints are all on this \
+         surface"
     )
 }
 
 #[test]
-fn non_text_on_a_surface_in_binding_is_refused() {
+fn non_text_on_a_surface_in_binding_to_an_ephemeral_channel_is_refused() {
     let refusal = sole_refusal(concat!(
         r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
@@ -230,7 +339,10 @@ surface alice_pod {
 }
 "#
     ));
-    assert_eq!(refusal.message, surface_refusal("heard"));
+    assert_eq!(
+        refusal.message,
+        leaves_the_page("heard", "ephemeral:alice-pod.utterance")
+    );
     assert_eq!(
         refusal.line_col(),
         Some((18, 60)),
@@ -240,12 +352,13 @@ surface alice_pod {
 }
 
 #[test]
-fn non_text_on_a_surface_out_binding_is_refused() {
+fn non_text_on_a_surface_out_binding_to_a_durable_channel_is_refused() {
     let refusal = sole_refusal(concat!(
         r#"
-channel utterance at "ephemeral:alice-pod.utterance" {
+channel utterance at "brenn:alice-pod.utterance" {
     push_depth = 4;
     retain_depth = 16;
+    standing_retain_depth = 16;
 }
 
 component Widget {
@@ -266,15 +379,23 @@ surface alice_pod {
 }
 "#
     ));
-    assert_eq!(refusal.message, surface_refusal("said"));
+    assert_eq!(
+        refusal.message,
+        leaves_the_page("said", "brenn:alice-pod.utterance")
+    );
 }
 
-/// A surface `io` with no channel is page-local: the tail is the only place
-/// such a channel could be declared, so it is refused there too.
+/// An `io` on a handle to a transportable declaration lowers to a pair; the
+/// key is refused once, at its value, and neither half carries it.
 #[test]
-fn non_text_on_a_surface_io_binding_is_refused() {
+fn non_text_on_a_surface_io_binding_to_an_ephemeral_channel_is_refused() {
     let refusal = sole_refusal(concat!(
         r#"
+channel state at "ephemeral:alice-pod.state" {
+    push_depth = 1;
+    retain_depth = 1;
+}
+
 component Widget {
     "#,
         processor_needs!("ports"),
@@ -283,15 +404,48 @@ component Widget {
 }
 
 surface alice_pod {
-    grants = [];
+    grants = [subscribe, publish];
 
     new widget: Widget {
         chrome = true;
         grants = [ports];
-        io state { push_depth = 0; retain_depth = 1; non_text = true; }
+        io state <-> state { push_depth = 1; retain_depth = 1; non_text = true; }
     }
 }
 "#
     ));
-    assert_eq!(refusal.message, surface_refusal("state"));
+    assert_eq!(
+        refusal.message,
+        leaves_the_page("state", "ephemeral:alice-pod.state")
+    );
+}
+
+#[test]
+fn non_text_on_a_reserved_plane_is_refused() {
+    let refusal = sole_refusal(concat!(
+        r#"
+component Widget {
+    "#,
+        surface_any!(),
+        r#"
+    in theme;
+}
+
+surface alice_pod {
+    grants = [];
+
+    new widget: Widget {
+        chrome = true;
+        grants = [];
+        in theme <- "local:brenn/theme" { push_depth = 1; non_text = true; }
+    }
+}
+"#
+    ));
+    assert_eq!(
+        refusal.message,
+        "the `theme` port of instance `widget` of surface `alice_pod` states `non_text` on the \
+         reserved plane local:brenn/theme: the kernel and chrome read every `local:brenn/` \
+         plane as text"
+    );
 }

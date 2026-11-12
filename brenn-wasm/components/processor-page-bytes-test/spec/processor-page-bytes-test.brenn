@@ -4,7 +4,7 @@
 /// was handed other than `in` and `state` (each envelope as its header, content
 /// type and bytes in hex), its deferred view, the sync port, and the result of
 /// every command. `memo`, `timer` and `out` are where its commands publish,
-/// park and edit bodies; `state` carries its UTF-8 state workload; `ask` is
+/// park and edit bodies; `state` carries its binary state workload; `ask` is
 /// where a caller asks it for a reply, and `peer` is where it calls one.
 component ProcessorPageBytesTest {
   abi = processor;

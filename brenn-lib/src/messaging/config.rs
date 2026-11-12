@@ -1422,6 +1422,10 @@ pub struct SurfaceSubscriptionRaw {
     /// operator away from a knob that would do nothing. Setting it to any value is a
     /// boot config error.
     pub wake_min: Option<WakeMin>,
+    /// Whether the port needs a channel that may carry non-text bodies. Same
+    /// semantics as [`WasmConsumerSubscriptionRaw::non_text`]; legal only where
+    /// the port's channel is page-local.
+    pub non_text: bool,
 }
 
 /// A static output binding on a surface (`[[surface.output]]`).
@@ -1462,6 +1466,10 @@ pub struct SurfaceOutputRaw {
     /// `None` ⇒ [`DEFAULT_WASM_PUBLISH_CAPACITY`] (1.0). Must be finite and
     /// `>= 0` when present. Same knob as `[[wasm_consumer.output]]`'s.
     pub publish_capacity: Option<f64>,
+    /// Whether the port needs a channel that may carry non-text bodies. Same
+    /// semantics as [`WasmConsumerOutputRaw::non_text`]; legal only where the
+    /// port's channel is page-local.
+    pub non_text: bool,
 }
 
 /// A combined input+output port on a surface-hosted component
@@ -1520,6 +1528,10 @@ pub struct SurfaceIoPortRaw {
     /// Max tokens carried between activations for the output half. `None` ⇒
     /// [`DEFAULT_WASM_PUBLISH_CAPACITY`].
     pub publish_capacity: Option<f64>,
+    /// Whether the port needs a channel that may carry non-text bodies. Same
+    /// semantics as [`WasmConsumerIoPortRaw::non_text`]; legal only where the
+    /// port's channel is page-local.
+    pub non_text: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1822,6 +1834,9 @@ pub struct ResolvedLocalChannel {
     /// messages it replays to a port on attach. Bounded — the ring is page
     /// memory.
     pub ring_depth: u64,
+    /// Whether the page ring may carry non-text bodies — true iff any binding
+    /// on the address states it.
+    pub non_text: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

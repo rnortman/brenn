@@ -12,7 +12,7 @@ use brenn_lib::messaging::ComponentGrant;
 use brenn_lib::messaging::Urgency;
 use brenn_lib::messaging::config::{
     DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC, ResolvedComponent,
-    ResolvedLocalChannel, SurfaceCall, SurfaceCallRaw,
+    ResolvedLocalChannel, SurfaceCall, SurfaceCallRaw, SurfaceSubscriptionRaw,
 };
 use brenn_lib::messaging::config::{Depth, SendRate};
 
@@ -340,6 +340,7 @@ fn valid_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         ..minimal_surface_raw()
     }
@@ -653,13 +654,14 @@ fn a_surface_output_on_a_tools_address_panics() {
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
-/// A surface input bound to a `non_text` channel is refused: a page holds only
-/// text.
+/// A surface input bound to a transportable `non_text` channel is refused: the
+/// page's wire carries text only.
 #[test]
 #[should_panic(
     expected = "subscription channel \"ephemeral:protobar-demo\" is declared `non_text`, \
-                and a surface carries only text bodies — the page does not yet hold non-text \
-                bodies at rest, and its wire is attach v4, which carries text only"
+                and a surface port may be bound to a `non_text` channel only where the \
+                channel is page-local — the page's wire is attach v4, which carries text \
+                only; bind the port to a text-only channel"
 )]
 fn a_surface_input_on_a_non_text_channel_panics() {
     let mut frames = ephem("protobar-demo");
@@ -2315,6 +2317,7 @@ fn surface_output_to_error_channel_covered_by_injected_grant() {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     });
     let mut resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     inject_surface_error_grant(&mut resolved, "surface-errors");
@@ -2345,6 +2348,7 @@ fn finish_surface_policies_injects_before_it_asserts_coverage() {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     });
     let mut resolved = resolve_surfaces(&[raw], &dir, &test_globals());
 
@@ -2386,6 +2390,7 @@ fn surface_duplicate_output_port_panics() {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     });
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
@@ -2471,6 +2476,7 @@ fn local_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
                 urgency: None,
                 publish_per_activation: None,
                 publish_capacity: None,
+                non_text: false,
             },
             SurfaceOutputRaw {
                 instance: "protobar".to_string(),
@@ -2479,10 +2485,35 @@ fn local_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
                 urgency: None,
                 publish_per_activation: None,
                 publish_capacity: None,
+                non_text: false,
             },
         ],
         ..minimal_surface_raw()
     }
+}
+
+/// A surface port stating `non_text` on a transportable channel is refused
+/// whatever the channel's own declaration says: lowering refuses it on a named
+/// address, and this is the refusal for a configuration lowering never saw.
+#[test]
+#[should_panic(
+    expected = "subscription instance \"protobar\" port \"messages\" states `non_text`, but \
+                its channel \"ephemeral:protobar-demo\" leaves the page — the page's wire is \
+                attach v4, which carries text only"
+)]
+fn a_surface_input_stating_non_text_on_a_transportable_channel_panics() {
+    let mut raw = valid_surface_raw();
+    raw.subscriptions[0].non_text = true;
+    resolve_surfaces(&[raw], &surface_dir(), &test_globals());
+}
+
+/// The output arm of the same refusal.
+#[test]
+#[should_panic(expected = "states `non_text`, but its channel \"brenn:alerts\" leaves the page")]
+fn a_surface_output_stating_non_text_on_a_transportable_channel_panics() {
+    let mut raw = valid_surface_raw();
+    raw.outputs[0].non_text = true;
+    resolve_surfaces(&[raw], &surface_dir(), &test_globals());
 }
 
 /// A `local:` binding resolves with no `[[channel]]` block, no
@@ -2505,16 +2536,76 @@ fn local_bindings_resolve_without_a_directory_entry_or_acl() {
             ResolvedLocalChannel {
                 address: "local:page-bus".to_string(),
                 ring_depth: 1,
+                non_text: false,
             },
             ResolvedLocalChannel {
                 address: "local:brenn/theme".to_string(),
                 ring_depth: 1,
+                non_text: false,
             },
         ]
     );
     // The surface's policy authorizes nothing on the bus, which is the point: a
     // local binding needs no grant because the server carries no local traffic.
     assert!(!s.policy.allows_channel_access("local:page-bus"));
+}
+
+/// A page-local channel may carry non-text bodies iff any binding on its
+/// address states `non_text`: one of two input bindings, or an output alone.
+/// A channel no binding declares stays text-only.
+#[test]
+fn a_local_channel_is_non_text_iff_any_binding_on_it_says_so() {
+    use brenn_lib::messaging::config::SurfaceOutputRaw;
+    let mut raw = local_surface_raw();
+    raw.subscriptions = vec![
+        local_sub_raw("local:page-bus", "protobar", "in"),
+        SurfaceSubscriptionRaw {
+            non_text: true,
+            ..local_sub_raw("local:page-bus", "protobar", "in-too")
+        },
+        local_sub_raw("local:quiet", "protobar", "hush"),
+    ];
+    raw.outputs.push(SurfaceOutputRaw {
+        instance: "protobar".to_string(),
+        port: "frames".to_string(),
+        channel: Some("local:frames".to_string()),
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+        non_text: true,
+    });
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
+    let facts: Vec<(&str, bool)> = resolved[0]
+        .local_channels
+        .iter()
+        .map(|channel| (channel.address.as_str(), channel.non_text))
+        .collect();
+    assert_eq!(
+        facts,
+        vec![
+            ("local:page-bus", true),
+            ("local:quiet", false),
+            ("local:brenn/theme", false),
+            ("local:frames", true),
+        ]
+    );
+}
+
+/// The kernel and chrome read every reserved plane as text, so no binding may
+/// declare one `non_text`.
+#[test]
+#[should_panic(
+    expected = "subscription instance \"protobar\" port \"theme\" states `non_text` on the \
+                reserved plane \"local:brenn/theme\": the kernel and chrome read every \
+                `local:brenn/` plane as text"
+)]
+fn non_text_on_a_reserved_plane_panics() {
+    let mut raw = local_surface_raw();
+    raw.subscriptions.push(SurfaceSubscriptionRaw {
+        non_text: true,
+        ..surface_sub_raw("local:brenn/theme", "protobar", "theme")
+    });
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// Ring depth is the **max** over the channel's declared bindings, not the
@@ -2743,6 +2834,7 @@ fn a_takeover_output_binding_without_the_grant_panics() {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }];
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
@@ -2762,6 +2854,7 @@ fn a_takeover_output_binding_with_the_grant_resolves() {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }];
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(
@@ -2795,6 +2888,7 @@ fn local_output_to_a_kernel_only_plane_panics() {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }];
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
@@ -3267,6 +3361,7 @@ fn io_surface_raw(grants: Vec<ComponentGrant>) -> brenn_lib::messaging::config::
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }];
     raw
 }

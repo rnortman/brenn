@@ -36,6 +36,7 @@ use super::driver::tests::{
     spill_channel, staged_module, subscriber_debug_lines, surface_document, surfaces_document,
     write_surface_kind,
 };
+use super::driver::tests::{bytes_panel_document, write_bundled_bytes_panel_kind};
 use brenn_messaging::config_reload::Outcome;
 
 // ── The oracle ────────────────────────────────────────────────────────────
@@ -1454,6 +1455,56 @@ async fn an_upgraded_kind_matches_a_fresh_boot() {
         },
     )
     .await;
+}
+
+/// **A page-local channel's `non_text` declaration flips, each way.** The
+/// declaration lives only in the surface binding tail and reaches nothing but
+/// the bindings document, so the retained document is the field this compares;
+/// a byte-carrying kind is installed so both documents are servable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_local_non_text_flip_matches_a_fresh_boot() {
+    for (from, to) in [(false, true), (true, false)] {
+        let kernel = tempfile::tempdir().expect("brenn's own surface tree");
+        let bundle = tempfile::tempdir().expect("a bundle surface tree");
+        let tree = Tree::new();
+        write_bundled_bytes_panel_kind(
+            &tree,
+            kernel.path(),
+            bundle.path(),
+            Some("brenn_processor_bytes_test.wasm"),
+        );
+        tree.write(&bytes_panel_document(from));
+        let (kernel_path, bundle_path) = (kernel.path(), bundle.path());
+
+        a_reload_matches_a_fresh_boot(
+            &tree,
+            move |db| BootFixture {
+                db: Some(db),
+                surface_assets: Some(kernel_path.to_path_buf()),
+                surface_bundle: Some(bundle_path.to_path_buf()),
+                ..BootFixture::default()
+            },
+            async |booted| {
+                reload_onto(booted, &tree, &bytes_panel_document(to)).await;
+                assert_eq!(
+                    booted.last_status().await.delta.surfaces_changed,
+                    vec!["deskbar".to_string()]
+                );
+            },
+            |reloaded| {
+                assert!(
+                    reloaded
+                        .retained
+                        .iter()
+                        .any(|line| line.contains("surface.deskbar.bindings")
+                            && line.contains(&format!("\"non_text\":{to}"))),
+                    "{:?}",
+                    reloaded.retained
+                );
+            },
+        )
+        .await;
+    }
 }
 
 const UPGRADED_ARTIFACT: &[u8] = b"the-upgraded-artifact";

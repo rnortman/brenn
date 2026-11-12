@@ -827,6 +827,7 @@ impl Schedules {
                 OutputSpec {
                     channel: binding.channel.clone(),
                     default_urgency: binding.urgency,
+                    non_text: ctx.bindings.carries_non_text(&binding.channel),
                 },
             );
             sink_mt.insert(

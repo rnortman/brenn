@@ -64,9 +64,10 @@ use brenn_attach_client::router::{
 };
 use brenn_attach_client::store::DeferOp;
 use brenn_attach_proto::{BatchDeferredOp, BatchEntry, DeferredOpKind};
+use brenn_envelope::MessageBody;
 
 use crate::activation::{DropVerdicts, Schedules};
-use crate::bindings::{AppliedBindings, channel_is_transportable};
+use crate::bindings::{AppliedBindings, carriage_refusal, channel_is_transportable};
 use crate::outbound::SurfaceOutbound;
 use crate::publish_buffer::{BufferedDeferOp, BufferedPublish, PublishBuffer};
 use crate::registry::{Registrations, SurfaceStores};
@@ -79,9 +80,10 @@ use crate::registry::{Registrations, SurfaceStores};
 /// [`crate::activation::ActivationCtx`] is one: the members travel together, and
 /// a completion touches more of the page than an assembly does.
 pub struct FlushCtx<'a, P> {
-    /// The wiring in force. Read only to resolve the noise of a binding a
-    /// confined append overflowed — every address a flush writes was captured
-    /// when the component published.
+    /// The wiring in force. Read to resolve the noise of a binding a confined
+    /// append overflowed, and to assert that every confined body coming to rest
+    /// is one its channel's declaration admits — every address a flush writes
+    /// was captured when the component published.
     pub bindings: &'a AppliedBindings,
     /// The attachment's contract, or `None` while detached. What a transportable
     /// flush is judged against before it is offered the wire: the buffer captured
@@ -260,6 +262,12 @@ fn apply_confined_ops<P: PlanePolicy>(
         kind,
     } in ops
     {
+        if let DeferOp::Edit {
+            body: Some(body), ..
+        } = &kind
+        {
+            assert_carried_in_force(ctx.bindings, instance, &port, &channel, body);
+        }
         let answer = ctx.router.apply_op(
             ctx.stores,
             DeferOpRequest {
@@ -334,6 +342,7 @@ fn route_publishes<P: PlanePolicy>(
         // The page is the authority here, so this commits now: minted, retained,
         // and by that single append every reader bound to the channel woken. It
         // never touches the wire, so a down link is no reason to delay it.
+        assert_carried_in_force(ctx.bindings, instance, &port, &channel, &body);
         let outcome = ctx.router.route(
             ctx.stores,
             RouteRequest {
@@ -376,6 +385,37 @@ fn route_publishes<P: PlanePolicy>(
         }
     }
     entries
+}
+
+/// Assert that the wiring in force lets `channel` carry `body`, for a confined
+/// body about to come to rest in a store.
+///
+/// The buffer judged the body's carriage when the component published, under
+/// the document its activation was seeded with. An activation is assembled,
+/// run and committed in one synchronous stretch and a document is applied only
+/// between stretches, so that document is the one in force here and this never
+/// fires. A driver that broke the stretch would otherwise leave a non-text body
+/// in a store its channel's declaration no longer admits, in front of readers
+/// that may only represent text.
+///
+/// # Panics
+///
+/// If the wiring in force refuses the body.
+fn assert_carried_in_force(
+    bindings: &AppliedBindings,
+    instance: &str,
+    port: &str,
+    channel: &str,
+    body: &MessageBody,
+) {
+    let refusal = carriage_refusal(channel, bindings.carries_non_text(channel), body);
+    assert!(
+        refusal.is_none(),
+        "surface client: {instance}'s port {port} committing {} to {channel}, which the wiring \
+         in force refuses ({refusal:?}): the buffer was judged under a bindings document other \
+         than the one in force",
+        body.summary()
+    );
 }
 
 /// One buffered control op as the batch frame carries it.

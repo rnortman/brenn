@@ -2335,10 +2335,90 @@ channel panel_bindings at "ephemeral:surface.surface.panel.bindings" {
         assert!(
             message.contains(
                 "surface config channel \"ephemeral:surface.surface.panel.bindings\" is \
-                 declared `non_text`"
+                 declared `non_text` — every surface replays it on attach, over attach v4, \
+                 which carries text only. Remove `non_text` from its declaration."
             ),
             "{message}"
         );
+    }
+
+    /// A page-local channel a surface binding declares `non_text` passes the
+    /// offline check: the fully stamped root with a second input on a
+    /// `local:` address stating it.
+    #[test]
+    fn a_page_local_non_text_binding_is_accepted() {
+        let document = described_root(
+            "",
+            &format!(
+                "new commons: SurfaceCommons;\n\
+                 new panel_desc: SurfaceDescription(slug = \"panel\");\n{KIND_STAMPS}"
+            ),
+        )
+        .replacen(
+            "    in messages;\n",
+            "    in messages;\n    in frames;\n",
+            1,
+        )
+        .replacen(
+            "        in messages <- feed { push_depth = 4; }\n",
+            "        in messages <- feed { push_depth = 4; }\n        \
+             in frames <- \"local:panel.frames\" { push_depth = 1; non_text = true; }\n",
+            1,
+        );
+        assert!(document.contains("non_text = true"), "{document}");
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let file = dir.path().join("main.brenn");
+        std::fs::write(&file, document).expect("the document is writable");
+        assert!(run_config_check(
+            &file,
+            &Roots::modules(vec![repo_root().join("config/specs")].into(), Vec::new())
+        ));
+    }
+
+    /// A surface port stating `non_text` on a link to another surface is
+    /// refused offline: the link's channel is `ephemeral:`, which leaves the
+    /// page, and only the planner knows where a link is placed.
+    #[test]
+    fn a_surface_port_stating_non_text_on_a_spanning_link_is_refused() {
+        let message = boot_gate_refusal(&format!(
+            r#"{preamble}
+component Talker {{
+    {talker}
+    out said;
+}}
+
+component Listener {{
+    {listener}
+    in heard;
+}}
+
+link relay;
+
+surface left {{
+    grants = [];
+    new t: Talker {{
+        grants = [ports];
+        out said -> relay {{ non_text = true; }}
+    }}
+{CHROME}}}
+
+surface right {{
+    grants = [];
+    new l: Listener {{
+        grants = [];
+        in heard <- relay {{ push_depth = 1; retain_depth = 1; }}
+    }}
+{CHROME}}}
+"#,
+            preamble = preamble("log"),
+            talker = processor_header("ports"),
+            listener = processor_header(""),
+        ));
+        assert!(
+            message.contains("port \"said\" states `non_text`, but its channel \"ephemeral:"),
+            "{message}"
+        );
+        assert!(message.contains("leaves the page"), "{message}");
     }
 
     /// A surface bound to a `non_text` channel is refused by the planner,
@@ -2366,8 +2446,8 @@ surface panel {{
         ));
         assert!(
             message.contains(
-                "channel \"brenn:alice.frames\" is declared `non_text`, and a surface carries \
-                 only text bodies"
+                "channel \"brenn:alice.frames\" is declared `non_text`, and a surface port may \
+                 be bound to a `non_text` channel only where the channel is page-local"
             ),
             "{message}"
         );

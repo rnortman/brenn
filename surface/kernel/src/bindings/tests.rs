@@ -56,6 +56,7 @@ fn local(channel: &str) -> LocalChannel {
         ring_depth: reserved_local_channel(channel)
             .map(|r| r.ring_depth)
             .unwrap_or(3),
+        non_text: false,
     }
 }
 
@@ -312,6 +313,7 @@ fn a_declared_local_channel_gets_a_store_at_its_ring_depth() {
     doc.local_channels.push(LocalChannel {
         channel: "local:page/scratch".to_string(),
         ring_depth: 5,
+        non_text: false,
     });
     let applied = applied(&doc);
     assert_eq!(
@@ -407,24 +409,68 @@ fn carriage_refusal_judges_the_body_against_the_channel() {
     let typed = MessageBody::from_parts(Some("text/csv"), b"a,b").expect("typed text");
     let binary = MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8]).expect("binary");
 
-    for channel in [LOCAL, WIRE, OTHER_WIRE] {
-        assert_eq!(carriage_refusal(channel, &untyped), None, "{channel}");
+    // Text is judged the same whatever the channel declares.
+    for declared in [false, true] {
+        for channel in [LOCAL, WIRE, OTHER_WIRE] {
+            assert_eq!(
+                carriage_refusal(channel, declared, &untyped),
+                None,
+                "{channel} {declared}"
+            );
+        }
+        assert_eq!(carriage_refusal(LOCAL, declared, &typed), None);
+        for channel in [WIRE, OTHER_WIRE] {
+            assert_eq!(
+                carriage_refusal(channel, declared, &typed),
+                Some(CarriageRefusal::WireCarriesUntypedTextOnly),
+                "{channel} {declared}"
+            );
+        }
     }
-    assert_eq!(carriage_refusal(LOCAL, &typed), None);
-    for channel in [WIRE, OTHER_WIRE] {
-        assert_eq!(
-            carriage_refusal(channel, &typed),
-            Some(CarriageRefusal::WireCarriesUntypedTextOnly),
-            "{channel}"
-        );
+    // A non-text body rests only on a page-local channel declared to carry one.
+    assert_eq!(carriage_refusal(LOCAL, true, &binary), None);
+    assert_eq!(
+        carriage_refusal(LOCAL, false, &binary),
+        Some(CarriageRefusal::TextOnlyChannel)
+    );
+    // A transportable channel refuses it whatever it is said to declare, and
+    // the refusal names the body, not the wire.
+    for declared in [false, true] {
+        for channel in [WIRE, OTHER_WIRE] {
+            assert_eq!(
+                carriage_refusal(channel, declared, &binary),
+                Some(CarriageRefusal::TextOnlyChannel),
+                "{channel} {declared}"
+            );
+        }
     }
-    // A non-text body goes nowhere, and its refusal names the body, not the
-    // wire, on a wire channel too.
-    for channel in [LOCAL, WIRE, OTHER_WIRE] {
-        assert_eq!(
-            carriage_refusal(channel, &binary),
-            Some(CarriageRefusal::TextOnlyChannel),
-            "{channel}"
-        );
-    }
+}
+
+#[test]
+fn carries_non_text_answers_the_documents_declaration() {
+    const BLOB: &str = "local:page/blob";
+    const NOTES: &str = "local:page/notes";
+    let applied = applied_with_blob(true);
+    assert!(applied.carries_non_text(BLOB));
+    assert!(!applied.carries_non_text(NOTES), "declared text-only");
+    assert!(!applied.carries_non_text(WIRE), "a wire channel");
+    assert!(
+        !applied.carries_non_text("local:page/undeclared"),
+        "a channel the document does not name"
+    );
+    assert!(
+        !applied.same_wiring_as(&applied_with_blob(false)),
+        "the declaration is part of the wiring"
+    );
+}
+
+/// The standard document plus `local:page/blob`, declared or not.
+fn applied_with_blob(non_text: bool) -> AppliedBindings {
+    let mut document = doc();
+    document.local_channels.push(LocalChannel {
+        non_text,
+        ..local("local:page/blob")
+    });
+    document.local_channels.push(local("local:page/notes"));
+    applied(&document)
 }

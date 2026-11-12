@@ -46,6 +46,8 @@ export interface KitPage {
     bytes_out_channel: string;
     /** The page-local channel `b-keeper` keeps typed bodies on and `plain` reads. */
     shared_channel: string;
+    /** The page-local channel, declared `non_text`, behind `b-keeper`'s `timer` port. */
+    bytes_timer_channel: string;
     /**
      * The `brenn:processor@0.1.0` instances with a `state` io port, each on a
      * page-local channel of its own.

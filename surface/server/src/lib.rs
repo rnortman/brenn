@@ -879,6 +879,15 @@ pub fn validate_surface_assets_in(
                 manifest,
                 &comp.grants,
             );
+            processor_assets::assert_contract_carries_bound_channels(
+                cx,
+                surface,
+                &comp.instance,
+                &comp.kind,
+                roots
+                    .kind_contract(&comp.kind)
+                    .expect("the kind resolved to a manifest, so it is in the served map"),
+            );
             assert_spec_bound(cx, &surface.slug, comp, &manifest.spec_sha256);
         }
     }
@@ -1643,6 +1652,7 @@ mod tests {
         r.local_channels = vec![ResolvedLocalChannel {
             address: "local:page-bus".to_string(),
             ring_depth: 3,
+            non_text: false,
         }];
         r
     }
@@ -1680,6 +1690,7 @@ mod tests {
             vec![brenn_surface_schema::LocalChannel {
                 channel: "local:page-bus".to_string(),
                 ring_depth: 3,
+                non_text: false,
             }]
         );
 
@@ -2210,6 +2221,160 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_real_kind(dir.path(), "frames", STALE_ARTIFACT);
         processor_assets::read_processor_record_in(AssetContext::BOOT, dir.path(), "frames");
+    }
+
+    /// The page-local channel the contract cases bind.
+    const STATE: &str = "local:deskbar/state";
+
+    /// [`resolved_with_processor`] with the instance's `state` port bound to
+    /// [`STATE`] as an input, an output, or both, and the channel declared
+    /// `non_text` or not.
+    fn resolved_bound_to_state(
+        kind: &str,
+        input: bool,
+        output: bool,
+        non_text: bool,
+    ) -> ResolvedSurface {
+        let mut surface = resolved_with_processor("deskbar", kind);
+        let instance = surface.components[0].instance.clone();
+        if input {
+            surface.subscriptions.push(SurfaceBinding {
+                channel_address: STATE.to_string(),
+                instance: instance.clone(),
+                port: "state".to_string(),
+                push_depth: 0,
+                retain_depth: 1,
+                noise: brenn_lib::messaging::config::NoiseLevel::Silent,
+            });
+        }
+        if output {
+            surface.outputs.push(SurfaceOutput {
+                channel_address: STATE.to_string(),
+                instance,
+                port: "state".to_string(),
+                default_urgency: Urgency::Normal,
+                budget: brenn_budget::SinkBudget {
+                    fill_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
+                    capacity_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
+                },
+            });
+        }
+        surface.local_channels = vec![brenn_lib::messaging::config::ResolvedLocalChannel {
+            address: STATE.to_string(),
+            ring_depth: 1,
+            non_text,
+        }];
+        surface
+    }
+
+    /// A string-contract kind under brenn's own mount, which is served.
+    fn write_string_contract_kind(dir: &std::path::Path, kind: &str) {
+        write_kernel_pair(dir);
+        write_processor_tree(dir, kind, &["types", "ports"], |_| {});
+    }
+
+    /// The input arm: a 0.1.0 instance reading a `non_text` channel would be
+    /// handed a body its string lowering panics on.
+    #[test]
+    #[should_panic(
+        expected = "boot: [[surface]] \"deskbar\": component \"fleet-1\"'s input port \"state\" is \
+                    bound to local:deskbar/state, a page-local channel declared `non_text`, and \
+                    its kind \"fleet\" is built against brenn:processor@0.1.0, which carries only \
+                    text — drop `non_text` from the ports bound to that channel, or install a \
+                    build of the kind against brenn:processor@0.2.0. Refusing to start"
+    )]
+    fn a_string_contract_instance_reading_a_non_text_channel_refuses_the_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_state("fleet", true, false, true)],
+        );
+    }
+
+    /// The output arm: the instance reads its own parked messages back through
+    /// its deferred view, so writing the channel is enough.
+    #[test]
+    #[should_panic(
+        expected = "component \"fleet-1\"'s output port \"state\" is bound to \
+                               local:deskbar/state, a page-local channel declared `non_text`"
+    )]
+    fn a_string_contract_instance_writing_a_non_text_channel_refuses_the_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_state("fleet", false, true, true)],
+        );
+    }
+
+    #[test]
+    fn a_string_contract_instance_on_a_text_only_channel_is_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        let roots = validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_state("fleet", true, true, false)],
+        );
+        assert!(roots.kinds.contains_key("fleet"));
+    }
+
+    #[test]
+    fn a_byte_contract_instance_on_a_non_text_channel_is_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_real_kind(dir.path(), "frames", BYTES_ARTIFACT);
+        let mut surface = resolved_bound_to_state("frames", true, true, true);
+        surface.components[0].grants = [
+            brenn_lib::messaging::ComponentGrant::Ports,
+            brenn_lib::messaging::ComponentGrant::Calls,
+        ]
+        .into();
+        let roots = validate_one_root(dir.path(), &[surface]);
+        assert_eq!(
+            roots.kind_contract("frames"),
+            Some(brenn_envelope::grants::ProcessorContract::V0_2)
+        );
+    }
+
+    /// A withheld kind is not served, so its instance's bindings are not
+    /// judged against a contract nobody can read off its record.
+    #[test]
+    fn an_instance_of_a_withheld_kind_on_a_non_text_channel_is_not_judged() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[resolved_bound_to_state("fleet", true, true, true)],
+        );
+        assert!(roots.withheld.contains_key("fleet"));
+    }
+
+    /// At reload the same rule is framed as a refusal: the caller catches the
+    /// panic, and the message names no restart.
+    #[test]
+    fn the_contract_refusal_at_reload_names_no_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        let mounts = mount_roots(&[("brenn", dir.path())]);
+        let surfaces = [resolved_bound_to_state("fleet", true, false, true)];
+        let payload = std::panic::catch_unwind(|| {
+            validate_surface_assets_in(AssetContext::RELOAD, &mounts, &surfaces)
+        })
+        .expect_err("the reload is refused");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("a formatted panic message");
+        assert!(
+            message.starts_with("reload: [[surface]] \"deskbar\"")
+                && message.contains("brenn:processor@0.1.0")
+                && message.ends_with("brenn:processor@0.2.0."),
+            "{message}"
+        );
     }
 
     /// A record an older brenn's build wrote, byte for byte as the emitter

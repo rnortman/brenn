@@ -1027,7 +1027,9 @@ Only a declaration states it: a tuning block is refused for it, because every
 system-minted family is text-only. A channel declared `non_text` may not be
 bound by a component built against the string contract
 `brenn:processor@0.1.0` — the component's load is refused at boot and at
-reload, naming the port and the channel — nor by a surface. It is served to a
+reload, naming the port and the channel; a surface instance's kind is judged
+the same way once its artifact is scanned — nor by a surface port, since the
+page's wire is attach v4, which carries text only. It is served to a
 remote whose attach session negotiated protocol v5; one on v4 asking for it is
 answered `Unavailable`. A durable
 channel holding a non-text message cannot later be declared text-only; give it
@@ -1448,10 +1450,31 @@ new motion: Motion { grants = [ports]; io state { push_depth = 0; retain_depth =
 On a declared channel it is a check: a port saying `non_text = true` bound to
 a channel that does not is refused when the plan is built, naming the port and
 the channel, so `config-check` reports it. A packaged assembly may write it,
-so a kind that keeps binary state can ship the declaration with itself. A
-surface binding may not say it, in any direction, and a surface may not be
-bound to a `non_text` channel; both are refused at `config-check`, boot and
-reload, until the page carries non-text bodies at rest and speaks attach v5.
+so a kind that keeps binary state can ship the declaration with itself.
+
+On a surface binding the key declares a **page-local** channel: a `local:`
+address outside the reserved `local:brenn/` planes, a free `io` port, or a
+link whose endpoints are all on that surface. The page ring is `non_text` when
+any surface binding on its address says so; a server-realm `channel`
+declaration at the same `local:` spelling is not read for it. A surface
+component built against `brenn:processor@0.2.0` then keeps binary state in the
+page, with no base64 — shown on the node rig, not yet run in a browser:
+
+```
+surface kiosk {
+  new viewer: Viewer { io state { push_depth = 0; retain_depth = 1; non_text = true; } }
+}
+```
+
+A surface binding stating it on a channel that leaves the page (a declared
+`ephemeral:` or `brenn:` channel, or a link with an endpoint off the surface)
+or on a reserved plane is refused, and so is a surface port bound to a
+declared `non_text` channel: the page's wire is attach v4, which carries text
+only. Those refusals are reported by `config-check`, boot and reload. A
+surface instance whose kind is built against `brenn:processor@0.1.0`, bound by
+input or output to a page-local `non_text` channel, is refused at boot and at
+reload, naming the port and the channel; `config-check` cannot see a kind's
+contract.
 
 A component placed inside a `surface` runs in the page. The same class placed at
 the top level runs in the backend, and is called a **consumer**:

@@ -3608,8 +3608,15 @@ fn surface_bindings(
                     &SURFACE_IN_KEYS,
                     errors,
                 );
-                refuse_surface_non_text(masked.non_text.take().as_ref(), &what, errors);
-                let tail = in_tail(&masked, errors);
+                let lowered = in_tail(&masked, errors);
+                let non_text = surface_non_text(
+                    tail.non_text.as_ref(),
+                    lowered.non_text,
+                    channel.as_deref(),
+                    &what,
+                    errors,
+                );
+                let tail = lowered;
                 link_endpoint(
                     endpoints,
                     binding.chan.as_ref(),
@@ -3620,7 +3627,7 @@ fn surface_bindings(
                     &port,
                     (false, true, false),
                     (tail.push_depth, tail.retain_depth),
-                    false,
+                    non_text,
                 );
                 out.subscriptions.push(SurfaceSubscriptionRaw {
                     channel: connected(binding.chan.as_ref(), channel, &port, at.owner),
@@ -3630,12 +3637,19 @@ fn surface_bindings(
                     retain_depth: tail.retain_depth,
                     noise: tail.noise,
                     wake_min: tail.wake_min,
+                    non_text,
                 });
             }
             RTail::Out(tail) => {
-                let mut masked = tail.clone();
-                refuse_surface_non_text(masked.non_text.take().as_ref(), &what, errors);
-                let tail = out_tail(&masked, errors);
+                let lowered = out_tail(tail, errors);
+                let non_text = surface_non_text(
+                    tail.non_text.as_ref(),
+                    lowered.non_text,
+                    channel.as_deref(),
+                    &what,
+                    errors,
+                );
+                let tail = lowered;
                 link_endpoint(
                     endpoints,
                     binding.chan.as_ref(),
@@ -3646,7 +3660,7 @@ fn surface_bindings(
                     &port,
                     (true, false, false),
                     (None, None),
-                    false,
+                    non_text,
                 );
                 out.outputs.push(SurfaceOutputRaw {
                     instance: at.instance.to_owned(),
@@ -3655,6 +3669,7 @@ fn surface_bindings(
                     urgency: tail.urgency,
                     publish_per_activation: tail.publish_per_activation,
                     publish_capacity: tail.publish_capacity,
+                    non_text,
                 });
             }
             RTail::Io(tail) => {
@@ -3666,8 +3681,15 @@ fn surface_bindings(
                     &SURFACE_IO_KEYS,
                     errors,
                 );
-                refuse_surface_non_text(masked.non_text.take().as_ref(), &what, errors);
-                let tail = io_tail(&masked, errors);
+                let lowered = io_tail(&masked, errors);
+                let non_text = surface_non_text(
+                    tail.non_text.as_ref(),
+                    lowered.non_text,
+                    channel.as_deref(),
+                    &what,
+                    errors,
+                );
+                let tail = lowered;
                 link_endpoint(
                     endpoints,
                     binding.chan.as_ref(),
@@ -3678,7 +3700,7 @@ fn surface_bindings(
                     &port,
                     (true, true, true),
                     (tail.push_depth, tail.retain_depth),
-                    false,
+                    non_text,
                 );
                 match io_shape(binding.chan.as_ref(), channel) {
                     IoShape::Pair(address) => {
@@ -3690,6 +3712,7 @@ fn surface_bindings(
                             retain_depth: tail.retain_depth,
                             noise: tail.noise,
                             wake_min: None,
+                            non_text,
                         });
                         out.outputs.push(SurfaceOutputRaw {
                             instance: at.instance.to_owned(),
@@ -3698,6 +3721,7 @@ fn surface_bindings(
                             urgency: tail.urgency,
                             publish_per_activation: tail.publish_per_activation,
                             publish_capacity: tail.publish_capacity,
+                            non_text,
                         });
                     }
                     IoShape::Port(channel) => {
@@ -3711,6 +3735,7 @@ fn surface_bindings(
                             urgency: tail.urgency,
                             publish_per_activation: tail.publish_per_activation,
                             publish_capacity: tail.publish_capacity,
+                            non_text,
                         });
                     }
                 }
@@ -3720,44 +3745,60 @@ fn surface_bindings(
 }
 
 /// The `in`/`io` tail key a surface binding has no field for: a page's
-/// throughput is the page's, not a knob the binding sets. `non_text` is the
-/// other key no surface binding reads, refused with its own reason.
+/// throughput is the page's, not a knob the binding sets.
 const SURFACE_MASKED_KEY: &str = "amplification";
 
-// `refuse_surface_non_text` gives attach v4's text-only wire as its reason;
-// moving the page's attach version stops the build here until that reason is
-// rewritten.
+// `surface_non_text` gives attach v4's text-only wire as its reason for
+// refusing a channel that leaves the page; moving the page's attach version
+// stops the build here until that reason is rewritten.
 const _: () = assert!(brenn_surface_schema::SURFACE_ATTACH_VERSION == 4);
 
-/// A surface port that says it needs a channel that may carry non-text
-/// bodies, refused at its own value.
+/// The `non_text` a surface port carries, judged against the address its
+/// binding names.
 ///
-/// The page does not yet hold non-text bodies at rest, and its wire is attach
-/// v4, which carries text only, so no surface binding can be served such a
-/// channel. A port with no `channel` of its own — page-local, or a link with
-/// a surface endpoint — has no other place the need could be declared.
-fn refuse_surface_non_text(attr: Option<&Attr<RVal>>, what: &str, errors: &mut Vec<Diagnostic>) {
-    if let Some(attr) = attr {
-        errors.push(Diagnostic::at(
-            format!(
-                "{what} states `{NON_TEXT_KEY}`: a surface port carries only text — the \
-                 page does not yet hold non-text bodies at rest, and its wire is attach v4, \
-                 which carries text only — so it can be bound to no channel that may carry \
-                 non-text bodies"
-            ),
-            attr.value.span().clone(),
-        ));
-    }
+/// Legal only where the port's channel is page-local. Where the binding names
+/// an address — a handle to a declaration or a literal — a non-`local:`
+/// address leaves the page over a text-only wire, and a reserved plane is read
+/// as text by the kernel and chrome; either refuses the key at its own value
+/// and lowers it as `false`. A link's placement is not known here, so a
+/// link-bound port's statement is carried and judged at boot.
+fn surface_non_text(
+    attr: Option<&Attr<RVal>>,
+    lowered: bool,
+    channel: Option<&str>,
+    what: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> bool {
+    let (true, Some(attr), Some(address)) = (lowered, attr, channel) else {
+        return lowered;
+    };
+    let reason = if !brenn_envelope::is_local_channel(address) {
+        format!(
+            "{what} states `{NON_TEXT_KEY}`, and its channel {address} leaves the page: the \
+             page's wire is attach v4, which carries text only. A surface port may state \
+             `{NON_TEXT_KEY}` only where its channel is page-local — a `local:` address, a \
+             free `io` port, or a link whose endpoints are all on this surface"
+        )
+    } else if brenn_surface_schema::is_reserved_local_namespace(address) {
+        format!(
+            "{what} states `{NON_TEXT_KEY}` on the reserved plane {address}: the kernel and \
+             chrome read every `local:brenn/` plane as text"
+        )
+    } else {
+        return true;
+    };
+    errors.push(Diagnostic::at(reason, attr.value.span().clone()));
+    false
 }
 
 /// The `in` tail keys a surface binding reads, for the refusal that says
 /// `amplification` is not one of them.
 static SURFACE_IN_KEYS: LazyLock<Vec<&'static str>> =
-    LazyLock::new(|| keys_without(InTail::<()>::KEYS, &[SURFACE_MASKED_KEY, NON_TEXT_KEY]));
+    LazyLock::new(|| keys_without(InTail::<()>::KEYS, &[SURFACE_MASKED_KEY]));
 
 /// The `io` tail keys a surface binding reads.
 static SURFACE_IO_KEYS: LazyLock<Vec<&'static str>> =
-    LazyLock::new(|| keys_without(IoTail::<()>::KEYS, &[SURFACE_MASKED_KEY, NON_TEXT_KEY]));
+    LazyLock::new(|| keys_without(IoTail::<()>::KEYS, &[SURFACE_MASKED_KEY]));
 
 // ---------------------------------------------------------------------------
 // Remotes

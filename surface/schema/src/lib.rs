@@ -141,10 +141,16 @@ pub use brenn_envelope::grants::ComponentGrant;
 /// its own `push_depth` — which may be more than `ring_depth` when a binding
 /// deepened the store. Bounded by construction: the store lives in page memory,
 /// so an unbounded depth is rejected at boot.
+///
+/// `non_text` says whether the channel's store may hold bodies that are not
+/// UTF-8 text: true iff some surface binding on the address states it. Only an
+/// unreserved `local:` channel may say so (the document's `validate`). No serde
+/// default: a document without the field was written by another build.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalChannel {
     pub channel: String,
     pub ring_depth: u64,
+    pub non_text: bool,
 }
 
 /// One declared component instance: its routing `instance` id and the component

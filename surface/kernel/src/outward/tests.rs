@@ -235,6 +235,7 @@ fn buffer(page: &SurfacePage, instance: &str) -> PublishBuffer {
             OutputSpec {
                 channel: binding.channel.clone(),
                 default_urgency: binding.urgency,
+                non_text: bindings.carries_non_text(&binding.channel),
             },
         );
         sink_mt.insert(binding.port.clone(), 1_000_000);

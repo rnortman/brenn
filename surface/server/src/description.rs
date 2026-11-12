@@ -1087,15 +1087,19 @@ fn assert_config_retention_at_least_one(channel: &str, directory: &MessagingDire
 /// Boot-assert: a surface config channel is not declared `non_text`.
 ///
 /// It is the one channel a page receives that is not a binding, so the binding
-/// refusal does not cover it, and a page holds only text.
+/// refusal does not cover it, and it reaches the page over attach v4, which
+/// carries text only.
 fn assert_config_channel_text_only(channel: &str, directory: &MessagingDirectory) {
+    // The reason below is attach v4's text-only wire; moving the page's attach
+    // version stops the build here until it is rewritten.
+    const _: () = assert!(brenn_surface_schema::SURFACE_ATTACH_VERSION == 4);
     let entry = directory
         .resolve(channel)
         .expect("caller confirmed the channel resolves");
     assert!(
         !entry.resolved_channel.non_text,
         "{CONFIG_REFUSAL}surface config channel {channel:?} is declared `non_text` — every \
-         surface replays it on attach, and a surface carries only text bodies. Remove \
+         surface replays it on attach, over attach v4, which carries text only. Remove \
          `non_text` from its declaration.",
     );
 }

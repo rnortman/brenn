@@ -157,13 +157,14 @@ impl MessageEnvelope {
 
     /// The body's text, for a carrier whose contract is a string.
     ///
-    /// Nothing outside the host can publish a non-text body, so a non-text
-    /// body reaching a string carrier is a host bug. A change that opens a
-    /// publish path for non-text bodies to a guest, a page, a remote daemon or
-    /// a conversation must, in the same change, keep such bodies away from
-    /// these carriers (a channel declaring that it may carry them, and string
-    /// carriers refused on such a channel); otherwise this panic becomes
-    /// reachable by a guest.
+    /// A non-text body reaching a string carrier is a host bug. Every publish
+    /// path for non-text bodies — a 0.2.0 component on the backend or on a
+    /// page, a remote daemon on attach v5 — admits one only onto a channel
+    /// declared to carry it, and every string carrier is refused on such a
+    /// channel when it is bound: a 0.1.0 component at boot and at reload on
+    /// the backend and on a page, an attach v4 session at subscribe. A change
+    /// that opens another publish path must keep the same two rules in the
+    /// same change; otherwise this panic becomes reachable by a guest.
     ///
     /// # Panics
     ///

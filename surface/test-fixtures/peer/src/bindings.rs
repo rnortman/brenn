@@ -130,11 +130,21 @@ pub fn output_at(instance: &str, port: &str, channel: &str, urgency: Urgency) ->
     }
 }
 
-/// One page-local channel declaration at the caller's ring depth.
+/// One text-only page-local channel declaration at the caller's ring depth.
 pub fn local(channel: &str, ring_depth: u64) -> LocalChannel {
     LocalChannel {
         channel: channel.to_string(),
         ring_depth,
+        non_text: false,
+    }
+}
+
+/// One page-local channel declaration at the caller's ring depth, declared
+/// `non_text`: its ring may carry bodies that are not UTF-8 text.
+pub fn local_non_text(channel: &str, ring_depth: u64) -> LocalChannel {
+    LocalChannel {
+        non_text: true,
+        ..local(channel, ring_depth)
     }
 }
 

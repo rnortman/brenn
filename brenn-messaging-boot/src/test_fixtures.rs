@@ -152,6 +152,7 @@ pub fn surface_io_port_raw(
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 
@@ -451,6 +452,7 @@ pub(super) fn surface_sub_raw(
         retain_depth: None,
         noise: None,
         wake_min: None,
+        non_text: false,
     }
 }
 

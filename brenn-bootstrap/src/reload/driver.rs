@@ -9811,12 +9811,12 @@ channel spill at "ephemeral:spill" {
     /// The words the bundled byte-carrying `panel` requires and is granted:
     /// the page's own two, and the two the bytes fixture imports. Its free
     /// `io` port is what `ports` reaches.
-    const BYTES_PANEL_WORDS: &str = "dom, page-dom, ports, calls";
+    pub(crate) const BYTES_PANEL_WORDS: &str = "dom, page-dom, ports, calls";
 
     /// Install a bundled `panel` whose component is `component`, with the
     /// record its build would write: the artifact's own import profile when it
     /// is a real component, none for placeholder bytes.
-    fn write_bundled_bytes_panel_kind(
+    pub(crate) fn write_bundled_bytes_panel_kind(
         tree: &Tree,
         kernel: &std::path::Path,
         bundle: &std::path::Path,
@@ -9951,6 +9951,114 @@ channel spill at "ephemeral:spill" {
             1 => Ok(()),
             n => Err(format!("the reload adds no notice, found {n} in all")),
         });
+    }
+
+    /// The one-surface document over the bundled byte-carrying `panel`: its
+    /// grants, and its free `io memo` port stating `non_text` or not.
+    pub(crate) fn bytes_panel_document(non_text: bool) -> String {
+        let tail = if non_text { " non_text = true;" } else { "" };
+        surface_document("deskbar", "panel", "Panel", "")
+            .replace(
+                "grants = [dom, page-dom];",
+                &format!("grants = [{BYTES_PANEL_WORDS}];"),
+            )
+            .replace(
+                "in feed <- deskbar_feed { push_depth = 2; }",
+                &format!(
+                    "in feed <- deskbar_feed {{ push_depth = 2; }}\n        \
+                     io memo {{ push_depth = 1; retain_depth = 2;{tail} }}"
+                ),
+            )
+    }
+
+    /// Boot the bundled `panel` as `component` (see
+    /// [`write_bundled_bytes_panel_kind`]) under [`bytes_panel_document`].
+    async fn boot_bytes_panel(
+        component: Option<&str>,
+        non_text: bool,
+    ) -> (Tree, tempfile::TempDir, tempfile::TempDir, Booted) {
+        let tree = Tree::new();
+        let kernel = tempfile::tempdir().expect("brenn's own surface tree");
+        let bundle = tempfile::tempdir().expect("a bundle surface tree");
+        write_bundled_bytes_panel_kind(&tree, kernel.path(), bundle.path(), component);
+        tree.write(&bytes_panel_document(non_text));
+        let booted = boot_with(
+            &tree,
+            BootFixture {
+                surface_assets: Some(kernel.path().to_path_buf()),
+                surface_bundle: Some(bundle.path().to_path_buf()),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        (tree, kernel, bundle, booted)
+    }
+
+    /// **A reload that would bind a string-contract instance to a `non_text`
+    /// channel is refused.** Both documents compile; only the kind's contract,
+    /// read off its record, says the second cannot be served. The running
+    /// bindings document is untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_binding_a_string_contract_instance_to_a_non_text_channel_is_refused() {
+        let (tree, _kernel, _bundle, mut booted) = boot_bytes_panel(None, false).await;
+        assert_eq!(
+            serving_roots(&booted).kind_contract("panel"),
+            Some(brenn_wasm::ProcessorContract::V0_1)
+        );
+        let before = newest_body(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the bindings document is retained");
+
+        tree.write(&bytes_panel_document(true));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        let refusal = &status.refusals[0];
+        assert!(
+            refusal.contains("component \"panel\"'s input port \"memo\"")
+                && refusal.contains("a page-local channel declared `non_text`")
+                && refusal.contains("brenn:processor@0.1.0")
+                && !refusal.contains("Refusing to start"),
+            "{refusal}"
+        );
+        assert_eq!(
+            newest_body(&booted.messenger, DESKBAR_BINDINGS).await,
+            Some(before),
+            "a refused reload leaves the served document in place"
+        );
+    }
+
+    /// **A page-local channel's declaration flips, each way, under a
+    /// byte-carrying kind.** Only the declaration moves, so the surface is
+    /// `changed`, its page is closed to come back, and the retained bindings
+    /// document carries the new flag.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_local_non_text_flip_changes_the_surface_each_way() {
+        let (tree, _kernel, _bundle, mut booted) =
+            boot_bytes_panel(Some("brenn_processor_bytes_test.wasm"), false).await;
+        for non_text in [true, false] {
+            let page = attach_a_session(&booted, "deskbar");
+            tree.write(&bytes_panel_document(non_text));
+            booted.driver.reload(TriggerSource::Signal).await;
+
+            let status = booted.last_status().await;
+            assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+            assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+            assert_eq!(
+                page.await.expect("the stand-in page task"),
+                brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            );
+            let body = newest_body(&booted.messenger, DESKBAR_BINDINGS)
+                .await
+                .expect("the bindings document is retained");
+            assert!(
+                body.contains(&format!("\"non_text\":{non_text}"))
+                    && !body.contains(&format!("\"non_text\":{}", !non_text)),
+                "{body}"
+            );
+        }
     }
 
     /// **A kind whose record goes stale under a running process is withheld,

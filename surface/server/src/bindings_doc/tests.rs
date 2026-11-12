@@ -53,6 +53,7 @@ fn bar() -> ResolvedSurface {
         ring_depth: reserved_local_channel(LOCAL_THEME_CHANNEL)
             .expect("the theme plane is reserved")
             .ring_depth,
+        non_text: false,
     });
     surface
 }
@@ -205,6 +206,45 @@ fn a_published_body_parses_back() {
     let docs = build_bindings_documents(std::slice::from_ref(&bar()), &params());
     let parsed = BindingsDocument::parse(&docs[0].1).expect("the builder writes readable bodies");
     assert_eq!(parsed, build_bindings_document(&bar(), &params()));
+}
+
+/// A page-local channel's `non_text` declaration reaches the page's router
+/// table, and moves the document's bytes when it flips.
+#[test]
+fn a_local_channels_non_text_declaration_reaches_the_document() {
+    let text = bar();
+    let mut declared = bar();
+    declared.outputs[0].channel_address = "local:bar/state".to_string();
+    declared.local_channels = vec![ResolvedLocalChannel {
+        address: "local:bar/state".to_string(),
+        ring_depth: 1,
+        non_text: true,
+    }];
+    let doc = build_bindings_document(&declared, &params());
+    assert_eq!(
+        doc.local_channels,
+        vec![LocalChannel {
+            channel: "local:bar/state".to_string(),
+            ring_depth: 1,
+            non_text: true,
+        }]
+    );
+    let mut flipped = declared.clone();
+    flipped.local_channels[0].non_text = false;
+    let flipped = build_bindings_documents(std::slice::from_ref(&flipped), &params());
+    let declared = build_bindings_documents(std::slice::from_ref(&declared), &params());
+    assert_ne!(declared[0].1, flipped[0].1);
+    assert!(!build_bindings_document(&text, &params()).local_channels[0].non_text);
+}
+
+/// The builder validates what it wrote, so a resolver that let `non_text` onto
+/// a reserved plane is caught on the server rather than in a page's reload loop.
+#[test]
+#[should_panic(expected = "which only an unreserved page-local channel may be")]
+fn build_panics_on_non_text_on_a_reserved_plane() {
+    let mut broken = bar();
+    broken.local_channels[0].non_text = true;
+    build_bindings_documents(std::slice::from_ref(&broken), &params());
 }
 
 /// A local binding whose router entry was lost is unresolvable wiring — the
