@@ -89,6 +89,46 @@ fn document_carries_every_resolved_section() {
     assert!(doc.validate().is_ok(), "the builder writes valid documents");
 }
 
+/// The wire table is copied from the resolved surface, entry for entry and in
+/// its order, declaration included; a page-local channel is not in it.
+#[test]
+fn document_carries_the_wire_channel_table() {
+    let mut surface = bar();
+    surface
+        .outputs
+        .push(brenn_lib::messaging::config::SurfaceOutput {
+            channel_address: "ephemeral:bar-frames".to_string(),
+            ..surface.outputs[0].clone()
+        });
+    surface.outputs.last_mut().expect("just pushed").port = "spare".to_string();
+    surface
+        .wire_channels
+        .push(brenn_lib::messaging::config::ResolvedWireChannel {
+            address: "ephemeral:bar-frames".to_string(),
+            non_text: true,
+        });
+    let doc = build_bindings_document(&surface, &params());
+    assert_eq!(
+        doc.wire_channels,
+        vec![
+            WireChannel {
+                channel: "brenn:bar-a".to_string(),
+                non_text: false,
+            },
+            WireChannel {
+                channel: "ephemeral:bar-frames".to_string(),
+                non_text: true,
+            },
+        ]
+    );
+    assert!(doc.validate().is_ok(), "the builder writes valid documents");
+    let body = doc.to_body();
+    assert!(
+        body.contains(r#"{"channel":"ephemeral:bar-frames","non_text":true}"#),
+        "{body}"
+    );
+}
+
 #[test]
 fn platform_section_names_derived_addresses_and_the_error_pair() {
     let doc = build_bindings_document(&bar(), &params());

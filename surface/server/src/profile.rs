@@ -19,7 +19,7 @@ use brenn_lib::messaging::{AttachScope, ComponentGrant, ParticipantId, Subscribe
 use brenn_messaging::MissingChannelPosture;
 
 use brenn_attach_server::profile::{
-    AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts,
+    AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts, TextOnlyPosture,
 };
 use brenn_attach_server::registry::SessionCaps;
 
@@ -298,6 +298,13 @@ impl AttachProfile for SurfaceProfile {
         // naming one the server cannot write is the server disagreeing with
         // itself.
         MissingChannelPosture::Invariant
+    }
+
+    fn text_only_posture(&self) -> TextOnlyPosture {
+        // A page refuses a non-text body itself for every channel its bindings
+        // document does not declare `non_text`, so one arriving here for a
+        // text-only channel came from no conforming page.
+        TextOnlyPosture::Violation
     }
 
     fn deferred_view_targets(&self) -> &[DeferredTarget] {

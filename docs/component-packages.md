@@ -179,15 +179,14 @@ What a 0.2.0 author relies on:
     `non_text` — a surface binding tail states `non_text = true` where its
     channel stays on the page (`docs/message-bus.md` §2.6) — published,
     parked, edited and read back byte for byte;
-  - typed text on any page-local (`local:`) channel, with its type; a
-    non-text body on a page-local channel not declared `non_text` is
-    `text-only-channel`;
+  - any body, text or not, with its type, on a port bound to a channel that
+    leaves the page and is declared `non_text`, over the page's wire (attach
+    v5): published, parked, edited and delivered byte for byte;
+  - typed text on any channel, page-local or not, with its type; a non-text
+    body on a channel not declared `non_text` is `text-only-channel`, and
+    nothing is buffered or sent;
   - any body, text or not, typed or not, in a sync call and its reply between
-    two 0.2.0 kinds;
-  - untyped text only on a port bound to a channel that leaves the page. A
-    typed text body there is refused with `invalid-body`, whose diagnostic
-    says the page's wire carries untyped text only; nothing is sent. A
-    non-text body is `text-only-channel`, as on any text-only channel.
+    two 0.2.0 kinds.
 
   The server holds a 0.2.0 kind's artifact to the shapes it serves before
   serving it, because the page's transpiled glue checks nothing against the
@@ -284,7 +283,7 @@ Another cut of this kind in force now: **`MessageEnvelope.body` is a
   its text, without its type. This is enforced at binding: a 0.1.0 component
   with any input or output port on a channel declared `non_text` is refused
   at boot and at reload — a consumer, and a served surface instance bound to
-  a page-local channel declared `non_text`. A kind reads it with `body.as_text()` or
+  any channel declared `non_text`, page-local or not. A kind reads it with `body.as_text()` or
   `envelope.text_body()?`, and compares a sentinel as
   `body.as_text() == Some("…")`.
 - `brenn_guest::MessageEnvelopeExt` gained `text_body(&self) -> Result<&str,

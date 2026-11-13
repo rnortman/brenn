@@ -53,6 +53,7 @@ fn subscription(instance: &str, port: &str, channel: &str, push: u64, retain: u6
 /// store.
 fn doc(subscriptions: Vec<Binding>) -> BindingsDocument {
     imply_vocabularies(BindingsDocument {
+        wire_channels: vec![],
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![component("p1"), component("p2"), component("chrome")],
         subscriptions,
@@ -497,6 +498,65 @@ fn reapplying_a_declaring_document_keeps_a_non_text_store() {
     let store = blob_store(&stores);
     assert_eq!(store.retained().count(), 1);
     assert_eq!(store.parked().count(), 1);
+}
+
+/// The standard wiring with `WIRE`, a transportable channel, declared
+/// `non_text` or not.
+fn applied_with_wire_declared(non_text: bool) -> AppliedBindings {
+    let mut doc = doc(standard());
+    for wire in &mut doc.wire_channels {
+        if wire.channel == WIRE {
+            wire.non_text = non_text;
+        }
+    }
+    AppliedBindings::apply(&doc.to_body()).expect("applies")
+}
+
+/// A transportable channel's store answers to its declaration by the same rule
+/// as a page-local one: kept while a document declares it `non_text`, dropped
+/// whole and recreated empty, its readers charged, when one stops.
+#[test]
+fn a_transportable_store_holding_non_text_is_kept_or_dropped_by_its_declaration() {
+    let declared = applied_with_wire_declared(true);
+    let mut stores = stores_for(&declared);
+    let mut subs = plane();
+    let mut regs = Registrations::new();
+    regs.register(
+        "p1",
+        ProcessorContract::V0_2,
+        Some(&declared),
+        &mut stores,
+        &mut subs,
+    );
+    let store = stores.get_mut(WIRE).expect("wire store");
+    store.insert(bytes_env(WIRE, &[0xff, 0x00]));
+    store.insert(env(WIRE, "text beside it"));
+
+    let report = reconcile_stores(&applied_with_wire_declared(true), &mut stores);
+    assert!(report.lost_schedules.is_empty() && report.retired.is_empty());
+    assert_eq!(
+        stores.get(WIRE).expect("wire store").retained().count(),
+        2,
+        "a document that still declares the channel keeps the store"
+    );
+
+    let text_only = applied_with_wire_declared(false);
+    let report = reconcile_stores(&text_only, &mut stores);
+    regs.reconcile(&text_only, &mut stores, &mut subs);
+    let (channel, overflow) = report
+        .retired
+        .first()
+        .expect("the reader still bound to the channel is charged");
+    assert_eq!(channel, WIRE);
+    assert!(
+        overflow
+            .iter()
+            .any(|o| o.subscriber == BindingKey::new("p1", "in") && o.evicted == 2),
+        "{overflow:?}"
+    );
+    let store = stores.get(WIRE).expect("the channel is still bound");
+    assert_eq!(store.retained().count(), 0, "dropped whole, text included");
+    assert_eq!(store.depth(), 9, "recreated at the document's depth");
 }
 
 #[test]

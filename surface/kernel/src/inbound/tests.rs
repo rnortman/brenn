@@ -253,6 +253,7 @@ fn a_config_pass_applies_every_document_it_carried_in_order() {
         document
             .subscriptions
             .push(fixtures::subscription("p1", "in2", WIRE_TWO, 4, 2));
+        document.wire_channels.push(fixtures::wire(WIRE_TWO));
         document.to_body()
     };
 
@@ -546,6 +547,96 @@ fn an_arrival_that_outruns_a_fatal_bindings_position_asks_for_the_kill() {
     assert_eq!(page.schedules.metered_drops("p1", "in"), 1);
 }
 
+fn non_text_body(bytes: &[u8]) -> brenn_envelope::MessageBody {
+    brenn_envelope::MessageBody::from_parts(Some("image/png"), bytes)
+        .expect("a well-formed non-text body")
+}
+
+/// A pass whose rows carry the caller's bodies, at consecutive seqs from 1.
+fn deliver_bodies(channel: &str, bodies: Vec<brenn_envelope::MessageBody>) -> ServerFrame {
+    ServerFrame::Deliver {
+        channel: channel.to_string(),
+        rows: bodies
+            .into_iter()
+            .enumerate()
+            .map(|(i, body)| {
+                let seq = i as u64 + 1;
+                DeliverRow {
+                    envelope: MessageEnvelope {
+                        message_id: Uuid::from_u128(0x5eed_0000 + u128::from(seq)),
+                        body,
+                        ..env(channel, "")
+                    },
+                    seq,
+                    cursor: cursor(&format!("c{seq}")),
+                    dropped: 0,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// [`configured`], under a document that declares `WIRE` `non_text`.
+fn configured_non_text() -> SurfacePage {
+    let mut document = doc(W::default());
+    for wire in &mut document.wire_channels {
+        if wire.channel == WIRE {
+            wire.non_text = true;
+        }
+    }
+    let mut page = attached();
+    let configured = only_configured(route(&mut page, deliver(CONFIG, &document.to_body(), 1, 0)));
+    for frame in &configured.frames {
+        if let ClientFrame::Subscribe { channel, .. } = frame {
+            route(&mut page, subscribe_result(channel, 0, None));
+        }
+    }
+    page
+}
+
+/// A transportable channel the document declares `non_text` stores a non-text
+/// row as it arrived, bytes and content type both.
+#[test]
+fn a_non_text_row_on_a_declared_wire_channel_is_stored() {
+    let mut page = configured_non_text();
+    let bytes = [0x89, b'P', b'N', b'G', 0xff, 0x00];
+    let inbound = route(
+        &mut page,
+        deliver_bodies(WIRE, vec![non_text_body(&bytes), "m1".into()]),
+    );
+    assert_eq!(inbound, Inbound::default());
+    let window = serve(&mut page, W::default());
+    assert_eq!(window.envelopes.len(), 2);
+    assert_eq!(window.envelopes[0].body.as_bytes(), bytes);
+    assert_eq!(window.envelopes[0].body.content_type(), Some("image/png"));
+    assert_eq!(window.envelopes[1].body.as_text(), Some("m1"));
+}
+
+/// The server builds the document and its directory from one plan, so a
+/// non-text row on a channel the document declares text-only is a broken peer:
+/// fatal, and no row of the pass — not even the text rows ahead of it — reaches
+/// the store.
+#[test]
+fn a_non_text_row_on_a_text_only_wire_channel_is_fatal_and_stores_nothing() {
+    let mut page = configured(W::default());
+    let err = on_server_frame(
+        &mut page,
+        deliver_bodies(WIRE, vec!["m0".into(), non_text_body(&[0xff])]),
+        NOW,
+    )
+    .expect_err("the peer's own wiring declares the channel text-only");
+    assert!(err.contains(WIRE), "{err}");
+    assert!(err.contains("text-only"), "{err}");
+    assert_eq!(
+        page.stores
+            .get(WIRE)
+            .expect("the document names the channel")
+            .retained()
+            .count(),
+        0
+    );
+}
+
 #[test]
 fn a_delivery_on_a_channel_never_active_is_fatal() {
     let mut page = configured(W::default());
@@ -676,6 +767,7 @@ fn a_config_pass_stops_at_its_first_unusable_document() {
         document
             .subscriptions
             .push(fixtures::subscription("p1", "in2", WIRE_TWO, 4, 2));
+        document.wire_channels.push(fixtures::wire(WIRE_TWO));
         document.to_body()
     };
 
@@ -840,7 +932,7 @@ fn a_batch_result_for_a_correlation_nothing_sent_is_fatal() {
 }
 
 #[test]
-fn a_text_only_refusal_of_a_flush_is_fatal_at_v4() {
+fn a_text_only_refusal_of_a_flush_is_fatal_on_the_surface_route() {
     let mut page = configured(W::default());
     let correlation = batch_correlation(&queue_flush(&mut page, 1));
     let err = on_server_frame(
@@ -851,7 +943,7 @@ fn a_text_only_refusal_of_a_flush_is_fatal_at_v4() {
         },
         NOW,
     )
-    .expect_err("a v4 attachment cannot earn the refusal");
+    .expect_err("the surface route never sends the refusal");
     assert!(err.contains("TextOnlyChannel"), "{err}");
     assert!(err.contains(&correlation.to_string()), "{err}");
 }

@@ -165,8 +165,11 @@ pub enum FrameOutcome {
 /// not counted here.
 #[derive(Default)]
 pub struct SessionCounters {
-    /// Inbound text (application) frames dispatched. Binary-frame and
-    /// cap-overflow violations tear down before this counts them.
+    /// Inbound websocket messages read, text or binary, counted before the
+    /// session version's frame cap or its decoder is applied: a message refused
+    /// as over that cap or as undecodable is counted, then tears the session
+    /// down. A message over the websocket read cap arrives as a read error and
+    /// is not counted.
     pub frames_in: u64,
     /// Server frames the session task enqueued to the writer.
     pub frames_out: u64,

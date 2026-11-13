@@ -73,7 +73,7 @@ pub enum Event {
     /// Carries the parsed wiring rather than a frame's payload — the wiring is
     /// retained bus state now.
     Connected {
-        bindings: BindingsDocument,
+        bindings: Box<BindingsDocument>,
         /// This attachment's principal, `surface:<slug>`.
         participant_id: String,
         /// The peer-minted id of this attachment, which the surface's own
@@ -736,7 +736,7 @@ fn connected(page: &SurfacePage) -> Event {
         .bindings()
         .expect("surface client: a configured page has a document in force");
     Event::Connected {
-        bindings: bindings.document().clone(),
+        bindings: Box::new(bindings.document().clone()),
         participant_id: facts.participant_id.clone(),
         session_id: facts.session_id.clone(),
         max_body_bytes: facts.max_body_bytes,

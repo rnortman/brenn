@@ -2,7 +2,7 @@ use brenn_lib::access::AppPolicy;
 use brenn_lib::messaging::Urgency;
 use brenn_lib::messaging::config::{
     NoiseLevel, ResolvedComponent, ResolvedSubscription, ResolvedSurface,
-    ResolvedSurfaceSubscription, SurfaceBinding, SurfaceOutput,
+    ResolvedSurfaceSubscription, ResolvedWireChannel, SurfaceBinding, SurfaceOutput,
 };
 
 /// The `[surface_description]` parameters a runtime fixture carries. Taken from
@@ -45,6 +45,7 @@ impl SurfaceFixture {
                 subscriptions: vec![],
                 wire_subscriptions: vec![],
                 local_channels: vec![],
+                wire_channels: vec![],
                 outputs: vec![],
                 calls: vec![],
                 policy: AppPolicy::default(),
@@ -177,8 +178,8 @@ impl SurfaceFixture {
         self
     }
 
-    /// Finish building, deriving any missing wire subscriptions
-    /// ([`derive_wire_subscriptions`]).
+    /// Finish building, deriving any missing wire subscriptions and wire
+    /// channel entries ([`derive_wire_subscriptions`]).
     pub fn build(mut self) -> ResolvedSurface {
         derive_wire_subscriptions(&mut self.inner);
         self.inner
@@ -197,6 +198,9 @@ impl SurfaceFixture {
 /// panics: a stated pair boot could not have produced would pin a replay clamp
 /// no config can reach, and the behavior under it would be untestable fiction.
 /// Every rig that installs surfaces onto an `AppState` runs this.
+///
+/// It also completes the wire channel table ([`derive_wire_channels`]), the
+/// other per-channel half boot resolves beside the bindings.
 ///
 /// A derived subscription's `channel_uuid` is left [`uuid::Uuid::nil`]: the
 /// bindings name addresses, and only the channel entry set knows which uuid an
@@ -268,6 +272,33 @@ pub fn derive_wire_subscriptions(surface: &mut ResolvedSurface) {
                         wake_min: brenn_lib::messaging::WakeMin::Normal,
                     },
                 }),
+        }
+    }
+    derive_wire_channels(surface);
+}
+
+/// Give every transportable channel a binding names that lacks one a wire
+/// channel entry, text-only, appended in first-binding order (subscriptions,
+/// then outputs) — the order boot resolves the table in.
+///
+/// Boot reads each entry's `non_text` off the channel directory; a fixture has
+/// none, so a fixture whose subject is a `non_text` channel states that entry
+/// itself and this leaves it as stated. An entry naming a channel no binding
+/// names is left too: the bindings document's `validate` is what refuses it.
+pub fn derive_wire_channels(surface: &mut ResolvedSurface) {
+    let bound: Vec<String> = surface
+        .subscriptions
+        .iter()
+        .map(|b| b.channel_address.clone())
+        .chain(surface.outputs.iter().map(|b| b.channel_address.clone()))
+        .filter(|c| brenn_surface_schema::wire_bound_address(c))
+        .collect();
+    for address in bound {
+        if !surface.wire_channels.iter().any(|w| w.address == address) {
+            surface.wire_channels.push(ResolvedWireChannel {
+                address,
+                non_text: false,
+            });
         }
     }
 }

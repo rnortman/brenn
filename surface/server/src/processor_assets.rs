@@ -607,14 +607,21 @@ pub fn assert_imports_granted(
 }
 
 /// Refuse an instance whose kind's contract carries only text when any port it
-/// binds, input or output, is on a page-local channel declared `non_text`.
+/// binds, input or output, is on a channel declared `non_text` — page-local or
+/// transportable.
 ///
 /// The backend's rule for a consumer, asked of a surface instance. Outputs
 /// count as well as inputs: an instance reads its own parked messages back
-/// through its deferred view, so a 0.1.0 build bound to an output another
-/// binding declared `non_text` could be handed a non-text body as a string —
-/// and the page kernel's lowering panics on that. `call` and `sync` ports are
-/// bound to no channel and are not examined.
+/// through its deferred view, so a 0.1.0 build bound to an output on a
+/// `non_text` channel could be handed a non-text body as a string — and the
+/// page kernel's lowering panics on that. `call` and `sync` ports are bound to
+/// no channel and are not examined.
+///
+/// The declaration is read off the resolved surface: `local_channels` for a
+/// page-local channel, `wire_channels` (the directory's) for a transportable
+/// one. The fix the message names depends on the class: a page-local
+/// channel's declaration is the ports' statement, a transportable one's is the
+/// channel's own.
 ///
 /// Asked after the kind's record is read, because the contract is a fact of
 /// the artifact and the configuration does not state it; the caller skips an
@@ -635,11 +642,30 @@ pub fn assert_contract_carries_bound_channels(
         return;
     }
     let AssetContext { when, verdict } = cx;
-    let non_text = |channel: &str| {
-        surface
+    // The class of channel a `non_text` declaration sits in, as the refusal
+    // names it, and the fix it offers.
+    let declared_class = |channel: &str| {
+        if surface
             .local_channels
             .iter()
             .any(|c| c.non_text && c.address == channel)
+        {
+            Some((
+                "a page-local channel declared `non_text`",
+                "drop `non_text` from the ports bound to that channel",
+            ))
+        } else if surface
+            .wire_channels
+            .iter()
+            .any(|c| c.non_text && c.address == channel)
+        {
+            Some((
+                "a channel declared `non_text`",
+                "bind the port to a text-only channel",
+            ))
+        } else {
+            None
+        }
     };
     let inputs = surface
         .subscriptions
@@ -651,18 +677,17 @@ pub fn assert_contract_carries_bound_channels(
         .iter()
         .filter(|b| b.instance == instance)
         .map(|b| ("output", &b.port, &b.channel_address));
-    if let Some((direction, port, channel)) = inputs
-        .chain(outputs)
-        .find(|(_, _, channel)| non_text(channel))
-    {
-        panic!(
-            "{when}: [[surface]] {:?}: component {instance:?}'s {direction} port {port:?} is \
-             bound to {channel}, a page-local channel declared `non_text`, and its kind {kind:?} \
-             is built against {contract}, which carries only text — drop `non_text` from the \
-             ports bound to that channel, or install a build of the kind against {}.{verdict}",
-            surface.slug,
-            brenn_envelope::grants::ProcessorContract::V0_2,
-        );
+    for (direction, port, channel) in inputs.chain(outputs) {
+        if let Some((class, fix)) = declared_class(channel) {
+            panic!(
+                "{when}: [[surface]] {:?}: component {instance:?}'s {direction} port {port:?} is \
+                 bound to {channel}, {class}, and its kind {kind:?} is built against \
+                 {contract}, which carries only text — {fix}, or install a build of the kind \
+                 against {}.{verdict}",
+                surface.slug,
+                brenn_envelope::grants::ProcessorContract::V0_2,
+            );
+        }
     }
 }
 

@@ -979,7 +979,7 @@ mod tests {
 
         let core = Rc::new(RefCell::new(KernelCore::new()));
         core.borrow_mut().on_event(&SessionEvent::Connected {
-            bindings: doc.clone(),
+            bindings: Box::new(doc.clone()),
             participant_id: pages::PRINCIPAL.to_string(),
             session_id: pages::SESSION_ID.to_string(),
             max_body_bytes: pages::BODY_CAP,

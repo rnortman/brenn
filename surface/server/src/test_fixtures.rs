@@ -181,6 +181,14 @@ pub fn surface_outputting_to(channel_address: &str) -> ResolvedSurface {
         subscriptions: vec![],
         wire_subscriptions: vec![],
         local_channels: vec![],
+        wire_channels: if brenn_envelope::is_local_channel(channel_address) {
+            vec![]
+        } else {
+            vec![brenn_lib::messaging::config::ResolvedWireChannel {
+                address: channel_address.to_string(),
+                non_text: false,
+            }]
+        },
         outputs: vec![SurfaceOutput {
             channel_address: channel_address.to_string(),
             instance: "writer".to_string(),

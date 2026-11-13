@@ -659,27 +659,17 @@ pub(super) fn decode_server(msg: WireMessage) -> Result<ServerFrame, DecodeError
     }
 }
 
-/// Every variable-length string the two lists carry: each operation's channel
-/// address plus each body it publishes or writes, as raw bytes.
+/// What one operation's channel and optional body charge: the channel address
+/// plus the body it publishes or writes, as raw bytes.
+pub(super) fn op_charge(channel: &str, body: Option<&MessageBody>) -> usize {
+    channel.len() + body.map_or(0, MessageBody::len)
+}
+
 pub(super) fn batch_charged_bytes(
     publishes: &[BatchEntry],
     deferred_ops: &[BatchDeferredOp],
 ) -> usize {
-    let entries: usize = publishes
-        .iter()
-        .map(|entry| entry.channel.len() + entry.body.len())
-        .sum();
-    let ops: usize = deferred_ops
-        .iter()
-        .map(|op| {
-            op.channel.len()
-                + match &op.op {
-                    DeferredOpKind::Cancel => 0,
-                    DeferredOpKind::Edit { body, .. } => body.as_ref().map_or(0, MessageBody::len),
-                }
-        })
-        .sum();
-    entries + ops
+    super::sum_op_charges(publishes, deferred_ops, op_charge)
 }
 
 /// The escaped charged budget, plus a fixed allowance per batch operation for

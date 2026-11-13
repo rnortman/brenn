@@ -2335,8 +2335,9 @@ channel panel_bindings at "ephemeral:surface.surface.panel.bindings" {
         assert!(
             message.contains(
                 "surface config channel \"ephemeral:surface.surface.panel.bindings\" is \
-                 declared `non_text` — every surface replays it on attach, over attach v4, \
-                 which carries text only. Remove `non_text` from its declaration."
+                 declared `non_text` — a page reads its bindings document as text, so the \
+                 declaration would admit only bodies no page can apply. Remove `non_text` from \
+                 its declaration."
             ),
             "{message}"
         );
@@ -2375,13 +2376,41 @@ channel panel_bindings at "ephemeral:surface.surface.panel.bindings" {
         ));
     }
 
+    /// A described document the offline check accepts, against the shipped
+    /// module root.
+    fn described_gate_accepts(contents: &str) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let file = dir.path().join("main.brenn");
+        std::fs::write(&file, contents).expect("the document is writable");
+        let roots: RootList = vec![repo_root().join("config/specs")].into();
+        let config = check_config(&DocumentInputs::deployment(file.clone(), roots.clone()))
+            .unwrap_or_else(|report| panic!("the front end must accept this document: {report}"))
+            .config;
+        if let Err(message) = offline_messaging_outcome(&config, &[]) {
+            panic!("the planner refused the document: {message}");
+        }
+        assert!(run_config_check(&file, &Roots::modules(roots, Vec::new())));
+    }
+
     /// A surface port stating `non_text` on a link to another surface is
-    /// refused offline: the link's channel is `ephemeral:`, which leaves the
-    /// page, and only the planner knows where a link is placed.
+    /// accepted offline: the statement is the link channel's declaration, by
+    /// the fold.
     #[test]
-    fn a_surface_port_stating_non_text_on_a_spanning_link_is_refused() {
-        let message = boot_gate_refusal(&format!(
-            r#"{preamble}
+    fn a_surface_port_stating_non_text_on_a_spanning_link_is_accepted() {
+        described_gate_accepts(&format!(
+            r#"use @surface-description::*;
+
+surface_description {{
+    prefix = "surface";
+    status_interval_secs = 60;
+}}
+new commons: SurfaceCommons;
+new left_desc: SurfaceDescription(slug = "left");
+new right_desc: SurfaceDescription(slug = "right");
+new talker_desc: KindDescription(kind = "talker");
+new listener_desc: KindDescription(kind = "listener");
+new shell_desc: KindDescription(kind = "shell");
+{preamble}
 component Talker {{
     {talker}
     out said;
@@ -2414,31 +2443,46 @@ surface right {{
             talker = processor_header("ports"),
             listener = processor_header(""),
         ));
-        assert!(
-            message.contains("port \"said\" states `non_text`, but its channel \"ephemeral:"),
-            "{message}"
-        );
-        assert!(message.contains("leaves the page"), "{message}");
     }
 
-    /// A surface bound to a `non_text` channel is refused by the planner,
+    /// A surface bound to a `non_text` channel is accepted by the planner,
     /// offline.
     #[test]
-    fn a_surface_bound_to_a_non_text_channel_is_refused() {
-        let message = boot_gate_refusal(&format!(
-            r#"{preamble}
-channel frames at "brenn:alice.frames" {{
+    fn a_surface_bound_to_a_non_text_channel_is_accepted() {
+        let document = described_root(
+            r#"
+channel frames at "brenn:alice.frames" {
     push_depth = 8;
     retain_depth = 64;
     standing_retain_depth = 64;
     non_text = true;
-}}
+}
+"#,
+            &format!(
+                "new commons: SurfaceCommons;\n\
+                 new panel_desc: SurfaceDescription(slug = \"panel\");\n{KIND_STAMPS}"
+            ),
+        )
+        .replacen(
+            "        in messages <- feed { push_depth = 4; }\n",
+            "        in messages <- frames { push_depth = 4; }\n",
+            1,
+        );
+        assert!(document.contains("<- frames"), "{document}");
+        described_gate_accepts(&document);
+    }
 
+    /// A surface port stating `non_text` on a channel declared text-only is
+    /// refused by the planner, offline.
+    #[test]
+    fn a_surface_port_stating_non_text_on_a_text_only_channel_is_refused() {
+        let message = boot_gate_refusal(&format!(
+            r#"{preamble}
 surface panel {{
     grants = [subscribe];
     new w: Widget {{
         grants = [log];
-        in messages <- frames {{ push_depth = 4; }}
+        in messages <- feed {{ push_depth = 4; non_text = true; }}
     }}
 {CHROME}}}
 "#,
@@ -2446,8 +2490,9 @@ surface panel {{
         ));
         assert!(
             message.contains(
-                "channel \"brenn:alice.frames\" is declared `non_text`, and a surface port may \
-                 be bound to a `non_text` channel only where the channel is page-local"
+                "port \"messages\" states `non_text`, but its channel \"brenn:alice.feed\" is \
+                 declared text-only — declare the channel `non_text`, or drop `non_text` from \
+                 the port"
             ),
             "{message}"
         );

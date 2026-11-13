@@ -153,6 +153,15 @@ pub struct LocalChannel {
     pub non_text: bool,
 }
 
+/// One transportable channel a binding names, and whether it may carry bodies
+/// that are not UTF-8 text: the directory's declaration of the channel, which
+/// the page has no other way to learn. No serde default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireChannel {
+    pub channel: String,
+    pub non_text: bool,
+}
+
 /// One declared component instance: its routing `instance` id and the component
 /// `kind` that backs it. Several instances may share a kind — one compiled
 /// module, N instantiations.
@@ -359,6 +368,12 @@ pub fn surface_bindable_address(channel: &str) -> bool {
     ChannelScheme::of(channel).is_some_and(surface_bindable)
 }
 
+/// Whether a binding naming `channel` gives it an entry in the bindings
+/// document's wire table: a surface-bindable address that leaves the page.
+pub fn wire_bound_address(channel: &str) -> bool {
+    surface_bindable_address(channel) && !brenn_envelope::is_local_channel(channel)
+}
+
 // ---------------------------------------------------------------------------
 // Reserved `local:` control channels
 // ---------------------------------------------------------------------------
@@ -477,7 +492,7 @@ pub const CONTROL_PLANE_VERSION: u8 = 1;
 /// serves. A plain number, so this crate takes no dependency on the protocol
 /// crate; the page offers exactly this version and the route serves exactly
 /// this version, so the two move together.
-pub const SURFACE_ATTACH_VERSION: u32 = 4;
+pub const SURFACE_ATTACH_VERSION: u32 = 5;
 
 /// The link state the kernel reports on [`LOCAL_LINK_STATE_CHANNEL`].
 ///

@@ -31,13 +31,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use brenn_attach_client::subs::SubscriptionDepths;
-use brenn_attach_proto::Codec;
 use brenn_envelope::grants::ComponentGrant;
 use brenn_envelope::{MessageBody, channel_capabilities};
 use brenn_surface_schema::bindings::{BindingsDocument, BindingsError, PlatformSection};
 use brenn_surface_schema::{
     Binding, CallBinding, ComponentEntry, LocalChannel, OutputBinding, RESERVED_LOCAL_CHANNELS,
-    SURFACE_ATTACH_VERSION, surface_bindable_address,
+    surface_bindable_address,
 };
 
 use crate::logic::GrantSet;
@@ -62,47 +61,16 @@ pub(crate) fn channel_is_transportable(channel: &str) -> bool {
         .transportable
 }
 
-/// Why a well-formed body may not be published onto a channel from the page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CarriageRefusal {
-    /// The body is not text, and the channel is not a page-local channel the
-    /// bindings document declares `non_text`.
-    TextOnlyChannel,
-    /// The channel leaves the page, and the attach version the page speaks
-    /// carries only untyped text.
-    WireCarriesUntypedTextOnly,
-}
-
-/// Whether `channel` may carry `body` when published from the page: `None` if
-/// it may, else why not.
+/// Whether a channel declared `declared_non_text` may carry `body`.
 ///
 /// The one rule every publish and edit body from a component passes before it
-/// is buffered, so no body reaches a store or the wire encoder that either
-/// cannot hold. `carries_non_text` is the channel's declaration in the wiring
-/// in force ([`AppliedBindings::carries_non_text`]).
-///
-/// A non-text body is admitted only on a page-local channel declared to carry
-/// one. Transportability is tested here rather than trusted to the declaration,
-/// so no document can put a non-text body in front of the attach v4 encoder.
-pub(crate) fn carriage_refusal(
-    channel: &str,
-    carries_non_text: bool,
-    body: &MessageBody,
-) -> Option<CarriageRefusal> {
-    if !body.is_text() {
-        if carries_non_text && !channel_is_transportable(channel) {
-            return None;
-        }
-        return Some(CarriageRefusal::TextOnlyChannel);
-    }
-    // Under attach v4 this refuses exactly a typed text body. At v5 the codec
-    // carries every body and this arm stops firing; it is then to be deleted
-    // with `PublishError::InvalidBody`'s second meaning.
-    if channel_is_transportable(channel) && !Codec::negotiated(SURFACE_ATTACH_VERSION).carries(body)
-    {
-        return Some(CarriageRefusal::WireCarriesUntypedTextOnly);
-    }
-    None
+/// is buffered, and every delivered row before it is stored, so no store and
+/// no flush holds a body its channel's declaration does not admit.
+/// `declared_non_text` is the channel's declaration in the wiring in force
+/// ([`AppliedBindings::carries_non_text`]), for either class of channel: the
+/// page's wire carries every body, so the declaration is the whole rule.
+pub(crate) fn channel_carries(declared_non_text: bool, body: &MessageBody) -> bool {
+    body.is_text() || declared_non_text
 }
 
 /// One surface's wiring, ready to run on.
@@ -133,7 +101,7 @@ pub struct AppliedBindings {
     wire_depths: BTreeMap<String, SubscriptionDepths>,
     /// Channel → the depth its page-side store is sized to, both classes.
     store_depths: BTreeMap<String, u64>,
-    /// The page-local channels the document declares `non_text`.
+    /// The channels the document declares `non_text`, both classes.
     non_text_channels: BTreeSet<String>,
     /// Instance id → the port names its component kind declares it may publish
     /// to. Shared rather than copied because every activation of the instance
@@ -239,6 +207,14 @@ impl AppliedBindings {
             *depth = (*depth).max(lc.ring_depth);
             if lc.non_text {
                 non_text_channels.insert(lc.channel.clone());
+            }
+        }
+        // A transportable channel's declaration is the directory's, carried in
+        // the wire table; the document's validation has proved the table names
+        // exactly the transportable channels the bindings do.
+        for wc in &doc.wire_channels {
+            if wc.non_text {
+                non_text_channels.insert(wc.channel.clone());
             }
         }
 
@@ -371,8 +347,9 @@ impl AppliedBindings {
         &self.doc.local_channels
     }
 
-    /// Whether the document declares `channel` a page-local channel that may
-    /// carry non-text bodies. `false` for every other channel, declared or not.
+    /// Whether the document declares `channel` — page-local or transportable —
+    /// a channel that may carry non-text bodies. `false` for every other
+    /// channel, declared or not.
     pub fn carries_non_text(&self, channel: &str) -> bool {
         self.non_text_channels.contains(channel)
     }

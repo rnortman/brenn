@@ -3,12 +3,15 @@
 // `processor-page-test`, differing from it only where the contracts do.
 //
 // Every activation that returns ok publishes one JSON report on `report`, as
-// untyped text: the page's wire carries untyped text only, and the rig binds
-// `report` to a wire channel, so a typed report would be refused.
+// untyped text, which the rig parses as the twin's report.
 //
-//   windows   each port window other than `in` and `state`: its port, new_from,
-//             dropped, and each envelope as its header (parsed), content type
-//             and bytes in hex
+//   windows   each port window other than `in`, `state` and `stream`: its port,
+//             new_from, dropped, and each envelope as its header (parsed),
+//             content type and bytes in hex
+//   streams   the `stream` window, when the instance has one: its port,
+//             new_from, dropped, its envelope count, their total length and the
+//             FNV-1a 64 of their bytes in order, in hex — never the bytes, so
+//             a measured delivery's report stays small
 //   deferred  each deferred window: its port, and each entry's index, content
 //             type, bytes in hex and deliver_after
 //   results   one word per command run
@@ -75,6 +78,8 @@ struct PageBytesTest;
 const COMMAND_PORT: &str = "in";
 /// The io port the state workload reads and writes.
 const STATE_PORT: &str = "state";
+/// The input port reported by checksum rather than by bytes.
+const STREAM_PORT: &str = "stream";
 /// The output port the report is published on.
 const REPORT_PORT: &str = "report";
 /// The content type the state workload publishes under.
@@ -85,6 +90,7 @@ const COUNTER_BYTES: usize = 4;
 impl Guest for PageBytesTest {
     fn receive(a: Activation) -> Result<Option<Body>, ReceiveError> {
         let mut windows = Vec::new();
+        let mut streams = Vec::new();
         let mut commands: Vec<String> = Vec::new();
         let mut reply: Option<Body> = None;
         let mut state_window: Option<&Body> = None;
@@ -98,6 +104,23 @@ impl Guest for PageBytesTest {
             }
             if w.port == STATE_PORT {
                 state_window = w.envelopes.last().map(|e| &e.body);
+                continue;
+            }
+            if w.port == STREAM_PORT {
+                let mut hash = FNV_OFFSET;
+                let mut len = 0;
+                for e in &w.envelopes {
+                    hash = fnv1a64_from(hash, &e.body.bytes);
+                    len += e.body.bytes.len();
+                }
+                streams.push(json!({
+                    "port": w.port,
+                    "new_from": w.new_from,
+                    "dropped": w.dropped,
+                    "count": w.envelopes.len(),
+                    "len": len,
+                    "fnv1a": format!("{hash:016x}"),
+                }));
                 continue;
             }
             if is_sync {
@@ -155,6 +178,7 @@ impl Guest for PageBytesTest {
 
         let report = json!({
             "windows": windows,
+            "streams": streams,
             "deferred": deferred,
             "results": results,
             "sync": a.sync,
@@ -351,8 +375,15 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// FNV-1a 64's offset basis.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    fnv1a64_from(FNV_OFFSET, bytes)
+}
+
+/// FNV-1a 64 continued from `hash` over `bytes`.
+fn fnv1a64_from(mut hash: u64, bytes: &[u8]) -> u64 {
     for b in bytes {
         hash ^= u64::from(*b);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);

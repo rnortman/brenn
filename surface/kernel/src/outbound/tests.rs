@@ -54,6 +54,7 @@ fn output(instance: &str, port: &str, channel: &str, urgency: Urgency) -> Output
 /// single-flush outbox, which is what makes an overflow reachable in one step.
 fn doc(outputs: Vec<OutputBinding>, error: Option<(&str, LogLevel)>) -> BindingsDocument {
     imply_vocabularies(BindingsDocument {
+        wire_channels: vec![],
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![
             component("p1", 2),
@@ -297,10 +298,10 @@ fn every_wire_outcome_maps_to_a_caller_status() {
     }
 }
 
-/// The page attaches at v4, which cannot carry the body this refusal answers,
-/// whoever the publish was for.
+/// The surface route answers a non-text body on a text-only channel with a
+/// close, never with this outcome, whoever the publish was for.
 #[test]
-fn a_text_only_refusal_is_unreconcilable_at_v4() {
+fn a_text_only_refusal_is_unreconcilable_on_the_surface_route() {
     let bindings = wiring();
     let mut outbound = SurfaceOutbound::new();
     publish(&mut outbound, &bindings, "p1", "out", "a", 5);
@@ -319,7 +320,7 @@ fn a_text_only_refusal_is_unreconcilable_at_v4() {
     for correlation in [0, 1, 2] {
         let err = outbound
             .on_publish_result(Some(correlation), PublishOutcome::TextOnlyChannel)
-            .expect_err("a v4 attachment cannot earn the refusal");
+            .expect_err("the surface route never sends the refusal");
         assert!(err.contains("TextOnlyChannel"), "{err}");
     }
 }
@@ -1011,6 +1012,108 @@ fn a_flushs_control_ops_are_re_checked_like_its_entries() {
         let steps = outbound.on_attached(&bindings, &facts(4), NOW);
         assert_eq!(steps.dropped, vec!["p1".to_string()]);
     }
+}
+
+/// The standard wiring with `OUT` declared `non_text`.
+fn declaring_out_non_text() -> AppliedBindings {
+    let mut declared = doc(standard_outputs(), Some((ERRORS, LogLevel::Warn)));
+    for wire in &mut declared.wire_channels {
+        if wire.channel == OUT {
+            wire.non_text = true;
+        }
+    }
+    AppliedBindings::apply(&declared.to_body()).expect("the declared fixture document applies")
+}
+
+fn non_text_body(bytes: &[u8]) -> MessageBody {
+    MessageBody::from_parts(Some("application/octet-stream"), bytes)
+        .expect("a well-formed non-text body")
+}
+
+/// A flush carrying non-text bodies to `OUT`, composed while `OUT` was declared
+/// `non_text`: an entry, and an edit that changes a parked body.
+fn non_text_flush() -> FlushBatch {
+    FlushBatch {
+        entries: vec![BatchEntry {
+            body: non_text_body(&[0xff, 0x00, 0xfe]),
+            ..entry(OUT, "")
+        }],
+        ops: vec![op(
+            OUT,
+            1,
+            DeferredOpKind::Edit {
+                body: Some(non_text_body(&[0x80, 0x81])),
+                deliver_after: None,
+            },
+        )],
+    }
+}
+
+/// A flush queued while its channel was declared `non_text` goes out at an
+/// attachment whose wiring still declares it so, non-text bodies and all.
+#[test]
+fn a_queued_non_text_flush_survives_a_wiring_that_still_declares_its_channel() {
+    let declared = declaring_out_non_text();
+    let mut outbound = SurfaceOutbound::new();
+    outbound.register("p1", &declared);
+    let queued = outbound.flush(&declared, None, "p1", non_text_flush(), NOW);
+    assert!(queued.frames.is_empty() && queued.dropped.is_empty());
+
+    let steps = outbound.on_attached(&declared, &facts(1_024), NOW);
+    assert!(steps.dropped.is_empty(), "{steps:?}");
+    match &steps.frames[..] {
+        [
+            ClientFrame::PublishBatch {
+                publishes,
+                deferred_ops,
+                ..
+            },
+        ] => {
+            assert_eq!(publishes, &non_text_flush().entries);
+            assert_eq!(deferred_ops, &non_text_flush().ops);
+        }
+        other => panic!("expected one PublishBatch frame, got {other:?}"),
+    }
+}
+
+/// The peer answers a non-text body on a text-only channel with a protocol
+/// close, so a flush queued under a wiring that declared its channel `non_text`
+/// and offered under one that does not is dropped whole — by an entry's body or
+/// by an edit's alone.
+#[test]
+fn a_queued_non_text_flush_is_dropped_when_its_channel_becomes_text_only() {
+    let declared = declaring_out_non_text();
+    let text_only = wiring();
+    let entry_only = FlushBatch {
+        ops: Vec::new(),
+        ..non_text_flush()
+    };
+    let edit_only = FlushBatch {
+        entries: vec![entry(OUT, "text")],
+        ..non_text_flush()
+    };
+    for batch in [non_text_flush(), entry_only, edit_only] {
+        let mut outbound = SurfaceOutbound::new();
+        outbound.register("p1", &declared);
+        outbound.flush(&declared, None, "p1", batch, NOW);
+        let steps = outbound.on_attached(&text_only, &facts(1_024), NOW);
+        assert_eq!(steps.dropped, vec!["p1".to_string()]);
+        assert!(steps.frames.is_empty());
+        assert_eq!(outbound.dropped_count("p1"), 1);
+    }
+}
+
+/// The same gate at the offer: a flush composed under a declaring wiring and
+/// offered once a text-only one is in force never queues.
+#[test]
+fn a_non_text_flush_offered_under_a_text_only_wiring_is_refused() {
+    let text_only = wiring();
+    let mut outbound = SurfaceOutbound::new();
+    outbound.register("p1", &text_only);
+    let steps = outbound.flush(&text_only, None, "p1", non_text_flush(), NOW);
+    assert_eq!(steps.dropped, vec!["p1".to_string()]);
+    let steps = outbound.on_attached(&text_only, &facts(1_024), NOW);
+    assert!(steps.frames.is_empty() && steps.dropped.is_empty());
 }
 
 #[test]

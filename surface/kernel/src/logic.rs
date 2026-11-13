@@ -1977,6 +1977,7 @@ mod tests {
     /// it in.
     fn document(components: Vec<ComponentEntry>, subscriptions: Vec<Binding>) -> BindingsDocument {
         BindingsDocument {
+            wire_channels: vec![],
             v: BINDINGS_DOCUMENT_VERSION,
             components,
             subscriptions,
@@ -1998,7 +1999,7 @@ mod tests {
     /// from `Connected` other than the wiring itself.
     fn connected(bindings: BindingsDocument, alert_granted: bool) -> Event {
         Event::Connected {
-            bindings,
+            bindings: Box::new(bindings),
             participant_id: "surface:deskbar".to_string(),
             session_id: "sess-1".to_string(),
             max_body_bytes: 65_536,

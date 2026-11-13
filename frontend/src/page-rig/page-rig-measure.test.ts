@@ -12,6 +12,10 @@
 //   page-local `io` port declared `non_text`: bytes across the crossing and at
 //   rest, no encoding.
 //
+// And one delivery workload: binary rows of the same sizes delivered over the
+// stand-in socket on a wire channel declared `non_text`, to a 0.2.0 instance
+// woken by each one (push 1, retain 1), which reports the row by checksum.
+//
 // Timings are printed, never asserted.
 //
 // Each size has its own state-holder per contract on the `measure` page: a
@@ -19,8 +23,8 @@
 // another.
 
 import { afterAll, describe, expect, it } from "vitest";
-import { type Page, type Report, only, openPage } from "./page.js";
-import { expectedState, generatedState } from "./state.js";
+import { type Page, type Report, bytesReport, only, openPage } from "./page.js";
+import { expectedState, fnv1a64, generatedState } from "./state.js";
 
 /** Raw state sizes, with the iterations timed and the untimed warm-up at each. */
 const SIZES = [
@@ -175,6 +179,34 @@ describe("page rig: the state workload on a page-local io port, on each contract
                         `noop on ${stater} ${ms(figures(noopSamples))}`,
                 );
             });
+        });
+    }
+
+    for (const { raw, n, warm } of SIZES) {
+        it(`times a binary row delivered to a 0.2.0 kind at ${raw} bytes`, { timeout: TIMEOUT_MS }, async () => {
+            const channel = rig().facts.stream_channel;
+            const generated = generatedState(raw);
+            const samples: number[] = [];
+            for (let i = 0; i < warm + n; i++) {
+                // Each row differs in its first four bytes, so a stale window
+                // cannot pass for the new row.
+                const bytes = generated.slice();
+                new DataView(bytes.buffer).setUint32(0, i, true);
+                const expected = fnv1a64(bytes);
+                const start = performance.now();
+                const reports = await rig().deliver(channel, {
+                    bytes,
+                    contentType: "application/octet-stream",
+                });
+                const elapsed = performance.now() - start;
+                expect(bytesReport(only(reports, "b-stream")).streams).toEqual([
+                    { port: "stream", new_from: 0, dropped: 0, count: 1, len: raw, fnv1a: expected },
+                ]);
+                if (i >= warm) {
+                    samples.push(elapsed);
+                }
+            }
+            lines.push(`0.2.0 binary row delivered: ${raw} B, N ${n}: ${ms(figures(samples))}`);
         });
     }
 });

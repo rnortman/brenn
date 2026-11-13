@@ -351,14 +351,17 @@ async fn text_only_channels_holding_non_text(env: &ReloadEnv, plan: &MessagingPl
 /// [`text_only_channels_holding_non_text`] asked again once the departing
 /// consumers and surfaces have stopped, panicking on a hit.
 ///
-/// Two kinds of writer can put a non-text body on a channel this reload makes
-/// text-only. A byte-carrying consumer bound to it is re-planned by the changed
-/// declaration, so it is among the departing; the retirement wait is unbounded
-/// and lets it finish its activation and flush or edit its buffer through the
-/// declaration it was started under, so a row can land after the up-front
-/// check said none. A remote whose publish ACL covers the channel is neither
-/// re-planned nor retired, so prepare refuses the reload instead
-/// ([`text_only_flips_under_remote_publishers`](super::delta::text_only_flips_under_remote_publishers)).
+/// Three kinds of writer can put a non-text body on a channel this reload
+/// makes text-only. A byte-carrying consumer bound to it is re-planned by the
+/// changed declaration, so it is among the departing; the retirement wait is
+/// unbounded and lets it finish its activation and flush or edit its buffer
+/// through the declaration it was started under, so a row can land after the
+/// up-front check said none. A remote whose publish ACL covers the channel is
+/// neither re-planned nor retired, and a surface's attached pages are an
+/// untrusted client that would time the window, so for both prepare refuses
+/// the reload instead
+/// ([`text_only_flips_under_remote_publishers`](super::delta::text_only_flips_under_remote_publishers),
+/// [`text_only_flips_under_surface_publishers`](super::delta::text_only_flips_under_surface_publishers)).
 /// Past the retirements nothing can be declined; the alternative to dying here
 /// is a text-only channel holding a body its readers cannot represent.
 pub(super) async fn assert_no_text_only_channel_holds_non_text(

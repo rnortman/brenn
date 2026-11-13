@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::profile::{
-    AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts,
+    AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts, TextOnlyPosture,
 };
 use crate::registry::{AttachRegistry, SessionCaps};
 use crate::session::AttachSessionCtx;
@@ -74,6 +74,10 @@ pub struct TestProfile {
     /// the surface answer every fixture starts from; a suite exercising the
     /// runtime-provisioned route sets `Race`.
     pub missing_channel_posture: MissingChannelPosture,
+    /// What a non-text body for a text-only channel means. `Outcome` is the
+    /// default; a suite exercising a route that tells its attachers every
+    /// declaration sets `Violation`.
+    pub text_only_posture: TextOnlyPosture,
     /// The directory entry this stub mints on a successful subscribe, if any.
     /// `None` is the boot-declared answer a surface gives; a suite exercising
     /// the runtime-entry hook states the entry it means to see minted, whose
@@ -110,6 +114,7 @@ impl TestProfile {
             session_caps: SessionCaps::UNCAPPED,
             max_active_subscriptions: usize::MAX,
             missing_channel_posture: MissingChannelPosture::Invariant,
+            text_only_posture: TextOnlyPosture::Outcome,
             runtime_entry: None,
         }
     }
@@ -153,6 +158,10 @@ impl AttachProfile for TestProfile {
 
     fn missing_channel_posture(&self) -> MissingChannelPosture {
         self.missing_channel_posture
+    }
+
+    fn text_only_posture(&self) -> TextOnlyPosture {
+        self.text_only_posture
     }
 
     fn deferred_view_targets(&self) -> &[DeferredTarget] {

@@ -531,6 +531,51 @@ fn surface_resolves_happy_path() {
     assert_eq!(s.publish_per_sec, DEFAULT_SURFACE_PUBLISH_PER_SEC);
 }
 
+/// The wire table names every transportable channel the bindings do, once, in
+/// first-binding order — subscriptions, then outputs — with the directory's
+/// declaration of each; a page-local binding adds nothing to it.
+#[test]
+fn the_wire_table_holds_each_bound_transportable_channel_once_in_binding_order() {
+    use brenn_lib::messaging::config::{ResolvedWireChannel, SurfaceOutputRaw};
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    // A second reader of the ephemeral channel, and a second writer of the
+    // durable one: neither adds an entry.
+    raw.subscriptions.push(surface_sub_raw(
+        "ephemeral:protobar-demo",
+        "sidecar",
+        "messages",
+    ));
+    raw.outputs.push(SurfaceOutputRaw {
+        instance: "sidecar".to_string(),
+        port: "out".to_string(),
+        ..raw.outputs[0].clone()
+    });
+    raw.components[1].declared_out_ports = vec!["out".to_string()];
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    assert_eq!(
+        resolved[0].wire_channels,
+        vec![
+            ResolvedWireChannel {
+                address: "ephemeral:protobar-demo".to_string(),
+                non_text: false,
+            },
+            ResolvedWireChannel {
+                address: "brenn:alerts".to_string(),
+                non_text: false,
+            },
+        ]
+    );
+}
+
+/// A surface bound only to page-local channels has an empty wire table.
+#[test]
+fn a_page_local_surface_has_an_empty_wire_table() {
+    let resolved = resolve_surfaces(&[local_surface_raw()], &dir_of(vec![]), &test_globals());
+    assert!(!resolved[0].local_channels.is_empty());
+    assert!(resolved[0].wire_channels.is_empty());
+}
+
 /// A component's declared out-port vocabulary reaches the resolved instance
 /// whole: the bound port and the ports the surface leaves unwired alike.
 ///
@@ -654,34 +699,61 @@ fn a_surface_output_on_a_tools_address_panics() {
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
-/// A surface input bound to a transportable `non_text` channel is refused: the
-/// page's wire carries text only.
+/// A surface may be bound to a transportable `non_text` channel without its
+/// ports stating it, in either direction; the resolved table carries each
+/// channel's declaration in first-binding order.
 #[test]
-#[should_panic(
-    expected = "subscription channel \"ephemeral:protobar-demo\" is declared `non_text`, \
-                and a surface port may be bound to a `non_text` channel only where the \
-                channel is page-local — the page's wire is attach v4, which carries text \
-                only; bind the port to a text-only channel"
-)]
-fn a_surface_input_on_a_non_text_channel_panics() {
+fn a_surface_bound_to_a_non_text_channel_resolves_with_its_declaration() {
+    use brenn_lib::messaging::config::ResolvedWireChannel;
     let mut frames = ephem("protobar-demo");
     frames.resolved_channel.non_text = true;
-    resolve_surfaces(
+    let resolved = resolve_surfaces(
         &[valid_surface_raw()],
         &surface_dir_with(frames),
         &test_globals(),
     );
-}
+    assert_eq!(
+        resolved[0].wire_channels,
+        vec![
+            ResolvedWireChannel {
+                address: "ephemeral:protobar-demo".to_string(),
+                non_text: true,
+            },
+            ResolvedWireChannel {
+                address: "brenn:alerts".to_string(),
+                non_text: false,
+            },
+        ]
+    );
 
-/// The output arm of the same refusal: no surface binding, in either
-/// direction, is on a `non_text` channel.
-#[test]
-#[should_panic(expected = "channel \"brenn:alerts\" is declared `non_text`")]
-fn a_surface_output_on_a_non_text_channel_panics() {
     let mut alerts = brenn_entry("brenn:alerts");
     alerts.resolved_channel.non_text = true;
     let dir = dir_of(vec![alerts, ephem("protobar-demo")]);
-    resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
+    assert_eq!(
+        resolved[0]
+            .wire_channels
+            .iter()
+            .map(|w| (w.address.as_str(), w.non_text))
+            .collect::<Vec<_>>(),
+        [("ephemeral:protobar-demo", false), ("brenn:alerts", true)]
+    );
+}
+
+/// A port stating `non_text` on a channel declared `non_text` resolves, in
+/// either direction.
+#[test]
+fn a_port_stating_non_text_on_a_declared_channel_resolves() {
+    let mut frames = ephem("protobar-demo");
+    frames.resolved_channel.non_text = true;
+    let mut alerts = brenn_entry("brenn:alerts");
+    alerts.resolved_channel.non_text = true;
+    let dir = dir_of(vec![alerts, frames]);
+    let mut raw = valid_surface_raw();
+    raw.subscriptions[0].non_text = true;
+    raw.outputs[0].non_text = true;
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    assert!(resolved[0].wire_channels.iter().all(|w| w.non_text));
 }
 
 /// The fixture surface with `sidecar` answering `protobar`'s call.
@@ -2492,16 +2564,16 @@ fn local_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
     }
 }
 
-/// A surface port stating `non_text` on a transportable channel is refused
-/// whatever the channel's own declaration says: lowering refuses it on a named
-/// address, and this is the refusal for a configuration lowering never saw.
+/// A surface port stating `non_text` on a transportable channel declared
+/// text-only is refused: the statement asks for a channel that admits non-text
+/// bodies.
 #[test]
 #[should_panic(
-    expected = "subscription instance \"protobar\" port \"messages\" states `non_text`, but \
-                its channel \"ephemeral:protobar-demo\" leaves the page — the page's wire is \
-                attach v4, which carries text only"
+    expected = "subscription instance \"protobar\" port \"messages\" states `non_text`, but its channel \"ephemeral:protobar-demo\" is \
+                declared text-only — declare the channel `non_text`, or drop `non_text` from \
+                the port"
 )]
-fn a_surface_input_stating_non_text_on_a_transportable_channel_panics() {
+fn a_surface_input_stating_non_text_on_a_text_only_channel_panics() {
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].non_text = true;
     resolve_surfaces(&[raw], &surface_dir(), &test_globals());
@@ -2509,8 +2581,12 @@ fn a_surface_input_stating_non_text_on_a_transportable_channel_panics() {
 
 /// The output arm of the same refusal.
 #[test]
-#[should_panic(expected = "states `non_text`, but its channel \"brenn:alerts\" leaves the page")]
-fn a_surface_output_stating_non_text_on_a_transportable_channel_panics() {
+#[should_panic(
+    expected = "states `non_text`, but its channel \"brenn:alerts\" is declared \
+                           text-only — declare the channel `non_text`, or drop `non_text` from \
+                           the port"
+)]
+fn a_surface_output_stating_non_text_on_a_text_only_channel_panics() {
     let mut raw = valid_surface_raw();
     raw.outputs[0].non_text = true;
     resolve_surfaces(&[raw], &surface_dir(), &test_globals());

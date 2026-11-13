@@ -21,7 +21,15 @@ import {
     stringReport,
 } from "./page.js";
 import { expectConsoleError } from "../test-setup.js";
-import { readClientFrame } from "./peer.js";
+import {
+    type Json,
+    bytesOfHex,
+    fillBinary,
+    hexOf as hexOfBytes,
+    readClientFrame,
+    sampleTemplate,
+    textOf,
+} from "./peer.js";
 import { expectedState, generatedState } from "./state.js";
 
 /**
@@ -75,14 +83,10 @@ function envelopeFields(hex: string): Record<string, unknown> {
 const CSV = "a,b\n1,2\né\n";
 /** Bytes that are not UTF-8, in hex. */
 const NOT_UTF8 = "ff00fe";
-/**
- * What a 0.2.0 guest is told when it publishes a typed body on a port bound to
- * a channel that leaves the page.
- */
-const WIRE_DIAGNOSTIC =
-    "this port is bound to a channel that leaves the page, and this brenn's page carries " +
-    "only untyped text off the page: publish without a content type, or bind the port to a " +
-    "page-local channel";
+/** `text` as a body typed `contentType`. */
+function typed(contentType: string, text: string): { bytes: Uint8Array; contentType: string } {
+    return { bytes: new Uint8Array(Buffer.from(text, "utf8")), contentType };
+}
 
 function bytesDeferredOf(
     report: Report,
@@ -247,8 +251,13 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         // Every value, not only the type: an optional field read under a name
         // Rust no longer writes would come back null or empty, not throw.
         const frames = rig().kit.client_samples.map((sample) =>
-            readClientFrame(JSON.stringify(sample)),
+            readClientFrame("text" in sample ? sample.text : bytesOfHex(sample.hex)),
         );
+        const body = (hex: string, contentType: string | null) => ({
+            bytes: bytesOfHex(hex),
+            contentType,
+        });
+        const far = 4_102_444_800_000;
         expect(frames).toEqual([
             { type: "Hello" },
             { type: "Subscribe", channel: "ephemeral:rig.in.keeper" },
@@ -256,17 +265,64 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
                 type: "Publish",
                 attribution: "keeper",
                 channel: "ephemeral:rig.report",
-                body: "{}",
+                body: body(hexOf("a,b"), "text/csv"),
                 correlation: 1,
             },
             {
                 type: "PublishBatch",
-                attribution: "keeper",
+                attribution: "b-keeper",
                 correlation: 2,
-                publishes: [{ channel: "ephemeral:rig.report", body: "{}" }],
-                deferredOps: [expect.anything()],
+                publishes: [
+                    { channel: "ephemeral:rig.report", body: body(hexOf("{}"), null), deliverAfter: null },
+                    {
+                        channel: "ephemeral:rig.bytes-out",
+                        body: body(hexOf("# é"), "text/markdown"),
+                        deliverAfter: null,
+                    },
+                    {
+                        channel: "ephemeral:rig.bytes-feed",
+                        body: body("ff00", "application/octet-stream"),
+                        deliverAfter: far,
+                    },
+                ],
+                deferredOps: [
+                    {
+                        channel: "ephemeral:rig.bytes-feed",
+                        messageId: "00000000-0000-0000-0000-000000000001",
+                        kind: "edit",
+                        body: body("ffd8", "image/jpeg"),
+                        deliverAfter: far + 1,
+                    },
+                    {
+                        channel: "ephemeral:rig.bytes-feed",
+                        messageId: "00000000-0000-0000-0000-000000000002",
+                        kind: "edit",
+                        body: null,
+                        deliverAfter: far + 2,
+                    },
+                    {
+                        channel: "ephemeral:rig.feed",
+                        messageId: "00000000-0000-0000-0000-000000000003",
+                        kind: "cancel",
+                        body: null,
+                        deliverAfter: null,
+                    },
+                ],
             },
         ]);
+    });
+
+    it("assembles each binary server sample byte for byte from its template", () => {
+        const kit = rig().kit;
+        expect(kit.server_samples.length).toBeGreaterThan(0);
+        for (const sample of kit.server_samples) {
+            const bodies = sample.bodies.map((b) => ({
+                bytes: bytesOfHex(b.hex),
+                contentType: b.content_type,
+            }));
+            const values: Record<string, Json> = sample.values;
+            expect(hexOfBytes(fillBinary(sampleTemplate(kit, sample), values, bodies))).toBe(sample.hex);
+        }
     });
 
     it("keeps a typed body on a page-local channel and hands it back with its type", async () => {
@@ -394,23 +450,127 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         expect(refused.results).toEqual(["invalid-body:untyped body is not valid UTF-8"]);
     });
 
-    it("refuses a typed body on a wire-bound port with the diagnostic, and sends nothing", async () => {
+    it("carries a typed text body on a wire-bound port with its type", async () => {
         const out = rig().facts.bytes_out_channel;
-        const refused = only(
+        const sent = only(
             await rig().command("b-keeper", `publish out text/csv ${hexOf(CSV)}`),
             "b-keeper",
         );
-        expect(refused.results).toEqual([`invalid-body:${WIRE_DIAGNOSTIC}`]);
-        expect(rig().wire(out)).toEqual([]);
+        expect(sent.results).toEqual(["ok"]);
+        const wire = rig().wire(out);
+        expect(wire.map((p) => [p.frame, p.attribution])).toEqual([["PublishBatch", "b-keeper"]]);
+        expect(wire[0]?.body.contentType).toBe("text/csv");
+        expectSameBytes(textOf(wire[0]?.body ?? { bytes: new Uint8Array(), contentType: null }), CSV);
     });
 
     it("sends an untyped body on a wire-bound port as a 0.1.0 kind would", async () => {
         const out = rig().facts.bytes_out_channel;
+        const before = rig().wire(out).length;
         const sent = only(await rig().command("b-keeper", `publish out - ${hexOf(TEXT)}`), "b-keeper");
         expect(sent.results).toEqual(["ok"]);
-        const wire = rig().wire(out);
+        const wire = rig().wire(out).slice(before);
         expect(wire.map((p) => [p.frame, p.attribution])).toEqual([["PublishBatch", "b-keeper"]]);
-        expectSameBytes((wire[0] as { body: string }).body, TEXT);
+        expect(wire[0]?.body.contentType).toBeNull();
+        expectSameBytes(textOf(wire[0]?.body ?? { bytes: new Uint8Array(), contentType: null }), TEXT);
+    });
+
+    it("delivers a non-UTF-8 typed row on a non_text wire channel to a 0.2.0 kind, byte for byte", async () => {
+        const channel = rig().facts.bytes_feed_channel;
+        const feed = bytesWindowOf(
+            only(
+                await rig().deliver(channel, {
+                    bytes: bytesOfHex(NOT_UTF8),
+                    contentType: "application/octet-stream",
+                }),
+                "b-keeper",
+            ),
+            "feed",
+        );
+        expect(feed.envelopes.map((e) => [e.content_type, e.hex])).toEqual([
+            ["application/octet-stream", NOT_UTF8],
+        ]);
+        expect(feed.envelopes[0]?.header["channel"]).toBe(channel);
+    });
+
+    it("publishes a non-UTF-8 typed body on a non_text wire channel, byte for byte", async () => {
+        const channel = rig().facts.bytes_wire_channel;
+        const sent = only(
+            await rig().command("b-keeper", `publish bout image/jpeg ${NOT_UTF8}`),
+            "b-keeper",
+        );
+        expect(sent.results).toEqual(["ok"]);
+        const wire = rig().wire(channel);
+        expect(wire.map((p) => [p.frame, p.attribution, p.body.contentType, hexOfBytes(p.body.bytes)])).toEqual([
+            ["PublishBatch", "b-keeper", "image/jpeg", NOT_UTF8],
+        ]);
+    });
+
+    it("parks, edits and cancels a non-UTF-8 body on a non_text wire channel through the peer", async () => {
+        const channel = rig().facts.bytes_wire_channel;
+        const held = () =>
+            rig()
+                .parked(channel, "b-keeper")
+                .map((m) => [m.body.contentType, hexOfBytes(m.body.bytes), m.deliverAfter]);
+        const viewed = async () =>
+            bytesDeferredOf(only(await rig().command("b-keeper", "noop"), "b-keeper"), "bout").map((e) => [
+                e.content_type,
+                e.hex,
+                e.deliver_after,
+            ]);
+
+        const parked = only(
+            await rig().command("b-keeper", `defer bout application/octet-stream ${NOT_UTF8} ${FAR_FUTURE_MS}`),
+            "b-keeper",
+        );
+        expect(parked.results).toEqual(["ok"]);
+        expect(held()).toEqual([["application/octet-stream", NOT_UTF8, FAR_FUTURE_MS]]);
+        expect(await viewed()).toEqual(held());
+
+        const edited = only(await rig().command("b-keeper", "edit bout 0 image/png 89504e47ff"), "b-keeper");
+        expect(edited.results).toEqual(["ok"]);
+        expect(held()).toEqual([["image/png", "89504e47ff", FAR_FUTURE_MS]]);
+        expect(await viewed()).toEqual(held());
+
+        const cancelled = only(await rig().command("b-keeper", "cancel bout 0"), "b-keeper");
+        expect(cancelled.results).toEqual(["ok"]);
+        expect(held()).toEqual([]);
+        expect(await viewed()).toEqual([]);
+        expect(rig().wire(channel)).toHaveLength(1);
+    });
+
+    it("refuses a non-text body on a text-only wire channel, published, parked or edited", async () => {
+        const out = rig().facts.bytes_out_channel;
+        const wireBefore = rig().wire(out).length;
+        const refused = only(await rig().command("b-keeper", `publish out image/jpeg ${NOT_UTF8}`), "b-keeper");
+        expect(refused.results).toEqual(["text-only-channel"]);
+        const deferred = only(
+            await rig().command("b-keeper", `defer out application/octet-stream ${NOT_UTF8} ${FAR_FUTURE_MS}`),
+            "b-keeper",
+        );
+        expect(deferred.results).toEqual(["text-only-channel"]);
+        expect(rig().parked(out, "b-keeper")).toEqual([]);
+
+        const parked = only(
+            await rig().command("b-keeper", `defer out text/csv ${hexOf(CSV)} ${FAR_FUTURE_MS}`),
+            "b-keeper",
+        );
+        expect(parked.results).toEqual(["ok"]);
+        const edited = only(
+            await rig().command("b-keeper", `edit out 0 application/octet-stream ${NOT_UTF8}`),
+            "b-keeper",
+        );
+        expect(edited.results).toEqual(["text-only-channel"]);
+        const kept = rig().parked(out, "b-keeper");
+        expect(kept.map((m) => [m.body.contentType, hexOfBytes(m.body.bytes)])).toEqual([["text/csv", hexOf(CSV)]]);
+        const viewed = only(await rig().command("b-keeper", "noop"), "b-keeper");
+        expect(bytesDeferredOf(viewed, "out").map((e) => [e.content_type, e.hex])).toEqual([
+            ["text/csv", hexOf(CSV)],
+        ]);
+
+        const cancelled = only(await rig().command("b-keeper", "cancel out 0"), "b-keeper");
+        expect(cancelled.results).toEqual(["ok"]);
+        expect(rig().parked(out, "b-keeper")).toEqual([]);
+        expect(rig().wire(out)).toHaveLength(wireBefore);
     });
 
     it("refuses a non-text call to a 0.1.0 callee as text-only-peer, without running it", async () => {
@@ -435,13 +595,35 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         expect(only(reports, "b-mixed").results).toEqual([`ok:-:${hexOf(request)}`]);
     });
 
-    it("delivers a wire row to a 0.2.0 kind with no content type", async () => {
+    it("delivers a typed text row to a 0.2.0 kind with its type", async () => {
+        const channel = rig().facts.bytes_feed_channel;
+        const feed = bytesWindowOf(
+            only(await rig().deliver(channel, typed("text/csv", CSV)), "b-keeper"),
+            "feed",
+        );
+        expect(feed.envelopes).toHaveLength(1);
+        expect(feed.envelopes[0]?.content_type).toBe("text/csv");
+        expect(feed.envelopes[0]?.hex).toBe(hexOf(CSV));
+        expect(feed.envelopes[0]?.header["channel"]).toBe(channel);
+    });
+
+    it("delivers an untyped wire row to a 0.2.0 kind with no content type", async () => {
         const channel = rig().facts.bytes_feed_channel;
         const feed = bytesWindowOf(only(await rig().deliver(channel, TEXT), "b-keeper"), "feed");
+        expect(feed.envelopes.map((e) => [e.content_type, e.hex])).toEqual([[null, hexOf(TEXT)]]);
+    });
+
+    it("delivers a typed text row to a 0.1.0 kind as bare text", async () => {
+        const channel = rig().facts.feed_channel;
+        const feed = windowOf(
+            only(await rig().deliver(channel, typed("text/csv", CSV)), "responder"),
+            "feed",
+        );
         expect(feed.envelopes).toHaveLength(1);
-        expect(feed.envelopes[0]?.content_type).toBeNull();
-        expect(feed.envelopes[0]?.hex).toBe(hexOf(TEXT));
-        expect(feed.envelopes[0]?.header["channel"]).toBe(channel);
+        const envelope = envelopeFields(feed.envelopes[0] as string);
+        expect(envelope["channel"]).toBe(channel);
+        expectSameBytes(envelope["body"] as string, CSV);
+        expect("content_type" in envelope).toBe(false);
     });
 
     it("traps a 0.1.0 caller handed a non-text reply, after the callee ran ok", async () => {

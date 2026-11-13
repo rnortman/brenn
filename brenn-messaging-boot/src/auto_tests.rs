@@ -1865,31 +1865,42 @@ fn a_surface_endpoint_disagreeing_with_its_declaration_on_non_text_panics() {
     );
 }
 
-/// A surface port stating `non_text` on a link with a backend endpoint: the
-/// link's channel is `ephemeral:` and leaves the page, so the surface resolver
-/// refuses the statement.
+/// A link spanning a surface and a backend consumer is `non_text` when either
+/// end states it, or both, and text-only when neither does; the surface
+/// resolves bound to it, and its table carries the folded declaration.
 #[test]
-#[should_panic(expected = "states `non_text`, but its channel \"ephemeral:")]
-fn a_surface_endpoint_stating_non_text_on_a_spanning_link_panics() {
-    let mut surfaces = vec![surface_with_free_ports("deskbar")];
-    surfaces[0].subscriptions.clear();
-    surfaces[0].outputs[0].non_text = true;
-    let mut publisher = surface_pub("deskbar", "out");
-    publisher.non_text = true;
-    let consumers = [subscriber("indexer", 2, 6)];
-    let wiring = lower_auto_wiring(
-        &[link(vec![
-            publisher,
-            wasm_sub("indexer", "tap", Depth::Bounded(2), Depth::Bounded(6)),
-        ])],
-        &consumers,
-        &surfaces,
-        &[],
-        &globals(),
-    );
-    let entries = wiring.nondurable_entries().to_vec();
-    assert!(entries[0].resolved_channel.non_text);
-    resolve_surfaces_with_auto(&surfaces, &dir_of(entries), &globals(), &wiring);
+fn a_spanning_link_is_non_text_from_either_end_and_the_surface_carries_it() {
+    for (surface_says, backend_says) in [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let mut surfaces = vec![surface_with_free_ports("deskbar")];
+        surfaces[0].subscriptions.clear();
+        surfaces[0].outputs[0].non_text = surface_says;
+        let mut publisher = surface_pub("deskbar", "out");
+        publisher.non_text = surface_says;
+        let mut consumers = [subscriber("indexer", 2, 6)];
+        consumers[0].subscriptions[0].non_text = backend_says;
+        let mut reader = wasm_sub("indexer", "tap", Depth::Bounded(2), Depth::Bounded(6));
+        reader.non_text = backend_says;
+        let wiring = lower_auto_wiring(
+            &[link(vec![publisher, reader])],
+            &consumers,
+            &surfaces,
+            &[],
+            &globals(),
+        );
+        let entries = wiring.nondurable_entries().to_vec();
+        let folded = surface_says || backend_says;
+        assert_eq!(entries[0].resolved_channel.non_text, folded);
+        let resolved = resolve_surfaces_with_auto(&surfaces, &dir_of(entries), &globals(), &wiring);
+        let table: Vec<(&str, bool)> = resolved[0]
+            .wire_channels
+            .iter()
+            .map(|w| (w.address.as_str(), w.non_text))
+            .collect();
+        assert_eq!(table.len(), 1, "{surface_says} {backend_says}");
+        assert!(table[0].0.starts_with("ephemeral:"));
+        assert_eq!(table[0].1, folded, "{surface_says} {backend_says}");
+    }
 }
 
 /// A free surface `io` port's page ring is declared by the port.
@@ -1906,16 +1917,25 @@ fn a_free_surface_io_port_is_non_text_iff_it_says_so() {
     }
 }
 
-/// A surface `io` port named at an `ephemeral:` address leaves the page.
+/// A surface `io` port named at an `ephemeral:` address states its channel's
+/// declaration: the auto channel is `non_text` iff the port says so, and the
+/// surface carries it.
 #[test]
-#[should_panic(expected = "states `non_text`, but its channel \"ephemeral:deskbar.loop\"")]
-fn a_surface_io_port_stating_non_text_at_an_ephemeral_address_panics() {
-    let mut surfaces = vec![surface_with_io_port("deskbar")];
-    surfaces[0].io_ports[0].channel = Some("ephemeral:deskbar.loop".to_string());
-    surfaces[0].io_ports[0].non_text = true;
-    let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &globals());
-    let entries = wiring.nondurable_entries().to_vec();
-    resolve_surfaces_with_auto(&surfaces, &dir_of(entries), &globals(), &wiring);
+fn a_surface_io_port_at_an_ephemeral_address_is_non_text_iff_it_says_so() {
+    for says in [false, true] {
+        let mut surfaces = vec![surface_with_io_port("deskbar")];
+        surfaces[0].io_ports[0].channel = Some("ephemeral:deskbar.loop".to_string());
+        surfaces[0].io_ports[0].non_text = says;
+        let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &globals());
+        let entries = wiring.nondurable_entries().to_vec();
+        let resolved = resolve_surfaces_with_auto(&surfaces, &dir_of(entries), &globals(), &wiring);
+        let table: Vec<(&str, bool)> = resolved[0]
+            .wire_channels
+            .iter()
+            .map(|w| (w.address.as_str(), w.non_text))
+            .collect();
+        assert_eq!(table, [("ephemeral:deskbar.loop", says)]);
+    }
 }
 
 /// A server-realm `local:` channel declared `non_text` lends nothing to a page

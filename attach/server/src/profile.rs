@@ -100,6 +100,17 @@ pub enum PublishPosture {
     Diagnostic,
 }
 
+/// What a non-text body offered to a text-only channel is on this route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextOnlyPosture {
+    /// The attacher cannot see a channel's declaration: a conforming client's
+    /// ordinary mistake, answered `TextOnlyChannel`.
+    Outcome,
+    /// The attacher is told every channel's declaration before it may
+    /// publish: no conforming client sends one, so it is a protocol violation.
+    Violation,
+}
+
 /// The per-connection publish token bucket's shape.
 ///
 /// A struct, not two adjacent `u32` params, because a burst and a refill rate
@@ -166,6 +177,11 @@ pub trait AttachProfile: Send + Sync {
     /// output set answers `Invariant`; a matcher-granted, runtime-provisioned one
     /// answers `Race`.
     fn missing_channel_posture(&self) -> MissingChannelPosture;
+
+    /// What a non-text body offered to a channel declared text-only means for
+    /// this attacher — see [`TextOnlyPosture`]. Attacher-level: it turns on
+    /// what the route tells its attachers, not on which channel was named.
+    fn text_only_posture(&self) -> TextOnlyPosture;
 
     /// Every `(attribution, channel)` whose parked-message mirror a fresh
     /// attachment is seeded with, deduped and in a stable order so the seeding

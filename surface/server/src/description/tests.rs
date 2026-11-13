@@ -60,6 +60,13 @@ fn surface(slug: &str, skin: &str, components: &[(&str, &str)]) -> ResolvedSurfa
             // hash has nothing to bind to.
             .map(|(instance, kind)| ResolvedComponent::minimal(instance, kind))
             .collect(),
+        wire_channels: subscriptions
+            .iter()
+            .map(|b| brenn_lib::messaging::config::ResolvedWireChannel {
+                address: b.channel_address.clone(),
+                non_text: false,
+            })
+            .collect(),
         subscriptions,
         wire_subscriptions: vec![],
         local_channels: vec![],
@@ -1234,10 +1241,13 @@ fn validate_panics_on_config_channel_that_retains_nothing() {
     validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 
-/// Every surface replays its config channel on attach, and a page holds only
-/// text, so the channel may not be declared `non_text`.
+/// A page reads its bindings document as text, so the config channel may not
+/// be declared `non_text`.
 #[test]
-#[should_panic(expected = "is declared `non_text` — every surface replays it on attach")]
+#[should_panic(
+    expected = "is declared `non_text` — a page reads its bindings document as text, so \
+                           the declaration would admit only bodies no page can apply"
+)]
 fn validate_panics_on_a_non_text_config_channel() {
     let surfaces = multi_surface_config();
     let dir =

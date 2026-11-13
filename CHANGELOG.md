@@ -4,6 +4,58 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **For operators and WASM component authors: the surface page speaks attach
+  protocol v5, and a surface may bind a channel declared `non_text`.** The
+  browser page and the surface route move together from attach v4 to v5 and
+  only v5; v4 is served to remote daemons only. Every publish and every
+  delivery on a surface page, its own bindings document included, is now a
+  binary websocket frame, whatever its body — for chrome and every in-tree
+  0.1.0 component on text bodies as for a 0.2.0 kind's bytes. **No browser has
+  run the page's wire.** The binary send and `ArrayBuffer` receive of the
+  page's websocket have run only against the page rig's stand-in socket under
+  node, never against a browser's; a difference between the two would show as
+  no surface page configuring itself. **Before deploying this release, run
+  `make e2e`**: `e2e/tests/bar.spec.ts` and `e2e/tests/surface-reload.spec.ts`
+  load surface pages and are the only tests that run the page's wire in a
+  browser.
+  - A port of a page-hosted `brenn:processor@0.2.0` kind bound to a channel
+    that leaves the page carries typed text with its type, and non-text
+    bodies when the channel is declared `non_text`: published, parked,
+    edited and delivered byte for byte with the content type. A non-text body
+    for a text-only channel is refused to the kind with `text-only-channel`
+    and nothing is sent. Shown on the node rig only.
+  - A surface port that does not state `non_text` may be bound to a channel
+    declared `non_text`. The `non_text` key on a surface binding is refused
+    in two cases: on a reserved `local:brenn/` plane, and on a declared
+    `ephemeral:` or `brenn:` channel that is text-only (reported by
+    `config-check`, boot and reload, naming the port and the channel). A
+    surface config channel declared `non_text` is still refused: a page reads
+    its bindings document as text.
+  - A served surface instance whose kind is built against
+    `brenn:processor@0.1.0`, bound by input or output to any `non_text`
+    channel, page-local or not, is refused at boot and at reload, naming the
+    port, the channel and the fix.
+  - Reload: changing the declaration of a surface's config, geometry or
+    status channel now closes that surface's pages, which reload on the new
+    configuration, as a change to a channel it binds already did; changing
+    the surface error channel's closes every surface's. A reload that
+    redeclares a durable channel text-only while a running surface may
+    publish to it (an output bound to it, or one of its own platform
+    channels) is refused, naming the channel as the reloaded configuration
+    names it; restart instead.
+  - On the surface route a non-text body offered for a text-only channel is a
+    protocol violation: the session is closed, the
+    `attach_protocol_violation` security event is logged and fail2ban sees
+    it. A page is told every channel's declaration and never sends one. On
+    the remote route it is still answered `TextOnlyChannel`.
+  - The surface route's frame cap is v5's, 204 800 bytes at the default body
+    cap, down from 532 480.
+  - The surface bindings document's version is 7: a page older than its
+    server reloads, as at every version move.
+  - Limits on a stream delivered to a surface are in `docs/message-bus.md`
+    §2.1.4; node-rig timings of binary rows over the page's wire are in
+    `docs/page-rig-timings.md`.
+
 - **For operators and WASM component authors: `non_text` on a surface's
   page-local channels.** A surface binding tail (`in`, `out`, `io`) may now
   state `non_text = true` where its channel stays on the page — a `local:`
@@ -16,19 +68,16 @@ All notable changes to Brenn are documented here.
   A served surface instance whose kind is built against
   `brenn:processor@0.1.0`, bound by input or output to such a channel, is
   refused at boot and at reload, naming the port and the channel. The key is
-  still refused on a surface binding whose channel leaves the page and on a
-  reserved plane. The surface bindings document's version moved to 6: a page
-  older than its server reloads, as at every version move. Node-rig timings
-  against 0.1.0's base64 in JSON are in `docs/page-rig-timings.md`.
+  refused on a reserved plane, and on a channel that leaves the page and is
+  declared text-only (above). Node-rig timings against 0.1.0's base64 in JSON
+  are in `docs/page-rig-timings.md`.
 - **For WASM component authors: the surface host serves the provisional
   `brenn:processor@0.2.0` beside 0.1.0.** A page-hosted 0.2.0 kind is handed
   each message as a header plus the body's bytes and content type, as on the
-  backend. On a page it carries typed text on a page-local channel with its
-  type, and any body in a sync call and reply between two 0.2.0 kinds. A port
-  bound to a channel that leaves the page carries untyped text only: a typed
-  text body there is refused with `invalid-body`, a non-text one with
-  `text-only-channel`; a non-text body is held at rest only on a page-local
-  channel declared `non_text` (above). The server type-checks a 0.2.0
+  backend. On a page it carries typed text on any channel with its type, and
+  any body in a sync call and reply between two 0.2.0 kinds; a non-text body
+  is held at rest on any channel declared `non_text`, page-local or not, and
+  refused with `text-only-channel` elsewhere (above). The server type-checks a 0.2.0
   surface kind's artifact against the shapes it serves: one built against a superseded shape is
   withheld under a bundle mount and a boot refusal under brenn's own. The
   page manifest names each kind's contract. A brenn whose surfaces
@@ -86,12 +135,12 @@ All notable changes to Brenn are documented here.
   port and the channel, so a missing declaration shows up in the log.
   Refused, at `config-check`, boot or reload as each can be checked: a 0.1.0
   component with any port on a `non_text` channel (at boot and reload, naming
-  the component, port and channel); a surface binding to a declared
-  `non_text` channel, a `non_text` key on a surface binding whose channel
-  leaves the page or is a reserved plane, and a `non_text` surface config
-  channel; redeclaring a durable channel text-only while it holds a
-  non-text message, and, on reload only, while a `remote`'s publish ACL covers
-  it (restart instead). A remote attacher on attach protocol v4 subscribing to a
+  the component, port and channel); a `non_text` key on a surface binding
+  whose channel is a reserved plane or is declared text-only, and a
+  `non_text` surface config channel; redeclaring a durable channel text-only
+  while it holds a non-text message, and, on reload only, while a `remote`'s
+  publish ACL covers it or a running surface may publish to it (restart
+  instead). A remote attacher on attach protocol v4 subscribing to a
   `non_text` channel is answered `Unavailable`, which is not a violation and
   feeds nothing to fail2ban; one on v5 is served it. See
   `docs/config-dsl.md` and `docs/message-bus.md` §2.1.
@@ -102,8 +151,8 @@ All notable changes to Brenn are documented here.
   bodies, onto and from channels declared `non_text`, and receives every body
   with its content type. A non-text body offered for a text-only channel is
   answered with the new outcome `TextOnlyChannel` and nothing is stored. v5
-  carries no blob transfer. The browser page and the surface route stay on
-  v4. **A deployed v4 daemon keeps everything it has, frame for frame**: it
+  carries no blob transfer. The browser page and the surface route speak v5
+  only (above). **A deployed v4 daemon keeps everything it has, frame for frame**: it
   negotiates v4 and sees the frames it saw before. It does not get non-text
   bodies, content types, `non_text` channels, or the non-text entries a v5
   session of the same remote parked, which are left out of its deferred
@@ -132,9 +181,6 @@ All notable changes to Brenn are documented here.
   message search index once and builds one new index on the message store,
   both before serving, so it takes longer on a large database. No stored
   message is rewritten, and the previous release still opens the database.
-- A surface kind built against `brenn:processor@0.2.0` is withheld under a
-  bundle mount, with an alert naming the contract; under brenn's own mount it
-  refuses to boot.
 - **Notice: the string component contract is to be removed.** When any
   component built against `brenn:processor@0.1.0` is loaded, the backend
   writes one `warn!` at boot and after each applied reload naming them. No

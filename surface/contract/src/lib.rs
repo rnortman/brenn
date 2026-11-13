@@ -438,13 +438,11 @@ pub enum PublishError {
     /// (publishes / bytes / calls) or the port's own millitoken sink bucket.
     /// Buckets refill per activation, so the next activation may well succeed.
     QuotaExceeded,
-    /// The body is malformed — the content type is not a well-formed media
-    /// type, or a text body is not UTF-8 — or it is a typed text body on a
-    /// port bound to a channel that leaves the page, which the page's wire
-    /// carries untyped only. Carries which.
+    /// The body is malformed: the content type is not a well-formed media
+    /// type, or a text body is not UTF-8. Carries which.
     InvalidBody(String),
-    /// The body is not text, and no channel a page reaches carries non-text
-    /// bodies.
+    /// The body is not text, and the port's channel is not declared
+    /// `non_text`.
     TextOnlyChannel,
 }
 

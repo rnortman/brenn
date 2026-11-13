@@ -913,7 +913,7 @@ fn escaped_len(s: &str) -> usize {
 
 /// What one operation's channel and optional body charge: the channel and the
 /// content type escaped, the body raw.
-fn op_charge(channel: &str, body: Option<&MessageBody>) -> usize {
+pub(super) fn op_charge(channel: &str, body: Option<&MessageBody>) -> usize {
     escaped_len(channel)
         + body.map_or(0, |body| {
             body.content_type().map_or(0, escaped_len) + body.len()
@@ -924,21 +924,7 @@ pub(super) fn batch_charged_bytes(
     publishes: &[BatchEntry],
     deferred_ops: &[BatchDeferredOp],
 ) -> usize {
-    let entries: usize = publishes
-        .iter()
-        .map(|entry| op_charge(&entry.channel, Some(&entry.body)))
-        .sum();
-    let ops: usize = deferred_ops
-        .iter()
-        .map(|op| {
-            let body = match &op.op {
-                DeferredOpKind::Cancel => None,
-                DeferredOpKind::Edit { body, .. } => body.as_ref(),
-            };
-            op_charge(&op.channel, body)
-        })
-        .sum();
-    entries + ops
+    super::sum_op_charges(publishes, deferred_ops, op_charge)
 }
 
 pub(super) fn check_batch_legality(

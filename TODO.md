@@ -81,9 +81,15 @@ end as the string component contract's period (`dual-contract-period-length`);
 (c) a fixed number of releases or a date; (d) a hard cut — remove v4 at the
 next release; a v4 daemon then fails negotiation until rebuilt at a new pin,
 and the server's per-version reader and writer and the client crate's v4 codec
-go (about 450 lines are the remote route's dual service while the page is on
-v4; about 1,300 are removed when v4 goes, page included). The page is not part
-of the question: it moves to v5 in lockstep with the backend. (2) Blob
+go. The browser page and the surface route speak v5 only, so v4 is served to
+remote daemons only and everything removing it removes is the remote route's
+dual service: the v4 codec, `attach/proto/src/wire/v4.rs` (920 lines, 712 of
+them outside its test module) with its test files `v4/fixtures.rs` and
+`v4/schema_tests.rs` (1,266 lines), about 2,190 lines in all, plus the
+`Version::V4` dispatch arms in `attach/proto/src/wire/mod.rs` and the server's
+v4-only branches (the `Unavailable` answer to a `non_text` subscribe, the v4
+`Deliver` text assertion, the deferred view's cut of non-text entries), a few
+dozen lines. The page is not part of the question. (2) Blob
 transfer for remote attachers is not designed, and under the protocol's
 strict-schema rule ("Any schema change bumps the transport version") it is
 expected to arrive as a version 6 unless that design's growth rule for v5 says
@@ -133,19 +139,46 @@ channel. The binary-bus project accepts the surface host's byte path
 it, a non-text body crosses in a sync call or its reply, and a non-text body
 also rests on a page-local channel declared `non_text`, stored and read back
 byte for byte, and timed there against 0.1.0's base64 in JSON
-(`docs/page-rig-timings.md`). That is shown in node, not in a page, and its
+(`docs/page-rig-timings.md`). Two more facts are shown on the rig and only
+there. First, the page's wire is attach v5, on which every publish and every
+delivery is a binary frame whatever its body — text bodies, in-tree 0.1.0
+kinds and the page's own bindings document included; the browser transport's
+binary send and its `ArrayBuffer` receive
+(`attach/client/src/transport/websys.rs`) have run against the rig's
+`WebSocket` stand-in under node, never against a browser's socket. Second,
+non-text bodies cross that wire in both directions on a transportable channel
+declared `non_text`. That is shown in node, not in a page, and its
 timings are V8 under node. A difference between the two in the
-engine, a real network fetch, a real socket or a real `Window` would be
-found by an out-of-tree component. Done when a spec in the `make e2e`
+engine, a real network fetch or a real `Window` would be found by an
+out-of-tree component; one in the socket would be found by the first surface
+page any deployment since the page's wire moved to attach v5 serves.
+
+Before deploying a commit at or above the one that moved the page's wire to
+attach v5, run `make e2e`: `e2e/tests/bar.spec.ts` and
+`e2e/tests/surface-reload.spec.ts` load surface pages and are the only tests
+that run the binary socket in a browser.
+
+Done when a spec in the `make e2e`
 suite runs a kind's retained round trip on a page-local `io` port in
 Chromium, the body compared byte for byte — a non-UTF-8 body, on a
-page-local `io` port declared `non_text` — and records the time per
+page-local `io` port declared `non_text` — and, in the same spec, delivers a
+non-UTF-8 body to a 0.2.0 kind over the page's real websocket and receives
+one published by it, compared byte for byte, and records the time per
 activation at the rig's sizes; or when the owner rules that the node rig is
 enough and removes this entry. Facts that bear on it: `make e2e` is operator-run
 ("before tagging a release, and after any change under `surface/`",
-`e2e-in-ci`) and no gate runs it; no browser is installed where the agent
-cycles run, so a spec written there lands unrun unless Playwright's
-chromium is provisioned first. `processor-transplant-browser-engine` tracks
+`e2e-in-ci`) and no gate runs it. Option (a)'s command below has been run
+where the agent cycles run: `npm ci` and `npx playwright install chromium`
+succeeded and Playwright's Chromium is downloaded, but it cannot start there
+for want of host libraries — `libnspr4.so`, `libnss3.so`, `libnssutil3.so`,
+`libatk-1.0.so.0`, `libatk-bridge-2.0.so.0`, `libatspi.so.0`, `libX11.so.6`,
+`libXcomposite.so.1`, `libXdamage.so.1`, `libXext.so.6`, `libXfixes.so.3`,
+`libXrandr.so.2`, `libgbm.so.1`, `libxcb.so.1`; on Fedora, by name and not
+verified by installing them, the packages `nspr nss nss-util atk at-spi2-atk
+at-spi2-core libX11 libXcomposite libXdamage libXext libXfixes libXrandr
+mesa-libgbm libxcb` — which need root to install. What is left of
+provisioning a browser for the cycles is those packages; until then a spec
+written there lands unrun. `processor-transplant-browser-engine` tracks
 the same missing engine for the transplant parity test's guest; the
 Chromium spec here runs a transpiled guest in a browser engine too.
 
@@ -172,8 +205,12 @@ whose first run, and any repair it needs, is the owner's.
 (c) Rule the node rig enough and remove this entry. Then the first run of
 binary state on an `io` port in a real browser is an out-of-tree surface
 component's, after it moves to `brenn:processor@0.2.0`; a difference between
-node and a browser in the engine, `fetch`, the socket or `Window` is found
-there.
+node and a browser in the engine, `fetch` or `Window` is found there. The
+socket is not: under (c) the first binary frame on a real browser websocket
+is the first delivery to the first page of the first deployment since the
+page's wire moved to attach v5 — the owner's own, with in-tree chrome, on
+text bodies — and a difference between node's stand-in and a browser socket
+shows as no surface page configuring itself, not as binary state failing.
 
 Until one of these, the project does not declare `brenn:processor@0.2.0`
 stable: that declaration is what tells out-of-tree surface components to move,
@@ -1061,7 +1098,10 @@ A node rig (`//frontend:vitest_page_rig`) now runs the production kernel
 bundle with the production page glue and a transpiled kind against a
 scripted attach peer under `make check`, and through it pins the publish
 route, a refused publish, the deferred view, the activation crossing and
-one sync call, for headless kinds. It runs node's WebAssembly engine with
+one sync call, for headless kinds, and the page's binary socket: every frame
+is binary at attach v5 over a `WebSocket` stand-in, and non-text bodies are
+delivered, published, parked and edited on a transportable channel declared
+`non_text`. It runs node's WebAssembly engine with
 stand-in browser globals: it does not compile or run the
 `wasm-bindgen-test` suites, and it covers nothing that needs a real DOM —
 the text-not-markup pins, the DOM capability host, mount and unmount stay
@@ -3102,8 +3142,11 @@ A served window is retained context followed by what is new, so encoding
 envelopes where an activation is lowered for its guest — the whole envelope for
 a 0.1.0 instance, its header for a 0.2.0 one — re-encodes the retained prefix
 on every activation,
-and re-encodes the same envelope once per subscribing instance. The envelope was
-itself decoded from JSON at frame parse and that wire text was discarded. The
+and re-encodes the same envelope once per subscribing instance. On the page's
+wire (attach v5) a delivered row is its header as JSON inside the frame's
+header and its body as raw bytes after it (`attach/proto/src/wire/v5.rs`), so
+the header is decoded from JSON at frame parse and that text discarded, and no
+whole-envelope JSON is on the wire at all. The
 steady-state cost per envelope is one decode plus (retain_depth × activations ×
 subscribers) encodes, on the browser's delivery hot path — work that grows with
 the product of retain depth and message rate rather than with new messages. It
@@ -3112,8 +3155,11 @@ someone widens a retain window to survive a longer outage, which is the sizing
 knob the message-bus doc tells them to reach for.
 
 The fix is memoisation: keep the JSON beside the envelope in the channel store
-entry (an `Rc<str>` computed at insert, or the wire text the frame already
-carried), and clone it at window assembly. That changes `attach/client`'s store
+entry, and clone it at window assembly. The wire carries only the header's
+text, in the shape a 0.2.0 instance is handed (`HeaderShape`, which
+`MessageEnvelope::to_header_json` writes), so keeping wire text can serve the
+0.2.0 lowering only; the whole envelope a 0.1.0 instance is handed can only be
+computed at insert. That changes `attach/client`'s store
 entry and `ServedWindow`, which is vocabulary shared with the non-surface attach
 client and which the envelope-lowering design deliberately left holding decoded
 envelopes — so it wants a design cycle, not a drive-by.

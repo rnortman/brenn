@@ -6,8 +6,8 @@ use brenn_lib::messaging::config::{
     AttachSendBudget, DEFAULT_PARKED_BATCH_DEPTH, DEFAULT_WASM_PUBLISH_CAPACITY,
     DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth, MessagingGlobalConfig, NoiseLevel,
     ResolvedComponent, ResolvedLocalChannel, ResolvedSubscription, ResolvedSurface,
-    ResolvedSurfaceSubscription, SurfaceBinding, SurfaceCall, SurfaceCallRaw, SurfaceComponentRaw,
-    SurfaceConfigRaw, SurfaceOutput, SurfaceOutputRaw,
+    ResolvedSurfaceSubscription, ResolvedWireChannel, SurfaceBinding, SurfaceCall, SurfaceCallRaw,
+    SurfaceComponentRaw, SurfaceConfigRaw, SurfaceOutput, SurfaceOutputRaw,
 };
 use brenn_lib::messaging::{
     ChannelScheme, ComponentGrant, ComponentHost, EntityKind, MessagingDirectory, Plane, Urgency,
@@ -900,15 +900,17 @@ pub(crate) fn resolve_surfaces(
         // Items 3–5 shared by both binding directions: component must be
         // declared, port charset valid, channel scheme restricted to
         // brenn:/ephemeral:/local: and the referenced channel must exist and
-        // wear the transport its address names. Returns `()`; each caller
-        // re-derives the binding's scheme for its own coverage check (item 6)
-        // after this validation has guaranteed the scheme is one of the three
-        // accepted ones.
+        // wear the transport its address names. Returns the directory entry's
+        // `non_text` for a transportable channel and `None` for a `local:` one;
+        // each caller re-derives the binding's scheme for its own coverage
+        // check (item 6) after this validation has guaranteed the scheme is one
+        // of the three accepted ones.
         let validate_binding = |direction: &str,
                                 channel: &str,
                                 instance: &str,
                                 port: &str,
-                                non_text: bool| {
+                                non_text: bool|
+         -> Option<bool> {
             // Item 5: instance must be declared on this surface.
             assert!(
                 instances.contains(instance),
@@ -964,29 +966,19 @@ pub(crate) fn resolve_surfaces(
                          ingress paths)",
                         entry.transport_type,
                     );
-                    // The reasons below are attach v4's text-only wire;
-                    // moving the page's attach version stops the build here
-                    // until they are rewritten.
-                    const _: () = assert!(brenn_surface_schema::SURFACE_ATTACH_VERSION == 4);
-                    // A port's own statement is judged first: lowering cannot
-                    // see where auto-wiring places a link, and a hand-built
-                    // configuration passes no lowering at all.
+                    // A port that states `non_text` asks for a channel that
+                    // admits non-text bodies; one that does not state it may
+                    // still be bound to such a channel. On a link the
+                    // statement is the declaration, by the fold, so this
+                    // cannot fire there.
                     assert!(
-                        !non_text,
+                        !non_text || entry.resolved_channel.non_text,
                         "config: [[surface]] {slug:?}: {direction} instance {instance:?} port \
-                         {port:?} states `non_text`, but its channel {channel:?} leaves the page — \
-                         the page's wire is attach v4, which carries text only. A surface port may \
-                         state `non_text` only where its channel is page-local; a link with an \
-                         endpoint off this surface, or an `io` port named at an `ephemeral:` or \
-                         `brenn:` address, is not"
+                         {port:?} states `non_text`, but its channel {channel:?} is declared \
+                         text-only — declare the channel `non_text`, or drop `non_text` from the \
+                         port"
                     );
-                    assert!(
-                        !entry.resolved_channel.non_text,
-                        "config: [[surface]] {slug:?}: {direction} channel {channel:?} is \
-                         declared `non_text`, and a surface port may be bound to a `non_text` \
-                         channel only where the channel is page-local — the page's wire is \
-                         attach v4, which carries text only; bind the port to a text-only channel"
-                    );
+                    Some(entry.resolved_channel.non_text)
                 }
                 // `local:` — page-local pub/sub. There is nothing to look up:
                 // local channels are declared per-surface (the binding *is* the
@@ -1033,6 +1025,7 @@ pub(crate) fn resolve_surfaces(
                              after the local: prefix",
                         );
                     }
+                    None
                 }
                 _ => {
                     unreachable!("the scheme assert above admits only the schemes a surface binds",)
@@ -1093,6 +1086,9 @@ pub(crate) fn resolve_surfaces(
         // First insertion order is preserved so the bindings document lists
         // the channels predictably.
         let mut local_channel_folds: IndexMap<String, LocalChannelFold> = IndexMap::new();
+        // Every transportable channel a binding names, with the directory's
+        // `non_text`, in first-binding order: subscriptions, then outputs.
+        let mut wire_channel_table: IndexMap<String, bool> = IndexMap::new();
 
         // Subscriptions (input bindings): item 6 coverage is `allows_channel_access`
         // over the full address. Every *transportable* binding additionally
@@ -1133,7 +1129,13 @@ pub(crate) fn resolve_surfaces(
                 sub.channel.as_deref(),
                 auto_wiring.surface_channel(slug, &sub.instance, &sub.port),
             );
-            validate_binding(direction, &channel, &sub.instance, &sub.port, sub.non_text);
+            if let Some(declared) =
+                validate_binding(direction, &channel, &sub.instance, &sub.port, sub.non_text)
+            {
+                wire_channel_table
+                    .entry(channel.clone())
+                    .or_insert(declared);
+            }
             assert!(
                 seen_sub_ports.insert((sub.instance.as_str(), sub.port.as_str())),
                 "config: [[surface]] {slug:?}: duplicate {direction} binding for instance \
@@ -1408,7 +1410,13 @@ pub(crate) fn resolve_surfaces(
                 out.channel.as_deref(),
                 auto_wiring.surface_channel(slug, &out.instance, &out.port),
             );
-            validate_binding(direction, &channel, &out.instance, &out.port, out.non_text);
+            if let Some(declared) =
+                validate_binding(direction, &channel, &out.instance, &out.port, out.non_text)
+            {
+                wire_channel_table
+                    .entry(channel.clone())
+                    .or_insert(declared);
+            }
             assert!(
                 seen_out_ports.insert((out.instance.as_str(), out.port.as_str())),
                 "config: [[surface]] {slug:?}: duplicate {direction} binding for instance {:?} \
@@ -1595,6 +1603,11 @@ pub(crate) fn resolve_surfaces(
             })
             .collect();
 
+        let wire_channels = wire_channel_table
+            .into_iter()
+            .map(|(address, non_text)| ResolvedWireChannel { address, non_text })
+            .collect();
+
         let calls = resolve_surface_calls(slug, &resolved_components, &surface.calls);
 
         result.push(ResolvedSurface {
@@ -1604,6 +1617,7 @@ pub(crate) fn resolve_surfaces(
             subscriptions,
             wire_subscriptions,
             local_channels,
+            wire_channels,
             outputs,
             calls,
             policy,

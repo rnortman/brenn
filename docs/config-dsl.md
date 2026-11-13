@@ -1028,14 +1028,16 @@ system-minted family is text-only. A channel declared `non_text` may not be
 bound by a component built against the string contract
 `brenn:processor@0.1.0` — the component's load is refused at boot and at
 reload, naming the port and the channel; a surface instance's kind is judged
-the same way once its artifact is scanned — nor by a surface port, since the
-page's wire is attach v4, which carries text only. It is served to a
-remote whose attach session negotiated protocol v5; one on v4 asking for it is
-answered `Unavailable`. A durable
+the same way once its artifact is scanned, whether the channel is page-local
+or declared. A surface port may be bound to it: the page's wire is attach v5,
+which carries every body. It is served to a remote whose attach session
+negotiated protocol v5; one on v4 asking for it is answered `Unavailable`. A durable
 channel holding a non-text message cannot later be declared text-only; give it
 a new address instead. A reload does not redeclare a durable channel
-text-only while a `remote`'s publish ACL covers its old or its new address;
-that change needs a restart.
+text-only while a `remote`'s publish ACL covers its old or its new address,
+or while a surface of the running configuration may publish to it (an output
+bound to it, or its own config, geometry, status or error channel); that
+change needs a restart.
 
 The address prefix is the contract: it says the blast radius without consulting
 any subscriber table. Which prefixes exist, and what each one promises about
@@ -1452,8 +1454,9 @@ a channel that does not is refused when the plan is built, naming the port and
 the channel, so `config-check` reports it. A packaged assembly may write it,
 so a kind that keeps binary state can ship the declaration with itself.
 
-On a surface binding the key declares a **page-local** channel: a `local:`
-address outside the reserved `local:brenn/` planes, a free `io` port, or a
+On a surface binding whose channel stays on the page the key declares a
+**page-local** channel: a `local:` address outside the reserved `local:brenn/`
+planes, a free `io` port, or a
 link whose endpoints are all on that surface. The page ring is `non_text` when
 any surface binding on its address says so; a server-realm `channel`
 declaration at the same `local:` spelling is not read for it. A surface
@@ -1466,15 +1469,20 @@ surface kiosk {
 }
 ```
 
-A surface binding stating it on a channel that leaves the page (a declared
-`ephemeral:` or `brenn:` channel, or a link with an endpoint off the surface)
-or on a reserved plane is refused, and so is a surface port bound to a
-declared `non_text` channel: the page's wire is attach v4, which carries text
-only. Those refusals are reported by `config-check`, boot and reload. A
-surface instance whose kind is built against `brenn:processor@0.1.0`, bound by
-input or output to a page-local `non_text` channel, is refused at boot and at
-reload, naming the port and the channel; `config-check` cannot see a kind's
-contract.
+On a surface binding whose channel leaves the page — a declared `ephemeral:`
+or `brenn:` channel — the key is a check, as on a consumer: stated on a port
+whose channel is declared text-only, it is refused, naming the port and the
+channel; a port that does not state it may be bound to a channel declared
+`non_text`, and a 0.2.0 kind there publishes and is delivered non-text bodies
+over the page's wire — shown on the node rig, not yet run in a browser. On a
+link with an endpoint off the surface the statement is the declaration, by the
+fold. Stated on a reserved plane it is refused. A surface's config channel
+declared `non_text` is refused: a page reads its bindings document as text.
+Those refusals are reported by `config-check`, boot and reload. A surface
+instance whose kind is built against `brenn:processor@0.1.0`, bound by input
+or output to any `non_text` channel, page-local or declared, is refused at
+boot and at reload, naming the port and the channel; `config-check` cannot see
+a kind's contract.
 
 A component placed inside a `surface` runs in the page. The same class placed at
 the top level runs in the backend, and is called a **consumer**:

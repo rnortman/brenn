@@ -19,7 +19,7 @@ use uuid::Uuid;
 /// The peer's opening `Hello`, stating the surface route's range — a peer that
 /// speaks what the page speaks, which is what every test but a negotiation one
 /// wants.
-pub fn server_hello() -> String {
+pub fn server_hello() -> WireMessage {
     frame(&ServerFrame::Hello {
         versions: VersionRange::exactly(SURFACE_ATTACH_VERSION),
         ident: "peer".to_string(),
@@ -28,7 +28,7 @@ pub fn server_hello() -> String {
 
 /// The `Welcome` stating `facts`. Every field of the frame is one of the
 /// attachment facts, so the two cannot drift.
-pub fn welcome(facts: AttachmentFacts) -> String {
+pub fn welcome(facts: AttachmentFacts) -> WireMessage {
     frame(&ServerFrame::Welcome {
         version: facts.version,
         participant_id: facts.participant_id,
@@ -41,7 +41,7 @@ pub fn welcome(facts: AttachmentFacts) -> String {
 }
 
 /// An accepted subscribe, replaying `replay_count` messages behind it.
-pub fn subscribe_result(channel: &str, replay_count: u32) -> String {
+pub fn subscribe_result(channel: &str, replay_count: u32) -> WireMessage {
     frame(&ServerFrame::SubscribeResult {
         channel: channel.to_string(),
         outcome: SubscribeOutcome::Ok,
@@ -79,7 +79,7 @@ pub fn row(channel: &str, body: &str, seq: u64, id: u128) -> DeliverRow {
 
 /// A whole delivery pass on `channel`, one row per `(body, seq, id)`, as the
 /// peer writes it — one frame, however many rows.
-pub fn deliver_pass(channel: &str, rows: &[(&str, u64, u128)]) -> String {
+pub fn deliver_pass(channel: &str, rows: &[(&str, u64, u128)]) -> WireMessage {
     frame(&ServerFrame::Deliver {
         channel: channel.to_string(),
         rows: rows
@@ -90,12 +90,12 @@ pub fn deliver_pass(channel: &str, rows: &[(&str, u64, u128)]) -> String {
 }
 
 /// A one-row pass at a stated position and identity.
-pub fn deliver_at(channel: &str, body: &str, seq: u64, id: u128) -> String {
+pub fn deliver_at(channel: &str, body: &str, seq: u64, id: u128) -> WireMessage {
     deliver_pass(channel, &[(body, seq, id)])
 }
 
 /// A one-row pass at the first position, for a channel a test delivers on once.
-pub fn deliver(channel: &str, body: &str) -> String {
+pub fn deliver(channel: &str, body: &str) -> WireMessage {
     deliver_at(channel, body, 1, 0x9001)
 }
 
@@ -104,34 +104,28 @@ fn surface_codec() -> Codec {
     Codec::negotiated(SURFACE_ATTACH_VERSION)
 }
 
-/// Serialize a server frame the way a peer writes it: a text message at the
-/// surface route's version.
-pub fn frame(frame: &ServerFrame) -> String {
-    match surface_codec().encode_server(frame) {
-        WireMessage::Text(text) => text,
-        WireMessage::Binary(_) => panic!("a surface peer frame is a text message: {frame:?}"),
-    }
+/// Serialize a server frame the way a peer writes it at the surface route's
+/// version: a text or a binary message, as the version fixes for its kind.
+pub fn frame(frame: &ServerFrame) -> WireMessage {
+    surface_codec().encode_server(frame)
 }
 
 /// Serialize a client frame the way the page writes it, at the surface
 /// route's version.
-pub fn client_frame(frame: &ClientFrame) -> String {
-    match surface_codec().encode_client(frame) {
-        WireMessage::Text(text) => text,
-        WireMessage::Binary(_) => panic!("a page frame is a text message: {frame:?}"),
-    }
+pub fn client_frame(frame: &ClientFrame) -> WireMessage {
+    surface_codec().encode_client(frame)
 }
 
 /// Read a server frame a peer wrote at the surface route's version.
-pub fn read_server_frame(text: &str) -> ServerFrame {
+pub fn read_server_frame(message: WireMessage) -> ServerFrame {
     surface_codec()
-        .decode_server(WireMessage::Text(text.to_string()))
+        .decode_server(message)
         .unwrap_or_else(|err| panic!("not a server frame: {err}"))
 }
 
 /// Read a client frame the page wrote at the surface route's version.
-pub fn read_client_frame(text: &str) -> ClientFrame {
+pub fn read_client_frame(message: WireMessage) -> ClientFrame {
     surface_codec()
-        .decode_client(WireMessage::Text(text.to_string()))
+        .decode_client(message)
         .unwrap_or_else(|err| panic!("not a client frame: {err}"))
 }

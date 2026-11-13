@@ -363,6 +363,31 @@ device is sharing it publishes a `stopped` fact for it, and it deletes
 nothing. It is ungated because the consent outlives the grant: a stop the
 gate refused would leave the device sharing when the grant returns.
 
+**The surface route's wire.** A surface page attaches over the attach
+protocol at version 5 and only 5: the route offers no range and no fallback,
+and a page offering anything else is closed as incompatible. Every publish and
+every delivery is a binary frame, whatever its body. A frame malformed for v5
+— a text message of a binary kind, a binary message of a text kind, a header
+whose lengths disagree with the bytes after it, a malformed content type, a
+text body that is not UTF-8 — is a violation with no fallback decoding: the
+session is closed, the `attach_protocol_violation` security event is logged,
+and it is fail2ban signal. The websocket read cap and the frame cap are v5's,
+204 800 bytes at the default body cap; a frame over it is the over-cap
+violation. A page's bytes and content types are its assertion, as a remote's
+and a guest's are: the type is validated for syntax and, for a text type, the
+bytes for UTF-8, and the two are **never checked against each other**. A
+non-text body is admitted only onto a channel declared `non_text`. Offered for
+a text-only channel, it is a protocol violation on this route, where on the
+remote route (§9a) it is answered `TextOnlyChannel`: the page is handed every
+channel's declaration in its bindings document before it may publish, and its
+kernel refuses such a body to the component synchronously, so no conforming
+page ever sends one, whereas a remote cannot see the declaration. A reload
+closes a surface's sessions, and waits for them to end, before it replaces any
+directory entry they may name — a channel the surface binds, or its config,
+geometry, status or error channel — so a page's publish never meets an entry
+changing under it; a reload that would make a durable channel text-only while
+a running surface may publish to it is refused and needs a restart.
+
 **What the reviewer verifies:** authority comes from the session everywhere; the
 inbound schema is closed and rejects+signals unknowns; every security-relevant
 field is bound/allowlisted at intake; state-changing entry points carry CSRF-
@@ -825,8 +850,8 @@ internally-originated.
   trust of the body it labels, and a downstream decision that treats it as
   verified is a finding. A non-text body is admitted only onto a channel
   declared `non_text`, and every reader that can only represent text — a 0.1.0
-  component, a surface, an attach v4 session — is refused at binding or at
-  subscribe rather than at delivery (an attach v4 session's deferred view
+  component, on the backend or hosted on a surface page, an attach v4
+  session — is refused at binding or at subscribe rather than at delivery (an attach v4 session's deferred view
   leaves out a non-text entry a v5 sibling session parked); a store write of a non-text body to a
   text-only channel panics as a host bug.
 
@@ -1213,7 +1238,8 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   for a text-only channel, it is refused by the attach handler before the bus
   is asked, answered `TextOnlyChannel` with nothing stored: a conforming
   client's ordinary mistake (it cannot see the declaration), so not a
-  violation and not fail2ban signal. Offered for a channel the directory does
+  violation and not fail2ban signal (on the surface route the same body is a
+  violation; §6). On the remote route, offered for a channel the directory does
   not hold at that moment — deprovisioned, or mid-reload — it is answered as an
   absent channel is (`Failed` for a single publish, the entry dropped from a
   batch) and is never handed to the bus, whose own later read could find an

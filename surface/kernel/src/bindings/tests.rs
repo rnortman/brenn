@@ -65,6 +65,7 @@ fn local(channel: &str) -> LocalChannel {
 /// something to say.
 fn doc() -> BindingsDocument {
     imply_vocabularies(BindingsDocument {
+        wire_channels: vec![],
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![component("p1"), component("p2"), component("chrome")],
         subscriptions: vec![
@@ -400,50 +401,19 @@ fn the_parsed_document_is_kept() {
 }
 
 #[test]
-fn carriage_refusal_judges_the_body_against_the_channel() {
-    use super::{CarriageRefusal, carriage_refusal};
+fn channel_carries_admits_text_everywhere_and_non_text_where_declared() {
+    use super::channel_carries;
     use brenn_envelope::MessageBody;
 
-    const LOCAL: &str = "local:page/notes";
     let untyped = MessageBody::text("a,b");
     let typed = MessageBody::from_parts(Some("text/csv"), b"a,b").expect("typed text");
     let binary = MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8]).expect("binary");
-
-    // Text is judged the same whatever the channel declares.
     for declared in [false, true] {
-        for channel in [LOCAL, WIRE, OTHER_WIRE] {
-            assert_eq!(
-                carriage_refusal(channel, declared, &untyped),
-                None,
-                "{channel} {declared}"
-            );
-        }
-        assert_eq!(carriage_refusal(LOCAL, declared, &typed), None);
-        for channel in [WIRE, OTHER_WIRE] {
-            assert_eq!(
-                carriage_refusal(channel, declared, &typed),
-                Some(CarriageRefusal::WireCarriesUntypedTextOnly),
-                "{channel} {declared}"
-            );
-        }
+        assert!(channel_carries(declared, &untyped), "untyped, {declared}");
+        assert!(channel_carries(declared, &typed), "typed text, {declared}");
     }
-    // A non-text body rests only on a page-local channel declared to carry one.
-    assert_eq!(carriage_refusal(LOCAL, true, &binary), None);
-    assert_eq!(
-        carriage_refusal(LOCAL, false, &binary),
-        Some(CarriageRefusal::TextOnlyChannel)
-    );
-    // A transportable channel refuses it whatever it is said to declare, and
-    // the refusal names the body, not the wire.
-    for declared in [false, true] {
-        for channel in [WIRE, OTHER_WIRE] {
-            assert_eq!(
-                carriage_refusal(channel, declared, &binary),
-                Some(CarriageRefusal::TextOnlyChannel),
-                "{channel} {declared}"
-            );
-        }
-    }
+    assert!(channel_carries(true, &binary));
+    assert!(!channel_carries(false, &binary));
 }
 
 #[test]
@@ -460,6 +430,36 @@ fn carries_non_text_answers_the_documents_declaration() {
     );
     assert!(
         !applied.same_wiring_as(&applied_with_blob(false)),
+        "the declaration is part of the wiring"
+    );
+}
+
+/// The wire table is the other half of the declaration: a transportable channel
+/// it declares `non_text` answers so, one it declares text-only does not, and
+/// the flag is part of the wiring.
+#[test]
+fn carries_non_text_answers_the_wire_tables_declaration() {
+    let declared_with = |non_text: bool| {
+        let mut document = doc();
+        let entry = document
+            .wire_channels
+            .iter_mut()
+            .find(|w| w.channel == OTHER_WIRE)
+            .expect("the fixture's output channel has a wire entry");
+        entry.non_text = non_text;
+        applied(&document)
+    };
+    let declared = declared_with(true);
+    assert!(declared.carries_non_text(OTHER_WIRE));
+    assert!(!declared.carries_non_text(WIRE), "declared text-only");
+    assert!(
+        !declared.carries_non_text("ephemeral:site.bar.undeclared"),
+        "a channel the document does not name"
+    );
+    let text_only = declared_with(false);
+    assert!(!text_only.carries_non_text(OTHER_WIRE));
+    assert!(
+        !declared.same_wiring_as(&text_only),
         "the declaration is part of the wiring"
     );
 }

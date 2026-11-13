@@ -17,7 +17,7 @@ use brenn_surface_schema::bindings::{
 };
 use brenn_surface_schema::{
     Binding, CallBinding, ComponentEntry, ComponentGrant, LocalChannel, NoiseLevel, OutputBinding,
-    Urgency,
+    Urgency, WireChannel,
 };
 
 /// The chrome instance every fixture document names, declared like any other
@@ -68,7 +68,8 @@ pub fn component_with_grants(
 }
 
 /// Give every component that states no port vocabulary the one its own output
-/// bindings imply.
+/// bindings imply, and complete the wire channel table
+/// ([`imply_wire_channels`]).
 ///
 /// The document side of the fixture rule whose home is
 /// `brenn_lib::messaging::config::imply_out_port_vocabulary` — a separate
@@ -90,7 +91,37 @@ pub fn imply_vocabularies(mut doc: BindingsDocument) -> BindingsDocument {
         ports.dedup();
         c.declared_out_ports = ports;
     }
+    imply_wire_channels(doc)
+}
+
+/// Give every transportable channel a binding names that has no wire channel
+/// entry a text-only one, in first-binding order (subscriptions, then outputs).
+/// A suite whose subject is a channel declared `non_text` states that entry
+/// itself; an entry already present is left as stated.
+pub fn imply_wire_channels(mut doc: BindingsDocument) -> BindingsDocument {
+    let bound: Vec<String> = doc.bound_wire_channels().map(str::to_owned).collect();
+    for channel in bound {
+        if !doc.wire_channels.iter().any(|w| w.channel == channel) {
+            doc.wire_channels.push(wire(&channel));
+        }
+    }
     doc
+}
+
+/// One text-only transportable channel declaration.
+pub fn wire(channel: &str) -> WireChannel {
+    WireChannel {
+        channel: channel.to_string(),
+        non_text: false,
+    }
+}
+
+/// One transportable channel declaration, declared `non_text`.
+pub fn wire_non_text(channel: &str) -> WireChannel {
+    WireChannel {
+        non_text: true,
+        ..wire(channel)
+    }
 }
 
 /// One input binding at the caller's depths, counted at the `metered` rung so a
@@ -186,6 +217,7 @@ pub fn doc(
         subscriptions,
         outputs,
         local_channels,
+        wire_channels: vec![],
         chrome_instance: CHROME.to_string(),
         platform: platform(),
         calls: vec![],

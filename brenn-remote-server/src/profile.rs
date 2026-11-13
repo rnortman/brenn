@@ -27,7 +27,7 @@ use brenn_lib::messaging::{AttachScope, ParticipantId, SubscriberEntry, Subscrib
 use brenn_messaging::MissingChannelPosture;
 
 use brenn_attach_server::profile::{
-    AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts,
+    AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts, TextOnlyPosture,
 };
 use brenn_attach_server::registry::SessionCaps;
 
@@ -183,6 +183,12 @@ impl AttachProfile for RemoteProfile {
         // runtime, so an entry naming one that deprovisioned mid-flush is an
         // ordinary race the daemon reconciles from.
         MissingChannelPosture::Race
+    }
+
+    fn text_only_posture(&self) -> TextOnlyPosture {
+        // A daemon is never told a channel's declaration, so a non-text body
+        // for a text-only channel is a conforming client's mistake.
+        TextOnlyPosture::Outcome
     }
 
     fn deferred_view_targets(&self) -> &[DeferredTarget] {

@@ -60,12 +60,12 @@ use crate::reload::api_keys::api_keys_delta;
 use crate::reload::compare::non_convergible_differences;
 use crate::reload::delta::{
     LiveFacts, PlanDelta, PlanFacts, convergibility_refusals, plan_delta,
-    text_only_flips_under_remote_publishers,
+    text_only_flips_under_remote_publishers, text_only_flips_under_surface_publishers,
 };
 use crate::reload::dynamic::DynamicSnapshot;
 use crate::reload::mqtt::mqtt_clients_delta;
 use crate::reload::surfaces::{
-    SurfaceDocInputs, SurfaceDocParams, SurfaceDocs, arriving, build_surface_docs,
+    SurfaceDocInputs, SurfaceDocParams, SurfaceDocs, SurfacePlatform, arriving, build_surface_docs,
     system_participant_refusals,
 };
 use crate::reload::tools::{ToolsDelta, candidate_tools};
@@ -678,6 +678,16 @@ impl ReloadDriver {
             mqtt_ingress: &plan.mqtt_ingress_channels,
             surfaces: &plan.surfaces,
         };
+        // Level 1 holds both inputs equal across the two documents, so the
+        // candidate's answer is the running process's too.
+        let surface_platform = SurfacePlatform {
+            prefix: &candidate.config.surface_description.prefix,
+            error_channel: candidate
+                .config
+                .observability
+                .surface_error_channel
+                .as_deref(),
+        };
         let mut delta = plan_delta(
             &baseline_facts,
             &candidate_facts,
@@ -693,6 +703,7 @@ impl ReloadDriver {
                 mqtt_clients: &client_identities,
                 clients_stopping: &mqtt_clients.removed,
             },
+            surface_platform,
         );
         delta.webhook = webhook;
         delta.mqtt_clients = mqtt_clients;
@@ -707,6 +718,11 @@ impl ReloadDriver {
         refusals.extend(text_only_flips_under_remote_publishers(
             &delta,
             &plan.remotes,
+        ));
+        refusals.extend(text_only_flips_under_surface_publishers(
+            &delta,
+            &self.baseline.surfaces,
+            surface_platform,
         ));
         if !refusals.is_empty() {
             return refused(Some(sha), refusals);
@@ -10053,12 +10069,377 @@ channel spill at "ephemeral:spill" {
             let body = newest_body(&booted.messenger, DESKBAR_BINDINGS)
                 .await
                 .expect("the bindings document is retained");
+            let document = brenn_surface_schema::bindings::BindingsDocument::parse(&body)
+                .expect("the retained document parses");
             assert!(
-                body.contains(&format!("\"non_text\":{non_text}"))
-                    && !body.contains(&format!("\"non_text\":{}", !non_text)),
+                !document.local_channels.is_empty()
+                    && document
+                        .local_channels
+                        .iter()
+                        .all(|c| c.non_text == non_text),
                 "{body}"
             );
         }
+    }
+
+    /// `deskbar_feed`'s opening line in every one-surface document.
+    const DESKBAR_FEED_OPENING: &str =
+        "channel deskbar_feed at \"ephemeral:deskbar.feed\" {\n    push_depth = 4;";
+
+    /// The bound transportable channel `panel`'s `feed` port reads.
+    const DESKBAR_FEED: &str = "ephemeral:deskbar.feed";
+
+    /// `document` with `deskbar_feed` declared `non_text`.
+    fn feed_non_text(document: &str) -> String {
+        assert!(document.contains(DESKBAR_FEED_OPENING), "{document}");
+        document.replace(
+            DESKBAR_FEED_OPENING,
+            "channel deskbar_feed at \"ephemeral:deskbar.feed\" {\n    non_text = true;\n    \
+             push_depth = 4;",
+        )
+    }
+
+    /// [`bytes_panel_document`] with no `non_text` on `memo`, and with the
+    /// transportable channel `feed` binds declared `non_text` or not. The port
+    /// itself states nothing.
+    pub(crate) fn feed_declared_document(non_text: bool) -> String {
+        let document = bytes_panel_document(false);
+        if non_text {
+            feed_non_text(&document)
+        } else {
+            document
+        }
+    }
+
+    /// The `non_text` flag the retained bindings document gives `channel` in
+    /// its wire channel table.
+    async fn retained_wire_declaration(booted: &Booted, channel: &str) -> bool {
+        let body = newest_body(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the bindings document is retained");
+        let document = brenn_surface_schema::bindings::BindingsDocument::parse(&body)
+            .expect("the retained document parses");
+        document
+            .wire_channels
+            .iter()
+            .find(|wire| wire.channel == channel)
+            .unwrap_or_else(|| panic!("{channel} is in the wire channel table: {body}"))
+            .non_text
+    }
+
+    /// **A bound `ephemeral:` channel's declaration flips, each way, under an
+    /// attached page.** The channel is in `channels_changed` and the surface in
+    /// `surfaces_changed`; the page is closed before the entry is replaced, and
+    /// the republished document's wire table carries the new declaration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bound_ephemeral_channel_flip_changes_the_surface_each_way() {
+        let (tree, _kernel, _bundle, mut booted) =
+            boot_bytes_panel(Some("brenn_processor_bytes_test.wasm"), false).await;
+        assert!(!retained_wire_declaration(&booted, DESKBAR_FEED).await);
+        for non_text in [true, false] {
+            let page = attach_a_session(&booted, "deskbar");
+            tree.write(&feed_declared_document(non_text));
+            booted.driver.reload(TriggerSource::Signal).await;
+
+            let status = booted.last_status().await;
+            assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+            assert_eq!(
+                status.delta.channels_changed,
+                vec![DESKBAR_FEED.to_string()]
+            );
+            assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+            assert_eq!(
+                page.await.expect("the stand-in page task"),
+                brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            );
+            assert_eq!(
+                retained_wire_declaration(&booted, DESKBAR_FEED).await,
+                non_text
+            );
+        }
+    }
+
+    /// **A reload declaring a channel `non_text` under a string-contract
+    /// instance bound to it is refused.** The kind's record says the instance
+    /// can only be handed text; the running document stands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_declaring_a_string_contract_instances_wire_channel_non_text_is_refused() {
+        let (tree, _kernel, _bundle, mut booted) = boot_bytes_panel(None, false).await;
+        assert_eq!(
+            serving_roots(&booted).kind_contract("panel"),
+            Some(brenn_wasm::ProcessorContract::V0_1)
+        );
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the bindings document is retained");
+
+        tree.write(&feed_declared_document(true));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        let refusal = &status.refusals[0];
+        assert!(
+            refusal.contains("component \"panel\"'s input port \"feed\"")
+                && refusal.contains(&format!("{DESKBAR_FEED}, a channel declared `non_text`"))
+                && refusal.contains("bind the port to a text-only channel")
+                && refusal.contains("brenn:processor@0.1.0")
+                && !refusal.contains("Refusing to start"),
+            "{refusal}"
+        );
+        assert_eq!(
+            newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+                .await
+                .map(|envelope| envelope.message_id),
+            Some(before.message_id),
+            "a refused reload leaves the served document in place"
+        );
+    }
+
+    /// The durable channel `memo` is bound to in [`memo_on_a_durable_channel`].
+    const DESKBAR_STORE: &str = "brenn:deskbar.store";
+
+    /// [`bytes_panel_document`] with `memo` bound, both ways, to a durable
+    /// channel declared `non_text` or not.
+    fn memo_on_a_durable_channel(non_text: bool) -> String {
+        let flag = if non_text {
+            "    non_text = true;\n"
+        } else {
+            ""
+        };
+        let document = bytes_panel_document(false);
+        let free = "io memo { push_depth = 1; retain_depth = 2; }";
+        let surface = "surface deskbar {\n    grants = [subscribe];";
+        assert!(document.contains(free), "{document}");
+        assert!(document.contains(surface), "{document}");
+        document
+            .replace(
+                free,
+                "io memo <-> deskbar_store { push_depth = 1; retain_depth = 2; }",
+            )
+            .replace(
+                surface,
+                &format!(
+                    "channel deskbar_store at \"{DESKBAR_STORE}\" {{\n{flag}    push_depth = 1;\n    \
+                     retain_depth = 4;\n    standing_retain_depth = 4;\n}}\n\n\
+                     surface deskbar {{\n    grants = [subscribe, publish];"
+                ),
+            )
+    }
+
+    /// **A durable channel a surface's port writes is not made text-only by a
+    /// reload.** The output arm of the rule the status channel's case pins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_only_flip_under_a_surface_output_is_refused() {
+        let tree = Tree::new();
+        let kernel = tempfile::tempdir().expect("brenn's own surface tree");
+        let bundle = tempfile::tempdir().expect("a bundle surface tree");
+        write_bundled_bytes_panel_kind(
+            &tree,
+            kernel.path(),
+            bundle.path(),
+            Some("brenn_processor_bytes_test.wasm"),
+        );
+        tree.write(&memo_on_a_durable_channel(true));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                surface_assets: Some(kernel.path().to_path_buf()),
+                surface_bundle: Some(bundle.path().to_path_buf()),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        assert!(retained_wire_declaration(&booted, DESKBAR_STORE).await);
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("boot published the surface's bindings document");
+
+        tree.write(&memo_on_a_durable_channel(false));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(
+            status.refusals,
+            vec![format!(
+                "{DESKBAR_STORE} is changed to text-only but surface \"deskbar\" may publish to \
+                 it: this change needs a restart"
+            )],
+        );
+        assert_eq!(
+            newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+                .await
+                .map(|envelope| envelope.message_id),
+            Some(before.message_id),
+            "a refused reload leaves the served document in place"
+        );
+    }
+
+    /// Reload `booted` onto `candidate`, which the planner refuses, and assert
+    /// the refusal is exactly `expected` — the operator's verdict, verbatim, not
+    /// reported as a possible host defect — and that the running surface and
+    /// its retained document stand.
+    async fn assert_planner_refuses(
+        tree: &Tree,
+        booted: &mut Booted,
+        candidate: &str,
+        expected: &str,
+    ) {
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("boot published the surface's bindings document");
+        tree.write(candidate);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(status.refusals, vec![expected.to_string()]);
+        assert!(serves_surface(booted, "deskbar"));
+        assert_eq!(
+            newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+                .await
+                .map(|envelope| envelope.message_id),
+            Some(before.message_id),
+            "a refused reload leaves the served document in place"
+        );
+    }
+
+    /// **A port stating `non_text` on a channel declared text-only is refused
+    /// by the reload, in the planner's own words.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_port_stating_non_text_on_a_text_only_channel_is_refused_verbatim() {
+        let (tree, _assets, mut booted) = boot_one_panel_surface("").await;
+        let binding = "in feed <- deskbar_feed { push_depth = 2; }";
+        let document = surface_document("deskbar", "panel", "Panel", "");
+        assert!(document.contains(binding), "{document}");
+        let candidate = document.replace(
+            binding,
+            "in feed <- deskbar_feed { push_depth = 2; non_text = true; }",
+        );
+        assert_planner_refuses(
+            &tree,
+            &mut booted,
+            &candidate,
+            "config: [[surface]] \"deskbar\": subscription instance \"panel\" port \"feed\" \
+             states `non_text`, but its channel \"ephemeral:deskbar.feed\" is declared text-only \
+             — declare the channel `non_text`, or drop `non_text` from the port",
+        )
+        .await;
+    }
+
+    /// **A surface's config channel declared `non_text` is refused by the
+    /// reload, with the reason a page gives it.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_config_channel_declared_non_text_is_refused_verbatim() {
+        let (tree, _assets, mut booted) = boot_one_panel_surface("").await;
+        let opening = "channel deskbar_bindings at \
+                       \"ephemeral:surface.surface.deskbar.bindings\" {\n    push_depth = 1;";
+        let document = surface_document("deskbar", "panel", "Panel", "");
+        assert!(document.contains(opening), "{document}");
+        let candidate = document.replace(
+            opening,
+            "channel deskbar_bindings at \"ephemeral:surface.surface.deskbar.bindings\" {\n    \
+             non_text = true;\n    push_depth = 1;",
+        );
+        assert_planner_refuses(
+            &tree,
+            &mut booted,
+            &candidate,
+            "config: surface config channel \"ephemeral:surface.surface.deskbar.bindings\" is \
+             declared `non_text` — a page reads its bindings document as text, so the declaration \
+             would admit only bodies no page can apply. Remove `non_text` from its declaration.",
+        )
+        .await;
+    }
+
+    /// The one-surface document with `deskbar`'s status channel's opening line
+    /// replaced by `opening`.
+    fn status_declared(opening: &str) -> String {
+        const STATUS_OPENING: &str = "channel deskbar_status at \"brenn:surface.surface.deskbar.status\" {\n    push_depth = 1;";
+        let document = surface_document("deskbar", "panel", "Panel", "");
+        assert!(document.contains(STATUS_OPENING), "{document}");
+        document.replace(STATUS_OPENING, opening)
+    }
+
+    /// **A retuned status channel replaces its surface.** No binding names the
+    /// channel, but every page publishes its heartbeat onto it, so its entry is
+    /// never replaced under an attached session: the page is closed to come
+    /// back before the walk, and its document is republished.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retuned_status_channel_replaces_its_surface() {
+        let (tree, _assets, mut booted) = boot_one_panel_surface("").await;
+        let page = attach_a_session(&booted, "deskbar");
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("boot published the surface's bindings document");
+
+        tree.write(&status_declared(
+            "channel deskbar_status at \"brenn:surface.surface.deskbar.status\" {\n    push_depth = 2;",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.channels_changed,
+            vec!["brenn:surface.surface.deskbar.status".to_string()]
+        );
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+        );
+        assert!(serves_surface(&booted, "deskbar"));
+        let after = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the bindings document is still retained");
+        assert_ne!(
+            after.message_id, before.message_id,
+            "the document is republished"
+        );
+    }
+
+    /// **A durable channel a surface publishes onto is not made text-only by a
+    /// reload.** Its pages could still store a non-text row through the old
+    /// entry while the commit waits; the reload is refused naming the surface,
+    /// and the running document stands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_only_flip_under_a_publishing_surface_is_refused() {
+        let non_text = status_declared(
+            "channel deskbar_status at \"brenn:surface.surface.deskbar.status\" {\n    \
+             non_text = true;\n    push_depth = 1;",
+        );
+        let tree = Tree::new();
+        let assets = tempfile::tempdir().expect("a surface asset tree");
+        write_surface_kind(&tree, assets.path(), "panel", "Panel");
+        tree.write(&non_text);
+        let mut booted = boot_with_panel(&tree, assets.path()).await;
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("boot published the surface's bindings document");
+
+        tree.write(&surface_document("deskbar", "panel", "Panel", ""));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(
+            status.refusals,
+            vec![
+                "brenn:surface.surface.deskbar.status is changed to text-only but surface \
+                 \"deskbar\" may publish to it: this change needs a restart"
+                    .to_string()
+            ],
+        );
+        assert_eq!(
+            newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+                .await
+                .map(|envelope| envelope.message_id),
+            Some(before.message_id),
+            "a refused reload leaves the served document in place"
+        );
     }
 
     /// **A kind whose record goes stale under a running process is withheld,

@@ -35,12 +35,12 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::{
     BatchAnswer, Discarded, FlushBatch, OutboxSteps, Outboxes, PendingPublishes, PublishRequest,
 };
-use brenn_attach_proto::{ClientFrame, PublishBatchOutcome, PublishOutcome};
-use brenn_envelope::Urgency;
+use brenn_attach_proto::{ClientFrame, DeferredOpKind, PublishBatchOutcome, PublishOutcome};
+use brenn_envelope::{MessageBody, Urgency};
 use brenn_surface_schema::telemetry::ErrorReportDocument;
 use brenn_surface_schema::{LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES};
 
-use crate::bindings::AppliedBindings;
+use crate::bindings::{AppliedBindings, channel_carries};
 
 /// The urgency the kernel states on the documents it writes about itself.
 ///
@@ -440,12 +440,13 @@ impl SurfaceOutbound {
         outcome: PublishOutcome,
     ) -> Result<Option<PublishAnswer>, String> {
         let tag = self.pending.on_result(correlation)?;
-        // The page attaches at v4, which cannot carry the non-text body this
-        // refusal answers, so a peer that sends it is not a conforming one.
+        // The surface route answers a non-text body offered to a text-only
+        // channel with a protocol close, never with this outcome, so a peer that
+        // sends it is not the server this page was built against.
         if outcome == PublishOutcome::TextOnlyChannel {
             return Err(format!(
-                "PublishResult {correlation:?} answered {outcome:?}, which a v4 attachment \
-                 cannot earn"
+                "PublishResult {correlation:?} answered {outcome:?}, which the surface route \
+                 never sends"
             ));
         }
         match tag {
@@ -476,7 +477,7 @@ impl SurfaceOutbound {
                     "PublishResult refused a {kind:?} document the wiring names: {outcome:?}"
                 )),
                 PublishOutcome::TextOnlyChannel => {
-                    unreachable!("refused above: a v4 attachment cannot earn {outcome:?}")
+                    unreachable!("refused above: the surface route never sends {outcome:?}")
                 }
             },
         }
@@ -660,9 +661,10 @@ impl SurfaceOutbound {
     /// A queued flush was composed under the previous attachment's contract, and a
     /// reconnect can hand the page a different one. Every gate the peer answers
     /// with a violation rather than an outcome is re-checked here, and there are
-    /// three: a channel the new wiring no longer binds to this instance, the
-    /// batch legality law against the new `max_body_bytes`, and the composed
-    /// frame against the new `max_frame_bytes`. The caps are one operator knob —
+    /// four: a channel the new wiring no longer binds to this instance, a
+    /// non-text body on a channel the new wiring declares text-only, the batch
+    /// legality law against the new `max_body_bytes`, and the composed frame
+    /// against the new `max_frame_bytes`. The caps are one operator knob —
     /// the frame cap is derived from the body cap — which an operator can lower on
     /// a restart with no build change and so no forced reload. The channel gate
     /// applies to the flush's control ops as well, and the legality law charges
@@ -724,7 +726,7 @@ impl SurfaceOutbound {
 }
 
 /// Whether a flush passes every gate the peer answers with a violation. See
-/// [`SurfaceOutbound::on_attached`] for why these three and no others.
+/// [`SurfaceOutbound::on_attached`] for why these four and no others.
 ///
 /// `facts` of `None` asks the wiring half alone, which is the only half that has
 /// an answer while detached.
@@ -735,9 +737,25 @@ fn survives(
     facts: Option<&AttachmentFacts>,
 ) -> bool {
     let admits = |channel: &str| publishes_on(bindings, instance, channel);
-    batch.entries.iter().all(|entry| admits(&entry.channel))
-        && batch.ops.iter().all(|op| admits(&op.channel))
+    let carries = |channel: &str, body: &MessageBody| {
+        channel_carries(bindings.carries_non_text(channel), body)
+    };
+    batch
+        .entries
+        .iter()
+        .all(|entry| admits(&entry.channel) && carries(&entry.channel, &entry.body))
+        && batch.ops.iter().all(|op| {
+            admits(&op.channel) && op_body(&op.op).is_none_or(|body| carries(&op.channel, body))
+        })
         && facts.is_none_or(|facts| fits_the_caps(instance, batch, facts))
+}
+
+/// The body a control op writes: an edit's new body, if it states one.
+fn op_body(op: &DeferredOpKind) -> Option<&MessageBody> {
+    match op {
+        DeferredOpKind::Edit { body, .. } => body.as_ref(),
+        DeferredOpKind::Cancel => None,
+    }
 }
 
 /// Whether a flush clears the attachment's two size caps: the protocol's batch
@@ -749,11 +767,6 @@ fn survives(
 /// to bound it: the number that governs is the one the peer stated on this
 /// attachment, and a peer built against a different derivation would state a
 /// different one.
-///
-/// Both measures encode every body, and the v4 encoder panics on one that is
-/// not untyped text. None reaches it: a component's publish or edit on a
-/// channel that leaves the page passed [`crate::bindings::carriage_refusal`],
-/// which refuses every body this attachment's codec cannot carry.
 fn fits_the_caps(instance: &str, batch: &FlushBatch, facts: &AttachmentFacts) -> bool {
     let codec = facts.codec();
     codec
@@ -772,7 +785,7 @@ fn publish_status(outcome: PublishOutcome) -> PublishStatus {
         PublishOutcome::BodyTooLarge { len, max } => PublishStatus::BodyTooLarge { len, max },
         PublishOutcome::Failed => PublishStatus::Failed,
         PublishOutcome::TextOnlyChannel => {
-            unreachable!("refused where the result is settled: a v4 attachment cannot earn it")
+            unreachable!("refused where the result is settled: the surface route never sends it")
         }
     }
 }

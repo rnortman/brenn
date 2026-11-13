@@ -35,6 +35,7 @@ fn component(instance: &str) -> ComponentEntry {
 /// page-local channel declared.
 fn doc(instances: &[&str]) -> BindingsDocument {
     imply_vocabularies(BindingsDocument {
+        wire_channels: vec![],
         v: BINDINGS_DOCUMENT_VERSION,
         components: instances.iter().map(|i| component(i)).collect(),
         subscriptions: Vec::new(),

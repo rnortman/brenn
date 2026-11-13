@@ -32,7 +32,7 @@ use chrono::{DateTime, Utc};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use super::profile::{DeferredTarget, PublishPosture};
+use super::profile::{DeferredTarget, PublishPosture, TextOnlyPosture};
 use super::registry::DeferredViewPush;
 use super::session::{AttachSessionCtx, FrameOutcome, SessionCounters, sanitize_client_detail};
 
@@ -109,8 +109,9 @@ pub(crate) fn admit_attribution_or_violate(
 /// Then the body cap (an outcome, metered and escalating — see
 /// [`BODY_TOO_LARGE_VIOLATION_THRESHOLD`]), then the connection's rate bucket
 /// (an outcome; a legitimate retry loop reaches it), then the text-only
-/// refusal (an outcome, behind the bucket so a client looping on it is metered),
-/// then the bus. What each of
+/// refusal (an outcome behind the bucket, so a client looping on it is metered,
+/// or a violation where the route tells its attachers every declaration — see
+/// [`TextOnlyPosture`]), then the bus. What each of
 /// the bus's own refusals means is the profile's call: on a channel boot proved
 /// reachable and policy-covered an invariant-excluded outcome is a broken
 /// server, and on a diagnostics channel the same outcome is reported instead —
@@ -196,11 +197,15 @@ pub async fn handle_publish(
         }
     }
 
-    // 5. A non-text body bound for a text-only channel. The attacher cannot see
-    //    the declaration, so this is a conforming client's mistake and gets an
-    //    outcome. Nothing is stored and no bus budget is drawn.
+    // 5. A non-text body bound for a text-only channel. What it is depends on
+    //    whether the route tells its attachers the declaration (see
+    //    `TextOnlyPosture`): a violation if it does, an outcome if it does not.
+    //    Either way nothing is stored and no bus budget is drawn.
     let door = text_only_door(ctx, channel, body);
     if door == TextOnlyDoor::Refuse {
+        if let Err(violation) = text_only_refusal_admissible(ctx, "Publish", channel) {
+            return violation;
+        }
         note_text_only_refusal(ctx, counters, channel, body);
         let frame = ServerFrame::PublishResult {
             correlation,
@@ -474,9 +479,10 @@ pub async fn handle_publish_batch(
         Ok(ops) => ops,
         Err(violation) => return violation,
     };
-    // The first entry or edit carrying a non-text body to a text-only channel.
-    // Answered only after the draw below, so a refused flush is metered like
-    // any other.
+    // The first entry or edit carrying a non-text body to a text-only channel,
+    // on a route where that is an outcome (resolve has already killed the
+    // connection where it is a violation). Answered only after the draw below,
+    // so a refused flush is metered like any other.
     let text_only_refusal = resolved
         .iter()
         .filter(|entry| entry.door == TextOnlyDoor::Refuse)
@@ -694,12 +700,16 @@ fn resolve_batch_entries<'a>(
                 Some(at).filter(|at| *at > flush_now)
             }
         };
+        let door = text_only_door(ctx, &entry.channel, &entry.body);
+        if door == TextOnlyDoor::Refuse {
+            text_only_refusal_admissible(ctx, "PublishBatch entry", &entry.channel)?;
+        }
         resolved.push(ResolvedBatchEntry {
             channel: entry.channel.as_str(),
             body: &entry.body,
             urgency: entry.urgency,
             deliver_after,
-            door: text_only_door(ctx, &entry.channel, &entry.body),
+            door,
         });
     }
     Ok(resolved)
@@ -748,6 +758,9 @@ fn resolve_deferred_ops<'a>(
             Some((Some(body), _)) => text_only_door(ctx, &op.channel, body),
             _ => TextOnlyDoor::Admit,
         };
+        if door == TextOnlyDoor::Refuse {
+            text_only_refusal_admissible(ctx, "PublishBatch control op", &op.channel)?;
+        }
         resolved.push(ResolvedDeferredOp {
             channel: op.channel.as_str(),
             message_id: op.message_id,
@@ -806,7 +819,8 @@ fn assert_publishable(
 enum TextOnlyDoor {
     /// A text body, or a channel declared `non_text`: the bus is asked.
     Admit,
-    /// A non-text body for a channel declared text-only: `TextOnlyChannel`.
+    /// A non-text body for a channel declared text-only: `TextOnlyChannel`,
+    /// or a violation, by the route's [`TextOnlyPosture`].
     Refuse,
     /// A non-text body for a channel the directory does not hold. The bus is
     /// never handed it: the bus resolves the address again later, and a reload
@@ -830,6 +844,23 @@ fn text_only_door(ctx: &AttachSessionCtx, channel: &str, body: &MessageBody) -> 
         None => TextOnlyDoor::Absent,
         Some(entry) if entry.may_hold(body) => TextOnlyDoor::Admit,
         Some(_) => TextOnlyDoor::Refuse,
+    }
+}
+
+/// Whether a door refusal of a non-text body for `channel` may be answered
+/// with an outcome, or the violation it is on a route whose attachers are told
+/// every declaration. `what` names the frame element for the security log.
+fn text_only_refusal_admissible(
+    ctx: &AttachSessionCtx,
+    what: &str,
+    channel: &str,
+) -> Result<(), FrameOutcome> {
+    match ctx.profile.text_only_posture() {
+        TextOnlyPosture::Outcome => Ok(()),
+        TextOnlyPosture::Violation => Err(ctx.violation(format!(
+            "{what} carries a non-text body to text-only channel {}",
+            sanitize_client_detail(channel),
+        ))),
     }
 }
 

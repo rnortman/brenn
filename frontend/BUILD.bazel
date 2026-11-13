@@ -444,7 +444,8 @@ vitest_bin.vitest_test(
 )
 
 # The state workload at three sizes on each contract — 0.1.0 base64 in JSON,
-# 0.2.0 binary at rest on a `non_text` page-local channel — in one run: timings
+# 0.2.0 binary at rest on a `non_text` page-local channel — and binary rows of
+# the same sizes delivered over the socket to a 0.2.0 kind, in one run: timings
 # printed, nothing asserted on time. Run by hand with
 # `bazel test --test_output=all`; `docs/page-rig-timings.md` records a run.
 vitest_bin.vitest_test(

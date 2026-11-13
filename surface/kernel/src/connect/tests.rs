@@ -65,6 +65,7 @@ fn ack(replay_count: u32) -> SubscribeAck {
 /// shape for a document to be valid and for a second version of it to differ.
 fn doc(kind: &str) -> BindingsDocument {
     imply_vocabularies(BindingsDocument {
+        wire_channels: vec![],
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![ComponentEntry {
             instance: "chrome".to_string(),

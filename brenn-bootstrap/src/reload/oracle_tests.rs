@@ -36,7 +36,9 @@ use super::driver::tests::{
     spill_channel, staged_module, subscriber_debug_lines, surface_document, surfaces_document,
     write_surface_kind,
 };
-use super::driver::tests::{bytes_panel_document, write_bundled_bytes_panel_kind};
+use super::driver::tests::{
+    bytes_panel_document, feed_declared_document, write_bundled_bytes_panel_kind,
+};
 use brenn_messaging::config_reload::Outcome;
 
 // ── The oracle ────────────────────────────────────────────────────────────
@@ -1498,6 +1500,61 @@ async fn a_page_local_non_text_flip_matches_a_fresh_boot() {
                         .iter()
                         .any(|line| line.contains("surface.deskbar.bindings")
                             && line.contains(&format!("\"non_text\":{to}"))),
+                    "{:?}",
+                    reloaded.retained
+                );
+            },
+        )
+        .await;
+    }
+}
+
+/// **A bound `ephemeral:` channel's `non_text` declaration flips, each way.**
+/// The channel's entry is replaced and the surface promoted, so the directory,
+/// the served runtime and the retained document — whose wire table carries the
+/// declaration — are all compared; a byte-carrying kind is installed so both
+/// documents are servable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_ephemeral_channel_flip_matches_a_fresh_boot() {
+    for (from, to) in [(false, true), (true, false)] {
+        let kernel = tempfile::tempdir().expect("brenn's own surface tree");
+        let bundle = tempfile::tempdir().expect("a bundle surface tree");
+        let tree = Tree::new();
+        write_bundled_bytes_panel_kind(
+            &tree,
+            kernel.path(),
+            bundle.path(),
+            Some("brenn_processor_bytes_test.wasm"),
+        );
+        tree.write(&feed_declared_document(from));
+        let (kernel_path, bundle_path) = (kernel.path(), bundle.path());
+
+        a_reload_matches_a_fresh_boot(
+            &tree,
+            move |db| BootFixture {
+                db: Some(db),
+                surface_assets: Some(kernel_path.to_path_buf()),
+                surface_bundle: Some(bundle_path.to_path_buf()),
+                ..BootFixture::default()
+            },
+            async |booted| {
+                reload_onto(booted, &tree, &feed_declared_document(to)).await;
+                let status = booted.last_status().await;
+                assert_eq!(
+                    status.delta.channels_changed,
+                    vec!["ephemeral:deskbar.feed".to_string()]
+                );
+                assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+            },
+            |reloaded| {
+                assert!(
+                    reloaded
+                        .retained
+                        .iter()
+                        .any(|line| line.contains("surface.deskbar.bindings")
+                            && line.contains(&format!(
+                                "{{\"channel\":\"ephemeral:deskbar.feed\",\"non_text\":{to}}}"
+                            ))),
                     "{:?}",
                     reloaded.retained
                 );

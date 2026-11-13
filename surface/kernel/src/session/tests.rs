@@ -443,7 +443,7 @@ fn phase_two_announces_the_attachment_with_its_wiring_and_its_facts() {
                 alert_granted,
             },
         ] => {
-            assert_eq!(bindings, &doc("protobar"));
+            assert_eq!(bindings.as_ref(), &doc("protobar"));
             assert_eq!(participant_id, PRINCIPAL);
             assert_eq!(session_id, SESSION_ID);
             assert_eq!(*max_body_bytes, BODY_CAP);

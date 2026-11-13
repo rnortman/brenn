@@ -33,9 +33,11 @@ use brenn_envelope::{GuestBody, MessageBody, Urgency};
 use brenn_surface_contract::{CallError, DeferError, PublishError};
 use uuid::Uuid;
 
+use brenn_attach_client::Codec;
 use brenn_attach_client::store::DeferOp;
+use brenn_surface_schema::SURFACE_ATTACH_VERSION;
 
-use crate::bindings::{CarriageRefusal, carriage_refusal, channel_is_transportable};
+use crate::bindings::{channel_carries, channel_is_transportable};
 use crate::outbound::truncate_report_field;
 
 /// The byte cap on a guest-supplied port name reaching a diagnostic. The name is
@@ -77,6 +79,20 @@ fn port_for_report(port: &str) -> String {
     truncate_report_field(format!("{port:?}"), MAX_PORT_NAME_REPORT_BYTES)
 }
 
+/// What one buffered operation on a transportable `channel` charges against
+/// the wire batch budget, by the codec of the version the surface route serves.
+fn wire_charge(channel: &str, body: Option<&MessageBody>) -> usize {
+    Codec::negotiated(SURFACE_ATTACH_VERSION).op_charged_bytes(channel, body)
+}
+
+/// The body a control op writes: an edit's new body, if it states one.
+fn defer_op_body(kind: &DeferOp) -> Option<&MessageBody> {
+    match kind {
+        DeferOp::Edit { body, .. } => body.as_ref(),
+        DeferOp::Cancel => None,
+    }
+}
+
 /// A gate verdict as the component sees it on the publish path.
 ///
 /// The classification is [`brenn_budget::publish_refusal_kind`], shared with the
@@ -89,12 +105,6 @@ fn publish_error(refusal: GateRefusal) -> PublishFault {
         PublishRefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
     })
 }
-
-/// The diagnostic a component is handed for a typed text body on a port bound
-/// to a channel that leaves the page.
-pub const WIRE_CARRIES_UNTYPED_TEXT_ONLY: &str = "this port is bound to a channel that leaves \
-the page, and this brenn's page carries only untyped text off the page: publish without a \
-content type, or bind the port to a page-local channel";
 
 /// A component body built into the body the buffer holds, or the refusal its
 /// malformation draws, spelled by `invalid_body`.
@@ -310,10 +320,12 @@ impl PublishBuffer {
     }
 
     /// What this activation's *transportable* work has already spent of the wire
-    /// batch budget: every channel address and body it will carry, charged
-    /// exactly as v4's `Codec::batch_charged_bytes` charges the frame it
-    /// composes into. Summed from the buffered work rather than accumulated, so
-    /// the two cannot drift.
+    /// batch budget: every operation it will carry, charged by the codec of the
+    /// version the surface route serves, exactly as that codec's
+    /// `batch_charged_bytes` charges the frame it composes into. Summed from the
+    /// buffered work rather than accumulated, so the two cannot drift. The
+    /// route's version rather than an attachment's: a buffer exists while
+    /// detached, and the route serves exactly one.
     ///
     /// Confined publishes are not charged: they never join a batch.
     fn batch_charge(&self) -> usize {
@@ -321,21 +333,13 @@ impl PublishBuffer {
             .entries
             .iter()
             .filter(|entry| channel_is_transportable(&entry.channel))
-            .map(|entry| entry.channel.len() + entry.body.len())
+            .map(|entry| wire_charge(&entry.channel, Some(&entry.body)))
             .sum();
         let ops: usize = self
             .defer_ops
             .iter()
             .filter(|op| channel_is_transportable(&op.channel))
-            .map(|op| {
-                op.channel.len()
-                    + match &op.kind {
-                        DeferOp::Edit {
-                            body: Some(body), ..
-                        } => body.len(),
-                        _ => 0,
-                    }
-            })
+            .map(|op| wire_charge(&op.channel, defer_op_body(&op.kind)))
             .sum();
         entries + ops
     }
@@ -449,7 +453,7 @@ impl PublishBuffer {
     /// documented positions: the call ceiling first (so a component looping on
     /// rejections pays for them), then the port — three-way, per
     /// [`Self::publish_unwired`] — then the body (`invalid-body`), then whether
-    /// the channel may carry it ([`carriage_refusal`]), then everything the gate
+    /// the channel may carry it ([`channel_carries`]), then everything the gate
     /// judges, which it charges only on acceptance.
     fn publish_inner(
         &mut self,
@@ -466,18 +470,12 @@ impl PublishBuffer {
             return self.publish_unwired(port, body, deliver_after);
         };
         let body = build_body(body, PublishError::InvalidBody)?;
-        self.judge_carriage(
-            port,
-            spec,
-            &body,
-            PublishError::TextOnlyChannel,
-            PublishError::InvalidBody,
-        )?;
+        self.judge_carriage(port, spec, &body, PublishError::TextOnlyChannel)?;
         let urgency = urgency_override.unwrap_or(spec.default_urgency);
         // The wire batch budget, before the gate charges anything: the gate
         // charges on acceptance and `take` asserts its count against this
         // buffer's, so a refusal after it would leave the two disagreeing.
-        let charge = spec.channel.len() + body.len();
+        let charge = wire_charge(&spec.channel, Some(&body));
         if body.len() <= self.gate.max_body_bytes()
             && self.overruns_batch_budget(&spec.channel, charge)
         {
@@ -577,7 +575,7 @@ impl PublishBuffer {
     /// not about any budget, and so the one refusal here that draws no call
     /// slot), then the shared call count, then the port and the snapshot
     /// index — the two answers only this buffer holds — then an edit body's
-    /// build (`invalid-body`) and carriage ([`carriage_refusal`]), then the
+    /// build (`invalid-body`) and carriage ([`channel_carries`]), then the
     /// gate's op ceiling and edit-body rules.
     ///
     /// The port is judged three ways as it is on the publish path, but the
@@ -620,13 +618,7 @@ impl PublishBuffer {
                     .map(|body| build_body(body, DeferError::InvalidBody))
                     .transpose()?;
                 if let Some(body) = &body {
-                    self.judge_carriage(
-                        port,
-                        spec,
-                        body,
-                        DeferError::TextOnlyChannel,
-                        DeferError::InvalidBody,
-                    )?;
+                    self.judge_carriage(port, spec, body, DeferError::TextOnlyChannel)?;
                 }
                 DeferOp::Edit {
                     body,
@@ -634,15 +626,11 @@ impl PublishBuffer {
                 }
             }
         };
-        let edit_body_len = match &kind {
-            DeferOp::Edit {
-                body: Some(body), ..
-            } => Some(body.len()),
-            _ => None,
-        };
+        let edit_body = defer_op_body(&kind);
+        let edit_body_len = edit_body.map(MessageBody::len);
         // The wire batch budget, as on the publish path: an op names a channel
         // and an edit carries a body, and the legality law charges both.
-        let charge = spec.channel.len() + edit_body_len.unwrap_or(0);
+        let charge = wire_charge(&spec.channel, edit_body);
         if edit_body_len.is_none_or(|len| len <= self.gate.max_body_bytes())
             && self.overruns_batch_budget(&spec.channel, charge)
         {
@@ -658,48 +646,30 @@ impl PublishBuffer {
         Ok(())
     }
 
-    /// Whether `spec`'s channel may carry `body` ([`carriage_refusal`]), as the
+    /// Whether `spec`'s channel may carry `body` ([`channel_carries`]), as the
     /// refusal the publish and edit paths both answer: `text_only` for a
-    /// non-text body on a channel not declared to carry one, `invalid_body`
-    /// with [`WIRE_CARRIES_UNTYPED_TEXT_ONLY`] for a typed text body bound for
-    /// the wire. Each refusal is logged.
+    /// non-text body on a channel not declared to carry one. Each refusal is
+    /// logged.
     fn judge_carriage<E>(
         &self,
         port: &str,
         spec: &OutputSpec,
         body: &MessageBody,
         text_only: E,
-        invalid_body: impl FnOnce(String) -> E,
     ) -> Result<(), PortFault<E>> {
-        let Some(refusal) = carriage_refusal(&spec.channel, spec.non_text, body) else {
+        if channel_carries(spec.non_text, body) {
             return Ok(());
-        };
-        self.log_carriage_refusal(port, &spec.channel, body, refusal);
-        Err(PortFault::Refused(match refusal {
-            CarriageRefusal::TextOnlyChannel => text_only,
-            CarriageRefusal::WireCarriesUntypedTextOnly => {
-                invalid_body(WIRE_CARRIES_UNTYPED_TEXT_ONLY.to_owned())
-            }
-        }))
-    }
-
-    /// One line per body refused for its carriage. The per-activation call
-    /// ceiling bounds how many one activation can write.
-    fn log_carriage_refusal(
-        &self,
-        port: &str,
-        channel: &str,
-        body: &MessageBody,
-        refusal: CarriageRefusal,
-    ) {
+        }
+        // One line per body refused for its carriage. The per-activation call
+        // ceiling bounds how many one activation can write.
         tracing::info!(
             instance = %self.instance,
             port = %port_for_report(port),
-            channel,
+            channel = %spec.channel,
             body = %body.summary(),
-            ?refusal,
-            "surface client: refused a component body its port's channel cannot carry"
+            "surface client: refused a non-text body on a channel declared text-only"
         );
+        Err(PortFault::Refused(text_only))
     }
 
     /// How many publishes were accepted. Read by the driver to mint one envelope
@@ -744,8 +714,7 @@ impl PublishBuffer {
 
 #[cfg(test)]
 mod tests {
-    use brenn_attach_proto::{BatchEntry, Codec};
-    use brenn_surface_schema::SURFACE_ATTACH_VERSION;
+    use brenn_attach_proto::{BatchDeferredOp, BatchEntry};
 
     use super::*;
 
@@ -910,15 +879,26 @@ mod tests {
     /// itself is what keeps the two from drifting.
     #[test]
     fn everything_the_buffer_accepts_composes_a_legal_batch() {
-        let cap = 128;
-        let mut buf = buffer(cap as u64);
-        // Publish until refused, then check the survivors against the law.
+        let cap = 160;
+        let mut buf = declared_buffer_capped(cap as u64);
+        // Publish until refused, then check the survivors against the law:
+        // untyped text, typed text, a content type the header escapes, and
+        // non-text bytes on the declared transportable port.
         for i in 0..64 {
-            if buf.publish("out", text(format!("body-{i}"))).is_err() {
+            let (port, body) = match i % 4 {
+                0 => ("out", text(format!("body-{i}"))),
+                1 => ("out", parts(Some("text/csv"), format!("a,{i}").as_bytes())),
+                2 => (
+                    "out",
+                    parts(Some("text/plain; charset=\"utf-8\""), b"quoted"),
+                ),
+                _ => ("bout", parts(Some("image/jpeg"), &[0xff, 0xd8, 0xff])),
+            };
+            if buf.publish(port, body).is_err() {
                 break;
             }
         }
-        assert!(buf.len() > 1, "the fixture must admit more than one entry");
+        assert!(buf.len() > 3, "the fixture must admit every kind of body");
         let flushed = buf.take();
         let entries: Vec<BatchEntry> = flushed
             .publishes
@@ -1190,6 +1170,61 @@ mod tests {
         );
     }
 
+    /// The buffer's running charge is the codec's charge of the batch the
+    /// flush composes into, publishes and control ops together — a cancel, an
+    /// edit with a body and one without — and a confined publish adds nothing.
+    #[test]
+    fn the_running_charge_is_the_codecs_charge_of_the_composed_batch() {
+        let mut buf = PublishBuffer::new(
+            "keeper",
+            HashMap::from([
+                ("out".to_string(), spec(WIRE)),
+                ("notes".to_string(), spec(LOCAL)),
+            ]),
+            vocabulary(),
+            HashMap::from([
+                ("out".to_string(), 1_000_000),
+                ("notes".to_string(), 1_000_000),
+            ]),
+            1_024,
+            HashMap::from([(
+                "out".to_string(),
+                vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)],
+            )]),
+        );
+        assert_eq!(buf.publish("out", text("first")), Ok(()));
+        assert_eq!(buf.publish("notes", text("confined")), Ok(()));
+        assert_eq!(buf.publish("out", text("\"quoted\"")), Ok(()));
+        assert_eq!(buf.defer_cancel("out", 0), Ok(()));
+        assert_eq!(buf.defer_edit("out", 1, Some(text("edited")), None), Ok(()));
+        assert_eq!(buf.defer_edit("out", 2, None, Some(60_000)), Ok(()));
+        let charge = buf.batch_charge();
+
+        let flushed = buf.take();
+        let entries: Vec<BatchEntry> = flushed
+            .publishes
+            .into_iter()
+            .filter(|p| channel_is_transportable(&p.channel))
+            .map(|p| BatchEntry {
+                channel: p.channel,
+                body: p.body,
+                urgency: p.urgency,
+                deliver_after: p.deliver_after,
+            })
+            .collect();
+        assert_eq!(entries.len(), 2);
+        let ops: Vec<BatchDeferredOp> = flushed
+            .defer_ops
+            .into_iter()
+            .map(crate::flush::wire_op)
+            .collect();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(
+            charge,
+            Codec::negotiated(SURFACE_ATTACH_VERSION).batch_charged_bytes(&entries, &ops)
+        );
+    }
+
     /// A buffer whose two bound ports each hold one parked message.
     fn buffer_with_parked() -> PublishBuffer {
         PublishBuffer::new(
@@ -1212,12 +1247,6 @@ mod tests {
     }
 
     const NOT_UTF8: &str = "untyped body is not valid UTF-8";
-
-    fn wire_refusal<E>(variant: impl FnOnce(String) -> E) -> Result<(), PortFault<E>> {
-        Err(PortFault::Refused(variant(
-            WIRE_CARRIES_UNTYPED_TEXT_ONLY.to_owned(),
-        )))
-    }
 
     #[test]
     fn a_malformed_body_is_invalid_body_on_every_port_after_the_port_check() {
@@ -1266,18 +1295,13 @@ mod tests {
     }
 
     #[test]
-    fn typed_text_stays_on_the_page_and_keeps_its_type() {
+    fn typed_text_keeps_its_type_on_every_bound_channel() {
         let mut buf = buffer(1_024);
-        assert_eq!(
-            buf.publish("out", parts(Some("text/csv"), b"a,b")),
-            wire_refusal(PublishError::InvalidBody),
-            "the page's wire carries untyped text only"
-        );
+        assert_eq!(buf.publish("out", parts(Some("text/csv"), b"a,b")), Ok(()));
         assert_eq!(
             buf.publish_with_urgency("out", parts(Some("text/csv"), b"a,b"), Urgency::High),
-            wire_refusal(PublishError::InvalidBody)
+            Ok(())
         );
-        assert_eq!(buf.len(), 0, "the refused publish buffers nothing");
         assert_eq!(
             buf.publish("notes", parts(Some("text/csv"), b"a,b")),
             Ok(())
@@ -1285,13 +1309,16 @@ mod tests {
         assert_eq!(
             buf.publish("out", parts(None, b"plain")),
             Ok(()),
-            "untyped parts are untyped text, which the wire carries"
+            "untyped parts are untyped text"
         );
         let flushed = buf.take().publishes;
-        assert_eq!(flushed.len(), 2);
-        assert_eq!(flushed[0].body.content_type(), Some("text/csv"));
-        assert_eq!(flushed[0].body.as_text(), Some("a,b"));
-        assert_eq!(flushed[1].body, MessageBody::text("plain"));
+        assert_eq!(flushed.len(), 4);
+        for p in &flushed[..3] {
+            assert_eq!(p.body.content_type(), Some("text/csv"));
+            assert_eq!(p.body.as_text(), Some("a,b"));
+        }
+        assert_eq!(flushed[0].channel, WIRE);
+        assert_eq!(flushed[3].body, MessageBody::text("plain"));
     }
 
     #[test]
@@ -1311,9 +1338,9 @@ mod tests {
             "uncarriable before oversize"
         );
         assert_eq!(
-            buf.publish("out", parts(Some("text/csv"), &[b'a'; 9])),
-            wire_refusal(PublishError::InvalidBody),
-            "the wire's refusal before oversize"
+            buf.publish("out", parts(Some("image/png"), &oversize)),
+            Err(PortFault::Refused(PublishError::TextOnlyChannel)),
+            "uncarriable on the wire before oversize"
         );
     }
 
@@ -1367,16 +1394,16 @@ mod tests {
             Err(PortFault::Refused(DeferError::TextOnlyChannel))
         );
         assert_eq!(
-            buf.defer_edit("out", 0, Some(parts(Some("text/csv"), b"a,b")), None),
-            wire_refusal(DeferError::InvalidBody)
+            buf.defer_edit("notes", 0, Some(parts(Some("text/csv"), b"a,b")), None),
+            Ok(())
         );
         assert_eq!(
-            buf.defer_edit("notes", 0, Some(parts(Some("text/csv"), b"a,b")), None),
+            buf.defer_edit("out", 0, Some(parts(Some("text/csv"), b"a,b")), None),
             Ok(())
         );
         assert_eq!(buf.defer_edit("out", 0, None, Some(60_000)), Ok(()));
         let ops = buf.take().defer_ops;
-        assert_eq!(ops.len(), 2, "only the accepted edits are buffered");
+        assert_eq!(ops.len(), 3, "only the accepted edits are buffered");
         let DeferOp::Edit {
             body: Some(body), ..
         } = &ops[0].kind
@@ -1387,27 +1414,34 @@ mod tests {
     }
 
     const LOCAL_BLOB: &str = "local:page/blob";
+    const WIRE_BLOB: &str = "ephemeral:site.bar.frames";
 
     /// A buffer with one port on a page-local channel declared `non_text`
-    /// (`blob`), one on an undeclared page-local channel (`notes`), and one on a
-    /// transportable channel whose spec claims the declaration (`out`) — which
-    /// no planner produces, and which the carriage rule must still refuse. Each
-    /// port holds one parked message.
+    /// (`blob`), one on a transportable channel declared `non_text` (`bout`),
+    /// one on an undeclared page-local channel (`notes`) and one on an
+    /// undeclared transportable channel (`out`). Each port holds one parked
+    /// message.
     fn declared_buffer() -> PublishBuffer {
-        let ports = ["blob", "notes", "out"];
+        declared_buffer_capped(1_024)
+    }
+
+    /// [`declared_buffer`] under the body cap `max_body_bytes`.
+    fn declared_buffer_capped(max_body_bytes: u64) -> PublishBuffer {
+        let ports = ["blob", "bout", "notes", "out"];
         PublishBuffer::new(
             "keeper",
             HashMap::from([
                 ("blob".to_string(), declared_spec(LOCAL_BLOB)),
+                ("bout".to_string(), declared_spec(WIRE_BLOB)),
                 ("notes".to_string(), spec(LOCAL)),
-                ("out".to_string(), declared_spec(WIRE)),
+                ("out".to_string(), spec(WIRE)),
             ]),
             Arc::new(ports.into_iter().map(str::to_string).collect()),
             ports
                 .into_iter()
                 .map(|p| (p.to_string(), 1_000_000))
                 .collect(),
-            1_024,
+            max_body_bytes,
             ports
                 .into_iter()
                 .zip(1u128..)
@@ -1417,40 +1451,42 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_page_local_port_carries_a_non_text_body() {
-        let mut buf = declared_buffer();
-        let jpeg = || parts(Some("image/jpeg"), &[0xff, 0xd8, 0xff]);
-        assert_eq!(buf.publish("blob", jpeg()), Ok(()));
-        assert_eq!(buf.publish_deferred("blob", jpeg(), 60_000), Ok(()));
-        assert_eq!(
-            buf.publish_with_urgency("blob", jpeg(), Urgency::High),
-            Ok(())
-        );
-        assert_eq!(
-            buf.defer_edit("blob", 0, Some(parts(None, b"plain")), None),
-            Ok(()),
-            "text is carried on a declared channel too"
-        );
-        assert_eq!(buf.defer_edit("blob", 0, Some(jpeg()), None), Ok(()));
-        let flushed = buf.take();
-        assert_eq!(flushed.publishes.len(), 3);
-        for p in &flushed.publishes {
-            assert_eq!(p.channel, LOCAL_BLOB);
-            assert_eq!(p.body.content_type(), Some("image/jpeg"));
-            assert_eq!(p.body.as_bytes(), &[0xff, 0xd8, 0xff]);
+    fn a_declared_port_of_either_class_carries_a_non_text_body() {
+        for (port, channel) in [("blob", LOCAL_BLOB), ("bout", WIRE_BLOB)] {
+            let mut buf = declared_buffer();
+            let jpeg = || parts(Some("image/jpeg"), &[0xff, 0xd8, 0xff]);
+            assert_eq!(buf.publish(port, jpeg()), Ok(()), "{port}");
+            assert_eq!(buf.publish_deferred(port, jpeg(), 60_000), Ok(()));
+            assert_eq!(
+                buf.publish_with_urgency(port, jpeg(), Urgency::High),
+                Ok(())
+            );
+            assert_eq!(
+                buf.defer_edit(port, 0, Some(parts(None, b"plain")), None),
+                Ok(()),
+                "text is carried on a declared channel too"
+            );
+            assert_eq!(buf.defer_edit(port, 0, Some(jpeg()), None), Ok(()));
+            let flushed = buf.take();
+            assert_eq!(flushed.publishes.len(), 3);
+            for p in &flushed.publishes {
+                assert_eq!(p.channel, channel);
+                assert_eq!(p.body.content_type(), Some("image/jpeg"));
+                assert_eq!(p.body.as_bytes(), &[0xff, 0xd8, 0xff]);
+            }
+            assert_eq!(flushed.publishes[1].deliver_after, Some(60_000));
+            let DeferOp::Edit {
+                body: Some(body), ..
+            } = &flushed.defer_ops[1].kind
+            else {
+                panic!("the second op is the non-text edit");
+            };
+            assert!(!body.is_text());
         }
-        assert_eq!(flushed.publishes[1].deliver_after, Some(60_000));
-        let DeferOp::Edit {
-            body: Some(body), ..
-        } = &flushed.defer_ops[1].kind
-        else {
-            panic!("the second op is the non-text edit");
-        };
-        assert!(!body.is_text());
     }
 
     #[test]
-    fn an_undeclared_or_transportable_port_refuses_a_non_text_body_each_way() {
+    fn an_undeclared_port_of_either_class_refuses_a_non_text_body_each_way() {
         let mut buf = declared_buffer();
         let jpeg = || parts(Some("image/jpeg"), &[0xff, 0xd8]);
         for port in ["notes", "out"] {
@@ -1470,11 +1506,6 @@ mod tests {
                 "{port}, edit"
             );
         }
-        assert_eq!(
-            buf.publish("out", parts(Some("text/csv"), b"a,b")),
-            wire_refusal(PublishError::InvalidBody),
-            "the declaration does not touch the wire's typed-text rule"
-        );
         let flushed = buf.take();
         assert!(flushed.publishes.is_empty());
         assert!(flushed.defer_ops.is_empty());

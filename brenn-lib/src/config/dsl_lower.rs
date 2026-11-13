@@ -3748,20 +3748,13 @@ fn surface_bindings(
 /// throughput is the page's, not a knob the binding sets.
 const SURFACE_MASKED_KEY: &str = "amplification";
 
-// `surface_non_text` gives attach v4's text-only wire as its reason for
-// refusing a channel that leaves the page; moving the page's attach version
-// stops the build here until that reason is rewritten.
-const _: () = assert!(brenn_surface_schema::SURFACE_ATTACH_VERSION == 4);
-
 /// The `non_text` a surface port carries, judged against the address its
 /// binding names.
 ///
-/// Legal only where the port's channel is page-local. Where the binding names
-/// an address — a handle to a declaration or a literal — a non-`local:`
-/// address leaves the page over a text-only wire, and a reserved plane is read
-/// as text by the kernel and chrome; either refuses the key at its own value
-/// and lowers it as `false`. A link's placement is not known here, so a
-/// link-bound port's statement is carried and judged at boot.
+/// Refused only on a reserved plane, which the kernel and chrome read as text;
+/// there the key is refused at its own value and lowered as `false`. Lowering
+/// sees an address and not a declaration, so a statement on any other address
+/// is carried, and boot judges it against the channel's declaration.
 fn surface_non_text(
     attr: Option<&Attr<RVal>>,
     lowered: bool,
@@ -3772,22 +3765,16 @@ fn surface_non_text(
     let (true, Some(attr), Some(address)) = (lowered, attr, channel) else {
         return lowered;
     };
-    let reason = if !brenn_envelope::is_local_channel(address) {
-        format!(
-            "{what} states `{NON_TEXT_KEY}`, and its channel {address} leaves the page: the \
-             page's wire is attach v4, which carries text only. A surface port may state \
-             `{NON_TEXT_KEY}` only where its channel is page-local — a `local:` address, a \
-             free `io` port, or a link whose endpoints are all on this surface"
-        )
-    } else if brenn_surface_schema::is_reserved_local_namespace(address) {
+    if !brenn_surface_schema::is_reserved_local_namespace(address) {
+        return true;
+    }
+    errors.push(Diagnostic::at(
         format!(
             "{what} states `{NON_TEXT_KEY}` on the reserved plane {address}: the kernel and \
              chrome read every `local:brenn/` plane as text"
-        )
-    } else {
-        return true;
-    };
-    errors.push(Diagnostic::at(reason, attr.value.span().clone()));
+        ),
+        attr.value.span().clone(),
+    ));
     false
 }
 

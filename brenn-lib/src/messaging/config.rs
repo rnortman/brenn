@@ -1839,6 +1839,17 @@ pub struct ResolvedLocalChannel {
     pub non_text: bool,
 }
 
+/// One transportable channel some binding of the surface names, with the
+/// directory's declaration of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWireChannel {
+    /// Full `ephemeral:` or `brenn:` channel address.
+    pub address: String,
+    /// The directory entry's `non_text`: whether the channel may carry bodies
+    /// that are not UTF-8 text.
+    pub non_text: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSurface {
     /// `surface:<slug>` participant identity source.
@@ -1862,6 +1873,11 @@ pub struct ResolvedSurface {
     /// source of truth for this traffic, so these channels exist nowhere else
     /// server-side.
     pub local_channels: Vec<ResolvedLocalChannel>,
+    /// Every distinct transportable channel this surface's bindings name, with
+    /// the directory's declaration of it. Deduped, in first-binding order
+    /// (subscriptions, then outputs). Carried to the client in the bindings
+    /// document.
+    pub wire_channels: Vec<ResolvedWireChannel>,
     /// Resolved output bindings (component/port → channel), each carrying its
     /// resolved default publish urgency.
     pub outputs: Vec<SurfaceOutput>,

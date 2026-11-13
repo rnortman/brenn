@@ -57,7 +57,7 @@ use brenn_surface_schema::bindings::{
 };
 use brenn_surface_schema::{
     Binding, ComponentEntry, ComponentGrant, LocalChannel, NoiseLevel, OutputBinding,
-    Urgency as SchemaUrgency,
+    Urgency as SchemaUrgency, WireChannel,
 };
 
 use brenn_envelope::ChannelScheme;
@@ -193,6 +193,16 @@ fn document(spec: &MountSpec) -> BindingsDocument {
             non_text: false,
         })
         .collect();
+    // The scheme under test may be transportable, so every bound address
+    // that crosses the wire is declared there too, text-only.
+    let wire_channels: Vec<WireChannel> = local_channels
+        .iter()
+        .filter(|lc| brenn_surface_schema::wire_bound_address(&lc.channel))
+        .map(|lc| WireChannel {
+            channel: lc.channel.clone(),
+            non_text: false,
+        })
+        .collect();
     let mut declared_out_ports: Vec<String> =
         outputs.iter().map(|b| b.port.clone()).collect::<Vec<_>>();
     declared_out_ports.sort();
@@ -229,6 +239,7 @@ fn document(spec: &MountSpec) -> BindingsDocument {
         subscriptions,
         outputs,
         local_channels,
+        wire_channels,
         chrome_instance: CHROME.to_string(),
         platform: PlatformSection {
             geometry_channel: "brenn:site.surface.conf.geometry".to_string(),

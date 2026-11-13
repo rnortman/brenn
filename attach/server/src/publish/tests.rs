@@ -2173,6 +2173,227 @@ async fn a_v5_refused_batch_under_a_drained_budget_answers_rate_limited() {
     assert_eq!(counters.publish_rate_limited, 1);
 }
 
+// ── The text-only refusal on a route that tells its attachers ────────────────
+
+/// The fixture's authority under the `Violation` posture: a route whose
+/// attachers are told every channel's declaration.
+fn violation_profile() -> TestProfile {
+    TestProfile {
+        text_only_posture: TextOnlyPosture::Violation,
+        ..profile()
+    }
+}
+
+/// The violation's detail, or a panic naming what the handler did instead.
+fn violation_detail(outcome: FrameOutcome) -> String {
+    match outcome {
+        FrameOutcome::Violation(detail) => detail,
+        FrameOutcome::Continue => panic!("expected a violation, the frame was answered"),
+        FrameOutcome::Disconnect => panic!("expected a violation, got a disconnect"),
+    }
+}
+
+/// Under `Violation` a non-text publish to a text-only channel kills the
+/// connection naming the rule and the channel: no frame answers it, nothing is
+/// stored, and it is not counted as an answered refusal.
+#[tokio::test]
+async fn a_non_text_publish_to_a_text_only_channel_is_a_violation_under_that_posture() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_at_version(&db, violation_profile(), true, 64, MAX_BODY, 5).await;
+    let mut bucket = wide_bucket();
+    let mut counters = SessionCounters::default();
+
+    let detail = violation_detail(
+        handle_publish(
+            &ctx,
+            &mut bucket,
+            request(OUT, Some(SUB), &png(4)),
+            &mut counters,
+        )
+        .await,
+    );
+    assert!(
+        detail.contains("Publish carries a non-text body to text-only channel brenn:demo-out"),
+        "{detail}"
+    );
+    assert!(rx.try_recv().is_err(), "no frame answers a violation");
+    assert!(bodies(&ctx, OUT).await.is_empty(), "nothing is stored");
+    assert_eq!(counters.publishes, 0);
+    assert_eq!(counters.publish_text_only_refused, 0);
+}
+
+/// Under `Violation` a batch entry carrying a non-text body to a text-only
+/// channel kills the connection at resolve: nothing of the flush lands, and the
+/// send budget is not drawn, since nothing is answered.
+#[tokio::test]
+async fn a_non_text_batch_entry_to_a_text_only_channel_is_a_violation_before_the_draw() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_at_version(&db, violation_profile(), true, 1, MAX_BODY, 5).await;
+    let mut counters = SessionCounters::default();
+    let (mut sibling, _guard) = sibling_view_queue(&ctx);
+    let later = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis() as u64;
+    let publishes = [
+        entry(OUT, r#"{"n":1}"#, Some(later)),
+        BatchEntry {
+            body: png(2),
+            ..entry(OUT, "", None)
+        },
+    ];
+
+    let detail = violation_detail(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+    );
+    assert!(
+        detail.contains(
+            "PublishBatch entry carries a non-text body to text-only channel brenn:demo-out"
+        ),
+        "{detail}"
+    );
+    assert!(rx.try_recv().is_err(), "no frame answers a violation");
+    assert!(bodies(&ctx, OUT).await.is_empty());
+    assert!(
+        ctx.messenger
+            .deferred_view_for_sender(OUT, sender_of(Some(SUB)).as_str())
+            .await
+            .is_empty(),
+        "nothing parked"
+    );
+    assert!(sibling.try_recv().is_err(), "no view restated");
+    assert_eq!(counters.publish_text_only_refused, 0);
+
+    // The one token of the budget is still there.
+    let publishes = [entry(OUT, "{}", None)];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+}
+
+/// Under `Violation` an edit carrying a non-text body to a text-only channel
+/// kills the connection at resolve: the cancel ahead of it is not applied, the
+/// parked bodies are untouched, and the budget is not drawn.
+#[tokio::test]
+async fn a_non_text_edit_to_a_text_only_channel_is_a_violation_before_the_draw() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_at_version(&db, violation_profile(), true, 1, MAX_BODY, 5).await;
+    let mut counters = SessionCounters::default();
+    let kept = park(&ctx, OUT, r#"{"v":1}"#).await;
+    let edited = park(&ctx, OUT, r#"{"v":2}"#).await;
+    let ops = [
+        cancel(OUT, kept),
+        BatchDeferredOp {
+            channel: OUT.to_string(),
+            message_id: edited,
+            op: DeferredOpKind::Edit {
+                body: Some(png(3)),
+                deliver_after: None,
+            },
+        },
+    ];
+
+    let detail = violation_detail(
+        handle_publish_batch(&ctx, batch(Some(SUB), &[], &ops), &mut counters).await,
+    );
+    assert!(
+        detail.contains(
+            "PublishBatch control op carries a non-text body to text-only channel brenn:demo-out"
+        ),
+        "{detail}"
+    );
+    assert!(rx.try_recv().is_err(), "no frame answers a violation");
+    let parked: Vec<_> = ctx
+        .messenger
+        .deferred_view_for_sender(OUT, sender_of(Some(SUB)).as_str())
+        .await
+        .into_iter()
+        .map(|message| message.envelope.body.clone())
+        .collect();
+    assert_eq!(
+        parked,
+        vec![
+            MessageBody::from(r#"{"v":1}"#),
+            MessageBody::from(r#"{"v":2}"#)
+        ]
+    );
+
+    let publishes = [entry(OUT, "{}", None)];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(
+        batch_outcome(&mut rx),
+        PublishBatchOutcome::Ok,
+        "the violating flush drew nothing"
+    );
+}
+
+/// The posture changes only what a refusal is. Under either, typed text on a
+/// text-only channel and a non-text body on a channel declared `non_text` are
+/// admitted, by a single publish and in a batch.
+#[tokio::test]
+async fn text_and_declared_non_text_bodies_are_admitted_under_either_posture() {
+    for posture in [TextOnlyPosture::Outcome, TextOnlyPosture::Violation] {
+        let db = brenn_messaging_store::db::init_db_memory();
+        let (ctx, mut rx) = attach_at_version(
+            &db,
+            TestProfile {
+                text_only_posture: posture,
+                ..profile()
+            },
+            true,
+            64,
+            4 * MAX_BODY,
+            5,
+        )
+        .await;
+        let mut bucket = wide_bucket();
+        let mut counters = SessionCounters::default();
+        let typed = MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+
+        for (channel, body) in [(OUT, typed.clone()), (FRAMES, png(3))] {
+            assert!(matches!(
+                handle_publish(
+                    &ctx,
+                    &mut bucket,
+                    request(channel, Some(SUB), &body),
+                    &mut counters
+                )
+                .await,
+                FrameOutcome::Continue
+            ));
+            assert_eq!(
+                published_outcome(&mut rx),
+                PublishOutcome::Ok,
+                "{posture:?} {channel}"
+            );
+        }
+
+        let publishes = [
+            BatchEntry {
+                body: typed.clone(),
+                ..entry(OUT, "", None)
+            },
+            BatchEntry {
+                body: png(2),
+                ..entry(FRAMES, "", None)
+            },
+        ];
+        assert!(matches!(
+            handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+            FrameOutcome::Continue
+        ));
+        assert_eq!(
+            batch_outcome(&mut rx),
+            PublishBatchOutcome::Ok,
+            "{posture:?}"
+        );
+        assert_eq!(counters.publishes, 4, "{posture:?}");
+        assert_eq!(counters.publish_text_only_refused, 0, "{posture:?}");
+    }
+}
+
 // ── A target the directory does not hold ─────────────────────────────────────
 
 /// Take `channel` out of the directory, as a deprovision or the first half of a

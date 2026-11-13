@@ -202,19 +202,20 @@ Who is shown the content type today:
 | Query API (`Messenger::query`), host code | text and type | bytes and type |
 | A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, `BrennMessageEdit`) | `"body": "…"`, then `"content_type": "…"` | `"body": {"binary": true, "content_type": "…", "size": N}` — a placeholder, never the bytes |
 | The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` |
-| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | bytes and type; on a page, a body that arrived over the wire has no type, since the page's wire is attach v4 (below), while page-local typed text keeps its type | bytes and type on the backend; on a page, at rest only on a page-local channel declared `non_text` (shown on the node rig, not yet in a browser), and in a sync call or reply |
+| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | text and type, on the backend and on a page, whether the row arrived over the page's wire or stayed on the page | bytes and type on the backend; on a page, at rest on any channel declared `non_text`, page-local or wire-bound (shown on the node rig, not yet in a browser), and in a sync call or reply |
 | 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload, on the backend and on a page |
-| Attach v4 sessions (`Deliver`, `DeferredView`) | bare text, **no type** | never bound: a surface binding to a `non_text` channel that leaves the page is refused at plan (a page-local channel never crosses the wire), a remote's subscribe is answered `Unavailable`; left out of a deferred view |
-| Attach v5 sessions (`Deliver`, `DeferredView`) | text and type | bytes and type |
+| Attach v4 sessions (`Deliver`, `DeferredView`), served to remotes only | bare text, **no type** | never bound: a remote's subscribe is answered `Unavailable`; left out of a deferred view |
+| Attach v5 sessions (`Deliver`, `DeferredView`): a remote's, and every surface page's | text and type | bytes and type |
 
 The two string carriers lose a typed text body's *type*, never its content.
 They cannot carry a non-text body at all, so they are kept off every channel
 declared `non_text` (§2.1) before any message flows — on a page as on the
-backend, where a served 0.1.0 instance bound to a page-local `non_text`
-channel is refused at boot and at reload — and a text-only channel never holds
-a non-text body. On a page that applies a bindings document withdrawing a
-channel's declaration, the kernel empties that channel's store if it holds a
-non-text body, retained or parked, before any reader sees it. Reaching a string carrier with one anyway is a
+backend, where a served 0.1.0 instance bound to a `non_text` channel,
+page-local or wire-bound, is refused at boot and at reload — and a text-only
+channel never holds a non-text body. On a page that applies a bindings document
+withdrawing a channel's declaration, page-local or wire-bound, the kernel
+empties that channel's store if it holds a non-text body, retained or parked,
+before any reader sees it. Reaching a string carrier with one anyway is a
 host bug and a panic.
 
 One exception is cut rather than refused. A remote may hold a v4 and a v5
@@ -234,9 +235,12 @@ offered for a text-only channel is refused to that component
 protocol v5, through `Publish` and `PublishBatch` (entries and deferred edits),
 on the same terms: a non-text body offered for a text-only channel is answered
 `TextOnlyChannel` — the whole batch, if any body in it is refused — and nothing
-is stored. What still cannot: a 0.1.0 component, an attach v4 session (the
-page's, and a remote's that negotiated v4), a conversation and every host door
-that takes a string; every body they produce is untyped text.
+is stored. A 0.2.0 component hosted on a surface page, on the same terms, on
+page-local and wire-bound channels alike: the page's wire is attach v5 and
+carries every body with its type, and the page refuses a non-text body for a
+text-only channel to the component before anything is sent. What still cannot:
+a 0.1.0 component, a remote's attach v4 session, a conversation and every host
+door that takes a string; every body they produce is untyped text.
 
 ### 2.1.3 Limits on a remote's stream of messages
 
@@ -288,6 +292,48 @@ present, then `urgency` and `envelope_type`. The body entries are `body` (a JSON
 text body, or `body_base64` for a non-text one, followed by `content_type` when
 the body has one. An untyped text body's line is exactly the line written
 before bodies became bytes.
+
+### 2.1.4 Limits on a stream delivered to a surface
+
+The delivery half of the path from a publisher to a 0.2.0 kind on a surface
+page: bus, attach session, websocket, page kernel, activation. Defaults;
+"fixed" is a compile-time constant.
+
+| Limit | Default | Raised by |
+|---|---|---|
+| Body cap, one message | 65,536 bytes raw | Operator: `messaging { max_body_bytes }` (restart) |
+| Channel window (`ephemeral:`) | the channel's `retain_depth`, a count, at most 4,096; no byte bound | Operator; the 4,096 is fixed |
+| Session push queue / writer queue | 256 / 256 frames | Fixed |
+| A live `Deliver` | one row per frame; no rate limit and no byte budget on delivery | — |
+| A replay or catch-up `Deliver` | up to `max(push_depth, retain_depth)` rows in one frame, with no size cap | the binding's depths |
+| Server-to-page frame size | unbounded: the 204,800-byte v5 frame cap bounds what a page sends | — |
+| The page's inbound queue | unbounded; drained one frame per browser task | — |
+| The page's store | `max(push_depth, retain_depth)` rows per channel, a count | the binding's depths |
+| One activation's input | every bound port's window, with no byte limit; the 4 MiB per-activation bound is on publishes only | — |
+| Sessions per surface / per user on one surface | 64 / 16 | Fixed |
+
+What follows:
+
+- **Rate.** Delivery adds no rate limit to what the publisher sustains: for a
+  remote onto an `ephemeral:` channel, what §2.1.3 says.
+- **Falling behind.** The server keeps at most 256 undelivered frames per
+  session and then reads the channel's window by cursor; the page keeps at
+  most the store's depth. A kind slower than the stream is activated with the
+  newest `push_depth` rows and the rest are drops — what a frame stream wants:
+  `push_depth = 1`, `retain_depth = 1`. Each activation instantiates the kind
+  afresh, so its cost floors the frame interval; `docs/page-rig-timings.md`
+  has the node figures.
+- **Loudness.** A binding's `noise` decides what a drop does. At `fatal` the
+  first overrun kills the instance; a stream binding states `silent` or
+  `metered`.
+- **Reconnect.** A replay pass is one frame of up to the window's depth times
+  the body cap, on every reconnect.
+
+So a camera frame that fits 64 KiB, sent by a remote onto a `non_text`
+`ephemeral:` channel, reaches a 0.2.0 kind on a surface at 1 per second with
+no configuration and at up to 30 per second with one `remote`-block setting;
+larger frames need the body cap raised. These are limits, not measurements,
+and no browser has run the path.
 
 ### 2.2 Subscriptions
 
@@ -494,25 +540,31 @@ On a declared channel the same key on a port is a check, not a declaration: a
 port stating `non_text = true` bound to a channel that does not is refused
 when the plan is built, so `config-check` reports it.
 
-On a surface the key declares a page-local channel: a surface binding tail
-may state it only where its channel stays on the page — a `local:` address
-outside the reserved `local:brenn/` planes, a free `io` port, or a link whose
-endpoints are all on that surface — and the page ring is `non_text` when any
-surface binding on its address says so. A server-realm `channel` declaration
-at a `local:` address is never read for it. Stated on a binding whose channel
-leaves the page (a declared `ephemeral:` or `brenn:` channel, or a link with
-an endpoint off the surface), or on a reserved plane, it is refused when the
-plan is built; so is a surface bound to a declared `non_text` channel, since
-the page's wire is attach v4, which carries text only. On a declared page-local
-channel a page-hosted `brenn:processor@0.2.0` kind publishes, parks and edits
-non-text bodies, and reads them back byte for byte with their content type —
-shown on the node rig; no browser has run it yet. A page-hosted 0.2.0 kind
-also keeps typed text on any page-local channel with its type and passes any
-body in a sync call between 0.2.0 kinds; a port bound to a channel that
-leaves the page carries untyped text only: a typed text body there is refused
-with `invalid-body`, and a non-text body with `text-only-channel`, as on any
-text-only channel. A remote attacher on v5 is served
-a `non_text` channel; one on v4 is answered `Unavailable`.
+On a surface binding the key does what it does on the backend. Where the
+channel stays on the page — a `local:` address outside the reserved
+`local:brenn/` planes, a free `io` port, or a link whose endpoints are all on
+that surface — it declares a page-local channel, and the page ring is
+`non_text` when any surface binding on its address says so; a server-realm
+`channel` declaration at a `local:` address is never read for it. Where the
+channel leaves the page — a declared `ephemeral:` or `brenn:` channel — it is
+a check: stated on a port whose channel is declared text-only, it is refused
+when the plan is built, and a port that does not state it may be bound to a
+channel declared `non_text`. On a link with an endpoint off the surface the
+statement is the declaration, by the fold above. Stated on a reserved plane it
+is refused. A surface's config channel declared `non_text` is refused: a page
+reads its bindings document as text, so the declaration would admit only
+bodies no page can apply. A 0.1.0 kind bound to any `non_text` channel,
+page-local or wire-bound, is refused at boot and at reload.
+
+The page's wire is attach v5. On any channel declared `non_text`, page-local
+or wire-bound, a page-hosted `brenn:processor@0.2.0` kind publishes, parks and
+edits non-text bodies, is delivered them, and reads them back byte for byte
+with their content type; on any channel it keeps typed text with its type; it
+passes any body in a sync call between 0.2.0 kinds. A non-text body for a
+text-only channel is refused with `text-only-channel`. This is shown on the
+node rig, against a stand-in for the browser's websocket; no browser has run
+it yet. A remote attacher on v5 is served a `non_text` channel; one on v4 is
+answered `Unavailable`.
 
 **The timer-cap coupling.** A channel's `retain_depth` also caps its channel-wide
 deferred set, so on an auto channel the fold above is what bounds how many

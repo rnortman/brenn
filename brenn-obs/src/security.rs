@@ -71,11 +71,14 @@ pub enum SecurityEventType {
     /// existing fail2ban jail without regex changes (`security_event = true`).
     ForwardedHeaderInvalid,
     /// An attach WebSocket connection sent a frame a correct attacher structurally
-    /// cannot produce: unparseable JSON, an unknown frame type, a binary frame, a
-    /// frame larger than the derived read cap (no config-legal frame can exceed
-    /// it), a `Subscribe` to an unbound channel, a duplicate or class-mismatched
+    /// cannot produce: unparseable JSON, an unknown frame type, a frame malformed
+    /// for the session's version (a binary message under v4; a text message of a
+    /// binary kind or a binary message of a text kind under v5), a frame larger
+    /// than the session's frame cap (no config-legal frame can exceed it), a
+    /// `Subscribe` to an unbound channel, a duplicate or class-mismatched
     /// `Subscribe`, a resume seq the server never assigned, an `Unsubscribe` of a
-    /// non-active channel, or a `Publish` to an unbound port. Either an attacher
+    /// non-active channel, a `Publish` to an unbound port, or, on the surface
+    /// route, a non-text body offered to a text-only channel. Either an attacher
     /// bug or tampering; both are reject-and-log per the security posture. The
     /// connection is killed with no response frame, and the source IP is banned by
     /// fail2ban after repeated hits (same `security_event = true` jail — no regex

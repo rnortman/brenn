@@ -12,12 +12,12 @@ use brenn_lib::messaging::gates::{BodySizeExceeded, check_body_size};
 use brenn_messaging::SubscriberRegistration;
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_surface_schema::LogLevel;
-use brenn_surface_server::SurfaceRoots;
 use brenn_surface_server::bindings_doc::{BindingsDocParams, build_bindings_documents};
 use brenn_surface_server::description::{
     DescriptionSelection, SURFACE_CONFIG_COMPONENT, SURFACE_HELP_COMPONENT,
     build_description_docs_selected, distinct_kinds,
 };
+use brenn_surface_server::{SurfaceRoots, platform_channels};
 use brenn_tool_registry::TOOL_EXECUTOR_COMPONENT;
 use uuid::Uuid;
 
@@ -57,6 +57,23 @@ impl SurfaceDelta {
     }
 }
 
+/// What derives the channels every surface's sessions may name besides its
+/// bindings: the `[surface_description]` prefix and the `[observability]`
+/// surface error channel. Level 1 holds both equal across the two plans, so
+/// one value answers for either side.
+#[derive(Clone, Copy)]
+pub(crate) struct SurfacePlatform<'a> {
+    pub prefix: &'a str,
+    pub error_channel: Option<&'a str>,
+}
+
+impl SurfacePlatform<'_> {
+    /// The platform channels of one surface, by address.
+    pub fn channels(&self, surface: &ResolvedSurface) -> Vec<String> {
+        platform_channels(self.prefix, self.error_channel, surface)
+    }
+}
+
 /// What a surface is compared against besides its own resolved value.
 ///
 /// Both are *closures* in the sense the consumer delta already uses: a surface
@@ -68,10 +85,12 @@ pub(crate) struct SurfaceClosure<'a> {
     /// Uuids of every entry in the channel delta.
     pub moved_channels: &'a HashSet<Uuid>,
     /// Addresses of the same entries, which is the grain a surface's output
-    /// bindings name a channel at.
+    /// bindings and its platform channels name a channel at.
     pub moved_addresses: &'a HashSet<String>,
     /// Kinds whose installed bytes or root moved between the two scans.
     pub kinds_changed: &'a BTreeSet<String>,
+    /// What a surface's platform channels are derived from.
+    pub platform: SurfacePlatform<'a>,
 }
 
 /// Classify every difference between the two plans' surface lists.
@@ -112,12 +131,18 @@ pub(crate) fn surface_delta(
     delta
 }
 
-/// Whether any channel this surface binds is in the channel delta.
+/// Whether any channel this surface's sessions may name is in the channel
+/// delta: one it binds, or one of its platform channels.
 ///
 /// Inputs are compared by uuid (a transportable subscription carries the
-/// directory's own key) and outputs by address (an output binding names a
-/// channel by address and never resolves a uuid). A `local:` binding is in
-/// neither set: that traffic has no directory entry to move.
+/// directory's own key) and outputs and platform channels by address (neither
+/// resolves a uuid). A `local:` binding is in neither set: that traffic has no
+/// directory entry to move.
+///
+/// The platform channels are counted because a promoted surface's sessions are
+/// closed before the commit walks the channels: an entry an attached session
+/// may subscribe or publish is never replaced under it, where a heartbeat
+/// landing between the removal and the add would meet no entry at all.
 fn touches_moved_channel(surface: &ResolvedSurface, closure: &SurfaceClosure<'_>) -> bool {
     surface.wire_subscriptions.iter().any(|sub| {
         closure
@@ -127,6 +152,11 @@ fn touches_moved_channel(surface: &ResolvedSurface, closure: &SurfaceClosure<'_>
         .outputs
         .iter()
         .any(|out| closure.moved_addresses.contains(&out.channel_address))
+        || closure
+            .platform
+            .channels(surface)
+            .iter()
+            .any(|address| closure.moved_addresses.contains(address))
 }
 
 /// Whether any kind this surface instantiates was installed differently by the
@@ -513,6 +543,7 @@ mod tests {
                 moved_channels: &moved_channels,
                 moved_addresses,
                 kinds_changed,
+                platform: PLATFORM,
             },
         )
     }
@@ -533,6 +564,15 @@ mod tests {
             .map(|sub| sub.subscription.channel_uuid)
             .collect()
     }
+
+    /// The platform every case runs under: the default prefix and an error
+    /// channel.
+    const PLATFORM: SurfacePlatform<'static> = SurfacePlatform {
+        prefix: "surface",
+        error_channel: Some(ERROR_CHANNEL),
+    };
+
+    const ERROR_CHANNEL: &str = "brenn:surface-errors";
 
     fn moved(addresses: &[&str]) -> HashSet<String> {
         addresses.iter().map(|a| (*a).to_string()).collect()
@@ -972,6 +1012,63 @@ mod tests {
             &after,
             &moved(&["brenn:elsewhere"]),
             &BTreeSet::new(),
+        );
+        assert!(delta.is_empty());
+    }
+
+    /// Platform closure: a surface's config, geometry and status channels are
+    /// its own, so a move of one promotes that surface and no other.
+    #[test]
+    fn a_surface_whose_own_platform_channel_moved_is_changed() {
+        let before = vec![surface("wall", None, None), surface("kiosk", None, None)];
+        let after = before.clone();
+        for address in [
+            "ephemeral:surface.surface.wall.bindings",
+            "brenn:surface.surface.wall.geometry",
+            "brenn:surface.surface.wall.status",
+        ] {
+            let delta = closed_delta(&before, &after, &moved(&[address]), &BTreeSet::new());
+            assert_eq!(slugs_changed(&delta), vec!["wall"], "{address}");
+        }
+    }
+
+    /// The surface error channel is every surface's: its move promotes all.
+    #[test]
+    fn a_moved_error_channel_changes_every_surface() {
+        let before = vec![surface("wall", None, None), surface("kiosk", None, None)];
+        let after = before.clone();
+        let delta = closed_delta(&before, &after, &moved(&[ERROR_CHANNEL]), &BTreeSet::new());
+        assert_eq!(slugs_changed(&delta), vec!["wall", "kiosk"]);
+    }
+
+    /// Another surface's platform channel, or a channel under the prefix that
+    /// is no surface's, promotes nobody; and with no error channel configured,
+    /// the address that would have been it is an ordinary channel.
+    #[test]
+    fn a_platform_channel_that_is_not_this_surfaces_promotes_nothing() {
+        let before = vec![surface("wall", None, None)];
+        let after = before.clone();
+        for address in [
+            "brenn:surface.surface.kiosk.status",
+            "brenn:surface.index",
+            "brenn:surface.surface.wall.help",
+        ] {
+            let delta = closed_delta(&before, &after, &moved(&[address]), &BTreeSet::new());
+            assert!(delta.is_empty(), "{address}");
+        }
+        let moved_addresses = moved(&[ERROR_CHANNEL]);
+        let delta = surface_delta(
+            &before,
+            &after,
+            &SurfaceClosure {
+                moved_channels: &HashSet::new(),
+                moved_addresses: &moved_addresses,
+                kinds_changed: &BTreeSet::new(),
+                platform: SurfacePlatform {
+                    error_channel: None,
+                    ..PLATFORM
+                },
+            },
         );
         assert!(delta.is_empty());
     }

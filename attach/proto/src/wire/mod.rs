@@ -14,8 +14,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BatchDeferredOp, BatchEntry, BatchIllegal, ClientFrame, MAX_BATCH_OPS, MessageBody,
-    SUPPORTED_VERSIONS, ServerFrame, VersionRange,
+    BatchDeferredOp, BatchEntry, BatchIllegal, ClientFrame, DeferredOpKind, MAX_BATCH_OPS,
+    MessageBody, SUPPORTED_VERSIONS, ServerFrame, VersionRange,
 };
 
 /// One websocket message, as either end writes or reads it.
@@ -185,7 +185,21 @@ impl Codec {
         }
     }
 
-    /// What a batch's two lists charge against the body cap.
+    /// What one publish, or one control op, is charged against the body cap:
+    /// the summand of [`batch_charged_bytes`](Codec::batch_charged_bytes).
+    /// `body` is `None` for a cancel and for an edit that changes no body.
+    ///
+    /// For an embedder that keeps a running charge over work it has not yet
+    /// composed into a batch, so its budget and the batch law cannot disagree.
+    pub fn op_charged_bytes(self, channel: &str, body: Option<&MessageBody>) -> usize {
+        match self.version {
+            Version::V4 => v4::op_charge(channel, body),
+            Version::V5 => v5::op_charge(channel, body),
+        }
+    }
+
+    /// What a batch's two lists charge against the body cap: the sum of
+    /// [`op_charged_bytes`](Codec::op_charged_bytes) over every operation.
     ///
     /// A batch is charged as a whole rather than per entry because it travels as
     /// one frame: what has to be bounded is the frame, and one budget spent
@@ -262,6 +276,31 @@ impl Codec {
             Version::V4 => v4::batch_frame_bytes(attribution, publishes, deferred_ops),
             Version::V5 => v5::batch_frame_bytes(attribution, publishes, deferred_ops),
         }
+    }
+}
+
+/// A batch's charge under a version's per-operation charge `op_charge`.
+fn sum_op_charges(
+    publishes: &[BatchEntry],
+    deferred_ops: &[BatchDeferredOp],
+    op_charge: fn(&str, Option<&MessageBody>) -> usize,
+) -> usize {
+    let entries: usize = publishes
+        .iter()
+        .map(|entry| op_charge(&entry.channel, Some(&entry.body)))
+        .sum();
+    let ops: usize = deferred_ops
+        .iter()
+        .map(|op| op_charge(&op.channel, op_body(&op.op)))
+        .sum();
+    entries + ops
+}
+
+/// The body a control op writes: an edit's new body, if it states one.
+fn op_body(op: &DeferredOpKind) -> Option<&MessageBody> {
+    match op {
+        DeferredOpKind::Edit { body, .. } => body.as_ref(),
+        DeferredOpKind::Cancel => None,
     }
 }
 
@@ -544,6 +583,92 @@ mod tests {
     #[should_panic(expected = "empty or outside")]
     fn an_empty_served_range_has_no_transport_cap() {
         max_transport_frame_bytes(VersionRange { min: 5, max: 4 }, 1024);
+    }
+
+    /// Entries and control ops of every shape the charge distinguishes:
+    /// typed text, untyped text and non-text bodies, an edit with a body and
+    /// one without, a cancel, and channels JSON escapes.
+    fn every_charged_shape() -> (Vec<BatchEntry>, Vec<BatchDeferredOp>) {
+        let typed = MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+        let non_text =
+            MessageBody::from_parts(Some("image/x; n=\"q\""), &[0xff, 0x00, 0xfe]).unwrap();
+        let publishes = vec![
+            BatchEntry::new("ephemeral:plain", typed.clone(), crate::Urgency::Normal),
+            BatchEntry::new(
+                "brenn:\"quoted\"\n",
+                "untyped".into(),
+                crate::Urgency::Normal,
+            ),
+            BatchEntry::new("ephemeral:bytes", non_text.clone(), crate::Urgency::Normal)
+                .deliver_after(7),
+        ];
+        let op = |channel: &str, op: DeferredOpKind| BatchDeferredOp {
+            channel: channel.to_string(),
+            message_id: uuid::Uuid::nil(),
+            op,
+        };
+        let deferred_ops = vec![
+            op(
+                "ephemeral:bytes",
+                DeferredOpKind::Edit {
+                    body: Some(non_text),
+                    deliver_after: None,
+                },
+            ),
+            op(
+                "brenn:\u{1}",
+                DeferredOpKind::Edit {
+                    body: None,
+                    deliver_after: Some(9),
+                },
+            ),
+            op("ephemeral:plain", DeferredOpKind::Cancel),
+        ];
+        (publishes, deferred_ops)
+    }
+
+    /// The batch charge is the sum of the per-operation charge, at every
+    /// version, so an embedder's running charge and the batch law agree.
+    #[test]
+    fn the_batch_charge_is_the_sum_of_the_op_charges_at_every_version() {
+        let (publishes, deferred_ops) = every_charged_shape();
+        for version in SUPPORTED_VERSIONS.min..=SUPPORTED_VERSIONS.max {
+            let codec = Codec::negotiated(version);
+            let summed: usize = publishes
+                .iter()
+                .map(|entry| codec.op_charged_bytes(&entry.channel, Some(&entry.body)))
+                .chain(
+                    deferred_ops
+                        .iter()
+                        .map(|op| codec.op_charged_bytes(&op.channel, super::op_body(&op.op))),
+                )
+                .sum();
+            assert_eq!(
+                codec.batch_charged_bytes(&publishes, &deferred_ops),
+                summed,
+                "v{version}"
+            );
+        }
+    }
+
+    /// v4 charges the channel and the body raw; v5 also charges the content
+    /// type, and escapes the channel and the type as JSON writes them.
+    #[test]
+    fn the_op_charge_is_each_versions_law() {
+        let v4 = Codec::negotiated(4);
+        let v5 = Codec::negotiated(5);
+        let typed = MessageBody::from_parts(Some("text/x; n=\"q\""), b"abc").unwrap();
+        assert_eq!(v4.op_charged_bytes("brenn:a", Some(&typed)), 7 + 3);
+        assert_eq!(
+            v5.op_charged_bytes("brenn:a", Some(&typed)),
+            7 + "text/x; n=\\\"q\\\"".len() + 3
+        );
+        assert_eq!(v4.op_charged_bytes("brenn:\"a\"", None), 9);
+        assert_eq!(v5.op_charged_bytes("brenn:\"a\"", None), 11);
+        assert_eq!(v5.op_charged_bytes("brenn:\u{1}", None), 6 + 6);
+        let untyped: MessageBody = "abcd".into();
+        assert_eq!(v4.op_charged_bytes("e:x", Some(&untyped)), 3 + 4);
+        assert_eq!(v5.op_charged_bytes("e:x", Some(&untyped)), 3 + 4);
     }
 
     #[test]

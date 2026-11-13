@@ -58,6 +58,7 @@ use brenn_attach_proto::{
 };
 
 use crate::activation::DropVerdicts;
+use crate::bindings::channel_carries;
 use crate::outbound::{LostFlush, PublishAnswer};
 use crate::page::{Configured, SurfacePage};
 
@@ -205,9 +206,12 @@ fn on_subscribe_result(
     let ack = match settlement {
         SubscribeSettlement::Opened(ack) => ack,
         // Every channel a surface subscribes is provisioned before the backend
-        // accepts a connection and named by the wiring it delivered, so an
-        // unavailable one is an answer this route's profile cannot legally
-        // produce — a broken peer, like any other.
+        // accepts a connection and named by the wiring it delivered. The server
+        // answers `Unavailable` for a non-text channel only to a v4 session,
+        // and for a channel absent from its directory, which a reload never
+        // leaves it while a session that may name the channel is attached. So
+        // it is an answer this route cannot legally produce — a broken peer,
+        // like any other.
         SubscribeSettlement::Unavailable => {
             return Err(format!(
                 "the peer answered Unavailable on {channel}, a channel its own wiring names"
@@ -235,7 +239,9 @@ fn on_subscribe_result(
 ///
 /// Three outcomes. A straggling pass is discarded whole and reported once. The
 /// config channel's rows are the page's wiring and each runs phase 2. Anything
-/// else goes into the channel's store — for every subscribed channel uniformly,
+/// else is checked against the channel's declaration — a non-text row on a
+/// channel the wiring declares text-only is the peer's fault and an `Err`,
+/// before any row is stored — and goes into the channel's store — for every subscribed channel uniformly,
 /// registered readers or not, because retention is what makes a message
 /// recoverable and is not a fact about who is listening.
 ///
@@ -306,6 +312,24 @@ fn on_deliver(
             ..Inbound::default()
         });
     }
+    // The server builds the document and its directory from one plan, and a
+    // reload that changes a declaration closes the session first, so a non-text
+    // row on a channel the document declares text-only is a broken peer.
+    let declared_non_text = page
+        .connect
+        .bindings()
+        .expect("surface client: a subscribed channel implies a document in force")
+        .carries_non_text(&channel);
+    if let Some(row) = rows
+        .iter()
+        .find(|row| !channel_carries(declared_non_text, &row.envelope.body))
+    {
+        return Err(format!(
+            "the peer delivered a non-text body ({}) on {channel}, which its own wiring declares \
+             text-only",
+            row.envelope.body.summary()
+        ));
+    }
     let overflow = {
         let store = page.stores.get_mut(&channel).unwrap_or_else(|| {
             panic!("surface client: delivery on {channel:?}, which the page retains nothing for")
@@ -357,12 +381,13 @@ fn on_batch_result(
     outcome: PublishBatchOutcome,
     now: Millis,
 ) -> Result<Inbound, String> {
-    // The page attaches at v4, which cannot carry the non-text body this
-    // refusal answers, so a peer that sends it is not a conforming one.
+    // The surface route answers a non-text body offered to a text-only channel
+    // with a protocol close, never with this outcome, so a peer that sends it
+    // is not the server this page was built against.
     if outcome == PublishBatchOutcome::TextOnlyChannel {
         return Err(format!(
-            "PublishBatchResult {correlation} answered {outcome:?}, which a v4 attachment cannot \
-             earn"
+            "PublishBatchResult {correlation} answered {outcome:?}, which the surface route \
+             never sends"
         ));
     }
     let BatchAnswer {

@@ -11,7 +11,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { REPO_ROOT } from "../test-helpers/transpiled-processor.js";
 import { Failures, type ParkedTimer, type RigTimers, installGlobals, tick } from "./globals.js";
-import { type Kit, type KitPage, Peer, type WirePublish } from "./peer.js";
+import { type Kit, type KitPage, type Parked, Peer, type RigBody, type WirePublish, textOf } from "./peer.js";
 
 const STATIC_ROOT = resolve(REPO_ROOT, "surface/page-rig-dist");
 const KIT_PATH = resolve(REPO_ROOT, "surface/test-fixtures/peer/page_rig_kit.json");
@@ -56,6 +56,15 @@ export interface BytesReport {
         new_from: number;
         dropped: number;
         envelopes: BytesEnvelope[];
+    }[];
+    /** The `stream` window, by checksum: its envelopes' count, total length and FNV-1a 64. */
+    streams: {
+        port: string;
+        new_from: number;
+        dropped: number;
+        count: number;
+        len: number;
+        fnv1a: string;
     }[];
     deferred: {
         port: string;
@@ -137,12 +146,14 @@ export interface Page {
     readonly facts: KitPage;
     /** Deliver `lines` as one command on `instance`'s `in` channel, settle, and return the reports produced. */
     command(instance: string, ...lines: string[]): Promise<Report[]>;
-    /** Deliver `body` on `channel`, settle, and return the reports produced. */
-    deliver(channel: string, body: string): Promise<Report[]>;
+    /** Deliver `body` on `channel` — a string as untyped text — settle, and return the reports produced. */
+    deliver(channel: string, body: string | RigBody): Promise<Report[]>;
     /** Every report `instance` has published, oldest first. */
     reports(instance: string): Report[];
     /** Every body the kernel published to the wire on `channel`, oldest first. */
     wire(channel: string): WirePublish[];
+    /** What `instance` has parked with the peer on the wire channel `channel`, soonest first. */
+    parked(channel: string, instance: string): Parked[];
     /** The rows of the newest status document the kernel published. */
     status(): StatusRow[];
     /** Wait until the page is quiescent; rethrow the first recorded failure. */
@@ -288,15 +299,15 @@ export async function openPage(name: string): Promise<Page> {
     const reportsOf = (instance: string): Report[] =>
         peer.published
             .filter((p) => p.channel === facts.report_channel && p.attribution === instance)
-            .map((p) => parseReport(instance, contractOf(instance), p.body));
+            .map((p) => parseReport(instance, contractOf(instance), textOf(p.body)));
     const reportsSince = (order: number): Report[] =>
         peer.published
             .filter((p) => p.order >= order && p.channel === facts.report_channel)
             .map((p) => {
                 if (p.attribution === null) {
-                    throw new Error(`an unattributed report reached the peer: ${p.body}`);
+                    throw new Error(`an unattributed report reached the peer: ${textOf(p.body)}`);
                 }
-                return parseReport(p.attribution, contractOf(p.attribution), p.body);
+                return parseReport(p.attribution, contractOf(p.attribution), textOf(p.body));
             });
 
     const latestStatus = (): StatusRow[] | null => {
@@ -304,7 +315,7 @@ export async function openPage(name: string): Promise<Page> {
         const latest = all[all.length - 1];
         return latest === undefined
             ? null
-            : (JSON.parse(latest.body) as { instances: StatusRow[] }).instances;
+            : (JSON.parse(textOf(latest.body)) as { instances: StatusRow[] }).instances;
     };
 
     // Bring-up is the one stretch of real asynchrony — dynamic import, streaming
@@ -360,6 +371,7 @@ export async function openPage(name: string): Promise<Page> {
         },
         reports: reportsOf,
         wire: (channel) => peer.published.filter((p) => p.channel === channel),
+        parked: (channel, instance) => peer.parked(channel, instance),
         status() {
             const rows = latestStatus();
             if (rows === null) {

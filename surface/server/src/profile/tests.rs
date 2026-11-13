@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
 use brenn_lib::access::AppPolicy;
 use brenn_lib::messaging::config::{Depth, ResolvedSurface};
 use brenn_messaging::testutils::empty_directory_messenger;
@@ -247,6 +250,16 @@ fn a_missing_output_stays_a_broken_invariant_for_a_surface() {
     );
 }
 
+/// A page is told every channel's `non_text` declaration before it may publish,
+/// so a non-text body offered to a text-only channel came from no conforming
+/// page: a protocol violation that closes the session and feeds fail2ban.
+/// Answering it with the remote's `Outcome` would leave a hostile page a
+/// metered, silent probe.
+#[test]
+fn a_non_text_body_on_a_text_only_channel_is_a_violation_for_a_surface() {
+    assert_eq!(profile().text_only_posture(), TextOnlyPosture::Violation);
+}
+
 /// The route's capacity policy reaches the registry through the profile, at the
 /// compiled-in surface caps. Asserted against the constants rather than the
 /// numbers so the test pins the wiring, not a value the operator may retune.
@@ -421,4 +434,62 @@ fn an_output_naming_an_undeclared_instance_is_a_boot_panic() {
         .output("brenn:ghost-out", "ghost", "out")
         .build();
     build_profile(&resolved);
+}
+
+/// Every address a built profile admits, for subscribe or for publish under any
+/// attribution, the bare identity's included.
+fn admitted_addresses(profile: &SurfaceProfile) -> BTreeSet<String> {
+    profile
+        .subscribable
+        .keys()
+        .chain(profile.kernel_publishable.iter())
+        .chain(profile.component_publishable.values().flatten())
+        .cloned()
+        .collect()
+}
+
+/// Every transportable address a binding of `resolved` names.
+fn bound_addresses(resolved: &ResolvedSurface) -> BTreeSet<String> {
+    resolved
+        .subscriptions
+        .iter()
+        .map(|b| &b.channel_address)
+        .chain(resolved.outputs.iter().map(|b| &b.channel_address))
+        .filter(|address| !brenn_envelope::is_local_channel(address))
+        .cloned()
+        .collect()
+}
+
+/// **`platform_channels` is exactly what the profile admits beyond the
+/// bindings.** A reload reads the list to learn which entries an attached
+/// page can name; an address the profile admits and the list omits is one a
+/// reload could replace under an attached session. Asked with and without an
+/// error channel, both directions.
+#[test]
+fn platform_channels_are_what_the_profile_admits_besides_the_bindings() {
+    let resolved = two_component_surface();
+    let prefix = description_params().prefix;
+    for error_channel in [None, Some(ERROR_CHANNEL)] {
+        let mut runtime = runtime(resolved.clone());
+        if let Some(channel) = error_channel {
+            Arc::get_mut(&mut runtime.profile)
+                .expect("the profile is not shared yet")
+                .bind_error_channel(channel);
+        }
+        let platform: BTreeSet<String> =
+            crate::platform_channels(&prefix, error_channel, &resolved)
+                .into_iter()
+                .collect();
+        let bound = bound_addresses(&resolved);
+        assert!(
+            platform.is_disjoint(&bound),
+            "no platform channel is a binding's: {platform:?} / {bound:?}"
+        );
+        let expected: BTreeSet<String> = bound.union(&platform).cloned().collect();
+        assert_eq!(
+            admitted_addresses(&runtime.profile),
+            expected,
+            "error channel {error_channel:?}"
+        );
+    }
 }

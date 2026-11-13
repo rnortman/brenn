@@ -67,7 +67,7 @@ use brenn_attach_proto::{BatchDeferredOp, BatchEntry, DeferredOpKind};
 use brenn_envelope::MessageBody;
 
 use crate::activation::{DropVerdicts, Schedules};
-use crate::bindings::{AppliedBindings, carriage_refusal, channel_is_transportable};
+use crate::bindings::{AppliedBindings, channel_carries, channel_is_transportable};
 use crate::outbound::SurfaceOutbound;
 use crate::publish_buffer::{BufferedDeferOp, BufferedPublish, PublishBuffer};
 use crate::registry::{Registrations, SurfaceStores};
@@ -408,18 +408,17 @@ fn assert_carried_in_force(
     channel: &str,
     body: &MessageBody,
 ) {
-    let refusal = carriage_refusal(channel, bindings.carries_non_text(channel), body);
     assert!(
-        refusal.is_none(),
+        channel_carries(bindings.carries_non_text(channel), body),
         "surface client: {instance}'s port {port} committing {} to {channel}, which the wiring \
-         in force refuses ({refusal:?}): the buffer was judged under a bindings document other \
+         in force declares text-only: the buffer was judged under a bindings document other \
          than the one in force",
         body.summary()
     );
 }
 
 /// One buffered control op as the batch frame carries it.
-fn wire_op(op: BufferedDeferOp) -> BatchDeferredOp {
+pub(crate) fn wire_op(op: BufferedDeferOp) -> BatchDeferredOp {
     let BufferedDeferOp {
         channel,
         message_id,

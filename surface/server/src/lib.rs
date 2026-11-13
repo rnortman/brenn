@@ -156,6 +156,29 @@ pub struct SurfaceDescriptionRuntime {
     pub config_channel: String,
 }
 
+/// The transportable channels a session of `surface` may subscribe or publish
+/// besides its bindings: its config, geometry and status channels, and the
+/// surface error channel when one is configured.
+///
+/// The one statement of that set outside the profile, for whoever must know
+/// every directory entry an attached page can name — a reload that would
+/// replace one of them closes the surface's sessions first.
+pub fn platform_channels(
+    prefix: &str,
+    error_channel: Option<&str>,
+    surface: &ResolvedSurface,
+) -> Vec<String> {
+    let slug = &surface.slug;
+    [
+        description::surface_config_channel(prefix, slug),
+        description::surface_geometry_channel(prefix, slug),
+        description::surface_status_channel(prefix, slug),
+    ]
+    .into_iter()
+    .chain(error_channel.map(str::to_string))
+    .collect()
+}
+
 /// Assert that a channel the wire maps hold is transportable — the one channel
 /// characteristic the surface bridge is allowed to see, because only
 /// transportable channels cross the websocket at all.
@@ -1547,6 +1570,15 @@ mod tests {
                 },
             }],
             local_channels: vec![],
+            wire_channels: ["ephemeral:protobar-demo", "brenn:writer-out"]
+                .into_iter()
+                .map(
+                    |address| brenn_lib::messaging::config::ResolvedWireChannel {
+                        address: address.to_string(),
+                        non_text: false,
+                    },
+                )
+                .collect(),
             outputs: vec![SurfaceOutput {
                 channel_address: "brenn:writer-out".to_string(),
                 instance: "writer".to_string(),
@@ -1897,6 +1929,7 @@ mod tests {
         }];
         surface.subscriptions = vec![];
         surface.outputs = vec![];
+        surface.wire_channels = vec![];
         surface
     }
 
@@ -2226,6 +2259,9 @@ mod tests {
     /// The page-local channel the contract cases bind.
     const STATE: &str = "local:deskbar/state";
 
+    /// The transportable channel the contract cases bind.
+    const FRAMES: &str = "ephemeral:deskbar-frames";
+
     /// [`resolved_with_processor`] with the instance's `state` port bound to
     /// [`STATE`] as an input, an output, or both, and the channel declared
     /// `non_text` or not.
@@ -2235,11 +2271,34 @@ mod tests {
         output: bool,
         non_text: bool,
     ) -> ResolvedSurface {
+        resolved_bound_to(kind, STATE, input, output, non_text)
+    }
+
+    /// As [`resolved_bound_to_state`], on the transportable [`FRAMES`], whose
+    /// declaration is the directory's and rides in the wire table.
+    fn resolved_bound_to_frames(
+        kind: &str,
+        input: bool,
+        output: bool,
+        non_text: bool,
+    ) -> ResolvedSurface {
+        resolved_bound_to(kind, FRAMES, input, output, non_text)
+    }
+
+    /// [`resolved_with_processor`] with the instance's `state` port bound to
+    /// `channel`, declared in the table of its class.
+    fn resolved_bound_to(
+        kind: &str,
+        channel: &str,
+        input: bool,
+        output: bool,
+        non_text: bool,
+    ) -> ResolvedSurface {
         let mut surface = resolved_with_processor("deskbar", kind);
         let instance = surface.components[0].instance.clone();
         if input {
             surface.subscriptions.push(SurfaceBinding {
-                channel_address: STATE.to_string(),
+                channel_address: channel.to_string(),
                 instance: instance.clone(),
                 port: "state".to_string(),
                 push_depth: 0,
@@ -2249,7 +2308,7 @@ mod tests {
         }
         if output {
             surface.outputs.push(SurfaceOutput {
-                channel_address: STATE.to_string(),
+                channel_address: channel.to_string(),
                 instance,
                 port: "state".to_string(),
                 default_urgency: Urgency::Normal,
@@ -2259,11 +2318,18 @@ mod tests {
                 },
             });
         }
-        surface.local_channels = vec![brenn_lib::messaging::config::ResolvedLocalChannel {
-            address: STATE.to_string(),
-            ring_depth: 1,
-            non_text,
-        }];
+        if brenn_envelope::is_local_channel(channel) {
+            surface.local_channels = vec![brenn_lib::messaging::config::ResolvedLocalChannel {
+                address: channel.to_string(),
+                ring_depth: 1,
+                non_text,
+            }];
+        } else {
+            surface.wire_channels = vec![brenn_lib::messaging::config::ResolvedWireChannel {
+                address: channel.to_string(),
+                non_text,
+            }];
+        }
         surface
     }
 
@@ -2372,6 +2438,104 @@ mod tests {
         assert!(
             message.starts_with("reload: [[surface]] \"deskbar\"")
                 && message.contains("brenn:processor@0.1.0")
+                && message.ends_with("brenn:processor@0.2.0."),
+            "{message}"
+        );
+    }
+
+    /// The input arm on a transportable channel: the declaration is the
+    /// directory's, so the fix names the binding, not the port's statement.
+    #[test]
+    #[should_panic(
+        expected = "boot: [[surface]] \"deskbar\": component \"fleet-1\"'s input port \"state\" is \
+                    bound to ephemeral:deskbar-frames, a channel declared `non_text`, and its \
+                    kind \"fleet\" is built against brenn:processor@0.1.0, which carries only \
+                    text — bind the port to a text-only channel, or install a build of the kind \
+                    against brenn:processor@0.2.0. Refusing to start"
+    )]
+    fn a_string_contract_instance_reading_a_non_text_wire_channel_refuses_the_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_frames("fleet", true, false, true)],
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "component \"fleet-1\"'s output port \"state\" is bound to \
+                    ephemeral:deskbar-frames, a channel declared `non_text`"
+    )]
+    fn a_string_contract_instance_writing_a_non_text_wire_channel_refuses_the_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_frames("fleet", false, true, true)],
+        );
+    }
+
+    #[test]
+    fn a_string_contract_instance_on_a_text_only_wire_channel_is_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        let roots = validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_frames("fleet", true, true, false)],
+        );
+        assert!(roots.kinds.contains_key("fleet"));
+    }
+
+    #[test]
+    fn a_byte_contract_instance_on_a_non_text_wire_channel_is_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_real_kind(dir.path(), "frames", BYTES_ARTIFACT);
+        let mut surface = resolved_bound_to_frames("frames", true, true, true);
+        surface.components[0].grants = [
+            brenn_lib::messaging::ComponentGrant::Ports,
+            brenn_lib::messaging::ComponentGrant::Calls,
+        ]
+        .into();
+        let roots = validate_one_root(dir.path(), &[surface]);
+        assert_eq!(
+            roots.kind_contract("frames"),
+            Some(brenn_envelope::grants::ProcessorContract::V0_2)
+        );
+    }
+
+    #[test]
+    fn an_instance_of_a_withheld_kind_on_a_non_text_wire_channel_is_not_judged() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[resolved_bound_to_frames("fleet", true, true, true)],
+        );
+        assert!(roots.withheld.contains_key("fleet"));
+    }
+
+    #[test]
+    fn the_wire_channel_contract_refusal_at_reload_names_no_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        let mounts = mount_roots(&[("brenn", dir.path())]);
+        let surfaces = [resolved_bound_to_frames("fleet", false, true, true)];
+        let payload = std::panic::catch_unwind(|| {
+            validate_surface_assets_in(AssetContext::RELOAD, &mounts, &surfaces)
+        })
+        .expect_err("the reload is refused");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("a formatted panic message");
+        assert!(
+            message.starts_with("reload: [[surface]] \"deskbar\"")
+                && message.contains("ephemeral:deskbar-frames, a channel declared `non_text`")
                 && message.ends_with("brenn:processor@0.2.0."),
             "{message}"
         );

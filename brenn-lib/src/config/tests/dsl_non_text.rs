@@ -1,7 +1,6 @@
 //! Lowering `non_text`: on a channel declaration, on each consumer binding
 //! tail and the link endpoints those bindings present, and on surface binding
-//! tails — carried where the port's channel is page-local, refused where its
-//! address leaves the page or is a reserved plane.
+//! tails — carried on every address but a reserved plane, where it is refused.
 
 use brenn_dsl::{processor_needs, surface_any};
 
@@ -300,123 +299,82 @@ surface alice_pod {{
     );
 }
 
-/// The refusal a surface binding draws for `non_text` on an address that
-/// leaves the page.
-fn leaves_the_page(port: &str, address: &str) -> String {
-    format!(
-        "the `{port}` port of instance `widget` of surface `alice_pod` states `non_text`, and \
-         its channel {address} leaves the page: the page's wire is attach v4, which carries \
-         text only. A surface port may state `non_text` only where its channel is page-local \
-         — a `local:` address, a free `io` port, or a link whose endpoints are all on this \
-         surface"
-    )
-}
-
+/// Lowering sees an address and not a declaration, so a surface port's
+/// `non_text` on a transportable address — an `in`, an `out` and an `io` on a
+/// handle, each to an `ephemeral:` or `brenn:` channel — is carried to the
+/// planner, which judges it against the channel's declaration.
 #[test]
-fn non_text_on_a_surface_in_binding_to_an_ephemeral_channel_is_refused() {
-    let refusal = sole_refusal(concat!(
-        r#"
-channel utterance at "ephemeral:alice-pod.utterance" {
+fn every_surface_tail_carries_its_non_text_on_a_transportable_address() {
+    let document = format!(
+        concat!(
+            r#"
+channel utterance at "ephemeral:alice-pod.utterance" {{
     push_depth = 4;
     retain_depth = 16;
-}
+    non_text = true;
+}}
 
-component Widget {
-    "#,
-        surface_any!(),
-        r#"
-    in heard;
-}
-
-surface alice_pod {
-    grants = [subscribe];
-
-    new widget: Widget {
-        chrome = true;
-        grants = [];
-        in heard <- utterance { push_depth = 2; non_text = true; }
-    }
-}
-"#
-    ));
-    assert_eq!(
-        refusal.message,
-        leaves_the_page("heard", "ephemeral:alice-pod.utterance")
-    );
-    assert_eq!(
-        refusal.line_col(),
-        Some((18, 60)),
-        "the span is the refused key's own value: {}",
-        refusal.render()
-    );
-}
-
-#[test]
-fn non_text_on_a_surface_out_binding_to_a_durable_channel_is_refused() {
-    let refusal = sole_refusal(concat!(
-        r#"
-channel utterance at "brenn:alice-pod.utterance" {
+channel said at "brenn:alice-pod.said" {{
     push_depth = 4;
     retain_depth = 16;
     standing_retain_depth = 16;
-}
+}}
 
-component Widget {
-    "#,
-        processor_needs!("ports"),
-        r#"
-    out said;
-}
-
-surface alice_pod {
-    grants = [publish];
-
-    new widget: Widget {
-        chrome = true;
-        grants = [ports];
-        out said -> utterance { non_text = true; }
-    }
-}
-"#
-    ));
-    assert_eq!(
-        refusal.message,
-        leaves_the_page("said", "brenn:alice-pod.utterance")
-    );
-}
-
-/// An `io` on a handle to a transportable declaration lowers to a pair; the
-/// key is refused once, at its value, and neither half carries it.
-#[test]
-fn non_text_on_a_surface_io_binding_to_an_ephemeral_channel_is_refused() {
-    let refusal = sole_refusal(concat!(
-        r#"
-channel state at "ephemeral:alice-pod.state" {
+channel state at "ephemeral:alice-pod.state" {{
     push_depth = 1;
     retain_depth = 1;
-}
+    non_text = true;
+}}
 
-component Widget {
-    "#,
-        processor_needs!("ports"),
-        r#"
+// ── packaged ──
+component Widget {{
+    {}
+    in heard;
+    out said;
     io state;
-}
+}}
+// ── packaged ──
 
-surface alice_pod {
+surface alice_pod {{
     grants = [subscribe, publish];
 
-    new widget: Widget {
+    new widget: Widget {{
         chrome = true;
         grants = [ports];
-        io state <-> state { push_depth = 1; retain_depth = 1; non_text = true; }
-    }
-}
+        in heard <- utterance {{ push_depth = 2; non_text = true; }}
+        out said -> said {{ non_text = true; }}
+        io state <-> state {{ push_depth = 1; retain_depth = 1; non_text = true; }}
+    }}
+}}
 "#
-    ));
+        ),
+        processor_needs!("ports"),
+    );
+    let config = config_from_dsl(&document);
+    let surface: &SurfaceConfigRaw = &config.surfaces[0];
+    let subscriptions: Vec<(&str, Option<&str>, bool)> = surface
+        .subscriptions
+        .iter()
+        .map(|sub| (sub.port.as_str(), sub.channel.as_deref(), sub.non_text))
+        .collect();
     assert_eq!(
-        refusal.message,
-        leaves_the_page("state", "ephemeral:alice-pod.state")
+        subscriptions,
+        vec![
+            ("heard", Some("ephemeral:alice-pod.utterance"), true),
+            ("state", Some("ephemeral:alice-pod.state"), true),
+        ]
+    );
+    let outputs: Vec<(&str, Option<&str>, bool)> = surface
+        .outputs
+        .iter()
+        .map(|out| (out.port.as_str(), out.channel.as_deref(), out.non_text))
+        .collect();
+    assert_eq!(
+        outputs,
+        vec![
+            ("said", Some("brenn:alice-pod.said"), true),
+            ("state", Some("ephemeral:alice-pod.state"), true),
+        ]
     );
 }
 
