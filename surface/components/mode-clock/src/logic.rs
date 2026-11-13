@@ -29,8 +29,6 @@ use crate::spec::port::CONFIG;
 pub enum ContractViolation {
     /// A window arrived on a port this component does not bind.
     WrongPort { port: String },
-    /// The delivered envelope did not parse as a [`MessageEnvelope`].
-    BadEnvelope(String),
 }
 
 /// Everything the glue needs to emit the operator-visible malformed-body log
@@ -221,8 +219,8 @@ pub enum ConfigNote {
 }
 
 /// One activation window on the `config` port, in the terms this state machine
-/// reads it by: the port it arrived on, and the new envelope documents it
-/// carries, oldest first.
+/// reads it by: the port it arrived on, and the new envelopes it carries, parsed
+/// by the glue, oldest first.
 ///
 /// A borrowed view rather than the host's own window type: this module compiles
 /// for the host, where it is unit-tested, and for wasm32 against the guest SDK,
@@ -230,7 +228,7 @@ pub enum ConfigNote {
 /// borrows one into the other.
 pub struct ConfigWindow<'a> {
     pub port: &'a str,
-    pub new_raw: &'a [String],
+    pub new: &'a [MessageEnvelope],
 }
 
 /// The body published on the `theme` port: the control-plane version and the
@@ -374,23 +372,20 @@ impl ModeClock {
         self.faults
     }
 
-    /// Handle a `config`-port delivery. Rejects a wrong port and an unparseable
-    /// envelope (both `ContractViolation`, panic-worthy skew). A well-formed
-    /// envelope whose body violates the config convention returns
+    /// Handle a `config`-port delivery. Rejects a wrong port (a
+    /// `ContractViolation`, panic-worthy skew). An envelope whose body violates the config convention returns
     /// `ConfigOutcome::Malformed` — config untouched, counter bumped — so one
     /// buggy publisher cannot brick the theme axis.
     pub fn on_config(
         &mut self,
         port: &str,
-        envelope_json: &str,
+        envelope: &MessageEnvelope,
     ) -> Result<ConfigOutcome, ContractViolation> {
         if port != CONFIG {
             return Err(ContractViolation::WrongPort {
                 port: port.to_string(),
             });
         }
-        let envelope: MessageEnvelope = serde_json::from_str(envelope_json)
-            .map_err(|e| ContractViolation::BadEnvelope(e.to_string()))?;
         let parsed = envelope
             .body
             .as_text()
@@ -403,9 +398,7 @@ impl ModeClock {
             }
             Err(reason) => {
                 self.faults += 1;
-                Ok(ConfigOutcome::Malformed(FaultReport::new(
-                    &envelope, reason,
-                )))
+                Ok(ConfigOutcome::Malformed(FaultReport::new(envelope, reason)))
             }
         }
     }
@@ -436,19 +429,19 @@ impl ModeClock {
             });
         }
         let mut notes = Vec::new();
-        if window.new_raw.len() > 1 {
+        if window.new.len() > 1 {
             notes.push(ConfigNote::Misconfigured(format!(
                 "latest-wins port {:?} presented {} new messages; its binding's push_depth \
                  should be 1 — coalescing to the latest is the subscription's job, not the \
                  component's",
                 window.port,
-                window.new_raw.len(),
+                window.new.len(),
             )));
         }
-        let Some(envelope_json) = window.new_raw.last() else {
+        let Some(envelope) = window.new.last() else {
             return Ok(notes);
         };
-        if let ConfigOutcome::Malformed(report) = self.on_config(window.port, envelope_json)? {
+        if let ConfigOutcome::Malformed(report) = self.on_config(window.port, envelope)? {
             notes.push(ConfigNote::Malformed(report));
         }
         Ok(notes)
@@ -525,11 +518,11 @@ fn parse_config(body: &str) -> Result<Config, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brenn_surface_test_fixtures::sample_envelope_json;
+    use brenn_surface_test_fixtures::sample_envelope;
 
     /// A config body as wire JSON text, wrapped in the sample envelope.
-    fn config_msg(fields: serde_json::Value) -> String {
-        sample_envelope_json(&fields.to_string())
+    fn config_msg(fields: serde_json::Value) -> MessageEnvelope {
+        sample_envelope(&fields.to_string())
     }
 
     fn m(h: u16, min: u16) -> u16 {
@@ -562,8 +555,7 @@ mod tests {
     /// silently drops its kind out of that grep.
     #[test]
     fn the_fault_line_names_the_publisher_the_message_and_the_context() {
-        let envelope: MessageEnvelope =
-            serde_json::from_str(&sample_envelope_json("x")).expect("the fixture envelope parses");
+        let envelope = sample_envelope("x");
         let line = FaultReport::new(&envelope, "trailing garbage".to_string())
             .log_message("mode-clock config");
         assert!(line.contains("malformed mode-clock config"), "{line}");
@@ -811,12 +803,23 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_envelope_is_a_contract_violation() {
+    fn a_non_text_config_body_is_a_publisher_fault() {
         let mut clock = ModeClock::new();
-        assert!(matches!(
-            clock.on_config("config", "not json"),
-            Err(ContractViolation::BadEnvelope(_))
-        ));
+        clock
+            .on_config("config", &config_msg(serde_json::json!({ "mode": "dark" })))
+            .unwrap();
+        let mut envelope = sample_envelope("");
+        envelope.body = brenn_envelope::MessageBody::from_parts(
+            Some("application/octet-stream"),
+            br#"{"mode":"light"}"#,
+        )
+        .expect("a binary body builds");
+        match clock.on_config("config", &envelope) {
+            Ok(ConfigOutcome::Malformed(report)) => assert_eq!(report.reason, "body is not text"),
+            other => panic!("expected a malformed-config report, got {other:?}"),
+        }
+        assert_eq!(clock.faults(), 1);
+        assert_eq!(clock.tick(m(12, 0)).dispatch, Some(Theme::Dark));
     }
 
     #[test]
@@ -835,20 +838,15 @@ mod tests {
 
     // ── The activation-window fold ──────────────────────────────────────────
 
-    /// The new envelope documents of a `config` window, oldest first. Retained
-    /// context is not part of the fold, so the window is exactly this list.
-    fn new_raws(new: &[serde_json::Value]) -> Vec<String> {
-        new.iter()
-            .map(|body| sample_envelope_json(&body.to_string()))
-            .collect()
+    /// The new envelopes of a `config` window, oldest first. Retained context
+    /// is not part of the fold, so the window is exactly this list.
+    fn new_envelopes(new: &[serde_json::Value]) -> Vec<MessageEnvelope> {
+        new.iter().cloned().map(config_msg).collect()
     }
 
-    /// The window over those documents.
-    fn config_window(new_raw: &[String]) -> ConfigWindow<'_> {
-        ConfigWindow {
-            port: CONFIG,
-            new_raw,
-        }
+    /// The window over those envelopes.
+    fn config_window(new: &[MessageEnvelope]) -> ConfigWindow<'_> {
+        ConfigWindow { port: CONFIG, new }
     }
 
     #[test]
@@ -859,7 +857,7 @@ mod tests {
         // is evidence the binding's push_depth is wrong.
         let mut clock = ModeClock::new();
         let notes = clock
-            .on_config_window(config_window(&new_raws(&[
+            .on_config_window(config_window(&new_envelopes(&[
                 serde_json::json!({ "mode": "light" }),
                 serde_json::json!({ "mode": "auto" }),
                 serde_json::json!({ "mode": "dark" }),
@@ -884,7 +882,7 @@ mod tests {
         // new snapshot. The context is not re-applied and nothing is reported.
         let mut clock = ModeClock::new();
         let notes = clock
-            .on_config_window(config_window(&new_raws(&[
+            .on_config_window(config_window(&new_envelopes(&[
                 serde_json::json!({ "mode": "light" }),
             ])))
             .expect("the config port satisfies the contract");
@@ -896,7 +894,7 @@ mod tests {
     fn a_pure_context_config_window_changes_nothing() {
         let mut clock = ModeClock::new();
         let notes = clock
-            .on_config_window(config_window(&new_raws(&[])))
+            .on_config_window(config_window(&new_envelopes(&[])))
             .expect("the config port satisfies the contract");
         assert_eq!(notes, Vec::new());
         // Default `auto` still holds: the context config was never applied.
@@ -913,7 +911,7 @@ mod tests {
             .on_config("config", &config_msg(serde_json::json!({ "mode": "dark" })))
             .unwrap();
         let notes = clock
-            .on_config_window(config_window(&new_raws(&[
+            .on_config_window(config_window(&new_envelopes(&[
                 serde_json::json!({ "mode": "light" }),
                 serde_json::json!({ "mode": "sepia" }),
             ])))
@@ -962,11 +960,11 @@ mod tests {
     #[test]
     fn a_window_on_a_wrong_port_is_a_contract_violation() {
         let mut clock = ModeClock::new();
-        let raws = new_raws(&[serde_json::json!({ "mode": "dark" })]);
+        let new = new_envelopes(&[serde_json::json!({ "mode": "dark" })]);
         assert_eq!(
             clock.on_config_window(ConfigWindow {
                 port: "messages",
-                new_raw: &raws,
+                new: &new,
             }),
             Err(ContractViolation::WrongPort {
                 port: "messages".to_string()
@@ -985,7 +983,7 @@ mod tests {
         assert_eq!(
             clock.on_config_window(ConfigWindow {
                 port: "messages",
-                new_raw: &[],
+                new: &[],
             }),
             Err(ContractViolation::WrongPort {
                 port: "messages".to_string()

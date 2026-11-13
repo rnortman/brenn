@@ -36,6 +36,8 @@ export interface StringReport {
         entries: { index: number; hex: string; deliver_after: number }[];
     }[];
     results: string[];
+    /** The activation's clock reading, epoch milliseconds, or null when it had none. */
+    now: number | null;
     sync: string | null;
 }
 

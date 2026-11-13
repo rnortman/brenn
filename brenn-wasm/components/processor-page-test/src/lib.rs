@@ -9,6 +9,7 @@
 //   deferred  each deferred window: its port, and each entry's index, payload
 //             in hex and deliver_after
 //   results   one word per command run
+//   now       the activation's clock reading, or null
 //   sync      the activation's sync port, or null
 //
 // `in` carries the commands and is not reported. `state` carries the workload
@@ -21,8 +22,12 @@
 //   noop
 //   publish <port> <hex>
 //   publish-fill <port> <len>       publish <len> bytes of 'x'
+//   publish-urgent <port> <urgency> <hex>
+//                                   `urgency` is very-low, low, normal or high
 //   defer <port> <hex> <deliver-after-ms>
-//   edit <port> <index> <hex>
+//   edit <port> <index> <hex>       replace the body, keep the release time
+//   retime <port> <index> <deliver-after-ms>
+//                                   move the release time, keep the body
 //   cancel <port> <index>
 //   call <port> <hex>               the result is `ok:none`, `ok:<hex>` or the
 //                                   call-error's word
@@ -55,7 +60,8 @@ wit_bindgen::generate!({
 
 use brenn::processor::calls::{CallError, call};
 use brenn::processor::ports::{
-    DeferError, PublishError, defer_cancel, defer_edit, publish, publish_deferred,
+    DeferError, PublishError, Urgency, defer_cancel, defer_edit, publish, publish_deferred,
+    publish_with_urgency,
 };
 use serde_json::{Value, json};
 
@@ -126,6 +132,7 @@ impl Guest for PageTest {
             "windows": windows,
             "deferred": deferred,
             "results": results,
+            "now": a.now,
             "sync": a.sync,
         });
         publish(REPORT_PORT, &report.to_string())
@@ -145,6 +152,14 @@ fn run(line: &str, state_window: Option<&String>) -> Result<String, ReceiveError
             let len: usize = len.parse().map_err(|_| bad())?;
             word(publish(port, &"x".repeat(len)), publish_word)
         }
+        ["publish-urgent", port, level, body] => word(
+            publish_with_urgency(
+                port,
+                &text(body).ok_or_else(bad)?,
+                urgency(level).ok_or_else(bad)?,
+            ),
+            publish_word,
+        ),
         ["defer", port, body, at] => word(
             publish_deferred(
                 port,
@@ -159,6 +174,15 @@ fn run(line: &str, state_window: Option<&String>) -> Result<String, ReceiveError
                 index.parse().map_err(|_| bad())?,
                 Some(&text(body).ok_or_else(bad)?),
                 None,
+            ),
+            defer_word,
+        ),
+        ["retime", port, index, at] => word(
+            defer_edit(
+                port,
+                index.parse().map_err(|_| bad())?,
+                None,
+                Some(at.parse().map_err(|_| bad())?),
             ),
             defer_word,
         ),
@@ -258,6 +282,17 @@ fn call_word(e: &CallError) -> String {
         CallError::Failed => "failed",
         CallError::InvalidPayload(_) => "invalid-payload",
         CallError::QuotaExceeded => "quota-exceeded",
+    })
+}
+
+/// A command's urgency word.
+fn urgency(level: &str) -> Option<Urgency> {
+    Some(match level {
+        "very-low" => Urgency::VeryLow,
+        "low" => Urgency::Low,
+        "normal" => Urgency::Normal,
+        "high" => Urgency::High,
+        _ => return None,
     })
 }
 

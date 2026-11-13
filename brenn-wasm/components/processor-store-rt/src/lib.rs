@@ -21,7 +21,7 @@
 //   begin → get → commit (assert absent after delete)
 //   begin → put → (drop guard: RAII rollback) → begin → get → commit (assert absent)
 
-use brenn_guest::{Activation, Error, Processor, store};
+use brenn_guest::{Activation, Body, Error, Processor, store};
 
 struct ProcessorStoreRt;
 
@@ -98,7 +98,7 @@ fn round_trip() -> Result<(), Error> {
 }
 
 impl Processor for ProcessorStoreRt {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         for window in activation.port_windows() {
             for env in window.new_envelopes() {
                 let env = env?;

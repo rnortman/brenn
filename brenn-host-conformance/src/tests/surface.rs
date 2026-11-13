@@ -44,7 +44,7 @@ use brenn_attach_client::router::{Origin, RouteOutcome, RouteRequest};
 use brenn_attach_proto::SubscribeOutcome;
 use brenn_envelope::grants::ProcessorContract;
 use brenn_envelope::{GuestBody, MessageBody, Urgency};
-use brenn_page_harness::{Kind, Page, types};
+use brenn_page_harness::{Kind, Page, Published, bus};
 use brenn_surface_contract::ActivationError;
 use brenn_surface_kernel::ActivationOutcome;
 use brenn_surface_kernel::activation::ReadyActivation;
@@ -426,18 +426,21 @@ fn invoke(kind: &Kind, config: &BTreeMap<String, String>, ready: ReadyActivation
         ..
     } = ready;
     let mut harness = kind.instantiate(Page::with_config(config.clone()));
-    let answer = harness.receive(&to_wit(&activation.lower_v0_1()));
+    let answer = harness.receive(&to_wit(&activation));
 
     let outcome = match answer {
-        Ok(Ok(reply)) => ActivationOutcome::Ok(reply.map(GuestBody::Text)),
+        Ok(Ok(reply)) => ActivationOutcome::Ok(reply.map(|reply| GuestBody::Parts {
+            content_type: reply.content_type,
+            bytes: reply.bytes,
+        })),
         Ok(Err(error)) => ActivationOutcome::Err(ActivationError {
             // Both arms are one fact to the page — the activation returned err —
             // and the text is the component's own account of it, never parsed.
             message: match error {
-                types::ReceiveError::MalformedEnvelope(detail) => {
+                bus::ReceiveError::MalformedEnvelope(detail) => {
                     format!("malformed envelope: {detail}")
                 }
-                types::ReceiveError::ProcessingFailed(detail) => detail,
+                bus::ReceiveError::ProcessingFailed(detail) => detail,
             },
         }),
         Err(trap) => ActivationOutcome::Trap(format!("{trap:#}")),
@@ -465,32 +468,62 @@ fn invoke(kind: &Kind, config: &BTreeMap<String, String>, ready: ReadyActivation
 /// a suite that needed it would record an ordered call log instead.
 fn replay(page: &mut Page, buffer: &mut PublishBuffer) -> usize {
     let mut accepted = 0;
-    for (port, body) in std::mem::take(&mut page.published) {
+    for Published { port, body, .. } in std::mem::take(&mut page.published) {
         buffer
-            .publish(&port, GuestBody::Text(body))
+            .publish(&port, guest_body(body))
             .unwrap_or_else(|fault| panic!("the probe's publish on {port} was refused: {fault:?}"));
         accepted += 1;
     }
-    for (port, body, deliver_after) in std::mem::take(&mut page.parked) {
+    for Published {
+        port,
+        body,
+        deliver_after,
+    } in std::mem::take(&mut page.parked)
+    {
+        let deliver_after = deliver_after.expect("a parked record carries its release time");
         buffer
-            .publish_deferred(&port, GuestBody::Text(body), deliver_after)
+            .publish_deferred(&port, guest_body(body), deliver_after)
             .unwrap_or_else(|fault| panic!("the probe's park on {port} was refused: {fault:?}"));
         accepted += 1;
     }
     accepted
 }
 
-/// The kernel's activation as the WIT world carries it. One shape, two spellings:
-/// the kernel holds the contract crate's types and the guest is bound to the
-/// generated ones.
-fn to_wit(activation: &brenn_surface_contract::Activation) -> types::Activation {
-    types::Activation {
+/// A body the guest handed the recording page, as the buffer takes a 0.2.0 one.
+fn guest_body(body: brenn_page_harness::Body) -> GuestBody {
+    GuestBody::Parts {
+        content_type: body.content_type,
+        bytes: body.bytes,
+    }
+}
+
+/// A kernel-held body as the world carries it.
+fn wit_body(body: &MessageBody) -> bus::Body {
+    bus::Body {
+        content_type: body.content_type().map(str::to_owned),
+        bytes: body.as_bytes().to_vec(),
+    }
+}
+
+/// The kernel's activation as the 0.2.0 world carries it: each envelope as its
+/// header and its body, each parked body as it was handed over. The kernel's
+/// own crossing builds this record in the browser alone, so the adapter lowers
+/// it here from the same fields.
+fn to_wit(activation: &brenn_surface_kernel::activation::PageActivation) -> bus::Activation {
+    bus::Activation {
         ports: activation
             .ports
             .iter()
-            .map(|window| types::PortWindow {
+            .map(|window| bus::PortWindow {
                 port: window.port.clone(),
-                envelopes: window.envelopes.clone(),
+                envelopes: window
+                    .envelopes
+                    .iter()
+                    .map(|envelope| bus::Envelope {
+                        header: envelope.to_header_json(),
+                        body: wit_body(&envelope.body),
+                    })
+                    .collect(),
                 new_from: window.new_from,
                 // Saturating: the carrier counts in u64 and the world types
                 // this u32, and a saturated count still says "you lost more
@@ -501,14 +534,14 @@ fn to_wit(activation: &brenn_surface_contract::Activation) -> types::Activation 
         deferred: activation
             .deferred
             .iter()
-            .map(|window| types::DeferredWindow {
+            .map(|window| bus::DeferredWindow {
                 port: window.port.clone(),
                 entries: window
                     .entries
                     .iter()
-                    .map(|entry| types::DeferredEntry {
+                    .map(|entry| bus::DeferredEntry {
                         index: entry.index,
-                        payload: entry.payload.clone(),
+                        body: wit_body(&entry.payload),
                         deliver_after: entry.deliver_after,
                     })
                     .collect(),
@@ -533,7 +566,7 @@ impl Host for Surface {
         self.registered = true;
         self.feed(Input::ActivationRegistered {
             instance: PROBE.to_string(),
-            contract: ProcessorContract::V0_1,
+            contract: ProcessorContract::V0_2,
         });
     }
 
@@ -572,7 +605,7 @@ impl Host for Surface {
         tokio::time::sleep(idle).await;
         self.feed(Input::ActivationRegistered {
             instance: PROBE.to_string(),
-            contract: ProcessorContract::V0_1,
+            contract: ProcessorContract::V0_2,
         });
     }
 

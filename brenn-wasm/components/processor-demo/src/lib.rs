@@ -28,14 +28,14 @@ mod spec;
 
 use crate::spec::port::OUT;
 use brenn_guest::{
-    Activation, Error, MessageEnvelopeExt, Processor, defer_cancel, defer_edit, publish,
+    Activation, Body, Error, MessageEnvelopeExt, Processor, defer_cancel, defer_edit, publish,
     publish_deferred,
 };
 
 struct ProcessorDemo;
 
 impl Processor for ProcessorDemo {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         for window in activation.port_windows() {
             for env in window.new_envelopes() {
                 let env = env?;
@@ -65,7 +65,7 @@ impl Processor for ProcessorDemo {
                             Some(e) => format!(
                                 "view={} first={} at={}",
                                 view.entries().len(),
-                                e.payload(),
+                                e.body().as_text()?,
                                 e.deliver_after()
                             ),
                             None => format!("view={}", view.entries().len()),

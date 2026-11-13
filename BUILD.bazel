@@ -194,6 +194,7 @@ filegroup(
         "//brenn-wasm/components/processor-page-bytes-test:policy_srcs",
         "//brenn-wasm/components/processor-page-test:policy_srcs",
         "//brenn-wasm/components/processor-provider-test:policy_srcs",
+        "//brenn-wasm/components/processor-sdk-bytes-test:policy_srcs",
         "//brenn-wasm/components/processor-stale-contract-test:policy_srcs",
         "//brenn-wasm/components/processor-store-rt:policy_srcs",
         "//brenn-wasm/components/processor-tool-test:policy_srcs",

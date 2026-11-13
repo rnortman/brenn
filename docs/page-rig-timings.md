@@ -105,7 +105,7 @@ a chain, not of one activation:
 
 - a `state` or `noop` figure spans three activations — the driver's press
   activation, the fixture's activation, and the driver's render activation;
-  two of them are 0.1.0 SDK activations of `EchoStub`;
+  two of them are 0.2.0 SDK activations of `EchoStub`;
 - a delivered-row figure spans the emitting activation, the row out over the
   page's websocket, the server, the row back in, the delivery activation, and
   two driver renders (the emitting report and the delivery report).
@@ -118,16 +118,16 @@ attach send budget (256 per instance for the life of the server, refilled one
 per 15 s), and the run's 178 rows, warm-ups included, stay under it. The 0.1.0
 base64 workload was not run in Chromium.
 
-`noop` on `stater` (empty windows), N 500, warm-up 50: mean 2.100 / median
-2.100 / min 1.700 ms.
+`noop` on `stater` (empty windows), N 500, warm-up 50: mean 1.720 / median
+1.700 / min 1.300 ms.
 
 ### `0.2.0 binary at rest`, Chromium
 
 | Raw B | N | `state` mean / median / min ms | `noop` mean / median / min ms |
 |---:|---:|---|---|
-| 49,149 | 200 | 2.555 / 2.450 / 1.900 | 2.078 / 2.100 / 1.700 |
-| 1,048,576 | 40 | 5.843 / 5.800 / 5.500 | 2.810 / 2.800 / 2.600 |
-| 3,000,000 | 20 | 12.500 / 12.350 / 11.600 | 4.800 / 4.450 / 4.200 |
+| 49,149 | 200 | 2.137 / 2.100 / 1.700 | 1.698 / 1.700 / 1.400 |
+| 1,048,576 | 40 | 5.175 / 5.100 / 4.500 | 2.573 / 2.500 / 2.300 |
+| 3,000,000 | 20 | 11.990 / 10.800 / 10.300 | 4.170 / 4.200 / 3.800 |
 
 Warm-ups 10, 5 and 3. Each size runs on a freshly loaded page, so the one
 holder's state ring starts empty.
@@ -136,14 +136,14 @@ holder's state ring starts empty.
 
 | Raw B | N | click to delivery report mean / median / min ms |
 |---:|---:|---|
-| 49,149 | 100 | 45.754 / 45.700 / 44.700 |
-| 1,048,576 | 40 | 24.755 / 24.600 / 23.400 |
-| 3,000,000 | 20 | 62.250 / 61.200 / 58.200 |
+| 49,149 | 100 | 45.232 / 45.100 / 44.100 |
+| 1,048,576 | 40 | 24.215 / 23.450 / 22.300 |
+| 3,000,000 | 20 | 62.095 / 59.750 / 56.800 |
 
 Warm-ups 10, 5 and 3; every row `application/octet-stream`, differing in its
 first four bytes, and the delivery report's count, length and FNV-1a 64
 checked on every sample. The smallest size is slower than the middle one on
-every sample of this run (min 44.7 ms against 23.4 ms). The run does not say
+every sample of this run (min 44.1 ms against 22.3 ms). The run does not say
 why; a delay of about 40 ms on the smallest frames has the shape of Nagle's
 algorithm meeting a delayed acknowledgement on the loopback socket, and the
 server does not set `TCP_NODELAY` — unverified, tracked as

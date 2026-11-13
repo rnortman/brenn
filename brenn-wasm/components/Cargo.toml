@@ -45,6 +45,7 @@ members = [
     "processor-page-test",
     "processor-multiport",
     "processor-provider-test",
+    "processor-sdk-bytes-test",
     "processor-stale-contract-test",
     "processor-store-rt",
     "processor-tool-test",

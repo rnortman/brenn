@@ -21,6 +21,10 @@ import { openSurface } from "./echo-stub";
  *  3. The largest measured size (3,000,000 B) crosses once at rest and once
  *     over the socket, so the body-cap setting and the `emit`/`stream` path
  *     that `bytes-measure.spec.ts` times are held on every run.
+ *  4. A guest-SDK kind (`processor-sdk-bytes-test`, served from the harness's
+ *     third mount) keeps the same binary state at the largest size through
+ *     `RetainedState` and its own byte codec on a `non_text` page-local `io`
+ *     port, created and stepped twice.
  *
  * Runs after `bar.spec.ts`, whose first test needs pristine channels, and
  * before `surface-reload.spec.ts`, which rewrites the live document. Every
@@ -153,4 +157,17 @@ test("the largest measured size crosses once at rest and once over the socket", 
     sum,
   );
   expect(delivered.streams[0]).toMatchObject({ count: 1, len: LARGEST });
+});
+
+test("a guest-SDK kind keeps its binary state through RetainedState, created and stepped twice", async ({
+  page,
+}) => {
+  await openSurface(page, "bytes");
+  const pattern = generatedState(LARGEST);
+  const results: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    const report = await run(page, "drive-sdk-stater", `state ${LARGEST}`, () => true);
+    results.push(...report.results);
+  }
+  expect(results).toEqual([0, 1, 2].map((steps) => expectedState(pattern, steps)));
 });

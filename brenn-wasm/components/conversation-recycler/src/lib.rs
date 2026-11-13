@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use crate::logic::{Decision, Knobs, STORE_KEYS, State};
 use crate::spec::port::{EPOCH, TICK};
 use crate::spec::{InPort, config, log, store};
-use brenn_guest::{Activation, Error, MessageEnvelope, Processor, publish, repark};
+use brenn_guest::{Activation, Body, Error, MessageEnvelope, Processor, publish, repark};
 
 const STORE_NAMESPACE: &str = "recycler";
 /// A tick's body is irrelevant — the wake is the message.
@@ -38,7 +38,7 @@ fn publish_ms(env: &MessageEnvelope) -> Result<u64, Error> {
 }
 
 impl Processor for ConversationRecycler {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         let knobs = Knobs::from_lookup(config::get).map_err(Error::failed)?;
         let now = activation
             .now()

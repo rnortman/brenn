@@ -144,7 +144,7 @@ fn op_entry(op: &ProcessorDeferredOp) -> serde_json::Value {
             "op": "edit",
             "port": port,
             "index": index,
-            "payload": body.as_ref().map(|b| b.as_text().expect("a 0.1.0 edit body is text")),
+            "payload": body.as_ref().map(|b| b.as_text().expect("the probe edits with text")),
             "deliver_after": deliver_after,
         }),
     }

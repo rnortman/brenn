@@ -202,7 +202,7 @@ Who is shown the content type today:
 | Query API (`Messenger::query`), host code | text and type | bytes and type |
 | A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, `BrennMessageEdit`) | `"body": "…"`, then `"content_type": "…"` | `"body": {"binary": true, "content_type": "…", "size": N}` — a placeholder, never the bytes |
 | The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` |
-| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | text and type, on the backend and on a page, whether the row arrived over the page's wire or stayed on the page | bytes and type on the backend; on a page, at rest on any channel declared `non_text`, page-local or wire-bound (shown on the node rig; `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery in Chromium), and in a sync call or reply |
+| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | text and type, on the backend and on a page, whether the row arrived over the page's wire or stayed on the page | bytes and type on the backend; on a page, at rest on any channel declared `non_text`, page-local or wire-bound (shown on the node rig; `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery in Chromium, and an SDK-built kind's binary state on a page-local `io` port), and in a sync call or reply |
 | 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload, on the backend and on a page |
 | Attach v4 sessions (`Deliver`, `DeferredView`), served to remotes only | bare text, **no type** | never bound: a remote's subscribe is answered `Unavailable`; left out of a deferred view |
 | Attach v5 sessions (`Deliver`, `DeferredView`): a remote's, and every surface page's | text and type | bytes and type |
@@ -567,7 +567,8 @@ passes any body in a sync call between 0.2.0 kinds. A non-text body for a
 text-only channel is refused with `text-only-channel`. This is shown on the
 node rig, against a stand-in for the browser's websocket;
 `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery in
-Chromium. A remote attacher on v5 is served a `non_text` channel; one on v4 is
+Chromium, and an SDK-built kind's binary state on a page-local `io` port. A
+remote attacher on v5 is served a `non_text` channel; one on v4 is
 answered `Unavailable`.
 
 **The timer-cap coupling.** A channel's `retain_depth` also caps its channel-wide

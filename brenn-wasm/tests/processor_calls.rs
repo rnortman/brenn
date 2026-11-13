@@ -69,7 +69,7 @@ fn component_with_slow_peer(delay: Duration) -> ProcessorComponent {
     let caller: SyncCallerFn =
         Arc::new(move |_slug: &str, _port: &str, body: MessageBody, _chain| {
             std::thread::sleep(delay);
-            let body = body.as_text().expect("a 0.1.0 caller sends text");
+            let body = body.as_text().expect("the caller sends text");
             SyncAnswer::Ok(Some(MessageBody::text(format!("answer:{body}"))))
         });
     let mut calls = HashMap::new();

@@ -107,6 +107,28 @@ All notable changes to Brenn are documented here.
   refusal reached a `brenn:processor@0.1.0` guest with no payload, the
   generated glue could not lower it, and the instance failed with
   `expected a string`.
+- **BREAKING for component authors: `brenn-guest` binds
+  `brenn:processor@0.2.0`.** Every component built on the guest SDK from this
+  pin on is a 0.2.0 artifact; every in-tree SDK component and surface kind is
+  one, with the same bodies on the same channels as before. The one edit
+  every component makes: `Processor::receive` returns
+  `Result<Option<Body>, Error>` (a text reply is `Ok(Some(text.into()))`).
+  Bodies are `Body` (owned, read as bytes, text or JSON, with its content
+  type) and `BodyRef` (borrowed, to publish); `publish`, `publish_deferred`,
+  `repark`, `defer_edit` and calls take any body, and a `&str` is still
+  untyped text. `PortWindow::new_raw`/`context_raw` become
+  `new_messages`/`context_messages` (`Message`: header JSON, `Body`,
+  `envelope()`), `DeferredEntry::payload` becomes `body`, `calls::CallError`
+  is an SDK enum, and `Error` gains `TextOnlyChannel` and `InvalidBody`. The
+  JSON conveniences still publish untyped text. `RetainedState<T, C = Json>`
+  takes a `StateCodec`, so a state can be stored as bytes with no JSON and no
+  base64, on a channel (or surface binding) declared `non_text`; worked
+  example `brenn-wasm/components/processor-sdk-bytes-test`.
+  `surface/page-harness` drives 0.2.0 kinds only. **While 0.2.0 is
+  provisional**, a brenn release that changed its shape would refuse an
+  artifact built at this pin until it was rebuilt; to stay on 0.1.0, keep the
+  older pin or write raw 0.1.0 bindings. No shape change is pending. The full
+  before/after list is in `docs/component-packages.md`, *Contract evolution*.
 - **BREAKING for component authors: `MessageEnvelope.body` is a
   `MessageBody`.** A message body on the bus is now bytes with an optional
   content type. Under the current component contract every body a component
@@ -132,15 +154,15 @@ All notable changes to Brenn are documented here.
   refusals a 0.2.0 guest can draw: `invalid-body`, `text-only-channel`,
   `text-only-peer`. In a sync call between contracts, a 0.2.0 callee may
   reply with a non-text body to anyone; a 0.1.0 caller handed such a reply
-  traps, and the callee is unaffected. The guest SDK does not serve 0.2.0
-  yet: a 0.2.0 component uses raw bindings. **0.2.0 is
-  provisional:** brenn makes no compatibility promise for it yet; it may be
+  traps, and the callee is unaffected. The guest SDK builds 0.2.0 (the
+  `brenn-guest` entry above); a raw 0.2.0 component reads both WIT files.
+  **0.2.0 is provisional:** brenn makes no compatibility promise for it yet; it may be
   replaced by a different contract or withdrawn in any release, with no dual
   period; a component that must keep running across brenn releases stays on
   0.1.0. The removal period of 0.1.0 has not begun and does not begin until a
   later release declares the byte-carrying contract stable. **No existing
-  component is affected**: 0.1.0 artifacts, in-tree and out-of-tree, load and
-  run as before. See `docs/component-packages.md`, *Contract evolution*.
+  component is affected**: 0.1.0 artifacts load and run as before. See
+  `docs/component-packages.md`, *Contract evolution*.
 - **For operators: `non_text` on channels and binding tails.** A channel
   declared `non_text = true` may carry non-text bodies; every channel is
   text-only by default, so no existing configuration changes meaning. A

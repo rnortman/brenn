@@ -8,8 +8,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use brenn_activation::sync::{SyncAnswer, SyncRefusal};
-use brenn_activation::{Activation, DeferredEntry, DeferredWindow, PortWindow};
-use brenn_envelope::{MessageBody, MessageEnvelope};
+use brenn_activation::{Activation, DeferredEntry, DeferredWindow};
+use brenn_envelope::MessageBody;
 use brenn_wasm::{
     ComponentGrant, HostActivation, OutputPortSpec, ProcessorCallTarget, ProcessorComponent,
     ProcessorContract, ProcessorDeferredOp, ProcessorLoadSpec, ProcessorOutcome, ProcessorPublish,
@@ -82,42 +82,17 @@ fn load_bytes_calling(
     })
 }
 
-/// An envelope on `channel` carrying `body`.
-fn envelope(channel: &str, body: MessageBody) -> Arc<MessageEnvelope> {
-    let mut e: MessageEnvelope = serde_json::from_value(serde_json::json!({
-        "message_id": "00000000-0000-0000-0000-0000000000b1",
-        "source": "test",
-        "channel": channel,
-        "sender": "test-sender",
-        "publish_ts": "2026-01-01T00:00:00Z",
-        "body": "",
-        "urgency": "normal",
-        "envelope_type": "brenn",
-    }))
-    .expect("a test envelope deserializes");
-    e.body = body;
-    Arc::new(e)
-}
-
-fn body(content_type: Option<&str>, bytes: &[u8]) -> MessageBody {
-    MessageBody::from_parts(content_type, bytes).expect("a test body is well-formed")
-}
-
-fn window(port: &str, envelopes: Vec<Arc<MessageEnvelope>>) -> PortWindow<Arc<MessageEnvelope>> {
-    PortWindow {
-        port: port.to_string(),
-        envelopes,
-        new_from: 0,
-        dropped: 0,
-    }
-}
-
 /// An activation whose `in` window carries `commands` as one new text message.
 fn commands(commands: &str) -> HostActivation {
     Activation {
-        ports: vec![window(
+        ports: vec![common::window(
             "in",
-            vec![envelope("brenn:in", MessageBody::text(commands))],
+            vec![common::envelope(
+                "brenn:in",
+                "b1",
+                MessageBody::text(commands),
+            )],
+            0,
         )],
         deferred: vec![],
         now: Some(1_000),
@@ -144,19 +119,6 @@ fn ok(outcome: ProcessorOutcome) -> (Vec<ProcessorPublish>, Vec<ProcessorDeferre
     let report = serde_json::from_str(report.body.as_text().expect("the report is text"))
         .expect("the report is JSON");
     (publishes, deferred_ops, report)
-}
-
-fn results(report: &Value) -> Vec<&str> {
-    report["results"]
-        .as_array()
-        .expect("results")
-        .iter()
-        .map(|r| r.as_str().expect("a result word"))
-        .collect()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Bytes that are not UTF-8 (a JPEG start-of-image marker).
@@ -189,16 +151,27 @@ fn a_0_1_and_a_0_2_artifact_load_and_run_side_by_side() {
 fn a_0_2_activation_delivers_header_content_type_and_bytes_exactly() {
     let component = load_bytes(None, 1024 * 1024);
     let feed = vec![
-        envelope("brenn:feed", MessageBody::text("plain")),
-        envelope("brenn:feed", body(Some("text/markdown"), b"# title")),
-        envelope("brenn:feed", body(Some("image/jpeg"), NOT_UTF8)),
+        common::envelope("brenn:feed", "b1", MessageBody::text("plain")),
+        common::envelope(
+            "brenn:feed",
+            "b1",
+            common::body(Some("text/markdown"), b"# title"),
+        ),
+        common::envelope(
+            "brenn:feed",
+            "b1",
+            common::body(Some("image/jpeg"), NOT_UTF8),
+        ),
     ];
-    let parked = envelope(
+    let parked = common::envelope(
         "brenn:out",
-        body(Some("application/octet-stream"), NOT_UTF8),
+        "b1",
+        common::body(Some("application/octet-stream"), NOT_UTF8),
     );
     let mut activation = commands("");
-    activation.ports.push(window("feed", feed.clone()));
+    activation
+        .ports
+        .push(common::window("feed", feed.clone(), 0));
     activation.deferred.push(DeferredWindow {
         port: "out".to_string(),
         entries: vec![DeferredEntry {
@@ -216,7 +189,7 @@ fn a_0_2_activation_delivers_header_content_type_and_bytes_exactly() {
     assert_eq!(delivered.len(), feed.len());
     for (sent, got) in feed.iter().zip(delivered) {
         assert_eq!(got["content_type"].as_str(), sent.body.content_type());
-        assert_eq!(got["hex"], hex(sent.body.as_bytes()));
+        assert_eq!(got["hex"], common::hex(sent.body.as_bytes()));
         let header: Value = serde_json::from_str(&sent.to_header_json()).unwrap();
         assert_eq!(
             got["header"], header,
@@ -229,7 +202,7 @@ fn a_0_2_activation_delivers_header_content_type_and_bytes_exactly() {
     assert_eq!(report["deferred"][0]["port"], "out");
     assert_eq!(entry["index"], 0);
     assert_eq!(entry["content_type"], "application/octet-stream");
-    assert_eq!(entry["hex"], hex(NOT_UTF8));
+    assert_eq!(entry["hex"], common::hex(NOT_UTF8));
     assert_eq!(entry["deliver_after"], 5_000);
 }
 
@@ -241,30 +214,33 @@ fn a_0_2_publish_deferred_publish_and_edit_carry_the_body_given() {
          defer out application/octet-stream {h} 9000\n\
          edit out 0 image/png {h}\n\
          publish out text/markdown 2a",
-        h = hex(NOT_UTF8)
+        h = common::hex(NOT_UTF8)
     ));
     activation.deferred.push(DeferredWindow {
         port: "out".to_string(),
         entries: vec![DeferredEntry {
             index: 0,
-            payload: envelope("brenn:out", MessageBody::text("parked")),
+            payload: common::envelope("brenn:out", "b1", MessageBody::text("parked")),
             deliver_after: 5_000,
         }],
     });
     let (publishes, ops, report) = ok(component.handle(activation));
-    assert_eq!(results(&report), ["ok", "ok", "ok", "ok"]);
+    assert_eq!(common::results(&report), ["ok", "ok", "ok", "ok"]);
 
     assert_eq!(publishes.len(), 3);
     assert_eq!(publishes[0].port, "out");
     assert_eq!(publishes[0].channel_address, "brenn:out");
-    assert_eq!(publishes[0].body, body(Some("image/jpeg"), NOT_UTF8));
+    assert_eq!(
+        publishes[0].body,
+        common::body(Some("image/jpeg"), NOT_UTF8)
+    );
     assert_eq!(publishes[0].deliver_after, None);
     assert_eq!(
         publishes[1].body,
-        body(Some("application/octet-stream"), NOT_UTF8)
+        common::body(Some("application/octet-stream"), NOT_UTF8)
     );
     assert_eq!(publishes[1].deliver_after, Some(9_000));
-    assert_eq!(publishes[2].body, body(Some("text/markdown"), b"*"));
+    assert_eq!(publishes[2].body, common::body(Some("text/markdown"), b"*"));
     assert!(publishes[2].body.is_text());
 
     assert_eq!(
@@ -272,7 +248,7 @@ fn a_0_2_publish_deferred_publish_and_edit_carry_the_body_given() {
         [ProcessorDeferredOp::Edit {
             port: "out".to_string(),
             index: 0,
-            body: Some(body(Some("image/png"), NOT_UTF8)),
+            body: Some(common::body(Some("image/png"), NOT_UTF8)),
             deliver_after: None,
         }]
     );
@@ -288,7 +264,7 @@ fn a_malformed_body_is_invalid_body() {
          publish out application/json ff",
     )));
     assert_eq!(
-        results(&report),
+        common::results(&report),
         [
             "invalid-body",
             "invalid-body",
@@ -308,19 +284,19 @@ fn a_non_text_body_on_a_text_only_port_is_refused_and_typed_text_is_not() {
          publish out text/plain;charset=iso-8859-1 41\n\
          edit out 0 image/png {h}\n\
          publish out text/markdown 2a",
-        h = hex(NOT_UTF8)
+        h = common::hex(NOT_UTF8)
     ));
     activation.deferred.push(DeferredWindow {
         port: "out".to_string(),
         entries: vec![DeferredEntry {
             index: 0,
-            payload: envelope("brenn:out", MessageBody::text("parked")),
+            payload: common::envelope("brenn:out", "b1", MessageBody::text("parked")),
             deliver_after: 5_000,
         }],
     });
     let (publishes, ops, report) = ok(component.handle(activation));
     assert_eq!(
-        results(&report),
+        common::results(&report),
         [
             "text-only-channel",
             "text-only-channel",
@@ -331,7 +307,7 @@ fn a_non_text_body_on_a_text_only_port_is_refused_and_typed_text_is_not() {
     );
     assert!(ops.is_empty(), "the refused edit buffers nothing");
     assert_eq!(publishes.len(), 1, "only the typed text is buffered");
-    assert_eq!(publishes[0].body, body(Some("text/markdown"), b"*"));
+    assert_eq!(publishes[0].body, common::body(Some("text/markdown"), b"*"));
 }
 
 fn text_only_refusal_warns(lines: &[&str]) -> Vec<String> {
@@ -350,10 +326,10 @@ fn text_only_refusals_reach_the_operator_as_one_warn_per_activation() {
         "publish out image/jpeg {h}\n\
          publish out application/octet-stream {h}\n\
          defer out image/jpeg {h} 9000",
-        h = hex(NOT_UTF8)
+        h = common::hex(NOT_UTF8)
     ))));
     assert_eq!(
-        results(&report),
+        common::results(&report),
         [
             "text-only-channel",
             "text-only-channel",
@@ -384,9 +360,9 @@ fn a_non_text_publish_on_a_non_text_port_writes_no_refusal_warn() {
     let component = load_bytes(Some(port("brenn:out", true)), 1024 * 1024);
     let (publishes, _, report) = ok(component.handle(commands(&format!(
         "publish out image/jpeg {}",
-        hex(NOT_UTF8)
+        common::hex(NOT_UTF8)
     ))));
-    assert_eq!(results(&report), ["ok"]);
+    assert_eq!(common::results(&report), ["ok"]);
     assert_eq!(publishes.len(), 1);
     logs_assert(|lines| {
         let warns = text_only_refusal_warns(lines);
@@ -404,10 +380,10 @@ fn the_body_cap_counts_raw_bytes() {
     let component = load_bytes(Some(port("brenn:out", true)), cap);
     let (publishes, _, report) = ok(component.handle(commands(&format!(
         "publish out application/octet-stream {}\npublish out application/octet-stream {}",
-        hex(&vec![0xffu8; cap + 1]),
-        hex(&vec![0xffu8; cap]),
+        common::hex(&vec![0xffu8; cap + 1]),
+        common::hex(&vec![0xffu8; cap]),
     ))));
-    assert_eq!(results(&report), ["invalid-payload", "ok"]);
+    assert_eq!(common::results(&report), ["invalid-payload", "ok"]);
     assert_eq!(publishes.len(), 1);
     assert_eq!(publishes[0].body.len(), cap);
 }
@@ -417,9 +393,9 @@ fn a_declared_unwired_port_checks_the_body_but_has_no_channel_rule() {
     let component = load_bytes(Some(port("brenn:out", false)), 1024 * 1024);
     let (publishes, _, report) = ok(component.handle(commands(&format!(
         "publish state noslash 00\npublish state image/jpeg {}",
-        hex(NOT_UTF8)
+        common::hex(NOT_UTF8)
     ))));
-    assert_eq!(results(&report), ["invalid-body", "ok"]);
+    assert_eq!(common::results(&report), ["invalid-body", "ok"]);
     assert!(
         publishes.is_empty(),
         "an unwired port drops what it accepts"
@@ -442,16 +418,21 @@ fn a_malformed_body_on_an_undeclared_port_traps() {
 fn a_malformed_edit_body_out_of_range_is_out_of_range() {
     let component = load_bytes(Some(port("brenn:out", true)), 1024 * 1024);
     let (_, ops, report) = ok(component.handle(commands("edit out 3 noslash 00")));
-    assert_eq!(results(&report), ["out-of-range"]);
+    assert_eq!(common::results(&report), ["out-of-range"]);
     assert!(ops.is_empty());
 }
 
 /// A sync-call activation asking the fixture to reply with `command`'s body.
 fn sync_call(command: &str) -> HostActivation {
     Activation {
-        ports: vec![window(
+        ports: vec![common::window(
             "ask",
-            vec![envelope("brenn:ask", MessageBody::text(command))],
+            vec![common::envelope(
+                "brenn:ask",
+                "b1",
+                MessageBody::text(command),
+            )],
+            0,
         )],
         deferred: vec![],
         now: Some(1_000),
@@ -466,7 +447,7 @@ fn a_typed_text_reply_is_the_answer_with_its_type() {
     else {
         panic!("a text reply is ok");
     };
-    assert_eq!(reply, Some(body(Some("text/markdown"), b"*")));
+    assert_eq!(reply, Some(common::body(Some("text/markdown"), b"*")));
 }
 
 /// A reply is judged against the callee's own contract: a non-text one ends
@@ -476,7 +457,7 @@ fn a_non_text_reply_ends_the_callee_ok_with_its_buffer_flushed() {
     let component = load_bytes(Some(port("brenn:out", true)), 1024 * 1024);
     let outcome = component.handle(sync_call(&format!(
         "publish out - 6869\nreply image/png {}",
-        hex(NOT_UTF8)
+        common::hex(NOT_UTF8)
     )));
     let ProcessorOutcome::Ok {
         reply, publishes, ..
@@ -484,7 +465,7 @@ fn a_non_text_reply_ends_the_callee_ok_with_its_buffer_flushed() {
     else {
         panic!("a non-text reply is ok, got {outcome:?}");
     };
-    assert_eq!(reply, Some(body(Some("image/png"), NOT_UTF8)));
+    assert_eq!(reply, Some(common::body(Some("image/png"), NOT_UTF8)));
     assert!(
         publishes.iter().any(|p| p.port == "out"),
         "the buffer flushes"
@@ -505,7 +486,10 @@ fn a_malformed_reply_traps() {
 fn a_reply_over_the_cap_traps() {
     let cap = 4096;
     let component = load_bytes(Some(port("brenn:out", true)), cap);
-    let outcome = component.handle(sync_call(&format!("reply - {}", hex(&vec![b'a'; cap + 1]))));
+    let outcome = component.handle(sync_call(&format!(
+        "reply - {}",
+        common::hex(&vec![b'a'; cap + 1])
+    )));
     let ProcessorOutcome::Trap(why) = outcome else {
         panic!("expected a trap, got {outcome:?}");
     };
@@ -531,12 +515,15 @@ fn recording(answer: SyncAnswer) -> (SyncCallerFn, Asked) {
 
 #[test]
 fn a_0_2_call_hands_the_peer_bytes_and_returns_the_reply() {
-    let (caller, asked) = recording(SyncAnswer::Ok(Some(body(Some("image/png"), NOT_UTF8))));
+    let (caller, asked) = recording(SyncAnswer::Ok(Some(common::body(
+        Some("image/png"),
+        NOT_UTF8,
+    ))));
     let component = load_bytes_calling(None, 1024 * 1024, caller);
     let (_, _, report) = ok(component.handle(commands("call peer application/x-frame ff00")));
     assert_eq!(
-        results(&report),
-        [format!("ok:image/png:{}", hex(NOT_UTF8)).as_str()]
+        common::results(&report),
+        [format!("ok:image/png:{}", common::hex(NOT_UTF8)).as_str()]
     );
     let asked = asked.lock().unwrap();
     assert_eq!(
@@ -544,7 +531,7 @@ fn a_0_2_call_hands_the_peer_bytes_and_returns_the_reply() {
         [(
             "callee".to_string(),
             "answer".to_string(),
-            body(Some("application/x-frame"), &[0xff, 0x00]),
+            common::body(Some("application/x-frame"), &[0xff, 0x00]),
         )]
     );
 }
@@ -554,10 +541,10 @@ fn a_0_2_call_reads_untyped_text_and_no_reply() {
     let (caller, _) = recording(SyncAnswer::Ok(Some(MessageBody::text("hi"))));
     let component = load_bytes_calling(None, 1024 * 1024, caller);
     let (_, _, report) = ok(component.handle(commands("call peer - 00")));
-    assert_eq!(results(&report), ["ok:-:6869"]);
+    assert_eq!(common::results(&report), ["ok:-:6869"]);
     let component = load_bytes(None, 1024 * 1024);
     let (_, _, report) = ok(component.handle(commands("call peer - 00")));
-    assert_eq!(results(&report), ["ok:none"]);
+    assert_eq!(common::results(&report), ["ok:none"]);
 }
 
 #[test]
@@ -566,10 +553,10 @@ fn a_0_2_call_draws_the_body_refusals_and_text_only_peer() {
     let component = load_bytes_calling(None, 4096, caller);
     let (_, _, report) = ok(component.handle(commands(&format!(
         "call peer noslash 00\ncall peer - ff\ncall peer - {}\ncall peer image/png ff",
-        hex(&[b'a'; 4097])
+        common::hex(&[b'a'; 4097])
     ))));
     assert_eq!(
-        results(&report),
+        common::results(&report),
         [
             "invalid-body",
             "invalid-body",

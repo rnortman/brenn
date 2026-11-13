@@ -316,9 +316,9 @@ fn a_page_dom_grant_in_a_load_spec_is_refused() {
 /// This test pins the artifact import strings against the grant vocabulary; a
 /// drift between the built components and the words surfaces here first.
 ///
-/// Every fixture import sits at exactly `@0.1.0`, so this test only ever exercises
-/// the exact-match path of `semver_compat_match`. The version rules themselves are
-/// checked against the linker by `semver_mirror_matches_wasmtime_linker`.
+/// Every fixture import sits at exactly `@0.1.0` or `@0.2.0`, so this test only
+/// ever exercises the exact-match path of `semver_compat_match`. The version rules
+/// themselves are checked against the linker by `semver_mirror_matches_wasmtime_linker`.
 ///
 /// Every fixture is also built by the pinned toolchain, so the host-side suite only
 /// ever sees components carrying the current encoded type section. Loading a

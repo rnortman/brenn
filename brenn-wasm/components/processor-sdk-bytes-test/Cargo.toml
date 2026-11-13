@@ -1,0 +1,17 @@
+# The guest SDK's binary-state fixture: `RetainedState` with a byte codec on a
+# `non_text` state port, and the SDK's body accessors reported back. Run on the
+# backend host, the node page rig and in Chromium.
+# Not listed in brenn-wasm/deployed-components.txt.
+
+[package]
+name = "brenn-processor-sdk-bytes-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+brenn-guest = { path = "../guest" }
+serde_json = "1"

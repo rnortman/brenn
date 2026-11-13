@@ -18,7 +18,7 @@
 mod logic;
 mod spec;
 
-use brenn_guest::{Activation, Error, Processor};
+use brenn_guest::{Activation, Body, Error, Processor};
 
 use crate::logic::Settings;
 use crate::spec::config;
@@ -26,7 +26,7 @@ use crate::spec::config;
 struct GoogleMapsTools;
 
 impl Processor for GoogleMapsTools {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         let settings = Settings::from_lookup(config::get).map_err(Error::failed)?;
         brenn_provider_kit_guest::serve::<logic::Maps>(&activation, &settings)?;
         Ok(None)

@@ -4934,6 +4934,12 @@ new sifter: Demo {{
         }
     }
 
+    /// [`install_package`] over the raw `brenn:processor@0.1.0` fixture, whose
+    /// imports need `ports` and `calls` granted.
+    fn install_string_package(root: &std::path::Path, module_text: &str) {
+        install_package_from(root, module_text, "brenn_processor_page_test.wasm");
+    }
+
     /// A 0.1.0 consumer arriving with an input on a `non_text` channel is
     /// refused, and nothing of it is wired.
     #[tokio::test(flavor = "multi_thread")]
@@ -4942,8 +4948,13 @@ new sifter: Demo {{
         let components = tempfile::tempdir().expect("a components root");
         let booted = boot(&tree, vec![components.path().to_path_buf()]).await;
 
-        tree.write(&frames_consumer_document(true, "frames", "sink", "ports"));
-        install_package(components.path(), &staged_module(&tree));
+        tree.write(&frames_consumer_document(
+            true,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
+        install_string_package(components.path(), &staged_module(&tree));
 
         assert_names_the_pairing(&refusals_of(&booted).await, "input port \"inbound\"");
         assert!(!booted.driver.registry().contains_key("sifter"));
@@ -4959,8 +4970,13 @@ new sifter: Demo {{
         let components = tempfile::tempdir().expect("a components root");
         let booted = boot(&tree, vec![components.path().to_path_buf()]).await;
 
-        tree.write(&frames_consumer_document(true, "work", "frames", "ports"));
-        install_package(components.path(), &staged_module(&tree));
+        tree.write(&frames_consumer_document(
+            true,
+            "work",
+            "frames",
+            "ports, calls",
+        ));
+        install_string_package(components.path(), &staged_module(&tree));
 
         assert_names_the_pairing(&refusals_of(&booted).await, "output port \"digest\"");
         assert!(!booted.driver.registry().contains_key("sifter"));
@@ -4971,13 +4987,23 @@ new sifter: Demo {{
     /// running consumer untouched.
     #[tokio::test(flavor = "multi_thread")]
     async fn declaring_a_string_contract_consumers_channel_non_text_is_refused() {
-        let tree = Tree::holding(&frames_consumer_document(false, "frames", "sink", "ports"));
+        let tree = Tree::holding(&frames_consumer_document(
+            false,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
         let components = tempfile::tempdir().expect("a components root");
-        install_package(components.path(), &staged_module(&tree));
+        install_string_package(components.path(), &staged_module(&tree));
         let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
         let running = Arc::clone(&booted.driver.registry()["sifter"].component);
 
-        tree.write(&frames_consumer_document(true, "frames", "sink", "ports"));
+        tree.write(&frames_consumer_document(
+            true,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
         booted.driver.reload(TriggerSource::Bus).await;
 
         let status = booted.last_status().await;
@@ -5016,7 +5042,7 @@ new sifter: Demo {{
         let running = Arc::clone(&booted.driver.registry()["sifter"].component);
         assert_eq!(running.contract(), brenn_wasm::ProcessorContract::V0_2);
 
-        install_package(components.path(), &staged_module(&tree));
+        install_string_package(components.path(), &staged_module(&tree));
         booted.driver.reload(TriggerSource::Bus).await;
 
         let status = booted.last_status().await;
@@ -5036,9 +5062,14 @@ new sifter: Demo {{
                                brenn:frames, a channel declared `non_text`"
     )]
     async fn booting_a_string_contract_consumer_on_a_non_text_channel_panics() {
-        let tree = Tree::holding(&frames_consumer_document(true, "frames", "sink", "ports"));
+        let tree = Tree::holding(&frames_consumer_document(
+            true,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
         let components = tempfile::tempdir().expect("a components root");
-        install_package(components.path(), &staged_module(&tree));
+        install_string_package(components.path(), &staged_module(&tree));
         boot(&tree, vec![components.path().to_path_buf()]).await;
     }
 
@@ -5077,13 +5108,23 @@ new sifter: Demo {{
     #[tokio::test(flavor = "multi_thread")]
     #[traced_test]
     async fn the_string_contract_notice_follows_boot_and_applied_reloads() {
-        let tree = Tree::holding(&frames_consumer_document(false, "frames", "sink", "ports"));
+        let tree = Tree::holding(&frames_consumer_document(
+            false,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
         let components = tempfile::tempdir().expect("a components root");
-        install_package(components.path(), &staged_module(&tree));
+        install_string_package(components.path(), &staged_module(&tree));
         let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
         logs_assert(|lines| expect_string_contract_notices(lines, "sifter", 1));
 
-        tree.write(&frames_consumer_document(false, "work", "sink", "ports"));
+        tree.write(&frames_consumer_document(
+            false,
+            "work",
+            "sink",
+            "ports, calls",
+        ));
         booted.driver.reload(TriggerSource::Signal).await;
         let status = booted.last_status().await;
         assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
@@ -5091,7 +5132,12 @@ new sifter: Demo {{
 
         booted.driver.reload(TriggerSource::Signal).await;
         assert_eq!(booted.last_status().await.outcome, Outcome::Unchanged);
-        tree.write(&frames_consumer_document(true, "frames", "sink", "ports"));
+        tree.write(&frames_consumer_document(
+            true,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
         booted.driver.reload(TriggerSource::Signal).await;
         assert_eq!(booted.last_status().await.outcome, Outcome::Refused);
         logs_assert(|lines| expect_string_contract_notices(lines, "sifter", 2));

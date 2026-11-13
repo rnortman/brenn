@@ -71,6 +71,9 @@ pub const STRING_KIND: &str = "processor-page-test";
 /// The rig's fixture kind on `brenn:processor@0.2.0`, the twin of
 /// [`STRING_KIND`].
 pub const BYTES_KIND: &str = "processor-page-bytes-test";
+/// The rig's guest-SDK kind on `brenn:processor@0.2.0`, whose binary state is
+/// kept through the SDK's `RetainedState` and runs the same workload.
+pub const SDK_BYTES_KIND: &str = "processor-sdk-bytes-test";
 /// The channel every instance's report is published on.
 pub const REPORT_CHANNEL: &str = "ephemeral:rig.report";
 /// The wire channel `responder`'s `feed` port is subscribed to.
@@ -107,11 +110,12 @@ pub const MEASURE_BODY_CAP: u64 = 4_194_304;
 pub const INSTANCES: [&str; 4] = ["chrome", "keeper", "reader", "responder"];
 
 /// One page's state-holders: those of [`STRING_KIND`], then those of
-/// [`BYTES_KIND`].
+/// [`BYTES_KIND`], then those of [`SDK_BYTES_KIND`].
 #[derive(Clone, Copy)]
 pub struct Staters {
     pub string: &'static [&'static str],
     pub bytes: &'static [&'static str],
+    pub sdk: &'static [&'static str],
 }
 
 impl Staters {
@@ -119,7 +123,8 @@ impl Staters {
     fn all(self) -> impl Iterator<Item = (&'static str, &'static str)> {
         let string = self.string.iter().map(|s| (*s, STRING_KIND));
         let bytes = self.bytes.iter().map(|s| (*s, BYTES_KIND));
-        string.chain(bytes)
+        let sdk = self.sdk.iter().map(|s| (*s, SDK_BYTES_KIND));
+        string.chain(bytes).chain(sdk)
     }
 }
 
@@ -151,11 +156,13 @@ pub const CROSSERS: &[(&str, &str)] = &[
     ("caller", STRING_KIND),
 ];
 
-/// The `cases` page's cast: one state-holder and the contract crossers.
+/// The `cases` page's cast: one state-holder on the string contract, one of
+/// the guest-SDK kind, and the contract crossers.
 pub const CASES_CAST: Cast = Cast {
     staters: Staters {
         string: &["stater"],
         bytes: &[],
+        sdk: &["s-stater"],
     },
     crossers: CROSSERS,
 };
@@ -167,6 +174,7 @@ pub const MEASURE_CAST: Cast = Cast {
     staters: Staters {
         string: &["stater-1", "stater-2", "stater-3"],
         bytes: &["b-stater-1", "b-stater-2", "b-stater-3"],
+        sdk: &[],
     },
     crossers: &[("b-stream", BYTES_KIND)],
 };
@@ -175,8 +183,17 @@ pub const MEASURE_CAST: Cast = Cast {
 pub fn kind_contract(kind: &str) -> ProcessorContract {
     match kind {
         STRING_KIND => ProcessorContract::V0_1,
-        BYTES_KIND => ProcessorContract::V0_2,
+        BYTES_KIND | SDK_BYTES_KIND => ProcessorContract::V0_2,
         other => panic!("the rig stages no kind {other:?}"),
+    }
+}
+
+/// The grants `kind`'s specification requires: the raw fixtures call, and the
+/// guest-SDK kind logs a recovered state.
+fn kind_grants(kind: &str) -> [ComponentGrant; 2] {
+    match kind {
+        SDK_BYTES_KIND => [ComponentGrant::Ports, ComponentGrant::Log],
+        _ => [ComponentGrant::Ports, ComponentGrant::Calls],
     }
 }
 
@@ -209,11 +226,10 @@ fn instances(cast: Cast) -> Vec<(&'static str, &'static str)> {
 /// The bindings document a rig page running `cast` is put in force with.
 pub fn document(cast: Cast) -> BindingsDocument {
     let staters = cast.staters;
-    let grants = [ComponentGrant::Ports, ComponentGrant::Calls];
     let all = instances(cast);
     let mut components: Vec<_> = all
         .iter()
-        .map(|(instance, kind)| component_with_grants(instance, kind, &grants))
+        .map(|(instance, kind)| component_with_grants(instance, kind, &kind_grants(kind)))
         .collect();
     let mut subscriptions: Vec<_> = all
         .iter()
@@ -341,6 +357,7 @@ fn page(max_body_bytes: u64, cast: Cast) -> Value {
         "bytes_timer_channel": BYTES_TIMER_CHANNEL,
         "state_instances": staters.string,
         "bytes_state_instances": staters.bytes,
+        "sdk_state_instances": staters.sdk,
         "status_channel": document.platform.status_channel,
         "max_body_bytes": max_body_bytes,
         "ladder": {
@@ -1211,7 +1228,10 @@ mod tests {
                 .map(|l| l.channel)
                 .collect()
         };
-        assert_eq!(declared(CASES_CAST), [BYTES_TIMER_CHANNEL]);
+        assert_eq!(
+            declared(CASES_CAST),
+            [state_channel("s-stater"), BYTES_TIMER_CHANNEL.to_string()]
+        );
         assert_eq!(
             declared(MEASURE_CAST),
             ["b-stater-1", "b-stater-2", "b-stater-3"].map(state_channel)
@@ -1280,6 +1300,15 @@ mod tests {
         };
         assert_eq!(kind_of("stater-1"), STRING_KIND);
         assert_eq!(kind_of("b-stater-1"), BYTES_KIND);
+        let cases = kit["pages"]["cases"]["instances"]
+            .as_array()
+            .expect("instances is a list");
+        let s_stater = cases
+            .iter()
+            .find(|i| i["instance"] == "s-stater")
+            .expect("cases has s-stater");
+        assert_eq!(s_stater["kind"], json!(SDK_BYTES_KIND));
+        assert_eq!(s_stater["contract"], json!("brenn:processor@0.2.0"));
     }
 
     #[test]

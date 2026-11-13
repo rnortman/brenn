@@ -211,7 +211,7 @@ dependencies = [
 name = "brenn-processor-mqtt-test"
 version = "0.1.0"
 dependencies = [
- "wit-bindgen-rt",
+ "brenn-guest",
 ]
 
 [[package]]
@@ -244,6 +244,14 @@ name = "brenn-processor-provider-test"
 version = "0.1.0"
 dependencies = [
  "brenn-guest",
+]
+
+[[package]]
+name = "brenn-processor-sdk-bytes-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+ "serde_json",
 ]
 
 [[package]]

@@ -8,8 +8,9 @@
 // dead-code warnings at the module level.
 #![allow(dead_code)]
 
-use brenn_activation::ProcessorActivation;
-use brenn_envelope::MessageEnvelope;
+use brenn_activation::{PortWindow, ProcessorActivation};
+use brenn_envelope::testutils::{fixture_envelope, message_id};
+use brenn_envelope::{MessageBody, MessageEnvelope};
 use brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT;
 use brenn_wasm::{
     GuestAlertSeverity, HostActivation, KvStore, MqttPublishFn, MqttPublishOutcome, OutputAclFn,
@@ -17,6 +18,7 @@ use brenn_wasm::{
     ProvidesHost, ProvidesHostFn, QueuedToolRequest, ReplayComponent, SinkBudget, ToolCallError,
     ToolHost, ToolHostFn,
 };
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -101,6 +103,55 @@ fn parked_envelope(port: &str, body: &str) -> Arc<MessageEnvelope> {
         }))
         .expect("a parked test envelope deserializes"),
     )
+}
+
+/// The fixture envelope on `channel` carrying `body`, its message id derived
+/// from the label `id`.
+pub fn envelope(channel: &str, id: &str, body: MessageBody) -> Arc<MessageEnvelope> {
+    Arc::new(fixture_envelope(channel, id, body))
+}
+
+/// The message id [`envelope`] stamps for the label `id`, as its header reads.
+pub fn fixture_id(id: &str) -> String {
+    message_id(id).to_string()
+}
+
+/// A body of the given content type and bytes.
+///
+/// # Panics
+///
+/// On a malformed content type, or a text-typed body that is not UTF-8.
+pub fn body(content_type: Option<&str>, bytes: &[u8]) -> MessageBody {
+    MessageBody::from_parts(content_type, bytes).expect("a test body is well-formed")
+}
+
+/// A window on `port` whose entries from `new_from` on are new, nothing dropped.
+pub fn window(
+    port: &str,
+    envelopes: Vec<Arc<MessageEnvelope>>,
+    new_from: u32,
+) -> PortWindow<Arc<MessageEnvelope>> {
+    PortWindow {
+        port: port.to_string(),
+        envelopes,
+        new_from,
+        dropped: 0,
+    }
+}
+
+/// The result words of a byte fixture's JSON report.
+pub fn results(report: &Value) -> Vec<&str> {
+    report["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|r| r.as_str().expect("a result word"))
+        .collect()
+}
+
+/// Lower-case hex of `bytes`, as the byte fixtures report a body.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Absolute path to a built component artifact, by artifact stem

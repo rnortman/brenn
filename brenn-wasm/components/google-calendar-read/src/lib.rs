@@ -19,14 +19,14 @@ mod logic;
 mod spec;
 
 use brenn_google_workspace::settings::Settings;
-use brenn_guest::{Activation, Error, Processor};
+use brenn_guest::{Activation, Body, Error, Processor};
 
 use crate::spec::config;
 
 struct GoogleCalendarRead;
 
 impl Processor for GoogleCalendarRead {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         let settings =
             Settings::from_lookup(config::get, "calendar_host").map_err(Error::failed)?;
         brenn_provider_kit_guest::serve::<logic::CalendarReads>(&activation, &settings)?;

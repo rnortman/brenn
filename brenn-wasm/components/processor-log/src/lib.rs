@@ -29,7 +29,7 @@
 
 use brenn_guest::alert::Severity;
 use brenn_guest::log::Level;
-use brenn_guest::{Activation, Error, MessageEnvelopeExt, Processor};
+use brenn_guest::{Activation, Body, Error, MessageEnvelopeExt, Processor};
 use brenn_guest::{alert, log};
 
 struct ProcessorLog;
@@ -107,7 +107,7 @@ fn execute_directive(dir: &serde_json::Value) -> Result<(), Error> {
 }
 
 impl Processor for ProcessorLog {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         for window in activation.port_windows() {
             for env in window.new_envelopes() {
                 let env = env?;

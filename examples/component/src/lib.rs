@@ -8,7 +8,7 @@
 
 mod spec;
 
-use brenn_guest::{Activation, Error, MessageEnvelopeExt, OutPort, Processor};
+use brenn_guest::{Activation, Body, Error, MessageEnvelopeExt, OutPort, Processor};
 use heck::{ToKebabCase, ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
 use serde::Serialize;
 
@@ -45,7 +45,7 @@ fn recase(original: &str) -> Cased {
 struct ExampleCaser;
 
 impl Processor for ExampleCaser {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         for window in activation.port_windows() {
             // The host binds only the ports the specification declares, so a
             // window on any other name is the host's error, not input.

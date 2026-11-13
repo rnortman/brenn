@@ -2,13 +2,15 @@
 //
 // Provides typed ergonomics on top of the raw WIT bindings:
 // - `Error` / `Processor` trait / `Activation` / `PortWindow` — dispatch
+// - `Body` / `BodyRef` / `Message` — bodies as bytes with an optional content
+//   type, and window entries
 // - `MessageEnvelopeExt` — typed envelope helpers
 // - `publish` / `publish_json` / `publish_with_urgency` / `OutPort<T>` — ports
 // - `store::Transaction` RAII guard — eliminates the leaked-tx trap footgun
 // - `log` / `alert` modules — fire-and-forget diagnostics
 // - `config` module — operator config access
-// - `RetainedState<T>` — a component's state on a retained `io` port, which
-//   is where it lives: linear memory is activation-scoped
+// - `RetainedState<T, C>` / `StateCodec` — a component's state on a retained
+//   `io` port, which is where it lives: linear memory is activation-scoped
 // - `calls` module — call a peer component and read its reply inline
 // - `tools` module — async tool calls and the result envelope they answer with
 // - `provides` module — serve the tools the class declares, acting for the
@@ -27,19 +29,28 @@
 // log/alert per-activation quotas (256 log / 4 alert), truncation caps
 // (4 KiB message/body, 256 B title), config-map contract (process-lifetime-
 // fixed, "brenn." prefix host-injected), publish provenance caveat
-// (processor.wit:94-106). This crate propagates structured errors as `Error`;
-// it never retries or falls back.
+// (`ports.publish` in `processor.wit`). This crate propagates structured errors as `Error`;
+// it never retries or falls back. Every generated path is named in `contract`
+// and nowhere else.
 //
 // **Publish-failure scope**: returning `Err` from `receive` discards ALL
 // buffered publishes for the activation — across all port-windows (atomic
-// activation-scoped flush, processor.wit:89-92). Log/alert emissions are NOT
+// activation-scoped flush, `ports.publish` in `processor.wit`). Log/alert emissions are NOT
 // discarded (immediate by contract).
 
 use core::marker::PhantomData;
 
+#[doc(hidden)]
 pub mod bindings;
+#[doc(hidden)]
+pub mod contract;
 
+mod body;
+
+#[doc(hidden)]
 pub use bindings::export;
+use body::UNTYPED_TEXT;
+pub use body::{Body, BodyRef, Message};
 
 // ── re-exports ────────────────────────────────────────────────────────────────
 
@@ -78,6 +89,13 @@ pub enum Error {
     /// harmless for the component — a provider drops the request rather than
     /// failing the activation.
     NotPending(String),
+    /// A publish, park or edit of a non-text body onto a channel not declared
+    /// `non_text`. The diagnostic names the port, the body's content type and
+    /// length, and the fix. Structural: no later activation repairs it.
+    TextOnlyChannel(String),
+    /// The host refused a body as malformed — a content type that does not
+    /// parse, or a text-typed body that is not UTF-8 — with its diagnostic.
+    InvalidBody(String),
 }
 
 impl Error {
@@ -107,44 +125,10 @@ impl core::fmt::Display for Error {
             Error::MalformedEnvelope(msg)
             | Error::ProcessingFailed(msg)
             | Error::QuotaExceeded(msg)
-            | Error::NotPending(msg) => f.write_str(msg),
+            | Error::NotPending(msg)
+            | Error::TextOnlyChannel(msg)
+            | Error::InvalidBody(msg) => f.write_str(msg),
         }
-    }
-}
-
-impl From<Error> for bindings::ReceiveError {
-    fn from(e: Error) -> Self {
-        match e {
-            Error::MalformedEnvelope(msg) => bindings::ReceiveError::MalformedEnvelope(msg),
-            // The host has one failure arm for both: the distinction is the
-            // guest's, drawn so a component can decide, and the diagnostic text
-            // already names the variant.
-            Error::ProcessingFailed(msg) | Error::QuotaExceeded(msg) | Error::NotPending(msg) => {
-                bindings::ReceiveError::ProcessingFailed(msg)
-            }
-        }
-    }
-}
-
-/// Map a `PublishError` to a `ProcessingFailed` with a per-port diagnostic.
-///
-/// Single canonical expansion of the `PublishError` variants — both `publish()`
-/// and `publish_with_urgency()` delegate here so that adding a new variant
-/// requires only one change.  The port name is included so multi-port
-/// diagnostics are actionable ("publish to out1: not-permitted").
-fn publish_error(port: &str, e: bindings::brenn::processor::ports::PublishError) -> Error {
-    use bindings::brenn::processor::ports::PublishError;
-    let quota = matches!(e, PublishError::QuotaExceeded);
-    let variant = match e {
-        PublishError::NotPermitted => String::from("not-permitted"),
-        PublishError::InvalidPayload(m) => format!("invalid-payload: {m}"),
-        PublishError::QuotaExceeded => String::from("quota-exceeded"),
-    };
-    let diagnostic = format!("publish to {port}: {variant}");
-    if quota {
-        Error::QuotaExceeded(diagnostic)
-    } else {
-        Error::ProcessingFailed(diagnostic)
     }
 }
 
@@ -213,8 +197,9 @@ pub trait Processor {
     /// [`Activation::sync`] names a port. Answer `Some` only there: a reply on
     /// an ordinary activation is a host trap, because a component replying to a
     /// cause that asked nothing has lost track of why it was called. Ordinary
-    /// activations return `Ok(None)`.
-    fn receive(activation: Activation) -> Result<Option<String>, Error>;
+    /// activations return `Ok(None)`. A text reply is
+    /// `Ok(Some(text.into()))`.
+    fn receive(activation: Activation) -> Result<Option<Body>, Error>;
 }
 
 /// One activation: a snapshot of all bound input ports.
@@ -307,12 +292,12 @@ impl Activation {
     pub fn sync_request(&self) -> Option<(&str, Result<MessageEnvelope, Error>)> {
         let window = self.sync_window()?;
         assert_eq!(
-            window.new_raw().len(),
+            window.new_messages().len(),
             1,
             "a sync-call activation's window on port {:?} carries the one live request, not {} \
              of them",
             window.port(),
-            window.new_raw().len(),
+            window.new_messages().len(),
         );
         let request = window
             .new_envelopes()
@@ -349,15 +334,19 @@ impl Activation {
             .filter(move |window| Some(window.port()) != sync)
     }
 
-    /// Drop one port's window, so a component folding through
+    /// Take one port's window out, so a component folding through
     /// [`Self::delivered_windows`] never sees it.
     ///
-    /// The one caller is [`RetainedState::around`], which reads the state body
-    /// out of the window and then takes it away: the port is the SDK's own
-    /// mechanism, and a component asked to recognize and skip it every time
-    /// would have one more thing to forget on every activation.
-    fn drop_window(&mut self, port: &str) {
-        self.windows.retain(|window| window.port() != port);
+    /// The one caller is [`RetainedState::load`], which reads the state body
+    /// out of the window it takes: the port is the SDK's own mechanism, and a
+    /// component asked to recognize and skip it every time would have one more
+    /// thing to forget on every activation.
+    fn take_window(&mut self, port: &str) -> Option<PortWindow> {
+        let at = self
+            .windows
+            .iter()
+            .position(|window| window.port() == port)?;
+        Some(self.windows.remove(at))
     }
 }
 
@@ -383,7 +372,7 @@ impl DeferredWindow {
 /// One parked message in a [`DeferredWindow`].
 pub struct DeferredEntry {
     index: u32,
-    payload: String,
+    body: Body,
     deliver_after: u64,
 }
 
@@ -394,9 +383,9 @@ impl DeferredEntry {
         self.index
     }
 
-    /// The message body this component published for deferred delivery.
-    pub fn payload(&self) -> &str {
-        &self.payload
+    /// The body this component published for deferred delivery.
+    pub fn body(&self) -> &Body {
+        &self.body
     }
 
     /// Scheduled release time, epoch milliseconds UTC.
@@ -406,13 +395,14 @@ impl DeferredEntry {
 }
 
 // TODO(guest-envelope-accessors): no whole-window accessor; consumers chain
-// the two halves below by hand to read context then new in order.
+// `context_messages` and `new_messages` (or the envelope halves) by hand to
+// read context then new in order.
 /// Messages and context for one logical input port.
 pub struct PortWindow {
     port: String,
     dropped: u32,
-    /// All envelopes: context (..new_from) then new (new_from..).
-    envelopes: Vec<String>,
+    /// All messages: context (..new_from) then new (new_from..).
+    messages: Vec<Message>,
     new_from: usize,
 }
 
@@ -435,103 +425,48 @@ impl PortWindow {
 
     /// Within-host-lifetime gap signal only; always 0 for sampled ports.
     /// `dropped == 0` is NOT proof of no-gap across a host restart.
-    /// See `processor.wit:37-48` caveats.
+    /// See the caveats on `port-window.dropped` in `processor.wit`.
     pub fn dropped(&self) -> u32 {
         self.dropped
     }
 
-    /// New (unprocessed) envelopes for this activation, parsed.
+    /// New (unprocessed) envelopes for this activation, parsed by
+    /// [`Message::envelope`].
     ///
     /// Parse failure yields `Err(Error::MalformedEnvelope)` for that item;
     /// the caller decides whether to skip (`filter_map`) or fail the batch
     /// (`env?`).
     pub fn new_envelopes(&self) -> impl Iterator<Item = Result<MessageEnvelope, Error>> + '_ {
-        self.envelopes[self.new_from..].iter().map(|json| {
-            serde_json::from_str(json).map_err(|e| Error::malformed(format!("envelope JSON: {e}")))
-        })
+        self.new_messages().iter().map(Message::envelope)
     }
 
     /// Retained context envelopes (channel-wide most-recent, NOT a
-    /// per-subscriber delivery log — see `processor.wit:18-29`), parsed.
+    /// per-subscriber delivery log), parsed by
+    /// [`Message::envelope`].
     pub fn context_envelopes(&self) -> impl Iterator<Item = Result<MessageEnvelope, Error>> + '_ {
-        self.envelopes[..self.new_from].iter().map(|json| {
-            serde_json::from_str(json)
-                .map_err(|e| Error::malformed(format!("context envelope JSON: {e}")))
-        })
+        self.context_messages().iter().map(Message::envelope)
     }
 
-    /// Raw JSON strings for new envelopes (new_from..).
-    pub fn new_raw(&self) -> &[String] {
-        &self.envelopes[self.new_from..]
+    /// New (unprocessed) messages for this activation, as handed over.
+    pub fn new_messages(&self) -> &[Message] {
+        &self.messages[self.new_from..]
     }
 
-    /// Raw JSON strings for context envelopes (..new_from).
-    pub fn context_raw(&self) -> &[String] {
-        &self.envelopes[..self.new_from]
+    /// Retained context messages, as handed over.
+    pub fn context_messages(&self) -> &[Message] {
+        &self.messages[..self.new_from]
     }
-}
-
-/// Validate and construct an `Activation` from WIT-generated types.
-///
-/// Returns `Err(ProcessingFailed)` if any port-window has `new_from >
-/// envelopes.len()` (host contract violation, processor.wit:32-36). Called
-/// inside `export_processor!` before user code runs, so all PortWindow
-/// accessors may slice unconditionally.
-///
-/// `pub` is required here because `export_processor!` is a `#[macro_export]`
-/// and expands in the downstream component's crate — `$crate::build_activation`
-/// resolves to a cross-crate call, which needs `pub`. Direct use by component
-/// authors is discouraged (use `export_processor!` instead).
-#[doc(hidden)]
-pub fn build_activation(raw: bindings::Activation) -> Result<Activation, Error> {
-    let mut windows = Vec::with_capacity(raw.ports.len());
-    for pw in raw.ports {
-        let new_from = pw.new_from as usize;
-        let len = pw.envelopes.len();
-        if new_from > len {
-            return Err(Error::failed(format!(
-                "host invariant violation: new_from {new_from} > {len} on port {}",
-                pw.port
-            )));
-        }
-        windows.push(PortWindow {
-            port: pw.port,
-            dropped: pw.dropped,
-            envelopes: pw.envelopes,
-            new_from,
-        });
-    }
-    let deferred = raw
-        .deferred
-        .into_iter()
-        .map(|dw| DeferredWindow {
-            port: dw.port,
-            entries: dw
-                .entries
-                .into_iter()
-                .map(|e| DeferredEntry {
-                    index: e.index,
-                    payload: e.payload,
-                    deliver_after: e.deliver_after,
-                })
-                .collect(),
-        })
-        .collect();
-    Ok(Activation {
-        windows,
-        deferred,
-        now: raw.now,
-        sync: raw.sync,
-    })
 }
 
 /// Export glue macro: implements the WIT `Guest` trait for a shim that
-/// validates the activation invariant and delegates to your `Processor` impl.
+/// validates the activation and delegates to your `Processor` impl.
 ///
 /// ```rust,ignore
 /// struct MyProcessor;
 /// impl brenn_guest::Processor for MyProcessor {
-///     fn receive(a: brenn_guest::Activation) -> Result<Option<String>, brenn_guest::Error> {
+///     fn receive(
+///         a: brenn_guest::Activation,
+///     ) -> Result<Option<brenn_guest::Body>, brenn_guest::Error> {
 ///         // ...
 ///         Ok(None)
 ///     }
@@ -543,18 +478,8 @@ macro_rules! export_processor {
     ($ty:ty) => {
         struct __BrennGuestShim;
         impl $crate::bindings::Guest for __BrennGuestShim {
-            fn receive(
-                a: $crate::bindings::Activation,
-            ) -> ::core::result::Result<
-                ::core::option::Option<::std::string::String>,
-                $crate::bindings::ReceiveError,
-            > {
-                let activation = match $crate::build_activation(a) {
-                    Ok(a) => a,
-                    Err(e) => return ::core::result::Result::Err($crate::bindings::ReceiveError::from(e)),
-                };
-                <$ty as $crate::Processor>::receive(activation)
-                    .map_err($crate::bindings::ReceiveError::from)
+            fn receive(a: $crate::contract::RawActivation) -> $crate::contract::RawReply {
+                $crate::contract::receive::<$ty>(a)
             }
         }
         $crate::export!(__BrennGuestShim with_types_in $crate::bindings);
@@ -569,8 +494,9 @@ macro_rules! export_processor {
 pub trait MessageEnvelopeExt {
     /// The body's text.
     ///
-    /// Returns `Err(MalformedEnvelope)` if the body is not text. Under the
-    /// 0.1.0 contract every body a component is handed is text.
+    /// Returns `Err(MalformedEnvelope)` if the body is not text — a body on a
+    /// channel declared `non_text`, which a component reads through
+    /// [`Message::body`].
     fn text_body(&self) -> Result<&str, Error>;
 
     /// Deserialize the `body` field as `T`.
@@ -585,8 +511,6 @@ pub trait MessageEnvelopeExt {
     fn webhook_body(&self) -> Result<WebhookEnvelope, Error>;
 }
 
-// TODO(wasm-guest-tests-unrun): `text_body`, `json_body` and `webhook_body`
-// have no test on a text and a non-text body; this crate has no test target.
 impl MessageEnvelopeExt for MessageEnvelope {
     fn text_body(&self) -> Result<&str, Error> {
         self.body
@@ -618,14 +542,26 @@ impl MessageEnvelopeExt for MessageEnvelope {
 ///
 /// **Requires grant:** `"ports"` in `[[wasm_consumer]]` grants.
 ///
+/// `body` is anything that converts to a [`BodyRef`]: a `&str` or `&String`
+/// is an untyped text body; bytes are
+/// `BodyRef::typed("application/octet-stream", &bytes)`, and need a channel
+/// declared `non_text` ([`Error::TextOnlyChannel`] otherwise).
+///
 /// Diagnostic on error: `"publish to {port}: {variant}"`.
-pub fn publish(port: &str, payload: &str) -> Result<(), Error> {
-    bindings::brenn::processor::ports::publish(port, payload).map_err(|e| publish_error(port, e))
+pub fn publish<'a>(port: &str, body: impl Into<BodyRef<'a>>) -> Result<(), Error> {
+    contract::publish(port, body.into())
 }
 
-/// Serialize `value` to JSON and publish on the named output port.
+/// Serialize `value` to JSON and publish it on the named output port.
 ///
 /// **Requires grant:** `"ports"` in `[[wasm_consumer]]` grants.
+///
+/// The body is untyped text, as every JSON convenience in this crate
+/// publishes: stating `application/json` would change what every reader of
+/// the channel is shown — a conversation is shown a typed body's content type
+/// — for nothing a reader that parses the body gains. A component that wants
+/// the type stated publishes
+/// `BodyRef::typed("application/json", json.as_bytes())` itself.
 pub fn publish_json<T: serde::Serialize>(port: &str, value: &T) -> Result<(), Error> {
     let payload =
         serde_json::to_string(value).map_err(|e| Error::failed(format!("serialize: {e}")))?;
@@ -639,10 +575,12 @@ pub fn publish_json<T: serde::Serialize>(port: &str, value: &T) -> Result<(), Er
 /// Use when per-message urgency intent differs from the port default.
 /// `Urgency` variants bridge exhaustively to WIT urgency — adding a variant
 /// on either side fails compilation.
-pub fn publish_with_urgency(port: &str, payload: &str, urgency: Urgency) -> Result<(), Error> {
-    let wit_urgency = urgency_to_wit(urgency);
-    bindings::brenn::processor::ports::publish_with_urgency(port, payload, wit_urgency)
-        .map_err(|e| publish_error(port, e))
+pub fn publish_with_urgency<'a>(
+    port: &str,
+    body: impl Into<BodyRef<'a>>,
+    urgency: Urgency,
+) -> Result<(), Error> {
+    contract::publish_with_urgency(port, body.into(), urgency)
 }
 
 /// Buffer a message on the named output port to become observable only at
@@ -654,26 +592,12 @@ pub fn publish_with_urgency(port: &str, payload: &str, urgency: Urgency) -> Resu
 ///
 /// Compute `deliver_after` from [`Activation::now`] plus your delay; a guest has
 /// no clock of its own.
-pub fn publish_deferred(port: &str, payload: &str, deliver_after: u64) -> Result<(), Error> {
-    bindings::brenn::processor::ports::publish_deferred(port, payload, deliver_after)
-        .map_err(|e| publish_error(port, e))
-}
-
-/// Map a `DeferError` to a `ProcessingFailed` with a per-port diagnostic.
-fn defer_error(port: &str, e: bindings::brenn::processor::ports::DeferError) -> Error {
-    use bindings::brenn::processor::ports::DeferError;
-    let variant = match e {
-        DeferError::NotPermitted => "not-permitted",
-        DeferError::OutOfRange => "out-of-range",
-        DeferError::QuotaExceeded => "quota-exceeded",
-        DeferError::InvalidDeliverAfter => "invalid-deliver-after",
-    };
-    let diagnostic = format!("defer control on {port}: {variant}");
-    if matches!(e, DeferError::QuotaExceeded) {
-        Error::QuotaExceeded(diagnostic)
-    } else {
-        Error::ProcessingFailed(diagnostic)
-    }
+pub fn publish_deferred<'a>(
+    port: &str,
+    body: impl Into<BodyRef<'a>>,
+    deliver_after: u64,
+) -> Result<(), Error> {
+    contract::publish_deferred(port, body.into(), deliver_after)
 }
 
 /// Cancel one of this component's own parked messages on `port`, named by its
@@ -684,11 +608,11 @@ fn defer_error(port: &str, e: bindings::brenn::processor::ports::DeferError) -> 
 ///
 /// **Requires grant:** `"ports"` in `[[wasm_consumer]]` grants.
 pub fn defer_cancel(port: &str, index: u32) -> Result<(), Error> {
-    bindings::brenn::processor::ports::defer_cancel(port, index).map_err(|e| defer_error(port, e))
+    contract::defer_cancel(port, index)
 }
 
 /// Edit one of this component's own parked messages on `port`, named by its
-/// `index` into the deferred window this activation delivered. `payload` and
+/// `index` into the deferred window this activation delivered. `body` and
 /// `deliver_after` are each `Some` to change, `None` to leave alone. Buffered and
 /// applied atomically iff `receive` returns `Ok`; same index and race semantics
 /// as [`defer_cancel`].
@@ -697,11 +621,10 @@ pub fn defer_cancel(port: &str, index: u32) -> Result<(), Error> {
 pub fn defer_edit(
     port: &str,
     index: u32,
-    payload: Option<&str>,
+    body: Option<BodyRef<'_>>,
     deliver_after: Option<u64>,
 ) -> Result<(), Error> {
-    bindings::brenn::processor::ports::defer_edit(port, index, payload, deliver_after)
-        .map_err(|e| defer_error(port, e))
+    contract::defer_edit(port, index, body, deliver_after)
 }
 
 /// Cancel every standing wake this activation's window carries on `port`, and
@@ -726,7 +649,12 @@ pub fn defer_edit(
 /// tracking time is that fault hidden rather than reported. A quota is the one
 /// refusal a conforming deployment produces transiently — buckets refill per
 /// activation — so it is logged and the activation carries on.
-pub fn repark(activation: &Activation, port: &str, payload: &str, release_at: Option<u64>) {
+pub fn repark<'a>(
+    activation: &Activation,
+    port: &str,
+    body: impl Into<BodyRef<'a>>,
+    release_at: Option<u64>,
+) {
     if let Some(window) = activation.deferred_for(port) {
         for entry in window.entries() {
             if let Err(err) = defer_cancel(port, entry.index()) {
@@ -743,7 +671,7 @@ pub fn repark(activation: &Activation, port: &str, payload: &str, release_at: Op
     let Some(deliver_after) = release_at else {
         return;
     };
-    if let Err(err) = publish_deferred(port, payload, deliver_after) {
+    if let Err(err) = publish_deferred(port, body, deliver_after) {
         assert!(
             err.is_quota(),
             "brenn-guest: the tick on {port:?} could not be scheduled: {err:?}"
@@ -751,18 +679,6 @@ pub fn repark(activation: &Activation, port: &str, payload: &str, release_at: Op
         log::error(format!(
             "tick on {port:?} could not be scheduled: quota exceeded"
         ));
-    }
-}
-
-/// Convert `brenn_envelope::Urgency` to WIT urgency exhaustively.
-/// Variant drift on either side fails compilation.
-fn urgency_to_wit(u: Urgency) -> bindings::brenn::processor::ports::Urgency {
-    use bindings::brenn::processor::ports::Urgency as WitUrgency;
-    match u {
-        Urgency::VeryLow => WitUrgency::VeryLow,
-        Urgency::Low => WitUrgency::Low,
-        Urgency::Normal => WitUrgency::Normal,
-        Urgency::High => WitUrgency::High,
     }
 }
 
@@ -811,7 +727,8 @@ impl<T: serde::Serialize> OutPort<T> {
         self.name
     }
 
-    /// Serialize `value` and publish with the port's configured default urgency.
+    /// Serialize `value` and publish it, untyped text as [`publish_json`]
+    /// publishes, with the port's configured default urgency.
     pub fn publish(&self, value: &T) -> Result<(), Error> {
         publish_json(self.name, value)
     }
@@ -826,8 +743,54 @@ impl<T: serde::Serialize> OutPort<T> {
 
 // ── retained state ────────────────────────────────────────────────────────────
 
+/// How a [`RetainedState`] body is written and read: a content type, and the
+/// bytes a value encodes to.
+///
+/// [`Json`] is the default, publishing JSON as untyped text. A binary state is
+/// an author's own codec — a type implementing this for the state type, with a
+/// non-text `CONTENT_TYPE` such as `application/octet-stream` — and the SDK
+/// prescribes no layout. The state port's channel must then be declared
+/// `non_text` (see [`RetainedState`]).
+pub trait StateCodec<T> {
+    /// The content type the state body is published with; `None` is untyped
+    /// text. [`RetainedState::load`] refuses a stored body whose content type
+    /// is not exactly this one, before `decode` sees it.
+    const CONTENT_TYPE: Option<&'static str>;
+
+    /// Encode `value` to the body's bytes. Must encode an unchanged value to
+    /// the same bytes every time: the unchanged-state skip compares bytes.
+    ///
+    /// An `Err` means this activation's state is not stored. Inside
+    /// [`RetainedState::around_on`], [`StateLoss`] answers for it as it does for
+    /// a store the host refused: `FailActivation` fails the activation,
+    /// `Recover` logs the codec's error on every activation that hits it and
+    /// leaves the last stored body in place.
+    fn encode(value: &T) -> Result<Vec<u8>, Error>;
+
+    /// Decode a stored body's bytes. An `Err` is an unreadable state, which
+    /// [`StateLoss`] answers for.
+    fn decode(bytes: &[u8]) -> Result<T, Error>;
+}
+
+/// The default [`StateCodec`]: the value as JSON, published as untyped text.
+pub struct Json;
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> StateCodec<T> for Json {
+    const CONTENT_TYPE: Option<&'static str> = None;
+
+    fn encode(value: &T) -> Result<Vec<u8>, Error> {
+        serde_json::to_vec(value)
+            .map_err(|e| Error::failed(format!("retained state serialize: {e}")))
+    }
+
+    fn decode(bytes: &[u8]) -> Result<T, Error> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| Error::malformed(format!("retained state body JSON: {e}")))
+    }
+}
+
 /// A component's state, kept on a retained `io` port instead of in linear
-/// memory.
+/// memory, written and read through the codec `C`.
 ///
 /// Linear memory is activation-scoped: an instance's statics, `thread_local!`s
 /// and heap live for exactly one activation, so a value a component wants on
@@ -855,33 +818,54 @@ impl<T: serde::Serialize> OutPort<T> {
 // TODO(retained-state-port-attribute): the pair belongs on the port in the
 // specification, so no document transcribes it and no binding can override it.
 ///
-/// The idiom is load, work, store, and [`RetainedState::around`] is all three —
-/// a component's `receive` is one call to it. [`RetainedState::load`] and
+/// **A binary state needs a `non_text` channel.** With a codec whose
+/// `CONTENT_TYPE` is not a text type, the channel must be declared to carry
+/// non-text bodies — on a surface, in the binding:
+///
+/// ```text
+/// io state { push_depth = 0; retain_depth = 1; non_text = true; }
+/// ```
+///
+/// and on the backend, on the channel itself. Without it the first store fails
+/// the activation with [`Error::TextOnlyChannel`], under either [`StateLoss`].
+///
+/// **A state body is one message**, so it is bounded by the channel's
+/// `max_body_bytes` (65,536 bytes unless the channel or surface raises it,
+/// applied on a page to page-local publishes too) and by the 4 MiB of
+/// publishes one activation may make.
+///
+/// The idiom is load, work, store, and [`RetainedState::around`] (or
+/// [`RetainedState::around_on`] for a codec of your own) is all three — a
+/// component's `receive` is one call to it. [`RetainedState::load`] and
 /// [`RetainedState::store`] are underneath it, for a component whose shape
 /// `around` does not fit.
 ///
 /// `store` publishes through the ordinary buffer, so a state write is discarded
 /// with everything else when the activation returns `Err` — the state a failed
 /// activation would have left behind is exactly the state nobody wants kept.
-/// It also skips the publish outright when the serialized bytes match what
-/// `load` read, so an activation that changed nothing costs no message and no
-/// budget. That skip is a byte comparison, so a state body must serialize the
-/// same way twice: a `std::collections::HashMap` in a body iterates in an order
-/// seeded per instance and defeats it, where a `BTreeMap` does not.
+/// It also skips the publish outright when the encoded bytes match what `load`
+/// read, so an activation that changed nothing costs no message and no budget.
+/// The comparison is against the body `load` took out of the activation, so
+/// no second copy of the state is kept for it. That skip is a byte comparison,
+/// so a state must encode the same way twice: a `std::collections::HashMap` in
+/// a JSON body iterates in an order seeded per instance and defeats it, where a
+/// `BTreeMap` does not.
 ///
 /// Host resources the component holds by handle — DOM elements — are owned by
 /// the mount and not by the memory, so a [`dom::Node`] stored in a state body
 /// names the same element on the next activation.
-pub struct RetainedState<T> {
-    port: OutPort<T>,
-    /// The serialized body `load` read, so `store` can tell an unchanged state
-    /// from a changed one. `None` before the first `load`, which makes the
-    /// first `store` unconditional.
-    seen: Option<String>,
+pub struct RetainedState<T, C = Json> {
+    port: &'static str,
+    /// The encoded body `load` read, so `store` can tell an unchanged state
+    /// from a changed one. `None` before a `load` that read a body of this
+    /// codec's type, which makes the next `store` unconditional.
+    seen: Option<Vec<u8>>,
+    _marker: PhantomData<fn() -> (T, C)>,
 }
 
-/// What a component does when a retained state body is lost — either one it
-/// cannot deserialize, or one the host refused to accept. The one decision
+/// What a component does when a retained state body is lost — one it cannot
+/// decode, a value its codec will not encode, or a write the host refused to
+/// accept. The one decision
 /// [`RetainedState::around`] leaves to its caller.
 ///
 /// Which answer is right depends on what the state holds. A component whose
@@ -890,112 +874,44 @@ pub struct RetainedState<T> {
 /// state is a recomputable summary loses a recomputation and nothing else, so
 /// it carries on.
 ///
-/// Both losses are ordinary events rather than host faults: an unreadable body
-/// is a version skew across a deploy, and a refused write is a body over the
-/// host's per-message cap or a spent publish budget.
+/// All three losses are ordinary events rather than host faults: an unreadable
+/// body is a version skew across a deploy — a changed type, or a changed codec
+/// whose content type no longer matches the stored body's; a value the codec
+/// will not encode depends on that value, so a later activation may leave one
+/// that encodes; and a refused write is a body over the host's per-message cap
+/// or a spent publish budget.
+///
+/// A write refused for its *shape* is none of these, and no answer here covers
+/// it: [`Error::TextOnlyChannel`] (a non-text codec on a channel not declared
+/// `non_text`) and [`Error::InvalidBody`] fail the activation either way,
+/// because under `Recover` the state would never persist and the log would say
+/// so on every activation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StateLoss {
     /// Fail the activation: an unreadable body is refused before `body` runs,
-    /// and a refused write is refused after it.
+    /// and a value that will not encode or a refused write is refused after it.
     FailActivation,
     /// Log it and carry on: an unreadable body starts from `T::default()`, and
-    /// a refused write leaves the last body that was accepted for the next
-    /// activation to reconcile from.
+    /// a value that will not encode or a refused write leaves the last body
+    /// that was accepted for the next activation to reconcile from.
     Recover,
 }
 
-impl<T: serde::Serialize + serde::de::DeserializeOwned> RetainedState<T> {
-    /// Bind a state cell to a port handle — normally the specification's own,
-    /// `spec::state()`.
+impl<T: serde::Serialize + serde::de::DeserializeOwned> RetainedState<T, Json> {
+    /// Bind a JSON state cell to a port handle — normally the specification's
+    /// own, `spec::state()`.
     pub const fn new(port: OutPort<T>) -> Self {
-        RetainedState { port, seen: None }
+        RetainedState::on(port.name())
     }
 
-    /// The newest state body on the port's window, deserialized.
-    ///
-    /// `Ok(None)` where the window holds nothing at all: a first mount, or a
-    /// realm that did not survive whatever came before. `Err` where a body is
-    /// there and is not this type — a version skew across a deploy is an
-    /// ordinary event, so the caller decides (typically: log it, start from a
-    /// default, and let the next `store` overwrite).
-    ///
-    /// An unbound state port is a deployment fault, not a first mount, and
-    /// fails the activation: a component that silently started from a default
-    /// every time would look exactly like one whose state never persists.
-    pub fn load(&mut self, activation: &Activation) -> Result<Option<T>, Error> {
-        let name = self.port.name();
-        let window = activation
-            .port_windows()
-            .find(|w| w.port() == name)
-            .ok_or_else(|| {
-                Error::failed(format!(
-                    "retained state: no window for port {name:?}; the port is not bound"
-                ))
-            })?;
-        // A window is context then new, so the newest body is the last new one
-        // where there is one and the last context one otherwise.
-        let Some(raw) = window.new_raw().last().or(window.context_raw().last()) else {
-            return Ok(None);
-        };
-        let envelope: MessageEnvelope = serde_json::from_str(raw)
-            .map_err(|e| Error::malformed(format!("retained state envelope JSON: {e}")))?;
-        let text = envelope.text_body()?;
-        self.seen = Some(text.to_owned());
-        let value = serde_json::from_str(text)
-            .map_err(|e| Error::malformed(format!("retained state body JSON: {e}")))?;
-        Ok(Some(value))
-    }
-
-    /// Publish `value` as the port's new retained body, unless it serializes to
-    /// the bytes [`RetainedState::load`] already read.
-    ///
-    /// **Requires grant:** `"ports"`.
-    pub fn store(&mut self, value: &T) -> Result<(), Error> {
-        let body = serde_json::to_string(value)
-            .map_err(|e| Error::failed(format!("retained state serialize: {e}")))?;
-        if self.seen.as_deref() == Some(body.as_str()) {
-            return Ok(());
-        }
-        publish(self.port.name(), &body)?;
-        self.seen = Some(body);
-        Ok(())
-    }
-
-    /// Publish `value`, reporting a refusal the way `loss` asks for.
-    ///
-    /// A refusal here is not a deployment fault the component can be sure of:
-    /// the per-message cap is measured against a body whose size is driven by
-    /// what the component was sent, and the publish budget is a bucket that
-    /// refills. So neither kind traps. What both mean is that this activation's
-    /// state did not land, which is the loss [`StateLoss`] answers for.
-    fn store_or_report(&mut self, value: &T, loss: StateLoss) -> Result<(), Error> {
-        let Err(err) = self.store(value) else {
-            return Ok(());
-        };
-        let bytes = serde_json::to_string(value).map_or(0, |body| body.len());
-        let detail = format!(
-            "retained state publish on port {:?} ({bytes} bytes) was refused: {err:?}",
-            self.port.name(),
-        );
-        match loss {
-            StateLoss::FailActivation => Err(Error::failed(detail)),
-            StateLoss::Recover => {
-                log::error(detail);
-                Ok(())
-            }
-        }
-    }
-}
-
-impl<T: serde::Serialize + serde::de::DeserializeOwned + Default> RetainedState<T> {
-    /// Run one activation around a state cell: load the state, hand it to
+    /// Run one activation around a JSON state cell: load the state, hand it to
     /// `body` along with the activation, store what `body` left.
     ///
     /// This is the whole idiom, so a component's `receive` is the call and
     /// nothing else:
     ///
     /// ```rust,ignore
-    /// fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    /// fn receive(activation: Activation) -> Result<Option<Body>, Error> {
     ///     RetainedState::around(
     ///         activation,
     ///         spec::state::<Panel>(),
@@ -1006,6 +922,150 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned + Default> RetainedState<
     ///         },
     ///     )
     /// }
+    /// ```
+    ///
+    /// [`RetainedState::around_on`] over the port's name, with [`Json`]; its
+    /// documentation is the contract.
+    ///
+    /// **Requires grant:** `"ports"`.
+    pub fn around<R>(
+        activation: Activation,
+        port: OutPort<T>,
+        loss: StateLoss,
+        body: impl FnOnce(&Activation, &mut T) -> Result<R, Error>,
+    ) -> Result<R, Error>
+    where
+        T: Default,
+    {
+        RetainedState::<T, Json>::around_on(activation, port.name(), loss, body)
+    }
+}
+
+impl<T, C: StateCodec<T>> RetainedState<T, C> {
+    /// Bind a state cell to the port named `port`, with the codec `C` —
+    /// normally `RetainedState::<MyState, MyCodec>::on(spec::port::STATE)`.
+    pub const fn on(port: &'static str) -> Self {
+        RetainedState {
+            port,
+            seen: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Take the state port's window out of `activation` and decode its newest
+    /// body.
+    ///
+    /// `Ok(None)` where the window holds nothing at all: a first mount, or a
+    /// realm that did not survive whatever came before. `Err` where a body is
+    /// there and is not this state — a content type other than the codec's
+    /// `CONTENT_TYPE` (`MalformedEnvelope`, naming both), or bytes the codec
+    /// refuses. Either is a version skew across a deploy, an ordinary event, so
+    /// the caller decides (typically: log it, start from a default, and let the
+    /// next `store` overwrite).
+    ///
+    /// The window is gone from `activation` afterwards, whatever the answer:
+    /// the port is this helper's own mechanism. The newest body's bytes are
+    /// kept, moved, as the baseline [`RetainedState::store`] compares with.
+    ///
+    /// An unbound state port is a deployment fault, not a first mount, and
+    /// is an `Err`: a component that silently started from a default every
+    /// time would look exactly like one whose state never persists.
+    pub fn load(&mut self, activation: &mut Activation) -> Result<Option<T>, Error> {
+        let name = self.port;
+        let window = activation.take_window(name).ok_or_else(|| {
+            Error::failed(format!(
+                "retained state: no window for port {name:?}; the port is not bound"
+            ))
+        })?;
+        // A window is context then new, so its last entry is the newest body.
+        let Some(newest) = window.messages.into_iter().next_back() else {
+            return Ok(None);
+        };
+        let body = newest.into_body();
+        if body.content_type() != C::CONTENT_TYPE {
+            return Err(Error::malformed(format!(
+                "retained state on port {name:?} is a body of {}, not of this codec's content \
+                 type {}",
+                body.describe(),
+                C::CONTENT_TYPE.unwrap_or(UNTYPED_TEXT),
+            )));
+        }
+        let value = C::decode(body.as_bytes())?;
+        self.seen = Some(body.into_bytes());
+        Ok(Some(value))
+    }
+
+    /// Publish `value` as the port's new retained body, unless it encodes to
+    /// the bytes [`RetainedState::load`] already read.
+    ///
+    /// **Requires grant:** `"ports"`.
+    pub fn store(&mut self, value: &T) -> Result<(), Error> {
+        self.store_encoded(C::encode(value)?)
+    }
+
+    fn store_encoded(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
+        if self.seen.as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
+        publish(self.port, BodyRef::from_parts(C::CONTENT_TYPE, &bytes))?;
+        self.seen = Some(bytes);
+        Ok(())
+    }
+
+    /// Publish `value`, reporting a refusal the way `loss` asks for.
+    ///
+    /// A refusal for size or budget is not a deployment fault the component
+    /// can be sure of: the per-message cap is measured against a body whose
+    /// size is driven by what the component was sent, and the publish budget
+    /// is a bucket that refills. So neither kind traps. What both mean is that
+    /// this activation's state did not land, which is the loss [`StateLoss`]
+    /// answers for. A refusal of the body's shape is returned as it stands.
+    ///
+    /// A value the codec will not encode is the same loss — nothing is
+    /// published — and `loss` answers for it too, reported as the codec's
+    /// failure rather than as a refusal.
+    fn store_or_report(&mut self, value: &T, loss: StateLoss) -> Result<(), Error> {
+        // TODO(test-missing-codec-encode-failure-loss-path): no test makes a
+        // codec refuse to encode, under either `StateLoss`.
+        let detail = match C::encode(value) {
+            Err(err) => format!(
+                "retained state on port {:?} failed to encode: {err:?}",
+                self.port,
+            ),
+            Ok(encoded) => {
+                let bytes = encoded.len();
+                let Err(err) = self.store_encoded(encoded) else {
+                    return Ok(());
+                };
+                if matches!(err, Error::TextOnlyChannel(_) | Error::InvalidBody(_)) {
+                    return Err(err);
+                }
+                format!(
+                    "retained state publish on port {:?} ({bytes} bytes) was refused: {err:?}",
+                    self.port,
+                )
+            }
+        };
+        match loss {
+            StateLoss::FailActivation => Err(Error::failed(detail)),
+            StateLoss::Recover => {
+                log::error(detail);
+                Ok(())
+            }
+        }
+    }
+
+    /// Run one activation around a state cell on the port named `port`, with
+    /// the codec `C`: load the state, hand it to `body` along with the
+    /// activation, store what `body` left.
+    ///
+    /// ```rust,ignore
+    /// RetainedState::<Canvas, CanvasCodec>::around_on(
+    ///     activation,
+    ///     spec::port::STATE,
+    ///     StateLoss::FailActivation,
+    ///     |activation, canvas| { /* ... */ Ok(None) },
+    /// )
     /// ```
     ///
     /// The activation `body` is handed has **no window on the state port**: the
@@ -1021,40 +1081,49 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned + Default> RetainedState<
     /// activation's publishes anyway, and the state a failed activation would
     /// have left is exactly the state nobody wants kept.
     ///
-    /// A host that refuses the store — a body over its per-message cap, a spent
-    /// publish budget — is the other way this activation's state is lost, and
-    /// `loss` answers for it on the same terms as an unreadable body. Neither
-    /// traps: a state body's size is driven by what the component was sent, so a
-    /// large message would otherwise be a way to kill an instance.
+    /// On an activation that found no state, what `body` leaves is stored
+    /// unconditionally — `T::default()` too, when `body` changed nothing —
+    /// because there is no stored body to compare it with. A component whose
+    /// default is not a state it wants kept calls this only on activations that
+    /// have a state to keep or create one.
+    ///
+    /// A value the codec will not encode, and a host that refuses the store — a
+    /// body over its per-message cap, a spent publish budget — are the other
+    /// ways this activation's state is lost, and `loss` answers for them on the
+    /// same terms as an unreadable body. None traps: a state's value and its
+    /// body's size are driven by what the component was sent, so a crafted or
+    /// large message would otherwise be a way to kill an instance. A store
+    /// refused [`Error::TextOnlyChannel`] or [`Error::InvalidBody`] fails the
+    /// activation with that error whatever `loss` says.
     ///
     /// **Requires grant:** `"ports"`.
-    pub fn around<R>(
+    pub fn around_on<R>(
         mut activation: Activation,
-        port: OutPort<T>,
+        port: &'static str,
         loss: StateLoss,
         body: impl FnOnce(&Activation, &mut T) -> Result<R, Error>,
-    ) -> Result<R, Error> {
-        let mut cell = RetainedState::new(port);
-        let mut state = match cell.load(&activation) {
+    ) -> Result<R, Error>
+    where
+        T: Default,
+    {
+        let mut cell = Self::on(port);
+        let mut state = match cell.load(&mut activation) {
             Ok(state) => state.unwrap_or_default(),
             Err(err) => match loss {
                 StateLoss::FailActivation => {
                     return Err(Error::failed(format!(
-                        "retained state on port {:?} is unreadable: {err:?}",
-                        cell.port.name()
+                        "retained state on port {port:?} is unreadable: {err:?}"
                     )));
                 }
                 StateLoss::Recover => {
                     log::error(format!(
-                        "retained state on port {:?} is unreadable, starting from the default: \
-                         {err:?}",
-                        cell.port.name()
+                        "retained state on port {port:?} is unreadable, starting from the \
+                         default: {err:?}"
                     ));
                     T::default()
                 }
             },
         };
-        activation.drop_window(cell.port.name());
         let answer = body(&activation, &mut state)?;
         cell.store_or_report(&state, loss)?;
         Ok(answer)
@@ -1086,7 +1155,7 @@ pub mod store {
     //! already rolled back — avoiding the host's rollback-after-commit warning.
 
     use super::Error;
-    use crate::bindings::brenn::processor::store::{self as raw, StoreError};
+    use crate::contract::store::{self as raw, StoreError};
 
     fn store_err(op: &str, e: StoreError) -> Error {
         Error::failed(format!("store {op}: {e:?}"))
@@ -1201,11 +1270,11 @@ pub mod log {
     //! The wrappers return `()` — inventing a `Result` would imply delivery
     //! tracking that the WIT contract deliberately omits.
 
-    pub use crate::bindings::brenn::processor::log::Level;
+    pub use crate::contract::log::Level;
 
     /// Emit one log line at the given level.
     pub fn log(level: Level, msg: impl core::fmt::Display) {
-        crate::bindings::brenn::processor::log::log(level, &format!("{msg}"));
+        crate::contract::log::log(level, &format!("{msg}"));
     }
 
     /// Emit a TRACE log line.
@@ -1249,7 +1318,7 @@ pub mod alert {
     //! logs the suppressed count. Use for human-actionable conditions only.
     //! There is NO implicit log-level→alert escalation.
 
-    pub use crate::bindings::brenn::processor::alert::Severity;
+    pub use crate::contract::alert::Severity;
 
     /// Page the operator.
     ///
@@ -1261,11 +1330,7 @@ pub mod alert {
         title: impl core::fmt::Display,
         body: impl core::fmt::Display,
     ) {
-        crate::bindings::brenn::processor::alert::alert(
-            severity,
-            &format!("{title}"),
-            &format!("{body}"),
-        );
+        crate::contract::alert::alert(severity, &format!("{title}"), &format!("{body}"));
     }
 }
 
@@ -1286,7 +1351,7 @@ pub mod config {
 
     /// Raw config lookup. Absent key is a normal condition (`None`).
     pub fn get(key: &str) -> Option<String> {
-        crate::bindings::brenn::processor::config::get(key)
+        crate::contract::config::get(key)
     }
 
     /// Parse a config value as `T`. Absent key → `Ok(None)`; parse failure
@@ -1343,19 +1408,39 @@ pub mod calls {
     //! makes, not what one costs — a call runs a whole activation of the peer,
     //! uncoalesced and with the peer's own budgets.
 
-    use super::Error;
-    use crate::bindings::brenn::processor::calls::{self as raw};
+    use super::{Body, BodyRef, Error};
 
     /// Why a call did not answer, for a guest that classifies before it gives
     /// up. [`CallPort::call`] flattens this into an [`Error`]; reach for
     /// [`CallPort::try_call`] to keep it.
-    pub use crate::bindings::brenn::processor::calls::CallError;
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum CallError {
+        /// The component holds no grant for this port.
+        NotPermitted,
+        /// The port is declared but the deployment wired no peer to it.
+        Unwired,
+        /// The peer did not run: mid-mount, mid-reload or out of service.
+        Refused,
+        /// The peer ran and failed.
+        Failed,
+        /// The request was refused for its size, with the host's diagnostic.
+        InvalidPayload(String),
+        /// The request body was malformed — a content type that does not
+        /// parse, or a text-typed body that is not UTF-8 — with the
+        /// diagnostic.
+        InvalidBody(String),
+        /// The request is not text and the peer reads text only.
+        TextOnlyPeer,
+        /// This activation's call budget is spent.
+        QuotaExceeded,
+    }
 
     /// Whether a later activation may retry this failure. Only a peer that did
     /// not run is transient — it may be mid-mount, mid-reload or briefly out of
-    /// service. An ungranted or unwired port, an oversize payload and an
-    /// exhausted budget are all permanent for this activation, and a peer that
-    /// ran and failed will fail again on the same input.
+    /// service. An ungranted or unwired port, an oversize or malformed
+    /// request, a text-only peer and an exhausted budget are all permanent for
+    /// this activation, and a peer that ran and failed will fail again on the
+    /// same input.
     pub fn is_transient(e: &CallError) -> bool {
         matches!(e, CallError::Refused)
     }
@@ -1368,6 +1453,8 @@ pub mod calls {
             CallError::Refused => String::from("refused"),
             CallError::Failed => String::from("failed"),
             CallError::InvalidPayload(m) => format!("invalid-payload: {m}"),
+            CallError::InvalidBody(m) => format!("invalid-body: {m}"),
+            CallError::TextOnlyPeer => String::from("text-only-peer"),
             CallError::QuotaExceeded => String::from("quota-exceeded"),
         };
         Error::failed(format!("call {port}: {variant}"))
@@ -1398,26 +1485,33 @@ pub mod calls {
 
         /// Call the peer wired to this port, keeping the failure variant.
         ///
-        /// `Ok(None)` is a peer that ran and answered nothing, which is a
-        /// conforming answer and not a failure.
-        pub fn try_call(&self, payload: &str) -> Result<Option<String>, CallError> {
-            raw::call(self.name, payload)
+        /// `body` converts as a publish's does: a `&str` is an untyped text
+        /// request. `Ok(None)` is a peer that ran and answered nothing, which
+        /// is a conforming answer and not a failure.
+        pub fn try_call<'a>(
+            &self,
+            body: impl Into<BodyRef<'a>>,
+        ) -> Result<Option<Body>, CallError> {
+            crate::contract::call(self.name, body.into())
         }
 
         /// Call the peer wired to this port.
         ///
         /// Diagnostic on error: `"call {port}: {variant}"`.
-        pub fn call(&self, payload: &str) -> Result<Option<String>, Error> {
-            self.try_call(payload).map_err(|e| call_err(self.name, e))
+        pub fn call<'a>(&self, body: impl Into<BodyRef<'a>>) -> Result<Option<Body>, Error> {
+            self.try_call(body).map_err(|e| call_err(self.name, e))
         }
 
         /// Call the peer wired to this port with a JSON-serialized request, and
         /// deserialize its reply.
         ///
-        /// A peer that answers nothing is `Ok(None)`; a peer whose reply does
-        /// not deserialize is an [`Error::MalformedEnvelope`], because the two
-        /// ends of a call agree on a dialect the same way two ends of a channel
-        /// do.
+        /// The request is untyped text, as every JSON convenience publishes. A
+        /// peer that answers nothing is `Ok(None)`; a reply that is not text,
+        /// or does not deserialize, is an [`Error::MalformedEnvelope`], because
+        /// the two ends of a call agree on a dialect the same way two ends of a
+        /// channel do.
+        // TODO(wasm-guest-tests-unrun): the refusal of a non-text reply has no
+        // test of its own; no fixture holds `calls` with a non-text callee.
         pub fn call_json<Req: serde::Serialize, Rep: serde::de::DeserializeOwned>(
             &self,
             request: &Req,
@@ -1427,7 +1521,13 @@ pub mod calls {
                 .map_err(|e| Error::failed(format!("call {port}: serialize request: {e}")))?;
             match self.call(&body)? {
                 None => Ok(None),
-                Some(reply) => serde_json::from_str(&reply).map(Some).map_err(|e| {
+                Some(reply) => serde_json::from_str(
+                    reply
+                        .as_text()
+                        .map_err(|e| Error::malformed(format!("call {port}: reply: {e}")))?,
+                )
+                .map(Some)
+                .map_err(|e| {
                     Error::MalformedEnvelope(format!("call {port}: deserialize reply: {e}"))
                 }),
             }
@@ -1456,12 +1556,12 @@ pub mod mqtt {
     //! awaits the PUBACK before returning.
 
     use super::Error;
-    use crate::bindings::brenn::processor::mqtt::{self as raw};
+    use crate::contract::mqtt::{self as raw};
 
     /// The broker outcome of a failed publish, for a guest that classifies
     /// before it gives up. [`publish`] flattens this into an [`Error`]; reach
     /// for [`try_publish`] to keep it.
-    pub use crate::bindings::brenn::processor::mqtt::MqttPublishError as PublishError;
+    pub use crate::contract::mqtt::MqttPublishError as PublishError;
 
     /// Whether a later activation may retry this failure. Only a broker
     /// disconnect / submit failure / dropped ack is transient; a denial, an
@@ -1573,7 +1673,7 @@ pub mod tools {
     //! the component's tool-result inbox, correlated by `call_id`.
 
     use super::Error;
-    use crate::bindings::brenn::processor::tools::{self as raw, ToolError};
+    use crate::contract::tools::{self as raw, ToolError};
 
     /// Human-readable rendering of a `ToolError` for a diagnostic message.
     pub(crate) fn tool_err(tool: &str, e: ToolError) -> Error {
@@ -1713,7 +1813,7 @@ pub mod provides {
     //! naming the request, to be completed from there.
 
     use super::Error;
-    use crate::bindings::brenn::processor::provides::{self as raw, CompleteError};
+    use crate::contract::provides::{self as raw, CompleteError};
 
     /// A host-minted pending-request id, opaque to the component.
     ///
@@ -1927,7 +2027,7 @@ pub mod dom {
     //! ([`crate::RetainedState`]), and the element a handle named when it was
     //! stored is the element it names when it is read back.
 
-    use crate::bindings::brenn::processor::dom as raw;
+    use crate::contract::dom as raw;
 
     /// A page element this instance may act on.
     ///
@@ -2081,7 +2181,7 @@ pub mod dom {
 
     /// Why the browser refused an [`animate`] call: `Refused` carries the
     /// browser's own message.
-    pub use crate::bindings::brenn::processor::dom::AnimateError;
+    pub use crate::contract::dom::AnimateError;
 
     /// Start a Web Animations API animation on the node. `keyframes` is the
     /// JSON text of the keyframe array `Element.animate` takes and `options`
@@ -2214,8 +2314,8 @@ pub mod dom {
     /// A gesture's reply dialect is exactly this one field: present and true
     /// cancels, present and false does not. Returned as the `Ok` payload of
     /// [`crate::Processor::receive`] on a sync-call activation.
-    pub fn cancel_reply() -> String {
-        format!("{{\"{CANCEL_KEY}\":true}}")
+    pub fn cancel_reply() -> crate::Body {
+        crate::Body::text(format!("{{\"{CANCEL_KEY}\":true}}"))
     }
 
     /// The reply that lets the gesture's event proceed.
@@ -2224,8 +2324,8 @@ pub mod dom {
     /// all, which the host also reads as "do not cancel". This is the one that
     /// has decided, so it is spelled in the dialect rather than as an empty
     /// object the reader would refuse.
-    pub fn proceed_reply() -> String {
-        format!("{{\"{CANCEL_KEY}\":false}}")
+    pub fn proceed_reply() -> crate::Body {
+        crate::Body::text(format!("{{\"{CANCEL_KEY}\":false}}"))
     }
 }
 
@@ -2245,7 +2345,7 @@ pub mod page_dom {
     //! declared capabilities and the code it can write equal at compile time. A
     //! class granted only `"dom"` cannot name anything here.
 
-    use crate::bindings::brenn::processor::page_dom as raw;
+    use crate::contract::page_dom as raw;
     use crate::dom::Node;
 
     /// The surface root, which holds every instance wrapper.

@@ -151,8 +151,9 @@ write_file(
     content = ['{"type": "object"}', ""],
 )
 
-# The page rig's fixture kinds, one per contract, staged like served kinds and
-# never served: they are outside `_PROCESSOR_KINDS`, so they are not in `dist`.
+# The page rig's fixture kinds — one raw kind per contract and the guest-SDK
+# kind — staged like served kinds and never served: they are outside
+# `_PROCESSOR_KINDS`, so they are not in `dist`.
 surface_processor_assets(
     name = "processor-page-test_assets",
     component = "//brenn-wasm/components/processor-page-test:component",
@@ -167,6 +168,13 @@ surface_processor_assets(
     spec = "//brenn-wasm/components/processor-page-bytes-test:spec/processor-page-bytes-test.brenn",
 )
 
+surface_processor_assets(
+    name = "processor-sdk-bytes-test_assets",
+    component = "//brenn-wasm/components/processor-sdk-bytes-test:component",
+    kind = "processor-sdk-bytes-test",
+    spec = "//brenn-wasm/components/processor-sdk-bytes-test:spec/processor-sdk-bytes-test.brenn",
+)
+
 # What the page rig serves: the production kernel bundle and the fixture kinds,
 # laid out as `dist` lays them out.
 surface_dist(
@@ -176,6 +184,7 @@ surface_dist(
     stages = [
         ":processor-page-bytes-test_assets",
         ":processor-page-test_assets",
+        ":processor-sdk-bytes-test_assets",
         "//surface/kernel:kernel_dist",
     ],
     target_compatible_with = HOST_ONLY,

@@ -99,6 +99,11 @@ export interface KitPage {
     state_instances: string[];
     /** The same, on `brenn:processor@0.2.0`. */
     bytes_state_instances: string[];
+    /**
+     * The `processor-sdk-bytes-test` instances, whose binary state the guest
+     * SDK keeps on a `non_text` page-local channel of its own.
+     */
+    sdk_state_instances: string[];
     status_channel: string;
     max_body_bytes: number;
     ladder: { hello: Json; welcome: Json; config_deliver: { header: string; body: string } };

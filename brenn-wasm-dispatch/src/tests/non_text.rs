@@ -1,6 +1,6 @@
 //! Bodies that are not text, end to end through the dispatcher: 0.2.0
 //! consumers (`processor-bytes-test`) on channels declared `non_text`, beside a
-//! 0.1.0 one (`processor-dual`) where the channel is text-only.
+//! 0.1.0 one (`processor-page-test`) where the channel is text-only.
 //!
 //! Each consumer is driven by text commands on its `in` channel and reports
 //! what it was handed as JSON on `report`, which a reader subscribed to every
@@ -13,7 +13,6 @@ use brenn_lib::messaging::config::{WasmOutputPort, WasmSinkBudget};
 use brenn_wasm::ProcessorContract;
 
 const BYTES_WASM: &str = "brenn-wasm/target/components/brenn_processor_bytes_test.wasm";
-const DUAL_WASM: &str = "brenn-wasm/target/components/brenn_processor_dual.wasm";
 
 /// The participant subscribed to every report channel.
 const READER: &str = "nt-report-reader";
@@ -519,21 +518,17 @@ async fn a_typed_text_body_reaches_a_0_2_reader_typed_and_a_0_1_reader_as_its_te
         vec![input("nt-reader-new", "feed", &notes)],
         vec![output("report", &new_report)],
     );
-    let old_outputs = vec![output("out1", &old_out), output("out2", &old_out)];
-    let old_component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        declared_out_ports: ["out1", "out2"].into_iter().map(String::from).collect(),
-        output_ports: output_specs(&old_outputs),
-        input_amplification_mt: test_amp_map(),
-        grants: [ComponentGrant::Ports].into_iter().collect(),
-        alerter: noop_proc_alerter(),
-        ..ProcessorLoadSpec::minimal(std::path::Path::new(DUAL_WASM), "nt-reader-old")
-    }));
-    assert_eq!(old_component.contract(), ProcessorContract::V0_1);
+    let old_outputs = vec![output("report", &old_out)];
     let old_reader = consumer(
         "nt-reader-old",
-        old_component,
+        string_contract_component(
+            "nt-reader-old",
+            output_specs(&old_outputs),
+            std::collections::HashMap::new(),
+            Arc::new(|_, _, _, _| SyncAnswer::Ok(None)),
+        ),
         &messenger,
-        vec![input("nt-reader-old", "in", &notes)],
+        vec![input("nt-reader-old", "feed", &notes)],
         old_outputs,
     );
 
@@ -553,27 +548,36 @@ async fn a_typed_text_body_reaches_a_0_2_reader_typed_and_a_0_1_reader_as_its_te
     assert_eq!(feed[0]["hex"], "23206869");
 
     activate(&old_reader).await;
-    // The dual fixture republishes each envelope-json it was handed, once per
-    // output port; both ports are bound to one channel.
+    // The string fixture reports each envelope-json it was handed as hex, in an
+    // untyped report.
     let reader = ParticipantId::for_wasm(READER);
-    let echoed: Vec<serde_json::Value> = testutils::owed_everywhere(&messenger, &reader)
+    let old_reports: Vec<serde_json::Value> = testutils::owed_everywhere(&messenger, &reader)
         .await
         .into_iter()
         .filter(|(channel, _)| *channel == old_out.address)
         .map(|(_, envelope)| {
-            serde_json::from_str(envelope.body.as_text().expect("the echo is text"))
-                .expect("the echo is the envelope-json the guest was handed")
+            assert_eq!(envelope.body.content_type(), None);
+            serde_json::from_str(envelope.body.as_text().expect("a report is text"))
+                .expect("a report is JSON")
         })
         .collect();
-    assert_eq!(echoed.len(), 2, "{echoed:?}");
-    for envelope in &echoed {
-        assert_eq!(envelope["body"], "# hi");
-        assert_eq!(envelope["channel"], notes.address.as_str());
-        assert!(
-            envelope.get("content_type").is_none(),
-            "the 0.1.0 envelope carries no type: {envelope}"
-        );
-    }
+    assert_eq!(old_reports.len(), 1, "{old_reports:?}");
+    let report = &old_reports[0];
+    let feed = window(report, "feed");
+    assert_eq!(feed.len(), 1, "{report}");
+    let handed = feed[0].as_str().expect("an envelope's hex");
+    let handed: Vec<u8> = (0..handed.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&handed[i..i + 2], 16).expect("hex"))
+        .collect();
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&handed).expect("the guest was handed envelope JSON");
+    assert_eq!(envelope["body"], "# hi");
+    assert_eq!(envelope["channel"], notes.address.as_str());
+    assert!(
+        envelope.get("content_type").is_none(),
+        "the 0.1.0 envelope carries no type: {envelope}"
+    );
 }
 
 /// A non-text publish to a text-only channel is refused at the door: the

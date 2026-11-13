@@ -30,7 +30,7 @@
 use brenn_guest::provides::{self, OutcomeErrorKind, PendingId, ToolRequest, drop_not_pending};
 use brenn_guest::serde_json::{Value, json};
 use brenn_guest::tools::{self, ToolResult};
-use brenn_guest::{Activation, Error, Processor};
+use brenn_guest::{Activation, Body, Error, Processor};
 
 /// The tool every nested call reaches.
 const NESTED_TOOL: &str = "api-request";
@@ -38,7 +38,7 @@ const NESTED_TOOL: &str = "api-request";
 struct ProcessorProviderTest;
 
 impl Processor for ProcessorProviderTest {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         for request in activation.tool_requests()? {
             serve(&request)?;
         }

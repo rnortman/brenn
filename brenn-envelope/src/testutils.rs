@@ -1,9 +1,13 @@
 //! Envelope frames for tests, built through the one canonical serializer.
 //!
 //! A test host — the page harness, an out-of-tree component's own suite —
-//! windows envelope text at a guest exactly as a real host does. That text is
-//! [`MessageEnvelope::to_envelope_json`] and nothing else: a hand-written JSON
-//! object beside it is a second wire format that no host produces and that
+//! windows envelopes at a guest exactly as a real host does, starting from
+//! [`fixture_envelope`]. A `brenn:processor@0.2.0` window entry is the
+//! envelope's [`MessageEnvelope::to_header_json`] beside its body's content
+//! type and bytes. A `brenn:processor@0.1.0` entry is the envelope's text,
+//! [`MessageEnvelope::to_envelope_json`], which [`envelope`] and
+//! [`envelope_on`] build for a suite driving a 0.1.0 guest. A hand-written JSON
+//! object beside either is a second wire format that no host produces and that
 //! stops matching the moment the frame gains or renames a field.
 //!
 //! Placement-neutral on purpose. A component that runs on the backend and on

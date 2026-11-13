@@ -42,8 +42,8 @@ export interface BytesReport {
 }
 
 /**
- * Parse one scrollback entry: a 0.1.0 envelope as JSON whose `body` string is
- * the fixture's report JSON.
+ * Parse one scrollback entry: the text-shape envelope JSON whose `body` string
+ * is the fixture's report JSON.
  */
 export function parseEntry(text: string): BytesReport {
   const envelope = JSON.parse(text) as { body?: unknown };

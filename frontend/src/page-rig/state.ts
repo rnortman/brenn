@@ -1,6 +1,7 @@
 // The fixture kinds' state workload, computed on the test's side: the bytes
 // `state <raw-len>` generates, advanced by its increments, and the result word
-// the guest reports for them. Both fixture kinds run the same workload.
+// the guest reports for them. Every fixture kind with a `state` command runs the
+// same workload: the two raw kinds and the guest-SDK kind.
 
 /** FNV-1a 64 of `bytes`, as 16 hex digits, in two 32-bit halves. */
 export function fnv1a64(bytes: Uint8Array): string {
@@ -18,7 +19,7 @@ export function fnv1a64(bytes: Uint8Array): string {
     return hi.toString(16).padStart(8, "0") + lo.toString(16).padStart(8, "0");
 }
 
-/** The bytes either fixture generates for `state <len>` when it holds no state. */
+/** The bytes every fixture generates for `state <len>` when it holds no state. */
 export function generatedState(len: number): Uint8Array {
     const bytes = new Uint8Array(len);
     for (let i = 0; i < len; i++) {
@@ -38,7 +39,7 @@ export function withCounter(bytes: Uint8Array, counter: number): Uint8Array {
 }
 
 /**
- * The result word either fixture reports for the state of `generated.length`
+ * The result word every fixture reports for the state of `generated.length`
  * bytes, advanced `steps` times: each step adds one to the little-endian `u32`
  * in the first four bytes.
  */

@@ -1,5 +1,5 @@
 {
-  "checksum": "680c7c56942c8c10a62890514fa76ec140a5449b21928155636f807bfa8ea58e",
+  "checksum": "a0f2dd64107bbc8cd1f434ef5f9d3d06295291deb48092757908ab2a163037cc",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -8270,6 +8270,12 @@
           "selects": {}
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "build_script_attrs": {
@@ -8389,6 +8395,12 @@
           "selects": {}
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -8453,6 +8465,12 @@
               "id": "serde_derive 1.0.228",
               "target": "serde_derive"
             }
+          ],
+          "selects": {}
+        },
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
           ],
           "selects": {}
         },
@@ -8624,6 +8642,12 @@
           ],
           "selects": {}
         },
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "build_script_attrs": {
@@ -8755,6 +8779,12 @@
           "**"
         ],
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -8808,6 +8838,12 @@
           "selects": {}
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -8881,6 +8917,12 @@
           ],
           "selects": {}
         },
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -8951,6 +8993,12 @@
           "selects": {}
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -9089,6 +9137,12 @@
           }
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -21742,6 +21796,12 @@
           "selects": {}
         },
         "edition": "2018",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.15.2"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -32216,6 +32276,12 @@
           "selects": {}
         },
         "edition": "2021",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.244.0"
       },
       "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
@@ -32350,6 +32416,12 @@
           }
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.254.2"
       },
       "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
@@ -32820,6 +32892,12 @@
           ],
           "selects": {}
         },
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "48.0.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -33040,6 +33118,12 @@
           "selects": {}
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "48.0.8"
       },
       "build_script_attrs": {
@@ -33195,6 +33279,12 @@
               "target": "wasmtime_internal_versioned_export_macros",
               "alias": "wasmtime_versioned_export_macros"
             }
+          ],
+          "selects": {}
+        },
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
           ],
           "selects": {}
         },

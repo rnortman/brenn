@@ -1,5 +1,5 @@
 {
-  "checksum": "b55a36b12efdcd6c009718e466447a2d878d8bdbdec4b372973d7b9fd6ad27eb",
+  "checksum": "007d1629bdc7fce532b43de04202b4d1a1cab90953c5360373b8fe4d6fc318bd",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -812,15 +812,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "deps": {
-          "common": [
-            {
-              "id": "wit-bindgen-rt 0.44.0",
-              "target": "wit_bindgen_rt"
-            }
-          ],
-          "selects": {}
-        },
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -932,6 +923,33 @@
         "compile_data_glob": [
           "**"
         ],
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-sdk-bytes-test 0.1.0": {
+      "name": "brenn-processor-sdk-bytes-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -4473,6 +4491,7 @@
     "brenn-processor-page-bytes-test 0.1.0": "brenn-wasm/components/processor-page-bytes-test",
     "brenn-processor-page-test 0.1.0": "brenn-wasm/components/processor-page-test",
     "brenn-processor-provider-test 0.1.0": "brenn-wasm/components/processor-provider-test",
+    "brenn-processor-sdk-bytes-test 0.1.0": "brenn-wasm/components/processor-sdk-bytes-test",
     "brenn-processor-stale-contract-test 0.1.0": "brenn-wasm/components/processor-stale-contract-test",
     "brenn-processor-store-rt 0.1.0": "brenn-wasm/components/processor-store-rt",
     "brenn-processor-tool-test 0.1.0": "brenn-wasm/components/processor-tool-test",

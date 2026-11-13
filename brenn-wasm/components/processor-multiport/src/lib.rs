@@ -36,7 +36,7 @@
 // Does not import `store` (import-GC strips it; host links it regardless —
 // exercising the subset-instantiation property).
 
-use brenn_guest::{Activation, Error, Processor, publish, serde_json};
+use brenn_guest::{Activation, Body, Error, Processor, publish, serde_json};
 
 #[derive(serde::Serialize)]
 struct PortSummary<'a> {
@@ -52,7 +52,7 @@ struct PortSummary<'a> {
 struct ProcessorMultiport;
 
 impl Processor for ProcessorMultiport {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         // Check sentinels and collect summary entries.
         let windows: Vec<_> = activation.port_windows().collect();
 
@@ -89,19 +89,20 @@ impl Processor for ProcessorMultiport {
                     answering = true;
                 }
                 if env.body.as_text() == Some("__long_reply__") {
-                    return Ok(Some("x".repeat(4096)));
+                    return Ok(Some("x".repeat(4096).into()));
                 }
             }
             // Count context envelopes through `context_envelopes()` to exercise
-            // the parsed iterator path (not just the raw slice). Must equal new_from;
-            // a [..new_from] ↔ [new_from..] transposition would flip this vs new_raw.
+            // the parsed iterator path (not just the slice). Must equal new_from;
+            // a [..new_from] ↔ [new_from..] transposition would flip this vs
+            // new_messages.
             let context_count = window.context_envelopes().count();
             summary_parts.push(PortSummary {
                 port: window.port(),
-                len: window.new_raw().len() + window.context_raw().len(), // total envelopes
-                // context_raw().len() == new_from by PortWindow invariant:
+                len: window.new_messages().len() + window.context_messages().len(),
+                // context_messages().len() == new_from by PortWindow invariant:
                 // context is ..new_from, so its length equals the split index.
-                new_from: window.context_raw().len(),
+                new_from: window.context_messages().len(),
                 dropped: window.dropped(),
                 context_count,
             });
@@ -115,7 +116,7 @@ impl Processor for ProcessorMultiport {
             // rather than vacuous, and on a sync one it is what makes
             // flush-before-reply observable.
             publish("out", "buffered-before-reply")?;
-            return Ok(Some(json));
+            return Ok(Some(json.into()));
         }
         publish("out", &json)?;
         Ok(None)

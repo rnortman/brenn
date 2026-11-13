@@ -21,12 +21,12 @@
 // The "out" port must be bound by the host; an unbound port returns
 // PublishError::NotPermitted (treated as a test-infrastructure bug — panic).
 
-use brenn_guest::{Activation, Error, MessageEnvelopeExt, Processor, config, publish};
+use brenn_guest::{Activation, Body, Error, MessageEnvelopeExt, Processor, config, publish};
 
 struct ProcessorConfig;
 
 impl Processor for ProcessorConfig {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         let windows: Vec<_> = activation.port_windows().collect();
         if windows.is_empty() {
             // Legacy path: no port windows → read "test-key" directly.

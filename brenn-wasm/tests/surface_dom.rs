@@ -24,12 +24,12 @@ use brenn_chrome::wire::{
     TakeoverBody, TakeoverMode, ToastBody, ToastSeverity, ToastSource,
 };
 use brenn_envelope::grants::ComponentGrant::{Alert, Config, Dom, Log, Ports, Store};
-use brenn_envelope::testutils::{NOW_MS, envelope};
+use brenn_envelope::testutils::NOW_MS;
 use brenn_meeting::logic::{AckTarget, SNOOZE_SECS, dismiss_body, snooze_body};
 use brenn_page_harness::{
     Declared, GestureBody, GestureDetail, GestureModifiers, GesturePointer, Harness, Listener,
-    Page, ROOT, delivery_on, gesture, gesture_at, gesture_body, gesture_with, mount, ports,
-    sync_call, types,
+    Page, ROOT, bus, delivery_on, gesture, gesture_at, gesture_body, gesture_with, mount, ports,
+    sync_call,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -170,7 +170,7 @@ fn chrome() -> Harness {
 }
 
 /// An ordinary delivery on echo-stub's one bound input port.
-fn delivery(context: &[&str], new: &[&str], dropped: u32) -> types::Activation {
+fn delivery(context: &[&str], new: &[&str], dropped: u32) -> bus::Activation {
     delivery_on(ECHO_IN_PORT, context, new, dropped)
 }
 
@@ -406,7 +406,7 @@ fn a_refused_state_write_is_reported_where_the_state_is_recomputable() {
             .page()
             .parked
             .iter()
-            .filter(|(port, _, _)| port == MODE_TICK_PORT)
+            .filter(|parked| parked.port == MODE_TICK_PORT)
             .count(),
         1,
         "and the chain that causes the next activation is still armed"
@@ -537,10 +537,10 @@ fn a_press_with_a_position_appends_it_to_the_status_line() {
 fn a_request_that_is_no_gesture_is_refused_with_its_port() {
     let mut harness = echo_stub_mounted();
     let refused = harness
-        .receive(&sync_call(SEND, envelope("not-a-gesture", "{}")))
+        .receive(&sync_call(SEND, "{}"))
         .expect("a malformed request is a refusal, not a trap")
         .expect_err("a body without `event`, `listener` and `target` is no gesture");
-    let types::ReceiveError::MalformedEnvelope(message) = refused else {
+    let bus::ReceiveError::MalformedEnvelope(message) = refused else {
         panic!("the parse failure is a malformed request: {refused:?}");
     };
     assert!(
@@ -757,7 +757,7 @@ fn echo_stub_with_three_entries() -> (Harness, u64, Vec<u64>) {
 /// A click on the scrollback as the kernel reports it: the scrollback is the
 /// listener, `target` the node hit, `child` the scrollback's child on the path,
 /// and the pointer position every mouse event carries.
-fn pick_body(scrollback: u64, target: u64, child: Option<u64>) -> types::Activation {
+fn pick_body(scrollback: u64, target: u64, child: Option<u64>) -> bus::Activation {
     gesture_body(
         PICK,
         &GestureBody {
@@ -1487,8 +1487,8 @@ fn the_mount_recompute_dispatches_a_theme_and_parks_the_next_boundary() {
         .page()
         .parked
         .iter()
-        .filter(|(port, _, _)| port == MODE_TICK_PORT)
-        .map(|(_, body, _)| body.as_str())
+        .filter(|parked| parked.port == MODE_TICK_PORT)
+        .map(|parked| parked.body.as_text().expect("the wake is text"))
         .collect();
     assert_eq!(parked, ["{}"], "the boundary wake is the message");
 }

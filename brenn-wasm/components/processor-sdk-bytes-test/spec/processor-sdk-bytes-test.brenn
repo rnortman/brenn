@@ -1,0 +1,18 @@
+/// The guest SDK's binary-state fixture: a component built on `brenn-guest`
+/// whose retained state is bytes, published as `application/octet-stream`
+/// through `RetainedState` and a hand-written `StateCodec`. It is driven by
+/// text commands on `in` and publishes one untyped report per activation on
+/// `report`: the `feed` window as the SDK reads it, and the result of every
+/// command. `state` carries the binary state, and its channel or binding must
+/// be declared `non_text`.
+///
+/// `log` is required because a state recovered under `StateLoss::Recover` is
+/// logged.
+component ProcessorSdkBytesTest {
+  abi = processor;
+  requires = [ports, log];
+  in in;
+  optional in feed;
+  io state;
+  out report;
+}

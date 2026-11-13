@@ -175,7 +175,8 @@ What a 0.2.0 author relies on:
   page brings each instance up on its own contract's imports. What a
   page-hosted 0.2.0 kind carries today, shown on the node rig;
   `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery
-  in Chromium:
+  in Chromium, and an SDK-built kind's binary state on a page-local `io`
+  port:
   - any body, text or not, with its type, on a page-local channel declared
     `non_text` — a surface binding tail states `non_text = true` where its
     channel stays on the page (`docs/message-bus.md` §2.6) — published,
@@ -199,9 +200,12 @@ What a 0.2.0 author relies on:
   and the check's account; under brenn's own mount it is a boot refusal. An
   artifact the server cannot read is a broken install and fatal under any
   mount.
-- **Not served yet:** the guest SDK (`brenn-guest`) builds against 0.1.0 only,
-  so a 0.2.0 component uses raw bindings over both WIT files, `processor.wit`
-  first, with the world `brenn:processor/processor@0.2.0`.
+- **The guest SDK builds 0.2.0.** A component built on `brenn-guest` is a
+  0.2.0 artifact, and every in-tree SDK component is one. A component that
+  stays on 0.1.0 does so by keeping an older brenn pin or by writing raw
+  bindings over `processor.wit` alone; a raw 0.2.0 component reads both WIT
+  files, `processor.wit` first, with the world
+  `brenn:processor/processor@0.2.0`.
 
 A backend that loads any 0.1.0 artifact says so in one `warn!` at boot and
 after each applied reload, naming them. It names no removal release: the
@@ -295,11 +299,98 @@ Another cut of this kind in force now: **`MessageEnvelope.body` is a
   `envelope-json` text, in a test for instance, calls `to_envelope_json`.
   `Deserialize` reads the text shape and refuses a `content_type` or
   `body_base64` key.
-- `RetainedState` is unchanged in signature and behaviour.
+- `RetainedState` was unchanged in signature and behaviour by this cut.
 
 The WIT, the `envelope-json` text and every runtime contract are byte-identical
 for the bodies a deployed component can meet, so no deployed artifact is
 affected; the cut is paid at the next pin bump.
+
+Another cut of this kind in force now: **`brenn-guest` binds
+`brenn:processor@0.2.0`.** The SDK generates the byte-carrying world and no
+other, so every component built on it from this pin on is a 0.2.0 artifact.
+The one edit every component makes is `Processor::receive`'s reply type; a
+component that only publishes and reads text changes little else.
+
+| Before | After |
+|---|---|
+| `fn receive(activation: Activation) -> Result<Option<String>, Error>` | `fn receive(activation: Activation) -> Result<Option<Body>, Error>`; a text reply is `Ok(Some(text.into()))` |
+| `PortWindow::new_raw() -> &[String]`, `context_raw() -> &[String]` (envelope JSON) | `new_messages() -> &[Message]`, `context_messages() -> &[Message]`; there is no string form of an envelope |
+| — | `Message`: `header_json() -> &str` (the open JSON header), `body() -> &Body`, `envelope() -> Result<MessageEnvelope, Error>` |
+| `new_envelopes()`, `context_envelopes()` | unchanged in signature, read through `Message::envelope` |
+| `DeferredEntry::payload() -> &str` | `DeferredEntry::body() -> &Body`; its text is `entry.body().as_text()?` |
+| `publish(port, &str)`, `publish_with_urgency`, `publish_deferred`, `repark` | the same names, the body `impl Into<BodyRef<'_>>`; a `&str` or `&String` is untyped text, so text call sites compile unchanged |
+| `defer_edit(port, index, Option<&str>, deliver_after)` | `defer_edit(port, index, Option<BodyRef<'_>>, deliver_after)` |
+| `calls::CallError`, the generated WIT variant | an SDK enum: `NotPermitted`, `Unwired`, `Refused`, `Failed`, `InvalidPayload(String)`, `InvalidBody(String)`, `TextOnlyPeer`, `QuotaExceeded` |
+| `CallPort::try_call(&str) -> Result<Option<String>, CallError>`, `call` likewise | the request `impl Into<BodyRef<'_>>`, the reply `Option<Body>`; `call_json` requires a text reply and answers `MalformedEnvelope` for any other |
+| `dom::cancel_reply()`, `proceed_reply() -> String` | `-> Body`, the same JSON as untyped text |
+| `RetainedState<T>` | `RetainedState<T, C = Json>`; `RetainedState<T>`, `new` and `around` compile unchanged |
+| `RetainedState::load(&mut self, &Activation)` | `load(&mut self, &mut Activation)`, taking the state window out of the activation |
+| `build_activation` (public) | gone; the export shim builds the activation |
+| `Error` | gains `TextOnlyChannel(String)` and `InvalidBody(String)` |
+
+- **Bodies.** `Body` is a body as it crossed the boundary: `content_type()`,
+  `as_bytes()`, `into_bytes()`, `is_text()`, `as_text()` (`MalformedEnvelope`
+  for a non-text type or bytes that are not UTF-8), `json::<T>()`; built by
+  `Body::text(..)` or `Body::typed(content_type, bytes)`, or from a `String`
+  or `&str` as untyped text. `BodyRef` is a borrowed body to hand the host:
+  `BodyRef::text(&str)`, `BodyRef::typed(content_type, &[u8])`, or from a
+  `&str`, `&String` or `&Body`. Bytes go out as
+  `publish(port, BodyRef::typed("application/octet-stream", &bytes))`, typed
+  text as `BodyRef::typed("text/markdown", s.as_bytes())`.
+  `MessageEnvelopeExt::text_body` answers `MalformedEnvelope` for a non-text
+  body, which a running guest can now be handed.
+- **The JSON conveniences state no content type.** `publish_json`,
+  `OutPort::publish`, `CallPort::call_json`'s request, `provides::complete`,
+  `tools::call_async_json` and a JSON `RetainedState` publish untyped text,
+  byte for byte what they published before. An author who wants
+  `application/json` stated publishes `BodyRef::typed`. `mqtt::publish_json`
+  keeps MQTT's own `application/json`.
+- **Two new refusals.** `Error::TextOnlyChannel` is a publish, park or edit of
+  a non-text body onto a channel not declared `non_text`; its message names
+  the port, the body's content type and length, and the fix ("declare
+  `non_text = true` on the channel, or on the binding where the channel stays
+  on the page"). It is structural: no later activation repairs it.
+  `Error::InvalidBody` is a malformed content type, or a text-typed body that
+  is not UTF-8. Both fail the activation as `processing-failed`. A call keeps
+  its own `CallError::TextOnlyPeer` (a non-text request to a peer built on
+  0.1.0, which does not run) and `CallError::InvalidBody`. A kind that matches
+  `Error` or `CallError` exhaustively adds the arms.
+- **Binary state.** `RetainedState<T, C>` takes a `StateCodec<T>`: a
+  `CONTENT_TYPE` (`None` is untyped text), `encode(&T) -> Result<Vec<u8>,
+  Error>` and `decode(&[u8]) -> Result<T, Error>`. `Json` is the default and
+  publishes what `RetainedState` always did. A byte codec is the author's own
+  `impl StateCodec<MyState> for MyCodec` with a non-text `CONTENT_TYPE`, bound
+  by port name: `RetainedState::<MyState, MyCodec>::on(spec::port::STATE)` and
+  `around_on(activation, spec::port::STATE, loss, body)`. A stored body whose
+  content type is not exactly the codec's is unreadable state, handled by
+  `StateLoss` as any version skew is. The worked example is
+  `brenn-wasm/components/processor-sdk-bytes-test`.
+- **A binary state needs a `non_text` channel.** On a surface the binding says
+  so — `io state { push_depth = 0; retain_depth = 1; non_text = true; }` — and
+  on the backend the channel does. Without it the first store fails the
+  activation with `Error::TextOnlyChannel` under either `StateLoss`; nothing
+  is persisted and nothing is silently lost. A state body is one message, so
+  it is bounded by the channel's `max_body_bytes` (65,536 B by default,
+  applied on a page to page-local publishes too) and by the 4 MiB of
+  publishes one activation may make.
+- **`surface/page-harness` drives 0.2.0 kinds only.** `Page::published` and
+  `parked` record `Published { port, body, deliver_after }` with a harness
+  `Body { content_type, bytes }`; `published_on(port)` still returns the text
+  bodies and panics on a non-text one; `bodies_on(port)` returns the records.
+  Activation builders return `bus` records (`bus::Activation` and
+  `bus::ReceiveError` in place of `types::…`); `sync_call(port, request)`
+  takes the request body text; `delivery_of(port, context, new, dropped)`
+  delivers `Body` values; `seeding_state_body(Body)` sits beside
+  `seeding_state(&str)`; `call_returning` and `receive` return the reply as a
+  `Body`. A transcript line for an untyped text body is unchanged; any other
+  body is rendered as its content type and length.
+
+While 0.2.0 is provisional this cut has a consequence an author should weigh
+before bumping the pin: a component built at any pin from this commit on is a
+0.2.0 artifact, and brenn makes no compatibility promise for 0.2.0 yet, so a
+brenn release that changed the provisional shape would refuse that artifact at
+load until it was rebuilt. The ways to stay on 0.1.0 are to keep the older pin
+or to write raw 0.1.0 bindings. No shape change is pending.
 
 Freezing the macro vocabulary of a one-operator ecosystem buys nothing a pin
 does not already buy, which is why the two are split rather than held to one

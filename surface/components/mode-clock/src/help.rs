@@ -130,7 +130,7 @@ fn output_section(out: &mut String) {
 mod tests {
     use super::*;
     use crate::logic::{ConfigOutcome, ModeClock};
-    use brenn_surface_test_fixtures::{json_blocks, sample_envelope_json};
+    use brenn_surface_test_fixtures::{json_blocks, sample_envelope};
 
     #[test]
     fn help_sidecar_matches_generator() {
@@ -155,7 +155,7 @@ mod tests {
             let mut clock = ModeClock::new();
             let body = serde_json::json!({ "mode": mode.as_str() });
             assert_eq!(
-                clock.on_config(CONFIG, &sample_envelope_json(&body.to_string())),
+                clock.on_config(CONFIG, &sample_envelope(&body.to_string())),
                 Ok(ConfigOutcome::Accepted),
                 "documented mode {} is rejected by the parser",
                 mode.as_str()
@@ -191,7 +191,7 @@ mod tests {
             .replacen("<HH:MM>", &fmt_hhmm(DEFAULT_DARK_START), 1);
         let mut clock = ModeClock::new();
         assert_eq!(
-            clock.on_config(CONFIG, &sample_envelope_json(&filled)),
+            clock.on_config(CONFIG, &sample_envelope(&filled)),
             Ok(ConfigOutcome::Accepted),
             "the documented body shape is not accepted: {filled}"
         );

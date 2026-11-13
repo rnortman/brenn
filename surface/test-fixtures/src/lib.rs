@@ -50,8 +50,13 @@ pub fn sample_envelope_json(body: &str) -> String {
 /// deserializes — a fixture is a test dependency, so a break here should fail
 /// loud.
 pub fn sample_envelope(body: &str) -> MessageEnvelope {
-    serde_json::from_str(&sample_envelope_json(body))
-        .expect("surface test fixture: sample envelope JSON deserializes")
+    parse_envelope(&sample_envelope_json(body))
+}
+
+/// [`sample_envelope`] with `publish_ts` chosen, for suites that judge
+/// staleness on the publish timestamp.
+pub fn sample_envelope_at(body: &str, publish_ts: &str) -> MessageEnvelope {
+    parse_envelope(&sample_envelope_json_at(body, publish_ts))
 }
 
 /// The golden serialized kernel `Activation`, shared by the two suites that pin
@@ -85,6 +90,16 @@ mod tests {
         assert_eq!(
             envelope.envelope_type,
             brenn_envelope::ChannelScheme::Ephemeral
+        );
+    }
+
+    #[test]
+    fn sample_envelope_at_carries_its_publish_ts() {
+        let envelope = sample_envelope_at("hello", "2026-07-12T00:00:00Z");
+        assert_eq!(envelope.body.as_text(), Some("hello"));
+        assert_eq!(
+            envelope.publish_ts.to_rfc3339(),
+            "2026-07-12T00:00:00+00:00"
         );
     }
 }

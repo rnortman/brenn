@@ -41,19 +41,37 @@ reload's prepare — runs `brenn_wasm::check_surface_component` on every
 `brenn:processor@0.2.0` kind any declared mount offers, instantiated or
 not: a full compile of the artifact under a freshly built wasmtime
 `Engine`. A reload that changes nothing about a kind compiles it again, so
-reload and boot latency grow by one compile per offered 0.2.0 kind (0.66 s
-for a 66 KB fixture in an unoptimized build; no optimized figure taken).
-No in-tree kind is on 0.2.0 yet; the cost arrives as bundles migrate.
-Each check logs `elapsed_ms` on "surface provisional-contract artifact
-checked". Needed: a decision on the memo's key and its soundness. The
-record's `source_sha256` is the cheap key, but at kind grain it is the
-record's word, not a hash of the artifact (the artifact is hashed only
-for instantiated kinds, in `verify_processor_artifacts_in`), and this
-check is the only thing that keeps a page from silently misreading a
-stale provisional artifact; so either an argument that a verdict reused
-on the record's word cannot reach a page unverified, or a hash pass the
-memo pays for. Building the check's `Engine` once per scan is the smaller
-step. Code site: `surface/server/src/processor_assets.rs`, at the
+reload and boot latency grow by one compile per offered 0.2.0 kind. Every
+in-tree kind is on 0.2.0, so every scan compiles all six served kinds
+(chrome, echo-stub, meeting, mode-clock, processor-transplant, protobar;
+2,346,992 B together). The build compiles wasmtime's compiler crates
+optimized in every mode (`crate.annotation` list in `MODULE.bazel`), which
+is what keeps a dev-build scan within seconds. Measured `elapsed_ms` per
+kind, one scan, on "surface provisional-contract artifact checked":
+
+| kind | B | dev, compiler unoptimized | dev, compiler optimized | `-c opt` |
+|---|---:|---:|---:|---:|
+| chrome | 493,966 | 13,017 | 1,319–1,494 | 457 |
+| echo-stub | 305,978 | 7,743 | 853–907 | 297 |
+| meeting | 401,116 | 10,873 | 1,095–1,166 | 367 |
+| mode-clock | 287,399 | 7,614 | 784–895 | 265 |
+| processor-transplant | 248,399 | 6,398 | 673–718 | 229 |
+| protobar | 610,134 | about 16,000, projected | 1,460–1,596 | 509 |
+| six-kind scan | 2,346,992 | about 61,600 | 6,287–6,541 | 2,124 |
+
+The unoptimized-compiler server did not finish booting within `make e2e`'s
+60 s wait, so protobar's figure is projected at that run's 26–27 ms per KB.
+The optimized dev column is four scans (boot and three reloads); the other
+two are one boot each. Needed: a decision on the memo's key and its
+soundness. The record's `source_sha256` is the cheap key, but at kind
+grain it is the record's word, not a hash of the artifact (the artifact is
+hashed only for instantiated kinds, in `verify_processor_artifacts_in`),
+and this check is the only thing that keeps a page from silently
+misreading a stale provisional artifact; so either an argument that a
+verdict reused on the record's word cannot reach a page unverified, or a
+hash pass the memo pays for. Building the check's `Engine` once per scan
+is a smaller step that does not touch the compile, where the time goes.
+Code site: `surface/server/src/processor_assets.rs`, at the
 `check_surface_component` call in `read_processor_record_or_version_in`.
 Done when an unchanged 0.2.0 artifact is not recompiled by a reload.
 
@@ -158,43 +176,6 @@ splitting a pass changes how many delivery points it is. Code site
 (`TODO(attach-replay-pass-frame-size)`): `send_pass` in
 `attach/server/src/subscription.rs`.
 
-## `binary-contract-version-mechanism`
-
-Owner confirmation wanted: the byte-carrying component contract
-`brenn:processor@0.2.0` was built under mechanism (c) on a product-owner
-proxy's ruling, not the owner's. Under (c) 0.2.0 re-declares only the shapes
-that changed (the envelope and activation records, `ports`, `receive`, and
-`calls`), and every unchanged interface (`log`, `store`, `dom` and the rest)
-keeps its `@0.1.0` name for both contracts: one host impl per unchanged
-interface, an interface's version is the version at which its shape last
-changed, and `@0.1.0` names remain in the contract permanently — after the
-dual period the 0.1.0 package lives on as the home of the unchanged
-interfaces and only the string-carrying shapes are removed. The alternative
-(a) moves everything to 0.2.0: about 800–1,500 more lines of forwarding
-bindings during the period, repeated at every later contract change, and
-0.1.0 is deleted whole at the period's end. The question put to the owner:
-the spec says "it needs to be versioned and we need to temporarily support
-both WIT interfaces"; the proxy read "both WIT interfaces" as the
-string-carrying and the byte-carrying shapes, which (c) serves together only
-for the period; if it means the two contract versions, so that nothing named
-0.1.0 survives the period, only (a) delivers it, and whether permanent
-`@0.1.0` names are within "temporarily" is the owner's to say. The sizing
-spike ran both, recommended (c) as engineering, and left the meaning of
-"versioned" to the owner. Until when reversing is cheap: the headers of
-`processor.wit` and `processor-0.2.wit`, `docs/component-packages.md` and
-`CHANGELOG.md` mark 0.2.0 provisional — no compatibility promise, replaceable
-or withdrawable with no dual period, the 0.1.0 removal period not yet running
-— and 0.2.0 is not to be declared stable while this entry is open. While that
-marking stands, a brenn release carrying 0.2.0 freezes nothing and reversing
-to (a) is a rework of the contract's WIT and host bindings (the surface
-host's too, once built); a release whose texts drop the marking is the point
-of no cheap return, after which reversing is a third contract and a second
-dual period. Done = the owner confirms (c) or asks for (a); the entry is
-removed with the answer, and only after it may 0.2.0 be declared stable.
-Code site: the `TODO(binary-contract-version-mechanism)` comment at the
-provisional paragraph in `processor.wit`'s header. (Sizing spike report §5
-OQ1; ruled in the plan of the dual-contract backend cycle.)
-
 ## `conversation-send-content-type`
 
 Owner ruling needed before the blob conversation/tool slice is designed:
@@ -214,20 +195,27 @@ cycle".
 
 ## `dual-contract-period-length`
 
-Owner ruling needed before the release that declares the byte-carrying
-component contract stable: how long the old `brenn:processor` string contract
-stays supported after that release, and how out-of-tree
-authors are told. Options: a fixed number of releases; a date; or until the
-owner's known out-of-tree repositories have moved plus a warning period for
-unknown ones. The backend warns at boot and after a reload, naming every
+Ruled by the binary-bus project's owner-proxy, on the owner's instruction
+that the proxy decides (cycle 10 planning stop), not by the owner in
+person: the old `brenn:processor` string contract stays served for at
+least three brenn releases after the release that declares the
+byte-carrying contract stable, and is not removed before the owner's three known
+out-of-tree component repositories have moved: `brenn-fastmail`,
+`brenn-component-demo`, and a third, the owner's private components
+repository, whose name this tree's scrub gate does not admit. Out-of-tree authors are told by the
+boot and reload warning, which from the declaring release names the
+earliest removal release, and by the same sentence in the WIT headers,
+`docs/component-packages.md` and `CHANGELOG.md`. Releases, not a date:
+brenn has no release calendar. Done = the declaring release carries those
+texts; the owner may shorten or lengthen the count here before then.
+The backend warns at boot and after a reload, naming every
 loaded 0.1.0 artifact and deliberately naming no removal release; the
 `TODO(dual-contract-period-length)` comment sits at that warning, and the WIT
 header and `docs/component-packages.md` describe the period without a length.
-The period does not begin while 0.2.0 is marked provisional (see
-`binary-contract-version-mechanism`), so its length is counted from the
-release that declares 0.2.0 stable; the answer goes into the warning and
-those two texts. (Sizing spike report §5 OQ5 and §4.) Attach v4's period
-is asked separately, under `attach-v4-beside-v5`.
+The period does not begin while 0.2.0 is marked provisional, so its length is
+counted from the release that declares 0.2.0 stable; the answer goes into the
+warning and those two texts. (Sizing spike report §5 OQ5 and §4.) Attach v4's
+period is asked separately, under `attach-v4-beside-v5`.
 
 ## `blob-handle-integrity`
 
@@ -703,6 +691,34 @@ Code site (`TODO(test-downstream-llvm-pins-unguarded)`):
 Done = every module that registers this toolchain block runs the host-library
 check against its own pinned distribution, and the manual-`readelf` sentence
 is gone from their `llvm_version` comments.
+
+## `test-missing-codec-encode-failure-loss-path`
+
+A `StateCodec::encode` that refuses a value is answered by the component's
+`StateLoss` in `RetainedState::store_or_report`: under `FailActivation` the
+activation fails with "retained state on port … failed to encode", under
+`Recover` the error is logged and the activation succeeds with nothing
+stored. That is the intended behaviour, and the rustdoc of
+`StateCodec::encode` and of `StateLoss` states it: an encode refusal depends
+on the value, as an over-size state does, so a later activation with a
+different value can succeed, and the `Json` codec's serialize error took the
+same path before `StateCodec` existed. Only a store the host refuses for a
+reason no value can repair (`TextOnlyChannel`, `InvalidBody`) fails the
+activation under either answer.
+
+No test makes a codec refuse to encode: `processor-sdk-bytes-test`'s codec
+refuses only on decode, and no fixture's JSON state can fail to serialize.
+The test needs a refusing codec in a real component, and
+`processor-sdk-bytes-test` is the documented worked example of a byte
+codec: a value its codec refuses only to be tested would make it a worse
+one to copy, so where the refusing codec lives is to be settled with the
+test.
+
+Code site (`TODO(test-missing-codec-encode-failure-loss-path)`):
+`brenn-wasm/components/guest/src/lib.rs`, `RetainedState::store_or_report`.
+
+Done = a test drives a real component's codec refusal to encode under both
+`StateLoss` answers.
 
 ## `test-selinux-positive-paths-silently-skip`
 
@@ -2770,18 +2786,29 @@ the pure-logic code into a host-buildable module the guest crate includes, or a
 wasm32 test rule (which is the same missing rule work `surface-wasm-test-in-ci`
 describes, without the browser half).
 
-The guest SDK has the same gap with no tests written: `brenn-guest`'s
-`MessageEnvelopeExt` (`text_body`, and `json_body` / `webhook_body` through it)
-has no test that it returns the text of a text body and `MalformedEnvelope` for
-a non-text one, because the crate is a wasm32-only `wasm_guest_library` whose
-`lib.rs` carries the `wit_bindgen::generate!` bindings. The non-text arm is
-unreachable from a running guest under the 0.1.0 contract (the host panics
-before lowering a non-text body), so only a unit test can reach it.
+The guest SDK has no test target either: `brenn-guest` is a wasm32-only
+`wasm_guest_library` whose bindings do not compile off wasm32, so its helpers
+are tested only through real components under the `brenn-wasm` suites.
+`brenn-wasm/tests/sdk_bytes.rs` runs, through the
+`processor-sdk-bytes-test` fixture: `text_body` on text and non-text bodies;
+`Message` and `Body` accessors (`as_text` on both arms, `json`,
+`content_type`, `as_bytes`); the byte publish; `RetainedState` with a byte
+codec; a stored body it cannot read, under both `StateLoss` answers by its
+content-type check and under `FailActivation` by the codec's own decode error,
+which reaches the same arm of `around_on`; and its `TextOnlyChannel` refusal
+under both answers. A codec that refuses to encode is not run
+(`test-missing-codec-encode-failure-loss-path`). The existing suites
+run `json_body`, `webhook_body`, `publish_json`, the deferred ops, calls and
+JSON `RetainedState` through real components. Still with no test of its own:
+`calls::CallPort::call_json`'s refusal of a non-text reply — `Body::as_text`'s
+non-text arm, which is run, behind a `?` on `try_call`'s reply, which the call
+suites run; reaching the composition needs a fixture holding `calls` and a
+wired non-text callee on every host's bindings.
 
 Code sites (`TODO(wasm-guest-tests-unrun)`):
 `brenn-wasm/components/replay/BUILD.bazel` and
 `brenn-wasm/components/replay-generic/BUILD.bazel`, above the guest cdylib;
-`brenn-wasm/components/guest/src/lib.rs`, above `impl MessageEnvelopeExt`.
+`brenn-wasm/components/guest/src/lib.rs`, above `CallPort::call_json`.
 
 
 ## `sw-registration-csp-blocked`
@@ -3696,7 +3723,10 @@ The shape is a port attribute in the *specification* — `io state retained;`, o
 a `retained` marker on the port declaration — that the DSL resolves to the pair
 and refuses to let a binding override, the way the free-`io` form already
 claims a port without an arrow. One declaration in `config/specs/<kind>.brenn`,
-zero per instance.
+zero per instance. A state port whose `StateCodec` publishes a non-text body
+also needs `non_text = true` on its binding on a surface (or on the channel on
+the backend), a third value transcribed per instance that the same attribute
+could carry.
 
 Not a patch: it adds vocabulary to the config DSL, which is a grammar every
 out-of-tree bundle author and every operator reads, and it has to settle what a
@@ -3787,15 +3817,14 @@ contract.
   window on every activation, context then new, oldest to newest — the WIT
   ordering guarantee. `PortWindow` holds that ordered vector but exposes only
   the two halves, and states the join in a private field comment, so every
-  consumer chains `context_envelopes()` with `new_envelopes()` by hand. Add
-  `PortWindow::envelopes()` over the vector directly (not by chaining the two
-  opaque iterators), preferably `impl DoubleEndedIterator` so a newest-first
-  walk is `.rev()`. Whether it keeps the "context envelope JSON" / "envelope
-  JSON" error distinction is this crate's call. Its rustdoc, and the public
-  rustdoc on the two existing halves, state the ordering and the
-  channel-wide-context caveat (`processor.wit`, context is most-recent on the
-  channel, not a delivery log); the stale `processor.wit:NN-NN` line citations
-  in the guest crate ride the same change.
+  consumer chains `context_messages()` with `new_messages()` (or
+  `context_envelopes()` with `new_envelopes()`) by hand. Add
+  `PortWindow::messages()` over the vector directly, and an `envelopes()`
+  beside it (not by chaining the two opaque iterators), preferably
+  `impl DoubleEndedIterator` so a newest-first walk is `.rev()`. Their
+  rustdoc, and the public rustdoc on the existing halves, state the ordering
+  and the channel-wide-context caveat (`processor.wit`, context is
+  most-recent on the channel, not a delivery log).
 
 The guest crate has no test lane of its own; `brenn-envelope` does, and
 `text()` is tested there. The window ordering wants an assertion wherever the
@@ -3956,24 +3985,21 @@ serves, logs no `unrecognized_url` events, and shows the Brenn icon.
 
 ## `guest-binary-body`
 
-`brenn-wasm/components/guest/BUILD.bazel` exports `serde` and `serde_json`
-from the guest hub so an out-of-tree crate can derive against the instance
-brenn-guest's bounds demand, and nothing else. An out-of-tree kind whose
-retained state outgrows JSON therefore has no format crate it can link: a
-`bincode` or `postcard` from its own hub implements against another serde
-instance, and a base64 crate from its own hub is a second hub in the guest.
-One out-of-tree kind already hand-writes both — a fixed-width layout and
-RFC 4648 base64 — and tracks it under the same slug. The base64 is there because
-`ports.publish` takes a `string` (`brenn-wasm/wit/processor.wit`), so a
-binary body pays 4/3 against `max_body_bytes`.
-
-Two shapes, and the choice is a design question: two more aliases from
-`wasm_crates` — a fixed-width binary format (`bincode` with fixed int
-encoding; `postcard`'s varints make a body's length depend on handle values,
-which an exact size projection cannot have) and a base64 crate — which is
-cheap and keeps the 4/3; or a byte payload on the port, which removes the
-4/3 and is a contract change on every host, harness and SDK. Decide when a
-second out-of-tree kind needs a binary body.
+The guest SDK's port carries bytes (`brenn:processor@0.2.0`) and
+`RetainedState` takes a `StateCodec`, so a binary state needs no base64 and no
+JSON: an author implements `StateCodec` for the state type and binds the state
+port's channel `non_text` (worked example:
+`brenn-wasm/components/processor-sdk-bytes-test`). What remains is the derive.
+`brenn-wasm/components/guest/BUILD.bazel` exports `serde` and `serde_json` from
+the guest hub so an out-of-tree crate can derive against the instance
+brenn-guest's bounds demand, and nothing else; a serde format crate from the
+author's own hub implements against another serde instance. Needed: a
+fixed-width serde format a guest can link against the hub's serde instance —
+either a crate exported from the guest hub or a serializer the SDK owns.
+`bincode` with fixed int encoding is the known candidate and is flagged
+unmaintained (RUSTSEC-2025-0141), so exporting it needs the owner's `ignore`
+in `deny.toml` or another choice; `postcard`'s varints make a body's length
+depend on handle values, which an exact size projection cannot have.
 
 Code sites (`TODO(guest-binary-body)`):
 `brenn-wasm/components/guest/BUILD.bazel`, at the `serde` alias.

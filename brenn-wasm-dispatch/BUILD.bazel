@@ -50,10 +50,10 @@ rust_test(
     data = [
         "//brenn-wasm:fixture_git_forge_parser",
         "//brenn-wasm:fixture_processor_bytes_test",
-        "//brenn-wasm:fixture_processor_call_test",
         "//brenn-wasm:fixture_processor_demo",
         "//brenn-wasm:fixture_processor_dual",
         "//brenn-wasm:fixture_processor_multiport",
+        "//brenn-wasm:fixture_processor_page_test",
     ],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),

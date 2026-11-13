@@ -322,7 +322,7 @@ fn handle_webhook_envelope_publishes_inner_body() {
             assert_eq!(
                 publishes[0].body.content_type(),
                 None,
-                "a 0.1.0 publish is untyped text"
+                "a text publish through the SDK is untyped text"
             );
         }
         other => panic!("expected Ok with one publish, got {other:?}"),
@@ -758,9 +758,8 @@ fn per_sink_suppression_emits_post_activation_warn() {
 #[test]
 fn multi_port_publishes_routed_independently() {
     let comp = load_dual();
-    // One brenn envelope → processor-dual publishes its JSON to "out1" then "out2".
-    let payload = envelope_json("brenn:source", "hello");
-    let activation = single_port_activation("in", vec![payload.clone()], 0);
+    // One brenn envelope → processor-dual republishes its body to "out1" then "out2".
+    let activation = single_port_activation("in", vec![envelope_json("brenn:source", "hello")], 0);
     match comp.handle(common::host_activation(activation)) {
         ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
@@ -774,14 +773,14 @@ fn multi_port_publishes_routed_independently() {
                 "first publish must resolve to out1's channel"
             );
             assert_eq!(publishes[0].port, "out1");
-            assert_eq!(publishes[0].body.as_text().unwrap(), payload);
+            assert_eq!(publishes[0].body.as_text().unwrap(), "hello");
             // out2 publish must resolve to brenn:channel-out2, not out1's address.
             assert_eq!(
                 publishes[1].channel_address, "brenn:channel-out2",
                 "second publish must resolve to out2's channel"
             );
             assert_eq!(publishes[1].port, "out2");
-            assert_eq!(publishes[1].body.as_text().unwrap(), payload);
+            assert_eq!(publishes[1].body.as_text().unwrap(), "hello");
         }
         other => panic!("expected Ok with 2 publishes, got {other:?}"),
     }

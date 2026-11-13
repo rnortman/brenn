@@ -21,7 +21,7 @@
 //! dispatches — which is what converges the shell off the page's initial dark
 //! stamp.
 
-use brenn_guest::{Activation, Error, Processor, RetainedState, StateLoss, dom, log, repark};
+use brenn_guest::{Activation, Body, Error, Processor, RetainedState, StateLoss, dom, log, repark};
 
 use crate::logic::{ConfigNote, ConfigWindow, ModeClock, ThemeBody};
 use crate::spec::{InPort, port::TICK};
@@ -39,7 +39,7 @@ impl crate::spec::StatePayload for ModeClock {}
 struct ModeClockComponent;
 
 impl Processor for ModeClockComponent {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         // The theme is a pure function of the clock and the config, so an
         // unreadable body costs only the fault count and one redundant
         // dispatch: start from the default and let the store overwrite it.
@@ -84,10 +84,11 @@ fn on_activation(activation: &Activation, clock: &mut ModeClock) -> Result<(), E
         if matches!(InPort::of(window)?, InPort::Tick) {
             continue;
         }
+        let new = window.new_envelopes().collect::<Result<Vec<_>, _>>()?;
         let notes = clock
             .on_config_window(ConfigWindow {
                 port: window.port(),
-                new_raw: window.new_raw(),
+                new: &new,
             })
             .map_err(|violation| {
                 Error::failed(format!("mode-clock: {violation:?} on an activation window"))

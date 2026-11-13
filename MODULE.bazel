@@ -201,6 +201,39 @@ register_toolchains("@llvm_toolchain//:all", dev_dependency = True)
 # A stale lockfile fails brenn's own build with rules_rust's digest-mismatch
 # error, which names that command.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+
+# wasmtime's compiler, optimized in every compilation mode. Loading a component
+# compiles it, and the surface server type-checks every served kind that way at
+# boot and at every reload; an unoptimized cranelift makes that tens of seconds
+# in a dev build. These are the crates on the compile path (validation,
+# translation, codegen, register allocation); the flag follows the mode's own
+# `opt-level`, so it wins in `fastbuild` and `dbg` and is a no-op in `opt`.
+# Build scripts and proc macros run in the exec configuration and are not
+# covered.
+[
+    crate.annotation(
+        crate = name,
+        repositories = ["crates"],
+        rustc_flags = ["-Copt-level=3"],
+    )
+    for name in [
+        "cranelift-assembler-x64",
+        "cranelift-bforest",
+        "cranelift-bitset",
+        "cranelift-codegen",
+        "cranelift-codegen-shared",
+        "cranelift-control",
+        "cranelift-entity",
+        "cranelift-frontend",
+        "cranelift-native",
+        "regalloc2",
+        "wasmparser",
+        "wasmtime-environ",
+        "wasmtime-internal-core",
+        "wasmtime-internal-cranelift",
+    ]
+]
+
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",

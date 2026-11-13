@@ -247,6 +247,17 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         }
     });
 
+    it("keeps the guest SDK's binary state on a non_text page-local io port, stepped twice", async () => {
+        expect(rig().facts.sdk_state_instances).toEqual(["s-stater"]);
+        const results: string[] = [];
+        for (let i = 0; i < 3; i++) {
+            const report = bytesReport(only(await rig().command("s-stater", "state 1024"), "s-stater"));
+            results.push(...report.results);
+        }
+        const generated = generatedState(1024);
+        expect(results).toEqual([0, 1, 2].map((steps) => expectedState(generated, steps)));
+    });
+
     it("reads every client frame sample the kit emits", () => {
         // Every value, not only the type: an optional field read under a name
         // Rust no longer writes would come back null or empty, not throw.

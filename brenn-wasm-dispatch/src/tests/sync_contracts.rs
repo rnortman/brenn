@@ -1,9 +1,9 @@
 //! Sync calls across the two component contracts: a request and a reply are
 //! bodies, and each end reads only what its contract carries.
 //!
-//! A callee is a real 0.1.0 fixture (`processor-multiport`) or a real 0.2.0
+//! A callee is the raw 0.1.0 fixture (`processor-page-test`) or the raw 0.2.0
 //! one (`processor-bytes-test`), and is judged against its own contract only:
-//! the request names no caller. A 0.1.0 caller (`processor-call-test`) is the
+//! the request names no caller. A 0.1.0 caller (`processor-page-test`) is the
 //! end that cannot read a non-text reply.
 
 use super::*;
@@ -13,7 +13,6 @@ use brenn_lib::messaging::MessageBody;
 use brenn_wasm::ProcessorContract;
 
 const BYTES_WASM: &str = "brenn-wasm/target/components/brenn_processor_bytes_test.wasm";
-const CALL_TEST_WASM: &str = "brenn-wasm/target/components/brenn_processor_call_test.wasm";
 
 /// Bytes that are not UTF-8 (a JPEG start-of-image marker).
 const NOT_UTF8: &[u8] = &[0xff, 0xd8, 0xff, 0x00];
@@ -85,16 +84,30 @@ fn bytes_callee(mut cfg: WasmConsumerConfig) -> WasmConsumerConfig {
     cfg
 }
 
+/// `cfg` serving the 0.1.0 page fixture on its `ask` port, its reports
+/// published on `report_channel`. It replies with the request's text.
+fn string_callee(cfg: &mut WasmConsumerConfig, report_channel: &str) {
+    cfg.component = string_contract_component(
+        &cfg.slug,
+        std::collections::HashMap::from([(
+            "report".to_string(),
+            test_out_spec(report_channel.to_string()),
+        )]),
+        std::collections::HashMap::new(),
+        Arc::new(|_, _, _, _| SyncAnswer::Ok(None)),
+    );
+    cfg.sync_ports = ["ask".to_string()].into_iter().collect();
+}
+
 /// A 0.1.0 callee cannot read a non-text request, so it is refused before
 /// anything advances: the callee does not run, its input is still owed, and
 /// nothing reaches its output.
 #[tokio::test]
 async fn a_non_text_request_to_a_0_1_callee_is_refused_and_the_callee_does_not_run() {
     let slug = "sync-text-only-callee";
-    let (messenger, in_entries, _out_entry, out_sub, wasm_sub, mut cfg, _alerts, _db) =
+    let (messenger, in_entries, out_entry, out_sub, wasm_sub, mut cfg, _alerts, _db) =
         build_multiport_setup(slug, &["sync-text-only-a"]).await;
-    cfg.sync_ports = ["ask".to_string()].into_iter().collect();
-    assert_eq!(cfg.component.contract(), ProcessorContract::V0_1);
+    string_callee(&mut cfg, &out_entry.address);
     testutils::insert_bus_message(&messenger, &in_entries[0], "queued", ChannelScheme::Brenn).await;
 
     let answer = call(&cfg, &wasm_sub, body(Some("image/png"), NOT_UTF8)).await;
@@ -120,21 +133,16 @@ async fn a_non_text_request_to_a_0_1_callee_is_refused_and_the_callee_does_not_r
 #[tokio::test]
 async fn a_typed_text_request_from_a_0_2_caller_reaches_a_0_1_callee_as_its_text() {
     let slug = "sync-typed-text-to-0-1";
-    let (_messenger, _in, _out_entry, _out_sub, wasm_sub, mut cfg, _alerts, _db) =
+    let (_messenger, _in, out_entry, _out_sub, wasm_sub, mut cfg, _alerts, _db) =
         build_multiport_setup(slug, &["sync-typed-text-a"]).await;
-    cfg.sync_ports = ["ask".to_string()].into_iter().collect();
+    string_callee(&mut cfg, &out_entry.address);
 
-    let answer = call(&cfg, &wasm_sub, body(Some("text/markdown"), b"__reply__")).await;
+    let answer = call(&cfg, &wasm_sub, body(Some("text/markdown"), b"# echo me")).await;
 
-    let SyncAnswer::Ok(Some(reply)) = answer else {
-        panic!("the 0.1.0 callee read its text request and answered, got {answer:?}");
-    };
-    assert_eq!(reply.content_type(), None, "a 0.1.0 reply is untyped text");
-    assert!(
-        reply
-            .as_text()
-            .is_some_and(|t| t.contains("\"port\":\"ask\"")),
-        "the reply is the callee's summary: {reply:?}"
+    assert_eq!(
+        answer,
+        SyncAnswer::Ok(Some(MessageBody::text("# echo me"))),
+        "the callee echoed exactly the text it read, as an untyped 0.1.0 reply"
     );
 }
 
@@ -245,36 +253,33 @@ async fn a_non_text_reply_traps_the_0_1_caller() {
     let slug = "sync-bytes-0-1-caller";
     let (messenger, in_entries, out_entry, out_sub, wasm_sub, mut cfg, alert_handle, _db) =
         build_multiport_setup(slug, &["sync-bytes-0-1-caller-a"]).await;
-    let mut output_ports = std::collections::HashMap::new();
-    output_ports.insert("out".to_string(), test_out_spec(out_entry.address.clone()));
-    let mut calls = std::collections::HashMap::new();
-    calls.insert(
-        "ask".to_string(),
-        brenn_wasm::ProcessorCallTarget {
-            target_slug: "thumbnailer".to_string(),
-            target_port: "shrink".to_string(),
-        },
-    );
     let reply = body(Some("image/png"), NOT_UTF8);
-    cfg.component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        declared_out_ports: output_ports.keys().cloned().collect(),
-        output_ports,
-        input_amplification_mt: test_amp_map(),
-        grants: [ComponentGrant::Ports, ComponentGrant::Calls]
-            .into_iter()
-            .collect(),
-        alerter: noop_proc_alerter(),
-        declared_call_ports: ["ask".to_string()].into_iter().collect(),
-        calls,
-        sync_caller: Some(Arc::new(move |_, _, _, _| {
-            SyncAnswer::Ok(Some(reply.clone()))
-        })),
-        ..ProcessorLoadSpec::minimal(std::path::Path::new(CALL_TEST_WASM), slug)
-    }));
-    assert_eq!(cfg.component.contract(), ProcessorContract::V0_1);
+    cfg.component = string_contract_component(
+        slug,
+        std::collections::HashMap::from([(
+            "report".to_string(),
+            test_out_spec(out_entry.address.clone()),
+        )]),
+        std::collections::HashMap::from([(
+            "peer".to_string(),
+            brenn_wasm::ProcessorCallTarget {
+                target_slug: "thumbnailer".to_string(),
+                target_port: "shrink".to_string(),
+            },
+        )]),
+        Arc::new(move |_, _, _, _| SyncAnswer::Ok(Some(reply.clone()))),
+    );
+    // The fixture reads its commands off `in`.
+    cfg.inputs[0].port = "in".to_string();
     let (alert_dispatcher, captured_alerts, cap_handle) = make_capturing_alerter_with_severity();
     cfg.alert_dispatcher = alert_dispatcher;
-    testutils::insert_bus_message(&messenger, &in_entries[0], "call:x", ChannelScheme::Brenn).await;
+    testutils::insert_bus_message(
+        &messenger,
+        &in_entries[0],
+        "call peer 78",
+        ChannelScheme::Brenn,
+    )
+    .await;
 
     drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 

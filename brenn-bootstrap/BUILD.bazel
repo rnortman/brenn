@@ -83,8 +83,9 @@ rust_test(
     # they import; `rustc_env` below names the directory those paths hang off.
     data = [
         "//:brenn_configs",
-        # `brenn.e2e.brenn`'s second module root.
+        # `brenn.e2e.brenn`'s second and third module roots.
         "//brenn-wasm/components/processor-page-bytes-test:spec/processor-page-bytes-test.brenn",
+        "//brenn-wasm/components/processor-sdk-bytes-test:spec/processor-sdk-bytes-test.brenn",
         # The recycler's dispatch cases drive the deployed guest through the real
         # lowering.
         "//brenn-wasm:fixture_conversation_recycler",
@@ -106,7 +107,7 @@ rust_test(
         # router.
         "//brenn-wasm:fixture_processor_call_test",
         # The contract-pairing reload cases roll a consumer back from this
-        # byte-carrying build to the demo's string build.
+        # byte-carrying build to the string build, `processor-page-test`.
         "//brenn-wasm:fixture_processor_bytes_test",
         "//brenn-wasm:fixture_processor_config",
         "//brenn-wasm:fixture_processor_demo",
@@ -114,6 +115,9 @@ rust_test(
         # package name, which is what makes the record comparison the only
         # thing that can see the change.
         "//brenn-wasm:fixture_processor_dual",
+        # The raw `brenn:processor@0.1.0` fixture: the string build the
+        # contract-pairing refusal and the string-contract notice cases install.
+        "//brenn-wasm:fixture_processor_page_test",
         # The provided-tool boot-path case installs the provider fixture as a
         # providing class's package.
         "//brenn-wasm:fixture_processor_provider_test",

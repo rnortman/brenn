@@ -2,11 +2,11 @@
 // `mqtt-publish` naming an authorized client,
 // the host callback reports a broker error, and the guest propagates it back).
 //
-// Uses the `processor-mqtt-test` raw-bindings fixture component: on any
-// activation with ≥1 new envelope, the component calls
-// `mqtt_publish("test-client", "test/topic", payload, None, 0, false)` and
-// maps the returned `MqttPublishError` to
-// `Err(ReceiveError::ProcessingFailed("ErrorVariant:detail"))`.
+// Uses the `processor-mqtt-test` SDK fixture component: on any activation
+// with ≥1 new envelope, the component publishes the first new message's body
+// bytes with `mqtt::try_publish("test-client", "test/topic", payload, None, 0,
+// false)` and maps the returned `PublishError` to a processing failure
+// `"ErrorVariant:detail"`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -433,12 +433,12 @@ fn publish_json_sends_json_under_the_json_content_type() {
     assert_eq!(content_type.as_deref(), Some("application/json"));
     assert_eq!(*qos, 0);
     assert!(!*retain);
-    // The fixture publishes the envelope it was handed, so the payload is that
-    // envelope as a JSON string — which is the point: it came back out of
+    // The fixture publishes the body it was handed, so the payload is that
+    // body as a JSON string — which is the point: it came back out of
     // `serde_json`, not out of a `Debug` rendering.
     let decoded: String =
         serde_json::from_slice(payload).expect("publish_json sends JSON, not a Debug rendering");
-    assert_eq!(decoded, envelope_with_body("PUBLISH_JSON"));
+    assert_eq!(decoded, "PUBLISH_JSON");
 }
 
 /// `mqtt::publish_text` sends the bytes as given, under `text/plain`.
@@ -461,7 +461,7 @@ fn publish_text_sends_the_body_under_the_text_content_type() {
     assert_eq!(content_type.as_deref(), Some("text/plain"));
     assert_eq!(
         payload.as_slice(),
-        envelope_with_body("PUBLISH_TEXT").as_bytes(),
+        b"PUBLISH_TEXT",
         "the text wrapper sends the bytes it was given, unencoded"
     );
 }

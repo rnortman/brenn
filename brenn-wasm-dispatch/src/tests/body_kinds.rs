@@ -3,22 +3,29 @@
 //! The contract's `envelope-json` and `deferred-entry.payload` are strings. A
 //! typed text body crosses as exactly its text; a non-text body reaching
 //! either is a host invariant broken, and lowering panics naming the carrier.
+//!
+//! The guest is the raw 0.1.0 fixture `processor-page-test`.
 
 use super::*;
 
 use brenn_lib::messaging::MessageBody;
 
-/// The `outcome` of each of this subscriber's quarantine rows.
-async fn failure_outcomes(
+/// The `outcome` and `diagnostic` of each of this subscriber's quarantine rows.
+async fn failure_rows(
     messenger: &brenn_messaging::Messenger,
     subscriber: &ParticipantId,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     let conn = messenger.db().lock().await;
     let mut stmt = conn
-        .prepare("SELECT outcome FROM messaging_wasm_consume_failures WHERE subscriber = ?1")
+        .prepare(
+            "SELECT outcome, diagnostic FROM messaging_wasm_consume_failures \
+             WHERE subscriber = ?1",
+        )
         .expect("the failure query prepares");
     let rows = stmt
-        .query_map(rusqlite::params![subscriber.as_str()], |row| row.get(0))
+        .query_map(rusqlite::params![subscriber.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .expect("the failure query runs");
     rows.map(|r| r.expect("a failure row reads back")).collect()
 }
@@ -28,17 +35,26 @@ fn binary_body() -> MessageBody {
         .expect("a typed binary body is constructible")
 }
 
-/// The demo component traps on a body that is exactly `__trap__`. A
-/// `text/markdown` body with that text makes it trap, so the guest was handed
-/// the bare text, not the type or a wrapped value. A guest that could not parse
-/// its envelope would return an error instead, quarantined as `err`.
+/// `cfg` running the string fixture, its reports dropped.
+fn on_the_string_fixture(cfg: &mut WasmConsumerConfig) {
+    cfg.component = string_contract_component(
+        &cfg.slug,
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+        Arc::new(|_, _, _, _| SyncAnswer::Ok(None)),
+    );
+}
+
+/// The string fixture fails its activation on a body that is exactly `fail`
+/// and on any line that is not a command. A `text/markdown` body `fail` makes
+/// it fail with "asked to fail", so the guest was handed the bare text, not the
+/// type or a wrapped value.
 #[tokio::test]
 async fn a_typed_text_body_reaches_the_guest_as_exactly_its_text() {
     let slug = "body-typed-text";
     let (messenger, channel, wasm_sub) =
         testutils::build_wasm_messenger(slug, "typed-ch", Depth::Unbounded, Depth::Unbounded).await;
-    let body =
-        MessageBody::from_parts(Some("text/markdown"), b"__trap__").expect("typed text body");
+    let body = MessageBody::from_parts(Some("text/markdown"), b"fail").expect("typed text body");
     testutils::insert_bus_body_from(
         &messenger,
         &channel,
@@ -50,19 +66,23 @@ async fn a_typed_text_body_reaches_the_guest_as_exactly_its_text() {
     )
     .await;
 
-    let (cfg, _handle, _db) = build_cfg(
+    let (mut cfg, _handle, _db) = build_cfg(
         slug,
         Arc::clone(&messenger),
         &channel,
         Depth::Unbounded,
         Depth::Unbounded,
     );
+    on_the_string_fixture(&mut cfg);
     drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
-    assert_eq!(
-        failure_outcomes(&messenger, &wasm_sub).await,
-        vec!["trap".to_owned()],
-        "the guest saw `__trap__` and trapped; the batch is quarantined"
+    let failures = failure_rows(&messenger, &wasm_sub).await;
+    assert_eq!(failures.len(), 1, "the batch is quarantined: {failures:?}");
+    let (outcome, diagnostic) = &failures[0];
+    assert_eq!(outcome, "err", "the guest's activation failed");
+    assert!(
+        diagnostic.contains("asked to fail"),
+        "the guest read `fail`, not some other line: {diagnostic}"
     );
 }
 
@@ -86,13 +106,14 @@ async fn a_non_text_body_in_a_window_panics_at_lowering() {
     )
     .await;
 
-    let (cfg, _handle, _db) = build_cfg(
+    let (mut cfg, _handle, _db) = build_cfg(
         slug,
         Arc::clone(&messenger),
         &channel,
         Depth::Unbounded,
         Depth::Unbounded,
     );
+    on_the_string_fixture(&mut cfg);
     drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 }
 
@@ -101,8 +122,9 @@ async fn a_non_text_body_in_a_window_panics_at_lowering() {
 #[tokio::test]
 #[should_panic(expected = "0.1.0 deferred-entry.payload")]
 async fn a_non_text_parked_body_panics_at_deferred_lowering() {
-    let (messenger, _in_entry, out_entry, wasm_sub, _out_sub, cfg, _handle, _db) =
+    let (messenger, _in_entry, out_entry, wasm_sub, _out_sub, mut cfg, _handle, _db) =
         build_two_channel_setup("body-binary-parked", "body-binary-reader").await;
+    on_the_string_fixture(&mut cfg);
     let now = chrono::Utc::now();
     testutils::insert_bus_body_from(
         &messenger,

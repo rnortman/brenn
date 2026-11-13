@@ -10,13 +10,17 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { ProcessorInstance } from "../surface.js";
+import type { BytesProcessorInstance, ProcessorInstance } from "../surface.js";
 
-/** The transpiled module's `--instantiation sync` entry point. */
+/**
+ * The transpiled module's `--instantiation sync` entry point. What it returns
+ * is the world's export, whose shape depends on the contract the kind was
+ * built against; the caller names it.
+ */
 type Instantiate = (
     getCoreModule: (name: string) => WebAssembly.Module,
     imports: Record<string, Record<string, unknown>>,
-) => ProcessorInstance;
+) => unknown;
 
 /**
  * The repo root. vitest runs with its config root (`frontend/`) as cwd, so the
@@ -25,9 +29,15 @@ type Instantiate = (
  */
 export const REPO_ROOT = resolve(process.cwd(), "..");
 
-/** Where the transpiled tree of one processor kind is served from. */
-export function transpiledDir(kind: string): string {
-    return resolve(REPO_ROOT, "surface/dist/processor", kind);
+/**
+ * A staged surface tree under the repo root: the served one, or the page rig's,
+ * which holds the rig's fixture kinds.
+ */
+export type DistDir = "surface/dist" | "surface/page-rig-dist";
+
+/** Where the transpiled tree of one processor kind is staged in `dist`. */
+export function transpiledDir(dist: DistDir, kind: string): string {
+    return resolve(REPO_ROOT, dist, "processor", kind);
 }
 
 /**
@@ -35,8 +45,8 @@ export function transpiledDir(kind: string): string {
  *
  * A silently skipped test asserts its invariant nowhere and reports green.
  */
-export function requireTranspiledTree(kind: string): void {
-    const dir = transpiledDir(kind);
+export function requireTranspiledTree(dist: DistDir, kind: string): void {
+    const dir = transpiledDir(dist, kind);
     if (!existsSync(resolve(dir, `${kind}.js`))) {
         throw new Error(
             `the transpiled ${kind} tree is missing at ${dir} — ` +
@@ -59,35 +69,41 @@ interface Compiled {
     cores: Map<string, WebAssembly.Module>;
 }
 
-function compileTranspiled(kind: string): Promise<Compiled> {
-    const existing = compiled.get(kind);
+function compileTranspiled(dist: DistDir, kind: string): Promise<Compiled> {
+    const dir = transpiledDir(dist, kind);
+    const existing = compiled.get(dir);
     if (existing !== undefined) {
         return existing;
     }
-    const dir = transpiledDir(kind);
     const loading = (async (): Promise<Compiled> => {
         const { instantiate } = (await import(
             /* @vite-ignore */ pathToFileURL(resolve(dir, `${kind}.js`)).href
         )) as { instantiate: Instantiate };
         return { instantiate, cores: new Map() };
     })();
-    compiled.set(kind, loading);
+    compiled.set(dir, loading);
     return loading;
 }
 
 /**
- * Instantiate the transpiled guest of `kind` against `imports`.
+ * Instantiate the transpiled guest of `kind`, staged in `dist`, against
+ * `imports`. `I` is the instance shape of the contract the kind is built
+ * against: `ProcessorInstance` for `brenn:processor@0.1.0`,
+ * `BytesProcessorInstance` for `brenn:processor@0.2.0`.
  *
  * Cheap after the first call for a kind: the glue is evaluated once and each
  * core module is compiled once, so a caller that instantiates per activation
  * pays for instantiation and not for compilation.
  */
-export async function instantiateTranspiled(
+export async function instantiateTranspiled<
+    I extends ProcessorInstance | BytesProcessorInstance,
+>(
+    dist: DistDir,
     kind: string,
     imports: Record<string, Record<string, unknown>>,
-): Promise<ProcessorInstance> {
-    const dir = transpiledDir(kind);
-    const { instantiate, cores } = await compileTranspiled(kind);
+): Promise<I> {
+    const dir = transpiledDir(dist, kind);
+    const { instantiate, cores } = await compileTranspiled(dist, kind);
     // Synchronous, as the sync-instantiation glue requires.
     return instantiate((name) => {
         const held = cores.get(name);
@@ -97,5 +113,5 @@ export async function instantiateTranspiled(
         const module = new WebAssembly.Module(readFileSync(resolve(dir, name)));
         cores.set(name, module);
         return module;
-    }, imports);
+    }, imports) as I;
 }

@@ -23,14 +23,14 @@ mod logic;
 mod spec;
 
 use brenn_google_workspace::settings::Settings;
-use brenn_guest::{Activation, Error, Processor};
+use brenn_guest::{Activation, Body, Error, Processor};
 
 use crate::spec::config;
 
 struct GoogleGmailRead;
 
 impl Processor for GoogleGmailRead {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         let settings = Settings::from_lookup(config::get, "gmail_host").map_err(Error::failed)?;
         brenn_provider_kit_guest::serve::<logic::GmailReads>(&activation, &settings)?;
         Ok(None)

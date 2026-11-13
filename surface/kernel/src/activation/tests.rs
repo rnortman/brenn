@@ -1286,7 +1286,7 @@ fn insert(page: &mut Page, channel: &str, envelope: MessageEnvelope) {
 /// Every field of the record is populated, and every window *shape* a component
 /// can be handed appears once, so the seam is crossed by each of them:
 ///
-/// - `in` — retained context followed by one new envelope, so `new_from` is
+/// - `mixed` — retained context followed by one new envelope, so `new_from` is
 ///   neither zero nor the length. Its new envelope carries the optional fields a
 ///   minimal one omits, pinning both arms of the envelope's
 ///   `skip_serializing_if` optionals.
@@ -1300,14 +1300,14 @@ fn insert(page: &mut Page, channel: &str, envelope: MessageEnvelope) {
 ///   in every activation.
 ///
 /// Plus the sync window holding the kernel-minted request, a deferred window
-/// with a parked entry, `now`, and `sync`. The request's body is the
-/// transplant guest's `__reply__` marker, so the frontend half drives the reply
-/// arm of the lift — the one field whose loss silently turns a sync call into a
-/// fire-and-forget activation.
+/// with a parked entry, `now`, and `sync`. The frontend half's guest replies
+/// with the request's body, so it drives the reply arm of the lift — the one
+/// field whose loss silently turns a sync call into a fire-and-forget
+/// activation.
 fn golden_activation() -> brenn_surface_contract::Activation {
     let mut page = Page::new(applied(
         vec![
-            subscription("p1", "in", WIRE, 2, 1),
+            subscription("p1", "mixed", WIRE, 2, 1),
             subscription("p1", "lossy", PEEK, 1, 0),
             subscription("p1", "context", LOCAL, 0, 2),
             subscription("p1", "silent", OUT, 0, 1),
@@ -1427,7 +1427,7 @@ fn the_golden_activation_carries_every_window_shape() {
             .clone()
     };
 
-    let mixed = window("in");
+    let mixed = window("mixed");
     assert_eq!((mixed.envelopes.len(), mixed.new_from), (2, 1));
 
     let lossy = window("lossy");

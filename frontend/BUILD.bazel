@@ -350,7 +350,6 @@ copy_to_directory(
     srcs = [
         "//brenn-wasm/components/processor-transplant:transplant.json",
         "//surface:dist",
-        "//surface/test-fixtures:activation.json",
         ":ts_src",
     ],
     replace_prefixes = {"frontend/ts_src": "frontend"},
@@ -360,13 +359,14 @@ copy_to_directory(
 
 TRANSPILED_TESTS = [
     "src/processor-transplant.test.ts",
-    "src/surface-activation-golden.test.ts",
 ]
 
-# The page rig runs in its own target, below.
+# The page rig runs in its own target, below, with the golden activation, whose
+# guest is the rig's string-contract fixture kind.
 PAGE_RIG_TESTS = [
     "src/page-rig/page-rig.test.ts",
     "src/page-rig/page-rig-measure.test.ts",
+    "src/surface-activation-golden.test.ts",
 ]
 
 vitest_bin.vitest_test(
@@ -420,6 +420,7 @@ copy_to_directory(
     testonly = True,
     srcs = [
         "//surface:page_rig_dist",
+        "//surface/test-fixtures:activation.json",
         "//surface/test-fixtures/peer:page_rig_kit.json",
         ":ts_src",
     ],
@@ -434,6 +435,7 @@ vitest_bin.vitest_test(
     args = [
         "run",
         "src/page-rig/page-rig.test.ts",
+        "src/surface-activation-golden.test.ts",
     ],
     chdir = package_name() + "/vitest_page_rig_root/frontend",
     data = [
