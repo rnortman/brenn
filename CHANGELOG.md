@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.35.1] — 2026-11-13
+
 - **API-key spend is no longer overcounted.** A key profile's month-to-date
   `usd` in the account ledger (`brenn:agent.accounts`) was inflated for
   long-lived sessions: each turn was charged from Claude Code's running
