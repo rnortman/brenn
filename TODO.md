@@ -47,7 +47,7 @@ in-tree kind is on 0.2.0, so every scan compiles all six served kinds
 2,346,992 B together). The build compiles wasmtime's compiler crates
 optimized in every mode (`crate.annotation` list in `MODULE.bazel`), which
 is what keeps a dev-build scan within seconds. Measured `elapsed_ms` per
-kind, one scan, on "surface provisional-contract artifact checked":
+kind, one scan, on "surface byte-contract artifact checked":
 
 | kind | B | dev, compiler unoptimized | dev, compiler optimized | `-c opt` |
 |---|---:|---:|---:|---:|
@@ -67,35 +67,86 @@ soundness. The record's `source_sha256` is the cheap key, but at kind
 grain it is the record's word, not a hash of the artifact (the artifact is
 hashed only for instantiated kinds, in `verify_processor_artifacts_in`),
 and this check is the only thing that keeps a page from silently
-misreading a stale provisional artifact; so either an argument that a
-verdict reused on the record's word cannot reach a page unverified, or a
-hash pass the memo pays for. Building the check's `Engine` once per scan
-is a smaller step that does not touch the compile, where the time goes.
+misreading an artifact that does not have the contract's shape; so either
+an argument that a verdict reused on the record's word cannot reach a page
+unverified, or a hash pass the memo pays for. Building the check's `Engine`
+once per scan is a smaller step that does not touch the compile, where the
+time goes.
 Code site: `surface/server/src/processor_assets.rs`, at the
 `check_surface_component` call in `read_processor_record_or_version_in`.
 Done when an unchanged 0.2.0 artifact is not recompiled by a reload.
 
 ## `stale-contract-import-side-fixture`
 
-The refusal of a stale provisional `brenn:processor@0.2.0` artifact is
-pinned by a fixture on the export side only, on both hosts. The one stale
-fixture, `brenn-wasm/components/processor-stale-contract-test`, changes
-`bus.envelope`, which the backend host (`ProcessorComponent::load`) and
-the surface server's check (`brenn_wasm::check_surface_component`) both
-catch on the type of the `receive` export. That the same two refuse an
-artifact whose *imported* `ports@0.2.0` or `calls@0.2.0` function differs
-from the host's rests on a reading of wasmtime's `instantiate_pre` and on
-no test. On a page nothing else stands behind the check: the jco glue
-does not type-check, so an artifact the check wrongly lets through is
-misread silently, which the contract's header says cannot happen
-(`brenn-wasm/wit/processor-0.2.wit`). Needed: a second stale fixture
-whose `ports@0.2.0` (or `calls@0.2.0`) function signature differs from
-the host's in a way the `receive` export's type does not show, so only
-the import side can refuse it; a test on the backend host and a test on
-the surface server's check. Done when both tests refuse it by type — the
-backend at load, the surface check at its import-type stage. Code site
-(`TODO(stale-contract-import-side-fixture)`): `brenn-wasm/src/lib.rs`,
-the import-type step of `check_surface_component`.
+The refusal of a `brenn:processor@0.2.0` artifact whose *imported*
+`ports@0.2.0` or `calls@0.2.0` function differs from the host's is pinned
+on the surface server's check (`brenn-wasm/tests/bytes_contract.rs`: a
+wrong type under the served name, a wrong type under an aliased name, and
+a function the host does not have) and by no test on the backend host.
+That `ProcessorComponent::load` refuses such an artifact rests on a
+reading of wasmtime's `instantiate_pre` against the typed definitions the
+backend links. The export side is pinned on both hosts by
+`brenn-wasm/components/processor-stale-contract-test`. Needed: a backend
+test that loads an artifact whose only fault is the type of an imported
+`ports@0.2.0` function, with `ports` granted, and shows the refusal is by
+type — the load's panic words it as an import not linked, for a missing
+grant and a wrong type alike, so the test needs the message to carry
+wasmtime's whole account or some other way to tell the two apart. Done
+when that test refuses it by type at load. Code site
+(`TODO(stale-contract-import-side-fixture)`): `brenn-wasm/src/lib.rs`, the
+`instantiate_pre` step of `ProcessorComponent::load`.
+
+## `surface-check-untyped-imports`
+
+`brenn_wasm::check_surface_component` type-checks a 0.2.0 surface kind's
+`ports@0.2.0` and `calls@0.2.0` imports (and through them every `bus@0.2.0`
+type they use) and its `receive` export, under any import name the check
+accepts. The functions of every other interface a surface host serves —
+`log`, `alert`, `config`, `dom` and `page-dom`, all at `@0.1.0` — are
+stubbed untyped by the check's stub pass, which accepts any type. The jco
+glue on the page checks nothing against the host, so a kind bound by hand
+with a wrong-typed function of one of these interfaces passes the check, is
+served, and is misread on the page. The backend host links typed
+definitions for every interface it serves and has no such gap. Closing it
+means linking typed definitions on the surface check: the backend's own for
+`log`, `alert` and `config`, and typed trap stubs generated from the WIT for
+`dom` and `page-dom`, which have no backend definition. The stub pass
+defines nothing under a name that is a semver-compatible alias of a typed
+definition's name: wasmtime then resolves an aliased import to the typed
+definition and refuses a function that definition does not have, where a
+stub under the alias's own name would be found first and shadow it. So each
+interface that gains a typed definition joins the names the stub pass
+skips, in the same change, and that change adds a fixture importing that
+interface under a semver-compatible alias with a wrong-typed function,
+refused by type: nothing in the code ties a typed definition to its name in
+the skip list, and that fixture is what fails when the name is forgotten.
+When every interface has a typed definition the stub pass is deleted.
+Tightening the check withholds an out-of-tree kind that is served today,
+and it is done all the same: a kind that would be misread on the page is
+refused before it is served. It is a correction to the host, not a change
+to the contract, and it draws no dual period: `brenn:processor@0.2.0`'s
+promise is to artifacts that have the shapes the WIT files state for every
+interface they import, and says that a host which accepts one that does not
+may come to refuse it (`brenn-wasm/wit/processor-0.2.wit`). A kind whose
+wrong-typed import was never built against those files is misread today;
+refusing it takes nothing from any artifact the promise is made to. The
+release that tightens the check says so in a `CHANGELOG.md` entry headed
+for component authors, and that entry is the whole announcement. Done when
+`check_surface_component` refuses, by type, a 0.2.0 kind any of whose
+imported functions does not have the type the WIT files state (an interface
+that carries types only, `bus@0.2.0` or `types@0.1.0`, is held where a
+function or `receive` uses its types; a type nothing uses crosses no
+boundary and no host compares it); tests pin that refusal with two fixtures
+whose only fault is the type of a function imported from an interface
+outside `ports@0.2.0` and `calls@0.2.0`, one under the served name and one
+under a semver-compatible alias of it; the `CHANGELOG.md` entry for
+component authors in the release that carries the change says which
+artifacts are now refused; and `docs/component-packages.md`, *Contract
+evolution*, no longer says a surface host leaves any import untyped — the
+paragraph "The shapes do not change." (its "on a surface those three alone"
+and "a surface host today") and the **On a surface.** bullet state what the
+check then type-checks. Code site (`TODO(surface-check-untyped-imports)`):
+`brenn-wasm/src/lib.rs`, the stub pass of `check_surface_component`.
 
 ## `byte-body-ceiling-per-activation`
 
@@ -129,7 +180,7 @@ build-id gate and a daemon deploys on its own schedule
 bridge) takes `brenn-attach-client` by pin. Questions: (1) Is v4 served at all
 past that release? Options: (a) until the known out-of-tree daemons have
 moved, then removed — needs someone to say what the pod pins; (b) to the same
-end as the string component contract's period (`dual-contract-period-length`);
+end as the string component contract's period (`string-contract-removal`);
 (c) a fixed number of releases or a date; (d) a hard cut — remove v4 at the
 next release; a v4 daemon then fails negotiation until rebuilt at a new pin,
 and the server's per-version reader and writer and the client crate's v4 codec
@@ -193,29 +244,80 @@ byte-body core's design raised it and left it out as "a product decision
 nobody has asked for", and its design gate ruled it "never wanted in this
 cycle".
 
-## `dual-contract-period-length`
+## `string-contract-removal`
 
-Ruled by the binary-bus project's owner-proxy, on the owner's instruction
-that the proxy decides (cycle 10 planning stop), not by the owner in
-person: the old `brenn:processor` string contract stays served for at
-least three brenn releases after the release that declares the
-byte-carrying contract stable, and is not removed before the owner's three known
-out-of-tree component repositories have moved: `brenn-fastmail`,
-`brenn-component-demo`, and a third, the owner's private components
-repository, whose name this tree's scrub gate does not admit. Out-of-tree authors are told by the
-boot and reload warning, which from the declaring release names the
-earliest removal release, and by the same sentence in the WIT headers,
-`docs/component-packages.md` and `CHANGELOG.md`. Releases, not a date:
-brenn has no release calendar. Done = the declaring release carries those
-texts; the owner may shorten or lengthen the count here before then.
-The backend warns at boot and after a reload, naming every
-loaded 0.1.0 artifact and deliberately naming no removal release; the
-`TODO(dual-contract-period-length)` comment sits at that warning, and the WIT
-header and `docs/component-packages.md` describe the period without a length.
-The period does not begin while 0.2.0 is marked provisional, so its length is
-counted from the release that declares 0.2.0 stable; the answer goes into the
-warning and those two texts. (Sizing spike report §5 OQ5 and §4.) Attach v4's
-period is asked separately, under `attach-v4-beside-v5`.
+Remove the string component contract `brenn:processor@0.1.0` when both
+conditions hold: the release that declared `brenn:processor@0.2.0` stable and
+the three brenn releases after it have been tagged (the declaring release is
+the one whose `CHANGELOG.md` heading holds the entry "`brenn:processor@0.2.0`
+is stable"; a release is a `v*` tag with its own `CHANGELOG.md` heading), and
+the owner's three known out-of-tree component repositories have moved to
+0.2.0: `brenn-fastmail`, `brenn-component-demo`, and a third, the owner's
+private components repository, whose name this tree's scrub gate does not
+admit. The count of three was ruled by the binary-bus project's owner-proxy
+on the owner's instruction that the proxy decides, not by the owner in
+person. The owner may lengthen it at any time by editing the texts that state
+it — both WIT headers, `docs/component-packages.md`, and the period's one Rust
+spelling, `string_contract_period!` in `brenn-bootstrap/src/consumers.rs`,
+from which both notices are built; the agreement test there fails until all
+of them match — and may shorten it only before the declaring release is
+tagged; after that it is a published promise to component authors. What
+removal takes: on the backend, the 0.1.0 `ProcessorPre` arm, the string
+activation lowering and the 0.1.0 names in the grant-to-import mapping and
+the parity gate; on the page and the surface server, the 0.1.0 `ports` import
+shape and the JSON activation lift; in `processor.wit`, the 0.1.0 activation
+records, `ports`, `calls` and world, the file remaining as the home of the
+interfaces 0.2.0 imports unchanged; the raw 0.1.0 fixtures and
+`brenn-wasm/tests/string_contract.rs`; the two notices, with the period
+agreement test beside them, its three `data` entries in
+`brenn-bootstrap/BUILD.bazel` and the `component-packages.md` line in
+`docs/BUILD.bazel`. After removal a 0.1.0 artifact is a boot refusal naming
+the contract and the release that dropped it. Done = no host serves 0.1.0 and
+the texts say which release dropped it. Code sites
+(`TODO(string-contract-removal)`): the two notices in
+`brenn-bootstrap/src/consumers.rs`.
+
+## `blob-attachment-host-sites`
+
+Four facts about the host that the design of blobs attached to bus messages
+must deal with. `brenn:processor@0.2.0` publishes two growth rules to
+component authors — the delivery header gains keys, and a new interface may
+act on the ports a component already has — and each fact is a place where the
+host makes one of them, or a blob's lifetime, easy to get wrong.
+(1) A parked message, one published with a future `deliver_after`, is outside
+the retained window: a `DeferredSet` entry beside the ring on a non-durable
+channel, a row whose `retained_seq` is NULL on a durable one. Eviction never
+takes it; it leaves only by cancel or release. Whatever keeps a blob alive
+must therefore count parked messages as holders beside retained ones; a rule
+that counts retained messages only deletes the blobs of a message not yet
+delivered.
+(2) An attachment-carrying publish made through a new interface must be
+pushed into the same per-activation publish buffer as `ports.publish` —
+`ProcessorData::publish_buffer` on the backend, `PublishBuffer::entries` on
+the page — and not into a buffer of its own that is merged at flush. The
+contract promises the flush in call order, and a second buffer loses the
+order between the two interfaces: async tool requests are kept in one today
+and are appended after every port publish.
+(3) A key written in the shared part of the envelope serializer
+(`ShapedEnvelope::serialize`) is written in every shape: the 0.2.0 header, and
+also the 0.1.0 `envelope-json`, attach v4 frames, what a conversation is shown
+and the eviction archive. `HeaderShape::serialize_body` is the header-only
+position, for a key the other shapes must not carry; it is handed the body
+alone today.
+(4) The page does not pass a delivered header through. Attach v5 reads it into
+the typed `EnvelopeHeader`, the page rebuilds a `MessageEnvelope` from that,
+and the guest's header is serialized from the rebuilt envelope. A header key
+`EnvelopeHeader` does not hold is tolerated on read and dropped before the
+guest sees it, so the struct is extended in the same change that first writes
+the key. A remote daemon built at an older `brenn-attach-client` pin drops it
+whatever the page does (`attach-v4-beside-v5`, question 2).
+Done when the blob design states what it does about each of the four and the
+six `TODO(blob-attachment-host-sites)` comments are gone. Code sites:
+`DeferredSet` in `brenn-queue/src/deferred.rs` and the eviction `DELETE` in
+`brenn-messaging-store/src/db/bus.rs` (1); `take_ok_publishes` in
+`brenn-wasm/src/lib.rs` and `PublishBuffer::entries` in
+`surface/kernel/src/publish_buffer.rs` (2); `ShapedEnvelope::serialize` (3)
+and `EnvelopeHeader` (4) in `brenn-envelope/src/shape.rs`.
 
 ## `blob-handle-integrity`
 
@@ -260,7 +362,9 @@ layer. Do not add one." The owner has since asked for blobs as a general
 mechanism (camera frames, drive files, component bundles, UI uploads), so the
 store is to be built; what is open is its boundary. The sizing spike's
 reading: a blob exists only as an attachment of a retained message and lives
-and dies with message retention, with no state of its own. The owner's words
+and dies with message retention, with no state of its own. That reading does
+not say what holds the blobs of a parked message, which is not retained
+(`blob-attachment-host-sites`). The owner's words
 that bear on it, from the handle lifetime rule in the notes after cycle 1: a
 handle is usable only if it "must currently exist in the retained buffer of
 one of the channels that it has access to", and "An LLM typically would not

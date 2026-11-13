@@ -2827,6 +2827,9 @@ impl ProcessorData {
     /// caller's result inbox as `reply_to`; ordinary port publishes keep
     /// `reply_to: None`. On `Err`/`Trap` this is never called and both buffers drop
     /// with the store — the trap-discard guarantee.
+    // TODO(blob-attachment-host-sites): a publish from another interface that
+    // must keep call order with `ports.publish` goes into `publish_buffer`
+    // itself; a buffer appended here, as tool requests are, loses that order.
     fn take_ok_publishes(&mut self) -> Vec<ProcessorPublish> {
         // The gate counts the entry ceiling, this buffer holds the entries: a push
         // that skipped `admit_publish` would let the two disagree and the ceiling
@@ -3245,8 +3248,10 @@ pub enum SurfaceComponentStage {
     /// The artifact is not a component, is not on `brenn:processor@0.2.0`, or
     /// imports an interface name the surface host does not serve under it.
     Name,
-    /// A function the artifact imports from a provisional interface does not
-    /// have the host's type.
+    /// A function the artifact imports from `ports@0.2.0` or `calls@0.2.0`,
+    /// under any name the name stage accepts, does not have the host's type or
+    /// is not one the host has; or an import under a served name is not an
+    /// interface.
     ImportType,
     /// The artifact's `receive` export does not have the host's type.
     ExportType,
@@ -3303,9 +3308,8 @@ fn surface_v0_2_import_names() -> Vec<&'static str> {
 /// name and never a refusal.
 ///
 /// The page's transpiled glue is generated from the artifact's own types and
-/// checks nothing against the host, so this is where an artifact built against
-/// a superseded shape of the provisional contract is refused rather than
-/// misread.
+/// checks nothing against the host, so this is where an artifact that does not
+/// have the contract's shape is refused rather than misread.
 pub fn check_surface_component(bytes: &[u8]) -> Result<(), SurfaceComponentRefusal> {
     let refuse = |stage, detail: String| SurfaceComponentRefusal { stage, detail };
     let mut cfg = Config::new();
@@ -3351,21 +3355,30 @@ pub fn check_surface_component(bytes: &[u8]) -> Result<(), SurfaceComponentRefus
         ));
     }
 
-    // TODO(stale-contract-import-side-fixture): no fixture on either host
-    // pins a refusal at this stage; only the export stage has one.
-    //
-    // The two provisional interfaces are linked with the backend's statically
+    // `ports@0.2.0` and `calls@0.2.0` are linked with the backend's statically
     // typed definitions, so `instantiate_pre` type-checks each function the
-    // artifact imports from them. Every other interface is stubbed untyped:
-    // those are not provisional, and no backend definition of `dom` exists to
-    // link.
+    // artifact imports from them, and with them every `bus@0.2.0` type. The
+    // names they are linked under are listed here, beside the definitions,
+    // because the stub pass must define nothing under any name that aliases
+    // one: wasmtime looks an import up by its exact name first, so a stub
+    // instance under the artifact's own `…/ports@0.2.1` would be found
+    // before the typed `…/ports@0.2.0` and shadow it.
     let mut linker: Linker<ProcessorData> = Linker::new(&engine);
     ports_v0_2::add_to_linker::<_, HasSelf<ProcessorData>>(&mut linker, |d| d)
         .unwrap_or_else(|e| panic!("failed to add the 0.2.0 ports to a surface check: {e}"));
     calls_v0_2::add_to_linker::<_, HasSelf<ProcessorData>>(&mut linker, |d| d)
         .unwrap_or_else(|e| panic!("failed to add the 0.2.0 calls to a surface check: {e}"));
-    linker
-        .define_unknown_imports_as_traps(&component)
+    let typed: Vec<&'static str> = [ComponentGrant::Ports, ComponentGrant::Calls]
+        .into_iter()
+        .map(|grant| {
+            grant
+                .wit_import(ProcessorContract::V0_2)
+                .unwrap_or_else(|| {
+                    panic!("{} has no {} import", grant.word(), ProcessorContract::V0_2)
+                })
+        })
+        .collect();
+    stub_untyped_surface_imports(&mut linker, &engine, &component, &typed)
         .map_err(|e| refuse(SurfaceComponentStage::ImportType, format!("{e:#}")))?;
     let instance_pre = linker
         .instantiate_pre(&component)
@@ -3374,6 +3387,73 @@ pub fn check_surface_component(bytes: &[u8]) -> Result<(), SurfaceComponentRefus
     processor_v0_2_bindings::ProcessorPre::new(instance_pre)
         .map(|_| ())
         .map_err(|e| refuse(SurfaceComponentStage::ExportType, format!("{e:#}")))
+}
+
+/// The surface check's stub pass: defines a trap for every function and
+/// resource of each imported interface that has no typed definition, so that
+/// `instantiate_pre` finds the interface linked and checks the rest.
+///
+/// An import whose name is a semver-compatible alias of one of `typed` gets
+/// nothing, so wasmtime resolves it to the typed definition and refuses a
+/// function that definition does not have. A root import that is not an
+/// instance gets nothing either, and `instantiate_pre` refuses it as missing:
+/// every name a surface host serves is an interface.
+///
+/// TODO(surface-check-untyped-imports): the functions of `log`, `alert`,
+/// `config`, `dom` and `page-dom` are stubbed untyped here, so an import of one
+/// of them with the wrong type passes this check and is misread on the page.
+fn stub_untyped_surface_imports(
+    linker: &mut Linker<ProcessorData>,
+    engine: &Engine,
+    component: &Component,
+    typed: &[&str],
+) -> wasmtime::Result<()> {
+    use wasmtime::component::types::ComponentItem;
+    for (name, import) in component.component_type().imports(engine) {
+        if typed
+            .iter()
+            .any(|typed_name| semver_compat_match(name, typed_name))
+        {
+            continue;
+        }
+        if let ComponentItem::ComponentInstance(instance) = import.ty {
+            stub_instance(&mut linker.instance(name)?, engine, name, &instance)?;
+        }
+    }
+    Ok(())
+}
+
+/// Defines a trap for every function and resource `instance` exports, under
+/// `linker`, which is the instance named `path`, walking nested instances.
+fn stub_instance(
+    linker: &mut wasmtime::component::LinkerInstance<'_, ProcessorData>,
+    engine: &Engine,
+    path: &str,
+    instance: &wasmtime::component::types::ComponentInstance,
+) -> wasmtime::Result<()> {
+    use wasmtime::component::ResourceType;
+    use wasmtime::component::types::ComponentItem;
+    for (name, export) in instance.exports(engine) {
+        match export.ty {
+            ComponentItem::ComponentFunc(_) => {
+                let qualified = format!("{path}#{name}");
+                linker.func_new(name, move |_, _, _, _| {
+                    wasmtime::bail!("unknown import: `{qualified}` has not been defined")
+                })?;
+            }
+            ComponentItem::Resource(_) => {
+                linker.resource(name, ResourceType::host::<()>(), |_, _| Ok(()))?;
+            }
+            ComponentItem::ComponentInstance(nested) => {
+                stub_instance(&mut linker.instance(name)?, engine, name, &nested)?;
+            }
+            ComponentItem::CoreFunc(_)
+            | ComponentItem::Module(_)
+            | ComponentItem::Component(_)
+            | ComponentItem::Type(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Version-strip, sort, and dedup a component's raw import names into the
@@ -3961,6 +4041,9 @@ impl ProcessorComponent {
             });
         }
 
+        // TODO(stale-contract-import-side-fixture): no test pins a refusal by
+        // import type on this host; the panic below words a wrong type and a
+        // missing grant alike.
         let instance_pre = linker.instantiate_pre(&component).unwrap_or_else(|e| {
             panic!(
                 "processor component pre-instantiation failed — import not linked \

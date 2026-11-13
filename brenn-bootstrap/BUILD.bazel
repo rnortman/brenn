@@ -83,6 +83,11 @@ rust_test(
     # they import; `rustc_env` below names the directory those paths hang off.
     data = [
         "//:brenn_configs",
+        # The string contract's removal period is held to one wording across
+        # the texts that state it.
+        "//brenn-wasm:wit/processor-0.2.wit",
+        "//brenn-wasm:wit/processor.wit",
+        "//docs:component-packages.md",
         # `brenn.e2e.brenn`'s second and third module roots.
         "//brenn-wasm/components/processor-page-bytes-test:spec/processor-page-bytes-test.brenn",
         "//brenn-wasm/components/processor-sdk-bytes-test:spec/processor-sdk-bytes-test.brenn",

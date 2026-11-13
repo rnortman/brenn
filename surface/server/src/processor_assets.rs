@@ -68,8 +68,8 @@ const KNOWN_IMPORTS: [&str; 13] = [
     "calls", "dom", "page-dom",
 ];
 
-/// Why a record this server reads no further, or a provisional contract shape
-/// it does not serve, is not served: the outcome a caller withholds under a
+/// Why a record this server reads no further, or a `brenn:processor@0.2.0`
+/// artifact that does not have the contract's shape, is not served: the outcome a caller withholds under a
 /// bundle's mount and refuses under brenn's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnservedRecord {
@@ -93,18 +93,16 @@ pub fn record_contract(manifest: &ProcessorManifest) -> brenn_envelope::grants::
     )
 }
 
-/// Why a kind on the provisional byte-carrying contract is not served: its
-/// artifact is built against a shape of that contract this brenn does not
-/// serve. One sentence naming the kind, the contract, wasmtime's account and
+/// Why a kind on the byte-carrying contract is not served: its artifact does
+/// not have that contract's shape. One sentence naming the kind, the contract, wasmtime's account and
 /// the migration.
 pub fn stale_contract_reason(kind: &str, refusal: &brenn_wasm::SurfaceComponentRefusal) -> String {
     use brenn_envelope::grants::ProcessorContract;
     format!(
-        "processor component {kind:?} is built against the provisional component contract {}, \
-         but its artifact is built against a shape of it this brenn does not serve ({refusal}). \
-         Rebuild the kind against this brenn's `processor-0.2.wit`, or build it against {}.",
+        "processor component {kind:?} declares the component contract {}, but its artifact \
+         does not have that contract's shape ({refusal}). Rebuild the kind against this brenn's \
+         `processor-0.2.wit`.",
         ProcessorContract::V0_2,
-        ProcessorContract::V0_1,
     )
 }
 
@@ -254,8 +252,8 @@ pub fn read_processor_record_in(
 /// instead of panicked on.
 ///
 /// `Err` is a record this server does not serve: one whose `v` it does not
-/// read, or one on the provisional byte-carrying contract whose artifact is
-/// built against a shape of that contract this host does not serve. The caller decides what that means where
+/// read, or a `brenn:processor@0.2.0` artifact that does not have the
+/// contract's shape. The caller decides what that means where
 /// it found the tree: a broken install under brenn's own mount, or a bundle
 /// authored on its own schedule under any other declared mount, which is
 /// withheld rather than fatal.
@@ -264,7 +262,7 @@ pub fn read_processor_record_in(
 ///
 /// On a missing/unreadable manifest, a manifest whose `v` does not parse, and —
 /// once the version matches — everything [`read_processor_record_in`] panics
-/// on, including an unreadable artifact for a kind on the provisional contract.
+/// on, including an unreadable artifact for a kind on the byte-carrying contract.
 pub fn read_processor_record_or_version_in(
     cx: AssetContext,
     surface_root: &Path,
@@ -335,9 +333,9 @@ pub fn read_processor_record_or_version_in(
     assert_spec_name_derives(cx, kind, &manifest);
     assert_import_profile(cx, kind, &manifest);
     // The page's glue is generated from the artifact's own types and checks
-    // nothing against the host, so a kind on the provisional contract is held
-    // to the host's shapes here, on the artifact the transpile consumed. A
-    // 0.1.0 kind's contract is stable and its artifact is not opened.
+    // nothing against the host, so a 0.2.0 kind is held to the host's shapes
+    // here, on the artifact the transpile consumed. A 0.1.0 kind's artifact is
+    // not opened.
     if record_contract(&manifest) == brenn_envelope::grants::ProcessorContract::V0_2 {
         let artifact = component_artifact(kind);
         let path = dir.join(&artifact);
@@ -347,7 +345,7 @@ pub fn read_processor_record_or_version_in(
         let bytes = std::fs::read(&path).unwrap_or_else(|err| {
             panic!(
                 "{when}: processor component {kind:?} source artifact {artifact} is unreadable at \
-                 {} ({err}) — its provisional contract cannot be checked. Rebuild the surface \
+                 {} ({err}) — its contract shape cannot be checked. Rebuild the surface \
                  assets (`make build`) and redeploy.{verdict}",
                 path.display(),
             )
@@ -366,7 +364,7 @@ pub fn read_processor_record_or_version_in(
             elapsed_ms = started.elapsed().as_millis(),
             accepted = checked.is_ok(),
             refusal = checked.as_ref().err().map(tracing::field::display),
-            "surface provisional-contract artifact checked"
+            "surface byte-contract artifact checked"
         );
         if let Err(refusal) = checked {
             return Err(UnservedRecord {

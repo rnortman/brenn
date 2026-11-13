@@ -373,8 +373,8 @@ pub struct SurfaceRoots {
 pub const WITHHELD_ALERT_TITLE: &str = "surface kind withheld";
 
 /// One installed kind this host will not serve: where it is, what its record
-/// declares, and why that record, or the provisional contract shape its
-/// artifact is built against, is not served here.
+/// declares, and why that record, or a `brenn:processor@0.2.0` artifact that
+/// does not have the contract's shape, is not served here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WithheldKind {
     /// The mount offering this kind, as its root list names it.
@@ -383,8 +383,8 @@ pub struct WithheldKind {
     pub root: std::path::PathBuf,
     /// The schema version the record declares.
     pub record_v: u32,
-    /// One sentence naming the cause (a record version, or a provisional
-    /// component contract shape, this host does not serve) and the migration. It is what the alert
+    /// One sentence naming the cause (a record version this host does not
+    /// read, or an artifact without the component contract's shape) and the migration. It is what the alert
     /// carries, what the page manifest hands the kernel, and what the kind's
     /// description documents state.
     pub reason: String,
@@ -624,7 +624,7 @@ impl SurfaceRoots {
                 // Withheld here and served there is already `Offered` above.
                 continue;
             };
-            // The reason is compared because a stale provisional artifact
+            // The reason is compared because a stale artifact
             // replaced in place by a differently stale one keeps both the
             // record version and the tree.
             if now.record_v == held.record_v && now.root == held.root && now.reason == held.reason {
@@ -780,7 +780,7 @@ pub fn validate_surface_assets_in(
     // of two root sets see the upgrade that installed it. The artifact digests
     // are not run here — hashing a whole component nothing runs would be paid
     // again on every reload for a tree no page can reach — they run below, per
-    // instantiated kind. The type check of a provisional-contract artifact does
+    // instantiated kind. The type check of a 0.2.0 artifact does
     // run here, inside the record read: it decides between served and
     // withheld, and a kind that moved between the two without its bytes
     // changing would read to the next comparison as withdrawn.
@@ -2222,12 +2222,9 @@ mod tests {
             held.reason.contains("\"frames\"")
                 && held
                     .reason
-                    .contains("provisional component contract brenn:processor@0.2.0")
+                    .contains("component contract brenn:processor@0.2.0")
                 && held.reason.contains("type-checking export func `receive`")
-                && held.reason.contains("processor-0.2.wit")
-                && held
-                    .reason
-                    .contains("build it against brenn:processor@0.1.0"),
+                && held.reason.contains("processor-0.2.wit"),
             "the reason names the kind, the contract, wasmtime's account and the migration: {}",
             held.reason
         );
@@ -2236,9 +2233,7 @@ mod tests {
     /// The same kind in brenn's own tree is a broken install, as a stale record
     /// is there.
     #[test]
-    #[should_panic(
-        expected = "is built against the provisional component contract brenn:processor@0.2.0"
-    )]
+    #[should_panic(expected = "declares the component contract brenn:processor@0.2.0")]
     fn a_stale_byte_contract_kind_under_brenns_own_mount_is_a_boot_refusal() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
@@ -2628,7 +2623,7 @@ mod tests {
         );
     }
 
-    /// A stale provisional artifact replaced in place by a differently stale
+    /// A stale artifact replaced in place by a differently stale
     /// one keeps the record version and the tree; the reason is what moved.
     #[test]
     fn a_withheld_kind_whose_reason_changed_is_a_difference() {

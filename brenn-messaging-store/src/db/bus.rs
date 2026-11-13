@@ -470,6 +470,8 @@ pub fn bus_gc_evict_channel(
     // Step 3: delete eligible message rows (FTS trigger fires on each DELETE).
     // Snapshot is stable under the SQLite mutex. Parked rows (retained_seq NULL)
     // are excluded — a long-parked message is never reaped before it releases.
+    // TODO(blob-attachment-host-sites): a parked row is not retained and this
+    // statement never deletes it; whatever keeps a blob alive counts it as a holder.
     let messages_deleted = tx
         .execute(
             "DELETE FROM messaging_messages

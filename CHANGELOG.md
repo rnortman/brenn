@@ -4,6 +4,25 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **For WASM component authors: `brenn:processor@0.2.0` is stable, and the
+  string contract `brenn:processor@0.1.0` is being removed.** The 0.2.0
+  shapes (`bus`, `ports`, `calls` and the `receive` export) are now frozen:
+  a breaking change would be a new version served beside 0.2.0 for a dual
+  period. The contract grows only by new interfaces under new grant words
+  and by new keys in the open message header, which a guest ignores when it
+  does not know them. Nothing changed in the shapes, so 0.2.0 artifacts built
+  at an earlier pin need no rebuild.
+  The string contract is served by this release and the three after it, and
+  is not removed before the out-of-tree components known to us
+  (`brenn-fastmail`, `brenn-component-demo` and one private repository) have
+  moved. Only the string contract's world and its `types`, `ports@0.1.0` and
+  `calls@0.1.0` interfaces go; the other `@0.1.0` interfaces stay. To move,
+  rebuild on a current `brenn-guest` pin. Operators running 0.1.0 components
+  or surface kinds see a `warn!` naming them at boot and after each reload;
+  nothing stops working yet. Surface hosts now also refuse a 0.2.0 kind
+  that imports a `ports` or `calls` interface under a near-miss version or
+  with an extra function. See `docs/component-packages.md`, *Contract
+  evolution*.
 - **For operators and WASM component authors: binary bodies on surface pages
   are now tested in a real browser.** Until now, the path that carries
   non-text (binary) message bodies between a surface page and the server had
@@ -87,18 +106,19 @@ All notable changes to Brenn are documented here.
   declared text-only (above). Node-rig timings against 0.1.0's base64 in JSON
   are in `docs/page-rig-timings.md`, with Chromium figures for the binary
   state.
-- **For WASM component authors: the surface host serves the provisional
+- **For WASM component authors: the surface host serves
   `brenn:processor@0.2.0` beside 0.1.0.** A page-hosted 0.2.0 kind is handed
   each message as a header plus the body's bytes and content type, as on the
   backend. On a page it carries typed text on any channel with its type, and
   any body in a sync call and reply between two 0.2.0 kinds; a non-text body
   is held at rest on any channel declared `non_text`, page-local or not, and
-  refused with `text-only-channel` elsewhere (above). The server type-checks a 0.2.0
-  surface kind's artifact against the shapes it serves: one built against a superseded shape is
-  withheld under a bundle mount and a boot refusal under brenn's own. The
-  page manifest names each kind's contract. A brenn whose surfaces
-  instantiate any 0.1.0 kind names those kinds in one `warn!` at boot and
-  after each applied reload.
+  refused with `text-only-channel` elsewhere (above). The server holds a
+  0.2.0 surface kind's artifact to the import names it serves and
+  type-checks its `ports` and `calls` imports and its `receive` export: one
+  that fails either is withheld under a bundle mount and a boot refusal under
+  brenn's own. The page manifest names each kind's contract. A brenn whose
+  surfaces instantiate any 0.1.0 kind names those kinds in one `warn!` at
+  boot and after each applied reload.
 - A page-hosted component's refused publish, edit or call now hands the
   guest the refusal's diagnostic (`invalid-payload`, `invalid-body`), as the
   backend does.
@@ -124,10 +144,9 @@ All notable changes to Brenn are documented here.
   takes a `StateCodec`, so a state can be stored as bytes with no JSON and no
   base64, on a channel (or surface binding) declared `non_text`; worked
   example `brenn-wasm/components/processor-sdk-bytes-test`.
-  `surface/page-harness` drives 0.2.0 kinds only. **While 0.2.0 is
-  provisional**, a brenn release that changed its shape would refuse an
-  artifact built at this pin until it was rebuilt; to stay on 0.1.0, keep the
-  older pin or write raw 0.1.0 bindings. No shape change is pending. The full
+  `surface/page-harness` drives 0.2.0 kinds only. 0.2.0 is stable (the entry
+  above); to stay on 0.1.0 for the rest of its removal period, keep the older
+  pin or write raw 0.1.0 bindings. The full
   before/after list is in `docs/component-packages.md`, *Contract evolution*.
 - **BREAKING for component authors: `MessageEnvelope.body` is a
   `MessageBody`.** A message body on the bus is now bytes with an optional
@@ -145,7 +164,7 @@ All notable changes to Brenn are documented here.
   built against the byte-carrying contract, below; see
   `docs/message-bus.md` §2.1.2.
 - **For WASM component authors: a byte-carrying component contract,
-  `brenn:processor@0.2.0`, provisional.** The backend host now serves it
+  `brenn:processor@0.2.0`.** The backend host now serves it
   beside the string contract `brenn:processor@0.1.0`. A 0.2.0 component is
   handed each message as an open JSON header plus the body's bytes and
   content type, and publishes, parks, edits, calls and replies with bytes and
@@ -156,11 +175,8 @@ All notable changes to Brenn are documented here.
   reply with a non-text body to anyone; a 0.1.0 caller handed such a reply
   traps, and the callee is unaffected. The guest SDK builds 0.2.0 (the
   `brenn-guest` entry above); a raw 0.2.0 component reads both WIT files.
-  **0.2.0 is provisional:** brenn makes no compatibility promise for it yet; it may be
-  replaced by a different contract or withdrawn in any release, with no dual
-  period; a component that must keep running across brenn releases stays on
-  0.1.0. The removal period of 0.1.0 has not begun and does not begin until a
-  later release declares the byte-carrying contract stable. **No existing
+  0.2.0 is stable from this release, and 0.1.0's removal period begins with
+  it (the entry above). **No existing
   component is affected**: 0.1.0 artifacts load and run as before. See
   `docs/component-packages.md`, *Contract evolution*.
 - **For operators: `non_text` on channels and binding tails.** A channel
@@ -219,11 +235,11 @@ All notable changes to Brenn are documented here.
   message search index once and builds one new index on the message store,
   both before serving, so it takes longer on a large database. No stored
   message is rewritten, and the previous release still opens the database.
-- **Notice: the string component contract is to be removed.** When any
-  component built against `brenn:processor@0.1.0` is loaded, the backend
-  writes one `warn!` at boot and after each applied reload naming them. No
-  removal release is scheduled and nothing needs to change yet; the removal
-  period does not begin until the byte-carrying contract is declared stable.
+- **Notice: the string component contract is being removed.** The backend
+  names loaded `brenn:processor@0.1.0` components, and instantiated 0.1.0
+  surface kinds, in one `warn!` each at boot and after each applied reload;
+  the notice states the removal period and asks for a rebuild against
+  `brenn:processor@0.2.0` (the entry above).
 - In the browser surface, a publish carrying an unrecognized urgency value
   now traps the component instead of being refused as `invalid-payload`.
   Such a value can only come from the page glue and the kernel disagreeing,

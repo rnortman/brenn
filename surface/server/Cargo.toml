@@ -13,7 +13,7 @@ testutils = ["brenn-lib/testutils", "dep:brenn-db", "dep:brenn-messaging-store",
 # Reaches down to brenn-attach-server for the attachment authority a surface
 # lowers to, to brenn-messaging for the bus the boot documents publish onto, to
 # the surface schema/contract crates for the shapes the page shares, and to
-# brenn-wasm for the type check of a kind's provisional-contract artifact. Nothing
+# brenn-wasm for the type check of a kind's `brenn:processor@0.2.0` artifact. Nothing
 # above is named here — the route hands `AppState`-held facts in.
 [dependencies]
 brenn-attach-server = { version = "0.1.0", path = "../../attach/server" }

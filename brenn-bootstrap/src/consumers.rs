@@ -244,11 +244,54 @@ pub(crate) fn assert_contract_carries_bound_channels(
     }
 }
 
+/// The string contract's removal period, in the one wording every text that
+/// states it carries: both WIT headers, `docs/component-packages.md` and the
+/// two notices below. A literal, so `concat!` can build the notices from it;
+/// `period_tests` fails until every text carries this wording.
+macro_rules! string_contract_period {
+    () => {
+        "the string contract is served by the release that declares brenn:processor@0.2.0 \
+         stable and by the three brenn releases after it, and no release before the fourth \
+         after it removes it"
+    };
+}
+
+/// The title of the `CHANGELOG.md` entry whose release heading names the
+/// declaring release.
+macro_rules! declaration_entry_title {
+    () => {
+        "brenn:processor@0.2.0 is stable"
+    };
+}
+
+/// What both notices tell the operator to do and where to look, from the
+/// sentence after the consequence clause to the end.
+macro_rules! string_contract_rebuild {
+    () => {
+        concat!(
+            " Rebuild them against brenn:processor@0.2.0, which a brenn-guest pin at or after \
+             the declaring release builds. The declaring release is the one whose CHANGELOG.md \
+             heading holds the entry \"",
+            declaration_entry_title!(),
+            "\"."
+        )
+    };
+}
+
+#[cfg(test)]
+const STRING_CONTRACT_PERIOD: &str = string_contract_period!();
+
+#[cfg(test)]
+const DECLARATION_ENTRY_TITLE: &str = declaration_entry_title!();
+
 /// The text of the notice [`warn_string_contract_components`] writes.
-pub(crate) const STRING_CONTRACT_NOTICE: &str = "components built against the string component \
-     contract brenn:processor@0.1.0 are loaded; brenn intends to remove that contract after a \
-     byte-carrying contract is declared stable, and no removal is scheduled; nothing needs to \
-     change yet";
+pub(crate) const STRING_CONTRACT_NOTICE: &str = concat!(
+    "components built against the string component contract brenn:processor@0.1.0 are loaded, \
+     and that contract is being removed: ",
+    string_contract_period!(),
+    "; a brenn without it refuses these components at boot.",
+    string_contract_rebuild!()
+);
 
 /// The slugs of the components in `running` built against the string
 /// contract, sorted.
@@ -270,9 +313,11 @@ pub(crate) fn string_contract_slugs<'a>(
 /// against the string contract, when any are; nothing otherwise.
 ///
 /// `running` must be the whole running set, so the line describes what is
-/// running. It names no removal release and asks for no rebuild, which is true while the
-/// byte-carrying contract is provisional. A log line and not an alert: it
-/// reaches the console and the diagnostic file and pages nobody.
+/// running. It states the string contract's removal period and asks for a
+/// rebuild against the byte-carrying contract. A log line and not an alert,
+/// because the period is counted in releases and nothing stops working at the
+/// release that writes it: it reaches the console and the diagnostic file and
+/// pages nobody.
 pub(crate) fn warn_string_contract_components<'a>(
     running: impl IntoIterator<Item = (&'a str, brenn_wasm::ProcessorContract)>,
 ) {
@@ -280,16 +325,18 @@ pub(crate) fn warn_string_contract_components<'a>(
     if slugs.is_empty() {
         return;
     }
-    // TODO(dual-contract-period-length): the notice names the removal period
-    // once the owner has ruled on its length.
+    // TODO(string-contract-removal): this notice leaves with the string contract.
     warn!(count = slugs.len(), slugs = ?slugs, "{STRING_CONTRACT_NOTICE}");
 }
 
 /// The text of the notice [`warn_string_contract_surface_kinds`] writes.
-pub(crate) const STRING_CONTRACT_SURFACE_NOTICE: &str = "surface component kinds built against \
-     the string component contract brenn:processor@0.1.0 are instantiated; brenn intends to \
-     remove that contract after a byte-carrying contract is declared stable, and no removal is \
-     scheduled; nothing needs to change yet";
+pub(crate) const STRING_CONTRACT_SURFACE_NOTICE: &str = concat!(
+    "surface component kinds built against the string component contract \
+     brenn:processor@0.1.0 are instantiated, and that contract is being removed: ",
+    string_contract_period!(),
+    "; a brenn without it does not run these kinds.",
+    string_contract_rebuild!()
+);
 
 /// The served kinds on the string contract that some surface in `surfaces`
 /// instantiates, sorted and deduplicated. A withheld kind is not served and
@@ -322,8 +369,7 @@ pub(crate) fn warn_string_contract_surface_kinds(
     if kinds.is_empty() {
         return;
     }
-    // TODO(dual-contract-period-length): the notice names the removal period
-    // once the owner has ruled on its length.
+    // TODO(string-contract-removal): this notice leaves with the string contract.
     warn!(count = kinds.len(), kinds = ?kinds, "{STRING_CONTRACT_SURFACE_NOTICE}");
 }
 
@@ -680,6 +726,85 @@ pub(crate) fn fixture_artifact(file_name: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The string contract's removal period reads the same in every text that
+    /// states it, so lengthening it in one text and not the others fails here.
+    ///
+    /// Only the file texts can drift: the notices are built from the same
+    /// macros as the constants they are checked against, so their checks fail
+    /// only if a notice stops being built from them. That the `CHANGELOG.md`
+    /// entry carries the title the notices quote is held by review; no test
+    /// reads `CHANGELOG.md`.
+    mod period_tests {
+        use super::super::{
+            DECLARATION_ENTRY_TITLE, STRING_CONTRACT_NOTICE, STRING_CONTRACT_PERIOD,
+            STRING_CONTRACT_SURFACE_NOTICE,
+        };
+
+        /// The texts an out-of-tree author reads at their pin, relative to
+        /// the repository root.
+        const TEXTS: [&str; 3] = [
+            "brenn-wasm/wit/processor.wit",
+            "brenn-wasm/wit/processor-0.2.wit",
+            "docs/component-packages.md",
+        ];
+
+        /// `text` with WIT doc markers and backticks removed and every run of
+        /// whitespace collapsed to one space, so a line break or code font
+        /// does not change the wording.
+        fn normalized(text: &str) -> String {
+            text.replace("///", " ")
+                .replace('`', "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        #[test]
+        fn every_text_states_the_period_in_one_wording() {
+            for relative in TEXTS {
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join(relative);
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                assert!(
+                    normalized(&text).contains(STRING_CONTRACT_PERIOD),
+                    "{relative} does not state the string contract's removal period as \
+                     `string_contract_period!` in brenn-bootstrap/src/consumers.rs words it"
+                );
+            }
+            for notice in [STRING_CONTRACT_NOTICE, STRING_CONTRACT_SURFACE_NOTICE] {
+                assert!(
+                    notice.contains(STRING_CONTRACT_PERIOD),
+                    "notice {notice:?} does not state the period"
+                );
+            }
+        }
+
+        #[test]
+        fn the_notices_say_what_to_do_and_where_to_look() {
+            for notice in [STRING_CONTRACT_NOTICE, STRING_CONTRACT_SURFACE_NOTICE] {
+                for needed in [
+                    "brenn:processor@0.1.0",
+                    "Rebuild",
+                    "brenn-guest",
+                    DECLARATION_ENTRY_TITLE,
+                ] {
+                    assert!(
+                        notice.contains(needed),
+                        "notice {notice:?} lacks {needed:?}"
+                    );
+                }
+                for stale in ["no removal is scheduled", "nothing needs to change"] {
+                    assert!(
+                        !notice.contains(stale),
+                        "notice {notice:?} still says {stale:?}"
+                    );
+                }
+            }
+        }
+    }
 
     /// The verify-then-load pair, over a package on disk.
     ///

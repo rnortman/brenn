@@ -102,7 +102,7 @@ and the tool-result body grow by added fields, which `brenn-guest` ignores; `v`
 moves only for a change a provider built against the older body would misread,
 and `brenn-guest` refuses a version it does not know.
 
-**The byte-carrying contract (provisional).** The backend host serves two
+**The byte-carrying contract.** The backend host serves two
 `brenn:processor` contracts side by side. Under the string contract, `brenn:processor@0.1.0` (`brenn-wasm/wit/processor.wit`),
 a component is handed each message as `envelope-json` text and publishes
 `payload: string`. Under the byte-carrying contract, `brenn:processor@0.2.0`
@@ -131,27 +131,73 @@ exactly the detected contract's import set; an artifact mixing the two, or
 naming an interface at a version this brenn does not serve, is refused at load
 by name.
 
-PROVISIONAL. brenn makes no compatibility promise for
-`brenn:processor@0.2.0` yet: it may be replaced by a different contract or
-withdrawn in any brenn release, with no dual period. A component that must
-keep running across brenn releases stays on `brenn:processor@0.1.0`. The
-removal period of 0.1.0 has not begun, and it does not begin until brenn
-declares the byte-carrying contract stable, which a later release does by
-editing this paragraph in `processor.wit` and `processor-0.2.wit` and the
-matching one in `docs/component-packages.md`.
+**`brenn:processor@0.2.0` is stable.** The interfaces `bus@0.2.0`,
+`ports@0.2.0` and `calls@0.2.0` and the `receive` export of the 0.2.0 world
+are frozen whole: no type or function in them is changed, removed or added,
+and each keeps doing what `processor-0.2.wit` says it does. While brenn serves
+`brenn:processor@0.2.0`, an artifact built against it at any brenn commit that
+carried it loads and means what it meant. brenn does not stop serving it
+without a removal period, announced in `CHANGELOG.md` and in the WIT header
+no later than the first release the period counts, as 0.1.0's is. A breaking
+change is a new version of the interfaces that change, served beside 0.2.0
+through that period. No such period has begun for 0.2.0, and no length is
+promised for one.
 
-The rule for any change to a provisional shape is that an artifact built
-against the superseded shape is refused at load, by name or by type, never
-misread: the loader holds every import to the contract's names, and wasmtime
-type-checks every import and the `receive` export when the component is
-linked. A shape whose meaning changes without a change of name or type would
-pass both, so it changes its name or its version with its meaning.
+The contract grows without a new version in two ways. A new capability is a
+new interface under a new grant word, with its own version; a component that
+does not import it is linked, activated and answered exactly as before. Such an
+interface may act on the ports a component already has — publish, park, read
+or edit a parked message, call a peer, shape the reply to a sync call — and
+may carry what the 0.2.0 functions cannot. The 0.2.0 functions keep their
+shapes and their behaviour beside it: what one of them does with a message's
+body does not change, and what it does with any part of a message it cannot
+express is stated by the interface that introduces that part. And
+`bus.envelope.header` is an open JSON object: it gains keys, the keys it has
+keep their meaning, and a guest ignores a key it does not know.
+
+The limits a host applies — body caps, budgets, depths — are host and operator
+policy, not part of this promise; the refusal a limit draws keeps its variant
+and its meaning.
+
+**The string contract's removal period.** The string contract
+`brenn:processor@0.1.0` is being removed: the string contract is served by the
+release that declares `brenn:processor@0.2.0` stable and by the three brenn
+releases after it, and no release before the fourth after it removes it. The
+declaring release is the one whose `CHANGELOG.md` heading holds the entry
+"`brenn:processor@0.2.0` is stable"; a release is a `v*` tag with its own
+`CHANGELOG.md` heading. Removal also does not happen before the three known
+out-of-tree component repositories have moved to 0.2.0: `brenn-fastmail`,
+`brenn-component-demo`, and a third, private one. What is removed
+is the string contract and nothing else: its world, the activation records of
+`types`, `ports@0.1.0` and `calls@0.1.0`. Every other interface in
+`processor.wit` stays as it is — it is what a 0.2.0 component imports. After
+removal a host refuses a string-contract artifact at load. The period can be
+lengthened; once the declaring release is tagged, it is not shortened.
+
+The shapes do not change. An artifact that does not have them — bound by hand
+against some other text, for instance — is refused at load, by name or by
+type, never misread: the loader holds every import to the contract's names,
+and wasmtime type-checks the `ports` and `calls` imports, which carry every
+`bus` type, and the `receive` export when the component is linked — on the
+backend with every other import, on a surface those three alone (*On a
+surface*, below). A shape whose meaning changed without a change of name or
+type would pass both, so a shape whose meaning changes changes its name or its
+version with its meaning; that is why the promise covers behaviour and not
+only types. The promise is to an artifact that has the shapes the WIT files
+state for every interface it imports, the `@0.1.0` interfaces of
+`processor.wit` included. A host that accepts an artifact which does not have
+them — a surface host today, for an import outside `ports` and `calls` — may
+refuse it in a later release; that is a correction to the host, announced in
+`CHANGELOG.md`, not a breaking change to the contract, and it draws no dual
+period.
 
 What a 0.2.0 author relies on:
 
 - **The header is open.** `bus.envelope.header` is the canonical envelope as
   JSON without its body. Keys are added over time, without a new contract
-  version; a guest ignores a key it does not know.
+  version; the keys it has keep their meaning, and a guest ignores a key it
+  does not know. A new interface may give a message parts that travel as
+  header keys.
 - **A body is validated where it enters the host.** A content type must be a
   well-formed media type; a text body (no content type, `text/*`,
   `application/json` or a `+json` subtype, with no charset other than UTF-8
@@ -170,9 +216,9 @@ What a 0.2.0 author relies on:
   caller cannot read that reply, so it is the *caller's* activation that
   traps, naming its `call` port and the peer. A typed text reply reaches a
   0.1.0 caller as its text, as a typed text message does on a channel.
-- **On a surface.** The surface host serves 0.2.0 beside 0.1.0, provisional
-  as on the backend; the page manifest names each kind's contract and the
-  page brings each instance up on its own contract's imports. What a
+- **On a surface.** The surface host serves 0.2.0 beside 0.1.0; the page
+  manifest names each kind's contract and the page brings each instance up on
+  its own contract's imports. What a
   page-hosted 0.2.0 kind carries today, shown on the node rig;
   `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery
   in Chromium, and an SDK-built kind's binary state on a page-local `io`
@@ -194,8 +240,8 @@ What a 0.2.0 author relies on:
   serving it, because the page's transpiled glue checks nothing against the
   host: the server holds its import names to the ones a surface host
   serves, and wasmtime type-checks its `ports` and `calls` imports and its
-  `receive` export. An artifact built against a superseded
-  provisional shape is **withheld** under a bundle mount, by the rule above
+  `receive` export. An artifact that does not have the
+  contract's shape is **withheld** under a bundle mount, by the rule above
   for a record it does not read, with a reason naming the kind, the contract
   and the check's account; under brenn's own mount it is a boot refusal. An
   artifact the server cannot read is a broken install and fatal under any
@@ -207,10 +253,10 @@ What a 0.2.0 author relies on:
   files, `processor.wit` first, with the world
   `brenn:processor/processor@0.2.0`.
 
-A backend that loads any 0.1.0 artifact says so in one `warn!` at boot and
-after each applied reload, naming them. It names no removal release: the
-length of the period is not decided, and it is counted from the release that
-declares 0.2.0 stable.
+A backend that loads any 0.1.0 artifact, and one whose surfaces instantiate
+any 0.1.0 kind, says so in one `warn!` each at boot and after each applied
+reload, naming them, stating the removal period and telling the operator to
+rebuild them against 0.2.0.
 
 One runtime contract is a **candidate for deletion**, recorded here so that a
 bundle author meets it before it happens rather than after: `brenn:replay` is
@@ -385,12 +431,12 @@ component that only publishes and reads text changes little else.
   `Body`. A transcript line for an untyped text body is unchanged; any other
   body is rendered as its content type and length.
 
-While 0.2.0 is provisional this cut has a consequence an author should weigh
-before bumping the pin: a component built at any pin from this commit on is a
-0.2.0 artifact, and brenn makes no compatibility promise for 0.2.0 yet, so a
-brenn release that changed the provisional shape would refuse that artifact at
-load until it was rebuilt. The ways to stay on 0.1.0 are to keep the older pin
-or to write raw 0.1.0 bindings. No shape change is pending.
+A component built at any pin from this cut on is a 0.2.0 artifact. 0.2.0 is
+stable (*Contract evolution*, above), and because its shapes have not changed
+since the contract first appeared, an artifact built at a pin before the
+declaring release is under the promise as one built after it is. A component
+stays on 0.1.0 for the rest of that contract's removal period by keeping the
+older pin or by writing raw 0.1.0 bindings.
 
 Freezing the macro vocabulary of a one-operator ecosystem buys nothing a pin
 does not already buy, which is why the two are split rather than held to one

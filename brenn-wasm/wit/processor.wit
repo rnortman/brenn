@@ -14,17 +14,29 @@ package brenn:processor@0.1.0;
 /// every interface whose shape it does not change from this file.
 ///
 /// brenn releases first and serves the old and the new contract together for
-/// a period; components follow on their own schedule. The string contract is
-/// to be removed, at a release not yet named.
+/// a period; components follow on their own schedule. That period is now
+/// running for the string contract: the string contract is served by the
+/// release that declares `brenn:processor@0.2.0` stable and by the three brenn
+/// releases after it, and no release before the fourth after it removes it.
+/// The declaring release is the one whose `CHANGELOG.md` heading holds the
+/// entry "`brenn:processor@0.2.0` is stable"; a release is a `v*` tag with its
+/// own `CHANGELOG.md` heading. Removal also waits until the known out-of-tree
+/// component repositories have moved (`docs/component-packages.md`, *Contract
+/// evolution*); that can lengthen the period and never shortens it.
 ///
-/// PROVISIONAL. brenn makes no compatibility promise for
-/// `brenn:processor@0.2.0` yet: it may be replaced by a different contract or
-/// withdrawn in any brenn release, with no dual period. A component that must
-/// keep running across brenn releases stays on `brenn:processor@0.1.0`. The
-/// removal period of 0.1.0 has not begun, and it does not begin until brenn
-/// declares the byte-carrying contract stable, which a later release does by
-/// editing this paragraph in `processor.wit` and `processor-0.2.wit` and the
-/// matching one in `docs/component-packages.md`.
+/// What is removed is the string contract and nothing else in this file: this
+/// world, the activation records of `types`, `ports@0.1.0` and `calls@0.1.0`.
+/// Every other interface here stays as it is — it is what a
+/// `brenn:processor@0.2.0` component imports. After removal a host refuses a
+/// string-contract artifact at load. A component moves by rebuilding against
+/// `brenn:processor@0.2.0`: on `brenn-guest`, at a brenn pin at or after the
+/// declaring release; with raw bindings, over both files with the world
+/// `brenn:processor/processor@0.2.0`.
+///
+/// `brenn:processor@0.2.0` is STABLE: its shapes do not change, a breaking
+/// change to it would be a new version served beside it, and brenn does not
+/// stop serving it without an announced removal period. `processor-0.2.wit`
+/// states the promise and how the contract grows without a new version.
 ///
 /// `examples/component/` is the in-repository canary that a change to the
 /// world is complete on this side.

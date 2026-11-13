@@ -43,6 +43,9 @@ impl<B: BodyShape> Serialize for ShapedEnvelope<'_, B> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // Destructured without `..`, so a field added to the envelope does not
         // compile until it is written here.
+        // TODO(blob-attachment-host-sites): a key written here is written in
+        // every shape, the 0.1.0 `envelope-json` and attach v4 included; a
+        // header-only key goes through `HeaderShape::serialize_body`.
         let MessageEnvelope {
             message_id,
             source,
@@ -250,6 +253,9 @@ impl<'de> Deserialize<'de> for MessageEnvelope {
 /// this shape does not hold — so a writer may add keys a reader built before
 /// them skips. A missing optional field reads as absent; a missing required
 /// one is refused.
+// TODO(blob-attachment-host-sites): a header key this struct does not hold is
+// dropped where an envelope is rebuilt from it — on the page, before the guest
+// sees it; extend the struct in the change that writes the key.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct EnvelopeHeader {
     message_id: uuid::Uuid,

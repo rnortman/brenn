@@ -281,6 +281,8 @@ pub struct PublishBuffer {
     /// the identity is what travels either way.
     deferred: HashMap<String, Vec<Uuid>>,
     /// Accepted publishes, in call order.
+    // TODO(blob-attachment-host-sites): an attachment-carrying publish is an
+    // entry of this list, not of a list beside it, or call order is lost.
     entries: Vec<BufferedPublish>,
     /// Accepted control ops, in call order.
     defer_ops: Vec<BufferedDeferOp>,

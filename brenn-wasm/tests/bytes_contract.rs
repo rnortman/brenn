@@ -662,6 +662,96 @@ fn the_surface_check_refuses_a_file_that_is_not_a_component_by_name() {
     );
 }
 
+/// A component that imports `brenn:processor/bus@0.2.0` as an empty instance,
+/// so that it is on the 0.2.0 contract, then `import`, a WAT import
+/// declaration; it exports no `receive`.
+fn surface_fixture(import: &str) -> Vec<u8> {
+    let wat = format!(
+        r#"(component
+             (import "{bus}" (instance))
+             {import})"#,
+        bus = ProcessorContract::V0_2_MARKER,
+    );
+    wat::parse_str(&wat).unwrap_or_else(|e| panic!("surface fixture assembles: {e}"))
+}
+
+/// The surface check's refusal of `bytes`, which must be at `ImportType`.
+fn refused_on_import_type(bytes: &[u8]) -> brenn_wasm::SurfaceComponentRefusal {
+    let refusal =
+        brenn_wasm::check_surface_component(bytes).expect_err("the fixture must be refused");
+    assert_eq!(
+        refusal.stage,
+        brenn_wasm::SurfaceComponentStage::ImportType,
+        "{refusal}"
+    );
+    refusal
+}
+
+#[test]
+fn the_surface_check_refuses_a_wrong_typed_ports_function_by_type() {
+    let bytes = surface_fixture(
+        r#"(import "brenn:processor/ports@0.2.0"
+             (instance (export "publish" (func (param "port" string) (param "payload" string)))))"#,
+    );
+    let refusal = refused_on_import_type(&bytes);
+    assert!(refusal.detail.contains("publish"), "{refusal}");
+}
+
+/// An aliased name resolves to the typed `ports` definition, not to a stub
+/// under the alias's own name.
+#[test]
+fn the_surface_check_refuses_a_wrong_typed_ports_function_under_an_aliased_name() {
+    let bytes = surface_fixture(
+        r#"(import "brenn:processor/ports@0.2.1"
+             (instance (export "publish" (func (param "port" string) (param "payload" string)))))"#,
+    );
+    refused_on_import_type(&bytes);
+}
+
+#[test]
+fn the_surface_check_refuses_a_wrong_typed_calls_function_under_an_aliased_name() {
+    let bytes = surface_fixture(
+        r#"(import "brenn:processor/calls@0.2.0+x"
+             (instance (export "call"
+               (func (param "port" string) (param "payload" string) (result string)))))"#,
+    );
+    refused_on_import_type(&bytes);
+}
+
+#[test]
+fn the_surface_check_refuses_a_ports_function_the_host_does_not_have() {
+    let bytes = surface_fixture(
+        r#"(import "brenn:processor/ports@0.2.0" (instance (export "extra" (func))))"#,
+    );
+    let refusal = refused_on_import_type(&bytes);
+    assert!(refusal.detail.contains("extra"), "{refusal}");
+}
+
+#[test]
+fn the_surface_check_refuses_a_served_name_imported_as_a_function() {
+    let bytes = surface_fixture(r#"(import "brenn:processor/log@0.1.0" (func))"#);
+    let refusal = refused_on_import_type(&bytes);
+    assert!(
+        refusal.detail.contains("brenn:processor/log@0.1.0"),
+        "{refusal}"
+    );
+}
+
+/// An aliased name is accepted by name and passes the import stage when it
+/// imports nothing the host lacks; this fixture is refused only for want of
+/// `receive`.
+#[test]
+fn the_surface_check_passes_an_aliased_ports_import_that_imports_nothing_wrong() {
+    let bytes = surface_fixture(r#"(import "brenn:processor/ports@0.2.1" (instance))"#);
+    let refusal = brenn_wasm::check_surface_component(&bytes)
+        .expect_err("a fixture with no receive export must be refused");
+    assert_eq!(
+        refusal.stage,
+        brenn_wasm::SurfaceComponentStage::ExportType,
+        "{refusal}"
+    );
+}
+
 fn artifact_bytes(name: &str) -> Vec<u8> {
     let path = common::artifact_path(name);
     std::fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))

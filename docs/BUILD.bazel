@@ -7,6 +7,7 @@ policy_srcs()
 exports_files([
     "chat-protocol.md",
     "claude-accounts.md",
+    "component-packages.md",
     "config-dsl.md",
     "google-maps-platform.md",
     "google-workspace.md",

@@ -2,19 +2,50 @@ package brenn:processor@0.2.0;
 
 /// The byte-carrying component contract.
 ///
-/// PROVISIONAL. brenn makes no compatibility promise for
-/// `brenn:processor@0.2.0` yet: it may be replaced by a different contract or
-/// withdrawn in any brenn release, with no dual period. A component that must
-/// keep running across brenn releases stays on `brenn:processor@0.1.0`. The
-/// removal period of 0.1.0 has not begun, and it does not begin until brenn
-/// declares the byte-carrying contract stable, which a later release does by
-/// editing this paragraph in `processor.wit` and `processor-0.2.wit` and the
-/// matching one in `docs/component-packages.md`.
+/// STABLE. The interfaces `bus@0.2.0`, `ports@0.2.0` and `calls@0.2.0` and
+/// the `receive` export of this world are frozen whole: no type or function in
+/// them is changed, removed or added, and each keeps doing what this file says
+/// it does. While brenn serves `brenn:processor@0.2.0`, an artifact built
+/// against it at any brenn commit that carried it loads and means what it
+/// meant. brenn does not stop serving it without a removal period, announced
+/// in `CHANGELOG.md` and in this file no later than the first release the
+/// period counts, as 0.1.0's is. A breaking change is a new version of the
+/// interfaces that change, served beside this one through that period. No
+/// such period has begun for 0.2.0, and this file promises no length for one.
 ///
-/// Whoever changes a provisional shape is bound by one rule: an artifact
-/// built against a superseded shape is refused at load, by name or by type,
-/// never misread. A host checks import names and types, not meaning, so a
-/// shape whose meaning changes changes its name or its version with it.
+/// The contract grows without a new version in two ways. A new capability is
+/// a new interface under a new grant word, with its own version; a component
+/// that does not import it is linked, activated and answered exactly as
+/// before. Such an interface may act on the ports a component already has —
+/// publish, park, read or edit a parked message, call a peer, shape the reply
+/// to a sync call — and may carry what the functions here cannot. The
+/// functions here keep their shapes and their behaviour beside it: what one of
+/// them does with a message's body does not change, and what it does with any
+/// part of a message it cannot express is stated by the interface that
+/// introduces that part. And `bus.envelope.header` is an open JSON object: it
+/// gains keys, the keys it has keep their meaning, and a guest ignores a key
+/// it does not know.
+///
+/// The limits a host applies — body caps, budgets, depths — are host and
+/// operator policy, not part of this promise; the refusal a limit draws keeps
+/// its variant and its meaning.
+///
+/// A host checks names and types, not meaning: the name of every import, and
+/// the types of the shapes this file states. An artifact that does not have
+/// these shapes — bound by hand against some other text, for instance — is
+/// refused at load, by name or by type, never misread. The promise is to an
+/// artifact that has the shapes the contract's files state for every
+/// interface it imports: the three of this file and the `@0.1.0` interfaces
+/// of `processor.wit`. A host that accepts an artifact which does not have
+/// them may refuse it in a later release; that is a correction to the host,
+/// announced in `CHANGELOG.md`, not a breaking change to the contract, and it
+/// draws no dual period.
+///
+/// The string contract `brenn:processor@0.1.0` is being removed: the string
+/// contract is served by the release that declares `brenn:processor@0.2.0`
+/// stable and by the three brenn releases after it, and no release before the
+/// fourth after it removes it. `processor.wit` says what is removed and what
+/// stays.
 ///
 /// This package declares only the interfaces whose shape differs from 0.1.0:
 /// `bus`, `ports` and `calls`. Every other interface a component imports is
