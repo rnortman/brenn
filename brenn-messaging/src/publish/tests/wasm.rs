@@ -318,6 +318,7 @@ async fn build_wasm_messenger(
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(wasm_slug.to_string()),
@@ -412,6 +413,7 @@ async fn build_wasm_and_app_messenger(
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![
             SubscriberEntry {
@@ -680,6 +682,7 @@ async fn build_wasm_output_messenger(
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(subscriber_slug.to_string()),
@@ -851,6 +854,7 @@ async fn build_wasm_mixed_output_messenger_at_retain(
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(subscriber_slug.to_string()),

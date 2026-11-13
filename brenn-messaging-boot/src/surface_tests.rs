@@ -68,6 +68,7 @@ fn surface_boot_directory() -> messaging::MessagingDirectory {
             sink: Sink::Drop,
             wake_min: brenn_lib::messaging::WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Surface("deskbar".to_string()),
@@ -167,6 +168,7 @@ fn system_boot_directory() -> messaging::MessagingDirectory {
             sink: Sink::Drop,
             wake_min: brenn_lib::messaging::WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::System("relay".to_string()),
@@ -281,6 +283,7 @@ fn ephem_with(
             sink: Sink::Drop,
             wake_min: brenn_lib::messaging::WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![],
         transport_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
@@ -3349,6 +3352,7 @@ fn surface_input_binding_on_a_built_retain_zero_channel_panics() {
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         }],
         &globals,
     );

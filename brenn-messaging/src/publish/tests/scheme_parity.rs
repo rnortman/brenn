@@ -591,6 +591,7 @@ async fn the_release_pass_releases_a_confined_local_channels_parked_message() {
                 impetus: None,
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Local,
+                transport: None,
             },
             release_at,
         )

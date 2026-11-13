@@ -76,6 +76,10 @@ pub fn run_messaging_migrations(conn: &Connection) {
             -- holds a TEXT value for a text body and a BLOB value otherwise
             -- (`body_column`), and the full-text index covers the TEXT rows.
             content_type        TEXT,
+            -- `TransportMeta` JSON on a row a transport adaptor published with
+            -- the payload as the body; NULL on every other row. The decoder
+            -- panics on a value that does not parse (the host wrote every row).
+            transport           TEXT,
             -- Non-brenn envelope rows must never have deliver_after or delivery_deadline;
             -- those are bus-only dispatch fields. This constraint makes the
             -- invariant machine-enforced rather than convention-enforced.
@@ -179,6 +183,10 @@ pub fn run_messaging_migrations(conn: &Connection) {
     if !brenn_db::column_exists(conn, "messaging_messages", "content_type") {
         conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN content_type TEXT;")
             .expect("failed to add messaging_messages.content_type column");
+    }
+    if !brenn_db::column_exists(conn, "messaging_messages", "transport") {
+        conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN transport TEXT;")
+            .expect("failed to add messaging_messages.transport column");
     }
     ensure_text_body_fts(conn);
     if !brenn_db::column_exists(conn, "messaging_channels", "last_retained_seq") {

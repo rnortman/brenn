@@ -300,6 +300,7 @@ pub mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,
@@ -603,6 +604,7 @@ pub mod tests {
                     sink: Sink::Drop,
                     wake_min: WakeMin::Normal,
                     non_text: false,
+                    untyped_content_type: None,
                 },
                 subscribers: vec![],
                 transport_type: ChannelScheme::Brenn,
@@ -634,6 +636,7 @@ pub mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,
@@ -701,6 +704,7 @@ pub mod tests {
                     sink: Sink::Drop,
                     wake_min: WakeMin::Normal,
                     non_text: false,
+                    untyped_content_type: None,
                 },
                 subscribers: vec![],
                 transport_type: ChannelScheme::Brenn,
@@ -732,6 +736,7 @@ pub mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,
@@ -801,6 +806,7 @@ pub mod tests {
                         sink: Sink::Drop,
                         wake_min: WakeMin::Normal,
                         non_text: false,
+                        untyped_content_type: None,
                     },
                     subscribers: vec![SubscriberEntry {
                         kind: SubscriberEntryKind::App("sub-app".to_string()),
@@ -838,6 +844,7 @@ pub mod tests {
                     sink: Sink::Drop,
                     wake_min: WakeMin::Normal,
                     non_text: false,
+                    untyped_content_type: None,
                 },
                 subscribers: vec![SubscriberEntry {
                     kind: SubscriberEntryKind::App("sub-app".to_string()),
@@ -964,6 +971,7 @@ pub mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers,
             transport_type: transport,
@@ -1591,6 +1599,7 @@ pub mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,
@@ -1643,7 +1652,7 @@ pub mod tests {
         // Golden: the complete SQL string `load_window_snapshot` prepares.
         let golden = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
                       m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
-                      c.address, rc.address, m.envelope_type, m.impetus, m.content_type \
+                      c.address, rc.address, m.envelope_type, m.impetus, m.content_type, m.transport \
                FROM messaging_messages m \
                JOIN messaging_channels c ON c.uuid = m.channel_uuid \
                LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid \
@@ -1680,6 +1689,7 @@ pub mod tests {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: scheme,
+            transport: None,
         }
     }
 
@@ -1754,6 +1764,7 @@ pub mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,

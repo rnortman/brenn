@@ -326,6 +326,17 @@ fn unquote(value: &str) -> &str {
     }
 }
 
+/// Refuse a content type [`MessageBody::from_parts`] would refuse, by the same
+/// parse: for a type stated in configuration, checked before any body exists.
+pub fn check_content_type(content_type: &str) -> Result<(), BodyError> {
+    parse_media_type(content_type)
+        .map(|_| ())
+        .map_err(|reason| BodyError::InvalidContentType {
+            content_type: content_type.to_owned(),
+            reason,
+        })
+}
+
 /// Parse `type "/" subtype *( *SP ";" *SP token "=" ( token / quoted-string ) )`
 /// over ASCII, at most [`MAX_CONTENT_TYPE_LEN`] bytes.
 fn parse_media_type(ct: &str) -> Result<MediaType<'_>, &'static str> {
@@ -535,6 +546,33 @@ mod tests {
         ] {
             MessageBody::from_parts(Some(ct), b"{}")
                 .unwrap_or_else(|e| panic!("{ct:?} refused: {e}"));
+        }
+    }
+
+    /// The configuration-time check and body construction agree on every type,
+    /// with the same reason for each refusal.
+    #[test]
+    fn check_content_type_agrees_with_from_parts() {
+        let over = format!("application/{}", "x".repeat(MAX_CONTENT_TYPE_LEN));
+        let cases = [
+            "application/octet-stream",
+            "text/plain; charset=utf-8",
+            "image/png",
+            "application/vnd.example+json; profile=\"https://alice.example.com/p\"",
+            "",
+            "octet-stream",
+            "text/",
+            "/plain",
+            "text/plain;",
+            "text/plain; charset",
+            "text/plain; note=\"open",
+            "tëxt/plain",
+            "text/plain\n",
+            over.as_str(),
+        ];
+        for ct in cases {
+            let constructed = MessageBody::from_parts(Some(ct), &[]).map(|_| ());
+            assert_eq!(check_content_type(ct), constructed, "{ct:?}");
         }
     }
 

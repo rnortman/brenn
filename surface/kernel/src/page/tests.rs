@@ -200,6 +200,7 @@ fn env(channel: &str, body: &str) -> MessageEnvelope {
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
+        transport: None,
     }
 }
 

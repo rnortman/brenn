@@ -155,6 +155,20 @@ express is stated by the interface that introduces that part. And
 `bus.envelope.header` is an open JSON object: it gains keys, the keys it has
 keep their meaning, and a guest ignores a key it does not know.
 
+How the host adds a header key, so the next key's author starts from it: the
+key is a field of `MessageEnvelope` in `brenn-envelope`, `Option` and absent
+when unset. `ShapedEnvelope::serialize` writes it with `optional_field` — in
+the shared part, which every shape reads, or in `HeaderShape`'s header-only
+position — so an envelope without it serializes byte-identically to one built
+before the key existed. `EnvelopeHeader` and the text-shape reader
+`TextShapeIn` hold it, and `MessageEnvelope::header()` and `from_header()`
+destructure without `..`, so the compiler refuses the change until both carry
+it. A durable channel stores it in one nullable column of `messaging_messages`
+that joins every SELECT and decoder rebuilding an envelope; a ring holds the
+whole envelope and needs nothing. Attach v5 carries the header as an open
+object too, so the key crosses it with no protocol version bump. `transport`
+took this route through the shared part.
+
 The limits a host applies — body caps, budgets, depths — are host and operator
 policy, not part of this promise; the refusal a limit draws keeps its variant
 and its meaning.
@@ -197,7 +211,14 @@ What a 0.2.0 author relies on:
   JSON without its body. Keys are added over time, without a new contract
   version; the keys it has keep their meaning, and a guest ignores a key it
   does not know. A new interface may give a message parts that travel as
-  header keys.
+  header keys. The first added key is `transport`: present only on a message
+  a transport adaptor published in the raw ingress shape
+  (`docs/message-bus.md` §2.7.1), an object with one member named for the
+  transport — `{"mqtt": {"client_slug", "topic", "qos", "received_at"}}` or
+  `{"webhook": {"headers", "key_id", "client_ip", "received_at",
+  "endpoint_slug"}}`. Its presence is how a reader tells a raw ingress message,
+  whose body is the payload, from a wrapped one, whose body is the wrapper
+  JSON.
 - **A body is validated where it enters the host.** A content type must be a
   well-formed media type; a text body (no content type, `text/*`,
   `application/json` or a `+json` subtype, with no charset other than UTF-8
@@ -373,6 +394,9 @@ component that only publishes and reads text changes little else.
 | `RetainedState::load(&mut self, &Activation)` | `load(&mut self, &mut Activation)`, taking the state window out of the activation |
 | `build_activation` (public) | gone; the export shim builds the activation |
 | `Error` | gains `TextOnlyChannel(String)` and `InvalidBody(String)` |
+| — | `MessageEnvelopeExt::mqtt_body() -> Result<MqttEnvelope, Error>`, the wrapped MQTT shape, beside `webhook_body` |
+| — | `MessageEnvelopeExt::mqtt_transport() -> Result<&MqttTransport, Error>`, `webhook_transport() -> Result<&WebhookTransport, Error>`: a raw ingress message's `transport` |
+| — | `MqttPayloadBody::text() -> Option<&str>`: the wrapper's text payload, `None` for the binary placeholder |
 
 - **Bodies.** `Body` is a body as it crossed the boundary: `content_type()`,
   `as_bytes()`, `into_bytes()`, `is_text()`, `as_text()` (`MalformedEnvelope`
@@ -401,6 +425,14 @@ component that only publishes and reads text changes little else.
   its own `CallError::TextOnlyPeer` (a non-text request to a peer built on
   0.1.0, which does not run) and `CallError::InvalidBody`. A kind that matches
   `Error` or `CallError` exhaustively adds the arms.
+- **Ingress shapes.** `brenn-guest` re-exports `MqttEnvelope`,
+  `MqttPayloadBody`, `TransportMeta`, `MqttTransport` and `WebhookTransport`
+  beside `WebhookEnvelope`. Each of the four ingress accessors checks the
+  message's scheme first, then its shape: `mqtt_body` and `webhook_body`
+  answer `Error::ProcessingFailed` for a message carrying `transport`, naming the
+  transport accessor, and `mqtt_transport` and `webhook_transport` answer it
+  for one without, naming the wrapper accessor. A raw message's body is read
+  as any body is, through `Message::body()`.
 - **Binary state.** `RetainedState<T, C>` takes a `StateCodec<T>`: a
   `CONTENT_TYPE` (`None` is untyped text), `encode(&T) -> Result<Vec<u8>,
   Error>` and `decode(&[u8]) -> Result<T, Error>`. `Json` is the default and

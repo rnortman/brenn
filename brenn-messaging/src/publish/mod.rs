@@ -1288,6 +1288,7 @@ fn surface_feed_envelope(
         impetus,
         urgency,
         envelope_type: scheme,
+        transport: None,
     }
 }
 
@@ -1301,7 +1302,9 @@ impl Messenger {
     /// The caller holds the DB lock (`conn` / the transaction) and commits it
     /// after all `insert_message` calls for the batch.
     ///
-    /// Always inserts with no impetus.
+    /// Always inserts with no impetus. `transport` is the transport metadata
+    /// of a message a transport adaptor published with the payload as the
+    /// body, `None` from every other path.
     #[allow(clippy::too_many_arguments)]
     fn insert_message(
         &self,
@@ -1316,6 +1319,7 @@ impl Messenger {
         reply_to_uuid: Option<Uuid>,
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
+        transport: Option<&super::TransportMeta>,
     ) -> InsertedMessage {
         channel.assert_may_hold(body);
         insert_message_in_tx(
@@ -1330,6 +1334,7 @@ impl Messenger {
             delivery_deadline,
             deliver_after,
             None,
+            transport,
             publish_ts_ns,
         )
     }
@@ -1380,78 +1385,133 @@ impl Messenger {
     }
 }
 
+/// What a transport adaptor publishes onto its ingress channel; the variant
+/// is the channel's ingress shape.
+#[derive(Debug, Clone)]
+pub enum IngressMessage {
+    /// The transport's wrapper JSON (`WebhookEnvelope` or `MqttEnvelope`),
+    /// stored as untyped text with no transport metadata. Only a text-only
+    /// ingress channel takes it.
+    Wrapped(String),
+    /// The payload itself as the body, with the transport's metadata in the
+    /// envelope's `transport` field. Only an ingress channel declared
+    /// `non_text` takes it.
+    Raw {
+        body: super::MessageBody,
+        transport: super::TransportMeta,
+    },
+}
+
 impl Messenger {
     /// Host-originated transport ingress publish.
     ///
     /// Unlike `publish`, this entry point is for host-side transport adaptors
     /// (webhook, mqtt) that have already performed admission (signature
-    /// verification, replay protection). It bypasses all CC-facing gates
-    /// (sender lookup, send-budget decrement, body-length check) and stamps the
-    /// channel's own `transport_type` on the stored message row.
+    /// verification, replay protection) and judged the outside input. It
+    /// bypasses all CC-facing gates (sender lookup, send-budget decrement) and
+    /// stamps the channel's own `transport_type` on the stored message row.
+    ///
+    /// The adaptor reads the shape from, sizes the body against
+    /// [`max_body_bytes`](Self::max_body_bytes), and publishes on the one
+    /// `channel` entry it hands here, so every refusal below is a host bug.
     ///
     /// Returns once the durable DB insert of the message + pending-push rows
     /// commits. Panics on any DB error (fail-fast; axum's per-task panic handler
     /// converts this to a 500 for the HTTP caller — satisfying the "never 2xx if
-    /// durable enqueue failed" contract without an explicit `Err` path). A
-    /// host-built malformed envelope or an unresolvable channel likewise panics
-    /// (fail-fast, CLAUDE.md). There are no business-logic rejections (no budget /
-    /// sender gate) for this host-originated entry point.
+    /// durable enqueue failed" contract without an explicit `Err` path).
     ///
     /// `source` and `sender` are stamped verbatim on the message row (e.g.
     /// `source = "webhook:<slug>"`, `sender = key_id`).
+    ///
+    /// # Panics
+    ///
+    /// - the channel's scheme is neither `Webhook` nor `Mqtt`;
+    /// - `Wrapped` on a channel declared `non_text`, or `Raw` on a text-only
+    ///   channel;
+    /// - `Wrapped` whose text does not parse as the scheme's wrapper struct;
+    /// - `Raw` whose `transport` is of another scheme than the channel's;
+    /// - `Raw` whose body is longer than the body cap.
     pub async fn publish_transport_ingress(
         &self,
         channel: Arc<super::ChannelEntry>,
         source: &str,
         sender: &str,
-        body: super::MessageBody,
+        message: IngressMessage,
         urgency: Urgency,
     ) {
         let publish_ts_ns = db::utc_to_ns(Utc::now());
-        let text = body.as_text().unwrap_or_else(|| {
+        let scheme = channel.transport_type;
+        if !matches!(scheme, ChannelScheme::Webhook | ChannelScheme::Mqtt) {
             panic!(
-                "publish_transport_ingress: host built a malformed envelope for channel '{}' — \
-                 the body is not text ({}); this is a host-internal bug, not an attacker \
-                 input",
-                channel.address,
-                body.summary()
-            )
-        });
-
-        // Accept-side validation: deserialize the body JSON into the channel's
-        // transport-typed struct to verify the host built a structurally valid
-        // envelope. A deserialize failure is a host-internal bug — panic.
-        match channel.transport_type {
-            ChannelScheme::Webhook => {
-                serde_json::from_str::<super::WebhookEnvelope>(text).unwrap_or_else(|e| {
-                    panic!(
-                        "publish_transport_ingress: host built a malformed WebhookEnvelope for \
-                         channel '{}' — this is a host-internal bug, not an attacker input: {e}",
-                        channel.address
-                    )
-                });
-            }
-            ChannelScheme::Mqtt => {
-                serde_json::from_str::<super::MqttEnvelope>(text).unwrap_or_else(|e| {
-                    panic!(
-                        "publish_transport_ingress: host built a malformed MqttEnvelope for \
-                         channel '{}' — this is a host-internal bug, not an attacker input: {e}",
-                        channel.address
-                    )
-                });
-            }
-            other => {
-                panic!(
-                    "publish_transport_ingress: called with unexpected transport type {:?} for \
-                     channel '{}' — only Webhook and Mqtt are valid for this entry point",
-                    other, channel.address
-                );
-            }
+                "publish_transport_ingress: called with unexpected transport type {:?} for \
+                 channel '{}' — only Webhook and Mqtt are valid for this entry point",
+                scheme, channel.address
+            );
         }
+        let non_text = channel.resolved_channel.non_text;
+        let (body, transport) = match message {
+            IngressMessage::Wrapped(text) => {
+                assert!(
+                    !non_text,
+                    "publish_transport_ingress: host published the wrapped shape on channel \
+                     '{}', which is declared non_text and takes the raw shape — the adaptor \
+                     read a different channel entry from the one it publishes on",
+                    channel.address
+                );
+                // Accept-side validation: the host built a structurally valid
+                // wrapper, or this is a host-internal bug.
+                if scheme == ChannelScheme::Webhook {
+                    serde_json::from_str::<super::WebhookEnvelope>(&text).unwrap_or_else(|e| {
+                        panic!(
+                            "publish_transport_ingress: host built a malformed WebhookEnvelope \
+                             for channel '{}' — this is a host-internal bug, not an attacker \
+                             input: {e}",
+                            channel.address
+                        )
+                    });
+                } else {
+                    serde_json::from_str::<super::MqttEnvelope>(&text).unwrap_or_else(|e| {
+                        panic!(
+                            "publish_transport_ingress: host built a malformed MqttEnvelope for \
+                             channel '{}' — this is a host-internal bug, not an attacker \
+                             input: {e}",
+                            channel.address
+                        )
+                    });
+                }
+                (super::MessageBody::text(text), None)
+            }
+            IngressMessage::Raw { body, transport } => {
+                assert!(
+                    non_text,
+                    "publish_transport_ingress: host published the raw shape on channel '{}', \
+                     which is text-only and takes the wrapped shape — the adaptor read a \
+                     different channel entry from the one it publishes on",
+                    channel.address
+                );
+                assert_eq!(
+                    transport.scheme(),
+                    scheme,
+                    "publish_transport_ingress: host published {:?} transport metadata on \
+                     channel '{}'",
+                    transport.scheme(),
+                    channel.address
+                );
+                let cap = self.max_body_bytes();
+                assert!(
+                    body.len() <= cap,
+                    "publish_transport_ingress: host published a raw body ({}) over the \
+                     {cap}-byte body cap on channel '{}' — the adaptor must refuse it first",
+                    body.summary(),
+                    channel.address
+                );
+                (body, Some(transport))
+            }
+        };
 
-        // DB work: insert the message row under one lock (step 6). No budget
-        // decrement, no sender gate, no body-length gate. No deliver_after /
-        // delivery_deadline for transport ingress — both are None (always immediate).
+        // DB work: insert the message row under one lock. No budget decrement
+        // and no sender gate. No deliver_after / delivery_deadline for transport
+        // ingress — both are None (always immediate).
         {
             let conn = self.db.lock().await;
             let tx = conn
@@ -1460,7 +1520,7 @@ impl Messenger {
             self.insert_message(
                 &tx,
                 &channel,
-                channel.transport_type,
+                scheme,
                 source,
                 sender,
                 &body,
@@ -1469,6 +1529,7 @@ impl Messenger {
                 None, // no reply_to
                 None, // no deliver_after — transport ingress is always immediate
                 None, // no delivery_deadline
+                transport.as_ref(),
             );
             tx.commit().expect("messaging: commit transport ingress tx");
         }
@@ -1665,6 +1726,7 @@ impl Messenger {
                     reply_to_target.as_ref().map(|target| target.uuid),
                     release,
                     None, // no delivery_deadline
+                    None, // no transport metadata
                 );
                 // A parked message is not observable before release, so it must
                 // not be fed now.
@@ -2072,6 +2134,7 @@ impl Messenger {
                         None, // no reply_to — not exposed to attachers
                         Some(release_at),
                         None, // no delivery_deadline
+                        None, // no transport metadata
                     );
                     // Not fed now: a parked message is not observable before
                     // release, and the release sweep does its own fan-out.
@@ -2090,6 +2153,7 @@ impl Messenger {
                     None, // no reply_to — not exposed to attachers
                     None,
                     None, // no delivery_deadline
+                    None, // no transport metadata
                 );
                 if !feed_targets.is_empty()
                     && self

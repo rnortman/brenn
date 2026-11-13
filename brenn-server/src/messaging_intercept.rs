@@ -1770,6 +1770,7 @@ mod tests {
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: brenn_lib::messaging::ChannelScheme::Mqtt,
@@ -2529,6 +2530,7 @@ mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Webhook,
@@ -3355,6 +3357,7 @@ mod tests {
             impetus: None,
             urgency: Urgency::Low,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+            transport: None,
         };
         let messages = vec![envelope];
         let resp = super::BrennPendingListResponse {
@@ -4193,7 +4196,7 @@ mod tests {
                 channel,
                 addr,
                 "home",
-                body.into(),
+                brenn_messaging::IngressMessage::Wrapped(body.to_owned()),
                 brenn_lib::messaging::Urgency::Normal,
             )
             .await;
@@ -4515,6 +4518,7 @@ mod tests {
             impetus: None,
             urgency: brenn_lib::messaging::Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+            transport: None,
         }
     }
 
@@ -4584,6 +4588,88 @@ mod tests {
             body_entries(&envelopes[1]),
             (json!("# hi"), Some(json!("text/markdown")))
         );
+    }
+
+    /// `MessageChannelGet` shows a raw ingress message's transport metadata
+    /// beside its body: the placeholder for a non-text body, the text and its
+    /// type for a text one.
+    #[tokio::test]
+    async fn message_channel_get_shows_raw_ingress_transport_metadata() {
+        let bridge = crate::active_bridge::ActiveBridge::test_new_for_mqtt_subscribe_raw().await;
+        let addr = "mqtt:home:home/camera/still";
+        let sub = subscribe_result(
+            &bridge,
+            json!({ "address": addr, "push_depth": 0, "retain_depth": 5 }),
+        )
+        .await;
+        assert_eq!(sub["ok"], json!(true), "subscribe must succeed: {sub}");
+        let messenger = bridge.messenger().unwrap();
+        let channel = messenger
+            .directory()
+            .resolve(addr)
+            .expect("mqtt channel created by subscribe")
+            .clone();
+        assert!(
+            channel.resolved_channel.non_text,
+            "the tuning makes the minted channel raw"
+        );
+        let transport =
+            brenn_lib::messaging::TransportMeta::Mqtt(brenn_lib::messaging::MqttTransport {
+                client_slug: "home".to_string(),
+                topic: "home/camera/still".to_string(),
+                qos: 1,
+                received_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            });
+        for body in [markdown_body(), binary_body()] {
+            messenger
+                .publish_transport_ingress(
+                    channel.clone(),
+                    "test",
+                    "home",
+                    brenn_messaging::IngressMessage::Raw {
+                        body,
+                        transport: transport.clone(),
+                    },
+                    brenn_lib::messaging::Urgency::Normal,
+                )
+                .await;
+        }
+
+        let req = post_tool_use_req(
+            MCP_MESSAGE_QUERY_CHANNEL_TOOL,
+            json!({ "address": addr, "limit": 10 }),
+        );
+        let out = match try_handle_messaging_tool(&bridge, &req).await {
+            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
+                updated_output: Some(out),
+            })) => out,
+            other => panic!("unexpected MessageChannelGet result: {other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let envelopes = v.as_array().expect("a JSON array of envelopes");
+        assert_eq!(envelopes.len(), 2, "{out}");
+        let metadata = json!({ "mqtt": {
+            "client_slug": "home",
+            "topic": "home/camera/still",
+            "qos": 1,
+            "received_at": "2023-11-14T22:13:20Z",
+        }});
+        // Newest first.
+        assert_eq!(
+            body_entries(&envelopes[0]),
+            (
+                json!({ "binary": true, "content_type": "image/jpeg", "size": 3 }),
+                None
+            )
+        );
+        assert_eq!(
+            body_entries(&envelopes[1]),
+            (json!("# hi"), Some(json!("text/markdown")))
+        );
+        for envelope in envelopes {
+            assert_eq!(envelope["envelope_type"], "mqtt", "{envelope}");
+            assert_eq!(envelope["transport"], metadata, "{envelope}");
+        }
     }
 
     /// `BrennPendingList` lists each message in the conversation shape.

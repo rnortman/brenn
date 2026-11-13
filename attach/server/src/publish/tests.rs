@@ -113,6 +113,7 @@ fn channel_raw(address: &str) -> ChannelConfigRaw {
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     }
 }
 

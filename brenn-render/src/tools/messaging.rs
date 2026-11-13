@@ -7,7 +7,7 @@
 //! history. The other two reuse `AutoApproveTool`.
 
 use brenn_lib::app::AppTool;
-use brenn_lib::messaging::MessageEnvelope;
+use brenn_lib::messaging::{MessageEnvelope, TransportMeta};
 use brenn_lib::util::html_escape;
 use brenn_ws_types::ToolResponseDecision;
 
@@ -121,15 +121,23 @@ fn render_status_badge(outcome: Option<&serde_json::Value>) -> String {
 /// Used when an active bridge accepts a delivered message.
 ///
 /// A text body is rendered as markdown. A non-text body is one fixed line
-/// naming its content type and size, never its bytes.
+/// naming its content type and size, never its bytes. A message carrying
+/// transport metadata gets one escaped line of it above the body.
 pub fn format_message_html_single(env: &MessageEnvelope) -> String {
-    let body_html = match env.body.as_text() {
+    let mut body_html = match &env.transport {
+        Some(transport) => format!(
+            r#"<div class="brenn-msg-transport">{line}</div>"#,
+            line = html_escape(&transport_line(transport)),
+        ),
+        None => String::new(),
+    };
+    body_html.push_str(&match env.body.as_text() {
         Some(text) => render_markdown(text),
         None => format!(
             r#"<span class="brenn-msg-binary">{line}</span>"#,
             line = html_escape(&format!("binary body: {}", env.body.summary())),
         ),
-    };
+    });
     let publish_ts = env.publish_ts.to_rfc3339();
     format!(
         r#"<details class="brenn-message brenn-message-recv">
@@ -144,6 +152,19 @@ pub fn format_message_html_single(env: &MessageEnvelope) -> String {
         sender = html_escape(&env.sender),
         publish_ts = html_escape(&publish_ts),
     )
+}
+
+/// The one-line summary of a message's transport metadata, unescaped.
+fn transport_line(transport: &TransportMeta) -> String {
+    match transport {
+        TransportMeta::Mqtt(mqtt) => {
+            format!("mqtt {} {} qos {}", mqtt.client_slug, mqtt.topic, mqtt.qos)
+        }
+        TransportMeta::Webhook(webhook) => format!(
+            "webhook {} key {} from {}",
+            webhook.endpoint_slug, webhook.key_id, webhook.client_ip
+        ),
+    }
 }
 
 /// Render a batch of received messages as a wrapped `<div>` containing
@@ -178,6 +199,7 @@ mod tests {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+            transport: None,
         }
     }
 
@@ -366,5 +388,58 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("<i>"), "{html}");
+    }
+
+    #[test]
+    fn an_mqtt_transport_renders_one_escaped_line_above_the_body() {
+        let html = format_message_html_single(&MessageEnvelope {
+            transport: Some(TransportMeta::Mqtt(brenn_lib::messaging::MqttTransport {
+                client_slug: "broker".into(),
+                topic: "cam/<b>front</b>".into(),
+                qos: 1,
+                received_at: Utc::now(),
+            })),
+            ..fake_envelope("hi")
+        });
+        assert!(
+            html.contains(
+                r#"<div class="brenn-msg-body"><div class="brenn-msg-transport">mqtt broker cam/&lt;b&gt;front&lt;/b&gt; qos 1</div><p>hi</p>"#
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_webhook_transport_renders_one_escaped_line_above_a_binary_body() {
+        let body = brenn_lib::messaging::MessageBody::from_parts(
+            Some("application/octet-stream"),
+            &[0xff],
+        )
+        .unwrap();
+        let html = format_message_html_single(&MessageEnvelope {
+            body,
+            transport: Some(TransportMeta::Webhook(
+                brenn_lib::messaging::WebhookTransport {
+                    headers: vec![("x-sig".into(), "[redacted]".into())],
+                    key_id: "k<1>".into(),
+                    client_ip: "192.0.2.1".into(),
+                    received_at: Utc::now(),
+                    endpoint_slug: "scanner".into(),
+                },
+            )),
+            ..fake_envelope("")
+        });
+        assert!(
+            html.contains(
+                r#"<div class="brenn-msg-body"><div class="brenn-msg-transport">webhook scanner key k&lt;1&gt; from 192.0.2.1</div><span class="brenn-msg-binary">binary body: application/octet-stream, 1 bytes</span></div>"#
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn no_transport_line_without_transport() {
+        let html = format_message_html_single(&fake_envelope("hi"));
+        assert!(!html.contains("brenn-msg-transport"), "{html}");
     }
 }

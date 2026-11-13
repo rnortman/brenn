@@ -74,6 +74,7 @@ pub fn sync_request(
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Local,
+        transport: None,
     }
 }
 

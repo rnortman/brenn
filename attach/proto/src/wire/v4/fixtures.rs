@@ -36,6 +36,7 @@ fn bare_envelope() -> MessageEnvelope {
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Ephemeral,
+        transport: None,
     }
 }
 
@@ -56,6 +57,7 @@ fn full_envelope() -> MessageEnvelope {
         impetus: Some(Impetus::Replenish),
         urgency: Urgency::High,
         envelope_type: ChannelScheme::Brenn,
+        transport: None,
     }
 }
 

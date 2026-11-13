@@ -48,6 +48,7 @@ fn bare_envelope() -> MessageEnvelope {
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Ephemeral,
+        transport: None,
     }
 }
 
@@ -65,6 +66,7 @@ fn full_envelope(body: MessageBody) -> MessageEnvelope {
         impetus: Some(Impetus::Replenish),
         urgency: Urgency::High,
         envelope_type: ChannelScheme::Brenn,
+        transport: None,
     }
 }
 
@@ -301,6 +303,34 @@ fn every_body_round_trips_in_every_binary_kind() {
             }],
         });
     }
+}
+
+/// A header key added under the open-header rule crosses v5 with no version
+/// change: an envelope carrying `transport` comes back with it.
+#[test]
+fn a_deliver_row_keeps_transport_metadata() {
+    let mut envelope = full_envelope(jpeg());
+    envelope.deliver_after = None;
+    envelope.delivery_deadline = None;
+    envelope.channel = "mqtt:broker:cam/front".to_string();
+    envelope.envelope_type = ChannelScheme::Mqtt;
+    envelope.transport = Some(brenn_envelope::TransportMeta::Mqtt(
+        brenn_envelope::MqttTransport {
+            client_slug: "broker".to_string(),
+            topic: "cam/front".to_string(),
+            qos: 2,
+            received_at: at(1_700_000_002),
+        },
+    ));
+    server_round_trip(ServerFrame::Deliver {
+        channel: "mqtt:broker:cam/front".to_string(),
+        rows: vec![DeliverRow {
+            envelope,
+            seq: 1,
+            cursor: cursor("c"),
+            dropped: 0,
+        }],
+    });
 }
 
 /// Entries' bodies first, then the edits that carry one, each in order: what

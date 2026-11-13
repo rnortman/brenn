@@ -1745,6 +1745,7 @@ fn archive_line(body: brenn_lib::messaging::MessageBody) -> String {
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
+        transport: None,
     };
     serde_json::to_string(&envelope.shaped::<crate::db::bus::ArchiveShape>()).unwrap()
 }

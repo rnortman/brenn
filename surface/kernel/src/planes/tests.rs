@@ -119,6 +119,7 @@ fn envelope(channel: &str, body: String, publish_ts: DateTime<Utc>) -> MessageEn
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Local,
+        transport: None,
     }
 }
 

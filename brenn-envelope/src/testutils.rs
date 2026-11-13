@@ -79,6 +79,7 @@ pub fn fixture_envelope(channel: &str, id: &str, body: MessageBody) -> MessageEn
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: scheme,
+        transport: None,
     }
 }
 

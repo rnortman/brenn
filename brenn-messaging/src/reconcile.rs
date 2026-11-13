@@ -280,6 +280,7 @@ mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers,
             transport_type: ChannelScheme::Brenn,

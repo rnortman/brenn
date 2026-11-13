@@ -168,6 +168,7 @@ async fn err_outcome_acks_push_row_at_activation_start() {
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(slug.to_string()),
@@ -1196,6 +1197,7 @@ fn trigger_channel() -> brenn_lib::messaging::config::ChannelConfigRaw {
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     }
 }
 
@@ -2125,6 +2127,7 @@ mod peer_calls {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![SubscriberEntry {
                 kind: SubscriberEntryKind::Wasm(reader.to_string()),

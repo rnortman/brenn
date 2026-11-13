@@ -49,8 +49,9 @@ pub struct EditFields {
 /// Outcome of `Messenger::edit`.
 #[derive(Debug)]
 pub enum EditResult {
-    /// Edit applied; returns the updated envelope.
-    Ok { envelope: MessageEnvelope },
+    /// Edit applied; returns the updated envelope, boxed so the other
+    /// variants do not carry its size.
+    Ok { envelope: Box<MessageEnvelope> },
     /// No `messaging_messages` row with that UUID.
     UnknownMessage,
     /// Message exists but the `sender` string does not match the caller.
@@ -286,7 +287,9 @@ impl Messenger {
                 .unwrap_or_else(|| panic!("messaging: edited message {message_uuid} vanished"))
         };
 
-        EditResult::Ok { envelope }
+        EditResult::Ok {
+            envelope: Box::new(envelope),
+        }
     }
 
     /// List the still-parked messages authored by this app's sender. Optionally
@@ -469,6 +472,7 @@ mod tests {
                 sink: crate::config::Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![crate::SubscriberEntry {
                 kind: crate::SubscriberEntryKind::App("pa-alice".to_string()),

@@ -212,6 +212,7 @@ pub fn wasm_channel_entry(
             sink: config::Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(slug.to_string()),
@@ -259,6 +260,7 @@ pub fn ephemeral_channel_entry(name: &str, retain_depth: u64) -> ChannelEntry {
             sink: config::Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![],
         transport_type: ChannelScheme::Ephemeral,

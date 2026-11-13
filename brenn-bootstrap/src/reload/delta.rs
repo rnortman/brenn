@@ -905,6 +905,32 @@ pub(crate) fn text_only_flips_under_surface_publishers(
     out
 }
 
+/// Every ingress channel this delta takes from `non_text` to text-only, as
+/// refusal lines.
+///
+/// The transport adaptor publishes onto an `mqtt:` or `webhook:` channel in
+/// the shape it read off the entry, and a reload does not pause it: a payload
+/// already past that decision stores a non-text body on a channel the commit
+/// has just made text-only. A restart stops the adaptor first. Widening needs
+/// no rule: a wrapped message in flight lands as text, which any channel holds.
+pub(crate) fn ingress_narrowings_under_their_transport(delta: &PlanDelta) -> Vec<String> {
+    text_only_narrowings(delta)
+        .filter(|change| {
+            matches!(
+                ChannelScheme::of(&change.new.address),
+                Some(ChannelScheme::Mqtt | ChannelScheme::Webhook)
+            )
+        })
+        .map(|change| {
+            format!(
+                "{} is changed to text-only but its transport publishes onto it and a \
+                 reload does not pause it: {NEEDS_RESTART}",
+                change.new.address,
+            )
+        })
+        .collect()
+}
+
 /// Every channel change this delta makes from `non_text` to text-only: the
 /// changes the reload's text-only rules judge, each against its own writers.
 fn text_only_narrowings(delta: &PlanDelta) -> impl Iterator<Item = &ChannelChange> {
@@ -2891,6 +2917,110 @@ mod tests {
                     .to_string(),
             ],
         );
+    }
+
+    /// `webhook:gh-events` with a tuning block, raw or wrapped.
+    fn webhook_tuned(non_text: bool) -> BrennConfig {
+        let mut config = BrennConfig::default();
+        config.channels.push(surface_index_channel());
+        let mut endpoint = webhook_endpoint_raw("gh-events");
+        // Within the default body cap, as a raw endpoint's ceiling must be.
+        endpoint.transport_ceiling_bytes = 65_536;
+        config.webhook_endpoints = vec![endpoint];
+        let mut tuning = durable("webhook:gh-events", "", 4, None);
+        tuning.uuid = None;
+        tuning.non_text = non_text;
+        config.channels.push(tuning);
+        config
+    }
+
+    /// Narrowing an ingress channel is refused whoever subscribes to it: the
+    /// transport keeps publishing through the commit. Widening is not.
+    #[test]
+    fn an_ingress_narrowing_is_refused() {
+        let narrowed = delta_between(&webhook_tuned(true), &webhook_tuned(false), "aa", "aa");
+        assert_eq!(
+            ingress_narrowings_under_their_transport(&narrowed),
+            vec![
+                "webhook:gh-events is changed to text-only but its transport publishes onto \
+                 it and a reload does not pause it: this change needs a restart"
+                    .to_string(),
+            ],
+        );
+        let widened = delta_between(&webhook_tuned(false), &webhook_tuned(true), "aa", "aa");
+        assert_eq!(addresses_changed(&widened), vec!["webhook:gh-events"]);
+        assert!(ingress_narrowings_under_their_transport(&widened).is_empty());
+        let declared = delta_between(&work_declared(true), &work_declared(false), "aa", "aa");
+        assert!(
+            ingress_narrowings_under_their_transport(&declared).is_empty(),
+            "a declared channel's narrowing is judged by its own writers' rules",
+        );
+    }
+
+    /// A static `mqtt:` channel minted by a consumer subscription, under a raw
+    /// tuning block stating `untyped_content_type` or not.
+    fn mqtt_raw_tuned(untyped_content_type: Option<&str>) -> BrennConfig {
+        let mut config = base();
+        config
+            .mqtt_clients
+            .push(brenn_messaging_boot::test_fixtures::minimal_mqtt_client(
+                "ha",
+            ));
+        let mut listener = consumer("listener", &[]);
+        listener.subscriptions = vec![brenn_lib::messaging::config::WasmConsumerSubscriptionRaw {
+            channel: Some("mqtt:ha:cam/+/frame".to_string()),
+            port: "in".to_string(),
+            push_depth: Some(Depth::Bounded(4)),
+            retain_depth: Some(Depth::Bounded(4)),
+            noise: None,
+            wake_min: None,
+            amplification: None,
+            non_text: true,
+        }];
+        listener.mqtt_subscribe_acl = vec![brenn_lib::access::raw::MqttSubMatcherRaw {
+            client: "ha".to_string(),
+            topic_filter: "cam/#".to_string(),
+        }];
+        config.wasm_consumers = vec![listener];
+        let mut tuning = ChannelConfigRaw {
+            address: None,
+            address_prefix: Some("mqtt:ha:cam/".to_string()),
+            ..durable("unused", "", 4, None)
+        };
+        tuning.uuid = None;
+        tuning.non_text = true;
+        tuning.untyped_content_type = untyped_content_type.map(str::to_string);
+        config.channels.push(tuning);
+        config
+    }
+
+    /// The declared type is part of the resolved channel, so changing it alone
+    /// moves the channel and the subscriber rules judge it.
+    #[test]
+    fn a_changed_untyped_content_type_moves_the_channel() {
+        let delta = delta_between(
+            &mqtt_raw_tuned(None),
+            &mqtt_raw_tuned(Some("application/octet-stream")),
+            "aa",
+            "aa",
+        );
+        assert_eq!(addresses_changed(&delta), vec!["mqtt:ha:cam/+/frame"]);
+        let [change] = delta.channels_changed.as_slice() else {
+            panic!("one changed entry");
+        };
+        assert_eq!(
+            change.new.resolved_channel.untyped_content_type.as_deref(),
+            Some("application/octet-stream"),
+        );
+        assert!(ingress_narrowings_under_their_transport(&delta).is_empty());
+    }
+
+    fn addresses_changed(delta: &PlanDelta) -> Vec<&str> {
+        delta
+            .channels_changed
+            .iter()
+            .map(|change| change.new.address.as_str())
+            .collect()
     }
 
     /// An ephemeral channel's flip is not refused: its ring leaves with the old

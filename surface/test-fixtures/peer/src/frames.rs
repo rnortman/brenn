@@ -69,6 +69,7 @@ pub fn row(channel: &str, body: &str, seq: u64, id: u128) -> DeliverRow {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Ephemeral,
+            transport: None,
         },
         seq,
         cursor: serde_json::from_value(serde_json::Value::String(format!("c{seq}")))

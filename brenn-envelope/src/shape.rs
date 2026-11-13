@@ -14,7 +14,7 @@ use std::marker::PhantomData;
 use serde::ser::{Error as _, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{ChannelScheme, Impetus, MessageBody, MessageEnvelope, Urgency};
+use crate::{ChannelScheme, Impetus, MessageBody, MessageEnvelope, TransportMeta, Urgency};
 
 /// The entries a contract writes at the body's position.
 pub trait BodyShape {
@@ -59,10 +59,11 @@ impl<B: BodyShape> Serialize for ShapedEnvelope<'_, B> {
             impetus,
             urgency,
             envelope_type,
+            transport,
         } = self.envelope;
         // Every field, plus one for a shape that writes a second body entry;
         // a length hint only, which JSON ignores.
-        let mut out = serializer.serialize_struct("MessageEnvelope", 13)?;
+        let mut out = serializer.serialize_struct("MessageEnvelope", 14)?;
         out.serialize_field("message_id", message_id)?;
         out.serialize_field("source", source)?;
         out.serialize_field("channel", channel)?;
@@ -75,6 +76,7 @@ impl<B: BodyShape> Serialize for ShapedEnvelope<'_, B> {
         optional_field(&mut out, "impetus", impetus)?;
         out.serialize_field("urgency", urgency)?;
         out.serialize_field("envelope_type", envelope_type)?;
+        optional_field(&mut out, "transport", transport)?;
         out.end()
     }
 }
@@ -162,10 +164,11 @@ impl MessageEnvelope {
     ///
     /// A non-text body reaching a string carrier is a host bug. Every publish
     /// path for non-text bodies — a 0.2.0 component on the backend or on a
-    /// page, a remote daemon on attach v5 — admits one only onto a channel
-    /// declared to carry it, and every string carrier is refused on such a
-    /// channel when it is bound: a 0.1.0 component at boot and at reload on
-    /// the backend and on a page, an attach v4 session at subscribe. A change
+    /// page, a remote daemon on attach v5, a transport adaptor in the raw
+    /// ingress shape — admits one only onto a channel declared to carry it,
+    /// and every string carrier is refused on such a channel when it is bound:
+    /// a 0.1.0 component at boot and at reload on the backend and on a page,
+    /// an attach v4 session at subscribe. A change
     /// that opens another publish path must keep the same two rules in the
     /// same change; otherwise this panic becomes reachable by a guest.
     ///
@@ -210,6 +213,7 @@ struct TextShapeIn {
     impetus: Option<Impetus>,
     urgency: Urgency,
     envelope_type: ChannelScheme,
+    transport: Option<TransportMeta>,
 }
 
 fn refuse_content_type<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
@@ -240,6 +244,7 @@ impl<'de> Deserialize<'de> for MessageEnvelope {
             impetus: w.impetus,
             urgency: w.urgency,
             envelope_type: w.envelope_type,
+            transport: w.transport,
         })
     }
 }
@@ -269,6 +274,7 @@ pub struct EnvelopeHeader {
     impetus: Option<Impetus>,
     urgency: Urgency,
     envelope_type: ChannelScheme,
+    transport: Option<TransportMeta>,
 }
 
 impl MessageEnvelope {
@@ -289,6 +295,7 @@ impl MessageEnvelope {
             impetus,
             urgency,
             envelope_type,
+            transport,
         } = self;
         EnvelopeHeader {
             message_id: *message_id,
@@ -302,6 +309,7 @@ impl MessageEnvelope {
             impetus: *impetus,
             urgency: *urgency,
             envelope_type: *envelope_type,
+            transport: transport.clone(),
         }
     }
 
@@ -319,6 +327,7 @@ impl MessageEnvelope {
             impetus,
             urgency,
             envelope_type,
+            transport,
         } = header;
         MessageEnvelope {
             message_id,
@@ -333,6 +342,7 @@ impl MessageEnvelope {
             impetus,
             urgency,
             envelope_type,
+            transport,
         }
     }
 }
@@ -358,6 +368,7 @@ mod tests {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Brenn,
+            transport: None,
         }
     }
 
@@ -448,6 +459,7 @@ mod tests {
             impetus: Some(Impetus::Replenish),
             urgency: Urgency::High,
             envelope_type: ChannelScheme::Ephemeral,
+            transport: None,
         };
         let parsed: MessageEnvelope = serde_json::from_str(&env.to_envelope_json()).unwrap();
         assert_eq!(parsed, env);
@@ -520,6 +532,7 @@ mod tests {
             impetus: Some(Impetus::Replenish),
             urgency: Urgency::High,
             envelope_type: ChannelScheme::Ephemeral,
+            transport: None,
         }
     }
 
@@ -583,5 +596,111 @@ mod tests {
     )]
     fn require_text_body_panics_naming_the_message() {
         envelope(binary()).require_text_body("test carrier");
+    }
+
+    fn mqtt_transport() -> TransportMeta {
+        TransportMeta::Mqtt(crate::MqttTransport {
+            client_slug: "broker".to_string(),
+            topic: "cam/front".to_string(),
+            qos: 1,
+            received_at: DateTime::<Utc>::from_timestamp(1_700_000_001, 0).unwrap(),
+        })
+    }
+
+    fn webhook_transport() -> TransportMeta {
+        TransportMeta::Webhook(crate::WebhookTransport {
+            headers: vec![
+                (
+                    "content-type".to_string(),
+                    "application/octet-stream".to_string(),
+                ),
+                ("authorization".to_string(), "[redacted]".to_string()),
+            ],
+            key_id: "k1".to_string(),
+            client_ip: "192.0.2.7".to_string(),
+            received_at: DateTime::<Utc>::from_timestamp(1_700_000_002, 0).unwrap(),
+            endpoint_slug: "scanner".to_string(),
+        })
+    }
+
+    fn with_transport(body: MessageBody, transport: TransportMeta) -> MessageEnvelope {
+        let mut env = envelope(body);
+        env.channel = "mqtt:broker:cam/front".to_string();
+        env.envelope_type = transport.scheme();
+        env.transport = Some(transport);
+        env
+    }
+
+    /// The key follows `envelope_type` in the header, pinned literally.
+    #[test]
+    fn the_header_carries_transport_after_envelope_type() {
+        let env = with_transport(binary(), mqtt_transport());
+        assert_eq!(
+            env.to_header_json(),
+            concat!(
+                r#"{"message_id":"00000000-0000-0000-0000-000000000000","source":"src","#,
+                r#""channel":"mqtt:broker:cam/front","sender":"alice","#,
+                r#""publish_ts":"2023-11-14T22:13:20Z","urgency":"normal","#,
+                r#""envelope_type":"mqtt","transport":{"mqtt":{"client_slug":"broker","#,
+                r#""topic":"cam/front","qos":1,"received_at":"2023-11-14T22:13:21Z"}}}"#
+            )
+        );
+    }
+
+    /// The text shape carries the key too, and reads it back.
+    #[test]
+    fn the_text_shape_carries_and_reads_back_transport() {
+        for transport in [mqtt_transport(), webhook_transport()] {
+            let env = with_transport(MessageBody::text("{\"on\":true}"), transport.clone());
+            let text = env.to_envelope_json();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["transport"], serde_json::to_value(&transport).unwrap());
+            let parsed: MessageEnvelope = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed, env);
+        }
+    }
+
+    /// An envelope rebuilt from its header keeps the key, whatever the body.
+    #[test]
+    fn transport_round_trips_through_header_and_from_header() {
+        let typed = MessageBody::from_parts(Some("application/json"), b"{}").unwrap();
+        for env in [
+            with_transport(binary(), mqtt_transport()),
+            with_transport(typed, webhook_transport()),
+        ] {
+            let header: EnvelopeHeader = serde_json::from_str(&env.to_header_json()).unwrap();
+            assert_eq!(header, env.header());
+            assert_eq!(MessageEnvelope::from_header(header, env.body.clone()), env);
+        }
+    }
+
+    /// Absent, the key is absent from every shape and reads back as `None`.
+    #[test]
+    fn an_envelope_without_transport_has_no_key_and_reads_none() {
+        let env = envelope(MessageBody::text("x"));
+        for json in [env.to_header_json(), env.to_envelope_json()] {
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(v.get("transport").is_none(), "{json}");
+        }
+        let header: EnvelopeHeader = serde_json::from_str(&env.to_header_json()).unwrap();
+        assert_eq!(
+            MessageEnvelope::from_header(header, env.body.clone()).transport,
+            None
+        );
+        let parsed: MessageEnvelope = serde_json::from_str(&env.to_envelope_json()).unwrap();
+        assert_eq!(parsed.transport, None);
+    }
+
+    /// A transport the reader does not know is refused, as an unknown
+    /// `envelope_type` is.
+    #[test]
+    fn a_header_naming_an_unknown_transport_is_refused() {
+        let env = with_transport(binary(), mqtt_transport());
+        let mut v: serde_json::Value = serde_json::from_str(&env.to_header_json()).unwrap();
+        v["transport"] = json!({"coap": {"path": "/x"}});
+        let err = serde_json::from_value::<EnvelopeHeader>(v.clone()).unwrap_err();
+        assert!(err.to_string().contains("coap"), "{err}");
+        v["body"] = json!("x");
+        assert!(serde_json::from_value::<MessageEnvelope>(v).is_err());
     }
 }

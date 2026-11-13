@@ -36,7 +36,9 @@ pub use connection::{
     ArrivingFilters, register_and_spawn, spawn_client_supervisor, union_subscriptions,
 };
 pub use egress::{MqttEgressError, SendBudget, enforce_and_publish};
-pub use payload::{InboundPayload, OutboundPayload, classify_inbound, decode_outbound_body};
+pub use payload::{
+    InboundClass, InboundPayload, OutboundPayload, classify_inbound, decode_outbound_body,
+};
 pub use service::{
     IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService,
 };

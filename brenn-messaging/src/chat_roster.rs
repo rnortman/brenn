@@ -68,6 +68,7 @@ pub fn chat_roster_entry(
             sink: defaults.default_sink,
             wake_min: defaults.default_wake_min,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: Vec::new(),
         transport_type: ChannelScheme::Brenn,

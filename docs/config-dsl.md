@@ -981,6 +981,13 @@ channel bar_layout at "brenn:bar-layout" {
 }
 
 channel at prefix "mqtt:broker:alice/" { push_depth = 4; retain_depth = 16; }
+channel at prefix "mqtt:broker:cam/" {
+  push_depth = 1;
+  retain_depth = 16;
+  standing_retain_depth = 16;
+  non_text = true;
+  untyped_content_type = "application/octet-stream";
+}
 ```
 
 The first **declares** a channel and binds a handle to it: `bar_layout` is now a
@@ -1023,8 +1030,23 @@ whole retention story.
 channel frames at "ephemeral:cam.frames" { non_text = true; retain_depth = 4; }
 ```
 
-Only a declaration states it: a tuning block is refused for it, because every
-system-minted family is text-only. A channel declared `non_text` may not be
+A tuning block states it only in the `mqtt:` and `webhook:` families, where
+it selects the raw ingress shape: the transport's payload is the body, typed,
+and its metadata is the envelope's `transport` key, instead of the wrapper JSON
+as untyped text (`docs/message-bus.md` §2.7.1). Every other system-minted
+family is text-only, and a tuning block there is refused for it.
+
+`untyped_content_type = "<media type>"` types an MQTT payload the broker
+delivers with no Content-Type: legal only on an `mqtt:` tuning block that also
+states `non_text = true`, refused on a declaration and on any other family, its
+value a media type the bus accepts (at most 255 bytes). The publisher's own
+Content-Type wins when there is one; the word never looks at the payload's
+bytes. Without it, an untyped payload is untyped text and one that is not UTF-8
+is dropped — so a publisher on MQTT 3.1.1, or one that sets no Content-Type,
+needs it to deliver binary. The `mqtt:broker:cam/` block above is such a raw
+channel.
+
+A `non_text` channel may not be
 bound by a component built against the string contract
 `brenn:processor@0.1.0` — the component's load is refused at boot and at
 reload, naming the port and the channel; a surface instance's kind is judged
@@ -1945,6 +1967,17 @@ Five more declarations, each a body of attrs:
   `component = "replay-generic";` — and, unlike a consumer's, that name is
   anchored by no import: a replay component ships no module, so a typo surfaces
   at boot rather than at compile.
+
+  An endpoint whose `webhook:<slug>` channel a tuning block makes raw
+  (`non_text = true`) delivers the request body itself, typed with the
+  endpoint's content type (normalized, without parameters). Such an endpoint
+  states a `transport_ceiling_bytes` within `messaging { max_body_bytes }` —
+  the default ceiling, 1 MiB, is over the default cap of 64 KiB — and a content
+  type the bus accepts; config-check, boot and reload refuse it otherwise. A
+  text content type (`application/json`, the default, or `text/*`) still
+  requires a UTF-8 body; a non-text one such as `application/octet-stream`
+  takes any bytes. A declared parameter is dropped, not applied, so one that
+  would make the type non-text (`text/csv; charset=windows-1252`) is refused.
 - `mqtt_client <name> { … }` — a broker connection; `mqtt:<client>:<topic>`
   addresses name channels through it.
 - `repo <name> { remote = …; }` — a git remote plus a slug, mounted by whichever

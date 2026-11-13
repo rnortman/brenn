@@ -3903,20 +3903,10 @@ brenn-lib/src/wasm_package.rs, at `PackageRecord`.
 
 ## `guest-envelope-accessors`
 
-`brenn-guest` ships half of the reads a backend consumer actually makes, and an
-out-of-tree consumer restates the other half privately against brenn's own
+`brenn-guest` exposes a port window only as its two halves, and an
+out-of-tree consumer restates the join privately against brenn's own
 contract.
 
-- **MQTT body.** `MessageEnvelopeExt` has `webhook_body()` and nothing for
-  MQTT, though `docs/message-bus.md` says a backend consumer may subscribe to
-  an MQTT input; `MqttEnvelope` and `MqttPayloadBody` are not re-exported, so
-  a consumer that reads one takes a direct dependency on `brenn-envelope` and
-  hand-matches `Text`/`Binary` to reach the text. Two accessors close it:
-  `MessageEnvelopeExt::mqtt_body()` built like `webhook_body()` (scheme guard
-  first, then the body parse), and `MqttPayloadBody::text(&self) ->
-  Option<&str>` in `brenn-envelope`, beside the enum and its trust-boundary
-  comment, with the binary-is-a-placeholder reading in its rustdoc. Re-export
-  both MQTT types from `brenn-guest` beside `WebhookEnvelope`.
 - **Whole window.** A stateless consumer rebuilds its picture from the whole
   window on every activation, context then new, oldest to newest — the WIT
   ordering guarantee. `PortWindow` holds that ordered vector but exposes only
@@ -3930,17 +3920,14 @@ contract.
   and the channel-wide-context caveat (`processor.wit`, context is
   most-recent on the channel, not a delivery log).
 
-The guest crate has no test lane of its own; `brenn-envelope` does, and
-`text()` is tested there. The window ordering wants an assertion wherever the
-guest's window construction can be exercised.
+The guest crate has no test lane of its own; the window ordering wants an
+assertion wherever the guest's window construction can be exercised.
 
-Done = a consumer reads an MQTT payload's text and its whole window in order
-through `brenn-guest` alone, with no direct `brenn-envelope` dependency and no
-private restatement of either contract.
+Done = a consumer reads its whole window in order through `brenn-guest`
+alone, with no private restatement of the contract.
 
 Code sites (`TODO(guest-envelope-accessors)`):
-brenn-wasm/components/guest/src/lib.rs, at `PortWindow` and at
-`MessageEnvelopeExt`; brenn-envelope/src/lib.rs, at `MqttPayloadBody`.
+brenn-wasm/components/guest/src/lib.rs, at `PortWindow`.
 
 
 ## `guest-alert-damping`
@@ -4292,3 +4279,60 @@ across such a reload. The `TODO(reload-grant-reaches-queued-calls)` comment
 sits where `invoke_for_llm` builds the call's context in
 `brenn-tool-registry/src/registry.rs`.
 
+
+## `mqtt-ingress-text-rule`
+
+The default MQTT ingress shape (`MqttEnvelope`) calls a payload text only when it is valid UTF-8
+and has no Content-Type or one starting with `text/`, case-sensitively (`classify_inbound`,
+`brenn-mqtt/src/payload.rs`). The bus's own rule (`is_text_content_type`,
+`brenn-envelope/src/body.rs`) also counts `application/json` and `+json` types,
+case-insensitively. So a UTF-8 JSON payload published with `Content-Type: application/json`
+reaches a default `mqtt:` channel as a placeholder with no bytes, and publishers are told to omit
+the Content-Type. Aligning the default path with the bus rule turns placeholders into
+`{"text": …}` for existing consumers of an external contract, so it was not done with the raw
+ingress shape, where the bus rule applies. Decide: align the default classification (a behaviour
+change to announce in `CHANGELOG.md`), or leave it and document the raw shape as the answer.
+Done = the default path uses the bus rule, or `docs/message-bus.md` says why it does not. Code
+site: `classify_inbound`.
+
+
+## `quality-resolved-channel-literal-fallout-recurs-per-field`
+
+Tests build `ChannelEntry` and `ResolvedChannel` by full struct literal at about a hundred sites
+across the tree (`brenn-messaging/src/query.rs`, `brenn-server/src/active_bridge/test_fixtures.rs`,
+`brenn-server/src/webhook_router.rs`, `brenn-server/src/mqtt_router.rs`,
+`brenn-server/src/routes/webhooks/inbound.rs`, `surface/`, the `brenn-lib` messaging config
+tests, …), most restating the same unbounded, silent, drop, text-only channel that
+`brenn_lib::messaging::test_support::test_channel_entry` already builds. Every field added to
+`ResolvedChannel` costs one mechanical line per site (`untyped_content_type` cost about 125),
+and the blob work's next field will cost the same. Decide which test literals must keep forcing
+a decision on each new field, as production constructors do, and move the rest onto
+`test_channel_entry` or a `ResolvedChannel` test constructor in the same module, spread with
+`..`. Done = a new `ResolvedChannel` field needs no edit outside production constructors, the
+shared test constructors and the tests that state it on purpose. Code site:
+`test_channel_entry` in `brenn-lib/src/messaging/test_support.rs`.
+
+## `webhook-replay-recorded-before-publish`
+
+A replay-protected webhook endpoint records a delivery in its replay store before the router
+publishes it: the inbound handler (`brenn-server/src/routes/webhooks/inbound.rs`) calls the
+replay component's `check` and, on an accepted verdict, only then `deliver_inbound`. Every 500
+answered after that point — an endpoint retired mid-request, a WASM owner missing from the
+channel's subscribers, an endpoint and channel of different plans during a reload's commit
+(shape, size or type mismatch on a raw channel), any other `deliver_inbound` error — leaves
+the delivery recorded and nothing published. Where the mount still answers, the sender's retry
+is refused 409 as a duplicate and raises a replay security event, which feeds fail2ban and the
+phone alert, against a sender that behaved correctly; the message is lost. The `brenn:replay`
+world exports `check` alone (`brenn-wasm/wit/replay.wit`), an external contract out-of-tree
+replay components implement, so no call releases a record today. Make a delivery count as
+seen only once it is published: release the record when the publish fails, record it after
+the publish succeeds, or hold the store's write open until the publish returns — whichever
+the replay contract allows without opening a real replay window for two concurrent copies of
+one delivery. Done = a correctly signed retry after a post-replay-check 500 is never refused
+as a replay duplicate and raises no replay security event: it meets the answer a first
+attempt would meet at that moment, and is published exactly once when that answer is
+success. Tests: one for the reload-mismatch path, where the retry after the reload is
+accepted and published once; one for an error that persists, a WASM owner missing from the
+channel's subscribers, where the retry is answered 500 again and not 409.
+`docs/message-bus.md` §2.7.1 then drops the sentence describing the loss. Code sites: the
+replay check and the `deliver_inbound` call in the inbound handler.

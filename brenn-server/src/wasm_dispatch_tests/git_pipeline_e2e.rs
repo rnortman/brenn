@@ -142,6 +142,7 @@ fn webhook_channel(endpoint_slug: &str) -> ChannelEntry {
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(PARSER_SLUG.to_string()),

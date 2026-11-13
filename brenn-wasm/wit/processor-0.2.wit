@@ -80,6 +80,10 @@ interface bus {
         /// The canonical envelope as JSON, without its body: an OPEN object.
         /// Keys are added over time; a guest MUST ignore a key it does not
         /// know. Its `envelope_type` is an open string set, as under 0.1.0.
+        /// Its `transport` key is present on a message a transport adaptor
+        /// published in the raw ingress shape, whose body is the transport's
+        /// payload: an object with one member named for the transport, `mqtt`
+        /// or `webhook`, holding that transport's metadata.
         header: string,
         /// The message body, byte-exact, with the content type it was
         /// published with.

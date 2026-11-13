@@ -261,6 +261,7 @@ mod tests {
                 sink: Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![brenn_lib::messaging::SubscriberEntry {
                 kind: brenn_lib::messaging::SubscriberEntryKind::App(APP.to_string()),

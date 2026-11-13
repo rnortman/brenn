@@ -16,6 +16,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 
+use brenn_lib::messaging::is_text_content_type;
 use brenn_lib::util::{hmac_sha256_parts_verify, hmac_sha256_verify};
 use brenn_lib::webhook::config::ResolvedWebhookEndpoint;
 use brenn_lib::webhook::is_valid_key_id;
@@ -51,6 +52,42 @@ pub enum WebhookRejection {
     TimestampOutOfWindow,
 }
 
+/// The shape a request's channel publishes in, which decides what the body
+/// must be before it is authenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressShape {
+    /// The body is carried as text inside a `WebhookEnvelope`; it must be UTF-8.
+    Wrapped,
+    /// The body is the bus body, typed with the endpoint's content type; it
+    /// must be UTF-8 only when that type is a text type.
+    Raw,
+}
+
+/// A verified request body, in the shape it was verified for. Either way the
+/// bytes are the ones that were signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedBody {
+    Wrapped(String),
+    Raw(Bytes),
+}
+
+impl VerifiedBody {
+    /// The body's bytes as received.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Wrapped(text) => text.as_bytes(),
+            Self::Raw(bytes) => bytes,
+        }
+    }
+
+    pub fn shape(&self) -> IngressShape {
+        match self {
+            Self::Wrapped(_) => IngressShape::Wrapped,
+            Self::Raw(_) => IngressShape::Raw,
+        }
+    }
+}
+
 /// Success payload from `verify_request`.
 #[derive(Debug)]
 pub struct VerifiedRequest {
@@ -58,8 +95,7 @@ pub struct VerifiedRequest {
     /// Single-key/single-token endpoints with no id-header configured yield
     /// the lone configured id.
     pub key_id: String,
-    /// Raw body as UTF-8 string. Same bytes that were signed.
-    pub body: String,
+    pub body: VerifiedBody,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,15 +271,18 @@ fn resolve_token<'a>(
 /// Steps:
 ///
 /// 1. Content-Type check (415 on mismatch).
-/// 2. UTF-8 check on body (400 on failure).
-/// 3. Scheme-dispatched auth (401 variants; all failure modes in `WebhookRejection`).
+/// 2. UTF-8 check on body (400 on failure): always for `Wrapped`; for `Raw`
+///    only when the endpoint's content type is a text type.
+/// 3. Scheme-dispatched auth over the bytes as received (401 variants; all
+///    failure modes in `WebhookRejection`).
 ///
 /// On success returns a `VerifiedRequest` with the matched trust-anchor
-/// identifier and the raw body as UTF-8.
+/// identifier and the body in `shape`.
 ///
 /// `now` is injected for testability; production callers pass `SystemTime::now()`.
 pub fn verify_request(
     endpoint: &ResolvedWebhookEndpoint,
+    shape: IngressShape,
     content_type: Option<&HeaderValue>,
     headers: &HeaderMap,
     body: Bytes,
@@ -253,7 +292,24 @@ pub fn verify_request(
     check_content_type(content_type, &endpoint.content_type)?;
 
     // Step 2: UTF-8 check.
-    let body_str = std::str::from_utf8(&body).map_err(|_| WebhookRejection::BodyNotUtf8)?;
+    // `wrapped_text` is the wrapped shape's body text; `None` for raw.
+    let wrapped_text = match shape {
+        IngressShape::Wrapped => {
+            Some(std::str::from_utf8(&body).map_err(|_| WebhookRejection::BodyNotUtf8)?)
+        }
+        IngressShape::Raw => {
+            if is_text_content_type(Some(&endpoint.content_type))
+                && std::str::from_utf8(&body).is_err()
+            {
+                return Err(WebhookRejection::BodyNotUtf8);
+            }
+            None
+        }
+    };
+    let verified_body = || match wrapped_text {
+        Some(text) => VerifiedBody::Wrapped(text.to_owned()),
+        None => VerifiedBody::Raw(body.clone()),
+    };
 
     match &endpoint.scheme {
         // ------------------------------------------------------------------
@@ -286,7 +342,7 @@ pub fn verify_request(
             } else {
                 Ok(VerifiedRequest {
                     key_id: kr.resolved_id,
-                    body: body_str.to_string(),
+                    body: verified_body(),
                 })
             }
         }
@@ -370,7 +426,7 @@ pub fn verify_request(
             } else {
                 Ok(VerifiedRequest {
                     key_id: kr.resolved_id,
-                    body: body_str.to_string(),
+                    body: verified_body(),
                 })
             }
         }
@@ -435,7 +491,7 @@ pub fn verify_request(
             } else {
                 Ok(VerifiedRequest {
                     key_id: kr.resolved_id,
-                    body: body_str.to_string(),
+                    body: verified_body(),
                 })
             }
         }
@@ -472,7 +528,7 @@ pub fn verify_request(
             } else {
                 Ok(VerifiedRequest {
                     key_id: kr.resolved_id,
-                    body: body_str.to_string(),
+                    body: verified_body(),
                 })
             }
         }
@@ -718,7 +774,14 @@ mod tests {
         let ct: HeaderValue = "text/plain".parse().unwrap();
         let headers = HeaderMap::new();
         let body = Bytes::from(b"{}".as_ref());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(result.unwrap_err(), WebhookRejection::WrongContentType);
     }
 
@@ -727,7 +790,14 @@ mod tests {
         let ep = make_hmac_raw_body_endpoint("k1", b"secret", HexFormat::Hex, None);
         let headers = HeaderMap::new();
         let body = Bytes::from(b"{}".as_ref());
-        let result = verify_request(&ep, None, &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            None,
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(result.unwrap_err(), WebhookRejection::WrongContentType);
     }
 
@@ -740,7 +810,14 @@ mod tests {
         let mac = hmac_sha256(b"secret", &body);
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::Hex, &mac).parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert!(result.is_ok(), "{:?}", result.unwrap_err());
     }
 
@@ -756,7 +833,80 @@ mod tests {
         let mac = hmac_sha256(b"secret", &body);
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::Hex, &mac).parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
+        assert_eq!(result.unwrap_err(), WebhookRejection::BodyNotUtf8);
+    }
+
+    /// A raw endpoint whose content type is not a text type takes any bytes,
+    /// authenticated over the bytes as received.
+    #[test]
+    fn raw_non_text_endpoint_accepts_non_utf8_body() {
+        let mut ep = make_hmac_raw_body_endpoint("k1", b"secret", HexFormat::Hex, None);
+        ep.content_type = "application/octet-stream".to_string();
+        let ct: HeaderValue = "application/octet-stream".parse().unwrap();
+        let body = Bytes::from(vec![0xff, 0x00, 0xfe]);
+        let mac = hmac_sha256(b"secret", &body);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sig", make_sig(HexFormat::Hex, &mac).parse().unwrap());
+        let vr = verify_request(
+            &ep,
+            IngressShape::Raw,
+            Some(&ct),
+            &headers,
+            body.clone(),
+            at_unix(1000),
+        )
+        .expect("a non-text raw endpoint takes any bytes");
+        assert_eq!(vr.body, VerifiedBody::Raw(body));
+        assert_eq!(vr.body.shape(), IngressShape::Raw);
+    }
+
+    /// A bad signature over the same bytes is still refused on a raw endpoint.
+    #[test]
+    fn raw_non_text_endpoint_still_authenticates() {
+        let mut ep = make_hmac_raw_body_endpoint("k1", b"secret", HexFormat::Hex, None);
+        ep.content_type = "application/octet-stream".to_string();
+        let ct: HeaderValue = "application/octet-stream".parse().unwrap();
+        let body = Bytes::from(vec![0xff, 0x00, 0xfe]);
+        let mac = hmac_sha256(b"wrong-secret", &body);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sig", make_sig(HexFormat::Hex, &mac).parse().unwrap());
+        let result = verify_request(
+            &ep,
+            IngressShape::Raw,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
+        assert_eq!(result.unwrap_err(), WebhookRejection::HmacMismatch);
+    }
+
+    /// A raw endpoint whose content type is a text type refuses a body that is
+    /// not UTF-8 before authentication, as a wrapped one does.
+    #[test]
+    fn raw_text_endpoint_refuses_non_utf8_body() {
+        let ep = make_hmac_raw_body_endpoint("k1", b"secret", HexFormat::Hex, None);
+        let ct: HeaderValue = "application/json".parse().unwrap();
+        let body = Bytes::from(vec![0xff, 0xfe]);
+        let mac = hmac_sha256(b"secret", &body);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sig", make_sig(HexFormat::Hex, &mac).parse().unwrap());
+        let result = verify_request(
+            &ep,
+            IngressShape::Raw,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(result.unwrap_err(), WebhookRejection::BodyNotUtf8);
     }
 
@@ -772,10 +922,20 @@ mod tests {
         let mac = hmac_sha256(b"mysecret", &body);
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::Hex, &mac).parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body.clone(), at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body.clone(),
+            at_unix(1000),
+        );
         let vr = result.unwrap();
         assert_eq!(vr.key_id, "k1");
-        assert_eq!(vr.body, "{\"hello\":\"world\"}");
+        assert_eq!(
+            vr.body,
+            VerifiedBody::Wrapped("{\"hello\":\"world\"}".to_string())
+        );
     }
 
     #[test]
@@ -787,7 +947,14 @@ mod tests {
         let mac = hmac_sha256(b"phonebuddy-secret", &body);
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::V1Hex, &mac).parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert!(result.is_ok());
     }
 
@@ -802,7 +969,14 @@ mod tests {
             "x-sig",
             make_sig(HexFormat::Sha256Hex, &mac).parse().unwrap(),
         );
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert!(result.is_ok());
     }
 
@@ -812,7 +986,14 @@ mod tests {
         let ct: HeaderValue = "application/json".parse().unwrap();
         let body = Bytes::from("{}");
         let headers = HeaderMap::new();
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(
             result.unwrap_err(),
             WebhookRejection::MissingOrMalformedSignatureHeader
@@ -831,7 +1012,14 @@ mod tests {
             "x-sig",
             make_sig(HexFormat::Sha256Hex, &mac).parse().unwrap(),
         );
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(
             result.unwrap_err(),
             WebhookRejection::MissingOrMalformedSignatureHeader
@@ -847,7 +1035,14 @@ mod tests {
         let mac = hmac_sha256(b"wrong-secret", &body);
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::Hex, &mac).parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(result.unwrap_err(), WebhookRejection::HmacMismatch);
     }
 
@@ -867,7 +1062,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::Hex, &mac).parse().unwrap());
         headers.insert("x-key-id", "not-a-real-key".parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(result.unwrap_err(), WebhookRejection::UnknownKeyId);
     }
 
@@ -886,7 +1088,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::Hex, &mac).parse().unwrap());
         // No x-key-id header.
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(
             result.unwrap_err(),
             WebhookRejection::MissingOrMalformedKeyIdHeader
@@ -908,7 +1117,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::Hex, &mac).parse().unwrap());
         headers.insert("x-key-id", "primary".parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         let vr = result.unwrap();
         assert_eq!(vr.key_id, "primary");
     }
@@ -933,7 +1149,14 @@ mod tests {
         // 65-character key_id — one over the allowed maximum.
         let oversized_key_id: String = "a".repeat(65);
         headers.insert("x-key-id", oversized_key_id.parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(
             result.unwrap_err(),
             WebhookRejection::MissingOrMalformedKeyIdHeader,
@@ -962,10 +1185,20 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::V0Hex, &mac).parse().unwrap());
         headers.insert("x-timestamp", t.to_string().parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body.clone(), at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body.clone(),
+            at_unix(1000),
+        );
         let vr = result.unwrap();
         assert_eq!(vr.key_id, "k1");
-        assert_eq!(vr.body, "{\"event\":\"message\"}");
+        assert_eq!(
+            vr.body,
+            VerifiedBody::Wrapped("{\"event\":\"message\"}".to_string())
+        );
     }
 
     #[test]
@@ -985,7 +1218,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::V0Hex, &mac).parse().unwrap());
         headers.insert("x-timestamp", t.to_string().parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, now);
+        let result = verify_request(&ep, IngressShape::Wrapped, Some(&ct), &headers, body, now);
         assert_eq!(result.unwrap_err(), WebhookRejection::TimestampOutOfWindow);
     }
 
@@ -998,7 +1231,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::V0Hex, &mac).parse().unwrap());
         // No x-timestamp header.
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(
             result.unwrap_err(),
             WebhookRejection::MissingOrMalformedSignatureHeader
@@ -1015,7 +1255,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-sig", make_sig(HexFormat::V0Hex, &mac).parse().unwrap());
         headers.insert("x-timestamp", t.to_string().parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(result.unwrap_err(), WebhookRejection::HmacMismatch);
     }
 
@@ -1042,10 +1289,20 @@ mod tests {
         headers.insert("x-sig", make_sig(HexFormat::V0Hex, &mac).parse().unwrap());
         headers.insert("x-timestamp", t.to_string().parse().unwrap());
         let body = Bytes::from(body_bytes.as_ref());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(t as u64));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(t as u64),
+        );
         let vr = result.expect("body-before-t verify_request should succeed");
         assert_eq!(vr.key_id, "k1");
-        assert_eq!(vr.body, std::str::from_utf8(body_bytes).unwrap());
+        assert_eq!(
+            vr.body,
+            VerifiedBody::Wrapped(std::str::from_utf8(body_bytes).unwrap().to_string())
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1070,10 +1327,20 @@ mod tests {
         let mac = hmac_sha256(b"stripe-secret", &canonical);
         let mut headers = HeaderMap::new();
         headers.insert("stripe-signature", stripe_header(t, &mac).parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body.clone(), at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body.clone(),
+            at_unix(1000),
+        );
         let vr = result.unwrap();
         assert_eq!(vr.key_id, "stripe-key");
-        assert_eq!(vr.body, "{\"type\":\"payment_intent.created\"}");
+        assert_eq!(
+            vr.body,
+            VerifiedBody::Wrapped("{\"type\":\"payment_intent.created\"}".to_string())
+        );
     }
 
     #[test]
@@ -1098,10 +1365,17 @@ mod tests {
         );
         let mut headers = HeaderMap::new();
         headers.insert("stripe-signature", hdr.parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         let vr = result.expect("multiple v1= with one correct candidate should succeed");
         assert_eq!(vr.key_id, "stripe-key");
-        assert_eq!(vr.body, "{}");
+        assert_eq!(vr.body, VerifiedBody::Wrapped("{}".to_string()));
     }
 
     #[test]
@@ -1118,7 +1392,14 @@ mod tests {
         let mac = hmac_sha256(b"stripe-secret", &canonical);
         let mut headers = HeaderMap::new();
         headers.insert("stripe-signature", stripe_header(t, &mac).parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1400));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1400),
+        );
         assert_eq!(result.unwrap_err(), WebhookRejection::TimestampOutOfWindow);
     }
 
@@ -1134,7 +1415,14 @@ mod tests {
             "stripe-signature",
             format!("v1={}", hex::encode(mac)).parse().unwrap(),
         );
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(
             result.unwrap_err(),
             WebhookRejection::MissingOrMalformedSignatureHeader
@@ -1150,7 +1438,14 @@ mod tests {
         let mac = hmac_sha256(b"wrong-secret", b"1000.{}");
         let mut headers = HeaderMap::new();
         headers.insert("stripe-signature", stripe_header(t, &mac).parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(result.unwrap_err(), WebhookRejection::HmacMismatch);
     }
 
@@ -1165,7 +1460,14 @@ mod tests {
         let body = Bytes::from("{}");
         let mut headers = HeaderMap::new();
         headers.insert("x-token", "my-super-secret-token".parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         let vr = result.unwrap();
         assert_eq!(vr.key_id, "goog");
     }
@@ -1177,7 +1479,14 @@ mod tests {
         let body = Bytes::from("{}");
         let mut headers = HeaderMap::new();
         headers.insert("x-token", "wrong-token".parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(result.unwrap_err(), WebhookRejection::HmacMismatch);
     }
 
@@ -1187,7 +1496,14 @@ mod tests {
         let ct: HeaderValue = "application/json".parse().unwrap();
         let body = Bytes::from("{}");
         let headers = HeaderMap::new();
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(
             result.unwrap_err(),
             WebhookRejection::MissingOrMalformedSignatureHeader
@@ -1202,7 +1518,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-token", "my-secret-token".parse().unwrap());
         headers.insert("x-token-id", "not-a-real-id".parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         assert_eq!(result.unwrap_err(), WebhookRejection::UnknownKeyId);
     }
 
@@ -1214,7 +1537,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-token", "my-secret-token".parse().unwrap());
         headers.insert("x-token-id", "primary".parse().unwrap());
-        let result = verify_request(&ep, Some(&ct), &headers, body, at_unix(1000));
+        let result = verify_request(
+            &ep,
+            IngressShape::Wrapped,
+            Some(&ct),
+            &headers,
+            body,
+            at_unix(1000),
+        );
         let vr = result.unwrap();
         assert_eq!(vr.key_id, "primary");
     }

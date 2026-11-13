@@ -1142,9 +1142,15 @@ vocabulary! {
         /// single document contract.
         opt doctype: V,
         /// Whether the channel may carry non-text bodies; absent is text-only.
-        /// Legal on a declaration, refused on a tuning — a system-minted family
-        /// is written and read by host code that parses text.
+        /// Legal on a declaration, and on a tuning of the `mqtt:` or `webhook:`
+        /// family, where it selects the raw ingress shape; refused on any
+        /// other tuning — those families are written and read by host code
+        /// that parses text.
         opt non_text: V,
+        /// The content type of a payload the broker delivers with none: a
+        /// media type. Legal only on an `mqtt:` tuning that states
+        /// `non_text = true`.
+        opt untyped_content_type: V,
     }
 
     /// A `surface` body's attrs.

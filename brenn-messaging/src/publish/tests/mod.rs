@@ -264,6 +264,7 @@ pub(super) async fn build_messenger_with(
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         // Subscribers populated below: pa-alice is push-enabled (Unbounded).
         subscribers: std::iter::once(SubscriberEntry {

@@ -104,7 +104,9 @@ non-text bodies (§2.1.2). The default is text-only. A declared channel states
 it in its block (`non_text = true`); an auto channel takes it from the ports
 bound to it (§2.6); a surface's page-local channel takes it from the surface
 bindings on its address, and is `non_text` when any of them says so (§2.6);
-every system-minted channel is text-only. It is a static
+a system-minted channel is text-only unless it is a `webhook:` or `mqtt:`
+ingress channel whose tuning block states `non_text = true`, which selects
+the raw ingress shape (§2.7.1). It is a static
 fact about the channel, read from configuration at every boot and never
 persisted, and it does not look at subscribers: a non-text publish to a
 text-only channel is refused at the publishing door, and a reader that can
@@ -186,7 +188,11 @@ decodes, re-encodes or guesses.
   parameters, ASCII, at most 255 bytes). It is stored and returned verbatim
   with the body, and it does not count toward the size cap.
 - **The size cap** (`max_body_bytes`) counts raw bytes, for text and non-text
-  bodies alike.
+  bodies alike. On a raw ingress channel (§2.7.1) the transport's payload is
+  the body and obeys the cap: an MQTT payload over it is dropped for that
+  channel and logged, and a raw webhook endpoint's `transport_ceiling_bytes`
+  may not exceed it. On a wrapped ingress channel the wrapper is the body and
+  the transport's own limit bounds it, as before.
 - **Search** (`search` on a query, FTS on a durable channel, substring match on
   a ring) covers text bodies only. A non-text body never matches a search and
   is returned by a query without one like any other message.
@@ -197,15 +203,20 @@ decodes, re-encodes or guesses.
 
 Who is shown the content type today:
 
-| Reader | Typed text body | Non-text body |
-|---|---|---|
-| Query API (`Messenger::query`), host code | text and type | bytes and type |
-| A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, `BrennMessageEdit`) | `"body": "…"`, then `"content_type": "…"` | `"body": {"binary": true, "content_type": "…", "size": N}` — a placeholder, never the bytes |
-| The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` |
-| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | text and type, on the backend and on a page, whether the row arrived over the page's wire or stayed on the page | bytes and type on the backend; on a page, at rest on any channel declared `non_text`, page-local or wire-bound (shown on the node rig; `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery in Chromium, and an SDK-built kind's binary state on a page-local `io` port), and in a sync call or reply |
-| 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload, on the backend and on a page |
-| Attach v4 sessions (`Deliver`, `DeferredView`), served to remotes only | bare text, **no type** | never bound: a remote's subscribe is answered `Unavailable`; left out of a deferred view |
-| Attach v5 sessions (`Deliver`, `DeferredView`): a remote's, and every surface page's | text and type | bytes and type |
+| Reader | Typed text body | Non-text body | `transport` (raw ingress) |
+|---|---|---|---|
+| Query API (`Messenger::query`), host code | text and type | bytes and type | `MessageEnvelope.transport` |
+| A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, `BrennMessageEdit`) | `"body": "…"`, then `"content_type": "…"` | `"body": {"binary": true, "content_type": "…", "size": N}` — a placeholder, never the bytes | after `envelope_type` |
+| The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` | after `envelope_type` |
+| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | text and type, on the backend and on a page, whether the row arrived over the page's wire or stayed on the page | bytes and type on the backend; on a page, at rest on any channel declared `non_text`, page-local or wire-bound (shown on the node rig; `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery in Chromium, and an SDK-built kind's binary state on a page-local `io` port), and in a sync call or reply | in the header, on the backend; no page binds an ingress channel |
+| 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload, on the backend and on a page | only on a channel narrowed back to text-only that still retains raw text messages (§2.7.1) |
+| Attach v4 sessions (`Deliver`, `DeferredView`), served to remotes only | bare text, **no type** | never bound: a remote's subscribe is answered `Unavailable`; left out of a deferred view | never: no session binds an ingress channel |
+| Attach v5 sessions (`Deliver`, `DeferredView`): a remote's, and every surface page's | text and type | bytes and type | never: no session binds an ingress channel |
+
+The last column is the one envelope key a message a transport adaptor
+published in the raw ingress shape (§2.7.1) carries beyond the others: an
+object with one member named for the transport, `{"mqtt": {…}}` or
+`{"webhook": {…}}`. Every other message has no `transport` key.
 
 The two string carriers lose a typed text body's *type*, never its content.
 They cannot carry a non-text body at all, so they are kept off every channel
@@ -238,14 +249,21 @@ on the same terms: a non-text body offered for a text-only channel is answered
 is stored. A 0.2.0 component hosted on a surface page, on the same terms, on
 page-local and wire-bound channels alike: the page's wire is attach v5 and
 carries every body with its type, and the page refuses a non-text body for a
-text-only channel to the component before anything is sent. What still cannot:
+text-only channel to the component before anything is sent. A transport
+adaptor — an MQTT client or a webhook endpoint — onto its ingress channel when
+that channel takes the raw shape (§2.7.1): the payload with the publisher's or
+endpoint's content type, judged by the rule above, and dropped (MQTT) or
+refused (webhook) when it fails it. What still cannot:
 a 0.1.0 component, a remote's attach v4 session, a conversation and every host
 door that takes a string; every body they produce is untyped text.
 
 ### 2.1.3 Limits on a remote's stream of messages
 
 At default configuration, for a remote attacher on attach v5. "Operator" names
-the setting that raises a limit; "fixed" is a compile-time constant.
+the setting that raises a limit; "fixed" is a compile-time constant. An ingress
+channel (`webhook:`, `mqtt:`) is outside this section: a remote cannot
+subscribe to one, and its subscribe to such an address ends the session as a
+protocol violation.
 
 | Limit | Default | Raised by |
 |---|---|---|
@@ -288,7 +306,8 @@ not measurements.
 evicted message, one per line. The fields are the envelope's, in its order —
 `message_id`, `source`, `channel`, `sender`, `publish_ts`, the body entries,
 whichever of `reply_to`, `delivery_deadline`, `deliver_after` and `impetus` are
-present, then `urgency` and `envelope_type`. The body entries are `body` (a JSON string) for a
+present, then `urgency`, `envelope_type`, and `transport` on a message that
+arrived in the raw ingress shape (§2.7.1). The body entries are `body` (a JSON string) for a
 text body, or `body_base64` for a non-text one, followed by `content_type` when
 the body has one. An untyped text body's line is exactly the line written
 before bodies became bytes.
@@ -297,7 +316,8 @@ before bodies became bytes.
 
 The delivery half of the path from a publisher to a 0.2.0 kind on a surface
 page: bus, attach session, websocket, page kernel, activation. Defaults;
-"fixed" is a compile-time constant.
+"fixed" is a compile-time constant. An ingress channel (`webhook:`, `mqtt:`) is
+outside this section: a surface cannot bind one (§2.1.1).
 
 | Limit | Default | Raised by |
 |---|---|---|
@@ -754,6 +774,128 @@ deleting the row and folding the static entry in. The re-declared block keeps
 the channel's identity by construction, since a declaration derives its uuid
 from its address; a `uuid_pins` entry that moves it is refused, because the
 address still belongs to the stored row the dormant subscription names.
+
+### 2.7.1 The two ingress shapes
+
+A `webhook:` or `mqtt:` channel takes what its transport receives in one of two
+shapes. Which one is a fact of the channel, read from configuration: a tuning
+block — exact or prefix — stating `non_text = true` makes the channel *raw*;
+without it the channel is *wrapped*. No subscriber and no message selects the
+shape, and the adaptor reads it from the channel entry it publishes on.
+
+```
+channel at prefix "mqtt:broker:cam/" { push_depth = 1; retain_depth = 16; standing_retain_depth = 16; non_text = true; untyped_content_type = "application/octet-stream"; }
+channel at "webhook:scanner"        { push_depth = 1; retain_depth = 100; standing_retain_depth = 100; non_text = true; }
+```
+
+**Wrapped**, the default, is the shape every ingress channel had before the
+opt-in existed, unchanged. The body is the transport's wrapper JSON —
+`MqttEnvelope` or `WebhookEnvelope` — as untyped text, and the message has no
+`transport` key. An MQTT payload that is not text is a placeholder inside the
+wrapper and its bytes reach no channel; a webhook body must be UTF-8 or the
+request is refused before authentication.
+
+**Raw.** The body is the payload itself, byte-exact, with a content type, and
+the message carries the transport's metadata in the envelope's `transport` key
+(§2.1.2):
+
+- MQTT: `{"mqtt": {"client_slug", "topic", "qos", "received_at"}}` — the
+  client, the topic the message was actually published on, the delivery QoS
+  and the host's receive time; the wrapper's fields less the payload.
+- Webhook: `{"webhook": {"headers", "key_id", "client_ip", "received_at",
+  "endpoint_slug"}}` — the wrapper's fields less the body: the request headers
+  with credential-bearing values replaced by `"[redacted]"` and non-UTF-8
+  values left out, the key that authenticated the request, the client address,
+  the receive time and the endpoint.
+
+A conversation reads a raw message as any other: a text body verbatim with its
+type, a non-text body as the placeholder, and the `transport` object beside
+it. A 0.2.0 component reads the bytes as the body and the metadata from the
+header; `brenn-guest`'s `mqtt_transport()` and `webhook_transport()` read it,
+and its `mqtt_body()` and `webhook_body()` read the wrapper, each refusing the
+other shape by name. A 0.1.0 component cannot bind a raw channel: boot and
+reload refuse it, as on any `non_text` channel (§2.1). The size cap applies to
+a raw body (§2.1.2).
+
+**MQTT on a raw channel.** The body's content type is the publisher's MQTT 5
+Content-Type property when the broker delivered one. A payload with none takes
+the channel's `untyped_content_type`, when the tuning block states it; without
+it, the payload is untyped text. `untyped_content_type` is legal only on an
+`mqtt:` tuning block that also states `non_text = true`, its value a media type
+the bus accepts; it never looks at the payload's bytes, it is the same for every
+message on the channel, and the message does not record whether the publisher
+or the channel stated its type. A publisher on MQTT 3.1.1, which has no
+Content-Type, or one that sets none, needs it to deliver binary: without it a
+payload that is not UTF-8 cannot be untyped text and is dropped. A channel
+declaring a non-text type makes every untyped payload non-text, even one whose
+bytes are UTF-8; text publishers on such a filter set a Content-Type, or the
+filter is split across two channels.
+
+Each payload is judged per channel. A bad one is dropped for that channel —
+one `warn` naming client, topic, channel, size and reason, nothing stored, no
+substitute type — and is still published on any other channel it matches:
+
+| Input | Outcome |
+|---|---|
+| Content-Type malformed, empty or over 255 bytes, whatever the channel declares | dropped |
+| Text Content-Type (§2.1.2's rule), payload not UTF-8 | dropped |
+| Text Content-Type, payload UTF-8 | typed text body |
+| Any other well-formed Content-Type | non-text body, byte-exact |
+| No Content-Type, channel declares none, payload UTF-8 | untyped text body |
+| No Content-Type, channel declares none, payload not UTF-8 | dropped; the log line names `untyped_content_type` |
+| No Content-Type, channel declares a non-text type | non-text body of that type, UTF-8 or not |
+| No Content-Type, channel declares a text type | text body of that type if UTF-8, else dropped |
+| Payload over `max_body_bytes` | dropped |
+
+The bus's text rule, not the wrapped shape's classification, decides text on a
+raw channel: a UTF-8 payload sent as `application/json` is a typed text body
+there, and still a placeholder on a wrapped channel. An empty payload is an
+empty body of whatever kind its typing gives.
+
+**Webhook on a raw channel.** The body is typed with the endpoint's content
+type, normalized as endpoint resolution normalizes it — no parameters from the
+sender's header, which stays in `headers`. The pre-authentication UTF-8 refusal
+(400 `{"error":"schema"}`) applies when that type is a text type by §2.1.2's
+rule, and not otherwise; the default endpoint type, `application/json`, is a
+text type, so an endpoint that takes arbitrary bytes declares a non-text type
+such as `application/octet-stream`. Authentication and the replay check run
+over the bytes as received. A raw endpoint states a `transport_ceiling_bytes`
+of at most `messaging.max_body_bytes` — the default ceiling, 1 MiB, is over the
+default cap — and its content type must be a media type the bus accepts;
+config-check, boot and reload refuse an endpoint that breaks either, so the
+existing 413 is the refusal a sender meets for a body over the cap. During a
+reload's commit an endpoint of the old document can briefly serve requests
+against the new document's channel; a request whose shape, size or type then
+does not fit the channel is answered 500 with a `warn` and nothing is stored.
+On an endpoint without replay protection the sender's retry meets the new
+endpoint. On a replay-protected endpoint the replay check has already recorded
+the delivery when the 500 is answered, so the retry is refused 409 as a
+duplicate and raises a replay security event: the message is lost, as with any
+500 answered after the replay check. A default endpoint's responses are
+unchanged on every path.
+
+**Changing a channel's shape.** Widening a channel to raw is a tuning change
+like any other: a reload applies it when every subscriber on the channel is
+moving, and otherwise needs a restart. Narrowing a raw channel back to wrapped
+is refused by a reload with `NEEDS_RESTART`, since the transport keeps
+publishing through a reload. At the restart, a channel that is text-only and
+still holds a non-text message, visible or parked, refuses the start, as a
+declared channel does (§2.1); for a system-minted address the remedy is to keep
+`non_text = true` in the tuning block or to delete the channel's stored
+messages. `untyped_content_type` changes the same way: a change to the word is a
+tuning change, and removing it together with `non_text` is a narrowing. A
+dynamic `mqtt:` channel minted by a running session takes the tuning the
+process booted with, `non_text` and `untyped_content_type` included, from its
+first message; a retune reaches it at the next restart.
+
+A shape change rewrites nothing already stored. After widening, the window
+holds wrapper messages without `transport` and raw messages with it until the
+old ones age out; a reader tells them apart by the key, and the SDK accessors
+name the other shape when asked for the wrong one. After a narrowing that the
+restart admits — only text bodies retained — a 0.1.0 component may bind the
+channel and receives raw text messages whose `envelope-json` carries
+`transport` and whose body is not a wrapper. Deleting the channel's stored
+messages starts it clean in either direction.
 
 ### 2.8 The reload pair
 

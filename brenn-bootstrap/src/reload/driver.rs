@@ -59,8 +59,9 @@ use crate::reload::agents::AgentInputs;
 use crate::reload::api_keys::api_keys_delta;
 use crate::reload::compare::non_convergible_differences;
 use crate::reload::delta::{
-    LiveFacts, PlanDelta, PlanFacts, convergibility_refusals, plan_delta,
-    text_only_flips_under_remote_publishers, text_only_flips_under_surface_publishers,
+    LiveFacts, PlanDelta, PlanFacts, convergibility_refusals,
+    ingress_narrowings_under_their_transport, plan_delta, text_only_flips_under_remote_publishers,
+    text_only_flips_under_surface_publishers,
 };
 use crate::reload::dynamic::DynamicSnapshot;
 use crate::reload::mqtt::mqtt_clients_delta;
@@ -719,6 +720,7 @@ impl ReloadDriver {
             &delta,
             &plan.remotes,
         ));
+        refusals.extend(ingress_narrowings_under_their_transport(&delta));
         refusals.extend(text_only_flips_under_surface_publishers(
             &delta,
             &self.baseline.surfaces,
@@ -5071,6 +5073,119 @@ new sifter: Demo {{
         let components = tempfile::tempdir().expect("a components root");
         install_string_package(components.path(), &staged_module(&tree));
         boot(&tree, vec![components.path().to_path_buf()]).await;
+    }
+
+    // ── A string-contract component on a raw ingress channel ─────────────
+
+    /// The system-minted ingress channel the consumer below reads.
+    const RAW_INGRESS: &str = "mqtt:broker:cam/front";
+
+    /// One MQTT client, the sink, and — when `raw` — a prefix tuning block
+    /// making every `mqtt:broker:cam/` channel `non_text`; with `consumer`,
+    /// `sifter` reading [`RAW_INGRESS`] and writing the sink. The class is the
+    /// one [`frames_consumer_document`] uses, so the same installed package
+    /// serves each document.
+    fn ingress_consumer_document(raw: bool, consumer: bool) -> String {
+        let tuning = if raw {
+            r#"channel at prefix "mqtt:broker:cam/" {
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+    non_text = true;
+}
+"#
+        } else {
+            ""
+        };
+        let instance = if consumer {
+            format!(
+                r#"new sifter: Demo {{
+    grants = [ports, calls];
+    in inbound <- "{RAW_INGRESS}" {{ push_depth = 4; }}
+    out digest -> sink;
+}}
+"#
+            )
+        } else {
+            String::new()
+        };
+        document(&format!(
+            r#"mqtt_client broker {{
+    url = "mqtts://127.0.0.1:8883";
+    qos = 1;
+}}
+channel sink at "brenn:sink" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
+{tuning}{PACKAGED}component Demo {{
+    abi = processor;
+    requires = [ports, calls];
+    in inbound;
+    out digest;
+}}
+{PACKAGED}
+{instance}"#
+        ))
+    }
+
+    /// The refusal names the consumer, its input port, the ingress channel and
+    /// the string contract.
+    fn assert_names_the_ingress_pairing(refusals: &[String]) {
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        let refusal = &refusals[0];
+        for needle in [
+            "\"sifter\"",
+            "input port \"inbound\"",
+            RAW_INGRESS,
+            "declared `non_text`",
+            "brenn:processor@0.1.0",
+        ] {
+            assert!(refusal.contains(needle), "{needle:?} in {refusal:?}");
+        }
+    }
+
+    /// A 0.1.0 consumer bound to an `mqtt:` channel a tuning block makes raw
+    /// stops the process at boot: the binding mints the channel `non_text`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic(
+        expected = "consumer \"sifter\": its input port \"inbound\" is bound to \
+                    mqtt:broker:cam/front, a channel declared `non_text`"
+    )]
+    async fn booting_a_string_contract_consumer_on_a_raw_ingress_channel_panics() {
+        let tree = Tree::holding(&ingress_consumer_document(true, true));
+        let components = tempfile::tempdir().expect("a components root");
+        install_string_package(components.path(), &staged_module(&tree));
+        boot(&tree, vec![components.path().to_path_buf()]).await;
+    }
+
+    /// The same consumer on the same channel with no tuning block boots: the
+    /// channel is wrapped, so the refusal above is the tuning's doing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_string_contract_consumer_on_a_wrapped_ingress_channel_boots() {
+        let tree = Tree::holding(&ingress_consumer_document(false, true));
+        let components = tempfile::tempdir().expect("a components root");
+        install_string_package(components.path(), &staged_module(&tree));
+        let booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        assert!(booted.driver.registry().contains_key("sifter"));
+    }
+
+    /// A 0.1.0 consumer arriving by reload on a raw ingress channel is
+    /// refused, and nothing of it is wired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_string_contract_consumer_arriving_on_a_raw_ingress_channel_is_refused() {
+        let tree = Tree::holding(&ingress_consumer_document(true, false));
+        let components = tempfile::tempdir().expect("a components root");
+        let booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        tree.write(&ingress_consumer_document(true, true));
+        install_string_package(components.path(), &staged_module(&tree));
+
+        assert_names_the_ingress_pairing(&refusals_of(&booted).await);
+        assert!(!booted.driver.registry().contains_key("sifter"));
+        let kind = SubscriberEntryKind::Wasm("sifter".to_string());
+        assert!(subscribed_anywhere(&booted.messenger, &kind).is_empty());
     }
 
     /// Holds the string-contract notice lines in `lines` to `expected`, each

@@ -249,4 +249,92 @@ mod tests {
             .push(location_consumer("fixes", &["alice"]));
         assert!(resolve_messaging_offline(&config, &[]).is_none());
     }
+
+    /// A document with one `[[webhook_endpoint]]` "scanner" declaring
+    /// `content_type` and `ceiling`, its channel tuned `non_text = true`, and
+    /// the index the document owes.
+    fn raw_webhook_document(content_type: &str, ceiling: usize) -> BrennConfig {
+        let mut config = BrennConfig::default();
+        let mut endpoint = crate::test_fixtures::webhook_endpoint_raw("scanner");
+        endpoint.content_type = content_type.to_string();
+        endpoint.transport_ceiling_bytes = ceiling;
+        config.webhook_endpoints.push(endpoint);
+        config
+            .channels
+            .push(brenn_lib::messaging::config::ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(1)),
+                retain_depth: Some(Depth::Bounded(8)),
+                standing_retain_depth: Some(Depth::Bounded(8)),
+                non_text: true,
+                ..brenn_lib::messaging::config::ChannelConfigRaw::minimal("webhook:scanner")
+            });
+        config
+            .channels
+            .push(durable_channel("brenn:surface.index", Depth::Bounded(1)));
+        config
+    }
+
+    /// A raw endpoint whose ceiling is within the body cap and whose type is a
+    /// media type passes; the parameters of its declared type are stripped as
+    /// endpoint resolution strips them.
+    #[test]
+    fn a_raw_webhook_endpoint_within_the_cap_passes() {
+        let config = raw_webhook_document("Application/Octet-Stream; x=1", 65_536);
+        resolve_messaging_offline(&config, &[]);
+    }
+
+    /// A raw endpoint whose ceiling exceeds the body cap is refused, naming both
+    /// numbers and both settings.
+    #[test]
+    #[should_panic(expected = "transport_ceiling_bytes = 65537 exceeds \
+                               messaging.max_body_bytes = 65536")]
+    fn a_raw_webhook_endpoint_over_the_cap_is_refused() {
+        let config = raw_webhook_document("application/octet-stream", 65_537);
+        resolve_messaging_offline(&config, &[]);
+    }
+
+    /// The default ceiling is over the default cap, so a raw endpoint that
+    /// leaves it is refused too.
+    #[test]
+    #[should_panic(expected = "exceeds messaging.max_body_bytes")]
+    fn a_raw_webhook_endpoint_at_the_default_ceiling_is_refused() {
+        let config = raw_webhook_document("application/octet-stream", 1024 * 1024);
+        resolve_messaging_offline(&config, &[]);
+    }
+
+    /// A raw endpoint whose content type is not a media type is refused.
+    #[test]
+    #[should_panic(expected = "content_type \"octet-stream\" cannot type a raw body")]
+    fn a_raw_webhook_endpoint_with_a_malformed_type_is_refused() {
+        let config = raw_webhook_document("octet-stream", 65_536);
+        resolve_messaging_offline(&config, &[]);
+    }
+
+    /// A raw endpoint whose declared `charset` makes its type non-text is
+    /// refused: the parameterless type every body is judged by is text.
+    #[test]
+    #[should_panic(
+        expected = "content_type \"text/csv; charset=windows-1252\" is not a text \
+                               type by its parameters"
+    )]
+    fn a_raw_webhook_endpoint_with_a_non_utf8_charset_is_refused() {
+        let config = raw_webhook_document("text/csv; charset=windows-1252", 65_536);
+        resolve_messaging_offline(&config, &[]);
+    }
+
+    /// A declared `charset=utf-8` leaves the verdict as it is and passes.
+    #[test]
+    fn a_raw_webhook_endpoint_with_a_utf8_charset_passes() {
+        let config = raw_webhook_document("text/csv; charset=utf-8", 65_536);
+        resolve_messaging_offline(&config, &[]);
+    }
+
+    /// The same endpoint on a wrapped channel is not checked: its body is the
+    /// wrapper's, bounded by the ceiling alone.
+    #[test]
+    fn a_wrapped_webhook_endpoint_is_not_held_to_the_cap() {
+        let mut config = raw_webhook_document("octet-stream", 1024 * 1024);
+        config.channels.retain(|c| !c.non_text);
+        resolve_messaging_offline(&config, &[]);
+    }
 }

@@ -235,17 +235,18 @@ struct RowEnvelope<'a> {
 }
 
 /// A row's `header`: written from the delivered envelope in the header shape,
-/// borrowing it; read as the envelope's fields.
+/// borrowing it; read as the envelope's fields, boxed so the borrowed
+/// variant does not carry the read one's size.
 enum Header<'a> {
     Out(&'a MessageEnvelope),
-    In(EnvelopeHeader),
+    In(Box<EnvelopeHeader>),
 }
 
 impl Header<'_> {
     fn into_fields(self) -> EnvelopeHeader {
         match self {
             Header::Out(envelope) => envelope.header(),
-            Header::In(header) => header,
+            Header::In(header) => *header,
         }
     }
 }
@@ -261,7 +262,7 @@ impl Serialize for Header<'_> {
 
 impl<'de> Deserialize<'de> for Header<'_> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        EnvelopeHeader::deserialize(deserializer).map(Header::In)
+        EnvelopeHeader::deserialize(deserializer).map(|header| Header::In(Box::new(header)))
     }
 }
 

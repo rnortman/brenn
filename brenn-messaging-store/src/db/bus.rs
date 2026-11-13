@@ -11,7 +11,8 @@ use super::types::PendingPushRow;
 use crate::store::OverflowEvent;
 use brenn_db::format_ts_for_db;
 use brenn_lib::messaging::{
-    BodyShape, ChannelScheme, Impetus, MessageBody, MessageEnvelope, ParticipantId, Urgency,
+    BodyShape, ChannelScheme, Impetus, MessageBody, MessageEnvelope, ParticipantId, TransportMeta,
+    Urgency,
 };
 
 // ---------------------------------------------------------------------------
@@ -30,7 +31,7 @@ pub struct InsertedMessage {
 }
 
 /// Insert a message row in a single transaction. The caller has already
-/// validated channel/sender/budget.
+/// validated channel/sender/budget. The row carries no transport metadata.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_message(
     conn: &Connection,
@@ -59,6 +60,7 @@ pub fn insert_message(
         delivery_deadline,
         deliver_after,
         impetus,
+        None,
         publish_ts_ns,
     );
     tx.commit().expect("messaging: commit tx");
@@ -69,8 +71,8 @@ pub fn insert_message(
 /// responsible for BEGIN/COMMIT (or rollback on panic via the `Transaction`
 /// Drop guard).
 ///
-/// Used by `publish_from_wasm` to batch multiple messages into one outer
-/// transaction. All other callers use `insert_message`.
+/// Used by the `Messenger`, which batches messages into one outer transaction
+/// and is the one writer of `transport`; other callers use `insert_message`.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_message_in_tx(
     tx: &rusqlite::Transaction<'_>,
@@ -84,6 +86,7 @@ pub fn insert_message_in_tx(
     delivery_deadline: Option<DateTime<Utc>>,
     deliver_after: Option<DateTime<Utc>>,
     impetus: Option<Impetus>,
+    transport: Option<&TransportMeta>,
     publish_ts_ns: i64,
 ) -> InsertedMessage {
     let now = format_ts_for_db(Utc::now());
@@ -104,8 +107,8 @@ pub fn insert_message_in_tx(
         "INSERT INTO messaging_messages
          (uuid, channel_uuid, source, sender, body, urgency, envelope_type,
           reply_to_uuid, delivery_deadline, deliver_after, publish_ts_ns, created_at,
-          retained_seq, impetus, content_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+          retained_seq, impetus, content_type, transport)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
             uuid_bytes,
             channel_bytes,
@@ -122,6 +125,7 @@ pub fn insert_message_in_tx(
             retained_seq,
             impetus.map(Impetus::as_str),
             content_type,
+            transport.map(super::transport_column),
         ],
     )
     .expect("messaging: insert message");
@@ -347,7 +351,7 @@ pub fn bus_gc_evict_channel(
             .prepare(
                 "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                         m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                        rc.address, m.impetus, m.content_type
+                        rc.address, m.impetus, m.content_type, m.transport
                  FROM messaging_messages m
                  LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
                  WHERE m.channel_uuid = ?1
@@ -380,6 +384,7 @@ pub fn bus_gc_evict_channel(
                     let publish_ts_ns: i64 = row.get(7)?;
                     let reply_to: Option<String> = row.get(8)?;
                     let impetus_str: Option<String> = row.get(9)?;
+                    let transport = super::read_transport(row, 11, message_id)?;
                     Ok((
                         message_id,
                         source,
@@ -391,6 +396,7 @@ pub fn bus_gc_evict_channel(
                         publish_ts_ns,
                         reply_to,
                         impetus_str,
+                        transport,
                     ))
                 },
             )
@@ -407,6 +413,7 @@ pub fn bus_gc_evict_channel(
                     publish_ts_ns,
                     reply_to,
                     impetus_str,
+                    transport,
                 ) = r.expect("bus_gc_evict_channel: archive SELECT row");
                 let urgency = Urgency::parse(&urgency_str).unwrap_or_else(|| {
                     panic!("bus_gc_evict_channel: invalid urgency: {urgency_str:?}")
@@ -436,6 +443,7 @@ pub fn bus_gc_evict_channel(
                     impetus,
                     urgency,
                     envelope_type: channel_envelope_type,
+                    transport,
                 }
             })
             .collect();
@@ -640,8 +648,8 @@ fn depth_limit(depth: brenn_lib::messaging::config::Depth) -> i64 {
 
 /// The one retained-window query body, shared by every retention-order read.
 ///
-/// Selects the 15 envelope columns `super::row_to_envelope` decodes (0-14) plus
-/// `m.id` (15) and `m.retained_seq` (16), newest-first, for channel `?1`.
+/// Selects the 16 envelope columns `super::row_to_envelope` decodes (0-15) plus
+/// `m.id` (16) and `m.retained_seq` (17), newest-first, for channel `?1`.
 /// `where_tail` adds predicates after the retained-set predicate; `limit_param`
 /// names the bind holding the row cap. One copy so a change to the retained-set
 /// predicate cannot land on some reads and miss others.
@@ -650,7 +658,7 @@ fn retained_window_sql(where_tail: &str, limit_param: &str) -> String {
         "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency,
                 m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
                 c.address, rc.address, m.envelope_type, m.impetus, m.content_type,
-                m.id, m.retained_seq
+                m.transport, m.id, m.retained_seq
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
@@ -669,8 +677,8 @@ fn read_retained_rows(
         .query_map(params, |row| {
             let envelope = super::row_to_envelope(row)?;
             Ok(RetainedRow {
-                id: row.get(15)?,
-                seq: row.get(16)?,
+                id: row.get(16)?,
+                seq: row.get(17)?,
                 envelope,
             })
         })
@@ -1100,8 +1108,8 @@ pub fn update_parked_message(
 /// Deserialize a `MessageEnvelope` from a row with columns:
 /// 0:uuid, 1:source, 2:sender, 3:body, 4:urgency, 5:delivery_deadline,
 /// 6:deliver_after, 7:publish_ts_ns, 8:channel_address, 9:reply_to,
-/// 10:envelope_type, 11:impetus, 12:content_type. A SELECT that carries further
-/// columns puts them after column 12.
+/// 10:envelope_type, 11:impetus, 12:content_type, 13:transport. A SELECT that
+/// carries further columns puts them after column 13.
 pub(super) fn row_to_message_envelope(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<MessageEnvelope> {
@@ -1120,6 +1128,7 @@ pub(super) fn row_to_message_envelope(
     let message_id = Uuid::from_slice(&msg_uuid_bytes)
         .unwrap_or_else(|e| panic!("messaging: row uuid malformed: {e}"));
     let body = super::read_body(row, 3, 12, message_id)?;
+    let transport = super::read_transport(row, 13, message_id)?;
     let urgency = Urgency::parse(&urgency_str)
         .unwrap_or_else(|| panic!("messaging: invalid urgency in row: {urgency_str:?}"));
     let delivery_deadline = delivery_deadline_s.map(|s| {
@@ -1150,6 +1159,7 @@ pub(super) fn row_to_message_envelope(
         impetus,
         urgency,
         envelope_type,
+        transport,
     })
 }
 
@@ -1170,7 +1180,8 @@ pub fn list_pending_messages_for_sender(
     let mut sql = String::from(
         "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                 m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                c.address, rc.address, m.envelope_type, m.impetus, m.content_type
+                c.address, rc.address, m.envelope_type, m.impetus, m.content_type,
+                m.transport
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
@@ -1208,7 +1219,8 @@ pub fn load_envelope_by_uuid(conn: &Connection, uuid: Uuid) -> Option<MessageEnv
     conn.query_row(
         "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                 m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                c.address, rc.address, m.envelope_type, m.impetus, m.content_type
+                c.address, rc.address, m.envelope_type, m.impetus, m.content_type,
+                m.transport
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid

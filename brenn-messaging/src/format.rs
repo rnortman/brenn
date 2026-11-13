@@ -180,6 +180,7 @@ mod tests {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Brenn,
+            transport: None,
         }
     }
 
@@ -346,5 +347,34 @@ mod tests {
             serde_json::from_str(text.strip_prefix(MESSAGING_SINGLE_HEADING).unwrap().trim())
                 .unwrap();
         assert_eq!(json["body"], serde_json::Value::String(forged.to_string()));
+    }
+
+    /// The transport metadata follows `envelope_type` in the conversation
+    /// shape, beside the placeholder of a non-text body.
+    #[test]
+    fn transport_metadata_follows_envelope_type() {
+        let body = MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, b'Z']).unwrap();
+        let e = MessageEnvelope {
+            channel: "mqtt:broker:cam/front".into(),
+            envelope_type: ChannelScheme::Mqtt,
+            transport: Some(crate::TransportMeta::Mqtt(crate::MqttTransport {
+                client_slug: "broker".into(),
+                topic: "cam/front".into(),
+                qos: 0,
+                received_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            })),
+            ..fixed(body)
+        };
+        let text = format_messaging_event_single(&e);
+        assert!(text.starts_with(MQTT_SINGLE_HEADING), "{text}");
+        assert!(
+            text.ends_with(concat!(
+                r#""body":{"binary":true,"content_type":"image/jpeg","size":3},"#,
+                r#""urgency":"normal","envelope_type":"mqtt","#,
+                r#""transport":{"mqtt":{"client_slug":"broker","topic":"cam/front","qos":0,"#,
+                r#""received_at":"2023-11-14T22:13:20Z"}}}"#
+            )),
+            "{text}"
+        );
     }
 }

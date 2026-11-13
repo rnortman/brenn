@@ -4,6 +4,33 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **For operators and WASM component authors: MQTT and webhook ingress can
+  carry the payload itself.** A tuning block for an `mqtt:` or `webhook:`
+  channel — exact or prefix — may now state `non_text = true`. Such a channel
+  takes the *raw* ingress shape: the body is the payload byte for byte, typed
+  with the MQTT publisher's Content-Type or the webhook endpoint's content
+  type, and the message carries the transport's metadata (client, topic, QoS
+  and receive time; or the endpoint, key id, client address, receive time and
+  headers with credentials redacted) in a new open-header key, `transport`.
+  Binary MQTT payloads and non-UTF-8 webhook bodies reach a 0.2.0 component
+  as bytes; a conversation is shown a non-text body as the usual placeholder
+  with the metadata beside it. Without the opt-in nothing changes: both
+  wrappers, `MqttEnvelope` and `WebhookEnvelope`, are byte-identical and stay
+  the default, so the opt-in is the whole compatibility story — there is no
+  dual period and no shim. An `mqtt:` tuning block that is `non_text` may also
+  state `untyped_content_type = "<media type>"`, which types payloads the
+  broker delivers with no Content-Type (MQTT 3.1.1 publishers, firmware that
+  sets none); without it an untyped payload that is not UTF-8 is dropped. A
+  raw webhook endpoint must state a `transport_ceiling_bytes` within
+  `messaging { max_body_bytes }` and a content type the bus accepts; one with
+  a non-text content type such as `application/octet-stream` accepts any
+  bytes. Narrowing a raw channel back to the default needs a restart.
+  `brenn-guest` gains `mqtt_body()`, `mqtt_transport()` and
+  `webhook_transport()` beside `webhook_body()`, which now names the raw shape
+  when handed it, and `MqttPayloadBody::text()`. The database gains a nullable
+  `transport` column on the first boot. A raw channel's stored messages are
+  not readable by an earlier build: rolling back with them stored is not
+  supported. See `docs/message-bus.md` §2.7.1 and `docs/config-dsl.md`.
 - **For WASM component authors: `brenn:processor@0.2.0` is stable, and the
   string contract `brenn:processor@0.1.0` is being removed.** The 0.2.0
   shapes (`bus`, `ports`, `calls` and the `receive` export) are now frozen:

@@ -1,6 +1,7 @@
-//! `publish_transport_ingress` tests: the webhook-ingress publish path inserts a
+//! `publish_transport_ingress` tests: the ingress publish path inserts a
 //! pending push row and signals the dispatcher without inline deliver / eager
-//! wake (R1), and panics fail-fast on a malformed `WebhookEnvelope` body.
+//! wake (R1), stores each ingress shape as its row, and panics fail-fast on
+//! every host-bug input.
 //!
 //! Production items are reached via `use super::super::*;` (directly from
 //! `publish/mod.rs`); the cross-family shared fixtures (`CountingRouter`,
@@ -29,6 +30,7 @@ use std::sync::atomic::Ordering;
 /// app with no covering policy so the gate denies it (test-2 deny variant).
 async fn build_webhook_messenger(
     cover: bool,
+    non_text: bool,
 ) -> (
     Arc<Messenger>,
     Arc<ChannelEntry>,
@@ -64,7 +66,8 @@ async fn build_webhook_messenger(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
-            non_text: false,
+            non_text,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::App("myapp".to_string()),
@@ -132,6 +135,7 @@ async fn build_webhook_messenger(
 /// covering matcher); `cover = false` denies via the Point-A gate (test-2).
 async fn build_mqtt_messenger(
     cover: bool,
+    non_text: bool,
 ) -> (
     Arc<Messenger>,
     Arc<ChannelEntry>,
@@ -166,7 +170,8 @@ async fn build_mqtt_messenger(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
-            non_text: false,
+            non_text,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::App("myapp".to_string()),
@@ -237,13 +242,13 @@ const VALID_MQTT_BODY: &str = r#"{"client_slug":"homeassistant","topic":"home/ki
 #[tokio::test]
 #[should_panic(expected = "malformed WebhookEnvelope")]
 async fn publish_transport_ingress_panics_on_malformed_envelope() {
-    let (messenger, channel, _, _) = build_webhook_messenger(true).await;
+    let (messenger, channel, _, _) = build_webhook_messenger(true, false).await;
     messenger
         .publish_transport_ingress(
             channel,
             "webhook:wh-test",
             "key1",
-            "not-valid-json-at-all".into(),
+            IngressMessage::Wrapped("not-valid-json-at-all".to_owned()),
             Urgency::Low,
         )
         .await;
@@ -266,13 +271,13 @@ async fn retained_message_count(messenger: &Arc<Messenger>) -> i64 {
 async fn publish_transport_ingress_commits_without_inline_dispatch() {
     let valid_body = r#"{"headers":[],"key_id":"k","client_ip":"1.2.3.4","received_at":"2024-01-01T00:00:00Z","body":"hi","endpoint_slug":"wh-test"}"#;
 
-    let (messenger, channel, _db, router) = build_webhook_messenger(true).await;
+    let (messenger, channel, _db, router) = build_webhook_messenger(true, false).await;
     messenger
         .publish_transport_ingress(
             channel.clone(),
             "webhook:wh-test",
             "k",
-            valid_body.into(),
+            IngressMessage::Wrapped(valid_body.to_owned()),
             Urgency::Normal,
         )
         .await;
@@ -301,13 +306,13 @@ async fn publish_transport_ingress_commits_without_inline_dispatch() {
 #[tokio::test]
 #[should_panic(expected = "malformed MqttEnvelope")]
 async fn publish_transport_ingress_panics_on_malformed_mqtt_envelope() {
-    let (messenger, channel, _, _) = build_mqtt_messenger(true).await;
+    let (messenger, channel, _, _) = build_mqtt_messenger(true, false).await;
     messenger
         .publish_transport_ingress(
             channel,
             "mqtt:homeassistant:home/+/state",
             "homeassistant",
-            "not-valid-json-at-all".into(),
+            IngressMessage::Wrapped("not-valid-json-at-all".to_owned()),
             Urgency::Low,
         )
         .await;
@@ -319,13 +324,13 @@ async fn publish_transport_ingress_panics_on_malformed_mqtt_envelope() {
 /// inline dispatch (R1).
 #[tokio::test]
 async fn publish_transport_ingress_mqtt_stores_typed_row_and_pending_push() {
-    let (messenger, channel, db, router) = build_mqtt_messenger(true).await;
+    let (messenger, channel, db, router) = build_mqtt_messenger(true, false).await;
     messenger
         .publish_transport_ingress(
             channel.clone(),
             "mqtt:homeassistant:home/+/state",
             "homeassistant",
-            VALID_MQTT_BODY.into(),
+            IngressMessage::Wrapped(VALID_MQTT_BODY.to_owned()),
             Urgency::Normal,
         )
         .await;
@@ -367,4 +372,210 @@ async fn publish_transport_ingress_mqtt_stores_typed_row_and_pending_push() {
         0,
         "publish_transport_ingress must not call deliver inline"
     );
+}
+
+/// `received_at` shared by the raw-shape fixtures.
+fn fixture_received_at() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp")
+}
+
+fn mqtt_transport() -> crate::TransportMeta {
+    crate::TransportMeta::Mqtt(crate::MqttTransport {
+        client_slug: "homeassistant".to_owned(),
+        topic: "home/kitchen/state".to_owned(),
+        qos: 1,
+        received_at: fixture_received_at(),
+    })
+}
+
+fn webhook_transport() -> crate::TransportMeta {
+    crate::TransportMeta::Webhook(crate::WebhookTransport {
+        headers: vec![("x-signature".to_owned(), "[redacted]".to_owned())],
+        key_id: "k".to_owned(),
+        client_ip: "192.0.2.1".to_owned(),
+        received_at: fixture_received_at(),
+        endpoint_slug: "wh-test".to_owned(),
+    })
+}
+
+fn octet_stream(bytes: &[u8]) -> crate::MessageBody {
+    crate::MessageBody::from_parts(Some("application/octet-stream"), bytes)
+        .expect("a well-formed non-text body")
+}
+
+/// The stored row's body bytes, content type and transport column.
+async fn stored_row(db: &brenn_db::Db) -> (Vec<u8>, Option<String>, Option<String>) {
+    let conn = db.lock().await;
+    conn.query_row(
+        "SELECT body, content_type, transport FROM messaging_messages",
+        [],
+        |r| {
+            let body: rusqlite::types::Value = r.get(0)?;
+            let body = match body {
+                rusqlite::types::Value::Blob(b) => b,
+                rusqlite::types::Value::Text(t) => t.into_bytes(),
+                other => panic!("unexpected body column {other:?}"),
+            };
+            Ok((body, r.get(1)?, r.get(2)?))
+        },
+    )
+    .expect("one stored message")
+}
+
+/// `Raw` on an `mqtt:` channel declared `non_text` stores the body byte-exact
+/// with its content type and the transport metadata.
+#[tokio::test]
+async fn raw_on_a_non_text_mqtt_channel_stores_body_type_and_transport() {
+    let (messenger, channel, db, _) = build_mqtt_messenger(true, true).await;
+    let bytes = [0u8, 0xFF, 0x10, 0x80];
+    messenger
+        .publish_transport_ingress(
+            channel,
+            "mqtt:homeassistant:home/+/state",
+            "homeassistant",
+            IngressMessage::Raw {
+                body: octet_stream(&bytes),
+                transport: mqtt_transport(),
+            },
+            Urgency::Normal,
+        )
+        .await;
+    let (body, content_type, transport) = stored_row(&db).await;
+    assert_eq!(body, bytes);
+    assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
+    let transport: crate::TransportMeta =
+        serde_json::from_str(&transport.expect("transport column set")).unwrap();
+    assert_eq!(transport, mqtt_transport());
+    assert_eq!(retained_message_count(&messenger).await, 1);
+}
+
+/// `Raw` on a `webhook:` channel declared `non_text` stores the same way.
+#[tokio::test]
+async fn raw_on_a_non_text_webhook_channel_stores_body_type_and_transport() {
+    let (messenger, channel, db, _) = build_webhook_messenger(true, true).await;
+    let bytes = [0xDEu8, 0xAD, 0xBE, 0xEF];
+    messenger
+        .publish_transport_ingress(
+            channel,
+            "webhook:wh-test",
+            "k",
+            IngressMessage::Raw {
+                body: octet_stream(&bytes),
+                transport: webhook_transport(),
+            },
+            Urgency::Normal,
+        )
+        .await;
+    let (body, content_type, transport) = stored_row(&db).await;
+    assert_eq!(body, bytes);
+    assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
+    let transport: crate::TransportMeta =
+        serde_json::from_str(&transport.expect("transport column set")).unwrap();
+    assert_eq!(transport, webhook_transport());
+}
+
+/// `Wrapped` stores the wrapper as untyped text, `transport` NULL.
+#[tokio::test]
+async fn wrapped_stores_untyped_text_with_no_transport() {
+    let (messenger, channel, db, _) = build_mqtt_messenger(true, false).await;
+    messenger
+        .publish_transport_ingress(
+            channel,
+            "mqtt:homeassistant:home/+/state",
+            "homeassistant",
+            IngressMessage::Wrapped(VALID_MQTT_BODY.to_owned()),
+            Urgency::Normal,
+        )
+        .await;
+    let (body, content_type, transport) = stored_row(&db).await;
+    assert_eq!(body, VALID_MQTT_BODY.as_bytes());
+    assert_eq!(content_type, None);
+    assert_eq!(transport, None);
+}
+
+#[tokio::test]
+#[should_panic(expected = "only Webhook and Mqtt are valid")]
+async fn ingress_on_a_brenn_channel_panics() {
+    let (messenger, channel, _, _) = build_mqtt_messenger(true, false).await;
+    let mut entry = (*channel).clone();
+    entry.transport_type = ChannelScheme::Brenn;
+    messenger
+        .publish_transport_ingress(
+            Arc::new(entry),
+            "brenn:x",
+            "homeassistant",
+            IngressMessage::Wrapped(VALID_MQTT_BODY.to_owned()),
+            Urgency::Normal,
+        )
+        .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "published the wrapped shape")]
+async fn wrapped_on_a_non_text_channel_panics() {
+    let (messenger, channel, _, _) = build_mqtt_messenger(true, true).await;
+    messenger
+        .publish_transport_ingress(
+            channel,
+            "mqtt:homeassistant:home/+/state",
+            "homeassistant",
+            IngressMessage::Wrapped(VALID_MQTT_BODY.to_owned()),
+            Urgency::Normal,
+        )
+        .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "published the raw shape")]
+async fn raw_on_a_text_only_channel_panics() {
+    let (messenger, channel, _, _) = build_mqtt_messenger(true, false).await;
+    messenger
+        .publish_transport_ingress(
+            channel,
+            "mqtt:homeassistant:home/+/state",
+            "homeassistant",
+            IngressMessage::Raw {
+                body: crate::MessageBody::text("22.5"),
+                transport: mqtt_transport(),
+            },
+            Urgency::Normal,
+        )
+        .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "transport metadata on channel")]
+async fn raw_with_another_schemes_transport_panics() {
+    let (messenger, channel, _, _) = build_mqtt_messenger(true, true).await;
+    messenger
+        .publish_transport_ingress(
+            channel,
+            "mqtt:homeassistant:home/+/state",
+            "homeassistant",
+            IngressMessage::Raw {
+                body: octet_stream(b"x"),
+                transport: webhook_transport(),
+            },
+            Urgency::Normal,
+        )
+        .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "over the")]
+async fn raw_over_the_body_cap_panics() {
+    let (messenger, channel, _, _) = build_mqtt_messenger(true, true).await;
+    let oversized = vec![0u8; messenger.max_body_bytes() + 1];
+    messenger
+        .publish_transport_ingress(
+            channel,
+            "mqtt:homeassistant:home/+/state",
+            "homeassistant",
+            IngressMessage::Raw {
+                body: octet_stream(&oversized),
+                transport: mqtt_transport(),
+            },
+            Urgency::Normal,
+        )
+        .await;
 }

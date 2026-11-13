@@ -169,6 +169,7 @@ pub(super) async fn bridge_with_messenger_for_drain_at_ceiling(
             sink: brenn_lib::messaging::config::Sink::Drop,
             wake_min: brenn_lib::messaging::WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![brenn_lib::messaging::SubscriberEntry {
             kind: brenn_lib::messaging::SubscriberEntryKind::App("testapp".to_string()),

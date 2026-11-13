@@ -31,6 +31,7 @@ fn nondurable_channel(address: &str, depth: u64) -> brenn_lib::messaging::config
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     }
 }
 
@@ -371,6 +372,7 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -508,6 +510,7 @@ async fn build_messaging_keeps_a_dynamic_subscription_on_a_chat_channel() {
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -588,6 +591,7 @@ async fn build_messaging_holds_a_dynamic_subscription_dormant_while_its_block_is
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     };
     // The block that keeps messaging up when the declared one is commented out.
     let inert_block = nondurable_channel("ephemeral:inert", 1);
@@ -731,6 +735,7 @@ async fn build_messaging_prunes_a_dynamic_subscription_when_the_channel_row_is_d
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     };
     let inert_block = nondurable_channel("ephemeral:inert", 1);
     let with_block = BrennConfig {
@@ -844,6 +849,7 @@ async fn build_messaging_does_not_reconstruct_orphan_channel() {
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -928,6 +934,7 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -1072,6 +1079,7 @@ fn config_with_one_brenn_channel(address: &str) -> (brenn_lib::config::BrennConf
                 sink: None,
                 wake_min: None,
                 non_text: false,
+                untyped_content_type: None,
             },
             surface_index_channel(),
         ],
@@ -1987,6 +1995,7 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         }],
         surfaces: vec![SurfaceConfigRaw {
             grants: vec![AttachGrant::EphemeralSubscribe],
@@ -2178,6 +2187,7 @@ async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
@@ -2265,6 +2275,7 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         }
     }
     fn sub(channel: &str, port: &str) -> WasmConsumerSubscriptionRaw {
@@ -2371,6 +2382,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
@@ -2425,6 +2437,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         impetus: None,
         urgency: brenn_lib::messaging::Urgency::Normal,
         envelope_type: brenn_lib::messaging::ChannelScheme::Local,
+        transport: None,
     });
     let window = store
         .window(&subscriber, 4, 0)
@@ -2699,6 +2712,7 @@ async fn auto_channels_list_as_their_durability_says() {
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         }],
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
@@ -2866,6 +2880,7 @@ fn warm_brenn_priming_configs(
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     };
     let channel_only = BrennConfig {
         channels: vec![channel.clone(), surface_index_channel()],
@@ -3063,6 +3078,7 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
@@ -3591,6 +3607,7 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     };
 
     // No configured surfaces ⇒ derived boot-published set is just the index.
@@ -4165,6 +4182,7 @@ async fn a_tuning_block_reaches_every_system_channel_mint_site() {
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         }
     };
     let mut config = BrennConfig {
@@ -4251,6 +4269,7 @@ async fn build_messaging_refuses_a_subscriber_above_the_channel_ceiling() {
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         }],
         ..BrennConfig::default()
     };
@@ -4342,6 +4361,7 @@ fn tuning_raw(address: &str) -> brenn_lib::messaging::config::ChannelConfigRaw {
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     }
 }
 
@@ -5075,4 +5095,147 @@ fn text_only_channels_holding_non_text_names_exactly_those() {
         "{refusals:?}"
     );
     assert!(text_only_channels_holding_non_text(&[], [&plain]).is_empty());
+}
+
+/// A system-minted channel's refusal names its tuning block as the remedy,
+/// since an operator can neither declare nor rename the address.
+#[test]
+fn a_system_channel_holding_non_text_is_told_to_state_non_text_in_its_tuning() {
+    use brenn_lib::messaging::test_support::test_channel_entry;
+
+    let mut ingress = test_channel_entry("door", vec![]);
+    ingress.address = "mqtt:broker:cam/door".to_string();
+    let refusals = text_only_channels_holding_non_text(&[ingress.uuid], [&ingress]);
+    assert_eq!(
+        refusals,
+        vec![
+            "config: channel \"mqtt:broker:cam/door\" is declared text-only, but its store \
+             holds messages whose bodies are not text; state `non_text = true` in the \
+             channel's tuning block, or delete the channel's stored messages"
+                .to_string(),
+        ],
+    );
+}
+
+/// The address of the runtime-created channel the two tests below rebuild.
+const REBUILT_MQTT_ADDRESS: &str = "mqtt:homeassistant:cam/runtime/frame";
+
+/// A restart's state for an `mqtt:` channel a runtime subscribe created: its
+/// channel row, the dynamic subscription that keeps it, and one stored message
+/// whose body is not text. The returned config omits the filter and carries
+/// `tuning`, so the channel reaches the directory only by reconstruction.
+async fn rebuilt_mqtt_channel_holding_non_text(
+    tuning: Option<brenn_lib::messaging::config::ChannelConfigRaw>,
+) -> MessagingResult {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::mqtt_channel_uuid_from_address;
+    use brenn_server::test_support::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let channel_uuid = mqtt_channel_uuid_from_address(REBUILT_MQTT_ADDRESS);
+    let static_address = "mqtt:homeassistant:home/static/state";
+    let mut config = BrennConfig {
+        mqtt_clients: vec![minimal_mqtt_client("homeassistant")],
+        apps: vec![app_raw_with_mqtt_subscription("someapp", static_address)],
+        ..BrennConfig::default()
+    };
+    config.channels.push(surface_index_channel());
+    config.channels.extend(tuning);
+    let db = init_db_memory();
+    {
+        let conn = db.lock().await;
+        let channel_entry = brenn_lib::messaging::ChannelEntry {
+            uuid: channel_uuid,
+            address: REBUILT_MQTT_ADDRESS.to_string(),
+            description: None,
+            transport_type: ChannelScheme::Mqtt,
+            resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
+                push_depth: Depth::Bounded(4),
+                retain_depth: Depth::Bounded(4),
+                standing_retain_depth: Depth::Bounded(4),
+                noise: NoiseLevel::Silent,
+                sink: brenn_lib::messaging::config::Sink::Drop,
+                wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: true,
+                untyped_content_type: None,
+            },
+            subscribers: Vec::new(),
+            mount: None,
+        };
+        brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&channel_entry));
+        conn.execute(
+            "INSERT INTO messaging_dynamic_subscriptions \
+             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
+             VALUES (?1, 'graf', '0', '4', 'silent', 'normal', 1, '2026-06-20T00:00:00Z')",
+            rusqlite::params![channel_uuid.as_bytes().to_vec()],
+        )
+        .expect("seed durable dynamic row");
+        brenn_messaging_store::db::insert_message(
+            &conn,
+            channel_uuid,
+            "mqtt:homeassistant",
+            "mqtt:homeassistant",
+            &brenn_envelope::MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, 0xff, 0x00])
+                .expect("a well-formed binary body"),
+            brenn_lib::messaging::Urgency::Normal,
+            ChannelScheme::Mqtt,
+            None,
+            None,
+            None,
+            None,
+            0,
+        );
+    }
+
+    let mut apps_map: IM<String, AppConfig> = IM::new();
+    let mut graf_app = minimal_app_config("graf", None, vec![]);
+    graf_app.policy = std::sync::Arc::new(
+        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([REBUILT_MQTT_ADDRESS]),
+    );
+    apps_map.insert("graf".to_string(), graf_app);
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    boot_messaging_with(&config, db, &apps, alert_dispatcher, "brenn://test").await
+}
+
+/// A rebuilt channel whose tuning makes it text-only while its store holds a
+/// non-text row refuses the start, as a planned channel does.
+#[tokio::test]
+#[should_panic(
+    expected = "refusing to start:\nconfig: channel \"mqtt:homeassistant:cam/runtime/frame\" is \
+                declared text-only, but its store holds messages whose bodies are not text; \
+                state `non_text = true` in the channel's tuning block"
+)]
+async fn a_rebuilt_text_only_channel_holding_non_text_refuses_the_start() {
+    rebuilt_mqtt_channel_holding_non_text(None).await;
+}
+
+/// Under a raw prefix block the same channel is rebuilt `non_text`, carrying
+/// the block's declared content type, and the start proceeds.
+#[tokio::test]
+async fn a_rebuilt_channel_under_a_raw_prefix_block_carries_its_tuning() {
+    use brenn_lib::messaging::config::ChannelConfigRaw;
+
+    let tuning = ChannelConfigRaw {
+        address: None,
+        address_prefix: Some("mqtt:homeassistant:cam/".to_string()),
+        push_depth: Some(Depth::Bounded(1)),
+        retain_depth: Some(Depth::Bounded(4)),
+        standing_retain_depth: Some(Depth::Bounded(4)),
+        non_text: true,
+        untyped_content_type: Some("application/octet-stream".to_string()),
+        ..ChannelConfigRaw::minimal("unused")
+    };
+    let result = rebuilt_mqtt_channel_holding_non_text(Some(tuning)).await;
+    let messenger = result.messenger.expect("messaging comes up");
+    let channel = messenger
+        .directory()
+        .resolve(REBUILT_MQTT_ADDRESS)
+        .expect("the runtime-created channel is rebuilt");
+    assert!(channel.resolved_channel.non_text);
+    assert_eq!(
+        channel.resolved_channel.untyped_content_type.as_deref(),
+        Some("application/octet-stream"),
+    );
 }

@@ -53,6 +53,9 @@ pub(crate) use envelope_column::EnvelopeTypeColumn;
 mod body_column;
 pub(crate) use body_column::{body_columns, read_body};
 
+mod transport_column;
+pub(crate) use transport_column::{read_transport, transport_column};
+
 mod types;
 pub use types::PendingPushRow;
 

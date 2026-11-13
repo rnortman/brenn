@@ -745,9 +745,15 @@ A bus message body is bytes with an optional content type, and is *text* or
 - **No path decodes, base64-encodes or lossily converts a body's bytes into a
   conversation's context or into markup.** `from_utf8_lossy` and its kin are
   not used on a body anywhere.
-- **The MQTT ingress placeholder** (`MqttPayloadBody::Binary`) is the same rule
-  applied at the transport edge: a broker payload that is not text arrives as
-  metadata, never as bytes.
+- **At the transport edge the same rule holds in both ingress shapes**
+  (`docs/message-bus.md` §2.7.1). On a wrapped channel, the default, a broker
+  payload that is not text arrives as metadata inside the wrapper
+  (`MqttPayloadBody::Binary`) and its bytes reach no channel. On a channel
+  whose tuning block states `non_text = true` the payload's bytes are the
+  body; a conversation is shown a non-text one as the placeholder above, with
+  the message's `transport` metadata beside it. In both shapes the topic and
+  the webhook request headers (credential values redacted) are sender-chosen
+  text that reaches a conversation's context, as they did inside the wrapper.
 
 The first producer of such bodies on the bus is a WASM component built against
 the byte-carrying contract `brenn:processor@0.2.0` (§8), publishing onto a
@@ -887,6 +893,13 @@ the code to:
   whole. The route disables the router's global limit deliberately: an endpoint
   whose ceiling is above it must serve, and a per-endpoint ceiling that some
   outer layer silently overrode would be a limit nobody could reason about.
+- **A body that is not UTF-8 is refused before authentication** — 400
+  `{"error":"schema"}` and a `SchemaViolation` event — on every default
+  endpoint, and on an endpoint whose channel takes the raw ingress shape only
+  when the endpoint's content type is a text type. A raw endpoint with a
+  non-text type accepts any bytes, and authentication runs over them as
+  received; its `transport_ceiling_bytes` may not exceed the bus's
+  `max_body_bytes`.
 
 The endpoint table is swapped by a reload rather than rebuilt, so a request
 holds the endpoint it resolved at arrival for its whole life: the scheme it was

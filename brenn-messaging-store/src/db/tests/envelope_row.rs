@@ -19,7 +19,7 @@ fn select_envelope_base_matches_prerefactor_literal() {
     // is edited without updating `row_to_envelope`'s positional contract.
     let golden = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
                   m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
-                  c.address, rc.address, m.envelope_type, m.impetus, m.content_type \
+                  c.address, rc.address, m.envelope_type, m.impetus, m.content_type, m.transport \
            FROM messaging_messages m \
            JOIN messaging_channels c ON c.uuid = m.channel_uuid \
            LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid ";

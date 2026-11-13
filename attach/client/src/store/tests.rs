@@ -34,6 +34,7 @@ fn env(body: &str) -> MessageEnvelope {
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Ephemeral,
+        transport: None,
     }
 }
 

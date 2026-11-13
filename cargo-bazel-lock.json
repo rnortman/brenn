@@ -1,5 +1,5 @@
 {
-  "checksum": "a0f2dd64107bbc8cd1f434ef5f9d3d06295291deb48092757908ab2a163037cc",
+  "checksum": "48dbf9a5b1c6c08b072d45e83b87ced0176586a325eb7fdef7525793f2bc6bc3",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -4542,6 +4542,10 @@
             {
               "id": "base64ct 1.8.3",
               "target": "base64ct"
+            },
+            {
+              "id": "bytes 1.11.1",
+              "target": "bytes"
             },
             {
               "id": "libc 0.2.186",

@@ -28,4 +28,6 @@ pub use error::WebhookError;
 pub use service::{
     EndpointRuntime, EndpointView, ReplayGuard, WebhookEventRouter, WebhookService, WebhookTable,
 };
-pub use signature::{VerifiedRequest, WebhookRejection, verify_request};
+pub use signature::{
+    IngressShape, VerifiedBody, VerifiedRequest, WebhookRejection, verify_request,
+};

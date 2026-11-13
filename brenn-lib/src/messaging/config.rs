@@ -320,9 +320,16 @@ pub struct ChannelConfigRaw {
     /// Per-`(sender, channel)` send-rate gate. `None` ⇒ inherit from global
     /// default. Class-uniform: every scheme is rate-gated.
     pub send_rate: Option<SendRate>,
-    /// Whether the channel may carry non-text bodies. Declaring role only: a
-    /// system-minted family is text-only, so a tuning block may not say so.
+    /// Whether the channel may carry non-text bodies. On a declaring block, the
+    /// declaration itself. On a tuning block, legal only for the `mqtt:` and
+    /// `webhook:` families, where it selects the raw ingress shape: the
+    /// transport's payload is the body. The other system families are written
+    /// and read by host code that parses text.
     pub non_text: bool,
+    /// The content type of a payload the broker delivers with none. Legal only
+    /// on an `mqtt:` tuning block that also states `non_text`; a well-formed
+    /// media type, as the operator wrote it.
+    pub untyped_content_type: Option<String>,
 }
 
 #[cfg(any(test, feature = "testutils"))]
@@ -357,6 +364,7 @@ impl ChannelConfigRaw {
             wake_min: None,
             send_rate: None,
             non_text: false,
+            untyped_content_type: None,
         }
     }
 }
@@ -1604,6 +1612,10 @@ pub struct ResolvedChannel {
     /// non-text body never enters it, and only a channel that says `false` may
     /// be bound by a consumer that can represent nothing but text.
     pub non_text: bool,
+    /// The content type a raw `mqtt:` channel gives a payload the broker
+    /// delivers with none. `None` on every other channel, and on a raw `mqtt:`
+    /// channel whose tuning states none: such a payload is then untyped text.
+    pub untyped_content_type: Option<String>,
 }
 
 /// Resolved millitoken budget knobs for one WASM egress sink (output port or MQTT
@@ -2159,6 +2171,7 @@ pub fn validate_subscriber_depth_ceilings(directory: &MessagingDirectory) {
 ///   `standing_retain_depth` on a durable channel
 /// - `standing_retain_depth` or `sink` on a non-durable channel
 /// - `retain_depth` of `Unbounded` on a non-durable channel
+/// - `untyped_content_type` on any declared channel
 pub fn build_channel_entries(
     raw_channels: &[ChannelConfigRaw],
     defaults: &MessagingGlobalConfig,
@@ -2184,6 +2197,12 @@ pub fn build_channel_entries(
         assert!(
             !name.is_empty(),
             "config: [[channel]] address {raw_address:?} must name a channel after its scheme",
+        );
+        assert!(
+            ch.untyped_content_type.is_none(),
+            "config: [[channel]] {raw_address:?} is a declared channel and must not set \
+             untyped_content_type — a declared channel's bodies are typed by their \
+             publishers; the word types untyped payloads on a raw mqtt: tuning",
         );
         assert!(
             name.chars().all(is_unreserved_char),
@@ -2306,6 +2325,7 @@ pub fn build_channel_entries(
             wake_min,
             send_rate,
             non_text: ch.non_text,
+            untyped_content_type: None,
         };
         assert_depths_within_standing(&resolved, &format!("[[channel]] {canonical:?}"));
 
@@ -2525,6 +2545,8 @@ struct SystemChannelTuningEntry {
     sink: Option<Sink>,
     wake_min: Option<WakeMin>,
     send_rate: Option<SendRate>,
+    non_text: bool,
+    untyped_content_type: Option<String>,
 }
 
 /// The operator's tuning table for system-minted channels, keyed by exact
@@ -2583,6 +2605,9 @@ impl SystemChannelTuning {
 /// - an exact address or prefix in the `brenn:tool-requests/` family
 /// - a duplicate exact address or a duplicate prefix
 /// - `sink = "archive"` (stated or inherited) with no `[messaging].archive_path`
+/// - `non_text` on a block outside the `mqtt:` and `webhook:` families
+/// - `untyped_content_type` on a block outside the `mqtt:` family, on one that
+///   does not also state `non_text`, or naming no well-formed media type
 pub fn build_system_channel_tuning(
     raw_channels: &[ChannelConfigRaw],
     defaults: &MessagingGlobalConfig,
@@ -2672,12 +2697,37 @@ pub fn build_system_channel_tuning(
             "config: [[channel]] {label} tunes a system-minted channel and must not set \
              description — the endpoint/tool that mints the channel owns it",
         );
+        let family = SystemChannelFamily::of_prefix(&entry_key);
         assert!(
-            !ch.non_text,
-            "config: [[channel]] {label} tunes a system-minted channel and must not set \
-             non_text — every system family is written and read by host code that parses \
-             text",
+            !ch.non_text || family == Some(SystemChannelFamily::Ingress),
+            "config: [[channel]] {label} tunes a tool or device-location channel and must \
+             not set non_text — those families are written and read by host code that \
+             parses text; non_text on an mqtt: or webhook: block selects the raw ingress \
+             shape",
         );
+        if let Some(content_type) = &ch.untyped_content_type {
+            assert!(
+                matches!(
+                    ChannelScheme::split(&entry_key),
+                    Some((ChannelScheme::Mqtt, _))
+                ),
+                "config: [[channel]] {label} sets untyped_content_type outside the mqtt: \
+                 family — a webhook: channel's body is typed by its endpoint, and the \
+                 tool and device-location families are text-only",
+            );
+            assert!(
+                ch.non_text,
+                "config: [[channel]] {label} sets untyped_content_type without \
+                 non_text = true — a wrapped mqtt: channel's body is the wrapper, so the \
+                 word would type nothing",
+            );
+            brenn_envelope::check_content_type(content_type).unwrap_or_else(|e| {
+                panic!(
+                    "config: [[channel]] {label} untyped_content_type is not a media type \
+                     the bus accepts: {e}"
+                )
+            });
+        }
 
         let stated = |key: ChannelDepthKey, value: Option<Depth>| -> Depth {
             let required = depth_required(key, ChannelBlockRole::Tuning, TUNING_DURABILITY_IGNORED);
@@ -2708,6 +2758,8 @@ pub fn build_system_channel_tuning(
             sink: ch.sink,
             wake_min: ch.wake_min,
             send_rate: ch.send_rate,
+            non_text: ch.non_text,
+            untyped_content_type: ch.untyped_content_type.clone(),
         };
         assert_rungs_within_standing(
             entry.push_depth,
@@ -2742,9 +2794,7 @@ pub fn build_system_channel_tuning(
              component's calls is the one on its `brenn:tools/<tool>` channels",
         );
         assert!(
-            !(SystemChannelFamily::of_prefix(&entry_key)
-                == Some(SystemChannelFamily::DeviceLocation)
-                && entry.send_rate.is_some()),
+            !(family == Some(SystemChannelFamily::DeviceLocation) && entry.send_rate.is_some()),
             "config: [[channel]] {label} tunes a location channel's `send_rate` — the rate \
              is the host's: a user's stop shares the bucket with that user's fixes, and a \
              stop the rate refuses is a withdrawal of sharing that is never recorded",
@@ -2858,9 +2908,10 @@ pub fn resolve_system_channel(
         send_rate: tuned
             .and_then(|t| t.send_rate)
             .unwrap_or(defaults.default_send_rate),
-        // Every system family is written and read by host code that parses
-        // text.
-        non_text: false,
+        // Only an ingress block may state `non_text`, so a tool or
+        // device-location channel is always text-only.
+        non_text: tuned.is_some_and(|t| t.non_text),
+        untyped_content_type: tuned.and_then(|t| t.untyped_content_type.clone()),
     }
 }
 
@@ -3537,6 +3588,7 @@ mod tests {
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         }
     }
 
@@ -3650,6 +3702,7 @@ mod tests {
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         }
     }
 
@@ -3763,6 +3816,7 @@ channel demo at "ephemeral:protobar-demo" {
                 sink: None,
                 wake_min: None,
                 non_text: false,
+                untyped_content_type: None,
             }],
             &global_defaults(),
         );
@@ -4123,6 +4177,7 @@ channel demo at "ephemeral:protobar-demo" {
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         }
     }
 
@@ -4458,11 +4513,141 @@ channel demo at "ephemeral:protobar-demo" {
     }
 
     #[test]
-    #[should_panic(expected = "must not set non_text")]
+    #[should_panic(expected = "tunes a tool or device-location channel and must not set non_text")]
     fn a_tuning_block_with_non_text_panics() {
-        let mut block = tuning_block("webhook:hook", 1, 8, 8);
+        let mut block = tuning_block("brenn:tools/git-repo-pull", 1, 8, 8);
         block.non_text = true;
         tuning_of(&[block]);
+    }
+
+    #[test]
+    #[should_panic(expected = "tunes a tool or device-location channel and must not set non_text")]
+    fn a_device_location_prefix_with_non_text_panics() {
+        let mut block = tuning_prefix("brenn:device-location.", 1, 8, 8);
+        block.non_text = true;
+        tuning_of(&[block]);
+    }
+
+    /// An ingress block stating `non_text` makes the channels it tunes raw,
+    /// exact or by prefix; a channel it does not reach stays text-only.
+    #[test]
+    fn an_ingress_tuning_block_carries_non_text() {
+        let raw = |mut block: ChannelConfigRaw| {
+            block.non_text = true;
+            block
+        };
+        let tuned = tuning_of(&[
+            raw(tuning_block("webhook:scanner", 1, 8, 8)),
+            raw(tuning_block("mqtt:broker:door/state", 1, 8, 8)),
+            raw(tuning_prefix("mqtt:broker:cam/", 1, 8, 8)),
+            tuning_prefix("mqtt:broker:", 1, 8, 8),
+        ]);
+        for (address, non_text) in [
+            ("webhook:scanner", true),
+            ("webhook:github", false),
+            ("mqtt:broker:door/state", true),
+            ("mqtt:broker:cam/+/frame", true),
+            ("mqtt:broker:hall/state", false),
+            ("mqtt:other:cam/+/frame", false),
+        ] {
+            let ch = resolve_system_channel(address, &tuned, &global_defaults());
+            assert_eq!(ch.non_text, non_text, "{address}");
+            assert_eq!(ch.untyped_content_type, None, "{address}");
+        }
+    }
+
+    /// A raw `mqtt:` block's declared content type resolves onto the channels
+    /// it tunes, and onto nothing else.
+    #[test]
+    fn an_mqtt_tuning_block_carries_its_untyped_content_type() {
+        let declaring = |mut block: ChannelConfigRaw, content_type: &str| {
+            block.non_text = true;
+            block.untyped_content_type = Some(content_type.to_string());
+            block
+        };
+        let tuned = tuning_of(&[
+            declaring(
+                tuning_block("mqtt:broker:door/state", 1, 8, 8),
+                "text/plain; charset=utf-8",
+            ),
+            declaring(
+                tuning_prefix("mqtt:broker:cam/", 1, 8, 8),
+                "application/octet-stream",
+            ),
+            ChannelConfigRaw {
+                non_text: true,
+                ..tuning_prefix("mqtt:broker:raw/", 1, 8, 8)
+            },
+        ]);
+        for (address, declared) in [
+            ("mqtt:broker:door/state", Some("text/plain; charset=utf-8")),
+            ("mqtt:broker:cam/+/frame", Some("application/octet-stream")),
+            ("mqtt:broker:raw/frame", None),
+            ("mqtt:broker:hall/state", None),
+        ] {
+            let ch = resolve_system_channel(address, &tuned, &global_defaults());
+            assert_eq!(ch.untyped_content_type.as_deref(), declared, "{address}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "sets untyped_content_type outside the mqtt: family")]
+    fn untyped_content_type_on_a_webhook_tuning_panics() {
+        let mut block = tuning_block("webhook:scanner", 1, 8, 8);
+        block.non_text = true;
+        block.untyped_content_type = Some("application/octet-stream".to_string());
+        tuning_of(&[block]);
+    }
+
+    #[test]
+    #[should_panic(expected = "sets untyped_content_type outside the mqtt: family")]
+    fn untyped_content_type_on_a_tool_tuning_panics() {
+        let mut block = tuning_block("brenn:tools/git-repo-pull", 1, 8, 8);
+        block.untyped_content_type = Some("application/octet-stream".to_string());
+        tuning_of(&[block]);
+    }
+
+    #[test]
+    #[should_panic(expected = "sets untyped_content_type without non_text = true")]
+    fn untyped_content_type_on_a_wrapped_mqtt_tuning_panics() {
+        let mut block = tuning_prefix("mqtt:broker:cam/", 1, 8, 8);
+        block.untyped_content_type = Some("application/octet-stream".to_string());
+        tuning_of(&[block]);
+    }
+
+    #[test]
+    #[should_panic(expected = "is a declared channel and must not set untyped_content_type")]
+    fn untyped_content_type_on_a_declared_channel_panics() {
+        let mut block = raw_channel("1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32", "frames");
+        block.non_text = true;
+        block.untyped_content_type = Some("application/octet-stream".to_string());
+        build_channel_entries(&[block], &global_defaults());
+    }
+
+    /// A malformed, an empty and an over-long declared type are each refused
+    /// with the parser's reason.
+    #[test]
+    fn a_malformed_untyped_content_type_panics() {
+        let over = format!("application/{}", "x".repeat(255));
+        for (content_type, reason) in [
+            ("octet-stream", "expected '/' after the type"),
+            ("", "missing type"),
+            (over.as_str(), "longer than 255 bytes"),
+        ] {
+            let mut block = tuning_prefix("mqtt:broker:cam/", 1, 8, 8);
+            block.non_text = true;
+            block.untyped_content_type = Some(content_type.to_string());
+            let panic = std::panic::catch_unwind(|| tuning_of(&[block]))
+                .expect_err("a malformed type is refused");
+            let message = panic
+                .downcast_ref::<String>()
+                .expect("a formatted panic message");
+            assert!(
+                message.contains("untyped_content_type is not a media type the bus accepts")
+                    && message.contains(reason),
+                "{content_type:?}: {message}",
+            );
+        }
     }
 
     /// A declared channel is text-only unless its block says otherwise, on
@@ -4490,9 +4675,10 @@ channel demo at "ephemeral:protobar-demo" {
         assert!(by_address("brenn:state"));
     }
 
-    /// Every system-minted family is text-only, tuned or not.
+    /// Every system-minted channel is text-only with no tuning block stating
+    /// `non_text`.
     #[test]
-    fn every_system_channel_is_text_only() {
+    fn every_system_channel_is_text_only_with_no_tuning_block_stating_it() {
         let tuned = tuning_of(&[tuning_block("webhook:hook", 1, 8, 8)]);
         for address in [
             "webhook:hook",
@@ -5469,6 +5655,7 @@ new pfin: Finance();
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,
@@ -5522,6 +5709,7 @@ new pfin: Finance();
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,
@@ -5578,6 +5766,7 @@ new pfin: Finance();
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: crate::messaging::ChannelScheme::Brenn,
@@ -5691,6 +5880,7 @@ new pfin: Finance();
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: crate::messaging::ChannelScheme::Brenn,
@@ -5722,6 +5912,7 @@ new pfin: Finance();
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Webhook,
@@ -6041,6 +6232,7 @@ new router: Router { grants = []; subscribe_acls = []; io tick {} }
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Brenn,
@@ -6655,6 +6847,7 @@ new router: Router { grants = []; subscribe_acls = []; io tick {} }
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: Vec::new(),
             transport_type: ChannelScheme::Brenn,

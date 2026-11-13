@@ -55,8 +55,8 @@ pub use body::{Body, BodyRef, Message};
 // ── re-exports ────────────────────────────────────────────────────────────────
 
 pub use brenn_envelope::{
-    BodyError, ChannelScheme, MessageBody, MessageEnvelope, Urgency, WebhookEnvelope,
-    is_text_content_type,
+    BodyError, ChannelScheme, MessageBody, MessageEnvelope, MqttEnvelope, MqttPayloadBody,
+    MqttTransport, TransportMeta, Urgency, WebhookEnvelope, WebhookTransport, is_text_content_type,
 };
 pub use serde;
 pub use serde_json;
@@ -488,9 +488,15 @@ macro_rules! export_processor {
 
 // ── envelope helpers ──────────────────────────────────────────────────────────
 
-// TODO(guest-envelope-accessors): `webhook_body` has no MQTT twin, and the
-// MQTT envelope types are not re-exported.
 /// Extension methods for `MessageEnvelope`.
+///
+/// An `mqtt:` or `webhook:` message arrives in one of two shapes, chosen by
+/// the channel: *wrapped* (the default), whose body is the [`MqttEnvelope`] or
+/// [`WebhookEnvelope`] JSON, or *raw* (a channel tuned `non_text`), whose body
+/// is the payload itself and whose `transport` holds the metadata. The
+/// presence of `transport` tells them apart message by message; the
+/// `*_body` accessors read the wrapped shape and the `*_transport` accessors
+/// the raw one, each refusing the other with a named error.
 pub trait MessageEnvelopeExt {
     /// The body's text.
     ///
@@ -506,9 +512,64 @@ pub trait MessageEnvelopeExt {
 
     /// Parse `body` as a `WebhookEnvelope`.
     ///
-    /// Returns `Err(ProcessingFailed)` if `envelope_type != "webhook"`;
+    /// Returns `Err(ProcessingFailed)` if `envelope_type != "webhook"` or the
+    /// message is in the raw shape (its body is the request body; read
+    /// [`webhook_transport`](Self::webhook_transport) and the body);
     /// `Err(MalformedEnvelope)` if the body JSON is malformed.
     fn webhook_body(&self) -> Result<WebhookEnvelope, Error>;
+
+    /// Parse `body` as an `MqttEnvelope`.
+    ///
+    /// Returns `Err(ProcessingFailed)` if `envelope_type != "mqtt"` or the
+    /// message is in the raw shape (its body is the payload; read
+    /// [`mqtt_transport`](Self::mqtt_transport) and the body);
+    /// `Err(MalformedEnvelope)` if the body JSON is malformed.
+    fn mqtt_body(&self) -> Result<MqttEnvelope, Error>;
+
+    /// The MQTT metadata of a raw-shape message.
+    ///
+    /// Returns `Err(ProcessingFailed)` if `envelope_type != "mqtt"` or the
+    /// message has no `transport` (it is in the wrapped shape; read
+    /// [`mqtt_body`](Self::mqtt_body)).
+    fn mqtt_transport(&self) -> Result<&MqttTransport, Error>;
+
+    /// The webhook metadata of a raw-shape message.
+    ///
+    /// Returns `Err(ProcessingFailed)` if `envelope_type != "webhook"` or the
+    /// message has no `transport` (it is in the wrapped shape; read
+    /// [`webhook_body`](Self::webhook_body)).
+    fn webhook_transport(&self) -> Result<&WebhookTransport, Error>;
+}
+
+/// `Err(ProcessingFailed)` unless the envelope's scheme is `expected`.
+fn require_scheme(envelope: &MessageEnvelope, expected: ChannelScheme) -> Result<(), Error> {
+    if envelope.envelope_type != expected {
+        return Err(Error::failed(format!(
+            "expected {expected:?} envelope, got {:?}",
+            envelope.envelope_type
+        )));
+    }
+    Ok(())
+}
+
+/// `Err(ProcessingFailed)` when the envelope is in the raw shape, for an
+/// accessor that reads the wrapper.
+fn require_wrapped(envelope: &MessageEnvelope, transport_accessor: &str) -> Result<(), Error> {
+    if envelope.transport.is_some() {
+        return Err(Error::failed(format!(
+            "message is in the raw ingress shape: its body is the payload, not a wrapper; \
+             read `{transport_accessor}()` and the body"
+        )));
+    }
+    Ok(())
+}
+
+/// `Err(ProcessingFailed)` naming the wrapper accessor, for a message with no
+/// transport metadata.
+fn wrapped_shape_error(body_accessor: &str) -> Error {
+    Error::failed(format!(
+        "message is in the wrapped ingress shape and has no `transport`; read `{body_accessor}()`"
+    ))
 }
 
 impl MessageEnvelopeExt for MessageEnvelope {
@@ -524,14 +585,41 @@ impl MessageEnvelopeExt for MessageEnvelope {
     }
 
     fn webhook_body(&self) -> Result<WebhookEnvelope, Error> {
-        if self.envelope_type != ChannelScheme::Webhook {
-            return Err(Error::failed(format!(
-                "expected webhook envelope, got {:?}",
-                self.envelope_type
-            )));
-        }
+        require_scheme(self, ChannelScheme::Webhook)?;
+        require_wrapped(self, "webhook_transport")?;
         serde_json::from_str(self.text_body()?)
             .map_err(|e| Error::malformed(format!("webhook body JSON: {e}")))
+    }
+
+    fn mqtt_body(&self) -> Result<MqttEnvelope, Error> {
+        require_scheme(self, ChannelScheme::Mqtt)?;
+        require_wrapped(self, "mqtt_transport")?;
+        serde_json::from_str(self.text_body()?)
+            .map_err(|e| Error::malformed(format!("mqtt body JSON: {e}")))
+    }
+
+    fn mqtt_transport(&self) -> Result<&MqttTransport, Error> {
+        require_scheme(self, ChannelScheme::Mqtt)?;
+        match &self.transport {
+            Some(TransportMeta::Mqtt(transport)) => Ok(transport),
+            Some(other) => Err(Error::failed(format!(
+                "mqtt message carries {:?} transport metadata",
+                other.scheme()
+            ))),
+            None => Err(wrapped_shape_error("mqtt_body")),
+        }
+    }
+
+    fn webhook_transport(&self) -> Result<&WebhookTransport, Error> {
+        require_scheme(self, ChannelScheme::Webhook)?;
+        match &self.transport {
+            Some(TransportMeta::Webhook(transport)) => Ok(transport),
+            Some(other) => Err(Error::failed(format!(
+                "webhook message carries {:?} transport metadata",
+                other.scheme()
+            ))),
+            None => Err(wrapped_shape_error("webhook_body")),
+        }
     }
 }
 

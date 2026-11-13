@@ -200,6 +200,7 @@ fn chat_channel_entry(
             sink: defaults.default_sink,
             wake_min,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers,
         transport_type: scheme,

@@ -109,6 +109,7 @@ fn directory_with_channels(bares: &[String], standing: Depth) -> MessagingDirect
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         })
         .collect();
     let entries = build_channel_entries(&raw, &MessagingGlobalConfig::default());
@@ -169,6 +170,7 @@ fn full_directory_with_config_channels(
             sink: None,
             wake_min: None,
             non_text: config_non_text,
+            untyped_content_type: None,
         });
     }
     let entries = build_channel_entries(&raw, &MessagingGlobalConfig::default());
@@ -204,6 +206,7 @@ fn full_directory_raw(
         sink: None,
         wake_min: None,
         non_text: false,
+        untyped_content_type: None,
     };
     let boot_published = boot_published_bare_channels(PREFIX, surfaces)
         .into_iter()

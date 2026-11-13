@@ -986,6 +986,7 @@ dependencies = [
  "brenn-envelope",
  "brenn-lib",
  "brenn-messaging-store",
+ "bytes",
  "libc",
  "rcgen",
  "rumqttc-next",

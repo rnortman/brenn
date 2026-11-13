@@ -18,7 +18,7 @@ use rumqttc::{
 };
 use rustls_pki_types::pem::PemObject as _;
 
-use crate::payload::classify_inbound;
+use crate::payload::InboundPayload;
 use crate::service::{MqttEventRouter, MqttService};
 use crate::state::{
     DEFERRED_SUBSCRIBES_POISONED, IngressSubscription, MqttClientHandle,
@@ -1090,7 +1090,7 @@ async fn handle_event(
                 QoS::ExactlyOnce => 2,
             };
 
-            let inbound_payload = classify_inbound(&p.payload[..], content_type.as_deref());
+            let inbound_payload = InboundPayload::new(p.payload, content_type);
 
             router
                 .deliver_inbound(client_slug, &topic_str, inbound_payload, delivery_qos)

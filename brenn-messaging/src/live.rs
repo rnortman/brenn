@@ -252,6 +252,7 @@ impl Messenger {
             impetus: None,
             urgency,
             envelope_type: dest.scheme,
+            transport: None,
         }
     }
 }

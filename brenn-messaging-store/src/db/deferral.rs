@@ -38,7 +38,7 @@ pub struct DeferredLookup {
     pub release_at: DateTime<Utc>,
 }
 
-/// Columns 0-12 as `row_to_message_envelope` expects them, plus `m.id` at 13,
+/// Columns 0-13 as `row_to_message_envelope` expects them, plus `m.id` at 14,
 /// for the messages on one channel that are unreleased, optionally narrowed to
 /// those whose `deliver_after` stands in the `cmp` relation to `?2`.
 ///
@@ -56,7 +56,8 @@ fn deferred_select(cmp: Option<&str>) -> String {
     format!(
         "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                 m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                c.address, rc.address, m.envelope_type, m.impetus, m.content_type, m.id
+                c.address, rc.address, m.envelope_type, m.impetus, m.content_type,
+                m.transport, m.id
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
@@ -99,7 +100,7 @@ pub fn list_deferred_for_sender(
             |row| {
                 let deliver_after: String = row.get(6)?;
                 Ok(DeferredRow {
-                    message_id: row.get(13)?,
+                    message_id: row.get(14)?,
                     release_at: parse_release(&deliver_after),
                     envelope: super::bus::row_to_message_envelope(row)?,
                 })
@@ -368,7 +369,7 @@ pub fn release_due_for_channel(
                 // The row still carries the release time this call is about to
                 // clear; a released message is not a deferred one.
                 envelope.deliver_after = None;
-                Ok((row.get(13)?, envelope))
+                Ok((row.get(14)?, envelope))
             })
             .expect("query release_due_for_channel");
         for r in rows {

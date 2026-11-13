@@ -391,6 +391,7 @@ impl<P: PlanePolicy> LocalRouter<P> {
             impetus: None,
             urgency,
             envelope_type: ChannelScheme::Local,
+            transport: None,
         };
         if let Some(release_at) = deliver_after.filter(|at| *at > epoch_ms(stamp.publish_ts)) {
             let sender = envelope.sender.clone();

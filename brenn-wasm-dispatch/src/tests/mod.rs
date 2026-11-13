@@ -162,6 +162,7 @@ pub fn brenn_channel(address: &str, sub_slug: &str) -> ChannelEntry {
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(sub_slug.to_string()),
@@ -449,6 +450,7 @@ pub async fn build_multiport_setup_with_depths(
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(out_sub_slug.clone()),
@@ -637,6 +639,7 @@ pub async fn build_two_channel_setup(
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(slug.to_string()),
@@ -665,6 +668,7 @@ pub async fn build_two_channel_setup(
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(second_sub_slug.to_string()),

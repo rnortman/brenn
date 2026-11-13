@@ -729,6 +729,7 @@ impl ActiveBridge {
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![brenn_lib::messaging::SubscriberEntry {
                 kind: brenn_lib::messaging::SubscriberEntryKind::App("testapp".to_string()),
@@ -760,6 +761,7 @@ impl ActiveBridge {
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: brenn_lib::messaging::ChannelScheme::Brenn,
@@ -919,6 +921,7 @@ impl ActiveBridge {
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: brenn_lib::messaging::ChannelScheme::Mqtt,
@@ -1007,6 +1010,7 @@ impl ActiveBridge {
             true,
             mqtt_subscribe_test_policy(),
             brenn_lib::messaging::config::Depth::Unbounded,
+            Default::default(),
         )
         .await
     }
@@ -1021,6 +1025,7 @@ impl ActiveBridge {
             true,
             mqtt_subscribe_test_policy(),
             brenn_lib::messaging::config::Depth::Bounded(2),
+            Default::default(),
         )
         .await
     }
@@ -1035,6 +1040,7 @@ impl ActiveBridge {
             false,
             mqtt_subscribe_test_policy(),
             brenn_lib::messaging::config::Depth::Unbounded,
+            Default::default(),
         )
         .await
     }
@@ -1050,6 +1056,39 @@ impl ActiveBridge {
             true,
             policy,
             brenn_lib::messaging::config::Depth::Unbounded,
+            Default::default(),
+        )
+        .await
+    }
+
+    /// Same wiring as [`test_new_for_mqtt_subscribe`] but with an `mqtt:home:`
+    /// prefix tuning stating `non_text`, so every channel a subscribe mints for
+    /// the `home` client takes the raw ingress shape.
+    pub(crate) async fn test_new_for_mqtt_subscribe_raw() -> Arc<Self> {
+        let global = brenn_lib::messaging::MessagingGlobalConfig::default();
+        let tuning = brenn_lib::messaging::config::build_system_channel_tuning(
+            &[brenn_lib::messaging::config::ChannelConfigRaw {
+                send_rate: None,
+                uuid: None,
+                address: None,
+                address_prefix: Some("mqtt:home:".to_string()),
+                description: None,
+                push_depth: Some(brenn_lib::messaging::config::Depth::Bounded(1)),
+                retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(100)),
+                standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(100)),
+                noise: None,
+                sink: None,
+                wake_min: None,
+                non_text: true,
+                untyped_content_type: None,
+            }],
+            &global,
+        );
+        Self::test_new_for_mqtt_subscribe_with_singleton(
+            true,
+            mqtt_subscribe_test_policy(),
+            brenn_lib::messaging::config::Depth::Unbounded,
+            tuning,
         )
         .await
     }
@@ -1064,6 +1103,7 @@ impl ActiveBridge {
         singleton: bool,
         policy: brenn_lib::access::AppPolicy,
         standing_retain_depth: brenn_lib::messaging::config::Depth,
+        system_channel_tuning: brenn_lib::messaging::config::SystemChannelTuning,
     ) -> Arc<Self> {
         use std::sync::Arc;
 
@@ -1089,6 +1129,7 @@ impl ActiveBridge {
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: brenn_lib::messaging::ChannelScheme::Brenn,
@@ -1150,7 +1191,8 @@ impl ActiveBridge {
                 as Arc<dyn brenn_messaging::WakeRouter>,
             brenn_lib::messaging::MessagingGlobalConfig::default(),
         )
-        .with_ring_stores(ring_stores);
+        .with_ring_stores(ring_stores)
+        .with_system_channel_tuning(system_channel_tuning);
 
         // MqttService with a registered `home` ingress supervisor. Non-default
         // qos (2) / urgency (High) so qos-/urgency-resolution is observable; the
@@ -1251,6 +1293,7 @@ impl ActiveBridge {
                     sink: brenn_lib::messaging::config::Sink::Drop,
                     wake_min: brenn_lib::messaging::WakeMin::Normal,
                     non_text: false,
+                    untyped_content_type: None,
                 },
                 subscribers: vec![brenn_lib::messaging::SubscriberEntry {
                     kind: brenn_lib::messaging::SubscriberEntryKind::App("testapp".to_string()),

@@ -41,9 +41,12 @@
 //
 //   windows   the `feed` window, when the instance has one: its port, new_from,
 //             dropped, and each message as the SDK reads it — its header
-//             (parsed), content type, bytes in hex, and three verdicts, each the
+//             (parsed), content type, bytes in hex, three verdicts, each the
 //             value or the word `malformed`: `text_body` (through
-//             `Message::envelope`), `as_text` and `json` (on `Message::body`)
+//             `Message::envelope`), `as_text` and `json` (on `Message::body`),
+//             and the four ingress accessors `mqtt_transport`,
+//             `webhook_transport`, `mqtt_body` and `webhook_body`, each
+//             `{"ok": <value>}` or `{"err": "<error kind>"}`
 //   streams   always empty
 //   deferred  always empty
 //   results   one word per command run
@@ -53,8 +56,8 @@ mod spec;
 
 use brenn_guest::serde_json::{self, Value, json};
 use brenn_guest::{
-    Activation, Body, Error, Message, MessageEnvelopeExt, Processor, RetainedState, StateCodec,
-    StateLoss, publish,
+    Activation, Body, Error, Message, MessageEnvelope, MessageEnvelopeExt, Processor,
+    RetainedState, StateCodec, StateLoss, publish,
 };
 
 use crate::spec::port::{FEED, IN, REPORT, STATE};
@@ -187,17 +190,44 @@ fn report_message(message: &Message) -> Result<Value, Error> {
     let header: Value = serde_json::from_str(message.header_json())
         .map_err(|e| Error::malformed(format!("feed header is not JSON: {e}")))?;
     let body = message.body();
-    let text_body = message
-        .envelope()
-        .and_then(|envelope| envelope.text_body().map(str::to_owned));
+    let envelope = message.envelope();
+    let text_body = envelope
+        .as_ref()
+        .ok()
+        .and_then(|envelope| envelope.text_body().ok().map(str::to_owned));
+    let accessor = |read: &dyn Fn(&MessageEnvelope) -> Result<Value, Error>| match &envelope {
+        Ok(envelope) => read(envelope).unwrap_or_else(|e| json!({ "err": error_kind(&e) })),
+        Err(e) => json!({ "err": error_kind(e) }),
+    };
     Ok(json!({
         "header": header,
         "content_type": body.content_type(),
         "hex": hex(body.as_bytes()),
-        "text_body": text_body.map_or_else(|_| Value::from(MALFORMED), Value::from),
+        "text_body": text_body.map_or_else(|| Value::from(MALFORMED), Value::from),
         "as_text": body.as_text().map_or_else(|_| Value::from(MALFORMED), Value::from),
         "json": body.json::<Value>().unwrap_or_else(|_| Value::from(MALFORMED)),
+        "mqtt_transport": accessor(&|e| e.mqtt_transport().map(ok_json)),
+        "webhook_transport": accessor(&|e| e.webhook_transport().map(ok_json)),
+        "mqtt_body": accessor(&|e| e.mqtt_body().map(|v| ok_json(&v))),
+        "webhook_body": accessor(&|e| e.webhook_body().map(|v| ok_json(&v))),
     }))
+}
+
+/// An accessor's `Ok` value as the report records it.
+fn ok_json<T: brenn_guest::serde::Serialize>(value: &T) -> Value {
+    json!({ "ok": value })
+}
+
+/// The kind of an SDK error, as the report records it.
+fn error_kind(error: &Error) -> &'static str {
+    match error {
+        Error::MalformedEnvelope(_) => "malformed-envelope",
+        Error::ProcessingFailed(_) => "processing-failed",
+        Error::QuotaExceeded(_) => "quota-exceeded",
+        Error::NotPending(_) => "not-pending",
+        Error::TextOnlyChannel(_) => "text-only-channel",
+        Error::InvalidBody(_) => "invalid-body",
+    }
 }
 
 fn verb(line: &str) -> Option<&str> {

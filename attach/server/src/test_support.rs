@@ -241,6 +241,7 @@ pub async fn one_channel_messenger_declared(
         sink: None,
         wake_min: None,
         non_text,
+        untyped_content_type: None,
     };
     let entry = build_channel_entries(&[raw], &MessagingGlobalConfig::default())
         .pop()

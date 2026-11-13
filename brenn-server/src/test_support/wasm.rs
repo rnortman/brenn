@@ -43,6 +43,7 @@ pub fn wasm_subscriber_channel_entry(
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(wasm_slug.to_string()),

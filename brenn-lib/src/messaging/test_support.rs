@@ -88,6 +88,9 @@ pub fn brenn_delivery_policy(
 /// fresh. Pass `subscribers` (often `vec![]`) for the per-subscriber wiring a test
 /// needs. Single home for the default `ChannelEntry` literal so a new field is one
 /// edit rather than one per test module.
+// TODO(quality-resolved-channel-literal-fallout-recurs-per-field): most test
+// `ChannelEntry` / `ResolvedChannel` literals across the tree restate this
+// default instead of building on it.
 pub fn test_channel_entry(name: &str, subscribers: Vec<SubscriberEntry>) -> ChannelEntry {
     ChannelEntry {
         uuid: Uuid::new_v4(),
@@ -102,6 +105,7 @@ pub fn test_channel_entry(name: &str, subscribers: Vec<SubscriberEntry>) -> Chan
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers,
         transport_type: ChannelScheme::Brenn,

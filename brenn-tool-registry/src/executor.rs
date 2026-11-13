@@ -2032,6 +2032,7 @@ mod tests {
             wake_min: WakeMin::Normal,
             send_rate: SendRate::default(),
             non_text: false,
+            untyped_content_type: None,
         };
         let (_wake, snapshot) = h
             .messenger

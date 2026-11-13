@@ -239,6 +239,7 @@ fn channel(
         // runtime field carries it.
         doctype: _,
         non_text,
+        untyped_content_type,
     } = attrs;
     ChannelConfigRaw {
         uuid,
@@ -259,6 +260,11 @@ fn channel(
             .as_ref()
             .and_then(|attr| send_rate(&attr.value, "send_rate", errors)),
         non_text: opt_bool(non_text.as_ref(), "non_text", errors).unwrap_or_default(),
+        untyped_content_type: opt_str(
+            untyped_content_type.as_ref(),
+            "untyped_content_type",
+            errors,
+        ),
     }
 }
 

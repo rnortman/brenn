@@ -918,9 +918,18 @@ pub fn text_only_channels_holding_non_text<'a>(
         .into_iter()
         .filter(|entry| !entry.resolved_channel.non_text && held.contains(&entry.uuid))
         .map(|entry| {
+            let remedy = match messaging::config::SystemChannelFamily::of(&entry.address) {
+                // The system mints the address, so it can be neither declared
+                // nor renamed; its tuning block is what states `non_text`.
+                Some(_) => {
+                    "state `non_text = true` in the channel's tuning block, or delete the \
+                     channel's stored messages"
+                }
+                None => "declare it `non_text = true`, or give it a new address",
+            };
             format!(
                 "config: channel {:?} is declared text-only, but its store holds messages whose \
-                 bodies are not text; declare it `non_text = true`, or give it a new address",
+                 bodies are not text; {remedy}",
                 entry.address,
             )
         })
@@ -1376,10 +1385,25 @@ pub async fn commit_messaging(
             &system_channel_tuning,
             global_defaults,
         );
-        for channel in reconstruction.entries {
-            if directory.by_uuid(&channel.uuid).is_none() {
-                directory.add_channel(channel);
-            }
+        let rebuilt: Vec<ChannelEntry> = reconstruction
+            .entries
+            .into_iter()
+            .filter(|channel| directory.by_uuid(&channel.uuid).is_none())
+            .collect();
+        // The planned channels were checked before the plan was committed; a
+        // channel rebuilt from its row joins only here, under the tuning this
+        // process booted with, and is held to the same rule.
+        let refusals = text_only_channels_holding_non_text(
+            &brenn_messaging_store::db::channels_holding_non_text_rows(&conn),
+            &rebuilt,
+        );
+        assert!(
+            refusals.is_empty(),
+            "refusing to start:\n{}",
+            refusals.join("\n"),
+        );
+        for channel in rebuilt {
+            directory.add_channel(channel);
         }
         let undeclared: std::collections::HashMap<uuid::Uuid, String> =
             reconstruction.skipped.into_iter().collect();

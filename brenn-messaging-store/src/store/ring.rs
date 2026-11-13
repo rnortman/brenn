@@ -732,6 +732,7 @@ impl RingStore {
             impetus: msg.impetus,
             urgency: msg.urgency,
             envelope_type: msg.envelope_type,
+            transport: None,
         }
     }
 }
@@ -972,6 +973,7 @@ mod tests {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Ephemeral,
+            transport: None,
         }
     }
 

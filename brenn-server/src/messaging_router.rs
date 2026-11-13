@@ -919,6 +919,7 @@ mod tests {
                 impetus: None,
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Brenn,
+                transport: None,
             }),
         }];
         router
@@ -987,6 +988,7 @@ mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![SubscriberEntry {
                 kind: conv_key(),
@@ -1416,6 +1418,7 @@ mod tests {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+            transport: None,
         };
         let _ = router.deliver(&key, &Arc::new(env), 1).await;
     }
@@ -1617,6 +1620,7 @@ mod tests {
             sink: None,
             wake_min: None,
             non_text: false,
+            untyped_content_type: None,
         };
         let entry = build_channel_entries(&[raw], &MessagingGlobalConfig::default())
             .pop()
@@ -1682,6 +1686,7 @@ mod tests {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+            transport: None,
         }
     }
 

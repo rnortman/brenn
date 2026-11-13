@@ -560,7 +560,12 @@ fn a_database_from_before_byte_bodies_migrates_and_serves_its_rows_unchanged() {
             .query_row(&sql, [uuid.as_bytes().to_vec()], row_to_envelope)
             .unwrap();
         assert_eq!(envelope.body, MessageBody::text(text), "old row unchanged");
+        assert_eq!(envelope.transport, None, "an old row carries no transport");
     }
+    assert!(
+        brenn_db::column_exists(&conn, "messaging_messages", "transport"),
+        "the transport column is added"
+    );
     assert_eq!(fts_ids(&conn, "november"), [1]);
     assert_eq!(fts_ids(&conn, "papa"), [2]);
     assert!(

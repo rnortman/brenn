@@ -797,6 +797,18 @@ pub fn webhook_mount(raw: &WebhookEndpointConfigRaw) -> String {
     mount
 }
 
+/// The endpoint's declared content type as every request is matched against
+/// it and a raw body is typed with it: the media type before any `;`, trimmed
+/// and lowercased.
+pub fn normalized_content_type(raw: &WebhookEndpointConfigRaw) -> String {
+    raw.content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase()
+}
+
 /// Resolve replay protection for `raw` and assert that its store_path is not
 /// already in `store_path_set`. On success the store_path is inserted into the
 /// set.
@@ -1014,14 +1026,7 @@ pub fn resolve_webhook_identities(
         // Rule 2 + per-scheme validation (also loads secrets).
         let scheme = resolve_signature_scheme(raw);
 
-        // Normalize content_type: strip params, lowercase.
-        let content_type = raw
-            .content_type
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase();
+        let content_type = normalized_content_type(raw);
 
         // Extract max_skew_secs from schemes that carry a timestamp window.
         // Injected into replay protection config as "brenn.max-skew-secs".

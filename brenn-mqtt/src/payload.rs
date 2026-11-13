@@ -3,53 +3,61 @@
 //! Outbound: converts a `serde_json::Value` body from `MqttSend` into raw bytes
 //! + optional Content Type.
 //!
-//! Inbound: classifies raw bytes + optional Content Type into `InboundPayload`.
+//! Inbound: `InboundPayload` carries the broker's bytes and Content Type;
+//! `classify_inbound` reads them for the default ingress shape.
 
 use base64ct::{Base64, Encoding as _};
+use bytes::Bytes;
 use serde_json::Value;
 
 use brenn_lib::mqtt::error::MqttError;
 
-/// The decoded form of an inbound MQTT publish payload.
+/// An inbound MQTT publish payload as the broker delivered it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InboundPayload {
-    /// Valid UTF-8 payload with no binary-indicating Content Type.
-    Text(String),
-    /// Binary payload or text with an explicit non-text Content Type.
-    Binary {
-        /// Base64-encoded bytes (standard alphabet with padding).
-        base64: String,
-        /// MQTT 5 Content Type property, if present.
-        content_type: Option<String>,
-    },
+pub struct InboundPayload {
+    /// The payload bytes, shared with the broker packet rather than copied. A
+    /// bus body built from them is a copy of its own.
+    pub bytes: Bytes,
+    /// MQTT 5 Content Type property, if present.
+    pub content_type: Option<String>,
 }
 
-/// Classify an inbound publish into `InboundPayload`.
+impl InboundPayload {
+    pub fn new(bytes: impl Into<Bytes>, content_type: Option<String>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            content_type,
+        }
+    }
+}
+
+/// The default ingress shape's reading of an inbound payload; see
+/// [`classify_inbound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundClass<'a> {
+    /// Valid UTF-8 with no binary-indicating Content Type.
+    Text(&'a str),
+    /// Not UTF-8, or text with a Content Type not starting with `text/`.
+    Binary,
+}
+
+/// Classify an inbound payload for the default (`MqttEnvelope`) ingress shape.
 ///
 /// Decision rule (deterministic):
 /// - If bytes are valid UTF-8 **and** (no `content_type` present **or**
-///   `content_type.starts_with("text/")`) → `InboundPayload::Text`.
-/// - Otherwise → `InboundPayload::Binary`.
-pub fn classify_inbound(bytes: &[u8], content_type: Option<&str>) -> InboundPayload {
-    let is_text = match std::str::from_utf8(bytes) {
-        Err(_) => false,
-        Ok(_) => {
-            // Valid UTF-8. Now check content type.
-            match content_type {
-                None => true,
-                Some(ct) => ct.starts_with("text/"),
-            }
+///   `content_type.starts_with("text/")`) → [`InboundClass::Text`].
+/// - Otherwise → [`InboundClass::Binary`].
+///
+/// The raw ingress shape does not use this rule; the bus's own content-type
+/// rule types its body.
+// TODO(mqtt-ingress-text-rule): this rule is narrower than the bus's
+// `is_text_content_type` (no `application/json`, case-sensitive).
+pub fn classify_inbound<'a>(bytes: &'a [u8], content_type: Option<&str>) -> InboundClass<'a> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if content_type.is_none_or(|ct| ct.starts_with("text/")) => {
+            InboundClass::Text(text)
         }
-    };
-
-    if is_text {
-        // SAFETY: we just validated it is valid UTF-8.
-        InboundPayload::Text(std::str::from_utf8(bytes).unwrap().to_string())
-    } else {
-        InboundPayload::Binary {
-            base64: Base64::encode_string(bytes),
-            content_type: content_type.map(str::to_string),
-        }
+        _ => InboundClass::Binary,
     }
 }
 
@@ -110,72 +118,51 @@ mod tests {
     #[test]
     fn valid_utf8_no_content_type_is_text() {
         let result = classify_inbound(b"hello world", None);
-        assert_eq!(result, InboundPayload::Text("hello world".to_string()));
+        assert_eq!(result, InboundClass::Text("hello world"));
     }
 
     #[test]
     fn valid_utf8_text_content_type_is_text() {
         let result = classify_inbound(b"hello", Some("text/plain"));
-        assert_eq!(result, InboundPayload::Text("hello".to_string()));
+        assert_eq!(result, InboundClass::Text("hello"));
     }
 
     #[test]
     fn valid_utf8_text_html_content_type_is_text() {
         let result = classify_inbound(b"<h1>hi</h1>", Some("text/html; charset=utf-8"));
-        assert_eq!(result, InboundPayload::Text("<h1>hi</h1>".to_string()),);
+        assert_eq!(result, InboundClass::Text("<h1>hi</h1>"));
     }
 
     #[test]
     fn valid_utf8_application_json_content_type_is_binary() {
         // content_type doesn't start with "text/" → Binary path.
         let result = classify_inbound(b"{}", Some("application/json"));
-        // Verify both the variant and the content_type passthrough (test-3).
-        match result {
-            InboundPayload::Binary { content_type, .. } => {
-                assert_eq!(
-                    content_type.as_deref(),
-                    Some("application/json"),
-                    "content_type must be passed through to the Binary variant"
-                );
-            }
-            InboundPayload::Text(_) => panic!("expected Binary, got Text"),
-        }
+        assert_eq!(result, InboundClass::Binary);
     }
 
     #[test]
     fn invalid_utf8_no_content_type_is_binary() {
         let result = classify_inbound(&[0xFF, 0xFE], None);
-        assert!(matches!(result, InboundPayload::Binary { .. }));
+        assert_eq!(result, InboundClass::Binary);
     }
 
     #[test]
     fn invalid_utf8_text_content_type_still_binary() {
         // UTF-8 check fails; conjunctive rule → Binary.
         let result = classify_inbound(&[0xFF, 0xFE], Some("text/plain"));
-        assert!(matches!(result, InboundPayload::Binary { .. }));
+        assert_eq!(result, InboundClass::Binary);
     }
 
     #[test]
     fn empty_bytes_no_content_type_is_text() {
         let result = classify_inbound(b"", None);
-        assert_eq!(result, InboundPayload::Text(String::new()));
+        assert_eq!(result, InboundClass::Text(""));
     }
 
     #[test]
-    fn binary_content_type_produces_correct_base64() {
-        let bytes = b"\x00\x01\x02";
-        let result = classify_inbound(bytes, Some("application/octet-stream"));
-        match result {
-            InboundPayload::Binary {
-                base64,
-                content_type,
-            } => {
-                let decoded = Base64::decode_vec(&base64).unwrap();
-                assert_eq!(decoded, bytes);
-                assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
-            }
-            InboundPayload::Text(_) => panic!("expected Binary"),
-        }
+    fn binary_content_type_is_binary() {
+        let result = classify_inbound(b"\x00\x01\x02", Some("application/octet-stream"));
+        assert_eq!(result, InboundClass::Binary);
     }
 
     // --- decode_outbound_body ---

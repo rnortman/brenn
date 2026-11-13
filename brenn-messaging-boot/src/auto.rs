@@ -945,6 +945,7 @@ fn synthesize_entry(
             sink,
             wake_min: defaults.default_wake_min,
             non_text: endpoints.iter().any(|endpoint| endpoint.non_text),
+            untyped_content_type: None,
         },
         subscribers: vec![],
         transport_type: placement.scheme,

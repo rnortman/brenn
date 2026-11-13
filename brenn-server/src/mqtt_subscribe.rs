@@ -782,7 +782,7 @@ mod tests {
             .deliver_inbound(
                 "home",
                 "sensors/kitchen/temp",
-                InboundPayload::Text("22.5".to_string()),
+                InboundPayload::new("22.5", None),
                 0,
             )
             .await;
@@ -838,7 +838,7 @@ mod tests {
             .deliver_inbound(
                 "home",
                 "sensors/kitchen/temp",
-                InboundPayload::Text("22.5".to_string()),
+                InboundPayload::new("22.5", None),
                 0,
             )
             .await;
@@ -1397,7 +1397,7 @@ mod tests {
     async fn deliver_and_count(bridge: &ActiveBridge, client: &str, topic: &str) -> i64 {
         let router = bridge.mqtt_event_router().clone();
         router
-            .deliver_inbound(client, topic, InboundPayload::Text("v".to_string()), 0)
+            .deliver_inbound(client, topic, InboundPayload::new("v", None), 0)
             .await;
         let conn = bridge.messenger().unwrap().db().lock().await;
         conn.query_row(

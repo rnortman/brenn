@@ -376,7 +376,7 @@ pub async fn subscribe_live_confirmed(
     assert!(
         msg.topic == topic
             && msg.client == client_slug
-            && matches!(&msg.payload, InboundPayload::Text(t) if *t == barrier),
+            && msg.payload == InboundPayload::new(barrier.clone(), None),
         "subscribe_live_confirmed: expected the barrier on {topic:?} for client \
          {client_slug:?}, got a delivery on {:?} for {:?}: {:?}",
         msg.topic,

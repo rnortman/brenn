@@ -36,6 +36,7 @@ pub use config::{
     AppWebhookSubscriptionRaw, ReplayProtectedEndpoint, ResolvedWebhookEndpoint,
     ResolvedWebhookSubscription, WEBHOOK_MOUNT_PREFIX, WebhookEndpointConfigRaw,
     WebhookEndpointIdentity, WebhookKeyConfigRaw, WebhookOwner, WebhookTokenConfigRaw,
-    resolve_webhook_endpoints, resolve_webhook_identities, webhook_mount, webhook_store_paths,
+    normalized_content_type, resolve_webhook_endpoints, resolve_webhook_identities, webhook_mount,
+    webhook_store_paths,
 };
 pub use scheme::{HexFormat, SignatureAlgorithm, SignatureScheme, UnloadedSignatureScheme};

@@ -1,20 +1,27 @@
 // The guest SDK on the byte-carrying contract, through a real component on the
 // backend host: `processor-sdk-bytes-test` keeps a binary retained state through
 // `RetainedState` with its own `StateCodec`, and reports how the SDK's body
-// accessors read the messages on its `feed` port.
+// accessors read the messages on its `feed` port, the ingress accessors
+// included.
 //
 // Each test drives activations by hand: the state window an activation is
 // handed is the body the previous one published on `state`, which is what the
 // channel would retain at `retain_depth = 1`.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use brenn_activation::Activation;
-use brenn_envelope::MessageBody;
+use brenn_envelope::testutils::fixture_envelope;
+use brenn_envelope::{
+    MessageBody, MessageEnvelope, MqttEnvelope, MqttPayloadBody, MqttTransport, TransportMeta,
+    WebhookEnvelope, WebhookTransport,
+};
 use brenn_wasm::{
     ComponentGrant, HostActivation, OutputPortSpec, ProcessorComponent, ProcessorLoadSpec,
     ProcessorOutcome, ProcessorPublish,
 };
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 mod common;
@@ -301,4 +308,141 @@ fn the_sdk_reads_each_kind_of_body_as_it_is() {
         ]
     );
     assert_eq!(report["sync"], Value::Null);
+}
+
+/// One `mqtt:` or `webhook:` feed message on `channel` with `body`, carrying
+/// `transport` (the raw shape) or none (the wrapped shape).
+fn ingress(
+    channel: &str,
+    id: &str,
+    body: MessageBody,
+    transport: Option<TransportMeta>,
+) -> Arc<MessageEnvelope> {
+    let mut envelope = fixture_envelope(channel, id, body);
+    envelope.transport = transport;
+    Arc::new(envelope)
+}
+
+#[test]
+fn the_sdk_reads_each_ingress_shape_through_its_accessors_and_refuses_the_other() {
+    let component = load(true);
+    let at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("an instant");
+    let mqtt = MqttTransport {
+        client_slug: "broker".to_string(),
+        topic: "cam/front".to_string(),
+        qos: 1,
+        received_at: at,
+    };
+    let webhook = WebhookTransport {
+        headers: vec![("x-sig".to_string(), "[redacted]".to_string())],
+        key_id: "k1".to_string(),
+        client_ip: "192.0.2.1".to_string(),
+        received_at: at,
+        endpoint_slug: "scanner".to_string(),
+    };
+    let wrapped_mqtt = MqttEnvelope {
+        client_slug: "broker".to_string(),
+        topic: "cam/front".to_string(),
+        payload: MqttPayloadBody::Text {
+            text: "21.5".to_string(),
+        },
+        received_at: at,
+        qos: 1,
+    };
+    let wrapped_webhook = WebhookEnvelope {
+        headers: vec![],
+        key_id: "k1".to_string(),
+        client_ip: "192.0.2.1".to_string(),
+        received_at: at,
+        body: "{}".to_string(),
+        endpoint_slug: "scanner".to_string(),
+    };
+    let feed = vec![
+        ingress(
+            "mqtt:broker:cam/front",
+            "20",
+            common::body(Some("image/jpeg"), &[0xff, 0xd8]),
+            Some(TransportMeta::Mqtt(mqtt.clone())),
+        ),
+        ingress(
+            "mqtt:broker:cam/front",
+            "21",
+            MessageBody::text(serde_json::to_string(&wrapped_mqtt).expect("serializes")),
+            None,
+        ),
+        ingress(
+            "webhook:scanner",
+            "22",
+            common::body(Some("application/octet-stream"), &[0x00, 0xff]),
+            Some(TransportMeta::Webhook(webhook.clone())),
+        ),
+        ingress(
+            "webhook:scanner",
+            "23",
+            MessageBody::text(serde_json::to_string(&wrapped_webhook).expect("serializes")),
+            None,
+        ),
+    ];
+    let mut activation = activation("", None);
+    activation.ports.push(common::window("feed", feed, 0));
+    let (_, report) = ok(component.handle(activation));
+
+    let entries = report["windows"][0]["envelopes"]
+        .as_array()
+        .expect("envelopes");
+    let seen: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "hex": e["hex"],
+                "header_transport": e["header"]["transport"],
+                "mqtt_transport": e["mqtt_transport"],
+                "webhook_transport": e["webhook_transport"],
+                "mqtt_body": e["mqtt_body"],
+                "webhook_body": e["webhook_body"],
+            })
+        })
+        .collect();
+    let failed = json!({ "err": "processing-failed" });
+    assert_eq!(
+        seen,
+        [
+            json!({
+                "hex": "ffd8",
+                "header_transport": { "mqtt": mqtt },
+                "mqtt_transport": { "ok": mqtt },
+                "webhook_transport": failed,
+                "mqtt_body": failed,
+                "webhook_body": failed,
+            }),
+            json!({
+                "hex": common::hex(
+                    serde_json::to_string(&wrapped_mqtt).expect("serializes").as_bytes()
+                ),
+                "header_transport": null,
+                "mqtt_transport": failed,
+                "webhook_transport": failed,
+                "mqtt_body": { "ok": wrapped_mqtt },
+                "webhook_body": failed,
+            }),
+            json!({
+                "hex": "00ff",
+                "header_transport": { "webhook": webhook },
+                "mqtt_transport": failed,
+                "webhook_transport": { "ok": webhook },
+                "mqtt_body": failed,
+                "webhook_body": failed,
+            }),
+            json!({
+                "hex": common::hex(
+                    serde_json::to_string(&wrapped_webhook).expect("serializes").as_bytes()
+                ),
+                "header_transport": null,
+                "mqtt_transport": failed,
+                "webhook_transport": failed,
+                "mqtt_body": failed,
+                "webhook_body": { "ok": wrapped_webhook },
+            }),
+        ]
+    );
 }

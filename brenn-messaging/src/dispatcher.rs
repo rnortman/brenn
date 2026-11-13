@@ -474,6 +474,7 @@ mod tests {
                 sink: crate::config::Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![crate::SubscriberEntry {
                 kind: crate::SubscriberEntryKind::App("target".to_string()),

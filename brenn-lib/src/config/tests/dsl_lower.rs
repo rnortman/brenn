@@ -128,6 +128,7 @@ fn channel_at(address: &str) -> ChannelConfigRaw {
         wake_min: None,
         send_rate: None,
         non_text: false,
+        untyped_content_type: None,
     }
 }
 

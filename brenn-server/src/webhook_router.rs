@@ -7,10 +7,13 @@
 //! construction, before any webhook request can arrive.
 //!
 //! Delivery path:
-//! 1. Build the `WebhookEnvelope` from the threaded HTTP metadata, masking
+//! 1. Build the transport metadata from the threaded HTTP metadata, masking
 //!    credential-bearing header values using `SignatureScheme::credential_header_names`.
 //! 2. Resolve the `webhook:<slug>` channel from the `MessagingDirectory`.
-//! 3. Call `Messenger::publish_transport_ingress` — durably enqueues + dispatches
+//! 3. Check the verified body against that entry — its shape, and for the raw
+//!    shape the body cap and the endpoint's content type — and build either the
+//!    `WebhookEnvelope` (wrapped) or the typed body with `TransportMeta` (raw).
+//! 4. Call `Messenger::publish_transport_ingress` — durably enqueues + dispatches
 //!    to channel subscribers via the standard bus publish path.
 
 use std::net::IpAddr;
@@ -18,10 +21,15 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::http::HeaderMap;
-use brenn_lib::messaging::{SubscriberEntryKind, WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope};
+use brenn_lib::messaging::{
+    ChannelEntry, MessageBody, SubscriberEntryKind, TransportMeta, WEBHOOK_ADDRESS_PREFIX,
+    WebhookEnvelope, WebhookTransport,
+};
 use brenn_lib::webhook::config::{ResolvedWebhookEndpoint, WebhookOwner};
 use brenn_lib::webhook::scheme::SignatureScheme;
+use brenn_messaging::IngressMessage;
 use brenn_webhook::service::WebhookEventRouter;
+use brenn_webhook::signature::VerifiedBody;
 use tokio::sync::OnceCell;
 
 use crate::state::AppState;
@@ -59,29 +67,27 @@ impl WebhookEventRouterImpl {
     }
 }
 
-/// Build a `WebhookEnvelope` from the threaded HTTP metadata, applying
+/// Build the transport metadata both ingress shapes carry, applying
 /// scheme-driven credential-header masking.
 ///
 /// All headers from the `HeaderMap` are captured as ordered `(name, value)`
 /// pairs (lowercased names, as axum exposes them). Header values for the
 /// scheme's credential-bearing header names are replaced with `"[redacted]"`.
-/// Non-UTF-8 header values are skipped (they cannot appear in valid UTF-8
-/// webhook payloads; the admission path already guards for replay-protected
-/// endpoints; any non-UTF-8 value on a non-replay endpoint is treated as
-/// non-existent rather than panicking here).
+/// Non-UTF-8 header values are skipped and logged: they cannot be carried as
+/// JSON strings, and the admission path already refuses them for
+/// replay-protected endpoints.
 ///
 /// `received_at` is converted from `SystemTime` to `DateTime<Utc>`. A
 /// `SystemTime` before UNIX_EPOCH panics — that is a host clock misconfiguration,
 /// not a transient error.
-fn build_webhook_envelope(
+fn build_webhook_transport(
     endpoint_slug: &str,
     key_id: &str,
     headers: HeaderMap,
     client_ip: IpAddr,
     received_at: SystemTime,
-    raw_body: String,
     scheme: &SignatureScheme,
-) -> WebhookEnvelope {
+) -> WebhookTransport {
     use chrono::{DateTime, Utc};
 
     let credential_names = scheme.credential_header_names();
@@ -117,8 +123,8 @@ fn build_webhook_envelope(
             endpoint = %endpoint_slug,
             skipped_count = skipped_non_utf8_headers.len(),
             skipped_header_names = ?skipped_non_utf8_headers,
-            "build_webhook_envelope: skipped non-UTF-8 header value(s); \
-             these headers are absent from the stored envelope"
+            "build_webhook_transport: skipped non-UTF-8 header value(s); \
+             these headers are absent from the stored message"
         );
     }
 
@@ -132,13 +138,96 @@ fn build_webhook_envelope(
         });
     let received_at_chrono = DateTime::<Utc>::from(std::time::UNIX_EPOCH + duration_since_epoch);
 
-    WebhookEnvelope {
+    WebhookTransport {
         headers: headers_vec,
         key_id: key_id.to_owned(),
         client_ip: client_ip.to_string(),
         received_at: received_at_chrono,
-        body: raw_body,
         endpoint_slug: endpoint_slug.to_owned(),
+    }
+}
+
+/// The wrapped shape: the transport metadata with the body inside it.
+fn wrap(transport: WebhookTransport, body: String) -> WebhookEnvelope {
+    let WebhookTransport {
+        headers,
+        key_id,
+        client_ip,
+        received_at,
+        endpoint_slug,
+    } = transport;
+    WebhookEnvelope {
+        headers,
+        key_id,
+        client_ip,
+        received_at,
+        body,
+        endpoint_slug,
+    }
+}
+
+/// Check the verified body against the channel entry it is about to be
+/// published on, and build what is published.
+///
+/// The endpoint the request was verified under and the entry resolved now may
+/// be of different plans while a reload commits: the endpoint table is swapped
+/// after the channel entries. Each disagreement is an `Err` naming the two
+/// values, which the handler answers 500; nothing is stored.
+fn ingress_message(
+    endpoint: &ResolvedWebhookEndpoint,
+    channel: &ChannelEntry,
+    body: VerifiedBody,
+    transport: WebhookTransport,
+    max_body_bytes: usize,
+) -> Result<IngressMessage, String> {
+    let endpoint_slug = endpoint.slug.as_str();
+    let channel_address = channel.address.as_str();
+    let channel_raw = channel.resolved_channel.non_text;
+    match body {
+        VerifiedBody::Wrapped(text) => {
+            if channel_raw {
+                return Err(format!(
+                    "webhook_router: endpoint '{endpoint_slug}' verified the request for the \
+                     wrapped shape but channel '{channel_address}' is now `non_text` (raw); \
+                     returning 500 to caller"
+                ));
+            }
+            let envelope_json = serde_json::to_string(&wrap(transport, text))
+                .expect("WebhookEnvelope serialization is infallible");
+            Ok(IngressMessage::Wrapped(envelope_json))
+        }
+        VerifiedBody::Raw(bytes) => {
+            if !channel_raw {
+                return Err(format!(
+                    "webhook_router: endpoint '{endpoint_slug}' verified the request for the \
+                     raw shape but channel '{channel_address}' is now text-only (wrapped); \
+                     returning 500 to caller"
+                ));
+            }
+            if bytes.len() > max_body_bytes {
+                return Err(format!(
+                    "webhook_router: endpoint '{endpoint_slug}' admitted a {}-byte body under \
+                     transport_ceiling_bytes = {}, over messaging.max_body_bytes = \
+                     {max_body_bytes} for raw channel '{channel_address}'; returning 500 to \
+                     caller",
+                    bytes.len(),
+                    endpoint.transport_ceiling_bytes,
+                ));
+            }
+            let body =
+                MessageBody::from_parts(Some(&endpoint.content_type), &bytes).map_err(|error| {
+                    format!(
+                        "webhook_router: endpoint '{endpoint_slug}' content_type {:?} cannot \
+                         type this body for raw channel '{channel_address}' ({error}); \
+                         returning 500 to caller",
+                        endpoint.content_type,
+                    )
+                })?;
+            Ok(IngressMessage::Raw {
+                body,
+                transport: TransportMeta::Webhook(transport),
+            })
+        }
     }
 }
 
@@ -151,13 +240,14 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
         headers: HeaderMap,
         client_ip: IpAddr,
         received_at: SystemTime,
-        raw_body: String,
+        body: VerifiedBody,
     ) -> Result<(), String> {
         let endpoint_slug = endpoint.slug.as_str();
         let owner = &endpoint.owner;
-        // Returns Err only for invariant-violation cases (startup race, unknown owner,
-        // missing messenger/channel) that require the HTTP layer to emit 5xx so the
-        // sender can retry rather than treating the drop as success.
+        // Returns Err for the startup race, an unknown owning app, a channel retired
+        // mid-request, a WASM owner missing from the channel's subscribers, and an
+        // endpoint and channel that disagree during a reload's commit; the HTTP layer
+        // answers each with 5xx so the sender does not take the drop for success.
         //
         // Use `get()` rather than `expect()` to distinguish a startup race from
         // a configuration bug.
@@ -190,22 +280,19 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
             return Err(msg);
         }
 
-        // Build the WebhookEnvelope with credential-header masking. The scheme
-        // is the one on the handed-over endpoint, which is the one the request
-        // was verified against — a reload may have replaced the table entry
-        // since, and masking under the new scheme's header set would mask the
-        // wrong headers.
-        let envelope = build_webhook_envelope(
+        // Build the transport metadata with credential-header masking. The
+        // scheme is the one on the handed-over endpoint, which is the one the
+        // request was verified against — a reload may have replaced the table
+        // entry since, and masking under the new scheme's header set would
+        // mask the wrong headers.
+        let transport = build_webhook_transport(
             endpoint_slug,
             key_id,
             headers,
             client_ip,
             received_at,
-            raw_body,
             &endpoint.scheme,
         );
-        let envelope_json =
-            serde_json::to_string(&envelope).expect("WebhookEnvelope serialization is infallible");
 
         // Resolve the webhook: channel from the messaging directory.
         // The channel must exist — it was derived from this endpoint at startup and upserted.
@@ -254,6 +341,17 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
             }
         }
 
+        let message = ingress_message(
+            endpoint,
+            &channel,
+            body,
+            transport,
+            messenger.max_body_bytes(),
+        )
+        .inspect_err(|msg| {
+            tracing::warn!(endpoint = endpoint_slug, channel = %channel_address, "{msg}");
+        })?;
+
         // source == "webhook:<slug>", sender == key_id (envelope identifier).
         let source = channel_address.clone();
         let sender = key_id;
@@ -263,13 +361,7 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
         // `204` is returned by the HTTP handler only after this returns (durable enqueue
         // has completed). Never 204 if enqueue failed — the handler maps Err→500.
         messenger
-            .publish_transport_ingress(
-                channel,
-                &source,
-                sender,
-                envelope_json.as_str().into(),
-                endpoint.urgency,
-            )
+            .publish_transport_ingress(channel, &source, sender, message, endpoint.urgency)
             .await;
         Ok(())
     }
@@ -366,6 +458,17 @@ mod tests {
         db: brenn_db::Db,
         endpoint_slug: &str,
     ) -> Arc<brenn_messaging::Messenger> {
+        messenger_with_shaped_webhook_channel(db, endpoint_slug, false, 65_536)
+    }
+
+    /// [`messenger_with_webhook_channel`] with the channel's `non_text` and the
+    /// bus's body cap stated.
+    fn messenger_with_shaped_webhook_channel(
+        db: brenn_db::Db,
+        endpoint_slug: &str,
+        non_text: bool,
+        max_body_bytes: usize,
+    ) -> Arc<brenn_messaging::Messenger> {
         let channel_uuid = webhook_channel_uuid_from_slug(endpoint_slug);
         let address = format!("{WEBHOOK_ADDRESS_PREFIX}{endpoint_slug}");
         let entry = ChannelEntry {
@@ -380,7 +483,8 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
-                non_text: false,
+                non_text,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: ChannelScheme::Webhook,
@@ -398,7 +502,10 @@ mod tests {
             Arc::new(IndexMap::new()),
             Arc::new(brenn_messaging::query::NoopWakeRouter)
                 as Arc<dyn brenn_messaging::WakeRouter>,
-            MessagingGlobalConfig::default(),
+            MessagingGlobalConfig {
+                max_body_bytes,
+                ..MessagingGlobalConfig::default()
+            },
         )
     }
 
@@ -426,6 +533,7 @@ mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![SubscriberEntry {
                 kind: SubscriberEntryKind::App(app_slug.to_string()),
@@ -547,7 +655,7 @@ mod tests {
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
-                "hello".to_string(),
+                VerifiedBody::Wrapped("hello".to_string()),
             )
             .await
             .expect("delivery should succeed");
@@ -602,7 +710,7 @@ mod tests {
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
-                "hello".to_string(),
+                VerifiedBody::Wrapped("hello".to_string()),
             )
             .await
             .expect("delivery itself succeeds; the subscriber is denied, not the ingress");
@@ -651,7 +759,7 @@ mod tests {
                     test_headers(),
                     test_ip(),
                     SystemTime::now(),
-                    body.to_string(),
+                    VerifiedBody::Wrapped(body.to_string()),
                 )
                 .await
                 .expect("delivery itself succeeds while the subscriber is denied");
@@ -708,7 +816,7 @@ mod tests {
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
-                "x".to_string(),
+                VerifiedBody::Wrapped("x".to_string()),
             )
             .await;
 
@@ -741,7 +849,7 @@ mod tests {
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
-                "hello".to_string(),
+                VerifiedBody::Wrapped("hello".to_string()),
             )
             .await
             .expect("delivery should succeed for a present wasm owner");
@@ -777,7 +885,7 @@ mod tests {
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
-                "hello".to_string(),
+                VerifiedBody::Wrapped("hello".to_string()),
             )
             .await;
 
@@ -812,7 +920,7 @@ mod tests {
                 headers,
                 "192.168.1.1".parse().unwrap(),
                 SystemTime::now(),
-                "raw-body-content".to_string(),
+                VerifiedBody::Wrapped("raw-body-content".to_string()),
             )
             .await
             .expect("delivery should succeed");
@@ -879,7 +987,7 @@ mod tests {
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
-                "hello".to_string(),
+                VerifiedBody::Wrapped("hello".to_string()),
             )
             .await
             .expect("delivery should succeed");
@@ -944,7 +1052,7 @@ mod tests {
                 headers,
                 "127.0.0.1".parse().unwrap(),
                 SystemTime::now(),
-                "{}".to_string(),
+                VerifiedBody::Wrapped("{}".to_string()),
             )
             .await
             .expect("delivery should succeed");
@@ -1012,6 +1120,7 @@ mod tests {
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
                 non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![SubscriberEntry {
                 kind: SubscriberEntryKind::App("myapp".to_string()),
@@ -1072,7 +1181,7 @@ mod tests {
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
-                "body".to_string(),
+                VerifiedBody::Wrapped("body".to_string()),
             )
             .await
             .expect("delivery must succeed even with send_budget=0");
@@ -1133,7 +1242,7 @@ mod tests {
                 headers,
                 "127.0.0.1".parse().unwrap(),
                 SystemTime::now(),
-                "{}".to_string(),
+                VerifiedBody::Wrapped("{}".to_string()),
             )
             .await
             .expect("delivery should succeed");
@@ -1170,5 +1279,208 @@ mod tests {
             .find(|(n, _)| n == "x-token-id")
             .expect("x-token-id header must be present in envelope");
         assert_eq!(tid_entry.1, "t1", "identifier header must NOT be masked");
+    }
+
+    // -----------------------------------------------------------------------
+    // Raw shape
+    // -----------------------------------------------------------------------
+
+    /// One stored row on a webhook channel: body bytes, content type, transport.
+    type StoredRow = (Vec<u8>, Option<String>, Option<String>);
+
+    async fn stored_rows(db: &brenn_db::Db, endpoint_slug: &str) -> Vec<StoredRow> {
+        let uuid = webhook_channel_uuid_from_slug(endpoint_slug);
+        let conn = db.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT body, content_type, transport FROM messaging_messages \
+                 WHERE channel_uuid = ?1 ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([uuid.as_bytes().to_vec()], |r| {
+            let body = match r.get::<_, rusqlite::types::Value>(0)? {
+                rusqlite::types::Value::Blob(b) => b,
+                rusqlite::types::Value::Text(t) => t.into_bytes(),
+                other => panic!("unexpected body column {other:?}"),
+            };
+            Ok((body, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// An endpoint `ep-raw` owned by `myapp`, with the given content type and
+    /// transport ceiling, signing with the credential header `x-sig`.
+    fn raw_endpoint(content_type: &str, ceiling: usize) -> Arc<ResolvedWebhookEndpoint> {
+        let mut endpoint = test_endpoint("ep-raw", WebhookOwner::App(Arc::from("myapp")));
+        let ep = Arc::get_mut(&mut endpoint).expect("sole reference");
+        ep.content_type = content_type.to_string();
+        ep.transport_ceiling_bytes = ceiling;
+        endpoint
+    }
+
+    /// A router over one `webhook:ep-raw` channel of the given shape and body cap.
+    fn raw_router(non_text: bool, max_body_bytes: usize) -> (WebhookEventRouterImpl, brenn_db::Db) {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        state.messenger = Some(messenger_with_shaped_webhook_channel(
+            db.clone(),
+            "ep-raw",
+            non_text,
+            max_body_bytes,
+        ));
+        state.webhook = test_webhook_svc("ep-raw", "myapp");
+        let router = WebhookEventRouterImpl::new();
+        router.set_state(state);
+        (router, db)
+    }
+
+    async fn deliver(
+        router: &WebhookEventRouterImpl,
+        endpoint: &Arc<ResolvedWebhookEndpoint>,
+        body: VerifiedBody,
+    ) -> Result<(), String> {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/octet-stream".parse().unwrap());
+        headers.insert("x-sig", "v1=secret-bearing".parse().unwrap());
+        headers.insert("x-device", "cam-1".parse().unwrap());
+        router
+            .deliver_inbound(
+                endpoint,
+                "k1",
+                headers,
+                "192.0.2.7".parse().unwrap(),
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+                body,
+            )
+            .await
+    }
+
+    /// A raw body on a raw channel is the stored body, byte-exact, typed with
+    /// the endpoint's content type, with the masked metadata in `transport`.
+    #[tokio::test]
+    async fn a_raw_body_is_stored_byte_exact_with_the_endpoint_type_and_transport() {
+        let (router, db) = raw_router(true, 65_536);
+        let endpoint = raw_endpoint("application/octet-stream", 1024);
+        let bytes = vec![0xff, 0x00, 0xfe, 0x80];
+        deliver(&router, &endpoint, VerifiedBody::Raw(bytes.clone().into()))
+            .await
+            .expect("a raw body within the cap is published");
+
+        let rows = stored_rows(&db, "ep-raw").await;
+        assert_eq!(rows.len(), 1);
+        let (body, content_type, transport) = &rows[0];
+        assert_eq!(body, &bytes);
+        assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
+        let transport: TransportMeta =
+            serde_json::from_str(transport.as_deref().expect("transport is stored")).unwrap();
+        let TransportMeta::Webhook(meta) = transport else {
+            panic!("expected webhook transport, got {transport:?}");
+        };
+        assert_eq!(meta.endpoint_slug, "ep-raw");
+        assert_eq!(meta.key_id, "k1");
+        assert_eq!(meta.client_ip, "192.0.2.7");
+        assert_eq!(meta.received_at.timestamp(), 1_700_000_000);
+        assert_eq!(
+            meta.headers,
+            vec![
+                (
+                    "content-type".to_string(),
+                    "application/octet-stream".to_string()
+                ),
+                ("x-sig".to_string(), "[redacted]".to_string()),
+                ("x-device".to_string(), "cam-1".to_string()),
+            ],
+            "the credential header is masked, the rest kept in order"
+        );
+    }
+
+    /// The wrapped shape on a text-only channel still stores the envelope with
+    /// no `transport`.
+    #[tokio::test]
+    async fn a_wrapped_body_stores_no_transport() {
+        let (router, db) = raw_router(false, 65_536);
+        let endpoint = raw_endpoint("application/json", 1024);
+        deliver(&router, &endpoint, VerifiedBody::Wrapped("{}".to_string()))
+            .await
+            .expect("wrapped delivery succeeds");
+        let rows = stored_rows(&db, "ep-raw").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, None, "the wrapper is untyped text");
+        assert_eq!(rows[0].2, None, "the wrapper carries no transport column");
+    }
+
+    /// A request verified for one shape against a channel of the other is
+    /// refused and stores nothing, in both directions.
+    #[tokio::test]
+    async fn a_shape_mismatch_is_refused_and_stores_nothing() {
+        let (router, db) = raw_router(true, 65_536);
+        let endpoint = raw_endpoint("application/json", 1024);
+        let err = deliver(&router, &endpoint, VerifiedBody::Wrapped("{}".to_string()))
+            .await
+            .expect_err("wrapped onto a raw channel is refused");
+        assert!(err.contains("wrapped shape"), "{err}");
+        assert!(stored_rows(&db, "ep-raw").await.is_empty());
+
+        let (router, db) = raw_router(false, 65_536);
+        let err = deliver(&router, &endpoint, VerifiedBody::Raw("{}".into()))
+            .await
+            .expect_err("raw onto a text-only channel is refused");
+        assert!(err.contains("raw shape"), "{err}");
+        assert!(stored_rows(&db, "ep-raw").await.is_empty());
+    }
+
+    /// An endpoint of another plan whose ceiling admits a body over the bus's
+    /// cap: refused, nothing stored, no panic.
+    #[tokio::test]
+    async fn a_raw_body_over_the_cap_under_a_wider_ceiling_is_refused() {
+        let (router, db) = raw_router(true, 8);
+        let endpoint = raw_endpoint("application/octet-stream", 1024 * 1024);
+        let err = deliver(&router, &endpoint, VerifiedBody::Raw(vec![0u8; 9].into()))
+            .await
+            .expect_err("a body over the cap is refused");
+        assert!(err.contains("max_body_bytes = 8"), "{err}");
+        assert!(err.contains("transport_ceiling_bytes = 1048576"), "{err}");
+        assert!(stored_rows(&db, "ep-raw").await.is_empty());
+    }
+
+    /// An endpoint of another plan whose content type the bus refuses, and a
+    /// text type over bytes that are not UTF-8: each refused, nothing stored.
+    #[tokio::test]
+    async fn a_raw_body_the_bus_cannot_type_is_refused() {
+        let (router, db) = raw_router(true, 65_536);
+        let err = deliver(
+            &router,
+            &raw_endpoint("not a media type", 1024),
+            VerifiedBody::Raw(vec![1, 2, 3].into()),
+        )
+        .await
+        .expect_err("a malformed endpoint type is refused");
+        assert!(err.contains("\"not a media type\""), "{err}");
+
+        let err = deliver(
+            &router,
+            &raw_endpoint("application/json", 1024),
+            VerifiedBody::Raw(vec![0xff, 0xfe].into()),
+        )
+        .await
+        .expect_err("non-UTF-8 under a text type is refused");
+        assert!(err.contains("\"application/json\""), "{err}");
+        assert!(stored_rows(&db, "ep-raw").await.is_empty());
+    }
+
+    /// Under the same mismatched endpoint, a body the pair admits is stored,
+    /// typed with the endpoint's type.
+    #[tokio::test]
+    async fn a_raw_body_within_the_cap_under_a_mismatched_endpoint_is_stored() {
+        let (router, db) = raw_router(true, 8);
+        let endpoint = raw_endpoint("text/plain", 1024 * 1024);
+        deliver(&router, &endpoint, VerifiedBody::Raw("abcdefgh".into()))
+            .await
+            .expect("a body at the cap is published");
+        let rows = stored_rows(&db, "ep-raw").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, b"abcdefgh");
+        assert_eq!(rows[0].1.as_deref(), Some("text/plain"));
     }
 }

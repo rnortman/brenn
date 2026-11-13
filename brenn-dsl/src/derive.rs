@@ -59,7 +59,7 @@ use crate::derived::{
     DRemoteSubEntry, DWebhook, DerivedConfig,
 };
 use crate::diag::{Diagnostic, check_unique, or_list, two_site};
-use crate::model::Word;
+use crate::model::{Attr, ChannelAttrs, Word};
 use crate::resolved::scheme::{config_identified, spellable_quoted_list, split_spellable};
 use crate::resolved::{
     ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef,
@@ -429,6 +429,16 @@ fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
                 int_or_word_span(&attr.value).clone(),
             ));
         }
+        if let Some(attr) = &channel.attrs.untyped_content_type {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{address}` is a declared channel, so it states no \
+                     untyped_content_type: its bodies are typed by their publishers — the \
+                     word belongs on a raw `mqtt:` tuning"
+                ),
+                attr.value.span().clone(),
+            ));
+        }
         if let Some(attr) = &channel.attrs.sink
             && !sink_admitted(durable)
         {
@@ -480,17 +490,75 @@ fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
                 attr.value.span().clone(),
             ));
         }
-        if let Some(attr) = &tuning.attrs.non_text {
+        let scheme = split_spellable(tuning.address.value()).map(|(scheme, _)| scheme);
+        let ingress = matches!(scheme, Some(ChannelScheme::Mqtt | ChannelScheme::Webhook));
+        if let Some(attr) = &tuning.attrs.non_text
+            && !ingress
+        {
             errors.push(Diagnostic::at(
                 format!(
-                    "the block tuning `{label}` states no non_text: a tuning matches a \
-                     family the system mints, and every such family is written and read \
-                     by host code that parses text — non_text belongs on a `channel` \
-                     declaration"
+                    "the block tuning `{label}` states no non_text: only an `mqtt:` or \
+                     `webhook:` tuning takes it, where it selects the raw ingress shape — \
+                     the payload is the body; the tool and device-location families are \
+                     written and read by host code that parses text"
                 ),
                 attr.value.span().clone(),
             ));
         }
+        if let Some(attr) = &tuning.attrs.untyped_content_type {
+            check_untyped_content_type(&label, scheme, &tuning.attrs, attr, errors);
+        }
+    }
+}
+
+/// The refusals of `untyped_content_type` on a tuning: outside the `mqtt:`
+/// family, without `non_text = true` beside it, or naming no media type the
+/// bus accepts.
+fn check_untyped_content_type(
+    label: &str,
+    scheme: Option<ChannelScheme>,
+    attrs: &ChannelAttrs<RVal>,
+    attr: &Attr<RVal>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let span = attr.value.span().clone();
+    if scheme != Some(ChannelScheme::Mqtt) {
+        errors.push(Diagnostic::at(
+            format!(
+                "the block tuning `{label}` states no untyped_content_type: only an `mqtt:` \
+                 tuning takes it — a `webhook:` channel's body is typed by its endpoint, \
+                 and the tool and device-location families are text-only"
+            ),
+            span,
+        ));
+        return;
+    }
+    let raw = attrs
+        .non_text
+        .as_ref()
+        .is_some_and(|non_text| matches!(non_text.value.value(), RValue::Bool(true)));
+    if !raw {
+        errors.push(Diagnostic::at(
+            format!(
+                "the block tuning `{label}` states untyped_content_type without \
+                 `non_text = true`: a wrapped `mqtt:` channel's body is the wrapper, so the \
+                 word would type nothing"
+            ),
+            span,
+        ));
+        return;
+    }
+    // A value that is not a string is lowering's refusal.
+    if let RValue::Str(content_type) = attr.value.value()
+        && let Err(e) = brenn_envelope::check_content_type(content_type)
+    {
+        errors.push(Diagnostic::at(
+            format!(
+                "the block tuning `{label}` states untyped_content_type {content_type:?}, \
+                 which is not a media type the bus accepts: {e}"
+            ),
+            span,
+        ));
     }
 }
 

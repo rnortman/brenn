@@ -36,7 +36,7 @@ pub mod shape;
 pub mod testutils;
 pub mod tool_schema;
 
-pub use body::{BodyError, GuestBody, MessageBody, is_text_content_type};
+pub use body::{BodyError, GuestBody, MessageBody, check_content_type, is_text_content_type};
 pub use shape::{
     BodyShape, EnvelopeHeader, HeaderShape, ShapedEnvelope, TextShape, serialize_text_shape,
 };
@@ -340,11 +340,14 @@ pub fn is_local_channel(address: &str) -> bool {
 // WebhookEnvelope
 // ---------------------------------------------------------------------------
 
-/// Transport-typed envelope for webhook ingress messages.
+/// Transport-typed envelope for webhook ingress messages: the default
+/// (wrapped) ingress shape.
 ///
 /// Stored as the `body` JSON of a `messaging_messages` row with
 /// `envelope_type = 'webhook'`. The `body` field carries the raw request
-/// body as opaque bytes-as-UTF-8-string; the bus never parses it.
+/// body as opaque bytes-as-UTF-8-string; the bus never parses it. A channel
+/// tuned `non_text` takes the raw shape instead: the request body is the
+/// message body and [`WebhookTransport`] the metadata.
 ///
 /// Credential-bearing header values are masked to `"[redacted]"` at
 /// envelope construction time (after signature verification) so the
@@ -379,9 +382,9 @@ pub struct WebhookEnvelope {
 /// `Binary { binary_placeholder, content_type }` placeholder form.
 ///
 /// Binary payloads are represented as a placeholder only:
-/// `{ binary_placeholder: true, content_type }`. The raw bytes are **not**
-/// carried — they never reach the LLM/browser, preserving the prompt-injection
-/// trust boundary.
+/// `{ binary_placeholder: true, content_type }`. The wrapper does **not**
+/// carry the raw bytes. A channel tuned `non_text` takes the raw shape, whose
+/// body is the payload bytes and whose metadata is [`MqttTransport`].
 ///
 /// `content_type` in the `Binary` variant has no
 /// `#[serde(skip_serializing_if)]`: the key is always emitted (as `null` when
@@ -389,8 +392,6 @@ pub struct WebhookEnvelope {
 /// alphabetically (`binary_placeholder`, `content_type`) so untagged
 /// serialization is byte-compatible with the `serde_json::Map` (sorted-key)
 /// output of the borrowed view.
-// TODO(guest-envelope-accessors): no `text()` accessor; consumers hand-match
-// the variants to reach the payload text.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum MqttPayloadBody {
@@ -404,7 +405,23 @@ pub enum MqttPayloadBody {
     },
 }
 
-/// Transport-typed envelope for MQTT ingress messages.
+impl MqttPayloadBody {
+    /// The payload's text, or `None` for a binary payload.
+    ///
+    /// In the wrapped shape a binary payload is a placeholder: its bytes were
+    /// not kept, so there is nothing to read. A channel tuned `non_text` takes
+    /// the raw shape instead, where the payload itself is the message body.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } => Some(text),
+            Self::Binary { .. } => None,
+        }
+    }
+}
+
+/// Transport-typed envelope for MQTT ingress messages: the default (wrapped)
+/// ingress shape. A channel tuned `non_text` takes the raw shape instead: the
+/// payload is the message body and [`MqttTransport`] the metadata.
 ///
 /// Stored as the `body` JSON of a `messaging_messages` row with
 /// `envelope_type = 'mqtt'`. This is the owned host↔guest contract; the
@@ -420,7 +437,7 @@ pub struct MqttEnvelope {
     pub client_slug: String,
     /// The **actual** published topic, not the subscribed filter.
     pub topic: String,
-    /// Text vs. binary-placeholder payload. Raw bytes are never carried.
+    /// Text vs. binary-placeholder payload. The wrapper never carries raw bytes.
     pub payload: MqttPayloadBody,
     /// Host receive timestamp.
     pub received_at: DateTime<Utc>,
@@ -428,6 +445,59 @@ pub struct MqttEnvelope {
     /// actually delivered this message — may differ from the QoS the bridge
     /// requested at subscribe time).
     pub qos: u8,
+}
+
+/// The MQTT metadata of a message whose body is the broker payload itself:
+/// the fields of [`MqttEnvelope`] less `payload`, with the same meanings.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MqttTransport {
+    /// The declared client this arrived on.
+    pub client_slug: String,
+    /// The **actual** published topic, not the subscribed filter.
+    pub topic: String,
+    /// Delivery QoS of the inbound PUBLISH.
+    pub qos: u8,
+    /// Host receive timestamp.
+    pub received_at: DateTime<Utc>,
+}
+
+/// The webhook metadata of a message whose body is the request body itself:
+/// the fields of [`WebhookEnvelope`] less `body`, with the same meanings.
+/// Credential-bearing header values are `"[redacted]"`, as there.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WebhookTransport {
+    /// HTTP request headers as ordered key-value pairs (names lowercased).
+    pub headers: Vec<(String, String)>,
+    /// Identifier of the key that authenticated the request.
+    pub key_id: String,
+    /// Client IP address rendered to string.
+    pub client_ip: String,
+    /// Timestamp when the request was received at the HTTP handler.
+    pub received_at: DateTime<Utc>,
+    /// The originating webhook endpoint slug.
+    pub endpoint_slug: String,
+}
+
+/// The transport metadata a [`MessageEnvelope`] carries under the header key
+/// `transport`: `{"mqtt":{…}}` or `{"webhook":{…}}`.
+///
+/// Closed, like `envelope_type`: a transport added later comes with a new
+/// [`ChannelScheme`], which a reader built before it already refuses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportMeta {
+    Mqtt(MqttTransport),
+    Webhook(WebhookTransport),
+}
+
+impl TransportMeta {
+    /// The channel scheme of the transport this metadata belongs to.
+    pub fn scheme(&self) -> ChannelScheme {
+        match self {
+            Self::Mqtt(_) => ChannelScheme::Mqtt,
+            Self::Webhook(_) => ChannelScheme::Webhook,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +770,12 @@ pub struct MessageEnvelope {
     /// Additive to the LLM-facing JSON; the LLM is the maximally-adaptable
     /// consumer.
     pub envelope_type: ChannelScheme,
+    /// The transport's metadata, on a message a transport adaptor published
+    /// with the payload itself as the body; `None` on every other message,
+    /// including the wrapper-shaped ingress messages, whose metadata is
+    /// inside the body. Serialized under the header key `transport`, after
+    /// `envelope_type`, and omitted when absent.
+    pub transport: Option<TransportMeta>,
 }
 
 // ---------------------------------------------------------------------------
@@ -726,10 +802,99 @@ mod tests {
             impetus: None,
             urgency,
             envelope_type,
+            transport: None,
         }
     }
 
     // ── Epoch-millisecond times ───────────────────────────────────────────
+
+    #[test]
+    fn mqtt_payload_body_text_reads_text_and_not_the_placeholder() {
+        let text = MqttPayloadBody::Text {
+            text: "21.5".to_string(),
+        };
+        assert_eq!(text.text(), Some("21.5"));
+        let binary = MqttPayloadBody::Binary {
+            binary_placeholder: true,
+            content_type: Some("image/jpeg".to_string()),
+        };
+        assert_eq!(binary.text(), None);
+    }
+
+    /// Both variants' wire form, pinned literally: the header key's value is
+    /// an external contract read by out-of-tree components.
+    #[test]
+    fn transport_meta_wire_form_is_pinned_and_round_trips() {
+        let at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let mqtt = TransportMeta::Mqtt(MqttTransport {
+            client_slug: "broker".to_string(),
+            topic: "cam/front".to_string(),
+            qos: 1,
+            received_at: at,
+        });
+        let webhook = TransportMeta::Webhook(WebhookTransport {
+            headers: vec![
+                ("x-sig".to_string(), "[redacted]".to_string()),
+                ("x-tag".to_string(), "a".to_string()),
+                ("x-tag".to_string(), "b".to_string()),
+            ],
+            key_id: "k1".to_string(),
+            client_ip: "192.0.2.7".to_string(),
+            received_at: at,
+            endpoint_slug: "scanner".to_string(),
+        });
+        for (meta, wire, scheme) in [
+            (
+                &mqtt,
+                concat!(
+                    r#"{"mqtt":{"client_slug":"broker","topic":"cam/front","qos":1,"#,
+                    r#""received_at":"2023-11-14T22:13:20Z"}}"#
+                ),
+                ChannelScheme::Mqtt,
+            ),
+            (
+                &webhook,
+                concat!(
+                    r#"{"webhook":{"headers":[["x-sig","[redacted]"],["x-tag","a"],"#,
+                    r#"["x-tag","b"]],"key_id":"k1","client_ip":"192.0.2.7","#,
+                    r#""received_at":"2023-11-14T22:13:20Z","endpoint_slug":"scanner"}}"#
+                ),
+                ChannelScheme::Webhook,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(meta).unwrap(), wire);
+            assert_eq!(&serde_json::from_str::<TransportMeta>(wire).unwrap(), meta);
+            assert_eq!(meta.scheme(), scheme);
+        }
+    }
+
+    /// The wrapped webhook shape, headers included: order kept, a repeated name
+    /// kept twice, a masked value as the literal `"[redacted]"`.
+    #[test]
+    fn webhook_envelope_wire_form_with_headers_is_pinned() {
+        let envelope = WebhookEnvelope {
+            headers: vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("x-sig".to_string(), "[redacted]".to_string()),
+                ("x-tag".to_string(), "a".to_string()),
+                ("x-tag".to_string(), "b".to_string()),
+            ],
+            key_id: "k1".to_string(),
+            client_ip: "192.0.2.7".to_string(),
+            received_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            body: r#"{"kind":"ping"}"#.to_string(),
+            endpoint_slug: "scanner".to_string(),
+        };
+        let wire = concat!(
+            r#"{"headers":[["content-type","application/json"],["x-sig","[redacted]"],"#,
+            r#"["x-tag","a"],["x-tag","b"]],"key_id":"k1","client_ip":"192.0.2.7","#,
+            r#""received_at":"2023-11-14T22:13:20Z","body":"{\"kind\":\"ping\"}","#,
+            r#""endpoint_slug":"scanner"}"#
+        );
+        assert_eq!(serde_json::to_string(&envelope).unwrap(), wire);
+        let back: WebhookEnvelope = serde_json::from_str(wire).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), wire);
+    }
 
     #[test]
     fn epoch_ms_conversion_refuses_what_chrono_cannot_carry() {
@@ -1077,6 +1242,7 @@ mod tests {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Brenn,
+            transport: None,
         };
         let v: Value = serde_json::from_str(&env.to_envelope_json()).unwrap();
         assert_eq!(

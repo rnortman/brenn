@@ -17,6 +17,7 @@ pub(super) fn default_resolved_channel() -> ResolvedChannel {
         sink: Sink::Drop,
         wake_min: WakeMin::Normal,
         non_text: false,
+        untyped_content_type: None,
     }
 }
 

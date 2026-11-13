@@ -71,8 +71,8 @@ pub use ingress::{
 };
 pub use live::{GapReason, PrepaidDestination, PrepaidEntry, Replay};
 pub use publish::{
-    AttachBatchPublish, AttachSendDraw, AttachSendVerdict, MissingChannelPosture, PublishOrigin,
-    PublishResult, WasmPublish, is_well_formed_address,
+    AttachBatchPublish, AttachSendDraw, AttachSendVerdict, IngressMessage, MissingChannelPosture,
+    PublishOrigin, PublishResult, WasmPublish, is_well_formed_address,
 };
 pub use query::{MessageQuery, QueryError};
 
@@ -6962,6 +6962,7 @@ mod tests {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: scheme,
+            transport: None,
         }
     }
 

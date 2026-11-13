@@ -1025,6 +1025,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(out1_sub_slug.clone()),
@@ -1049,6 +1050,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
             non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(out2_sub_slug.clone()),
