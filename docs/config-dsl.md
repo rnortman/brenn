@@ -1461,7 +1461,8 @@ link whose endpoints are all on that surface. The page ring is `non_text` when
 any surface binding on its address says so; a server-realm `channel`
 declaration at the same `local:` spelling is not read for it. A surface
 component built against `brenn:processor@0.2.0` then keeps binary state in the
-page, with no base64 — shown on the node rig, not yet run in a browser:
+page, with no base64 — shown on the node rig; `e2e/tests/bytes.spec.ts` runs
+the publish and the read-back in Chromium:
 
 ```
 surface kiosk {
@@ -1474,7 +1475,8 @@ or `brenn:` channel — the key is a check, as on a consumer: stated on a port
 whose channel is declared text-only, it is refused, naming the port and the
 channel; a port that does not state it may be bound to a channel declared
 `non_text`, and a 0.2.0 kind there publishes and is delivered non-text bodies
-over the page's wire — shown on the node rig, not yet run in a browser. On a
+over the page's wire — shown on the node rig; `e2e/tests/bytes.spec.ts` runs
+the publish and the delivery in Chromium. On a
 link with an endpoint off the surface the statement is the declaration, by the
 fold. Stated on a reserved plane it is refused. A surface's config channel
 declared `non_text` is refused: a page reads its bindings document as text.

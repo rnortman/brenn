@@ -1,11 +1,13 @@
 /// The page host's test fixture, on the `brenn:processor@0.2.0` contract: the
 /// twin of `processor-page-test`. It is driven by text commands on `in` and
 /// publishes one untyped report per activation on `report`: every window it
-/// was handed other than `in` and `state` (each envelope as its header, content
-/// type and bytes in hex), its deferred view, the sync port, and the result of
-/// every command. `memo`, `timer` and `out` are where its commands publish,
-/// park and edit bodies; `state` carries its binary state workload; `ask` is
-/// where a caller asks it for a reply, and `peer` is where it calls one.
+/// was handed other than `in`, `state` and `stream` (each envelope as its
+/// header, content type and bytes in hex), its deferred view, the sync port,
+/// and the result of every command. `memo`, `timer` and `out` are where its
+/// commands publish, park and edit bodies; `state` carries its binary state
+/// workload; the `stream` window is reported by envelope count, total length
+/// and checksum, never by bytes; `ask` is where a caller asks it for a reply,
+/// and `peer` is where it calls one.
 component ProcessorPageBytesTest {
   abi = processor;
   requires = [ports, calls];
@@ -14,6 +16,7 @@ component ProcessorPageBytesTest {
   optional io memo;
   optional io state;
   optional io timer;
+  optional in stream;
   sync ask;
   call peer;
   optional out out;

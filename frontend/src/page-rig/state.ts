@@ -28,13 +28,22 @@ export function generatedState(len: number): Uint8Array {
 }
 
 /**
+ * A fresh copy of `bytes`, at least four long, with `counter` as the
+ * little-endian `u32` in bytes 0..4.
+ */
+export function withCounter(bytes: Uint8Array, counter: number): Uint8Array {
+    const out = new Uint8Array(bytes);
+    new DataView(out.buffer).setUint32(0, counter >>> 0, true);
+    return out;
+}
+
+/**
  * The result word either fixture reports for the state of `generated.length`
  * bytes, advanced `steps` times: each step adds one to the little-endian `u32`
  * in the first four bytes.
  */
 export function expectedState(generated: Uint8Array, steps: number): string {
-    const bytes = generated.slice();
-    const view = new DataView(bytes.buffer);
-    view.setUint32(0, (view.getUint32(0, true) + steps) >>> 0, true);
+    const view = new DataView(generated.buffer, generated.byteOffset, generated.byteLength);
+    const bytes = withCounter(generated, view.getUint32(0, true) + steps);
     return `state:${bytes.length}:${fnv1a64(bytes)}`;
 }

@@ -15,6 +15,7 @@ use @git-sync-consumer::*;
 use @meeting::*;
 use @mode-clock::*;
 use @processor-demo::*;
+use @processor-page-bytes-test::*;
 use @processor-transplant::*;
 use @protobar::*;
 use @surface-description::*;
@@ -51,6 +52,13 @@ observability {
   surface_error_channel = "brenn:surface-errors";
 }
 
+/// Raised from the 64 KiB default so the `bytes` surface's fixture can publish
+/// the measured body sizes (49 149, 1 048 576 and 3 000 000 bytes) on the page
+/// and over its wire.
+messaging {
+  max_body_bytes = 4194304;
+}
+
 // Every durable uuid is carried rather than derived. An unused pin is a compile
 // error, which keeps this block honest against the declarations — including the
 // ones the assemblies below stamp.
@@ -69,12 +77,17 @@ uuid_pins {
   "brenn:surface.surface.loopback.help" = "e887add3-567f-4c78-a689-e4c942b4aca8";
   "brenn:surface.surface.loopback.geometry" = "88785ea0-383c-41b1-a46c-a86c5b7d5ac2";
   "brenn:surface.surface.loopback.status" = "501eaf58-6e8f-4fb9-bf10-f916a0673ecb";
+  "brenn:surface.surface.bytes.help" = "fa040201-db95-4b36-ac67-63505f645d25";
+  "brenn:surface.surface.bytes.geometry" = "a4f66fad-35d2-4160-91f1-851c48eea1c7";
+  "brenn:surface.surface.bytes.status" = "4a24a7d4-d4fe-4331-bc57-ddefc46f6862";
   "brenn:surface.kind.protobar.help" = "e01edb29-0c73-475f-bc57-a2ff204d99a1";
   "brenn:surface.kind.protobar.schema" = "d557bf65-99ce-404e-b834-d232548045ba";
   "brenn:surface.kind.echo-stub.help" = "f95e0ce1-363d-4c6b-89bf-63148106fe73";
   "brenn:surface.kind.echo-stub.schema" = "8c0d76ee-abac-422d-a9d4-de3b44bf9857";
   "brenn:surface.kind.chrome.help" = "5e544eb5-4f75-4835-ae17-2cae2801e660";
   "brenn:surface.kind.chrome.schema" = "4490b610-206c-4041-87e1-83d611d3a603";
+  "brenn:surface.kind.processor-page-bytes-test.help" = "163b44ee-b095-489a-9ef9-f19af0bff72b";
+  "brenn:surface.kind.processor-page-bytes-test.schema" = "e23d3209-1c2d-413c-8379-9970471f3b8c";
   "brenn:bar-layout" = "3c1142e7-5a7f-4781-939a-dfaa0cc8c7a0";
   "brenn:bar-a" = "3b2ef031-f286-42e8-a9ac-c66aade0ce0a";
   "brenn:bar-b" = "2ccd9df1-08b1-4554-9745-fc3ade11ed98";
@@ -88,10 +101,12 @@ new bar_desc: SurfaceDescription(slug = "bar");
 new bar_pixel_desc: SurfaceDescription(slug = "bar-pixel");
 new bar_feeder_desc: SurfaceDescription(slug = "bar-feeder");
 new loopback_desc: SurfaceDescription(slug = "loopback");
+new bytes_desc: SurfaceDescription(slug = "bytes");
 
 new protobar_desc: KindDescription(kind = "protobar");
 new echo_stub_desc: KindDescription(kind = "echo-stub");
 new chrome_desc: KindDescription(kind = "chrome");
+new page_bytes_test_desc: KindDescription(kind = "processor-page-bytes-test");
 
 /// At least one app is mandatory. This one exists only to satisfy config
 /// validation: no conversation is ever started against it, and it holds no
@@ -259,4 +274,95 @@ surface loopback {
 new loopback_chrome: StandardChrome(slug = "loopback", layout = loopback_layout) {
   grants = [dom, log, page-dom, ports, takeover];
   surfaces = ["loopback"];
+}
+
+/// The wire channel the `bytes` page's `keeper` publishes non-text bodies on
+/// and is fed back from: each body leaves over the page's websocket and comes
+/// back over it.
+channel bytes_wire at "ephemeral:bytes.wire" {
+  non_text = true;
+  push_depth = 1;
+  retain_depth = 1;
+}
+/// The wire channel the `bytes` page's `streamer` emits its workload on and
+/// reads back as its `stream` window, reported by checksum.
+channel bytes_stream at "ephemeral:bytes.stream" {
+  non_text = true;
+  push_depth = 1;
+  retain_depth = 1;
+}
+/// Placeholder layout channel for the bytes page: nothing publishes, so the
+/// chrome renders its default layout. `ephemeral:` rather than `local:` for the
+/// reason `bar_feeder_layout` gives.
+channel bytes_layout at "ephemeral:bytes.in.chrome.layout" {
+  description = "Layout documents for the bytes page (latest-wins)";
+  push_depth = 1;
+  retain_depth = 1;
+}
+// Each fixture instance's command and report links, both ends on the `bytes`
+// page, so every command and report is a page-local text channel.
+link bytes_keeper_cmd;
+link bytes_keeper_report;
+link bytes_stater_cmd;
+link bytes_stater_report;
+link bytes_streamer_cmd;
+link bytes_streamer_report;
+/// The byte path in Chromium, driven by `e2e/tests/bytes.spec.ts` and timed by
+/// `e2e/tests/bytes-measure.spec.ts`. Three `processor-page-bytes-test`
+/// instances on `brenn:processor@0.2.0`: `keeper` keeps a non-text body on a
+/// page-local `io` port and sends one over the page's websocket and back;
+/// `stater` runs the binary state workload; `streamer` emits the workload over
+/// the websocket and reads it back by checksum. Each is driven by an `EchoStub`
+/// whose sent text is the fixture's command and whose scrollback shows the
+/// fixture's reports.
+///
+/// Every channel a non-text body rests on or crosses is `non_text`; the drivers
+/// touch only the text links. The fixture kind is served from the harness's
+/// second mount, so only `make e2e` can boot this surface.
+surface bytes {
+  grants = [subscribe, publish];
+  new keeper: ProcessorPageBytesTest {
+    grants = [ports, calls];
+    in in <- bytes_keeper_cmd { push_depth = 1; retain_depth = 1; }
+    out report -> bytes_keeper_report;
+    io memo { push_depth = 0; retain_depth = 1; non_text = true; }
+    out out -> bytes_wire;
+    in feed <- bytes_wire { push_depth = 1; retain_depth = 1; }
+  }
+  new stater: ProcessorPageBytesTest {
+    grants = [ports, calls];
+    in in <- bytes_stater_cmd { push_depth = 1; retain_depth = 1; }
+    out report -> bytes_stater_report;
+    io state { push_depth = 0; retain_depth = 1; non_text = true; }
+  }
+  new streamer: ProcessorPageBytesTest {
+    grants = [ports, calls];
+    in in <- bytes_streamer_cmd { push_depth = 1; retain_depth = 1; }
+    out report -> bytes_streamer_report;
+    out out -> bytes_stream;
+    in stream <- bytes_stream { push_depth = 1; retain_depth = 1; }
+  }
+  new drive-keeper: EchoStub {
+    grants = [ports, log, dom];
+    out out -> bytes_keeper_cmd;
+    in messages <- bytes_keeper_report { push_depth = 8; retain_depth = 8; }
+    io state { push_depth = 0; retain_depth = 1; }
+  }
+  new drive-stater: EchoStub {
+    grants = [ports, log, dom];
+    out out -> bytes_stater_cmd;
+    in messages <- bytes_stater_report { push_depth = 8; retain_depth = 8; }
+    io state { push_depth = 0; retain_depth = 1; }
+  }
+  new drive-streamer: EchoStub {
+    grants = [ports, log, dom];
+    out out -> bytes_streamer_cmd;
+    in messages <- bytes_streamer_report { push_depth = 8; retain_depth = 8; }
+    io state { push_depth = 0; retain_depth = 1; }
+  }
+}
+
+new bytes_chrome: StandardChrome(slug = "bytes", layout = bytes_layout) {
+  grants = [dom, log, page-dom, ports, takeover];
+  surfaces = ["bytes"];
 }

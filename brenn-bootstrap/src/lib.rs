@@ -1483,6 +1483,9 @@ pub async fn run_server(
     info!("listening on {}", listener.local_addr().unwrap());
 
     use std::net::SocketAddr;
+    // TODO(surface-small-row-delivery-latency): small binary rows round-trip a
+    // surface page's websocket about 20 ms slower than megabyte rows; the
+    // listener's sockets keep Nagle's algorithm on.
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

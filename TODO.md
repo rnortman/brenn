@@ -1,5 +1,39 @@
 # TODOs
 
+## `surface-small-row-delivery-latency`
+
+In the Chromium timing run (`make e2e-measure`, `docs/page-rig-timings.md`,
+"`0.2.0 binary row delivered`, Chromium"), a 49,149-byte binary row emitted by
+a page-hosted kind and delivered back to it over the page's websocket took
+about 45 ms from click to delivery report on every one of 100 samples, against
+about 25 ms for a 1,048,576-byte row; the browser state chains on the same page
+take 2-6 ms. The cause is not established. About 40 ms on small frames only has
+the shape of Nagle's algorithm meeting a delayed acknowledgement, and the
+server's listener (`axum::serve` in `brenn-bootstrap/src/lib.rs`) does not set
+`TCP_NODELAY`. Done when the extra latency is located (which hop: the page's
+send, the server's write of the `Deliver`, or a kernel flush timer) and either
+removed or explained in the timings document. Changing the server's socket
+options affects every HTTP and websocket route and wants a ruling. Code site
+(`TODO(surface-small-row-delivery-latency)`): `axum::serve` in
+`brenn-bootstrap/src/lib.rs`.
+
+## `deferred-op-body-walk-copies`
+
+Refactor, no ruling wanted: "the body a deferred op writes" (`Cancel` none,
+`Edit` its optional body) is still matched by hand in
+`attach/server/src/publish.rs` (two sites), in `FlushBatch::carried_by` in
+`attach/client/src/publish.rs` and in `attach/client/src/store.rs`, beside
+one private helper per crate (`op_body` in `attach/proto/src/wire/mod.rs`,
+`defer_op_body` in `surface/kernel/src/publish_buffer.rs`, `op_body` in
+`surface/kernel/src/outbound.rs`); every match is exhaustive, so a new
+variant fails to compile, but a change to which bodies an op carries — blobs
+attached to messages — must find each one. Done when `DeferredOpKind` and
+`brenn_attach_client::store::DeferOp` each have one public `body()` accessor
+and every site uses it; the accessor adds to `brenn-attach-client`'s public
+API, which out-of-tree daemons take by pin, so it lands with the design that
+next changes that API. Code site (`TODO(deferred-op-body-walk-copies)`):
+`op_body` in `attach/proto/src/wire/mod.rs`.
+
 ## `efficiency-surface-type-check-recompiles-every-kind-every-scan`
 
 Every surface asset scan — at boot and at every reload, inline in the
@@ -123,103 +157,6 @@ exceeds it would fail the transport on every reconnect. Needs a design:
 splitting a pass changes how many delivery points it is. Code site
 (`TODO(attach-replay-pass-frame-size)`): `send_pass` in
 `attach/server/src/subscription.rs`.
-
-## `surface-byte-crossing-in-browser`
-
-The page's body crossing — guest, jco glue, `frontend/src/surface.ts`,
-the kernel's wasm-bindgen exports, the page-local store, and back through
-the activation — is gated only by the node rig: node's WebAssembly
-engine, and stand-ins for `Window`, `document`, `HTMLElement`,
-`WebSocket`, `fetch` and the timer functions. The page's own `bootstrap`,
-its default kernel init and its streaming compile run there, but against
-node's implementations and a `fetch` that answers from disk. No test runs
-the crossing in a real browser: no spec in `e2e/` binds a `local:`
-channel. The binary-bus project accepts the surface host's byte path
-(`brenn:processor@0.2.0`) on that rig: text and typed-text bodies cross
-it, a non-text body crosses in a sync call or its reply, and a non-text body
-also rests on a page-local channel declared `non_text`, stored and read back
-byte for byte, and timed there against 0.1.0's base64 in JSON
-(`docs/page-rig-timings.md`). Two more facts are shown on the rig and only
-there. First, the page's wire is attach v5, on which every publish and every
-delivery is a binary frame whatever its body — text bodies, in-tree 0.1.0
-kinds and the page's own bindings document included; the browser transport's
-binary send and its `ArrayBuffer` receive
-(`attach/client/src/transport/websys.rs`) have run against the rig's
-`WebSocket` stand-in under node, never against a browser's socket. Second,
-non-text bodies cross that wire in both directions on a transportable channel
-declared `non_text`. That is shown in node, not in a page, and its
-timings are V8 under node. A difference between the two in the
-engine, a real network fetch or a real `Window` would be found by an
-out-of-tree component; one in the socket would be found by the first surface
-page any deployment since the page's wire moved to attach v5 serves.
-
-Before deploying a commit at or above the one that moved the page's wire to
-attach v5, run `make e2e`: `e2e/tests/bar.spec.ts` and
-`e2e/tests/surface-reload.spec.ts` load surface pages and are the only tests
-that run the binary socket in a browser.
-
-Done when a spec in the `make e2e`
-suite runs a kind's retained round trip on a page-local `io` port in
-Chromium, the body compared byte for byte — a non-UTF-8 body, on a
-page-local `io` port declared `non_text` — and, in the same spec, delivers a
-non-UTF-8 body to a 0.2.0 kind over the page's real websocket and receives
-one published by it, compared byte for byte, and records the time per
-activation at the rig's sizes; or when the owner rules that the node rig is
-enough and removes this entry. Facts that bear on it: `make e2e` is operator-run
-("before tagging a release, and after any change under `surface/`",
-`e2e-in-ci`) and no gate runs it. Option (a)'s command below has been run
-where the agent cycles run: `npm ci` and `npx playwright install chromium`
-succeeded and Playwright's Chromium is downloaded, but it cannot start there
-for want of host libraries — `libnspr4.so`, `libnss3.so`, `libnssutil3.so`,
-`libatk-1.0.so.0`, `libatk-bridge-2.0.so.0`, `libatspi.so.0`, `libX11.so.6`,
-`libXcomposite.so.1`, `libXdamage.so.1`, `libXext.so.6`, `libXfixes.so.3`,
-`libXrandr.so.2`, `libgbm.so.1`, `libxcb.so.1`; on Fedora, by name and not
-verified by installing them, the packages `nspr nss nss-util atk at-spi2-atk
-at-spi2-core libX11 libXcomposite libXdamage libXext libXfixes libXrandr
-mesa-libgbm libxcb` — which need root to install. What is left of
-provisioning a browser for the cycles is those packages; until then a spec
-written there lands unrun. `processor-transplant-browser-engine` tracks
-the same missing engine for the transplant parity test's guest; the
-Chromium spec here runs a transpiled guest in a browser engine too.
-
-The question for the owner. The owner asked that the binary bus "work on the
-browser side (the surface)", where the component with the large binary state
-runs. The binary-bus project has delivered that use case — binary state on a
-page-local `io` port, no base64 — in node only, and has no slice that runs it
-in a browser: its agent cycles have no browser, and it did not write a spec
-that would land unrun. Nothing in the project waits to be built before the
-spec can be written. This entry therefore waits on the owner, who has three
-ways to close it:
-
-(a) Provision a browser for the cycles — Playwright's Chromium installed
-where the agent cycles run (`cd e2e && npm ci && npx playwright install
-chromium`), recorded by editing this entry to say so. The project then takes a
-cycle that writes the spec, runs it under `make e2e`, and records browser
-timings beside the node ones. Cost: one cycle, and a browser in the agents'
-environment.
-
-(b) Run it by hand — the owner asks for the spec written unrun and runs
-`make e2e` themself, as the suite is run today before a release. Cost: a spec
-whose first run, and any repair it needs, is the owner's.
-
-(c) Rule the node rig enough and remove this entry. Then the first run of
-binary state on an `io` port in a real browser is an out-of-tree surface
-component's, after it moves to `brenn:processor@0.2.0`; a difference between
-node and a browser in the engine, `fetch` or `Window` is found there. The
-socket is not: under (c) the first binary frame on a real browser websocket
-is the first delivery to the first page of the first deployment since the
-page's wire moved to attach v5 — the owner's own, with in-tree chrome, on
-text bodies — and a difference between node's stand-in and a browser socket
-shows as no surface page configuring itself, not as binary state failing.
-
-Until one of these, the project does not declare `brenn:processor@0.2.0`
-stable: that declaration is what tells out-of-tree surface components to move,
-and it should not be made on a surface byte path no browser has run. That
-sequencing is the binary-bus project's own ruling, not the owner's; the owner
-may overrule it here.
-
-Code site (`TODO(surface-byte-crossing-in-browser)`):
-`frontend/src/page-rig/globals.ts`, at the install function.
 
 ## `binary-contract-version-mechanism`
 
@@ -1203,7 +1140,9 @@ not by `make check`, and not by `.github/workflows/ci.yml`. Only an operator run
 by hand answers anything, and four of its six specs sat red — a stale
 component-element selector — for an unbounded span before anyone noticed. The
 suite covers layout switching, malformed-layout last-good retention,
-per-instance content isolation, and reload/durable-snapshot restore; acceptance
+per-instance content isolation, reload/durable-snapshot restore, and the
+surface byte path (a 0.2.0 kind's non-text bodies at rest on the page and over
+the page's binary websocket); acceptance
 decisions have already leaned on one of those specs while it was dead, which is
 the specific harm an ungated suite does.
 
@@ -1218,7 +1157,11 @@ project's deploys. Landing the CI step before both hold turns main red on
 every push, which is also the auto-deploy-to-staging path.
 
 Until then the operator-side trigger stands in for the gate: run `make e2e`
-before tagging a release, and after any change under `surface/`.
+before tagging a release, and after any change under `surface/`. Also run it
+before deploying a commit at or above the one that moved the page's wire to
+attach v5: `e2e/tests/bar.spec.ts`, `e2e/tests/bytes.spec.ts` and
+`e2e/tests/surface-reload.spec.ts` load surface pages and are the only tests
+that run the page's binary websocket in a browser.
 
 One of the two blockers is answered elsewhere, which narrows this one.
 `brenn-component-demo` runs the same recipe — build the artifacts, mint an
@@ -1241,8 +1184,8 @@ Code site (`TODO(e2e-in-ci)`): `Makefile`, the `e2e` target.
 
 ## `e2e-tag-scheme-tie`
 
-`e2e/tests/bar.spec.ts` (`echoStubHost`) locates a mounted component by the
-attributes the kernel stamps on its host element, `data-kind` and
+`e2e/tests/echo-stub.ts` (`echoStubHost`, shared by every spec that drives an
+echo-stub) locates a mounted component by the attributes the kernel stamps on its host element, `data-kind` and
 `data-instance`, re-encoding in TypeScript a naming whose only home is
 `mount_host` (`surface/kernel/src/dom.rs`). Nothing mechanical ties the two — a
 comment is the whole link, and a comment does not break a build. That drift already
@@ -1261,7 +1204,7 @@ spec imports. Needs a design call first: the e2e/TS side deliberately has no
 bundler and no `ts-rs` bridge, so who emits the constant, when it runs, and
 which gate proves it current is a new seam rather than a local edit.
 
-Code site (`TODO(e2e-tag-scheme-tie)`): `e2e/tests/bar.spec.ts`, `echoStubHost`.
+Code site (`TODO(e2e-tag-scheme-tie)`): `e2e/tests/echo-stub.ts`, `echoStubHost`.
 
 ---
 
@@ -1707,9 +1650,9 @@ Done when `surface/dist` is served in the browser test fixture and those two
 filesystem calls (the `file://` dynamic import and the `readFileSync` of core
 wasm) are swapped for `fetch`.
 
-`surface-byte-crossing-in-browser` tracks the same missing browser engine for
-the page's whole body crossing: the Chromium spec it asks for also runs a
-jco-transpiled guest in a browser engine, loaded by the page's own `fetch`.
+`e2e/tests/bytes.spec.ts` runs a jco-transpiled `brenn:processor@0.2.0`
+guest in Chromium, loaded by the page's own `fetch`; no e2e surface
+instantiates the transplant guest, so this entry's case is still open.
 
 Code site (`TODO(processor-transplant-browser-engine)`):
 `frontend/src/test-helpers/transpiled-processor.ts`, the header note on how

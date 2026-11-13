@@ -83,6 +83,8 @@ rust_test(
     # they import; `rustc_env` below names the directory those paths hang off.
     data = [
         "//:brenn_configs",
+        # `brenn.e2e.brenn`'s second module root.
+        "//brenn-wasm/components/processor-page-bytes-test:spec/processor-page-bytes-test.brenn",
         # The recycler's dispatch cases drive the deployed guest through the real
         # lowering.
         "//brenn-wasm:fixture_conversation_recycler",

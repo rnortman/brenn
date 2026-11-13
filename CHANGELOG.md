@@ -4,26 +4,40 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **For operators and WASM component authors: binary bodies on surface pages
+  are now tested in a real browser.** Until now, the path that carries
+  non-text (binary) message bodies between a surface page and the server had
+  run only in a node.js stand-in. `make e2e` now runs it in Chromium
+  (`e2e/tests/bytes.spec.ts`): a page-hosted `brenn:processor@0.2.0`
+  component stores a binary body on a page-local `io` port and reads it back,
+  and publishes one over the page's websocket and receives it, each checked
+  byte for byte, including a 3,000,000-byte body. A new `make e2e-measure`
+  target runs the browser timing workload on its own; one run's figures are
+  in `docs/page-rig-timings.md`. Those figures show small (~48 KB) delivered
+  rows arriving slower than 1 MiB ones; the cause is not yet established and
+  is tracked as `surface-small-row-delivery-latency` in `TODO.md`. The e2e
+  server now reads its own mounts document, which adds the test component;
+  the dev server and deployments are unchanged.
+
 - **For operators and WASM component authors: the surface page speaks attach
   protocol v5, and a surface may bind a channel declared `non_text`.** The
   browser page and the surface route move together from attach v4 to v5 and
   only v5; v4 is served to remote daemons only. Every publish and every
   delivery on a surface page, its own bindings document included, is now a
   binary websocket frame, whatever its body — for chrome and every in-tree
-  0.1.0 component on text bodies as for a 0.2.0 kind's bytes. **No browser has
-  run the page's wire.** The binary send and `ArrayBuffer` receive of the
-  page's websocket have run only against the page rig's stand-in socket under
-  node, never against a browser's; a difference between the two would show as
-  no surface page configuring itself. **Before deploying this release, run
-  `make e2e`**: `e2e/tests/bar.spec.ts` and `e2e/tests/surface-reload.spec.ts`
-  load surface pages and are the only tests that run the page's wire in a
+  0.1.0 component on text bodies as for a 0.2.0 kind's bytes. `make e2e` runs
+  the page's wire in Chromium, text bodies and non-text bodies both (below).
+  **Before deploying this release, run `make e2e`**: `e2e/tests/bar.spec.ts`,
+  `e2e/tests/bytes.spec.ts` and `e2e/tests/surface-reload.spec.ts` load
+  surface pages and are the only tests that run the page's wire in a
   browser.
   - A port of a page-hosted `brenn:processor@0.2.0` kind bound to a channel
     that leaves the page carries typed text with its type, and non-text
     bodies when the channel is declared `non_text`: published, parked,
     edited and delivered byte for byte with the content type. A non-text body
     for a text-only channel is refused to the kind with `text-only-channel`
-    and nothing is sent. Shown on the node rig only.
+    and nothing is sent. Shown on the node rig; `e2e/tests/bytes.spec.ts`
+    runs the publish and the delivery in Chromium.
   - A surface port that does not state `non_text` may be bound to a channel
     declared `non_text`. The `non_text` key on a surface binding is refused
     in two cases: on a reserved `local:brenn/` plane, and on a declared
@@ -53,8 +67,8 @@ All notable changes to Brenn are documented here.
   - The surface bindings document's version is 7: a page older than its
     server reloads, as at every version move.
   - Limits on a stream delivered to a surface are in `docs/message-bus.md`
-    §2.1.4; node-rig timings of binary rows over the page's wire are in
-    `docs/page-rig-timings.md`.
+    §2.1.4; node-rig and Chromium timings of binary rows over the page's wire
+    are in `docs/page-rig-timings.md`.
 
 - **For operators and WASM component authors: `non_text` on a surface's
   page-local channels.** A surface binding tail (`in`, `out`, `io`) may now
@@ -64,13 +78,15 @@ All notable changes to Brenn are documented here.
   when any surface binding on its address says so. A page-hosted
   `brenn:processor@0.2.0` kind then publishes, parks, edits and reads back
   non-text bodies there with their content type — binary state on an `io`
-  port with no base64. Shown on the node rig only; no browser has run it yet.
+  port with no base64. Shown on the node rig; `e2e/tests/bytes.spec.ts` runs
+  the publish and the read-back in Chromium.
   A served surface instance whose kind is built against
   `brenn:processor@0.1.0`, bound by input or output to such a channel, is
   refused at boot and at reload, naming the port and the channel. The key is
   refused on a reserved plane, and on a channel that leaves the page and is
   declared text-only (above). Node-rig timings against 0.1.0's base64 in JSON
-  are in `docs/page-rig-timings.md`.
+  are in `docs/page-rig-timings.md`, with Chromium figures for the binary
+  state.
 - **For WASM component authors: the surface host serves the provisional
   `brenn:processor@0.2.0` beside 0.1.0.** A page-hosted 0.2.0 kind is handed
   each message as a header plus the body's bytes and content type, as on the

@@ -297,6 +297,8 @@ fn sum_op_charges(
 }
 
 /// The body a control op writes: an edit's new body, if it states one.
+// TODO(deferred-op-body-walk-copies): the same match is written by hand at
+// other sites across the attach crates and the kernel.
 fn op_body(op: &DeferredOpKind) -> Option<&MessageBody> {
     match op {
         DeferredOpKind::Edit { body, .. } => body.as_ref(),

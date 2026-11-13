@@ -61,6 +61,8 @@ rust_test(
     crate_features = ["testutils"],
     data = [
         "//:brenn_configs",
+        # `brenn.e2e.brenn`'s second module root.
+        "//brenn-wasm/components/processor-page-bytes-test:spec/processor-page-bytes-test.brenn",
         "//docs:config-dsl.md",
         "//docs:google-maps-platform.md",
         "//docs:google-workspace.md",

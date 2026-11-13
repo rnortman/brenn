@@ -202,7 +202,7 @@ Who is shown the content type today:
 | Query API (`Messenger::query`), host code | text and type | bytes and type |
 | A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, `BrennMessageEdit`) | `"body": "…"`, then `"content_type": "…"` | `"body": {"binary": true, "content_type": "…", "size": N}` — a placeholder, never the bytes |
 | The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` |
-| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | text and type, on the backend and on a page, whether the row arrived over the page's wire or stayed on the page | bytes and type on the backend; on a page, at rest on any channel declared `non_text`, page-local or wire-bound (shown on the node rig, not yet in a browser), and in a sync call or reply |
+| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | text and type, on the backend and on a page, whether the row arrived over the page's wire or stayed on the page | bytes and type on the backend; on a page, at rest on any channel declared `non_text`, page-local or wire-bound (shown on the node rig; `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery in Chromium), and in a sync call or reply |
 | 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload, on the backend and on a page |
 | Attach v4 sessions (`Deliver`, `DeferredView`), served to remotes only | bare text, **no type** | never bound: a remote's subscribe is answered `Unavailable`; left out of a deferred view |
 | Attach v5 sessions (`Deliver`, `DeferredView`): a remote's, and every surface page's | text and type | bytes and type |
@@ -322,7 +322,8 @@ What follows:
   newest `push_depth` rows and the rest are drops — what a frame stream wants:
   `push_depth = 1`, `retain_depth = 1`. Each activation instantiates the kind
   afresh, so its cost floors the frame interval; `docs/page-rig-timings.md`
-  has the node figures.
+  has the node
+  and Chromium figures.
 - **Loudness.** A binding's `noise` decides what a drop does. At `fatal` the
   first overrun kills the instance; a stream binding states `silent` or
   `metered`.
@@ -332,8 +333,10 @@ What follows:
 So a camera frame that fits 64 KiB, sent by a remote onto a `non_text`
 `ephemeral:` channel, reaches a 0.2.0 kind on a surface at 1 per second with
 no configuration and at up to 30 per second with one `remote`-block setting;
-larger frames need the body cap raised. These are limits, not measurements,
-and no browser has run the path.
+larger frames need the body cap raised. These are limits, not measurements;
+`docs/page-rig-timings.md` has what one delivered row costs a 0.2.0 kind in
+Chromium, with a kind on the page as the publisher — no browser run has a
+remote as the publisher.
 
 ### 2.2 Subscriptions
 
@@ -562,8 +565,9 @@ edits non-text bodies, is delivered them, and reads them back byte for byte
 with their content type; on any channel it keeps typed text with its type; it
 passes any body in a sync call between 0.2.0 kinds. A non-text body for a
 text-only channel is refused with `text-only-channel`. This is shown on the
-node rig, against a stand-in for the browser's websocket; no browser has run
-it yet. A remote attacher on v5 is served a `non_text` channel; one on v4 is
+node rig, against a stand-in for the browser's websocket;
+`e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery in
+Chromium. A remote attacher on v5 is served a `non_text` channel; one on v4 is
 answered `Unavailable`.
 
 **The timer-cap coupling.** A channel's `retain_depth` also caps its channel-wide

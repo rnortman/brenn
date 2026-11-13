@@ -35,6 +35,7 @@
 //                                   call-error's word
 //   reply <content-type> <hex>      the sync reply
 //   state <raw-len>                 the binary state workload
+//   emit <port> <raw-len> <counter> the workload's bytes, published once
 //   fail                            end the activation with an error
 //
 // A publish, defer-op or call result is `ok` or the error variant's word; a
@@ -55,6 +56,12 @@
 // `application/octet-stream` and reports
 // `state:<len>:<FNV-1a 64 of the bytes, hex>`. A `raw-len` under four is an
 // error.
+//
+// `emit <port> <raw-len> <counter>` builds the same `raw-len` bytes as `state`
+// creates, overwrites bytes 0..4 with `counter` as a little-endian `u32`, and
+// publishes them on `port` as `application/octet-stream`. It reports
+// `emit:<len>:<FNV-1a 64 of the bytes, hex>`, or the publish error's word. A
+// `raw-len` under four is an error.
 
 // The generated `receive` lowering takes one flattened argument per canonical-ABI
 // field, which is more than the lint's threshold. Nothing there is hand-written.
@@ -244,6 +251,11 @@ fn run(
             String::from("ok")
         }
         ["state", len] => state(len.parse().map_err(|_| bad())?, state_window)?,
+        ["emit", port, len, counter] => emit(
+            port,
+            len.parse().map_err(|_| bad())?,
+            counter.parse().map_err(|_| bad())?,
+        )?,
         ["fail"] => {
             return Err(ReceiveError::ProcessingFailed(String::from(
                 "asked to fail",
@@ -262,7 +274,7 @@ fn state(raw_len: usize, stored: Option<&Body>) -> Result<String, ReceiveError> 
         )));
     }
     let bytes = match stored {
-        None => (0..raw_len).map(|i| ((i * 31 + 7) % 256) as u8).collect(),
+        None => workload(raw_len),
         Some(body) => {
             if body.bytes.len() != raw_len {
                 return Err(failed(&format!(
@@ -289,6 +301,37 @@ fn state(raw_len: usize, stored: Option<&Body>) -> Result<String, ReceiveError> 
     )
     .map_err(|e| failed(&publish_word(&e)))?;
     Ok(result)
+}
+
+/// The emit workload: the state pattern with `counter` in its first four bytes,
+/// published once on `port`.
+fn emit(port: &str, raw_len: usize, counter: u32) -> Result<String, ReceiveError> {
+    if raw_len < COUNTER_BYTES {
+        return Err(ReceiveError::ProcessingFailed(format!(
+            "emit: raw-len {raw_len} is under {COUNTER_BYTES}"
+        )));
+    }
+    let mut bytes = workload(raw_len);
+    bytes[..COUNTER_BYTES].copy_from_slice(&counter.to_le_bytes());
+    let result = format!("emit:{}:{:016x}", bytes.len(), fnv1a64(&bytes));
+    Ok(
+        match publish(
+            port,
+            &Body {
+                content_type: Some(String::from(STATE_CONTENT_TYPE)),
+                bytes,
+            },
+        ) {
+            Ok(()) => result,
+            Err(e) => publish_word(&e),
+        },
+    )
+}
+
+/// The workload's `raw_len` bytes: byte i is (i * 31 + 7) mod 256, every byte
+/// value, so not UTF-8.
+fn workload(raw_len: usize) -> Vec<u8> {
+    (0..raw_len).map(|i| ((i * 31 + 7) % 256) as u8).collect()
 }
 
 /// A command body's text. Commands are untyped UTF-8; anything else is a

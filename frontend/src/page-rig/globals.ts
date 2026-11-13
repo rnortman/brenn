@@ -411,9 +411,6 @@ export function installGlobals(
     failures: Failures,
     webSocket: unknown,
 ): InstalledGlobals {
-    // TODO(surface-byte-crossing-in-browser): the page's body crossing is gated
-    // only here, on node's WebAssembly engine with these stand-ins; no test runs
-    // it in a real browser.
     if (rigFailures !== null) {
         failures.fatal("the stand-in globals are already installed in this worker");
     }

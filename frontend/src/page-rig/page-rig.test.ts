@@ -30,7 +30,7 @@ import {
     sampleTemplate,
     textOf,
 } from "./peer.js";
-import { expectedState, generatedState } from "./state.js";
+import { expectedState, fnv1a64, generatedState, withCounter } from "./state.js";
 
 /**
  * Text a mangled crossing would show: non-ASCII, an astral-plane character, a
@@ -538,11 +538,35 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         expect(rig().wire(channel)).toHaveLength(1);
     });
 
-    it("refuses a non-text body on a text-only wire channel, published, parked or edited", async () => {
+    it("emits the workload with its counter on a non_text wire channel, byte for byte", async () => {
+        const channel = rig().facts.bytes_wire_channel;
+        const before = rig().wire(channel).length;
+        const expected = withCounter(generatedState(64), 5);
+        const sent = only(await rig().command("b-keeper", "emit bout 64 5"), "b-keeper");
+        expect(sent.results).toEqual([`emit:64:${fnv1a64(expected)}`]);
+        const wire = rig().wire(channel).slice(before);
+        expect(wire.map((p) => [p.frame, p.attribution, p.body.contentType, hexOfBytes(p.body.bytes)])).toEqual([
+            ["PublishBatch", "b-keeper", "application/octet-stream", hexOfBytes(expected)],
+        ]);
+    });
+
+    it("fails an emit under the counter's four bytes without publishing, and keeps the instance", async () => {
+        const channel = rig().facts.bytes_wire_channel;
+        const before = rig().wire(channel).length;
+        expectConsoleError(/activation failed on 'b-keeper': .*emit: raw-len 3 is under 4/);
+        const reports = await rig().command("b-keeper", "emit bout 3 1");
+        expect(reports.map((r) => r.instance)).not.toContain("b-keeper");
+        expect(rig().wire(channel)).toHaveLength(before);
+        expect(rig().status().find((row) => row.instance === "b-keeper")?.state).toBe("mounted");
+    });
+
+    it("refuses a non-text body on a text-only wire channel, published, emitted, parked or edited", async () => {
         const out = rig().facts.bytes_out_channel;
         const wireBefore = rig().wire(out).length;
         const refused = only(await rig().command("b-keeper", `publish out image/jpeg ${NOT_UTF8}`), "b-keeper");
         expect(refused.results).toEqual(["text-only-channel"]);
+        const emitted = only(await rig().command("b-keeper", "emit out 64 1"), "b-keeper");
+        expect(emitted.results).toEqual(["text-only-channel"]);
         const deferred = only(
             await rig().command("b-keeper", `defer out application/octet-stream ${NOT_UTF8} ${FAR_FUTURE_MS}`),
             "b-keeper",

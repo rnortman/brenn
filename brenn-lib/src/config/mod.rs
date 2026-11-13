@@ -87,8 +87,8 @@ pub use surface_description::*;
 pub use test_fixtures::{
     PACKAGED, PACKAGED_MODULE, config_from_dsl, declaring_text, lower_document, lower_tree,
     remote_exact_ceiling, remote_fleet, remote_prefix_ceiling, remote_raw, repo_sync_at,
-    sole_refusal, split_packaged, stage_fixture, test_api_key_provider_raw, test_app_config,
-    test_oauth_provider_raw,
+    shipped_module_roots, sole_refusal, split_packaged, stage_fixture, test_api_key_provider_raw,
+    test_app_config, test_oauth_provider_raw,
 };
 pub use watchdog::*;
 

@@ -173,8 +173,9 @@ What a 0.2.0 author relies on:
 - **On a surface.** The surface host serves 0.2.0 beside 0.1.0, provisional
   as on the backend; the page manifest names each kind's contract and the
   page brings each instance up on its own contract's imports. What a
-  page-hosted 0.2.0 kind carries today, shown on the node rig and not yet run
-  in a browser:
+  page-hosted 0.2.0 kind carries today, shown on the node rig;
+  `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery
+  in Chromium:
   - any body, text or not, with its type, on a page-local channel declared
     `non_text` — a surface binding tail states `non_text = true` where its
     channel stays on the page (`docs/message-bus.md` §2.6) — published,
