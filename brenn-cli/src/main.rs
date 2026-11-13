@@ -750,7 +750,7 @@ async fn run_cc(cli: CcArgs) {
             }
             SessionEvent::TurnCompleted(res) => {
                 println!("\n--- Turn complete ---");
-                if let Some(cost) = res.total_cost_usd {
+                if let Some(cost) = res.stated_cost_usd() {
                     println!("Cost: ${cost:.4}");
                 }
                 if let Some(turns) = res.num_turns {

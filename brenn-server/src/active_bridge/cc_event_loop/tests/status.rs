@@ -22,6 +22,7 @@ async fn completed_sends_idle_status() {
         num_turns: Some(2),
         session_id: Some("sess-1".into()),
         total_cost_usd: Some(0.03),
+        model_usage_since_last_result: None,
         usage: None,
         result: None,
         stop_reason: Some("end_turn".into()),
@@ -30,7 +31,7 @@ async fn completed_sends_idle_status() {
         extra: serde_json::Value::Object(Default::default()),
     };
     event_tx
-        .send(SessionEvent::TurnCompleted(result))
+        .send(SessionEvent::TurnCompleted(Box::new(result)))
         .await
         .unwrap();
 

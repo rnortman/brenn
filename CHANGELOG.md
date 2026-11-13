@@ -4,6 +4,22 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **API-key spend is no longer overcounted.** A key profile's month-to-date
+  `usd` in the account ledger (`brenn:agent.accounts`) was inflated for
+  long-lived sessions: each turn was charged from Claude Code's running
+  session total, so resumed or respawned sessions re-booked spend already
+  counted. Each turn is now charged only the cost Claude Code states for that
+  result alone. Expect the ledger at or below the Platform console's figure;
+  one well above it is a bug to report. Already-booked months are not
+  corrected.
+  - A result carrying a running total but no per-result cost is counted as a
+    turn with no cost, logged as an error and alerted once per server run.
+  - A negative per-result cost now panics where it is read, for every profile.
+- The status-bar cost pill's per-turn and conversation figures use the same
+  per-result cost; the conversation figure is the conversation's stored total
+  and does not reset at compaction. The chat-protocol `cost_usage` field
+  `since_last_compaction_usd` keeps its name (now a misnomer, documented).
+
 ## [0.35.0] — 2026-11-12
 
 - **Claude profiles can be API keys.** A `claude_profile` that states

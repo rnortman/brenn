@@ -211,7 +211,7 @@ pub enum SessionEvent {
     },
     /// Turn complete (CC emitted a `result` message). The session stays alive —
     /// CC is waiting for the next user message on stdin.
-    TurnCompleted(crate::protocol::incoming::ResultMessage),
+    TurnCompleted(Box<crate::protocol::incoming::ResultMessage>),
     /// Session died unexpectedly (process exit, broken pipe, etc.)
     Died(CcError),
     /// CC sent something we couldn't parse. Not an error — probably a protocol

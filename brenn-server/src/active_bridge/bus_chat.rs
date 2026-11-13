@@ -1206,11 +1206,11 @@ fn translate(msg: WsServerMessage, turns: &mut TurnIds) -> Vec<Outbound> {
         })],
         WsServerMessage::CostUsage {
             last_turn_usd,
-            since_last_compaction_usd,
+            conversation_total_usd,
             last_24h_usd,
         } => vec![Outbound::Record(ChatEvent::CostUsage {
             last_turn_usd,
-            since_last_compaction_usd,
+            since_last_compaction_usd: conversation_total_usd,
             last_24h_usd,
         })],
 
@@ -1524,7 +1524,7 @@ mod tests {
         assert_eq!(
             record(WsServerMessage::CostUsage {
                 last_turn_usd: 0.01,
-                since_last_compaction_usd: 0.5,
+                conversation_total_usd: 0.5,
                 last_24h_usd: 9.0,
             }),
             ChatEvent::CostUsage {

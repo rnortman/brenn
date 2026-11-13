@@ -171,7 +171,7 @@ export class BrennApp extends LitElement {
   @state() private permissionMode: PermissionModeState = { status: "unseen" };
   @state() private costUsage: {
     lastTurnUsd: number;
-    sinceLastCompactionUsd: number;
+    conversationTotalUsd: number;
     last24hUsd: number;
   } | null = null;
   @state() private approvalVisible = false;
@@ -1392,7 +1392,7 @@ export class BrennApp extends LitElement {
       case "CostUsage":
         this.costUsage = {
           lastTurnUsd: msg.last_turn_usd,
-          sinceLastCompactionUsd: msg.since_last_compaction_usd,
+          conversationTotalUsd: msg.conversation_total_usd,
           last24hUsd: msg.last_24h_usd,
         };
         break;

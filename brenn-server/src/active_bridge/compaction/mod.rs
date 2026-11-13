@@ -79,11 +79,11 @@ use super::ActiveBridge;
 use super::bridge_io::persist_incoming_message_sync;
 
 /// Report a `result` frame to the agent-status reporter when it is a turn: it
-/// carries `total_cost_usd`, or it is an API key's refusal. Any other frame
-/// without a cost is not a model turn, so it charges nothing, counts nothing
-/// and clears no flag. `cost` is this frame's per-turn delta, 0 when it
-/// carried none.
-fn report_turn(bridge: &ActiveBridge, result: &ResultMessage, cost: f64) {
+/// carries `total_cost_usd`, states a cost, or is an API key's refusal. Any
+/// other frame is not a model turn, so it charges nothing, counts nothing and
+/// clears no flag. `stated_cost` is the cost the result states; the turn is
+/// charged it, or 0 when it states none.
+fn report_turn(bridge: &ActiveBridge, result: &ResultMessage, stated_cost: Option<f64>) {
     let profile = bridge.cc_profile_name();
     let is_error = result.is_error == Some(true);
     let refusal = profile.as_deref().and_then(|name| {
@@ -102,7 +102,7 @@ fn report_turn(bridge: &ActiveBridge, result: &ResultMessage, cost: f64) {
             )
         })
     });
-    if result.total_cost_usd.is_none() && refusal.is_none() {
+    if result.total_cost_usd.is_none() && stated_cost.is_none() && refusal.is_none() {
         return;
     }
     if let Some(flag) = &refusal {
@@ -122,7 +122,7 @@ fn report_turn(bridge: &ActiveBridge, result: &ResultMessage, cost: f64) {
         bridge.conversation_id,
         profile,
         brenn_cc_profile::TurnOutcome {
-            cost,
+            cost: stated_cost.unwrap_or(0.0),
             is_error,
             refusal,
         },
@@ -140,43 +140,29 @@ pub(in crate::active_bridge) async fn handle_turn_completed(
         "CC turn completed"
     );
 
-    // --- Per-turn cost arithmetic (no DB, no await) ---
-    // Computed before the unified DB scope so the results are ready for the
-    // cost-bookkeeping region inside that scope.
-    //
-    // Only process cost when CC actually reported a value. Treating None as 0
-    // would poison `last_total_cost_usd` — on the next real-cost turn the
-    // delta would be `cur - 0 = cur`, double-counting the entire session
-    // cumulative (correctness-1 / correctness-2).
-    let last_turn;
-    let cur_total_opt = result.total_cost_usd;
-    {
-        let mut guard = bridge
-            .last_total_cost_usd
-            .lock()
-            .expect("last_total_cost_usd lock");
-        let prev_total = guard.unwrap_or(0.0);
-        last_turn = match cur_total_opt {
-            None => {
-                // CC didn't report cost for this turn (e.g. compaction-result
-                // frames). Leave last_total_cost_usd unchanged so the next real
-                // cost turn computes the correct delta.
-                0.0
-            }
-            Some(cur) => {
-                // If CC reset (compaction), cur < prev — treat the whole new
-                // value as the per-turn cost (cost of the compact operation).
-                let delta = if cur < prev_total {
-                    cur
-                } else {
-                    cur - prev_total
-                };
-                *guard = Some(cur);
-                delta
-            }
-        };
+    // --- Per-turn cost (no DB, no await) ---
+    // A result's cost is what it states for itself; `total_cost_usd` is CC's
+    // running total for the session and is never read as money. A frame that
+    // carries `total_cost_usd` but states no cost is from a CC Brenn does not
+    // understand: alert, count the turn, book nothing.
+    let stated_cost = result.stated_cost_usd();
+    if stated_cost.is_none() && result.total_cost_usd.is_some() {
+        error!(
+            conversation_id = bridge.conversation_id,
+            cc_version = ?bridge.cc_version.lock().expect("cc_version lock").clone(),
+            "CC result carries total_cost_usd but no model_usage_since_last_result cost; \
+             booking 0 for this turn"
+        );
+        alert_dispatcher.alert_once_per_process(
+            AlertSeverity::Warning,
+            "Claude Code result without per-result cost".to_string(),
+            "result-without-per-result-cost",
+            "Claude Code result without per-result cost — spend is not being counted; \
+             upgrade Claude Code or adapt Brenn"
+                .to_string(),
+        );
     }
-    let cur_total = cur_total_opt.unwrap_or(0.0);
+    let last_turn = stated_cost.unwrap_or(0.0);
 
     // Hoist wall-clock read before the lock; a clock_gettime syscall under the
     // DB mutex contradicts the refactor's goal of minimising hold time.
@@ -197,6 +183,7 @@ pub(in crate::active_bridge) async fn handle_turn_completed(
     // deadlocks.
     let model_window_updated;
     let last_24h;
+    let conversation_total;
     {
         let conn = bridge.db.lock().await;
 
@@ -208,21 +195,22 @@ pub(in crate::active_bridge) async fn handle_turn_completed(
             update_max_tokens_from_result_sync(bridge, result, alert_dispatcher, &conn);
 
         // Region 3: cost bookkeeping.
-        // Only persist cost when CC reported a real value — writing NULL to
-        // conversations.total_cost_usd destroys the cross-restart baseline.
-        if cur_total_opt.is_some() {
-            conversation::set_cost(&conn, bridge.conversation_id, cur_total_opt);
-        }
+        // The conversation total is the sum of the costs results stated; a
+        // frame that states none leaves it unwritten and reports it as stored.
+        conversation_total = match stated_cost {
+            Some(cost) => conversation::add_cost(&conn, bridge.conversation_id, cost),
+            None => conversation::get_total_cost_usd(&conn, bridge.conversation_id).unwrap_or(0.0),
+        };
         // Skip zero-valued rows: a last_turn == 0.0 insert is a no-op against
-        // the 24h aggregate but bloats the table. Compaction-result frames and
-        // turns where CC reported total_cost_usd = None produce zero; skipping
-        // is correct in both cases.
+        // the 24h aggregate but bloats the table. Frames that state no cost
+        // and refusals stating `{}` produce zero; skipping is correct in both
+        // cases.
         if last_turn > 0.0 {
             brenn_db::cost_samples::insert(&conn, bridge.conversation_id, last_turn);
 
             // Record the llm_turn usage event only for real-cost turns. Zero-cost
-            // frames (compaction-result, CC turns where total_cost_usd=None) must
-            // not inflate llm_turns counters or produce phantom event rows.
+            // frames (compaction-result, results stating no cost) must not
+            // inflate llm_turns counters or produce phantom event rows.
             if let Some((device_id, user_id)) =
                 brenn_usage_db::resolve_sender_for_conversation(&conn, bridge.conversation_id)
             {
@@ -249,7 +237,7 @@ pub(in crate::active_bridge) async fn handle_turn_completed(
     }
     // DB lock released; no further DB access on this path.
 
-    report_turn(bridge, result, last_turn);
+    report_turn(bridge, result, stated_cost);
 
     // --- Stream-derived context broadcast (after scope: depends on model_window_updated) ---
     // Broadcast ContextUsage only when the authoritative window size is
@@ -270,7 +258,7 @@ pub(in crate::active_bridge) async fn handle_turn_completed(
 
     bridge.broadcast(WsServerMessage::CostUsage {
         last_turn_usd: last_turn,
-        since_last_compaction_usd: cur_total,
+        conversation_total_usd: conversation_total,
         last_24h_usd: last_24h,
     });
 
@@ -464,7 +452,7 @@ pub(super) mod tests {
     use super::super::test_support::{
         await_fence, drain_broadcast, event_fence, install_failing_session,
         install_recording_session, recv_broadcast, set_context_usage, set_waiting_for_idle,
-        test_bridge, test_bridge_singleton, user_text,
+        stated_cost_map, test_bridge, test_bridge_singleton, user_text,
     };
     use super::*;
     use brenn_cc::protocol::incoming::{ResultMessage, ResultOrigin};
@@ -488,12 +476,23 @@ pub(super) mod tests {
             num_turns: Some(1),
             session_id: None,
             total_cost_usd: None,
+            model_usage_since_last_result: None,
             usage: None,
             result: None,
             stop_reason: None,
             model_usage: None,
             origin: None,
             extra: serde_json::json!({}),
+        }
+    }
+
+    /// A successful ResultMessage with the given running total and the given
+    /// per-result cost (`None` leaves `model_usage_since_last_result` absent).
+    fn result_stating(total_cost_usd: Option<f64>, stated: Option<f64>) -> ResultMessage {
+        ResultMessage {
+            total_cost_usd,
+            model_usage_since_last_result: stated.map(stated_cost_map),
+            ..stub_result()
         }
     }
 
@@ -598,7 +597,7 @@ pub(super) mod tests {
 
         let fence = event_fence(&bridge);
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .expect("event loop must accept the event (loop alive)");
         await_fence(fence).await;
@@ -606,7 +605,7 @@ pub(super) mod tests {
         // The loop survived if it processes a second event.
         let fence2 = event_fence(&bridge);
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .expect("event loop must still be alive for a second event");
         await_fence(fence2).await;
@@ -776,7 +775,7 @@ pub(super) mod tests {
         // Fire TurnCompleted — should clear the map and emit
         // PermissionCancelled for the stranded entry, plus Status(Idle).
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .unwrap();
 
@@ -820,7 +819,7 @@ pub(super) mod tests {
         let (_bridge, event_tx, mut broadcast_rx, _ab) = test_bridge().await;
 
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .unwrap();
 
@@ -879,7 +878,7 @@ pub(super) mod tests {
             .await;
 
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .unwrap();
 
@@ -913,7 +912,7 @@ pub(super) mod tests {
         };
 
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .unwrap();
 
@@ -965,7 +964,7 @@ pub(super) mod tests {
         });
 
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .unwrap();
 
@@ -1027,7 +1026,7 @@ pub(super) mod tests {
         });
 
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .unwrap();
 
@@ -1083,7 +1082,7 @@ pub(super) mod tests {
         // Fire two user-turn TurnCompleteds before CompactBoundary.
         for i in 0..2 {
             event_tx
-                .send(SessionEvent::TurnCompleted(stub_result()))
+                .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
                 .await
                 .unwrap();
 
@@ -1132,7 +1131,7 @@ pub(super) mod tests {
 
         // /compact's TurnCompleted fires the real transition.
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .unwrap();
 
@@ -1206,7 +1205,7 @@ pub(super) mod tests {
 
         // Step 2: /compact's TurnCompleted fires the transition.
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .unwrap();
 
@@ -1297,7 +1296,7 @@ pub(super) mod tests {
             CompactionPhase::PendingTurnCompletion { hints: None };
 
         event_tx
-            .send(SessionEvent::TurnCompleted(stub_result()))
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
             .await
             .unwrap();
 
@@ -1326,82 +1325,68 @@ pub(super) mod tests {
         );
     }
 
-    #[test]
-    fn cost_delta_basic() {
-        // Two consecutive totals: 0.10 then 0.30 → delta 0.20.
-        let prev: f64 = 0.10;
-        let cur: f64 = 0.30;
-        let last_turn = if cur < prev { cur } else { cur - prev };
-        assert!((last_turn - 0.20).abs() < 1e-9);
+    /// Read a conversation row's `(total_cost_usd, updated_at)`.
+    async fn conversation_cost_row(bridge: &ActiveBridge) -> (Option<f64>, String) {
+        let conn = bridge.db.lock().await;
+        let conv = brenn_db::conversation::get_conversation(&conn, bridge.conversation_id);
+        (conv.total_cost_usd, conv.updated_at)
     }
 
-    #[test]
-    fn cost_delta_handles_compaction_reset() {
-        // Compaction: previous 1.50, current 0.001 → cur < prev → last_turn = cur.
-        let prev: f64 = 1.50;
-        let cur: f64 = 0.001;
-        let last_turn = if cur < prev { cur } else { cur - prev };
-        assert!((last_turn - 0.001).abs() < 1e-9);
+    /// Receive broadcasts until the next `CostUsage`; returns
+    /// `(last_turn_usd, conversation_total_usd)`.
+    async fn next_cost_usage(rx: &mut broadcast::Receiver<WsServerMessage>) -> (f64, f64) {
+        loop {
+            if let WsServerMessage::CostUsage {
+                last_turn_usd,
+                conversation_total_usd,
+                ..
+            } = recv_broadcast(rx).await
+            {
+                return (last_turn_usd, conversation_total_usd);
+            }
+        }
     }
 
-    /// Bridge-path cost delta: two consecutive `TurnCompleted` events with
-    /// real `total_cost_usd` values exercise the full path through
-    /// `handle_turn_completed` — `last_total_cost_usd` mutex read/write,
-    /// `cost_samples::insert`, `CostUsage` broadcast — not just the inline
-    /// arithmetic. The second turn must emit `CostUsage { last_turn_usd ≈ 0.20 }`.
-    ///
-    /// An all-zeros `CostUsage` broadcast would fail this test, proving the
-    /// bridge-level path is exercised (not only the arithmetic unit tests above).
+    fn assert_close(actual: f64, expected: f64, what: &str) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "{what}: expected {expected}, got {actual}"
+        );
+    }
+
+    /// Two results stating 0.10 then 0.20 through the event loop: each turn
+    /// books what it states, the conversation total is their running sum on
+    /// the broadcast and in the row, and `cost_samples` holds both. A later
+    /// frame with neither `total_cost_usd` nor a per-result cost books nothing,
+    /// reports the stored total, and leaves the row unwritten.
     #[tokio::test]
-    async fn cost_delta_bridge_path() {
+    async fn stated_costs_sum_into_the_conversation_total() {
         let (bridge, event_tx, mut broadcast_rx, _ab) = test_bridge().await;
 
-        // Turn 1: total_cost_usd = 0.10 → last_turn = 0.10 (prev was 0).
-        let fence = event_fence(&bridge);
         event_tx
-            .send(SessionEvent::TurnCompleted(result_with_cost(0.10)))
+            .send(SessionEvent::TurnCompleted(Box::new(result_stating(
+                Some(0.10),
+                Some(0.10),
+            ))))
             .await
             .unwrap();
-        // Drain turn-1 broadcasts (CostUsage + Status(Idle)) after the handler
-        // completes. Fence ensures the match arm fully completes before draining.
-        // Valid because handle_turn_completed completes within one match-arm
-        // invocation (no mid-handler yield releasing the loop to another arm).
-        // If the handler is ever restructured across multiple invocations, this
-        // drain would be incomplete and turn-2 could see stale messages.
-        await_fence(fence).await;
-        drain_broadcast(&mut broadcast_rx);
+        let (last, total) = next_cost_usage(&mut broadcast_rx).await;
+        assert_close(last, 0.10, "turn 1 last_turn_usd");
+        assert_close(total, 0.10, "turn 1 conversation_total_usd");
 
-        // Turn 2: total_cost_usd = 0.30 → last_turn = 0.30 - 0.10 = 0.20.
+        // The running total CC reports is irrelevant: 0.30 here, but only the
+        // stated 0.20 is booked.
         event_tx
-            .send(SessionEvent::TurnCompleted(result_with_cost(0.30)))
+            .send(SessionEvent::TurnCompleted(Box::new(result_stating(
+                Some(0.30),
+                Some(0.20),
+            ))))
             .await
             .unwrap();
+        let (last, total) = next_cost_usage(&mut broadcast_rx).await;
+        assert_close(last, 0.20, "turn 2 last_turn_usd");
+        assert_close(total, 0.30, "turn 2 conversation_total_usd");
 
-        // CostUsage is broadcast before Status(Idle); receive it first.
-        let cost_msg = recv_broadcast(&mut broadcast_rx).await;
-        match cost_msg {
-            WsServerMessage::CostUsage { last_turn_usd, .. } => {
-                assert!(
-                    (last_turn_usd - 0.20).abs() < 1e-9,
-                    "second turn delta must be 0.20; got {last_turn_usd}"
-                );
-            }
-            other => panic!("expected CostUsage, got {other:?}"),
-        }
-
-        // Confirm last_total_cost_usd is persisted in the bridge mutex.
-        let stored = bridge
-            .last_total_cost_usd
-            .lock()
-            .expect("lock")
-            .expect("must be set after two cost turns");
-        assert!(
-            (stored - 0.30).abs() < 1e-9,
-            "last_total_cost_usd must be 0.30 after turn 2; got {stored}"
-        );
-
-        // Verify cost_samples::insert was called — DB rows exist and sum correctly.
-        // If the insert guard were inverted (or the DB call skipped), this fails.
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
         let db_sum = {
             let conn = bridge.db.lock().await;
@@ -1409,7 +1394,105 @@ pub(super) mod tests {
         };
         assert!(
             (db_sum - 0.30).abs() < 1e-6,
-            "cost_samples DB rows must sum to 0.30 (both turns inserted); got {db_sum}"
+            "cost_samples DB rows must sum to 0.30; got {db_sum}"
+        );
+        let (stored, updated_at) = conversation_cost_row(&bridge).await;
+        assert_close(
+            stored.expect("total stored"),
+            0.30,
+            "conversations.total_cost_usd",
+        );
+
+        // A frame that is not a turn: no running total, no per-result cost.
+        let fence = event_fence(&bridge);
+        event_tx
+            .send(SessionEvent::TurnCompleted(Box::new(stub_result())))
+            .await
+            .unwrap();
+        let (last, total) = next_cost_usage(&mut broadcast_rx).await;
+        await_fence(fence).await;
+        assert_close(last, 0.0, "non-turn last_turn_usd");
+        assert_close(total, 0.30, "non-turn conversation_total_usd");
+        let (stored_after, updated_after) = conversation_cost_row(&bridge).await;
+        assert_eq!(
+            stored_after, stored,
+            "a non-turn frame must not write the total"
+        );
+        assert_eq!(
+            updated_after, updated_at,
+            "a non-turn frame must not touch updated_at"
+        );
+    }
+
+    /// A respawned process's first result reports a restored running total
+    /// below the stored conversation total; it is booked as what it states,
+    /// never as the whole running total. A later, lower running total again
+    /// books only what its result states.
+    #[tokio::test]
+    async fn a_restored_running_total_is_never_booked() {
+        let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
+        {
+            let conn = bridge.db.lock().await;
+            brenn_db::conversation::add_cost(&conn, bridge.conversation_id, 76.0);
+        }
+
+        handle_turn_completed(&bridge, &result_stating(Some(73.13), Some(0.60)), &ad).await;
+        let (stored, _) = conversation_cost_row(&bridge).await;
+        assert_close(
+            stored.expect("total stored"),
+            76.60,
+            "total after the respawn turn",
+        );
+
+        handle_turn_completed(&bridge, &result_stating(Some(2.0), Some(0.05)), &ad).await;
+        let (stored, _) = conversation_cost_row(&bridge).await;
+        assert_close(
+            stored.expect("total stored"),
+            76.65,
+            "total after a lower running total",
+        );
+
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+        let db_sum = {
+            let conn = bridge.db.lock().await;
+            brenn_db::cost_samples::sum_since(&conn, cutoff)
+        };
+        assert!(
+            (db_sum - 0.65).abs() < 1e-6,
+            "cost_samples must hold only the stated costs; got {db_sum}"
+        );
+    }
+
+    /// A result with `total_cost_usd` and no per-result cost is from a CC Brenn
+    /// does not understand: it books 0, alerts, and leaves the stored total.
+    #[tokio::test]
+    async fn a_result_without_a_stated_cost_books_nothing_and_alerts() {
+        let (bridge, _event_tx, mut broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
+        let (ad, captured, handle) = brenn_obs::alerting::make_capturing_alerter();
+        {
+            let conn = bridge.db.lock().await;
+            brenn_db::conversation::add_cost(&conn, bridge.conversation_id, 1.5);
+        }
+        let (_, updated_at) = conversation_cost_row(&bridge).await;
+
+        handle_turn_completed(&bridge, &result_stating(Some(4.0), None), &ad).await;
+
+        let (last, total) = next_cost_usage(&mut broadcast_rx).await;
+        assert_close(last, 0.0, "last_turn_usd");
+        assert_close(total, 1.5, "conversation_total_usd");
+        let (stored, updated_after) = conversation_cost_row(&bridge).await;
+        assert_eq!(stored, Some(1.5), "the stored total must be unchanged");
+        assert_eq!(updated_after, updated_at, "the row must not be written");
+
+        drop(ad);
+        handle.await.expect("alert drainer");
+        let alerts = captured.lock().expect("captured lock");
+        assert!(
+            alerts
+                .iter()
+                .any(|(title, _)| title == "Claude Code result without per-result cost"),
+            "expected the per-result-cost alert; got {alerts:?}"
         );
     }
 
@@ -1638,6 +1721,7 @@ pub(super) mod tests {
             num_turns: Some(1),
             session_id: None,
             total_cost_usd: Some(cost),
+            model_usage_since_last_result: Some(stated_cost_map(cost)),
             usage: None,
             result: None,
             stop_reason: None,
@@ -1648,7 +1732,7 @@ pub(super) mod tests {
 
         let fence = event_fence(&bridge);
         event_tx
-            .send(SessionEvent::TurnCompleted(result))
+            .send(SessionEvent::TurnCompleted(Box::new(result)))
             .await
             .expect("event_tx closed — event loop crashed before TurnCompleted was sent");
 
@@ -1702,7 +1786,7 @@ pub(super) mod tests {
         let WsServerMessage::CostUsage {
             last_turn_usd,
             last_24h_usd,
-            since_last_compaction_usd,
+            conversation_total_usd,
         } = cost_msg
         else {
             unreachable!()
@@ -1716,8 +1800,8 @@ pub(super) mod tests {
             "CostUsage.last_24h_usd must be {cost}; got {last_24h_usd}"
         );
         assert!(
-            (since_last_compaction_usd - cost).abs() < 1e-9,
-            "CostUsage.since_last_compaction_usd must be {cost}; got {since_last_compaction_usd}"
+            (conversation_total_usd - cost).abs() < 1e-9,
+            "CostUsage.conversation_total_usd must be {cost}; got {conversation_total_usd}"
         );
 
         // Shared assertion 4: ContextUsage broadcast was emitted.
@@ -1786,24 +1870,11 @@ pub(super) mod tests {
     // LLM turn usage attribution integration tests
     // -----------------------------------------------------------------------
 
-    /// Build a ResultMessage with a non-zero cost so the `if last_turn > 0.0`
-    /// guard at compaction.rs:245 is satisfied and a usage event is attempted.
+    /// Build a ResultMessage stating a non-zero cost so the `last_turn > 0.0`
+    /// guard in `handle_turn_completed` is satisfied and a usage event is
+    /// attempted.
     fn result_with_cost(cost: f64) -> ResultMessage {
-        ResultMessage {
-            subtype: Some("success".into()),
-            duration_ms: None,
-            duration_api_ms: None,
-            is_error: Some(false),
-            num_turns: Some(1),
-            session_id: None,
-            total_cost_usd: Some(cost),
-            usage: None,
-            result: None,
-            stop_reason: None,
-            model_usage: None,
-            origin: None,
-            extra: serde_json::json!({}),
-        }
+        result_stating(Some(cost), Some(cost))
     }
 
     #[tokio::test]

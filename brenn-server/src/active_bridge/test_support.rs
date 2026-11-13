@@ -20,6 +20,21 @@ use super::cc_event_loop::cc_event_loop;
 use super::compaction::{CompactionPhase, ContextUsage};
 use super::{ActiveBridge, ActiveBridges};
 
+/// A one-model `model_usage_since_last_result` map stating `cost`.
+pub(in crate::active_bridge) fn stated_cost_map(
+    cost: f64,
+) -> std::collections::BTreeMap<String, brenn_cc::protocol::incoming::ModelUsageEntry> {
+    std::collections::BTreeMap::from([(
+        "claude-sonnet-4-6".to_string(),
+        brenn_cc::protocol::incoming::ModelUsageEntry {
+            context_window: None,
+            max_output_tokens: None,
+            cost_usd: Some(cost),
+            extra: serde_json::json!({}),
+        },
+    )])
+}
+
 /// Core no-spawn bridge constructor: runs the shared 5-step init
 /// (db, user, conversation, broadcast channel, mpsc channel) and returns the
 /// full superset of handles. Callers destructure what they need and add extras.

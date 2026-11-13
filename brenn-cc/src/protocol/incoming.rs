@@ -348,8 +348,10 @@ pub struct HookInput {
 
 // --- Result ---
 
-/// Per-model usage entry from `result.modelUsage`. Keys in the map are model
-/// slugs as they appear in the CC stream, including any `[1m]` suffix.
+/// Per-model usage entry under `result.modelUsage` (running totals) or
+/// `result.model_usage_since_last_result` (this result's own calls); see
+/// `cost_usd`. Keys in either map are model slugs as they appear in the CC
+/// stream, including any `[1m]` suffix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelUsageEntry {
     /// Authoritative max context window for this model (e.g. 200_000, 1_000_000).
@@ -365,7 +367,10 @@ pub struct ModelUsageEntry {
     /// Maximum output tokens for this model.
     #[serde(default, rename = "maxOutputTokens")]
     pub max_output_tokens: Option<u64>,
-    /// Per-model cumulative cost in USD.
+    /// Per-model cost in USD. Under `modelUsage` it is CC's running total for
+    /// the session (restored from the transcript on `--resume`); under
+    /// `model_usage_since_last_result` it is the cost of the calls this
+    /// process made since its previous result.
     #[serde(default, rename = "costUSD")]
     pub cost_usd: Option<f64>,
     /// Other fields (inputTokens, outputTokens, cacheReadInputTokens,
@@ -406,8 +411,17 @@ pub struct ResultMessage {
     pub num_turns: Option<u64>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// CC's running total for the CC session. Not a per-turn figure: a
+    /// resumed process starts from a total restored from the transcript.
+    /// Never read as money; see [`ResultMessage::stated_cost_usd`].
     #[serde(default)]
     pub total_cost_usd: Option<f64>,
+    /// Per-model usage of the calls this process counted since its previous
+    /// result (since it started, for its first). Each call is stated on at
+    /// most one result, across resumes and kills. `{}` states zero; absent
+    /// states nothing.
+    #[serde(default)]
+    pub model_usage_since_last_result: Option<std::collections::BTreeMap<String, ModelUsageEntry>>,
     #[serde(default)]
     pub usage: Option<Usage>,
     #[serde(default)]
@@ -426,6 +440,31 @@ pub struct ResultMessage {
     pub origin: Option<ResultOrigin>,
     #[serde(flatten)]
     pub extra: serde_json::Value,
+}
+
+impl ResultMessage {
+    /// The cost this result states for itself: the sum of `costUSD` over
+    /// `model_usage_since_last_result`. `Some(0.0)` (positive zero) for `{}`;
+    /// `None` when the field is absent or any entry lacks `costUSD`.
+    ///
+    /// # Panics
+    ///
+    /// If any entry's `costUSD` is negative or not finite: CC never states
+    /// such a cost, and booking it would lower money totals.
+    pub fn stated_cost_usd(&self) -> Option<f64> {
+        self.model_usage_since_last_result
+            .as_ref()?
+            .iter()
+            .try_fold(0.0, |total, (model, entry)| {
+                let cost = entry.cost_usd?;
+                assert!(
+                    cost.is_finite() && cost >= 0.0,
+                    "CC result states costUSD {cost} for model `{model}` in \
+                     model_usage_since_last_result — a stated cost is finite and not negative"
+                );
+                Some(total + cost)
+            })
+    }
 }
 
 // --- Rate Limit Event ---
@@ -1003,6 +1042,82 @@ mod tests {
         }
     }
 
+    fn parse_result(json: &str) -> ResultMessage {
+        match serde_json::from_str::<CcIncoming>(json).expect("parse result") {
+            CcIncoming::Result(res) => res,
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stated_cost_sums_every_model_and_leaves_extra() {
+        let res = parse_result(
+            r#"{
+                "type": "result",
+                "subtype": "success",
+                "total_cost_usd": 73.13,
+                "model_usage_since_last_result": {
+                    "claude-opus-4-7[1m]": {"inputTokens": 10, "outputTokens": 400, "costUSD": 0.5},
+                    "claude-haiku-4-5": {"inputTokens": 3, "outputTokens": 20, "costUSD": 0.25}
+                }
+            }"#,
+        );
+        assert_eq!(res.stated_cost_usd(), Some(0.75));
+        assert!(
+            res.extra.get("model_usage_since_last_result").is_none(),
+            "the field is typed and must not also land in extra"
+        );
+    }
+
+    #[test]
+    fn stated_cost_of_empty_object_is_zero() {
+        let res = parse_result(
+            r#"{"type": "result", "subtype": "success", "total_cost_usd": 0, "model_usage_since_last_result": {}}"#,
+        );
+        let cost = res.stated_cost_usd().expect("`{}` states a cost");
+        // `-0.0 == 0.0`, so compare bits: an empty f64 `Sum` is `-0.0`.
+        assert_eq!(cost.to_bits(), 0.0_f64.to_bits(), "got {cost:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "a stated cost is finite and not negative")]
+    fn stated_cost_panics_on_a_negative_entry() {
+        let res = parse_result(
+            r#"{
+                "type": "result",
+                "subtype": "success",
+                "model_usage_since_last_result": {
+                    "claude-opus-4-7": {"costUSD": 0.5},
+                    "claude-haiku-4-5": {"costUSD": -0.3}
+                }
+            }"#,
+        );
+        res.stated_cost_usd();
+    }
+
+    #[test]
+    fn stated_cost_is_none_when_field_absent() {
+        let res =
+            parse_result(r#"{"type": "result", "subtype": "success", "total_cost_usd": 0.05}"#);
+        assert!(res.model_usage_since_last_result.is_none());
+        assert_eq!(res.stated_cost_usd(), None);
+    }
+
+    #[test]
+    fn stated_cost_is_none_when_an_entry_lacks_cost() {
+        let res = parse_result(
+            r#"{
+                "type": "result",
+                "subtype": "success",
+                "model_usage_since_last_result": {
+                    "claude-opus-4-7": {"outputTokens": 400, "costUSD": 0.5},
+                    "claude-haiku-4-5": {"outputTokens": 20}
+                }
+            }"#,
+        );
+        assert_eq!(res.stated_cost_usd(), None);
+    }
+
     #[test]
     fn parse_result_with_task_notification_origin() {
         // A CC-autonomous turn stamps `origin.kind = "task-notification"`.
@@ -1087,6 +1202,7 @@ mod tests {
             num_turns: Some(1),
             session_id: None,
             total_cost_usd: None,
+            model_usage_since_last_result: None,
             usage: None,
             result: None,
             stop_reason: None,

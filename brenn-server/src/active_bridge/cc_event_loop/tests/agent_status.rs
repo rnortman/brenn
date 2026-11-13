@@ -88,8 +88,16 @@ fn rate_limit(info: serde_json::Value) -> SessionEvent {
     })
 }
 
-fn result(total_cost_usd: Option<f64>, is_error: bool, text: Option<&str>) -> SessionEvent {
-    SessionEvent::TurnCompleted(ResultMessage {
+/// A `result` frame. `cost` is what it states in
+/// `model_usage_since_last_result` (`None` leaves the field absent);
+/// `total_cost_usd` is CC's running total, which is never booked.
+fn result(
+    total_cost_usd: Option<f64>,
+    cost: Option<f64>,
+    is_error: bool,
+    text: Option<&str>,
+) -> SessionEvent {
+    SessionEvent::TurnCompleted(Box::new(ResultMessage {
         subtype: Some(if is_error { "error" } else { "success" }.into()),
         duration_ms: Some(10),
         duration_api_ms: Some(10),
@@ -97,13 +105,15 @@ fn result(total_cost_usd: Option<f64>, is_error: bool, text: Option<&str>) -> Se
         num_turns: Some(1),
         session_id: Some("sess-1".into()),
         total_cost_usd,
+        model_usage_since_last_result: cost
+            .map(crate::active_bridge::test_support::stated_cost_map),
         usage: None,
         result: text.map(str::to_string),
         stop_reason: None,
         model_usage: None,
         origin: None,
         extra: serde_json::Value::Object(Default::default()),
-    })
+    }))
 }
 
 fn initialized() -> SessionEvent {
@@ -207,25 +217,29 @@ async fn an_unknown_status_is_drift_and_nothing_else() {
 #[tokio::test]
 async fn a_costed_turn_under_a_key_charges_it() {
     let rig = quiet_rig(Some("work-key")).await;
-    rig.send(result(Some(0.4), false, Some("done"))).await;
+    rig.send(result(Some(0.4), Some(0.4), false, Some("done")))
+        .await;
     let key = key_record(&rig.published().await).expect("the turn published accounts");
     assert_eq!(key.usd, 0.4);
     assert_eq!(key.turns, Some(1));
     assert_eq!(key.exhausted, None);
 }
 
-/// CC reports a cumulative `total_cost_usd`; the key is charged each frame's
-/// delta. A total lower than the last one is taken whole.
+/// The key is charged what each result states, whatever CC's running
+/// `total_cost_usd` does: here it rises, then falls below the last value as
+/// after a respawn that restored a stale total.
 #[tokio::test]
-async fn a_key_is_charged_the_delta_of_the_cumulative_cost() {
+async fn a_key_is_charged_what_each_result_states() {
     let rig = quiet_rig(Some("work-key")).await;
-    rig.send(result(Some(0.4), false, Some("one"))).await;
-    rig.send(result(Some(0.7), false, Some("two"))).await;
+    rig.send(result(Some(5.4), Some(0.4), false, Some("one")))
+        .await;
+    rig.send(result(Some(5.7), Some(0.3), false, Some("two")))
+        .await;
     let key = key_record(&rig.published().await).expect("the turns published accounts");
     assert!((key.usd - 0.7).abs() < 1e-9, "charged {}", key.usd);
     assert_eq!(key.turns, Some(2));
 
-    rig.send(result(Some(0.1), false, Some("after a reset")))
+    rig.send(result(Some(3.1), Some(0.1), false, Some("after a respawn")))
         .await;
     let key = key_record(&rig.published().await).expect("the turn published accounts");
     assert!((key.usd - 0.8).abs() < 1e-9, "charged {}", key.usd);
@@ -233,12 +247,21 @@ async fn a_key_is_charged_the_delta_of_the_cumulative_cost() {
 }
 
 #[tokio::test]
+async fn a_result_stating_a_cost_without_a_running_total_is_a_turn() {
+    let rig = quiet_rig(Some("work-key")).await;
+    rig.send(result(None, Some(0.4), false, Some("done"))).await;
+    let key = key_record(&rig.published().await).expect("the turn published accounts");
+    assert!((key.usd - 0.4).abs() < 1e-9, "charged {}", key.usd);
+    assert_eq!(key.turns, Some(1));
+}
+
+#[tokio::test]
 async fn a_frame_without_cost_that_is_not_a_refusal_is_not_a_turn() {
     let rig = quiet_rig(Some("work-key")).await;
     rig.send(initialized()).await;
     rig.published().await;
-    rig.send(result(None, false, Some("compacted"))).await;
-    rig.send(result(None, true, Some("overloaded"))).await;
+    rig.send(result(None, None, false, Some("compacted"))).await;
+    rig.send(result(None, None, true, Some("overloaded"))).await;
     let published = rig.published().await;
     assert!(
         published
@@ -252,6 +275,7 @@ async fn a_frame_without_cost_that_is_not_a_refusal_is_not_a_turn() {
 async fn a_refusal_without_cost_flags_the_key() {
     let rig = quiet_rig(Some("work-key")).await;
     rig.send(result(
+        None,
         None,
         true,
         Some("API Error: Credit balance is too low"),
@@ -268,10 +292,30 @@ async fn a_refusal_without_cost_flags_the_key() {
     assert_eq!(flag.until_ms, None);
 }
 
+/// A refused turn states `{}`: a measured zero, still one turn, still a flag.
+#[tokio::test]
+async fn a_refusal_stating_an_empty_cost_flags_the_key_and_charges_nothing() {
+    let rig = quiet_rig(Some("work-key")).await;
+    let SessionEvent::TurnCompleted(mut refused) = result(
+        Some(0.0),
+        None,
+        true,
+        Some("API Error: Credit balance is too low"),
+    ) else {
+        unreachable!()
+    };
+    refused.model_usage_since_last_result = Some(std::collections::BTreeMap::new());
+    rig.send(SessionEvent::TurnCompleted(refused)).await;
+    let key = key_record(&rig.published().await).expect("the refusal published accounts");
+    assert_eq!(key.turns, Some(1));
+    assert_eq!(key.usd, 0.0);
+    assert!(key.exhausted.is_some(), "the key is flagged");
+}
+
 #[tokio::test]
 async fn a_marker_on_a_subscription_flags_nothing() {
     let rig = quiet_rig(Some("personal")).await;
-    rig.send(result(None, true, Some("credit balance is too low")))
+    rig.send(result(None, None, true, Some("credit balance is too low")))
         .await;
     assert!(rig.published().await.is_empty());
 }

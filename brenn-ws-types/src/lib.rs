@@ -951,14 +951,12 @@ pub enum WsServerMessage {
     /// pill. Field names are snake_case on the wire (no rename_all on
     /// WsServerMessage); TypeScript receives them as `last_turn_usd`, etc.
     CostUsage {
-        /// Cost of the most recent turn (cumulative current minus cumulative
-        /// previous). On the first turn of a fresh session this equals
-        /// `since_last_compaction_usd`. On a turn immediately after compaction,
-        /// this is the cost of the compaction operation itself (near zero).
+        /// Cost of the most recent turn: the cost CC's result states for
+        /// itself. 0 for a result that states none.
         last_turn_usd: f64,
-        /// Cumulative session cost since the last `/compact`, taken straight
-        /// from CC's `result.total_cost_usd` (CC resets at compaction).
-        since_last_compaction_usd: f64,
+        /// The conversation's total cost: the sum of its turns' costs, as
+        /// stored. Does not reset at compaction.
+        conversation_total_usd: f64,
         /// Process-wide sum of `last_turn_usd` samples across every conversation
         /// served by this brenn instance in the last 24 wall-clock hours.
         last_24h_usd: f64,

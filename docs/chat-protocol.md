@@ -363,8 +363,8 @@ Cost telemetry, emitted after each turn completes.
 
 | field | type | meaning |
 |---|---|---|
-| `last_turn_usd` | number | cost of the turn just finished |
-| `since_last_compaction_usd` | number | cumulative session cost since the last compaction |
+| `last_turn_usd` | number | cost of the turn just finished: the cost Claude Code's result states for itself; 0 when it states none |
+| `since_last_compaction_usd` | number | the conversation's total cost — the sum of its turns' costs; it does not reset at compaction; the name is historical |
 | `last_24h_usd` | number | sum across every conversation this server ran in the last 24 wall hours |
 
 ---

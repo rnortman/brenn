@@ -173,10 +173,6 @@ pub struct ActiveBridge {
     /// `context_usage.max_tokens` directly; subsequent broadcasts within the same
     /// session use that as the denominator, not this seed.
     pub(super) seed_max_tokens: std::sync::Mutex<Option<u64>>,
-    /// Cumulative cost as of the last persisted turn. Used to compute per-turn
-    /// delta. Loaded from `conversations.total_cost_usd` at bridge construction
-    /// and updated after each turn before broadcasting.
-    pub(super) last_total_cost_usd: std::sync::Mutex<Option<f64>>,
     /// Last top-level assistant model slug. Used to pick the right key out of
     /// `result.modelUsage`. `None` until the first non-subagent assistant message.
     pub(super) active_model_slug: std::sync::Mutex<Option<String>>,
@@ -589,15 +585,9 @@ impl ActiveBridge {
         let approval_rules =
             ApprovalRuleSet::new(&global_extra, &app_config.approval_rules, db_rule_tuples);
 
-        // Seed last_total_cost_usd from the existing conversation row so that
-        // the first turn delta is correct even after a bridge restart. The
-        // row's epoch is read in the same scope.
-        let (initial_cost, spawned_epoch) = {
+        let spawned_epoch = {
             let conn = db.lock().await;
-            (
-                brenn_db::conversation::get_total_cost_usd(&conn, conversation_id),
-                brenn_db::conversation::get_conversation(&conn, conversation_id).epoch,
-            )
+            brenn_db::conversation::get_conversation(&conn, conversation_id).epoch
         };
 
         #[cfg(test)]
@@ -660,7 +650,6 @@ impl ActiveBridge {
             compaction_config: app_config.compaction.clone(),
             context_usage: std::sync::Mutex::new(None),
             seed_max_tokens: std::sync::Mutex::new(None),
-            last_total_cost_usd: std::sync::Mutex::new(initial_cost),
             active_model_slug: std::sync::Mutex::new(None),
             cc_version: std::sync::Mutex::new(None),
             server_shutting_down,

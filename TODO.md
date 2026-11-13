@@ -30,6 +30,16 @@ with a test; and the warning in the assembly comment and in
 `config/specs/agent-status.brenn`, on the paragraph of the assembly's
 comment that warns of the loop.
 
+## `chat-cost-usage-field-misnamed`
+
+`cost_usage`'s `since_last_compaction_usd` in the chat protocol carries the
+conversation's total cost and never reset at compaction. Renaming it is a
+breaking change to the record vocabulary, which `docs/chat-protocol.md` §11
+allows only with a new `v`. Rename it to `conversation_total_usd` in
+whichever change next bumps the chat protocol version, in
+`brenn-envelope/src/chat.rs`, the `bus_chat.rs` mapping and
+`docs/chat-protocol.md`.
+
 ## `claude-key-flag-operator-clear`
 
 An operator cannot tell Brenn that a flagged API-key profile works again.

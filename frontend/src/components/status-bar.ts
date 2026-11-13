@@ -26,7 +26,7 @@ export interface ContextUsageInfo {
 
 export interface CostUsageInfo {
   lastTurnUsd: number;
-  sinceLastCompactionUsd: number;
+  conversationTotalUsd: number;
   last24hUsd: number;
 }
 
@@ -119,9 +119,9 @@ export class BrennStatusBar extends LitElement {
 
   private renderCostUsage() {
     if (!this.costUsage) return nothing;
-    const { lastTurnUsd, sinceLastCompactionUsd, last24hUsd } = this.costUsage;
+    const { lastTurnUsd, conversationTotalUsd, last24hUsd } = this.costUsage;
     const fmt = (v: number) => `$${v.toFixed(v < 1 ? 4 : 2)}`;
-    const tip = `Last turn ${fmt(lastTurnUsd)} · since compact ${fmt(sinceLastCompactionUsd)} · 24h ${fmt(last24hUsd)}`;
+    const tip = `Last turn ${fmt(lastTurnUsd)} · conversation ${fmt(conversationTotalUsd)} · 24h ${fmt(last24hUsd)}`;
     return html`<span class="cost-usage" title=${tip}
       >${fmt(lastTurnUsd)} · 24h ${fmt(last24hUsd)}</span
     >`;

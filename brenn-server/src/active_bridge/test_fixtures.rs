@@ -654,7 +654,6 @@ impl ActiveBridge {
             compaction_config,
             context_usage: std::sync::Mutex::new(None),
             seed_max_tokens: std::sync::Mutex::new(None),
-            last_total_cost_usd: std::sync::Mutex::new(None),
             active_model_slug: std::sync::Mutex::new(None),
             cc_version: std::sync::Mutex::new(None),
             server_shutting_down: Arc::new(AtomicBool::new(false)),

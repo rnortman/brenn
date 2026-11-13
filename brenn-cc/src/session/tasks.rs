@@ -268,7 +268,7 @@ async fn run_stdout_reader<R: tokio::io::AsyncRead + Unpin>(
                         // Emit TurnCompleted but do NOT break or set alive=false.
                         // CC stays alive, waiting for the next user message.
                         event_tx
-                            .send(SessionEvent::TurnCompleted(res))
+                            .send(SessionEvent::TurnCompleted(Box::new(res)))
                             .await
                             .is_ok()
                     }

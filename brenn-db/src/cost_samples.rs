@@ -1,7 +1,7 @@
 //! Per-turn cost samples for the 24-hour rolling cost window.
 //!
-//! Each row records the per-turn cost delta (`current_total - prev_total`)
-//! from a single CC turn completion. Old rows are pruned eagerly on each turn.
+//! Each row records the cost a single CC result states for its turn. Old
+//! rows are pruned eagerly on each turn.
 //! The `sum_since` query is process-wide (no `WHERE conversation_id`) so the
 //! 24h aggregate spans all conversations served by this brenn instance.
 //!
@@ -13,8 +13,8 @@ use rusqlite::Connection;
 
 /// Insert a per-turn cost sample.
 ///
-/// `turn_cost_usd` is the delta between consecutive `result.total_cost_usd`
-/// values. Zero-valued samples are not inserted (caller responsibility).
+/// `turn_cost_usd` is the cost the result states for its turn. The caller must not insert
+/// zero-valued samples.
 pub fn insert(conn: &Connection, conversation_id: i64, turn_cost_usd: f64) {
     let now_secs = Utc::now().timestamp();
     conn.execute(

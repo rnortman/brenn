@@ -838,3 +838,100 @@ async fn a_respawn_mounts_the_bridges_tool_socket() {
             .contains(&"BRENN_TOOL_SOCKET=/run/brenn/tool.sock".to_string())
     );
 }
+
+/// A swap from a subscription profile onto a key profile, then the
+/// replacement's first result: its running total is restored from the
+/// transcript and large, but the key is charged only what the result states.
+#[tokio::test]
+async fn a_swap_onto_a_key_charges_it_only_what_the_replacement_states() {
+    use crate::active_bridge::test_support::{await_fence, event_fence};
+    use crate::agent_status::tests::{Recording, accounts_of, profiles};
+    use crate::agent_status::{AgentStatusReporter, Publishing};
+    use brenn_messaging::agent_status::ACCOUNTS_ADDRESS;
+
+    let sink = Arc::new(Recording::default());
+    let reporter = AgentStatusReporter::start(
+        &profiles(),
+        Some(Publishing {
+            sink: sink.clone(),
+            retained_accounts: None,
+        }),
+    );
+    reporter.flush().await;
+    sink.take();
+
+    let (replacement, _new_outgoing) = CcSession::recording_for_test();
+    let host = FakeHost::spawning(replacement);
+    let (alerts, _h) = noop_alert_dispatcher();
+    let (bridge, event_tx, event_rx, mut broadcast_rx, alerts, _ab) = make_bridge_no_loop(
+        "testapp",
+        alerts,
+        TestBridgeConfig {
+            cc_profiles: Some(goal_for("testapp", &["work-key", "personal"])),
+            swap_host: Some(host.clone() as Arc<dyn ProfileSwapHost>),
+            agent_status: Some(reporter.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    bridge.set_cc_profile_for_test(Some("personal"));
+    let _old_outgoing = bridge.install_recording_session_for_test().await;
+    drop(tokio::spawn(cc_event_loop(
+        event_rx,
+        bridge.clone(),
+        alerts,
+    )));
+
+    ack_the_swap_death(bridge.clone(), event_tx.clone());
+    bridge.reconsider_profile();
+    broadcasts_until(&mut broadcast_rx, |m| {
+        matches!(
+            m,
+            WsServerMessage::Status {
+                state: CcState::Idle
+            }
+        )
+    })
+    .await;
+    assert_eq!(bridge.cc_profile_name().as_deref(), Some("work-key"));
+    reporter.flush().await;
+    sink.take();
+
+    let fence = event_fence(&bridge);
+    event_tx
+        .send(SessionEvent::TurnCompleted(Box::new(
+            brenn_cc::protocol::incoming::ResultMessage {
+                subtype: Some("success".into()),
+                is_error: Some(false),
+                total_cost_usd: Some(73.13),
+                model_usage_since_last_result: Some(
+                    crate::active_bridge::test_support::stated_cost_map(0.5),
+                ),
+                extra: serde_json::json!({}),
+                ..Default::default()
+            },
+        )))
+        .await
+        .expect("event loop gone");
+    await_fence(fence).await;
+    reporter.flush().await;
+
+    let published = sink.take();
+    let key = published
+        .iter()
+        .rev()
+        .find(|(address, _)| *address == ACCOUNTS_ADDRESS)
+        .map(|(_, body)| {
+            accounts_of(body)
+                .into_iter()
+                .find(|a| a.account == "work-key")
+                .expect("the key's record")
+        })
+        .expect("the turn published accounts");
+    assert!(
+        (key.usd - 0.5).abs() < 1e-9,
+        "the key must be charged the stated 0.5, not the running total; charged {}",
+        key.usd
+    );
+    assert_eq!(key.turns, Some(1));
+}

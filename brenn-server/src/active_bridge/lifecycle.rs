@@ -846,6 +846,7 @@ mod tests {
             num_turns: Some(1),
             session_id: None,
             total_cost_usd: None,
+            model_usage_since_last_result: None,
             usage: None,
             result: None,
             stop_reason: None,
@@ -854,7 +855,7 @@ mod tests {
             extra: serde_json::Value::Object(Default::default()),
         };
         event_tx
-            .send(SessionEvent::TurnCompleted(result))
+            .send(SessionEvent::TurnCompleted(Box::new(result)))
             .await
             .unwrap();
 
@@ -923,6 +924,7 @@ mod tests {
             num_turns: Some(1),
             session_id: None,
             total_cost_usd: None,
+            model_usage_since_last_result: None,
             usage: None,
             result: None,
             stop_reason: None,
@@ -932,7 +934,7 @@ mod tests {
         };
         let fence = event_fence(&bridge);
         event_tx
-            .send(SessionEvent::TurnCompleted(result))
+            .send(SessionEvent::TurnCompleted(Box::new(result)))
             .await
             .unwrap();
 

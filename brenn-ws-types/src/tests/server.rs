@@ -313,7 +313,7 @@ fn server_message_variants_serialize() {
         },
         WsServerMessage::CostUsage {
             last_turn_usd: 0.25,
-            since_last_compaction_usd: 1.5,
+            conversation_total_usd: 1.5,
             last_24h_usd: 12.5,
         },
         WsServerMessage::PushVapidKey {
@@ -578,12 +578,12 @@ fn cost_usage_wire_format() {
     // Exactly-representable f64 values so `Value::Number` comparison is exact.
     let msg = WsServerMessage::CostUsage {
         last_turn_usd: 0.25,
-        since_last_compaction_usd: 1.5,
+        conversation_total_usd: 1.5,
         last_24h_usd: 12.5,
     };
     assert_wire(
         &msg,
-        r#"{"type":"CostUsage","last_turn_usd":0.25,"since_last_compaction_usd":1.5,"last_24h_usd":12.5}"#,
+        r#"{"type":"CostUsage","last_turn_usd":0.25,"conversation_total_usd":1.5,"last_24h_usd":12.5}"#,
     );
 }
 

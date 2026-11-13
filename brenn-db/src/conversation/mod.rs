@@ -285,23 +285,22 @@ pub fn complete_conversation(conn: &Connection, conversation_id: i64, total_cost
     assert!(rows == 1, "conversation {conversation_id} not found");
 }
 
-/// Update the cumulative cost for a conversation (replace, not accumulate).
-/// Called on each turn completion — CC's result.total_cost_usd is cumulative.
-pub fn set_cost(conn: &Connection, conversation_id: i64, total_cost_usd: Option<f64>) {
+/// Add one turn's cost to a conversation's total (NULL counts as 0) and
+/// return the new total. Called for every result that states a cost.
+pub fn add_cost(conn: &Connection, conversation_id: i64, turn_cost_usd: f64) -> f64 {
     let now = format_ts_for_db(Utc::now());
-    let rows = conn
-        .execute(
-            "UPDATE conversations SET total_cost_usd = ?1, updated_at = ?2 WHERE id = ?3",
-            (total_cost_usd, &now, conversation_id),
-        )
-        .expect("failed to set conversation cost");
-    assert!(rows == 1, "conversation {conversation_id} not found");
+    conn.query_row(
+        "UPDATE conversations SET total_cost_usd = COALESCE(total_cost_usd, 0) + ?1, \
+         updated_at = ?2 WHERE id = ?3 RETURNING total_cost_usd",
+        (turn_cost_usd, &now, conversation_id),
+        |row| row.get::<_, f64>(0),
+    )
+    .unwrap_or_else(|e| panic!("add_cost: conversation {conversation_id}: {e}"))
 }
 
-/// Read the cumulative cost for a conversation.
+/// Read a conversation's total cost: the sum of the costs its turns stated.
 ///
 /// Returns `None` for a fresh conversation where no cost has been recorded yet.
-/// Used at bridge construction to seed `last_total_cost_usd`.
 pub fn get_total_cost_usd(conn: &Connection, conversation_id: i64) -> Option<f64> {
     conn.query_row(
         "SELECT total_cost_usd FROM conversations WHERE id = ?1",
@@ -1196,23 +1195,30 @@ mod tests {
     }
 
     #[test]
-    fn set_cost_updates_cost_without_changing_status() {
+    fn add_cost_adds_to_null_and_to_a_value_without_changing_status() {
         let db = init_db_memory();
         let conn = db.blocking_lock();
         let user_id = setup_user(&conn);
         let conv_id = create_conversation(&conn, user_id, "test", false);
 
-        // First turn cost.
-        set_cost(&conn, conv_id, Some(0.01));
+        // NULL counts as 0.
+        let total = add_cost(&conn, conv_id, 0.01);
+        assert!((total - 0.01).abs() < 1e-9, "returned total: {total}");
         let conv = get_conversation(&conn, conv_id);
-        assert_eq!(conv.total_cost_usd, Some(0.01));
-        assert_eq!(conv.status, ConversationStatus::Active); // Status unchanged.
-
-        // Second turn cost (cumulative — replaces, not accumulates).
-        set_cost(&conn, conv_id, Some(0.035));
-        let conv = get_conversation(&conn, conv_id);
-        assert_eq!(conv.total_cost_usd, Some(0.035));
+        assert!((conv.total_cost_usd.unwrap() - 0.01).abs() < 1e-9);
         assert_eq!(conv.status, ConversationStatus::Active);
+
+        // Accumulates, and returns the new total.
+        let total = add_cost(&conn, conv_id, 0.025);
+        assert!((total - 0.035).abs() < 1e-9, "returned total: {total}");
+        let conv = get_conversation(&conn, conv_id);
+        assert!((conv.total_cost_usd.unwrap() - 0.035).abs() < 1e-9);
+        assert_eq!(conv.status, ConversationStatus::Active);
+
+        // A zero turn still writes a total (NULL becomes 0 on a fresh row).
+        let other = create_conversation(&conn, user_id, "other", false);
+        assert_eq!(add_cost(&conn, other, 0.0), 0.0);
+        assert_eq!(get_total_cost_usd(&conn, other), Some(0.0));
     }
 
     /// `get_total_cost_usd` returns `None` for a fresh conversation (test-4).
@@ -1226,22 +1232,23 @@ mod tests {
         assert_eq!(get_total_cost_usd(&conn, conv_id), None);
     }
 
-    /// `get_total_cost_usd` returns the previously persisted value (test-4).
+    /// `get_total_cost_usd` returns the total `add_cost` accumulated (test-4).
     #[test]
-    fn get_total_cost_usd_returns_set_value() {
+    fn get_total_cost_usd_returns_added_value() {
         let db = init_db_memory();
         let conn = db.blocking_lock();
         let user_id = setup_user(&conn);
         let conv_id = create_conversation(&conn, user_id, "test", false);
-        set_cost(&conn, conv_id, Some(0.42));
+        add_cost(&conn, conv_id, 0.40);
+        add_cost(&conn, conv_id, 0.02);
         let cost = get_total_cost_usd(&conn, conv_id);
         assert!(
             cost.is_some(),
-            "get_total_cost_usd must return Some after set_cost(Some(...))"
+            "get_total_cost_usd must return Some after add_cost"
         );
         assert!(
             (cost.unwrap() - 0.42).abs() < 1e-9,
-            "get_total_cost_usd must return the value written by set_cost"
+            "get_total_cost_usd must return the sum add_cost wrote"
         );
     }
 

@@ -315,17 +315,15 @@ repo?: string | null, success: boolean,
  */
 error?: string | null, } | { "type": "CostUsage", 
 /**
- * Cost of the most recent turn (cumulative current minus cumulative
- * previous). On the first turn of a fresh session this equals
- * `since_last_compaction_usd`. On a turn immediately after compaction,
- * this is the cost of the compaction operation itself (near zero).
+ * Cost of the most recent turn: the cost CC's result states for
+ * itself. 0 for a result that states none.
  */
 last_turn_usd: number, 
 /**
- * Cumulative session cost since the last `/compact`, taken straight
- * from CC's `result.total_cost_usd` (CC resets at compaction).
+ * The conversation's total cost: the sum of its turns' costs, as
+ * stored. Does not reset at compaction.
  */
-since_last_compaction_usd: number, 
+conversation_total_usd: number, 
 /**
  * Process-wide sum of `last_turn_usd` samples across every conversation
  * served by this brenn instance in the last 24 wall-clock hours.

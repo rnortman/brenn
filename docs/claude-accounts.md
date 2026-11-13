@@ -263,13 +263,23 @@ bodies, the send rate they need, and the rules for a reader are in
 [the bus documentation](message-bus.md), §2.9. Without the channels the ledger
 is still kept in memory and nothing is published.
 
-**What a key profile's record counts.** Each turn that reports a cost adds it
-to `usd` and counts one in `turns`, for the calendar month in the profile's
-`reset_tz`; at the month's turn the record starts again at zero. A `result`
-that is not a model turn and carries no cost is not counted. `budget_usd` is
-reported beside the spend and enforces nothing: the spend limit on the Platform
-console is the stop, and the console, not the ledger, is the authority on what
-the key cost. Spend by anything else holding the key is not in the ledger.
+**What a key profile's record counts.** A turn's cost is the figure Claude
+Code's `result` states for that result alone (`model_usage_since_last_result`),
+never its running session total, so a resumed or respawned process is charged
+only what it spent itself. Each turn adds its cost to `usd` and counts one in
+`turns`, for the calendar month in the profile's `reset_tz`; at the month's
+turn the record starts again at zero. A `result` that is not a model turn and
+carries no cost is not counted. A process killed mid-turn leaves that turn's
+spend uncounted: Claude Code states it on no result. A `result` that carries
+a running total but no per-result figure is counted as a turn with no cost,
+logged as an error and alerted once per server run. `budget_usd` is reported
+beside the spend and enforces nothing: the spend limit on the Platform console
+is the stop, and the console, not the ledger, is the authority on what the
+key cost. Spend by anything else holding the key is not in the ledger.
+Everything the ledger leaves out makes it lower, so a month's `usd` is
+expected at or below the console's figure for the key. A `usd` well above it
+means Brenn is booking spend Claude Code did not make: a counting bug to
+report, not a number to budget by.
 
 **What a subscription profile's record counts.** No money: its period is `-`
 and `usd` is 0. It carries flags only.

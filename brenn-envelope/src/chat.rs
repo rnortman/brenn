@@ -505,7 +505,10 @@ pub enum ChatEvent {
     CostUsage {
         /// Cost of the turn just finished.
         last_turn_usd: f64,
-        /// Cumulative session cost since the last compaction.
+        /// The conversation's total cost: the sum of its turns' costs. It
+        /// does not reset at compaction; the name is historical.
+        // TODO(chat-cost-usage-field-misnamed): rename to
+        // `conversation_total_usd` at the next chat protocol version bump.
         since_last_compaction_usd: f64,
         /// Sum across every conversation this server ran in the last 24 wall
         /// hours.
