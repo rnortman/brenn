@@ -26,9 +26,9 @@ use uuid::Uuid;
 use super::{
     AttachGrant, ChannelEntry, ChannelScheme, ComponentGrant, MessagingDirectory,
     SubscriberEntryKind, TOOL_RESULTS_NAMESPACE, WakeMin, canonicalize_channel_address,
-    ends_at_tuning_boundary, in_a_tool_namespace, in_the_device_location_family,
-    is_device_location_prefix, is_reserved_channel_name, is_unreserved_char,
-    nondurable_channel_uuid, tuning_boundary_list,
+    ends_at_tuning_boundary, in_a_tool_namespace, in_app_tool_results_namespace,
+    in_the_device_location_family, is_device_location_prefix, is_reserved_channel_name,
+    is_unreserved_char, nondurable_channel_uuid, tuning_boundary_list,
 };
 use crate::config::AppConfigRaw;
 
@@ -743,6 +743,8 @@ pub struct ProvidedToolDecl {
     /// The most calls of this tool outstanding at once; at least one.
     pub max_concurrency: u32,
     pub auto_approve: bool,
+    /// Whether a call may hand the tool attachments.
+    pub accepts_attachments: bool,
 }
 
 /// One `call` binding of a top-level consumer (`call <port> -> <slug>.<port>`).
@@ -2453,6 +2455,7 @@ pub const INGRESS_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(100);
 ///
 /// Their executor and consumers are in-process and eager, so the window covers a
 /// burst arriving while the executor is busy, not a multi-day outage.
+// TODO(tool-request-window-overflow-silent): does not cover the largest burst one activation may queue to one tool.
 pub const TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(16);
 
 /// Retained window each user's `brenn:device-location.<username>` channel
@@ -2486,9 +2489,12 @@ pub const DEVICE_LOCATION_SEND_RATE: SendRate = SendRate {
 pub enum SystemChannelFamily {
     /// `webhook:<slug>` and `mqtt:<client>:<topic>` — inbound facts from outside.
     Ingress,
-    /// `brenn:tools/<tool>`, `brenn:tool-results/<slug>` and
-    /// `brenn:tool-requests/<slug>` — the async-tool request/result substrate
-    /// and the per-provider request inboxes.
+    /// `brenn:tools/<tool>`, `brenn:tool-results/<slug>`,
+    /// `brenn:tool-requests/<slug>` and `brenn:app-tool-results/<app-slug>` —
+    /// the async-tool request/result substrate, the per-provider request
+    /// inboxes and the per-app result inboxes. A conversation's naming of an
+    /// attachment reads this family: on a member other than its own app's
+    /// result inbox it names none.
     Tool,
     /// `brenn:device-location.<username>` — one per registered user, carrying
     /// every location fix and sharing change that user's devices report.
@@ -2806,11 +2812,16 @@ pub fn build_system_channel_tuning(
             ChannelScheme::split(&entry_key),
             Some((ChannelScheme::Brenn, name)) if name.starts_with(TOOL_RESULTS_NAMESPACE)
         );
-        // A result inbox's send rate is the host's, set where the inbox entry is
-        // built; a block's rate would be silently overridden there. Refused here
-        // for the same no-registry reason as the noise refusal below.
+        let app_tool_result_inbox = matches!(
+            ChannelScheme::split(&entry_key),
+            Some((ChannelScheme::Brenn, name)) if in_app_tool_results_namespace(name)
+        );
+        // A result inbox's send rate — a component's or an app's — is the host's,
+        // set where the inbox entry is built; a block's rate would be silently
+        // overridden there. Refused here for the same no-registry reason as the
+        // noise refusal below.
         assert!(
-            !(tool_result_inbox && entry.send_rate.is_some()),
+            !((tool_result_inbox || app_tool_result_inbox) && entry.send_rate.is_some()),
             "config: [[channel]] {label} tunes a tool-result inbox's `send_rate` — the \
              inbox's send rate is the host's: the tool executor is its only publisher and \
              publishes at most one result per request it dequeues, so the rate that bounds a \
@@ -4453,6 +4464,46 @@ channel demo at "ephemeral:protobar-demo" {
         tuning_of(&[block]);
     }
 
+    /// An app's result inbox takes the same refusal, by address and by its
+    /// own prefix.
+    #[test]
+    #[should_panic(
+        expected = "tunes a tool-result inbox's `send_rate` — the inbox's send \
+                               rate is the host's"
+    )]
+    fn an_exact_app_inbox_tuning_block_with_a_send_rate_panics() {
+        let mut block = tuning_block("brenn:app-tool-results/pfin", 1, 4, 4);
+        block.send_rate = Some(a_send_rate());
+        tuning_of(&[block]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "tunes a tool-result inbox's `send_rate` — the inbox's send \
+                               rate is the host's"
+    )]
+    fn a_prefix_app_inbox_tuning_block_with_a_send_rate_panics() {
+        let mut block = tuning_prefix("brenn:app-tool-results/", 1, 4, 4);
+        block.send_rate = Some(a_send_rate());
+        tuning_of(&[block]);
+    }
+
+    /// An app's result inbox is sized by its own prefix and not by a
+    /// component inbox prefix.
+    #[test]
+    fn an_app_inbox_is_tuned_by_its_own_prefix_only() {
+        let defaults = global_defaults();
+        let components_only = tuning_of(&[tuning_prefix("brenn:tool-results/", 1, 6, 6)]);
+        let untouched =
+            resolve_system_channel("brenn:app-tool-results/pfin", &components_only, &defaults);
+        let tuned = tuning_of(&[tuning_prefix("brenn:app-tool-results/", 1, 6, 6)]);
+        assert_ne!(untouched.retain_depth, Depth::Bounded(6));
+        assert_eq!(
+            resolve_system_channel("brenn:app-tool-results/pfin", &tuned, &defaults).retain_depth,
+            Depth::Bounded(6),
+        );
+    }
+
     /// Without `send_rate` the same blocks build, and the operator's other
     /// knobs on a result inbox stay the operator's.
     #[test]
@@ -4823,6 +4874,14 @@ channel demo at "ephemeral:protobar-demo" {
         );
         assert_eq!(
             SystemChannelFamily::of("tool-results/sync"),
+            Some(SystemChannelFamily::Tool)
+        );
+        assert_eq!(
+            SystemChannelFamily::of("brenn:tool-requests/x"),
+            Some(SystemChannelFamily::Tool)
+        );
+        assert_eq!(
+            SystemChannelFamily::of("brenn:app-tool-results/x"),
             Some(SystemChannelFamily::Tool)
         );
         assert_eq!(SystemChannelFamily::of("brenn:tools.mine"), None);

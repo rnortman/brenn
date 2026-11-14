@@ -15,6 +15,7 @@ use std::borrow::Cow;
 
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
+use brenn_envelope::tool_schema::ATTACHMENTS_ARGUMENT;
 use brenn_envelope::{BodyError, MAX_ATTACHMENTS_PER_MESSAGE};
 use brenn_lib::messaging::{ChannelScheme, MessageEnvelope, Urgency};
 use brenn_messaging::format::{ConversationEnvelopes, ConversationShape};
@@ -367,10 +368,11 @@ async fn execute_send(
         Ok(parsed) => parsed,
         Err(outcome) => return outcome,
     };
-    let forwarded = match resolve_forwarded(bridge, messenger, tool_name, tool_input).await {
-        Ok(forwarded) => forwarded,
-        Err(outcome) => return outcome,
-    };
+    let forwarded =
+        match resolve_forwarded(bridge, messenger, MESSAGING_TOOL, tool_name, tool_input).await {
+            Ok(forwarded) => forwarded,
+            Err(outcome) => return outcome,
+        };
     let attachments = match held_attachments(forwarded) {
         Ok(attachments) => attachments,
         Err(outcome) => return outcome,
@@ -535,21 +537,24 @@ fn text_body(
     }
 }
 
-/// Admit every entry of a `BrennSend`'s `attachments` argument under the
-/// conversation naming rule, each as its new name and one hold on the blob it
-/// names. The first refusal refuses the whole send, and the holds already
-/// taken drop with it.
+/// Admit every entry of a call's `attachments` argument (`BrennSend`'s, or a
+/// registry tool's that accepts attachments) under the conversation naming
+/// rule, each as its new name and one hold on the blob it names. The first
+/// refusal refuses the whole call, and the holds already taken drop with it.
+/// `context` names the kind of tool in the warn log of a malformed argument.
 pub(crate) async fn resolve_forwarded(
     bridge: &ActiveBridge,
     messenger: &brenn_messaging::Messenger,
+    context: &str,
     tool_name: &str,
     tool_input: &serde_json::Value,
 ) -> Result<Vec<(AttachmentName, BlobHold)>, ToolOutcome> {
-    let entries = match tool_input.get("attachments") {
+    let entries = match tool_input.get(ATTACHMENTS_ARGUMENT) {
         None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
         Some(serde_json::Value::Object(entries)) => entries,
         Some(other) => {
-            return Err(reject(
+            return Err(outcome_rejection(
+                context,
                 tool_name,
                 &format!(
                     "`attachments` must be an object mapping each new attachment name to \
@@ -571,7 +576,7 @@ pub(crate) async fn resolve_forwarded(
     let mut forwarded = Vec::with_capacity(entries.len());
     for (new_name, source) in entries {
         let new_name = attachment_name(new_name)?;
-        let (message_id, name) = forwarded_source(tool_name, &new_name, source)?;
+        let (message_id, name) = forwarded_source(context, tool_name, &new_name, source)?;
         let message_id = message_uuid(message_id)?;
         let name = attachment_name(name)?;
         match messenger
@@ -599,12 +604,14 @@ pub(crate) async fn resolve_forwarded(
 /// One `attachments` entry's `message_id` and `name`, both strings and
 /// nothing else beside them.
 fn forwarded_source<'a>(
+    context: &str,
     tool_name: &str,
     new_name: &AttachmentName,
     source: &'a serde_json::Value,
 ) -> Result<(&'a str, &'a str), ToolOutcome> {
     let shape_err = || {
-        reject(
+        outcome_rejection(
+            context,
             tool_name,
             &format!(
                 "attachment {new_name}: each `attachments` entry must be \
@@ -1455,8 +1462,11 @@ async fn execute_unsubscribe(
 }
 /// A rejection of the call's arguments: warn-logged, `{"ok":false,"error":…}`.
 fn reject(tool_name: &str, error: &str) -> ToolOutcome {
-    outcome_rejection("messaging tool", tool_name, error)
+    outcome_rejection(MESSAGING_TOOL, tool_name, error)
 }
+
+/// The warn-log context of a messaging tool's rejection.
+pub(crate) const MESSAGING_TOOL: &str = "messaging tool";
 
 /// Server constructed without a Messenger (no channels configured). Surfaced
 /// as a tool-result error rather than a panic so the LLM can back off.

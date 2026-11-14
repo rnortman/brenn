@@ -294,9 +294,10 @@ impl SystemInbox {
     /// the channel's window, sized for the outage the operator intends to
     /// survive, not forever. So a fresh position re-runs at most a window's
     /// worth of already-handled messages, and anything dropped past the window
-    /// is counted, not silent. Handlers must tolerate that repeat — for the tool
-    /// executor it is the `Idempotency::Natural` contract every async tool
-    /// declares.
+    /// is stepped over silently: the participant's overflow rung is `Silent`,
+    /// which keeps no count and raises no alert. Handlers must tolerate the
+    /// repeat — for the tool executor it is the `Idempotency::Natural` contract
+    /// every async tool declares.
     ///
     /// Runs before the first window read; a push-enabled window read without a
     /// position panics.

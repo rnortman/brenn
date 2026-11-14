@@ -14,9 +14,10 @@
 // - `RetainedState<T, C>` / `StateCodec` — a component's state on a retained
 //   `io` port, which is where it lives: linear memory is activation-scoped
 // - `calls` module — call a peer component and read its reply inline
-// - `tools` module — async tool calls and the result envelope they answer with
+// - `tools` module — async tool calls, with or without attachments, and the
+//   result envelope they answer with
 // - `provides` module — serve the tools the class declares, acting for the
-//   requesting user
+//   requesting user, completing with or without attachments
 // - `blobs` module — open a received attachment, read it by byte range, and
 //   make a blob by positional writes
 // - `dom` module — element handles and mutators, for a page-hosted component
@@ -463,6 +464,27 @@ impl PortWindow {
     }
 }
 
+/// A message's port and index in this activation's windows, kept by a value
+/// parsed from it so the value can open the message's attachments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowPlace {
+    port: String,
+    index: u32,
+}
+
+impl WindowPlace {
+    fn of(message: &Message) -> WindowPlace {
+        WindowPlace {
+            port: message.port().to_owned(),
+            index: message.index(),
+        }
+    }
+
+    fn open(&self, name: &str) -> Result<blobs::Blob, blobs::OpenError> {
+        blobs::open_at(&self.port, self.index, name)
+    }
+}
+
 /// Export glue macro: implements the WIT `Guest` trait for a shim that
 /// validates the activation and delegates to your `Processor` impl.
 ///
@@ -742,7 +764,9 @@ impl From<PublishAttachmentsError> for Error {
 ///
 /// **Requires grants:** `"ports"` to publish, and `"blobs"` for the interface
 /// this calls and for any [`blobs::Blob`] to pass. Without `"ports"` every
-/// call is [`PublishAttachmentsError::NotPermitted`].
+/// call is [`PublishAttachmentsError::NotPermitted`]. A component that calls
+/// this imports the `ports` interface for its error type, whether or not it
+/// calls [`publish`], so its class requires `ports`.
 ///
 /// The message takes its place in call order among the other publishes of
 /// the activation and is flushed with them, iff `receive` returns `Ok`. It
@@ -756,11 +780,12 @@ pub fn publish_with_attachments<'a>(
     attachments: &[(&str, &blobs::Blob)],
     options: PublishOptions,
 ) -> Result<(), PublishAttachmentsError> {
-    let raw: Vec<(&str, &contract::RawBlob)> = attachments
-        .iter()
-        .map(|(name, blob)| (*name, blob.raw()))
-        .collect();
-    contract::publish_with_attachments(port, body.into(), &raw, options)
+    contract::publish_with_attachments(
+        port,
+        body.into(),
+        &blobs::raw_attachments(attachments),
+        options,
+    )
 }
 
 /// Cancel one of this component's own parked messages on `port`, named by its
@@ -1641,7 +1666,23 @@ pub mod blobs {
     /// Takes a hold and reads no byte: forwarding the handle with
     /// [`crate::publish_with_attachments`] copies nothing.
     pub fn open(message: &Message, name: &str) -> Result<Blob, OpenError> {
-        contract::blob_open(message.port(), message.index(), name).map(|raw| Blob { raw })
+        open_at(message.port(), message.index(), name)
+    }
+
+    /// [`open`] by the port and window index of a message this activation
+    /// delivered.
+    pub(crate) fn open_at(port: &str, index: u32, name: &str) -> Result<Blob, OpenError> {
+        contract::blob_open(port, index, name).map(|raw| Blob { raw })
+    }
+
+    /// Each attachment's name and raw handle, as the contract takes them.
+    pub(crate) fn raw_attachments<'a>(
+        attachments: &[(&'a str, &'a Blob)],
+    ) -> Vec<(&'a str, &'a RawBlob)> {
+        attachments
+            .iter()
+            .map(|(name, blob)| (*name, blob.raw()))
+            .collect()
     }
 
     impl Blob {
@@ -2195,6 +2236,114 @@ pub mod tools {
         call_async(tool, &args_json, call_id)
     }
 
+    /// Why a tool call that carries attachments was refused. The first six
+    /// mean what [`call_async`]'s refusals of the same names mean.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum CallAttachmentsError {
+        /// The tool is not granted to this component, or the component lacks
+        /// the grant the form needs (`tools` for [`call_async_with_attachments`],
+        /// `provides` for
+        /// [`crate::provides::call_async_for_with_attachments`]).
+        NotGranted,
+        /// The tool's ACL refused the arguments, with the reason.
+        Denied(String),
+        /// The arguments are malformed or over the cap, with the diagnostic.
+        InvalidArgs(String),
+        /// The grant's rate bucket is empty.
+        RateLimited,
+        /// The tool is not of the asynchronous class.
+        WrongClass,
+        /// The host failed, with the diagnostic.
+        Internal(String),
+        /// An attachment name outside the grammar of
+        /// [`crate::AttachmentName::new`], with the name.
+        InvalidAttachmentName(String),
+        /// The same attachment name given twice, with the name.
+        DuplicateAttachmentName(String),
+        /// More than [`brenn_envelope::MAX_ATTACHMENTS_PER_MESSAGE`] attachments.
+        TooManyAttachments,
+        /// The tool takes no attachments. Told only to a caller granted the
+        /// tool.
+        AttachmentsNotAccepted,
+    }
+
+    impl From<CallAttachmentsError> for Error {
+        fn from(e: CallAttachmentsError) -> Error {
+            let variant = match e {
+                CallAttachmentsError::NotGranted => String::from("not-granted"),
+                CallAttachmentsError::Denied(r) => format!("denied: {r}"),
+                CallAttachmentsError::InvalidArgs(m) => format!("invalid-args: {m}"),
+                CallAttachmentsError::RateLimited => String::from("rate-limited"),
+                CallAttachmentsError::WrongClass => String::from("wrong-class"),
+                CallAttachmentsError::Internal(t) => format!("internal: {t}"),
+                CallAttachmentsError::InvalidAttachmentName(n) => {
+                    format!("invalid-attachment-name: {n:?}")
+                }
+                CallAttachmentsError::DuplicateAttachmentName(n) => {
+                    format!("duplicate-attachment-name: {n:?}")
+                }
+                CallAttachmentsError::TooManyAttachments => String::from("too-many-attachments"),
+                CallAttachmentsError::AttachmentsNotAccepted => {
+                    String::from("attachments-not-accepted")
+                }
+            };
+            Error::failed(format!("call-async with attachments: {variant}"))
+        }
+    }
+
+    /// [`call_async`], carrying each named blob to the tool.
+    ///
+    /// **Requires grants:** a tool grant (the `tools` capability) to call, and
+    /// `"blobs"` for the interface this calls and for any [`blobs::Blob`] to
+    /// pass. Without `tools` every call is
+    /// [`CallAttachmentsError::NotGranted`]. A component that calls this
+    /// imports the `tools` interface for its error type, whether or not it
+    /// calls [`call_async`], so its class requires `tools`.
+    ///
+    /// Buffered with the activation's publishes and flushed iff `receive`
+    /// returns `Ok`, as [`call_async`]. The request holds its blobs from this
+    /// call: the handles may be dropped after it. The same blob may appear
+    /// under two names. An empty list calls as [`call_async`] does. A tool
+    /// that does not accept attachments refuses a non-empty list
+    /// ([`CallAttachmentsError::AttachmentsNotAccepted`]).
+    ///
+    /// [`blobs::Blob`]: crate::blobs::Blob
+    pub fn call_async_with_attachments(
+        tool: &str,
+        args_json: &str,
+        call_id: &str,
+        attachments: &[(&str, &crate::blobs::Blob)],
+    ) -> Result<(), CallAttachmentsError> {
+        crate::contract::call_async_with_attachments(
+            tool,
+            args_json,
+            call_id,
+            &crate::blobs::raw_attachments(attachments),
+        )
+    }
+
+    /// Serialize `args` to JSON and call [`call_async_with_attachments`]. An
+    /// `args` that does not serialize is
+    /// [`CallAttachmentsError::InvalidArgs`], and nothing is called.
+    pub fn call_async_with_attachments_json<T: serde::Serialize>(
+        tool: &str,
+        args: &T,
+        call_id: &str,
+        attachments: &[(&str, &crate::blobs::Blob)],
+    ) -> Result<(), CallAttachmentsError> {
+        let args_json = serialize_args(args)?;
+        call_async_with_attachments(tool, &args_json, call_id, attachments)
+    }
+
+    /// `args` as JSON text, or the refusal a call with attachments makes of
+    /// arguments that are not JSON.
+    pub(crate) fn serialize_args<T: serde::Serialize>(
+        args: &T,
+    ) -> Result<String, CallAttachmentsError> {
+        serde_json::to_string(args)
+            .map_err(|e| CallAttachmentsError::InvalidArgs(format!("serialize args: {e}")))
+    }
+
     /// One result delivered on the `tool-results` port.
     #[derive(Debug, Clone, PartialEq)]
     pub struct ToolResult {
@@ -2211,6 +2360,23 @@ pub mod tools {
         /// through [`crate::provides::call_async_for`]; `None` for a plain
         /// [`call_async`].
         pub serving: Option<crate::provides::PendingId>,
+        /// The attachments the result carries: the blobs the tool answered
+        /// with, present only on an `Ok` outcome. Read one with
+        /// [`ToolResult::open`].
+        pub attachments: Vec<crate::Attachment>,
+        /// Where the result's message sits in this activation's windows.
+        place: crate::WindowPlace,
+    }
+
+    impl ToolResult {
+        /// A handle to the result's attachment `name`, as [`crate::blobs::open`]
+        /// on the message the result was read from. Valid only in the
+        /// activation that delivered it.
+        ///
+        /// **Requires grant:** `"blobs"`.
+        pub fn open(&self, name: &str) -> Result<crate::blobs::Blob, crate::blobs::OpenError> {
+            self.place.open(name)
+        }
     }
 
     /// A tool's typed error, as the executor writes it:
@@ -2243,7 +2409,9 @@ pub mod tools {
     /// Parse one result body. A body the host built that does not parse, or
     /// carries a version other than `1`, is a host bug, surfaced as
     /// `MalformedEnvelope`.
-    pub(crate) fn parse_result(body: &str) -> Result<ToolResult, Error> {
+    pub(crate) fn parse_result(message: &crate::Message) -> Result<ToolResult, Error> {
+        let envelope = message.envelope()?;
+        let body = crate::MessageEnvelopeExt::text_body(&envelope)?;
         let wire: WireResult = serde_json::from_str(body)
             .map_err(|e| Error::malformed(format!("tool result body: {e}")))?;
         if wire.v != 1 {
@@ -2261,6 +2429,8 @@ pub mod tools {
                 WireOutcome::Err(err) => Err(err),
             },
             serving: wire.serving.map(crate::provides::PendingId::from),
+            attachments: message.attachments()?,
+            place: crate::WindowPlace::of(message),
         })
     }
 
@@ -2272,8 +2442,9 @@ pub mod tools {
         /// fault for the activation to surface rather than skip.
         pub fn tool_results(&self) -> Result<Vec<ToolResult>, Error> {
             self.reserved_window(brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT)?
-                .new_envelopes()
-                .map(|envelope| parse_result(crate::MessageEnvelopeExt::text_body(&envelope?)?))
+                .new_messages()
+                .iter()
+                .map(parse_result)
                 .collect()
         }
     }
@@ -2299,6 +2470,7 @@ pub mod provides {
 
     use super::Error;
     use crate::contract::provides::{self as raw, CompleteError};
+    use crate::tools::CallAttachmentsError;
 
     /// A host-minted pending-request id, opaque to the component.
     ///
@@ -2340,6 +2512,22 @@ pub mod provides {
         pub tool: String,
         /// The caller's arguments, as admitted by the host.
         pub args: serde_json::Value,
+        /// The attachments the caller handed the tool. Read one with
+        /// [`ToolRequest::open`].
+        pub attachments: Vec<crate::Attachment>,
+        /// Where the request's message sits in this activation's windows.
+        place: crate::WindowPlace,
+    }
+
+    impl ToolRequest {
+        /// A handle to the request's attachment `name`, as
+        /// [`crate::blobs::open`] on the message the request was read from.
+        /// Valid only in the activation that delivered it.
+        ///
+        /// **Requires grant:** `"blobs"`.
+        pub fn open(&self, name: &str) -> Result<crate::blobs::Blob, crate::blobs::OpenError> {
+            self.place.open(name)
+        }
     }
 
     /// The error kinds a provider may complete with. The admission kinds
@@ -2378,7 +2566,9 @@ pub mod provides {
 
     /// Parse one request body. A body the host built that does not parse is a
     /// host bug, surfaced as `MalformedEnvelope`.
-    pub(crate) fn parse_request(body: &str) -> Result<ToolRequest, Error> {
+    pub(crate) fn parse_request(message: &crate::Message) -> Result<ToolRequest, Error> {
+        let envelope = message.envelope()?;
+        let body = crate::MessageEnvelopeExt::text_body(&envelope)?;
         let wire: WireRequest = serde_json::from_str(body)
             .map_err(|e| Error::malformed(format!("tool request body: {e}")))?;
         if wire.v != 1 {
@@ -2391,6 +2581,8 @@ pub mod provides {
             id: PendingId(wire.id),
             tool: wire.tool,
             args: wire.args,
+            attachments: message.attachments()?,
+            place: crate::WindowPlace::of(message),
         })
     }
 
@@ -2402,8 +2594,9 @@ pub mod provides {
         /// fault for the activation to surface rather than skip.
         pub fn tool_requests(&self) -> Result<Vec<ToolRequest>, Error> {
             self.reserved_window(brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT)?
-                .new_envelopes()
-                .map(|envelope| parse_request(crate::MessageEnvelopeExt::text_body(&envelope?)?))
+                .new_messages()
+                .iter()
+                .map(parse_request)
                 .collect()
         }
     }
@@ -2467,6 +2660,113 @@ pub mod provides {
             .map_err(|e| Error::failed(format!("serialize args: {e}")))?;
         raw::call_async_for(&id.0, tool, &args_json, call_id)
             .map_err(|e| crate::tools::tool_err(tool, e))
+    }
+
+    /// [`call_async_for`], carrying each named blob to the tool.
+    ///
+    /// **Requires grants:** `provides`, as [`call_async_for`] does;
+    /// `"blobs"` for the interface this calls and for any
+    /// [`crate::blobs::Blob`] to pass. Without `provides` every call is
+    /// [`CallAttachmentsError::NotGranted`]. The nested call is admitted by
+    /// the component's own tool grants and its result arrives on
+    /// `tool-results`, so the class requires `tools` as well; a component
+    /// that calls this imports the `tools` interface for its error type.
+    ///
+    /// Buffered, bounded and refused as
+    /// [`crate::tools::call_async_with_attachments`]. An `id` not pending for
+    /// this component is [`CallAttachmentsError::Denied`]; answer a refusal
+    /// as [`call_async_for`] says.
+    pub fn call_async_for_with_attachments(
+        id: &PendingId,
+        tool: &str,
+        args: &impl serde::Serialize,
+        call_id: &str,
+        attachments: &[(&str, &crate::blobs::Blob)],
+    ) -> Result<(), CallAttachmentsError> {
+        let args_json = crate::tools::serialize_args(args)?;
+        crate::contract::call_async_for_with_attachments(
+            &id.0,
+            tool,
+            &args_json,
+            call_id,
+            &crate::blobs::raw_attachments(attachments),
+        )
+    }
+
+    /// Why [`complete_with_attachments`] refused a completion. The request
+    /// stays pending after every refusal but `NotPending`.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum CompleteAttachmentsError {
+        /// The component lacks the `provides` grant.
+        NotPermitted,
+        /// The host holds no such request for this component.
+        NotPending,
+        /// The outcome is over the cap, or the value does not serialize, with
+        /// the diagnostic.
+        InvalidOutcome(String),
+        /// An attachment name outside the grammar of
+        /// [`crate::AttachmentName::new`], with the name.
+        InvalidAttachmentName(String),
+        /// The same attachment name given twice, with the name.
+        DuplicateAttachmentName(String),
+        /// More than [`brenn_envelope::MAX_ATTACHMENTS_PER_MESSAGE`] attachments.
+        TooManyAttachments,
+    }
+
+    /// `NotPending` stays [`Error::NotPending`], so [`drop_not_pending`]
+    /// drops it; every other refusal fails the activation.
+    impl From<CompleteAttachmentsError> for Error {
+        fn from(e: CompleteAttachmentsError) -> Error {
+            const CALL: &str = "complete with attachments";
+            match e {
+                CompleteAttachmentsError::NotPending => {
+                    Error::NotPending(format!("{CALL}: not-pending"))
+                }
+                CompleteAttachmentsError::NotPermitted => {
+                    Error::failed(format!("{CALL}: not-permitted"))
+                }
+                CompleteAttachmentsError::InvalidOutcome(m) => {
+                    Error::failed(format!("{CALL}: invalid-outcome: {m}"))
+                }
+                CompleteAttachmentsError::InvalidAttachmentName(n) => {
+                    Error::failed(format!("{CALL}: invalid-attachment-name: {n:?}"))
+                }
+                CompleteAttachmentsError::DuplicateAttachmentName(n) => {
+                    Error::failed(format!("{CALL}: duplicate-attachment-name: {n:?}"))
+                }
+                CompleteAttachmentsError::TooManyAttachments => {
+                    Error::failed(format!("{CALL}: too-many-attachments"))
+                }
+            }
+        }
+    }
+
+    /// Answer request `id` with `value` and each named blob. Immediate, as
+    /// [`complete`]: the caller has its answer, attachments included, when
+    /// this returns, and a later `Err` or trap of the activation retracts
+    /// neither. The completion holds its blobs from this call, so a blob made
+    /// in this activation outlives it.
+    ///
+    /// **Requires grants:** `provides`, and `"blobs"` for the interface this
+    /// calls and for any [`crate::blobs::Blob`] to pass. A component that
+    /// calls this imports the `provides` interface for its error type,
+    /// whether or not it calls [`complete`].
+    ///
+    /// Only a value answers with attachments: a typed error carries none. An
+    /// empty list completes as [`complete`] does.
+    pub fn complete_with_attachments(
+        id: &PendingId,
+        value: &impl serde::Serialize,
+        attachments: &[(&str, &crate::blobs::Blob)],
+    ) -> Result<(), CompleteAttachmentsError> {
+        let value = serde_json::to_value(value).map_err(|e| {
+            CompleteAttachmentsError::InvalidOutcome(format!("serialize outcome: {e}"))
+        })?;
+        crate::contract::complete_with_attachments(
+            &id.0,
+            &serde_json::json!({ "ok": value }).to_string(),
+            &crate::blobs::raw_attachments(attachments),
+        )
     }
 }
 

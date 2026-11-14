@@ -114,29 +114,85 @@ the 0.2.0 world with `blobs` imported. A kind that does not name `blobs` in
 what they were. A kind that does is backend-only — a surface refuses a
 component that imports it, and the word is refused on a placed instance —
 and needs a brenn new enough to link it, by the same ordering rule as `calls`.
-Publishing with attachments goes through `blobs.publish` and needs `ports` as
-well; `ports.publish` still carries none. The interface is **not yet declared
+Publishing with attachments goes through `blobs.publish`, and a class that
+calls it requires `ports` as well as `blobs`, whether or not it also calls
+`ports.publish`: the function's error type wraps `ports@0.2.0`'s
+`publish-error`, so the artifact imports `brenn:processor/ports@0.2.0` for the
+type, which is what the build check and the load check read. `ports.publish`
+still carries none. The interface is **not yet declared
 stable**: a shape changes in place only while no tagged brenn release has
 served it; a shape a tagged release has served changes only as a new version
 of the interface, served beside the old one for at least one release and
 announced in `CHANGELOG.md`; the old version may be removed one release after
 its replacement, and nothing longer is promised.
 
-**Blobs and provided tools.** A tool call, a tool completion and a sync call
-carry no blob yet: `calls.call`, `tools.call-fast`, `tools.call-async`,
-`provides.call-async-for`, their results on `tool-results`, a request on
-`tool-requests` and `provides.complete` have no attachments. The shape can
-grow there. `tool-requests` and `tool-results` are ordinary input port
-windows, so once their messages carry attachments `blobs.open` reaches them by
-`(port, index, name)` with no change. An attachment-carrying completion is a
-function taking the same list of named `blob` handles `blobs.publish` takes —
-added to `blobs` before its declaration, or to a successor of `provides`. A
-blob lives while something holds it, and an activation's handles and buffered
-publishes are two kinds of holder; an immediate completion would clone the
-hold into the host's pending-result record, a third holder, which a later
-`Err` or trap of the activation, dropping only the first two, does not
-retract. What is undecided is the holder on the caller's side: a blob has no
-lifetime apart from a message or host code holding it.
+**Blobs and tool calls.** An asynchronous tool call carries named
+attachments by reference in both directions. Three functions of `blobs` are
+the forms that do, each taking a list of `(name, blob)` pairs as
+`blobs.publish` does — a handle from `open` or `writer.seal`, never an id:
+
+- `blobs.call-async` is `tools.call-async` carrying blobs to the tool;
+- `blobs.call-async-for` is `provides.call-async-for`, a provider's nested
+  call for a request it serves, carrying blobs;
+- `blobs.complete` is `provides.complete`, answering with blobs beside the
+  outcome. An `err` outcome carries none and is refused `invalid-outcome`.
+
+The plain forms — `tools.call-async`, `provides.call-async-for`,
+`provides.complete` — carry none, and neither do `calls.call` and
+`tools.call-fast`, which return inside the activation and put no message on
+the bus. An empty list behaves as the plain form.
+
+*The grants.* Each function needs the grant its plain form is linked under:
+`call-async` needs `tools`, `call-async-for` and `complete` need `provides`,
+and every one needs `blobs`. Each error type wraps the plain form's —
+`call-error` holds `tools.tool-error` as `plain(…)`, and `complete-error`
+holds `provides.complete-error` — so an artifact that calls `call-async` or
+`call-async-for` imports `brenn:processor/tools@0.1.0` for the type, and one
+that calls `complete` imports `brenn:processor/provides@0.1.0`, whether or not
+it calls a plain form. That import is what the build check and the load check
+read, so:
+
+- a class that calls a tool with attachments requires `tools` and `blobs`;
+- a provider that completes with attachments requires `provides` and `blobs`;
+- a provider that makes nested calls, plain or with attachments, requires
+  `tools` as well, because a nested call is admitted by the provider's own
+  tool grants and its result arrives on `tool-results`;
+- a class that publishes with attachments requires `ports` and `blobs`.
+
+A component that calls none of the three imports none of them, and nothing
+through them: an artifact already built is unaffected by their addition.
+
+*What arrives.* A request on `tool-requests` and a result on `tool-results`
+carry the attachments in the message's header like any message, under the
+names the caller or the tool gave; their bodies are unchanged. `blobs.open`
+reaches them by `(port, index, name)`, as on any input port. A result carries
+attachments only when its outcome is `ok`. `brenn-guest`'s
+`tools::ToolResult` and `provides::ToolRequest` list them in `attachments` and
+open one with `open(name)`.
+
+*Who holds a blob.* A call is buffered and flushed as the plain form is: the
+request reaches the bus iff the activation returns `ok`, and the buffered
+request holds its blobs until then; an `Err` or a trap drops them. On the bus,
+the request row holds them for its channel's window, whatever becomes of the
+call. A completion is immediate, as `provides.complete` is, and it is the one
+exception to "nothing a component holds outlives the activation": the
+completion holds the blobs it names from the call, so a blob the activation
+made and completed with survives the activation's later `Err` or trap, as the
+completion does. A completion whose waiter is gone drops them. A handle given
+to any of the three is cloned, not consumed, and the component may drop its
+handle after the call. No byte is copied anywhere on the path.
+
+*Which tool takes attachments.* A tool declares it: `accepts_attachments =
+true` on a `provide` statement (`docs/config-dsl.md`, "Provided tools"),
+default `false`. A call that carries attachments to a tool that does not is
+refused `attachments-not-accepted`, told only to a caller granted the tool. A
+tool that returns attachments needs no declaration.
+
+The shared bounds are the plain forms': the per-activation call cap, the
+publish-entry ceiling, the `call-id`, `args-json` and outcome-text caps, which
+weigh the JSON alone. At most 32 attachments per call or completion, each name
+in the attachment grammar, no name twice; each is a typed refusal. These
+three do not count against the per-activation blob-call or handle bounds.
 
 **Blobs and mutability.** A sealed blob is immutable, and the interface does
 not entrench it: an in-place mutable blob would add a mutability flag at

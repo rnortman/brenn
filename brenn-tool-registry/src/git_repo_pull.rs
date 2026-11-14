@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use brenn_lib::tools::{AclClause, acl_admits};
+use brenn_messaging_store::blob::HeldAttachments;
 use futures::future::join_all;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -22,7 +23,7 @@ use tracing::{debug, warn};
 use super::descriptor::{
     AclDenied, Idempotency, ToolClass, ToolDescriptor, ToolError, UserBinding,
 };
-use super::tool::{AsyncTool, ToolCtx};
+use super::tool::{AsyncTool, ToolCtx, ToolOutput};
 use brenn_git::pull::{pull_clone, pull_outcome_to_json};
 use brenn_git::sync::{CloneInfo, SyncTriggerSender};
 
@@ -92,6 +93,7 @@ impl GitRepoPullTool {
             idempotency: Idempotency::Natural,
             auto_approve: true,
             user_binding: UserBinding::None,
+            accepts_attachments: false,
         }
     }
 
@@ -130,7 +132,8 @@ impl AsyncTool for GitRepoPullTool {
         &self,
         ctx: &ToolCtx,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
+        _attachments: HeldAttachments,
+    ) -> Result<ToolOutput, ToolError> {
         let parsed: GitRepoPullArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("git-repo-pull args: {e}")))?;
 
@@ -209,7 +212,7 @@ impl AsyncTool for GitRepoPullTool {
             }
         }
 
-        Ok(serde_json::json!({ "repos": repos }))
+        Ok(serde_json::json!({ "repos": repos }).into())
     }
 }
 
@@ -217,6 +220,7 @@ impl AsyncTool for GitRepoPullTool {
 mod tests {
     use std::path::PathBuf;
 
+    use crate::testutil::ExecuteValue;
     use brenn_lib::messaging::ParticipantId;
     use brenn_lib::tools::{AclClause, ResolvedToolGrant};
     use std::collections::HashSet;
@@ -380,7 +384,7 @@ mod tests {
         );
 
         let out = tool
-            .execute(&ctx(Some(7)), serde_json::json!({"repos": ["testclone"]}))
+            .execute_value(&ctx(Some(7)), serde_json::json!({"repos": ["testclone"]}))
             .await
             .expect("execute ok");
         let repos = out["repos"].as_array().expect("repos array");
@@ -402,7 +406,7 @@ mod tests {
         );
 
         let out = tool
-            .execute(&ctx(Some(42)), serde_json::json!({"repos": ["testclone"]}))
+            .execute_value(&ctx(Some(42)), serde_json::json!({"repos": ["testclone"]}))
             .await
             .expect("execute ok");
         assert_eq!(out["repos"][0]["advanced"], true);
@@ -428,7 +432,7 @@ mod tests {
             Some(sender),
         );
 
-        tool.execute(&ctx(None), serde_json::json!({"repos": ["testclone"]}))
+        tool.execute_value(&ctx(None), serde_json::json!({"repos": ["testclone"]}))
             .await
             .expect("execute ok");
         match rx.try_recv() {
@@ -444,7 +448,7 @@ mod tests {
     async fn execute_unknown_slug_yields_per_repo_error() {
         let tool = GitRepoPullTool::new(clones_index(PathBuf::from("/nonexistent")), locks(), None);
         let out = tool
-            .execute(&ctx(None), serde_json::json!({"repos": ["ghost"]}))
+            .execute_value(&ctx(None), serde_json::json!({"repos": ["ghost"]}))
             .await
             .expect("execute ok");
         assert_eq!(out["repos"][0]["ok"], false);
@@ -455,7 +459,7 @@ mod tests {
     async fn execute_malformed_args_is_invalid_args() {
         let tool = GitRepoPullTool::new(clones_index(PathBuf::from("/x")), locks(), None);
         let err = tool
-            .execute(&ctx(None), serde_json::json!({"repo": "testclone"}))
+            .execute_value(&ctx(None), serde_json::json!({"repo": "testclone"}))
             .await
             .expect_err("must reject unknown field");
         assert!(matches!(err, ToolError::InvalidArgs(_)));
@@ -480,7 +484,7 @@ mod tests {
 
         let t = tool.clone();
         let handle = tokio::spawn(async move {
-            t.execute(&ctx(None), serde_json::json!({"repos": ["testclone"]}))
+            t.execute_value(&ctx(None), serde_json::json!({"repos": ["testclone"]}))
                 .await
                 .expect("execute ok")
         });

@@ -2695,18 +2695,6 @@ channel scratch at "ephemeral:scratch" {{
         }
         let reload_notify =
             reload_notify.expect("every fixture document declares the reload facility");
-        let dispatcher = dispatcher.then(|| {
-            let handle = brenn_messaging::dispatcher::spawn_dispatcher_task(
-                db.clone(),
-                router.clone() as Arc<dyn brenn_messaging::WakeRouter>,
-                messenger.dispatch_kick_notify(),
-                messenger.clone(),
-            );
-            // Kick immediately so the first dispatch does not wait out the
-            // poll interval — production boot does the same.
-            messenger.dispatch_kick();
-            handle
-        });
         let plan = plan_like_the_driver(
             &document.config,
             &apps,
@@ -2830,6 +2818,22 @@ channel scratch at "ephemeral:scratch" {{
         for surface in &plan.surfaces {
             router.register_surface_delivery_routes(surface);
         }
+        // Must spawn only after every delivery binding is registered,
+        // matching `run_server`: a row owed to a subscriber at boot — one a
+        // previous process over the same database left — is dispatched by the
+        // first sweep.
+        let dispatcher = dispatcher.then(|| {
+            let handle = brenn_messaging::dispatcher::spawn_dispatcher_task(
+                db.clone(),
+                router.clone() as Arc<dyn brenn_messaging::WakeRouter>,
+                messenger.dispatch_kick_notify(),
+                messenger.clone(),
+            );
+            // Kick immediately so the first dispatch does not wait out the
+            // poll interval.
+            messenger.dispatch_kick();
+            handle
+        });
         // The endpoint table boot installs: the document half, then the host
         // half over whatever secret files the fixture wrote, then the same
         // builder `run_server` calls — so a replay-protected endpoint's
@@ -5607,6 +5611,11 @@ remote pod {{
             .collect()
     }
 
+    /// Lower-case hex, as the byte-reporting fixtures spell a body or a blob.
+    pub(crate) fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     impl Booted {
         /// Signal every live supervisor to disconnect, for a case that booted
         /// against a real broker.
@@ -6842,8 +6851,13 @@ channel extra at "brenn:extra" {
             ) -> Result<(), AclDenied> {
                 Ok(())
             }
-            async fn execute(&self, _c: &ToolCtx, _a: Value) -> Result<Value, ToolError> {
-                Ok(json!({}))
+            async fn execute(
+                &self,
+                _c: &ToolCtx,
+                _a: Value,
+                _h: brenn_tool_registry::HeldAttachments,
+            ) -> Result<brenn_tool_registry::ToolOutput, ToolError> {
+                Ok(json!({}).into())
             }
         }
         RegisteredTool::Async(Arc::new(APull(ToolDescriptor {
@@ -6856,6 +6870,7 @@ channel extra at "brenn:extra" {
             idempotency: Idempotency::Natural,
             auto_approve: true,
             user_binding: brenn_tool_registry::UserBinding::None,
+            accepts_attachments: false,
         })))
     }
 

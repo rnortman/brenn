@@ -1013,8 +1013,11 @@ The first **declares** a channel and binds a handle to it: `bar_layout` is now a
 name other statements can reach. The second is a **tuning** — no handle, a
 matcher over a system-minted family, possibly a prefix — which says something
 about channels the system creates rather than creating one. The tunable
-families are `webhook:`, `mqtt:`, `brenn:tools/`, `brenn:tool-results/` and
-`brenn:device-location.` (`docs/message-bus.md` §2.7). A handle and a
+families are `webhook:`, `mqtt:`, `brenn:tools/`, `brenn:tool-results/`,
+`brenn:app-tool-results/` and `brenn:device-location.` (`docs/message-bus.md`
+§2.7). The four tool namespaces — `tools`, `tool-requests`, `tool-results`
+and `app-tool-results` — are reserved channel segments: no channel may be
+declared named `<segment>`, `<segment>.…` or `<segment>/…`. A handle and a
 literal address are disjoint spellings: a channel that is declared is referred
 to by its handle, never by re-spelling its address.
 
@@ -1339,6 +1342,19 @@ component GmailTools {
   requests and alerts, every time the window fills. Nothing at load refuses
   such a window.
 - `auto_approve` (default `true`) is whether a call skips the approval prompt.
+- `accepts_attachments` (default `false`) is whether a call may hand the tool
+  attachments — blobs named by reference (`docs/component-packages.md`, "Blobs
+  and tool calls"). A boolean; anything else is refused in `auto_approve`'s
+  words. With it, a component calls the tool through `blobs.call-async`, and a
+  conversation is offered a reserved argument, **`attachments`**, naming each
+  attachment as `BrennSend` does (`{"<name the tool sees>": {"message_id",
+  "name"}}`); the host resolves the names and removes the argument before the
+  tool sees its arguments. So `accepts_attachments = true` is refused, at the
+  value, on a tool whose `input_schema` has a top-level property named
+  `attachments`. A call carrying attachments to a tool without the flag is
+  refused before the tool runs. A tool that *returns* attachments needs no
+  flag. Changing the flag on a running deployment needs a restart, like every
+  `provide` key.
 - A `provide` statement takes no sub-blocks. Two statements in one class may not
   name the same tool, nor the same `mcp_name`.
 
@@ -1616,6 +1632,21 @@ port is neither the class's option nor the instance's to wire:
 
 So a tool-using instance's body holds its `tool` statements and the bindings for
 its own ports, and says nothing at all about `tool-results`.
+
+An agent granted at least one asynchronous registry tool gets a result inbox of
+its own, `brenn:app-tool-results/<app-slug>`, minted by the substrate. It holds
+the attachments of a tool result handed to one of the agent's conversations,
+and only those; a result without attachments is never published there. Nothing
+subscribes to it, and **no policy can reach it**: an `acl` matcher, exact or
+prefix, reaching into `app-tool-results/` is refused when the document is
+resolved, in any list and for any owner, and so is any position an agent
+states on an address in it. A conversation names an attachment there only
+when the host handed it that result (`docs/message-bus.md` §2.7). Size it like
+the component inboxes: `channel at "brenn:app-tool-results/<app-slug>" { ... }`
+for one agent, which must name an agent holding an asynchronous tool grant, or
+`channel at prefix "brenn:app-tool-results/" { ... }` for all of them; a block
+over `brenn:tool-results/` does not reach it. `send_rate` is the host's and is
+refused in either block.
 
 #### The request inbox port
 

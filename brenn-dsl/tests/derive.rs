@@ -32,14 +32,15 @@ const CHROME: &str = "    new shell: Shell { chrome = true; grants = []; }\n";
 #[test]
 fn a_handle_less_block_tunes_every_family_the_system_mints() {
     let config = derived(&format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}",
         tuning("mqtt:broker:alice/status"),
         tuning("webhook:alice-inbox"),
         tuning("brenn:tools/pull"),
         tuning("brenn:tool-results/alice"),
+        tuning("brenn:app-tool-results/alice"),
         tuning("brenn:device-location.alice"),
     ));
-    assert_eq!(config.resolved.tunings.len(), 5);
+    assert_eq!(config.resolved.tunings.len(), 6);
     assert!(config.resolved.channels.is_empty());
     assert!(config.channel_uuids.is_empty());
 }
@@ -50,7 +51,8 @@ fn a_handle_less_block_on_a_declarable_address_is_refused() {
         derive_refusal(&tuning("brenn:alice.status")),
         "`brenn:alice.status` names no system-minted family, so a handle-less block tunes \
          nothing; tuning blocks name `mqtt:`, `webhook:`, `brenn:tools/`, \
-         `brenn:tool-results/` and `brenn:device-location.` channels, and a declarable \
+         `brenn:tool-results/`, `brenn:app-tool-results/` and `brenn:device-location.` \
+         channels, and a declarable \
          channel is written `channel <handle> at \"brenn:alice.status\"`"
     );
 }

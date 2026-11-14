@@ -31,6 +31,9 @@ pub mod wasm_host;
 #[cfg(any(test, feature = "testutils"))]
 pub mod testutil;
 
+/// The carrier of a call's attachments in both directions, named in
+/// [`AsyncTool::execute`]'s signature.
+pub use brenn_messaging_store::blob::HeldAttachments;
 pub use cell::ToolRegistryCell;
 pub use descriptor::{
     AclDenied, DEFAULT_FAST_BUDGET, ENVELOPE_MARGIN, Idempotency, MAX_ARGS_BYTES,
@@ -45,5 +48,5 @@ pub use provided::{
 pub use provides_host::WasmProvidesHost;
 pub use rate_limit::RateLimiter;
 pub use registry::{GrantOwner, ToolRegistry};
-pub use tool::{ActingUser, AsyncTool, FastTool, RegisteredTool, ToolCtx};
+pub use tool::{ActingUser, AsyncTool, FastTool, RegisteredTool, ToolCtx, ToolOutput};
 pub use wasm_host::WasmToolHost;

@@ -53,6 +53,7 @@ brenn-host-conformance = { version = "0.1.0", path = "../brenn-host-conformance"
 brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
 brenn-messaging = { version = "0.1.0", path = "../brenn-messaging", features = ["testutils"] }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
+brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry", features = ["testutils"] }
 indexmap = "2"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde_json = "1.0.149"

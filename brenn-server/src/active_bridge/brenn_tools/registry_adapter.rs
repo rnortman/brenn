@@ -22,7 +22,13 @@ use super::super::ActiveBridge;
 use super::super::tool_summary::HandleBrennToolResult;
 use super::execute::ToolOutcome;
 use crate::intercept_helpers::{PostCard, answer_post_tool_use};
-use brenn_tool_registry::{ActingUser, ToolError};
+use crate::messaging_intercept::{held_attachments, missing_messenger, resolve_forwarded};
+use brenn_envelope::tool_schema::ATTACHMENTS_ARGUMENT;
+use brenn_messaging::PublishResult;
+use brenn_messaging::format::HandedToolResultShape;
+use brenn_tool_registry::{
+    ActingUser, HeldAttachments, TOOL_EXECUTOR_COMPONENT, ToolError, ToolOutput,
+};
 
 /// Handle PreToolUse + PostToolUse for any registry tool. Returns `None` when
 /// the request's tool name does not resolve to a registered tool (letting the
@@ -98,10 +104,14 @@ pub(super) async fn handle(
     }
 }
 
-/// Run a registry tool for the agent: the grant-presence check, then
-/// `invoke_for_llm` with the agent as caller, its conversation as the acting
-/// conversation, and the conversation's owner as the acting user. A `ToolError` becomes `ToolOutcome::Err` in the
-/// registry's error shape. `None` when `mcp_name` is not a registered tool.
+/// Run a registry tool for the agent: the grant-presence check, the
+/// attachments a call to an accepting tool names, then `invoke_for_llm` with
+/// the agent as caller, its conversation as the acting conversation, and the
+/// conversation's owner as the acting user. A `ToolError` becomes
+/// `ToolOutcome::Err` in the registry's error shape. A result that carries
+/// attachments is handed to the conversation through the app's result inbox
+/// and shown as `{"result", "message_id", "attachments"}`. `None` when
+/// `mcp_name` is not a registered tool.
 pub(super) async fn execute_registry_tool(
     bridge: &ActiveBridge,
     mcp_name: &str,
@@ -110,7 +120,9 @@ pub(super) async fn execute_registry_tool(
     // One snapshot for the lookup and the call: a reload between the two
     // cannot change which tool runs.
     let tools = bridge.tools.load();
-    let canonical = tools.get_by_mcp_name(mcp_name)?.descriptor().name;
+    let descriptor = tools.get_by_mcp_name(mcp_name)?.descriptor();
+    let canonical = descriptor.name;
+    let accepts_attachments = descriptor.accepts_attachments;
     let Some(grant) = bridge
         .app_config()
         .policy
@@ -130,6 +142,14 @@ pub(super) async fn execute_registry_tool(
             &ToolError::NotGranted,
         )));
     };
+    let (args, attachments) = if accepts_attachments {
+        match handed_attachments(bridge, mcp_name, input).await {
+            Ok(resolved) => resolved,
+            Err(refused) => return Some(refused),
+        }
+    } else {
+        (input.clone(), HeldAttachments::none())
+    };
     let caller = ParticipantId::for_app(&bridge.app_slug, &bridge.server_origin);
     let acting_user = ActingUser {
         id: bridge.user_id,
@@ -142,14 +162,111 @@ pub(super) async fn execute_registry_tool(
             grant,
             Some(bridge.conversation_id),
             Some(acting_user),
-            input.clone(),
+            args,
+            attachments,
             &bridge.alert_dispatcher,
         )
         .await;
     Some(match result {
-        Ok(value) => ToolOutcome::Ok(value),
+        Ok(ToolOutput { value, attachments }) if attachments.is_empty() => ToolOutcome::Ok(value),
+        Ok(ToolOutput { value, attachments }) => {
+            hand_result(bridge, canonical, value, attachments).await
+        }
         Err(e) => ToolOutcome::Err(tool_error_to_json(canonical, &e)),
     })
+}
+
+/// The warn-log context of a registry tool call's rejected `attachments`.
+const REGISTRY_TOOL: &str = "registry tool";
+
+/// A call to a tool that accepts attachments: its arguments without the
+/// reserved `attachments` argument, and a hold on each blob that argument
+/// names under the conversation naming rule. A refusal is the call's outcome,
+/// before the tool, its rate bucket or its request channel is reached.
+async fn handed_attachments(
+    bridge: &ActiveBridge,
+    mcp_name: &str,
+    input: &serde_json::Value,
+) -> Result<(serde_json::Value, HeldAttachments), ToolOutcome> {
+    let mut args = input.clone();
+    let named = match args.as_object_mut() {
+        Some(fields) => fields
+            .remove(ATTACHMENTS_ARGUMENT)
+            .is_some_and(|value| !value.is_null()),
+        // Not an object: the tool's own schema check refuses it.
+        None => false,
+    };
+    if !named {
+        return Ok((args, HeldAttachments::none()));
+    }
+    let Some(messenger) = bridge.messenger() else {
+        warn!(
+            tool = %mcp_name,
+            "registry_adapter: attachments named with no Messenger configured",
+        );
+        return Err(missing_messenger());
+    };
+    let forwarded = resolve_forwarded(bridge, messenger, REGISTRY_TOOL, mcp_name, input).await?;
+    Ok((args, held_attachments(forwarded)?))
+}
+
+/// Hand a result's attachments to the conversation through the app's result
+/// inbox, and show the conversation the value with the message they are
+/// named by. A publish that fails is the call's failure, never the bare value.
+async fn hand_result(
+    bridge: &ActiveBridge,
+    tool: &str,
+    value: serde_json::Value,
+    attachments: HeldAttachments,
+) -> ToolOutcome {
+    let messenger = bridge.messenger().unwrap_or_else(|| {
+        panic!(
+            "registry tool {tool} answered a conversation with attachments on a bridge with no \
+             Messenger; its blobs came from a store only a Messenger has"
+        )
+    });
+    match messenger
+        .hand_tool_result(
+            TOOL_EXECUTOR_COMPONENT,
+            &bridge.app_slug,
+            bridge.conversation_id,
+            tool,
+            attachments,
+        )
+        .await
+    {
+        Ok(handed) => ToolOutcome::Ok(
+            serde_json::to_value(HandedToolResultShape {
+                value: &value,
+                handed: &handed,
+            })
+            .expect("a tool result serializes"),
+        ),
+        Err(PublishResult::UnknownChannel(address)) => {
+            warn!(
+                tool,
+                app = %bridge.app_slug,
+                %address,
+                "registry_adapter: the app's tool-result inbox is gone; the result's \
+                 attachments are dropped",
+            );
+            ToolOutcome::Err(tool_error_to_json(
+                tool,
+                &ToolError::Internal(
+                    "the result's attachments could not be delivered: this app has no \
+                     tool-result channel now"
+                        .to_string(),
+                ),
+            ))
+        }
+        Err(other) => panic!(
+            "registry tool {tool}: publishing its result's attachments to app {:?}'s result \
+             inbox failed ({other:?}) — host-wiring invariant violated: the body is a few \
+             bytes, the send rate is the host's, a system publish draws no budget, and the \
+             {TOOL_EXECUTOR_COMPONENT} system policy grants publish on brenn:app-tool-results/*",
+            bridge.app_slug
+        ),
+    }
 }
 
 /// Render a tool error as the JSON body CC receives in place of tool output.
@@ -176,6 +293,9 @@ fn tool_error_to_json(tool: &str, err: &ToolError) -> serde_json::Value {
     };
     json!({ "error": detail, "error_type": kind })
 }
+
+#[cfg(test)]
+mod attachment_tests;
 
 #[cfg(test)]
 mod tests {
@@ -223,6 +343,7 @@ mod tests {
                     idempotency: Idempotency::Natural,
                     auto_approve: false,
                     user_binding: brenn_tool_registry::UserBinding::None,
+                    accepts_attachments: false,
                 },
             }
         }
@@ -270,6 +391,7 @@ mod tests {
                     idempotency: Idempotency::Natural,
                     auto_approve: true,
                     user_binding: brenn_tool_registry::UserBinding::ActingUser,
+                    accepts_attachments: false,
                 },
             }
         }
@@ -646,6 +768,43 @@ mod tests {
             panic!("expected an Err outcome, got {r:?}");
         };
         assert_eq!(output["error_type"], "not_granted", "{output}");
+    }
+
+    /// A bridge with no messaging answers a call naming attachments with the
+    /// missing-messenger error, and runs one naming none.
+    #[tokio::test]
+    async fn execute_registry_tool_without_a_messenger_refuses_named_attachments() {
+        use brenn_tool_registry::testutil::{
+            ATTACHMENT_ECHO, ATTACHMENT_ECHO_MCP, AttachmentEchoTool,
+        };
+        let registry = Arc::new(ToolRegistry::new(vec![RegisteredTool::Async(Arc::new(
+            AttachmentEchoTool::new(),
+        ))]));
+        let grants = BTreeMap::from([(
+            ATTACHMENT_ECHO.to_string(),
+            ResolvedToolGrant {
+                acl: vec![],
+                rate_limit: None,
+            },
+        )]);
+        let bridge = bridge_with(registry, grants).await;
+        let named = serde_json::json!({ "attachments": {
+            "doc": { "message_id": uuid::Uuid::nil().to_string(), "name": "scan.pdf" },
+        }});
+        let r = super::execute_registry_tool(&bridge, ATTACHMENT_ECHO_MCP, &named).await;
+        assert_eq!(
+            r,
+            Some(crate::messaging_intercept::missing_messenger()),
+            "{r:?}"
+        );
+        let r = super::execute_registry_tool(&bridge, ATTACHMENT_ECHO_MCP, &serde_json::json!({}))
+            .await;
+        assert_eq!(
+            r,
+            Some(super::ToolOutcome::Ok(
+                serde_json::json!({ "args": {}, "received": {} })
+            ))
+        );
     }
 
     /// A user-bound tool runs as the conversation's owner: the bridge's user

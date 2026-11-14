@@ -46,7 +46,9 @@ use brenn_activation::sync::CallDisposition;
 use brenn_common::sanitize_untrusted_str;
 use brenn_envelope::addressing::PROVIDER_CONCURRENCY_CEILING;
 use brenn_envelope::{GuestBody, MessageBody, MessageEnvelope};
-use brenn_messaging_store::blob::HeldAttachments;
+/// The blobs a completion or a published message carries, named in the
+/// [`ProvidesHost`] and [`ProcessorPublish`] seams.
+pub use brenn_messaging_store::blob::HeldAttachments;
 
 /// The grant vocabulary, re-exported: what a load spec grants, what this host
 /// links and what an operator writes are one set of words, and a caller
@@ -866,6 +868,9 @@ pub enum ToolCallError {
     WrongClass,
     /// Tool bug the host has already alerted on; stable coarse token.
     Internal(String),
+    /// The call carries attachments and the tool takes none. Drawn only by a
+    /// call made with attachments, after every other check passed.
+    AttachmentsNotAccepted,
 }
 
 /// A validated, host-resolved async tool request awaiting the activation's
@@ -911,12 +916,15 @@ pub trait ToolHost: Send + Sync {
     ///
     /// Runs the grant + ACL + class checks synchronously (so caller mistakes fail
     /// fast) and resolves the request/reply channels; does NOT publish — the
-    /// caller buffers the returned request for transactional flush.
+    /// caller buffers the returned request for transactional flush. A call
+    /// `with_attachments` to a tool that takes none is, after those checks,
+    /// [`ToolCallError::AttachmentsNotAccepted`].
     fn queue_async(
         &self,
         tool: &str,
         args_json: &str,
         call_id: &str,
+        with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError>;
 }
 
@@ -953,9 +961,16 @@ pub enum ProvidesCallError {
 /// invariant may panic per the project posture.
 pub trait ProvidesHost: Send + Sync {
     /// Answer the pending request `id` with `outcome_json`
-    /// (`{"ok": value}` / `{"err": {"kind", "detail"}}`). Immediate: the
-    /// waiting caller is answered before this returns.
-    fn complete(&self, id: &str, outcome_json: &str) -> Result<(), ProvidesCallError>;
+    /// (`{"ok": value}` / `{"err": {"kind", "detail"}}`) and `attachments`,
+    /// which an `err` outcome may not carry. Immediate: the waiting caller is
+    /// answered before this returns, and an accepted completion holds the
+    /// blobs from then on.
+    fn complete(
+        &self,
+        id: &str,
+        outcome_json: &str,
+        attachments: HeldAttachments,
+    ) -> Result<(), ProvidesCallError>;
 
     /// `ToolHost::queue_async` on behalf of the user whose request `serving`
     /// is. Does NOT publish — the caller buffers the returned request for the
@@ -966,6 +981,7 @@ pub trait ProvidesHost: Send + Sync {
         tool: &str,
         args_json: &str,
         call_id: &str,
+        with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError>;
 }
 
@@ -1662,7 +1678,7 @@ struct ProcessorData {
     /// appends them to the publish flush iff the activation returns ok (a trap
     /// discards them); each publishes to its `brenn:tools/<tool>` request channel,
     /// which the host creates at bootstrap and the `ToolExecutor` drains.
-    tool_request_buffer: Vec<QueuedToolRequest>,
+    tool_request_buffer: Vec<BufferedToolRequest>,
     /// Count of fast-tool calls this activation; quota enforcement (anti-flood).
     tool_call_count: usize,
     /// Count of `provides.complete` calls this activation; quota enforcement.
@@ -2043,7 +2059,7 @@ impl ProcessorData {
         }
         let held = match self.held_attachments(attachments) {
             Ok(held) => held,
-            Err(refusal) => return Ok(Err(refusal)),
+            Err(refusal) => return Ok(Err(refusal.into())),
         };
         // A bound port always has a seeded bucket, so the gate's miss panic is a
         // host invariant violation. Buffered async tool requests ride the entry
@@ -2105,7 +2121,7 @@ impl ProcessorData {
         // The attachments are judged as on a wired port; their holds drop with
         // the message.
         if let Err(refusal) = self.held_attachments(attachments) {
-            return Ok(Err(refusal));
+            return Ok(Err(refusal.into()));
         }
         if let Err(refusal) = self.gate.admit_publish_without_sink(
             body.len(),
@@ -2771,27 +2787,111 @@ const PROCESSOR_MAX_TOOL_CALL_ID_LEN: usize = 128;
 /// `do_publish`. Denial detail strings are echoed back to the guest verbatim (the
 /// caller already named the resource, so no information leak) but not logged.
 fn tool_call_error_to_wit(e: ToolCallError, slug: &str, tool: &str) -> ToolWitError {
+    log_tool_call_error(&e, slug, tool);
+    tool_error_into_v0_1(e)
+}
+
+/// Log the security-relevant seam refusals, keyed by slug.
+fn log_tool_call_error(e: &ToolCallError, slug: &str, tool: &str) {
     match e {
-        ToolCallError::NotGranted => {
-            warn!(
-                slug = %slug,
-                tool = %cap_guest_for_log(tool),
-                "wasm tool call: not-granted (unknown or ungranted tool)"
-            );
-            ToolWitError::NotGranted
-        }
-        ToolCallError::Denied(resource) => {
-            warn!(
-                slug = %slug,
-                tool = %cap_guest_for_log(tool),
-                "wasm tool call: denied — args named a resource outside the grant"
-            );
-            ToolWitError::Denied(resource)
-        }
+        ToolCallError::NotGranted => warn!(
+            slug = %slug,
+            tool = %cap_guest_for_log(tool),
+            "wasm tool call: not-granted (unknown or ungranted tool)"
+        ),
+        ToolCallError::Denied(_) => warn!(
+            slug = %slug,
+            tool = %cap_guest_for_log(tool),
+            "wasm tool call: denied — args named a resource outside the grant"
+        ),
+        ToolCallError::InvalidArgs(_)
+        | ToolCallError::RateLimited
+        | ToolCallError::WrongClass
+        | ToolCallError::Internal(_)
+        | ToolCallError::AttachmentsNotAccepted => {}
+    }
+}
+
+/// A seam refusal as a plain `tools` / `provides` call reads it.
+///
+/// # Panics
+///
+/// On `AttachmentsNotAccepted`: a plain call carries no attachments, so the
+/// seam cannot refuse it for them.
+fn tool_error_into_v0_1(e: ToolCallError) -> ToolWitError {
+    match e {
+        ToolCallError::NotGranted => ToolWitError::NotGranted,
+        ToolCallError::Denied(resource) => ToolWitError::Denied(resource),
         ToolCallError::InvalidArgs(detail) => ToolWitError::InvalidArgs(detail),
         ToolCallError::RateLimited => ToolWitError::RateLimited,
         ToolCallError::WrongClass => ToolWitError::WrongClass,
         ToolCallError::Internal(token) => ToolWitError::Internal(token),
+        ToolCallError::AttachmentsNotAccepted => {
+            panic!("host invariant: a tool call without attachments was refused for them")
+        }
+    }
+}
+
+/// An async tool request buffered for the activation's flush, with the
+/// holds on the blobs it carries.
+#[derive(Debug)]
+struct BufferedToolRequest {
+    request: QueuedToolRequest,
+    attachments: HeldAttachments,
+}
+
+/// Why `do_queue_async` refused a call, before it is told in the form the
+/// guest called.
+#[derive(Debug, PartialEq, Eq)]
+enum QueueRefusal {
+    /// A refusal `tools.tool-error` states, or `attachments-not-accepted`.
+    Tool(ToolCallError),
+    /// The attachments failed their checks.
+    Attachments(blobs::AttachmentRefusal),
+}
+
+impl QueueRefusal {
+    /// The refusal as a plain `tools.call-async` or `provides.call-async-for`
+    /// reads it.
+    ///
+    /// # Panics
+    ///
+    /// On an attachment refusal: a plain call carries none.
+    fn into_v0_1(self) -> ToolWitError {
+        match self {
+            Self::Tool(e) => tool_error_into_v0_1(e),
+            Self::Attachments(r) => {
+                panic!("host invariant: a tool call without attachments drew {r:?}")
+            }
+        }
+    }
+}
+
+/// Why `do_complete` refused a completion, before it is told in the form the
+/// guest called.
+#[derive(Debug, PartialEq, Eq)]
+enum CompleteRefusal {
+    Provides(ProvidesCallError),
+    /// The attachments failed their checks.
+    Attachments(blobs::AttachmentRefusal),
+}
+
+impl CompleteRefusal {
+    /// The refusal as a plain `provides.complete` reads it.
+    ///
+    /// # Panics
+    ///
+    /// On an attachment refusal: a plain completion carries none.
+    fn into_v0_1(self) -> CompleteWitError {
+        match self {
+            Self::Provides(ProvidesCallError::NotPending) => CompleteWitError::NotPending,
+            Self::Provides(ProvidesCallError::InvalidOutcome(detail)) => {
+                CompleteWitError::InvalidOutcome(detail)
+            }
+            Self::Attachments(r) => {
+                panic!("host invariant: a completion without attachments drew {r:?}")
+            }
+        }
     }
 }
 
@@ -2865,20 +2965,98 @@ impl ProcessorData {
     /// cap, the `args-json` byte cap, and the per-activation request-buffer cap
     /// (async requests flush as bus publishes, so they share the publish-count
     /// ceiling). Both imports share every bound; only the seam differs.
+    ///
+    /// `attachments` is empty for the plain forms. Otherwise they are judged
+    /// after the `args-json` cap and before the seam, and the request holds
+    /// their blobs from here until its flush or its drop.
+    ///
+    /// The seam host must be present: the plain forms are linked only under
+    /// their grant, and the `blobs` forms check it before calling here.
     fn do_queue_async(
         &mut self,
         serving: Option<&str>,
         tool: String,
         args_json: String,
         call_id: &str,
-    ) -> Result<(), ToolWitError> {
-        // Per-activation call cap, shared with `do_fast_call`. Bumped first so a
-        // *rejected* async call still consumes a slot (grant/ACL/parse failures go
-        // through the seam and never reach the request buffer, so the buffer cap
-        // below cannot bound them); without this a guest could loop failing
-        // `call-async` — each a full host-side JSON parse + ACL walk — unbounded
-        // within one activation. Only the first over-cap call warns (the
-        // publish/log-quota idiom).
+        attachments: &[(String, Resource<blobs::BlobHandle>)],
+    ) -> Result<(), QueueRefusal> {
+        if !self.charge_tool_call() {
+            return Err(QueueRefusal::Tool(ToolCallError::Internal(
+                "call-count-exceeded".to_string(),
+            )));
+        }
+        // Per-activation cap: buffered async requests become bus publishes at flush,
+        // so they share the one per-activation publish ceiling with port publishes
+        // (`do_publish` counts both buffers against the same bound). This keeps the
+        // total per-activation bus writes bounded by a single constant.
+        if self.gate.entries_at_ceiling(self.tool_request_buffer.len()) {
+            return Err(QueueRefusal::Tool(ToolCallError::Internal(
+                "too-many-async-requests".to_string(),
+            )));
+        }
+        if call_id.len() > PROCESSOR_MAX_TOOL_CALL_ID_LEN {
+            return Err(QueueRefusal::Tool(ToolCallError::InvalidArgs(format!(
+                "call_id {} bytes exceeds max {}",
+                call_id.len(),
+                PROCESSOR_MAX_TOOL_CALL_ID_LEN
+            ))));
+        }
+        if args_json.len() > PROCESSOR_MAX_TOOL_ARGS_BYTES {
+            return Err(QueueRefusal::Tool(ToolCallError::InvalidArgs(format!(
+                "args {} bytes exceeds max {}",
+                args_json.len(),
+                PROCESSOR_MAX_TOOL_ARGS_BYTES
+            ))));
+        }
+        let held = self
+            .held_attachments(attachments)
+            .map_err(QueueRefusal::Attachments)?;
+        let with_attachments = !held.is_empty();
+        let queued = match serving {
+            None => self
+                .tool_host
+                .as_ref()
+                .expect(
+                    "call-async host fn invoked without a tool_host (Tools grant linked but host \
+                     unset)",
+                )
+                .queue_async(&tool, &args_json, call_id, with_attachments),
+            Some(serving) => self
+                .provides_host
+                .as_ref()
+                .expect(
+                    "call-async-for host fn invoked without a provides_host (Provides grant \
+                     linked but host unset)",
+                )
+                .queue_async_for(serving, &tool, &args_json, call_id, with_attachments),
+        };
+        match queued {
+            Ok(request) => {
+                // Buffered here; `take_ok_publishes` appends it to the activation's
+                // publish flush iff the guest returns Ok. A trap/err drops the buffer
+                // with the store, so no request is published and its holds go.
+                self.tool_request_buffer.push(BufferedToolRequest {
+                    request,
+                    attachments: held,
+                });
+                Ok(())
+            }
+            Err(e) => {
+                log_tool_call_error(&e, &self.slug, &tool);
+                Err(QueueRefusal::Tool(e))
+            }
+        }
+    }
+
+    /// Count one async tool call against the per-activation cap shared with
+    /// `do_fast_call`; `false` once it is passed.
+    ///
+    /// Charged first, refused or not: grant/ACL/parse failures go through the
+    /// seam and never reach the request buffer, so the buffer cap cannot bound
+    /// them, and without this a guest could loop failing `call-async` — each a
+    /// full host-side JSON parse + ACL walk — unbounded within one activation.
+    /// Only the first over-cap call warns (the publish/log-quota idiom).
+    pub(crate) fn charge_tool_call(&mut self) -> bool {
         self.tool_call_count += 1;
         if self.tool_call_count > PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION {
             if self.tool_call_count == PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION + 1 {
@@ -2888,59 +3066,9 @@ impl ProcessorData {
                     "wasm async tool call: per-activation call cap exceeded; rejecting"
                 );
             }
-            return Err(ToolWitError::Internal("call-count-exceeded".to_string()));
+            return false;
         }
-        // Per-activation cap: buffered async requests become bus publishes at flush,
-        // so they share the one per-activation publish ceiling with port publishes
-        // (`do_publish` counts both buffers against the same bound). This keeps the
-        // total per-activation bus writes bounded by a single constant.
-        if self.gate.entries_at_ceiling(self.tool_request_buffer.len()) {
-            return Err(ToolWitError::Internal(
-                "too-many-async-requests".to_string(),
-            ));
-        }
-        if call_id.len() > PROCESSOR_MAX_TOOL_CALL_ID_LEN {
-            return Err(ToolWitError::InvalidArgs(format!(
-                "call_id {} bytes exceeds max {}",
-                call_id.len(),
-                PROCESSOR_MAX_TOOL_CALL_ID_LEN
-            )));
-        }
-        if args_json.len() > PROCESSOR_MAX_TOOL_ARGS_BYTES {
-            return Err(ToolWitError::InvalidArgs(format!(
-                "args {} bytes exceeds max {}",
-                args_json.len(),
-                PROCESSOR_MAX_TOOL_ARGS_BYTES
-            )));
-        }
-        let queued = match serving {
-            None => self
-                .tool_host
-                .as_ref()
-                .expect(
-                    "call-async host fn invoked without a tool_host (Tools grant linked but host \
-                     unset)",
-                )
-                .queue_async(&tool, &args_json, call_id),
-            Some(serving) => self
-                .provides_host
-                .as_ref()
-                .expect(
-                    "call-async-for host fn invoked without a provides_host (Provides grant \
-                     linked but host unset)",
-                )
-                .queue_async_for(serving, &tool, &args_json, call_id),
-        };
-        match queued {
-            Ok(request) => {
-                // Buffered here; `take_ok_publishes` appends it to the activation's
-                // publish flush iff the guest returns Ok. A trap/err drops the buffer
-                // with the store, so no request is published.
-                self.tool_request_buffer.push(request);
-                Ok(())
-            }
-            Err(e) => Err(tool_call_error_to_wit(e, &self.slug, &tool)),
-        }
+        true
     }
 
     /// Drain the activation's buffered port publishes and buffered async tool
@@ -2965,15 +3093,19 @@ impl ProcessorData {
             "every publish the gate admitted must be buffered or accounted a drop"
         );
         let mut publishes = std::mem::take(&mut self.publish_buffer);
-        for req in std::mem::take(&mut self.tool_request_buffer) {
+        for BufferedToolRequest {
+            request,
+            attachments,
+        } in std::mem::take(&mut self.tool_request_buffer)
+        {
             publishes.push(ProcessorPublish {
                 port: TOOL_REQUEST_LOG_PORT.to_string(),
-                channel_address: req.channel,
-                body: MessageBody::text(req.body_json),
+                channel_address: request.channel,
+                body: MessageBody::text(request.body_json),
                 urgency: ProcessorUrgency::Normal,
-                reply_to: Some(req.reply_to),
+                reply_to: Some(request.reply_to),
                 deliver_after: None,
-                attachments: HeldAttachments::none(),
+                attachments,
             });
         }
         publishes
@@ -2991,7 +3123,8 @@ impl processor_bindings::brenn::processor::tools::Host for ProcessorData {
         args_json: String,
         call_id: String,
     ) -> Result<(), ToolWitError> {
-        self.do_queue_async(None, tool, args_json, &call_id)
+        self.do_queue_async(None, tool, args_json, &call_id, &[])
+            .map_err(QueueRefusal::into_v0_1)
     }
 }
 
@@ -3009,11 +3142,53 @@ impl ProcessorData {
     /// debug: a restart's stale requests and a completion after the host's
     /// ceiling both produce it in normal operation, and the ceiling alerts on
     /// its own.
+    ///
+    /// `attachments` is empty for the plain form. Otherwise they are judged
+    /// after the outcome's size, and an accepted completion holds their blobs
+    /// whatever the activation's own outcome. The seam host must be present:
+    /// the plain form is linked only under the `provides` grant, and the
+    /// `blobs` form checks it before calling here.
     fn do_complete(
         &mut self,
         id: &str,
         outcome_json: &str,
-    ) -> wasmtime::Result<Result<(), CompleteWitError>> {
+        attachments: &[(String, Resource<blobs::BlobHandle>)],
+    ) -> wasmtime::Result<Result<(), CompleteRefusal>> {
+        self.charge_complete_call()?;
+        // Guest-controlled outcome text: cap before any host parses it.
+        if outcome_json.len() > PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES {
+            return Ok(Err(CompleteRefusal::Provides(
+                ProvidesCallError::InvalidOutcome(format!(
+                    "outcome {} bytes exceeds max {PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES}",
+                    outcome_json.len()
+                )),
+            )));
+        }
+        let held = match self.held_attachments(attachments) {
+            Ok(held) => held,
+            Err(refusal) => return Ok(Err(CompleteRefusal::Attachments(refusal))),
+        };
+        let host = self.provides_host.as_ref().expect(
+            "complete host fn invoked without a provides_host (Provides grant linked but host \
+             unset)",
+        );
+        Ok(match host.complete(id, outcome_json, held) {
+            Ok(()) => Ok(()),
+            Err(ProvidesCallError::NotPending) => {
+                debug!(
+                    slug = %self.slug,
+                    id = %cap_guest_for_log(id),
+                    "wasm provides: complete named an id not pending for this component"
+                );
+                Err(CompleteRefusal::Provides(ProvidesCallError::NotPending))
+            }
+            Err(e @ ProvidesCallError::InvalidOutcome(_)) => Err(CompleteRefusal::Provides(e)),
+        })
+    }
+
+    /// Count one completion against the per-activation cap; past it, the
+    /// activation traps.
+    pub(crate) fn charge_complete_call(&mut self) -> wasmtime::Result<()> {
         self.complete_call_count += 1;
         if self.complete_call_count > PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION {
             return Err(wasmtime::Error::msg(format!(
@@ -3022,31 +3197,7 @@ impl ProcessorData {
                 self.slug
             )));
         }
-        // Guest-controlled outcome text: cap before any host parses it.
-        if outcome_json.len() > PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES {
-            return Ok(Err(CompleteWitError::InvalidOutcome(format!(
-                "outcome {} bytes exceeds max {PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES}",
-                outcome_json.len()
-            ))));
-        }
-        let host = self.provides_host.as_ref().expect(
-            "complete host fn invoked without a provides_host (Provides grant linked but host \
-             unset)",
-        );
-        Ok(match host.complete(id, outcome_json) {
-            Ok(()) => Ok(()),
-            Err(ProvidesCallError::NotPending) => {
-                debug!(
-                    slug = %self.slug,
-                    id = %cap_guest_for_log(id),
-                    "wasm provides: complete named an id not pending for this component"
-                );
-                Err(CompleteWitError::NotPending)
-            }
-            Err(ProvidesCallError::InvalidOutcome(detail)) => {
-                Err(CompleteWitError::InvalidOutcome(detail))
-            }
-        })
+        Ok(())
     }
 }
 
@@ -3060,7 +3211,9 @@ impl processor_bindings::brenn::processor::provides::Host for ProcessorData {
         id: String,
         outcome_json: String,
     ) -> wasmtime::Result<Result<(), CompleteWitError>> {
-        self.do_complete(&id, &outcome_json)
+        Ok(self
+            .do_complete(&id, &outcome_json, &[])?
+            .map_err(CompleteRefusal::into_v0_1))
     }
 
     fn call_async_for(
@@ -3070,7 +3223,9 @@ impl processor_bindings::brenn::processor::provides::Host for ProcessorData {
         args_json: String,
         call_id: String,
     ) -> wasmtime::Result<Result<(), ToolWitError>> {
-        Ok(self.do_queue_async(Some(&serving), tool, args_json, &call_id))
+        Ok(self
+            .do_queue_async(Some(&serving), tool, args_json, &call_id, &[])
+            .map_err(QueueRefusal::into_v0_1))
     }
 }
 
@@ -4975,6 +5130,9 @@ mod import_normalization_tests {
 }
 
 #[cfg(test)]
+mod blob_tool_call_tests;
+
+#[cfg(test)]
 mod processor_store_host_tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -6066,8 +6224,9 @@ mod processor_store_host_tests {
     // --- do_fast_call / do_queue_async host-fn tests ---
 
     type StubFastFn = Box<dyn Fn(&str, &str) -> Result<String, ToolCallError> + Send + Sync>;
-    type StubQueueFn =
-        Box<dyn Fn(&str, &str, &str) -> Result<QueuedToolRequest, ToolCallError> + Send + Sync>;
+    type StubQueueFn = Box<
+        dyn Fn(&str, &str, &str, bool) -> Result<QueuedToolRequest, ToolCallError> + Send + Sync,
+    >;
 
     /// Recording `ToolHost` whose fast/async responses are supplied per-test.
     struct StubToolHost {
@@ -6081,21 +6240,21 @@ mod processor_store_host_tests {
         fn fast_ok(body: &'static str) -> Arc<Self> {
             Arc::new(Self {
                 fast: Mutex::new(Box::new(move |_t, _a| Ok(body.to_string()))),
-                queue: Mutex::new(Box::new(|_t, _a, _c| Err(ToolCallError::WrongClass))),
+                queue: Mutex::new(Box::new(|_t, _a, _c, _w| Err(ToolCallError::WrongClass))),
                 fast_calls: Mutex::new(Vec::new()),
             })
         }
         fn fast_err(err: ToolCallError) -> Arc<Self> {
             Arc::new(Self {
                 fast: Mutex::new(Box::new(move |_t, _a| Err(err.clone()))),
-                queue: Mutex::new(Box::new(|_t, _a, _c| Err(ToolCallError::WrongClass))),
+                queue: Mutex::new(Box::new(|_t, _a, _c, _w| Err(ToolCallError::WrongClass))),
                 fast_calls: Mutex::new(Vec::new()),
             })
         }
         fn queue_ok(req: QueuedToolRequest) -> Arc<Self> {
             Arc::new(Self {
                 fast: Mutex::new(Box::new(|_t, _a| Err(ToolCallError::WrongClass))),
-                queue: Mutex::new(Box::new(move |_t, _a, _c| Ok(req.clone()))),
+                queue: Mutex::new(Box::new(move |_t, _a, _c, _w| Ok(req.clone()))),
                 fast_calls: Mutex::new(Vec::new()),
             })
         }
@@ -6114,13 +6273,14 @@ mod processor_store_host_tests {
             tool: &str,
             args_json: &str,
             call_id: &str,
+            with_attachments: bool,
         ) -> Result<QueuedToolRequest, ToolCallError> {
-            (self.queue.lock().unwrap())(tool, args_json, call_id)
+            (self.queue.lock().unwrap())(tool, args_json, call_id, with_attachments)
         }
     }
 
     /// Build a `ProcessorData` wired to `host` (Tools-grant present in effect).
-    fn make_tool_data(host: ToolHostFn) -> ProcessorData {
+    pub(crate) fn make_tool_data(host: ToolHostFn) -> ProcessorData {
         ProcessorData {
             resource_table: ResourceTable::new(),
             limits: StoreLimitsBuilder::new().build(),
@@ -6233,7 +6393,7 @@ mod processor_store_host_tests {
             fast: Mutex::new(Box::new(|_t, _a| {
                 Ok("y".repeat(PROCESSOR_MAX_FAST_TOOL_RESULT_BYTES + 1))
             })),
-            queue: Mutex::new(Box::new(|_t, _a, _c| Err(ToolCallError::WrongClass))),
+            queue: Mutex::new(Box::new(|_t, _a, _c, _w| Err(ToolCallError::WrongClass))),
             fast_calls: Mutex::new(Vec::new()),
         });
         let alerter = CapturingProcessorAlerter::new();
@@ -6284,13 +6444,16 @@ mod processor_store_host_tests {
         };
         let mut data = make_tool_data(StubToolHost::queue_ok(req));
         for _ in 0..PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION {
-            data.do_queue_async(None, "apull".into(), "{}".into(), "c")
+            data.do_queue_async(None, "apull".into(), "{}".into(), "c", &[])
                 .expect("calls within the cap succeed");
         }
         let err = data
-            .do_queue_async(None, "apull".into(), "{}".into(), "c")
+            .do_queue_async(None, "apull".into(), "{}".into(), "c", &[])
             .expect_err("the over-cap async call must be rejected");
-        assert!(matches!(err, ToolWitError::Internal(_)));
+        assert!(matches!(
+            err,
+            QueueRefusal::Tool(ToolCallError::Internal(_))
+        ));
         assert_eq!(
             data.tool_request_buffer.len(),
             PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION,
@@ -6305,7 +6468,12 @@ mod processor_store_host_tests {
     }
 
     impl ProvidesHost for CountingProvidesHost {
-        fn complete(&self, _id: &str, _outcome_json: &str) -> Result<(), ProvidesCallError> {
+        fn complete(
+            &self,
+            _id: &str,
+            _outcome_json: &str,
+            _attachments: HeldAttachments,
+        ) -> Result<(), ProvidesCallError> {
             *self.completes.lock().unwrap() += 1;
             Err(ProvidesCallError::NotPending)
         }
@@ -6315,6 +6483,7 @@ mod processor_store_host_tests {
             _tool: &str,
             _args_json: &str,
             _call_id: &str,
+            _with_attachments: bool,
         ) -> Result<QueuedToolRequest, ToolCallError> {
             Err(ToolCallError::Denied("not pending".to_string()))
         }
@@ -6331,12 +6500,15 @@ mod processor_store_host_tests {
         data.provides_host = Some(host.clone());
         for _ in 0..PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION {
             let answer = data
-                .do_complete("feedface", "{\"ok\":1}")
+                .do_complete("feedface", "{\"ok\":1}", &[])
                 .expect("calls within the cap do not trap");
-            assert!(matches!(answer, Err(CompleteWitError::NotPending)));
+            assert!(matches!(
+                answer,
+                Err(CompleteRefusal::Provides(ProvidesCallError::NotPending))
+            ));
         }
         let trap = data
-            .do_complete("feedface", "{\"ok\":1}")
+            .do_complete("feedface", "{\"ok\":1}", &[])
             .expect_err("the over-cap call must trap");
         assert!(
             trap.to_string()
@@ -6359,8 +6531,8 @@ mod processor_store_host_tests {
         let mut data = make_tool_data(StubToolHost::fast_ok("{}"));
         data.provides_host = Some(host.clone());
         let over = "x".repeat(PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES + 1);
-        match data.do_complete("feedface", &over) {
-            Ok(Err(CompleteWitError::InvalidOutcome(detail))) => {
+        match data.do_complete("feedface", &over, &[]) {
+            Ok(Err(CompleteRefusal::Provides(ProvidesCallError::InvalidOutcome(detail)))) => {
                 assert!(
                     detail.contains(&over.len().to_string())
                         && detail.contains(&PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES.to_string()),
@@ -6372,8 +6544,10 @@ mod processor_store_host_tests {
         assert_eq!(*host.completes.lock().unwrap(), 0);
         let at = "x".repeat(PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES);
         assert!(matches!(
-            data.do_complete("feedface", &at),
-            Ok(Err(CompleteWitError::NotPending))
+            data.do_complete("feedface", &at, &[]),
+            Ok(Err(CompleteRefusal::Provides(
+                ProvidesCallError::NotPending
+            )))
         ));
         assert_eq!(*host.completes.lock().unwrap(), 1);
     }
@@ -6406,13 +6580,13 @@ mod processor_store_host_tests {
         }
         assert_eq!(data.gate.entries(), MAX_PUBLISHES_PER_ACTIVATION - 1);
 
-        data.do_queue_async(None, "apull".into(), "{}".into(), "c")
+        data.do_queue_async(None, "apull".into(), "{}".into(), "c", &[])
             .expect("the last slot is free");
         let err = data
-            .do_queue_async(None, "apull".into(), "{}".into(), "c")
+            .do_queue_async(None, "apull".into(), "{}".into(), "c", &[])
             .expect_err("the combined count is at the ceiling");
         assert!(
-            matches!(&err, ToolWitError::Internal(m) if m == "too-many-async-requests"),
+            matches!(&err, QueueRefusal::Tool(ToolCallError::Internal(m)) if m == "too-many-async-requests"),
             "the async site must refuse on the shared entry ceiling, got {err:?}"
         );
         assert_eq!(data.tool_request_buffer.len(), 1);
@@ -6439,9 +6613,15 @@ mod processor_store_host_tests {
             "git-repo-pull".into(),
             "{\"repos\":[]}".into(),
             "call-1",
+            &[],
         )
         .expect("valid async call must buffer");
-        assert_eq!(data.tool_request_buffer, vec![req]);
+        let buffered: Vec<_> = data
+            .tool_request_buffer
+            .iter()
+            .map(|b| &b.request)
+            .collect();
+        assert_eq!(buffered, vec![&req]);
     }
 
     /// `take_ok_publishes` (the Ok-path flush) appends each buffered async request
@@ -6467,7 +6647,7 @@ mod processor_store_host_tests {
         data.gate = ActivationGate::new(1024, budgets);
         data.do_publish_declared("out".into(), "port-body".into(), None, None)
             .expect("a bound port publish must buffer");
-        data.do_queue_async(None, "git-repo-pull".into(), "{}".into(), "c1")
+        data.do_queue_async(None, "git-repo-pull".into(), "{}".into(), "c1", &[])
             .expect("valid async call must buffer");
         assert_eq!(data.tool_request_buffer.len(), 1);
 
@@ -6499,9 +6679,12 @@ mod processor_store_host_tests {
         let mut data = make_tool_data(StubToolHost::queue_ok(req));
         let long_id = "z".repeat(PROCESSOR_MAX_TOOL_CALL_ID_LEN + 1);
         let err = data
-            .do_queue_async(None, "git-repo-pull".into(), "{}".into(), &long_id)
+            .do_queue_async(None, "git-repo-pull".into(), "{}".into(), &long_id, &[])
             .expect_err("over-length call_id must be rejected");
-        assert!(matches!(err, ToolWitError::InvalidArgs(_)));
+        assert!(matches!(
+            err,
+            QueueRefusal::Tool(ToolCallError::InvalidArgs(_))
+        ));
         assert!(data.tool_request_buffer.is_empty());
     }
 
@@ -6510,14 +6693,14 @@ mod processor_store_host_tests {
     fn do_queue_async_seam_error_buffers_nothing() {
         let host: Arc<StubToolHost> = Arc::new(StubToolHost {
             fast: Mutex::new(Box::new(|_t, _a| Err(ToolCallError::WrongClass))),
-            queue: Mutex::new(Box::new(|_t, _a, _c| Err(ToolCallError::NotGranted))),
+            queue: Mutex::new(Box::new(|_t, _a, _c, _w| Err(ToolCallError::NotGranted))),
             fast_calls: Mutex::new(Vec::new()),
         });
         let mut data = make_tool_data(host);
         let err = data
-            .do_queue_async(None, "mystery".into(), "{}".into(), "c1")
+            .do_queue_async(None, "mystery".into(), "{}".into(), "c1", &[])
             .expect_err("ungranted async tool must error");
-        assert!(matches!(err, ToolWitError::NotGranted));
+        assert_eq!(err, QueueRefusal::Tool(ToolCallError::NotGranted));
         assert!(data.tool_request_buffer.is_empty());
     }
 
@@ -7171,7 +7354,10 @@ mod processor_store_host_tests {
         let refused =
             BlobsHost::publish(&mut data, "out".to_string(), body(), Vec::new(), options())
                 .expect("no trap");
-        assert!(matches!(refused, Err(PublishError::NotPermitted)));
+        assert!(matches!(
+            refused,
+            Err(PublishError::Plain(ports_v0_2::PublishError::NotPermitted))
+        ));
         assert_eq!(data.gate.calls(), 1);
         assert!(data.publish_buffer.is_empty());
 
@@ -7180,13 +7366,19 @@ mod processor_store_host_tests {
             let refused =
                 BlobsHost::publish(&mut data, "out".to_string(), body(), Vec::new(), options())
                     .expect("no trap");
-            assert!(matches!(refused, Err(PublishError::NotPermitted)));
+            assert!(matches!(
+                refused,
+                Err(PublishError::Plain(ports_v0_2::PublishError::NotPermitted))
+            ));
         }
         assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION);
         let refused =
             BlobsHost::publish(&mut data, "out".to_string(), body(), Vec::new(), options())
                 .expect("no trap");
-        assert!(matches!(refused, Err(PublishError::QuotaExceeded)));
+        assert!(matches!(
+            refused,
+            Err(PublishError::Plain(ports_v0_2::PublishError::QuotaExceeded))
+        ));
         assert!(data.publish_buffer.is_empty());
 
         // With `ports`, an empty list behaves as `ports.publish`.

@@ -114,6 +114,10 @@ rust_test(
         # The contract-pairing reload cases roll a consumer back from this
         # byte-carrying build to the string build, `processor-page-test`.
         "//brenn-wasm:fixture_processor_bytes_test",
+        # The blob tool-call round trips run a caller and a provider that
+        # carry blobs on every call and completion.
+        "//brenn-wasm:fixture_processor_blob_caller_test",
+        "//brenn-wasm:fixture_processor_blob_provider_test",
         "//brenn-wasm:fixture_processor_config",
         "//brenn-wasm:fixture_processor_demo",
         # The bundle-shaped reload case installs a second artifact under one

@@ -742,6 +742,10 @@ A bus message body is bytes with an optional content type, and is *text* or
   placeholder**: `{"binary": true, "content_type": …, "size": …}`. The legacy
   UI's message card shows the same thing as one escaped line
   (`binary body: <content type>, <size> bytes`).
+- **A tool result that carries attachments reaches a conversation as its
+  JSON value beside each attachment's name, size and content type** and the
+  id of the message holding them on the app's result inbox — never a blob id
+  and never the bytes (§7.6). The value is the tool's, as for any tool result.
 - **No path decodes, base64-encodes or lossily converts a body's bytes into a
   conversation's context or into markup.** `from_utf8_lossy` and its kin are
   not used on a body anywhere.
@@ -785,14 +789,56 @@ by reference (`docs/message-bus.md` §2.1.2a).
   delivered — or one it made in this activation, and it names either by a
   resource handle, never by id: no function of the interface takes an id, so
   an id read from a header, a body or a component's own store opens nothing.
-  A handle dies with the activation. Publishing with attachments needs `ports`
-  as well. A conversation forwards, saves and attaches blobs by name (below).
-  Remotes and pages still cannot create a blob or read one's bytes; host
-  code's `Messenger::publish_from_system_with_attachments` has no production
-  caller, and is no longer the only non-component entry that publishes
-  attachments: `Messenger::publish_with_attachments` carries a conversation's.
-  Every later door that admits an outside producer or reader is a boundary
-  change to review here.
+  A handle dies with the activation, except one a tool completion named
+  (below). Publishing with attachments needs `ports` as well. A conversation
+  forwards, saves and attaches blobs by name (below). Remotes and pages still
+  cannot create a blob or read one's bytes. Host code's
+  `Messenger::publish_from_system_with_attachments` carries the tool
+  substrate's requests and results, and `Messenger::publish_with_attachments`
+  a conversation's sends. Every later door that admits an outside producer or
+  reader is a boundary change to review here.
+- **A tool call is a path for a blob between principals.** An asynchronous
+  registry call and its result carry attachments by reference
+  (`docs/message-bus.md` §2.1.2a). A caller gives a tool read access to
+  exactly the blobs it names, and it can name only blobs it could itself read:
+  a component by handle, a conversation by a name `admit_conversation_name`
+  admits. A tool gives its caller the blobs it answers with. Neither side
+  learns an id, and a provider still learns no caller (§8.4). A tool takes
+  attachments only if its declaration says so, checked before it runs; a
+  provider's completion holds the blobs it names past its activation's
+  `Err` or trap, and they drop with the call if its waiter is gone. A blob
+  handed to a provided tool stays on the provider's request inbox for that
+  inbox's window, whatever becomes of the call: handing a provider a blob is
+  giving it that blob.
+- **What an app's result inbox exposes: nothing to any policy.** A tool
+  result that carries attachments to a conversation is published on
+  `brenn:app-tool-results/<app-slug>` and written into the calling
+  conversation's read record, and into no other's. `AppPolicy::brenn_acl_covers`
+  answers no for the namespace whatever an app's matchers say, so no
+  conversation lists, reads, subscribes to or is delivered from any app's
+  result inbox, its own included; `resolve_channel` refuses an authored
+  matcher reaching into the namespace, for any owner, and the config language
+  refuses an agent's position there. `admit_named` admits a name on the app's
+  own inbox by the read record alone. So a result's attachments reach only
+  the conversation that made the call — not another conversation of the same
+  app, not another app, not another user — and that conversation cannot name
+  them again after its context is reset.
+- **A policy over the tool substrate is a watch of the traffic, never of its
+  blobs.** The three older tool channels now carry blobs: a request on
+  `brenn:tools/<tool>` carries what a component hands a tool, a request on
+  `brenn:tool-requests/<slug>` carries what any caller — a conversation
+  included — hands a provided tool, and a result on `brenn:tool-results/<slug>`
+  carries what a tool answers a component with. An app whose policy covers
+  them — an authored `acl` matcher, exact or prefix, read with
+  `MessageChannelGet` or subscribed with `MessageSubscribe` — reads the call
+  traffic of every user, and is shown each attachment's name, size and content
+  type. No attachment on a channel of the four tool namespaces can be named by
+  a conversation except on its own app's result inbox: `admit_named` refuses
+  it `tool_channel_attachment` after the policy check and before any lookup or
+  hold, whatever the policy says and however it came to cover the channel.
+  Naming such a message's body is unaffected. Any later door that lets a
+  participant read an attachment by policy must exclude these channels the
+  same way.
 - **Who may redeem what: a conversation, by (message id, attachment name).** A
   conversation is still never shown an id. It names an attachment by the id
   of the message that carries it and the attachment's name, and one function,
@@ -804,9 +850,11 @@ by reference (`docs/message-bus.md` §2.1.2a).
   policy lets it read now. `docs/message-bus.md` §2.1.2a states the rule. An
   admitted name is held under the store's own lock, so the blob cannot lose
   its last holder between the check and the hold. A refusal of a name the
-  host never handed over (`not_read`, `channel_not_readable`) is logged at
-  `warn` with app, conversation and message id: it is a mis-copied id or an
-  injected one.
+  host never handed over (`not_read`, `channel_not_readable`), or of an
+  attachment on a tool-substrate channel (`tool_channel_attachment`, above),
+  is logged at `warn` with app, conversation and message id: it is a
+  mis-copied id, an injected one, or a model reaching for another principal's
+  blob.
 - **What the rule does not close.** A conversation induced — by text it read —
   to forward or save a blob it legitimately holds does so: the rule bounds
   what it can name, not why it names it, and forwarding is a `BrennSend` under
@@ -853,7 +901,13 @@ by reference (`docs/message-bus.md` §2.1.2a).
   component's rate is the per-sink publish budget and the windows' depths;
   what tells the operator is the post-activation warning that counts the
   component's budget refusals. A conversation's rate is limited by its send
-  budget and rate. A per-producer share of the budget is
+  budget and rate. A tool call's blobs rest on the rows of the call — the
+  request on `brenn:tools/<tool>` and on a provider's request inbox, and the
+  result on the caller's inbox, a component's or an app's — each for that
+  channel's window, so a caller fills the pool through the channels of the
+  tools it calls, and a provider through its callers' inboxes; after a
+  restart an app's result inbox holds blobs no conversation can name until its
+  window turns over. A per-producer share of the budget is
   `blob-budget-per-component` in `TODO.md`.
 - **A bounded shared resource.** The store is one pool for every producer,
   bounded by `max_blob_bytes` per blob and `blob_budget_bytes` in total, both
@@ -1148,8 +1202,9 @@ A component class may declare `provide <tool>` statements; each becomes a
 registry tool that agents, `brenn-tool` and other components call like any
 other (`docs/config-dsl.md`, "Tool grants"). The component serves a call as an
 ordinary activation on its reserved `tool-requests` port, and answers it
-through `provides.complete`. It may act for the caller's user through
-`provides.call-async-for`.
+through `provides.complete`, or `blobs.complete` to answer with blobs. It may
+act for the caller's user through `provides.call-async-for` or
+`blobs.call-async-for`. A request and a result may carry attachments (§7.6).
 
 **Trust decision: a provider decides nothing about its own authority.**
 Admission happens before the provider sees a request. That covers the grant,

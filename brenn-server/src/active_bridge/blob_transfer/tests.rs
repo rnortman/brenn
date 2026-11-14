@@ -19,7 +19,7 @@ use super::TRANSFER_DEADLINE;
 use crate::active_bridge::test_support::test_bridge;
 use crate::active_bridge::tool_socket::{MAX_IN_FLIGHT, REQUEST_READ_DEADLINE, ToolSocket};
 use crate::messaging_intercept::blob_fixture::{
-    Fixture, HIDDEN, PRODUCER, RING, RING_DEPTH, SRC, fixture, fixture_with_limits,
+    Fixture, HIDDEN, PRODUCER, RING, RING_DEPTH, SRC, WATCHED, fixture, fixture_with_limits,
 };
 
 /// Room for a blob of several pieces and over the request line's cap.
@@ -250,6 +250,29 @@ async fn each_name_refusal_is_a_tool_error_before_any_byte() {
     // The attachment saves once every refusal is past.
     let (_, saved) = save(&path, &save_request(message, attachment("scan.pdf"))).await;
     assert_eq!(saved, b"bytes");
+}
+
+/// A call's attachment on a watched tool channel is refused
+/// `tool_channel_attachment` before any byte, and the call's body saves.
+#[tokio::test]
+async fn a_watched_tool_channels_attachment_is_refused_and_its_body_saved() {
+    let f = fixture().await;
+    let (message, _) = f.attached(WATCHED, b"handed bytes").await;
+    f.read(WATCHED).await;
+    let s = serve(&f, TRANSFER_DEADLINE);
+    let path = s.path();
+
+    let text = refused(
+        &path,
+        &save_request(message, attachment("scan.pdf")),
+        "tool_channel_attachment",
+    )
+    .await;
+    assert!(text["error"].as_str().unwrap().contains(WATCHED), "{text}");
+
+    let (header, saved) = save(&path, &save_request(message, SavePart::Body)).await;
+    assert_eq!(header.content_type, None);
+    assert_eq!(saved, b"a scan");
 }
 
 #[tokio::test]

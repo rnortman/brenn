@@ -5,7 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use brenn_lib::tools::AclClause;
 use brenn_tool_registry::{
-    AclDenied, AsyncTool, Idempotency, ToolClass, ToolCtx, ToolDescriptor, ToolError, UserBinding,
+    AclDenied, AsyncTool, HeldAttachments, Idempotency, ToolClass, ToolCtx, ToolDescriptor,
+    ToolError, ToolOutput, UserBinding,
 };
 use serde::Deserialize;
 
@@ -55,6 +56,7 @@ impl OAuthAccountsTool {
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
                 user_binding: UserBinding::ActingUser,
+                accepts_attachments: false,
             },
             service,
         }
@@ -82,7 +84,8 @@ impl AsyncTool for OAuthAccountsTool {
         &self,
         ctx: &ToolCtx,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
+        _attachments: HeldAttachments,
+    ) -> Result<ToolOutput, ToolError> {
         let user = ctx.require_acting_user(NAME)?.clone();
         let args: AccountsArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("{NAME} args: {e}")))?;
@@ -114,7 +117,7 @@ impl AsyncTool for OAuthAccountsTool {
                 })
             })
             .collect();
-        Ok(serde_json::json!({ "accounts": accounts }))
+        Ok(serde_json::json!({ "accounts": accounts }).into())
     }
 }
 
@@ -122,6 +125,7 @@ impl AsyncTool for OAuthAccountsTool {
 mod tests {
     use super::*;
     use crate::testutil::{alice, credential, provider_clause, provider_config, service, tool_ctx};
+    use brenn_tool_registry::testutil::ExecuteValue;
 
     fn tool() -> (OAuthAccountsTool, Arc<OAuthService>, tempfile::TempDir) {
         let (svc, dir) = service(vec![
@@ -160,7 +164,7 @@ mod tests {
         connect(&svc, "bob", "google", "bob@example.com").await;
 
         let out = tool
-            .execute(
+            .execute_value(
                 &tool_ctx(Some(alice()), vec![provider_clause("*")]),
                 serde_json::json!({}),
             )
@@ -188,7 +192,7 @@ mod tests {
         connect(&svc, "alice", "google", "alice@example.com").await;
         connect(&svc, "alice", "other", "alice@example.com").await;
         let out = tool
-            .execute(
+            .execute_value(
                 &tool_ctx(Some(alice()), vec![provider_clause("*")]),
                 serde_json::json!({"provider": "other"}),
             )
@@ -206,7 +210,7 @@ mod tests {
         connect(&svc, "alice", "google", "alice@example.com").await;
         connect(&svc, "alice", "other", "alice@example.com").await;
         let out = tool
-            .execute(
+            .execute_value(
                 &tool_ctx(Some(alice()), vec![provider_clause("google")]),
                 serde_json::json!({}),
             )
@@ -222,7 +226,7 @@ mod tests {
     async fn nothing_connected_is_an_empty_list() {
         let (tool, _svc, _dir) = tool();
         let out = tool
-            .execute(
+            .execute_value(
                 &tool_ctx(Some(alice()), vec![provider_clause("*")]),
                 serde_json::json!({}),
             )
@@ -239,7 +243,7 @@ mod tests {
             serde_json::json!({"x": 1}),
         ] {
             let err = tool
-                .execute(
+                .execute_value(
                     &tool_ctx(Some(alice()), vec![provider_clause("*")]),
                     args.clone(),
                 )
@@ -252,7 +256,7 @@ mod tests {
     async fn no_acting_user_is_denied() {
         let (tool, _svc, _dir) = tool();
         let err = tool
-            .execute(
+            .execute_value(
                 &tool_ctx(None, vec![provider_clause("*")]),
                 serde_json::json!({}),
             )

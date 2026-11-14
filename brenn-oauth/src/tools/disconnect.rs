@@ -6,7 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use brenn_lib::tools::AclClause;
 use brenn_tool_registry::{
-    AclDenied, AsyncTool, Idempotency, ToolClass, ToolCtx, ToolDescriptor, ToolError, UserBinding,
+    AclDenied, AsyncTool, HeldAttachments, Idempotency, ToolClass, ToolCtx, ToolDescriptor,
+    ToolError, ToolOutput, UserBinding,
 };
 use serde::Deserialize;
 use tracing::info;
@@ -62,6 +63,7 @@ impl OAuthDisconnectTool {
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
                 user_binding: UserBinding::ActingUser,
+                accepts_attachments: false,
             },
             service,
         }
@@ -86,7 +88,8 @@ impl AsyncTool for OAuthDisconnectTool {
         &self,
         ctx: &ToolCtx,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
+        _attachments: HeldAttachments,
+    ) -> Result<ToolOutput, ToolError> {
         let user = ctx.require_acting_user(NAME)?.clone();
         let args: DisconnectArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("{NAME} args: {e}")))?;
@@ -153,7 +156,7 @@ impl AsyncTool for OAuthDisconnectTool {
         if let Some(detail) = detail {
             result["detail"] = serde_json::Value::String(detail);
         }
-        Ok(result)
+        Ok(result.into())
     }
 }
 
@@ -163,6 +166,7 @@ mod tests {
     use crate::testutil::{
         Stub, alice, credential, provider_clause, provider_config, service, start_stub, tool_ctx,
     };
+    use brenn_tool_registry::testutil::ExecuteValue;
 
     struct Fixture {
         tool: OAuthDisconnectTool,
@@ -204,7 +208,7 @@ mod tests {
             account: &str,
         ) -> Result<serde_json::Value, ToolError> {
             self.tool
-                .execute(
+                .execute_value(
                     &tool_ctx(Some(alice()), vec![provider_clause("*")]),
                     serde_json::json!({"provider": provider, "account": account}),
                 )
@@ -278,7 +282,7 @@ mod tests {
             .await;
         let tool = OAuthDisconnectTool::new(svc.clone());
         let err = tool
-            .execute(
+            .execute_value(
                 &tool_ctx(Some(alice()), vec![provider_clause("*")]),
                 serde_json::json!({"provider": "google", "account": "alice@example.com"}),
             )
@@ -338,7 +342,7 @@ mod tests {
         };
         let err = f
             .tool
-            .execute(
+            .execute_value(
                 &tool_ctx(Some(bob), vec![provider_clause("*")]),
                 serde_json::json!({"provider": "google", "account": "alice@example.com"}),
             )
@@ -359,7 +363,7 @@ mod tests {
         let f = fixture().await;
         let err = f
             .tool
-            .execute(
+            .execute_value(
                 &tool_ctx(None, vec![provider_clause("*")]),
                 serde_json::json!({"provider": "google", "account": "alice@example.com"}),
             )

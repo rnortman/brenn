@@ -10,8 +10,27 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use brenn_lib::messaging::ParticipantId;
 use brenn_lib::tools::{AclClause, ResolvedToolGrant};
+use brenn_messaging_store::blob::HeldAttachments;
 
 use super::descriptor::{AclDenied, ToolDescriptor, ToolError};
+
+/// What an async tool answers with: its JSON value, and the blobs it names.
+/// Whoever owns the value holds the blobs; dropping it lets them go.
+#[derive(Debug)]
+pub struct ToolOutput {
+    pub value: serde_json::Value,
+    pub attachments: HeldAttachments,
+}
+
+impl From<serde_json::Value> for ToolOutput {
+    /// A value with no attachments.
+    fn from(value: serde_json::Value) -> Self {
+        ToolOutput {
+            value,
+            attachments: HeldAttachments::none(),
+        }
+    }
+}
 
 /// The human on whose behalf a tool call runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,12 +170,15 @@ pub trait AsyncTool: Send + Sync {
         Ok(())
     }
 
-    /// Run the tool to completion.
+    /// Run the tool to completion. `attachments` is empty unless the
+    /// descriptor's `accepts_attachments` is set: the registry refuses a call
+    /// carrying any to a tool that does not accept them before this runs.
     async fn execute(
         &self,
         ctx: &ToolCtx,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError>;
+        attachments: HeldAttachments,
+    ) -> Result<ToolOutput, ToolError>;
 }
 
 /// A registered tool, class-erased for uniform storage. `descriptor()` recovers

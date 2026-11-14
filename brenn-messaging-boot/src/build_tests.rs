@@ -3377,8 +3377,13 @@ fn async_tool_registry_bound(
         ) -> Result<(), AclDenied> {
             Ok(())
         }
-        async fn execute(&self, _c: &ToolCtx, _a: Value) -> Result<Value, ToolError> {
-            Ok(json!({}))
+        async fn execute(
+            &self,
+            _c: &ToolCtx,
+            _a: Value,
+            _h: brenn_tool_registry::HeldAttachments,
+        ) -> Result<brenn_tool_registry::ToolOutput, ToolError> {
+            Ok(json!({}).into())
         }
     }
     std::sync::Arc::new(brenn_tool_registry::ToolRegistry::new(vec![
@@ -3392,6 +3397,7 @@ fn async_tool_registry_bound(
             idempotency: Idempotency::Natural,
             auto_approve: true,
             user_binding,
+            accepts_attachments: false,
         }))),
     ]))
 }
@@ -4053,7 +4059,14 @@ async fn boot_logs_every_injected_auto_grant() {
 #[should_panic(expected = "tunes a channel this config never mints")]
 fn a_tuning_block_for_an_undeclared_webhook_panics() {
     let tuning = tuning_of(&[tuning_raw("webhook:ghost")]);
-    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), true);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        true,
+    );
 }
 
 /// Same for a tool that is not registered.
@@ -4066,6 +4079,7 @@ fn a_tuning_block_for_an_unregistered_tool_panics() {
         &[],
         &["apull"],
         &std::collections::HashSet::new(),
+        None,
         true,
     );
 }
@@ -4081,6 +4095,7 @@ fn a_bare_tuning_block_for_an_unregistered_tool_panics() {
         &[],
         &["apull"],
         &std::collections::HashSet::new(),
+        None,
         true,
     );
 }
@@ -4091,7 +4106,7 @@ fn a_bare_tuning_block_for_an_unregistered_tool_panics() {
 fn a_tuning_block_for_an_ungranted_inbox_panics() {
     let tuning = tuning_of(&[tuning_raw("brenn:tool-results/ghost")]);
     let slugs: std::collections::HashSet<String> = ["sync".to_string()].into_iter().collect();
-    validate_exact_tuning_blocks(&tuning, &[], &["apull"], &slugs, true);
+    validate_exact_tuning_blocks(&tuning, &[], &["apull"], &slugs, None, true);
 }
 
 /// With no tool registry answering, the two tool families have no population
@@ -4104,11 +4119,25 @@ fn without_a_registry_the_tool_arms_are_skipped_and_the_webhook_arm_is_not() {
         tuning_raw("brenn:tools/nope"),
         tuning_raw("brenn:tool-results/ghost"),
     ]);
-    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), false);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        false,
+    );
 
     let webhook = tuning_of(&[tuning_raw("webhook:ghost")]);
     let refused = std::panic::catch_unwind(|| {
-        validate_exact_tuning_blocks(&webhook, &[], &[], &std::collections::HashSet::new(), false);
+        validate_exact_tuning_blocks(
+            &webhook,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+            None,
+            false,
+        );
     });
     assert!(refused.is_err());
 }
@@ -4129,7 +4158,50 @@ fn an_mqtt_block_matching_nothing_boots_and_real_blocks_pass() {
         tuning_raw("brenn:tool-results/sync"),
     ]);
     let slugs: std::collections::HashSet<String> = ["sync".to_string()].into_iter().collect();
-    validate_exact_tuning_blocks(&tuning, &["gh-events"], &["apull"], &slugs, true);
+    validate_exact_tuning_blocks(&tuning, &["gh-events"], &["apull"], &slugs, None, true);
+}
+
+/// An app's result inbox is checked against the apps holding an async tool
+/// grant: an exact block naming one passes, one naming another app is refused.
+#[test]
+fn an_app_inbox_block_names_an_app_holding_an_async_grant() {
+    let apps: std::collections::HashSet<String> = ["home".to_string()].into_iter().collect();
+    let tuning = tuning_of(&[tuning_raw("brenn:app-tool-results/home")]);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        Some(&apps),
+        true,
+    );
+    let ungranted = tuning_of(&[tuning_raw("brenn:app-tool-results/graf")]);
+    let refused = std::panic::catch_unwind(|| {
+        validate_exact_tuning_blocks(
+            &ungranted,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+            Some(&apps),
+            true,
+        );
+    });
+    assert!(refused.is_err());
+    // A consumer slug does not stand in for an app's.
+    let consumers: std::collections::HashSet<String> = ["graf".to_string()].into_iter().collect();
+    let refused = std::panic::catch_unwind(|| {
+        validate_exact_tuning_blocks(&ungranted, &[], &[], &consumers, Some(&apps), true);
+    });
+    assert!(refused.is_err());
+    // Without the apps to check against, the arm is skipped.
+    validate_exact_tuning_blocks(
+        &ungranted,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        true,
+    );
 }
 
 /// A location block is checked for shape: any username registration could
@@ -4137,7 +4209,14 @@ fn an_mqtt_block_matching_nothing_boots_and_real_blocks_pass() {
 #[test]
 fn a_location_block_naming_a_well_formed_user_passes() {
     let tuning = tuning_of(&[tuning_raw("brenn:device-location.alice")]);
-    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), true);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        true,
+    );
 }
 
 /// A remainder no registration could produce tunes a channel that is never
@@ -4146,7 +4225,14 @@ fn a_location_block_naming_a_well_formed_user_passes() {
 #[should_panic(expected = "tunes a location channel no user can have")]
 fn a_location_block_naming_no_possible_user_panics() {
     let tuning = tuning_of(&[tuning_raw("brenn:device-location.not a user!")]);
-    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), true);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        true,
+    );
 }
 
 /// The tuning table reaches every site that mints a system channel.
@@ -5293,4 +5379,113 @@ async fn boot_refuses_a_blob_directory_another_database_owns() {
     config.messaging.blob_dir = Some(dir);
 
     boot_messaging(&config, brenn_server::test_support::init_db_memory()).await;
+}
+
+/// The planner mints `brenn:app-tool-results/<app>` for an app granted an
+/// async registry tool, and for no other: not for an app granted only a fast
+/// tool, not for an app with no tool grant, and not for any app when the plan
+/// has no registry.
+#[test]
+fn the_plan_mints_an_app_result_inbox_only_for_an_app_granted_an_async_tool() {
+    use brenn_lib::access::AppPolicy;
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::app_tool_result_inbox_address;
+    use brenn_lib::tools::ResolvedToolGrant;
+    use brenn_tool_registry::ToolError;
+    use brenn_tool_registry::descriptor::{AclDenied, Idempotency, ToolClass, ToolDescriptor};
+    use brenn_tool_registry::tool::{FastTool, RegisteredTool, ToolCtx};
+    use indexmap::IndexMap as IM;
+    use serde_json::{Value, json};
+
+    struct FPing(ToolDescriptor);
+    impl FastTool for FPing {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.0
+        }
+        fn check_acl(
+            &self,
+            _a: &Value,
+            _c: &[brenn_lib::tools::AclClause],
+        ) -> Result<(), AclDenied> {
+            Ok(())
+        }
+        fn execute(&self, _c: &ToolCtx, _a: Value) -> Result<Value, ToolError> {
+            Ok(json!({}))
+        }
+    }
+    let async_only = async_tool_registry();
+    let apull = async_only
+        .get("apull")
+        .expect("apull is registered")
+        .clone();
+    let registry = Arc::new(brenn_tool_registry::ToolRegistry::new(vec![
+        apull,
+        RegisteredTool::Fast(Arc::new(FPing(ToolDescriptor {
+            name: "fping",
+            mcp_name: "mcp__brenn__FPing",
+            description: "stub fast",
+            input_schema: json!({ "type": "object" }),
+            class: ToolClass::Fast {
+                budget: std::time::Duration::from_millis(5),
+            },
+            acl_keys: &[],
+            idempotency: Idempotency::Natural,
+            auto_approve: true,
+            user_binding: brenn_tool_registry::UserBinding::None,
+            accepts_attachments: false,
+        }))),
+    ]));
+
+    let app_granted = |slug: &str, tools: &[&str]| {
+        let mut app = minimal_app_config(slug, None, vec![]);
+        app.policy = Arc::new(AppPolicy {
+            tool_grants: tools
+                .iter()
+                .map(|t| {
+                    (
+                        t.to_string(),
+                        ResolvedToolGrant {
+                            acl: vec![],
+                            rate_limit: None,
+                        },
+                    )
+                })
+                .collect(),
+            ..AppPolicy::default()
+        });
+        app
+    };
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::from([
+        ("both".to_string(), app_granted("both", &["apull", "fping"])),
+        ("fast".to_string(), app_granted("fast", &["fping"])),
+        ("none".to_string(), app_granted("none", &[])),
+    ]));
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    let mqtt_clients = brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients);
+    let plan_with = |tool_registry| {
+        plan_messaging(&PlanInputs {
+            config: &config,
+            apps: Some(&apps),
+            mqtt_clients: &mqtt_clients,
+            tool_registry,
+            replay_store_paths: &[],
+            device_location_users: &[],
+        })
+        .expect("a channel-declaring document configures messaging")
+    };
+    let minted = |plan: &MessagingPlan| -> Vec<String> {
+        ["both", "fast", "none"]
+            .into_iter()
+            .filter(|slug| {
+                plan.directory
+                    .resolve(&app_tool_result_inbox_address(slug))
+                    .is_some()
+            })
+            .map(String::from)
+            .collect()
+    };
+
+    assert_eq!(minted(&plan_with(Some(&registry))), vec!["both"]);
+    assert_eq!(minted(&plan_with(None)), Vec::<String>::new());
 }

@@ -7,7 +7,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use brenn_lib::tools::AclClause;
 use brenn_tool_registry::{
-    AclDenied, AsyncTool, Idempotency, ToolClass, ToolCtx, ToolDescriptor, ToolError, UserBinding,
+    AclDenied, AsyncTool, HeldAttachments, Idempotency, ToolClass, ToolCtx, ToolDescriptor,
+    ToolError, ToolOutput, UserBinding,
 };
 use serde::Deserialize;
 use tracing::info;
@@ -72,6 +73,7 @@ impl OAuthConnectTool {
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
                 user_binding: UserBinding::ActingUser,
+                accepts_attachments: false,
             },
             service,
         }
@@ -112,7 +114,8 @@ impl AsyncTool for OAuthConnectTool {
         &self,
         ctx: &ToolCtx,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
+        _attachments: HeldAttachments,
+    ) -> Result<ToolOutput, ToolError> {
         let user = ctx.require_acting_user(NAME)?.clone();
         let args: ConnectArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("{NAME} args: {e}")))?;
@@ -169,7 +172,7 @@ impl AsyncTool for OAuthConnectTool {
         if let Some(hint) = args.login_hint {
             result["account_hint"] = serde_json::Value::String(hint);
         }
-        Ok(result)
+        Ok(result.into())
     }
 }
 
@@ -179,6 +182,7 @@ mod tests {
 
     use brenn_lib::tools::ResolvedToolGrant;
     use brenn_tool_registry::ActingUser;
+    use brenn_tool_registry::testutil::ExecuteValue;
 
     use super::*;
     use crate::flow::s256_challenge;
@@ -213,7 +217,7 @@ mod tests {
     async fn connect_records_a_flow_and_returns_its_link() {
         let (tool, svc, _dir) = tool();
         let out = tool
-            .execute(
+            .execute_value(
                 &ctx(Some(alice())),
                 serde_json::json!({
                     "provider": "google",
@@ -254,7 +258,7 @@ mod tests {
             serde_json::json!({"provider": "google", "scope_sets": []}),
             serde_json::json!({"provider": "google", "scope_sets": ["mail"], "x": 1}),
         ] {
-            let err = tool.execute(&ctx(Some(alice())), args.clone()).await;
+            let err = tool.execute_value(&ctx(Some(alice())), args.clone()).await;
             assert!(matches!(err, Err(ToolError::InvalidArgs(_))), "{args}");
         }
     }
@@ -263,7 +267,7 @@ mod tests {
     async fn no_acting_user_is_denied() {
         let (tool, _svc, _dir) = tool();
         let err = tool
-            .execute(
+            .execute_value(
                 &ctx(None),
                 serde_json::json!({"provider": "google", "scope_sets": ["mail"]}),
             )

@@ -146,6 +146,7 @@ fn provided_tool(
         input_schema: serde_json::json!({ "type": "object" }),
         max_concurrency,
         auto_approve: true,
+        accepts_attachments: false,
     }
 }
 

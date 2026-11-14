@@ -6,8 +6,9 @@
 //! is a [`BlobHold`], so a blob with an open handle is not deleted under it,
 //! and every handle lives in the activation's `ResourceTable`, which drops with
 //! the activation. Nothing here cleans up at the end of an activation: what a
-//! published message names is held by the publish buffer's entry, and
-//! everything else lets go when the store drops.
+//! published message or a buffered tool request names is held by its buffer
+//! entry, what a completion names is held by the completion from the call on,
+//! and everything else lets go when the store drops.
 //!
 //! `open` looks an attachment up by `(port, index, name)` in a table the host
 //! built from the envelopes it delivered; no function takes a blob id.
@@ -22,9 +23,10 @@ use wasmtime::component::Resource;
 use crate::processor_v0_2_bindings::brenn::processor0_2_0::bus as bus_v0_2;
 use crate::processor_v0_3_bindings::brenn::processor0_3_0::blobs as wit;
 use crate::{
-    PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION, PROCESSOR_MAX_BLOB_CALLS_PER_ACTIVATION,
-    PROCESSOR_MAX_BLOB_HANDLES, PROCESSOR_MAX_BLOB_READ_BYTES, PROCESSOR_MAX_BLOB_WRITE_BYTES,
-    ProcessorData, ProcessorUrgency, PublishRefusal,
+    CompleteRefusal, CompleteWitError, PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION,
+    PROCESSOR_MAX_BLOB_CALLS_PER_ACTIVATION, PROCESSOR_MAX_BLOB_HANDLES,
+    PROCESSOR_MAX_BLOB_READ_BYTES, PROCESSOR_MAX_BLOB_WRITE_BYTES, ProcessorData, ProcessorUrgency,
+    ProvidesCallError, PublishRefusal, QueueRefusal, ToolCallError, ToolWitError,
 };
 
 /// The blob store as a component's activation reaches it.
@@ -263,16 +265,16 @@ impl ProcessorData {
     pub(crate) fn held_attachments(
         &self,
         attachments: &[(String, Resource<BlobHandle>)],
-    ) -> Result<HeldAttachments, PublishRefusal> {
+    ) -> Result<HeldAttachments, AttachmentRefusal> {
         if attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE {
-            return Err(PublishRefusal::TooManyAttachments);
+            return Err(AttachmentRefusal::TooMany);
         }
         let mut names: Vec<AttachmentName> = Vec::with_capacity(attachments.len());
         for (name, _) in attachments {
             let name = AttachmentName::new(name.as_str())
-                .map_err(|e| PublishRefusal::InvalidAttachmentName(e.to_string()))?;
+                .map_err(|e| AttachmentRefusal::InvalidName(e.to_string()))?;
             if names.contains(&name) {
-                return Err(PublishRefusal::DuplicateAttachmentName(name.to_string()));
+                return Err(AttachmentRefusal::DuplicateName(name.to_string()));
             }
             names.push(name);
         }
@@ -352,7 +354,7 @@ impl wit::Host for ProcessorData {
             if let Err(refusal) = self.gate.charge_call() {
                 return Ok(Err(crate::publish_error(refusal).into_blobs()));
             }
-            return Ok(Err(wit::PublishError::NotPermitted));
+            return Ok(Err(PublishRefusal::NotPermitted.into_blobs()));
         }
         let urgency = options.urgency.map(|u| match u {
             wit::Urgency::VeryLow => ProcessorUrgency::VeryLow,
@@ -369,6 +371,130 @@ impl wit::Host for ProcessorData {
                 &attachments,
             )?
             .map_err(PublishRefusal::into_blobs))
+    }
+
+    fn call_async(
+        &mut self,
+        tool: String,
+        args_json: String,
+        call_id: String,
+        attachments: Vec<(String, Resource<BlobHandle>)>,
+    ) -> wasmtime::Result<Result<(), wit::CallError>> {
+        if self.tool_host.is_none() {
+            return Ok(Err(self.ungranted_call()));
+        }
+        Ok(self
+            .do_queue_async(None, tool, args_json, &call_id, &attachments)
+            .map_err(QueueRefusal::into_blobs))
+    }
+
+    fn call_async_for(
+        &mut self,
+        serving: String,
+        tool: String,
+        args_json: String,
+        call_id: String,
+        attachments: Vec<(String, Resource<BlobHandle>)>,
+    ) -> wasmtime::Result<Result<(), wit::CallError>> {
+        if self.provides_host.is_none() {
+            return Ok(Err(self.ungranted_call()));
+        }
+        Ok(self
+            .do_queue_async(Some(&serving), tool, args_json, &call_id, &attachments)
+            .map_err(QueueRefusal::into_blobs))
+    }
+
+    fn complete(
+        &mut self,
+        id: String,
+        outcome_json: String,
+        attachments: Vec<(String, Resource<BlobHandle>)>,
+    ) -> wasmtime::Result<Result<(), wit::CompleteError>> {
+        if self.provides_host.is_none() {
+            // Charged as the plain form charges, so a component without
+            // `provides` cannot loop on this for free.
+            self.charge_complete_call()?;
+            return Ok(Err(wit::CompleteError::NotPermitted));
+        }
+        Ok(self
+            .do_complete(&id, &outcome_json, &attachments)?
+            .map_err(CompleteRefusal::into_blobs))
+    }
+}
+
+impl ProcessorData {
+    /// The answer to a `blobs` tool call from a component without the grant
+    /// its plain form is linked under. The call is charged against the cap
+    /// the plain form shares, so a component without the grant cannot loop on
+    /// this for free.
+    fn ungranted_call(&mut self) -> wit::CallError {
+        if !self.charge_tool_call() {
+            return wit::CallError::Plain(ToolWitError::Internal(
+                "call-count-exceeded".to_string(),
+            ));
+        }
+        wit::CallError::Plain(ToolWitError::NotGranted)
+    }
+}
+
+impl QueueRefusal {
+    fn into_blobs(self) -> wit::CallError {
+        match self {
+            Self::Tool(ToolCallError::AttachmentsNotAccepted) => {
+                wit::CallError::AttachmentsNotAccepted
+            }
+            Self::Tool(e) => wit::CallError::Plain(crate::tool_error_into_v0_1(e)),
+            Self::Attachments(refusal) => match refusal {
+                AttachmentRefusal::InvalidName(why) => wit::CallError::InvalidAttachmentName(why),
+                AttachmentRefusal::DuplicateName(name) => {
+                    wit::CallError::DuplicateAttachmentName(name)
+                }
+                AttachmentRefusal::TooMany => wit::CallError::TooManyAttachments,
+            },
+        }
+    }
+}
+
+impl CompleteRefusal {
+    fn into_blobs(self) -> wit::CompleteError {
+        match self {
+            Self::Provides(ProvidesCallError::NotPending) => {
+                wit::CompleteError::Plain(CompleteWitError::NotPending)
+            }
+            Self::Provides(ProvidesCallError::InvalidOutcome(detail)) => {
+                wit::CompleteError::Plain(CompleteWitError::InvalidOutcome(detail))
+            }
+            Self::Attachments(refusal) => match refusal {
+                AttachmentRefusal::InvalidName(why) => {
+                    wit::CompleteError::InvalidAttachmentName(why)
+                }
+                AttachmentRefusal::DuplicateName(name) => {
+                    wit::CompleteError::DuplicateAttachmentName(name)
+                }
+                AttachmentRefusal::TooMany => wit::CompleteError::TooManyAttachments,
+            },
+        }
+    }
+}
+
+/// Why a call's attachments were refused: the three checks
+/// `held_attachments` makes, shared by every form that carries attachments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttachmentRefusal {
+    /// A name outside the grammar; the diagnostic.
+    InvalidName(String),
+    /// A name given twice; the name.
+    DuplicateName(String),
+    TooMany,
+}
+
+impl From<AttachmentRefusal> for PublishRefusal {
+    fn from(refusal: AttachmentRefusal) -> Self {
+        match refusal {
+            AttachmentRefusal::InvalidName(why) => Self::InvalidAttachmentName(why),
+            AttachmentRefusal::DuplicateName(name) => Self::DuplicateAttachmentName(name),
+            AttachmentRefusal::TooMany => Self::TooManyAttachments,
+        }
     }
 }
 
@@ -510,14 +636,10 @@ impl ProcessorData {
 impl PublishRefusal {
     pub(crate) fn into_blobs(self) -> wit::PublishError {
         match self {
-            Self::NotPermitted => wit::PublishError::NotPermitted,
-            Self::InvalidPayload(why) => wit::PublishError::InvalidPayload(why),
-            Self::InvalidBody(why) => wit::PublishError::InvalidBody(why),
-            Self::TextOnlyChannel => wit::PublishError::TextOnlyChannel,
-            Self::QuotaExceeded => wit::PublishError::QuotaExceeded,
             Self::InvalidAttachmentName(why) => wit::PublishError::InvalidAttachmentName(why),
             Self::DuplicateAttachmentName(name) => wit::PublishError::DuplicateAttachmentName(name),
             Self::TooManyAttachments => wit::PublishError::TooManyAttachments,
+            plain => wit::PublishError::Plain(plain.into_v0_2()),
         }
     }
 }

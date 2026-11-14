@@ -491,6 +491,24 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
         );
         tuned_inbox_slugs.insert(consumer.slug.clone());
     }
+    // --- Apps: one `brenn:app-tool-results/<app-slug>` inbox per app granted
+    // an async tool ---
+    //
+    // Where a tool result that carries attachments to one of the app's
+    // conversations rests. No subscriber, no input port, no derived grant: no
+    // policy covers the namespace, so the entry is all there is.
+    let mut app_inbox_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(registry) = tool_registry {
+        for (app_slug, entry) in brenn_tool_registry::bus_wiring::app_result_inbox_entries(
+            registry,
+            apps.iter().map(|(slug, app)| (slug.as_str(), &*app.policy)),
+            &system_channel_tuning,
+            global_defaults,
+        ) {
+            all_entries.push(entry);
+            app_inbox_slugs.insert(app_slug.to_string());
+        }
+    }
     // --- Provided tools: one `brenn:tool-requests/<slug>` inbox per provider ---
     //
     // Sized from the consumer's own declarations, so it needs no registry and a
@@ -577,6 +595,9 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
         &webhook_slugs,
         &async_tool_names,
         &tuned_inbox_slugs,
+        // An app's inbox needs both the registry and the resolved apps to
+        // decide; a plan missing either skips the family, boot authoritative.
+        inputs.apps.is_some().then_some(&app_inbox_slugs),
         tool_registry.is_some(),
     );
     // System participant specs: every `system:` principal is declared here and
@@ -1308,6 +1329,7 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
             max_concurrency,
             auto_approve: true,
+            accepts_attachments: false,
         };
         let mut provider =
             WasmConsumerConfigRaw::minimal("prov", "processor-provider-test", &["brenn:work"]);

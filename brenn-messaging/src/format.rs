@@ -112,6 +112,26 @@ impl EnvelopeShape for ConversationShape {
     }
 }
 
+/// What a conversation is shown for a tool result that carries attachments:
+/// `{"result": <value>, "message_id": <uuid>, "attachments": {…}}`, the
+/// attachments in the conversation shape's metadata form, with no blob id.
+pub struct HandedToolResultShape<'a> {
+    /// The tool's JSON value.
+    pub value: &'a serde_json::Value,
+    /// The inbox message the attachments are named by.
+    pub handed: &'a crate::HandedToolResult,
+}
+
+impl Serialize for HandedToolResultShape<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("HandedToolResult", 3)?;
+        out.serialize_field("result", self.value)?;
+        out.serialize_field("message_id", &self.handed.message_id)?;
+        write_attachment_metadata(&self.handed.attachments, &mut out)?;
+        out.end()
+    }
+}
+
 #[derive(Serialize)]
 struct BinaryPlaceholder<'a> {
     binary: bool,
@@ -437,6 +457,31 @@ mod tests {
             assert!(!text.contains("5f0c5f0c"), "{text}");
             assert!(!text.contains("9e1d9e1d"), "{text}");
         }
+    }
+
+    /// A tool result handed with attachments is the value, the inbox message's
+    /// id, and the attachments as the conversation shape writes them: no blob id.
+    #[test]
+    fn a_handed_tool_result_shows_the_value_message_id_and_attachment_metadata() {
+        let e = with_attachments(MessageBody::text(""));
+        let handed = crate::HandedToolResult {
+            message_id: e.message_id,
+            attachments: e.attachments.clone(),
+        };
+        let value = serde_json::json!({ "pages": 3 });
+        let text = serde_json::to_string(&HandedToolResultShape {
+            value: &value,
+            handed: &handed,
+        })
+        .unwrap();
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"result":{{"pages":3}},"message_id":"{}",{ATTACHMENT_METADATA}}}"#,
+                e.message_id
+            )
+        );
+        assert!(!text.contains("5f0c5f0c"), "{text}");
     }
 
     /// Without attachments the conversation text has no `attachments` key.

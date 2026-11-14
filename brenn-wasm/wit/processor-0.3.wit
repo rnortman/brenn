@@ -33,7 +33,10 @@ package brenn:processor@0.3.0;
 /// every other handle and writer is dropped, so a sealed blob no published
 /// message names and an unsealed writer's bytes are deleted. On `err` or a
 /// trap nothing is published, and every blob the activation made is deleted.
-/// A blob it only opened lives on by the messages that name it.
+/// A blob it only opened lives on by the messages that name it. The one
+/// exception is `complete`: a completion holds the blobs it names from the
+/// call, so a blob the activation made and completed with survives the
+/// activation's `err` or trap, as the completion does.
 ///
 /// Bounds. The largest read and write, how many handles an activation may
 /// hold, how many calls it may make and how many bytes it may write are host
@@ -51,11 +54,13 @@ package brenn:processor@0.3.0;
 /// the message. The deferred window shows a parked message's body, index and
 /// release time and not its attachments, and no function of this interface
 /// reads or edits them. TODO(blobs-parked-message-attachments)
-/// A `receive` reply, `calls.call`, `tools.call-fast`, `tools.call-async`,
-/// `provides.call-async-for`, their results on `tool-results`, a request on
-/// `tool-requests` and `provides.complete` carry no attachments: a blob
-/// reaches another component only on a published message.
-/// TODO(blobs-on-tool-calls)
+/// `tools.call-async`, `provides.call-async-for` and `provides.complete`
+/// carry no attachments; `call-async`, `call-async-for` and `complete` of
+/// this interface are the forms that do. A request on `tool-requests` carries
+/// the attachments its caller gave, and a result on `tool-results` those the
+/// tool answered with; their bodies are those of the plain forms.
+/// A `receive` reply, `calls.call` and `tools.call-fast` carry no
+/// attachments. TODO(blobs-on-sync-calls)
 ///
 /// Mutability. A sealed blob is immutable, and a handle to one is proof that
 /// nothing changes under its reader. The interface does not entrench that:
@@ -71,6 +76,9 @@ package brenn:processor@0.3.0;
 
 interface blobs {
     use brenn:processor/bus@0.2.0.{body};
+    use brenn:processor/ports@0.2.0.{publish-error as ports-publish-error};
+    use brenn:processor/tools@0.1.0.{tool-error};
+    use brenn:processor/provides@0.1.0.{complete-error as plain-complete-error};
 
     /// The largest single read and single write the host serving the call
     /// accepts, in bytes.
@@ -199,19 +207,12 @@ interface blobs {
     }
 
     variant publish-error {
-        /// The component lacks the `ports` grant, or the bound channel fails
-        /// the host's output ACL. As `ports.publish-error.not-permitted`.
-        not-permitted,
-        /// As `ports.publish-error.invalid-payload`; the body alone is
-        /// weighed, never the attachments.
-        invalid-payload(string),
-        /// As `ports.publish-error.invalid-body`.
-        invalid-body(string),
-        /// As `ports.publish-error.text-only-channel`. The body is judged;
-        /// a text body may carry attachments of any content type.
-        text-only-channel,
-        /// As `ports.publish-error.quota-exceeded`.
-        quota-exceeded,
+        /// A refusal `ports.publish` gives, with its meaning. `not-permitted`
+        /// is also the answer to a component without the `ports` grant. For
+        /// `invalid-payload` the body alone is weighed, never the
+        /// attachments; for `text-only-channel` the body is judged, and a
+        /// text body may carry attachments of any content type.
+        plain(ports-publish-error),
         /// An attachment name outside the grammar: 1 to 64 bytes, the first
         /// ASCII alphanumeric, the rest ASCII alphanumeric or `.`, `_`, `-`.
         invalid-attachment-name(string),
@@ -225,7 +226,9 @@ interface blobs {
     /// and each named blob. Buffering, the atomic flush and the answer to
     /// `port` are those of `ports.publish`, and the message keeps its place
     /// in call order among the `ports` publishes. Publishing needs the
-    /// `ports` grant. The same blob may be named twice. An empty list
+    /// `ports` grant; an artifact that calls this function imports
+    /// `brenn:processor/ports@0.2.0` for its error type, so its class
+    /// requires `ports`. The same blob may be named twice. An empty list
     /// behaves as `ports.publish`. The message holds its blobs from this
     /// call; the component may drop its handles.
     ///
@@ -239,6 +242,82 @@ interface blobs {
     publish: func(port: string, body: body,
         attachments: list<tuple<string, borrow<blob>>>,
         options: publish-options) -> result<_, publish-error>;
+
+    /// Why a tool call that carries attachments was refused.
+    variant call-error {
+        /// A refusal the plain form gives, with its meaning.
+        plain(tool-error),
+        /// As `publish-error.invalid-attachment-name`.
+        invalid-attachment-name(string),
+        /// The same name given twice.
+        duplicate-attachment-name(string),
+        /// More than 32 attachments.
+        too-many-attachments,
+        /// The tool takes no attachments. Told only to a caller granted the
+        /// tool.
+        attachments-not-accepted,
+    }
+
+    /// `tools.call-async`, carrying each named blob to the tool. Needs the
+    /// `tools` grant: without it every call is `plain(not-granted)`. An
+    /// artifact that calls it imports `brenn:processor/tools@0.1.0` for its
+    /// error type, so its class requires `tools`.
+    ///
+    /// Buffered and flushed exactly as the plain form: the request reaches
+    /// the bus iff the activation returns `ok`, and holds its blobs from this
+    /// call, so the component may drop its handles. On `err` or a trap the
+    /// request is dropped and its holds with it. It shares the plain form's
+    /// per-activation call cap, the publish-entry ceiling, and the `call-id`
+    /// and `args-json` caps. The same blob may be given under two names. An
+    /// empty list behaves as the plain form.
+    ///
+    /// The checks run in a fixed order: the call cap; the `tools` grant; the
+    /// entry ceiling; `call-id`; `args-json`; the attachments
+    /// (`too-many-attachments`, `invalid-attachment-name`,
+    /// `duplicate-attachment-name`); the plain form's checks (grant, class,
+    /// arguments, ACL); last `attachments-not-accepted`.
+    call-async: func(tool: string, args-json: string, call-id: string,
+        attachments: list<tuple<string, borrow<blob>>>) -> result<_, call-error>;
+
+    /// `provides.call-async-for`, carrying each named blob. Needs the
+    /// `provides` grant, as the plain form does: without it every call is
+    /// `plain(not-granted)`. The nested call is admitted by the component's
+    /// own tool grants and its result arrives on `tool-results`, so a
+    /// provider that makes one requires `tools` as well; an artifact that
+    /// calls it imports `brenn:processor/tools@0.1.0` for its error type.
+    /// Buffered, bounded and checked as `call-async`, with the `provides`
+    /// grant in place of `tools`.
+    call-async-for: func(serving: string, tool: string, args-json: string,
+        call-id: string, attachments: list<tuple<string, borrow<blob>>>)
+        -> result<_, call-error>;
+
+    variant complete-error {
+        /// The component lacks the `provides` grant.
+        not-permitted,
+        /// A refusal the plain form gives, with its meaning: `not-pending`,
+        /// or `invalid-outcome`, which is also the answer to an `err`
+        /// outcome given with attachments.
+        plain(plain-complete-error),
+        invalid-attachment-name(string),
+        duplicate-attachment-name(string),
+        too-many-attachments,
+    }
+
+    /// `provides.complete`, answering with each named blob beside the
+    /// outcome. Immediate, as the plain form: the completion holds the blobs
+    /// it names from this call, and a later `err` or trap of the activation
+    /// retracts neither. It shares the plain form's per-activation cap, and
+    /// passing it traps. A result carries attachments only when its outcome
+    /// is `ok`. An artifact that calls it imports
+    /// `brenn:processor/provides@0.1.0` for its error type, so its class
+    /// requires `provides`.
+    ///
+    /// The checks run in a fixed order: the cap; the `provides` grant; the
+    /// outcome text's size; the attachments; then the plain form's checks,
+    /// with the refusal of an `err` outcome given attachments after the
+    /// outcome parses.
+    complete: func(id: string, outcome-json: string,
+        attachments: list<tuple<string, borrow<blob>>>) -> result<_, complete-error>;
 }
 
 world processor {

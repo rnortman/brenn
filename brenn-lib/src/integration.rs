@@ -878,6 +878,10 @@ fn messaging_virtual_tools(enabled: bool, has_shell: bool) -> Vec<VirtualToolDef
                 "conversation since its context was last reset (its start, a compaction, a ",
                 "user's slash command); otherwise read it again with MessageChannelGet. Any ",
                 "refused attachment refuses the whole send, with a `reason`, and spends no budget. ",
+                "A tool result that carries attachments is shown as ",
+                "`{\"result\": …, \"message_id\": …, \"attachments\": …}`; its attachments are ",
+                "named by that `message_id`. They cannot be named once this conversation's ",
+                "context is reset: call the tool again. ",
                 files,
             ]
             .concat(),

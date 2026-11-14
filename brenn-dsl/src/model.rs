@@ -1603,6 +1603,7 @@ vocabulary! {
         req input_schema: V,
         opt max_concurrency: V,
         opt auto_approve: V,
+        opt accepts_attachments: V,
     }
 
     /// The `handler` block of an attachment target: the union of every handler

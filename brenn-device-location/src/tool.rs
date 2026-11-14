@@ -4,7 +4,8 @@
 use async_trait::async_trait;
 use brenn_lib::tools::AclClause;
 use brenn_tool_registry::{
-    AclDenied, AsyncTool, Idempotency, ToolClass, ToolCtx, ToolDescriptor, ToolError, UserBinding,
+    AclDenied, AsyncTool, HeldAttachments, Idempotency, ToolClass, ToolCtx, ToolDescriptor,
+    ToolError, ToolOutput, UserBinding,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
@@ -66,6 +67,7 @@ impl DeviceLocationTool {
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
                 user_binding: UserBinding::ActingUser,
+                accepts_attachments: false,
             },
             db,
             bus,
@@ -124,7 +126,8 @@ impl AsyncTool for DeviceLocationTool {
         &self,
         ctx: &ToolCtx,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
+        _attachments: HeldAttachments,
+    ) -> Result<ToolOutput, ToolError> {
         let user = ctx.require_acting_user(NAME)?.clone();
         let args: DeviceLocationArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("{NAME} args: {e}")))?;
@@ -185,7 +188,7 @@ impl AsyncTool for DeviceLocationTool {
         if devices.is_empty() {
             answer["how_to_enable"] = serde_json::Value::from(HOW_TO_ENABLE);
         }
-        Ok(answer)
+        Ok(answer.into())
     }
 }
 
@@ -202,6 +205,7 @@ mod tests {
         DEVICE_LOCATION_COMPONENT, insert_device_location_message,
     };
     use brenn_tool_registry::ActingUser;
+    use brenn_tool_registry::testutil::ExecuteValue;
     use chrono::Offset as _;
 
     const ALICE: i64 = 1;
@@ -277,7 +281,7 @@ mod tests {
         args: serde_json::Value,
     ) -> serde_json::Value {
         tool(db, m)
-            .execute(&tool_ctx(Some(who)), args)
+            .execute_value(&tool_ctx(Some(who)), args)
             .await
             .unwrap()
     }
@@ -423,7 +427,7 @@ mod tests {
         assert_eq!(devices[0]["device"], "laptop");
 
         let err = tool(&db, &m)
-            .execute(
+            .execute_value(
                 &tool_ctx(Some(user(ALICE, "alice"))),
                 serde_json::json!({"device": "tablet"}),
             )
@@ -474,7 +478,7 @@ mod tests {
         assert_eq!(out["devices"], serde_json::json!([]));
         // Bob's device name narrows nothing for alice either.
         let err = tool(&db, &m)
-            .execute(
+            .execute_value(
                 &tool_ctx(Some(user(ALICE, "alice"))),
                 serde_json::json!({"device": "laptop"}),
             )
@@ -517,7 +521,7 @@ mod tests {
     async fn extra_keys_are_invalid_args() {
         let (db, m) = bus().await;
         let err = tool(&db, &m)
-            .execute(
+            .execute_value(
                 &tool_ctx(Some(user(ALICE, "alice"))),
                 serde_json::json!({"x": 1}),
             )
@@ -529,7 +533,7 @@ mod tests {
     async fn no_acting_user_is_denied() {
         let (db, m) = bus().await;
         let err = tool(&db, &m)
-            .execute(&tool_ctx(None), serde_json::json!({}))
+            .execute_value(&tool_ctx(None), serde_json::json!({}))
             .await;
         assert!(
             matches!(&err, Err(ToolError::Denied(d)) if d.starts_with("device-location: acts as the acting user")),
@@ -542,7 +546,7 @@ mod tests {
     async fn a_call_before_the_messenger_is_attached_panics() {
         let (db, _m) = bus().await;
         let outcome = DeviceLocationTool::new(db, DeviceLocationBus::default())
-            .execute(&tool_ctx(Some(user(ALICE, "alice"))), serde_json::json!({}))
+            .execute_value(&tool_ctx(Some(user(ALICE, "alice"))), serde_json::json!({}))
             .await;
         unreachable!("answered without a messenger: {outcome:?}");
     }

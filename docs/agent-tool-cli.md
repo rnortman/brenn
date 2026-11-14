@@ -163,6 +163,30 @@ The rule is about the message, not the blob: an attachment of an evicted
 message is refused even if another retained message names the same blob, until
 you read that other message.
 
+**A tool result can carry attachments.** A registry tool that answers with
+blobs is shown to you — as a tool call and from `brenn-tool call` alike — as
+
+```json
+{"result": <the tool's value>,
+ "message_id": "<uuid>",
+ "attachments": {"<name>": {"size": 12345, "content_type": "application/pdf"}}}
+```
+
+and a result without attachments is the tool's value alone, as always. Name
+those attachments by that `message_id`: `brenn-tool save <message_id>
+--attachment <name>`, `BrennSend`'s `attachments`, or another tool call. They
+cannot be named after your context is reset — a restart, a compaction, a user
+turn that began with `/` — and the message cannot be read again: call the tool
+again.
+
+**Handing a tool attachments.** A tool that accepts attachments has an
+`attachments` argument in its `describe` schema and says so in its
+description. It takes the same form as `BrennSend`'s:
+`{"<name the tool sees>": {"message_id": "<uuid>", "name": "<attachment
+name>"}}`, under the rule above. A refused name refuses the call before the
+tool runs, with the refusal below. A tool without the argument takes no
+attachments; passing it is `invalid_args`.
+
 **`save`** writes an attachment's bytes, or a body's, to `--out`:
 
 ```bash
@@ -207,11 +231,17 @@ everything. Each is a refusal you can read — nothing waits for room.
 `{"ok": false, "reason": <kind>, "error": <text>}`. The kinds are
 `malformed_message_id`, `malformed_attachment_name`, `not_read`,
 `channel_not_readable`, `not_retained`, `no_such_attachment`,
-`too_many_attachments`, `duplicate_attachment_name`, `malformed_content_type`,
-`no_files`, `blob_too_large`, `send_files_too_large`, `blob_budget_exhausted`
-and `blobs_unavailable`. `not_read` — after a restart, a compaction, or a
-user turn that began with `/` — is cured by reading the message again
-(`MessageChannelGet`) and retrying.
+`tool_channel_attachment`, `too_many_attachments`,
+`duplicate_attachment_name`, `malformed_content_type`, `no_files`,
+`blob_too_large`, `send_files_too_large`, `blob_budget_exhausted` and
+`blobs_unavailable`. `not_read` — after a restart, a compaction, or a user
+turn that began with `/` — is cured by reading the message again
+(`MessageChannelGet`) and retrying; for a tool result, by calling the tool
+again. `tool_channel_attachment` is final: the message is on a channel of
+the tool substrate (`brenn:tools/…`, `brenn:tool-requests/…`,
+`brenn:tool-results/…`) that your app may watch, and a tool call's
+attachments are for the tool and its caller — you are shown their names,
+sizes and content types only. Its body can still be saved.
 
 **Without a shell tool there is no `save` or `send`.** Both run through your
 shell. A conversation of an app that lists `Bash` in `disabled_tools` can

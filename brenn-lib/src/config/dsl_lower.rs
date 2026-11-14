@@ -3136,6 +3136,7 @@ fn consumer(
                 input_schema: tool.input_schema.clone(),
                 max_concurrency: tool.max_concurrency,
                 auto_approve: tool.auto_approve,
+                accepts_attachments: tool.accepts_attachments,
             })
             .collect(),
         grants: authority

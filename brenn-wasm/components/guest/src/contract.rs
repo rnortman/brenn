@@ -17,6 +17,8 @@ use crate::{
     Processor, PublishAttachmentsError, PublishOptions, Urgency,
     blobs::{BlobLimits, CreateError, Gap, OpenError, ReadError, SealError, WriteError},
     calls::CallError,
+    provides::CompleteAttachmentsError,
+    tools::CallAttachmentsError,
 };
 
 pub(crate) use bindings::brenn::processor0_1_0::{
@@ -353,11 +355,13 @@ pub(crate) fn publish_with_attachments(
         deliver_after: options.deliver_after,
     };
     raw_blobs::publish(port, raw_body(body), attachments, options).map_err(|e| match e {
-        raw_blobs::PublishError::NotPermitted => PublishAttachmentsError::NotPermitted,
-        raw_blobs::PublishError::InvalidPayload(m) => PublishAttachmentsError::InvalidPayload(m),
-        raw_blobs::PublishError::InvalidBody(m) => PublishAttachmentsError::InvalidBody(m),
-        raw_blobs::PublishError::TextOnlyChannel => PublishAttachmentsError::TextOnlyChannel,
-        raw_blobs::PublishError::QuotaExceeded => PublishAttachmentsError::QuotaExceeded,
+        raw_blobs::PublishError::Plain(plain) => match plain {
+            ports::PublishError::NotPermitted => PublishAttachmentsError::NotPermitted,
+            ports::PublishError::InvalidPayload(m) => PublishAttachmentsError::InvalidPayload(m),
+            ports::PublishError::InvalidBody(m) => PublishAttachmentsError::InvalidBody(m),
+            ports::PublishError::TextOnlyChannel => PublishAttachmentsError::TextOnlyChannel,
+            ports::PublishError::QuotaExceeded => PublishAttachmentsError::QuotaExceeded,
+        },
         raw_blobs::PublishError::InvalidAttachmentName(m) => {
             PublishAttachmentsError::InvalidAttachmentName(m)
         }
@@ -365,5 +369,61 @@ pub(crate) fn publish_with_attachments(
             PublishAttachmentsError::DuplicateAttachmentName(m)
         }
         raw_blobs::PublishError::TooManyAttachments => PublishAttachmentsError::TooManyAttachments,
+    })
+}
+
+/// The `blobs` interface's `call-error` as the SDK's, exhaustively; the
+/// plain form's `tool-error` it wraps is flattened into the same enum.
+fn call_attachments_error(e: raw_blobs::CallError) -> CallAttachmentsError {
+    use raw_blobs::CallError as Raw;
+    use tools::ToolError as Plain;
+    match e {
+        Raw::Plain(Plain::NotGranted) => CallAttachmentsError::NotGranted,
+        Raw::Plain(Plain::Denied(m)) => CallAttachmentsError::Denied(m),
+        Raw::Plain(Plain::InvalidArgs(m)) => CallAttachmentsError::InvalidArgs(m),
+        Raw::Plain(Plain::RateLimited) => CallAttachmentsError::RateLimited,
+        Raw::Plain(Plain::WrongClass) => CallAttachmentsError::WrongClass,
+        Raw::Plain(Plain::Internal(m)) => CallAttachmentsError::Internal(m),
+        Raw::InvalidAttachmentName(m) => CallAttachmentsError::InvalidAttachmentName(m),
+        Raw::DuplicateAttachmentName(m) => CallAttachmentsError::DuplicateAttachmentName(m),
+        Raw::TooManyAttachments => CallAttachmentsError::TooManyAttachments,
+        Raw::AttachmentsNotAccepted => CallAttachmentsError::AttachmentsNotAccepted,
+    }
+}
+
+pub(crate) fn call_async_with_attachments(
+    tool: &str,
+    args_json: &str,
+    call_id: &str,
+    attachments: &[(&str, &RawBlob)],
+) -> Result<(), CallAttachmentsError> {
+    raw_blobs::call_async(tool, args_json, call_id, attachments).map_err(call_attachments_error)
+}
+
+pub(crate) fn call_async_for_with_attachments(
+    serving: &str,
+    tool: &str,
+    args_json: &str,
+    call_id: &str,
+    attachments: &[(&str, &RawBlob)],
+) -> Result<(), CallAttachmentsError> {
+    raw_blobs::call_async_for(serving, tool, args_json, call_id, attachments)
+        .map_err(call_attachments_error)
+}
+
+pub(crate) fn complete_with_attachments(
+    id: &str,
+    outcome_json: &str,
+    attachments: &[(&str, &RawBlob)],
+) -> Result<(), CompleteAttachmentsError> {
+    use provides::CompleteError as Plain;
+    use raw_blobs::CompleteError as Raw;
+    raw_blobs::complete(id, outcome_json, attachments).map_err(|e| match e {
+        Raw::NotPermitted => CompleteAttachmentsError::NotPermitted,
+        Raw::Plain(Plain::NotPending) => CompleteAttachmentsError::NotPending,
+        Raw::Plain(Plain::InvalidOutcome(m)) => CompleteAttachmentsError::InvalidOutcome(m),
+        Raw::InvalidAttachmentName(m) => CompleteAttachmentsError::InvalidAttachmentName(m),
+        Raw::DuplicateAttachmentName(m) => CompleteAttachmentsError::DuplicateAttachmentName(m),
+        Raw::TooManyAttachments => CompleteAttachmentsError::TooManyAttachments,
     })
 }

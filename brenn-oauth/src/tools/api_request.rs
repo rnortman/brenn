@@ -37,8 +37,8 @@ use brenn_lib::config::{
 };
 use brenn_lib::tools::AclClause;
 use brenn_tool_registry::{
-    AclDenied, AsyncTool, ENVELOPE_MARGIN, Idempotency, MAX_ASYNC_RESULT_BYTES, ToolClass, ToolCtx,
-    ToolDescriptor, ToolError, UserBinding,
+    AclDenied, AsyncTool, ENVELOPE_MARGIN, HeldAttachments, Idempotency, MAX_ASYNC_RESULT_BYTES,
+    ToolClass, ToolCtx, ToolDescriptor, ToolError, ToolOutput, UserBinding,
 };
 use chrono::Utc;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -826,6 +826,7 @@ impl ApiRequestTool {
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
                 user_binding: UserBinding::ActingOrLentUser,
+                accepts_attachments: false,
             },
             oauth,
             keys,
@@ -1013,7 +1014,8 @@ impl AsyncTool for ApiRequestTool {
         &self,
         ctx: &ToolCtx,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
+        _attachments: HeldAttachments,
+    ) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
         let args: ApiArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("{NAME} args: {e}")))?;
@@ -1033,7 +1035,7 @@ impl AsyncTool for ApiRequestTool {
                 request.line()
             )));
         }
-        match provider {
+        let value = match provider {
             ResolvedProvider::Key(config) => match &config.keys {
                 ApiKeys::Deployment(key) => {
                     self.execute_key(ctx, config, key.expose(), request, started)
@@ -1048,7 +1050,8 @@ impl AsyncTool for ApiRequestTool {
                 self.execute_oauth(ctx, service, config, request, started)
                     .await
             }
-        }
+        }?;
+        Ok(value.into())
     }
 }
 
@@ -1237,6 +1240,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use brenn_tool_registry::ActingUser;
+    use brenn_tool_registry::testutil::ExecuteValue;
 
     use super::*;
     use crate::testutil::{
@@ -1317,7 +1321,7 @@ mod tests {
             acl: Vec<AclClause>,
             args: serde_json::Value,
         ) -> Result<serde_json::Value, ToolError> {
-            self.tool.execute(&tool_ctx(user, acl), args).await
+            self.tool.execute_value(&tool_ctx(user, acl), args).await
         }
 
         async fn get(&self, path: &str) -> Result<serde_json::Value, ToolError> {
@@ -2345,7 +2349,7 @@ mod tests {
             acl: Vec<AclClause>,
             args: serde_json::Value,
         ) -> Result<serde_json::Value, ToolError> {
-            self.tool.execute(&tool_ctx(user, acl), args).await
+            self.tool.execute_value(&tool_ctx(user, acl), args).await
         }
 
         fn seen(&self) -> Vec<crate::testutil::ApiSeen> {
@@ -2391,7 +2395,7 @@ mod tests {
 
         let in_flight = tokio::spawn({
             let (tool, args, ctx) = (tool.clone(), args.clone(), ctx());
-            async move { tool.execute(&ctx, args).await }
+            async move { tool.execute_value(&ctx, args).await }
         });
         while stub.lock().unwrap().api_seen.is_empty() {
             tokio::task::yield_now().await;
@@ -2406,7 +2410,7 @@ mod tests {
         assert_eq!(out["status"], 200);
 
         stub.lock().unwrap().api_gate = None;
-        tool.execute(&ctx(), args).await.unwrap();
+        tool.execute_value(&ctx(), args).await.unwrap();
         let sent: Vec<String> = stub
             .lock()
             .unwrap()
@@ -2676,7 +2680,7 @@ mod tests {
         post["body"] = serde_json::json!("{}");
         let out = f
             .tool
-            .execute(
+            .execute_value(
                 &stamped_component_ctx(vec![clause(&[
                     ("provider", "mail"),
                     ("user", "*"),
@@ -2721,7 +2725,7 @@ mod tests {
             "host": base.trim_start_matches("http://"), "path": "/v1/things",
         });
         let out = tool
-            .execute(
+            .execute_value(
                 &tool_ctx(Some(alice()), vec![provider_clause("maps")]),
                 args,
             )
@@ -2844,7 +2848,7 @@ mod tests {
         post["body"] = serde_json::json!("{}");
         let out = key
             .tool
-            .execute(
+            .execute_value(
                 &stamped_component_ctx(vec![clause(&[("provider", "maps"), ("method", "POST")])]),
                 post,
             )
@@ -2864,7 +2868,7 @@ mod tests {
         draft["body"] = serde_json::json!(r#"{"raw":"x"}"#);
         let out = f
             .tool
-            .execute(
+            .execute_value(
                 &stamped_component_ctx(vec![clause(&[
                     ("provider", "google"),
                     ("user", "*"),
@@ -2883,7 +2887,7 @@ mod tests {
         // The clause still bounds the method.
         let out = f
             .tool
-            .execute(
+            .execute_value(
                 &stamped_component_ctx(vec![clause(&[
                     ("provider", "google"),
                     ("user", "*"),
@@ -2907,7 +2911,7 @@ mod tests {
         ] {
             let out = f
                 .tool
-                .execute(
+                .execute_value(
                     &stamped_component_ctx(vec![acl.clone()]),
                     f.args("REPORT", "/dav/calendar"),
                 )
@@ -2917,7 +2921,7 @@ mod tests {
         }
         let out = f
             .tool
-            .execute(
+            .execute_value(
                 &stamped_component_ctx(vec![clause(&[("provider", "maps"), ("method", "GET")])]),
                 f.args("REPORT", "/dav/calendar"),
             )

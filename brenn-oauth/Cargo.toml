@@ -42,5 +42,6 @@ brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
 brenn-provider-kit = { version = "0.1.0", path = "../brenn-provider-kit" }
+brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry", features = ["testutils"] }
 tempfile = "3.27.0"
 tokio = { version = "1.50.0", features = ["full", "test-util"] }

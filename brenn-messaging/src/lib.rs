@@ -62,9 +62,11 @@ pub use brenn_lib::messaging::*;
 // The persistence layer below, bound at the crate root so the engine's modules
 // reach it as `crate::db`, `crate::store`, `crate::ingress`. Not re-exported:
 // crates above name `brenn_messaging_store` themselves.
-use brenn_messaging_store::blob::{BlobError, BlobHold, BlobStore, ReapReport, Retain};
+use brenn_messaging_store::blob::{
+    BlobError, BlobHold, BlobStore, HeldAttachments, ReapReport, Retain,
+};
 use brenn_messaging_store::{db, ingress, store};
-pub use conversation_blobs::{AdmittedPart, NameRefusal, NamedPart};
+pub use conversation_blobs::{AdmittedPart, HandedToolResult, NameRefusal, NamedPart};
 pub use edit::{CancelResult, EditFields, EditResult};
 pub use ingress::{
     CollapsedDrain, Event as IngressEvent, MAX_DELIVERED_RETENTION_DAYS,
@@ -1408,6 +1410,41 @@ impl Messenger {
                 blobs.retain_settled(id, &conn)
             }
         }
+    }
+
+    /// Take a hold on every blob `attachments` names, each through
+    /// [`Messenger::retain_blob`]: the attachments of an envelope the host
+    /// stamped, for host code that hands them on. `Err(name)` names the first
+    /// attachment whose blob nothing holds now.
+    ///
+    /// Answers whether each blob is held by anything, never whether anyone
+    /// may name it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a hold's reference differs from the one `attachments` gives
+    /// for it, or if the store answers anything but a hold or `NotFound`.
+    pub async fn hold_attachments(
+        &self,
+        attachments: &brenn_envelope::Attachments,
+    ) -> Result<HeldAttachments, brenn_envelope::AttachmentName> {
+        let mut entries = Vec::with_capacity(attachments.len());
+        for (name, reference) in attachments.iter() {
+            let hold = match self.retain_blob(&reference.id).await {
+                Ok(hold) => hold,
+                Err(BlobError::NotFound) => return Err(name.clone()),
+                Err(e) => panic!("holding attachment {name} (blob {}): {e}", reference.id),
+            };
+            assert_eq!(
+                &hold.reference(),
+                reference,
+                "attachment {name}: the store's record of blob {} differs from the envelope's",
+                reference.id
+            );
+            entries.push((name.clone(), hold));
+        }
+        Ok(HeldAttachments::new(entries)
+            .expect("an envelope's attachments are within the bound, under distinct names"))
     }
 
     /// Delete every blob nothing holds any longer, under the database lock.

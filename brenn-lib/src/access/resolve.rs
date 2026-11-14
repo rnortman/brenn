@@ -578,10 +578,26 @@ fn validate_mqtt_client(
 /// An auto channel's endpoint set is its ACL — an operator-written matcher
 /// reaching into the namespace would silently attach a third party. The
 /// sanctioned way to let others in is to give the channel a name.
+///
+/// And any matcher reaching into the app result-inbox namespace: no policy
+/// covers it (`AppPolicy::brenn_acl_covers`), so such a matcher could never
+/// match and is a configuration error rather than a silent no-op. A prefix must
+/// end at `/` or `.` and the segment holds neither, so the only prefixes that
+/// cover the namespace start with it.
 fn resolve_channel(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelMatcher {
+    let refuse_app_inbox = |kind: &str, value: &str| {
+        assert!(
+            !crate::messaging::in_app_tool_results_namespace(value),
+            "{owner}: {list} {kind} matcher {value:?} reaches into the reserved \
+             `app-tool-results/` namespace — an app's tool-result inbox holds every one of \
+             its conversations' results and no policy may reach it; a conversation names a \
+             result's attachments only by having been handed the result",
+        );
+    };
     match raw {
         ChannelMatcherRaw::Exact(s) => {
             assert!(!s.is_empty(), "{owner}: {list} exact matcher is empty",);
+            refuse_app_inbox("exact", s);
             assert!(
                 !crate::messaging::is_auto_channel_name(s),
                 "{owner}: {list} exact matcher {s:?} reaches into the reserved auto \
@@ -601,6 +617,7 @@ fn resolve_channel(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelM
                  it cannot over-match a sibling namespace",
                 crate::messaging::matcher_boundary_list(),
             );
+            refuse_app_inbox("prefix", p);
             assert!(
                 !crate::messaging::is_auto_channel_name(p),
                 "{owner}: {list} prefix matcher {p:?} reaches into the reserved auto \
@@ -963,6 +980,72 @@ mod tests {
             ..AppAclRaw::default()
         };
         build_app_policy("home", &[], &acl, &clients(&[]));
+    }
+
+    #[test]
+    #[should_panic(expected = "reaches into the reserved `app-tool-results/` namespace")]
+    fn app_tool_results_exact_matcher_panics_for_an_app() {
+        let acl = AppAclRaw {
+            brenn_subscribe: vec![ChannelMatcherRaw::Exact(
+                "app-tool-results/home".to_string(),
+            )],
+            ..AppAclRaw::default()
+        };
+        build_app_policy("home", &[], &acl, &clients(&[]));
+    }
+
+    #[test]
+    #[should_panic(expected = "reaches into the reserved `app-tool-results/` namespace")]
+    fn app_tool_results_prefix_matcher_panics_for_an_app() {
+        let acl = AppAclRaw {
+            brenn_subscribe: vec![ChannelMatcherRaw::Prefix("app-tool-results/".to_string())],
+            ..AppAclRaw::default()
+        };
+        build_app_policy("home", &[], &acl, &clients(&[]));
+    }
+
+    #[test]
+    #[should_panic(expected = "wasm consumer \"watcher\": subscribe_acl prefix matcher \
+                               \"app-tool-results/\" reaches into the reserved")]
+    fn app_tool_results_prefix_matcher_panics_for_a_wasm_consumer() {
+        let acl = [ChannelMatcherRaw::Prefix("app-tool-results/".to_string())];
+        build_wasm_policy(
+            "watcher",
+            [],
+            WasmAclsRaw {
+                subscribe: &acl,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "reaches into the reserved `app-tool-results/` namespace")]
+    fn app_tool_results_exact_matcher_panics_for_a_surface() {
+        build_attach_policy(
+            AttachOwner::Surface("deskbar"),
+            [AttachGrant::Subscribe],
+            AttachAclsRaw {
+                subscribe: &[ChannelMatcherRaw::Exact(
+                    "app-tool-results/home".to_string(),
+                )],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn tool_results_matchers_still_resolve() {
+        // The component inbox namespace keeps its authored reach.
+        let acl = AppAclRaw {
+            brenn_subscribe: vec![ChannelMatcherRaw::Prefix("tool-results/".to_string())],
+            ..AppAclRaw::default()
+        };
+        let policy = build_app_policy("home", &[], &acl, &clients(&[]));
+        assert_eq!(
+            policy.acls.brenn_subscribe,
+            vec![ChannelMatcher::Prefix("tool-results/".to_string())]
+        );
     }
 
     #[test]

@@ -23,6 +23,9 @@ pub(crate) const DST: &str = "brenn:dst";
 pub(crate) const HIDDEN: &str = "brenn:hidden";
 pub(crate) const RING: &str = "ephemeral:ring";
 pub(crate) const RING_DEPTH: u64 = 2;
+/// A provider's request inbox, which `testapp`'s policy covers by an exact
+/// matcher: a watch of tool-call traffic.
+pub(crate) const WATCHED: &str = "brenn:tool-requests/watched";
 
 pub(crate) struct Fixture {
     pub(crate) bridge: Arc<ActiveBridge>,
@@ -104,8 +107,9 @@ impl Fixture {
     }
 }
 
-/// `testapp` reads and publishes `brenn:src`, `brenn:dst` and `ephemeral:ring`
-/// and may not read `brenn:hidden`; a producer may publish anywhere.
+/// `testapp` reads and publishes `brenn:src`, `brenn:dst` and `ephemeral:ring`,
+/// reads [`WATCHED`], and may not read `brenn:hidden`; a producer may publish
+/// anywhere.
 /// `brenn:src` may hold a body that is not text.
 pub(crate) async fn fixture() -> Fixture {
     fixture_with_limits(TEST_BLOB_LIMITS).await
@@ -113,7 +117,39 @@ pub(crate) async fn fixture() -> Fixture {
 
 /// [`fixture`] with a blob store of `limits`.
 pub(crate) async fn fixture_with_limits(limits: BlobLimits) -> Fixture {
-    let durable: Vec<_> = ["src", "dst", "hidden"]
+    build(limits, None).await
+}
+
+/// [`fixture`] whose bridge holds `tools` and grants `testapp` each tool
+/// named in `granted`, with the tool executor's system policy wired as boot
+/// wires it, and `testapp`'s tool-result inbox when `inbox`.
+pub(crate) async fn fixture_with_tools(
+    tools: Arc<brenn_tool_registry::ToolRegistry>,
+    granted: &[&str],
+    inbox: bool,
+) -> Fixture {
+    fixture_with_rate_limited_tools(tools, granted, inbox, None).await
+}
+
+/// [`fixture_with_tools`] whose every grant carries `rate_limit`.
+pub(crate) async fn fixture_with_rate_limited_tools(
+    tools: Arc<brenn_tool_registry::ToolRegistry>,
+    granted: &[&str],
+    inbox: bool,
+    rate_limit: Option<brenn_lib::tools::ResolvedRateLimit>,
+) -> Fixture {
+    build(TEST_BLOB_LIMITS, Some((tools, granted, inbox, rate_limit))).await
+}
+
+type ToolWiring<'a> = (
+    Arc<brenn_tool_registry::ToolRegistry>,
+    &'a [&'a str],
+    bool,
+    Option<brenn_lib::tools::ResolvedRateLimit>,
+);
+
+async fn build(limits: BlobLimits, tools: Option<ToolWiring<'_>>) -> Fixture {
+    let mut durable: Vec<_> = ["src", "dst", "hidden", "tool-requests/watched"]
         .into_iter()
         .map(|name| test_channel_entry(name, vec![]))
         .map(|entry| match entry.address.as_str() {
@@ -121,6 +157,22 @@ pub(crate) async fn fixture_with_limits(limits: BlobLimits) -> Fixture {
             _ => entry,
         })
         .collect();
+    let mut registrations = covering_system_publisher(PRODUCER);
+    if let Some((_, _, inbox, _)) = tools {
+        if inbox {
+            durable.push(brenn_tool_registry::bus_wiring::app_result_inbox_entry(
+                "testapp",
+                &brenn_lib::messaging::config::SystemChannelTuning::default(),
+                &brenn_lib::messaging::MessagingGlobalConfig::default(),
+            ));
+        }
+        registrations.extend(brenn_messaging::testutils::system_registrations(
+            std::collections::HashMap::from([(
+                brenn_tool_registry::TOOL_EXECUTOR_COMPONENT.to_string(),
+                brenn_tool_registry::bus_wiring::tool_executor_system_policy(),
+            )]),
+        ));
+    }
     let ring = ephemeral_channel_entry("ring", RING_DEPTH);
     let db = crate::test_support::init_db_memory();
     {
@@ -149,6 +201,10 @@ pub(crate) async fn fixture_with_limits(limits: BlobLimits) -> Fixture {
     }
     policy
         .acls
+        .brenn_subscribe
+        .push(ChannelMatcher::Exact("tool-requests/watched".to_string()));
+    policy
+        .acls
         .ephemeral_subscribe
         .push(ChannelMatcher::Exact("ring".to_string()));
     policy
@@ -168,11 +224,28 @@ pub(crate) async fn fixture_with_limits(limits: BlobLimits) -> Fixture {
         Arc::new(brenn_messaging::query::NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
         brenn_lib::messaging::MessagingGlobalConfig::default(),
     )
-    .with_subscriber_registrations(covering_system_publisher(PRODUCER))
+    .with_subscriber_registrations(registrations)
     .with_ring_stores(Arc::new(brenn_messaging_store::store::RingStores::build(
         &rings,
     )));
     let (m, blobs) = install_blob_store_with(m, limits).await;
-    let bridge = ActiveBridge::test_new_with_messenger(m.clone()).await;
+    let bridge = match tools {
+        None => ActiveBridge::test_new_with_messenger(m.clone()).await,
+        Some((tools, granted, _, rate_limit)) => {
+            let grants = granted
+                .iter()
+                .map(|name| {
+                    (
+                        name.to_string(),
+                        brenn_lib::tools::ResolvedToolGrant {
+                            acl: vec![],
+                            rate_limit,
+                        },
+                    )
+                })
+                .collect();
+            ActiveBridge::test_new_with_messenger_and_tools(m.clone(), tools, grants).await
+        }
+    };
     Fixture { bridge, m, blobs }
 }

@@ -335,7 +335,8 @@ no published message names is deleted when the activation ends, and an `Err`
 or trap publishes nothing and deletes everything it made. A conversation
 does too, by name, below. Host code's
 `Messenger::publish_from_system_with_attachments` is a further publishing
-entry, and nothing in the server calls it outside tests. Remotes and pages
+entry; the tool substrate publishes a call's request and result through it
+(below). Remotes and pages
 see references as metadata only, and no surface host serves the interface.
 A remote's replay store and a page's rings do not hold the
 blob, so a reference there can outlive it. `ports.publish` and its siblings
@@ -375,7 +376,22 @@ The rule as built asks two things **of the one message named**:
   durable channel the newest `standing_retain_depth` retained rows, checked
   by rank so a row past that depth that the hourly reaper has not yet removed
   is refused. A parked message is not retained. The subscriber's own
-  `retain_depth` plays no part.
+  `retain_depth` plays no part. The app's own result inbox
+  (`brenn:app-tool-results/<app-slug>`, §2.7) is readable for this purpose by
+  that arm alone: no policy reaches it, and the record is the only way in.
+
+**One exception: the tool substrate's channels.** On a channel of the four
+tool namespaces (`brenn:tools/`, `brenn:tool-requests/`, `brenn:tool-results/`,
+`brenn:app-tool-results/`) a conversation names an attachment only on its own
+app's result inbox. An app whose policy covers `tools/`, `tool-requests/` or
+`tool-results/` reads those channels' messages — their bodies, and each
+attachment's name, size and content type — and naming one of their
+attachments is refused `tool_channel_attachment`, logged at `warn`; naming
+such a message's body works as on any channel. The reason: a tool call's
+blobs are passed between the call's parties — the caller, the tool, and the
+conversation the result is handed to — and a grant to watch the call traffic
+was written when that traffic held no blobs. It would otherwise reach every
+file any user's conversation or component hands a tool.
 
 On a ring channel the check and the hold are one call under the ring's lock,
 which hands out a hold on the one blob named, not on the message's other
@@ -473,10 +489,50 @@ create and written into the reference, a write entry on a sealed blob, and a
 rule for each of those three. The cost statement is the `blob` module's
 rustdoc.
 
+**A tool call carries attachments.** An asynchronous registry call and its
+result carry named attachments by reference, in both directions, for every
+caller and every tool the asynchronous path serves:
+
+- A component hands a tool blobs with `blobs.call-async` (or, as a provider's
+  nested call, `blobs.call-async-for`), and a provider answers with blobs
+  through `blobs.complete` (`docs/component-packages.md`, "Blobs and tool
+  calls"). The request on `brenn:tools/<tool>`, the request on a provider's
+  `brenn:tool-requests/<slug>` and the result on a component's
+  `brenn:tool-results/<slug>` carry them in the envelope like any message;
+  their bodies are unchanged. A result carries attachments only when its
+  outcome is the tool's own `ok`; an error, or a result the executor replaced
+  because it was too large, carries none.
+- A conversation hands a tool attachments in the reserved argument
+  `attachments`, offered only by a tool whose declaration accepts them, naming
+  each as `BrennSend` does — `(message id, attachment name)`, under the rule
+  below. A tool result that carries attachments is published on the app's
+  result inbox `brenn:app-tool-results/<app-slug>` (§2.7), recorded as read
+  for the calling conversation alone, and shown to it as
+  `{"result": <value>, "message_id": "<uuid>", "attachments": {<name>:
+  {"size", "content_type"}}}`; `BrennSend`, `brenn-tool save` and a later tool
+  call name its attachments by that `message_id`. After the record is reset
+  they cannot be named again; the conversation calls the tool again. A result
+  without attachments is the bare value, as before, and publishes nothing.
+
+Who holds a tool call's blob, at each moment: a component's queued call holds
+it in its buffered request until the activation ends, and drops it on an
+`Err` or trap; once published, the request row holds it for that channel's
+window — on a provider's request inbox, whatever becomes of the call; the
+executor holds it while it admits and runs the call; a provider's completion
+holds what it names from the call, through the pending call to the waiter,
+and a later `Err` or trap of the provider's activation does not drop it; a
+completion whose waiter is gone drops its holds; and the result row holds the
+result's blobs for its inbox's window, plus any hold a conversation's
+`BrennSend`, save or tool call takes by naming one. No holder is timed or
+keyed by a conversation, and no byte is copied on the path. After a restart a
+blob held only in flight is gone — no row names it, and the store unlinks it
+at the next start — and one a durable
+row names is redeemable while the row stays in its window.
+
 What is not built: the `blobs` interface on a page, save and attach for a
-conversation without a shell tool, connectors that produce blobs, the surface's handling of them, attachments on
-tool calls and their results, and transfer of bytes over attach or to a
-page.
+conversation without a shell tool, connectors that produce blobs, the
+surface's handling of them, attachments on `calls.call` and
+`tools.call-fast`, and transfer of bytes over attach or to a page.
 
 ### 2.1.3 Limits on a remote's stream of messages
 
@@ -834,7 +890,8 @@ unstated one refuses to boot.
 Some channels are minted by the system rather than declared by the operator: the
 webhook ingress channels (`webhook:<slug>`), the MQTT ingress channels
 (`mqtt:<client>:<topic>`), the async-tool substrate's request and result
-channels (`brenn:tools/<tool>`, `brenn:tool-results/<slug>`), and the per-user
+channels (`brenn:tools/<tool>`, `brenn:tool-results/<slug>`,
+`brenn:app-tool-results/<app-slug>`), and the per-user
 device-location channels (`brenn:device-location.<username>`). Nothing in config
 brings these into existence — an endpoint block, a subscription, a registered
 tool or a registered user does — so there is no declaring `[[channel]]` block to
@@ -847,7 +904,7 @@ a bounded in-code default:
 | Family | push | retain | standing |
 |---|---|---|---|
 | `webhook:<slug>`, `mqtt:<client>:<topic>` | 1 | 100 | 100 |
-| `brenn:tools/<tool>`, `brenn:tool-results/<slug>` | 1 | 16 | 16 |
+| `brenn:tools/<tool>`, `brenn:tool-results/<slug>`, `brenn:app-tool-results/<app-slug>` | 1 | 16 | 16 |
 | `brenn:device-location.<username>` | 1 | 2000 | 2000 |
 
 Ingress channels are fact channels; at their arrival rates a hundred messages is
@@ -926,13 +983,58 @@ and a system participant's overflow rung is `Silent` whatever the channel says.
 A `noise` written on a request-channel block is inert today
 (`TODO(system-participant-noise-inert)`).
 
+A request channel's window is also how many requests the executor can be
+behind on that tool. Each drain serves at most the window's newest unseen
+requests and steps over the older ones, as any subscriber's overflow does
+(drop oldest). One activation may queue up to 64 asynchronous calls, and the
+default window is 16: a request pushed past the window before the executor
+dequeues it is lost, attachments or not. No result is published for it, and
+the executor's overflow is silent
+(`TODO(tool-request-window-overflow-silent)`). Its blobs go when GC evicts
+its row. The window is also what keeps a request's attachments alive until the
+executor takes its own holds: a row evicted and reaped in the instant between
+the dequeue and that hold is answered `internal`, naming the attachment. An
+operator who expects bursts of calls to one tool sizes that tool's
+`brenn:tools/<tool>` window for the burst.
+
+An app's `brenn:app-tool-results/<app-slug>` inbox is minted for every app
+granted at least one asynchronous registry tool, at boot and when a reload
+grants the first one. It holds the attachments of the tool results handed to
+that app's conversations (§2.1.2a): each message's body is
+`{"v":1,"tool":"<name>"}` and its attachments are the result's — the tool's
+value is not in it, since the conversation receives that in place. A result
+without attachments is never published there. Nothing subscribes to it, and
+**no policy can cover it**: `AppPolicy` answers no for the namespace whatever
+its matchers say, so nothing lists, reads, subscribes to or is delivered from
+an app's result inbox, its own app included, and an authored matcher reaching
+into `app-tool-results/` is refused at start. A conversation names one of its
+attachments only through the read record, which the host writes for the
+conversation that made the call and for no other.
+
+Its window, as duration: with no subscriber, `standing_retain_depth` is the
+number that counts. A conversation names a result's attachment until that
+many newer attachment-carrying results exist on the inbox (`not_retained`
+after that), and the next hourly GC pass deletes the row and the reap its
+blobs. So an app's conversations *together* may receive 16 later
+attachment-carrying results, at the default, before an earlier one's
+attachments stop being nameable — ample for a conversation that forwards or
+saves a result within its turn or the next, and the number to raise for an
+app with many conversations fetching at once. The inbox is durable, and the
+read record is in memory: after a restart the inbox holds up to its standing
+depth of results no conversation can name, and their blobs stay charged to the
+blob budget until that many new results arrive and a GC pass runs.
+
 **Tuning them.** A `[[channel]]` block addressing one of these channels does not
 declare it; it *tunes* it. Synthesis still owns creation, identity and
 description, so `uuid` and `description` are rejected on a tuning block, and all
 three depths are required — a block that tunes states every number. `noise`,
 `wake_min`, `sink` and `send_rate` are optional and inherit the `[messaging]`
 globals, exactly as on a declaring block — except `send_rate` on a
-`brenn:tool-results/` inbox, which is the host's and refused in the block. An
+`brenn:tool-results/` or `brenn:app-tool-results/` inbox, which is the host's
+and refused in the block. An app's result inbox is tuned by its exact address,
+which must name an app holding an asynchronous tool grant, or by the prefix
+`brenn:app-tool-results/`; a block over `brenn:tool-results/` sizes component
+inboxes only. An
 explicit `"unbounded"` is legal
 here: unbounded is something an operator asks for in so many words, never
 something a default hands out.

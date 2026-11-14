@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use super::driver::tests::{
-    BootFixture, Booted, READER, Tree, bodies_on, boot_with, document_subscribing_acl,
+    BootFixture, Booted, READER, Tree, bodies_on, boot_with, document_subscribing_acl, hex,
     install_package_from, poll_until, staged_module,
 };
 
@@ -192,11 +192,6 @@ async fn stored(booted: &Booted, address: &str) -> usize {
         )
         .expect("the messages table is readable");
     usize::try_from(count).expect("a row count")
-}
-
-/// Lower-case hex, as the fixture reports a body.
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `entry`'s `mqtt_transport` is the raw message's metadata — client, the

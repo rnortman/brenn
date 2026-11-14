@@ -1,6 +1,8 @@
 //! The naming rule over a durable and a ring channel: the read record, each
-//! refusal with its cause, the hold an admitted name gives, and
-//! `publish_with_attachments`.
+//! refusal with its cause, the hold an admitted name gives,
+//! `publish_with_attachments`, a tool result handed to a conversation
+//! through its app's result inbox, and the tool substrate's other channels,
+//! whose attachments a conversation never names.
 
 use std::sync::Arc;
 
@@ -35,6 +37,14 @@ const WINDOWED: &str = "blob-windowed";
 const HIDDEN: &str = "hidden";
 const RING: &str = "blob-ring";
 const RING_DEPTH: u64 = 2;
+/// A second app, whose authored policy reaches into the app result-inbox
+/// namespace by a prefix built in code — past the resolver that refuses one.
+const OTHER_APP: &str = "other-app";
+/// The standing window of [`APP`]'s result inbox.
+const INBOX_STANDING: u64 = 2;
+/// The three tool-substrate namespaces other than the app result inboxes,
+/// each of which [`APP`]'s policy covers with a prefix matcher.
+const TOOL_NAMESPACES: [&str; 3] = ["tools/", "tool-requests/", "tool-results/"];
 
 struct Fixture {
     m: Arc<Messenger>,
@@ -44,10 +54,17 @@ struct Fixture {
     windowed: String,
     hidden: String,
     ring: String,
+    /// [`APP`]'s result inbox.
+    inbox: String,
+    /// [`OTHER_APP`]'s result inbox.
+    other_inbox: String,
+    /// One durable channel in each of [`TOOL_NAMESPACES`], in that order.
+    tool_channels: Vec<String>,
 }
 
-/// Reads `brenn:blob-*` and every `ephemeral:` channel, and may publish onto
-/// both schemes; `brenn:hidden` is outside its read grant.
+/// Reads `brenn:blob-*`, every channel in [`TOOL_NAMESPACES`] and every
+/// `ephemeral:` channel, and may publish onto both schemes; `brenn:hidden` is
+/// outside its read grant.
 fn app() -> brenn_lib::config::AppConfig {
     let mut cfg = test_app_config(
         APP,
@@ -71,6 +88,12 @@ fn app() -> brenn_lib::config::AppConfig {
         .acls
         .brenn_subscribe
         .push(ChannelMatcher::Prefix("blob-".to_string()));
+    for namespace in TOOL_NAMESPACES {
+        policy
+            .acls
+            .brenn_subscribe
+            .push(ChannelMatcher::Prefix(namespace.to_string()));
+    }
     policy.acls.brenn_publish.push(everything.clone());
     policy.acls.ephemeral_subscribe.push(everything.clone());
     policy.acls.ephemeral_publish.push(everything);
@@ -78,11 +101,37 @@ fn app() -> brenn_lib::config::AppConfig {
     cfg
 }
 
+/// Reads `brenn:blob-*` and, by a prefix only code can build, every app's
+/// result inbox.
+fn other_app() -> brenn_lib::config::AppConfig {
+    let mut cfg = test_app_config(
+        OTHER_APP,
+        Some(ResolvedMessagingConfig {
+            send_budget: 100,
+            subscriptions: vec![],
+        }),
+        vec![],
+    );
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy.grants.insert(AppCapability::DynamicSubscribe);
+    policy
+        .acls
+        .brenn_subscribe
+        .push(ChannelMatcher::Prefix("blob-".to_string()));
+    policy
+        .acls
+        .brenn_subscribe
+        .push(ChannelMatcher::Prefix("app-tool-results/".to_string()));
+    *cfg.policy_mut() = policy;
+    cfg
+}
+
 /// A messenger over three durable channels — one unbounded, one whose
 /// standing window is two messages deep over a subscriber depth of one, one
 /// the app may not read — and a ring of depth [`RING_DEPTH`], with a blob
-/// store, a system publisher allowed everywhere, and [`APP`]'s conversation
-/// [`CONV`].
+/// store, a system publisher allowed everywhere, a durable channel in each of
+/// [`TOOL_NAMESPACES`], and [`APP`]'s conversation [`CONV`].
 async fn fixture() -> Fixture {
     let durable = test_channel_entry(DURABLE, vec![]);
     let mut windowed = test_channel_entry(WINDOWED, vec![]);
@@ -90,13 +139,28 @@ async fn fixture() -> Fixture {
     windowed.resolved_channel.standing_retain_depth = Depth::Bounded(2);
     let hidden = test_channel_entry(HIDDEN, vec![]);
     let ring = ephemeral_channel_entry(RING, RING_DEPTH);
+    let mut inbox = test_channel_entry(&format!("app-tool-results/{APP}"), vec![]);
+    inbox.address = app_tool_result_inbox_address(APP);
+    inbox.resolved_channel.standing_retain_depth = Depth::Bounded(INBOX_STANDING);
+    let mut other_inbox = test_channel_entry(&format!("app-tool-results/{OTHER_APP}"), vec![]);
+    other_inbox.address = app_tool_result_inbox_address(OTHER_APP);
+    let tools: Vec<ChannelEntry> = TOOL_NAMESPACES
+        .iter()
+        .map(|namespace| test_channel_entry(&format!("{namespace}x"), vec![]))
+        .collect();
+    let tool_channels: Vec<String> = tools.iter().map(|entry| entry.address.clone()).collect();
     let addresses = [
         durable.address.clone(),
         windowed.address.clone(),
         hidden.address.clone(),
         ring.address.clone(),
+        inbox.address.clone(),
+        other_inbox.address.clone(),
     ];
-    let durables: Vec<ChannelEntry> = vec![durable, windowed, hidden];
+    let durables: Vec<ChannelEntry> = [durable, windowed, hidden, inbox, other_inbox]
+        .into_iter()
+        .chain(tools)
+        .collect();
     let db = init_db_memory();
     {
         let conn = db.lock().await;
@@ -116,6 +180,7 @@ async fn fixture() -> Fixture {
     }
     let mut apps = IndexMap::new();
     apps.insert(APP.to_string(), app());
+    apps.insert(OTHER_APP.to_string(), other_app());
     let rings = vec![ring];
     let m = Messenger::new(
         db,
@@ -131,7 +196,7 @@ async fn fixture() -> Fixture {
     .with_ring_stores(Arc::new(RingStores::build(&rings)));
     let blobs = TempBlobDir::new();
     let m = install_blob_store_at(m, blobs.path()).await;
-    let [durable, windowed, hidden, ring] = addresses;
+    let [durable, windowed, hidden, ring, inbox, other_inbox] = addresses;
     Fixture {
         m,
         _blobs: blobs,
@@ -139,6 +204,9 @@ async fn fixture() -> Fixture {
         windowed,
         hidden,
         ring,
+        inbox,
+        other_inbox,
+        tool_channels,
     }
 }
 
@@ -200,6 +268,16 @@ impl Fixture {
 
     fn blob_count(&self) -> usize {
         self.m.blob_store().unwrap().usage().sealed
+    }
+
+    /// Hand `conversation` of `app` a tool result carrying `bytes` as `out`.
+    async fn hand(&self, app: &str, conversation: i64, bytes: &[u8]) -> HandedToolResult {
+        let blob = seal_blob(&self.m, bytes);
+        let held = HeldAttachments::new(vec![(name("out"), blob)]).unwrap();
+        self.m
+            .hand_tool_result(PUBLISHER, app, conversation, "attachment-echo", held)
+            .await
+            .unwrap_or_else(|refused| panic!("{app}: the result publishes: {refused:?}"))
     }
 }
 
@@ -655,4 +733,267 @@ async fn publish_with_attachments_names_the_same_blob() {
             assert_eq!(f.blob_count(), before, "{addr}: no blob was made");
         }
     }
+}
+
+// ── A tool result handed to a conversation ──────────────────────────────
+
+/// The result rests on the app's inbox with the attachment's reference and a
+/// body naming the tool, and is recorded for the calling conversation alone;
+/// the app's policy covers nothing of the namespace and the name is admitted.
+#[tokio::test]
+async fn a_handed_result_is_nameable_by_the_calling_conversation_only() {
+    let f = fixture().await;
+    let handed = f.hand(APP, CONV, b"echoed bytes").await;
+    assert_eq!(f.blob_count(), 1);
+
+    let envelope =
+        f.m.store_for_address(&f.inbox)
+            .retained_tail(Depth::Bounded(1))
+            .await
+            .pop()
+            .unwrap();
+    assert_eq!(envelope.message_id, handed.message_id);
+    assert_eq!(envelope.attachments, handed.attachments);
+    assert_eq!(
+        envelope.body.as_text(),
+        Some(r#"{"v":1,"tool":"attachment-echo"}"#)
+    );
+    assert_eq!(handed.attachments.get(&name("out")).unwrap().size, 12);
+
+    assert!(f.m.conversation_has_read(CONV, handed.message_id));
+    assert!(!f.m.conversation_has_read(CONV + 1, handed.message_id));
+    assert_eq!(
+        f.admit_bytes(handed.message_id, &attachment("out")).await,
+        b"echoed bytes"
+    );
+    // A second conversation of the same app was handed nothing.
+    assert_eq!(
+        f.m.admit_conversation_name(CONV + 1, APP, handed.message_id, &attachment("out"))
+            .await
+            .unwrap_err(),
+        NameRefusal::NotRead
+    );
+}
+
+/// Another app's inbox is not readable through the own-inbox arm, nor through
+/// a policy built in code with a prefix over the whole namespace — even when
+/// the message is written into the record by hand.
+#[tokio::test]
+async fn another_apps_inbox_is_never_readable() {
+    let f = fixture().await;
+    let theirs = f.hand(OTHER_APP, CONV + 1, b"theirs").await;
+    f.m.note_conversation_sent(CONV, theirs.message_id, &f.other_inbox);
+    assert_eq!(
+        f.admit(theirs.message_id, &attachment("out"))
+            .await
+            .unwrap_err(),
+        NameRefusal::ChannelNotReadable {
+            channel: f.other_inbox.clone()
+        }
+    );
+
+    let ours = f.hand(APP, CONV, b"ours").await;
+    f.m.note_conversation_sent(CONV + 1, ours.message_id, &f.inbox);
+    assert_eq!(
+        f.m.admit_conversation_name(CONV + 1, OTHER_APP, ours.message_id, &attachment("out"))
+            .await
+            .unwrap_err(),
+        NameRefusal::ChannelNotReadable {
+            channel: f.inbox.clone()
+        }
+    );
+}
+
+/// A conversation cannot read an app's inbox, its own included, so nothing
+/// it reads feeds the record with one of its messages.
+#[tokio::test]
+async fn no_app_reads_a_result_inbox() {
+    let f = fixture().await;
+    f.hand(APP, CONV, b"x").await;
+    for (app, inbox) in [
+        (APP, &f.inbox),
+        (OTHER_APP, &f.inbox),
+        (OTHER_APP, &f.other_inbox),
+    ] {
+        let read =
+            f.m.query(&MessageQuery {
+                channel: inbox.clone(),
+                limit: 100,
+                before: None,
+                after: None,
+                sender: None,
+                search: None,
+                calling_app_slug: app.to_string(),
+            })
+            .await;
+        assert!(
+            matches!(read, Err(crate::query::QueryError::UnknownChannel(_))),
+            "{app} reading {inbox}: {read:?}"
+        );
+    }
+}
+
+/// Once the inbox's standing window holds that many newer results, an
+/// earlier one's attachments are no longer nameable.
+#[tokio::test]
+async fn a_result_past_the_inbox_window_is_not_retained() {
+    let f = fixture().await;
+    let first = f.hand(APP, CONV, b"first").await;
+    for _ in 0..INBOX_STANDING {
+        f.hand(APP, CONV, b"later").await;
+    }
+    assert_eq!(
+        f.admit(first.message_id, &attachment("out"))
+            .await
+            .unwrap_err(),
+        NameRefusal::NotRetained {
+            channel: f.inbox.clone(),
+            attachment: true
+        }
+    );
+}
+
+/// An app with no inbox — no async tool grant now — is refused unrecorded,
+/// and the blob goes with the holds.
+#[tokio::test]
+async fn a_result_for_an_app_with_no_inbox_is_refused() {
+    let f = fixture().await;
+    let blob = seal_blob(&f.m, b"orphan");
+    let held = HeldAttachments::new(vec![(name("out"), blob)]).unwrap();
+    let refused =
+        f.m.hand_tool_result(PUBLISHER, "no-such-app", CONV, "attachment-echo", held)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(&refused, PublishResult::UnknownChannel(addr) if addr == "brenn:app-tool-results/no-such-app"),
+        "{refused:?}"
+    );
+    assert_eq!(f.blob_count(), 0);
+}
+
+// ── The tool substrate's other channels ─────────────────────────────────
+
+/// On each of the three namespaces a policy covers, a message carrying an
+/// attachment and read by the conversation names its body and never its
+/// attachment. The refusal does not depend on retention, and takes no hold:
+/// once the row is gone the blob is reaped.
+#[tokio::test]
+async fn a_tool_channels_attachment_is_refused_and_its_body_admitted() {
+    let f = fixture().await;
+    for channel in &f.tool_channels {
+        assert_eq!(
+            SystemChannelFamily::of(channel),
+            Some(SystemChannelFamily::Tool),
+            "{channel}"
+        );
+        let photo = seal_blob(&f.m, b"handed bytes");
+        let uuid = f
+            .publish(channel, r#"{"call":"args"}"#, &[("photo", &photo)])
+            .await;
+        drop(photo);
+        f.read(channel).await;
+        assert!(f.m.conversation_has_read(CONV, uuid), "{channel}");
+
+        let refusal = f.admit(uuid, &attachment("photo")).await.unwrap_err();
+        assert_eq!(
+            refusal,
+            NameRefusal::ToolChannelAttachment {
+                channel: channel.clone()
+            }
+        );
+        assert_eq!(refusal.reason(), "tool_channel_attachment");
+        assert!(
+            refusal.to_string().contains(&format!(
+                "the attachments of a message on {channel} cannot be named"
+            )),
+            "{refusal}"
+        );
+        // An attachment the message does not carry gets the same answer: the
+        // channel decides, before the message is looked at.
+        assert_eq!(
+            f.admit(uuid, &attachment("other")).await.unwrap_err(),
+            NameRefusal::ToolChannelAttachment {
+                channel: channel.clone()
+            }
+        );
+        match f.admit(uuid, &NamedPart::Body).await {
+            Ok(AdmittedPart::Body(body)) => {
+                assert_eq!(body.as_text(), Some(r#"{"call":"args"}"#), "{channel}")
+            }
+            other => panic!("{channel}: expected the body, got {other:?}"),
+        }
+
+        {
+            let conn = f.m.db().lock().await;
+            conn.execute(
+                "UPDATE messaging_messages SET retained_seq = NULL WHERE uuid = ?1",
+                [uuid.as_bytes().to_vec()],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            f.admit(uuid, &attachment("photo")).await.unwrap_err(),
+            NameRefusal::ToolChannelAttachment {
+                channel: channel.clone()
+            },
+            "{channel}: refused whatever the retention"
+        );
+        {
+            let conn = f.m.db().lock().await;
+            conn.execute(
+                "DELETE FROM messaging_messages WHERE uuid = ?1",
+                [uuid.as_bytes().to_vec()],
+            )
+            .unwrap();
+        }
+        f.m.reap_blobs().await;
+        assert_eq!(f.blob_count(), 0, "{channel}: the refusal held nothing");
+    }
+}
+
+/// For an app whose policy does not cover the channel, the same message is
+/// `channel_not_readable`, attachment or body: the policy check comes first.
+#[tokio::test]
+async fn a_tool_channel_the_app_may_not_read_is_not_readable_first() {
+    let f = fixture().await;
+    for channel in &f.tool_channels {
+        let photo = seal_blob(&f.m, b"handed bytes");
+        let uuid = f.publish(channel, "call", &[("photo", &photo)]).await;
+        drop(photo);
+        f.m.note_conversation_sent(CONV + 1, uuid, channel);
+        for part in [attachment("photo"), NamedPart::Body] {
+            assert_eq!(
+                f.m.admit_conversation_name(CONV + 1, OTHER_APP, uuid, &part)
+                    .await
+                    .unwrap_err(),
+                NameRefusal::ChannelNotReadable {
+                    channel: channel.clone()
+                },
+                "{channel}: {part:?}"
+            );
+        }
+    }
+}
+
+/// The refusal reaches no channel outside the tool family: an ordinary
+/// `brenn:` channel's attachment and the app's own result inbox still admit.
+#[tokio::test]
+async fn the_own_inbox_and_an_ordinary_channel_still_admit_attachments() {
+    let f = fixture().await;
+    let photo = seal_blob(&f.m, b"ordinary");
+    let uuid = f.publish(&f.durable, "photo", &[("photo", &photo)]).await;
+    drop(photo);
+    f.read(&f.durable).await;
+    assert_eq!(SystemChannelFamily::of(&f.durable), None);
+    assert_eq!(f.admit_bytes(uuid, &attachment("photo")).await, b"ordinary");
+
+    let handed = f.hand(APP, CONV, b"result bytes").await;
+    assert_eq!(
+        SystemChannelFamily::of(&f.inbox),
+        Some(SystemChannelFamily::Tool)
+    );
+    assert_eq!(
+        f.admit_bytes(handed.message_id, &attachment("out")).await,
+        b"result bytes"
+    );
 }

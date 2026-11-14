@@ -33,6 +33,8 @@ members = [
     "google-gmail-read",
     "google-maps-tools",
     "processor-blobs-test",
+    "processor-blob-caller-test",
+    "processor-blob-provider-test",
     "processor-bytes-test",
     "processor-call-test",
     "processor-config",

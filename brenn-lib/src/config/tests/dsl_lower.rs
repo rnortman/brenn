@@ -6726,6 +6726,7 @@ fn a_providing_class_lowers_its_tools_onto_the_consumer() {
                 input_schema: serde_json::json!({ "type": "object" }),
                 max_concurrency: 4,
                 auto_approve: false,
+                accepts_attachments: false,
             },
             ProvidedToolDecl {
                 name: "mail-read".to_string(),
@@ -6734,6 +6735,7 @@ fn a_providing_class_lowers_its_tools_onto_the_consumer() {
                 input_schema: serde_json::json!({ "type": "object" }),
                 max_concurrency: 1,
                 auto_approve: true,
+                accepts_attachments: false,
             },
         ]
     );

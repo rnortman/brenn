@@ -1,10 +1,11 @@
 //! `BrennSend`'s forwarded attachments, each name refusal as the tool's error
-//! JSON, and the tool answers that feed the conversation's read record.
+//! JSON, the tool answers that feed the conversation's read record, and a
+//! watched tool channel whose attachments are shown and never forwarded.
 
 use serde_json::json;
 use uuid::Uuid;
 
-use super::blob_fixture::{DST, HIDDEN, RING, RING_DEPTH, SRC, fixture};
+use super::blob_fixture::{DST, HIDDEN, RING, RING_DEPTH, SRC, WATCHED, fixture};
 use super::*;
 
 fn forward(message_id: Uuid, name: &str) -> serde_json::Value {
@@ -293,4 +294,44 @@ async fn a_parked_message_is_not_retained_until_released() {
         "not_retained",
     );
     assert!(text.contains(DST), "{text}");
+}
+
+/// A conversation whose app's policy covers a provider's request inbox reads
+/// a call there and is shown its attachment's name, size and content type
+/// and no blob id; forwarding the attachment is refused
+/// `tool_channel_attachment` and publishes nothing.
+#[tokio::test]
+async fn a_watched_tool_requests_attachment_is_shown_and_never_forwarded() {
+    let f = fixture().await;
+    let (source, blob) = f.attached(WATCHED, b"handed bytes").await;
+    let shown = f
+        .call(
+            MCP_MESSAGE_QUERY_CHANNEL_TOOL,
+            json!({ "address": WATCHED, "limit": 50 }),
+        )
+        .await;
+    let messages = shown.as_array().expect("MessageChannelGet answers a list");
+    assert_eq!(messages.len(), 1, "{shown}");
+    assert_eq!(
+        messages[0]["attachments"]["scan.pdf"],
+        json!({ "size": 12, "content_type": "application/octet-stream" }),
+        "{shown}"
+    );
+    assert!(
+        !shown.to_string().contains(blob.as_str()),
+        "a blob id leaked: {shown}"
+    );
+    assert!(f.has_read(source), "the read is recorded");
+
+    let text = refused(
+        &f.send(json!({ "to": DST, "body": "fwd", "attachments": forward(source, "scan.pdf") }))
+            .await,
+        "tool_channel_attachment",
+    );
+    assert!(text.contains(WATCHED), "{text}");
+    assert!(
+        text.contains("names, sizes and content types only"),
+        "{text}"
+    );
+    assert!(f.retained(DST).await.is_empty(), "nothing was published");
 }

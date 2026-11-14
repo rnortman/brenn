@@ -24,6 +24,8 @@ const SDK_COMPONENTS: &[&str] = &[
     "google-gmail-organize",
     "google-gmail-read",
     "google-maps-tools",
+    "processor-blob-caller-test",
+    "processor-blob-provider-test",
     "processor-blobs-test",
     "processor-call-test",
     "processor-config",
@@ -143,4 +145,192 @@ fn every_deployed_processor_package_is_a_0_2_artifact() {
         wrong.is_empty(),
         "deployed packages built against a contract other than brenn:processor@0.2.0: {wrong:?}"
     );
+}
+
+/// The members `brenn:processor/blobs@0.3.0` had before it gained the
+/// tool-call forms. An artifact that names only these, and
+/// [`BLOBS_PUBLISH_ERROR_ALIAS`], imports no function added since; no
+/// function of the interface was removed or renamed, and the one
+/// pre-existing type that changed is `publish-error`.
+const BLOBS_MEMBERS_BEFORE_TOOL_CALLS: &[&str] = &[
+    "blob",
+    "blob-limits",
+    "create",
+    "create-error",
+    "gap",
+    "limits",
+    "open",
+    "open-error",
+    "publish",
+    "publish-error",
+    "publish-options",
+    "read-error",
+    "seal-error",
+    "urgency",
+    "write-error",
+    "writer",
+    "[method]blob.size",
+    "[method]blob.content-type",
+    "[method]blob.read",
+    "[method]writer.write",
+    "[method]writer.seal",
+    "[resource-drop]blob",
+    "[resource-drop]writer",
+    "body",
+];
+
+/// The one member the wrapping `publish-error` adds to an artifact that
+/// imports `publish`: the alias of `ports.publish-error` it `use`s, exported
+/// by the instance under its local name.
+const BLOBS_PUBLISH_ERROR_ALIAS: &str = "ports-publish-error";
+
+/// The member names an artifact imports from the interface `interface`.
+fn instance_members(engine: &Engine, name: &str, interface: &str) -> Option<Vec<String>> {
+    let path = artifact(name);
+    let component = Component::from_file(engine, &path)
+        .unwrap_or_else(|e| panic!("the artifact {}: {e}", path.display()));
+    let ty = component.component_type();
+    let (_, item) = ty
+        .imports(engine)
+        .find(|(import, _)| *import == interface)?;
+    let wasmtime::component::types::ComponentItem::ComponentInstance(instance) = item.ty else {
+        panic!("{name} imports {interface} as something other than an instance");
+    };
+    Some(
+        instance
+            .exports(engine)
+            .map(|(member, _)| member.to_string())
+            .collect(),
+    )
+}
+
+/// `processor-blobs-test` calls none of the tool-call forms, so it imports
+/// none of them: no function was added to its import, removed or renamed,
+/// and its import of `publish` reaches `ports.publish-error` through the one
+/// pre-existing type that changed. The existing suites load and run this
+/// artifact. The provider fixture imports no `blobs` at all.
+#[test]
+fn the_blobs_fixture_imports_only_what_the_interface_had_before_tool_calls() {
+    let engine = engine();
+    let members = instance_members(
+        &engine,
+        "processor-blobs-test",
+        "brenn:processor/blobs@0.3.0",
+    )
+    .expect("processor-blobs-test imports blobs");
+    let added: Vec<&String> = members
+        .iter()
+        .filter(|m| {
+            !BLOBS_MEMBERS_BEFORE_TOOL_CALLS.contains(&m.as_str())
+                && *m != BLOBS_PUBLISH_ERROR_ALIAS
+        })
+        .collect();
+    assert!(
+        added.is_empty(),
+        "processor-blobs-test imports blobs members it did not before: {added:?}"
+    );
+    assert!(members.iter().any(|m| m == "publish"), "{members:?}");
+    assert!(
+        members.iter().any(|m| m == BLOBS_PUBLISH_ERROR_ALIAS),
+        "{members:?}"
+    );
+    for interface in [
+        "brenn:processor/tools@0.1.0",
+        "brenn:processor/provides@0.1.0",
+    ] {
+        assert_eq!(
+            instance_members(&engine, "processor-blobs-test", interface),
+            None,
+            "processor-blobs-test imports {interface}"
+        );
+    }
+    assert_eq!(
+        instance_members(
+            &engine,
+            "processor-provider-test",
+            "brenn:processor/blobs@0.3.0"
+        ),
+        None
+    );
+}
+
+/// Whether `member` names a function rather than a type: a freestanding
+/// function, a resource method, or a resource's drop.
+fn is_function(engine: &Engine, name: &str, interface: &str, member: &str) -> bool {
+    let path = artifact(name);
+    let component = Component::from_file(engine, &path)
+        .unwrap_or_else(|e| panic!("the artifact {}: {e}", path.display()));
+    let ty = component.component_type();
+    let (_, item) = ty
+        .imports(engine)
+        .find(|(import, _)| *import == interface)
+        .unwrap_or_else(|| panic!("{name} does not import {interface}"));
+    let wasmtime::component::types::ComponentItem::ComponentInstance(instance) = item.ty else {
+        panic!("{name} imports {interface} as something other than an instance");
+    };
+    let (_, member_item) = instance
+        .exports(engine)
+        .find(|(m, _)| *m == member)
+        .unwrap_or_else(|| panic!("{name}'s import of {interface} has no member {member}"));
+    matches!(
+        member_item.ty,
+        wasmtime::component::types::ComponentItem::ComponentFunc(_)
+    )
+}
+
+/// The caller fixture makes every tool call through `blobs.call-async` and
+/// every publish through `blobs.publish`, and its class requires `tools` and
+/// `ports`: it imports both interfaces for the error types those functions
+/// reach, and no function of either. Its `grant_parity_test` holds the same
+/// artifact to its specification, so a component whose only tool calls and
+/// publishes carry attachments passes the build check.
+#[test]
+fn the_blob_caller_imports_tools_and_ports_for_their_types_alone() {
+    let engine = engine();
+    for interface in ["brenn:processor/tools@0.1.0", "brenn:processor/ports@0.2.0"] {
+        let members = instance_members(&engine, "processor-blob-caller-test", interface)
+            .unwrap_or_else(|| panic!("processor-blob-caller-test does not import {interface}"));
+        let functions: Vec<&String> = members
+            .iter()
+            .filter(|m| is_function(&engine, "processor-blob-caller-test", interface, m))
+            .collect();
+        assert!(
+            functions.is_empty(),
+            "processor-blob-caller-test calls {interface} functions: {functions:?}"
+        );
+    }
+    let blobs = instance_members(
+        &engine,
+        "processor-blob-caller-test",
+        "brenn:processor/blobs@0.3.0",
+    )
+    .expect("processor-blob-caller-test imports blobs");
+    for function in ["call-async", "publish"] {
+        assert!(blobs.iter().any(|m| m == function), "{blobs:?}");
+    }
+}
+
+/// The provider fixture completes through `blobs.complete` and nests through
+/// `blobs.call-async-for`, and imports `tools` and `provides` for their types.
+#[test]
+fn the_blob_provider_imports_tools_and_provides() {
+    let engine = engine();
+    for interface in [
+        "brenn:processor/tools@0.1.0",
+        "brenn:processor/provides@0.1.0",
+    ] {
+        assert!(
+            instance_members(&engine, "processor-blob-provider-test", interface).is_some(),
+            "processor-blob-provider-test does not import {interface}"
+        );
+    }
+    let blobs = instance_members(
+        &engine,
+        "processor-blob-provider-test",
+        "brenn:processor/blobs@0.3.0",
+    )
+    .expect("processor-blob-provider-test imports blobs");
+    for function in ["complete", "call-async-for"] {
+        assert!(blobs.iter().any(|m| m == function), "{blobs:?}");
+    }
 }

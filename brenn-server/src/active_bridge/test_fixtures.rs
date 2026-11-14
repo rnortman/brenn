@@ -1407,30 +1407,130 @@ impl ActiveBridge {
         messenger: Arc<brenn_messaging::Messenger>,
         alert_dispatcher: AlertDispatcher,
     ) -> Arc<Self> {
+        Self::test_new_over_messenger(
+            messenger,
+            "testapp",
+            "test",
+            alert_dispatcher,
+            TestBridgeConfig::default(),
+        )
+        .await
+    }
+
+    /// Like `test_new_with_messenger` with a tool registry and the app's
+    /// grants of it.
+    pub(crate) async fn test_new_with_messenger_and_tools(
+        messenger: Arc<brenn_messaging::Messenger>,
+        tools: Arc<brenn_tool_registry::ToolRegistry>,
+        tool_grants: std::collections::BTreeMap<String, brenn_lib::tools::ResolvedToolGrant>,
+    ) -> Arc<Self> {
+        Self::test_new_over_messenger(
+            messenger,
+            "testapp",
+            "test",
+            brenn_obs::alerting::noop_alert_dispatcher().0,
+            TestBridgeConfig {
+                tools: Some(tools),
+                tool_grants,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// A fresh conversation of `app_slug`, acting for `username` (created if
+    /// absent), over `messenger`'s database. `apps` is the agent table, whose
+    /// policies carry the tool grants, and `tools` the registry.
+    pub(crate) async fn test_new_for_conversation(
+        messenger: Arc<brenn_messaging::Messenger>,
+        apps: Arc<indexmap::IndexMap<String, brenn_lib::config::AppConfig>>,
+        app_slug: &str,
+        username: &str,
+        tools: Arc<brenn_tool_registry::ToolRegistry>,
+    ) -> Arc<Self> {
+        Self::test_new_over_messenger(
+            messenger,
+            app_slug,
+            username,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
+            TestBridgeConfig {
+                tools: Some(tools),
+                apps: Some(brenn_lib::config::AppTable::new(apps)),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// The path of this conversation's tool socket, as `brenn-tool` is given
+    /// it.
+    pub(crate) fn test_tool_socket_path(&self) -> PathBuf {
+        brenn_lib::runtime_dir::tool_socket_in(self.tool_socket.host_dir())
+    }
+
+    /// Run the Brenn tool `short_name` on `input` as CC's PostToolUse hook
+    /// does, and return the output the conversation is handed.
+    #[cfg(test)]
+    pub(crate) async fn test_post_tool_use(
+        &self,
+        short_name: &str,
+        input: serde_json::Value,
+    ) -> serde_json::Value {
+        use brenn_cc::session::ApprovalDecision;
+        let req = super::test_support::post_tool_use_req(
+            &format!("{}{short_name}", super::mcp_constants::MCP_BRENN_PREFIX),
+            input,
+        );
+        match super::brenn_tools::handle_brenn_tools(self, &req).await {
+            Some(super::tool_summary::HandleBrennToolResult::Respond(
+                ApprovalDecision::Continue {
+                    updated_output: Some(output),
+                },
+            )) => serde_json::from_str(&output).expect("the hook output is JSON"),
+            other => panic!("{short_name}: PostToolUse should continue with output, got {other:?}"),
+        }
+    }
+
+    /// A bridge for a fresh conversation of `app_slug` over `messenger`'s
+    /// database, acting for `username` (created if absent), and `config` with
+    /// the messenger set.
+    async fn test_new_over_messenger(
+        messenger: Arc<brenn_messaging::Messenger>,
+        app_slug: &str,
+        username: &str,
+        alert_dispatcher: AlertDispatcher,
+        config: TestBridgeConfig,
+    ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(16);
         let db = messenger.db().clone();
         let (user_id, conversation_id) = {
             let conn = db.lock().await;
             conn.execute(
-                "INSERT INTO users (username, password_hash, created_at) \
-                 VALUES ('test', 'x', datetime('now'))",
-                [],
+                "INSERT OR IGNORE INTO users (username, password_hash, created_at) \
+                 VALUES (?1, 'x', datetime('now'))",
+                [username],
             )
             .expect("insert user");
-            let uid: i64 = conn.last_insert_rowid();
-            let cid = brenn_db::conversation::create_conversation(&conn, uid, "testapp", false);
+            let uid: i64 = conn
+                .query_row(
+                    "SELECT id FROM users WHERE username = ?1",
+                    [username],
+                    |row| row.get(0),
+                )
+                .expect("the user");
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, app_slug, false);
             (uid, cid)
         };
         Self::inject_for_test_full(
             user_id,
             conversation_id,
-            "testapp",
+            app_slug,
             db,
             tx,
             alert_dispatcher,
             TestBridgeConfig {
                 messenger: Some(messenger),
-                ..Default::default()
+                ..config
             },
         )
     }

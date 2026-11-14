@@ -296,3 +296,67 @@ async fn a_messenger_without_a_blob_store_redeems_nothing() {
     assert!(matches!(m.retain_blob(&id).await, Err(BlobError::NotFound)));
     assert_eq!(m.reap_blobs().await, ReapReport::default());
 }
+
+// ── Holding an envelope's attachments ────────────────────────────────────
+
+/// `hold_attachments` takes one hold per distinct blob a stored envelope
+/// names, under the envelope's names, and the blobs stay redeemable through
+/// those holds after the row that named them is gone.
+#[tokio::test]
+async fn hold_attachments_holds_each_distinct_blob_an_envelope_names() {
+    let f = fixture().await;
+    let photo = seal_blob(&f.m, b"photo bytes");
+    let thumb = seal_blob(&f.m, b"thumb");
+    let uuid = f
+        .publish(
+            &f.durable,
+            "three names, two blobs",
+            None,
+            &[("photo", &photo), ("copy", &photo), ("thumb", &thumb)],
+        )
+        .await;
+    drop((photo, thumb));
+    let stored = f.newest(&f.durable).await;
+
+    let held = f.m.hold_attachments(&stored.attachments).await.unwrap();
+    assert_eq!(held.refs(), &stored.attachments);
+    assert_eq!(held.holds().len(), 2, "one hold per distinct blob");
+
+    f.delete_row(uuid).await;
+    assert_eq!(f.m.reap_blobs().await, ReapReport::default());
+    assert_eq!(held.holds()[0].read(0, 5).unwrap().len(), 5);
+    drop(held);
+    assert_eq!(f.m.reap_blobs().await.blobs, 2);
+}
+
+/// A name whose blob nothing holds is answered with that name, and no hold
+/// is kept on the others.
+#[tokio::test]
+async fn hold_attachments_names_the_first_attachment_nothing_holds() {
+    let f = fixture().await;
+    let photo = seal_blob(&f.m, b"photo bytes");
+    f.publish(&f.durable, "one", None, &[("photo", &photo)])
+        .await;
+    drop(photo);
+    let mut refs: std::collections::BTreeMap<AttachmentName, crate::BlobRef> = f
+        .newest(&f.durable)
+        .await
+        .attachments
+        .iter()
+        .map(|(n, r)| (n.clone(), r.clone()))
+        .collect();
+    refs.insert(
+        name("zz-gone"),
+        crate::BlobRef {
+            id: BlobId::new("0".repeat(32)),
+            size: 1,
+            content_type: "application/octet-stream".to_string(),
+        },
+    );
+    let attachments = crate::Attachments::from_map(refs);
+
+    assert_eq!(
+        f.m.hold_attachments(&attachments).await.unwrap_err(),
+        name("zz-gone")
+    );
+}

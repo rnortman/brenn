@@ -150,6 +150,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-processor-blob-caller-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
+name = "brenn-processor-blob-provider-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
 name = "brenn-processor-blobs-test"
 version = "0.1.0"
 dependencies = [

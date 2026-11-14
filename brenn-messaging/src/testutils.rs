@@ -738,6 +738,39 @@ pub async fn publish_attached(
     }
 }
 
+pub use brenn_messaging_store::testutils::held;
+
+/// Every retained message on `address`, oldest first, each with its retention
+/// sequence, read out of the table rather than through `Messenger::query`,
+/// which answers what some app may read.
+///
+/// # Panics
+///
+/// If `address` is not in the directory.
+pub async fn retained_on(
+    messenger: &Messenger,
+    address: &str,
+) -> Vec<(i64, brenn_envelope::MessageEnvelope)> {
+    let uuid = messenger
+        .directory()
+        .resolve(address)
+        .unwrap_or_else(|| panic!("{address} is in the directory"))
+        .uuid;
+    let conn = messenger.db().lock().await;
+    db::load_channel_retained_window_seq(&conn, uuid, Depth::Unbounded)
+}
+
+/// The blob id of each attachment `envelope` names, by name.
+pub fn attachment_ids(
+    envelope: &brenn_envelope::MessageEnvelope,
+) -> std::collections::BTreeMap<String, String> {
+    envelope
+        .attachments
+        .iter()
+        .map(|(name, reference)| (name.as_str().to_string(), reference.id.as_str().to_string()))
+        .collect()
+}
+
 /// Redeem `id` through `messenger` and read all of it, or the refusal.
 pub async fn redeem_all(
     messenger: &Messenger,

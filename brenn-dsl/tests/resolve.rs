@@ -5009,6 +5009,76 @@ fn a_provide_statement_holds_no_blocks_and_a_boolean_flag() {
         ))),
         "`auto_approve` is a boolean; this is a string"
     );
+    assert_eq!(
+        refusal(&provider_doc(&provide(
+            "mail-search",
+            "MailSearch",
+            "        accepts_attachments = 1;\n"
+        ))),
+        "`accepts_attachments` is a boolean; this is an integer"
+    );
+}
+
+/// `accepts_attachments` is false unless stated, and true where written.
+#[test]
+fn a_provided_tool_accepts_attachments_only_where_stated() {
+    let config = resolved(&provider_doc(&format!(
+        "{}{}",
+        provide("mail-search", "MailSearch", ""),
+        provide(
+            "mail-attach",
+            "MailAttach",
+            "        accepts_attachments = true;\n"
+        ),
+    )));
+    let provides = &config.consumers[0].class.provides;
+    assert!(!provides[0].accepts_attachments, "refused unless stated");
+    assert!(provides[1].accepts_attachments);
+}
+
+/// A tool that accepts attachments may not own the argument a conversation
+/// names them in; one that does not accept them may.
+#[test]
+fn an_accepting_tool_may_not_declare_the_attachments_property() {
+    let statement = |flag: &str| {
+        format!(
+            "    provide mail-attach {{\n        mcp_name = \"MailAttach\";\n        \
+             description = \"Attach.\";\n        \
+             input_schema = \"\"\"{{ \"type\": \"object\", \"properties\": \
+             {{ \"attachments\": {{ \"type\": \"string\" }} }} }}\"\"\";\n        \
+             accepts_attachments = {flag};\n    }}\n"
+        )
+    };
+    let source = provider_doc(&statement("true"));
+    let errors = resolve_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "a tool that accepts attachments may not declare a top-level `attachments` property in \
+         its `input_schema`: a conversation names the attachments it hands the tool in that \
+         argument"
+    );
+    assert_eq!(errors[0].line_col(), at(&source, "true;"));
+
+    let config = resolved(&provider_doc(&statement("false")));
+    assert!(!config.consumers[0].class.provides[0].accepts_attachments);
+}
+
+/// The statement's key set is closed.
+#[test]
+fn a_provide_statement_refuses_an_unknown_key() {
+    let errors = refusals(&provider_doc(&provide(
+        "mail-search",
+        "MailSearch",
+        "        attachments = true;\n",
+    )));
+    assert_eq!(
+        errors,
+        [
+            "unknown field `attachments`, expected one of `mcp_name`, `description`, \
+             `input_schema`, `max_concurrency`, `auto_approve`, `accepts_attachments`"
+        ]
+    );
 }
 
 /// The class body admits one statement kindword.

@@ -182,6 +182,8 @@ filegroup(
         "//brenn-wasm/components/google-maps-tools:policy_srcs",
         "//brenn-wasm/components/guest:policy_srcs",
         "//brenn-wasm/components/processor-blobs-test:policy_srcs",
+        "//brenn-wasm/components/processor-blob-caller-test:policy_srcs",
+        "//brenn-wasm/components/processor-blob-provider-test:policy_srcs",
         "//brenn-wasm/components/processor-bytes-test:policy_srcs",
         "//brenn-wasm/components/processor-call-test:policy_srcs",
         "//brenn-wasm/components/processor-config:policy_srcs",

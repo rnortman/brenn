@@ -1029,7 +1029,9 @@ pub(crate) fn derive_mqtt_ingress_channels(
 ///
 /// On a `webhook:` block naming no declared endpoint, a `brenn:tools/` block
 /// naming no registered async tool, or a `brenn:tool-results/` block naming no
-/// consumer that holds an async tool grant, or a `brenn:device-location.` block
+/// consumer that holds an async tool grant, a `brenn:app-tool-results/` block
+/// naming no app that holds one (checked only when `app_inbox_slugs` is
+/// given), or a `brenn:device-location.` block
 /// whose remainder is not a username. Also on an exact key of any scheme but
 /// `mqtt:` reaching the fall-through, which is a host bug.
 pub(crate) fn validate_exact_tuning_blocks(
@@ -1037,9 +1039,12 @@ pub(crate) fn validate_exact_tuning_blocks(
     webhook_slugs: &[&str],
     async_tool_names: &[&'static str],
     inbox_slugs: &std::collections::HashSet<String>,
+    app_inbox_slugs: Option<&std::collections::HashSet<String>>,
     check_tool_families: bool,
 ) {
-    use brenn_envelope::addressing::{TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE};
+    use brenn_envelope::addressing::{
+        APP_TOOL_RESULTS_NAMESPACE, TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE,
+    };
 
     for address in tuning.exact_addresses() {
         let (found, what) = if let Some(slug) = address.strip_prefix("webhook:") {
@@ -1057,6 +1062,17 @@ pub(crate) fn validate_exact_tuning_blocks(
             (
                 async_tool_names.contains(&name),
                 "a registered async tool with that name",
+            )
+        } else if let Some(app_slug) = address
+            .strip_prefix("brenn:")
+            .and_then(|n| n.strip_prefix(APP_TOOL_RESULTS_NAMESPACE))
+        {
+            let Some(app_inbox_slugs) = app_inbox_slugs.filter(|_| check_tool_families) else {
+                continue;
+            };
+            (
+                app_inbox_slugs.contains(app_slug),
+                "an app holding an async tool grant with that slug",
             )
         } else if let Some(slug) = address
             .strip_prefix("brenn:")

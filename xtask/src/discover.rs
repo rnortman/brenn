@@ -182,6 +182,8 @@ mod tests {
             ("google-gmail-read", Family::Guest),
             ("google-maps-tools", Family::Guest),
             ("processor-blobs-test", Family::Guest),
+            ("processor-blob-caller-test", Family::Guest),
+            ("processor-blob-provider-test", Family::Guest),
             ("processor-call-test", Family::Guest),
             ("processor-config", Family::Guest),
             ("processor-demo", Family::Guest),

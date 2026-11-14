@@ -135,6 +135,18 @@ pub struct ToolDescriptor {
     /// Whether the tool acts as a user; bounds which participants may be
     /// granted it.
     pub user_binding: UserBinding,
+    /// Whether a call may hand this tool attachments. The registry refuses a
+    /// call that carries any to a tool that does not, before `execute`.
+    pub accepts_attachments: bool,
+}
+
+impl ToolDescriptor {
+    /// Whether a call to this tool may carry attachments, `any` being whether
+    /// it carries at least one: every call site that hands a tool a call
+    /// judges it by this rule.
+    pub fn admits_attachments(&self, any: bool) -> bool {
+        !any || self.accepts_attachments
+    }
 }
 
 /// ACL denial from a tool's `check_acl`: the call named a resource outside the
@@ -208,7 +220,7 @@ impl ToolError {
 
 /// The `outcome` label for an invocation log line: `"ok"` on success, else the
 /// error's `kind_str`.
-pub fn outcome_label(result: &Result<serde_json::Value, ToolError>) -> &'static str {
+pub fn outcome_label<T>(result: &Result<T, ToolError>) -> &'static str {
     match result {
         Ok(_) => "ok",
         Err(e) => e.kind_str(),

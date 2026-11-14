@@ -441,8 +441,8 @@ fn a_named_channel_in_the_auto_namespace_panics() {
 
 #[test]
 #[should_panic(
-    expected = "reserved namespace (`tools`, `tool-results` or `tool-requests` are \
-                owned by the tool substrate"
+    expected = "reserved namespace (`tools`, `tool-results`, `tool-requests` or \
+                `app-tool-results` are owned by the tool substrate"
 )]
 fn a_named_channel_in_the_tool_requests_namespace_panics_naming_it() {
     let mut consumer = timer_consumer("etl");

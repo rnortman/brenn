@@ -8,7 +8,11 @@
 //! current config, admits through the per-tool
 //! rate limiter and concurrency semaphore, runs the tool, and publishes a v1
 //! result envelope back to the caller's inbox through the gated
-//! `publish_from_system` path — no ACL bypass. The envelope must fit the bus
+//! `publish_from_system` path — no ACL bypass. A request's attachments are
+//! held from its envelope when its batch is dequeued, before any request of
+//! the batch waits for admission, handed to the tool, and the
+//! tool's own `ok` result carries the attachments it answered with on the
+//! result message. The envelope must fit the bus
 //! body cap, `[messaging] max_body_bytes`: a result that does not is replaced
 //! by an `internal` error naming the cap, with a once-per-process Warning
 //! alert, so the caller is answered at once.
@@ -64,6 +68,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
+use brenn_envelope::AttachmentName;
 use brenn_envelope::addressing::TOOLS_NAMESPACE;
 use brenn_lib::messaging::{
     MessageEnvelope, ParticipantId, SubscriberKind, Urgency, canonical_address,
@@ -71,6 +76,7 @@ use brenn_lib::messaging::{
 use brenn_lib::tools::ResolvedToolGrant;
 use brenn_messaging::system::SystemInbox;
 use brenn_messaging::{Messenger, PublishResult};
+use brenn_messaging_store::blob::HeldAttachments;
 use brenn_messaging_store::store::MessageSeq;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use serde::{Deserialize, Serialize};
@@ -84,7 +90,7 @@ use super::cell::ToolRegistryCell;
 use super::descriptor::{MAX_ASYNC_RESULT_BYTES, PROVIDED_TOOL_CEILING, ToolError, outcome_label};
 use super::provided::ProviderRuntime;
 use super::registry::ToolRegistry;
-use super::tool::{RegisteredTool, ToolCtx};
+use super::tool::{RegisteredTool, ToolCtx, ToolOutput};
 
 /// The system component name the executor publishes results under. Its
 /// code-built policy (bootstrap) grants publish on exactly `brenn:tool-results/*`.
@@ -315,13 +321,16 @@ async fn process_batch(cx: BatchCtx, rows: Vec<(MessageSeq, MessageEnvelope)>) {
 
     // Group by request channel (one `brenn:tools/<tool>` channel per tool) so
     // each tool drains independently: admission on one tool never head-of-line
-    // blocks another.
-    let mut by_tool: HashMap<String, Vec<(MessageSeq, MessageEnvelope)>> = HashMap::new();
+    // blocks another. Every row's attachments are held here, while the batch
+    // is the newest thing this executor has read, so a row queued behind
+    // another's admission wait is not exposed to eviction and reap meanwhile.
+    let mut by_tool: HashMap<String, Vec<HeldRow>> = HashMap::new();
     for (seq, env) in rows {
+        let attachments = hold_request_attachments(&cx.shared.messenger, &env).await;
         by_tool
             .entry(env.channel.clone())
             .or_default()
-            .push((seq, env));
+            .push((seq, env, attachments));
     }
 
     let tools_prefix = canonical_address(TOOLS_NAMESPACE);
@@ -333,8 +342,8 @@ async fn process_batch(cx: BatchCtx, rows: Vec<(MessageSeq, MessageEnvelope)>) {
         let cx = cx.clone();
         let task = tokio::spawn(async move {
             let mut executions = Vec::new();
-            for (seq, env) in tool_rows {
-                if let Some(handle) = admit_and_dispatch(&cx, seq, env).await {
+            for (seq, env, attachments) in tool_rows {
+                if let Some(handle) = admit_and_dispatch(&cx, seq, env, attachments).await {
                     executions.push(handle);
                 }
             }
@@ -351,6 +360,27 @@ async fn process_batch(cx: BatchCtx, rows: Vec<(MessageSeq, MessageEnvelope)>) {
     }
     for task in tool_tasks {
         join_swallowing_alerted_panic(task).await;
+    }
+}
+
+/// A dequeued request row with the holds on its attachments, or the first
+/// attachment whose blob nothing held when the batch was dequeued.
+type HeldRow = (
+    MessageSeq,
+    MessageEnvelope,
+    Result<HeldAttachments, AttachmentName>,
+);
+
+/// Hold the blobs a request envelope names. `Err` names the first one nothing
+/// holds: its row was evicted and reaped between the dequeue and this hold.
+async fn hold_request_attachments(
+    messenger: &Messenger,
+    env: &MessageEnvelope,
+) -> Result<HeldAttachments, AttachmentName> {
+    if env.attachments.is_empty() {
+        Ok(HeldAttachments::none())
+    } else {
+        messenger.hold_attachments(&env.attachments).await
     }
 }
 
@@ -382,11 +412,13 @@ struct Reply {
 
 impl Reply {
     /// Build the result envelope and publish it to the reply target, or
-    /// warn-and-drop when the request carried none.
+    /// warn-and-drop when the request carried none. The message carries the
+    /// output's attachments iff its body is the tool's own `ok` outcome; an
+    /// error, or a body replaced for size, carries none.
     async fn send(
         &self,
         messenger: &Messenger,
-        result: Result<Value, ToolError>,
+        result: Result<ToolOutput, ToolError>,
         alert: &AlertDispatcher,
     ) {
         let Self {
@@ -395,17 +427,24 @@ impl Reply {
             call_id,
             serving,
         } = self;
+        let (result, attachments) = match result {
+            Ok(ToolOutput { value, attachments }) => (Ok(value), attachments),
+            Err(e) => (Err(e), HeldAttachments::none()),
+        };
         match addr {
             Some(addr) => {
-                let body = build_result_body(
+                let (body, attachments) = match build_result_body(
                     tool,
                     call_id,
                     serving.as_deref(),
                     &result,
                     messenger.max_body_bytes(),
                     alert,
-                );
-                publish_result(messenger, addr, &body).await;
+                ) {
+                    ResultBody::Own(body) => (body, attachments),
+                    ResultBody::Replaced(body) => (body, HeldAttachments::none()),
+                };
+                publish_result(messenger, addr, &body, attachments).await;
             }
             None => {
                 warn!(%tool, %call_id, "tool executor: request has no reply_to; result dropped");
@@ -422,10 +461,13 @@ impl Reply {
 /// `execute` future is spawned holding the permit and its `JoinHandle` is
 /// returned (so the per-tool drain can await delivery); every rejection path
 /// delivers its typed-error result inline and returns `None` (nothing spawned).
+/// `attachments` are the holds `process_batch` took on the request's blobs;
+/// every rejection path drops them.
 async fn admit_and_dispatch(
     cx: &BatchCtx,
     seq: MessageSeq,
     env: MessageEnvelope,
+    attachments: Result<HeldAttachments, AttachmentName>,
 ) -> Option<JoinHandle<()>> {
     let BatchCtx {
         shared:
@@ -483,8 +525,9 @@ async fn admit_and_dispatch(
                     &Err(ToolError::InvalidArgs("malformed request body".to_string())),
                     messenger.max_body_bytes(),
                     alert,
-                );
-                publish_result(messenger, &addr, &body).await;
+                )
+                .into_string();
+                publish_result(messenger, &addr, &body, HeldAttachments::none()).await;
             }
             return None;
         }
@@ -534,6 +577,25 @@ async fn admit_and_dispatch(
         return None;
     }
 
+    // A blob nothing held at the dequeue was evicted and reaped after the
+    // request was published.
+    let attachments = match attachments {
+        Ok(held) => held,
+        Err(name) => {
+            warn!(seq, %caller, %tool, attachment = %name, "tool executor: a request's attachment is no longer held");
+            reply
+                .send(
+                    messenger,
+                    Err(ToolError::Internal(format!(
+                        "attachment {name} of the request is no longer held"
+                    ))),
+                    alert,
+                )
+                .await;
+            return None;
+        }
+    };
+
     // Re-check the caller's grant for this tool against the current config.
     let grant = match caller_grants.grant(&caller, &tool) {
         Some(g) => g,
@@ -549,7 +611,13 @@ async fn admit_and_dispatch(
     // The tool must still be a registered async tool. A fast or unregistered tool
     // reaching here is a config/wiring anomaly; the caller learns a typed error.
     let async_tool = match registry.get(&tool) {
-        Some(RegisteredTool::Async(t)) => t.clone(),
+        Some(registered @ RegisteredTool::Async(t)) => {
+            if let Err(e) = ToolRegistry::check_attachments(registered, &attachments) {
+                reply.send(messenger, Err(e), alert).await;
+                return None;
+            }
+            t.clone()
+        }
         Some(RegisteredTool::Fast(_)) => {
             warn!(seq, %tool, "tool executor: request names a fast tool");
             reply
@@ -660,7 +728,7 @@ async fn admit_and_dispatch(
     let alert = alert.clone();
     Some(tokio::spawn(async move {
         let started = Instant::now();
-        let result = async_tool.execute(&ctx, args).await;
+        let result = async_tool.execute(&ctx, args, attachments).await;
         info!(
             tool = %tool,
             caller = %caller,
@@ -681,15 +749,23 @@ async fn admit_and_dispatch(
 /// fitted to that cap, so its refusal means the cap is below that result's
 /// `internal` error envelope, whose size varies with the `tool`, `call_id` and
 /// `serving` it echoes; anything else is a host-wiring bug (the executor's
-/// system policy must permit `brenn:tool-results/*`).
-async fn publish_result(messenger: &Messenger, reply_addr: &str, body: &str) {
+/// system policy must permit `brenn:tool-results/*`). `attachments` ride the
+/// message, and their holds drop with a dropped result.
+async fn publish_result(
+    messenger: &Messenger,
+    reply_addr: &str,
+    body: &str,
+    attachments: HeldAttachments,
+) {
     match messenger
-        .publish_from_system(
+        .publish_from_system_with_attachments(
             TOOL_EXECUTOR_COMPONENT,
             reply_addr,
             body.into(),
             Urgency::Normal,
             None,
+            None,
+            attachments,
         )
         .await
     {
@@ -736,7 +812,7 @@ fn build_result_body(
     result: &Result<Value, ToolError>,
     max_body_bytes: usize,
     alert: &AlertDispatcher,
-) -> String {
+) -> ResultBody {
     let envelope = |outcome: Value| {
         let mut body = json!({
             "v": 1,
@@ -762,9 +838,9 @@ fn build_result_body(
                 s.len(),
             ),
         );
-        return envelope(
+        return ResultBody::Replaced(envelope(
             json!({ "err": { "kind": "internal", "detail": "result exceeded size cap" } }),
-        );
+        ));
     }
     if s.len() > max_body_bytes {
         let len = s.len();
@@ -780,11 +856,29 @@ fn build_result_body(
                  max_response_bytes)."
             ),
         );
-        return envelope(json!({ "err": { "kind": "internal", "detail": format!(
+        return ResultBody::Replaced(envelope(
+            json!({ "err": { "kind": "internal", "detail": format!(
             "result of {len} bytes exceeds [messaging] max_body_bytes ({max_body_bytes})"
-        ) } }));
+        ) } }),
+        ));
     }
-    s
+    ResultBody::Own(s)
+}
+
+/// A serialized result envelope: the one the result itself made, or the
+/// `internal` error that replaced it for size.
+#[derive(Debug, PartialEq, Eq)]
+enum ResultBody {
+    Own(String),
+    Replaced(String),
+}
+
+impl ResultBody {
+    fn into_string(self) -> String {
+        match self {
+            ResultBody::Own(s) | ResultBody::Replaced(s) => s,
+        }
+    }
 }
 
 /// The `outcome` field of the result envelope: `{ok: <value>}` on success,
@@ -826,6 +920,7 @@ mod tests {
     use crate::provided::ProvidedTool;
     use crate::provided::tests::{PROVIDER, decl};
     use crate::registry::PROVIDED_ADMISSION_CEILING_DETAIL;
+    use crate::testutil::{ATTACHMENT_ECHO, AttachmentEchoTool};
     use crate::tool::{ActingUser, AsyncTool, FastTool};
 
     const CALLER: &str = "wasm:sync";
@@ -861,6 +956,7 @@ mod tests {
                     idempotency: Idempotency::Natural,
                     auto_approve: true,
                     user_binding: crate::UserBinding::None,
+                    accepts_attachments: false,
                 },
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -875,6 +971,12 @@ mod tests {
             self.gate = Some(gate.clone());
             self
         }
+
+        /// Declare that the tool accepts attachments.
+        fn accepting(mut self) -> Self {
+            self.descriptor.accepts_attachments = true;
+            self
+        }
     }
 
     #[async_trait]
@@ -885,7 +987,12 @@ mod tests {
         fn check_acl(&self, args: &Value, acl: &[AclClause]) -> Result<(), AclDenied> {
             crate::testutil::repo_acl_check(args, acl)
         }
-        async fn execute(&self, ctx: &ToolCtx, args: Value) -> Result<Value, ToolError> {
+        async fn execute(
+            &self,
+            ctx: &ToolCtx,
+            args: Value,
+            _attachments: HeldAttachments,
+        ) -> Result<ToolOutput, ToolError> {
             self.seen_users
                 .lock()
                 .unwrap()
@@ -899,7 +1006,7 @@ mod tests {
                 let _open = gate.acquire().await.expect("the gate is never closed");
             }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            Ok(json!({ "echoed": args }))
+            Ok(json!({ "echoed": args }).into())
         }
     }
 
@@ -920,6 +1027,7 @@ mod tests {
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
                 user_binding: crate::UserBinding::None,
+                accepts_attachments: false,
             })
         }
     }
@@ -971,6 +1079,7 @@ mod tests {
     /// provider runtime attached to the messenger.
     struct Harness {
         messenger: Arc<Messenger>,
+        _blob_dir: brenn_messaging::testutils::TempBlobDir,
         tools_uuid: uuid::Uuid,
         provided_uuid: uuid::Uuid,
         ghost_uuid: uuid::Uuid,
@@ -1012,11 +1121,24 @@ mod tests {
                 TOOL_EXECUTOR_COMPONENT.to_string(),
             ))],
         );
+        let echo_ch = test_channel_entry(
+            &request_channel_name(ATTACHMENT_ECHO),
+            vec![sub(SubscriberEntryKind::System(
+                TOOL_EXECUTOR_COMPONENT.to_string(),
+            ))],
+        );
         let tools_uuid = tools_ch.uuid;
         let provided_uuid = provided_ch.uuid;
         let ghost_uuid = ghost_ch.uuid;
         let results_uuid = results_ch.uuid;
-        let channels = vec![tools_ch, provided_ch, results_ch, requests_ch, ghost_ch];
+        let channels = vec![
+            tools_ch,
+            provided_ch,
+            results_ch,
+            requests_ch,
+            ghost_ch,
+            echo_ch,
+        ];
 
         {
             let conn = db.lock().await;
@@ -1032,6 +1154,7 @@ mod tests {
             Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
             messaging,
         );
+        let (messenger, blob_dir) = brenn_messaging::testutils::install_blob_store(messenger).await;
         let mut wasm_policies = HashMap::new();
         wasm_policies.insert(CALLER_SLUG.to_string(), subscribe_policy("tool-results/"));
         wasm_policies.insert(PROVIDER.to_string(), subscribe_policy("tool-requests/"));
@@ -1065,7 +1188,7 @@ mod tests {
         }
         // The executor reads its request channels through a position too,
         // primed at head before any request is inserted.
-        for entry in [&channels[0], &channels[1], &channels[4]] {
+        for entry in [&channels[0], &channels[1], &channels[4], &channels[5]] {
             messenger
                 .attach_subscriber(
                     &entry.address,
@@ -1081,6 +1204,7 @@ mod tests {
 
         Harness {
             messenger,
+            _blob_dir: blob_dir,
             tools_uuid,
             provided_uuid,
             ghost_uuid,
@@ -1499,7 +1623,9 @@ mod tests {
                 &Ok(json!({})),
                 h.messenger.max_body_bytes(),
                 &alert,
-            ),
+            )
+            .into_string(),
+            HeldAttachments::none(),
         )
         .await;
         // Nothing landed on any inbox; the drop is silent-but-logged.
@@ -1553,9 +1679,22 @@ mod tests {
             &Ok(json!({})),
             messenger.max_body_bytes(),
             &alert,
-        );
-        publish_result(&messenger, "brenn:tool-results/sync", &body).await;
-        publish_result(&messenger, "brenn:tool-results/sync", &body).await;
+        )
+        .into_string();
+        publish_result(
+            &messenger,
+            "brenn:tool-results/sync",
+            &body,
+            HeldAttachments::none(),
+        )
+        .await;
+        publish_result(
+            &messenger,
+            "brenn:tool-results/sync",
+            &body,
+            HeldAttachments::none(),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1664,7 +1803,8 @@ mod tests {
             &Ok(json!({ "blob": big })),
             2 * MAX_ASYNC_RESULT_BYTES,
             &alert,
-        );
+        )
+        .into_string();
         let v: Value = serde_json::from_str(&body).expect("capped body is JSON");
         assert_eq!(v["call_id"], "c7");
         assert_eq!(v["outcome"]["err"]["kind"], "internal");
@@ -1692,7 +1832,8 @@ mod tests {
     async fn build_result_body_over_the_bus_cap_answers_internal_naming_it() {
         let (alert, captured, handle) = make_capturing_alerter_with_severity();
         let value = json!({ "blob": "x".repeat(2048) });
-        let body = build_result_body("apull", "c8", Some("s1"), &Ok(value.clone()), 1024, &alert);
+        let body = build_result_body("apull", "c8", Some("s1"), &Ok(value.clone()), 1024, &alert)
+            .into_string();
         let v: Value = serde_json::from_str(&body).expect("fitted body is JSON");
         assert_eq!(v["call_id"], "c8");
         assert_eq!(v["serving"], "s1");
@@ -1705,7 +1846,7 @@ mod tests {
         );
         assert!(body.len() <= 1024, "the substitute fits the cap");
         // A second over-cap result is answered the same way without a second alert.
-        let second = build_result_body("apull", "c9", None, &Ok(value), 1024, &alert);
+        let second = build_result_body("apull", "c9", None, &Ok(value), 1024, &alert).into_string();
         let v: Value = serde_json::from_str(&second).expect("fitted body is JSON");
         assert_eq!(v["call_id"], "c9");
         assert_eq!(v["outcome"]["err"]["kind"], "internal");
@@ -1773,13 +1914,16 @@ mod tests {
         let value = json!({ "blob": "x".repeat(256) });
         let (probe, _hp) = noop_alert_dispatcher();
         let unfitted =
-            build_result_body("apull", "c11", None, &Ok(value.clone()), usize::MAX, &probe);
+            build_result_body("apull", "c11", None, &Ok(value.clone()), usize::MAX, &probe)
+                .into_string();
         let cap = unfitted.len();
 
         let (alert, captured, handle) = make_capturing_alerter_with_severity();
-        let at_cap = build_result_body("apull", "c11", None, &Ok(value.clone()), cap, &alert);
+        let at_cap =
+            build_result_body("apull", "c11", None, &Ok(value.clone()), cap, &alert).into_string();
         assert_eq!(at_cap, unfitted, "a body at the cap is sent unchanged");
-        let under = build_result_body("apull", "c11", None, &Ok(value.clone()), cap - 1, &alert);
+        let under = build_result_body("apull", "c11", None, &Ok(value.clone()), cap - 1, &alert)
+            .into_string();
         let v: Value = serde_json::from_str(&under).expect("fitted body is JSON");
         assert_eq!(v["outcome"]["err"]["kind"], "internal");
         alert.flush().await;
@@ -1796,7 +1940,13 @@ mod tests {
             ..Default::default()
         })
         .await;
-        publish_result(&h.messenger, "brenn:tool-results/sync", &at_cap).await;
+        publish_result(
+            &h.messenger,
+            "brenn:tool-results/sync",
+            &at_cap,
+            HeldAttachments::none(),
+        )
+        .await;
         let result = read_result(&h).await;
         assert_eq!(result["call_id"], "c11");
         assert_eq!(result["outcome"]["ok"], value);
@@ -1820,8 +1970,15 @@ mod tests {
             &Ok(json!({})),
             h.messenger.max_body_bytes(),
             &alert,
-        );
-        publish_result(&h.messenger, "brenn:tool-results/sync", &body).await;
+        )
+        .into_string();
+        publish_result(
+            &h.messenger,
+            "brenn:tool-results/sync",
+            &body,
+            HeldAttachments::none(),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1845,7 +2002,8 @@ mod tests {
             &Ok(value.clone()),
             MAX_ASYNC_RESULT_BYTES,
             &alert,
-        );
+        )
+        .into_string();
         assert!(
             body.len() <= MAX_ASYNC_RESULT_BYTES,
             "envelope {} over cap",
@@ -1933,8 +2091,13 @@ mod tests {
         assert_eq!(batch.len(), 1, "one pending request");
         let (seq, env) = batch.pop().expect("one pending request");
         let cx = exec.shared.batch_ctx();
-        let joined =
-            tokio::spawn(async move { admit_and_dispatch(&cx, seq, env).await.is_some() }).await;
+        let joined = tokio::spawn(async move {
+            let attachments = hold_request_attachments(&cx.shared.messenger, &env).await;
+            admit_and_dispatch(&cx, seq, env, attachments)
+                .await
+                .is_some()
+        })
+        .await;
         *joined
             .expect_err("admission panics")
             .into_panic()
@@ -2011,7 +2174,9 @@ mod tests {
                 &Ok(json!({ "echoed": { "repo": "brenn" } })),
                 h.messenger.max_body_bytes(),
                 &alert,
-            ),
+            )
+            .into_string(),
+            HeldAttachments::none(),
         )
         .await;
 
@@ -2307,7 +2472,7 @@ mod tests {
         assert_eq!(rows[0]["call_id"], "native1");
 
         h.provider
-            .complete(PROVIDER, &id, Ok(json!({ "answered": true })))
+            .complete(PROVIDER, &id, Ok(json!({ "answered": true }).into()))
             .expect("the provided call is pending");
         let rows = results_once(&h, 2).await;
         let provided = rows
@@ -2408,5 +2573,253 @@ mod tests {
             1,
             "the parked request never reached the provider"
         );
+    }
+
+    // --- attachments ---
+
+    use brenn_envelope::{AttachmentName, Attachments, BlobId, BlobRef};
+    use brenn_messaging::WasmPublish;
+    use brenn_messaging_store::testutils::{held, seal_bytes};
+
+    fn attachment(name: &str) -> AttachmentName {
+        AttachmentName::new(name).unwrap()
+    }
+
+    /// Publish a request from the caller onto `tool`'s channel exactly as a
+    /// component's flush does, carrying `attachments`.
+    async fn publish_request(h: &Harness, tool: &str, call_id: &str, attachments: HeldAttachments) {
+        let body = json!({
+            "v": 1,
+            "tool": tool,
+            "call_id": call_id,
+            "caller": CALLER,
+            "args": {},
+        })
+        .to_string();
+        let channel = canonical_address(&request_channel_name(tool));
+        h.messenger
+            .publish_from_wasm(
+                CALLER_SLUG,
+                &[WasmPublish {
+                    channel_address: &channel,
+                    body: body.as_str().into(),
+                    urgency: Urgency::Normal,
+                    reply_to: Some("brenn:tool-results/sync"),
+                    deliver_after: None,
+                    attachments: &attachments,
+                }],
+            )
+            .await;
+    }
+
+    /// The one result envelope on the caller's inbox.
+    async fn result_envelope(h: &Harness) -> Arc<MessageEnvelope> {
+        let rows = brenn_messaging::testutils::owed_everywhere(
+            &h.messenger,
+            &ParticipantId::for_wasm(CALLER_SLUG),
+        )
+        .await;
+        assert_eq!(rows.len(), 1, "exactly one result row on the caller inbox");
+        rows[0].1.clone()
+    }
+
+    fn echo_executor(h: &Harness, alert: AlertDispatcher) -> ToolExecutor {
+        executor(
+            h,
+            Arc::new(ToolRegistry::new(vec![RegisteredTool::Async(Arc::new(
+                AttachmentEchoTool::new(),
+            ))])),
+            Arc::new(ToolCallerGrants::new(HashMap::from([(
+                CALLER.to_string(),
+                BTreeMap::from([(ATTACHMENT_ECHO.to_string(), grant(vec![]))]),
+            )]))),
+            alert,
+        )
+    }
+
+    /// A request's attachments are held from its envelope and handed to the
+    /// tool; the tool's `ok` answer carries the attachments it returned on the
+    /// result message, by reference.
+    #[tokio::test]
+    async fn a_requests_attachments_reach_the_tool_and_its_answer_rides_the_result() {
+        let h = harness().await;
+        let store = h.messenger.blob_store().unwrap().clone();
+        let photo = seal_bytes(&store, "image/png", b"png bytes");
+        let photo_id = photo.id().clone();
+        publish_request(&h, ATTACHMENT_ECHO, "c1", held(&[("photo", &photo)])).await;
+        drop(photo);
+        let (alert, _hg) = noop_alert_dispatcher();
+        drain_and_join(&echo_executor(&h, alert)).await;
+
+        let result = result_envelope(&h).await;
+        let body: Value = serde_json::from_str(result.body.as_text().unwrap()).unwrap();
+        assert_eq!(
+            body["outcome"]["ok"],
+            json!({
+                "args": {},
+                "received": { "photo": { "size": 9, "content_type": "image/png" } }
+            })
+        );
+        assert_eq!(
+            result.attachments.get(&attachment("photo")).unwrap().id,
+            photo_id
+        );
+        assert_eq!(store.usage().sealed, 1, "one blob throughout");
+    }
+
+    /// A result whose body was replaced for size carries none of the tool's
+    /// attachments.
+    #[tokio::test]
+    async fn a_result_replaced_for_size_carries_no_attachments() {
+        let h = harness_with(MessagingGlobalConfig {
+            max_body_bytes: 400,
+            ..Default::default()
+        })
+        .await;
+        let store = h.messenger.blob_store().unwrap().clone();
+        let photo = seal_bytes(&store, "image/png", b"png bytes");
+        let long = |n: char| format!("{}{}", n, "x".repeat(60));
+        let names: Vec<String> = ['a', 'b', 'c', 'd', 'e'].into_iter().map(long).collect();
+        let entries: Vec<(&str, &brenn_messaging_store::blob::BlobHold)> =
+            names.iter().map(|n| (n.as_str(), &photo)).collect();
+        publish_request(&h, ATTACHMENT_ECHO, "c2", held(&entries)).await;
+        let (alert, _hg) = noop_alert_dispatcher();
+        drain_and_join(&echo_executor(&h, alert)).await;
+
+        let result = result_envelope(&h).await;
+        let body: Value = serde_json::from_str(result.body.as_text().unwrap()).unwrap();
+        assert_eq!(body["outcome"]["err"]["kind"], "internal");
+        assert!(result.attachments.is_empty());
+    }
+
+    /// A tool that takes no attachments is refused a request carrying any,
+    /// before it runs; the refusal carries none.
+    #[tokio::test]
+    async fn a_request_with_attachments_to_a_tool_that_takes_none_is_invalid_args() {
+        let h = harness().await;
+        let store = h.messenger.blob_store().unwrap().clone();
+        let photo = seal_bytes(&store, "image/png", b"png bytes");
+        publish_request(&h, "apull", "c3", held(&[("photo", &photo)])).await;
+        let tool = StubAsync::new(4, Duration::ZERO);
+        let seen = tool.seen_users.clone();
+        let (alert, _hg) = noop_alert_dispatcher();
+        let exec = executor(&h, registry(tool), caller_grants(vec![]), alert);
+        drain_and_join(&exec).await;
+
+        let result = result_envelope(&h).await;
+        let body: Value = serde_json::from_str(result.body.as_text().unwrap()).unwrap();
+        assert_eq!(body["outcome"]["err"]["kind"], "invalid_args");
+        assert_eq!(
+            body["outcome"]["err"]["detail"],
+            "tool apull takes no attachments"
+        );
+        assert!(result.attachments.is_empty());
+        assert!(seen.lock().unwrap().is_empty(), "the tool never ran");
+    }
+
+    /// A request naming a blob nothing held at the dequeue — its row evicted
+    /// and reaped after the publish — is answered `internal` naming the
+    /// attachment, and the tool is not run.
+    #[tokio::test]
+    async fn a_request_whose_blob_is_gone_is_answered_internal_naming_it() {
+        let h = harness().await;
+        publish_request(&h, ATTACHMENT_ECHO, "c4", HeldAttachments::none()).await;
+        let (alert, _hg) = noop_alert_dispatcher();
+        let exec = echo_executor(&h, alert);
+        let mut batch = exec.inbox.dequeue_batch().await;
+        assert_eq!(batch.len(), 1);
+        let (seq, mut env) = batch.pop().unwrap();
+        env.attachments = Attachments::from_map(BTreeMap::from([(
+            attachment("gone"),
+            BlobRef {
+                id: BlobId::new("0".repeat(32)),
+                size: 1,
+                content_type: "application/octet-stream".to_string(),
+            },
+        )]));
+        let cx = exec.shared.batch_ctx();
+        let attachments = hold_request_attachments(&cx.shared.messenger, &env).await;
+        assert!(
+            admit_and_dispatch(&cx, seq, env, attachments)
+                .await
+                .is_none()
+        );
+
+        let result = read_result(&h).await;
+        assert_eq!(result["outcome"]["err"]["kind"], "internal");
+        assert_eq!(
+            result["outcome"]["err"]["detail"],
+            "attachment gone of the request is no longer held"
+        );
+    }
+
+    /// Every request of a batch holds its attachments at the dequeue: a
+    /// request queued behind other requests' concurrency permits still runs
+    /// with its blob after every request row is evicted and the store reaped
+    /// meanwhile.
+    #[tokio::test]
+    async fn a_request_waiting_for_a_permit_keeps_its_blob_through_eviction_and_reap() {
+        use brenn_messaging_store::blob::ReapReport;
+        use brenn_messaging_store::db::bus_gc_evict_channel;
+
+        let h = harness().await;
+        let store = h.messenger.blob_store().unwrap().clone();
+        let first = seal_bytes(&store, "text/plain", b"first");
+        let second = seal_bytes(&store, "text/plain", b"second");
+        let third = seal_bytes(&store, "text/plain", b"third");
+        publish_request(&h, "apull", "c1", held(&[("doc", &first)])).await;
+        publish_request(&h, "apull", "c2", held(&[("doc", &second)])).await;
+        publish_request(&h, "apull", "c3", held(&[("doc", &third)])).await;
+        drop((first, second, third));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let tool = StubAsync::new(1, Duration::ZERO).accepting().gated(&gate);
+        let in_flight = tool.in_flight.clone();
+        let (alert, _hg) = noop_alert_dispatcher();
+        let exec = executor(&h, registry(tool), caller_grants(vec![]), alert);
+
+        let gc_while_parked = async {
+            // The first request runs holding the tool's one permit; the
+            // second waits for it, and the third is behind the second.
+            while in_flight.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            let mut evicted = 0;
+            {
+                let conn = h.messenger.db().lock().await;
+                for entry in h.messenger.directory().list_durable() {
+                    evicted += bus_gc_evict_channel(
+                        &conn,
+                        entry.uuid,
+                        &entry.address,
+                        entry.transport_type,
+                        0,
+                        entry.resolved_channel.sink,
+                        None,
+                    )
+                    .messages_evicted;
+                }
+            }
+            assert_eq!(evicted, 3, "every request row is evicted");
+            assert_eq!(
+                h.messenger.reap_blobs().await,
+                ReapReport::default(),
+                "the executor holds every request's blob"
+            );
+            gate.add_permits(3);
+        };
+        tokio::join!(exec.drain_step(), gc_while_parked);
+
+        let rows = results_once(&h, 3).await;
+        for call_id in ["c1", "c2", "c3"] {
+            let row = rows
+                .iter()
+                .find(|r| r["call_id"] == call_id)
+                .expect("a result");
+            assert!(
+                row["outcome"].get("ok").is_some(),
+                "{call_id} ran: {}",
+                row["outcome"]
+            );
+        }
     }
 }

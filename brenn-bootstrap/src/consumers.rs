@@ -1177,6 +1177,7 @@ mod tests {
                 input_schema: serde_json::json!({ "type": "object" }),
                 max_concurrency: 1,
                 auto_approve: false,
+                accepts_attachments: false,
             });
         let provider = consumer_provider(&consumer, &runtime).expect("a providing consumer");
         assert!(Arc::ptr_eq(&provider, &runtime));

@@ -4,6 +4,43 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Tool calls can carry blobs (binary attachments).** A tool can now be
+  handed blobs with its arguments and answer with blobs beside its result.
+  - **For agents and app authors:** a tool result with attachments is shown to
+    the conversation as `{"result": …, "message_id": "<uuid>", "attachments":
+    {<name>: {"size", "content_type"}}}`; `BrennSend`, `brenn-tool save` and
+    later tool calls name those attachments by that `message_id` until the
+    conversation's context is reset. A result without attachments is the bare
+    value, as before. A tool that accepts attachments takes an `attachments`
+    argument. See `docs/agent-tool-cli.md`.
+  - **For WASM component authors:** `brenn:processor/blobs@0.3.0` gains
+    `call-async`, `call-async-for` and `complete`, the attachment-carrying
+    forms of the tool-call and provider-answer functions; `brenn-guest` gains
+    matching `*_with_attachments` helpers. A provided tool takes attachments
+    only if its `provide` statement sets `accepts_attachments = true`
+    (default `false`); otherwise such a call is refused
+    `attachments-not-accepted`. Using the new functions also requires the
+    `tools` or `provides` capability they extend. `brenn-guest`'s
+    `ToolResult` and `ToolRequest` gain a public `attachments` field, so code
+    building or exhaustively destructuring them must change at its next pin
+    move. Components using none of this are unaffected. See
+    `docs/component-packages.md`, "Blobs and tool calls".
+- **BREAKING for operators: `app-tool-results` is a reserved channel name.**
+  Each app granted an asynchronous tool gets a private inbox channel,
+  `brenn:app-tool-results/<app-slug>`, holding the attachments of tool results
+  handed to its conversations (default depth 16, tunable with a `[[channel]]`
+  block; `send_rate` is refused). A configuration declaring a channel named
+  `app-tool-results…`, or a matcher reaching into it, is now refused at start.
+  Other configurations need no change. See `docs/message-bus.md` §2.7.
+- **BREAKING for WASM component authors: `blobs.publish`'s error type
+  changed.** It now wraps `ports@0.2.0`'s `publish-error` instead of restating
+  its cases, so a component calling `blobs.publish` must be rebuilt (its
+  source does not change) and its class must require `ports`, as any class
+  that sends already does.
+- A watch of the tool channels (`brenn:tools/`, `brenn:tool-requests/`,
+  `brenn:tool-results/`) now sees attachment names, sizes and content types,
+  but can never save or forward the blobs themselves. See
+  `docs/security-posture.md` §7.6.
 - **BREAKING for operators who install `brenn-tool` by hand: the tool socket
   protocol is v2.** The server refuses a v1 `brenn-tool` by name
   ("unsupported protocol version"). The binary at `tool_cli_path` must be the

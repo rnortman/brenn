@@ -23,4 +23,5 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 brenn-messaging = { version = "0.1.0", path = "../brenn-messaging", features = ["testutils"] }
+brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry", features = ["testutils"] }
 tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread"] }

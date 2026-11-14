@@ -6,8 +6,9 @@
 //! the tool executor's subscriptions are on one bus; the provider runs behind a
 //! real `WasmProvidesHost` over the process's `ProviderRuntime`. A rig may also
 //! hold a calling component, `processor-tool-test`, that calls one provided
-//! tool through `call-async` when its trigger channel is written. Each suite
-//! keeps its own stub and fixtures beside this.
+//! tool through `call-async` when its trigger channel is written, and the
+//! apps whose conversations call the registry, each with its result inbox
+//! beside a blob store. Each suite keeps its own stub and fixtures beside this.
 
 use super::*;
 
@@ -15,19 +16,21 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
+use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::config::{ProvidedToolDecl, SystemChannelTuning};
 use brenn_lib::tools::ResolvedToolGrant;
+use brenn_messaging::testutils::{TEST_BLOB_LIMITS, TempBlobDir, install_blob_store_with};
 use brenn_messaging::{Messenger, MountDebt};
 use brenn_tool_registry::bus_wiring::{
-    inbox_input_port, request_channel_entry, request_inbox_depth, request_inbox_entry,
-    request_inbox_subscription, request_input_port, tool_executor_spec,
+    app_result_inbox_entries, inbox_input_port, request_channel_entry, request_inbox_depth,
+    request_inbox_entry, request_inbox_subscription, request_input_port, tool_executor_spec,
     tool_executor_system_policy,
 };
 use brenn_tool_registry::executor::TOOL_EXECUTOR_COMPONENT;
 use brenn_tool_registry::testutil::grant;
 use brenn_tool_registry::{
-    ActingUser, GrantOwner, ProvidedTool, ProviderRuntime, RegisteredTool, ToolCallerGrants,
-    ToolError, ToolExecutor, ToolRegistry, WasmProvidesHost, WasmToolHost,
+    ActingUser, GrantOwner, HeldAttachments, ProvidedTool, ProviderRuntime, RegisteredTool,
+    ToolCallerGrants, ToolError, ToolExecutor, ToolRegistry, WasmProvidesHost, WasmToolHost,
 };
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -47,6 +50,20 @@ pub(super) struct ProviderSetup<'a> {
     pub component: ProcessorLoadSpec<'a>,
     /// A component that calls one provided tool, if the suite needs one.
     pub caller: Option<CallerSetup<'a>>,
+    /// Apps whose conversations call the registry, if the suite has any.
+    pub conversations: Option<ConversationSetup>,
+}
+
+/// The apps of a rig whose conversations call the registry. The rig gives the
+/// messenger a blob store, puts each app on it, and mints the result inbox of
+/// each app whose policy grants an asynchronous tool, by boot planning's rule.
+pub(super) struct ConversationSetup {
+    /// The apps, by slug, each with its policy and tool grants.
+    pub apps: IndexMap<String, AppConfig>,
+    /// Durable channels beside the tool substrate's, for the apps to read.
+    pub channels: Vec<ChannelEntry>,
+    /// A system principal that may publish on every channel.
+    pub producer: &'static str,
 }
 
 /// A `processor-tool-test` instance that calls `tool` with `args` through
@@ -77,6 +94,9 @@ pub(super) struct ProviderRig {
     pub provider_grants: BTreeMap<String, ResolvedToolGrant>,
     /// The provider's result inbox, for a case that delivers a result itself.
     pub provider_results: ChannelEntry,
+    /// The blob store's directory, on a rig built with conversations or for a
+    /// provider granted `blobs`.
+    pub blobs: Option<TempBlobDir>,
     caller: Option<Caller>,
 }
 
@@ -98,6 +118,7 @@ impl ProviderRig {
             grants: provider_grants,
             component,
             caller,
+            conversations,
         } = setup;
         let (alert, _alerts) = noop_alert_dispatcher();
         let runtime = ProviderRuntime::new(alert.clone());
@@ -137,6 +158,34 @@ impl ProviderRig {
             entries.extend([trigger.clone(), results.clone()]);
             (trigger, results, results_ch)
         });
+        let mut registrations = testutils::system_registrations(HashMap::from([(
+            TOOL_EXECUTOR_COMPONENT.to_string(),
+            tool_executor_system_policy(),
+        )]));
+        let with_blobs =
+            conversations.is_some() || component.grants.contains(&ComponentGrant::Blobs);
+        let apps = match conversations {
+            None => IndexMap::new(),
+            Some(ConversationSetup {
+                apps,
+                channels,
+                producer,
+            }) => {
+                entries.extend(channels);
+                entries.extend(
+                    app_result_inbox_entries(
+                        &registry,
+                        apps.iter().map(|(slug, app)| (slug.as_str(), &*app.policy)),
+                        &tuning,
+                        &defaults,
+                    )
+                    .into_iter()
+                    .map(|(_, entry)| entry),
+                );
+                registrations.extend(testutils::covering_system_publisher(producer));
+                apps
+            }
+        };
         brenn_messaging::system::fold_spec_subscriptions(
             &mut entries,
             &[tool_executor_spec(&tool_names)],
@@ -150,17 +199,20 @@ impl ProviderRig {
             db,
             Arc::new(MessagingDirectory::with_entries(entries.clone())),
             Arc::from("test"),
-            Arc::new(IndexMap::new()),
+            Arc::new(apps),
             Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
             defaults,
         )
         .with_subscriber_registrations(testutils::wasm_registrations(wasm_policies_from_entries(
             &entries,
         )))
-        .with_subscriber_registrations(testutils::system_registrations(HashMap::from([(
-            TOOL_EXECUTOR_COMPONENT.to_string(),
-            tool_executor_system_policy(),
-        )])));
+        .with_subscriber_registrations(registrations);
+        let (messenger, blobs) = if with_blobs {
+            let (messenger, dir) = install_blob_store_with(messenger, TEST_BLOB_LIMITS).await;
+            (messenger, Some(dir))
+        } else {
+            (messenger, None)
+        };
         runtime.attach(messenger.clone());
         let provider_sub = ParticipantId::for_wasm(slug);
         super::attach_input_ports(
@@ -191,7 +243,13 @@ impl ProviderRig {
             slug.to_string(),
             alert.clone(),
         ));
+        let blob_host = if component.grants.contains(&ComponentGrant::Blobs) {
+            brenn_wasm_dispatch::blob_host_over(&messenger)
+        } else {
+            None
+        };
         let provider_component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
+            blob_host,
             input_amplification_mt: HashMap::from([
                 (TOOL_REQUEST_INPUT_PORT.to_string(), 1000),
                 ("tool-results".to_string(), 1000),
@@ -307,6 +365,7 @@ impl ProviderRig {
             provider_sub,
             provider_grants,
             provider_results,
+            blobs,
             caller,
         }
     }
@@ -337,9 +396,11 @@ impl ProviderRig {
                     Some(7),
                     Some(alice()),
                     args,
+                    HeldAttachments::none(),
                     &alert,
                 )
                 .await
+                .map(|output| output.value)
         })
     }
 

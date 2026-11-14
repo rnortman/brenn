@@ -247,6 +247,7 @@ impl ToolHost for NotGrantedToolHost {
         _tool: &str,
         _args_json: &str,
         _call_id: &str,
+        _with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
         Err(ToolCallError::NotGranted)
     }
@@ -265,7 +266,12 @@ pub fn noop_tool_host() -> ToolHostFn {
 pub struct NothingPendingProvidesHost;
 
 impl ProvidesHost for NothingPendingProvidesHost {
-    fn complete(&self, _id: &str, _outcome_json: &str) -> Result<(), ProvidesCallError> {
+    fn complete(
+        &self,
+        _id: &str,
+        _outcome_json: &str,
+        _attachments: brenn_wasm::HeldAttachments,
+    ) -> Result<(), ProvidesCallError> {
         Err(ProvidesCallError::NotPending)
     }
     fn queue_async_for(
@@ -274,6 +280,7 @@ impl ProvidesHost for NothingPendingProvidesHost {
         _tool: &str,
         _args_json: &str,
         _call_id: &str,
+        _with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
         Err(ToolCallError::Denied("not pending".to_string()))
     }

@@ -317,9 +317,12 @@ documents record that the per-message rule is final and why.
 Saving an attachment or a non-text body to a file, and attaching a file to a send, exist
 only as `brenn-tool` commands, which a conversation runs through its shell tool. An app
 that lists `Bash` in `disabled_tools` gets forwarding by reference and neither of the two:
-its conversations see attachment metadata they cannot turn into bytes. A route through a
-tool call has the server open a path the conversation names under a tree the agent can
-rewrite, which is `security-host-paths-follow-agent-symlinks`; this entry waits on a
+its conversations see attachment metadata they cannot turn into bytes. A tool call now
+carries a blob by reference (an accepting registry tool's `attachments` argument, and a
+result's attachments named by its `message_id`), so a tool could be the route. What
+stands in the way is unchanged: a host tool that writes a file opens a path the
+conversation names under a tree the agent can rewrite, which is
+`security-host-paths-follow-agent-symlinks`; this entry waits on a
 safe-path answer there, or on another route that moves no bytes through the model's
 context. Done = a conversation without the shell tool saves an attachment to a file and
 attaches a file to a send, each with a test; or the documents record that it never will
@@ -362,8 +365,9 @@ The build-or-never ruling remains.
 The `blobs` component interface (`brenn:processor/blobs@0.3.0`) is served by
 the backend host and is not yet declared stable: its file says its shapes are
 expected to change, because no surface host serves it and the surface is where
-a synchronous host must answer a range read without the network, and because
-tool calls do not carry blobs yet (`blobs-on-tool-calls`). Until the
+a synchronous host must answer a range read without the network. (Its other
+reason, that tool calls did not carry blobs, is discharged: `call-async`,
+`call-async-for` and `complete` of the interface carry them.) Until the
 declaration the rule is: a shape changes in place only while no tagged brenn
 release has served it; a shape a tagged release has served changes only as a
 new version of the interface, served beside the old one for at least one
@@ -379,32 +383,23 @@ and the declaration is made for the backend alone. Code site
 (`TODO(blobs-interface-stable-declaration)`): the status paragraph of
 `brenn-wasm/wit/processor-0.3.wit`.
 
-## `blobs-on-tool-calls`
+## `blobs-on-sync-calls`
 
-A blob cannot cross a tool call or a sync call. A component serving a registry
-tool (`provides`) is handed its request as JSON text on `tool-requests` and
-answers through `provides.complete` with outcome JSON capped at 512 KiB;
-`tools.call-fast`, `tools.call-async`, `provides.call-async-for`, their results
-on `tool-results`, and `calls.call` carry no attachments either. The `blobs`
-interface lets a component read, make and attach blobs on published messages
-only, so an in-tree Google tool cannot return a mail or Drive attachment by
-reference, and a caller cannot hand a blob to a tool. Build the path: a tool
-request and a tool result that carry named attachments, and a completion that
-attaches blobs the provider sealed or was handed, under the same check on
-which blobs a component may name as a publish; the caller's side — a
-conversation or a component — receives the references. A conversation already
-has a reference form: (message id, attachment name), admitted only for a
-message the host handed it that is still retained on a channel its app may
-read. So a tool result that carries a blob to a conversation needs a message,
-or another holder the conversation can name, for that form to name; a bare
-blob id handed to a conversation is not a form it can redeem. The "Blobs and
-provided tools" paragraph of `docs/component-packages.md` is the starting
-point. Done = a fixture provider is handed a blob on a request and answers a
-request with a blob its caller can read, both by reference with no byte
-copied, and the interface's file states what each call form does with
-attachments. Code site (`TODO(blobs-on-tool-calls)`): the sentence of
-`brenn-wasm/wit/processor-0.3.wit` that says tool calls and completions carry
-no attachments.
+`tools.call-fast` and `calls.call` carry no attachments. Both return to the
+caller inside its activation: a fast call's result is a return value and a
+sync call's request and answer cross a host-side channel, none of them a bus
+message, so the route the asynchronous tool call takes — attachments on the
+request and result messages — does not reach them. A component that wants to
+hand a blob to a fast tool or to a sync callee, or get one back, must use the
+asynchronous call or a published message. Build it if a caller needs it: a
+form of each call taking and returning `blob` handles, the holds passed across
+the call by the host, under the rule that a component names a blob only by a
+handle. Done = a fixture hands a blob over `calls.call` and over
+`tools.call-fast` and reads one from each answer, by reference; or the
+documents record that these forms never carry blobs and why. Code site
+(`TODO(blobs-on-sync-calls)`): the sentence of
+`brenn-wasm/wit/processor-0.3.wit` that says these two forms carry no
+attachments.
 
 ## `blobs-parked-message-attachments`
 
@@ -432,9 +427,18 @@ A conversation is a producer against the same pool too, through a file it
 attaches with `brenn-tool send`: bounded per send (its files together at most
 `max_blob_bytes`) and in flight (eight open socket connections), and not over
 time, so over many sends one conversation can exhaust the pool as a component
-can. Decide whether a component or a conversation gets a share of the budget,
-who is charged for a blob that is forwarded and so held by messages of several
-producers, and whether the share is operator configuration. Done = one
+can. A tool call's blobs rest on the rows of the call — the request on
+`brenn:tools/<tool>` and on a provider's `brenn:tool-requests/<slug>`, and the
+result on the caller's inbox, a component's `brenn:tool-results/<slug>` or an
+app's `brenn:app-tool-results/<app-slug>` — each for that channel's window, so
+a caller fills the pool through the channels of the tools it calls and a
+provider through its callers' inboxes, as well as through their own
+publishes; and after a restart an app's inbox holds blobs no conversation can
+name until its window turns over. Decide whether a component or a
+conversation gets a share of the budget, who is charged for a blob that is
+forwarded and so held by messages of several producers — a blob handed to a
+tool or returned by one included — and whether the share is operator
+configuration. Done = one
 producer, component or conversation, at its share cannot cause another
 producer's write to be refused, with a test, and `docs/security-posture.md`
 §7.6 no longer states the exposure for either. Code site
@@ -557,18 +561,19 @@ compile-time `MAX_RESPONSE_BYTES_CEILING` (512 KiB, tied to
 `api-request-read-limit-vs-bus-cap`). What the component then answers its own
 caller is bounded again, by the provider kit's `COMPACT_RESULT_CEILING`
 (256 KiB) and the bus cap. A WebDAV file component or a mail-attachment tool
-built on the provider kit is therefore limited to small files. Decide
-between: (a) raising the caps to a stated size, with what that costs in
-memory per call and on the bus; (b) a route for a body that does not ride in
-the call — the host holds the bytes and the component names them by handle,
-for upload and for download — which is also what delivering a file to a user
-(`agent-file-delivery-beyond-markdown`) and attachments on the bus
-(`chat-bus-attachments`) would use; (c) keeping the caps and documenting them
-as the limit of what a provider component transfers. Under (b) the provider
-kit's contract probably changes, which components built outside this
-repository pay for at their next pin move. Done = the decision recorded here,
-and for (a) or (b) a component test that uploads and downloads a body larger
-than today's caps through the kit. The
+built on the provider kit is therefore limited to small files. The route is
+decided: a body that does not ride in the call, named by attachment on the
+tool call — the host holds the bytes and the component names them by handle,
+for upload and for download. The tool-call path it needs is built: a tool
+call and its result carry attachments by reference
+(`blobs.call-async`, `blobs.call-async-for` and `blobs.complete` in
+`brenn-wasm/wit/processor-0.3.wit`; `accepts_attachments` on a `provide`
+statement). What remains is `api-request` itself taking a request body and
+answering a response body as attachments, the provider kit's forms for
+handing and receiving them (its contract changes, which components built
+outside this repository pay for at their next pin move), and the component
+test. Done = a component test that uploads and downloads a body larger than
+today's caps through the kit. The
 `TODO(api-request-body-caps-bound-file-transfer)` comments sit at
 `MAX_ARGS_BYTES` and `MAX_ASYNC_RESULT_BYTES` in
 `brenn-tool-registry/src/descriptor.rs`.
@@ -3733,6 +3738,71 @@ Code site (`TODO(system-participant-noise-inert)`):
 
 Done = a tuning block's `noise` is either enacted by the system participant
 subscribed to that channel or refused at load, with no family in between.
+
+## `tool-request-window-overflow-silent`
+
+A tool call pushed past its request channel's window is lost with no answer and no log
+line. The tool executor drains `brenn:tools/<tool>` as a system participant whose window
+is the channel's `retain_depth` and whose overflow rung is `Silent`: each drain serves
+the window's newest unseen requests and steps over the older ones. A stepped-over call
+gets no result, so the component that made it is never answered, and nothing records
+that it happened; the blobs it carried go when GC evicts its row. The defaults guarantee
+the case: one activation may queue 64 asynchronous calls
+(`PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION`, `brenn-wasm/src/lib.rs`) and a request
+channel's default window is 16 (`TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH`,
+`brenn-lib/src/messaging/config.rs`), so a burst of more than 16 calls to one tool that
+lands before the executor's next drain loses all but the newest 16. The host admits a
+burst that its own default sizing then drops. `docs/message-bus.md`, the tool-channel
+section, states the behaviour and tells the operator to size the window; that is not
+enough for a default.
+
+Two things are to be done. Make the default sizing and the per-activation call cap
+cohere, so that a burst the host admits in one activation is not lost under defaults.
+The window's default also sets how long a handed blob rests on a request row and how
+many requests a fresh executor position re-runs, and the cap is shared with fast calls
+and with `MAX_FAST_CALLS_PER_ACTIVATION` in `brenn-tool-registry/src/descriptor.rs`;
+the change weighs those. And make a request the executor steps over observable: a log
+line or alert naming the tool and how many were skipped, at the drain in
+`brenn-messaging/src/system.rs` (`SystemInbox::dequeue_batch`), whatever
+`system-participant-noise-inert` settles about a block's `noise`.
+
+The bus has no backpressure and gets none: no blocking publish, no flow control, no
+redelivery. Loss by overflow stays the bus's rule, and a window an operator sized too
+small for the traffic still drops oldest. What is to be fixed is defaults that guarantee
+the loss and the silence around it.
+
+Code site (`TODO(tool-request-window-overflow-silent)`):
+`brenn-lib/src/messaging/config.rs`, at `TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH`.
+
+Done = under default sizing, the largest burst one activation may queue to one tool is
+served whole when the executor was caught up (a test), and a stepped-over request is
+logged; or the documents record, beside the two constants, the decision that the
+mismatch stands and why.
+
+## `agent-tool-namespace-subscribe-boot`
+
+The config language lets an agent, and only an agent, `subscribe` to a literal address
+in `brenn:tools/`, `brenn:tool-requests/` or `brenn:tool-results/` — the carve-out in
+`brenn-dsl/src/derive.rs` for an operator watching the tool substrate — and derives an
+exact `acl` entry from it (`brenn-dsl/tests/authority.rs`,
+`a_tool_namespace_address_stays_a_literal_and_derives_an_entry`). Nothing lowers and
+boots such a document. Read statically, `resolve_app_messaging`
+(`brenn-lib/src/messaging/config.rs`) resolves every static subscription through the
+config-time directory, which holds declared channels only, and panics on an address it
+does not find; the tool channels are minted into the runtime directory later, by boot
+planning. If that reading holds, the language accepts a document that cannot start.
+
+First establish which it is, with a test that lowers and boots an agent holding
+`subscribe "brenn:tool-requests/<slug>"`. If it does not boot, the fix is a choice:
+either a static subscription resolves against the channels boot will mint, or the
+carve-out goes and the language refuses the line, leaving an authored `acl` matcher with
+`MessageChannelGet` or `MessageSubscribe` as the way to watch the substrate.
+
+Code site (`TODO(agent-tool-namespace-subscribe-boot)`): `brenn-dsl/src/derive.rs`, at
+the comment "An agent watches the substrate through the other three namespaces".
+
+Done = a test boots such a document, or the language refuses it; no document the
+language accepts fails at start for this reason.
 
 ## `wasm-window-byte-cap`
 

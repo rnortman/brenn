@@ -1071,6 +1071,20 @@ fn a_tool_namespace_address_stays_a_literal_and_derives_an_entry() {
     );
 }
 
+/// An app's result inbox is outside the carve-out: no agent watches it.
+#[test]
+fn an_agent_cannot_name_an_app_result_inbox() {
+    assert_eq!(
+        derive_refusal(&agent_with(
+            "subscribe",
+            "    subscribe \"brenn:app-tool-results/alice\";\n",
+        )),
+        "this subscription of agent `alice` names `brenn:app-tool-results/alice`, an \
+         app's tool-result inbox: no participant may reach one — a conversation names a \
+         result's attachments only by having been handed the result"
+    );
+}
+
 /// The carve-out is an agent's alone. A component's own port binding onto the
 /// substrate's namespaces is the side door the port-name refusal would push an
 /// operator toward, and it is shut.

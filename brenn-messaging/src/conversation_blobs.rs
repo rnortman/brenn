@@ -9,6 +9,13 @@
 //! channel the conversation's app may read. Both conditions are asked of that
 //! one message.
 //!
+//! A tool result that carries attachments to a conversation is published to
+//! the app's result inbox by [`Messenger::hand_tool_result`], which records it
+//! for the calling conversation alone. No policy reaches that inbox, so the
+//! record is the only way in. On the tool substrate's other channels a
+//! policy shows a call's messages, and a conversation names their bodies but
+//! never their attachments, which are for the call's parties.
+//!
 //! The record is in memory and lost with the server process. It is bounded
 //! by dropping, never by waiting: [`READ_RECORD_MESSAGES`] messages per
 //! conversation, oldest dropped first, and [`READ_RECORD_CONVERSATIONS`]
@@ -22,11 +29,14 @@ use indexmap::IndexMap;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use brenn_messaging_store::blob::{BlobHold, Retain};
+use brenn_messaging_store::blob::{BlobHold, HeldAttachments, Retain};
 use brenn_messaging_store::store::RingNamed;
 
-use crate::config::Depth;
-use crate::{AttachmentName, BlobRef, MessageBody, MessageEnvelope, Messenger};
+use crate::config::{Depth, SystemChannelFamily};
+use crate::{
+    AttachmentName, Attachments, BlobRef, MessageBody, MessageEnvelope, Messenger, PublishResult,
+    Urgency, app_tool_result_inbox_address,
+};
 
 /// The most messages the read record keeps for one conversation.
 pub const READ_RECORD_MESSAGES: usize = 1024;
@@ -55,6 +65,9 @@ pub enum NameRefusal {
     NotRetained { channel: String, attachment: bool },
     /// The message does not carry the name; `carried` is what it does carry.
     NoSuchAttachment { carried: Vec<AttachmentName> },
+    /// The message is on a channel of the tool substrate other than the app's
+    /// own result inbox. A tool call's attachments are for the call's parties.
+    ToolChannelAttachment { channel: String },
 }
 
 impl NameRefusal {
@@ -65,6 +78,7 @@ impl NameRefusal {
             NameRefusal::ChannelNotReadable { .. } => "channel_not_readable",
             NameRefusal::NotRetained { .. } => "not_retained",
             NameRefusal::NoSuchAttachment { .. } => "no_such_attachment",
+            NameRefusal::ToolChannelAttachment { .. } => "tool_channel_attachment",
         }
     }
 }
@@ -75,7 +89,8 @@ impl fmt::Display for NameRefusal {
             NameRefusal::NotRead => f.write_str(
                 "this conversation has not been shown that message since it started, since its \
                  last compaction, since a user last sent it a slash command, or since the server \
-                 restarted; read it again with MessageChannelGet and retry",
+                 restarted; read it again with MessageChannelGet and retry, or, for a tool \
+                 result, call the tool again",
             ),
             NameRefusal::ChannelNotReadable { channel } => {
                 write!(f, "this app may not read channel {channel} now")
@@ -103,6 +118,12 @@ impl fmt::Display for NameRefusal {
                     names.join(", ")
                 )
             }
+            NameRefusal::ToolChannelAttachment { channel } => write!(
+                f,
+                "the attachments of a message on {channel} cannot be named: a tool call's \
+                 attachments are for the tool and its caller, and a conversation that reads the \
+                 call's messages is shown their names, sizes and content types only"
+            ),
         }
     }
 }
@@ -116,6 +137,16 @@ pub enum AdmittedPart {
     /// happens to the message.
     Attachment(BlobHold),
     Body(MessageBody),
+}
+
+/// A tool result's attachments, published to the app's result inbox and
+/// recorded for the conversation that made the call.
+#[derive(Debug)]
+pub struct HandedToolResult {
+    /// The inbox message the conversation names the attachments by.
+    pub message_id: Uuid,
+    /// The references the message carries, for rendering.
+    pub attachments: Attachments,
 }
 
 /// Per conversation id, the bus messages the host has handed that
@@ -213,18 +244,68 @@ impl Messenger {
             .is_some()
     }
 
+    /// Publish a tool result's attachments to `app_slug`'s result inbox as the
+    /// system principal `component`, and record the message in the
+    /// conversation's read record.
+    ///
+    /// The body is `{"v":1,"tool":"<tool>"}`: the conversation receives the
+    /// tool's value in place, and the message exists to hold the attachments.
+    /// Publishing and recording are one function so that no caller can do the
+    /// first without the second. A refused publish is returned unrecorded, and
+    /// `attachments`' holds drop with it.
+    pub async fn hand_tool_result(
+        &self,
+        component: &str,
+        app_slug: &str,
+        conversation_id: i64,
+        tool: &str,
+        attachments: HeldAttachments,
+    ) -> Result<HandedToolResult, PublishResult> {
+        let address = app_tool_result_inbox_address(app_slug);
+        let references = attachments.refs().clone();
+        let tool = serde_json::to_string(tool).expect("a string serializes");
+        let body = format!(r#"{{"v":1,"tool":{tool}}}"#);
+        match self
+            .publish_from_system_with_attachments(
+                component,
+                &address,
+                MessageBody::text(body),
+                Urgency::Normal,
+                None,
+                None,
+                attachments,
+            )
+            .await
+        {
+            PublishResult::Ok { message_id, .. } => {
+                self.conversation_reads
+                    .record(conversation_id, [(message_id, address.as_str())]);
+                Ok(HandedToolResult {
+                    message_id,
+                    attachments: references,
+                })
+            }
+            refused => Err(refused),
+        }
+    }
+
     /// Admit the conversation's name for `part` of `message_id`, for the app
     /// `app_slug`, and hand over what it names.
     ///
     /// In order: the message is in the conversation's read record; the app's
-    /// policy allows access to its channel and the directory resolves it;
-    /// the message is retained in the channel's window — the whole ring, or a
-    /// durable channel's standing depth — and not parked; the message carries
-    /// the name. An attachment's hold is taken under the store's own lock, so
-    /// the blob cannot lose its last holder between the check and the hold.
+    /// policy allows access to its channel; an attachment is not named on a
+    /// tool-substrate channel other than the app's own result inbox; the
+    /// directory resolves the channel; the message is retained in the
+    /// channel's window — the whole ring, or a durable channel's standing
+    /// depth — and not parked; the message carries the name. An attachment's
+    /// hold is taken under the store's own lock, so the blob cannot lose its
+    /// last holder between the check and the hold.
     ///
-    /// `not_read` and `channel_not_readable` are logged at `warn`: a name the
-    /// host never handed over is a mis-copied id or an injected one.
+    /// `not_read`, `channel_not_readable` and `tool_channel_attachment` are
+    /// logged at `warn`: a name the host never handed over is a mis-copied id
+    /// or an injected one, and a tool call's attachment named by a
+    /// conversation that only watched the call is a reach for another
+    /// principal's blob.
     ///
     /// # Panics
     ///
@@ -245,7 +326,9 @@ impl Messenger {
             .await;
         if let Err(refusal) = &admitted {
             match refusal {
-                NameRefusal::NotRead | NameRefusal::ChannelNotReadable { .. } => warn!(
+                NameRefusal::NotRead
+                | NameRefusal::ChannelNotReadable { .. }
+                | NameRefusal::ToolChannelAttachment { .. } => warn!(
                     app = %app_slug,
                     conversation_id,
                     %message_id,
@@ -284,14 +367,29 @@ impl Messenger {
         let not_readable = || NameRefusal::ChannelNotReadable {
             channel: channel.clone(),
         };
-        if !policy.allows_channel_access(&channel) {
-            return Err(not_readable());
-        }
-        let entry = self.directory.resolve(&channel).ok_or_else(not_readable)?;
         let name = match part {
             NamedPart::Attachment(name) => Some(name),
             NamedPart::Body => None,
         };
+        // On the tool substrate's channels a call's attachments are for its
+        // parties. A conversation names one only on its own app's result
+        // inbox, which no policy covers and the record alone opens: only
+        // `hand_tool_result` records its messages, each for the conversation
+        // that made the call. A policy over the other three namespaces is a
+        // watch of the traffic, and names bodies only.
+        let own_inbox = channel == app_tool_result_inbox_address(app_slug);
+        if !own_inbox && !policy.allows_channel_access(&channel) {
+            return Err(not_readable());
+        }
+        if !own_inbox
+            && name.is_some()
+            && SystemChannelFamily::of(&channel) == Some(SystemChannelFamily::Tool)
+        {
+            return Err(NameRefusal::ToolChannelAttachment {
+                channel: channel.clone(),
+            });
+        }
+        let entry = self.directory.resolve(&channel).ok_or_else(not_readable)?;
         let not_retained = || NameRefusal::NotRetained {
             channel: channel.clone(),
             attachment: name.is_some(),

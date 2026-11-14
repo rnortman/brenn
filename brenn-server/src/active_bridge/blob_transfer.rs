@@ -31,8 +31,8 @@ use super::brenn_tools::{CallOrigin, admit_tool_call};
 use super::tool_socket::response_line;
 use super::{ActiveBridge, ToolOutcome};
 use crate::messaging_intercept::{
-    SendArgs, attachment_name, held_attachments, message_uuid, missing_messenger, parse_send,
-    publish_send, refusal, resolve_forwarded,
+    MESSAGING_TOOL, SendArgs, attachment_name, held_attachments, message_uuid, missing_messenger,
+    parse_send, publish_send, refusal, resolve_forwarded,
 };
 
 /// The tool a `send_files` publishes through, as the catalog names it.
@@ -373,9 +373,15 @@ async fn prepare_send<'a>(
     admit_tool_call(bridge, CallOrigin::Socket, send_tool(), input)
         .map_err(|e| Response::Err(e.to_wire(send_tool())))?;
     let (messenger, args) = parse_send(bridge, MCP_MESSAGE_SEND_TOOL, input).map_err(tool_error)?;
-    let forwarded = resolve_forwarded(bridge, messenger, MCP_MESSAGE_SEND_TOOL, input)
-        .await
-        .map_err(tool_error)?;
+    let forwarded = resolve_forwarded(
+        bridge,
+        messenger,
+        MESSAGING_TOOL,
+        MCP_MESSAGE_SEND_TOOL,
+        input,
+    )
+    .await
+    .map_err(tool_error)?;
     let declared = check_declarations(&forwarded, files).map_err(tool_error)?;
     let Some(blobs) = messenger.blob_store() else {
         return Err(tool_error(refusal(

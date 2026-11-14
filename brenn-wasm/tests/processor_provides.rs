@@ -84,7 +84,12 @@ impl RecordingProvidesHost {
 }
 
 impl ProvidesHost for RecordingProvidesHost {
-    fn complete(&self, id: &str, outcome_json: &str) -> Result<(), ProvidesCallError> {
+    fn complete(
+        &self,
+        id: &str,
+        outcome_json: &str,
+        _attachments: brenn_wasm::HeldAttachments,
+    ) -> Result<(), ProvidesCallError> {
         if let Some(detail) = &self.refuse_outcome {
             return Err(ProvidesCallError::InvalidOutcome(detail.clone()));
         }
@@ -106,7 +111,9 @@ impl ProvidesHost for RecordingProvidesHost {
         tool: &str,
         args_json: &str,
         call_id: &str,
+        with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
+        assert!(!with_attachments, "a plain call carries no attachments");
         if !self.pending.lock().unwrap().contains(serving) {
             return Err(ToolCallError::Denied("not pending".to_string()));
         }
@@ -147,7 +154,9 @@ impl ToolHost for RecordingToolHost {
         tool: &str,
         args_json: &str,
         call_id: &str,
+        with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
+        assert!(!with_attachments, "a plain call carries no attachments");
         self.queued
             .lock()
             .unwrap()

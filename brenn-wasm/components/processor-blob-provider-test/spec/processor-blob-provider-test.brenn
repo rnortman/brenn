@@ -1,0 +1,16 @@
+/// Blob-carrying provided-tool test fixture. Serves `blob-echo` on its request
+/// inbox, choosing by the request's `mode` argument what to read of the
+/// attachments it was handed and what to answer with.
+component ProcessorBlobProviderTest {
+  abi = processor;
+  requires = [log, tools, provides, blobs];
+  in tool-results;
+  in tool-requests;
+  provide blob-echo {
+    mcp_name = "BlobEcho";
+    description = "Test fixture: read the handed attachments and answer with blobs, by the `mode` argument.";
+    input_schema = """{ "type": "object", "properties": { "mode": { "type": "string" } }, "required": ["mode"] }""";
+    accepts_attachments = true;
+    max_concurrency = 2;
+  }
+}

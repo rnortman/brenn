@@ -15,8 +15,9 @@ use brenn_lib::messaging::config::{MessagingGlobalConfig, ProvidedToolDecl};
 use brenn_lib::messaging::{SubscriberEntry, SubscriberEntryKind};
 use brenn_lib::tools::ResolvedToolGrant;
 use brenn_tool_registry::bus_wiring::{request_inbox_name, tool_executor_system_policy};
+use brenn_tool_registry::testutil::ExecuteValue;
 use brenn_tool_registry::{
-    AsyncTool, PROVIDED_TOOL_CEILING, ProvidedTool, TOOL_EXECUTOR_COMPONENT, ToolCtx, ToolError,
+    PROVIDED_TOOL_CEILING, ProvidedTool, TOOL_EXECUTOR_COMPONENT, ToolCtx, ToolError,
 };
 use serde_json::{Value, json};
 
@@ -90,6 +91,7 @@ async fn provider(slug: &str) -> Provider {
             input_schema: json!({ "type": "object" }),
             max_concurrency: 4,
             auto_approve: false,
+            accepts_attachments: false,
         },
         runtime.clone(),
     ));
@@ -159,7 +161,7 @@ impl Provider {
                 acting_user: None,
                 deadline: Some(tokio::time::Instant::now() + PROVIDED_TOOL_CEILING),
             };
-            tool.execute(&ctx, json!({})).await
+            tool.execute_value(&ctx, json!({})).await
         })
     }
 
@@ -212,7 +214,7 @@ async fn an_erring_activation_answers_the_requests_it_was_handed() {
     let ids = p.published_ids(3).await;
     let answered = ids[0].clone();
     p.runtime
-        .complete("prov-err", &answered, Ok(json!("answered")))
+        .complete("prov-err", &answered, Ok(json!("answered").into()))
         .expect("the request is pending");
 
     p.fail_with("__err__").await;
@@ -326,7 +328,7 @@ async fn a_failed_activation_leaves_requests_it_saw_only_as_context() {
         "the request is still pending for its provider"
     );
     p.runtime
-        .complete("prov-context", &ids[0], Ok(json!("late")))
+        .complete("prov-context", &ids[0], Ok(json!("late").into()))
         .expect("the provider can still answer it");
     assert_eq!(call.await.unwrap(), Ok(json!("late")));
 }

@@ -1988,6 +1988,7 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
             max_concurrency: 1,
             auto_approve: true,
+            accepts_attachments: false,
         }];
         consumer
     }
