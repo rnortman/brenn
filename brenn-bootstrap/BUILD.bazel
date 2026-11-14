@@ -83,6 +83,14 @@ rust_test(
     # they import; `rustc_env` below names the directory those paths hang off.
     data = [
         "//:brenn_configs",
+        # The string contract's removal period is held to one wording across
+        # the texts that state it.
+        "//brenn-wasm:wit/processor-0.2.wit",
+        "//brenn-wasm:wit/processor.wit",
+        "//docs:component-packages.md",
+        # `brenn.e2e.brenn`'s second and third module roots.
+        "//brenn-wasm/components/processor-page-bytes-test:spec/processor-page-bytes-test.brenn",
+        "//brenn-wasm/components/processor-sdk-bytes-test:spec/processor-sdk-bytes-test.brenn",
         # The recycler's dispatch cases drive the deployed guest through the real
         # lowering.
         "//brenn-wasm:fixture_conversation_recycler",
@@ -103,15 +111,28 @@ rust_test(
         # `brenn:processor/calls` into a chain and drives it through a real
         # router.
         "//brenn-wasm:fixture_processor_call_test",
+        # The contract-pairing reload cases roll a consumer back from this
+        # byte-carrying build to the string build, `processor-page-test`.
+        "//brenn-wasm:fixture_processor_bytes_test",
+        # The blob tool-call round trips run a caller and a provider that
+        # carry blobs on every call and completion.
+        "//brenn-wasm:fixture_processor_blob_caller_test",
+        "//brenn-wasm:fixture_processor_blob_provider_test",
         "//brenn-wasm:fixture_processor_config",
         "//brenn-wasm:fixture_processor_demo",
         # The bundle-shaped reload case installs a second artifact under one
         # package name, which is what makes the record comparison the only
         # thing that can see the change.
         "//brenn-wasm:fixture_processor_dual",
+        # The raw `brenn:processor@0.1.0` fixture: the string build the
+        # contract-pairing refusal and the string-contract notice cases install.
+        "//brenn-wasm:fixture_processor_page_test",
         # The provided-tool boot-path case installs the provider fixture as a
         # providing class's package.
         "//brenn-wasm:fixture_processor_provider_test",
+        # The ingress cases deliver MQTT payloads to the guest SDK's byte
+        # fixture and read back what its accessors returned.
+        "//brenn-wasm:fixture_processor_sdk_bytes_test",
         # The provided-tool reload cases call an added tool from a component,
         # through the executor, with the async-call fixture.
         "//brenn-wasm:fixture_processor_tool_test",

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brenn_attach_proto::{PublishOutcome, ServerFrame, Urgency};
+use brenn_attach_proto::{MessageBody, PublishOutcome, ServerFrame, Urgency};
 use brenn_db::Db;
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::AppPolicy;
@@ -29,9 +29,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::*;
+use crate::blobs::BlobTable;
 use crate::registry::{AttachSessionHandle, PUSH_QUEUE_FRAMES, SessionCaps, SessionPush};
 use crate::session::AttachSessionCtx;
-use crate::test_support::{AttachCtxBuilder, TestProfile};
+use crate::test_support::{AttachCtxBuilder, FrameRx, TestProfile};
 
 /// The attacher every fixture stands up.
 const ATTACHER: &str = "deskbar";
@@ -47,6 +48,9 @@ const ERRORS_BARE: &str = "demo-errors";
 /// An ephemeral channel, so a batch can straddle the substrate split.
 const EPH: &str = "ephemeral:demo-eph";
 const EPH_BARE: &str = "demo-eph";
+/// A channel declared `non_text`, which a v4 attacher may publish to.
+const FRAMES: &str = "brenn:demo-frames";
+const FRAMES_BARE: &str = "demo-frames";
 
 /// Bodies over this answer `BodyTooLarge`. Small enough that a test writes the
 /// oversize case as a literal.
@@ -57,15 +61,20 @@ const MAX_BODY: usize = 64;
 /// assertion.
 const SESSION_ID: Uuid = Uuid::from_u128(0x5e5_5104);
 
-/// The fixture's authority shape: the sub-identity publishes onto `OUT`, `EPH`
-/// and `ERRORS`, the bare identity onto `ERRORS` only, and `ERRORS` carries the
-/// diagnostics posture.
+/// The fixture's authority shape: the sub-identity publishes onto `OUT`, `EPH`,
+/// `FRAMES` and `ERRORS`, the bare identity onto `ERRORS` only, and `ERRORS`
+/// carries the diagnostics posture.
 fn profile() -> TestProfile {
     TestProfile {
         publishable: HashMap::from([
             (
                 Some(SUB.to_string()),
-                HashSet::from([OUT.to_string(), EPH.to_string(), ERRORS.to_string()]),
+                HashSet::from([
+                    OUT.to_string(),
+                    EPH.to_string(),
+                    FRAMES.to_string(),
+                    ERRORS.to_string(),
+                ]),
             ),
             (None, HashSet::from([ERRORS.to_string()])),
         ]),
@@ -104,6 +113,8 @@ fn channel_raw(address: &str) -> ChannelConfigRaw {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     }
 }
 
@@ -116,7 +127,7 @@ async fn attach_with(
     profile: TestProfile,
     granted: bool,
     burst: u32,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>) {
+) -> (AttachSessionCtx, FrameRx) {
     attach_with_body_cap(db, profile, granted, burst, MAX_BODY).await
 }
 
@@ -128,12 +139,29 @@ async fn attach_with_body_cap(
     granted: bool,
     burst: u32,
     max_body_bytes: usize,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>) {
+) -> (AttachSessionCtx, FrameRx) {
+    attach_at_version(db, profile, granted, burst, max_body_bytes, 4).await
+}
+
+/// [`attach_with_body_cap`], with the session's negotiated version as a
+/// parameter.
+async fn attach_at_version(
+    db: &Db,
+    profile: TestProfile,
+    granted: bool,
+    burst: u32,
+    max_body_bytes: usize,
+    version: u32,
+) -> (AttachSessionCtx, FrameRx) {
     let entries = build_channel_entries(
         &[
             channel_raw(OUT_BARE),
             channel_raw(ERRORS_BARE),
             channel_raw(EPH),
+            ChannelConfigRaw {
+                non_text: true,
+                ..channel_raw(FRAMES_BARE)
+            },
         ],
         &MessagingGlobalConfig::default(),
     );
@@ -156,6 +184,7 @@ async fn attach_with_body_cap(
         policy.acls.brenn_publish = vec![
             ChannelMatcher::Exact(OUT_BARE.to_string()),
             ChannelMatcher::Exact(ERRORS_BARE.to_string()),
+            ChannelMatcher::Exact(FRAMES_BARE.to_string()),
         ];
         policy.acls.ephemeral_publish = vec![ChannelMatcher::Exact(EPH_BARE.to_string())];
     }
@@ -188,12 +217,13 @@ async fn attach_with_body_cap(
         .policy(policy)
         .max_body_bytes(max_body_bytes)
         .session_id(SESSION_ID)
+        .version(version)
         .build()
 }
 
 /// The common attachment: everything granted, a budget wide enough that no test
 /// trips it unless it means to.
-async fn attach(db: &Db) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>) {
+async fn attach(db: &Db) -> (AttachSessionCtx, FrameRx) {
     attach_with(db, profile(), true, 64).await
 }
 
@@ -205,7 +235,7 @@ fn wide_bucket() -> TokenBucket {
 fn request<'a>(
     channel: &'a str,
     attribution: Option<&'a str>,
-    body: &'a str,
+    body: &'a MessageBody,
 ) -> PublishRequest<'a> {
     PublishRequest {
         channel,
@@ -213,12 +243,17 @@ fn request<'a>(
         body,
         urgency: Urgency::Normal,
         correlation: Some(7),
+        attachments: &[],
+        blobs: &NO_BLOBS,
     }
 }
 
+/// The blob table of a session that holds no handle.
+static NO_BLOBS: std::sync::LazyLock<BlobTable> = std::sync::LazyLock::new(BlobTable::default);
+
 /// The `PublishResult` outcome the handler enqueued, asserting the correlation
 /// rode back with it.
-fn published_outcome(rx: &mut mpsc::Receiver<ServerFrame>) -> PublishOutcome {
+fn published_outcome(rx: &mut FrameRx) -> PublishOutcome {
     match rx.try_recv().expect("a PublishResult frame") {
         ServerFrame::PublishResult {
             correlation,
@@ -250,7 +285,7 @@ async fn an_undeclared_attribution_is_a_violation() {
     let outcome = handle_publish(
         &ctx,
         &mut bucket,
-        request(OUT, Some("nobody"), "{}"),
+        request(OUT, Some("nobody"), &"{}".into()),
         &mut counters,
     )
     .await;
@@ -276,7 +311,13 @@ async fn a_channel_outside_the_senders_set_is_a_violation() {
 
     // The bare identity may write ERRORS but not OUT, which the sub-identity
     // may.
-    let outcome = handle_publish(&ctx, &mut bucket, request(OUT, None, "{}"), &mut counters).await;
+    let outcome = handle_publish(
+        &ctx,
+        &mut bucket,
+        request(OUT, None, &"{}".into()),
+        &mut counters,
+    )
+    .await;
 
     let FrameOutcome::Violation(detail) = outcome else {
         panic!("a channel outside the sender's set must kill the connection");
@@ -310,7 +351,7 @@ async fn a_granted_but_malformed_channel_is_a_violation_on_both_paths() {
     let outcome = handle_publish(
         &ctx,
         &mut bucket,
-        request(FORGED, Some(SUB), "{}"),
+        request(FORGED, Some(SUB), &"{}".into()),
         &mut counters,
     )
     .await;
@@ -345,7 +386,7 @@ async fn a_publish_lands_under_its_attributions_sender() {
     let outcome = handle_publish(
         &ctx,
         &mut bucket,
-        request(OUT, Some(SUB), r#"{"hello":1}"#),
+        request(OUT, Some(SUB), &r#"{"hello":1}"#.into()),
         &mut counters,
     )
     .await;
@@ -387,7 +428,7 @@ async fn the_attachers_own_publish_is_unattributed() {
     let outcome = handle_publish(
         &ctx,
         &mut bucket,
-        request(ERRORS, None, "{}"),
+        request(ERRORS, None, &"{}".into()),
         &mut counters,
     )
     .await;
@@ -427,7 +468,7 @@ async fn a_page_local_channel_in_a_publishable_set_panics() {
     let _ = handle_publish(
         &ctx,
         &mut bucket,
-        request("local:brenn/toast", Some(SUB), "{}"),
+        request("local:brenn/toast", Some(SUB), &"{}".into()),
         &mut counters,
     )
     .await;
@@ -441,7 +482,7 @@ async fn an_oversized_body_answers_rather_than_kills() {
     let (ctx, mut rx) = attach(&db).await;
     let mut bucket = TokenBucket::new(2, Duration::from_secs(3600), 2);
     let mut counters = SessionCounters::default();
-    let big = "x".repeat(MAX_BODY + 1);
+    let big = MessageBody::from("x".repeat(MAX_BODY + 1));
 
     let outcome = handle_publish(
         &ctx,
@@ -476,7 +517,7 @@ async fn persistent_oversized_bodies_escalate_to_a_violation() {
     let (ctx, _rx) = attach(&db).await;
     let mut bucket = wide_bucket();
     let mut counters = SessionCounters::default();
-    let big = "x".repeat(MAX_BODY + 1);
+    let big = MessageBody::from("x".repeat(MAX_BODY + 1));
 
     for _ in 1..BODY_TOO_LARGE_VIOLATION_THRESHOLD {
         assert!(matches!(
@@ -518,7 +559,7 @@ async fn an_exhausted_connection_bucket_answers_rate_limited() {
             handle_publish(
                 &ctx,
                 &mut bucket,
-                request(OUT, Some(SUB), "{}"),
+                request(OUT, Some(SUB), &"{}".into()),
                 &mut counters
             )
             .await,
@@ -552,7 +593,7 @@ async fn an_exhausted_send_budget_answers_rate_limited() {
             handle_publish(
                 &ctx,
                 &mut bucket,
-                request(OUT, Some(SUB), "{}"),
+                request(OUT, Some(SUB), &"{}".into()),
                 &mut counters
             )
             .await,
@@ -579,7 +620,7 @@ async fn a_diagnostic_channel_refusal_is_reported_not_fatal() {
     let outcome = handle_publish(
         &ctx,
         &mut bucket,
-        request(ERRORS, None, r#"{"message":"boom"}"#),
+        request(ERRORS, None, &r#"{"message":"boom"}"#.into()),
         &mut counters,
     )
     .await;
@@ -608,7 +649,7 @@ async fn a_diagnostic_publish_success_is_audited() {
     let outcome = handle_publish(
         &ctx,
         &mut bucket,
-        request(ERRORS, None, r#"{"message":"CANARY"}"#),
+        request(ERRORS, None, &r#"{"message":"CANARY"}"#.into()),
         &mut counters,
     )
     .await;
@@ -641,7 +682,7 @@ async fn an_ordinary_publish_success_is_not_audited() {
     let outcome = handle_publish(
         &ctx,
         &mut bucket,
-        request(OUT, Some(SUB), "{}"),
+        request(OUT, Some(SUB), &"{}".into()),
         &mut counters,
     )
     .await;
@@ -663,7 +704,7 @@ async fn a_cap_disagreement_is_counted_apart_from_client_oversize() {
     let (ctx, mut rx) = attach_with_body_cap(&db, profile(), true, 64, bus_max * 2).await;
     let mut bucket = wide_bucket();
     let mut counters = SessionCounters::default();
-    let body = "x".repeat(bus_max + 1);
+    let body = MessageBody::from("x".repeat(bus_max + 1));
 
     let outcome = handle_publish(
         &ctx,
@@ -703,7 +744,7 @@ async fn an_invariant_channel_refusal_panics() {
     let _ = handle_publish(
         &ctx,
         &mut bucket,
-        request(OUT, Some(SUB), "{}"),
+        request(OUT, Some(SUB), &"{}".into()),
         &mut counters,
     )
     .await;
@@ -714,9 +755,10 @@ async fn an_invariant_channel_refusal_panics() {
 fn entry(channel: &str, body: &str, deliver_after: Option<u64>) -> BatchEntry {
     BatchEntry {
         channel: channel.to_string(),
-        body: body.to_string(),
+        body: body.into(),
         urgency: Urgency::Normal,
         deliver_after,
+        attachments: Vec::new(),
     }
 }
 
@@ -738,12 +780,13 @@ fn batch<'a>(
         correlation: 11,
         publishes,
         deferred_ops,
+        blobs: &NO_BLOBS,
     }
 }
 
 /// The `PublishBatchResult` outcome the handler enqueued, asserting the
 /// correlation rode back with it.
-fn batch_outcome(rx: &mut mpsc::Receiver<ServerFrame>) -> PublishBatchOutcome {
+fn batch_outcome(rx: &mut FrameRx) -> PublishBatchOutcome {
     match rx.try_recv().expect("a PublishBatchResult frame") {
         ServerFrame::PublishBatchResult {
             correlation,
@@ -764,7 +807,7 @@ async fn bodies(ctx: &AttachSessionCtx, channel: &str) -> Vec<String> {
         .await
         .messages
         .into_iter()
-        .map(|row| row.message.body.clone())
+        .map(|row| row.message.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -803,7 +846,7 @@ async fn a_batch_lands_in_call_order_with_strictly_increasing_stamps() {
     assert_eq!(
         retained
             .iter()
-            .map(|row| row.message.body.as_str())
+            .map(|row| row.message.body.as_text().unwrap())
             .collect::<Vec<_>>(),
         vec![r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#],
     );
@@ -866,7 +909,7 @@ async fn the_batch_shape_gates_are_violations() {
             channel: OUT.to_string(),
             message_id: Uuid::new_v4(),
             op: DeferredOpKind::Edit {
-                body: Some("x".repeat(wide)),
+                body: Some("x".repeat(wide).into()),
                 deliver_after: None,
             },
         })
@@ -1099,7 +1142,7 @@ async fn a_scheduled_entry_parks_and_restates_the_view() {
     assert_eq!(view.channel, OUT);
     assert_eq!(view.attribution.as_deref(), Some(SUB));
     assert_eq!(view.entries.len(), 1);
-    assert_eq!(view.entries[0].body, r#"{"later":true}"#);
+    assert_eq!(view.entries[0].body, MessageBody::from(r#"{"later":true}"#));
 }
 
 /// The attacher's own flush parks under its bare identity, and its mirror names
@@ -1168,7 +1211,7 @@ async fn an_edit_op_rewrites_the_parked_body() {
         channel: OUT.to_string(),
         message_id: parked_id,
         op: DeferredOpKind::Edit {
-            body: Some(r#"{"v":2}"#.to_string()),
+            body: Some(r#"{"v":2}"#.into()),
             deliver_after: None,
         },
     }];
@@ -1186,7 +1229,77 @@ async fn an_edit_op_rewrites_the_parked_body() {
         )
         .await;
     assert_eq!(parked.len(), 1);
-    assert_eq!(parked[0].envelope.body, r#"{"v":2}"#);
+    assert_eq!(parked[0].envelope.body.as_text().unwrap(), r#"{"v":2}"#);
+}
+
+/// A v4 attacher may publish to a `non_text` channel, and what it parks and
+/// edits there is its own frames' strings: the stored bodies are untyped text
+/// and every restated view carries them as text.
+#[tokio::test]
+async fn a_v4_view_on_a_non_text_channel_after_a_publish_and_an_edit_is_text() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach(&db).await;
+    assert!(
+        ctx.messenger
+            .directory()
+            .resolve(FRAMES)
+            .expect("the fixture declares the channel")
+            .resolved_channel
+            .non_text
+    );
+    let mut counters = SessionCounters::default();
+    let (mut sibling, _guard) = sibling_view_queue(&ctx);
+
+    let later = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis() as u64;
+    let publishes = [
+        entry(FRAMES, r#"{"now":true}"#, None),
+        entry(FRAMES, r#"{"v":1}"#, Some(later)),
+    ];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+    let view = one_view(&mut sibling);
+    assert_eq!(view.channel, FRAMES);
+    assert_eq!(view.entries.len(), 1);
+    assert_eq!(view.entries[0].body, MessageBody::from(r#"{"v":1}"#));
+    let parked_id = view.entries[0].message_id;
+
+    let ops = [BatchDeferredOp {
+        channel: FRAMES.to_string(),
+        message_id: parked_id,
+        op: DeferredOpKind::Edit {
+            body: Some(r#"{"v":2}"#.into()),
+            deliver_after: None,
+        },
+    }];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &[], &ops), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+    let view = one_view(&mut sibling);
+    assert_eq!(view.entries.len(), 1);
+    assert_eq!(view.entries[0].message_id, parked_id);
+    assert_eq!(view.entries[0].body, MessageBody::from(r#"{"v":2}"#));
+
+    let parked = ctx
+        .messenger
+        .deferred_view_for_sender(FRAMES, sender_of(Some(SUB)).as_str())
+        .await;
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].envelope.body.content_type(), None);
+    assert_eq!(parked[0].envelope.body.as_text(), Some(r#"{"v":2}"#));
+    let retained = ctx
+        .messenger
+        .store_for_address(FRAMES)
+        .replay_from(None, Depth::Bounded(512))
+        .await
+        .messages;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].message.body.content_type(), None);
+    assert_eq!(retained[0].message.body.as_text(), Some(r#"{"now":true}"#));
 }
 
 /// An edit body is charged against the frame's byte budget like a published
@@ -1203,7 +1316,7 @@ async fn an_oversized_edit_body_kills_the_batch() {
         channel: OUT.to_string(),
         message_id: parked_id,
         op: DeferredOpKind::Edit {
-            body: Some("x".repeat(MAX_BODY + 1)),
+            body: Some("x".repeat(MAX_BODY + 1).into()),
             deliver_after: None,
         },
     }];
@@ -1220,7 +1333,11 @@ async fn an_oversized_edit_body_kills_the_batch() {
             ParticipantId::for_surface_component(ATTACHER, SUB).as_str(),
         )
         .await;
-    assert_eq!(parked[0].envelope.body, r#"{"v":1}"#, "nothing applied");
+    assert_eq!(
+        parked[0].envelope.body.as_text().unwrap(),
+        r#"{"v":1}"#,
+        "nothing applied"
+    );
 }
 
 /// An op naming a message parked by another sender is a violation: the ids a
@@ -1391,7 +1508,8 @@ async fn an_edit_op_moves_the_release_time() {
         "the stored release time moved to the edit's"
     );
     assert_eq!(
-        parked[0].envelope.body, r#"{"v":1}"#,
+        parked[0].envelope.body.as_text(),
+        Some(r#"{"v":1}"#),
         "the body is untouched"
     );
     let view = one_view(&mut sibling);
@@ -1425,7 +1543,7 @@ async fn one_flush_restates_a_channel_once_across_a_park_and_an_op() {
     assert_eq!(
         view.entries
             .iter()
-            .map(|e| e.body.as_str())
+            .map(|e| e.body.as_text().unwrap())
             .collect::<Vec<_>>(),
         vec![r#"{"new":true}"#],
         "the single restatement is the truth after both halves"
@@ -1466,7 +1584,10 @@ async fn batch_stamps_order_across_the_substrate_split() {
             .await
             .messages
         {
-            stamped.push((row.message.publish_ts, row.message.body.clone()));
+            stamped.push((
+                row.message.publish_ts,
+                row.message.body.as_text().unwrap().to_owned(),
+            ));
         }
     }
     assert_eq!(stamped.len(), 4, "both classes carried their half");
@@ -1488,7 +1609,7 @@ async fn batch_stamps_order_across_the_substrate_split() {
 // ── The parked-set mirror ────────────────────────────────────────────────────
 
 /// Park one message on `channel` under `SUB`'s sender, returning its id.
-async fn park(ctx: &AttachSessionCtx, channel: &str, body: &str) -> Uuid {
+async fn park(ctx: &AttachSessionCtx, channel: &str, body: impl Into<MessageBody>) -> Uuid {
     park_under(ctx, channel, Some(SUB), body).await
 }
 
@@ -1505,7 +1626,7 @@ async fn park_under(
     ctx: &AttachSessionCtx,
     channel: &str,
     attribution: Option<&str>,
-    body: &str,
+    body: impl Into<MessageBody>,
 ) -> Uuid {
     let release = Utc::now() + chrono::Duration::hours(1);
     ctx.messenger
@@ -1514,10 +1635,11 @@ async fn park_under(
             attribution,
             &[AttachBatchPublish {
                 channel_address: channel,
-                body,
+                body: body.into(),
                 urgency: Urgency::Normal,
                 publish_ts_ns: brenn_messaging_store::db::utc_to_ns(Utc::now()),
                 deliver_after: Some(release),
+                attachments: &HeldAttachments::none(),
             }],
             MissingChannelPosture::Invariant,
         )
@@ -1601,7 +1723,7 @@ async fn seeding_frames_the_nonempty_sets_and_stays_silent_about_the_rest() {
             assert_eq!(attribution.as_deref(), Some(SUB));
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].message_id, parked_id);
-            assert_eq!(entries[0].body, r#"{"later":true}"#);
+            assert_eq!(entries[0].body, MessageBody::from(r#"{"later":true}"#));
             assert!(
                 entries[0].deliver_after > Utc::now().timestamp_millis() as u64,
                 "the release time rides the wire in epoch milliseconds"
@@ -1697,4 +1819,910 @@ async fn a_seeding_target_the_profile_does_not_declare_panics() {
     let mut counters = SessionCounters::default();
 
     let _ = seed_deferred_views(&ctx, &mut counters).await;
+}
+
+fn parked_with(body: MessageBody) -> DeferredMessage {
+    DeferredMessage {
+        release_at: chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+        envelope: Arc::new(brenn_envelope::testutils::fixture_envelope(
+            "brenn:out",
+            "parked",
+            body,
+        )),
+    }
+}
+
+/// A view entry holds the parked body as it is, type and all: what a version
+/// can write of it is decided where the frame is encoded.
+#[test]
+fn a_view_entry_holds_the_parked_body_as_it_is() {
+    for body in [
+        MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap(),
+        MessageBody::from_parts(Some("image/png"), &[0x89]).unwrap(),
+    ] {
+        let entries = deferred_view_entries(&[parked_with(body.clone())]);
+        assert_eq!(entries[0].body, body);
+    }
+}
+
+/// The common attachment, negotiated at v5.
+async fn attach_v5(db: &Db) -> (AttachSessionCtx, FrameRx) {
+    attach_at_version(db, profile(), true, 64, MAX_BODY, 5).await
+}
+
+/// A typed body that is not text: never valid UTF-8, so nothing on the path can
+/// read it as a string.
+fn png(len: usize) -> MessageBody {
+    MessageBody::from_parts(Some("image/png"), &vec![0xff; len]).unwrap()
+}
+
+/// A single non-text publish to a `non_text` channel is stored byte-exact with
+/// its content type, and the body cap reads its raw length.
+#[tokio::test]
+async fn a_v5_non_text_publish_is_stored_with_its_type() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_v5(&db).await;
+    let mut bucket = wide_bucket();
+    let mut counters = SessionCounters::default();
+    let body = png(MAX_BODY);
+
+    let outcome = handle_publish(
+        &ctx,
+        &mut bucket,
+        request(FRAMES, Some(SUB), &body),
+        &mut counters,
+    )
+    .await;
+    assert!(matches!(outcome, FrameOutcome::Continue));
+    assert_eq!(published_outcome(&mut rx), PublishOutcome::Ok);
+
+    let over = png(MAX_BODY + 1);
+    let outcome = handle_publish(
+        &ctx,
+        &mut bucket,
+        request(FRAMES, Some(SUB), &over),
+        &mut counters,
+    )
+    .await;
+    assert!(matches!(outcome, FrameOutcome::Continue));
+    assert_eq!(
+        published_outcome(&mut rx),
+        PublishOutcome::BodyTooLarge {
+            len: (MAX_BODY + 1) as u64,
+            max: MAX_BODY as u64,
+        }
+    );
+
+    let retained = ctx
+        .messenger
+        .store_for_address(FRAMES)
+        .replay_from(None, Depth::Bounded(512))
+        .await
+        .messages;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].message.body, body);
+    assert_eq!(retained[0].message.body.content_type(), Some("image/png"));
+}
+
+/// A non-text batch entry, published now and parked for later, keeps its bytes
+/// and its content type on both paths.
+#[tokio::test]
+async fn a_v5_non_text_batch_entry_is_stored_and_parked_with_its_type() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_v5(&db).await;
+    let mut counters = SessionCounters::default();
+    let now_body = png(3);
+    let later_body = MessageBody::from_parts(Some("image/jpeg"), &[0x00, 0xd8, 0xff]).unwrap();
+    let later = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis() as u64;
+    let publishes = [
+        BatchEntry {
+            body: now_body.clone(),
+            ..entry(FRAMES, "", None)
+        },
+        BatchEntry {
+            body: later_body.clone(),
+            ..entry(FRAMES, "", Some(later))
+        },
+    ];
+
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+
+    let retained = ctx
+        .messenger
+        .store_for_address(FRAMES)
+        .replay_from(None, Depth::Bounded(512))
+        .await
+        .messages;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].message.body, now_body);
+    let parked = ctx
+        .messenger
+        .deferred_view_for_sender(FRAMES, sender_of(Some(SUB)).as_str())
+        .await;
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].envelope.body, later_body);
+    assert_eq!(parked[0].envelope.body.content_type(), Some("image/jpeg"));
+}
+
+/// A deferred edit carrying a non-text body replaces the parked body with it,
+/// content type and all.
+#[tokio::test]
+async fn a_v5_non_text_edit_rewrites_the_parked_body_with_its_type() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_v5(&db).await;
+    let mut counters = SessionCounters::default();
+    let parked_id = park(&ctx, FRAMES, r#"{"v":1}"#).await;
+    let body = png(5);
+
+    let ops = [BatchDeferredOp {
+        channel: FRAMES.to_string(),
+        message_id: parked_id,
+        op: DeferredOpKind::Edit {
+            body: Some(body.clone()),
+            deliver_after: None,
+        },
+    }];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &[], &ops), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+
+    let parked = ctx
+        .messenger
+        .deferred_view_for_sender(FRAMES, sender_of(Some(SUB)).as_str())
+        .await;
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].envelope.body, body);
+    assert_eq!(parked[0].envelope.body.content_type(), Some("image/png"));
+}
+
+// ── The text-only refusal ────────────────────────────────────────────────────
+
+/// A non-text publish to a text-only channel is answered `TextOnlyChannel`:
+/// nothing is stored, the connection token is spent (so a client looping on the
+/// mistake is metered), the counter moves and the first refusal is logged with
+/// the body's summary, never its bytes.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_v5_non_text_publish_to_a_text_only_channel_is_refused() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_v5(&db).await;
+    let mut bucket = TokenBucket::new(2, Duration::from_secs(3600), 2);
+    let mut counters = SessionCounters::default();
+    let body = png(4);
+
+    for _ in 0..2 {
+        assert!(matches!(
+            handle_publish(
+                &ctx,
+                &mut bucket,
+                request(OUT, Some(SUB), &body),
+                &mut counters
+            )
+            .await,
+            FrameOutcome::Continue
+        ));
+        assert_eq!(published_outcome(&mut rx), PublishOutcome::TextOnlyChannel);
+    }
+    assert_eq!(counters.publish_text_only_refused, 2);
+    assert_eq!(counters.publishes, 0);
+    assert!(bodies(&ctx, OUT).await.is_empty(), "nothing is stored");
+    assert!(logs_contain("answering TextOnlyChannel"));
+    assert!(logs_contain("image/png, 4 bytes"));
+
+    // Both refusals spent a connection token.
+    assert!(matches!(
+        handle_publish(
+            &ctx,
+            &mut bucket,
+            request(OUT, Some(SUB), &"{}".into()),
+            &mut counters
+        )
+        .await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(published_outcome(&mut rx), PublishOutcome::RateLimited);
+}
+
+/// Typed text is text: a v5 session publishes it onto a text-only channel and
+/// it is stored with its content type.
+#[tokio::test]
+async fn a_v5_typed_text_publish_to_a_text_only_channel_keeps_its_type() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_v5(&db).await;
+    let mut bucket = wide_bucket();
+    let mut counters = SessionCounters::default();
+    let body = MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+
+    assert!(matches!(
+        handle_publish(
+            &ctx,
+            &mut bucket,
+            request(OUT, Some(SUB), &body),
+            &mut counters
+        )
+        .await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(published_outcome(&mut rx), PublishOutcome::Ok);
+    assert_eq!(counters.publish_text_only_refused, 0);
+    let retained = ctx
+        .messenger
+        .store_for_address(OUT)
+        .replay_from(None, Depth::Bounded(512))
+        .await
+        .messages;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].message.body, body);
+    assert_eq!(
+        retained[0].message.body.content_type(),
+        Some("text/markdown")
+    );
+}
+
+/// One refused entry refuses the whole flush: the text entry beside it is not
+/// published, nothing parks, no view is restated — and the send budget is drawn
+/// anyway, so the next flush finds it spent.
+#[tokio::test]
+async fn a_v5_batch_with_a_refused_entry_applies_nothing_and_draws_the_budget() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_at_version(&db, profile(), true, 2, MAX_BODY, 5).await;
+    let mut counters = SessionCounters::default();
+    let (mut sibling, _guard) = sibling_view_queue(&ctx);
+    let later = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis() as u64;
+    let publishes = [
+        entry(OUT, r#"{"n":1}"#, Some(later)),
+        BatchEntry {
+            body: png(2),
+            ..entry(OUT, "", None)
+        },
+    ];
+
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::TextOnlyChannel);
+    assert_eq!(counters.publish_text_only_refused, 1);
+    assert_eq!(counters.publishes, 0);
+    assert!(bodies(&ctx, OUT).await.is_empty());
+    assert!(
+        ctx.messenger
+            .deferred_view_for_sender(OUT, sender_of(Some(SUB)).as_str())
+            .await
+            .is_empty(),
+        "nothing parked"
+    );
+    assert!(sibling.try_recv().is_err(), "no view restated");
+
+    let publishes = [entry(OUT, "{}", None)];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(
+        batch_outcome(&mut rx),
+        PublishBatchOutcome::RateLimited,
+        "the refused flush drew both tokens"
+    );
+}
+
+/// A refused edit refuses the flush the same way: the cancel ahead of it is
+/// not applied and the parked bodies are untouched.
+#[tokio::test]
+async fn a_v5_batch_with_a_refused_edit_applies_nothing() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_v5(&db).await;
+    let mut counters = SessionCounters::default();
+    let kept = park(&ctx, OUT, r#"{"v":1}"#).await;
+    let edited = park(&ctx, OUT, r#"{"v":2}"#).await;
+    let (mut sibling, _guard) = sibling_view_queue(&ctx);
+
+    let ops = [
+        cancel(OUT, kept),
+        BatchDeferredOp {
+            channel: OUT.to_string(),
+            message_id: edited,
+            op: DeferredOpKind::Edit {
+                body: Some(png(3)),
+                deliver_after: None,
+            },
+        },
+    ];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &[], &ops), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::TextOnlyChannel);
+    assert_eq!(counters.publish_text_only_refused, 1);
+    let parked: Vec<_> = ctx
+        .messenger
+        .deferred_view_for_sender(OUT, sender_of(Some(SUB)).as_str())
+        .await
+        .into_iter()
+        .map(|message| message.envelope.body.clone())
+        .collect();
+    assert_eq!(
+        parked,
+        vec![
+            MessageBody::from(r#"{"v":1}"#),
+            MessageBody::from(r#"{"v":2}"#)
+        ]
+    );
+    assert!(sibling.try_recv().is_err(), "no view restated");
+}
+
+/// Under a drained budget the same refused flush answers `RateLimited`: the
+/// draw comes first, as for any flush.
+#[tokio::test]
+async fn a_v5_refused_batch_under_a_drained_budget_answers_rate_limited() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_at_version(&db, profile(), true, 1, MAX_BODY, 5).await;
+    let mut counters = SessionCounters::default();
+    let refused = [BatchEntry {
+        body: png(2),
+        ..entry(OUT, "", None)
+    }];
+
+    for expected in [
+        PublishBatchOutcome::TextOnlyChannel,
+        PublishBatchOutcome::RateLimited,
+    ] {
+        assert!(matches!(
+            handle_publish_batch(&ctx, batch(Some(SUB), &refused, &[]), &mut counters).await,
+            FrameOutcome::Continue
+        ));
+        assert_eq!(batch_outcome(&mut rx), expected);
+    }
+    assert_eq!(counters.publish_text_only_refused, 1);
+    assert_eq!(counters.publish_rate_limited, 1);
+}
+
+// ── The text-only refusal on a route that tells its attachers ────────────────
+
+/// The fixture's authority under the `Violation` posture: a route whose
+/// attachers are told every channel's declaration.
+fn violation_profile() -> TestProfile {
+    TestProfile {
+        text_only_posture: TextOnlyPosture::Violation,
+        ..profile()
+    }
+}
+
+/// The violation's detail, or a panic naming what the handler did instead.
+fn violation_detail(outcome: FrameOutcome) -> String {
+    match outcome {
+        FrameOutcome::Violation(detail) => detail,
+        FrameOutcome::Continue => panic!("expected a violation, the frame was answered"),
+        FrameOutcome::Disconnect => panic!("expected a violation, got a disconnect"),
+    }
+}
+
+/// Under `Violation` a non-text publish to a text-only channel kills the
+/// connection naming the rule and the channel: no frame answers it, nothing is
+/// stored, and it is not counted as an answered refusal.
+#[tokio::test]
+async fn a_non_text_publish_to_a_text_only_channel_is_a_violation_under_that_posture() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_at_version(&db, violation_profile(), true, 64, MAX_BODY, 5).await;
+    let mut bucket = wide_bucket();
+    let mut counters = SessionCounters::default();
+
+    let detail = violation_detail(
+        handle_publish(
+            &ctx,
+            &mut bucket,
+            request(OUT, Some(SUB), &png(4)),
+            &mut counters,
+        )
+        .await,
+    );
+    assert!(
+        detail.contains("Publish carries a non-text body to text-only channel brenn:demo-out"),
+        "{detail}"
+    );
+    assert!(rx.try_recv().is_err(), "no frame answers a violation");
+    assert!(bodies(&ctx, OUT).await.is_empty(), "nothing is stored");
+    assert_eq!(counters.publishes, 0);
+    assert_eq!(counters.publish_text_only_refused, 0);
+}
+
+/// Under `Violation` a batch entry carrying a non-text body to a text-only
+/// channel kills the connection at resolve: nothing of the flush lands, and the
+/// send budget is not drawn, since nothing is answered.
+#[tokio::test]
+async fn a_non_text_batch_entry_to_a_text_only_channel_is_a_violation_before_the_draw() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_at_version(&db, violation_profile(), true, 1, MAX_BODY, 5).await;
+    let mut counters = SessionCounters::default();
+    let (mut sibling, _guard) = sibling_view_queue(&ctx);
+    let later = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis() as u64;
+    let publishes = [
+        entry(OUT, r#"{"n":1}"#, Some(later)),
+        BatchEntry {
+            body: png(2),
+            ..entry(OUT, "", None)
+        },
+    ];
+
+    let detail = violation_detail(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+    );
+    assert!(
+        detail.contains(
+            "PublishBatch entry carries a non-text body to text-only channel brenn:demo-out"
+        ),
+        "{detail}"
+    );
+    assert!(rx.try_recv().is_err(), "no frame answers a violation");
+    assert!(bodies(&ctx, OUT).await.is_empty());
+    assert!(
+        ctx.messenger
+            .deferred_view_for_sender(OUT, sender_of(Some(SUB)).as_str())
+            .await
+            .is_empty(),
+        "nothing parked"
+    );
+    assert!(sibling.try_recv().is_err(), "no view restated");
+    assert_eq!(counters.publish_text_only_refused, 0);
+
+    // The one token of the budget is still there.
+    let publishes = [entry(OUT, "{}", None)];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+}
+
+/// Under `Violation` an edit carrying a non-text body to a text-only channel
+/// kills the connection at resolve: the cancel ahead of it is not applied, the
+/// parked bodies are untouched, and the budget is not drawn.
+#[tokio::test]
+async fn a_non_text_edit_to_a_text_only_channel_is_a_violation_before_the_draw() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_at_version(&db, violation_profile(), true, 1, MAX_BODY, 5).await;
+    let mut counters = SessionCounters::default();
+    let kept = park(&ctx, OUT, r#"{"v":1}"#).await;
+    let edited = park(&ctx, OUT, r#"{"v":2}"#).await;
+    let ops = [
+        cancel(OUT, kept),
+        BatchDeferredOp {
+            channel: OUT.to_string(),
+            message_id: edited,
+            op: DeferredOpKind::Edit {
+                body: Some(png(3)),
+                deliver_after: None,
+            },
+        },
+    ];
+
+    let detail = violation_detail(
+        handle_publish_batch(&ctx, batch(Some(SUB), &[], &ops), &mut counters).await,
+    );
+    assert!(
+        detail.contains(
+            "PublishBatch control op carries a non-text body to text-only channel brenn:demo-out"
+        ),
+        "{detail}"
+    );
+    assert!(rx.try_recv().is_err(), "no frame answers a violation");
+    let parked: Vec<_> = ctx
+        .messenger
+        .deferred_view_for_sender(OUT, sender_of(Some(SUB)).as_str())
+        .await
+        .into_iter()
+        .map(|message| message.envelope.body.clone())
+        .collect();
+    assert_eq!(
+        parked,
+        vec![
+            MessageBody::from(r#"{"v":1}"#),
+            MessageBody::from(r#"{"v":2}"#)
+        ]
+    );
+
+    let publishes = [entry(OUT, "{}", None)];
+    assert!(matches!(
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(
+        batch_outcome(&mut rx),
+        PublishBatchOutcome::Ok,
+        "the violating flush drew nothing"
+    );
+}
+
+/// The posture changes only what a refusal is. Under either, typed text on a
+/// text-only channel and a non-text body on a channel declared `non_text` are
+/// admitted, by a single publish and in a batch.
+#[tokio::test]
+async fn text_and_declared_non_text_bodies_are_admitted_under_either_posture() {
+    for posture in [TextOnlyPosture::Outcome, TextOnlyPosture::Violation] {
+        let db = brenn_messaging_store::db::init_db_memory();
+        let (ctx, mut rx) = attach_at_version(
+            &db,
+            TestProfile {
+                text_only_posture: posture,
+                ..profile()
+            },
+            true,
+            64,
+            4 * MAX_BODY,
+            5,
+        )
+        .await;
+        let mut bucket = wide_bucket();
+        let mut counters = SessionCounters::default();
+        let typed = MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+
+        for (channel, body) in [(OUT, typed.clone()), (FRAMES, png(3))] {
+            assert!(matches!(
+                handle_publish(
+                    &ctx,
+                    &mut bucket,
+                    request(channel, Some(SUB), &body),
+                    &mut counters
+                )
+                .await,
+                FrameOutcome::Continue
+            ));
+            assert_eq!(
+                published_outcome(&mut rx),
+                PublishOutcome::Ok,
+                "{posture:?} {channel}"
+            );
+        }
+
+        let publishes = [
+            BatchEntry {
+                body: typed.clone(),
+                ..entry(OUT, "", None)
+            },
+            BatchEntry {
+                body: png(2),
+                ..entry(FRAMES, "", None)
+            },
+        ];
+        assert!(matches!(
+            handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await,
+            FrameOutcome::Continue
+        ));
+        assert_eq!(
+            batch_outcome(&mut rx),
+            PublishBatchOutcome::Ok,
+            "{posture:?}"
+        );
+        assert_eq!(counters.publishes, 4, "{posture:?}");
+        assert_eq!(counters.publish_text_only_refused, 0, "{posture:?}");
+    }
+}
+
+// ── A target the directory does not hold ─────────────────────────────────────
+
+/// Take `channel` out of the directory, as a deprovision or the first half of a
+/// reload's retune does; the profile still grants it.
+fn deprovision(ctx: &AttachSessionCtx, channel: &str) {
+    let uuid = ctx
+        .messenger
+        .directory()
+        .resolve(channel)
+        .expect("the fixture channel is in the directory")
+        .uuid;
+    assert!(ctx.messenger.directory().remove_channel(&uuid));
+}
+
+/// A non-text publish to a granted channel the directory does not hold is
+/// answered as the bus answers an absent channel — `Failed` under the
+/// diagnostic posture — and is never offered to the bus, whose own later read
+/// could find an entry the door never checked.
+#[tokio::test]
+async fn a_v5_non_text_publish_to_an_absent_channel_is_answered_as_absent() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_at_version(
+        &db,
+        TestProfile {
+            diagnostic: Some(FRAMES.to_string()),
+            ..profile()
+        },
+        true,
+        64,
+        MAX_BODY,
+        5,
+    )
+    .await;
+    let mut bucket = wide_bucket();
+    let mut counters = SessionCounters::default();
+    deprovision(&ctx, FRAMES);
+
+    let outcome = handle_publish(
+        &ctx,
+        &mut bucket,
+        request(FRAMES, Some(SUB), &png(3)),
+        &mut counters,
+    )
+    .await;
+    assert!(matches!(outcome, FrameOutcome::Continue));
+    assert_eq!(published_outcome(&mut rx), PublishOutcome::Failed);
+    assert_eq!(counters.publishes, 0);
+    assert_eq!(counters.publish_text_only_refused, 0);
+}
+
+/// Under `Race`, a batch's non-text entry and non-text edit on a channel the
+/// door found absent are the bus's answers for a target that is gone: the entry
+/// is dropped and warned about, the edit is a no-op, and the rest of the flush
+/// lands.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_v5_batch_drops_non_text_bodies_for_an_absent_channel_under_race() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_at_version(
+        &db,
+        TestProfile {
+            missing_channel_posture: MissingChannelPosture::Race,
+            ..profile()
+        },
+        true,
+        64,
+        4 * MAX_BODY,
+        5,
+    )
+    .await;
+    let mut counters = SessionCounters::default();
+    deprovision(&ctx, FRAMES);
+
+    let publishes = [
+        BatchEntry {
+            body: png(2),
+            ..entry(FRAMES, "", None)
+        },
+        entry(ERRORS, r#"{"here":true}"#, None),
+    ];
+    let ops = [BatchDeferredOp {
+        channel: FRAMES.to_string(),
+        message_id: Uuid::new_v4(),
+        op: DeferredOpKind::Edit {
+            body: Some(png(3)),
+            deliver_after: None,
+        },
+    }];
+    match handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &ops), &mut counters).await {
+        FrameOutcome::Continue => {}
+        FrameOutcome::Violation(detail) => panic!("the flush must not violate: {detail}"),
+        FrameOutcome::Disconnect => panic!("the flush must not disconnect"),
+    }
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+    assert_eq!(counters.publishes, 1, "the dropped entry published nothing");
+    assert_eq!(counters.publish_text_only_refused, 0);
+    assert_eq!(bodies(&ctx, ERRORS).await, vec![r#"{"here":true}"#]);
+    assert!(logs_contain(
+        "a non-text body for a target the directory does not hold"
+    ));
+    assert!(logs_contain("the directory does not hold its channel"));
+}
+
+/// Under `Race`, a cancel, a text edit and a schedule aimed at a granted channel
+/// the directory does not hold leave the attachment alive: the ops are lost
+/// races, the schedule is a vanished entry, and no view of the absent channel
+/// is restated. Text bodies, so a v4 session reaches it.
+#[tokio::test]
+async fn control_ops_and_schedules_on_an_absent_channel_are_no_ops_under_race() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx) = attach_with_body_cap(
+        &db,
+        TestProfile {
+            missing_channel_posture: MissingChannelPosture::Race,
+            ..profile()
+        },
+        true,
+        64,
+        4 * MAX_BODY,
+    )
+    .await;
+    let mut counters = SessionCounters::default();
+    let (mut sibling, _guard) = sibling_view_queue(&ctx);
+    deprovision(&ctx, OUT);
+    let later = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis() as u64;
+
+    let publishes = [
+        entry(OUT, r#"{"parked":true}"#, Some(later)),
+        entry(ERRORS, r#"{"here":true}"#, None),
+    ];
+    let ops = [
+        cancel(OUT, Uuid::new_v4()),
+        BatchDeferredOp {
+            channel: OUT.to_string(),
+            message_id: Uuid::new_v4(),
+            op: DeferredOpKind::Edit {
+                body: Some("{}".into()),
+                deliver_after: None,
+            },
+        },
+    ];
+    match handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &ops), &mut counters).await {
+        FrameOutcome::Continue => {}
+        FrameOutcome::Violation(detail) => panic!("the flush must not violate: {detail}"),
+        FrameOutcome::Disconnect => panic!("the flush must not disconnect"),
+    }
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+    assert_eq!(counters.publishes, 1);
+    assert_eq!(bodies(&ctx, ERRORS).await, vec![r#"{"here":true}"#]);
+    assert!(sibling.try_recv().is_err(), "no view of an absent channel");
+}
+
+/// Under `Invariant` the same cancel is a broken boot invariant.
+#[tokio::test]
+#[should_panic(expected = "the directory does not hold")]
+async fn a_control_op_on_an_absent_channel_panics_under_invariant() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, _rx) = attach(&db).await;
+    let mut counters = SessionCounters::default();
+    deprovision(&ctx, OUT);
+    let ops = [cancel(OUT, Uuid::new_v4())];
+    handle_publish_batch(&ctx, batch(Some(SUB), &[], &ops), &mut counters).await;
+}
+
+// ── Deferred views per session version ───────────────────────────────────────
+
+/// A view of one text entry, one typed-text entry and one non-text entry.
+fn mixed_view() -> crate::registry::DeferredViewPush {
+    let entry = |n: u128, body: MessageBody| DeferredViewEntry {
+        message_id: Uuid::from_u128(n),
+        body,
+        deliver_after: 1_700_000_000_000,
+    };
+    crate::registry::DeferredViewPush {
+        channel: FRAMES.to_string(),
+        attribution: Some(SUB.to_string()),
+        entries: vec![
+            entry(1, r#"{"v":1}"#.into()),
+            entry(2, png(3)),
+            entry(
+                3,
+                MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap(),
+            ),
+        ],
+    }
+}
+
+/// The entries of the one `DeferredView` frame `rx` holds.
+fn view_frame(rx: &mut FrameRx) -> Vec<DeferredViewEntry> {
+    match rx.try_recv().expect("a DeferredView frame") {
+        ServerFrame::DeferredView {
+            channel,
+            attribution,
+            entries,
+        } => {
+            assert_eq!(channel, FRAMES);
+            assert_eq!(attribution.as_deref(), Some(SUB));
+            entries
+        }
+        other => panic!("expected DeferredView, got {other:?}"),
+    }
+}
+
+/// A pushed view reaches a v4 session without the entries v4 cannot carry —
+/// typed text stays — and a v5 session with all of them. Each omission is
+/// counted; the first per view on a session is logged.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_pushed_view_is_cut_to_what_the_sessions_version_carries() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (v4, mut v4_rx) = attach(&db).await;
+    let mut counters = SessionCounters::default();
+    for _ in 0..2 {
+        assert!(matches!(
+            crate::subscription::send_deferred_view(&v4, mixed_view(), &mut counters).await,
+            FrameOutcome::Continue
+        ));
+        let ids: Vec<_> = view_frame(&mut v4_rx)
+            .iter()
+            .map(|entry| entry.message_id)
+            .collect();
+        assert_eq!(ids, vec![Uuid::from_u128(1), Uuid::from_u128(3)]);
+    }
+    assert_eq!(counters.deferred_view_entries_omitted, 2);
+    logs_assert(|lines| {
+        match lines
+            .iter()
+            .filter(|line| line.contains("left out for a session"))
+            .count()
+        {
+            1 => Ok(()),
+            n => Err(format!("one omission line per view per session, got {n}")),
+        }
+    });
+
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (v5, mut v5_rx) = attach_v5(&db).await;
+    let mut counters = SessionCounters::default();
+    assert!(matches!(
+        crate::subscription::send_deferred_view(&v5, mixed_view(), &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert_eq!(view_frame(&mut v5_rx), mixed_view().entries);
+    assert_eq!(counters.deferred_view_entries_omitted, 0);
+}
+
+/// A view a v4 session can see none of is still written, empty: each view
+/// replaces the last, so withholding it would leave a stale mirror standing.
+#[tokio::test]
+async fn a_pushed_view_cut_to_nothing_is_written_empty() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (v4, mut rx) = attach(&db).await;
+    let mut counters = SessionCounters::default();
+    let mut view = mixed_view();
+    view.entries.retain(|entry| !entry.body.is_text());
+
+    assert!(matches!(
+        crate::subscription::send_deferred_view(&v4, view, &mut counters).await,
+        FrameOutcome::Continue
+    ));
+    assert!(view_frame(&mut rx).is_empty());
+}
+
+/// Seeding cuts the same way: a v4 session is seeded with the text entries of
+/// a set that also holds non-text ones, and is sent no frame for a set it can
+/// see none of; a v5 session is seeded with everything.
+#[tokio::test]
+async fn seeding_is_cut_to_what_the_sessions_version_carries() {
+    for version in [4, 5] {
+        let db = brenn_messaging_store::db::init_db_memory();
+        let mut profile = profile();
+        profile.deferred_targets = vec![
+            DeferredTarget {
+                channel: FRAMES.to_string(),
+                attribution: Some(SUB.to_string()),
+            },
+            DeferredTarget {
+                channel: FRAMES.to_string(),
+                attribution: None,
+            },
+        ];
+        let (ctx, mut rx) = attach_at_version(&db, profile, true, 64, MAX_BODY, version).await;
+        let mut counters = SessionCounters::default();
+        let text = park(&ctx, FRAMES, r#"{"v":1}"#).await;
+        let binary = park(&ctx, FRAMES, png(3)).await;
+        let bare_binary = park_under(&ctx, FRAMES, None, png(5)).await;
+
+        assert!(matches!(
+            seed_deferred_views(&ctx, &mut counters).await,
+            FrameOutcome::Continue
+        ));
+
+        let mut seen = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let ServerFrame::DeferredView {
+                attribution,
+                entries,
+                ..
+            } = frame
+            else {
+                panic!("expected DeferredView, got {frame:?}");
+            };
+            seen.push((
+                attribution,
+                entries.iter().map(|e| e.message_id).collect::<Vec<_>>(),
+            ));
+        }
+        seen.sort();
+        let expected = match version {
+            4 => vec![(Some(SUB.to_string()), vec![text])],
+            _ => vec![
+                (None, vec![bare_binary]),
+                (Some(SUB.to_string()), vec![text, binary]),
+            ],
+        };
+        assert_eq!(seen, expected, "at v{version}");
+        assert_eq!(
+            counters.deferred_view_entries_omitted,
+            if version == 4 { 2 } else { 0 },
+        );
+    }
 }

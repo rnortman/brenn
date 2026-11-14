@@ -900,6 +900,42 @@ pub(crate) fn validate_static_subscriptions_deliverable(
     );
 }
 
+/// One refusal per channel in `planned` that is text-only while its durable
+/// store already holds a non-text message, visible or parked; `held` is the
+/// store's answer to which channels hold one
+/// (`brenn_messaging_store::db::channels_holding_non_text_rows`).
+///
+/// Such a channel was declared `non_text`, took non-text bodies, and is now
+/// declared text-only. Its rows survive the restart or reload, so a reader
+/// that can only represent text could be bound to it by valid configuration
+/// and handed one. Only a durable store keeps rows across a declaration
+/// change: a ring is rebuilt empty when its channel's entry changes.
+pub fn text_only_channels_holding_non_text<'a>(
+    held: &[uuid::Uuid],
+    planned: impl IntoIterator<Item = &'a ChannelEntry>,
+) -> Vec<String> {
+    planned
+        .into_iter()
+        .filter(|entry| !entry.resolved_channel.non_text && held.contains(&entry.uuid))
+        .map(|entry| {
+            let remedy = match messaging::config::SystemChannelFamily::of(&entry.address) {
+                // The system mints the address, so it can be neither declared
+                // nor renamed; its tuning block is what states `non_text`.
+                Some(_) => {
+                    "state `non_text = true` in the channel's tuning block, or delete the \
+                     channel's stored messages"
+                }
+                None => "declare it `non_text = true`, or give it a new address",
+            };
+            format!(
+                "config: channel {:?} is declared text-only, but its store holds messages whose \
+                 bodies are not text; {remedy}",
+                entry.address,
+            )
+        })
+        .collect()
+}
+
 /// True iff `build_messaging` will take its full path (and therefore requires
 /// a resolved `server_origin`). Both `build_messaging`'s early-return gate and
 /// `run_server`'s `any_messaging` MUST call this — it is the single source of
@@ -993,7 +1029,9 @@ pub(crate) fn derive_mqtt_ingress_channels(
 ///
 /// On a `webhook:` block naming no declared endpoint, a `brenn:tools/` block
 /// naming no registered async tool, or a `brenn:tool-results/` block naming no
-/// consumer that holds an async tool grant, or a `brenn:device-location.` block
+/// consumer that holds an async tool grant, a `brenn:app-tool-results/` block
+/// naming no app that holds one (checked only when `app_inbox_slugs` is
+/// given), or a `brenn:device-location.` block
 /// whose remainder is not a username. Also on an exact key of any scheme but
 /// `mqtt:` reaching the fall-through, which is a host bug.
 pub(crate) fn validate_exact_tuning_blocks(
@@ -1001,9 +1039,12 @@ pub(crate) fn validate_exact_tuning_blocks(
     webhook_slugs: &[&str],
     async_tool_names: &[&'static str],
     inbox_slugs: &std::collections::HashSet<String>,
+    app_inbox_slugs: Option<&std::collections::HashSet<String>>,
     check_tool_families: bool,
 ) {
-    use brenn_envelope::addressing::{TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE};
+    use brenn_envelope::addressing::{
+        APP_TOOL_RESULTS_NAMESPACE, TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE,
+    };
 
     for address in tuning.exact_addresses() {
         let (found, what) = if let Some(slug) = address.strip_prefix("webhook:") {
@@ -1021,6 +1062,17 @@ pub(crate) fn validate_exact_tuning_blocks(
             (
                 async_tool_names.contains(&name),
                 "a registered async tool with that name",
+            )
+        } else if let Some(app_slug) = address
+            .strip_prefix("brenn:")
+            .and_then(|n| n.strip_prefix(APP_TOOL_RESULTS_NAMESPACE))
+        {
+            let Some(app_inbox_slugs) = app_inbox_slugs.filter(|_| check_tool_families) else {
+                continue;
+            };
+            (
+                app_inbox_slugs.contains(app_slug),
+                "an app holding an async tool grant with that slug",
             )
         } else if let Some(slug) = address
             .strip_prefix("brenn:")
@@ -1116,6 +1168,18 @@ pub async fn build_messaging(
     let Some(mut plan) = plan else {
         return (MessagingResult::default(), PlanCarried::default());
     };
+    {
+        let held = brenn_messaging_store::db::channels_holding_non_text_rows(&*db.lock().await);
+        let refusals = text_only_channels_holding_non_text(
+            &held,
+            plan.directory.list().iter().map(|entry| &**entry),
+        );
+        assert!(
+            refusals.is_empty(),
+            "refusing to start:\n{}",
+            refusals.join("\n"),
+        );
+    }
     // Cloned: commit reads the ingress set too. The advisory is the caller's
     // alone (commit ignores it).
     let carried = PlanCarried {
@@ -1152,8 +1216,10 @@ pub async fn build_messaging(
 /// from, on an
 /// absent `server_origin` (a bootstrap bug past the plan), on a
 /// `[[remote]]` token file that is missing, unreadable, empty or
-/// group/world-readable, and on a roster publish or a stored dynamic `mqtt:`
-/// row the host cannot make sense of.
+/// group/world-readable, on a roster publish or a stored dynamic `mqtt:`
+/// row the host cannot make sense of, and on every refusal of
+/// [`BlobStore::open`](brenn_messaging_store::blob::BlobStore::open) — a held
+/// message naming blob bytes that are gone among them.
 pub async fn commit_messaging(
     plan: MessagingPlan,
     app_table: &brenn_lib::config::AppTable,
@@ -1184,6 +1250,7 @@ pub async fn commit_messaging(
         registrations,
         attach_send_budgets,
         messaging_globals,
+        blob_dir,
         llm_chat,
         // The advisory is the caller's to report; nothing commit does reads it.
         surface_error_advisory: _,
@@ -1197,6 +1264,22 @@ pub async fn commit_messaging(
     let ring_stores = Arc::new(brenn_messaging_store::store::RingStores::build(
         &nondurable_channels,
     ));
+
+    // The blob store reconciles the database with its directory and refuses to
+    // start where a held message names bytes that are gone. It runs before the
+    // messenger exists and before the listener is bound, and releases the
+    // connection before `Messenger::new` takes it.
+    let blob_store = {
+        let conn = db.lock().await;
+        brenn_messaging_store::blob::BlobStore::open(
+            &blob_dir,
+            brenn_messaging_store::blob::BlobLimits {
+                max_blob_bytes: messaging_globals.max_blob_bytes,
+                budget_bytes: messaging_globals.blob_budget_bytes,
+            },
+            &conn,
+        )
+    };
 
     // Sync DB state with config: upsert the configured channels here. The
     // durable dynamic subscriptions are merged back *after* the chat backfill
@@ -1249,6 +1332,7 @@ pub async fn commit_messaging(
     .with_subscriber_registrations(registrations)
     .with_attach_send_budgets(attach_send_budgets)
     .with_ring_stores(ring_stores)
+    .with_blob_store(blob_store)
     .with_llm_chat(llm_chat)
     .with_system_channel_tuning(system_channel_tuning.clone());
 
@@ -1337,10 +1421,25 @@ pub async fn commit_messaging(
             &system_channel_tuning,
             global_defaults,
         );
-        for channel in reconstruction.entries {
-            if directory.by_uuid(&channel.uuid).is_none() {
-                directory.add_channel(channel);
-            }
+        let rebuilt: Vec<ChannelEntry> = reconstruction
+            .entries
+            .into_iter()
+            .filter(|channel| directory.by_uuid(&channel.uuid).is_none())
+            .collect();
+        // The planned channels were checked before the plan was committed; a
+        // channel rebuilt from its row joins only here, under the tuning this
+        // process booted with, and is held to the same rule.
+        let refusals = text_only_channels_holding_non_text(
+            &brenn_messaging_store::db::channels_holding_non_text_rows(&conn),
+            &rebuilt,
+        );
+        assert!(
+            refusals.is_empty(),
+            "refusing to start:\n{}",
+            refusals.join("\n"),
+        );
+        for channel in rebuilt {
+            directory.add_channel(channel);
         }
         let undeclared: std::collections::HashMap<uuid::Uuid, String> =
             reconstruction.skipped.into_iter().collect();

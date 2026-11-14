@@ -13,13 +13,14 @@ use brenn_attach_client::router::{MessageStamp, Origin, ReleaseTimer, RouteOutco
 use brenn_attach_proto::{
     BatchEntry, ClientFrame, PublishBatchOutcome, PublishOutcome, SubscribeOutcome,
 };
-use brenn_envelope::Urgency;
+use brenn_envelope::grants::ProcessorContract;
+use brenn_envelope::{GuestBody, MessageBody, Urgency};
 use brenn_surface_contract::MOUNT_SYNC_PORT;
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::telemetry::{InstanceReport, StatusCounters};
 use brenn_surface_schema::{
     Binding, CONTROL_PLANE_VERSION, ComponentGrant, InstanceState, LOCAL_OVERLAY_STATE_CHANNEL,
-    LinkState, NoiseLevel, OverlayStateBody,
+    LinkState, LocalChannel, NoiseLevel, OverlayStateBody,
 };
 use uuid::Uuid;
 
@@ -146,7 +147,7 @@ fn park_notes(page: &mut SurfacePage, body: &str, release_at: u64, seed: u128) {
         RouteRequest {
             channel: NOTES,
             origin: Origin::Sub("p1"),
-            body: body.to_string(),
+            body: (body.to_string()).into(),
             stamp: stamp(seed),
             urgency: Urgency::Normal,
             deliver_after: Some(release_at),
@@ -171,9 +172,10 @@ fn block_the_outbox(page: &mut SurfacePage) {
         FlushBatch {
             entries: vec![BatchEntry {
                 channel: OUT.to_string(),
-                body: "{}".to_string(),
+                body: "{}".into(),
                 urgency: Urgency::Normal,
                 deliver_after: None,
+                attachments: Vec::new(),
             }],
             ops: Vec::new(),
         },
@@ -193,7 +195,7 @@ fn retained(page: &SurfacePage, channel: &str) -> Vec<String> {
         .get(channel)
         .expect("the fixture hosts the channel")
         .retained()
-        .map(|(envelope, _)| envelope.body.clone())
+        .map(|(envelope, _)| envelope.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -242,6 +244,7 @@ fn frames(effects: &[Effect]) -> Vec<&ClientFrame> {
 /// An empty buffer, for a completion that published nothing.
 fn empty_buffer() -> PublishBuffer {
     PublishBuffer::new(
+        "p1",
         Default::default(),
         Default::default(),
         Default::default(),
@@ -669,6 +672,7 @@ fn a_registration_before_the_first_document_subscribes_nothing() {
         &mut page,
         Input::ActivationRegistered {
             instance: "p1".to_string(),
+            contract: ProcessorContract::V0_1,
         },
     );
     assert!(effects.is_empty());
@@ -686,6 +690,7 @@ fn a_registration_under_a_document_subscribes_and_opens_an_outbox() {
         &mut page,
         Input::ActivationRegistered {
             instance: "p1".to_string(),
+            contract: ProcessorContract::V0_1,
         },
     );
     assert!(matches!(
@@ -703,6 +708,7 @@ fn an_instance_no_document_declares_gets_no_outbox() {
         &mut page,
         Input::ActivationRegistered {
             instance: "stranger".to_string(),
+            contract: ProcessorContract::V0_1,
         },
     );
     assert!(effects.is_empty());
@@ -764,6 +770,7 @@ fn registering_one_instance_twice_is_a_bug() {
         &mut page,
         Input::ActivationRegistered {
             instance: "p1".to_string(),
+            contract: ProcessorContract::V0_1,
         },
     );
 }
@@ -812,7 +819,7 @@ fn a_ready_instance_is_handed_over_in_flight() {
         notes
             .new_envelopes()
             .iter()
-            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
+            .map(|envelope| envelope.body.as_text().unwrap().to_owned())
             .collect::<Vec<_>>(),
         ["one"]
     );
@@ -854,7 +861,7 @@ fn sync_chained(
         SyncCall {
             instance,
             port,
-            body,
+            body: &MessageBody::text(body),
             chain,
         },
         stamp(0x59c),
@@ -879,6 +886,48 @@ fn admitted(answer: SyncDispatch) -> ReadyActivation {
         SyncDispatch::Ready(ready) => *ready,
         other => panic!("the request was not admitted: {other:?}"),
     }
+}
+
+/// A request body the target's contract cannot read is refused before anything
+/// is assembled: the target does not run, so it is not in flight and is owed
+/// nothing. A typed text request is not refused — the target reads its text.
+#[test]
+fn a_non_text_request_to_a_string_contract_target_is_refused_before_assembly() {
+    let mut page = page();
+    let bytes = MessageBody::from_parts(Some("application/octet-stream"), &[0xff, 0x00])
+        .expect("a byte body builds");
+    let (answer, _) = dispatch_sync(
+        &mut page,
+        SyncCall {
+            instance: "p2",
+            port: "ack",
+            body: &bytes,
+            chain: &[],
+        },
+        stamp(0x5a1),
+        NOW,
+        NOW_MS,
+    );
+    assert_eq!(refusal(answer), SyncRefusal::TextOnlyTarget);
+    assert!(!page.schedules.in_flight("p2"), "the target did not run");
+
+    let typed = MessageBody::from_parts(Some("text/csv"), b"a,b").expect("typed text builds");
+    let (answer, _) = dispatch_sync(
+        &mut page,
+        SyncCall {
+            instance: "p2",
+            port: "ack",
+            body: &typed,
+            chain: &[],
+        },
+        stamp(0x5a2),
+        NOW,
+        NOW_MS,
+    );
+    let ready = admitted(answer);
+    let lowered = ready.activation.lower_v0_1();
+    let request = lowered.ports.last().expect("the request window");
+    assert!(request.envelopes[0].contains(r#""body":"a,b""#));
 }
 
 /// The whole point of "not something special": the handler sees its full normal
@@ -916,7 +965,7 @@ fn a_sync_activation_carries_the_full_worldview_and_the_request() {
         notes
             .new_envelopes()
             .iter()
-            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
+            .map(|envelope| envelope.body.as_text().unwrap().to_owned())
             .collect::<Vec<_>>(),
         ["queued"]
     );
@@ -927,12 +976,11 @@ fn a_sync_activation_carries_the_full_worldview_and_the_request() {
     let [envelope] = &request.envelopes[..] else {
         panic!("a sync window is exactly the one live request: {request:?}");
     };
-    let envelope = brenn_surface_test_fixtures::parse_envelope(envelope);
     assert_eq!(envelope.channel, "local:brenn/sync/ack");
     assert_eq!(envelope.envelope_type, brenn_envelope::ChannelScheme::Local);
     assert_eq!(envelope.sender, "p2");
     assert_eq!(envelope.source, "p2");
-    assert_eq!(envelope.body, "{\"kind\":\"dismiss\"}");
+    assert_eq!(envelope.body.as_text(), Some("{\"kind\":\"dismiss\"}"));
     assert_eq!(envelope.urgency, Urgency::Normal);
     assert_eq!(envelope.message_id, stamp(0x59c).message_id);
     assert_eq!(envelope.deliver_after, None);
@@ -998,14 +1046,17 @@ fn a_sync_reply_commits_the_buffer_and_an_err_discards_it() {
     let mut ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
     ready
         .buffer
-        .publish("notes", "from the gesture".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("from the gesture".to_string()),
+        )
         .expect("p1 binds the page-local channel");
     feed(
         &mut page,
         Input::ActivationDone(Box::new(Completed {
             instance: ready.instance,
             generation: ready.generation,
-            outcome: ActivationOutcome::Ok(Some("{\"cancel\":true}".to_string())),
+            outcome: ActivationOutcome::Ok(Some(GuestBody::Text("{\"cancel\":true}".to_string()))),
             buffer: ready.buffer,
             stamps: vec![stamp(0x9c4)],
         })),
@@ -1015,7 +1066,10 @@ fn a_sync_reply_commits_the_buffer_and_an_err_discards_it() {
     let mut ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
     ready
         .buffer
-        .publish("notes", "never routed".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("never routed".to_string()),
+        )
         .expect("p1 binds the page-local channel");
     feed(
         &mut page,
@@ -1269,7 +1323,7 @@ fn drain(page: &mut SurfacePage) -> Vec<(String, Vec<String>)> {
             .ports
             .iter()
             .flat_map(|window| window.new_envelopes())
-            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
+            .map(|envelope| envelope.body.as_text().unwrap().to_owned())
             .collect();
         taken.push((ready.instance.clone(), bodies));
         feed(
@@ -1474,6 +1528,7 @@ fn a_re_registration_owes_a_fresh_mount_activation() {
         &mut page,
         Input::ActivationRegistered {
             instance: "p1".to_string(),
+            contract: ProcessorContract::V0_1,
         },
     );
     assert!(page.schedules.owes_mount_activation("p1"));
@@ -1508,13 +1563,26 @@ fn complete_ok(
     ready: ReadyActivation,
     reply: Option<&str>,
 ) -> (ActivationOutcome, Vec<Effect>) {
+    complete_with(
+        page,
+        ready,
+        reply.map(|reply| GuestBody::Text(reply.to_string())),
+    )
+}
+
+/// [`complete_ok`] with the reply as the component's body, before it is built.
+fn complete_with(
+    page: &mut SurfacePage,
+    ready: ReadyActivation,
+    reply: Option<GuestBody>,
+) -> (ActivationOutcome, Vec<Effect>) {
     let stamps = flush_stamps(ready.buffer.len());
     complete(
         page,
         Completed {
             instance: ready.instance,
             generation: ready.generation,
-            outcome: ActivationOutcome::Ok(reply.map(str::to_string)),
+            outcome: ActivationOutcome::Ok(reply),
             buffer: ready.buffer,
             stamps,
         },
@@ -1554,7 +1622,60 @@ fn a_reply_on_a_sync_activation_is_read() {
     let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
 
     let (ruled, _) = complete_ok(&mut page, ready, Some("answered"));
-    assert_eq!(ruled, ActivationOutcome::Ok(Some("answered".to_string())));
+    assert_eq!(
+        ruled,
+        ActivationOutcome::Ok(Some(MessageBody::text("answered")))
+    );
+    assert!(!page.registrations.is_failed("p2"));
+}
+
+/// A callee the page stopped activating while its sync activation ran flushed
+/// nothing, so its reply is not the caller's: the caller is answered a trap.
+#[test]
+fn a_reply_from_a_callee_gone_mid_flight_is_answered_as_a_trap() {
+    let mut page = page();
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+    feed(
+        &mut page,
+        Input::ActivationDeregistered {
+            instance: "p2".to_string(),
+        },
+    );
+
+    let (ruled, _) = complete_ok(&mut page, ready, Some("answered"));
+    assert_eq!(answer_for(ruled), SyncAnswer::Trap);
+}
+
+/// A reply the component built malformed is the callee's trap, judged before
+/// the cap; a well-formed typed or non-text reply is read with its type.
+#[test]
+fn a_malformed_reply_is_a_trap_and_a_typed_one_is_read() {
+    let mut page = page();
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+    let malformed = GuestBody::Parts {
+        content_type: Some("text/plain".to_string()),
+        bytes: vec![0xff],
+    };
+    let (ruled, _) = complete_with(&mut page, ready, Some(malformed));
+    assert!(
+        matches!(&ruled, ActivationOutcome::Trap(detail) if detail.contains("receive replied with an invalid body")),
+        "the completion reclassified the ok: {ruled:?}",
+    );
+    assert!(page.registrations.is_failed("p2"));
+
+    let mut page = self::page();
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+    let bytes = GuestBody::Parts {
+        content_type: Some("image/png".to_string()),
+        bytes: vec![0x89, 0x50],
+    };
+    let (ruled, _) = complete_with(&mut page, ready, Some(bytes));
+    assert_eq!(
+        ruled,
+        ActivationOutcome::Ok(Some(
+            MessageBody::from_parts(Some("image/png"), &[0x89, 0x50]).expect("a byte body builds")
+        ))
+    );
     assert!(!page.registrations.is_failed("p2"));
 }
 
@@ -1568,7 +1689,7 @@ fn a_reply_of_exactly_the_body_cap_is_read() {
 
     let reply = "x".repeat(pages::BODY_CAP as usize);
     let (ruled, _) = complete_ok(&mut page, ready, Some(&reply));
-    assert_eq!(ruled, ActivationOutcome::Ok(Some(reply)));
+    assert_eq!(ruled, ActivationOutcome::Ok(Some(MessageBody::text(reply))));
     assert!(!page.registrations.is_failed("p2"));
 }
 
@@ -1599,7 +1720,10 @@ fn a_trapped_reply_discards_the_buffer() {
     let mut ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
     ready
         .buffer
-        .publish("notes", "never routed".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("never routed".to_string()),
+        )
         .expect("p1 binds the page-local channel");
 
     let oversize = "x".repeat(pages::BODY_CAP as usize + 1);
@@ -1781,4 +1905,232 @@ fn a_refused_first_document_is_refused_again_on_reconnect_and_a_readable_one_con
         page.bindings().is_some(),
         "the readable document is in force"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A page-local channel declared `non_text`
+// ---------------------------------------------------------------------------
+
+/// `p1` writes `NOTES` at ring depth 2, declared `non_text` or not; with
+/// `reader`, the 0.1.0 instance `p2` reads it, one new message with two of
+/// context.
+fn blob_doc(non_text: bool, reader: bool) -> BindingsDocument {
+    let subscriptions = if reader {
+        vec![fixtures::subscription("p2", "notes", NOTES, 1, 2)]
+    } else {
+        Vec::new()
+    };
+    fixtures::doc(
+        vec![
+            fixtures::component("p1"),
+            fixtures::component("p2"),
+            fixtures::component(fixtures::CHROME),
+        ],
+        subscriptions,
+        vec![output("p1", "notes", NOTES)],
+        vec![LocalChannel {
+            non_text,
+            ..fixtures::local(NOTES, 2)
+        }],
+    )
+}
+
+fn octets(bytes: &[u8]) -> GuestBody {
+    GuestBody::Parts {
+        content_type: Some("application/octet-stream".to_string()),
+        bytes: bytes.to_vec(),
+    }
+}
+
+/// Route one of `p1`'s non-text bodies onto `NOTES` directly, parked when
+/// `release_at` is given.
+fn route_octets(page: &mut SurfacePage, bytes: &[u8], release_at: Option<u64>, seed: u128) {
+    let outcome = page.router.route(
+        &mut page.stores,
+        RouteRequest {
+            channel: NOTES,
+            origin: Origin::Sub("p1"),
+            body: MessageBody::from_parts(Some("application/octet-stream"), bytes)
+                .expect("a byte body builds"),
+            stamp: stamp(seed),
+            urgency: Urgency::Normal,
+            deliver_after: release_at,
+        },
+    );
+    match release_at {
+        Some(_) => assert!(matches!(outcome, RouteOutcome::Parked { .. })),
+        None => assert!(matches!(outcome, RouteOutcome::Routed { .. })),
+    }
+}
+
+/// `p1` alone mounted under `document` and owed its mount activation, handed
+/// over with a buffer seeded under `document`.
+fn p1_in_flight(document: &BindingsDocument, park_text: bool) -> (SurfacePage, ReadyActivation) {
+    let mut page = pages::mounting_page(CONFIG, EPOCH, pages::facts(), &["p1"], document, NOW);
+    if park_text {
+        park_notes(&mut page, "later", 9_000, 0xb0a);
+    }
+    let (ready, _) = dispatch(&mut page, NOW, NOW_MS);
+    let ready = ready.expect("p1 is owed its mount activation");
+    assert_eq!(ready.instance, "p1");
+    (page, ready)
+}
+
+fn commit_across(page: &mut SurfacePage, ready: ReadyActivation, stamps: Vec<MessageStamp>) {
+    feed(
+        page,
+        Input::ActivationDone(Box::new(Completed {
+            instance: ready.instance,
+            generation: ready.generation,
+            outcome: ActivationOutcome::Ok(None),
+            buffer: ready.buffer,
+            stamps,
+        })),
+    );
+}
+
+#[test]
+fn a_redelivered_document_differing_only_in_non_text_changes_the_wiring() {
+    let mut page = pages::attached_page(CONFIG, EPOCH, pages::facts());
+    feed(
+        &mut page,
+        config_delivery(&blob_doc(true, true).to_body(), 1),
+    );
+    let effects = feed(
+        &mut page,
+        config_delivery(&blob_doc(false, true).to_body(), 2),
+    );
+    assert!(
+        events(&effects)
+            .iter()
+            .any(|event| matches!(event, Event::WiringChanged)),
+        "{effects:?}"
+    );
+    assert!(
+        !page
+            .bindings()
+            .expect("the second document is in force")
+            .carries_non_text(NOTES)
+    );
+}
+
+/// The store invariant across a flip off: what the declaration admitted goes,
+/// its parked sender is charged, and a 0.1.0 reader the new document binds
+/// there is primed onto an empty store and lowers its next activation.
+#[test]
+fn withdrawing_the_declaration_empties_a_store_holding_non_text() {
+    let mut page = page_with(&blob_doc(true, false));
+    route_octets(&mut page, &[0xff, 0x00], None, 0xb01);
+    route_octets(&mut page, &[0xfe], Some(9_000), 0xb02);
+    assert_eq!(page.schedules.deferred_dropped("p1"), 0);
+
+    let applied = page
+        .apply_config(&blob_doc(false, true).to_body(), NOW)
+        .expect("the undeclaring document applies");
+    assert!(applied.wiring_changed);
+
+    let store = page.stores.get(NOTES).expect("recreated");
+    assert_eq!(store.retained().count(), 0);
+    assert_eq!(store.parked().count(), 0);
+    assert_eq!(
+        page.schedules.deferred_dropped("p1"),
+        1,
+        "the lost schedule is charged to the instance that parked it"
+    );
+    assert!(!store.has_deliverable(&BindingKey::new("p2", "notes")));
+    let (ready, _) = dispatch(&mut page, NOW, NOW_MS);
+    assert!(ready.is_none(), "nothing is owed");
+
+    feed(&mut page, publish_cmd("p1", "notes", "fresh", 0xb03));
+    let (ready, _) = dispatch(&mut page, NOW, NOW_MS);
+    let ready = ready.expect("p2 reads what p1 just wrote");
+    assert_eq!(ready.instance, "p2");
+    let lowered = ready.activation.lower_v0_1();
+    let notes = lowered
+        .ports
+        .iter()
+        .find(|window| window.port == "notes")
+        .expect("p2 binds the channel");
+    assert_eq!(notes.envelopes.len(), 1, "only the text published since");
+    assert!(notes.envelopes[0].contains(r#""body":"fresh""#));
+}
+
+#[test]
+fn withdrawing_the_declaration_drops_a_store_whose_only_non_text_body_is_parked() {
+    let mut page = page_with(&blob_doc(true, false));
+    route_octets(&mut page, &[0xfe], Some(9_000), 0xb04);
+
+    page.apply_config(&blob_doc(false, true).to_body(), NOW)
+        .expect("the undeclaring document applies");
+
+    let store = page.stores.get(NOTES).expect("recreated");
+    assert_eq!(store.parked().count(), 0);
+    assert_eq!(page.schedules.deferred_dropped("p1"), 1);
+    on_input(&mut page, Input::ReleaseDue, NOW, 9_000);
+    let store = page.stores.get(NOTES).expect("recreated");
+    assert_eq!(store.retained().count(), 0, "nothing was released");
+    assert!(!store.has_deliverable(&BindingKey::new("p2", "notes")));
+    let (ready, _) = dispatch(&mut page, NOW, 9_000);
+    assert!(ready.is_none(), "nothing is owed to p2");
+}
+
+#[test]
+#[should_panic(
+    expected = "the buffer was judged under a bindings document other than the one in force"
+)]
+fn a_non_text_publish_committed_after_its_declaration_is_withdrawn_panics() {
+    let (mut page, mut ready) = p1_in_flight(&blob_doc(true, false), false);
+    ready
+        .buffer
+        .publish("notes", octets(&[0xff]))
+        .expect("the declared channel admits it");
+    // A frame between dispatch and completion: no driver in the tree does this.
+    page.apply_config(&blob_doc(false, false).to_body(), NOW)
+        .expect("the undeclaring document applies");
+    commit_across(&mut page, ready, vec![stamp(0xb11)]);
+}
+
+#[test]
+#[should_panic(
+    expected = "the buffer was judged under a bindings document other than the one in force"
+)]
+fn a_non_text_edit_committed_after_its_declaration_is_withdrawn_panics() {
+    let (mut page, mut ready) = p1_in_flight(&blob_doc(true, false), true);
+    ready
+        .buffer
+        .defer_edit("notes", 0, Some(octets(&[0xff])), None)
+        .expect("the declared channel admits it");
+    page.apply_config(&blob_doc(false, false).to_body(), NOW)
+        .expect("the undeclaring document applies");
+    commit_across(&mut page, ready, Vec::new());
+}
+
+#[test]
+fn a_text_buffer_commits_across_a_withdrawn_declaration() {
+    let (mut page, mut ready) = p1_in_flight(&blob_doc(true, false), true);
+    ready
+        .buffer
+        .publish("notes", GuestBody::Text("plain".to_string()))
+        .expect("bound");
+    ready
+        .buffer
+        .defer_edit(
+            "notes",
+            0,
+            Some(GuestBody::Text("edited".to_string())),
+            None,
+        )
+        .expect("in the window");
+    page.apply_config(&blob_doc(false, false).to_body(), NOW)
+        .expect("the undeclaring document applies");
+    commit_across(&mut page, ready, vec![stamp(0xb12)]);
+    assert_eq!(retained(&page, NOTES), ["plain"]);
+    let parked: Vec<String> = page
+        .stores
+        .get(NOTES)
+        .expect("kept: it holds only text")
+        .parked()
+        .map(|(envelope, _)| envelope.body.as_text().unwrap().to_owned())
+        .collect();
+    assert_eq!(parked, ["edited"]);
 }

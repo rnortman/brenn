@@ -25,7 +25,9 @@ use super::{
     PrepaidDestination, PrepaidEntry, SubscriberEntryKind, Urgency, store,
 };
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
+use brenn_envelope::Attachments;
 use brenn_envelope::grants::AppCapability;
+use brenn_messaging_store::blob::HeldAttachments;
 
 use brenn_obs::security::{DenialKind, SecurityEventType, log_component_security_event};
 
@@ -275,7 +277,7 @@ impl Messenger {
     /// budget. The message body, channel address, and option fields come from
     /// the LLM tool call.
     ///
-    /// Thin wrapper over `publish_core` with the app-sender authority source;
+    /// [`Messenger::publish_with_attachments`] with no attachments;
     /// `publish_from_attacher` is the sibling entry for attach publishers.
     #[allow(clippy::too_many_arguments)]
     pub async fn publish(
@@ -283,11 +285,42 @@ impl Messenger {
         origin: PublishOrigin,
         sender_app_slug: &str,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
         reply_to: Option<&str>,
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
+    ) -> PublishResult {
+        self.publish_with_attachments(
+            origin,
+            sender_app_slug,
+            addr,
+            body,
+            urgency,
+            reply_to,
+            deliver_after,
+            delivery_deadline,
+            HeldAttachments::none(),
+        )
+        .await
+    }
+
+    /// [`Messenger::publish`] for a message naming the blobs `attachments`
+    /// holds. Thin wrapper over `publish_core` with the app-sender authority
+    /// source: every gate, the send budget included, applies unchanged, and a
+    /// parked message carries its attachments into the deferred set.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_with_attachments(
+        &self,
+        origin: PublishOrigin,
+        sender_app_slug: &str,
+        addr: &str,
+        body: super::MessageBody,
+        urgency: super::Urgency,
+        reply_to: Option<&str>,
+        deliver_after: Option<DateTime<Utc>>,
+        delivery_deadline: Option<DateTime<Utc>>,
+        attachments: HeldAttachments,
     ) -> PublishResult {
         assert!(
             !matches!(origin, PublishOrigin::System),
@@ -307,6 +340,7 @@ impl Messenger {
             deliver_after,
             delivery_deadline,
             None,
+            attachments,
         )
         .await
     }
@@ -348,8 +382,9 @@ impl Messenger {
         scope: AttachScope<'_>,
         attribution: Option<&str>,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
+        attachments: HeldAttachments,
     ) -> PublishResult {
         self.publish_core(
             PublishOrigin::System,
@@ -365,6 +400,7 @@ impl Messenger {
             None,
             None,
             None,
+            attachments,
         )
         .await
     }
@@ -389,7 +425,7 @@ impl Messenger {
         &self,
         slug: &str,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
     ) -> PublishResult {
         self.publish_core(
@@ -407,6 +443,7 @@ impl Messenger {
             None,
             // Server-constructed telemetry: no user gesture behind it.
             None,
+            HeldAttachments::none(),
         )
         .await
     }
@@ -428,7 +465,7 @@ impl Messenger {
         &self,
         component: &str,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
         reply_to: Option<&str>,
     ) -> PublishResult {
@@ -443,6 +480,40 @@ impl Messenger {
             None,
             // In-process substrate output; nothing here descends from a gesture.
             None,
+            HeldAttachments::none(),
+        )
+        .await
+    }
+
+    /// [`Messenger::publish_from_system`] with attachments and an optional
+    /// release time.
+    ///
+    /// `attachments` holds every blob it names, so the publish cannot fail on
+    /// them. The channel's store keeps its own holder — a ring entry's holds,
+    /// or a durable row's reference — and `attachments`' holds are released
+    /// when the publish returns, whatever its outcome.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_from_system_with_attachments(
+        &self,
+        component: &str,
+        addr: &str,
+        body: super::MessageBody,
+        urgency: super::Urgency,
+        reply_to: Option<&str>,
+        deliver_after: Option<DateTime<Utc>>,
+        attachments: HeldAttachments,
+    ) -> PublishResult {
+        self.publish_core(
+            PublishOrigin::System,
+            PublishPrincipal::System { component },
+            addr,
+            body,
+            urgency,
+            reply_to,
+            deliver_after,
+            None,
+            None,
+            attachments,
         )
         .await
     }
@@ -466,7 +537,7 @@ impl Messenger {
         conversation_id: i64,
         app_slug: &str,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
     ) -> PublishResult {
         self.publish_core(
@@ -485,6 +556,7 @@ impl Messenger {
             // propagate outward through the machinery's republish legs: an
             // attended turn's record must not re-arm every observer downstream.
             None,
+            HeldAttachments::none(),
         )
         .await
     }
@@ -608,12 +680,13 @@ impl Messenger {
         origin: PublishOrigin,
         principal: PublishPrincipal<'_>,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
         reply_to: Option<&str>,
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
         impetus: Option<Impetus>,
+        attachments: HeldAttachments,
     ) -> PublishResult {
         let sender = self.principal_identity(principal);
         let result = self
@@ -628,6 +701,7 @@ impl Messenger {
                 deliver_after,
                 delivery_deadline,
                 impetus,
+                attachments,
             )
             .await;
         self.record_publish_denial(&sender, &result);
@@ -720,12 +794,13 @@ impl Messenger {
         principal: PublishPrincipal<'_>,
         sender: &str,
         addr: &str,
-        body: &str,
+        body: super::MessageBody,
         urgency: super::Urgency,
         reply_to: Option<&str>,
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
         impetus: Option<Impetus>,
+        attachments: HeldAttachments,
     ) -> PublishResult {
         // 1. Validate address shape, then resolve. Shape errors return
         //    `MalformedAddress`; well-formed
@@ -919,7 +994,7 @@ impl Messenger {
         }
 
         // 3. Body length.
-        if let Err(e) = check_body_size(body, self.defaults.max_body_bytes) {
+        if let Err(e) = check_body_size(&body, self.defaults.max_body_bytes) {
             return PublishResult::BodyTooLarge {
                 len: e.len,
                 max: e.max,
@@ -1065,17 +1140,20 @@ impl Messenger {
         //    whether the deferred set is rows or a map, is the store's business
         //    and no caller's. The deferred cap is the store's too, so a durable
         //    schedule is refused at the same channel-wide bound a ring one is.
+        channel.assert_may_hold(&body);
         let store = self.store_for(&channel);
+        let attachment_refs = attachments.refs().clone();
         let message = store::NewMessage {
             source: self.source.as_ref().to_owned(),
             sender: sender.to_owned(),
-            body: body.to_string(),
+            body: body.clone(),
             urgency,
             envelope_type: scheme,
             reply_to: reply_to_target,
             delivery_deadline,
             impetus,
             publish_ts_ns,
+            attachments,
         };
         let (message_id, retained_seq) = match deliver_after {
             Some(release_at) => match store.park(message, release_at).await {
@@ -1132,13 +1210,14 @@ impl Messenger {
                     channel.address.clone(),
                     sender.to_owned(),
                     publish_ts_ns,
-                    body.to_owned(),
+                    body,
                     reply_to.map(|s| s.to_owned()),
                     delivery_deadline,
                     deliver_after,
                     impetus,
                     urgency,
                     scheme,
+                    attachment_refs,
                 ));
                 self.fan_out_attach_feed(
                     &feed_targets,
@@ -1177,8 +1256,8 @@ impl Messenger {
     /// `entry`'s attacher feed targets, or empty when no attached session holds
     /// a subscription for any of them.
     ///
-    /// The empty answer is the caller's licence to skip building the owned,
-    /// body-copying feed envelope at all, so the two questions are asked
+    /// The empty answer is the caller's licence to skip building the
+    /// owned feed envelope at all, so the two questions are asked
     /// together: a fan-out with no attached holder does nothing but allocate.
     ///
     /// The subscriber list is read from the directory here rather than taken from
@@ -1268,13 +1347,14 @@ fn surface_feed_envelope(
     channel: String,
     sender: String,
     publish_ts_ns: i64,
-    body: String,
+    body: super::MessageBody,
     reply_to: Option<String>,
     delivery_deadline: Option<DateTime<Utc>>,
     deliver_after: Option<DateTime<Utc>>,
     impetus: Option<Impetus>,
     urgency: Urgency,
     scheme: ChannelScheme,
+    attachments: Attachments,
 ) -> super::MessageEnvelope {
     super::MessageEnvelope {
         message_id,
@@ -1289,6 +1369,8 @@ fn surface_feed_envelope(
         impetus,
         urgency,
         envelope_type: scheme,
+        transport: None,
+        attachments,
     }
 }
 
@@ -1302,7 +1384,13 @@ impl Messenger {
     /// The caller holds the DB lock (`conn` / the transaction) and commits it
     /// after all `insert_message` calls for the batch.
     ///
-    /// Always inserts with no impetus.
+    /// Always inserts with no impetus. `transport` is the transport metadata
+    /// of a message a transport adaptor published with the payload as the
+    /// body, `None` from every other path.
+    ///
+    /// `attachments` are adopted in `tx`: the caller has called
+    /// [`HeldAttachments::make_durable`] on them before taking the lock, and
+    /// calls [`HeldAttachments::confirm_adopted`] once `tx` commits.
     #[allow(clippy::too_many_arguments)]
     fn insert_message(
         &self,
@@ -1311,13 +1399,16 @@ impl Messenger {
         envelope_type: ChannelScheme,
         source: &str,
         sender: &str,
-        body: &str,
+        body: &super::MessageBody,
         urgency: super::Urgency,
         publish_ts_ns: i64,
         reply_to_uuid: Option<Uuid>,
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
+        transport: Option<&super::TransportMeta>,
+        attachments: &HeldAttachments,
     ) -> InsertedMessage {
+        channel.assert_may_hold(body);
         insert_message_in_tx(
             tx,
             channel.uuid,
@@ -1330,6 +1421,8 @@ impl Messenger {
             delivery_deadline,
             deliver_after,
             None,
+            transport,
+            attachments,
             publish_ts_ns,
         )
     }
@@ -1380,69 +1473,136 @@ impl Messenger {
     }
 }
 
+/// What a transport adaptor publishes onto its ingress channel; the variant
+/// is the channel's ingress shape.
+#[derive(Debug, Clone)]
+pub enum IngressMessage {
+    /// The transport's wrapper JSON (`WebhookEnvelope` or `MqttEnvelope`),
+    /// stored as untyped text with no transport metadata. Only a text-only
+    /// ingress channel takes it.
+    Wrapped(String),
+    /// The payload itself as the body, with the transport's metadata in the
+    /// envelope's `transport` field. Only an ingress channel declared
+    /// `non_text` takes it.
+    Raw {
+        body: super::MessageBody,
+        transport: super::TransportMeta,
+    },
+}
+
 impl Messenger {
     /// Host-originated transport ingress publish.
     ///
     /// Unlike `publish`, this entry point is for host-side transport adaptors
     /// (webhook, mqtt) that have already performed admission (signature
-    /// verification, replay protection). It bypasses all CC-facing gates
-    /// (sender lookup, send-budget decrement, body-length check) and stamps the
-    /// channel's own `transport_type` on the stored message row.
+    /// verification, replay protection) and judged the outside input. It
+    /// bypasses all CC-facing gates (sender lookup, send-budget decrement) and
+    /// stamps the channel's own `transport_type` on the stored message row.
+    ///
+    /// The adaptor reads the shape from, sizes the body against
+    /// [`max_body_bytes`](Self::max_body_bytes), and publishes on the one
+    /// `channel` entry it hands here, so every refusal below is a host bug.
     ///
     /// Returns once the durable DB insert of the message + pending-push rows
     /// commits. Panics on any DB error (fail-fast; axum's per-task panic handler
     /// converts this to a 500 for the HTTP caller — satisfying the "never 2xx if
-    /// durable enqueue failed" contract without an explicit `Err` path). A
-    /// host-built malformed envelope or an unresolvable channel likewise panics
-    /// (fail-fast, CLAUDE.md). There are no business-logic rejections (no budget /
-    /// sender gate) for this host-originated entry point.
+    /// durable enqueue failed" contract without an explicit `Err` path).
     ///
     /// `source` and `sender` are stamped verbatim on the message row (e.g.
     /// `source = "webhook:<slug>"`, `sender = key_id`).
+    ///
+    /// # Panics
+    ///
+    /// - the channel's scheme is neither `Webhook` nor `Mqtt`;
+    /// - `Wrapped` on a channel declared `non_text`, or `Raw` on a text-only
+    ///   channel;
+    /// - `Wrapped` whose text does not parse as the scheme's wrapper struct;
+    /// - `Raw` whose `transport` is of another scheme than the channel's;
+    /// - `Raw` whose body is longer than the body cap.
     pub async fn publish_transport_ingress(
         &self,
         channel: Arc<super::ChannelEntry>,
         source: &str,
         sender: &str,
-        body: &str,
+        message: IngressMessage,
         urgency: Urgency,
     ) {
         let publish_ts_ns = db::utc_to_ns(Utc::now());
-
-        // Accept-side validation: deserialize the body JSON into the channel's
-        // transport-typed struct to verify the host built a structurally valid
-        // envelope. A deserialize failure is a host-internal bug — panic.
-        match channel.transport_type {
-            ChannelScheme::Webhook => {
-                serde_json::from_str::<super::WebhookEnvelope>(body).unwrap_or_else(|e| {
-                    panic!(
-                        "publish_transport_ingress: host built a malformed WebhookEnvelope for \
-                         channel '{}' — this is a host-internal bug, not an attacker input: {e}",
-                        channel.address
-                    )
-                });
-            }
-            ChannelScheme::Mqtt => {
-                serde_json::from_str::<super::MqttEnvelope>(body).unwrap_or_else(|e| {
-                    panic!(
-                        "publish_transport_ingress: host built a malformed MqttEnvelope for \
-                         channel '{}' — this is a host-internal bug, not an attacker input: {e}",
-                        channel.address
-                    )
-                });
-            }
-            other => {
-                panic!(
-                    "publish_transport_ingress: called with unexpected transport type {:?} for \
-                     channel '{}' — only Webhook and Mqtt are valid for this entry point",
-                    other, channel.address
-                );
-            }
+        let scheme = channel.transport_type;
+        if !matches!(scheme, ChannelScheme::Webhook | ChannelScheme::Mqtt) {
+            panic!(
+                "publish_transport_ingress: called with unexpected transport type {:?} for \
+                 channel '{}' — only Webhook and Mqtt are valid for this entry point",
+                scheme, channel.address
+            );
         }
+        let non_text = channel.resolved_channel.non_text;
+        let (body, transport) = match message {
+            IngressMessage::Wrapped(text) => {
+                assert!(
+                    !non_text,
+                    "publish_transport_ingress: host published the wrapped shape on channel \
+                     '{}', which is declared non_text and takes the raw shape — the adaptor \
+                     read a different channel entry from the one it publishes on",
+                    channel.address
+                );
+                // Accept-side validation: the host built a structurally valid
+                // wrapper, or this is a host-internal bug.
+                if scheme == ChannelScheme::Webhook {
+                    serde_json::from_str::<super::WebhookEnvelope>(&text).unwrap_or_else(|e| {
+                        panic!(
+                            "publish_transport_ingress: host built a malformed WebhookEnvelope \
+                             for channel '{}' — this is a host-internal bug, not an attacker \
+                             input: {e}",
+                            channel.address
+                        )
+                    });
+                } else {
+                    serde_json::from_str::<super::MqttEnvelope>(&text).unwrap_or_else(|e| {
+                        panic!(
+                            "publish_transport_ingress: host built a malformed MqttEnvelope for \
+                             channel '{}' — this is a host-internal bug, not an attacker \
+                             input: {e}",
+                            channel.address
+                        )
+                    });
+                }
+                (super::MessageBody::text(text), None)
+            }
+            IngressMessage::Raw { body, transport } => {
+                assert!(
+                    non_text,
+                    "publish_transport_ingress: host published the raw shape on channel '{}', \
+                     which is text-only and takes the wrapped shape — the adaptor read a \
+                     different channel entry from the one it publishes on",
+                    channel.address
+                );
+                assert_eq!(
+                    transport.scheme(),
+                    scheme,
+                    "publish_transport_ingress: host published {:?} transport metadata on \
+                     channel '{}'",
+                    transport.scheme(),
+                    channel.address
+                );
+                // TODO(ingress-oversize-payload-as-blob): a raw payload over the
+                // body cap is refused by its adaptor and never carried as an
+                // attachment.
+                let cap = self.max_body_bytes();
+                assert!(
+                    body.len() <= cap,
+                    "publish_transport_ingress: host published a raw body ({}) over the \
+                     {cap}-byte body cap on channel '{}' — the adaptor must refuse it first",
+                    body.summary(),
+                    channel.address
+                );
+                (body, Some(transport))
+            }
+        };
 
-        // DB work: insert the message row under one lock (step 6). No budget
-        // decrement, no sender gate, no body-length gate. No deliver_after /
-        // delivery_deadline for transport ingress — both are None (always immediate).
+        // DB work: insert the message row under one lock. No budget decrement
+        // and no sender gate. No deliver_after / delivery_deadline for transport
+        // ingress — both are None (always immediate).
         {
             let conn = self.db.lock().await;
             let tx = conn
@@ -1451,15 +1611,17 @@ impl Messenger {
             self.insert_message(
                 &tx,
                 &channel,
-                channel.transport_type,
+                scheme,
                 source,
                 sender,
-                body,
+                &body,
                 urgency,
                 publish_ts_ns,
                 None, // no reply_to
                 None, // no deliver_after — transport ingress is always immediate
                 None, // no delivery_deadline
+                transport.as_ref(),
+                &HeldAttachments::none(),
             );
             tx.commit().expect("messaging: commit transport ingress tx");
         }
@@ -1474,7 +1636,7 @@ impl Messenger {
 /// `body` is the message payload.
 pub struct WasmPublish<'a> {
     pub channel_address: &'a str,
-    pub body: &'a str,
+    pub body: super::MessageBody,
     /// Sender urgency intent for this publish.
     pub urgency: super::Urgency,
     /// Reply channel address, set only for async tool-call requests (the caller's
@@ -1487,6 +1649,10 @@ pub struct WasmPublish<'a> {
     /// until it; a past/absent value commits immediately. Mutually exclusive with
     /// `reply_to` in practice (tool requests never defer).
     pub deliver_after: Option<DateTime<Utc>>,
+    /// The blobs the message names, held by the caller for the whole flush.
+    /// The channel's store takes its own holder: a durable row adopts them, a
+    /// ring entry keeps a clone of the holds.
+    pub attachments: &'a HeldAttachments,
 }
 
 impl Messenger {
@@ -1503,6 +1669,14 @@ impl Messenger {
     ///
     /// Each publish carries its own urgency: port-configured default (for `publish`)
     /// or guest-supplied (for `publish-with-urgency`).
+    ///
+    /// Attachments of a durable entry are synced before the database lock is
+    /// taken, adopted with the entry's row, and confirmed after the commit; an
+    /// entry the deferred cap refuses adopts nothing, and a blob only it named
+    /// is deleted when the caller drops its holds. A ring entry's attachments
+    /// are neither synced nor adopted: the ring keeps the holds. A panic
+    /// mid-flush leaves the blobs adopted in the rolled-back transaction to the
+    /// next reap.
     pub async fn publish_from_wasm(&self, consumer_slug: &str, publishes: &[WasmPublish<'_>]) {
         if publishes.is_empty() {
             return;
@@ -1539,6 +1713,27 @@ impl Messenger {
         // after the lock is released so the durable transaction is not held
         // across the logging.
         let mut refused: Vec<(String, u64)> = Vec::new();
+        // The attachments of every durable entry inserted, confirmed once the
+        // transaction has committed. An entry the deferred cap refused is not
+        // here: nothing adopted its blobs.
+        let mut adopted: Vec<&HeldAttachments> = Vec::new();
+
+        // Sync the blobs a durable row will name before the lock. A ring entry's blobs stay unsynced.
+        for publish in publishes {
+            if publish.attachments.is_empty() {
+                continue;
+            }
+            let channel_addr = publish.channel_address;
+            let entry = self.directory.resolve(channel_addr).unwrap_or_else(|| {
+                panic!(
+                    "publish_from_wasm: channel {channel_addr:?} not in directory — \
+                     boot validation should have caught this (slug={consumer_slug})"
+                )
+            });
+            if entry.capabilities().durable {
+                publish.attachments.make_durable();
+            }
+        }
 
         {
             let conn = self.db.lock().await;
@@ -1592,6 +1787,7 @@ impl Messenger {
                 // Non-durable: skip the durable transaction machinery; ring
                 // append is deferred to after the lock.
                 if !entry.capabilities().durable {
+                    entry.assert_may_hold(&publish.body);
                     let scheme = ChannelScheme::of(channel_addr).unwrap_or_else(|| {
                         panic!(
                             "publish_from_wasm: channel {channel_addr:?} carries no scheme prefix \
@@ -1602,13 +1798,14 @@ impl Messenger {
                     let message = store::NewMessage {
                         source: source.to_owned(),
                         sender: sender.clone(),
-                        body: publish.body.to_string(),
+                        body: publish.body.clone(),
                         urgency: publish.urgency,
                         envelope_type: scheme,
                         reply_to: reply_to_target,
                         delivery_deadline: None,
                         impetus: None,
                         publish_ts_ns: db::utc_to_ns(Utc::now()),
+                        attachments: publish.attachments.clone(),
                     };
                     nondurable_pending.push((entry, message, release));
                     continue;
@@ -1649,13 +1846,16 @@ impl Messenger {
                     ChannelScheme::Brenn,
                     source,
                     &sender,
-                    publish.body,
+                    &publish.body,
                     publish.urgency,
                     publish_ts_ns,
                     reply_to_target.as_ref().map(|target| target.uuid),
                     release,
                     None, // no delivery_deadline
+                    None, // no transport metadata
+                    publish.attachments,
                 );
+                adopted.push(publish.attachments);
                 // A parked message is not observable before release, so it must
                 // not be fed now.
                 if release.is_none()
@@ -1671,13 +1871,14 @@ impl Messenger {
                             channel.address.clone(),
                             sender.clone(),
                             publish_ts_ns,
-                            publish.body.to_owned(),
+                            publish.body.clone(),
                             publish.reply_to.map(|s| s.to_owned()),
                             None,
                             None,
                             None,
                             publish.urgency,
                             ChannelScheme::Brenn,
+                            publish.attachments.refs().clone(),
                         )),
                         inserted.retained_seq.expect(
                             "publish: an unparked durable message holds a retention position",
@@ -1688,6 +1889,9 @@ impl Messenger {
             }
 
             tx.commit().expect("publish_from_wasm: commit tx");
+            for attachments in adopted {
+                attachments.confirm_adopted();
+            }
             debug!(
                 consumer_slug = consumer_slug,
                 publish_count = publishes.len(),
@@ -1730,6 +1934,7 @@ impl Messenger {
                         .reply_to
                         .as_ref()
                         .map(|target| target.address.clone());
+                    let attachment_refs = message.attachments.refs().clone();
                     let outcome = store.append(message).await;
                     self.enact_overflow_events(&entry, &outcome.overflow);
                     let feed_targets = self.attached_feed_targets(&entry);
@@ -1747,6 +1952,7 @@ impl Messenger {
                             None,
                             urgency,
                             scheme,
+                            attachment_refs,
                         ));
                         self.fan_out_attach_feed(
                             &feed_targets,
@@ -1793,7 +1999,7 @@ impl Messenger {
 /// from the *server's* output map.
 pub struct AttachBatchPublish<'a> {
     pub channel_address: &'a str,
-    pub body: &'a str,
+    pub body: super::MessageBody,
     pub urgency: super::Urgency,
     /// This entry's publish timestamp, assigned by the caller in call order
     /// across the whole flush — so call order is visible across the class
@@ -1809,6 +2015,9 @@ pub struct AttachBatchPublish<'a> {
     /// park-vs-immediate against the same instant. This entry point re-reads no
     /// clock and re-compares nothing.
     pub deliver_after: Option<DateTime<Utc>>,
+    /// The blobs this entry's message names, held by the caller until the
+    /// batch returns.
+    pub attachments: &'a HeldAttachments,
 }
 
 impl Messenger {
@@ -1869,6 +2078,14 @@ impl Messenger {
     /// discard entries the component published unconditionally over one it merely
     /// scheduled, and a post-activation flush has no error channel back to the
     /// guest to carry either outcome.
+    ///
+    /// **Attachments are stored with their entry.** A durable entry's blobs are
+    /// synced before the database lock is taken, adopted with the entry's row,
+    /// and confirmed after the commit. A ring entry's blobs are neither synced
+    /// nor adopted: the ring keeps the holds. An entry that publishes nothing
+    /// adopts nothing, and a blob only it named is deleted when the caller drops
+    /// its holds. A panic mid-batch leaves the blobs adopted in the rolled-back
+    /// transaction to the next reap.
     ///
     /// Returns the number of entries that published nothing — a schedule the
     /// deferred cap refused, or (under [`MissingChannelPosture::Race`]) a target
@@ -1970,6 +2187,16 @@ impl Messenger {
         // Schedules the deferred cap refused, warned about after the lock is
         // released so the transaction is not held across the logging.
         let mut refused: Vec<(String, u64)> = Vec::new();
+        // The attachments of every durable entry inserted, confirmed once the
+        // transaction has committed.
+        let mut adopted: Vec<&HeldAttachments> = Vec::new();
+
+        // Sync the blobs a durable row will name before the lock.
+        for (publish, _) in &durable {
+            if !publish.attachments.is_empty() {
+                publish.attachments.make_durable();
+            }
+        }
 
         {
             let conn = self.db.lock().await;
@@ -2031,7 +2258,7 @@ impl Messenger {
                 // config-wiring bug the single-publish path screams about, except
                 // that here there is no per-entry outcome to carry it back and an
                 // oversized row would already be committed with its siblings.
-                if let Err(e) = check_body_size(publish.body, self.defaults.max_body_bytes) {
+                if let Err(e) = check_body_size(&publish.body, self.defaults.max_body_bytes) {
                     panic!(
                         "publish_batch_from_attacher: entry body is {} bytes over the {} cap for \
                          {route} {slug:?} — the session handler rejects an over-cap entry as a \
@@ -2056,13 +2283,16 @@ impl Messenger {
                         ChannelScheme::Brenn,
                         source,
                         &sender,
-                        publish.body,
+                        &publish.body,
                         publish.urgency,
                         publish.publish_ts_ns,
                         None, // no reply_to — not exposed to attachers
                         Some(release_at),
                         None, // no delivery_deadline
+                        None, // no transport metadata
+                        publish.attachments,
                     );
+                    adopted.push(publish.attachments);
                     // Not fed now: a parked message is not observable before
                     // release, and the release sweep does its own fan-out.
                     continue;
@@ -2074,13 +2304,16 @@ impl Messenger {
                     ChannelScheme::Brenn,
                     source,
                     &sender,
-                    publish.body,
+                    &publish.body,
                     publish.urgency,
                     publish.publish_ts_ns,
                     None, // no reply_to — not exposed to attachers
                     None,
                     None, // no delivery_deadline
+                    None, // no transport metadata
+                    publish.attachments,
                 );
+                adopted.push(publish.attachments);
                 if !feed_targets.is_empty()
                     && self
                         .router
@@ -2093,13 +2326,14 @@ impl Messenger {
                             channel.address.clone(),
                             sender.clone(),
                             publish.publish_ts_ns,
-                            publish.body.to_owned(),
+                            publish.body.clone(),
                             None,
                             None,
                             None,
                             None,
                             publish.urgency,
                             ChannelScheme::Brenn,
+                            publish.attachments.refs().clone(),
                         )),
                         inserted.retained_seq.expect(
                             "publish: an unparked durable message holds a retention position",
@@ -2110,6 +2344,9 @@ impl Messenger {
             }
 
             tx.commit().expect("publish_batch_from_attacher: commit tx");
+            for attachments in adopted {
+                attachments.confirm_adopted();
+            }
         }
 
         // Durable attacher feeds, fanned out after the lock is released.
@@ -2131,9 +2368,10 @@ impl Messenger {
                     self.resolve_prepaid(&sender_id, policy, publish.channel_address)
                 });
             let prepaid = PrepaidEntry {
-                body: publish.body,
+                body: publish.body.clone(),
                 urgency: publish.urgency,
                 publish_ts: db::ns_to_utc(publish.publish_ts_ns),
+                attachments: publish.attachments.clone(),
             };
             match publish.deliver_after {
                 Some(release_at) => {

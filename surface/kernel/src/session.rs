@@ -73,7 +73,7 @@ pub enum Event {
     /// Carries the parsed wiring rather than a frame's payload — the wiring is
     /// retained bus state now.
     Connected {
-        bindings: BindingsDocument,
+        bindings: Box<BindingsDocument>,
         /// This attachment's principal, `surface:<slug>`.
         participant_id: String,
         /// The peer-minted id of this attachment, which the surface's own
@@ -539,8 +539,13 @@ impl Reactions {
         let OutboxSteps {
             frames,
             dropped,
+            released,
             retry_wakeup,
         } = steps;
+        assert!(
+            released.is_empty(),
+            "surface kernel: a v5 session's flush named a blob handle"
+        );
         self.frames(page, frames);
         for toast in outward::parked_drop_notices(&dropped) {
             self.control(toast);
@@ -718,6 +723,14 @@ fn frame_class(frame: &ClientFrame) -> &'static str {
         ClientFrame::Publish { .. } => "Publish",
         ClientFrame::PublishBatch { .. } => "PublishBatch",
         ClientFrame::Alert { .. } => "Alert",
+        ClientFrame::BlobCreate { .. }
+        | ClientFrame::BlobWrite { .. }
+        | ClientFrame::BlobSeal { .. }
+        | ClientFrame::BlobOpen { .. }
+        | ClientFrame::BlobRead { .. }
+        | ClientFrame::BlobClose { .. } => {
+            panic!("surface client: attach v5, which the page speaks, has no blob frame")
+        }
     }
 }
 
@@ -736,7 +749,7 @@ fn connected(page: &SurfacePage) -> Event {
         .bindings()
         .expect("surface client: a configured page has a document in force");
     Event::Connected {
-        bindings: bindings.document().clone(),
+        bindings: Box::new(bindings.document().clone()),
         participant_id: facts.participant_id.clone(),
         session_id: facts.session_id.clone(),
         max_body_bytes: facts.max_body_bytes,

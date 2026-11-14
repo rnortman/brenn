@@ -17,13 +17,12 @@ use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::{SubscriberEntry, SubscriberEntryKind};
 use brenn_messaging::{GapReason as BusGapReason, Replay};
 use brenn_messaging_store::store::{ResumeCursor, StoreRetained};
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::*;
 use crate::profile::SubscriptionFacts;
 use crate::session::AttachSessionCtx;
-use crate::test_support::{AttachCtxBuilder, TestProfile, one_channel_messenger};
+use crate::test_support::{AttachCtxBuilder, FrameRx, TestProfile, one_channel_messenger};
 
 /// The one channel every fixture declares, scheme-qualified and bare.
 const ADDR: &str = "brenn:durable-demo";
@@ -39,14 +38,14 @@ async fn attach_at(
     db: &Db,
     push_depth: u64,
     retain_depth: u64,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+) -> (AttachSessionCtx, FrameRx, Uuid) {
     attach_with_floor(db, push_depth, retain_depth, true).await
 }
 
 /// The same attachment with the delivery floor denying [`ADDR`] — the policy
 /// holds the transport grant but no matcher covering the channel, so the profile
 /// still admits the subscription and every send path must refuse it.
-async fn attach_denied(db: &Db) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+async fn attach_denied(db: &Db) -> (AttachSessionCtx, FrameRx, Uuid) {
     attach_with_floor(db, 8, 8, false).await
 }
 
@@ -57,7 +56,7 @@ async fn attach_with_floor(
     push_depth: u64,
     retain_depth: u64,
     granted: bool,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+) -> (AttachSessionCtx, FrameRx, Uuid) {
     let (messenger, channel_uuid) = one_channel_messenger(db, BARE).await;
 
     let mut policy = AppPolicy::default();
@@ -87,7 +86,7 @@ async fn attach_with_floor(
 
 /// The common fold: both knobs at 8, wide enough that no test trips the clamp
 /// unless it means to.
-async fn attach(db: &Db) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+async fn attach(db: &Db) -> (AttachSessionCtx, FrameRx, Uuid) {
     attach_at(db, 8, 8).await
 }
 
@@ -177,7 +176,7 @@ async fn seed(db: &Db, channel_uuid: Uuid, body: &str, ts_ns: i64) {
         channel_uuid,
         "test",
         "sender",
-        body,
+        &body.into(),
         Urgency::Normal,
         ChannelScheme::Brenn,
         None,
@@ -274,7 +273,7 @@ fn subscribe_result(frame: &ServerFrame) -> (u32, Option<ProtoGapReason>) {
 }
 
 /// Drain every frame the handlers enqueued.
-fn frames(rx: &mut mpsc::Receiver<ServerFrame>) -> Vec<ServerFrame> {
+fn frames(rx: &mut FrameRx) -> Vec<ServerFrame> {
     let mut out = Vec::new();
     while let Ok(frame) = rx.try_recv() {
         out.push(frame);
@@ -1121,7 +1120,7 @@ impl Class {
 /// admitting it at depth 8 both ways and the policy covering it.
 struct ParityRig {
     ctx: AttachSessionCtx,
-    rx: mpsc::Receiver<ServerFrame>,
+    rx: FrameRx,
     class: Class,
     channel_uuid: Uuid,
     db: Db,
@@ -1197,9 +1196,10 @@ async fn parity_commit(rig: &mut ParityRig, body: &str) {
                 .publish_prepaid(
                     &dest,
                     brenn_messaging::PrepaidEntry {
-                        body,
+                        body: body.into(),
                         urgency: brenn_lib::messaging::Urgency::Normal,
                         publish_ts: chrono::Utc::now(),
+                        attachments: brenn_messaging_store::blob::HeldAttachments::none(),
                     },
                 )
                 .await;
@@ -1244,7 +1244,10 @@ fn parity_lines(frame: &ServerFrame) -> Vec<String> {
                 // carries.
                 format!(
                     "deliver body={} span={} pos={} dropped={}",
-                    row.envelope.body, row.seq, state.resume.seq, row.dropped
+                    row.envelope.body.as_text().unwrap(),
+                    row.seq,
+                    state.resume.seq,
+                    row.dropped
                 )
             })
             .collect(),
@@ -1430,7 +1433,7 @@ async fn attach_runtime(
     max_active_subscriptions: usize,
     runtime_entry: Option<SubscriberEntry>,
     standing: Depth,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+) -> (AttachSessionCtx, FrameRx, Uuid) {
     let (messenger, channel_uuid) =
         crate::test_support::one_channel_messenger_at_standing(db, BARE, standing).await;
 
@@ -1518,6 +1521,62 @@ async fn a_granted_but_absent_channel_answers_unavailable() {
     assert!(
         wire.shared.lock().unwrap().is_empty(),
         "the router was never told to queue for it"
+    );
+}
+
+/// **A `non_text` channel is not served to a version that carries only text.**
+/// The attacher cannot see the declaration, so the ask is conforming: answered
+/// `Unavailable`, not a violation, and nothing opens.
+#[tokio::test]
+async fn a_non_text_channel_answers_unavailable_to_a_text_only_version() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (messenger, _uuid) =
+        crate::test_support::one_channel_messenger_declared(&db, BARE, Depth::Unbounded, true)
+            .await;
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy.acls.brenn_subscribe = vec![ChannelMatcher::Exact(BARE.to_string())];
+    let facts = SubscriptionFacts {
+        push_depth: 8,
+        retain_depth: 8,
+    };
+    let profile = TestProfile {
+        subscribable: HashMap::from([(ADDR.to_string(), facts)]),
+        subscribe_burst: 16,
+        runtime_entry: Some(minted_entry(8, 8)),
+        ..TestProfile::new()
+    };
+    let (ctx, mut rx) = AttachCtxBuilder::new(profile)
+        .messenger(messenger)
+        .policy(policy)
+        .build();
+    assert!(!brenn_attach_proto::carries_non_text_bodies(ctx.version()));
+    let mut wire = Wire::new(&ctx);
+
+    let outcome = wire.subscribe(&ctx, ADDR, 4, 4, None).await;
+
+    assert!(matches!(outcome, FrameOutcome::Continue), "not a violation");
+    let written = frames(&mut rx);
+    assert_eq!(written.len(), 1, "one frame, and it is the refusal");
+    match &written[0] {
+        ServerFrame::SubscribeResult {
+            channel,
+            outcome,
+            replay_count,
+            gap,
+        } => {
+            assert_eq!(channel, ADDR);
+            assert!(matches!(outcome, SubscribeOutcome::Unavailable));
+            assert_eq!(*replay_count, 0);
+            assert!(gap.is_none());
+        }
+        other => panic!("expected a SubscribeResult, got {other:?}"),
+    }
+    assert!(!wire.active.is_active(ADDR), "nothing was opened");
+    assert_eq!(wire.position(ADDR), None, "no span was anchored");
+    assert!(
+        directory_subscribers(&ctx, ADDR).is_empty(),
+        "no runtime entry was minted"
     );
 }
 
@@ -1687,4 +1746,119 @@ async fn a_profile_with_boot_declared_entries_touches_the_directory_not_at_all()
     assert!(matches!(wire.open(&ctx, 2).await, FrameOutcome::Continue));
 
     assert!(directory_subscribers(&ctx, ADDR).is_empty());
+}
+
+/// One delivery pass over a single row carrying `body`, written to a fresh
+/// connection; returns the frames it queued.
+async fn send_one_row(body: brenn_lib::messaging::MessageBody) -> Vec<ServerFrame> {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (ctx, mut rx, _uuid) = attach(&db).await;
+    let mut wire = Wire::new(&ctx);
+    wire.cursors.start_span(ADDR, Uuid::from_u128(0xfeed), 0);
+    let row = PassRow {
+        envelope: brenn_envelope::testutils::fixture_envelope(ADDR, "row", body),
+        dropped: 0,
+        retained_seq: 1,
+    };
+    let outcome = send_pass(&ctx, &mut wire.cursors, ADDR, vec![row], &mut wire.counters).await;
+    assert!(matches!(outcome, FrameOutcome::Continue));
+    frames(&mut rx)
+}
+
+/// A v4 `Deliver` row carries a typed text body as exactly its text: the
+/// frame is the one an untyped body with the same text produces.
+#[tokio::test]
+async fn a_typed_text_body_is_delivered_as_its_text() {
+    let typed =
+        brenn_lib::messaging::MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+    let typed_frames = send_one_row(typed).await;
+    let untyped_frames = send_one_row("# hi".into()).await;
+    assert_eq!(typed_frames.len(), 1);
+    let v4 = brenn_attach_proto::Codec::negotiated(4);
+    let brenn_attach_proto::WireMessage::Text(typed_text) = v4.encode_server(&typed_frames[0])
+    else {
+        panic!("a v4 frame is text");
+    };
+    assert_eq!(
+        brenn_attach_proto::WireMessage::Text(typed_text.clone()),
+        v4.encode_server(&untyped_frames[0])
+    );
+    assert!(typed_text.contains(r##""body":"# hi""##), "{typed_text}");
+    assert!(!typed_text.contains("content_type"), "{typed_text}");
+}
+
+/// A non-text body never reaches a v4 `Deliver` row: building it panics,
+/// naming the carrier.
+#[tokio::test]
+#[should_panic(expected = "attach v4 Deliver")]
+async fn a_non_text_body_panics_where_the_deliver_row_is_built() {
+    let body = brenn_lib::messaging::MessageBody::from_parts(
+        Some("application/octet-stream"),
+        &[0xff, 0x00],
+    )
+    .unwrap();
+    send_one_row(body).await;
+}
+
+/// A v5 session subscribes to a channel declared `non_text` and is replayed
+/// its non-text row byte-exact, with its content type.
+#[tokio::test]
+async fn a_v5_subscribe_to_a_non_text_channel_replays_a_non_text_row() {
+    use brenn_lib::messaging::{ChannelScheme, MessageBody, Urgency};
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (messenger, uuid) =
+        crate::test_support::one_channel_messenger_declared(&db, BARE, Depth::Unbounded, true)
+            .await;
+    let body = MessageBody::from_parts(Some("image/png"), &[0x89, 0x00, 0xff]).unwrap();
+    {
+        let conn = db.lock().await;
+        brenn_messaging_store::db::insert_message(
+            &conn,
+            uuid,
+            "test",
+            "sender",
+            &body,
+            Urgency::Normal,
+            ChannelScheme::Brenn,
+            None,
+            None,
+            None,
+            None,
+            100,
+        );
+    }
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy.acls.brenn_subscribe = vec![ChannelMatcher::Exact(BARE.to_string())];
+    let profile = TestProfile {
+        subscribable: HashMap::from([(
+            ADDR.to_string(),
+            SubscriptionFacts {
+                push_depth: 8,
+                retain_depth: 8,
+            },
+        )]),
+        subscribe_burst: 16,
+        runtime_entry: Some(minted_entry(8, 8)),
+        ..TestProfile::new()
+    };
+    let (ctx, mut rx) = AttachCtxBuilder::new(profile)
+        .messenger(messenger)
+        .policy(policy)
+        .version(5)
+        .build();
+    let mut wire = Wire::new(&ctx);
+
+    assert!(matches!(wire.open(&ctx, 8).await, FrameOutcome::Continue));
+
+    let out = frames(&mut rx);
+    assert_eq!(out.len(), 2, "the result plus one replay frame");
+    assert_eq!(subscribe_result(&out[0]), (1, None));
+    let ServerFrame::Deliver { rows, .. } = &out[1] else {
+        panic!("expected a Deliver, got {:?}", out[1]);
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].envelope.body, body);
+    assert_eq!(rows[0].envelope.body.content_type(), Some("image/png"));
+    assert!(wire.active.is_active(ADDR));
 }

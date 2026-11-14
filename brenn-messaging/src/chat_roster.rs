@@ -67,6 +67,8 @@ pub fn chat_roster_entry(
             noise: defaults.default_noise,
             sink: defaults.default_sink,
             wake_min: defaults.default_wake_min,
+            non_text: false,
+            untyped_content_type: None,
         },
         subscribers: Vec::new(),
         transport_type: ChannelScheme::Brenn,
@@ -148,7 +150,7 @@ impl Messenger {
             .publish_from_system(
                 CHAT_ROSTER_COMPONENT,
                 &address,
-                &body,
+                body.as_str().into(),
                 Urgency::Normal,
                 None,
             )

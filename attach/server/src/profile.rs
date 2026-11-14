@@ -100,6 +100,17 @@ pub enum PublishPosture {
     Diagnostic,
 }
 
+/// What a non-text body offered to a text-only channel is on this route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextOnlyPosture {
+    /// The attacher cannot see a channel's declaration: a conforming client's
+    /// ordinary mistake, answered `TextOnlyChannel`.
+    Outcome,
+    /// The attacher is told every channel's declaration before it may
+    /// publish: no conforming client sends one, so it is a protocol violation.
+    Violation,
+}
+
 /// The per-connection publish token bucket's shape.
 ///
 /// A struct, not two adjacent `u32` params, because a burst and a refill rate
@@ -112,6 +123,15 @@ pub struct PublishRate {
     pub burst: u32,
     /// Tokens refilled per second under sustained load.
     pub per_sec: u32,
+}
+
+/// What an attachment's blob door admits, answered by
+/// [`AttachProfile::blob_grant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobGrant {
+    /// Whether the attachment may create blobs. Reading an attachment is
+    /// judged per frame by [`AttachProfile::subscribable`], not here.
+    pub upload: bool,
 }
 
 /// The authority half of an attachment, boot-built by the route that owns the
@@ -166,6 +186,11 @@ pub trait AttachProfile: Send + Sync {
     /// output set answers `Invariant`; a matcher-granted, runtime-provisioned one
     /// answers `Race`.
     fn missing_channel_posture(&self) -> MissingChannelPosture;
+
+    /// What a non-text body offered to a channel declared text-only means for
+    /// this attacher — see [`TextOnlyPosture`]. Attacher-level: it turns on
+    /// what the route tells its attachers, not on which channel was named.
+    fn text_only_posture(&self) -> TextOnlyPosture;
 
     /// Every `(attribution, channel)` whose parked-message mirror a fresh
     /// attachment is seeded with, deduped and in a stable order so the seeding
@@ -256,6 +281,15 @@ pub trait AttachProfile: Send + Sync {
     /// answer, and clamping them against what the channel actually retains is
     /// the caller's, because only the caller holds the channel.
     fn runtime_entry(&self, channel: &str) -> Option<SubscriberEntry>;
+
+    /// Whether this attachment has the blob door, and whether it may create
+    /// blobs. `None`: no blob frame is admitted on this attachment, and a
+    /// publish naming attachments is a violation.
+    ///
+    /// Only the door is answered here. Which attachments a session may open is
+    /// [`AttachProfile::subscribable`] of the message's channel, and where it
+    /// may publish what it holds is [`AttachProfile::publishable`].
+    fn blob_grant(&self) -> Option<BlobGrant>;
 }
 
 #[cfg(test)]

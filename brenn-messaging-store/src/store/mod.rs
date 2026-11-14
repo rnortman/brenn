@@ -23,6 +23,8 @@ pub mod targets;
 
 #[cfg(test)]
 mod parity_tests;
+#[cfg(test)]
+mod ring_blob_tests;
 
 use std::sync::Arc;
 
@@ -30,7 +32,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use brenn_envelope::{ChannelCapabilities, ChannelScheme, Impetus, MessageEnvelope, Urgency};
+use brenn_envelope::{
+    ChannelCapabilities, ChannelScheme, Impetus, MessageBody, MessageEnvelope, Urgency,
+};
 use brenn_queue::{GapReason, ReplayDecision, Resume, Retained};
 
 /// A park refused because the channel's deferred set is already at its cap.
@@ -44,7 +48,7 @@ use brenn_lib::messaging::config::Depth;
 
 pub use db::DbStore;
 pub use registry::RingStores;
-pub use ring::RingStore;
+pub use ring::{RingNamed, RingStore, no_holds};
 pub use targets::{AttachFeedTarget, TargetResolver};
 
 /// A resolved reply target, carried in both the representations a store may
@@ -67,7 +71,7 @@ pub struct NewMessage {
     /// Node identity of the publishing process.
     pub source: String,
     pub sender: String,
-    pub body: String,
+    pub body: MessageBody,
     pub urgency: Urgency,
     /// The address scheme recorded on the envelope. Follows the channel except
     /// on ingress-bridged channels, where it names the originating transport.
@@ -83,6 +87,9 @@ pub struct NewMessage {
     /// verbatim on every scheme.
     pub impetus: Option<Impetus>,
     pub publish_ts_ns: i64,
+    /// The blobs the message names, each held until the store has taken its
+    /// own hold or durable reference.
+    pub attachments: crate::blob::HeldAttachments,
 }
 
 /// A store-assigned position, ascending within the store's lifetime. Comparable
@@ -722,12 +729,12 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     ) -> DeferralOutcome;
 
     /// Replace a parked message's body, its release time, or both. `None`
-    /// leaves that field alone.
+    /// leaves that field alone. A new body replaces the content type with it.
     async fn edit_deferred(
         &self,
         sender: &str,
         message_uuid: Uuid,
-        body: Option<String>,
+        body: Option<MessageBody>,
         release_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> DeferralOutcome;

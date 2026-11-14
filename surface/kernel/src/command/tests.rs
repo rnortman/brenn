@@ -141,7 +141,12 @@ fn publish_parts(frame: &ClientFrame) -> (&str, Option<&str>, &str, Urgency) {
             body,
             urgency,
             ..
-        } => (channel, attribution.as_deref(), body, *urgency),
+        } => (
+            channel,
+            attribution.as_deref(),
+            body.as_text().expect("a page publishes text"),
+            *urgency,
+        ),
         other => panic!("expected a Publish, got {other:?}"),
     }
 }
@@ -173,7 +178,7 @@ fn retained(page: &SurfacePage, channel: &str) -> Vec<String> {
         .get(channel)
         .expect("the fixture hosts the channel")
         .retained()
-        .map(|(envelope, _)| envelope.body.clone())
+        .map(|(envelope, _)| envelope.body.as_text().unwrap().to_owned())
         .collect()
 }
 

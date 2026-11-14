@@ -1,4 +1,10 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import {
+  CHAIN_TIMEOUT,
+  echoStubHost,
+  openSurface,
+  publishVia,
+} from "./echo-stub";
 
 /**
  * Browser e2e for the bar surface: the instances + layout + skins world.
@@ -29,7 +35,8 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  * `loopback` surface, one echo-stub reading its own output back. The bar
  * channels are durable with `retain_depth = 1` (latest-wins) and persist for
  * the whole server run, so spec 1 must run first against pristine empty
- * channels; the later specs republish their own layout/content preconditions
+ * channels (this file sorts before `bytes.spec.ts` and
+ * `surface-reload.spec.ts`); the later specs republish their own layout/content preconditions
  * so they do not depend on the exact retained state a prior spec left behind.
  *
  * Selectors are component/shell-authored marker attributes, never styling
@@ -39,16 +46,6 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  * and `[data-protobar-status]` (the latter carries the "gap — data may be
  * stale" hint when a real gap fires).
  */
-
-// Cold wasm load + WS connect + mount + snapshot replay can outlast the 5s
-// assertion default on a fresh navigation, so the chain assertions get a
-// generous explicit budget.
-const CHAIN_TIMEOUT = 20_000;
-
-/** Open a surface page and wait for its document to finish loading. */
-async function openSurface(page: Page, slug: string): Promise<void> {
-  await page.goto(`/surface/${slug}`, { waitUntil: "load" });
-}
 
 /** The `#surface-root` element that carries `data-layout` / `data-skin`. */
 function surfaceRoot(page: Page): Locator {
@@ -63,51 +60,6 @@ function panel(page: Page, instance: string): Locator {
 /** The protobar message node inside an instance's panel. */
 function panelMessage(page: Page, instance: string): Locator {
   return panel(page, instance).locator("[data-protobar-message]");
-}
-
-/**
- * An echo-stub instance's kernel-owned wrapper: a div stamped with the kind and
- * the instance (canonical source: `mount_wrapper` in
- * `surface/kernel/src/dom.rs`). The component's own host element inside it
- * carries no identity, so this names exactly one element.
- */
-function echoStubHost(page: Page, instance: string): Locator {
-  // TODO(e2e-tag-scheme-tie): these literals re-encode the Rust naming with
-  // nothing mechanical tying the two together.
-  return page.locator(
-    `div[data-kind="echo-stub"][data-instance="${instance}"]`,
-  );
-}
-
-/**
- * Publish `body` verbatim onto the channel bound to the feeder's `instance`
- * output by driving that echo-stub's own "send custom" button: fill its
- * free-form field, then click it. The click is dispatched from page script
- * rather than through Playwright because the feeder's `feed-layout` instance is
- * the fourth echo-stub and thus unassigned in the feeder's own config-default
- * `columns-3` layout — headless and `display:none`, so not clickable by a real
- * pointer — while its output is the only path onto the layout channel.
- *
- * Everything past the click is production: the component's gesture wiring asks
- * for a sync-call activation, and its entry publishes from inside one. No gate
- * is bypassed and no test-only production code exists.
- */
-async function publishVia(
-  feeder: Page,
-  instance: string,
-  body: string,
-): Promise<void> {
-  const el = echoStubHost(feeder, instance);
-  await expect(el).toBeAttached({ timeout: CHAIN_TIMEOUT });
-  await el.evaluate((node: Element, b: string) => {
-    const field = node.querySelector("[data-echo-input]");
-    const send = node.querySelector("[data-echo-send-custom]");
-    if (!(field instanceof HTMLInputElement) || !(send instanceof HTMLElement)) {
-      throw new Error("the echo-stub's custom-send controls are not rendered");
-    }
-    field.value = b;
-    send.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-  }, body);
 }
 
 test("bar loads the config-default layout with no stale hint on empty channels", async ({

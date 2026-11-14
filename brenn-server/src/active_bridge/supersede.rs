@@ -386,7 +386,7 @@ mod tests {
 
         reconciler
             .epochs()
-            .apply(&format!("brenn:{SLUG}.epoch"), "1");
+            .apply(&format!("brenn:{SLUG}.epoch"), &"1".into());
         crate::active_bridge::compaction::set_idle_and_drain(&bridge).await;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -426,7 +426,7 @@ mod tests {
 
         reconciler
             .epochs()
-            .apply(&format!("brenn:{SLUG}.epoch"), "1");
+            .apply(&format!("brenn:{SLUG}.epoch"), &"1".into());
         crate::active_bridge::compaction::set_idle_and_drain(&bridge).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(registry.get(old).await.is_some(), "still registered");

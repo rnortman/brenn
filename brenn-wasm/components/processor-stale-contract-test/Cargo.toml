@@ -1,0 +1,21 @@
+[package]
+name = "brenn-processor-stale-contract-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The macro generates this crate's bindings from its own WIT file at expansion
+# time; it tracks the tree's single wit-bindgen version.
+wit-bindgen = "0.60"
+
+# The crate's own WIT, which declares `brenn:processor@0.2.0` with an envelope
+# the host's does not have.
+[package.metadata.component]
+package = "brenn:processor"
+target = { path = "wit/stale-processor.wit", world = "brenn:processor/processor@0.2.0" }
+
+[package.metadata.component.dependencies]

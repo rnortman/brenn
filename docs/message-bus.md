@@ -99,6 +99,32 @@ are not transportable; `brenn:` (durable) and `ephemeral:` channels are. There
 is presently no durable and not-transportable channel type, but in principle
 there could be.
 
+A third, independent property is **`non_text`**: whether the channel may carry
+non-text bodies (§2.1.2). The default is text-only. A declared channel states
+it in its block (`non_text = true`); an auto channel takes it from the ports
+bound to it (§2.6); a surface's page-local channel takes it from the surface
+bindings on its address, and is `non_text` when any of them says so (§2.6);
+a system-minted channel is text-only unless it is a `webhook:` or `mqtt:`
+ingress channel whose tuning block states `non_text = true`, which selects
+the raw ingress shape (§2.7.1). It is a static
+fact about the channel, read from configuration at every boot and never
+persisted, and it does not look at subscribers: a non-text publish to a
+text-only channel is refused at the publishing door, and a reader that can
+only represent text is refused when it is *bound* to a `non_text` channel, not
+when a message arrives. Text is allowed on a `non_text` channel; the
+declaration widens what the channel may carry and narrows nothing.
+
+A durable channel that holds a non-text message, visible or parked, cannot be
+redeclared text-only: boot and reload refuse it, naming the channel. The way
+out is to keep the declaration, or to give the channel a new address;
+retention removes the messages in time on a bounded channel, so on an
+unbounded durable channel the declaration is in practice permanent. A reload
+also refuses to redeclare a durable channel text-only while any `remote`'s
+publish ACL covers it, under its old address or its new one, whatever protocol
+version the remote attaches at; a
+restart applies it. A ring is rebuilt empty when its declaration changes, as
+for any other attribute.
+
 ### 2.1.1 Which schemes each placement may bind
 
 The two component placements — a top-level WASM consumer on the backend, and a
@@ -140,6 +166,543 @@ a *different* uuid declares a different channel, and the dormant rows go on
 waiting for the old one; if that new block also reuses the old address, the boot
 refuses it rather than leaving a channel with no row of its own. Deleting the old
 row first is the way to start fresh at an address.
+
+### 2.1.2 What a message body is
+
+A message body is **bytes with an optional content type** (`MessageBody` in
+`brenn-envelope`). The channel holds them byte-exact; nothing on the bus
+decodes, re-encodes or guesses.
+
+- **No content type** means UTF-8 text of unstated type. This is what every
+  body was before bodies became bytes, and what every string-taking publish
+  door still produces.
+- **The text rule** (`is_text_content_type`). A body is *text* when its content
+  type is absent, or when its type is `text`, its type/subtype is
+  `application/json`, or its subtype ends in `+json` — and it carries no
+  `charset` parameter other than `utf-8` or `us-ascii`. Everything else is a
+  *non-text* body. `text/plain; charset=iso-8859-1` is therefore non-text, and
+  so is `application/octet-stream` holding bytes that happen to be valid UTF-8:
+  the kind follows the content type, never the bytes. A text body must be valid
+  UTF-8 or it cannot be constructed.
+- **The content type** is a media type (`type/subtype` plus `;`-separated
+  parameters, ASCII, at most 255 bytes). It is stored and returned verbatim
+  with the body, and it does not count toward the size cap.
+- **The size cap** (`max_body_bytes`) counts raw bytes, for text and non-text
+  bodies alike. On a raw ingress channel (§2.7.1) the transport's payload is
+  the body and obeys the cap: an MQTT payload over it is dropped for that
+  channel and logged, and a raw webhook endpoint's `transport_ceiling_bytes`
+  may not exceed it. On a wrapped ingress channel the wrapper is the body and
+  the transport's own limit bounds it, as before.
+- **Search** (`search` on a query, FTS on a durable channel, substring match on
+  a ring) covers text bodies only. A non-text body never matches a search and
+  is returned by a query without one like any other message.
+- **The rule is recorded at write time.** A durable channel stores a text body
+  as a TEXT value and a non-text body as a BLOB value in the same column, and
+  the full-text index covers the TEXT rows. Widening the text rule later
+  therefore ships with a migration of the rows it reclassifies.
+
+Who is shown the content type today:
+
+| Reader | Typed text body | Non-text body | `transport` (raw ingress) |
+|---|---|---|---|
+| Query API (`Messenger::query`), host code | text and type | bytes and type | `MessageEnvelope.transport` |
+| A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, `BrennMessageEdit`) | `"body": "…"`, then `"content_type": "…"` | `"body": {"binary": true, "content_type": "…", "size": N}` — a placeholder, never the bytes | after `envelope_type` |
+| The eviction archive | `"body"`, then `"content_type"` | `"body_base64"` (standard padded base64), then `"content_type"` | after `envelope_type` |
+| 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | text and type, on the backend and on a page, whether the row arrived over the page's wire or stayed on the page | bytes and type on the backend; on a page, at rest on any channel declared `non_text`, page-local or wire-bound (shown on the node rig; `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery in Chromium, and an SDK-built kind's binary state on a page-local `io` port), and in a sync call or reply | in the header, on the backend; no page binds an ingress channel |
+| 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload, on the backend and on a page | only on a channel narrowed back to text-only that still retains raw text messages (§2.7.1) |
+| Attach v4 sessions (`Deliver`, `DeferredView`), served to remotes only | bare text, **no type** | never bound: a remote's subscribe is answered `Unavailable`; left out of a deferred view | never: no session binds an ingress channel |
+| Attach v5 sessions (`Deliver`, `DeferredView`): a remote's, and every surface page's | text and type | bytes and type | never: no session binds an ingress channel |
+
+The last column is the one envelope key a message a transport adaptor
+published in the raw ingress shape (§2.7.1) carries beyond the others: an
+object with one member named for the transport, `{"mqtt": {…}}` or
+`{"webhook": {…}}`. Every other message has no `transport` key.
+
+The two string carriers lose a typed text body's *type*, never its content.
+They cannot carry a non-text body at all, so they are kept off every channel
+declared `non_text` (§2.1) before any message flows — on a page as on the
+backend, where a served 0.1.0 instance bound to a `non_text` channel,
+page-local or wire-bound, is refused at boot and at reload — and a text-only
+channel never holds a non-text body. On a page that applies a bindings document
+withdrawing a channel's declaration, page-local or wire-bound, the kernel
+empties that channel's store if it holds a non-text body, retained or parked,
+before any reader sees it. Reaching a string carrier with one anyway is a
+host bug and a panic.
+
+One exception is cut rather than refused. A remote may hold a v4 and a v5
+attach session at once, and both mirror the one parked set that belongs to the
+remote. A non-text entry the v5 session parked is left out of the deferred view
+sent to the v4 session (counted on its detach line, logged once per channel and
+attribution). For that session an empty view means nothing *it can represent*
+is standing; it cannot cancel or edit what it cannot see, and nothing it can
+name is affected.
+
+What can publish a typed or non-text body: a component built against the
+byte-carrying contract `brenn:processor@0.2.0`, through its publish, deferred
+publish, deferred edit and sync call, onto a channel declared `non_text` for a
+non-text body and onto any channel for a typed text one. A non-text body
+offered for a text-only channel is refused to that component
+(`text-only-channel`) and nothing is stored. A remote attacher on attach
+protocol v5, through `Publish` and `PublishBatch` (entries and deferred edits),
+on the same terms: a non-text body offered for a text-only channel is answered
+`TextOnlyChannel` — the whole batch, if any body in it is refused — and nothing
+is stored. A 0.2.0 component hosted on a surface page, on the same terms, on
+page-local and wire-bound channels alike: the page's wire is attach v5 and
+carries every body with its type, and the page refuses a non-text body for a
+text-only channel to the component before anything is sent. A transport
+adaptor — an MQTT client or a webhook endpoint — onto its ingress channel when
+that channel takes the raw shape (§2.7.1): the payload with the publisher's or
+endpoint's content type, judged by the rule above, and dropped (MQTT) or
+refused (webhook) when it fails it. A conversation, through `BrennSend` and
+`BrennMessageEdit`'s `content_type`, publishes a typed *text* body only: a type
+that is not text by the rule above is refused, and a conversation publishes
+bytes as an attachment (§2.1.2a). What still cannot publish a typed body:
+a 0.1.0 component, a remote's attach v4 session and every host door that takes
+a string; every body they produce is untyped text.
+
+### 2.1.2a Blobs: bytes a message names
+
+A body is capped at `max_body_bytes` because it is copied into every
+subscriber's window and held in rings. A large object — a photo, a recording,
+a file — rides beside the body instead, as a **blob**: an immutable run of
+bytes in the host's blob store, which a message names by reference. The store
+is in `brenn-messaging-store/src/blob/`.
+
+**A blob is a message's attachment, not a store of its own.** It has no name,
+no listing and no lifetime of its own, and nothing looks one up except
+through a message or a hold. The lifetime rule:
+
+> A blob lives exactly as long as a message the host holds names it, or host
+> code holds it open. When nothing does, it is deleted.
+
+"Holds" means two kinds of holder, counted in two places:
+
+- **An in-memory hold.** Host code holds a blob from sealing it or from
+  redeeming a reference (`Messenger::retain_blob`). A ring channel's entry
+  (`ephemeral:`, `local:`) holds every blob its message names, retained or
+  parked, until the ring drops the entry — overflow, a depth-0 append, a park
+  refused at the cap, a cancel, an edit's overwrite, the channel removed at
+  reload. A copy of an envelope a reader was handed is **not** a holder.
+- **A durable row.** A row of a `brenn:` channel that names a blob is counted
+  in the database, in the transaction that inserts it, and uncounted by a
+  trigger in the transaction of whatever statement deletes it — eviction,
+  withdraw, cancel, chat teardown, an operator's `sqlite3`.
+
+"Deleted" has two moments. A blob stops being **redeemable** the instant its
+last holder lets go — for a durable row, when the deleting statement commits.
+Its **bytes** are unlinked at once if no durable row ever named it (every blob
+only ring messages named); otherwise by the next **reap**, which runs after
+`Messenger::cancel`, after a durable cancel through
+`cancel_deferred_if_present`, at the end of every hourly bus-GC pass, and at
+boot. Until then the file stays on disk and charged to the budget, and
+nothing can reach it. A removal site with no reap call after it only delays
+the unlink to the next hourly pass; which blobs are deleted is decided by the
+two counts, never by who called.
+
+**Attachments.** `MessageEnvelope.attachments` is a map from name to
+reference, empty on a message that has none, and the key is absent from
+every serialization when it is empty.
+
+- A **name** is 1 to 64 bytes, first `[A-Za-z0-9]`, then `[A-Za-z0-9._-]`.
+  It is producer-chosen text a conversation is shown, so the grammar is
+  narrow; a filename that does not fit belongs in the body, keyed by the
+  name.
+- At most **32 attachments** per message. Two names may name the same blob.
+- A **reference** is `{"id": …, "size": N, "content_type": "…"}`. The id is
+  32 lowercase hex characters minted from random bytes, not derived from
+  content, and opaque: a reader must not parse it. There is no digest.
+
+Which reader sees what:
+
+| Reader | `attachments` |
+|---|---|
+| Host code (`Messenger::query`, the stores) | the references |
+| 0.2.0 components (`bus.envelope` header), on the backend and on a page | the references, in full |
+| Attach v5 sessions (`Deliver`), a remote's and every page's, replayed and live | the references, in full |
+| Attach v6 sessions (a remote's) | the references, in full, and the bytes by handle |
+| A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, the intercept outcome) | each name with `size` and `content_type`; **no id**. It names an attachment by (message id, name), below |
+| The eviction archive | the references, in full. The bytes are not archived: an archived message's attachments are not recoverable |
+| 0.1.0 components (`envelope-json`), attach v4 sessions | nothing; the envelope is byte-identical to one without attachments |
+
+**Who creates and redeems a blob.** A backend WASM component granted
+`blobs` does, through the `brenn:processor/blobs@0.3.0` interface
+(`brenn-wasm/wit/processor-0.3.wit`, `docs/component-packages.md`): it opens
+an attachment of a message in this activation's windows by its place —
+port, index, name — never by id, reads it by byte range, creates a blob by
+positional writes and seals it, and publishes a message naming blobs it
+opened or made, with `ports` granted as well. Forwarding an attachment is a
+hold on the same blob: no byte is copied. Every blob the activation made and
+no published message names is deleted when the activation ends, and an `Err`
+or trap publishes nothing and deletes everything it made. A conversation
+does too, by name, below. Host code's
+`Messenger::publish_from_system_with_attachments` is a further publishing
+entry; the tool substrate publishes a call's request and result through it
+(below). A remote attacher on attach v6 does, by handle, below. Pages and
+v4/v5 remotes see references as metadata only, and no surface host serves
+the interface. A remote's replay store and a page's rings do not hold the
+blob, so a reference there can outlive it. `ports.publish` and its siblings
+carry no attachments: a component that republishes a message through them
+sends the body alone.
+
+**A conversation is a holder by name.** It is never shown a blob id. It
+names an attachment as **(message id, attachment name)**, and a message's
+body as (message id, body), and nothing it does with a blob puts the bytes
+through the model's context: `BrennSend`'s `attachments` forwards an
+attachment by reference (a hold on the same blob, no byte copied);
+`brenn-tool save` writes an attachment's or a body's bytes to a file in the
+conversation's environment; `brenn-tool send` attaches a file of the
+conversation's own to a `BrennSend`, which seals a new blob the published
+message names. The two commands are described in `docs/agent-tool-cli.md`
+and need the conversation's shell tool. One function
+admits a name, `Messenger::admit_conversation_name`, and every verb calls it.
+The rule as built asks two things **of the one message named**:
+
+- **The conversation was handed it.** The host keeps, per conversation, the
+  messages it handed over — a push delivery, `MessageChannelGet`,
+  `BrennPendingList`, an edit's answer, and the answer to the conversation's
+  own send, by its id. The record is in memory on the `Messenger`: it
+  survives a bridge being retired and re-spawned and is lost at a server
+  restart. It holds at most 1,024 messages per conversation, oldest dropped
+  first, and at most 256 conversations, the least recently fed dropped
+  whole. It is cleared at a compaction boundary, at a spawn with no session
+  to resume (conversation start), and at every user turn whose text as
+  Claude Code receives it begins with `/`. Every drop and every clear costs a
+  re-read (`not_read`) and never admits wrongly. Two resets of the
+  conversation's context are not seen by the host — a resume Claude Code
+  answers with a fresh session, and a slash command sent while a turn is
+  running — and are tracked as `blob-handle-integrity` in `TODO.md`.
+- **It is still retained on a channel the app may read**: the app's policy
+  allows the channel and the directory resolves it, and the message is
+  inside the **channel's** window — the whole ring on a ring channel; on a
+  durable channel the newest `standing_retain_depth` retained rows, checked
+  by rank so a row past that depth that the hourly reaper has not yet removed
+  is refused. A parked message is not retained. The subscriber's own
+  `retain_depth` plays no part. The app's own result inbox
+  (`brenn:app-tool-results/<app-slug>`, §2.7) is readable for this purpose by
+  that arm alone: no policy reaches it, and the record is the only way in.
+
+**One exception: the tool substrate's channels.** On a channel of the four
+tool namespaces (`brenn:tools/`, `brenn:tool-requests/`, `brenn:tool-results/`,
+`brenn:app-tool-results/`) a conversation names an attachment only on its own
+app's result inbox. An app whose policy covers `tools/`, `tool-requests/` or
+`tool-results/` reads those channels' messages — their bodies, and each
+attachment's name, size and content type — and naming one of their
+attachments is refused `tool_channel_attachment`, logged at `warn`; naming
+such a message's body works as on any channel. The reason: a tool call's
+blobs are passed between the call's parties — the caller, the tool, and the
+conversation the result is handed to — and a grant to watch the call traffic
+was written when that traffic held no blobs. It would otherwise reach every
+file any user's conversation or component hands a tool.
+
+On a ring channel the check and the hold are one call under the ring's lock,
+which hands out a hold on the one blob named, not on the message's other
+attachments; on a durable channel the row is read and the blob held under
+one database guard. A retained message naming a blob the store cannot hold is
+a host bug and panics. Once a name is admitted the hold keeps the bytes for
+the transfer whatever happens to the message.
+
+The rule is per message, not per blob: an attachment of an evicted message is
+refused even while another retained, readable message names the same blob,
+and is admitted under that other message once the conversation has read it.
+A rule asked of the blob would admit that case; it needs a lookup from a blob
+to the retained messages naming it, which ring channels lack
+(`conversation-blob-name-per-message` in `TODO.md`).
+
+A file a conversation attaches is written through a writer that reserves the
+file's whole declared size before any byte crosses, so the store's two keys
+refuse it up front; if the publish is refused or the connection ends, the
+writer and the sealed blob drop and nothing remains.
+
+**A remote attacher is a holder by handle.** On attach v6 a remote's session
+has a blob door when its profile grants one and the host has a blob store;
+`Welcome.blobs` says so and states the bounds below. The session keeps a table
+of **handles** the client mints, each an upload being written or a held blob,
+and every blob frame names one:
+
+- **Opening.** `BlobOpen` names an attachment as **(channel, message id,
+  attachment name)**, never by blob id, and takes a hold on that one blob. The
+  remote must be allowed to subscribe to the channel, asked afresh at every
+  open; a channel outside that authority is a protocol violation. The message
+  must be inside the **channel's** window, as for a conversation — the whole
+  ring, or the newest `standing_retain_depth` retained rows of a durable
+  channel; the remote's own subscribe depth and ceiling play no part — and the
+  tool substrate's four namespaces are refused `ToolChannel`. Both rules are
+  the conversation door's, from the one admission function both doors call,
+  `Messenger::admit_retained_part`; the conversation's read record is not part
+  of it. The answers otherwise are `NotRetained` and `NoSuchAttachment`.
+  `BlobRead` then reads a byte range through the handle, at most one chunk
+  (256 KiB) an answer, and keeps working after the message is evicted.
+- **Uploading.** Only a remote with publish authority (`Welcome.blobs.upload`)
+  may `BlobCreate`: the whole declared size is reserved against the store's
+  two keys before a byte is sent, `BlobWrite` fills it by position and
+  `BlobSeal` makes it a held blob.
+- **Publishing.** `Publish` and each `PublishBatch` entry carry `attachments`,
+  names mapped to held handles, onto a channel the remote may publish to; the
+  message holds the blob as any message does, and a forward of an opened
+  attachment copies no byte. A handle not held answers `AttachmentNotHeld` and
+  publishes nothing.
+- **The session is the holder.** `BlobClose` gives a handle up. When the
+  session ends — however it ends — the table drops: unsealed uploads are
+  deleted, holds are let go, and nothing a remote made survives a detach unless
+  a message names it. The table drops before the session stops counting
+  against `max_sessions`.
+- **Bounds**, per session, each a typed answer: 64 handles (`HandleLimit`);
+  bytes held, 4 × `max_blob_bytes`, the declared sizes of the session's uploads
+  and the sizes of its held blobs, sealed uploads and opened attachments alike,
+  counted per handle (`BytesHeldLimit` on a create and on an open); 4 read
+  answers in flight (`TooManyReads`). An open hold keeps its blob charged after
+  the naming message is evicted, which is why opens count. Across a remote's
+  sessions the bounds multiply by `max_sessions`; nothing bounds a remote over
+  time.
+
+**Bounds.** Three keys in the `messaging` section (`docs/config-dsl.md`):
+`max_blob_bytes` caps one blob's extent (default 64 MiB), `blob_budget_bytes`
+caps the store's charged total (default 1 GiB), `blob_dir` is where the files
+live (default the database path with `.blobs` appended). Raising
+`max_blob_bytes` does not let a component make a larger blob: apart from that
+key, the host has a fixed per-activation write bound — at most 64 MiB of blob
+writes in one activation, summed over every `write` — a writer does not
+outlive its activation, and `seal` needs every byte of the blob's extent
+written. So no component can create a blob larger than that bound, whatever
+`max_blob_bytes` is; a higher value admits larger blobs from host code only,
+and no production host code makes one. A conversation's bound does scale with
+the key: one `brenn-tool send` may attach files whose sizes together are at
+most `max_blob_bytes`, each at most `max_blob_bytes`, and a conversation has
+at most eight socket connections open at once, so at most
+`8 × max_blob_bytes` charged and unsealed at a time; nothing bounds it over
+time. The per-activation bounds are in
+`docs/security-posture.md` §7.6. A write over either
+store key is refused to the producer; nothing is evicted to make room and nothing
+waits. A blob is charged from its first write until its file is unlinked. No
+per-channel setting exists: a reference is inert to a reader that does not
+know it.
+
+**Rows nothing evicts.** Rows of a durable channel that left the
+configuration are kept and never evicted, and so are the blobs they name.
+
+**Backup and restore.** The database and the blob directory are **one unit**
+to back up, restore and roll back. At boot the store reconciles the two and
+refuses to start — naming the blob and the messages — when a message names a
+blob with no reference record, when a referenced blob's file is missing or
+has the wrong length, when a blob's count disagrees with its references,
+when the directory holds an entry that is not a blob file or its owner
+record, when another
+open blob store — another host's, or a second host over the same database —
+holds the directory's lock, or when SQLite's `synchronous` is below `FULL`.
+Files no row names are deleted at boot, so two hosts must never share a blob
+directory: the lock stops the second while the first runs, and the owner
+record stops it while the first is down.
+
+*The owner record.* The directory holds one file besides its blobs, `owner`,
+holding the store generation of the database it belongs to
+(`messaging_store_identity.generation`). The first boot over an empty
+directory writes it (through a temporary `owner.tmp`, renamed into place);
+every later boot compares it with the database's and refuses to start, naming
+both generations, when they differ, and when the directory holds blob files
+and no record, or a record that is not one generation line. Restoring or
+moving the database and its directory together keeps the two equal. The two
+remedies:
+
+- *A fresh or replaced database beside an old directory* — the record names
+  another generation. The old files are another store's and this database
+  names none of them: remove the directory, or point `messaging { blob_dir }`
+  elsewhere, and the host claims a new one.
+- *A lost or damaged record beside the database that does own the files* —
+  write the database's generation back:
+  `sqlite3 <database> "SELECT generation FROM messaging_store_identity" > <blob_dir>/owner`.
+
+The host never adopts a foreign directory and never repairs a record on its
+own. So a
+database restored beside a blob directory that still holds every file its
+rows name boots; a database restored alone, or beside a directory that has
+moved on since the snapshot — as it does at every eviction — refuses when any
+message in it names a blob since deleted. A database-only snapshot, a deploy's
+rollback snapshot included, is therefore sound only while no message in it
+carries an attachment. To start a host that refuses anyway, delete the
+message rows the panic names with `sqlite3`; the trigger keeps the counts
+right, and the next boot's sweep removes what they named.
+
+**Mutability.** A blob is immutable once sealed, and nothing in the store
+forecloses a mutable kind later: the id is random rather than a content hash,
+the reference carries no digest, and the bytes are one file written in place.
+Three choices lean on immutability: `size` and `content_type` are copied into
+every reference, the bytes are synced once when a durable row first names
+them, and reads take no lock. A mutable blob would need a flag fixed at
+create and written into the reference, a write entry on a sealed blob, and a
+rule for each of those three. The cost statement is the `blob` module's
+rustdoc.
+
+**A tool call carries attachments.** An asynchronous registry call and its
+result carry named attachments by reference, in both directions, for every
+caller and every tool the asynchronous path serves:
+
+- A component hands a tool blobs with `blobs.call-async` (or, as a provider's
+  nested call, `blobs.call-async-for`), and a provider answers with blobs
+  through `blobs.complete` (`docs/component-packages.md`, "Blobs and tool
+  calls"). The request on `brenn:tools/<tool>`, the request on a provider's
+  `brenn:tool-requests/<slug>` and the result on a component's
+  `brenn:tool-results/<slug>` carry them in the envelope like any message;
+  their bodies are unchanged. A result carries attachments only when its
+  outcome is the tool's own `ok`; an error, or a result the executor replaced
+  because it was too large, carries none.
+- A conversation hands a tool attachments in the reserved argument
+  `attachments`, offered only by a tool whose declaration accepts them, naming
+  each as `BrennSend` does — `(message id, attachment name)`, under the rule
+  below. A tool result that carries attachments is published on the app's
+  result inbox `brenn:app-tool-results/<app-slug>` (§2.7), recorded as read
+  for the calling conversation alone, and shown to it as
+  `{"result": <value>, "message_id": "<uuid>", "attachments": {<name>:
+  {"size", "content_type"}}}`; `BrennSend`, `brenn-tool save` and a later tool
+  call name its attachments by that `message_id`. After the record is reset
+  they cannot be named again; the conversation calls the tool again. A result
+  without attachments is the bare value, as before, and publishes nothing.
+
+Who holds a tool call's blob, at each moment: a component's queued call holds
+it in its buffered request until the activation ends, and drops it on an
+`Err` or trap; once published, the request row holds it for that channel's
+window — on a provider's request inbox, whatever becomes of the call; the
+executor holds it while it admits and runs the call; a provider's completion
+holds what it names from the call, through the pending call to the waiter,
+and a later `Err` or trap of the provider's activation does not drop it; a
+completion whose waiter is gone drops its holds; and the result row holds the
+result's blobs for its inbox's window, plus any hold a conversation's
+`BrennSend`, save or tool call takes by naming one. No holder is timed or
+keyed by a conversation, and no byte is copied on the path. After a restart a
+blob held only in flight is gone — no row names it, and the store unlinks it
+at the next start — and one a durable
+row names is redeemable while the row stays in its window.
+
+What is not built: the `blobs` interface on a page, save and attach for a
+conversation without a shell tool, connectors that produce blobs, the
+surface's handling of them, attachments on `calls.call` and
+`tools.call-fast`, and transfer of bytes to a page.
+
+### 2.1.3 Limits on a remote's stream of messages
+
+At default configuration, for a remote attacher on attach v5 or v6. "Operator" names
+the setting that raises a limit; "fixed" is a compile-time constant. An ingress
+channel (`webhook:`, `mqtt:`) is outside this section: a remote cannot
+subscribe to one, and its subscribe to such an address ends the session as a
+protocol violation.
+
+| Limit | Default | Raised by |
+|---|---|---|
+| Body cap, one message | 65,536 bytes raw | Operator: `messaging { max_body_bytes }` (restart) |
+| v5 frame cap | 204,800 bytes | Derived from the body cap |
+| v6 frame cap | 274,432 bytes | Derived from the body cap |
+| Blob chunk, one `BlobWrite` or `BlobRead` answer (v6) | 262,144 bytes | Fixed |
+| Blob size (v6) | 64 MiB | Operator: `messaging { max_blob_bytes }` |
+| Blob pool, the whole host (v6) | 1 GiB | Operator: `messaging { blob_budget_bytes }` |
+| Blob handles per session (v6) | 64 | Fixed |
+| Bytes held per session (v6): writers, sealed uploads and opened attachments | 4 × `max_blob_bytes` (256 MiB) | Follows `max_blob_bytes` |
+| Blob read answers in flight per session (v6) | 4 | Fixed |
+| `PublishBatch`, whole frame | 65,536 charged bytes over at most 512 operations; and 4 MiB of bodies per activation, never the binding one below a 4 MiB body cap | The first follows the body cap; the second is fixed |
+| Connection publish bucket (single `Publish`) | burst 60, then 1 per second, per connection | Operator: `publish_burst`, `publish_per_sec` on the `remote` block, up to the bus's `default_send_rate` |
+| Per-(sender, channel) send rate (single `Publish`) | burst 240, then 30 per second | Operator: `messaging { default_send_rate }`, or `send_rate` on the channel |
+| Attach send budget (every durable `Publish`; every `PublishBatch` entry on any channel) | 256 tokens, then 1 per 15 seconds, shared by all the remote's sessions | **Fixed** |
+| Sessions per remote | 2 | Operator: `max_sessions` |
+| Channel window | the channel's `retain_depth` | Operator |
+| Session push queue / writer queue | 256 / 256 frames | Fixed |
+
+What a remote can sustain:
+
+- **Onto an `ephemeral:` channel with single `Publish` frames** — the
+  streaming path: 1 message per second of up to 64 KiB after a burst of 60.
+  With `publish_per_sec = 30`, 30 messages per second, up to about 1.9 MiB/s
+  at the default body cap. Beyond 30 per second needs `default_send_rate`
+  raised as well.
+- **Onto a durable `brenn:` channel**: 4 messages per minute sustained, and no
+  setting raises it. With single frames the burst before that is 60 at once,
+  then 1 per second until the 256-token budget is spent, then 4 per minute.
+- **With `PublishBatch`**: up to 256 entries at once, then 4 entries per
+  minute, on any channel class. A batch is not a streaming carrier for a
+  remote.
+- **Delivery to a subscribed remote**: one `Deliver` frame per live message,
+  with no rate limit of its own. A subscriber more than 256 frames behind loses
+  the queued copies and reads the rest from the channel's window by cursor;
+  what it loses past the window is reported in `dropped`. The window's depth,
+  as a duration at the publish rate, is how long a stall it survives.
+
+So a camera frame that fits 64 KiB travels from a remote onto an ephemeral
+channel at 1 per second with no configuration and at up to 30 per second with
+one `remote`-block setting; larger frames need the body cap raised, which
+raises it bus-wide, or a blob per frame on v6; a durable channel is not a
+video carrier. These are limits, not measurements.
+
+A camera frame over the body cap, sent on v6 as a blob per frame onto an
+`ephemeral:` channel, costs **four client frames plus one write per 256 KiB**
+(create, the writes, seal, publish, close) and three answers, none waited for;
+**one connection-bucket token** (the publish) — so the same `publish_per_sec`
+setting that governs body-sized frames governs these, 1 a second by default
+and 30 with one `remote`-block setting — and no send-budget token; and on the
+host **a file create, one file write per 256 KiB and, when the channel's
+window rolls past the frame, an unlink** (no sync on a ring channel). The
+close travels behind the publish (publish-or-drop), so a frame the connection
+bucket refuses is dropped with its blob and the daemon holds no handle past
+the frame it is sending; a daemon that kept handles to retry refused frames
+would meet the 64-handle bound within seconds at the default rate. A reader
+pays an open, one read per 256 KiB and a close. Against that, raising
+`max_body_bytes` costs one frame and no filesystem operation per camera frame,
+and raises the cap for every channel, ring and durable, and every subscriber's
+window copy. On a durable channel a blob per frame also costs a send-budget
+token and two fsyncs, and is not a video carrier, as before. These too are
+limits, not measurements.
+
+**The archive line format.** An `archive` sink writes one JSON object per
+evicted message, one per line. The fields are the envelope's, in its order —
+`message_id`, `source`, `channel`, `sender`, `publish_ts`, the body entries,
+whichever of `reply_to`, `delivery_deadline`, `deliver_after` and `impetus` are
+present, then `urgency`, `envelope_type`, and `transport` on a message that
+arrived in the raw ingress shape (§2.7.1). The body entries are `body` (a JSON string) for a
+text body, or `body_base64` for a non-text one, followed by `content_type` when
+the body has one. An untyped text body's line is exactly the line written
+before bodies became bytes.
+
+### 2.1.4 Limits on a stream delivered to a surface
+
+The delivery half of the path from a publisher to a 0.2.0 kind on a surface
+page: bus, attach session, websocket, page kernel, activation. Defaults;
+"fixed" is a compile-time constant. An ingress channel (`webhook:`, `mqtt:`) is
+outside this section: a surface cannot bind one (§2.1.1).
+
+| Limit | Default | Raised by |
+|---|---|---|
+| Body cap, one message | 65,536 bytes raw | Operator: `messaging { max_body_bytes }` (restart) |
+| Channel window (`ephemeral:`) | the channel's `retain_depth`, a count, at most 4,096; no byte bound | Operator; the 4,096 is fixed |
+| Session push queue / writer queue | 256 / 256 frames | Fixed |
+| A live `Deliver` | one row per frame; no rate limit and no byte budget on delivery | — |
+| A replay or catch-up `Deliver` | up to `max(push_depth, retain_depth)` rows in one frame, with no size cap | the binding's depths |
+| Server-to-page frame size | unbounded: the 204,800-byte v5 frame cap bounds what a page sends | — |
+| The page's inbound queue | unbounded; drained one frame per browser task | — |
+| The page's store | `max(push_depth, retain_depth)` rows per channel, a count | the binding's depths |
+| One activation's input | every bound port's window, with no byte limit; the 4 MiB per-activation bound is on publishes only | — |
+| Sessions per surface / per user on one surface | 64 / 16 | Fixed |
+
+What follows:
+
+- **Rate.** Delivery adds no rate limit to what the publisher sustains: for a
+  remote onto an `ephemeral:` channel, what §2.1.3 says.
+- **Falling behind.** The server keeps at most 256 undelivered frames per
+  session and then reads the channel's window by cursor; the page keeps at
+  most the store's depth. A kind slower than the stream is activated with the
+  newest `push_depth` rows and the rest are drops — what a frame stream wants:
+  `push_depth = 1`, `retain_depth = 1`. Each activation instantiates the kind
+  afresh, so its cost floors the frame interval; `docs/page-rig-timings.md`
+  has the node
+  and Chromium figures.
+- **Loudness.** A binding's `noise` decides what a drop does. At `fatal` the
+  first overrun kills the instance; a stream binding states `silent` or
+  `metered`.
+- **Reconnect.** A replay pass is one frame of up to the window's depth times
+  the body cap, on every reconnect.
+
+So a camera frame that fits 64 KiB, sent by a remote onto a `non_text`
+`ephemeral:` channel, reaches a 0.2.0 kind on a surface at 1 per second with
+no configuration and at up to 30 per second with one `remote`-block setting;
+larger frames need the body cap raised. These are limits, not measurements;
+`docs/page-rig-timings.md` has what one delivered row costs a 0.2.0 kind in
+Chromium, with a kind on the page as the publisher — no browser run has a
+remote as the publisher.
 
 ### 2.2 Subscriptions
 
@@ -251,6 +814,19 @@ whole of the callee's activation, and the call graph is acyclic by refusal at
 compile time. Anything that needs to cross a host boundary, survive a restart,
 fan out, or be retried is a message, not a call.
 
+Under the byte-carrying contract a call's request and its reply are message
+bodies — bytes with an optional content type — like any other. When the two
+ends speak different contracts, each end is held to its own:
+
+- A non-text request to a callee built against the string contract is refused
+  before the callee runs (`text-only-peer` to the caller). A typed text
+  request reaches it as its text.
+- A reply is judged against the callee's own contract only. A 0.2.0 callee
+  may reply with a non-text body to any caller; its activation ends ok and its
+  buffer flushes. A 0.1.0 caller cannot read that reply, so the *caller's*
+  activation traps, and the alert names the caller, whose wiring is the one to
+  change. A typed text reply reaches a 0.1.0 caller as its text.
+
 ### 2.5 State by retention
 
 Because channels persist independent of consumption, a retained channel *is* a
@@ -325,6 +901,42 @@ nothing else to derive from, and boot refuses a port that leaves either unwritte
 channel that needs channel-level tuning has outgrown auto declaration; write the
 `[[channel]]` block.
 
+`non_text` (§2.1) is folded the same way: a port states it on its binding tail,
+and an auto channel is `non_text` when any of its endpoints says so. This is
+how a component keeps binary state on its own `io` port with no declared
+channel: `io state { push_depth = 0; retain_depth = 1; non_text = true; }`.
+On a declared channel the same key on a port is a check, not a declaration: a
+port stating `non_text = true` bound to a channel that does not is refused
+when the plan is built, so `config-check` reports it.
+
+On a surface binding the key does what it does on the backend. Where the
+channel stays on the page — a `local:` address outside the reserved
+`local:brenn/` planes, a free `io` port, or a link whose endpoints are all on
+that surface — it declares a page-local channel, and the page ring is
+`non_text` when any surface binding on its address says so; a server-realm
+`channel` declaration at a `local:` address is never read for it. Where the
+channel leaves the page — a declared `ephemeral:` or `brenn:` channel — it is
+a check: stated on a port whose channel is declared text-only, it is refused
+when the plan is built, and a port that does not state it may be bound to a
+channel declared `non_text`. On a link with an endpoint off the surface the
+statement is the declaration, by the fold above. Stated on a reserved plane it
+is refused. A surface's config channel declared `non_text` is refused: a page
+reads its bindings document as text, so the declaration would admit only
+bodies no page can apply. A 0.1.0 kind bound to any `non_text` channel,
+page-local or wire-bound, is refused at boot and at reload.
+
+The page's wire is attach v5. On any channel declared `non_text`, page-local
+or wire-bound, a page-hosted `brenn:processor@0.2.0` kind publishes, parks and
+edits non-text bodies, is delivered them, and reads them back byte for byte
+with their content type; on any channel it keeps typed text with its type; it
+passes any body in a sync call between 0.2.0 kinds. A non-text body for a
+text-only channel is refused with `text-only-channel`. This is shown on the
+node rig, against a stand-in for the browser's websocket;
+`e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery in
+Chromium, and an SDK-built kind's binary state on a page-local `io` port. A
+remote attacher on v5 is served a `non_text` channel; one on v4 is
+answered `Unavailable`.
+
 **The timer-cap coupling.** A channel's `retain_depth` also caps its channel-wide
 deferred set, so on an auto channel the fold above is what bounds how many
 `deliver_after` schedules the port may hold outstanding. A component juggling K
@@ -347,7 +959,8 @@ unstated one refuses to boot.
 Some channels are minted by the system rather than declared by the operator: the
 webhook ingress channels (`webhook:<slug>`), the MQTT ingress channels
 (`mqtt:<client>:<topic>`), the async-tool substrate's request and result
-channels (`brenn:tools/<tool>`, `brenn:tool-results/<slug>`), and the per-user
+channels (`brenn:tools/<tool>`, `brenn:tool-results/<slug>`,
+`brenn:app-tool-results/<app-slug>`), and the per-user
 device-location channels (`brenn:device-location.<username>`). Nothing in config
 brings these into existence — an endpoint block, a subscription, a registered
 tool or a registered user does — so there is no declaring `[[channel]]` block to
@@ -360,7 +973,7 @@ a bounded in-code default:
 | Family | push | retain | standing |
 |---|---|---|---|
 | `webhook:<slug>`, `mqtt:<client>:<topic>` | 1 | 100 | 100 |
-| `brenn:tools/<tool>`, `brenn:tool-results/<slug>` | 1 | 16 | 16 |
+| `brenn:tools/<tool>`, `brenn:tool-results/<slug>`, `brenn:app-tool-results/<app-slug>` | 1 | 16 | 16 |
 | `brenn:device-location.<username>` | 1 | 2000 | 2000 |
 
 Ingress channels are fact channels; at their arrival rates a hundred messages is
@@ -439,13 +1052,58 @@ and a system participant's overflow rung is `Silent` whatever the channel says.
 A `noise` written on a request-channel block is inert today
 (`TODO(system-participant-noise-inert)`).
 
+A request channel's window is also how many requests the executor can be
+behind on that tool. Each drain serves at most the window's newest unseen
+requests and steps over the older ones, as any subscriber's overflow does
+(drop oldest). One activation may queue up to 64 asynchronous calls, and the
+default window is 16: a request pushed past the window before the executor
+dequeues it is lost, attachments or not. No result is published for it, and
+the executor's overflow is silent
+(`TODO(tool-request-window-overflow-silent)`). Its blobs go when GC evicts
+its row. The window is also what keeps a request's attachments alive until the
+executor takes its own holds: a row evicted and reaped in the instant between
+the dequeue and that hold is answered `internal`, naming the attachment. An
+operator who expects bursts of calls to one tool sizes that tool's
+`brenn:tools/<tool>` window for the burst.
+
+An app's `brenn:app-tool-results/<app-slug>` inbox is minted for every app
+granted at least one asynchronous registry tool, at boot and when a reload
+grants the first one. It holds the attachments of the tool results handed to
+that app's conversations (§2.1.2a): each message's body is
+`{"v":1,"tool":"<name>"}` and its attachments are the result's — the tool's
+value is not in it, since the conversation receives that in place. A result
+without attachments is never published there. Nothing subscribes to it, and
+**no policy can cover it**: `AppPolicy` answers no for the namespace whatever
+its matchers say, so nothing lists, reads, subscribes to or is delivered from
+an app's result inbox, its own app included, and an authored matcher reaching
+into `app-tool-results/` is refused at start. A conversation names one of its
+attachments only through the read record, which the host writes for the
+conversation that made the call and for no other.
+
+Its window, as duration: with no subscriber, `standing_retain_depth` is the
+number that counts. A conversation names a result's attachment until that
+many newer attachment-carrying results exist on the inbox (`not_retained`
+after that), and the next hourly GC pass deletes the row and the reap its
+blobs. So an app's conversations *together* may receive 16 later
+attachment-carrying results, at the default, before an earlier one's
+attachments stop being nameable — ample for a conversation that forwards or
+saves a result within its turn or the next, and the number to raise for an
+app with many conversations fetching at once. The inbox is durable, and the
+read record is in memory: after a restart the inbox holds up to its standing
+depth of results no conversation can name, and their blobs stay charged to the
+blob budget until that many new results arrive and a GC pass runs.
+
 **Tuning them.** A `[[channel]]` block addressing one of these channels does not
 declare it; it *tunes* it. Synthesis still owns creation, identity and
 description, so `uuid` and `description` are rejected on a tuning block, and all
 three depths are required — a block that tunes states every number. `noise`,
 `wake_min`, `sink` and `send_rate` are optional and inherit the `[messaging]`
 globals, exactly as on a declaring block — except `send_rate` on a
-`brenn:tool-results/` inbox, which is the host's and refused in the block. An
+`brenn:tool-results/` or `brenn:app-tool-results/` inbox, which is the host's
+and refused in the block. An app's result inbox is tuned by its exact address,
+which must name an app holding an asynchronous tool grant, or by the prefix
+`brenn:app-tool-results/`; a block over `brenn:tool-results/` sizes component
+inboxes only. An
 explicit `"unbounded"` is legal
 here: unbounded is something an operator asks for in so many words, never
 something a default hands out.
@@ -508,6 +1166,128 @@ deleting the row and folding the static entry in. The re-declared block keeps
 the channel's identity by construction, since a declaration derives its uuid
 from its address; a `uuid_pins` entry that moves it is refused, because the
 address still belongs to the stored row the dormant subscription names.
+
+### 2.7.1 The two ingress shapes
+
+A `webhook:` or `mqtt:` channel takes what its transport receives in one of two
+shapes. Which one is a fact of the channel, read from configuration: a tuning
+block — exact or prefix — stating `non_text = true` makes the channel *raw*;
+without it the channel is *wrapped*. No subscriber and no message selects the
+shape, and the adaptor reads it from the channel entry it publishes on.
+
+```
+channel at prefix "mqtt:broker:cam/" { push_depth = 1; retain_depth = 16; standing_retain_depth = 16; non_text = true; untyped_content_type = "application/octet-stream"; }
+channel at "webhook:scanner"        { push_depth = 1; retain_depth = 100; standing_retain_depth = 100; non_text = true; }
+```
+
+**Wrapped**, the default, is the shape every ingress channel had before the
+opt-in existed, unchanged. The body is the transport's wrapper JSON —
+`MqttEnvelope` or `WebhookEnvelope` — as untyped text, and the message has no
+`transport` key. An MQTT payload that is not text is a placeholder inside the
+wrapper and its bytes reach no channel; a webhook body must be UTF-8 or the
+request is refused before authentication.
+
+**Raw.** The body is the payload itself, byte-exact, with a content type, and
+the message carries the transport's metadata in the envelope's `transport` key
+(§2.1.2):
+
+- MQTT: `{"mqtt": {"client_slug", "topic", "qos", "received_at"}}` — the
+  client, the topic the message was actually published on, the delivery QoS
+  and the host's receive time; the wrapper's fields less the payload.
+- Webhook: `{"webhook": {"headers", "key_id", "client_ip", "received_at",
+  "endpoint_slug"}}` — the wrapper's fields less the body: the request headers
+  with credential-bearing values replaced by `"[redacted]"` and non-UTF-8
+  values left out, the key that authenticated the request, the client address,
+  the receive time and the endpoint.
+
+A conversation reads a raw message as any other: a text body verbatim with its
+type, a non-text body as the placeholder, and the `transport` object beside
+it. A 0.2.0 component reads the bytes as the body and the metadata from the
+header; `brenn-guest`'s `mqtt_transport()` and `webhook_transport()` read it,
+and its `mqtt_body()` and `webhook_body()` read the wrapper, each refusing the
+other shape by name. A 0.1.0 component cannot bind a raw channel: boot and
+reload refuse it, as on any `non_text` channel (§2.1). The size cap applies to
+a raw body (§2.1.2).
+
+**MQTT on a raw channel.** The body's content type is the publisher's MQTT 5
+Content-Type property when the broker delivered one. A payload with none takes
+the channel's `untyped_content_type`, when the tuning block states it; without
+it, the payload is untyped text. `untyped_content_type` is legal only on an
+`mqtt:` tuning block that also states `non_text = true`, its value a media type
+the bus accepts; it never looks at the payload's bytes, it is the same for every
+message on the channel, and the message does not record whether the publisher
+or the channel stated its type. A publisher on MQTT 3.1.1, which has no
+Content-Type, or one that sets none, needs it to deliver binary: without it a
+payload that is not UTF-8 cannot be untyped text and is dropped. A channel
+declaring a non-text type makes every untyped payload non-text, even one whose
+bytes are UTF-8; text publishers on such a filter set a Content-Type, or the
+filter is split across two channels.
+
+Each payload is judged per channel. A bad one is dropped for that channel —
+one `warn` naming client, topic, channel, size and reason, nothing stored, no
+substitute type — and is still published on any other channel it matches:
+
+| Input | Outcome |
+|---|---|
+| Content-Type malformed, empty or over 255 bytes, whatever the channel declares | dropped |
+| Text Content-Type (§2.1.2's rule), payload not UTF-8 | dropped |
+| Text Content-Type, payload UTF-8 | typed text body |
+| Any other well-formed Content-Type | non-text body, byte-exact |
+| No Content-Type, channel declares none, payload UTF-8 | untyped text body |
+| No Content-Type, channel declares none, payload not UTF-8 | dropped; the log line names `untyped_content_type` |
+| No Content-Type, channel declares a non-text type | non-text body of that type, UTF-8 or not |
+| No Content-Type, channel declares a text type | text body of that type if UTF-8, else dropped |
+| Payload over `max_body_bytes` | dropped |
+
+The bus's text rule, not the wrapped shape's classification, decides text on a
+raw channel: a UTF-8 payload sent as `application/json` is a typed text body
+there, and still a placeholder on a wrapped channel. An empty payload is an
+empty body of whatever kind its typing gives.
+
+**Webhook on a raw channel.** The body is typed with the endpoint's content
+type, normalized as endpoint resolution normalizes it — no parameters from the
+sender's header, which stays in `headers`. The pre-authentication UTF-8 refusal
+(400 `{"error":"schema"}`) applies when that type is a text type by §2.1.2's
+rule, and not otherwise; the default endpoint type, `application/json`, is a
+text type, so an endpoint that takes arbitrary bytes declares a non-text type
+such as `application/octet-stream`. Authentication and the replay check run
+over the bytes as received. A raw endpoint states a `transport_ceiling_bytes`
+of at most `messaging.max_body_bytes` — the default ceiling, 1 MiB, is over the
+default cap — and its content type must be a media type the bus accepts;
+config-check, boot and reload refuse an endpoint that breaks either, so the
+existing 413 is the refusal a sender meets for a body over the cap. During a
+reload's commit an endpoint of the old document can briefly serve requests
+against the new document's channel; a request whose shape, size or type then
+does not fit the channel is answered 500 with a `warn` and nothing is stored.
+On an endpoint without replay protection the sender's retry meets the new
+endpoint. On a replay-protected endpoint the replay check has already recorded
+the delivery when the 500 is answered, so the retry is refused 409 as a
+duplicate and raises a replay security event: the message is lost, as with any
+500 answered after the replay check. A default endpoint's responses are
+unchanged on every path.
+
+**Changing a channel's shape.** Widening a channel to raw is a tuning change
+like any other: a reload applies it when every subscriber on the channel is
+moving, and otherwise needs a restart. Narrowing a raw channel back to wrapped
+is refused by a reload with `NEEDS_RESTART`, since the transport keeps
+publishing through a reload. At the restart, a channel that is text-only and
+still holds a non-text message, visible or parked, refuses the start, as a
+declared channel does (§2.1); for a system-minted address the remedy is to keep
+`non_text = true` in the tuning block or to delete the channel's stored
+messages. `untyped_content_type` changes the same way: a change to the word is a
+tuning change, and removing it together with `non_text` is a narrowing. A
+dynamic `mqtt:` channel minted by a running session takes the tuning the
+process booted with, `non_text` and `untyped_content_type` included, from its
+first message; a retune reaches it at the next restart.
+
+A shape change rewrites nothing already stored. After widening, the window
+holds wrapper messages without `transport` and raw messages with it until the
+old ones age out; a reader tells them apart by the key, and the SDK accessors
+name the other shape when asked for the wrong one. After a narrowing that the
+restart admits — only text bodies retained — a 0.1.0 component may bind the
+channel and receives raw text messages whose `envelope-json` carries
+`transport` and whose body is not a wrapper. Deleting the channel's stored
+messages starts it clean in either direction.
 
 ### 2.8 The reload pair
 

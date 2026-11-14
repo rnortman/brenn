@@ -1071,6 +1071,20 @@ fn a_tool_namespace_address_stays_a_literal_and_derives_an_entry() {
     );
 }
 
+/// An app's result inbox is outside the carve-out: no agent watches it.
+#[test]
+fn an_agent_cannot_name_an_app_result_inbox() {
+    assert_eq!(
+        derive_refusal(&agent_with(
+            "subscribe",
+            "    subscribe \"brenn:app-tool-results/alice\";\n",
+        )),
+        "this subscription of agent `alice` names `brenn:app-tool-results/alice`, an \
+         app's tool-result inbox: no participant may reach one — a conversation names a \
+         result's attachments only by having been handed the result"
+    );
+}
+
 /// The carve-out is an agent's alone. A component's own port binding onto the
 /// substrate's namespaces is the side door the port-name refusal would push an
 /// operator toward, and it is shut.
@@ -2089,6 +2103,10 @@ fn a_backend_only_capability_is_refused_on_a_placed_instance() {
         (
             "mqtt",
             "`mqtt` is backend-only in v1; a surface-hosted component cannot be granted it",
+        ),
+        (
+            "blobs",
+            "`blobs` is backend-only: no surface host serves blob bytes yet",
         ),
     ] {
         assert!(
@@ -4404,7 +4422,7 @@ fn a_refused_ceiling_word_suppresses_the_fit_check() {
     assert_eq!(
         derive_refusal(&packaged_page(" { grants = [dom, chrome, subscribe]; }")),
         "`chrome` is not a grant word, so it caps nothing; a ceiling names `alert`, \
-         `calls`, `config`, `dom`, `dynamic_subscribe`, `ephemeral_publish`, \
+         `blobs`, `calls`, `config`, `dom`, `dynamic_subscribe`, `ephemeral_publish`, \
          `ephemeral_subscribe`, `log`, `mqtt`, `page-dom`, `ports`, `provides`, `publish`, \
          `pwa_push`, `store`, `subscribe`, `takeover` or `tools`"
     );

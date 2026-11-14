@@ -742,6 +742,8 @@ impl ActiveBridge {
                 noise: brenn_lib::messaging::config::NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![brenn_lib::messaging::SubscriberEntry {
                 kind: brenn_lib::messaging::SubscriberEntryKind::App("testapp".to_string()),
@@ -772,6 +774,8 @@ impl ActiveBridge {
                 noise: brenn_lib::messaging::config::NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: brenn_lib::messaging::ChannelScheme::Brenn,
@@ -930,6 +934,8 @@ impl ActiveBridge {
                 noise: brenn_lib::messaging::config::NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: brenn_lib::messaging::ChannelScheme::Mqtt,
@@ -1018,6 +1024,7 @@ impl ActiveBridge {
             true,
             mqtt_subscribe_test_policy(),
             brenn_lib::messaging::config::Depth::Unbounded,
+            Default::default(),
         )
         .await
     }
@@ -1032,6 +1039,7 @@ impl ActiveBridge {
             true,
             mqtt_subscribe_test_policy(),
             brenn_lib::messaging::config::Depth::Bounded(2),
+            Default::default(),
         )
         .await
     }
@@ -1046,6 +1054,7 @@ impl ActiveBridge {
             false,
             mqtt_subscribe_test_policy(),
             brenn_lib::messaging::config::Depth::Unbounded,
+            Default::default(),
         )
         .await
     }
@@ -1061,6 +1070,39 @@ impl ActiveBridge {
             true,
             policy,
             brenn_lib::messaging::config::Depth::Unbounded,
+            Default::default(),
+        )
+        .await
+    }
+
+    /// Same wiring as [`test_new_for_mqtt_subscribe`] but with an `mqtt:home:`
+    /// prefix tuning stating `non_text`, so every channel a subscribe mints for
+    /// the `home` client takes the raw ingress shape.
+    pub(crate) async fn test_new_for_mqtt_subscribe_raw() -> Arc<Self> {
+        let global = brenn_lib::messaging::MessagingGlobalConfig::default();
+        let tuning = brenn_lib::messaging::config::build_system_channel_tuning(
+            &[brenn_lib::messaging::config::ChannelConfigRaw {
+                send_rate: None,
+                uuid: None,
+                address: None,
+                address_prefix: Some("mqtt:home:".to_string()),
+                description: None,
+                push_depth: Some(brenn_lib::messaging::config::Depth::Bounded(1)),
+                retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(100)),
+                standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(100)),
+                noise: None,
+                sink: None,
+                wake_min: None,
+                non_text: true,
+                untyped_content_type: None,
+            }],
+            &global,
+        );
+        Self::test_new_for_mqtt_subscribe_with_singleton(
+            true,
+            mqtt_subscribe_test_policy(),
+            brenn_lib::messaging::config::Depth::Unbounded,
+            tuning,
         )
         .await
     }
@@ -1075,6 +1117,7 @@ impl ActiveBridge {
         singleton: bool,
         policy: brenn_lib::access::AppPolicy,
         standing_retain_depth: brenn_lib::messaging::config::Depth,
+        system_channel_tuning: brenn_lib::messaging::config::SystemChannelTuning,
     ) -> Arc<Self> {
         use std::sync::Arc;
 
@@ -1099,6 +1142,8 @@ impl ActiveBridge {
                 noise: brenn_lib::messaging::config::NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: brenn_lib::messaging::ChannelScheme::Brenn,
@@ -1160,7 +1205,8 @@ impl ActiveBridge {
                 as Arc<dyn brenn_messaging::WakeRouter>,
             brenn_lib::messaging::MessagingGlobalConfig::default(),
         )
-        .with_ring_stores(ring_stores);
+        .with_ring_stores(ring_stores)
+        .with_system_channel_tuning(system_channel_tuning);
 
         // MqttService with a registered `home` ingress supervisor. Non-default
         // qos (2) / urgency (High) so qos-/urgency-resolution is observable; the
@@ -1260,6 +1306,8 @@ impl ActiveBridge {
                     noise: brenn_lib::messaging::config::NoiseLevel::Silent,
                     sink: brenn_lib::messaging::config::Sink::Drop,
                     wake_min: brenn_lib::messaging::WakeMin::Normal,
+                    non_text: false,
+                    untyped_content_type: None,
                 },
                 subscribers: vec![brenn_lib::messaging::SubscriberEntry {
                     kind: brenn_lib::messaging::SubscriberEntryKind::App("testapp".to_string()),
@@ -1373,30 +1421,130 @@ impl ActiveBridge {
         messenger: Arc<brenn_messaging::Messenger>,
         alert_dispatcher: AlertDispatcher,
     ) -> Arc<Self> {
+        Self::test_new_over_messenger(
+            messenger,
+            "testapp",
+            "test",
+            alert_dispatcher,
+            TestBridgeConfig::default(),
+        )
+        .await
+    }
+
+    /// Like `test_new_with_messenger` with a tool registry and the app's
+    /// grants of it.
+    pub(crate) async fn test_new_with_messenger_and_tools(
+        messenger: Arc<brenn_messaging::Messenger>,
+        tools: Arc<brenn_tool_registry::ToolRegistry>,
+        tool_grants: std::collections::BTreeMap<String, brenn_lib::tools::ResolvedToolGrant>,
+    ) -> Arc<Self> {
+        Self::test_new_over_messenger(
+            messenger,
+            "testapp",
+            "test",
+            brenn_obs::alerting::noop_alert_dispatcher().0,
+            TestBridgeConfig {
+                tools: Some(tools),
+                tool_grants,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// A fresh conversation of `app_slug`, acting for `username` (created if
+    /// absent), over `messenger`'s database. `apps` is the agent table, whose
+    /// policies carry the tool grants, and `tools` the registry.
+    pub(crate) async fn test_new_for_conversation(
+        messenger: Arc<brenn_messaging::Messenger>,
+        apps: Arc<indexmap::IndexMap<String, brenn_lib::config::AppConfig>>,
+        app_slug: &str,
+        username: &str,
+        tools: Arc<brenn_tool_registry::ToolRegistry>,
+    ) -> Arc<Self> {
+        Self::test_new_over_messenger(
+            messenger,
+            app_slug,
+            username,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
+            TestBridgeConfig {
+                tools: Some(tools),
+                apps: Some(brenn_lib::config::AppTable::new(apps)),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// The path of this conversation's tool socket, as `brenn-tool` is given
+    /// it.
+    pub(crate) fn test_tool_socket_path(&self) -> PathBuf {
+        brenn_lib::runtime_dir::tool_socket_in(self.tool_socket.host_dir())
+    }
+
+    /// Run the Brenn tool `short_name` on `input` as CC's PostToolUse hook
+    /// does, and return the output the conversation is handed.
+    #[cfg(test)]
+    pub(crate) async fn test_post_tool_use(
+        &self,
+        short_name: &str,
+        input: serde_json::Value,
+    ) -> serde_json::Value {
+        use brenn_cc::session::ApprovalDecision;
+        let req = super::test_support::post_tool_use_req(
+            &format!("{}{short_name}", super::mcp_constants::MCP_BRENN_PREFIX),
+            input,
+        );
+        match super::brenn_tools::handle_brenn_tools(self, &req).await {
+            Some(super::tool_summary::HandleBrennToolResult::Respond(
+                ApprovalDecision::Continue {
+                    updated_output: Some(output),
+                },
+            )) => serde_json::from_str(&output).expect("the hook output is JSON"),
+            other => panic!("{short_name}: PostToolUse should continue with output, got {other:?}"),
+        }
+    }
+
+    /// A bridge for a fresh conversation of `app_slug` over `messenger`'s
+    /// database, acting for `username` (created if absent), and `config` with
+    /// the messenger set.
+    async fn test_new_over_messenger(
+        messenger: Arc<brenn_messaging::Messenger>,
+        app_slug: &str,
+        username: &str,
+        alert_dispatcher: AlertDispatcher,
+        config: TestBridgeConfig,
+    ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(16);
         let db = messenger.db().clone();
         let (user_id, conversation_id) = {
             let conn = db.lock().await;
             conn.execute(
-                "INSERT INTO users (username, password_hash, created_at) \
-                 VALUES ('test', 'x', datetime('now'))",
-                [],
+                "INSERT OR IGNORE INTO users (username, password_hash, created_at) \
+                 VALUES (?1, 'x', datetime('now'))",
+                [username],
             )
             .expect("insert user");
-            let uid: i64 = conn.last_insert_rowid();
-            let cid = brenn_db::conversation::create_conversation(&conn, uid, "testapp", false);
+            let uid: i64 = conn
+                .query_row(
+                    "SELECT id FROM users WHERE username = ?1",
+                    [username],
+                    |row| row.get(0),
+                )
+                .expect("the user");
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, app_slug, false);
             (uid, cid)
         };
         Self::inject_for_test_full(
             user_id,
             conversation_id,
-            "testapp",
+            app_slug,
             db,
             tx,
             alert_dispatcher,
             TestBridgeConfig {
                 messenger: Some(messenger),
-                ..Default::default()
+                ..config
             },
         )
     }

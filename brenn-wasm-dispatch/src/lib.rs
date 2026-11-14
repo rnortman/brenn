@@ -20,6 +20,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use brenn_activation::sync::{SyncAnswer, SyncRefusal, sync_request};
+use brenn_envelope::MessageBody;
 use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
 use brenn_lib::messaging::config::{ActivationPacing, WasmInputPort, WasmOutputPort};
 use brenn_lib::messaging::{ParticipantId, Urgency};
@@ -31,9 +32,9 @@ use brenn_obs::security::{SecurityEventType, log_component_security_event};
 use brenn_tool_registry::{ProvidedRequest, ProviderRuntime};
 use brenn_wasm::ProcessorDeferredOp;
 use brenn_wasm::{
-    GuestAlertSeverity, PROCESSOR_MAX_DIAG_BYTES, ProcessorActivation, ProcessorAlerter,
-    ProcessorComponent, ProcessorDeferredEntry, ProcessorDeferredWindow, ProcessorOutcome,
-    ProcessorPortWindow, ProcessorUrgency,
+    GuestAlertSeverity, HostActivation, HostDeferredEntry, HostDeferredWindow, HostPortWindow,
+    PROCESSOR_MAX_DIAG_BYTES, ProcessorAlerter, ProcessorComponent, ProcessorOutcome,
+    ProcessorUrgency,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -109,7 +110,7 @@ pub async fn apply_deferred_ops(
                     .await
             }
             ProcessorDeferredOp::Edit {
-                payload,
+                body,
                 deliver_after,
                 ..
             } => {
@@ -119,7 +120,7 @@ pub async fn apply_deferred_ops(
                         &out.channel_address,
                         sender,
                         uuid,
-                        payload.clone(),
+                        body.clone(),
                         release_at,
                         now,
                     )
@@ -448,7 +449,7 @@ pub struct SyncRequest {
     /// The declared `sync` port of the target the request is addressed to.
     pub port: String,
     /// The request body, which becomes the one envelope in that port's window.
-    pub body: String,
+    pub body: MessageBody,
     /// The slugs already running in this call's chain, caller-first. The target
     /// appearing in it would be a cycle the document was supposed to refuse.
     pub chain: Vec<String>,
@@ -489,6 +490,49 @@ pub fn sync_request_channel() -> (
     tokio::sync::mpsc::Receiver<SyncRequest>,
 ) {
     tokio::sync::mpsc::channel(SYNC_REQUEST_QUEUE_DEPTH)
+}
+
+/// The blob seam a consumer holding the `blobs` grant is loaded with, or
+/// `None` when `messenger` has no blob store.
+///
+/// `retain` blocks on [`Messenger::retain_blob`] through the runtime handle
+/// captured here, from the guest's blocking thread: a blob nothing holds is
+/// `None`, and any other error panics. `create` is the store's own. Here
+/// rather than beside the host's other seams so this crate's suites drive the
+/// production body instead of a copy of it.
+///
+/// # Panics
+///
+/// If no tokio runtime is entered — the handle is captured here, not at the
+/// call.
+#[must_use]
+pub fn blob_host_over(messenger: &Arc<Messenger>) -> Option<brenn_wasm::BlobHostFn> {
+    use brenn_messaging_store::blob::{BlobError, BlobHold, BlobStore, BlobWriter};
+
+    struct MessengerBlobs {
+        messenger: Arc<Messenger>,
+        store: Arc<BlobStore>,
+        handle: tokio::runtime::Handle,
+    }
+    impl brenn_wasm::BlobHost for MessengerBlobs {
+        fn retain(&self, id: &brenn_envelope::BlobId) -> Option<BlobHold> {
+            match self.handle.block_on(self.messenger.retain_blob(id)) {
+                Ok(hold) => Some(hold),
+                Err(BlobError::NotFound) => None,
+                Err(e) => panic!("retaining blob {id} for a component: {e}"),
+            }
+        }
+
+        fn create(&self, content_type: &str) -> Result<BlobWriter, BlobError> {
+            self.store.create(content_type)
+        }
+    }
+    let store = messenger.blob_store()?.clone();
+    Some(Arc::new(MessengerBlobs {
+        messenger: messenger.clone(),
+        store,
+        handle: tokio::runtime::Handle::current(),
+    }))
 }
 
 /// Spawn the off-loop dispatch task for one WASM consumer.
@@ -674,7 +718,7 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
             // guards.
             let cap = cfg.component.max_payload_bytes();
             assert!(
-                brenn_activation::sync::within_body_cap(&req.body, cap),
+                brenn_activation::sync::within_body_cap(req.body.as_bytes(), cap),
                 "wasm_dispatch: sync request for {} on port {:?} carries {} bytes, over the \
                  deployment's {cap}-byte body cap — a caller may not hand a guest an envelope \
                  its own host would refuse to publish",
@@ -682,6 +726,19 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
                 req.port,
                 req.body.len(),
             );
+            // A callee that reads only text has no way to read a non-text
+            // request. Refused before anything advances, so the callee does not
+            // run and its ports are as they were.
+            if !req.body.is_text() && !cfg.component.contract().carries_non_text_bodies() {
+                let refusal = SyncRefusal::TextOnlyTarget;
+                info!(
+                    slug = %cfg.slug,
+                    "wasm_dispatch: {}",
+                    refusal.describe(&cfg.slug, &req.port)
+                );
+                answer_sync(&cfg.slug, Some(req), SyncAnswer::Refused(refusal));
+                return;
+            }
             let snapshots = cfg
                 .messenger
                 .load_sync_activation_snapshot(subscriber, &cfg.inputs)
@@ -754,18 +811,20 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
         dropped_per_port.push(outcome.dropped);
     }
 
-    // Step 3: assemble ProcessorPortWindow per snapshot.
-    let mut ports: Vec<ProcessorPortWindow> = snapshots
+    // Step 3: assemble one window per snapshot. The envelopes go to the
+    // component as they are; lowering them to what its contract reads is the
+    // component's host's business.
+    let mut ports: Vec<HostPortWindow> = snapshots
         .iter()
         .zip(&dropped_per_port)
         .map(|(snap, dropped)| {
-            let envelopes: Vec<String> = snap
+            let envelopes: Vec<_> = snap
                 .entries
                 .iter()
-                .map(|(_, env)| env.to_envelope_json())
+                .map(|(_, env)| Arc::clone(env))
                 .collect();
 
-            ProcessorPortWindow {
+            HostPortWindow {
                 port: snap.port.clone(),
                 envelopes,
                 new_from: snap.new_from as u32,
@@ -785,7 +844,7 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
     // Scoped to this component's `wasm:<slug>` sender identity: a shared output
     // channel still shows only this component's schedule.
     let sender = subscriber.as_str();
-    let mut deferred: Vec<ProcessorDeferredWindow> = Vec::with_capacity(cfg.outputs.len());
+    let mut deferred: Vec<HostDeferredWindow> = Vec::with_capacity(cfg.outputs.len());
     // Per output port, the message identities behind each deferred-window entry,
     // in the same index order the guest sees. Captured at drain so a
     // `defer-cancel`/`defer-edit` names the identity the guest actually saw — a
@@ -800,12 +859,12 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
             .messenger
             .deferred_view_for_sender(&out.channel_address, sender)
             .await;
-        let entries: Vec<ProcessorDeferredEntry> = parked
+        let entries: Vec<HostDeferredEntry> = parked
             .iter()
             .enumerate()
-            .map(|(i, dm)| ProcessorDeferredEntry {
+            .map(|(i, dm)| HostDeferredEntry {
                 index: i as u32,
-                payload: dm.envelope.body.clone(),
+                payload: Arc::clone(&dm.envelope),
                 deliver_after: release_time_of(dm.release_at),
             })
             .collect();
@@ -813,7 +872,7 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
             out.port.clone(),
             parked.iter().map(|dm| dm.message_uuid()).collect(),
         );
-        deferred.push(ProcessorDeferredWindow {
+        deferred.push(HostDeferredWindow {
             port: out.port.clone(),
             entries,
         });
@@ -825,15 +884,15 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
     // single reading the rest of the assembly used.
     if let Some(req) = &sync {
         let request = sync_request(&cfg.slug, &req.port, req.body.clone(), Uuid::new_v4(), now);
-        ports.push(ProcessorPortWindow {
+        ports.push(HostPortWindow {
             port: req.port.clone(),
-            envelopes: vec![request.to_envelope_json()],
+            envelopes: vec![Arc::new(request)],
             new_from: 0,
             dropped: 0,
         });
     }
 
-    let activation = ProcessorActivation {
+    let activation = HostActivation {
         ports,
         deferred,
         now: Some(now_ms),
@@ -902,7 +961,7 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
                     .iter()
                     .map(|p| WasmPublish {
                         channel_address: &p.channel_address,
-                        body: &p.payload,
+                        body: p.body.clone(),
                         urgency: processor_urgency_to_messaging(p.urgency),
                         reply_to: p.reply_to.as_deref(),
                         // Representability was validated at buffer time
@@ -916,6 +975,7 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
                             )
                             .expect("deliver_after was range-validated at buffer time")
                         }),
+                        attachments: &p.attachments,
                     })
                     .collect();
                 cfg.messenger
@@ -1097,9 +1157,16 @@ fn fail_delivered_requests(
         .iter()
         .filter(|snap| snap.port == TOOL_REQUEST_INPUT_PORT)
         .flat_map(|snap| snap.new_entries())
-        .map(|(_, env)| match ProvidedRequest::parse(&env.body) {
-            Ok(request) => request.id,
-            Err(err) => panic!(
+        .map(|(_, env)| match env.body.as_text().map(ProvidedRequest::parse) {
+            Some(Ok(request)) => request.id,
+            None => panic!(
+                "BUG: wasm_dispatch: request {} on {}'s {TOOL_REQUEST_INPUT_PORT:?} port is not \
+                 text ({}) — the host builds every body on that channel",
+                env.message_id,
+                cfg.slug,
+                env.body.summary()
+            ),
+            Some(Err(err)) => panic!(
                 "BUG: wasm_dispatch: request {} on {}'s {TOOL_REQUEST_INPUT_PORT:?} port is not \
                  a provided-tool request ({err}) — the host builds every body on that channel",
                 env.message_id, cfg.slug

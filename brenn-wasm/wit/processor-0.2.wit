@@ -1,0 +1,296 @@
+package brenn:processor@0.2.0;
+
+/// The byte-carrying component contract.
+///
+/// STABLE. The interfaces `bus@0.2.0`, `ports@0.2.0` and `calls@0.2.0` and
+/// the `receive` export of this world are frozen whole: no type or function in
+/// them is changed, removed or added, and each keeps doing what this file says
+/// it does. While brenn serves `brenn:processor@0.2.0`, an artifact built
+/// against it at any brenn commit that carried it loads and means what it
+/// meant. brenn does not stop serving it without a removal period, announced
+/// in `CHANGELOG.md` and in this file no later than the first release the
+/// period counts, as 0.1.0's is. A breaking change is a new version of the
+/// interfaces that change, served beside this one through that period. No
+/// such period has begun for 0.2.0, and this file promises no length for one.
+///
+/// The contract grows without a new version in three ways. A new capability is
+/// a new interface under a new grant word, with its own version; a component
+/// that does not import it is linked, activated and answered exactly as
+/// before. Such an interface may act on the ports a component already has —
+/// publish, park, read or edit a parked message, call a peer, shape the reply
+/// to a sync call — and may carry what the functions here cannot. The
+/// functions here keep their shapes and their behaviour beside it: what one of
+/// them does with a message's body does not change, and what it does with any
+/// part of a message it cannot express is stated by the interface that
+/// introduces that part. And `bus.envelope.header` is an open JSON object: it
+/// gains keys, the keys it has keep their meaning, and a guest ignores a key
+/// it does not know. And a function may be added to an `@0.1.0` interface of
+/// `processor.wit` that this promise does not freeze, beside the functions it
+/// has, which keep their shapes and their behaviour, as `mqtt-publish-expiring`
+/// was; a component that does not call it imports nothing new.
+///
+/// The limits a host applies — body caps, budgets, depths — are host and
+/// operator policy, not part of this promise; the refusal a limit draws keeps
+/// its variant and its meaning.
+///
+/// A host checks names and types, not meaning: the name of every import, and
+/// the types of the shapes this file states. An artifact that does not have
+/// these shapes — bound by hand against some other text, for instance — is
+/// refused at load, by name or by type, never misread. The promise is to an
+/// artifact that has the shapes the contract's files state for every
+/// interface it imports: the three of this file and the `@0.1.0` interfaces
+/// of `processor.wit`. A host that accepts an artifact which does not have
+/// them may refuse it in a later release; that is a correction to the host,
+/// announced in `CHANGELOG.md`, not a breaking change to the contract, and it
+/// draws no dual period.
+///
+/// The string contract `brenn:processor@0.1.0` is being removed: the string
+/// contract is served by the release that declares `brenn:processor@0.2.0`
+/// stable and by the three brenn releases after it, and no release before the
+/// fourth after it removes it. `processor.wit` says what is removed and what
+/// stays.
+///
+/// This package declares only the interfaces whose shape differs from 0.1.0:
+/// `bus`, `ports` and `calls`. Every other interface a component imports is
+/// the `@0.1.0` one, unchanged; an interface's version is the version at which
+/// its shape last changed. A component is told apart by the interface carrying
+/// its activation: `brenn:processor/bus@0.2.0` here, `types@0.1.0` under the
+/// string contract. Read both files together, `processor.wit` first, and name
+/// the world `brenn:processor/processor@0.2.0`. A component that imports
+/// `blobs` reads `processor-0.3.wit` as well and names its world,
+/// `brenn:processor/processor@0.3.0`.
+///
+/// Every semantic of the 0.1.0 shapes not restated here — buffering and the
+/// atomic flush, unwired and undeclared ports, the mount activation, index
+/// resolution of deferred entries, the call budget — is unchanged.
+
+interface bus {
+    /// A message body: bytes and an optional media type. No content type means
+    /// UTF-8 text of unstated type, which is what every 0.1.0 payload is.
+    ///
+    /// A body handed to the host is validated before anything else sees it:
+    /// the content type must be a well-formed media type of at most 255 bytes,
+    /// and a text body must be UTF-8. A body is text when it has no content
+    /// type, or one naming `text/*`, `application/json` or a `+json` subtype
+    /// with no `charset` other than `utf-8` or `us-ascii`; every other body is
+    /// non-text. The content type is the sender's assertion; the host never
+    /// checks it against the bytes.
+    record body {
+        content-type: option<string>,
+        bytes: list<u8>,
+    }
+
+    /// One message in a window.
+    record envelope {
+        /// The canonical envelope as JSON, without its body: an OPEN object.
+        /// Keys are added over time; a guest MUST ignore a key it does not
+        /// know. Its `envelope_type` is an open string set, as under 0.1.0.
+        /// Its `transport` key is present on a message a transport adaptor
+        /// published in the raw ingress shape, whose body is the transport's
+        /// payload: an object with one member named for the transport, `mqtt`
+        /// or `webhook`, holding that transport's metadata. Its `attachments`
+        /// key is present on a message that carries attachments: an object
+        /// mapping each attachment's name to `{id, size, content_type}`;
+        /// `processor-0.3.wit` says what a component can do with one.
+        header: string,
+        /// The message body, byte-exact, with the content type it was
+        /// published with.
+        body: body,
+    }
+
+    /// Messages delivered on one logical input port for this activation. The
+    /// window semantics — which messages it holds, `new-from`, `dropped`, the
+    /// attach delivery point — are those of 0.1.0 `types.port-window`.
+    record port-window {
+        /// Logical input port name from host config — never a raw channel address.
+        port: string,
+        /// Ordered oldest→newest; entries from `new-from` onward are new.
+        envelopes: list<envelope>,
+        /// Index into `envelopes` of the first new message; `envelopes`' length
+        /// when the window is pure context.
+        new-from: u32,
+        /// Count of messages lost to push-overflow since the previous
+        /// successful invocation.
+        dropped: u32,
+    }
+
+    /// One of this component's own parked messages on an output port's
+    /// channel.
+    record deferred-entry {
+        /// Position within its `deferred-window.entries`, ordered by
+        /// `deliver-after` ascending; the index `defer-cancel` / `defer-edit`
+        /// name, valid only against the window it arrived in.
+        index: u32,
+        /// The body the component parked, byte-exact, with its content type.
+        body: body,
+        /// The scheduled release time, epoch milliseconds UTC.
+        deliver-after: u64,
+    }
+
+    /// The component's own parked messages on one output port's channel, a
+    /// snapshot taken at drain, ordered by `deliver-after` ascending.
+    record deferred-window {
+        /// Logical output port name from host config.
+        port: string,
+        entries: list<deferred-entry>,
+    }
+
+    /// One activation, as 0.1.0 `types.activation`: one window per bound input
+    /// port in config order, one deferred window per bound output port, the
+    /// host's wall clock at drain, and the live sync port on a sync-call
+    /// activation.
+    record activation {
+        ports: list<port-window>,
+        deferred: list<deferred-window>,
+        now: option<u64>,
+        sync: option<string>,
+    }
+
+    /// Outcome of processing the batch. A guest trap is a distinct,
+    /// host-observed failure (not representable here).
+    variant receive-error {
+        /// Guest could not parse one of the envelopes it was handed.
+        malformed-envelope(string),
+        /// Guest-defined processing failure with a diagnostic message.
+        processing-failed(string),
+    }
+}
+
+interface ports {
+    use bus.{body};
+
+    variant publish-error {
+        /// The publish was refused on authority: ungranted, outside an
+        /// in-flight activation, or the bound channel fails the host's output
+        /// ACL. A declared port the deployer left unwired is NOT this error.
+        not-permitted,
+        /// The body failed a size check (over the per-message cap, counted in
+        /// raw bytes), or `deliver-after` is not representable. Diagnostic
+        /// string.
+        invalid-payload(string),
+        /// The body is malformed: the content type is not a well-formed media
+        /// type, or a text body is not UTF-8. Diagnostic string.
+        invalid-body(string),
+        /// The body is not text and the channel bound to `port` is not
+        /// declared to carry non-text bodies. Nothing is buffered.
+        text-only-channel,
+        /// Publish budget exhausted: a per-sink token bucket, or a global
+        /// per-activation backstop (message count or total bytes).
+        quota-exceeded,
+    }
+
+    /// Message urgency — identical to RFC 8030 §5.3 ladder.
+    enum urgency { very-low, low, normal, high }
+
+    /// Buffer one message for the bus channel bound to `port`. `body` is the
+    /// message body only; the host assigns every envelope field. Urgency is
+    /// the port's configured default. Buffering, the atomic flush, the
+    /// three-way answer to `port` (wired, declared-but-unwired, undeclared)
+    /// and the provenance note are those of 0.1.0 `ports.publish`.
+    ///
+    /// The checks run in a fixed order: the call budget; the port (undeclared
+    /// traps); the output ACL; the body (`invalid-body`); whether the channel
+    /// may carry it (`text-only-channel`); then the size cap and budgets. A
+    /// declared, unwired port checks the body but has no channel to judge it
+    /// against.
+    publish: func(port: string, body: body) -> result<_, publish-error>;
+
+    /// Like `publish`, with an explicit urgency override.
+    publish-with-urgency: func(port: string, body: body, urgency: urgency)
+        -> result<_, publish-error>;
+
+    /// Buffer one message held until `deliver-after` (epoch milliseconds UTC),
+    /// as 0.1.0 `ports.publish-deferred`, checked as `publish` is.
+    publish-deferred: func(port: string, body: body, deliver-after: u64)
+        -> result<_, publish-error>;
+
+    /// Failure modes for the deferred-message control ops, as 0.1.0
+    /// `ports.defer-error` plus the two body refusals.
+    variant defer-error {
+        /// Ungranted, or outside an in-flight activation.
+        not-permitted,
+        /// `index` is outside the deferred window this activation delivered
+        /// for `port`; every index is, on a declared port left unwired.
+        out-of-range,
+        /// A per-activation budget is exhausted; an edit body is weighed
+        /// exactly as a published body is.
+        quota-exceeded,
+        /// A `defer-edit` `deliver-after` is not a representable timestamp.
+        invalid-deliver-after,
+        /// An edit body is malformed, as `publish-error.invalid-body`.
+        invalid-body(string),
+        /// An edit body is not text and the port's channel is not declared to
+        /// carry non-text bodies.
+        text-only-channel,
+    }
+
+    /// Cancel one of this component's own parked messages, as 0.1.0
+    /// `ports.defer-cancel`.
+    defer-cancel: func(port: string, index: u32) -> result<_, defer-error>;
+
+    /// Edit one of this component's own parked messages, as 0.1.0
+    /// `ports.defer-edit`. `body` replaces the content type and the bytes
+    /// together; `body` and `deliver-after` are each `some` to change, `none`
+    /// to leave alone. The checks run in order: `deliver-after`; the call
+    /// budget; the port (undeclared traps); the index (`out-of-range`); the
+    /// body (`invalid-body`, then `text-only-channel`); then the budgets.
+    defer-edit: func(port: string, index: u32, body: option<body>,
+        deliver-after: option<u64>) -> result<_, defer-error>;
+}
+
+interface calls {
+    use bus.{body};
+
+    /// Failure modes a guest can observe from a synchronous call to a peer, as
+    /// 0.1.0 `calls.call-error` plus the two body refusals.
+    variant call-error {
+        /// Ungranted, or the call is outside an in-flight activation.
+        not-permitted,
+        /// A declared `call` port the deployer left unbound.
+        unwired,
+        /// The peer did not run: not in service, or terminal.
+        refused,
+        /// The peer ran and did not answer ok. Its buffer flushed nothing.
+        failed,
+        /// The body is over the per-message cap, in raw bytes.
+        invalid-payload(string),
+        /// The body is malformed, as `ports.publish-error.invalid-body`.
+        invalid-body(string),
+        /// The body is not text and the peer is built against a contract that
+        /// carries only text. The peer did not run.
+        text-only-peer,
+        /// The activation's call budget is exhausted.
+        quota-exceeded,
+    }
+
+    /// Call the peer wired to `port` with `body` as its request and return its
+    /// reply inline, as 0.1.0 `calls.call`. The reply is the peer's body as it
+    /// gave it; a peer built against the string contract replies with untyped
+    /// text. A component built against the string contract that calls this one
+    /// cannot read a non-text reply, and it is that caller's activation that
+    /// traps.
+    call: func(port: string, body: body) -> result<option<body>, call-error>;
+}
+
+world processor {
+    use bus.{activation, receive-error, body};
+
+    import ports;
+    import calls;
+    import brenn:processor/store@0.1.0;
+    import brenn:processor/log@0.1.0;
+    import brenn:processor/alert@0.1.0;
+    import brenn:processor/config@0.1.0;
+    import brenn:processor/mqtt@0.1.0;
+    import brenn:processor/tools@0.1.0;
+    import brenn:processor/provides@0.1.0;
+    import brenn:processor/dom@0.1.0;
+    import brenn:processor/page-dom@0.1.0;
+
+    /// Receive one activation, as 0.1.0 `receive`. A sync-call activation may
+    /// answer with `ok(some(reply))`; an ordinary one must answer `ok(none)`.
+    /// The reply is a body, validated as a published body is: a malformed
+    /// reply or one over the per-message cap traps the activation, and nothing
+    /// it buffered is flushed.
+    export receive: func(a: activation) -> result<option<body>, receive-error>;
+}

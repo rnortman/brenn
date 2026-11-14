@@ -26,6 +26,7 @@ use crate::test_support::pages;
 use crate::test_support::pages::PRINCIPAL;
 
 use super::*;
+use brenn_envelope::grants::ProcessorContract;
 
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
 const WIRE: &str = "brenn:site.bar.in";
@@ -131,8 +132,13 @@ fn attach(page: &mut SurfacePage) -> Vec<ClientFrame> {
 fn configured(w: W) -> SurfacePage {
     let mut page = page();
     attach(&mut page);
-    page.registrations
-        .register("p1", None, &mut page.stores, &mut page.subs);
+    page.registrations.register(
+        "p1",
+        ProcessorContract::V0_1,
+        None,
+        &mut page.stores,
+        &mut page.subs,
+    );
     page.schedules.track("p1", false);
     let applied = page
         .apply_config(&body(w), NOW)
@@ -194,6 +200,8 @@ fn env(channel: &str, body: &str) -> MessageEnvelope {
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
+        transport: None,
+        attachments: Default::default(),
     }
 }
 
@@ -202,9 +210,10 @@ fn flush_batch() -> FlushBatch {
     FlushBatch {
         entries: vec![BatchEntry {
             channel: OUT.to_string(),
-            body: r#"{"n":1}"#.to_string(),
+            body: r#"{"n":1}"#.into(),
             urgency: WireUrgency::Normal,
             deliver_after: None,
+            attachments: Vec::new(),
         }],
         ops: Vec::new(),
     }
@@ -231,7 +240,7 @@ fn park(page: &mut SurfacePage, sender: &str) {
         RouteRequest {
             channel: NOTES,
             origin: Origin::Sub(sender),
-            body: "{}".to_string(),
+            body: "{}".into(),
             stamp,
             urgency: Urgency::Normal,
             deliver_after: Some(9_000),
@@ -280,7 +289,7 @@ fn phase_one_clears_the_deferred_view_mirror() {
         Some("p1".to_string()),
         vec![DeferredViewEntry {
             message_id: Uuid::from_u128(1),
-            body: "{}".to_string(),
+            body: "{}".into(),
             deliver_after: 9_000,
         }],
     );
@@ -311,8 +320,13 @@ fn the_config_ack_is_the_connect_states_answer() {
 fn phase_two_puts_the_wiring_in_force_and_subscribes_what_it_binds() {
     let mut page = page();
     attach(&mut page);
-    page.registrations
-        .register("p1", None, &mut page.stores, &mut page.subs);
+    page.registrations.register(
+        "p1",
+        ProcessorContract::V0_1,
+        None,
+        &mut page.stores,
+        &mut page.subs,
+    );
     let applied = page
         .apply_config(&body(W::default()), NOW)
         .expect("the fixture document applies");
@@ -342,13 +356,13 @@ fn phase_two_hands_the_wiring_to_the_plane_policy() {
     let carried = page.router.policy().guard(
         LOCAL_OVERLAY_STATE_CHANNEL,
         Origin::Sub("chrome"),
-        r#"{"v":1,"holder":"p1","since_stamp":0}"#.to_string(),
+        r#"{"v":1,"holder":"p1","since_stamp":0}"#.into(),
     );
     assert!(matches!(carried, GuardedBody::Carry(_)));
     let refused = page.router.policy().guard(
         LOCAL_OVERLAY_STATE_CHANNEL,
         Origin::Sub("chrome"),
-        r#"{"v":1,"holder":"ghost","since_stamp":0}"#.to_string(),
+        r#"{"v":1,"holder":"ghost","since_stamp":0}"#.into(),
     );
     assert!(matches!(refused, GuardedBody::Refused(_)));
 }

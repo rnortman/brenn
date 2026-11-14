@@ -12,10 +12,8 @@
 
 mod common;
 
-use brenn_wasm::{
-    ComponentGrant, ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
-    ProcessorPortWindow,
-};
+use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
+use brenn_wasm::{ComponentGrant, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -95,7 +93,7 @@ fn config_present_key_published_as_payload() {
     config.insert("test-key".to_string(), "hello-from-config".to_string());
     let comp = load_config_component(config);
 
-    let outcome = comp.handle(empty_activation());
+    let outcome = comp.handle(common::host_activation(empty_activation()));
     let publishes = match outcome {
         ProcessorOutcome::Ok { publishes: p, .. } => p,
         other => panic!("expected Ok, got: {other:?}"),
@@ -107,7 +105,8 @@ fn config_present_key_published_as_payload() {
     );
     assert_eq!(publishes[0].port, "out", "publish must be on port 'out'");
     assert_eq!(
-        publishes[0].payload, "hello-from-config",
+        publishes[0].body.as_text().unwrap(),
+        "hello-from-config",
         "published payload must equal the configured value"
     );
     assert_eq!(
@@ -126,7 +125,7 @@ fn config_absent_key_publishes_absent() {
     // Empty config — "test-key" is not set.
     let comp = load_config_component(HashMap::new());
 
-    let outcome = comp.handle(empty_activation());
+    let outcome = comp.handle(common::host_activation(empty_activation()));
     let publishes = match outcome {
         ProcessorOutcome::Ok { publishes: p, .. } => p,
         other => panic!("expected Ok, got: {other:?}"),
@@ -137,7 +136,8 @@ fn config_absent_key_publishes_absent() {
         "expected exactly one publish; got: {publishes:?}"
     );
     assert_eq!(
-        publishes[0].payload, "absent",
+        publishes[0].body.as_text().unwrap(),
+        "absent",
         "absent key must publish the literal 'absent'"
     );
 }
@@ -155,14 +155,15 @@ fn config_get_parsed_present_ok() {
 
     let envelope =
         directive_envelope(serde_json::json!({"cmd": "get_parsed", "key": "parsed-key"}));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     let publishes = match outcome {
         ProcessorOutcome::Ok { publishes: p, .. } => p,
         other => panic!("expected Ok, got: {other:?}"),
     };
     assert_eq!(publishes.len(), 1, "expected exactly one publish");
     assert_eq!(
-        publishes[0].payload, "ok:42",
+        publishes[0].body.as_text().unwrap(),
+        "ok:42",
         "parsed u32 must be published as 'ok:42'"
     );
 }
@@ -178,14 +179,15 @@ fn config_get_parsed_absent_key_publishes_absent() {
 
     let envelope =
         directive_envelope(serde_json::json!({"cmd": "get_parsed", "key": "parsed-key"}));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     let publishes = match outcome {
         ProcessorOutcome::Ok { publishes: p, .. } => p,
         other => panic!("expected Ok, got: {other:?}"),
     };
     assert_eq!(publishes.len(), 1, "expected exactly one publish");
     assert_eq!(
-        publishes[0].payload, "absent",
+        publishes[0].body.as_text().unwrap(),
+        "absent",
         "absent key must publish 'absent'"
     );
 }
@@ -206,7 +208,7 @@ fn config_get_parsed_bad_value_returns_labeled_error() {
 
     let envelope =
         directive_envelope(serde_json::json!({"cmd": "get_parsed", "key": "parsed-key"}));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     // The fixture propagates the error from get_parsed, so the activation returns Err.
     match &outcome {
         ProcessorOutcome::Err(e) => {
@@ -232,14 +234,15 @@ fn config_require_present_ok() {
     let comp = load_config_component(config);
 
     let envelope = directive_envelope(serde_json::json!({"cmd": "require", "key": "req-key"}));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     let publishes = match outcome {
         ProcessorOutcome::Ok { publishes: p, .. } => p,
         other => panic!("expected Ok, got: {other:?}"),
     };
     assert_eq!(publishes.len(), 1, "expected exactly one publish");
     assert_eq!(
-        publishes[0].payload, "ok:required-value",
+        publishes[0].body.as_text().unwrap(),
+        "ok:required-value",
         "require on present key must publish 'ok:<value>'"
     );
 }
@@ -256,7 +259,7 @@ fn config_require_absent_key_returns_labeled_error() {
     let comp = load_config_component(HashMap::new());
 
     let envelope = directive_envelope(serde_json::json!({"cmd": "require", "key": "req-key"}));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     match &outcome {
         ProcessorOutcome::Err(e) => {
             let diag = format!("{e:?}");

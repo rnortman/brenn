@@ -416,14 +416,15 @@ use serde::{Deserialize, Serialize};
 /// Why a buffered publish was refused, returned synchronously to the component
 /// from inside its activation entry.
 ///
-/// The three tags are `processor.wit`'s publish-error tags, so a component's
-/// publish-error vocabulary does not change with its hosting. `InvalidPayload`
-/// is deliberately narrower here: the WIT variant carries a diagnostic string
-/// and this one does not, because the page's wire form ([`publish_status_str`])
-/// is a bare tag. Refusal is an answer, never a failure: a refused publish is
-/// simply not buffered, the rest of the buffer is intact, and the activation
-/// continues. What to do about it is the component's decision, as
-/// it is on the backend.
+/// The variants are `processor-0.2.wit`'s publish-error variants, of which
+/// `processor.wit`'s are a subset, so a component's publish-error vocabulary
+/// does not change with its hosting. A variant that carries a diagnostic in the
+/// WIT carries it here; [`publish_status_str`] is the bare tag. A component on
+/// `brenn:processor@0.1.0` publishes untyped text, which draws neither
+/// `InvalidBody` nor `TextOnlyChannel`. Refusal is an answer, never a failure:
+/// a refused publish is simply not buffered, the rest of the buffer is intact,
+/// and the activation continues. What to do about it is the component's
+/// decision, as it is on the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishError {
     /// The port is not a bound output of this instance. The component named a
@@ -431,12 +432,18 @@ pub enum PublishError {
     NotPermitted,
     /// The body exceeds the surface's publish-body cap. The cap applies to every
     /// class, `local:` included: a component's body-size contract must not change
-    /// because an operator rebound its output.
-    InvalidPayload,
+    /// because an operator rebound its output. Carries the gate's account.
+    InvalidPayload(String),
     /// A budget is exhausted — this activation's per-activation cap
     /// (publishes / bytes / calls) or the port's own millitoken sink bucket.
     /// Buckets refill per activation, so the next activation may well succeed.
     QuotaExceeded,
+    /// The body is malformed: the content type is not a well-formed media
+    /// type, or a text body is not UTF-8. Carries which.
+    InvalidBody(String),
+    /// The body is not text, and the port's channel is not declared
+    /// `non_text`.
+    TextOnlyChannel,
 }
 
 /// Why a buffered deferred-message control op (cancel / edit) was refused,
@@ -465,13 +472,19 @@ pub enum DeferError {
     /// An edit's release time is not a representable timestamp. Refused here
     /// rather than left to collapse into an immediate release downstream.
     InvalidDeliverAfter,
+    /// An edit body is refused as [`PublishError::InvalidBody`] refuses a
+    /// published one. Carries why.
+    InvalidBody(String),
+    /// An edit body is not text, as [`PublishError::TextOnlyChannel`].
+    TextOnlyChannel,
 }
 
 /// Why a component's synchronous call to a peer did not answer.
 ///
-/// The `processor.wit` `call-error` variants verbatim — a component's call-error
-/// vocabulary does not change with its hosting, and the backend host maps the
-/// same [`brenn_activation::sync::SyncAnswer`] onto the same six words.
+/// The `processor-0.2.wit` `call-error` variants verbatim, of which
+/// `processor.wit`'s six are a subset — a component's call-error vocabulary
+/// does not change with its hosting, and the backend host maps the same
+/// [`brenn_activation::sync::SyncAnswer`] onto the same words.
 ///
 /// Note which of these are answers and which are deployment facts. `unwired` and
 /// `refused` say something about the document or the peer's state, not about the
@@ -492,19 +505,25 @@ pub enum CallError {
     /// The peer ran and did not answer ok: it erred or trapped, and its buffer
     /// flushed nothing.
     Failed,
-    /// The payload failed host validation. Carries the host's account of why,
-    /// which is the one call-error variant with a payload.
+    /// The payload failed host validation. Carries the host's account of why.
     InvalidPayload(String),
     /// The activation's call budget — shared with publishes — is exhausted.
     QuotaExceeded,
+    /// The request body is malformed, as [`PublishError::InvalidBody`]'s first
+    /// meaning. Carries why.
+    InvalidBody(String),
+    /// The request body is not text and the peer is on
+    /// `brenn:processor@0.1.0`, which cannot be handed one. The peer did not
+    /// run.
+    TextOnlyPeer,
 }
 
 /// The WIT `call-error` wire string for one refused call.
 ///
 /// The single executable definition of the values, shared by the kernel that
 /// writes them and the guest glue that lifts them, so the seam cannot drift by
-/// hand-copied literal. `invalid-payload`'s own detail string is carried beside
-/// the tag rather than in it, exactly as the WIT variant carries it.
+/// hand-copied literal. A variant's detail string is carried beside the tag
+/// rather than in it, exactly as the WIT variant carries it.
 pub fn call_error_str(error: &CallError) -> &'static str {
     match error {
         CallError::NotPermitted => "not-permitted",
@@ -513,6 +532,8 @@ pub fn call_error_str(error: &CallError) -> &'static str {
         CallError::Failed => "failed",
         CallError::InvalidPayload(_) => "invalid-payload",
         CallError::QuotaExceeded => "quota-exceeded",
+        CallError::InvalidBody(_) => "invalid-body",
+        CallError::TextOnlyPeer => "text-only-peer",
     }
 }
 
@@ -552,12 +573,14 @@ pub const ENTRY_REPLY_FIELD: &str = "reply";
 /// single executable definition of the values, shared by the kernel that writes
 /// them and the guest glue that reads them, so the seam cannot drift by
 /// hand-copied literal.
-pub fn publish_status_str(status: Result<(), PublishError>) -> &'static str {
+pub fn publish_status_str(status: &Result<(), PublishError>) -> &'static str {
     match status {
         Ok(()) => "ok",
         Err(PublishError::NotPermitted) => "not-permitted",
-        Err(PublishError::InvalidPayload) => "invalid-payload",
+        Err(PublishError::InvalidPayload(_)) => "invalid-payload",
         Err(PublishError::QuotaExceeded) => "quota-exceeded",
+        Err(PublishError::InvalidBody(_)) => "invalid-body",
+        Err(PublishError::TextOnlyChannel) => "text-only-channel",
     }
 }
 
@@ -788,13 +811,15 @@ pub fn dom_attribute_value_allowed(name: &str, value: &str) -> bool {
 /// The single executable definition of the values, shared by the kernel that writes
 /// them and the SDK that reads them, so the seam cannot drift by hand-copied
 /// literal.
-pub fn defer_status_str(status: Result<(), DeferError>) -> &'static str {
+pub fn defer_status_str(status: &Result<(), DeferError>) -> &'static str {
     match status {
         Ok(()) => "ok",
         Err(DeferError::NotPermitted) => "not-permitted",
         Err(DeferError::OutOfRange) => "out-of-range",
         Err(DeferError::QuotaExceeded) => "quota-exceeded",
         Err(DeferError::InvalidDeliverAfter) => "invalid-deliver-after",
+        Err(DeferError::InvalidBody(_)) => "invalid-body",
+        Err(DeferError::TextOnlyChannel) => "text-only-channel",
     }
 }
 
@@ -947,29 +972,37 @@ mod tests {
         // Same argument as the publish status: the kernel writes these and the
         // guest glue lifts them across the component boundary, so the two halves
         // agree only if the mapping is one function.
-        assert_eq!(defer_status_str(Ok(())), "ok");
+        assert_eq!(defer_status_str(&Ok(())), "ok");
         assert_eq!(
-            defer_status_str(Err(DeferError::NotPermitted)),
+            defer_status_str(&Err(DeferError::NotPermitted)),
             "not-permitted"
         );
         assert_eq!(
-            defer_status_str(Err(DeferError::OutOfRange)),
+            defer_status_str(&Err(DeferError::OutOfRange)),
             "out-of-range"
         );
         assert_eq!(
-            defer_status_str(Err(DeferError::QuotaExceeded)),
+            defer_status_str(&Err(DeferError::QuotaExceeded)),
             "quota-exceeded"
         );
         assert_eq!(
-            defer_status_str(Err(DeferError::InvalidDeliverAfter)),
+            defer_status_str(&Err(DeferError::InvalidDeliverAfter)),
             "invalid-deliver-after"
+        );
+        assert_eq!(
+            defer_status_str(&Err(DeferError::InvalidBody("not UTF-8".to_string()))),
+            "invalid-body"
+        );
+        assert_eq!(
+            defer_status_str(&Err(DeferError::TextOnlyChannel)),
+            "text-only-channel"
         );
     }
 
     #[test]
     fn call_error_strings_are_frozen() {
         // Same argument as the publish and defer statuses, with one more party:
-        // the backend host lifts the identical six words out of its own bindgen
+        // the backend host lifts the identical words out of its own bindgen
         // enum, so a rename here is a component seeing two vocabularies for one
         // facility depending on where it was placed.
         assert_eq!(call_error_str(&CallError::NotPermitted), "not-permitted");
@@ -981,6 +1014,11 @@ mod tests {
             "invalid-payload"
         );
         assert_eq!(call_error_str(&CallError::QuotaExceeded), "quota-exceeded");
+        assert_eq!(
+            call_error_str(&CallError::InvalidBody("not UTF-8".to_string())),
+            "invalid-body"
+        );
+        assert_eq!(call_error_str(&CallError::TextOnlyPeer), "text-only-peer");
     }
 
     /// A gesture body with every detail object present.
@@ -1228,17 +1266,25 @@ mod tests {
         // The kernel writes these and the guest glue lifts them across the
         // component boundary, so the two halves only agree if the mapping is one
         // function.
-        assert_eq!(publish_status_str(Ok(())), "ok");
+        assert_eq!(publish_status_str(&Ok(())), "ok");
         assert_eq!(
-            publish_status_str(Err(PublishError::NotPermitted)),
+            publish_status_str(&Err(PublishError::NotPermitted)),
             "not-permitted"
         );
         assert_eq!(
-            publish_status_str(Err(PublishError::InvalidPayload)),
+            publish_status_str(&Err(PublishError::InvalidPayload("too big".to_string()))),
             "invalid-payload"
         );
         assert_eq!(
-            publish_status_str(Err(PublishError::QuotaExceeded)),
+            publish_status_str(&Err(PublishError::InvalidBody("not UTF-8".to_string()))),
+            "invalid-body"
+        );
+        assert_eq!(
+            publish_status_str(&Err(PublishError::TextOnlyChannel)),
+            "text-only-channel"
+        );
+        assert_eq!(
+            publish_status_str(&Err(PublishError::QuotaExceeded)),
             "quota-exceeded"
         );
     }

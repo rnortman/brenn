@@ -788,6 +788,8 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -1067,13 +1069,14 @@ mod tests {
             .append(crate::store::NewMessage {
                 source: "node".to_string(),
                 sender: "test-sender".to_string(),
-                body: "hello".to_string(),
+                body: "hello".into(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
                 reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: crate::db::utc_to_ns(chrono::Utc::now()),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
             })
             .await;
 
@@ -1082,7 +1085,7 @@ mod tests {
             delivery
                 .messages
                 .iter()
-                .map(|e| e.body.as_str())
+                .map(|e| e.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["hello"],
             "the ring window served the conversation its unseen suffix"
@@ -1673,6 +1676,8 @@ mod tests {
                 noise: None,
                 sink: None,
                 wake_min: None,
+                non_text: false,
+                untyped_content_type: None,
             }],
             &global,
         );
@@ -1916,7 +1921,7 @@ mod tests {
                 uuid,
                 "src",
                 "someone",
-                body,
+                &body.into(),
                 Urgency::Normal,
                 ChannelScheme::Brenn,
                 None,
@@ -1993,7 +1998,7 @@ mod tests {
                 uuid,
                 "src",
                 "someone",
-                "owed",
+                &"owed".into(),
                 Urgency::Normal,
                 ChannelScheme::Brenn,
                 None,
@@ -2098,7 +2103,7 @@ mod tests {
                 uuid,
                 "src",
                 "someone",
-                body,
+                &body.into(),
                 Urgency::Normal,
                 ChannelScheme::Brenn,
                 None,

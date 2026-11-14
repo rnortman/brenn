@@ -63,7 +63,7 @@ async fn call(
         subscriber,
         SyncRequest {
             port: port.to_string(),
-            body: body.to_string(),
+            body: MessageBody::text(body.to_string()),
             chain: vec![],
             reply,
         },
@@ -95,7 +95,8 @@ async fn a_sync_call_is_one_ordinary_activation_plus_a_reply() {
         panic!("the callee answered ok with a reply, got {answer:?}");
     };
     let summary: serde_json::Value =
-        serde_json::from_str(&reply).expect("the reply is the fixture's summary");
+        serde_json::from_str(reply.as_text().expect("the reply is text"))
+            .expect("the reply is the fixture's summary");
     let ports: Vec<&str> = summary
         .as_array()
         .expect("the summary is an array")
@@ -276,7 +277,7 @@ async fn a_target_in_its_own_chain_is_a_host_panic() {
         &wasm_sub,
         SyncRequest {
             port: "ask".to_string(),
-            body: "__reply__".to_string(),
+            body: MessageBody::text("__reply__".to_string()),
             chain: vec!["someone-else".to_string(), slug.to_string()],
             reply,
         },
@@ -310,7 +311,7 @@ async fn requests_pending_at_stop_are_refused_unregistered() {
         let (reply, answer) = tokio::sync::oneshot::channel();
         tx.send(SyncRequest {
             port: port.to_string(),
-            body: "hello".to_string(),
+            body: MessageBody::text("hello".to_string()),
             chain: vec![],
             reply,
         })
@@ -332,7 +333,7 @@ async fn requests_pending_at_stop_are_refused_unregistered() {
     assert!(
         tx.send(SyncRequest {
             port: "ask".to_string(),
-            body: "late".to_string(),
+            body: MessageBody::text("late".to_string()),
             chain: vec![],
             reply,
         })
@@ -367,7 +368,7 @@ async fn a_stopping_task_refuses_the_requests_it_will_not_serve() {
         sync_tx
             .send(SyncRequest {
                 port: "ask".to_string(),
-                body: "__reply__".to_string(),
+                body: MessageBody::text("__reply__".to_string()),
                 chain: vec![],
                 reply,
             })
@@ -412,7 +413,7 @@ async fn the_consumer_task_serves_a_request_from_its_own_loop() {
     sync_tx
         .send(SyncRequest {
             port: "ask".to_string(),
-            body: "__reply__".to_string(),
+            body: MessageBody::text("__reply__".to_string()),
             chain: vec![],
             reply,
         })
@@ -455,7 +456,7 @@ async fn a_request_queued_before_the_task_starts_is_served_after_the_mount() {
     sync_tx
         .send(SyncRequest {
             port: "ask".to_string(),
-            body: "__reply__".to_string(),
+            body: MessageBody::text("__reply__".to_string()),
             chain: vec![],
             reply,
         })
@@ -467,6 +468,7 @@ async fn a_request_queued_before_the_task_starts_is_served_after_the_mount() {
     let SyncAnswer::Ok(Some(reply)) = answer else {
         panic!("the queued request was served and answered, got {answer:?}");
     };
+    let reply = reply.as_text().expect("the reply is text");
     assert!(
         reply.contains("\"port\":\"ask\""),
         "the answer came from the request's own activation: {reply}"

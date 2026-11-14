@@ -1,14 +1,42 @@
 package brenn:processor@0.1.0;
 
-/// External ABI — out-of-tree components are first-class consumers of this
-/// interface.
+/// The string component contract. External ABI — out-of-tree components are
+/// first-class consumers of this interface.
 ///
-/// Evolution is **additive-import-only**: a new capability is a new interface,
-/// and no existing shape moves. This is a runtime contract — a host links a
-/// component built against some earlier commit of this world, so a cut here is
-/// a boot refusal on a machine neither side chose. Breaking it is a deliberate
-/// coordinated event: every out-of-tree component is rebuilt against the new
-/// world before the host that needs it is released.
+/// This is a runtime contract: a host links a component built against some
+/// earlier commit of this world, so a cut here is a boot refusal on a machine
+/// neither side chose. A new capability is a new interface. A breaking change
+/// to a shape is a new version of the interfaces that change, and of no
+/// other: an interface's version is the version at which its shape last
+/// changed. A contract is told by the version of the interface carrying the
+/// activation: `types@0.1.0` for this string contract, `bus@0.2.0` for the
+/// byte-carrying contract, which `processor-0.2.wit` holds and which imports
+/// every interface whose shape it does not change from this file.
+///
+/// brenn releases first and serves the old and the new contract together for
+/// a period; components follow on their own schedule. That period is now
+/// running for the string contract: the string contract is served by the
+/// release that declares `brenn:processor@0.2.0` stable and by the three brenn
+/// releases after it, and no release before the fourth after it removes it.
+/// The declaring release is the one whose `CHANGELOG.md` heading holds the
+/// entry "`brenn:processor@0.2.0` is stable"; a release is a `v*` tag with its
+/// own `CHANGELOG.md` heading. Removal also waits until the known out-of-tree
+/// component repositories have moved (`docs/component-packages.md`, *Contract
+/// evolution*); that can lengthen the period and never shortens it.
+///
+/// What is removed is the string contract and nothing else in this file: this
+/// world, the activation records of `types`, `ports@0.1.0` and `calls@0.1.0`.
+/// Every other interface here stays as it is — it is what a
+/// `brenn:processor@0.2.0` component imports. After removal a host refuses a
+/// string-contract artifact at load. A component moves by rebuilding against
+/// `brenn:processor@0.2.0`: on `brenn-guest`, at a brenn pin at or after the
+/// declaring release; with raw bindings, over both files with the world
+/// `brenn:processor/processor@0.2.0`.
+///
+/// `brenn:processor@0.2.0` is STABLE: its shapes do not change, a breaking
+/// change to it would be a new version served beside it, and brenn does not
+/// stop serving it without an announced removal period. `processor-0.2.wit`
+/// states the promise and how the contract grows without a new version.
 ///
 /// `examples/component/` is the in-repository canary that a change to the
 /// world is complete on this side.
@@ -553,7 +581,9 @@ interface calls {
     /// runs to completion, and its ok flushes its buffer, before this returns —
     /// a caller that later errs or traps does not retract it (the same rule as
     /// `mqtt.mqtt-publish`). A `port` the specification does not declare traps
-    /// the activation, as in `ports.publish`.
+    /// the activation, as in `ports.publish`. A reply that is not text, which
+    /// only a peer built against a byte-carrying contract can give, traps the
+    /// activation too; the peer has run and its buffer is flushed.
     ///
     /// The peer's activation is an ordinary one plus a return obligation: it
     /// reads whatever its own bound ports hold, and its publishes go to its own

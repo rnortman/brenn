@@ -156,6 +156,29 @@ pub struct SurfaceDescriptionRuntime {
     pub config_channel: String,
 }
 
+/// The transportable channels a session of `surface` may subscribe or publish
+/// besides its bindings: its config, geometry and status channels, and the
+/// surface error channel when one is configured.
+///
+/// The one statement of that set outside the profile, for whoever must know
+/// every directory entry an attached page can name — a reload that would
+/// replace one of them closes the surface's sessions first.
+pub fn platform_channels(
+    prefix: &str,
+    error_channel: Option<&str>,
+    surface: &ResolvedSurface,
+) -> Vec<String> {
+    let slug = &surface.slug;
+    [
+        description::surface_config_channel(prefix, slug),
+        description::surface_geometry_channel(prefix, slug),
+        description::surface_status_channel(prefix, slug),
+    ]
+    .into_iter()
+    .chain(error_channel.map(str::to_string))
+    .collect()
+}
+
 /// Assert that a channel the wire maps hold is transportable — the one channel
 /// characteristic the surface bridge is allowed to see, because only
 /// transportable channels cross the websocket at all.
@@ -350,7 +373,8 @@ pub struct SurfaceRoots {
 pub const WITHHELD_ALERT_TITLE: &str = "surface kind withheld";
 
 /// One installed kind this host will not serve: where it is, what its record
-/// declares, and why that is not readable here.
+/// declares, and why that record, or a `brenn:processor@0.2.0` artifact that
+/// does not have the contract's shape, is not served here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WithheldKind {
     /// The mount offering this kind, as its root list names it.
@@ -359,9 +383,10 @@ pub struct WithheldKind {
     pub root: std::path::PathBuf,
     /// The schema version the record declares.
     pub record_v: u32,
-    /// One sentence naming both versions and the migration. It is what the
-    /// alert carries, what the page manifest hands the kernel, and what the
-    /// kind's description documents state.
+    /// One sentence naming the cause (a record version this host does not
+    /// read, or an artifact without the component contract's shape) and the migration. It is what the alert
+    /// carries, what the page manifest hands the kernel, and what the kind's
+    /// description documents state.
     pub reason: String,
 }
 
@@ -456,6 +481,10 @@ pub struct KindRoot {
     /// than re-read per request — the record was already read and walked at
     /// scan time, and a page render must not touch the filesystem.
     pub cores: Vec<String>,
+    /// The component contract the kind's artifact is built against, read off
+    /// its record. The page manifest carries it so the page builds the
+    /// instance's imports and entry in that contract's shape.
+    pub contract: brenn_envelope::grants::ProcessorContract,
 }
 
 impl KindRoot {
@@ -469,6 +498,7 @@ impl KindRoot {
             source_sha256: String::new(),
             spec_sha256: String::new(),
             cores: Vec::new(),
+            contract: brenn_envelope::grants::ProcessorContract::V0_1,
         }
     }
 
@@ -478,6 +508,17 @@ impl KindRoot {
     pub fn for_test_with_cores(root: impl Into<std::path::PathBuf>, cores: &[&str]) -> Self {
         let mut held = Self::for_test(root.into());
         held.cores = cores.iter().map(|core| (*core).to_string()).collect();
+        held
+    }
+
+    /// A kind root on `contract`, for tests that exercise the page manifest.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn for_test_with_contract(
+        root: impl Into<std::path::PathBuf>,
+        contract: brenn_envelope::grants::ProcessorContract,
+    ) -> Self {
+        let mut held = Self::for_test(root.into());
+        held.contract = contract;
         held
     }
 
@@ -521,6 +562,12 @@ impl SurfaceRoots {
         self.kinds.get(kind).map(|held| held.cores.as_slice())
     }
 
+    /// The component contract one served kind is built against, or `None`
+    /// where no installed root offers the kind.
+    pub fn kind_contract(&self, kind: &str) -> Option<brenn_envelope::grants::ProcessorContract> {
+        self.kinds.get(kind).map(|held| held.contract)
+    }
+
     /// Every kind on which `self` and `other` disagree, keyed by kind name.
     ///
     /// `self` is the set held — what is being served — and `other` the set just
@@ -528,7 +575,8 @@ impl SurfaceRoots {
     /// installation in both, which is what makes this map the closure input for
     /// "which surfaces does an installed tree move".
     ///
-    /// Withheld kinds are compared too, on their record version and their tree:
+    /// Withheld kinds are compared too, on their record version, their tree and
+    /// their reason:
     /// a kind withheld on both sides whose bundle was re-installed is a change
     /// an operator just made, and everything a reader says about it — the page
     /// manifest's reason, the description documents, the alert — is derived
@@ -576,7 +624,10 @@ impl SurfaceRoots {
                 // Withheld here and served there is already `Offered` above.
                 continue;
             };
-            if now.record_v == held.record_v && now.root == held.root {
+            // The reason is compared because a stale artifact
+            // replaced in place by a differently stale one keeps both the
+            // record version and the tree.
+            if now.record_v == held.record_v && now.root == held.root && now.reason == held.reason {
                 continue;
             }
             let difference = if now.mount == held.mount {
@@ -729,7 +780,10 @@ pub fn validate_surface_assets_in(
     // of two root sets see the upgrade that installed it. The artifact digests
     // are not run here — hashing a whole component nothing runs would be paid
     // again on every reload for a tree no page can reach — they run below, per
-    // instantiated kind.
+    // instantiated kind. The type check of a 0.2.0 artifact does
+    // run here, inside the record read: it decides between served and
+    // withheld, and a kind that moved between the two without its bytes
+    // changing would read to the next comparison as withdrawn.
     let mut manifests: HashMap<String, processor_assets::ProcessorManifest> = HashMap::new();
     let mut kinds: std::collections::BTreeMap<String, KindRoot> = std::collections::BTreeMap::new();
     let mut withheld: std::collections::BTreeMap<String, WithheldKind> =
@@ -738,14 +792,14 @@ pub fn validate_surface_assets_in(
         let manifest = match processor_assets::read_processor_record_or_version_in(cx, &root, &kind)
         {
             Ok(manifest) => manifest,
-            Err(record_v) => {
-                let reason = processor_assets::version_mismatch_reason(&kind, record_v);
+            Err(processor_assets::UnservedRecord { record_v, reason }) => {
                 // brenn's own surface tree travels in one tarball with the
                 // kernel and the binary and is installed as a sync, so a record
-                // the binary beside it cannot read is a broken install and
+                // the binary beside it cannot serve is a broken install and
                 // nothing an operator can converge. Under any other declared
-                // mount it is the ordinary middle of a rolling upgrade: the
-                // bundle is authored on its own schedule, and a host that
+                // mount it is the ordinary middle of a rolling upgrade, or a
+                // bundle built against a contract this host does not serve yet:
+                // the bundle is authored on its own schedule, and a host that
                 // cannot start until every third party has shipped is not
                 // deployable.
                 assert!(root != kernel.root, "{when}: {reason}{verdict}");
@@ -776,6 +830,7 @@ pub fn validate_surface_assets_in(
             root = %root.display(),
             spec_sha256 = %manifest.spec_sha256,
             source_sha256 = %manifest.source_sha256,
+            contract = %processor_assets::record_contract(&manifest),
             "surface processor kind resolved"
         );
         kinds.insert(
@@ -786,6 +841,7 @@ pub fn validate_surface_assets_in(
                 source_sha256: manifest.source_sha256.clone(),
                 spec_sha256: manifest.spec_sha256.clone(),
                 cores: manifest.cores(&kind),
+                contract: processor_assets::record_contract(&manifest),
             },
         );
         manifests.insert(kind, manifest);
@@ -845,6 +901,15 @@ pub fn validate_surface_assets_in(
                 &comp.kind,
                 manifest,
                 &comp.grants,
+            );
+            processor_assets::assert_contract_carries_bound_channels(
+                cx,
+                surface,
+                &comp.instance,
+                &comp.kind,
+                roots
+                    .kind_contract(&comp.kind)
+                    .expect("the kind resolved to a manifest, so it is in the served map"),
             );
             assert_spec_bound(cx, &surface.slug, comp, &manifest.spec_sha256);
         }
@@ -1505,6 +1570,15 @@ mod tests {
                 },
             }],
             local_channels: vec![],
+            wire_channels: ["ephemeral:protobar-demo", "brenn:writer-out"]
+                .into_iter()
+                .map(
+                    |address| brenn_lib::messaging::config::ResolvedWireChannel {
+                        address: address.to_string(),
+                        non_text: false,
+                    },
+                )
+                .collect(),
             outputs: vec![SurfaceOutput {
                 channel_address: "brenn:writer-out".to_string(),
                 instance: "writer".to_string(),
@@ -1610,6 +1684,7 @@ mod tests {
         r.local_channels = vec![ResolvedLocalChannel {
             address: "local:page-bus".to_string(),
             ring_depth: 3,
+            non_text: false,
         }];
         r
     }
@@ -1647,6 +1722,7 @@ mod tests {
             vec![brenn_surface_schema::LocalChannel {
                 channel: "local:page-bus".to_string(),
                 ring_depth: 3,
+                non_text: false,
             }]
         );
 
@@ -1853,6 +1929,7 @@ mod tests {
         }];
         surface.subscriptions = vec![];
         surface.outputs = vec![];
+        surface.wire_channels = vec![];
         surface
     }
 
@@ -2045,6 +2122,537 @@ mod tests {
             &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
             &[],
         );
+    }
+
+    /// A real guest artifact staged as the fixtures stage it, workspace-relative
+    /// as every test target's runfiles tree is laid out.
+    fn real_artifact(name: &str) -> Vec<u8> {
+        let path = std::path::PathBuf::from(format!("brenn-wasm/target/components/{name}.wasm"));
+        std::fs::read(&path)
+            .unwrap_or_else(|err| panic!("the {name} artifact is unreadable at {path:?}: {err}"))
+    }
+
+    /// Install `kind` under `dist` as the real component `artifact`, with the
+    /// record the build would write for it: the artifact's own import profile.
+    fn write_real_kind(dist: &std::path::Path, kind: &str, artifact: &str) {
+        let path =
+            std::path::PathBuf::from(format!("brenn-wasm/target/components/{artifact}.wasm"));
+        write_processor_tree_from_bytes(
+            dist,
+            kind,
+            &real_artifact(artifact),
+            &spec_bytes_for(kind),
+            brenn_wasm::processor_component_imports(&path),
+            true,
+            |_| {},
+        );
+    }
+
+    const BYTES_ARTIFACT: &str = "brenn_processor_bytes_test";
+    const STALE_ARTIFACT: &str = "brenn_processor_stale_contract_test";
+
+    #[test]
+    fn a_byte_contract_kind_is_served_with_its_contract() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_real_kind(bundle.path(), "frames", BYTES_ARTIFACT);
+
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("frames-bundle", bundle.path())]),
+            &[],
+        );
+
+        assert_eq!(roots.withheld_kind("frames"), None);
+        assert_eq!(roots.kind_root("frames"), Some(bundle.path()));
+        assert_eq!(
+            roots.kind_contract("frames"),
+            Some(brenn_envelope::grants::ProcessorContract::V0_2)
+        );
+    }
+
+    #[test]
+    fn a_byte_and_a_string_contract_kind_are_served_under_one_mount() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_real_kind(bundle.path(), "frames", BYTES_ARTIFACT);
+        write_processor_tree(bundle.path(), "fleet", &["types", "ports"], |_| {});
+
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[],
+        );
+
+        assert!(roots.withheld.is_empty(), "{:?}", roots.withheld);
+        assert_eq!(
+            roots.kind_contract("frames"),
+            Some(brenn_envelope::grants::ProcessorContract::V0_2)
+        );
+        assert_eq!(
+            roots.kind_contract("fleet"),
+            Some(brenn_envelope::grants::ProcessorContract::V0_1)
+        );
+    }
+
+    /// An artifact built against a `bus` that is not the host's names only
+    /// interfaces the host serves; wasmtime refuses it on the type of its
+    /// `receive` export, and under a bundle's mount the kind is withheld with
+    /// that account while a string-contract kind beside it is served.
+    #[test]
+    fn a_stale_byte_contract_kind_under_a_bundle_mount_is_withheld() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_real_kind(bundle.path(), "frames", STALE_ARTIFACT);
+        write_processor_tree(bundle.path(), "fleet", &["types", "ports"], |_| {});
+
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[resolved_with_processor("deskbar", "frames")],
+        );
+
+        assert!(roots.kinds.contains_key("fleet"));
+        assert_eq!(roots.kind_root("frames"), None);
+        let held = roots.withheld_kind("frames").expect("frames is withheld");
+        assert_eq!(held.record_v, processor_assets::MANIFEST_VERSION);
+        assert_eq!(held.mount, "fleet-bundle");
+        assert_eq!(held.root, bundle.path());
+        assert!(
+            held.reason.contains("\"frames\"")
+                && held
+                    .reason
+                    .contains("component contract brenn:processor@0.2.0")
+                && held.reason.contains("type-checking export func `receive`")
+                && held.reason.contains("processor-0.2.wit"),
+            "the reason names the kind, the contract, wasmtime's account and the migration: {}",
+            held.reason
+        );
+    }
+
+    /// The same kind in brenn's own tree is a broken install, as a stale record
+    /// is there.
+    #[test]
+    #[should_panic(expected = "declares the component contract brenn:processor@0.2.0")]
+    fn a_stale_byte_contract_kind_under_brenns_own_mount_is_a_boot_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_real_kind(dir.path(), "frames", STALE_ARTIFACT);
+        validate_one_root(dir.path(), &[resolved_with_processor("deskbar", "frames")]);
+    }
+
+    /// The record-only read refuses it by the same reason, so no reader of a
+    /// single kind serves it either.
+    #[test]
+    #[should_panic(expected = "type-checking export func `receive`")]
+    fn the_record_read_refuses_a_stale_byte_contract_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_real_kind(dir.path(), "frames", STALE_ARTIFACT);
+        processor_assets::read_processor_record_in(AssetContext::BOOT, dir.path(), "frames");
+    }
+
+    /// The page-local channel the contract cases bind.
+    const STATE: &str = "local:deskbar/state";
+
+    /// The transportable channel the contract cases bind.
+    const FRAMES: &str = "ephemeral:deskbar-frames";
+
+    /// [`resolved_with_processor`] with the instance's `state` port bound to
+    /// [`STATE`] as an input, an output, or both, and the channel declared
+    /// `non_text` or not.
+    fn resolved_bound_to_state(
+        kind: &str,
+        input: bool,
+        output: bool,
+        non_text: bool,
+    ) -> ResolvedSurface {
+        resolved_bound_to(kind, STATE, input, output, non_text)
+    }
+
+    /// As [`resolved_bound_to_state`], on the transportable [`FRAMES`], whose
+    /// declaration is the directory's and rides in the wire table.
+    fn resolved_bound_to_frames(
+        kind: &str,
+        input: bool,
+        output: bool,
+        non_text: bool,
+    ) -> ResolvedSurface {
+        resolved_bound_to(kind, FRAMES, input, output, non_text)
+    }
+
+    /// [`resolved_with_processor`] with the instance's `state` port bound to
+    /// `channel`, declared in the table of its class.
+    fn resolved_bound_to(
+        kind: &str,
+        channel: &str,
+        input: bool,
+        output: bool,
+        non_text: bool,
+    ) -> ResolvedSurface {
+        let mut surface = resolved_with_processor("deskbar", kind);
+        let instance = surface.components[0].instance.clone();
+        if input {
+            surface.subscriptions.push(SurfaceBinding {
+                channel_address: channel.to_string(),
+                instance: instance.clone(),
+                port: "state".to_string(),
+                push_depth: 0,
+                retain_depth: 1,
+                noise: brenn_lib::messaging::config::NoiseLevel::Silent,
+            });
+        }
+        if output {
+            surface.outputs.push(SurfaceOutput {
+                channel_address: channel.to_string(),
+                instance,
+                port: "state".to_string(),
+                default_urgency: Urgency::Normal,
+                budget: brenn_budget::SinkBudget {
+                    fill_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
+                    capacity_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
+                },
+            });
+        }
+        if brenn_envelope::is_local_channel(channel) {
+            surface.local_channels = vec![brenn_lib::messaging::config::ResolvedLocalChannel {
+                address: channel.to_string(),
+                ring_depth: 1,
+                non_text,
+            }];
+        } else {
+            surface.wire_channels = vec![brenn_lib::messaging::config::ResolvedWireChannel {
+                address: channel.to_string(),
+                non_text,
+            }];
+        }
+        surface
+    }
+
+    /// A string-contract kind under brenn's own mount, which is served.
+    fn write_string_contract_kind(dir: &std::path::Path, kind: &str) {
+        write_kernel_pair(dir);
+        write_processor_tree(dir, kind, &["types", "ports"], |_| {});
+    }
+
+    /// The input arm: a 0.1.0 instance reading a `non_text` channel would be
+    /// handed a body its string lowering panics on.
+    #[test]
+    #[should_panic(
+        expected = "boot: [[surface]] \"deskbar\": component \"fleet-1\"'s input port \"state\" is \
+                    bound to local:deskbar/state, a page-local channel declared `non_text`, and \
+                    its kind \"fleet\" is built against brenn:processor@0.1.0, which carries only \
+                    text — drop `non_text` from the ports bound to that channel, or install a \
+                    build of the kind against brenn:processor@0.2.0. Refusing to start"
+    )]
+    fn a_string_contract_instance_reading_a_non_text_channel_refuses_the_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_state("fleet", true, false, true)],
+        );
+    }
+
+    /// The output arm: the instance reads its own parked messages back through
+    /// its deferred view, so writing the channel is enough.
+    #[test]
+    #[should_panic(
+        expected = "component \"fleet-1\"'s output port \"state\" is bound to \
+                               local:deskbar/state, a page-local channel declared `non_text`"
+    )]
+    fn a_string_contract_instance_writing_a_non_text_channel_refuses_the_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_state("fleet", false, true, true)],
+        );
+    }
+
+    #[test]
+    fn a_string_contract_instance_on_a_text_only_channel_is_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        let roots = validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_state("fleet", true, true, false)],
+        );
+        assert!(roots.kinds.contains_key("fleet"));
+    }
+
+    #[test]
+    fn a_byte_contract_instance_on_a_non_text_channel_is_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_real_kind(dir.path(), "frames", BYTES_ARTIFACT);
+        let mut surface = resolved_bound_to_state("frames", true, true, true);
+        surface.components[0].grants = [
+            brenn_lib::messaging::ComponentGrant::Ports,
+            brenn_lib::messaging::ComponentGrant::Calls,
+        ]
+        .into();
+        let roots = validate_one_root(dir.path(), &[surface]);
+        assert_eq!(
+            roots.kind_contract("frames"),
+            Some(brenn_envelope::grants::ProcessorContract::V0_2)
+        );
+    }
+
+    /// A withheld kind is not served, so its instance's bindings are not
+    /// judged against a contract nobody can read off its record.
+    #[test]
+    fn an_instance_of_a_withheld_kind_on_a_non_text_channel_is_not_judged() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[resolved_bound_to_state("fleet", true, true, true)],
+        );
+        assert!(roots.withheld.contains_key("fleet"));
+    }
+
+    /// At reload the same rule is framed as a refusal: the caller catches the
+    /// panic, and the message names no restart.
+    #[test]
+    fn the_contract_refusal_at_reload_names_no_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        let mounts = mount_roots(&[("brenn", dir.path())]);
+        let surfaces = [resolved_bound_to_state("fleet", true, false, true)];
+        let payload = std::panic::catch_unwind(|| {
+            validate_surface_assets_in(AssetContext::RELOAD, &mounts, &surfaces)
+        })
+        .expect_err("the reload is refused");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("a formatted panic message");
+        assert!(
+            message.starts_with("reload: [[surface]] \"deskbar\"")
+                && message.contains("brenn:processor@0.1.0")
+                && message.ends_with("brenn:processor@0.2.0."),
+            "{message}"
+        );
+    }
+
+    /// The input arm on a transportable channel: the declaration is the
+    /// directory's, so the fix names the binding, not the port's statement.
+    #[test]
+    #[should_panic(
+        expected = "boot: [[surface]] \"deskbar\": component \"fleet-1\"'s input port \"state\" is \
+                    bound to ephemeral:deskbar-frames, a channel declared `non_text`, and its \
+                    kind \"fleet\" is built against brenn:processor@0.1.0, which carries only \
+                    text — bind the port to a text-only channel, or install a build of the kind \
+                    against brenn:processor@0.2.0. Refusing to start"
+    )]
+    fn a_string_contract_instance_reading_a_non_text_wire_channel_refuses_the_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_frames("fleet", true, false, true)],
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "component \"fleet-1\"'s output port \"state\" is bound to \
+                    ephemeral:deskbar-frames, a channel declared `non_text`"
+    )]
+    fn a_string_contract_instance_writing_a_non_text_wire_channel_refuses_the_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_frames("fleet", false, true, true)],
+        );
+    }
+
+    #[test]
+    fn a_string_contract_instance_on_a_text_only_wire_channel_is_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        let roots = validate_one_root(
+            dir.path(),
+            &[resolved_bound_to_frames("fleet", true, true, false)],
+        );
+        assert!(roots.kinds.contains_key("fleet"));
+    }
+
+    #[test]
+    fn a_byte_contract_instance_on_a_non_text_wire_channel_is_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_real_kind(dir.path(), "frames", BYTES_ARTIFACT);
+        let mut surface = resolved_bound_to_frames("frames", true, true, true);
+        surface.components[0].grants = [
+            brenn_lib::messaging::ComponentGrant::Ports,
+            brenn_lib::messaging::ComponentGrant::Calls,
+        ]
+        .into();
+        let roots = validate_one_root(dir.path(), &[surface]);
+        assert_eq!(
+            roots.kind_contract("frames"),
+            Some(brenn_envelope::grants::ProcessorContract::V0_2)
+        );
+    }
+
+    #[test]
+    fn an_instance_of_a_withheld_kind_on_a_non_text_wire_channel_is_not_judged() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[resolved_bound_to_frames("fleet", true, true, true)],
+        );
+        assert!(roots.withheld.contains_key("fleet"));
+    }
+
+    #[test]
+    fn the_wire_channel_contract_refusal_at_reload_names_no_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_string_contract_kind(dir.path(), "fleet");
+        let mounts = mount_roots(&[("brenn", dir.path())]);
+        let surfaces = [resolved_bound_to_frames("fleet", false, true, true)];
+        let payload = std::panic::catch_unwind(|| {
+            validate_surface_assets_in(AssetContext::RELOAD, &mounts, &surfaces)
+        })
+        .expect_err("the reload is refused");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("a formatted panic message");
+        assert!(
+            message.starts_with("reload: [[surface]] \"deskbar\"")
+                && message.contains("ephemeral:deskbar-frames, a channel declared `non_text`")
+                && message.ends_with("brenn:processor@0.2.0."),
+            "{message}"
+        );
+    }
+
+    /// A record an older brenn's build wrote, byte for byte as the emitter
+    /// writes it, is read as it always was: the kind is on 0.1.0, and its
+    /// artifact — here bytes that are not a component — is never opened.
+    #[test]
+    fn a_record_an_older_pin_wrote_for_a_string_contract_kind_is_served() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        let dir = processor_assets::kind_dir(bundle.path(), "fleet");
+        std::fs::create_dir_all(&dir).expect("create kind dir");
+        let component = b"placeholder bytes, not a component";
+        std::fs::write(dir.join("fleet.component.wasm"), component).expect("write");
+        std::fs::write(dir.join("fleet.js"), b"export function instantiate() {}").expect("write");
+        std::fs::write(dir.join("fleet.spec.brenn"), spec_bytes_for("fleet")).expect("write");
+        let record = format!(
+            "{{\n  \"v\": 3,\n  \"kind\": \"fleet\",\n  \"source_sha256\": \"{}\",\n  \
+             \"jco_version\": \"1.4.0\",\n  \"spec\": \"fleet.spec.brenn\",\n  \
+             \"spec_sha256\": \"{}\",\n  \"imports\": [\"brenn:processor/ports\", \
+             \"brenn:processor/types\"],\n  \"files\": [\"fleet.component.wasm\", \"fleet.js\", \
+             \"fleet.spec.brenn\"]\n}}\n",
+            brenn_lib::util::sha256_hex(component),
+            fixture_spec_hash("fleet"),
+        );
+        std::fs::write(dir.join("manifest.json"), record).expect("write record");
+
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[],
+        );
+
+        assert_eq!(roots.withheld_kind("fleet"), None);
+        assert_eq!(
+            roots.kind_contract("fleet"),
+            Some(brenn_envelope::grants::ProcessorContract::V0_1)
+        );
+    }
+
+    /// A record naming `bus` is held to its artifact, not served on its word:
+    /// placeholder bytes that are not a component are refused by name.
+    #[test]
+    fn a_kind_naming_bus_with_placeholder_bytes_is_unserved() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "frames", &["bus", "ports"], |_| {});
+
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("frames-bundle", bundle.path())]),
+            &[],
+        );
+
+        assert_eq!(roots.kind_contract("frames"), None);
+        let held = roots.withheld_kind("frames").expect("frames is withheld");
+        assert!(
+            held.reason.contains("refused by import name")
+                && held.reason.contains("is not a loadable component"),
+            "{}",
+            held.reason
+        );
+        let root = bundle.path().to_str().expect("a UTF-8 tempdir");
+        assert!(
+            !held.reason.contains(root),
+            "the reason pages are served names no server path: {}",
+            held.reason
+        );
+    }
+
+    /// An artifact the server cannot read is a broken install, not a stale
+    /// contract: the scan panics naming the read, under a bundle mount too.
+    #[test]
+    #[should_panic(expected = "source artifact frames.component.wasm is unreadable")]
+    fn a_byte_contract_kind_whose_artifact_is_unreadable_is_a_panic_not_a_withheld_kind() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "frames", &["bus", "ports"], |_| {});
+        let artifact =
+            processor_assets::kind_dir(bundle.path(), "frames").join("frames.component.wasm");
+        std::fs::remove_file(&artifact).expect("remove the artifact");
+        std::fs::create_dir(&artifact).expect("a directory where the artifact was");
+
+        validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("frames-bundle", bundle.path())]),
+            &[],
+        );
+    }
+
+    /// A stale artifact replaced in place by a differently stale
+    /// one keeps the record version and the tree; the reason is what moved.
+    #[test]
+    fn a_withheld_kind_whose_reason_changed_is_a_difference() {
+        let withheld = |reason: &str| SurfaceRoots {
+            kernel: Some(KernelRoot::for_test("/kernel")),
+            kinds: Default::default(),
+            withheld: [(
+                "frames".to_string(),
+                WithheldKind {
+                    mount: "frames-bundle".to_string(),
+                    root: std::path::PathBuf::from("/bundle"),
+                    record_v: processor_assets::MANIFEST_VERSION,
+                    reason: reason.to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let held = withheld("refused by export type: one shape");
+        let now = withheld("refused by import type: another shape");
+        assert!(
+            matches!(
+                held.kind_differences(&now).get("frames"),
+                Some(KindDifference::Reinstalled { mount, .. }) if mount == "frames-bundle"
+            ),
+            "{:?}",
+            held.kind_differences(&now),
+        );
+        assert!(held.kind_differences(&held.clone()).is_empty());
     }
 
     /// A kind in neither map is still the configuration error it was: withheld
@@ -2275,11 +2883,28 @@ mod tests {
         );
     }
 
+    /// The manifest lists `bus` so the refusal is proved for a
+    /// `brenn:processor@0.2.0` kind, where the `store` test above proves it for
+    /// a 0.1.0 one.
+    #[test]
+    #[should_panic(
+        expected = "imports \"brenn:processor/blobs\", which no surface can satisfy — it is backend-only"
+    )]
+    fn validate_surface_assets_panics_on_backend_only_blobs_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "blobs-rt", &["bus", "ports", "blobs"], |_| {});
+        validate_one_root(
+            dir.path(),
+            &[resolved_with_processor("deskbar", "blobs-rt")],
+        );
+    }
+
     /// The real backend fixture `processor-store-rt`, laid out as a deployed
     /// surface tree from its **actual bytes and actual import profile**, and run
     /// through the real boot validation.
     ///
-    /// The synthetic sibling above pins the rejection *mechanism* against a
+    /// The synthetic `store` test above pins the rejection *mechanism* against a
     /// hand-written `["ports", "store"]` manifest. This pins its *premise*: that
     /// the artifact backend tests load really does import `store`, so the
     /// mechanism is not rejecting a strawman. Nothing here is hand-written — the
@@ -2986,6 +3611,7 @@ mod tests {
                             source_sha256: (*source).to_string(),
                             spec_sha256: (*spec).to_string(),
                             cores: Vec::new(),
+                            contract: brenn_envelope::grants::ProcessorContract::V0_1,
                         },
                     )
                 })

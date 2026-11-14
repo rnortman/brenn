@@ -56,13 +56,15 @@ fn filler_envelope() -> MessageEnvelope {
         channel: CHANNEL.to_string(),
         sender: "test".to_string(),
         publish_ts: chrono::DateTime::from_timestamp(0, 0).expect("a representable instant"),
-        body: String::new(),
+        body: String::new().into(),
         reply_to: None,
         delivery_deadline: None,
         deliver_after: None,
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
+        transport: None,
+        attachments: Default::default(),
     }
 }
 

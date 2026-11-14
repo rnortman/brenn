@@ -18,6 +18,7 @@ use crate::test_support::bindings as fixtures;
 use crate::test_support::bindings::{output, subscription};
 
 use super::*;
+use brenn_envelope::grants::ProcessorContract;
 
 const WIRE: &str = "brenn:site.bar.in";
 const PEEK: &str = "brenn:site.bar.peek";
@@ -97,6 +98,8 @@ fn env(channel: &str, body: &str) -> MessageEnvelope {
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
+        transport: None,
+        attachments: Default::default(),
     }
 }
 
@@ -125,7 +128,13 @@ impl Page {
         let mut router = LocalRouter::new(planes);
         router.set_principal(PRINCIPAL.to_string());
         for instance in ["p1", "p2"] {
-            registrations.register(instance, Some(&bindings), &mut stores, &mut subs);
+            registrations.register(
+                instance,
+                ProcessorContract::V0_1,
+                Some(&bindings),
+                &mut stores,
+                &mut subs,
+            );
             schedules.track(instance, false);
         }
         Self {
@@ -188,7 +197,7 @@ impl Page {
             RouteRequest {
                 channel: LOCAL,
                 origin: Origin::Sub(instance),
-                body: body.to_string(),
+                body: (body.to_string()).into(),
                 stamp: MessageStamp {
                     message_id,
                     publish_ts: chrono::DateTime::from_timestamp(0, 0)
@@ -206,7 +215,7 @@ impl Page {
     }
 }
 
-fn ports(activation: &Activation) -> Vec<(&str, usize, u32, u64)> {
+fn ports(activation: &PageActivation) -> Vec<(&str, usize, u32, u64)> {
     activation
         .ports
         .iter()
@@ -214,7 +223,7 @@ fn ports(activation: &Activation) -> Vec<(&str, usize, u32, u64)> {
         .collect()
 }
 
-fn bodies(activation: &Activation, port: &str) -> Vec<String> {
+fn bodies(activation: &PageActivation, port: &str) -> Vec<String> {
     activation
         .ports
         .iter()
@@ -222,7 +231,7 @@ fn bodies(activation: &Activation, port: &str) -> Vec<String> {
         .expect("the activation windows the port")
         .envelopes
         .iter()
-        .map(|e| brenn_surface_test_fixtures::parse_envelope(e).body)
+        .map(|e| e.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -469,9 +478,16 @@ fn a_retain_only_binding_is_context_that_wakes_nobody_and_funds_nothing() {
     assert_eq!(page.schedules.metered_drops("p1", "peek"), 0);
     // And the grant is the fill alone, exactly as on an empty channel: retained
     // context funds no publish.
-    assert!(ready.buffer.publish("out", "a".into()).is_ok());
+    assert!(
+        ready
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("a".into()))
+            .is_ok()
+    );
     assert_eq!(
-        ready.buffer.publish("out", "b".into()),
+        ready
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("b".into())),
         Err(PortFault::Refused(PublishError::QuotaExceeded))
     );
 }
@@ -1059,14 +1075,23 @@ fn an_index_past_the_window_is_out_of_range() {
 fn the_buffer_admits_the_instances_own_ports_only() {
     let mut page = Page::standard();
     let mut ready = page.assemble("p1");
-    assert!(ready.buffer.publish("out", "hi".into()).is_ok());
+    assert!(
+        ready
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("hi".into()))
+            .is_ok()
+    );
     assert_eq!(
-        ready.buffer.publish("nope", "hi".into()),
+        ready
+            .buffer
+            .publish("nope", brenn_envelope::GuestBody::Text("hi".into())),
         Err(PortFault::Undeclared("\"nope\"".to_string()))
     );
     // An input port is not a place to publish, and p2's ports are p2's.
     assert_eq!(
-        ready.buffer.publish("in", "hi".into()),
+        ready
+            .buffer
+            .publish("in", brenn_envelope::GuestBody::Text("hi".into())),
         Err(PortFault::Undeclared("\"in\"".to_string()))
     );
     let flush = ready.buffer.take();
@@ -1082,20 +1107,44 @@ fn the_grant_counts_new_envelopes_and_not_context() {
     let mut ready = page.assemble("p1");
     // Fill 1000 plus a grant of 1000 per new envelope: `in` and `aux` each saw
     // w1, so three publishes are funded and the fourth is not.
-    assert!(ready.buffer.publish("out", "a".into()).is_ok());
-    assert!(ready.buffer.publish("out", "b".into()).is_ok());
-    assert!(ready.buffer.publish("out", "c".into()).is_ok());
+    assert!(
+        ready
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("a".into()))
+            .is_ok()
+    );
+    assert!(
+        ready
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("b".into()))
+            .is_ok()
+    );
+    assert!(
+        ready
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("c".into()))
+            .is_ok()
+    );
     assert_eq!(
-        ready.buffer.publish("out", "d".into()),
+        ready
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("d".into())),
         Err(PortFault::Refused(PublishError::QuotaExceeded))
     );
     page.schedules.finish_ok("p1", ready.buffer.take().carry);
 
     // Second activation, nothing new: the fill alone, and the carry was spent.
     let mut second = page.assemble("p1");
-    assert!(second.buffer.publish("out", "e".into()).is_ok());
+    assert!(
+        second
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("e".into()))
+            .is_ok()
+    );
     assert_eq!(
-        second.buffer.publish("out", "f".into()),
+        second
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("f".into())),
         Err(PortFault::Refused(PublishError::QuotaExceeded))
     );
 }
@@ -1107,10 +1156,22 @@ fn unspent_millitokens_carry_into_the_next_activation() {
     // Nothing published: the whole fill carries.
     page.schedules.finish_ok("p1", ready.buffer.take().carry);
     let mut second = page.assemble("p1");
-    assert!(second.buffer.publish("out", "a".into()).is_ok());
-    assert!(second.buffer.publish("out", "b".into()).is_ok());
+    assert!(
+        second
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("a".into()))
+            .is_ok()
+    );
+    assert!(
+        second
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("b".into()))
+            .is_ok()
+    );
     assert_eq!(
-        second.buffer.publish("out", "c".into()),
+        second
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("c".into())),
         Err(PortFault::Refused(PublishError::QuotaExceeded))
     );
 }
@@ -1121,7 +1182,7 @@ fn an_err_counts_the_failure_and_still_returns_the_carry() {
     let mut ready = page.assemble("p1");
     ready
         .buffer
-        .publish("out", "spent".into())
+        .publish("out", brenn_envelope::GuestBody::Text("spent".into()))
         .expect("the fill funds one publish");
     page.schedules.finish_err("p1", ready.buffer.into_carry());
     assert_eq!(page.schedules.entry_err_activations("p1"), 1);
@@ -1129,9 +1190,16 @@ fn an_err_counts_the_failure_and_still_returns_the_carry() {
     // What the component spent is a fact about the activation that happened: the
     // next one is funded by the fill alone.
     let mut second = page.assemble("p1");
-    assert!(second.buffer.publish("out", "a".into()).is_ok());
+    assert!(
+        second
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("a".into()))
+            .is_ok()
+    );
     assert_eq!(
-        second.buffer.publish("out", "b".into()),
+        second
+            .buffer
+            .publish("out", brenn_envelope::GuestBody::Text("b".into())),
         Err(PortFault::Refused(PublishError::QuotaExceeded))
     );
 }
@@ -1164,8 +1232,13 @@ fn the_buffer_carries_the_attachments_body_cap() {
     schedules.track("p1", false);
     let mut ready = schedules.assemble("p1", 0, &mut ctx);
     assert_eq!(
-        ready.buffer.publish("out", "far too long a body".into()),
-        Err(PortFault::Refused(PublishError::InvalidPayload))
+        ready.buffer.publish(
+            "out",
+            brenn_envelope::GuestBody::Text("far too long a body".into())
+        ),
+        Err(PortFault::Refused(PublishError::InvalidPayload(
+            "payload 19 bytes exceeds max 8".to_string()
+        )))
     );
 }
 
@@ -1215,7 +1288,7 @@ fn insert(page: &mut Page, channel: &str, envelope: MessageEnvelope) {
 /// Every field of the record is populated, and every window *shape* a component
 /// can be handed appears once, so the seam is crossed by each of them:
 ///
-/// - `in` — retained context followed by one new envelope, so `new_from` is
+/// - `mixed` — retained context followed by one new envelope, so `new_from` is
 ///   neither zero nor the length. Its new envelope carries the optional fields a
 ///   minimal one omits, pinning both arms of the envelope's
 ///   `skip_serializing_if` optionals.
@@ -1229,14 +1302,14 @@ fn insert(page: &mut Page, channel: &str, envelope: MessageEnvelope) {
 ///   in every activation.
 ///
 /// Plus the sync window holding the kernel-minted request, a deferred window
-/// with a parked entry, `now`, and `sync`. The request's body is the
-/// transplant guest's `__reply__` marker, so the frontend half drives the reply
-/// arm of the lift — the one field whose loss silently turns a sync call into a
-/// fire-and-forget activation.
-fn golden_activation() -> Activation {
+/// with a parked entry, `now`, and `sync`. The frontend half's guest replies
+/// with the request's body, so it drives the reply arm of the lift — the one
+/// field whose loss silently turns a sync call into a fire-and-forget
+/// activation.
+fn golden_activation() -> brenn_surface_contract::Activation {
     let mut page = Page::new(applied(
         vec![
-            subscription("p1", "in", WIRE, 2, 1),
+            subscription("p1", "mixed", WIRE, 2, 1),
             subscription("p1", "lossy", PEEK, 1, 0),
             subscription("p1", "context", LOCAL, 0, 2),
             subscription("p1", "silent", OUT, 0, 1),
@@ -1323,6 +1396,7 @@ fn golden_activation() -> Activation {
     page.schedules
         .assemble_sync("p1", generation, GOLDEN_SYNC_PORT, request, &mut ctx)
         .activation
+        .lower_v0_1()
 }
 
 #[test]
@@ -1355,7 +1429,7 @@ fn the_golden_activation_carries_every_window_shape() {
             .clone()
     };
 
-    let mixed = window("in");
+    let mixed = window("mixed");
     assert_eq!((mixed.envelopes.len(), mixed.new_from), (2, 1));
 
     let lossy = window("lossy");
@@ -1377,4 +1451,90 @@ fn the_golden_activation_carries_every_window_shape() {
     let sync = window(GOLDEN_SYNC_PORT);
     assert_eq!(activation.sync.as_deref(), Some(GOLDEN_SYNC_PORT));
     assert_eq!(sync.envelopes.len(), 1);
+}
+
+/// Insert one envelope carrying `body` on `channel`.
+fn arrive_body(page: &mut Page, channel: &str, body: brenn_envelope::MessageBody) {
+    let mut envelope = env(channel, "placeholder");
+    envelope.body = body;
+    page.stores
+        .get_mut(channel)
+        .expect("the fixture hosts the channel")
+        .insert(envelope);
+}
+
+/// A typed text body is windowed as exactly its text: the `envelope-json` a
+/// component is handed has no place for the type.
+#[test]
+fn a_typed_text_body_is_windowed_as_its_text() {
+    let mut page = Page::standard();
+    let body = brenn_envelope::MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+    arrive_body(&mut page, WIRE, body);
+    let ready = page.assemble("p1");
+    assert_eq!(bodies(&ready.activation, "in"), ["# hi"]);
+    let lowered = ready.activation.lower_v0_1();
+    let window = lowered
+        .ports
+        .iter()
+        .find(|w| w.port == "in")
+        .expect("the activation windows the port");
+    assert!(
+        window.envelopes[0].contains(r##""body":"# hi""##),
+        "{}",
+        window.envelopes[0]
+    );
+    assert!(!window.envelopes[0].contains("content_type"));
+}
+
+/// The page's own activation keeps every body as the store holds it, type and
+/// bytes; only the string contract's lowering reads it as text.
+#[test]
+fn the_page_activation_carries_the_body_with_its_type() {
+    let mut page = Page::standard();
+    let body = brenn_envelope::MessageBody::from_parts(Some("text/csv"), b"a,b").unwrap();
+    arrive_body(&mut page, WIRE, body.clone());
+    let ready = page.assemble("p1");
+    let window = ready
+        .activation
+        .ports
+        .iter()
+        .find(|w| w.port == "in")
+        .expect("the activation windows the port");
+    assert_eq!(window.envelopes[0].body, body);
+    assert_eq!(window.envelopes[0].body.content_type(), Some("text/csv"));
+}
+
+/// A non-text body is never lowered to `envelope-json`: the string contract's
+/// lowering panics, naming the carrier.
+#[test]
+#[should_panic(expected = "0.1.0 envelope-json")]
+fn a_non_text_window_body_panics_where_it_is_lowered_for_the_string_contract() {
+    let mut page = Page::standard();
+    let body =
+        brenn_envelope::MessageBody::from_parts(Some("application/octet-stream"), &[0xff]).unwrap();
+    arrive_body(&mut page, WIRE, body);
+    let ready = page.assemble("p1");
+    ready.activation.lower_v0_1();
+}
+
+/// A parked body the string contract cannot read is a panic where it is lowered.
+#[test]
+#[should_panic(expected = "0.1.0 deferred-entry.payload")]
+fn a_non_text_parked_body_panics_where_it_is_lowered_for_the_string_contract() {
+    let mut activation = PageActivation {
+        ports: vec![],
+        deferred: vec![DeferredWindow {
+            port: "out".to_string(),
+            entries: vec![DeferredEntry {
+                index: 0,
+                payload: brenn_envelope::MessageBody::from_parts(Some("image/png"), &[0x89])
+                    .unwrap(),
+                deliver_after: 1,
+            }],
+        }],
+        now: None,
+        sync: None,
+    };
+    activation.now = Some(0);
+    activation.lower_v0_1();
 }

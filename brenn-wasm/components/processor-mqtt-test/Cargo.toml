@@ -8,12 +8,4 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-# Runtime crate for the pinned wit-bindgen generator. The runtime is versioned
-# independently of the generator and does not track its version.
-wit-bindgen-rt = "0.44"
-
-[package.metadata.component]
-package = "brenn:processor"
-target = { path = "../../wit/processor.wit" }
-
-[package.metadata.component.dependencies]
+brenn-guest = { path = "../guest" }

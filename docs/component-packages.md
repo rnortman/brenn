@@ -40,8 +40,14 @@ bundle built earlier, against a brenn commit the host did not choose. The host
 and the bundle are installed by different releases, so a cut in one of these is
 a boot refusal on somebody else's machine:
 
-- the WIT packages `brenn:processor` and `brenn:replay` — a new capability is a
-  new interface, and no existing shape moves;
+- the WIT packages `brenn:processor` (`brenn-wasm/wit/processor.wit`,
+  `processor-0.2.wit` and `processor-0.3.wit`, read together) and
+  `brenn:replay` — a new capability is a new interface; a breaking change to a shape is a new version of the
+  interfaces that change and of no other, so an interface's version is the
+  version at which its shape last changed. brenn releases first and serves the
+  old and the new `brenn:processor` contract together for a period;
+  components follow on their own schedule (*The byte-carrying contract*,
+  below);
 - the **backend package record** (`package.json`, below) — `v` is the whole
   story, and a bump re-releases every bundle;
 - the **surface record** `processor/<kind>/manifest.json` v3 and the served
@@ -110,6 +116,308 @@ link it, by the same ordering rule as `calls`. No shim exists in either
 direction. `brenn-guest` reaches it through `mqtt::try_publish_expiring` and
 `mqtt::publish_text_expiring`.
 
+A fourth additive change in force: **`brenn:processor/blobs@0.3.0`**, the
+interface a component reads, creates and attaches blobs through, in
+`brenn-wasm/wit/processor-0.3.wit`. It is a new interface and a new grant word
+(`blobs`). `0.3.0` is the interface's version, not a third component
+contract: a component that imports it is a 0.2.0 component, told apart by
+`bus@0.2.0`, and names the world `brenn:processor/processor@0.3.0`, which is
+the 0.2.0 world with `blobs` imported. A kind that does not name `blobs` in
+`requires` does not import it, and its artifact, its record and its spec are
+what they were. A kind that does is backend-only — a surface refuses a
+component that imports it, and the word is refused on a placed instance —
+and needs a brenn new enough to link it, by the same ordering rule as `calls`.
+Publishing with attachments goes through `blobs.publish`, and a class that
+calls it requires `ports` as well as `blobs`, whether or not it also calls
+`ports.publish`: the function's error type wraps `ports@0.2.0`'s
+`publish-error`, so the artifact imports `brenn:processor/ports@0.2.0` for the
+type, which is what the build check and the load check read. `ports.publish`
+still carries none. The interface is **not yet declared
+stable**: a shape changes in place only while no tagged brenn release has
+served it; a shape a tagged release has served changes only as a new version
+of the interface, served beside the old one for at least one release and
+announced in `CHANGELOG.md`; the old version may be removed one release after
+its replacement, and nothing longer is promised.
+
+**Blobs and tool calls.** An asynchronous tool call carries named
+attachments by reference in both directions. Three functions of `blobs` are
+the forms that do, each taking a list of `(name, blob)` pairs as
+`blobs.publish` does — a handle from `open` or `writer.seal`, never an id:
+
+- `blobs.call-async` is `tools.call-async` carrying blobs to the tool;
+- `blobs.call-async-for` is `provides.call-async-for`, a provider's nested
+  call for a request it serves, carrying blobs;
+- `blobs.complete` is `provides.complete`, answering with blobs beside the
+  outcome. An `err` outcome carries none and is refused `invalid-outcome`.
+
+The plain forms — `tools.call-async`, `provides.call-async-for`,
+`provides.complete` — carry none, and neither do `calls.call` and
+`tools.call-fast`, which return inside the activation and put no message on
+the bus. An empty list behaves as the plain form.
+
+*The grants.* Each function needs the grant its plain form is linked under:
+`call-async` needs `tools`, `call-async-for` and `complete` need `provides`,
+and every one needs `blobs`. Each error type wraps the plain form's —
+`call-error` holds `tools.tool-error` as `plain(…)`, and `complete-error`
+holds `provides.complete-error` — so an artifact that calls `call-async` or
+`call-async-for` imports `brenn:processor/tools@0.1.0` for the type, and one
+that calls `complete` imports `brenn:processor/provides@0.1.0`, whether or not
+it calls a plain form. That import is what the build check and the load check
+read, so:
+
+- a class that calls a tool with attachments requires `tools` and `blobs`;
+- a provider that completes with attachments requires `provides` and `blobs`;
+- a provider that makes nested calls, plain or with attachments, requires
+  `tools` as well, because a nested call is admitted by the provider's own
+  tool grants and its result arrives on `tool-results`;
+- a class that publishes with attachments requires `ports` and `blobs`.
+
+A component that calls none of the three imports none of them, and nothing
+through them: an artifact already built is unaffected by their addition.
+
+*What arrives.* A request on `tool-requests` and a result on `tool-results`
+carry the attachments in the message's header like any message, under the
+names the caller or the tool gave; their bodies are unchanged. `blobs.open`
+reaches them by `(port, index, name)`, as on any input port. A result carries
+attachments only when its outcome is `ok`. `brenn-guest`'s
+`tools::ToolResult` and `provides::ToolRequest` list them in `attachments` and
+open one with `open(name)`.
+
+*Who holds a blob.* A call is buffered and flushed as the plain form is: the
+request reaches the bus iff the activation returns `ok`, and the buffered
+request holds its blobs until then; an `Err` or a trap drops them. On the bus,
+the request row holds them for its channel's window, whatever becomes of the
+call. A completion is immediate, as `provides.complete` is, and it is the one
+exception to "nothing a component holds outlives the activation": the
+completion holds the blobs it names from the call, so a blob the activation
+made and completed with survives the activation's later `Err` or trap, as the
+completion does. A completion whose waiter is gone drops them. A handle given
+to any of the three is cloned, not consumed, and the component may drop its
+handle after the call. No byte is copied anywhere on the path.
+
+*Which tool takes attachments.* A tool declares it: `accepts_attachments =
+true` on a `provide` statement (`docs/config-dsl.md`, "Provided tools"),
+default `false`. A call that carries attachments to a tool that does not is
+refused `attachments-not-accepted`, told only to a caller granted the tool. A
+tool that returns attachments needs no declaration.
+
+The shared bounds are the plain forms': the per-activation call cap, the
+publish-entry ceiling, the `call-id`, `args-json` and outcome-text caps, which
+weigh the JSON alone. At most 32 attachments per call or completion, each name
+in the attachment grammar, no name twice; each is a typed refusal. These
+three do not count against the per-activation blob-call or handle bounds.
+
+**Blobs and mutability.** A sealed blob is immutable, and the interface does
+not entrench it: an in-place mutable blob would add a mutability flag at
+`create`, a write path on a handle to a sealed mutable blob, and a way for a
+reader to learn which kind it holds, so a blob without the flag keeps its
+guarantee. All three are additions. Three choices lean on immutability and
+none forecloses mutation: `blob` has `read` and no `write`, so a handle to a
+sealed blob is proof nothing changes under its reader — mutation adds a write
+path, on `blob` or a third resource; `size` and `content-type` are fixed on a
+handle, so no call fails and a guest sizes its reads once — mutation needs a
+fixed extent or a size "at open"; and forwarding shares the blob rather than
+copying it, which is zero copy — mutation adds nothing there, but every holder
+then sees every write, a concurrency rule this interface does not yet state.
+
+**The byte-carrying contract.** The backend host serves two
+`brenn:processor` contracts side by side. Under the string contract, `brenn:processor@0.1.0` (`brenn-wasm/wit/processor.wit`),
+a component is handed each message as `envelope-json` text and publishes
+`payload: string`. Under the byte-carrying contract, `brenn:processor@0.2.0`
+(`brenn-wasm/wit/processor-0.2.wit`), it is handed each message as a header
+and a body of bytes with an optional content type, and publishes, parks,
+edits, calls and replies with such a body. No base64 and no JSON string sits
+around a body on that path.
+
+The 0.2.0 package declares only the three interfaces whose shape differs:
+`bus` (the body, the envelope and the activation), `ports` and `calls`. Every
+other interface keeps its `@0.1.0` name under both contracts. An artifact's
+imports are therefore:
+
+| | 0.1.0 | 0.2.0 |
+|---|---|---|
+| carries the activation | `brenn:processor/types@0.1.0` | `brenn:processor/bus@0.2.0` (and `types@0.1.0`, only if it uses `node`) |
+| `ports`, `calls` grants | `ports@0.1.0`, `calls@0.1.0` | `ports@0.2.0`, `calls@0.2.0` |
+| every other grant | its `@0.1.0` interface | the same `@0.1.0` interface |
+
+A grant word means the same capability under either contract. A reader tells
+an artifact's contract from its imports (`wasm-tools component wit
+<artifact>`): one importing `brenn:processor/bus@0.2.0` is 0.2.0, any other is
+0.1.0. Nothing else records it: not the package record, not the spec, whose
+`abi` stays `processor`. The loader and the build-time parity gate accept
+exactly the detected contract's import set; an artifact mixing the two, or
+naming an interface at a version this brenn does not serve, is refused at load
+by name.
+
+**`brenn:processor@0.2.0` is stable.** The interfaces `bus@0.2.0`,
+`ports@0.2.0` and `calls@0.2.0` and the `receive` export of the 0.2.0 world
+are frozen whole: no type or function in them is changed, removed or added,
+and each keeps doing what `processor-0.2.wit` says it does. While brenn serves
+`brenn:processor@0.2.0`, an artifact built against it at any brenn commit that
+carried it loads and means what it meant. brenn does not stop serving it
+without a removal period, announced in `CHANGELOG.md` and in the WIT header
+no later than the first release the period counts, as 0.1.0's is. A breaking
+change is a new version of the interfaces that change, served beside 0.2.0
+through that period. No such period has begun for 0.2.0, and no length is
+promised for one.
+
+The contract grows without a new version in three ways. A new capability is a
+new interface under a new grant word, with its own version; a component that
+does not import it is linked, activated and answered exactly as before. Such an
+interface may act on the ports a component already has — publish, park, read
+or edit a parked message, call a peer, shape the reply to a sync call — and
+may carry what the 0.2.0 functions cannot. The 0.2.0 functions keep their
+shapes and their behaviour beside it: what one of them does with a message's
+body does not change, and what it does with any part of a message it cannot
+express is stated by the interface that introduces that part. And
+`bus.envelope.header` is an open JSON object: it gains keys, the keys it has
+keep their meaning, and a guest ignores a key it does not know. And a function
+may be added to an `@0.1.0` interface of `processor.wit` that this promise does
+not freeze, beside the functions it has, which keep their shapes and their
+behaviour, as `mqtt-publish-expiring` was; a component that does not call it
+imports nothing new.
+
+How the host adds a header key, so the next key's author starts from it: the
+key is a field of `MessageEnvelope` in `brenn-envelope`, `Option` and absent
+when unset. `ShapedEnvelope::serialize` writes it with `optional_field` — in
+the shared part, which every shape reads, or in `HeaderShape`'s header-only
+position — so an envelope without it serializes byte-identically to one built
+before the key existed. `EnvelopeHeader` and the text-shape reader
+`TextShapeIn` hold it, and `MessageEnvelope::header()` and `from_header()`
+destructure without `..`, so the compiler refuses the change until both carry
+it. A durable channel stores it in one nullable column of `messaging_messages`
+that joins every SELECT and decoder rebuilding an envelope; a ring holds the
+whole envelope and needs nothing. Attach v5 carries the header as an open
+object too, so the key crosses it with no protocol version bump. `transport`
+took this route through the shared part.
+
+A key not every shape carries takes the second form: it is not written in the
+shared part but by a method of the shape trait, `EnvelopeShape`, which each
+shape implements, so each shape states what it writes. `attachments` took this
+route. It is a map, empty rather than `Option` when unset, and each writer
+skips it when empty, so an envelope without attachments is still
+byte-identical in every shape. `HeaderShape` writes each attachment's full
+reference (`{"photo": {"id": …, "size": N, "content_type": "…"}}`), the
+conversation's shape writes `size` and `content_type` without the id, and the
+text shape — 0.1.0's `envelope-json` and attach v4 — writes nothing, and its
+reader does not hold the field. A 0.2.0 component sees the key in
+`bus.envelope.header` under the growth rule above. The id there redeems
+nothing: a component granted `blobs` opens an attachment by its place in the
+activation — port, index and name — and forwards it by passing the handle to
+`blobs.publish`. A component's `ports.publish` carries no attachments, so
+republishing a message through it drops them (`docs/message-bus.md`
+§2.1.2a).
+
+The limits a host applies — body caps, budgets, depths — are host and operator
+policy, not part of this promise; the refusal a limit draws keeps its variant
+and its meaning.
+
+**The string contract's removal period.** The string contract
+`brenn:processor@0.1.0` is being removed: the string contract is served by the
+release that declares `brenn:processor@0.2.0` stable and by the three brenn
+releases after it, and no release before the fourth after it removes it. The
+declaring release is the one whose `CHANGELOG.md` heading holds the entry
+"`brenn:processor@0.2.0` is stable"; a release is a `v*` tag with its own
+`CHANGELOG.md` heading. Removal also does not happen before the three known
+out-of-tree component repositories have moved to 0.2.0: `brenn-fastmail`,
+`brenn-component-demo`, and a third, private one. What is removed
+is the string contract and nothing else: its world, the activation records of
+`types`, `ports@0.1.0` and `calls@0.1.0`. Every other interface in
+`processor.wit` stays as it is — it is what a 0.2.0 component imports. After
+removal a host refuses a string-contract artifact at load. The period can be
+lengthened; once the declaring release is tagged, it is not shortened.
+
+The shapes do not change. An artifact that does not have them — bound by hand
+against some other text, for instance — is refused at load, by name or by
+type, never misread: the loader holds every import to the contract's names,
+and wasmtime type-checks the `ports` and `calls` imports, which carry every
+`bus` type, and the `receive` export when the component is linked — on the
+backend with every other import, on a surface those three alone (*On a
+surface*, below). A shape whose meaning changed without a change of name or
+type would pass both, so a shape whose meaning changes changes its name or its
+version with its meaning; that is why the promise covers behaviour and not
+only types. The promise is to an artifact that has the shapes the WIT files
+state for every interface it imports, the `@0.1.0` interfaces of
+`processor.wit` included. A host that accepts an artifact which does not have
+them — a surface host today, for an import outside `ports` and `calls` — may
+refuse it in a later release; that is a correction to the host, announced in
+`CHANGELOG.md`, not a breaking change to the contract, and it draws no dual
+period.
+
+What a 0.2.0 author relies on:
+
+- **The header is open.** `bus.envelope.header` is the canonical envelope as
+  JSON without its body. Keys are added over time, without a new contract
+  version; the keys it has keep their meaning, and a guest ignores a key it
+  does not know. A new interface may give a message parts that travel as
+  header keys. The first added key is `transport`: present only on a message
+  a transport adaptor published in the raw ingress shape
+  (`docs/message-bus.md` §2.7.1), an object with one member named for the
+  transport — `{"mqtt": {"client_slug", "topic", "qos", "received_at"}}` or
+  `{"webhook": {"headers", "key_id", "client_ip", "received_at",
+  "endpoint_slug"}}`. Its presence is how a reader tells a raw ingress message,
+  whose body is the payload, from a wrapped one, whose body is the wrapper
+  JSON.
+- **A body is validated where it enters the host.** A content type must be a
+  well-formed media type; a text body (no content type, `text/*`,
+  `application/json` or a `+json` subtype, with no charset other than UTF-8
+  or US-ASCII) must be UTF-8. The size caps count raw bytes. The content type
+  is the sender's assertion and is never checked against the bytes.
+- **The refusals it can draw that a 0.1.0 component cannot:** `invalid-body`,
+  for a malformed content type or text that is not UTF-8, on a publish, an
+  edit or a call; `text-only-channel`, for a non-text body published, parked or
+  edited onto a channel not declared `non_text`; `text-only-peer`, for a
+  non-text body sent to a peer built against the string contract, which does
+  not run. A reply that is malformed or over the cap traps the replying
+  component, as an over-cap reply always has.
+- **A mixed sync pair.** A reply is judged against the replying component's
+  own contract only. A 0.2.0 component may reply to any caller with a
+  non-text body; its activation ends ok and its buffer flushes. A 0.1.0
+  caller cannot read that reply, so it is the *caller's* activation that
+  traps, naming its `call` port and the peer. A typed text reply reaches a
+  0.1.0 caller as its text, as a typed text message does on a channel.
+- **On a surface.** The surface host serves 0.2.0 beside 0.1.0; the page
+  manifest names each kind's contract and the page brings each instance up on
+  its own contract's imports. What a
+  page-hosted 0.2.0 kind carries today, shown on the node rig;
+  `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery
+  in Chromium, and an SDK-built kind's binary state on a page-local `io`
+  port:
+  - any body, text or not, with its type, on a page-local channel declared
+    `non_text` — a surface binding tail states `non_text = true` where its
+    channel stays on the page (`docs/message-bus.md` §2.6) — published,
+    parked, edited and read back byte for byte;
+  - any body, text or not, with its type, on a port bound to a channel that
+    leaves the page and is declared `non_text`, over the page's wire (attach
+    v5): published, parked, edited and delivered byte for byte;
+  - typed text on any channel, page-local or not, with its type; a non-text
+    body on a channel not declared `non_text` is `text-only-channel`, and
+    nothing is buffered or sent;
+  - any body, text or not, typed or not, in a sync call and its reply between
+    two 0.2.0 kinds.
+
+  The server holds a 0.2.0 kind's artifact to the shapes it serves before
+  serving it, because the page's transpiled glue checks nothing against the
+  host: the server holds its import names to the ones a surface host
+  serves, and wasmtime type-checks its `ports` and `calls` imports and its
+  `receive` export. An artifact that does not have the
+  contract's shape is **withheld** under a bundle mount, by the rule above
+  for a record it does not read, with a reason naming the kind, the contract
+  and the check's account; under brenn's own mount it is a boot refusal. An
+  artifact the server cannot read is a broken install and fatal under any
+  mount.
+- **The guest SDK builds 0.2.0.** A component built on `brenn-guest` is a
+  0.2.0 artifact, and every in-tree SDK component is one. A component that
+  stays on 0.1.0 does so by keeping an older brenn pin or by writing raw
+  bindings over `processor.wit` alone; a raw 0.2.0 component reads both WIT
+  files, `processor.wit` first, with the world
+  `brenn:processor/processor@0.2.0`.
+
+A backend that loads any 0.1.0 artifact, and one whose surfaces instantiate
+any 0.1.0 kind, says so in one `warn!` each at boot and after each applied
+reload, naming them, stating the removal period and telling the operator to
+rebuild them against 0.2.0.
+
 One runtime contract is a **candidate for deletion**, recorded here so that a
 bundle author meets it before it happens rather than after: `brenn:replay` is
 the one world native backend code calls synchronously per request, and the
@@ -176,6 +484,130 @@ JSON read as "a body that is not JSON"; `read_api_payload` reads a payload's
 bytes whichever field carried them. A component that matches `Answer` exhaustively adds an arm for `Bytes`
 — failing `internal`, if the API it calls never answers in bytes. The `testutil` fixtures gained `binary`, an answer carrying bytes, and
 `text_body`, a call's text body.
+
+Another cut of this kind in force now: **`MessageEnvelope.body` is a
+`MessageBody`**, bytes with an optional content type, re-exported from
+`brenn-guest` with `BodyError` and `is_text_content_type`.
+
+- Under the 0.1.0 contract the body is always text: the host never windows a
+  non-text body to a 0.1.0 component, and a typed text body arrives as exactly
+  its text, without its type. This is enforced at binding: a 0.1.0 component
+  with any input or output port on a channel declared `non_text` is refused
+  at boot and at reload — a consumer, and a served surface instance bound to
+  any channel declared `non_text`, page-local or not. A kind reads it with `body.as_text()` or
+  `envelope.text_body()?`, and compares a sentinel as
+  `body.as_text() == Some("…")`.
+- `brenn_guest::MessageEnvelopeExt` gained `text_body(&self) -> Result<&str,
+  Error>`, which answers `Error::MalformedEnvelope` for a body that is not
+  text. `json_body` and `webhook_body` keep their signatures and read through
+  it.
+- `MessageEnvelope` no longer implements `Serialize`. A kind that built
+  `envelope-json` text, in a test for instance, calls `to_envelope_json`.
+  `Deserialize` reads the text shape and refuses a `content_type` or
+  `body_base64` key.
+- `RetainedState` was unchanged in signature and behaviour by this cut.
+
+The WIT, the `envelope-json` text and every runtime contract are byte-identical
+for the bodies a deployed component can meet, so no deployed artifact is
+affected; the cut is paid at the next pin bump.
+
+Another cut of this kind in force now: **`brenn-guest` binds
+`brenn:processor@0.2.0`.** The SDK generates the byte-carrying world and no
+other, so every component built on it from this pin on is a 0.2.0 artifact.
+The one edit every component makes is `Processor::receive`'s reply type; a
+component that only publishes and reads text changes little else.
+
+| Before | After |
+|---|---|
+| `fn receive(activation: Activation) -> Result<Option<String>, Error>` | `fn receive(activation: Activation) -> Result<Option<Body>, Error>`; a text reply is `Ok(Some(text.into()))` |
+| `PortWindow::new_raw() -> &[String]`, `context_raw() -> &[String]` (envelope JSON) | `new_messages() -> &[Message]`, `context_messages() -> &[Message]`; there is no string form of an envelope |
+| — | `Message`: `header_json() -> &str` (the open JSON header), `body() -> &Body`, `envelope() -> Result<MessageEnvelope, Error>` |
+| `new_envelopes()`, `context_envelopes()` | unchanged in signature, read through `Message::envelope` |
+| `DeferredEntry::payload() -> &str` | `DeferredEntry::body() -> &Body`; its text is `entry.body().as_text()?` |
+| `publish(port, &str)`, `publish_with_urgency`, `publish_deferred`, `repark` | the same names, the body `impl Into<BodyRef<'_>>`; a `&str` or `&String` is untyped text, so text call sites compile unchanged |
+| `defer_edit(port, index, Option<&str>, deliver_after)` | `defer_edit(port, index, Option<BodyRef<'_>>, deliver_after)` |
+| `calls::CallError`, the generated WIT variant | an SDK enum: `NotPermitted`, `Unwired`, `Refused`, `Failed`, `InvalidPayload(String)`, `InvalidBody(String)`, `TextOnlyPeer`, `QuotaExceeded` |
+| `CallPort::try_call(&str) -> Result<Option<String>, CallError>`, `call` likewise | the request `impl Into<BodyRef<'_>>`, the reply `Option<Body>`; `call_json` requires a text reply and answers `MalformedEnvelope` for any other |
+| `dom::cancel_reply()`, `proceed_reply() -> String` | `-> Body`, the same JSON as untyped text |
+| `RetainedState<T>` | `RetainedState<T, C = Json>`; `RetainedState<T>`, `new` and `around` compile unchanged |
+| `RetainedState::load(&mut self, &Activation)` | `load(&mut self, &mut Activation)`, taking the state window out of the activation |
+| `build_activation` (public) | gone; the export shim builds the activation |
+| `Error` | gains `TextOnlyChannel(String)` and `InvalidBody(String)` |
+| — | `MessageEnvelopeExt::mqtt_body() -> Result<MqttEnvelope, Error>`, the wrapped MQTT shape, beside `webhook_body` |
+| — | `MessageEnvelopeExt::mqtt_transport() -> Result<&MqttTransport, Error>`, `webhook_transport() -> Result<&WebhookTransport, Error>`: a raw ingress message's `transport` |
+| — | `MqttPayloadBody::text() -> Option<&str>`: the wrapper's text payload, `None` for the binary placeholder |
+
+- **Bodies.** `Body` is a body as it crossed the boundary: `content_type()`,
+  `as_bytes()`, `into_bytes()`, `is_text()`, `as_text()` (`MalformedEnvelope`
+  for a non-text type or bytes that are not UTF-8), `json::<T>()`; built by
+  `Body::text(..)` or `Body::typed(content_type, bytes)`, or from a `String`
+  or `&str` as untyped text. `BodyRef` is a borrowed body to hand the host:
+  `BodyRef::text(&str)`, `BodyRef::typed(content_type, &[u8])`, or from a
+  `&str`, `&String` or `&Body`. Bytes go out as
+  `publish(port, BodyRef::typed("application/octet-stream", &bytes))`, typed
+  text as `BodyRef::typed("text/markdown", s.as_bytes())`.
+  `MessageEnvelopeExt::text_body` answers `MalformedEnvelope` for a non-text
+  body, which a running guest can now be handed.
+- **The JSON conveniences state no content type.** `publish_json`,
+  `OutPort::publish`, `CallPort::call_json`'s request, `provides::complete`,
+  `tools::call_async_json` and a JSON `RetainedState` publish untyped text,
+  byte for byte what they published before. An author who wants
+  `application/json` stated publishes `BodyRef::typed`. `mqtt::publish_json`
+  keeps MQTT's own `application/json`.
+- **Two new refusals.** `Error::TextOnlyChannel` is a publish, park or edit of
+  a non-text body onto a channel not declared `non_text`; its message names
+  the port, the body's content type and length, and the fix ("declare
+  `non_text = true` on the channel, or on the binding where the channel stays
+  on the page"). It is structural: no later activation repairs it.
+  `Error::InvalidBody` is a malformed content type, or a text-typed body that
+  is not UTF-8. Both fail the activation as `processing-failed`. A call keeps
+  its own `CallError::TextOnlyPeer` (a non-text request to a peer built on
+  0.1.0, which does not run) and `CallError::InvalidBody`. A kind that matches
+  `Error` or `CallError` exhaustively adds the arms.
+- **Ingress shapes.** `brenn-guest` re-exports `MqttEnvelope`,
+  `MqttPayloadBody`, `TransportMeta`, `MqttTransport` and `WebhookTransport`
+  beside `WebhookEnvelope`. Each of the four ingress accessors checks the
+  message's scheme first, then its shape: `mqtt_body` and `webhook_body`
+  answer `Error::ProcessingFailed` for a message carrying `transport`, naming the
+  transport accessor, and `mqtt_transport` and `webhook_transport` answer it
+  for one without, naming the wrapper accessor. A raw message's body is read
+  as any body is, through `Message::body()`.
+- **Binary state.** `RetainedState<T, C>` takes a `StateCodec<T>`: a
+  `CONTENT_TYPE` (`None` is untyped text), `encode(&T) -> Result<Vec<u8>,
+  Error>` and `decode(&[u8]) -> Result<T, Error>`. `Json` is the default and
+  publishes what `RetainedState` always did. A byte codec is the author's own
+  `impl StateCodec<MyState> for MyCodec` with a non-text `CONTENT_TYPE`, bound
+  by port name: `RetainedState::<MyState, MyCodec>::on(spec::port::STATE)` and
+  `around_on(activation, spec::port::STATE, loss, body)`. A stored body whose
+  content type is not exactly the codec's is unreadable state, handled by
+  `StateLoss` as any version skew is. The worked example is
+  `brenn-wasm/components/processor-sdk-bytes-test`.
+- **A binary state needs a `non_text` channel.** On a surface the binding says
+  so — `io state { push_depth = 0; retain_depth = 1; non_text = true; }` — and
+  on the backend the channel does. Without it the first store fails the
+  activation with `Error::TextOnlyChannel` under either `StateLoss`; nothing
+  is persisted and nothing is silently lost. A state body is one message, so
+  it is bounded by the channel's `max_body_bytes` (65,536 B by default,
+  applied on a page to page-local publishes too) and by the 4 MiB of
+  publishes one activation may make.
+- **`surface/page-harness` drives 0.2.0 kinds only.** `Page::published` and
+  `parked` record `Published { port, body, deliver_after }` with a harness
+  `Body { content_type, bytes }`; `published_on(port)` still returns the text
+  bodies and panics on a non-text one; `bodies_on(port)` returns the records.
+  Activation builders return `bus` records (`bus::Activation` and
+  `bus::ReceiveError` in place of `types::…`); `sync_call(port, request)`
+  takes the request body text; `delivery_of(port, context, new, dropped)`
+  delivers `Body` values; `seeding_state_body(Body)` sits beside
+  `seeding_state(&str)`; `call_returning` and `receive` return the reply as a
+  `Body`. A transcript line for an untyped text body is unchanged; any other
+  body is rendered as its content type and length.
+
+A component built at any pin from this cut on is a 0.2.0 artifact. 0.2.0 is
+stable (*Contract evolution*, above), and because its shapes have not changed
+since the contract first appeared, an artifact built at a pin before the
+declaring release is under the promise as one built after it is. A component
+stays on 0.1.0 for the rest of that contract's removal period by keeping the
+older pin or by writing raw 0.1.0 bindings.
 
 Freezing the macro vocabulary of a one-operator ecosystem buys nothing a pin
 does not already buy, which is why the two are split rather than held to one

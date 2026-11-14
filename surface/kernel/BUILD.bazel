@@ -22,5 +22,8 @@ surface_wasm_crate(
         "//surface/contract",
         "//surface/schema",
     ],
-    test_deps = ["//surface/test-fixtures"],
+    test_deps = [
+        "//surface/test-fixtures",
+        "//surface/test-fixtures/peer",
+    ],
 )

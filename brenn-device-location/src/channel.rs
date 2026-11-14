@@ -102,7 +102,11 @@ pub async fn read_window(messenger: &Messenger, username: &str) -> Window {
             foreign.push(envelope.sender.as_str());
             continue;
         }
-        let message: LocationMessage = serde_json::from_str(&envelope.body).unwrap_or_else(|e| {
+        let parsed = match envelope.body.as_text() {
+            Some(text) => serde_json::from_str::<LocationMessage>(text).map_err(|e| e.to_string()),
+            None => Err(format!("body is not text ({})", envelope.body.summary())),
+        };
+        let message = parsed.unwrap_or_else(|e| {
             panic!(
                 "device-location: message {} on {address:?} from {} does not parse: {e}",
                 envelope.message_id,
@@ -298,7 +302,7 @@ pub async fn publish(
         .publish_from_system(
             DEVICE_LOCATION_COMPONENT,
             &address,
-            &body,
+            body.as_str().into(),
             Urgency::Normal,
             None,
         )
@@ -513,7 +517,7 @@ pub(crate) mod tests {
             .publish_from_system(
                 DEVICE_LOCATION_COMPONENT,
                 &device_location_address("alice"),
-                r#"{"kind":"teleported"}"#,
+                r#"{"kind":"teleported"}"#.into(),
                 Urgency::Normal,
                 None,
             )

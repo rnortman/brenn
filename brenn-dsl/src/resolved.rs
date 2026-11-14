@@ -634,6 +634,8 @@ pub struct RProvidedTool {
     pub max_concurrency: u32,
     /// Whether an LLM call the grant permits skips user approval.
     pub auto_approve: bool,
+    /// Whether a call may hand the tool attachments.
+    pub accepts_attachments: bool,
 }
 
 impl ClassRef {

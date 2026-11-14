@@ -8,10 +8,11 @@
 
 use std::sync::Arc;
 
+use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
 use brenn_wasm::{
     ComponentGrant, GuestAlertSeverity, PROCESSOR_MAX_ALERT_CALLS_PER_ACTIVATION,
-    PROCESSOR_MAX_ALERT_TITLE_BYTES, PROCESSOR_MAX_LOG_CALLS_PER_ACTIVATION, ProcessorActivation,
-    ProcessorAlerter, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow,
+    PROCESSOR_MAX_ALERT_TITLE_BYTES, PROCESSOR_MAX_LOG_CALLS_PER_ACTIVATION, ProcessorAlerter,
+    ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
 };
 use tracing_test::traced_test;
 
@@ -102,7 +103,7 @@ fn log_happy_path_each_level() {
             "level": level_str,
             "message": format!("test-message-{level_str}")
         }));
-        let outcome = comp.handle(single_activation(envelope));
+        let outcome = comp.handle(common::host_activation(single_activation(envelope)));
         assert!(
             matches!(outcome, ProcessorOutcome::Ok { .. }),
             "log level {level_str}: expected Ok, got {outcome:?}"
@@ -146,7 +147,7 @@ fn alert_happy_path_each_severity() {
             "title": format!("title-{severity_str}"),
             "body": format!("body-{severity_str}")
         }));
-        let outcome = comp.handle(single_activation(envelope));
+        let outcome = comp.handle(common::host_activation(single_activation(envelope)));
         assert!(
             matches!(outcome, ProcessorOutcome::Ok { .. }),
             "alert severity {severity_str}: expected Ok, got {outcome:?}"
@@ -199,7 +200,7 @@ fn log_sanitization_escapes_control_chars() {
         "level": "info",
         "message": "line1\nline2\x1b[31mred slug=evil rest"
     }));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     assert!(matches!(outcome, ProcessorOutcome::Ok { .. }));
 
     // The raw newline and ESC must not appear verbatim — they are escape_debug'd.
@@ -237,7 +238,7 @@ fn alert_sanitization_truncates_and_escapes() {
         "title": "alert\x00title",
         "body": "normal body"
     }));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     assert!(matches!(outcome, ProcessorOutcome::Ok { .. }));
 
     let calls = alerter.calls.lock().unwrap();
@@ -265,7 +266,7 @@ fn alert_hostile_title_bounded_at_cap() {
         "title": hostile_title,
         "body": "normal body"
     }));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     assert!(matches!(outcome, ProcessorOutcome::Ok { .. }));
 
     let calls = alerter.calls.lock().unwrap();
@@ -304,7 +305,7 @@ fn log_oversized_message_truncated() {
         "level": "info",
         "message": msg
     }));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "oversized message must not cause an error"
@@ -342,7 +343,7 @@ fn log_quota_suppresses_excess() {
         "level": "info",
         "message": "quota-test-msg"
     }));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "log quota exhaustion must not fail the activation"
@@ -397,7 +398,7 @@ fn alert_quota_suppresses_excess() {
         "title": "quota-title",
         "body": "quota-body"
     }));
-    let outcome = comp.handle(single_activation(envelope));
+    let outcome = comp.handle(common::host_activation(single_activation(envelope)));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "alert quota exhaustion must not fail the activation"
@@ -439,7 +440,9 @@ fn log_survives_trap() {
         "message": "pre-trap-log"
     }));
     let trap_env = make_envelope(serde_json::json!({"cmd": "trap"}));
-    let outcome = comp.handle(multi_activation(vec![log_env, trap_env]));
+    let outcome = comp.handle(common::host_activation(multi_activation(vec![
+        log_env, trap_env,
+    ])));
     assert!(
         matches!(outcome, ProcessorOutcome::Trap(_)),
         "expected Trap outcome, got {outcome:?}"
@@ -465,7 +468,9 @@ fn log_survives_err() {
         "cmd": "err",
         "message": "test-err"
     }));
-    let outcome = comp.handle(multi_activation(vec![log_env, err_env]));
+    let outcome = comp.handle(common::host_activation(multi_activation(vec![
+        log_env, err_env,
+    ])));
     assert!(
         matches!(outcome, ProcessorOutcome::Err(_)),
         "expected Err outcome, got {outcome:?}"

@@ -48,7 +48,7 @@
 mod spec;
 
 use crate::spec::{InPort, alert, config, log, store, tools};
-use brenn_guest::{Activation, Error, Processor, serde_json};
+use brenn_guest::{Activation, Body, Error, MessageEnvelopeExt, Processor, serde_json};
 use serde::{Deserialize, Serialize};
 
 /// The async tool this consumer holds a grant for.
@@ -290,7 +290,7 @@ fn handle_tool_result(body: &str) -> Result<(), Error> {
 }
 
 impl Processor for GitSyncConsumer {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         // Read once per activation; config is process-lifetime-fixed. A missing
         // remote key fails the whole activation (fail-fast misconfig).
         let repo_map = load_repo_map()?;
@@ -299,8 +299,8 @@ impl Processor for GitSyncConsumer {
             for result in window.new_envelopes() {
                 let env = result?;
                 match port {
-                    InPort::PushEvents => handle_push_event(&repo_map, &env.body)?,
-                    InPort::ToolResults => handle_tool_result(&env.body)?,
+                    InPort::PushEvents => handle_push_event(&repo_map, env.text_body()?)?,
+                    InPort::ToolResults => handle_tool_result(env.text_body()?)?,
                 }
             }
         }

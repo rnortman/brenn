@@ -283,7 +283,7 @@ impl PwaPushService {
                 // source: use the server's own identifier (same as brenn: path)
                 sender_app_slug,
                 &sender,
-                body,
+                &brenn_lib::messaging::MessageBody::text(body),
                 MessagingUrgency::Low, // pwa_push messages don't wake bus subscribers
                 brenn_lib::messaging::ChannelScheme::Brenn,
                 None, // no reply_to

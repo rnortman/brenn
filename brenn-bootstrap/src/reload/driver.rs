@@ -58,11 +58,15 @@ use crate::consumers::{ConsumerLoadContext, ConsumerRegistry, LoadedConsumer, lo
 use crate::reload::agents::AgentInputs;
 use crate::reload::api_keys::api_keys_delta;
 use crate::reload::compare::non_convergible_differences;
-use crate::reload::delta::{LiveFacts, PlanDelta, PlanFacts, convergibility_refusals, plan_delta};
+use crate::reload::delta::{
+    LiveFacts, PlanDelta, PlanFacts, convergibility_refusals,
+    ingress_narrowings_under_their_transport, plan_delta, text_only_flips_under_remote_publishers,
+    text_only_flips_under_surface_publishers,
+};
 use crate::reload::dynamic::DynamicSnapshot;
 use crate::reload::mqtt::mqtt_clients_delta;
 use crate::reload::surfaces::{
-    SurfaceDocInputs, SurfaceDocParams, SurfaceDocs, arriving, build_surface_docs,
+    SurfaceDocInputs, SurfaceDocParams, SurfaceDocs, SurfacePlatform, arriving, build_surface_docs,
     system_participant_refusals,
 };
 use crate::reload::tools::{ToolsDelta, candidate_tools};
@@ -675,6 +679,16 @@ impl ReloadDriver {
             mqtt_ingress: &plan.mqtt_ingress_channels,
             surfaces: &plan.surfaces,
         };
+        // Level 1 holds both inputs equal across the two documents, so the
+        // candidate's answer is the running process's too.
+        let surface_platform = SurfacePlatform {
+            prefix: &candidate.config.surface_description.prefix,
+            error_channel: candidate
+                .config
+                .observability
+                .surface_error_channel
+                .as_deref(),
+        };
         let mut delta = plan_delta(
             &baseline_facts,
             &candidate_facts,
@@ -690,17 +704,28 @@ impl ReloadDriver {
                 mqtt_clients: &client_identities,
                 clients_stopping: &mqtt_clients.removed,
             },
+            surface_platform,
         );
         delta.webhook = webhook;
         delta.mqtt_clients = mqtt_clients;
         delta.api_keys = api_keys;
         delta.tools = tools;
-        let refusals = convergibility_refusals(
+        let mut refusals = convergibility_refusals(
             &baseline_facts,
             &candidate_facts,
             &delta,
             self.env.messenger.directory(),
         );
+        refusals.extend(text_only_flips_under_remote_publishers(
+            &delta,
+            &plan.remotes,
+        ));
+        refusals.extend(ingress_narrowings_under_their_transport(&delta));
+        refusals.extend(text_only_flips_under_surface_publishers(
+            &delta,
+            &self.baseline.surfaces,
+            surface_platform,
+        ));
         if !refusals.is_empty() {
             return refused(Some(sha), refusals);
         }
@@ -729,7 +754,7 @@ impl ReloadDriver {
         // Through the publisher's own gate, so prepare's verdict and the
         // publish-side verdict cannot drift apart at the boundary.
         if let Err(BodySizeExceeded { len, max }) =
-            check_body_size(&applied.body(), self.env.messenger.max_body_bytes())
+            check_body_size(&applied.body().into(), self.env.messenger.max_body_bytes())
         {
             return refused(
                 Some(sha),
@@ -1068,6 +1093,7 @@ impl ReloadDriver {
             provider_runtime: &self.env.provider_runtime,
             max_payload_bytes: self.env.max_payload_bytes,
             sync_router: Some(self.env.router.clone()),
+            blob_host: brenn_wasm_dispatch::blob_host_over(&self.env.messenger),
         };
         let mut loaded = Vec::new();
         let mut refusals = Vec::new();
@@ -1574,6 +1600,12 @@ impl ReloadDriver {
             sessions_retire_pending = ?applied.delta.sessions_retire_pending,
             "reload applied"
         );
+        crate::consumers::warn_string_contract_components(
+            self.registry
+                .iter()
+                .map(|(slug, running)| (slug.as_str(), running.component.contract())),
+        );
+        crate::consumers::warn_string_contract_surface_kinds(&surface_roots, &plan.surfaces);
         fit_session_lists(&mut applied, self.env.messenger.max_body_bytes());
         // The one field that is not prepare's: the outcome was reached now, not
         // when it was decided. Fixed width, so the size prepare measured stands.
@@ -1634,7 +1666,7 @@ impl ReloadDriver {
 /// body prepare proved publishable. The journal line above carries them in full
 /// either way.
 fn fit_session_lists(applied: &mut ReloadStatus, max: usize) {
-    if check_body_size(&applied.body(), max).is_ok() {
+    if check_body_size(&applied.body().into(), max).is_ok() {
         return;
     }
     let retired = applied.delta.sessions_retired.len();
@@ -1649,7 +1681,7 @@ fn fit_session_lists(applied: &mut ReloadStatus, max: usize) {
     applied.delta.sessions_retire_pending = vec![format!(
         "{pending} sessions retiring at turn end; names omitted"
     )];
-    if check_body_size(&applied.body(), max).is_ok() {
+    if check_body_size(&applied.body().into(), max).is_ok() {
         return;
     }
     applied.delta.sessions_retired.clear();
@@ -2663,18 +2695,6 @@ channel scratch at "ephemeral:scratch" {{
         }
         let reload_notify =
             reload_notify.expect("every fixture document declares the reload facility");
-        let dispatcher = dispatcher.then(|| {
-            let handle = brenn_messaging::dispatcher::spawn_dispatcher_task(
-                db.clone(),
-                router.clone() as Arc<dyn brenn_messaging::WakeRouter>,
-                messenger.dispatch_kick_notify(),
-                messenger.clone(),
-            );
-            // Kick immediately so the first dispatch does not wait out the
-            // poll interval — production boot does the same.
-            messenger.dispatch_kick();
-            handle
-        });
         let plan = plan_like_the_driver(
             &document.config,
             &apps,
@@ -2731,6 +2751,7 @@ channel scratch at "ephemeral:scratch" {{
                     provider_runtime: &provider_runtime,
                     max_payload_bytes: document.config.messaging.max_body_bytes,
                     sync_router: Some(router.clone()),
+                    blob_host: brenn_wasm_dispatch::blob_host_over(&messenger),
                 },
                 consumer,
                 None,
@@ -2753,6 +2774,11 @@ channel scratch at "ephemeral:scratch" {{
                 ),
             );
         }
+        crate::consumers::warn_string_contract_components(
+            registry
+                .iter()
+                .map(|(slug, running)| (slug.as_str(), running.component.contract())),
+        );
 
         // Detached, as `run_server` detaches it: a panic in the drain loop is
         // the test runtime's to report.
@@ -2792,6 +2818,22 @@ channel scratch at "ephemeral:scratch" {{
         for surface in &plan.surfaces {
             router.register_surface_delivery_routes(surface);
         }
+        // Must spawn only after every delivery binding is registered,
+        // matching `run_server`: a row owed to a subscriber at boot — one a
+        // previous process over the same database left — is dispatched by the
+        // first sweep.
+        let dispatcher = dispatcher.then(|| {
+            let handle = brenn_messaging::dispatcher::spawn_dispatcher_task(
+                db.clone(),
+                router.clone() as Arc<dyn brenn_messaging::WakeRouter>,
+                messenger.dispatch_kick_notify(),
+                messenger.clone(),
+            );
+            // Kick immediately so the first dispatch does not wait out the
+            // poll interval.
+            messenger.dispatch_kick();
+            handle
+        });
         // The endpoint table boot installs: the document half, then the host
         // half over whatever secret files the fixture wrote, then the same
         // builder `run_server` calls — so a replay-protected endpoint's
@@ -2815,6 +2857,7 @@ channel scratch at "ephemeral:scratch" {{
         // the operator's only unprompted notice of a withheld kind unreachable
         // from every test.
         crate::alert_withheld_kinds(&alert_dispatcher, &surface_roots);
+        crate::consumers::warn_string_contract_surface_kinds(&surface_roots, &plan.surfaces);
 
         // Without this the fresh side would read back whatever the database
         // it booted over still retained rather than what boot publishes.
@@ -2925,7 +2968,8 @@ channel scratch at "ephemeral:scratch" {{
             // The query answers newest first; reverse to chronological order.
             .rev()
             .map(|envelope| {
-                serde_json::from_str(&envelope.body).expect("the retained body is the schema")
+                serde_json::from_str(envelope.body.as_text().unwrap())
+                    .expect("the retained body is the schema")
             })
             .collect()
     }
@@ -4819,6 +4863,623 @@ new sifter: Demo {{
         );
     }
 
+    // ── A string-contract component on a `non_text` channel ──────────────
+
+    /// The channel a `non_text` declaration is toggled on, beside the sink
+    /// the consumer cases already use.
+    fn frames_channels(frames_non_text: bool) -> String {
+        format!(
+            r#"channel sink at "brenn:sink" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
+channel frames at "brenn:frames" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+    non_text = {frames_non_text};
+}}
+"#
+        )
+    }
+
+    /// [`frames_channels`] and one consumer, `sifter`, whose class requires
+    /// `requires` and whose `inbound` and `digest` ports are bound to the
+    /// channels named. The class is the same text for every choice of
+    /// channels, so one installed package serves each document.
+    fn frames_consumer_document(
+        frames_non_text: bool,
+        inbound: &str,
+        digest: &str,
+        requires: &str,
+    ) -> String {
+        document(&format!(
+            r#"{channels}{PACKAGED}component Demo {{
+    abi = processor;
+    requires = [{requires}];
+    in inbound;
+    out digest;
+}}
+{PACKAGED}
+new sifter: Demo {{
+    grants = [{requires}];
+    in inbound <- {inbound} {{ push_depth = 4; }}
+    out digest -> {digest};
+}}
+"#,
+            channels = frames_channels(frames_non_text),
+        ))
+    }
+
+    /// Prepare the candidate on disk and answer its refusals; panics if it is
+    /// not refused.
+    async fn refusals_of(booted: &Booted) -> Vec<String> {
+        let dynamic = booted.driver.dynamic_snapshot().await;
+        let users = booted.driver.registered_users().await;
+        match booted
+            .driver
+            .prepare(TriggerSource::Signal, &dynamic, &users)
+        {
+            Prepared::Refused { refusals, .. } => refusals,
+            other => panic!("the candidate must be refused: {}", outcome_of(&other)),
+        }
+    }
+
+    /// The refusal names the consumer, the port, the channel and the string
+    /// contract.
+    fn assert_names_the_pairing(refusals: &[String], port: &str) {
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        let refusal = &refusals[0];
+        for needle in [
+            "\"sifter\"",
+            port,
+            "brenn:frames",
+            "declared `non_text`",
+            "brenn:processor@0.1.0",
+        ] {
+            assert!(refusal.contains(needle), "{needle:?} in {refusal:?}");
+        }
+    }
+
+    /// [`install_package`] over the raw `brenn:processor@0.1.0` fixture, whose
+    /// imports need `ports` and `calls` granted.
+    fn install_string_package(root: &std::path::Path, module_text: &str) {
+        install_package_from(root, module_text, "brenn_processor_page_test.wasm");
+    }
+
+    /// A 0.1.0 consumer arriving with an input on a `non_text` channel is
+    /// refused, and nothing of it is wired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_string_contract_consumer_reading_a_non_text_channel_is_refused() {
+        let tree = Tree::holding(&document(&frames_channels(true)));
+        let components = tempfile::tempdir().expect("a components root");
+        let booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        tree.write(&frames_consumer_document(
+            true,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
+        install_string_package(components.path(), &staged_module(&tree));
+
+        assert_names_the_pairing(&refusals_of(&booted).await, "input port \"inbound\"");
+        assert!(!booted.driver.registry().contains_key("sifter"));
+        let kind = SubscriberEntryKind::Wasm("sifter".to_string());
+        assert!(subscribed_anywhere(&booted.messenger, &kind).is_empty());
+    }
+
+    /// The same for an output port: the deferred view reads a component's own
+    /// parked bodies back to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_string_contract_consumer_writing_a_non_text_channel_is_refused() {
+        let tree = Tree::holding(&document(&frames_channels(true)));
+        let components = tempfile::tempdir().expect("a components root");
+        let booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        tree.write(&frames_consumer_document(
+            true,
+            "work",
+            "frames",
+            "ports, calls",
+        ));
+        install_string_package(components.path(), &staged_module(&tree));
+
+        assert_names_the_pairing(&refusals_of(&booted).await, "output port \"digest\"");
+        assert!(!booted.driver.registry().contains_key("sifter"));
+    }
+
+    /// A declaration that makes a bound channel `non_text` re-plans the
+    /// consumer bound to it, and the re-load refuses the reload with the
+    /// running consumer untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn declaring_a_string_contract_consumers_channel_non_text_is_refused() {
+        let tree = Tree::holding(&frames_consumer_document(
+            false,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
+        let components = tempfile::tempdir().expect("a components root");
+        install_string_package(components.path(), &staged_module(&tree));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        let running = Arc::clone(&booted.driver.registry()["sifter"].component);
+
+        tree.write(&frames_consumer_document(
+            true,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert_names_the_pairing(&status.refusals, "input port \"inbound\"");
+        assert!(Arc::ptr_eq(
+            &running,
+            &booted.driver.registry()["sifter"].component
+        ));
+        assert!(
+            !booted
+                .messenger
+                .directory()
+                .resolve("brenn:frames")
+                .expect("the running declaration")
+                .resolved_channel
+                .non_text,
+            "the running directory keeps the text-only declaration",
+        );
+    }
+
+    /// Rolling a component back from a byte-carrying build to a string build
+    /// under the same package, while it reads a `non_text` channel, is
+    /// refused with the byte-carrying build still running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_string_build_replacing_a_byte_build_on_a_non_text_channel_is_refused() {
+        let text = frames_consumer_document(true, "frames", "sink", "ports, calls");
+        let tree = Tree::holding(&text);
+        let components = tempfile::tempdir().expect("a components root");
+        install_package_from(
+            components.path(),
+            &staged_module(&tree),
+            "brenn_processor_bytes_test.wasm",
+        );
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        let running = Arc::clone(&booted.driver.registry()["sifter"].component);
+        assert_eq!(running.contract(), brenn_wasm::ProcessorContract::V0_2);
+
+        install_string_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert_names_the_pairing(&status.refusals, "input port \"inbound\"");
+        assert!(Arc::ptr_eq(
+            &running,
+            &booted.driver.registry()["sifter"].component
+        ));
+    }
+
+    /// At boot the same pairing stops the process before any consumer
+    /// starts.
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic(
+        expected = "consumer \"sifter\": its input port \"inbound\" is bound to \
+                               brenn:frames, a channel declared `non_text`"
+    )]
+    async fn booting_a_string_contract_consumer_on_a_non_text_channel_panics() {
+        let tree = Tree::holding(&frames_consumer_document(
+            true,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
+        let components = tempfile::tempdir().expect("a components root");
+        install_string_package(components.path(), &staged_module(&tree));
+        boot(&tree, vec![components.path().to_path_buf()]).await;
+    }
+
+    // ── A string-contract component on a raw ingress channel ─────────────
+
+    /// The system-minted ingress channel the consumer below reads.
+    const RAW_INGRESS: &str = "mqtt:broker:cam/front";
+
+    /// One MQTT client, the sink, and — when `raw` — a prefix tuning block
+    /// making every `mqtt:broker:cam/` channel `non_text`; with `consumer`,
+    /// `sifter` reading [`RAW_INGRESS`] and writing the sink. The class is the
+    /// one [`frames_consumer_document`] uses, so the same installed package
+    /// serves each document.
+    fn ingress_consumer_document(raw: bool, consumer: bool) -> String {
+        let tuning = if raw {
+            r#"channel at prefix "mqtt:broker:cam/" {
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+    non_text = true;
+}
+"#
+        } else {
+            ""
+        };
+        let instance = if consumer {
+            format!(
+                r#"new sifter: Demo {{
+    grants = [ports, calls];
+    in inbound <- "{RAW_INGRESS}" {{ push_depth = 4; }}
+    out digest -> sink;
+}}
+"#
+            )
+        } else {
+            String::new()
+        };
+        document(&format!(
+            r#"mqtt_client broker {{
+    url = "mqtts://127.0.0.1:8883";
+    qos = 1;
+}}
+channel sink at "brenn:sink" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
+{tuning}{PACKAGED}component Demo {{
+    abi = processor;
+    requires = [ports, calls];
+    in inbound;
+    out digest;
+}}
+{PACKAGED}
+{instance}"#
+        ))
+    }
+
+    /// The refusal names the consumer, its input port, the ingress channel and
+    /// the string contract.
+    fn assert_names_the_ingress_pairing(refusals: &[String]) {
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        let refusal = &refusals[0];
+        for needle in [
+            "\"sifter\"",
+            "input port \"inbound\"",
+            RAW_INGRESS,
+            "declared `non_text`",
+            "brenn:processor@0.1.0",
+        ] {
+            assert!(refusal.contains(needle), "{needle:?} in {refusal:?}");
+        }
+    }
+
+    /// A 0.1.0 consumer bound to an `mqtt:` channel a tuning block makes raw
+    /// stops the process at boot: the binding mints the channel `non_text`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic(
+        expected = "consumer \"sifter\": its input port \"inbound\" is bound to \
+                    mqtt:broker:cam/front, a channel declared `non_text`"
+    )]
+    async fn booting_a_string_contract_consumer_on_a_raw_ingress_channel_panics() {
+        let tree = Tree::holding(&ingress_consumer_document(true, true));
+        let components = tempfile::tempdir().expect("a components root");
+        install_string_package(components.path(), &staged_module(&tree));
+        boot(&tree, vec![components.path().to_path_buf()]).await;
+    }
+
+    /// The same consumer on the same channel with no tuning block boots: the
+    /// channel is wrapped, so the refusal above is the tuning's doing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_string_contract_consumer_on_a_wrapped_ingress_channel_boots() {
+        let tree = Tree::holding(&ingress_consumer_document(false, true));
+        let components = tempfile::tempdir().expect("a components root");
+        install_string_package(components.path(), &staged_module(&tree));
+        let booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        assert!(booted.driver.registry().contains_key("sifter"));
+    }
+
+    /// A 0.1.0 consumer arriving by reload on a raw ingress channel is
+    /// refused, and nothing of it is wired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_string_contract_consumer_arriving_on_a_raw_ingress_channel_is_refused() {
+        let tree = Tree::holding(&ingress_consumer_document(true, false));
+        let components = tempfile::tempdir().expect("a components root");
+        let booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        tree.write(&ingress_consumer_document(true, true));
+        install_string_package(components.path(), &staged_module(&tree));
+
+        assert_names_the_ingress_pairing(&refusals_of(&booted).await);
+        assert!(!booted.driver.registry().contains_key("sifter"));
+        let kind = SubscriberEntryKind::Wasm("sifter".to_string());
+        assert!(subscribed_anywhere(&booted.messenger, &kind).is_empty());
+    }
+
+    /// Holds the string-contract notice lines in `lines` to `expected`, each
+    /// naming one component, `slug`; for `logs_assert`.
+    fn expect_string_contract_notices(
+        lines: &[&str],
+        slug: &str,
+        expected: usize,
+    ) -> Result<(), String> {
+        let notices: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line.contains(crate::consumers::STRING_CONTRACT_NOTICE))
+            .collect();
+        if let Some(line) = notices.iter().find(|line| {
+            !(line.contains("WARN")
+                && line.contains("count=1")
+                && line.contains(&format!("slugs=[\"{slug}\"]")))
+        }) {
+            return Err(format!("the notice names one component, {slug:?}: {line}"));
+        }
+        if notices.len() != expected {
+            return Err(format!(
+                "{expected} notice line(s) expected, found {}: {notices:?}",
+                notices.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// A string-contract component is named by the notice at boot and after
+    /// an applied reload; an unchanged and a refused reload write none.
+    ///
+    /// The boot under test is this harness's `boot`, which repeats the notice
+    /// call `run_server` makes; the call in `run_server` itself is not covered.
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn the_string_contract_notice_follows_boot_and_applied_reloads() {
+        let tree = Tree::holding(&frames_consumer_document(
+            false,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
+        let components = tempfile::tempdir().expect("a components root");
+        install_string_package(components.path(), &staged_module(&tree));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        logs_assert(|lines| expect_string_contract_notices(lines, "sifter", 1));
+
+        tree.write(&frames_consumer_document(
+            false,
+            "work",
+            "sink",
+            "ports, calls",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        logs_assert(|lines| expect_string_contract_notices(lines, "sifter", 2));
+
+        booted.driver.reload(TriggerSource::Signal).await;
+        assert_eq!(booted.last_status().await.outcome, Outcome::Unchanged);
+        tree.write(&frames_consumer_document(
+            true,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+        assert_eq!(booted.last_status().await.outcome, Outcome::Refused);
+        logs_assert(|lines| expect_string_contract_notices(lines, "sifter", 2));
+    }
+
+    /// With only byte-carrying components running, neither boot nor an applied
+    /// reload writes the notice.
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn no_string_contract_notice_without_a_string_contract_component() {
+        let tree = Tree::holding(&frames_consumer_document(
+            true,
+            "frames",
+            "sink",
+            "ports, calls",
+        ));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package_from(
+            components.path(),
+            &staged_module(&tree),
+            "brenn_processor_bytes_test.wasm",
+        );
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        tree.write(&frames_consumer_document(
+            true,
+            "work",
+            "sink",
+            "ports, calls",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        logs_assert(|lines| expect_string_contract_notices(lines, "sifter", 0));
+    }
+
+    // ── A durable channel declared text-only over non-text rows ──────────
+
+    /// Stores one non-text message on `brenn:frames`, as a byte-carrying
+    /// component's flush would.
+    async fn store_a_non_text_frame(booted: &Booted) {
+        booted
+            .messenger
+            .publish_from_wasm(
+                "framer",
+                &[brenn_messaging::WasmPublish {
+                    channel_address: "brenn:frames",
+                    body: brenn_envelope::MessageBody::from_parts(
+                        Some("image/jpeg"),
+                        &[0xff, 0xd8, 0xff, 0x00],
+                    )
+                    .expect("a well-formed binary body"),
+                    urgency: brenn_lib::messaging::Urgency::Normal,
+                    reply_to: None,
+                    deliver_after: None,
+                    attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
+                }],
+            )
+            .await;
+    }
+
+    /// Declaring a durable channel text-only while its store holds a non-text
+    /// message is refused, and the running declaration stays `non_text`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn declaring_a_durable_channel_holding_non_text_rows_text_only_is_refused() {
+        let tree = Tree::holding(&document(&frames_channels(true)));
+        let mut booted = boot(&tree, Vec::new()).await;
+        store_a_non_text_frame(&booted).await;
+
+        tree.write(&document(&frames_channels(false)));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.refusals);
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        for needle in [
+            "\"brenn:frames\"",
+            "declared text-only",
+            "not text",
+            "non_text = true",
+        ] {
+            assert!(
+                status.refusals[0].contains(needle),
+                "{needle:?} in {:?}",
+                status.refusals[0]
+            );
+        }
+        assert!(
+            booted
+                .messenger
+                .directory()
+                .resolve("brenn:frames")
+                .expect("the running declaration")
+                .resolved_channel
+                .non_text,
+            "the running directory keeps the `non_text` declaration",
+        );
+    }
+
+    /// Declaring a durable channel text-only while a remote may publish to it
+    /// is refused at prepare, with the remote named, and the running
+    /// declaration stays `non_text`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn declaring_a_channel_a_remote_publishes_to_text_only_is_refused() {
+        let mut token = tempfile::NamedTempFile::new().expect("a token file");
+        std::io::Write::write_all(&mut token, b"pod-token\n").expect("the token is written");
+        let with_remote = |non_text: bool| {
+            document(&format!(
+                r#"{channels}
+remote pod {{
+    token_file = "{token}";
+    grants = [publish];
+    acl publish [exact frames];
+}}
+"#,
+                channels = frames_channels(non_text),
+                token = token.path().display(),
+            ))
+        };
+        let tree = Tree::holding(&with_remote(true));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        tree.write(&with_remote(false));
+        let refusals = refusals_of(&booted).await;
+        assert_eq!(
+            refusals,
+            vec![format!(
+                "brenn:frames is changed to text-only but remote \"pod\" may publish to it: \
+                 {}",
+                super::super::NEEDS_RESTART,
+            )],
+        );
+        booted.driver.reload(TriggerSource::Signal).await;
+        assert_eq!(booted.last_status().await.outcome, Outcome::Refused);
+        assert!(
+            booted
+                .messenger
+                .directory()
+                .resolve("brenn:frames")
+                .expect("the running declaration")
+                .resolved_channel
+                .non_text,
+            "the running directory keeps the `non_text` declaration",
+        );
+    }
+
+    /// The same declaration over a channel whose store holds only text applies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn declaring_a_durable_channel_holding_only_text_text_only_applies() {
+        let tree = Tree::holding(&document(&frames_channels(true)));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        tree.write(&document(&frames_channels(false)));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    }
+
+    /// A non-text message that lands after the up-front check — a departing
+    /// writer's last flush during the retirements — is caught when the check is
+    /// asked again, and the process dies naming the channel and the way out.
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic(
+        expected = "while the departing consumers were stopping:\nconfig: channel \
+                    \"brenn:frames\" is declared text-only, but its store holds messages whose \
+                    bodies are not text; declare it `non_text = true`, or give it a new address"
+    )]
+    async fn a_non_text_message_landing_during_the_retirements_stops_the_commit() {
+        let tree = Tree::holding(&document(&frames_channels(true)));
+        let booted = boot(&tree, Vec::new()).await;
+
+        tree.write(&document(&frames_channels(false)));
+        let dynamic = booted.driver.dynamic_snapshot().await;
+        let users = booted.driver.registered_users().await;
+        let ready = match booted
+            .driver
+            .prepare(TriggerSource::Signal, &dynamic, &users)
+        {
+            Prepared::Ready(ready) => ready,
+            other => panic!("the candidate is applicable: {}", outcome_of(&other)),
+        };
+        store_a_non_text_frame(&booted).await;
+
+        super::super::commit::assert_no_text_only_channel_holds_non_text(
+            booted.driver.env(),
+            &ready.plan,
+        )
+        .await;
+    }
+
+    /// At boot the same configuration stops the process before the messaging
+    /// layer is committed.
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic(
+        expected = "config: channel \"brenn:frames\" is declared text-only, but its \
+                               store holds messages whose bodies are not text"
+    )]
+    async fn booting_a_durable_channel_holding_non_text_rows_as_text_only_panics() {
+        let db = brenn_server::test_support::init_db_memory();
+        let first = boot_with(
+            &Tree::holding(&document(&frames_channels(true))),
+            BootFixture {
+                db: Some(db.clone()),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        store_a_non_text_frame(&first).await;
+        drop(first);
+
+        boot_with(
+            &Tree::holding(&document(&frames_channels(false))),
+            BootFixture {
+                db: Some(db),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+    }
+
     /// A candidate that configures no messaging at all is refused: a process
     /// running the reload facility has messaging by construction.
     ///
@@ -4948,6 +5609,11 @@ new sifter: Demo {{
             .expect("the message rows read")
             .map(|row| row.expect("a message row"))
             .collect()
+    }
+
+    /// Lower-case hex, as the byte-reporting fixtures spell a body or a blob.
+    pub(crate) fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     impl Booted {
@@ -5267,7 +5933,7 @@ new sifter: Demo {{
                 brenn_messaging::PublishOrigin::Conversation { id: 1 },
                 READER,
                 "brenn:work",
-                r#"{"cmd":"get","key":"test-key"}"#,
+                r#"{"cmd":"get","key":"test-key"}"#.into(),
                 brenn_messaging::Urgency::Normal,
                 None,
                 None,
@@ -5673,6 +6339,7 @@ channel spare at "brenn:spare" {
                             source_sha256: "s".to_string(),
                             spec_sha256: "p".to_string(),
                             cores: Vec::new(),
+                            contract: brenn_envelope::grants::ProcessorContract::V0_1,
                         },
                     )
                 })
@@ -6065,7 +6732,7 @@ channel extra at "brenn:extra" {
                 brenn_messaging::PublishOrigin::Conversation { id: 1 },
                 READER,
                 RELOAD_ADDRESS,
-                "please",
+                "please".into(),
                 brenn_messaging::Urgency::Normal,
                 None,
                 None,
@@ -6184,8 +6851,13 @@ channel extra at "brenn:extra" {
             ) -> Result<(), AclDenied> {
                 Ok(())
             }
-            async fn execute(&self, _c: &ToolCtx, _a: Value) -> Result<Value, ToolError> {
-                Ok(json!({}))
+            async fn execute(
+                &self,
+                _c: &ToolCtx,
+                _a: Value,
+                _h: brenn_tool_registry::HeldAttachments,
+            ) -> Result<brenn_tool_registry::ToolOutput, ToolError> {
+                Ok(json!({}).into())
             }
         }
         RegisteredTool::Async(Arc::new(APull(ToolDescriptor {
@@ -6198,6 +6870,7 @@ channel extra at "brenn:extra" {
             idempotency: Idempotency::Natural,
             auto_approve: true,
             user_binding: brenn_tool_registry::UserBinding::None,
+            accepts_attachments: false,
         })))
     }
 
@@ -8772,7 +9445,7 @@ channel spill at "ephemeral:spill" {
             .expect("the fixture reader may read every address it is given")
             .into_iter()
             .next()
-            .map(|envelope| envelope.body)
+            .map(|envelope| envelope.body.as_text().unwrap().to_owned())
     }
 
     /// Whether the runtime table serves `slug`.
@@ -9330,6 +10003,624 @@ channel spill at "ephemeral:spill" {
         assert!(after.withheld.is_empty(), "{:?}", after.withheld);
     }
 
+    /// The words the bundled byte-carrying `panel` requires and is granted:
+    /// the page's own two, and the two the bytes fixture imports. Its free
+    /// `io` port is what `ports` reaches.
+    pub(crate) const BYTES_PANEL_WORDS: &str = "dom, page-dom, ports, calls";
+
+    /// Install a bundled `panel` whose component is `component`, with the
+    /// record its build would write: the artifact's own import profile when it
+    /// is a real component, none for placeholder bytes.
+    pub(crate) fn write_bundled_bytes_panel_kind(
+        tree: &Tree,
+        kernel: &std::path::Path,
+        bundle: &std::path::Path,
+        component: Option<&str>,
+    ) {
+        let modules = tree.modules();
+        std::fs::create_dir_all(&modules).expect("a module root");
+        let spec = format!(
+            "component Panel {{\n    {}\n    in feed;\n    io memo;\n}}\n",
+            brenn_dsl::fixture_text::processor_header(BYTES_PANEL_WORDS),
+        );
+        std::fs::write(modules.join("panel.brenn"), &spec).expect("the class module is writable");
+        std::fs::create_dir_all(kernel).expect("brenn's own surface tree");
+        brenn_surface_server::test_fixtures::write_kernel_pair(kernel);
+        std::fs::create_dir_all(bundle).expect("the bundle's surface tree");
+        let (bytes, imports) = match component {
+            Some(file_name) => {
+                let staged = tempfile::tempdir().expect("a staging dir");
+                let path = staged.path().join(file_name);
+                let bytes = crate::consumers::fixture_artifact(file_name);
+                std::fs::write(&path, &bytes).expect("stage the artifact");
+                (bytes, brenn_wasm::processor_component_imports(&path))
+            }
+            None => (b"component-bytes-for-panel".to_vec(), Vec::new()),
+        };
+        brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+            bundle,
+            "panel",
+            &bytes,
+            spec.as_bytes(),
+            imports,
+            true,
+            |_| {},
+        );
+    }
+
+    /// The surface notice lines in `lines`, each of which must name the one
+    /// kind `panel`.
+    fn surface_notices(lines: &[&str]) -> Result<usize, String> {
+        let notices: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line.contains(crate::consumers::STRING_CONTRACT_SURFACE_NOTICE))
+            .collect();
+        if let Some(line) = notices.iter().find(|line| {
+            !(line.contains("WARN")
+                && line.contains("count=1")
+                && line.contains("kinds=[\"panel\"]"))
+        }) {
+            return Err(format!("the notice names one kind, \"panel\": {line}"));
+        }
+        Ok(notices.len())
+    }
+
+    /// **A served string-contract kind rebuilt on the byte-carrying contract
+    /// is reinstalled, and the page comes back for its new contract.** The
+    /// bundle replaces the kind's tree in place with a 0.2.0 artifact the
+    /// surface host serves; nothing in the document moves. The kind is
+    /// `Reinstalled`, its surface's pages close, and the served set carries
+    /// the new contract, which is what the page manifest hands the page. The
+    /// surface notice names the kind at boot and is silent after the reload,
+    /// when no instantiated kind is on the string contract.
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn a_kind_rebuilt_on_the_byte_contract_is_reinstalled_with_its_contract() {
+        let tree = Tree::new();
+        let kernel = tempfile::tempdir().expect("brenn's own surface tree");
+        let bundle = tempfile::tempdir().expect("a bundle surface tree");
+        write_bundled_bytes_panel_kind(&tree, kernel.path(), bundle.path(), None);
+        tree.write(
+            &surface_document("deskbar", "panel", "Panel", "")
+                .replace(
+                    "grants = [dom, page-dom];",
+                    &format!("grants = [{BYTES_PANEL_WORDS}];"),
+                )
+                .replace(
+                    "in feed <- deskbar_feed { push_depth = 2; }",
+                    "in feed <- deskbar_feed { push_depth = 2; }\n        \
+                     io memo { push_depth = 1; retain_depth = 2; }",
+                ),
+        );
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                surface_assets: Some(kernel.path().to_path_buf()),
+                surface_bundle: Some(bundle.path().to_path_buf()),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            serving_roots(&booted).kind_contract("panel"),
+            Some(brenn_wasm::ProcessorContract::V0_1)
+        );
+        logs_assert(|lines| match surface_notices(lines)? {
+            1 => Ok(()),
+            n => Err(format!("boot writes one notice, found {n}")),
+        });
+        let page = attach_a_session(&booted, "deskbar");
+
+        write_bundled_bytes_panel_kind(
+            &tree,
+            kernel.path(),
+            bundle.path(),
+            Some("brenn_processor_bytes_test.wasm"),
+        );
+        let held = serving_roots(&booted);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.kinds_changed, vec!["panel".to_string()]);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        let after = serving_roots(&booted);
+        assert!(
+            matches!(
+                held.kind_differences(&after).get("panel"),
+                Some(brenn_surface_server::KindDifference::Reinstalled { .. })
+            ),
+            "{:?}",
+            held.kind_differences(&after),
+        );
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            "the page has to come back for the kind's new contract",
+        );
+        assert_eq!(
+            after.kind_contract("panel"),
+            Some(brenn_wasm::ProcessorContract::V0_2)
+        );
+        logs_assert(|lines| match surface_notices(lines)? {
+            1 => Ok(()),
+            n => Err(format!("the reload adds no notice, found {n} in all")),
+        });
+    }
+
+    /// The one-surface document over the bundled byte-carrying `panel`: its
+    /// grants, and its free `io memo` port stating `non_text` or not.
+    pub(crate) fn bytes_panel_document(non_text: bool) -> String {
+        let tail = if non_text { " non_text = true;" } else { "" };
+        surface_document("deskbar", "panel", "Panel", "")
+            .replace(
+                "grants = [dom, page-dom];",
+                &format!("grants = [{BYTES_PANEL_WORDS}];"),
+            )
+            .replace(
+                "in feed <- deskbar_feed { push_depth = 2; }",
+                &format!(
+                    "in feed <- deskbar_feed {{ push_depth = 2; }}\n        \
+                     io memo {{ push_depth = 1; retain_depth = 2;{tail} }}"
+                ),
+            )
+    }
+
+    /// Boot the bundled `panel` as `component` (see
+    /// [`write_bundled_bytes_panel_kind`]) under [`bytes_panel_document`].
+    async fn boot_bytes_panel(
+        component: Option<&str>,
+        non_text: bool,
+    ) -> (Tree, tempfile::TempDir, tempfile::TempDir, Booted) {
+        let tree = Tree::new();
+        let kernel = tempfile::tempdir().expect("brenn's own surface tree");
+        let bundle = tempfile::tempdir().expect("a bundle surface tree");
+        write_bundled_bytes_panel_kind(&tree, kernel.path(), bundle.path(), component);
+        tree.write(&bytes_panel_document(non_text));
+        let booted = boot_with(
+            &tree,
+            BootFixture {
+                surface_assets: Some(kernel.path().to_path_buf()),
+                surface_bundle: Some(bundle.path().to_path_buf()),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        (tree, kernel, bundle, booted)
+    }
+
+    /// **A reload that would bind a string-contract instance to a `non_text`
+    /// channel is refused.** Both documents compile; only the kind's contract,
+    /// read off its record, says the second cannot be served. The running
+    /// bindings document is untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_binding_a_string_contract_instance_to_a_non_text_channel_is_refused() {
+        let (tree, _kernel, _bundle, mut booted) = boot_bytes_panel(None, false).await;
+        assert_eq!(
+            serving_roots(&booted).kind_contract("panel"),
+            Some(brenn_wasm::ProcessorContract::V0_1)
+        );
+        let before = newest_body(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the bindings document is retained");
+
+        tree.write(&bytes_panel_document(true));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        let refusal = &status.refusals[0];
+        assert!(
+            refusal.contains("component \"panel\"'s input port \"memo\"")
+                && refusal.contains("a page-local channel declared `non_text`")
+                && refusal.contains("brenn:processor@0.1.0")
+                && !refusal.contains("Refusing to start"),
+            "{refusal}"
+        );
+        assert_eq!(
+            newest_body(&booted.messenger, DESKBAR_BINDINGS).await,
+            Some(before),
+            "a refused reload leaves the served document in place"
+        );
+    }
+
+    /// **A page-local channel's declaration flips, each way, under a
+    /// byte-carrying kind.** Only the declaration moves, so the surface is
+    /// `changed`, its page is closed to come back, and the retained bindings
+    /// document carries the new flag.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_local_non_text_flip_changes_the_surface_each_way() {
+        let (tree, _kernel, _bundle, mut booted) =
+            boot_bytes_panel(Some("brenn_processor_bytes_test.wasm"), false).await;
+        for non_text in [true, false] {
+            let page = attach_a_session(&booted, "deskbar");
+            tree.write(&bytes_panel_document(non_text));
+            booted.driver.reload(TriggerSource::Signal).await;
+
+            let status = booted.last_status().await;
+            assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+            assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+            assert_eq!(
+                page.await.expect("the stand-in page task"),
+                brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            );
+            let body = newest_body(&booted.messenger, DESKBAR_BINDINGS)
+                .await
+                .expect("the bindings document is retained");
+            let document = brenn_surface_schema::bindings::BindingsDocument::parse(&body)
+                .expect("the retained document parses");
+            assert!(
+                !document.local_channels.is_empty()
+                    && document
+                        .local_channels
+                        .iter()
+                        .all(|c| c.non_text == non_text),
+                "{body}"
+            );
+        }
+    }
+
+    /// `deskbar_feed`'s opening line in every one-surface document.
+    const DESKBAR_FEED_OPENING: &str =
+        "channel deskbar_feed at \"ephemeral:deskbar.feed\" {\n    push_depth = 4;";
+
+    /// The bound transportable channel `panel`'s `feed` port reads.
+    const DESKBAR_FEED: &str = "ephemeral:deskbar.feed";
+
+    /// `document` with `deskbar_feed` declared `non_text`.
+    fn feed_non_text(document: &str) -> String {
+        assert!(document.contains(DESKBAR_FEED_OPENING), "{document}");
+        document.replace(
+            DESKBAR_FEED_OPENING,
+            "channel deskbar_feed at \"ephemeral:deskbar.feed\" {\n    non_text = true;\n    \
+             push_depth = 4;",
+        )
+    }
+
+    /// [`bytes_panel_document`] with no `non_text` on `memo`, and with the
+    /// transportable channel `feed` binds declared `non_text` or not. The port
+    /// itself states nothing.
+    pub(crate) fn feed_declared_document(non_text: bool) -> String {
+        let document = bytes_panel_document(false);
+        if non_text {
+            feed_non_text(&document)
+        } else {
+            document
+        }
+    }
+
+    /// The `non_text` flag the retained bindings document gives `channel` in
+    /// its wire channel table.
+    async fn retained_wire_declaration(booted: &Booted, channel: &str) -> bool {
+        let body = newest_body(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the bindings document is retained");
+        let document = brenn_surface_schema::bindings::BindingsDocument::parse(&body)
+            .expect("the retained document parses");
+        document
+            .wire_channels
+            .iter()
+            .find(|wire| wire.channel == channel)
+            .unwrap_or_else(|| panic!("{channel} is in the wire channel table: {body}"))
+            .non_text
+    }
+
+    /// **A bound `ephemeral:` channel's declaration flips, each way, under an
+    /// attached page.** The channel is in `channels_changed` and the surface in
+    /// `surfaces_changed`; the page is closed before the entry is replaced, and
+    /// the republished document's wire table carries the new declaration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bound_ephemeral_channel_flip_changes_the_surface_each_way() {
+        let (tree, _kernel, _bundle, mut booted) =
+            boot_bytes_panel(Some("brenn_processor_bytes_test.wasm"), false).await;
+        assert!(!retained_wire_declaration(&booted, DESKBAR_FEED).await);
+        for non_text in [true, false] {
+            let page = attach_a_session(&booted, "deskbar");
+            tree.write(&feed_declared_document(non_text));
+            booted.driver.reload(TriggerSource::Signal).await;
+
+            let status = booted.last_status().await;
+            assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+            assert_eq!(
+                status.delta.channels_changed,
+                vec![DESKBAR_FEED.to_string()]
+            );
+            assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+            assert_eq!(
+                page.await.expect("the stand-in page task"),
+                brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            );
+            assert_eq!(
+                retained_wire_declaration(&booted, DESKBAR_FEED).await,
+                non_text
+            );
+        }
+    }
+
+    /// **A reload declaring a channel `non_text` under a string-contract
+    /// instance bound to it is refused.** The kind's record says the instance
+    /// can only be handed text; the running document stands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_declaring_a_string_contract_instances_wire_channel_non_text_is_refused() {
+        let (tree, _kernel, _bundle, mut booted) = boot_bytes_panel(None, false).await;
+        assert_eq!(
+            serving_roots(&booted).kind_contract("panel"),
+            Some(brenn_wasm::ProcessorContract::V0_1)
+        );
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the bindings document is retained");
+
+        tree.write(&feed_declared_document(true));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        let refusal = &status.refusals[0];
+        assert!(
+            refusal.contains("component \"panel\"'s input port \"feed\"")
+                && refusal.contains(&format!("{DESKBAR_FEED}, a channel declared `non_text`"))
+                && refusal.contains("bind the port to a text-only channel")
+                && refusal.contains("brenn:processor@0.1.0")
+                && !refusal.contains("Refusing to start"),
+            "{refusal}"
+        );
+        assert_eq!(
+            newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+                .await
+                .map(|envelope| envelope.message_id),
+            Some(before.message_id),
+            "a refused reload leaves the served document in place"
+        );
+    }
+
+    /// The durable channel `memo` is bound to in [`memo_on_a_durable_channel`].
+    const DESKBAR_STORE: &str = "brenn:deskbar.store";
+
+    /// [`bytes_panel_document`] with `memo` bound, both ways, to a durable
+    /// channel declared `non_text` or not.
+    fn memo_on_a_durable_channel(non_text: bool) -> String {
+        let flag = if non_text {
+            "    non_text = true;\n"
+        } else {
+            ""
+        };
+        let document = bytes_panel_document(false);
+        let free = "io memo { push_depth = 1; retain_depth = 2; }";
+        let surface = "surface deskbar {\n    grants = [subscribe];";
+        assert!(document.contains(free), "{document}");
+        assert!(document.contains(surface), "{document}");
+        document
+            .replace(
+                free,
+                "io memo <-> deskbar_store { push_depth = 1; retain_depth = 2; }",
+            )
+            .replace(
+                surface,
+                &format!(
+                    "channel deskbar_store at \"{DESKBAR_STORE}\" {{\n{flag}    push_depth = 1;\n    \
+                     retain_depth = 4;\n    standing_retain_depth = 4;\n}}\n\n\
+                     surface deskbar {{\n    grants = [subscribe, publish];"
+                ),
+            )
+    }
+
+    /// **A durable channel a surface's port writes is not made text-only by a
+    /// reload.** The output arm of the rule the status channel's case pins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_only_flip_under_a_surface_output_is_refused() {
+        let tree = Tree::new();
+        let kernel = tempfile::tempdir().expect("brenn's own surface tree");
+        let bundle = tempfile::tempdir().expect("a bundle surface tree");
+        write_bundled_bytes_panel_kind(
+            &tree,
+            kernel.path(),
+            bundle.path(),
+            Some("brenn_processor_bytes_test.wasm"),
+        );
+        tree.write(&memo_on_a_durable_channel(true));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                surface_assets: Some(kernel.path().to_path_buf()),
+                surface_bundle: Some(bundle.path().to_path_buf()),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        assert!(retained_wire_declaration(&booted, DESKBAR_STORE).await);
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("boot published the surface's bindings document");
+
+        tree.write(&memo_on_a_durable_channel(false));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(
+            status.refusals,
+            vec![format!(
+                "{DESKBAR_STORE} is changed to text-only but surface \"deskbar\" may publish to \
+                 it: this change needs a restart"
+            )],
+        );
+        assert_eq!(
+            newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+                .await
+                .map(|envelope| envelope.message_id),
+            Some(before.message_id),
+            "a refused reload leaves the served document in place"
+        );
+    }
+
+    /// Reload `booted` onto `candidate`, which the planner refuses, and assert
+    /// the refusal is exactly `expected` — the operator's verdict, verbatim, not
+    /// reported as a possible host defect — and that the running surface and
+    /// its retained document stand.
+    async fn assert_planner_refuses(
+        tree: &Tree,
+        booted: &mut Booted,
+        candidate: &str,
+        expected: &str,
+    ) {
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("boot published the surface's bindings document");
+        tree.write(candidate);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(status.refusals, vec![expected.to_string()]);
+        assert!(serves_surface(booted, "deskbar"));
+        assert_eq!(
+            newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+                .await
+                .map(|envelope| envelope.message_id),
+            Some(before.message_id),
+            "a refused reload leaves the served document in place"
+        );
+    }
+
+    /// **A port stating `non_text` on a channel declared text-only is refused
+    /// by the reload, in the planner's own words.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_port_stating_non_text_on_a_text_only_channel_is_refused_verbatim() {
+        let (tree, _assets, mut booted) = boot_one_panel_surface("").await;
+        let binding = "in feed <- deskbar_feed { push_depth = 2; }";
+        let document = surface_document("deskbar", "panel", "Panel", "");
+        assert!(document.contains(binding), "{document}");
+        let candidate = document.replace(
+            binding,
+            "in feed <- deskbar_feed { push_depth = 2; non_text = true; }",
+        );
+        assert_planner_refuses(
+            &tree,
+            &mut booted,
+            &candidate,
+            "config: [[surface]] \"deskbar\": subscription instance \"panel\" port \"feed\" \
+             states `non_text`, but its channel \"ephemeral:deskbar.feed\" is declared text-only \
+             — declare the channel `non_text`, or drop `non_text` from the port",
+        )
+        .await;
+    }
+
+    /// **A surface's config channel declared `non_text` is refused by the
+    /// reload, with the reason a page gives it.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_config_channel_declared_non_text_is_refused_verbatim() {
+        let (tree, _assets, mut booted) = boot_one_panel_surface("").await;
+        let opening = "channel deskbar_bindings at \
+                       \"ephemeral:surface.surface.deskbar.bindings\" {\n    push_depth = 1;";
+        let document = surface_document("deskbar", "panel", "Panel", "");
+        assert!(document.contains(opening), "{document}");
+        let candidate = document.replace(
+            opening,
+            "channel deskbar_bindings at \"ephemeral:surface.surface.deskbar.bindings\" {\n    \
+             non_text = true;\n    push_depth = 1;",
+        );
+        assert_planner_refuses(
+            &tree,
+            &mut booted,
+            &candidate,
+            "config: surface config channel \"ephemeral:surface.surface.deskbar.bindings\" is \
+             declared `non_text` — a page reads its bindings document as text, so the declaration \
+             would admit only bodies no page can apply. Remove `non_text` from its declaration.",
+        )
+        .await;
+    }
+
+    /// The one-surface document with `deskbar`'s status channel's opening line
+    /// replaced by `opening`.
+    fn status_declared(opening: &str) -> String {
+        const STATUS_OPENING: &str = "channel deskbar_status at \"brenn:surface.surface.deskbar.status\" {\n    push_depth = 1;";
+        let document = surface_document("deskbar", "panel", "Panel", "");
+        assert!(document.contains(STATUS_OPENING), "{document}");
+        document.replace(STATUS_OPENING, opening)
+    }
+
+    /// **A retuned status channel replaces its surface.** No binding names the
+    /// channel, but every page publishes its heartbeat onto it, so its entry is
+    /// never replaced under an attached session: the page is closed to come
+    /// back before the walk, and its document is republished.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retuned_status_channel_replaces_its_surface() {
+        let (tree, _assets, mut booted) = boot_one_panel_surface("").await;
+        let page = attach_a_session(&booted, "deskbar");
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("boot published the surface's bindings document");
+
+        tree.write(&status_declared(
+            "channel deskbar_status at \"brenn:surface.surface.deskbar.status\" {\n    push_depth = 2;",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.channels_changed,
+            vec!["brenn:surface.surface.deskbar.status".to_string()]
+        );
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+        );
+        assert!(serves_surface(&booted, "deskbar"));
+        let after = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the bindings document is still retained");
+        assert_ne!(
+            after.message_id, before.message_id,
+            "the document is republished"
+        );
+    }
+
+    /// **A durable channel a surface publishes onto is not made text-only by a
+    /// reload.** Its pages could still store a non-text row through the old
+    /// entry while the commit waits; the reload is refused naming the surface,
+    /// and the running document stands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_only_flip_under_a_publishing_surface_is_refused() {
+        let non_text = status_declared(
+            "channel deskbar_status at \"brenn:surface.surface.deskbar.status\" {\n    \
+             non_text = true;\n    push_depth = 1;",
+        );
+        let tree = Tree::new();
+        let assets = tempfile::tempdir().expect("a surface asset tree");
+        write_surface_kind(&tree, assets.path(), "panel", "Panel");
+        tree.write(&non_text);
+        let mut booted = boot_with_panel(&tree, assets.path()).await;
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("boot published the surface's bindings document");
+
+        tree.write(&surface_document("deskbar", "panel", "Panel", ""));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(
+            status.refusals,
+            vec![
+                "brenn:surface.surface.deskbar.status is changed to text-only but surface \
+                 \"deskbar\" may publish to it: this change needs a restart"
+                    .to_string()
+            ],
+        );
+        assert_eq!(
+            newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+                .await
+                .map(|envelope| envelope.message_id),
+            Some(before.message_id),
+            "a refused reload leaves the served document in place"
+        );
+    }
+
     /// **A kind whose record goes stale under a running process is withheld,
     /// alerted once, and takes its surface with it.** The other direction: a
     /// bundle installed at a record this binary does not read, under a document
@@ -9663,7 +10954,7 @@ channel spill at "ephemeral:spill" {
                 .publish_from_surface_platform(
                     &slug,
                     &channel,
-                    "{}",
+                    "{}".into(),
                     brenn_messaging::Urgency::Normal,
                 )
                 .await

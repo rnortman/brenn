@@ -22,7 +22,10 @@ use brenn_envelope::addressing::{
     is_unreserved_name,
 };
 use brenn_envelope::grants::ComponentGrant;
-use brenn_envelope::tool_schema::{INPUT_SCHEMA_SHAPE_REFUSAL, check_input_schema};
+use brenn_envelope::tool_schema::{
+    ATTACHMENTS_ARGUMENT, INPUT_SCHEMA_SHAPE_REFUSAL, check_input_schema,
+    declares_attachments_argument,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -4689,6 +4692,7 @@ fn provided_tool(
         input_schema,
         max_concurrency,
         auto_approve,
+        accepts_attachments,
     } = attrs;
     let name_ok = is_tool_name(name.value());
     if !name_ok {
@@ -4715,17 +4719,30 @@ fn provided_tool(
         None => Some(1),
     };
     let auto_approve = match &auto_approve {
-        Some(attr) => match attr.value.value() {
-            RValue::Bool(flag) => Some(*flag),
-            other => {
+        Some(attr) => provide_flag(&attr.value, "auto_approve", errors),
+        None => Some(true),
+    };
+    let accepts_attachments = match &accepts_attachments {
+        Some(attr) => {
+            let flag = provide_flag(&attr.value, "accepts_attachments", errors);
+            let reserved = input_schema
+                .as_ref()
+                .is_some_and(declares_attachments_argument);
+            if flag == Some(true) && reserved {
                 errors.push(Diagnostic::at(
-                    format!("`auto_approve` is a boolean; this is {}", other.kind()),
+                    format!(
+                        "a tool that accepts attachments may not declare a top-level \
+                         `{ATTACHMENTS_ARGUMENT}` property in its `input_schema`: a \
+                         conversation names the attachments it hands the tool in that argument"
+                    ),
                     attr.value.span().clone(),
                 ));
                 None
+            } else {
+                flag
             }
-        },
-        None => Some(true),
+        }
+        None => Some(false),
     };
     match (
         refused.any() || !name_ok,
@@ -4734,6 +4751,7 @@ fn provided_tool(
         input_schema,
         max_concurrency,
         auto_approve,
+        accepts_attachments,
     ) {
         (
             false,
@@ -4742,6 +4760,7 @@ fn provided_tool(
             Some(input_schema),
             Some(max_concurrency),
             Some(auto_approve),
+            Some(accepts_attachments),
         ) => Some(RProvidedTool {
             name,
             mcp_name,
@@ -4749,8 +4768,23 @@ fn provided_tool(
             input_schema,
             max_concurrency,
             auto_approve,
+            accepts_attachments,
         }),
         _ => None,
+    }
+}
+
+/// A `provide` statement's boolean key `key`.
+fn provide_flag(value: &RVal, key: &str, errors: &mut Vec<Diagnostic>) -> Option<bool> {
+    match value.value() {
+        RValue::Bool(flag) => Some(*flag),
+        other => {
+            errors.push(Diagnostic::at(
+                format!("`{key}` is a boolean; this is {}", other.kind()),
+                value.span().clone(),
+            ));
+            None
+        }
     }
 }
 
@@ -5156,7 +5190,7 @@ fn class_grants(class: &ComponentClass, errors: &mut Vec<Diagnostic>) -> Option<
     // requests the overlay hands its chrome no takeover plane to bind.
     for word in &optional {
         let imports =
-            ComponentGrant::parse(word.value()).is_some_and(|grant| grant.wit_import().is_some());
+            ComponentGrant::parse(word.value()).is_some_and(ComponentGrant::names_interface);
         if !imports {
             continue;
         }

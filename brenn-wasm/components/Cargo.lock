@@ -150,6 +150,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-processor-blob-caller-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
+name = "brenn-processor-blob-provider-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
+name = "brenn-processor-blobs-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
+name = "brenn-processor-bytes-test"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "brenn-processor-call-test"
 version = "0.1.0"
 dependencies = [
@@ -204,7 +232,7 @@ dependencies = [
 name = "brenn-processor-mqtt-test"
 version = "0.1.0"
 dependencies = [
- "wit-bindgen-rt",
+ "brenn-guest",
 ]
 
 [[package]]
@@ -217,10 +245,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-processor-page-bytes-test"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "brenn-processor-page-test"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "brenn-processor-provider-test"
 version = "0.1.0"
 dependencies = [
  "brenn-guest",
+]
+
+[[package]]
+name = "brenn-processor-sdk-bytes-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+ "serde_json",
+]
+
+[[package]]
+name = "brenn-processor-stale-contract-test"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
 ]
 
 [[package]]

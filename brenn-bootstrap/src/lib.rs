@@ -8,6 +8,8 @@
 mod agent_status;
 mod apps;
 mod automation;
+#[cfg(test)]
+mod bus_gc_blob_tests;
 mod cc_profile;
 mod cleanup;
 pub mod cli;
@@ -478,6 +480,11 @@ pub async fn run_server(
     // its own copy of the configuration.
     let config = document.config.clone();
 
+    // TODO(correctness-no-single-instance-guard-before-startup-side-effects):
+    // nothing refuses a second `brenn serve` beside a running one. The refusal
+    // belongs here, before the PID file is overwritten and before the startup
+    // hooks, the container sweep and the usage-session close below.
+
     // Write PID file if configured (used by logrotate's postrotate to send SIGHUP).
     if let Some(ref pid_file_path) = config.server.pid_file {
         crate::pid_file::write_pid_file(pid_file_path);
@@ -844,6 +851,7 @@ pub async fn run_server(
         &messaging_result.surfaces,
     );
     alert_withheld_kinds(&guard.alert_dispatcher, &surface_roots);
+    consumers::warn_string_contract_surface_kinds(&surface_roots, &messaging_result.surfaces);
 
     if let Some(messenger) = messenger {
         publish_boot_surface_documents(
@@ -936,6 +944,10 @@ pub async fn run_server(
             provider_runtime: &provider_runtime,
             max_payload_bytes: config.messaging.max_body_bytes,
             sync_router: messaging_result.router.clone(),
+            blob_host: messaging_result
+                .messenger
+                .as_ref()
+                .and_then(brenn_wasm_dispatch::blob_host_over),
         };
         messaging_result
             .wasm_consumers
@@ -948,6 +960,11 @@ pub async fn run_server(
             })
             .collect()
     };
+    consumers::warn_string_contract_components(
+        loaded_consumers
+            .iter()
+            .map(|(slug, loaded)| (slug.as_str(), loaded.component.contract())),
+    );
 
     // Register each loaded consumer's `Notify` and sync-request sender on the
     // WakeRouter as its WasmConsumer delivery binding. The router stores one
@@ -1507,6 +1524,9 @@ pub async fn run_server(
     info!("listening on {}", listener.local_addr().unwrap());
 
     use std::net::SocketAddr;
+    // TODO(surface-small-row-delivery-latency): small binary rows round-trip a
+    // surface page's websocket about 20 ms slower than megabyte rows; the
+    // listener's sockets keep Nagle's algorithm on.
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -1998,6 +2018,7 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
             max_concurrency: 1,
             auto_approve: true,
+            accepts_attachments: false,
         }];
         consumer
     }

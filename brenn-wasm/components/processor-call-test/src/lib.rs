@@ -19,7 +19,9 @@
 // happens and the reply is published and not returned, because answering an
 // activation that asked nothing is a trap.
 
-use brenn_guest::{Activation, Error, Processor, calls::CallPort, publish};
+use brenn_guest::{
+    Activation, Body, Error, MessageEnvelopeExt, Processor, calls::CallPort, publish,
+};
 
 /// The declared `call` port every call here goes out through. Spelled by hand
 /// rather than reached through a generated handle: this fixture has no
@@ -33,7 +35,7 @@ const CALL: &str = "call:";
 struct ProcessorCallTest;
 
 impl Processor for ProcessorCallTest {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         // The first new envelope on any window — the sync request when this is a
         // sync-call activation, the delivered message when it is not.
         let Some(envelope) = activation
@@ -43,11 +45,12 @@ impl Processor for ProcessorCallTest {
         else {
             return Ok(None);
         };
-        let body = envelope?.body;
+        let envelope = envelope?;
+        let body = envelope.text_body()?;
 
         let answer = match body.strip_prefix(CALL) {
             Some(rest) => match ASK.call(rest)? {
-                Some(reply) => format!("via:{reply}"),
+                Some(reply) => format!("via:{}", reply.as_text()?),
                 None => "via:none".to_string(),
             },
             None => format!("answer:{body}"),
@@ -55,7 +58,7 @@ impl Processor for ProcessorCallTest {
 
         publish(OUT, &answer)?;
         if activation.sync().is_some() {
-            Ok(Some(answer))
+            Ok(Some(answer.into()))
         } else {
             Ok(None)
         }

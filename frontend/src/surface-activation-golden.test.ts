@@ -11,49 +11,45 @@
 // TypeScript `as` assertion on the other cannot disagree visibly: the assertion
 // checks nothing, so `tsc --strict` is blind to it and every unit test on either
 // side agrees with itself. One file both sides pin against is what makes the
-// disagreement a failure.
+// disagreement a failure. The seam exists only on the string contract, so the
+// guest is a string-contract one.
 //
-// The guest is `processor-transplant`, because it is the one in-tree component
-// that reports what it was handed: its summary publish names every window, the
-// `message_id` of every envelope it parsed, `new_from`, `dropped` and `now`. So
-// this asserts more than "the glue accepted it" — it asserts the guest read back
-// what the kernel wrote.
+// The guest is `processor-page-test`, the raw `brenn:processor@0.1.0` fixture:
+// its report carries every window it was handed — each envelope as the hex of
+// the exact string — and every deferred entry, `now` and `sync`, and on a sync
+// activation it replies with the request's body. So this asserts the guest read
+// back, byte for byte, what the kernel wrote.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { activationEntry, type KernelActivation } from "./surface.js";
+import type { StringReport } from "./page-rig/page.js";
+import {
+    activationEntry,
+    type KernelActivation,
+    type ProcessorInstance,
+} from "./surface.js";
 import {
     REPO_ROOT,
     instantiateTranspiled,
     requireTranspiledTree,
 } from "./test-helpers/transpiled-processor.js";
 
-const KIND = "processor-transplant";
+const DIST = "surface/page-rig-dist";
+const KIND = "processor-page-test";
 const GOLDEN = resolve(REPO_ROOT, "surface/test-fixtures/activation.json");
 
-/** The `message_id` of one envelope, which is all this suite reads out of one. */
+/** The fixture's report, less the attribution the rig adds. */
+type Report = Omit<StringReport, "instance" | "contract">;
+
+/** The body of one envelope, which is all this suite reads out of one. */
 interface Envelope {
-    message_id: string;
     body: string;
 }
 
-/** One port window as the transplant guest's summary publish reports it. */
-interface PortSummary {
-    port: string;
-    ids: string[];
-    new_from: number;
-    dropped: number;
-}
-
-/** The transplant guest's summary publish, reduced to what this suite reads. */
-interface ActivationSummary {
-    ports: PortSummary[];
-    deferred: {
-        port: string;
-        entries: { index: number; payload: string; deliver_after: number }[];
-    }[];
-    now: number | null;
+/** Lower-case hex of the UTF-8 bytes of `text`, as the fixture reports strings. */
+function hex(text: string): string {
+    return Buffer.from(text, "utf8").toString("hex");
 }
 
 describe("the golden activation", () => {
@@ -62,19 +58,24 @@ describe("the golden activation", () => {
     const golden = readFileSync(GOLDEN, "utf8").trimEnd();
     const parsed = JSON.parse(golden) as KernelActivation;
 
-    let publishes: string[];
+    let reports: Report[];
     let answer: string | { reply: string } | undefined;
 
     beforeAll(async () => {
-        requireTranspiledTree(KIND);
-        publishes = [];
-        const instance = await instantiateTranspiled(KIND, {
-            "brenn:processor/config": { get: () => undefined },
-            "brenn:processor/log": { log: () => {} },
-            "brenn:processor/ports": {
-                publish: (_port: string, payload: string) => {
-                    publishes.push(payload);
+        requireTranspiledTree(DIST, KIND);
+        reports = [];
+        const instance = await instantiateTranspiled<ProcessorInstance>(DIST, KIND, {
+            "brenn:processor/calls": {
+                call: () => {
+                    throw new Error("the golden activation runs no commands");
                 },
+            },
+            "brenn:processor/ports": {
+                publish: (port: string, payload: string) => {
+                    expect(port).toBe("report");
+                    reports.push(JSON.parse(payload) as Report);
+                },
+                publishWithUrgency: () => {},
                 publishDeferred: () => {},
                 deferCancel: () => {},
                 deferEdit: () => {},
@@ -100,56 +101,44 @@ describe("the golden activation", () => {
         expect(parsed.deferred.length).toBeGreaterThan(0);
     });
 
-    it("answers the sync call the kernel minted", () => {
-        // The request body is the guest's `__reply__` marker, so the guest
-        // reports its sync accessors back: the port it read out of `sync`, that
-        // port compared against the mount item, whether the request is
-        // attributed to the target's own bare name, and the ports this
-        // activation delivered — everything the lift's `sync` mapping feeds. A
-        // lift that dropped `sync` turns a sync call into a fire-and-forget
-        // activation and fails here rather than silently.
-        const delivered = parsed.ports
-            .map((window) => window.port)
-            .filter((port) => port !== parsed.sync);
-        expect(answer).toEqual({
-            reply:
-                `replied:${parsed.sync}:mount=true:classified=undeclared:` +
-                `request=__reply__:` +
-                `bare-identity=true:delivered=[${delivered.join(",")}]`,
-        });
+    it("answers the sync call the kernel minted with the request's body", () => {
+        // A lift that dropped `sync` turns a sync call into a fire-and-forget
+        // activation, which answers nothing, and fails here rather than
+        // silently.
+        const request = parsed.ports.find((window) => window.port === parsed.sync);
+        expect(request).toBeDefined();
+        const last = request?.envelopes[request.envelopes.length - 1] ?? "";
+        expect(answer).toEqual({ reply: (JSON.parse(last) as Envelope).body });
     });
 
-    it("is read back by the guest as the kernel wrote it", () => {
-        const summary = JSON.parse(publishes[0]) as ActivationSummary;
-        expect(summary.ports).toEqual(
+    it("hands the guest every window byte for byte as the kernel wrote it", () => {
+        expect(reports).toHaveLength(1);
+        const [report] = reports;
+        expect(report.windows).toEqual(
             parsed.ports.map((window) => ({
                 port: window.port,
-                ids: window.envelopes.map(
-                    (envelope) => (JSON.parse(envelope) as Envelope).message_id,
-                ),
                 new_from: window.new_from,
                 dropped: window.dropped,
+                envelopes: window.envelopes.map(hex),
             })),
         );
-        expect(summary.deferred).toEqual(parsed.deferred);
-        expect(summary.now).toBe(parsed.now);
     });
 
-    it("delivers every new envelope's body to the guest", () => {
-        // The guest publishes one `<port>:<body>` marker per new envelope — bar
-        // the `__reply__` sentinel, which it answers instead of echoing. So this
-        // pins the *contents* crossing the seam, not just the count: a lift that
-        // truncated a window or reordered it shows up here, and the count is
-        // exact, so an extra or missing publish does too.
-        const expected = parsed.ports.flatMap((window) =>
-            window.envelopes
-                .slice(window.new_from)
-                .map((envelope) => (JSON.parse(envelope) as Envelope).body)
-                .filter((body) => !body.startsWith("__"))
-                .map((body) => `${window.port}:${body}`),
+    it("hands the guest the deferred view, the clock and the sync port", () => {
+        const [report] = reports;
+        expect(report.deferred).toEqual(
+            parsed.deferred.map((window) => ({
+                port: window.port,
+                entries: window.entries.map((entry) => ({
+                    index: entry.index,
+                    hex: hex(entry.payload),
+                    deliver_after: entry.deliver_after,
+                })),
+            })),
         );
-        expect(publishes.slice(1)).toEqual(expected);
-        expect(publishes).toHaveLength(1 + expected.length);
+        expect(report.now).toBe(parsed.now);
+        expect(report.sync).toBe(parsed.sync);
+        expect(report.results).toEqual([]);
     });
 
     it("carries every window shape the kernel can hand a component", () => {

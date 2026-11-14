@@ -2,20 +2,21 @@
 // `mqtt-publish` naming an authorized client,
 // the host callback reports a broker error, and the guest propagates it back).
 //
-// Uses the `processor-mqtt-test` raw-bindings fixture component: on any
-// activation with ≥1 new envelope, the component calls
-// `mqtt_publish("test-client", "test/topic", payload, None, 0, false)` and
-// maps the returned `MqttPublishError` to
-// `Err(ReceiveError::ProcessingFailed("ErrorVariant:detail"))`.
+// Uses the `processor-mqtt-test` SDK fixture component: on any activation
+// with ≥1 new envelope, the component publishes the first new message's body
+// bytes with `mqtt::try_publish("test-client", "test/topic", payload, None, 0,
+// false)` and maps the returned `PublishError` to a processing failure
+// `"ErrorVariant:detail"`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
 use brenn_budget::MAX_PUBLISH_CALLS_PER_ACTIVATION;
 use brenn_wasm::{
-    ComponentGrant, MqttPublishFn, MqttPublishOutcome, MqttPublishProps, ProcessorActivation,
-    ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow,
+    ComponentGrant, MqttPublishFn, MqttPublishOutcome, MqttPublishProps, ProcessorComponent,
+    ProcessorLoadSpec, ProcessorOutcome,
 };
 
 mod common;
@@ -92,7 +93,7 @@ fn mqtt_publish_broker_error_propagates_to_guest() {
     });
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(single_activation());
+    let outcome = comp.handle(common::host_activation(single_activation()));
 
     match outcome {
         ProcessorOutcome::Err(re) => {
@@ -127,7 +128,7 @@ fn mqtt_publish_not_permitted_propagates_to_guest() {
         Arc::new(|_client, _topic, _payload, _props| MqttPublishOutcome::NotPermitted);
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(single_activation());
+    let outcome = comp.handle(common::host_activation(single_activation()));
 
     match outcome {
         ProcessorOutcome::Err(re) => {
@@ -161,7 +162,7 @@ fn mqtt_publish_no_connector_propagates_to_guest() {
         Arc::new(|_client, _topic, _payload, _props| MqttPublishOutcome::NoConnector);
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(single_activation());
+    let outcome = comp.handle(common::host_activation(single_activation()));
 
     match outcome {
         ProcessorOutcome::Err(re) => {
@@ -200,7 +201,7 @@ fn mqtt_publish_invalid_payload_propagates_to_guest() {
     });
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(single_activation());
+    let outcome = comp.handle(common::host_activation(single_activation()));
 
     match outcome {
         ProcessorOutcome::Err(re) => {
@@ -240,7 +241,7 @@ fn mqtt_publish_then_trap_does_not_roll_back_broker_send() {
     });
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(trap_after_publish_activation());
+    let outcome = comp.handle(common::host_activation(trap_after_publish_activation()));
 
     match outcome {
         ProcessorOutcome::Trap(_) => {
@@ -309,7 +310,7 @@ fn mqtt_publish_quota_exceeded_propagates_to_guest() {
     });
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(single_activation());
+    let outcome = comp.handle(common::host_activation(single_activation()));
 
     match outcome {
         ProcessorOutcome::Err(re) => {
@@ -405,7 +406,9 @@ fn publish_json_sends_json_under_the_json_content_type() {
     let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(activation_with_body("PUBLISH_JSON"));
+    let outcome = comp.handle(common::host_activation(activation_with_body(
+        "PUBLISH_JSON",
+    )));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "expected Ok; got {outcome:?}"
@@ -423,12 +426,12 @@ fn publish_json_sends_json_under_the_json_content_type() {
             ..Default::default()
         }
     );
-    // The fixture publishes the envelope it was handed, so the payload is that
-    // envelope as a JSON string — which is the point: it came back out of
+    // The fixture publishes the body it was handed, so the payload is that
+    // body as a JSON string — which is the point: it came back out of
     // `serde_json`, not out of a `Debug` rendering.
     let decoded: String =
         serde_json::from_slice(payload).expect("publish_json sends JSON, not a Debug rendering");
-    assert_eq!(decoded, envelope_with_body("PUBLISH_JSON"));
+    assert_eq!(decoded, "PUBLISH_JSON");
 }
 
 /// `mqtt::publish_text` sends the bytes as given, under `text/plain`.
@@ -437,7 +440,9 @@ fn publish_text_sends_the_body_under_the_text_content_type() {
     let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(activation_with_body("PUBLISH_TEXT"));
+    let outcome = comp.handle(common::host_activation(activation_with_body(
+        "PUBLISH_TEXT",
+    )));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "expected Ok; got {outcome:?}"
@@ -450,7 +455,7 @@ fn publish_text_sends_the_body_under_the_text_content_type() {
     assert_eq!(props.message_expiry_s, None);
     assert_eq!(
         payload.as_slice(),
-        envelope_with_body("PUBLISH_TEXT").as_bytes(),
+        b"PUBLISH_TEXT",
         "the text wrapper sends the bytes it was given, unencoded"
     );
 }
@@ -463,7 +468,9 @@ fn publish_text_expiring_sends_the_expiry() {
     let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(activation_with_body("PUBLISH_TEXT_EXPIRING"));
+    let outcome = comp.handle(common::host_activation(activation_with_body(
+        "PUBLISH_TEXT_EXPIRING",
+    )));
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "expected Ok; got {outcome:?}"
@@ -483,10 +490,7 @@ fn publish_text_expiring_sends_the_expiry() {
             message_expiry_s: Some(90),
         }
     );
-    assert_eq!(
-        payload.as_slice(),
-        envelope_with_body("PUBLISH_TEXT_EXPIRING").as_bytes()
-    );
+    assert_eq!(payload.as_slice(), b"PUBLISH_TEXT_EXPIRING");
 }
 
 /// A zero expiry from a guest is refused by the host as `invalid-payload`
@@ -496,7 +500,9 @@ fn publish_expiring_with_zero_expiry_is_invalid_payload() {
     let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(activation_with_body("PUBLISH_ZERO_EXPIRY"));
+    let outcome = comp.handle(common::host_activation(activation_with_body(
+        "PUBLISH_ZERO_EXPIRY",
+    )));
     match outcome {
         ProcessorOutcome::Err(re) => {
             let msg = re.to_string();
@@ -550,7 +556,7 @@ fn the_sdk_classifies_and_renders_every_publish_failure() {
             .lock()
             .expect("the switchable callback's lock is never poisoned") = outcome.clone();
 
-        let result = comp.handle(activation_with_body("CLASSIFY"));
+        let result = comp.handle(common::host_activation(activation_with_body("CLASSIFY")));
 
         match result {
             ProcessorOutcome::Err(re) => {
@@ -573,7 +579,7 @@ fn the_sdk_classifies_a_quota_exhaustion_as_permanent() {
     let (callback, _seen) = recording_callback(MqttPublishOutcome::Ok);
     let comp = load_mqtt_test(callback);
 
-    let outcome = comp.handle(activation_with_body("CLASSIFY"));
+    let outcome = comp.handle(common::host_activation(activation_with_body("CLASSIFY")));
 
     match outcome {
         ProcessorOutcome::Err(re) => {

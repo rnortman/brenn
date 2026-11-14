@@ -46,6 +46,7 @@ use brenn_attach_client::publish::OutboxSteps;
 use brenn_attach_client::router::{MessageStamp, ReleaseTimer, ReleasedChannel};
 use brenn_attach_proto::{AlertSeverity, ClientFrame, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES};
 use brenn_envelope::grants::ComponentGrant;
+use brenn_envelope::{GuestBody, MessageBody};
 use brenn_surface_schema::{
     CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, ToastBody, ToastSeverity, ToastSource,
 };
@@ -134,8 +135,8 @@ pub struct SyncCall<'a> {
     pub instance: &'a str,
     /// The sync port the request arrives on — the component's own.
     pub port: &'a str,
-    /// The request payload — the component's own.
-    pub body: &'a str,
+    /// The request body — the component's own, already built.
+    pub body: &'a MessageBody,
     /// The instances whose activations are already on the stack above this
     /// request, outermost first. Empty for a caller that is not one of them: a
     /// gesture, the mount, a native caller.
@@ -237,13 +238,22 @@ pub fn dispatch_sync(
     let Some(bindings) = connect.bindings() else {
         return Err(SyncRefusal::Unwired);
     };
+    // A body the target's contract cannot read: the target does not run.
+    if !body.is_text()
+        && !registrations
+            .contract(instance)
+            .expect("surface client: a registered instance holds a contract")
+            .carries_non_text_bodies()
+    {
+        return Err(SyncRefusal::TextOnlyTarget);
+    }
     let generation = registrations
         .generation(instance)
         .expect("surface client: a registered instance holds a generation");
     let request = sync_request(
         instance,
         port,
-        body.to_string(),
+        body.clone(),
         stamp.message_id,
         stamp.publish_ts,
     );
@@ -269,7 +279,7 @@ pub struct Completed {
     /// The [`ReadyActivation::generation`] the assembly handed out — which mount
     /// of that instance ran.
     pub generation: u64,
-    pub outcome: ActivationOutcome,
+    pub outcome: ActivationOutcome<GuestBody>,
     /// The buffer this activation was seeded with, as the entry left it.
     pub buffer: PublishBuffer,
     /// One envelope stamp per buffered publish, minted at the driver. A
@@ -328,6 +338,13 @@ impl Completion {
     }
 }
 
+/// The outcome an absorbed completion is ruled to have.
+pub(crate) fn absorbed_outcome() -> ActivationOutcome {
+    ActivationOutcome::Trap(
+        "the page no longer activates this instance, so its completion was discarded".to_string(),
+    )
+}
+
 /// Take one activation's completion.
 ///
 /// Three shapes, and the two states that are not shapes at all. A completion whose
@@ -378,9 +395,12 @@ pub fn on_activation_done(
             publishes = buffer.len(),
             "surface client: absorbed the completion of an instance the page no longer activates"
         );
+        // The ruled outcome is a trap whatever the entry returned: its buffer
+        // flushed nothing, so a sync caller waiting on this activation is owed
+        // `failed`, never a reply to effects that did not happen.
         return Completion {
             absorbed: true,
-            ..Completion::nothing(instance, outcome)
+            ..Completion::nothing(instance, absorbed_outcome())
         };
     }
     let outcome = judge_reply(page, &instance, outcome);
@@ -434,21 +454,26 @@ pub fn on_activation_done(
 fn judge_reply(
     page: &SurfacePage,
     instance: &str,
-    outcome: ActivationOutcome,
+    outcome: ActivationOutcome<GuestBody>,
 ) -> ActivationOutcome {
-    let ActivationOutcome::Ok(Some(reply)) = &outcome else {
-        return outcome;
-    };
+    if !matches!(outcome, ActivationOutcome::Ok(Some(_))) {
+        return outcome.built();
+    }
     if page.schedules.in_flight_sync(instance).is_none() {
         return ActivationOutcome::Trap(
             "activation entry replied to an activation that asked nothing".to_string(),
         );
     }
+    let outcome = outcome.built();
+    let ActivationOutcome::Ok(Some(reply)) = &outcome else {
+        // The reply did not build: a trap already.
+        return outcome;
+    };
     // Saturating: the attachment states the cap in `u64` and a reply is bounded
     // by the address space it was built in, so a cap past `usize::MAX` is a cap
     // no reply can reach.
     let cap = usize::try_from(page.body_cap).unwrap_or(usize::MAX);
-    if !within_body_cap(reply, cap) {
+    if !within_body_cap(reply.as_bytes(), cap) {
         return ActivationOutcome::Trap(format!(
             "activation entry replied with {} bytes, over the {cap}-byte reply cap",
             reply.len(),

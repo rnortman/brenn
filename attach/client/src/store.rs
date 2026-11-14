@@ -50,7 +50,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
-use brenn_envelope::MessageEnvelope;
+use brenn_envelope::{MessageBody, MessageEnvelope};
 use brenn_queue::{OwnedDeferred, RingCore};
 use uuid::Uuid;
 
@@ -70,9 +70,19 @@ pub enum DeferOp {
     Cancel,
     /// Rewrite its body, its release time, or both, keeping its identity.
     Edit {
-        body: Option<String>,
+        body: Option<MessageBody>,
         deliver_after: Option<ReleaseTime>,
     },
+}
+
+impl DeferOp {
+    /// The body this op writes: an edit's new body, if it states one.
+    pub fn body(&self) -> Option<&MessageBody> {
+        match self {
+            Self::Edit { body, .. } => body.as_ref(),
+            Self::Cancel => None,
+        }
+    }
 }
 
 /// What became of a control op.
@@ -436,13 +446,10 @@ impl<K: Eq + Hash + Clone> ChannelStore<K> {
                     // is "the message" is this layer's knowledge. The envelope's own
                     // `deliver_after` stays `None` — a schedule is the channel's,
                     // held in its deferred set until it releases.
-                    match &op {
-                        DeferOp::Cancel => None,
-                        DeferOp::Edit { body, .. } => body.clone().map(|body| MessageEnvelope {
-                            body,
-                            ..entry.message.clone()
-                        }),
-                    },
+                    op.body().map(|body| MessageEnvelope {
+                        body: body.clone(),
+                        ..entry.message.clone()
+                    }),
                 ),
                 // Due and gone are one outcome: the op named an entry past the
                 // cutoff either way. A due entry is the one the sender's view

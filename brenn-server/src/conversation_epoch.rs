@@ -260,6 +260,8 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![brenn_lib::messaging::SubscriberEntry {
                 kind: brenn_lib::messaging::SubscriberEntryKind::App(APP.to_string()),
@@ -368,7 +370,7 @@ mod tests {
             WORK_UUID,
             "test-source",
             "app:peer",
-            body,
+            &body.into(),
             Urgency::Normal,
             ChannelScheme::Brenn,
             None,
@@ -391,7 +393,7 @@ mod tests {
             .await
             .messages
             .iter()
-            .map(|env| env.body.clone())
+            .map(|env| env.body.as_text().unwrap().to_owned())
             .collect()
     }
 
@@ -430,7 +432,7 @@ mod tests {
     }
 
     fn apply(f: &Fixture, epoch: &str) {
-        f.reconciler.epochs().apply(EPOCH, epoch);
+        f.reconciler.epochs().apply(EPOCH, &epoch.into());
     }
 
     #[tokio::test]

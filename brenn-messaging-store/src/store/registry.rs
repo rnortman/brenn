@@ -198,6 +198,8 @@ mod tests {
                 noise: NoiseLevel::Metered,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![],
             transport_type: scheme,

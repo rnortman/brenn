@@ -75,7 +75,8 @@ use crate::spec::{
     port::{OUT, REPORT, TICK},
 };
 use brenn_guest::{
-    Activation, Error, Processor, defer_cancel, defer_edit, publish, publish_deferred,
+    Activation, Body, Error, MessageEnvelopeExt, Processor, defer_cancel, defer_edit, publish,
+    publish_deferred,
 };
 
 #[derive(serde::Serialize)]
@@ -180,7 +181,7 @@ fn parse_marker(body: &str) -> Result<Option<Marker>, Error> {
 struct ProcessorTransplant;
 
 impl Processor for ProcessorTransplant {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         let counter = COUNTER.with(|c| {
             c.set(c.get() + 1);
             c.get()
@@ -201,8 +202,9 @@ impl Processor for ProcessorTransplant {
             for result in window.new_envelopes() {
                 let env = result?;
                 ids.push(env.message_id.to_string());
-                match parse_marker(&env.body)? {
-                    None => markers.push(format!("{}:{}", window.port(), env.body)),
+                let body = env.text_body()?;
+                match parse_marker(body)? {
+                    None => markers.push(format!("{}:{}", window.port(), body)),
                     Some(
                         m @ (Marker::Err | Marker::Trap | Marker::Reply | Marker::Answer { .. }),
                     ) => sentinel = Some(m),
@@ -219,19 +221,23 @@ impl Processor for ProcessorTransplant {
 
         let deferred = activation
             .deferred_windows()
-            .map(|window| DeferredSummary {
-                port: window.port(),
-                entries: window
-                    .entries()
-                    .iter()
-                    .map(|entry| DeferredEntrySummary {
-                        index: entry.index(),
-                        payload: entry.payload(),
-                        deliver_after: entry.deliver_after(),
-                    })
-                    .collect(),
+            .map(|window| {
+                Ok(DeferredSummary {
+                    port: window.port(),
+                    entries: window
+                        .entries()
+                        .iter()
+                        .map(|entry| {
+                            Ok(DeferredEntrySummary {
+                                index: entry.index(),
+                                payload: entry.body().as_text()?,
+                                deliver_after: entry.deliver_after(),
+                            })
+                        })
+                        .collect::<Result<_, Error>>()?,
+                })
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
 
         let summary = ActivationSummary {
             ports,
@@ -291,7 +297,7 @@ impl Processor for ProcessorTransplant {
                 Marker::Edit { index, delay_ms } => defer_edit(
                     OUT,
                     *index,
-                    Some(&format!("edited@{index}")),
+                    Some((&format!("edited@{index}")).into()),
                     Some(release_at(*delay_ms)?),
                 )?,
                 Marker::Retime { index, delay_ms } => {
@@ -341,19 +347,22 @@ impl Processor for ProcessorTransplant {
                 let bare_identity = request.sender == request.source
                     && !request.sender.is_empty()
                     && !request.sender.contains(':');
-                Ok(Some(format!(
-                    "replied:{port}:mount={}:classified={classified}:request={}:\
-                     bare-identity={bare_identity}:delivered=[{}]",
-                    activation.sync_is(brenn_guest::MOUNT),
-                    request.body,
-                    delivered.join(","),
-                )))
+                Ok(Some(
+                    format!(
+                        "replied:{port}:mount={}:classified={classified}:request={}:\
+                         bare-identity={bare_identity}:delivered=[{}]",
+                        activation.sync_is(brenn_guest::MOUNT),
+                        request.text_body()?,
+                        delivered.join(","),
+                    )
+                    .into(),
+                ))
             }
             // Unconditional, and of exactly the length asked for: the two
             // rules this drives — a reply nobody asked for, and a reply over
             // the cap — are the host's, and both are only observable if the
             // guest hands over what it was told to regardless.
-            Some(Marker::Answer { bytes }) => Ok(Some("x".repeat(bytes as usize))),
+            Some(Marker::Answer { bytes }) => Ok(Some("x".repeat(bytes as usize).into())),
             _ => Ok(None),
         }
     }

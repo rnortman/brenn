@@ -757,6 +757,8 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![SubscriberEntry {
                 kind: SubscriberEntryKind::App("test-app".to_string()),
@@ -873,6 +875,8 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![SubscriberEntry {
                 kind: SubscriberEntryKind::App("test-app".to_string()),

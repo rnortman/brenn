@@ -1,5 +1,5 @@
 {
-  "checksum": "b0dbc454202fefb7de37f7dcce0d64b8956faf84df66843774d832362d27559e",
+  "checksum": "fa571896f0429843c2940d04b3e211de60ac4f71cbd1f9f14a0ad0808ff42e90",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2573,6 +2573,10 @@
             {
               "id": "tracing 0.1.44",
               "target": "tracing"
+            },
+            {
+              "id": "uuid 1.24.0",
+              "target": "uuid"
             }
           ],
           "selects": {}
@@ -2615,6 +2619,10 @@
               "target": "serde"
             },
             {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            },
+            {
               "id": "uuid 1.24.0",
               "target": "uuid"
             }
@@ -2626,10 +2634,6 @@
             {
               "id": "chrono 0.4.45",
               "target": "chrono"
-            },
-            {
-              "id": "serde_json 1.0.150",
-              "target": "serde_json"
             }
           ],
           "selects": {}
@@ -4421,12 +4425,20 @@
         "deps": {
           "common": [
             {
+              "id": "base64ct 1.8.3",
+              "target": "base64ct"
+            },
+            {
               "id": "chrono 0.4.45",
               "target": "chrono"
             },
             {
               "id": "indexmap 2.14.0",
               "target": "indexmap"
+            },
+            {
+              "id": "rand 0.10.1",
+              "target": "rand"
             },
             {
               "id": "rusqlite 0.41.1",
@@ -4546,6 +4558,10 @@
             {
               "id": "base64ct 1.8.3",
               "target": "base64ct"
+            },
+            {
+              "id": "bytes 1.11.1",
+              "target": "bytes"
             },
             {
               "id": "libc 0.2.186",
@@ -5906,6 +5922,54 @@
       "license_ids": [],
       "license_file": null
     },
+    "brenn-surface-test-peer 0.1.0": {
+      "name": "brenn-surface-test-peer",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_surface_test_peer",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_surface_test_peer",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "chrono 0.4.45",
+              "target": "chrono"
+            },
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            },
+            {
+              "id": "uuid 1.24.0",
+              "target": "uuid"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
     "brenn-tool 0.1.0": {
       "name": "brenn-tool",
       "version": "0.1.0",
@@ -5928,17 +5992,12 @@
               "target": "serde_json"
             },
             {
-              "id": "tokio 1.54.1",
-              "target": "tokio"
-            }
-          ],
-          "selects": {}
-        },
-        "deps_dev": {
-          "common": [
-            {
               "id": "tempfile 3.27.0",
               "target": "tempfile"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
             }
           ],
           "selects": {}
@@ -8226,6 +8285,12 @@
           "selects": {}
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "build_script_attrs": {
@@ -8345,6 +8410,12 @@
           "selects": {}
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -8409,6 +8480,12 @@
               "id": "serde_derive 1.0.228",
               "target": "serde_derive"
             }
+          ],
+          "selects": {}
+        },
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
           ],
           "selects": {}
         },
@@ -8580,6 +8657,12 @@
           ],
           "selects": {}
         },
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "build_script_attrs": {
@@ -8711,6 +8794,12 @@
           "**"
         ],
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -8764,6 +8853,12 @@
           "selects": {}
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -8837,6 +8932,12 @@
           ],
           "selects": {}
         },
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -8907,6 +9008,12 @@
           "selects": {}
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -9045,6 +9152,12 @@
           }
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.135.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -21698,6 +21811,12 @@
           "selects": {}
         },
         "edition": "2018",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.15.2"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -32172,6 +32291,12 @@
           "selects": {}
         },
         "edition": "2021",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.244.0"
       },
       "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
@@ -32306,6 +32431,12 @@
           }
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "0.254.2"
       },
       "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
@@ -32776,6 +32907,12 @@
           ],
           "selects": {}
         },
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "48.0.8"
       },
       "license": "Apache-2.0 WITH LLVM-exception",
@@ -32996,6 +33133,12 @@
           "selects": {}
         },
         "edition": "2024",
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
+          ],
+          "selects": {}
+        },
         "version": "48.0.8"
       },
       "build_script_attrs": {
@@ -33151,6 +33294,12 @@
               "target": "wasmtime_internal_versioned_export_macros",
               "alias": "wasmtime_versioned_export_macros"
             }
+          ],
+          "selects": {}
+        },
+        "rustc_flags": {
+          "common": [
+            "-Copt-level=3"
           ],
           "selects": {}
         },
@@ -37313,6 +37462,7 @@
     "brenn-surface-schema 0.1.0": "surface/schema",
     "brenn-surface-server 0.1.0": "surface/server",
     "brenn-surface-test-fixtures 0.1.0": "surface/test-fixtures",
+    "brenn-surface-test-peer 0.1.0": "surface/test-fixtures/peer",
     "brenn-tool 0.1.0": "brenn-tool",
     "brenn-tool-proto 0.1.0": "brenn-tool-proto",
     "brenn-tool-registry 0.1.0": "brenn-tool-registry",

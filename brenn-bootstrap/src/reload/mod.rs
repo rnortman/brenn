@@ -82,6 +82,12 @@ mod google_workspace_boot_tests;
 #[cfg(test)]
 mod provided_tools_tests;
 
+#[cfg(test)]
+mod blob_tool_call_tests;
+
+#[cfg(test)]
+mod ingress_bytes_tests;
+
 /// Reload's MQTT convergence against a real broker. Filtered out of the
 /// hermetic test target and run by one that spawns `mosquitto`.
 #[cfg(test)]

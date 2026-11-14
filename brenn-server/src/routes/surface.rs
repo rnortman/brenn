@@ -26,7 +26,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use brenn_attach_proto::max_client_frame_bytes;
+use brenn_attach_proto::{VersionRange, max_transport_frame_bytes};
 use brenn_attach_server::profile::AttachProfile;
 use brenn_attach_server::registry::{
     AttachSessionGuard, AttachSessionHandle, CloseReason, PUSH_QUEUE_FRAMES, RegisterRejection,
@@ -36,6 +36,7 @@ use brenn_attach_server::session::{
 };
 use brenn_db::auth::session::Session;
 use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_surface_schema::SURFACE_ATTACH_VERSION;
 use brenn_surface_server::{SurfaceRuntime, telemetry};
 use tracing::warn;
 use uuid::Uuid;
@@ -353,7 +354,10 @@ pub async fn surface_ws_handler(
     // go quiet would otherwise proceed to retire the registration this publish
     // resolves against.
     let drain = state.attach_registry.drain_ticket(&slug);
-    let cap = max_client_frame_bytes(runtime.max_body_bytes);
+    // The page and this route move together, so the route serves the page's
+    // one version and nothing a non-page client might offer instead.
+    let versions = VersionRange::exactly(SURFACE_ATTACH_VERSION);
+    let cap = max_transport_frame_bytes(versions, runtime.max_body_bytes);
     let account = session.user.username;
     let heartbeat_secs = state.attach_heartbeat_secs;
     let alert_dispatcher = state.alert_dispatcher.clone();
@@ -372,6 +376,7 @@ pub async fn surface_ws_handler(
                 account,
                 ip,
                 max_body_bytes: runtime.max_body_bytes,
+                versions,
                 heartbeat_secs,
                 store_incarnation: runtime.store_incarnation(),
                 ident: build_id.to_string(),

@@ -8,8 +8,8 @@ description = "Brenn attachment protocol wire types — the generic bus-attachme
 [dependencies]
 brenn-envelope = { path = "../../brenn-envelope" }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 uuid = { version = "1.23.0", features = ["serde"] }
 
 [dev-dependencies]
 chrono = { version = "0.4.44", default-features = false, features = ["serde", "alloc"] }
-serde_json = "1.0.149"

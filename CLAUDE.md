@@ -71,6 +71,10 @@ can drop while another does not.
   scheduler subsystem — do not add one, do not reach for cron or sleep loops.
 - **State is a retained channel.** `retain_depth=1` on the channel carrying it.
   There is no separate state store, KV API, or config layer. Do not add one.
+- **A blob is a message's attachment.** Large bytes live in the blob store and a message
+  names them by reference; a blob lives while a message the host holds names it and is
+  deleted when none does. It has no name, listing or lifetime of its own. It is not a
+  state store — do not use it as one, and do not grow it into one.
 
 #### Design rule for new channels
 

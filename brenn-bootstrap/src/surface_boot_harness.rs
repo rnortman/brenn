@@ -44,8 +44,8 @@ impl BootedSurfaceHarness {
     }
 }
 
-/// Boot `config` with the standard no-op periphery and install its surfaces on a
-/// capturing-alerter `AppState`, over the boot's own messenger.
+/// Boot `config` with the standard no-op periphery and install its surfaces and
+/// remotes on a capturing-alerter `AppState`, over the boot's own messenger.
 ///
 /// A config handed here must declare each of its surfaces' derived status
 /// channels, for the reason [`surface_harness_with_siblings`] declares one: the
@@ -55,7 +55,7 @@ pub async fn booted_surface_harness(
     db: &brenn_db::Db,
     config: &brenn_lib::config::BrennConfig,
 ) -> BootedSurfaceHarness {
-    let (state, alerts, _handle) = test_state_with_capturing_alerter(db);
+    let (mut state, alerts, _handle) = test_state_with_capturing_alerter(db);
     let flusher = state.alert_dispatcher.clone();
     let apps: Arc<indexmap::IndexMap<String, brenn_lib::config::AppConfig>> =
         Arc::new(indexmap::IndexMap::new());
@@ -86,6 +86,15 @@ pub async fn booted_surface_harness(
         .expect("a config with a surface configures messaging");
     for surface in &result.surfaces {
         router.register_surface_delivery_routes(surface);
+    }
+    // The config's remotes, served and routed as boot serves and routes them.
+    state.remotes = Arc::new(brenn_remote_server::build_remote_runtimes(
+        &result.remotes,
+        Some(&messenger),
+        TEST_MAX_BODY_BYTES,
+    ));
+    for remote in &result.remotes {
+        router.register_remote_delivery_routes(remote);
     }
     router.set_state(state.clone());
     BootedSurfaceHarness {

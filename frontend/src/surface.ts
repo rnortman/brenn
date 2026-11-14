@@ -330,12 +330,19 @@ export function installGlobalHandlers(): void {
  * `cores` is named by the backend and not discovered here: the transpiled glue
  * looks a core module up synchronously, so nothing may be fetched at that
  * point and every core has to be compiled at bring-up.
+ *
+ * `contract` names the component contract the kind's artifact is built
+ * against, as `ProcessorContract` displays it. The glue cannot tell the
+ * contracts apart — it reads the same unversioned import keys for both and
+ * does not type-check — so the import table and the activation entry are
+ * chosen by this field and nothing else.
  */
 export interface ManifestComponent {
     instance: string;
     kind: string;
     module: string;
     cores: string[];
+    contract: string;
 }
 
 /**
@@ -396,6 +403,7 @@ function isSurfaceManifest(value: unknown): value is SurfaceManifest {
             typeof entry.instance === "string" &&
             typeof entry.kind === "string" &&
             typeof entry.module === "string" &&
+            typeof entry.contract === "string" &&
             Array.isArray(entry.cores) &&
             entry.cores.every((core) => typeof core === "string")
         );
@@ -465,37 +473,38 @@ export interface KernelModule extends WasmModule {
      * instance id from the loader's own closure over the manifest entry — the
      * component never names itself.
      *
-     * The four port entries answer a WIT variant name (or the empty string for
-     * ok) for everything the contract has a word for, and *throw* for the one
-     * thing it does not: a publish to a port the component's specification never
-     * declared. That thrown value carries no `payload`, so the glue lets it
-     * escape as a trap rather than lifting it into an error variant.
+     * The four port entries answer `undefined` for ok and the WIT variant as
+     * `{ tag, val? }` for everything the contract has a word for, and *throw*
+     * for the one thing it does not: a publish to a port the component's
+     * specification never declared. That thrown value carries no `payload`, so
+     * the glue lets it escape as a trap rather than lifting it into an error
+     * variant.
      */
     brenn_processor_publish(
         instance: string,
         port: string,
         body: string,
         urgency: string | undefined,
-    ): string;
+    ): PortRefusal | undefined;
     /** `deliverAfter` is epoch milliseconds UTC, typed `bigint` because the WIT `u64` exceeds `number`'s safe integer range. */
     brenn_processor_publish_deferred(
         instance: string,
         port: string,
         body: string,
         deliverAfter: bigint,
-    ): string;
+    ): PortRefusal | undefined;
     brenn_processor_defer_cancel(
         instance: string,
         port: string,
         index: number,
-    ): string;
+    ): PortRefusal | undefined;
     brenn_processor_defer_edit(
         instance: string,
         port: string,
         index: number,
         body: string | undefined,
         deliverAfter: bigint | undefined,
-    ): string;
+    ): PortRefusal | undefined;
     /**
      * One synchronous call to the peer the document wired `port` to, answered
      * inline with the peer's reply (`undefined` for a peer that replied nothing).
@@ -511,6 +520,35 @@ export interface KernelModule extends WasmModule {
         port: string,
         payload: string,
     ): string | undefined;
+    /**
+     * The `brenn:processor@0.2.0` twins of the port and call entries: each body
+     * is the glue's own `Body` object, passed through unread, and each answers
+     * exactly as its string twin does.
+     */
+    brenn_processor_publish_body(
+        instance: string,
+        port: string,
+        body: Body,
+        urgency: string | undefined,
+    ): PortRefusal | undefined;
+    brenn_processor_publish_deferred_body(
+        instance: string,
+        port: string,
+        body: Body,
+        deliverAfter: bigint,
+    ): PortRefusal | undefined;
+    brenn_processor_defer_edit_body(
+        instance: string,
+        port: string,
+        index: number,
+        body: Body | undefined,
+        deliverAfter: bigint | undefined,
+    ): PortRefusal | undefined;
+    brenn_processor_call_body(
+        instance: string,
+        port: string,
+        body: Body,
+    ): Body | undefined;
     brenn_processor_log(instance: string, level: string, message: string): void;
     brenn_processor_alert(
         instance: string,
@@ -522,9 +560,15 @@ export interface KernelModule extends WasmModule {
         instance: string,
         key: string,
     ): string | undefined;
+    /**
+     * `contract` names the component contract `entry` was built for, and with
+     * it what the kernel hands `entry`: the activation as JSON text under
+     * 0.1.0, the record the glue destructures under 0.2.0.
+     */
     brenn_processor_register(
         instance: string,
-        entry: (activation: string) => void,
+        entry: (activation: never) => unknown,
+        contract: string,
     ): boolean;
     brenn_processor_load_failed(instance: string, detail: string): void;
     brenn_processor_withheld(instance: string, reason: string): void;
@@ -594,6 +638,25 @@ export interface KernelModule extends WasmModule {
 }
 
 /**
+ * A port refusal as the kernel answers it: the WIT variant's name, and its
+ * payload exactly for a variant that carries one. The glue lowers it as the
+ * variant it is.
+ */
+export interface PortRefusal {
+    tag: string;
+    val?: string;
+}
+
+/**
+ * A `brenn:processor@0.2.0` body as the glue lifts and lowers it. The kernel
+ * builds and reads it; this layer only passes it through.
+ */
+export interface Body {
+    contentType: string | undefined;
+    bytes: Uint8Array;
+}
+
+/**
  * A `jco transpile --instantiation` module: instantiation-free at evaluation, so
  * one evaluation per *kind* is correct and sibling instances share the compiled
  * core modules through it. `getCoreModule` resolves the core wasm filenames the
@@ -603,12 +666,20 @@ interface ProcessorModule {
     instantiate(
         getCoreModule: (name: string) => WebAssembly.Module,
         imports: Record<string, Record<string, unknown>>,
-    ): ProcessorInstance;
+    ): unknown;
 }
 
-/** What a transpiled `world processor` exports: the activation entry point. */
+/** What a transpiled `brenn:processor@0.1.0` world exports: the activation entry point. */
 export interface ProcessorInstance {
     receive(activation: WitActivation): string | undefined;
+}
+
+/**
+ * What a transpiled `brenn:processor@0.2.0` world exports. The activation is
+ * the record the kernel built in the glue's own shape; its reply is a `Body`.
+ */
+export interface BytesProcessorInstance {
+    receive(activation: unknown): Body | undefined;
 }
 
 /**
@@ -791,11 +862,11 @@ function coreBasename(url: string): string {
  * `--instantiation` module per kind. Build-artifact-forced, which is the whole
  * reason the loader forks here and nowhere else.
  *
- * A refused publish reaches the guest as the WIT `publish-error` variant, a
- * refused deferred-message control op as the `defer-error` variant, and a
- * browser-refused animation as `animate-error`'s `refused`: the glue's
- * `getErrorPayload` reads a thrown value's own `payload` property, so the shim
- * throws the variant rather than returning it.
+ * A refused publish reaches the guest as the WIT `publish-error` variant the
+ * kernel answered, a refused deferred-message control op as the `defer-error`
+ * variant, and a browser-refused animation as `animate-error`'s `refused`: the
+ * glue's `getErrorPayload` reads a thrown value's own `payload` property, so the
+ * shim throws the variant rather than returning it.
  *
  * A port the component's specification does not declare is not a refusal and
  * gets no variant: the kernel entry throws, that throw passes straight through
@@ -806,14 +877,6 @@ function processorImports(
     kernel: KernelModule,
     instance: string,
 ): Record<string, Record<string, unknown>> {
-    // The kernel answers every one of these calls with a variant name or the empty
-    // string for ok; whether that name comes from `publish-error` or `defer-error`
-    // is the kernel's business, so one thrower serves them all.
-    const refuse = (error: string): void => {
-        if (error !== "") {
-            throw { payload: { tag: error } };
-        }
-    };
     const publish = (port: string, payload: string, urgency?: string): void =>
         refuse(
             kernel.brenn_processor_publish(instance, port, payload, urgency),
@@ -865,6 +928,89 @@ function processorImports(
             call: (port: string, payload: string) =>
                 kernel.brenn_processor_call(instance, port, payload),
         },
+        ...sharedImports(kernel, instance),
+    };
+}
+
+/**
+ * The `brenn:processor@0.2.0` import table: `processorImports` with `ports` and
+ * `calls` bound to the kernel's `_body` entries. A body is the glue's `Body`
+ * object, handed to the kernel as it arrived and back as the kernel built it.
+ *
+ * No `brenn:processor/bus` key: that interface carries types only, and the
+ * glue never reads one.
+ */
+function processorImportsBytes(
+    kernel: KernelModule,
+    instance: string,
+): Record<string, Record<string, unknown>> {
+    const publish = (port: string, body: Body, urgency?: string): void =>
+        refuse(
+            kernel.brenn_processor_publish_body(instance, port, body, urgency),
+        );
+    return {
+        "brenn:processor/ports": {
+            publish: (port: string, body: Body) => publish(port, body),
+            publishWithUrgency: (port: string, body: Body, urgency: string) =>
+                publish(port, body, urgency),
+            publishDeferred: (port: string, body: Body, deliverAfter: bigint) =>
+                refuse(
+                    kernel.brenn_processor_publish_deferred_body(
+                        instance,
+                        port,
+                        body,
+                        deliverAfter,
+                    ),
+                ),
+            deferCancel: (port: string, index: number) =>
+                refuse(
+                    kernel.brenn_processor_defer_cancel(instance, port, index),
+                ),
+            deferEdit: (
+                port: string,
+                index: number,
+                body: Body | undefined,
+                deliverAfter: bigint | undefined,
+            ) =>
+                refuse(
+                    kernel.brenn_processor_defer_edit_body(
+                        instance,
+                        port,
+                        index,
+                        body,
+                        deliverAfter,
+                    ),
+                ),
+        },
+        "brenn:processor/calls": {
+            call: (port: string, body: Body) =>
+                kernel.brenn_processor_call_body(instance, port, body),
+        },
+        ...sharedImports(kernel, instance),
+    };
+}
+
+/**
+ * Throw a port refusal the way the glue lifts an error variant. The kernel
+ * answers every port call with `undefined` for ok or the variant itself; which
+ * family it belongs to, and what its payload says, are the kernel's, so one
+ * thrower serves both contracts.
+ */
+function refuse(answer: PortRefusal | undefined): void {
+    if (answer !== undefined) {
+        throw { payload: answer };
+    }
+}
+
+/**
+ * The import entries both contracts share: every interface other than `ports`
+ * and `calls` is the same `@0.1.0` interface under either.
+ */
+function sharedImports(
+    kernel: KernelModule,
+    instance: string,
+): Record<string, Record<string, unknown>> {
+    return {
         "brenn:processor/log": {
             log: (level: string, message: string) =>
                 kernel.brenn_processor_log(instance, level, message),
@@ -946,7 +1092,8 @@ function processorImports(
  * `undefined` for ok with no reply, `{ reply }` for a sync-call activation's
  * answer, an error string for err, throw for trap.
  *
- * The one discrimination rule of this seam lives here. jco lifts the `err` arm
+ * The one discrimination rule of this seam, applied by `callReceive` for both
+ * contracts: jco lifts the `err` arm
  * of `receive`'s `result<option<string>, receive-error>` into a **throw** (a `ComponentError`
  * carrying the variant on an own `payload` property), so at this boundary err
  * and trap both arrive as exceptions. They are told apart by that property
@@ -986,36 +1133,47 @@ export function activationEntry(
             // option<string>: the sync port's name on a sync-call activation.
             sync: parsed.sync === null ? undefined : parsed.sync,
         };
-        let reply: string | undefined;
-        try {
-            reply = instance.receive(lifted);
-        } catch (err) {
-            if (
-                typeof err === "object" &&
-                err !== null &&
-                Object.prototype.hasOwnProperty.call(err, "payload")
-            ) {
-                // The kernel reads a returned string as the err arm.
-                return describeReceiveError(
-                    (err as { payload: unknown }).payload,
-                );
-            }
-            throw err;
-        }
-        // `ok(none)` lifts to `undefined`, which is the kernel's own "ok, no
-        // reply". `ok(some(reply))` becomes the reply object the kernel reads;
-        // whether a reply was allowed at all is the kernel's call, made against
-        // the activation's own `sync`.
-        return reply === undefined ? undefined : { reply };
+        return callReceive(() => instance.receive(lifted));
     };
+}
+
+/**
+ * One call of a component's `receive`, answered in the kernel's vocabulary,
+ * for either contract: `undefined` for ok with no reply, `{ reply }` for a
+ * reply, an error string for err; a trap is rethrown. Err and trap are told
+ * apart by the thrown value's own `payload` property (see `activationEntry`).
+ */
+function callReceive<R>(
+    receive: () => R | undefined,
+): string | { reply: R } | undefined {
+    let reply: R | undefined;
+    try {
+        reply = receive();
+    } catch (err) {
+        if (
+            typeof err === "object" &&
+            err !== null &&
+            Object.prototype.hasOwnProperty.call(err, "payload")
+        ) {
+            // The kernel reads a returned string as the err arm.
+            return describeReceiveError((err as { payload: unknown }).payload);
+        }
+        throw err;
+    }
+    // `ok(none)` lifts to `undefined`, which is the kernel's own "ok, no
+    // reply". `ok(some(reply))` becomes the reply object the kernel reads;
+    // whether a reply was allowed at all is the kernel's call, made against
+    // the activation's own `sync`.
+    return reply === undefined ? undefined : { reply };
 }
 
 /**
  * The activation entry the loader registers: one fresh guest instance per call.
  *
  * `mint` builds the instance — the transpiled module's `instantiate` over the
- * kind's compiled cores and this instance's import table — and its result is
- * used for exactly one activation and then dropped, which is what makes linear
+ * kind's compiled cores and this instance's import table — and `entry` is the
+ * contract's entry over it (`activationEntry` or `activationEntryBytes`). The
+ * instance is used for exactly one activation and then dropped, which is what makes linear
  * memory activation-scoped on the page. Compilation is not repeated; only
  * instantiation is, and that is allocating the guest's initial memory and
  * running its start function.
@@ -1024,10 +1182,26 @@ export function activationEntry(
  * the entry the way a trapping `receive` does, and the kernel reads it as
  * one — the activation did not run.
  */
-export function perActivationEntry(
-    mint: () => ProcessorInstance,
-): (activation: string) => string | { reply: string } | undefined {
-    return (json: string) => activationEntry(mint())(json);
+export function perActivationEntry<I, A, R>(
+    mint: () => I,
+    entry: (instance: I) => (activation: A) => R,
+): (activation: A) => R {
+    return (activation: A) => entry(mint())(activation);
+}
+
+/**
+ * The `brenn:processor@0.2.0` twin of `activationEntry`: the kernel hands the
+ * record the glue destructures, already in its shape, so it goes to `receive`
+ * untouched; a reply is the glue's `Body`, handed back as `{ reply }`, through
+ * the same `callReceive`.
+ *
+ * Exported for the unit tests.
+ */
+export function activationEntryBytes(
+    instance: BytesProcessorInstance,
+): (activation: unknown) => string | { reply: Body } | undefined {
+    return (activation: unknown) =>
+        callReceive(() => instance.receive(activation));
 }
 
 /**
@@ -1040,6 +1214,41 @@ function describeReceiveError(payload: unknown): string {
     const tag =
         typeof variant?.tag === "string" ? variant.tag : "receive failed";
     return typeof variant?.val === "string" ? `${tag}: ${variant.val}` : tag;
+}
+
+/** The string contract's name, as the server displays and the kernel parses it. */
+export const STRING_CONTRACT = "brenn:processor@0.1.0";
+/** The byte contract's name, as the server displays and the kernel parses it. */
+export const BYTES_CONTRACT = "brenn:processor@0.2.0";
+
+/**
+ * The activation entry for `component`, built for the contract its manifest
+ * entry names, or null for a contract this page does not know. No default: a
+ * wrong table would be read by the glue without complaint.
+ */
+function entryFor(
+    kernel: KernelModule,
+    component: ManifestComponent,
+    mint: (imports: Record<string, Record<string, unknown>>) => unknown,
+): ((activation: never) => unknown) | null {
+    switch (component.contract) {
+        case STRING_CONTRACT: {
+            const imports = processorImports(kernel, component.instance);
+            return perActivationEntry(
+                () => mint(imports) as ProcessorInstance,
+                activationEntry,
+            );
+        }
+        case BYTES_CONTRACT: {
+            const imports = processorImportsBytes(kernel, component.instance);
+            return perActivationEntry(
+                () => mint(imports) as BytesProcessorInstance,
+                activationEntryBytes,
+            );
+        }
+        default:
+            return null;
+    }
 }
 
 /**
@@ -1068,11 +1277,19 @@ async function startProcessor(
     try {
         const mod = await cache.module(component.module);
         const getCoreModule = await cache.coreLookup(component.cores);
-        const imports = processorImports(kernel, component.instance);
+        const entry = entryFor(kernel, component, (imports) =>
+            mod.instantiate(getCoreModule, imports),
+        );
+        if (entry === null) {
+            throw new Error(
+                `unknown component contract '${component.contract}'`,
+            );
+        }
         if (
             !kernel.brenn_processor_register(
                 component.instance,
-                perActivationEntry(() => mod.instantiate(getCoreModule, imports)),
+                entry,
+                component.contract,
             )
         ) {
             // The kernel already reported why (unknown instance, wrong ABI, or a

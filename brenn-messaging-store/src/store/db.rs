@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use brenn_envelope::{ChannelCapabilities, MessageEnvelope};
+use brenn_envelope::{ChannelCapabilities, MessageBody, MessageEnvelope};
 use brenn_queue::{GapReason, QuotaExceeded, ReplayDecision};
 
 use crate::db;
@@ -103,6 +103,37 @@ impl DbStore {
             message_uuid: inserted.uuid,
             seq: MessageSeq(u64::try_from(seq).expect("messaging: negative retained_seq")),
         }
+    }
+
+    /// Insert `msg` as one transaction, adopting its attachments, and confirm
+    /// the adoption once it has committed. The caller has synced the
+    /// attachments' bytes before taking the connection.
+    fn insert(
+        &self,
+        conn: &rusqlite::Connection,
+        msg: &NewMessage,
+        deliver_after: Option<DateTime<Utc>>,
+    ) -> db::InsertedMessage {
+        let tx = conn.unchecked_transaction().expect("messaging: begin tx");
+        let inserted = db::insert_message_in_tx(
+            &tx,
+            self.channel_uuid,
+            &msg.source,
+            &msg.sender,
+            &msg.body,
+            msg.urgency,
+            msg.envelope_type,
+            msg.reply_to.as_ref().map(|r| r.uuid),
+            msg.delivery_deadline,
+            deliver_after,
+            msg.impetus,
+            None,
+            &msg.attachments,
+            msg.publish_ts_ns,
+        );
+        tx.commit().expect("messaging: commit tx");
+        msg.attachments.confirm_adopted();
+        inserted
     }
 
     /// Where this channel's retained set begins, or the seq it will assign next
@@ -358,22 +389,10 @@ impl RetentionStore for DbStore {
     /// reported at that read (or by the eviction pass that outran it), so a
     /// third figure taken here would double-count the same loss.
     async fn append(&self, msg: NewMessage) -> AppendOutcome {
+        msg.attachments.make_durable();
         let conn = self.db.lock().await;
         AppendOutcome {
-            committed: Self::committed(db::insert_message(
-                &conn,
-                self.channel_uuid,
-                &msg.source,
-                &msg.sender,
-                &msg.body,
-                msg.urgency,
-                msg.envelope_type,
-                msg.reply_to.as_ref().map(|r| r.uuid),
-                msg.delivery_deadline,
-                None,
-                msg.impetus,
-                msg.publish_ts_ns,
-            )),
+            committed: Self::committed(self.insert(&conn, &msg, None)),
             overflow: Vec::new(),
         }
     }
@@ -385,29 +404,17 @@ impl RetentionStore for DbStore {
         msg: NewMessage,
         release_at: DateTime<Utc>,
     ) -> Result<Parked, QuotaExceeded> {
+        msg.attachments.make_durable();
         let conn = self.db.lock().await;
         // Cap check and insert share the connection guard, so the count a publish
         // is admitted against is the count it is added to.
         if let Some(cap) = db::deferred_cap_refusal(&conn, self.channel_uuid, self.deferred_cap) {
             return Err(QuotaExceeded { cap });
         }
-        let inserted = db::insert_message(
-            &conn,
-            self.channel_uuid,
-            &msg.source,
-            &msg.sender,
-            &msg.body,
-            msg.urgency,
-            msg.envelope_type,
-            msg.reply_to.as_ref().map(|r| r.uuid),
-            msg.delivery_deadline,
-            Some(release_at),
-            // A parked message keeps its impetus and redeems on release: the
-            // interaction happened, and when the message is processed is the
-            // usual bus question, not an authority one.
-            msg.impetus,
-            msg.publish_ts_ns,
-        );
+        // A parked message keeps its impetus and redeems on release: the
+        // interaction happened, and when the message is processed is the usual
+        // bus question, not an authority one.
+        let inserted = self.insert(&conn, &msg, Some(release_at));
         Ok(Parked {
             message_uuid: inserted.uuid,
         })
@@ -584,7 +591,7 @@ impl RetentionStore for DbStore {
         &self,
         sender: &str,
         message_uuid: Uuid,
-        body: Option<String>,
+        body: Option<MessageBody>,
         release_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> DeferralOutcome {
@@ -606,7 +613,7 @@ impl RetentionStore for DbStore {
             &conn,
             self.channel_uuid,
             lookup.message_id,
-            body.as_deref(),
+            body.as_ref(),
             release_at,
             now,
         );

@@ -165,6 +165,7 @@ impl StubRig {
                 ..ProcessorLoadSpec::minimal(Path::new(setup.wasm), setup.slug)
             },
             caller: setup.caller,
+            conversations: None,
         })
         .await;
         base.provider.component.open_store();

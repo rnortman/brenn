@@ -19,7 +19,7 @@ use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Binding, CallBinding, ComponentEntry, LocalChannel, LogLevel, OutputBinding,
+    Binding, CallBinding, ComponentEntry, LocalChannel, LogLevel, OutputBinding, WireChannel,
 };
 
 use super::description::{
@@ -120,14 +120,25 @@ pub fn build_bindings_document(
         outputs: resolved.outputs.iter().map(doc_output).collect(),
         calls: resolved.calls.iter().map(doc_call).collect(),
         // Page-local channels have no `[[channel]]` block and no directory
-        // entry, so this table is the only place their ring depths can come
-        // from.
+        // entry, so this table is the only place their ring depths and
+        // `non_text` declarations can come from.
         local_channels: resolved
             .local_channels
             .iter()
             .map(|c| LocalChannel {
                 channel: c.address.clone(),
                 ring_depth: c.ring_depth,
+                non_text: c.non_text,
+            })
+            .collect(),
+        // The directory's declaration of each transportable channel the
+        // bindings name: the page's only source for it.
+        wire_channels: resolved
+            .wire_channels
+            .iter()
+            .map(|c| WireChannel {
+                channel: c.address.clone(),
+                non_text: c.non_text,
             })
             .collect(),
         chrome_instance: resolved

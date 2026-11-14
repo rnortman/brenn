@@ -35,8 +35,6 @@ use crate::spec::port::{ACKS, AGENDA};
 pub enum ContractViolation {
     /// A window arrived on a port this component does not bind.
     WrongPort { port: String },
-    /// The delivered envelope did not parse as a [`MessageEnvelope`].
-    BadEnvelope(String),
 }
 
 /// Everything the glue needs to emit the operator-visible malformed-body log
@@ -70,23 +68,9 @@ impl FaultReport {
     }
 }
 
-/// Parse one delivered envelope, refusing a port this component does not bind.
-fn parse_delivery(
-    port: &str,
-    expected_ports: &[&str],
-    envelope_json: &str,
-) -> Result<MessageEnvelope, ContractViolation> {
-    if !expected_ports.contains(&port) {
-        return Err(ContractViolation::WrongPort {
-            port: port.to_string(),
-        });
-    }
-    serde_json::from_str(envelope_json).map_err(|e| ContractViolation::BadEnvelope(e.to_string()))
-}
-
 /// One activation window on a bound input port, in the terms this state machine
-/// reads it by: the port it arrived on, the new envelope documents it carries
-/// (oldest first, as delivered JSON), and how many passed unserved.
+/// reads it by: the port it arrived on, the new envelopes it carries (oldest
+/// first, parsed by the glue), and how many passed unserved.
 ///
 /// A borrowed view rather than either host's own window type: this module
 /// compiles for the host, where it is unit-tested, and for wasm32 against the
@@ -94,7 +78,7 @@ fn parse_delivery(
 /// The glue borrows one into the other.
 pub struct ActivationWindow<'a> {
     pub port: &'a str,
-    pub new_raw: &'a [String],
+    pub new: &'a [MessageEnvelope],
     pub dropped: u64,
 }
 
@@ -418,29 +402,32 @@ impl MeetingState {
         self.faults
     }
 
-    /// Handle a delivery on the `agenda` or `acks` port. Rejects a wrong port and
-    /// an unparseable envelope (both `ContractViolation`, panic-worthy skew). A
-    /// well-formed envelope whose body violates the convention returns
+    /// Handle a delivery on the `agenda` or `acks` port. Rejects a wrong port (a
+    /// `ContractViolation`, panic-worthy skew). An envelope whose body violates the convention returns
     /// `IngestOutcome::Malformed` — state untouched, counter bumped — so one buggy
     /// publisher cannot brick the panel.
     pub fn on_message(
         &mut self,
         port: &str,
-        envelope_json: &str,
+        envelope: &MessageEnvelope,
         now: DateTime<Utc>,
     ) -> Result<IngestOutcome, ContractViolation> {
-        let envelope = parse_delivery(port, &[AGENDA, ACKS], envelope_json)?;
+        if port != AGENDA && port != ACKS {
+            return Err(ContractViolation::WrongPort {
+                port: port.to_string(),
+            });
+        }
 
         let outcome = if port == AGENDA {
-            match parse_snapshot(&envelope.body) {
+            match body_text(envelope).and_then(parse_snapshot) {
                 Ok((meetings, warnings)) => {
                     self.meetings = meetings;
                     IngestOutcome::Accepted { warnings }
                 }
-                Err(reason) => self.fault(&envelope, reason),
+                Err(reason) => self.fault(envelope, reason),
             }
         } else {
-            match parse_ack(&envelope.body) {
+            match body_text(envelope).and_then(parse_ack) {
                 Ok(AckParse::Ack(target, action)) => {
                     self.store_ack(&target, action, envelope.publish_ts);
                     IngestOutcome::Accepted { warnings: vec![] }
@@ -453,7 +440,7 @@ impl MeetingState {
                 Ok(AckParse::Startless(warning)) => IngestOutcome::Accepted {
                     warnings: vec![IngestWarning::warn(warning)],
                 },
-                Err(reason) => self.fault(&envelope, reason),
+                Err(reason) => self.fault(envelope, reason),
             }
         };
         self.prune_acks(now);
@@ -487,17 +474,17 @@ impl MeetingState {
         }
         let mut notes = Vec::new();
         if window.port == AGENDA {
-            if window.new_raw.len() > 1 {
+            if window.new.len() > 1 {
                 notes.push(IngestWarning::error(format!(
                     "latest-wins port {:?} presented {} new messages; its binding's push_depth \
                      should be 1 — coalescing to the latest is the subscription's job, not the \
                      component's",
                     window.port,
-                    window.new_raw.len(),
+                    window.new.len(),
                 )));
             }
-            if let Some(envelope_json) = window.new_raw.last() {
-                notes.extend(self.ingest(window.port, envelope_json, now)?);
+            if let Some(envelope) = window.new.last() {
+                notes.extend(self.ingest(window.port, envelope, now)?);
             }
             return Ok(notes);
         }
@@ -509,8 +496,8 @@ impl MeetingState {
                 window.port, window.dropped
             )));
         }
-        for envelope_json in window.new_raw {
-            notes.extend(self.ingest(window.port, envelope_json, now)?);
+        for envelope in window.new {
+            notes.extend(self.ingest(window.port, envelope, now)?);
         }
         Ok(notes)
     }
@@ -519,10 +506,10 @@ impl MeetingState {
     fn ingest(
         &mut self,
         port: &str,
-        envelope_json: &str,
+        envelope: &MessageEnvelope,
         now: DateTime<Utc>,
     ) -> Result<Vec<IngestWarning>, ContractViolation> {
-        Ok(match self.on_message(port, envelope_json, now)? {
+        Ok(match self.on_message(port, envelope, now)? {
             IngestOutcome::Accepted { warnings } => warnings,
             IngestOutcome::Malformed(report) => {
                 vec![IngestWarning::error(report.log_message("meeting body"))]
@@ -706,6 +693,15 @@ fn parse_ts(field: &str, s: &str) -> Result<DateTime<Utc>, String> {
 
 /// Validate an agenda snapshot into meetings plus per-meeting override warnings
 /// (the meeting is kept with defaults), or a precise whole-snapshot fault reason.
+/// The body's text; a body that is not text is malformed like one that does
+/// not parse.
+fn body_text(envelope: &MessageEnvelope) -> Result<&str, String> {
+    envelope
+        .body
+        .as_text()
+        .ok_or_else(|| "body is not text".to_string())
+}
+
 fn parse_snapshot(body: &str) -> Result<(Vec<Meeting>, Vec<IngestWarning>), String> {
     let raw: RawSnapshot =
         serde_json::from_str(body).map_err(|e| format!("unparseable agenda: {e}"))?;
@@ -938,7 +934,7 @@ impl TakeoverBody {
 mod tests {
     use super::*;
 
-    use brenn_surface_test_fixtures::sample_envelope_json_at as envelope_json;
+    use brenn_surface_test_fixtures::sample_envelope_at;
 
     fn at(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
@@ -968,7 +964,11 @@ mod tests {
 
     fn feed_agenda(state: &mut MeetingState, body: &str, now: DateTime<Utc>) -> IngestOutcome {
         state
-            .on_message("agenda", &envelope_json(body, "2026-07-12T00:00:00Z"), now)
+            .on_message(
+                "agenda",
+                &sample_envelope_at(body, "2026-07-12T00:00:00Z"),
+                now,
+            )
             .unwrap()
     }
 
@@ -979,7 +979,7 @@ mod tests {
         now: DateTime<Utc>,
     ) -> IngestOutcome {
         state
-            .on_message("acks", &envelope_json(body, publish_ts), now)
+            .on_message("acks", &sample_envelope_at(body, publish_ts), now)
             .unwrap()
     }
 
@@ -1707,7 +1707,7 @@ mod tests {
         assert_eq!(
             state.on_message(
                 "messages",
-                &envelope_json(
+                &sample_envelope_at(
                     &snapshot("2026-07-12T15:00:00Z", "X"),
                     "2026-07-12T00:00:00Z"
                 ),
@@ -1720,29 +1720,43 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_envelope_is_a_contract_violation() {
+    fn a_non_text_body_is_a_publisher_fault() {
         let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:00:00Z");
+        feed_agenda(
+            &mut state,
+            &snapshot("2026-07-12T15:00:00Z", "Standup"),
+            now,
+        );
+        let mut envelope = sample_envelope_at("", "2026-07-12T00:00:00Z");
+        envelope.body = brenn_envelope::MessageBody::from_parts(
+            Some("application/octet-stream"),
+            snapshot("2026-07-12T16:00:00Z", "Other").as_bytes(),
+        )
+        .expect("a binary body builds");
         assert!(matches!(
-            state.on_message("agenda", "not json", at("2026-07-12T14:00:00Z")),
-            Err(ContractViolation::BadEnvelope(_))
+            state.on_message("agenda", &envelope, now),
+            Ok(IngestOutcome::Malformed(_))
         ));
+        assert_eq!(state.faults(), 1);
+        assert_eq!(active_id(&state, now), Some("m1".to_string()));
     }
 
     // ── The activation-window fold ──────────────────────────────────────────
 
-    /// The delivered envelope JSON for each of `bodies` — a window's `new_raw`.
-    fn new_raws(bodies: &[String]) -> Vec<String> {
+    /// The delivered envelope for each of `bodies` — a window's new entries.
+    fn new_envelopes(bodies: &[String]) -> Vec<MessageEnvelope> {
         bodies
             .iter()
-            .map(|body| envelope_json(body, "2026-07-12T00:00:00Z"))
+            .map(|body| sample_envelope_at(body, "2026-07-12T00:00:00Z"))
             .collect()
     }
 
-    /// A window on `port` carrying `new_raw` and no drops.
-    fn window<'a>(port: &'a str, new_raw: &'a [String]) -> ActivationWindow<'a> {
+    /// A window on `port` carrying `new` and no drops.
+    fn window<'a>(port: &'a str, new: &'a [MessageEnvelope]) -> ActivationWindow<'a> {
         ActivationWindow {
             port,
-            new_raw,
+            new,
             dropped: 0,
         }
     }
@@ -1767,7 +1781,7 @@ mod tests {
             .on_window(
                 window(
                     "agenda",
-                    &new_raws(&[
+                    &new_envelopes(&[
                         snapshot("2026-07-12T15:00:00Z", "First"),
                         snapshot("2026-07-12T16:00:00Z", "Second"),
                         snapshot("2026-07-12T17:00:00Z", "Third"),
@@ -1798,7 +1812,7 @@ mod tests {
             .on_window(
                 window(
                     "agenda",
-                    &new_raws(&[snapshot("2026-07-12T16:00:00Z", "Current")]),
+                    &new_envelopes(&[snapshot("2026-07-12T16:00:00Z", "Current")]),
                 ),
                 now,
             )
@@ -1819,7 +1833,7 @@ mod tests {
             .on_window(
                 window(
                     "agenda",
-                    &new_raws(&[
+                    &new_envelopes(&[
                         snapshot("2026-07-12T16:00:00Z", "Older"),
                         "{ not a snapshot }".to_string(),
                     ]),
@@ -1841,12 +1855,12 @@ mod tests {
         // this very window supersedes.
         let mut state = MeetingState::new();
         let now = at("2026-07-12T14:00:00Z");
-        let raws = new_raws(&[snapshot("2026-07-12T15:00:00Z", "Only")]);
+        let new = new_envelopes(&[snapshot("2026-07-12T15:00:00Z", "Only")]);
         let notes = state
             .on_window(
                 ActivationWindow {
                     port: "agenda",
-                    new_raw: &raws,
+                    new: &new,
                     dropped: 4,
                 },
                 now,
@@ -1877,7 +1891,7 @@ mod tests {
             .on_window(
                 window(
                     "acks",
-                    &new_raws(&[
+                    &new_envelopes(&[
                         ack_body("m1", "2026-07-12T15:00:00Z"),
                         ack_body("m2", "2026-07-12T16:00:00Z"),
                     ]),
@@ -1897,12 +1911,12 @@ mod tests {
         // so the meeting keeps escalating here with no other evidence.
         let mut state = MeetingState::new();
         let now = at("2026-07-12T14:00:00Z");
-        let raws = new_raws(&[ack_body("m1", "2026-07-12T15:00:00Z")]);
+        let new = new_envelopes(&[ack_body("m1", "2026-07-12T15:00:00Z")]);
         let notes = state
             .on_window(
                 ActivationWindow {
                     port: "acks",
-                    new_raw: &raws,
+                    new: &new,
                     dropped: 2,
                 },
                 now,
@@ -1924,7 +1938,7 @@ mod tests {
             state.on_window(
                 window(
                     "messages",
-                    &new_raws(&[snapshot("2026-07-12T15:00:00Z", "X")]),
+                    &new_envelopes(&[snapshot("2026-07-12T15:00:00Z", "X")]),
                 ),
                 at("2026-07-12T14:00:00Z"),
             ),
@@ -2091,9 +2105,7 @@ mod tests {
     /// silently drops its kind out of that grep.
     #[test]
     fn the_fault_line_names_the_publisher_the_message_and_the_context() {
-        let envelope: MessageEnvelope =
-            serde_json::from_str(&envelope_json("{}", "2026-07-12T00:00:00Z"))
-                .expect("the fixture envelope parses");
+        let envelope = sample_envelope_at("{}", "2026-07-12T00:00:00Z");
         let line =
             FaultReport::new(&envelope, "trailing garbage".to_string()).log_message("meeting body");
         assert!(line.contains("malformed meeting body"), "{line}");

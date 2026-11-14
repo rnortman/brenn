@@ -310,7 +310,7 @@ mod tests {
 
     use brenn_dsl::fixture_text::processor_header;
     use brenn_dsl::processor_needs;
-    use brenn_lib::config::{DocumentInputs, RootList};
+    use brenn_lib::config::{DocumentInputs, RootList, shipped_module_roots};
     use brenn_lib::messaging::ComponentGrant;
     use brenn_lib::messaging::config::Depth;
     // The counterpart constant, read only here: these tests are what hold it
@@ -1692,11 +1692,11 @@ new alice: Assistant();
     /// is reported `ok`.
     fn shipped_config(filename: &str) {
         let root = repo_root();
-        let specs = root.join("config/specs");
+        let roots = shipped_module_roots(&root, filename);
         assert!(
             run_config_check(
                 &root.join(filename),
-                &Roots::modules(vec![specs.clone()].into(), Vec::new())
+                &Roots::modules(roots.clone().into(), Vec::new())
             ),
             "{filename} must pass config-check"
         );
@@ -1705,7 +1705,7 @@ new alice: Assistant();
         // an error-lane retention default that stopped clearing the surface send
         // burst — from either side — is a red test here rather than a warning on
         // every dev boot.
-        let config = check_config(&DocumentInputs::with_modules(root.join(filename), specs))
+        let config = check_config(&DocumentInputs::deployment(root.join(filename), roots))
             .unwrap_or_else(|report| panic!("{filename} must compile: {report}"))
             .config;
         let advisories = offline_messaging_outcome(&config, &[])
@@ -1726,7 +1726,8 @@ new alice: Assistant();
         shipped_config("brenn.e2e.brenn");
     }
 
-    /// Each component's `spec_sha256` must match `config/specs/<kind>.brenn`.
+    /// Each component's `spec_sha256` must match `<kind>.brenn` in the one
+    /// module root of the file that packages it.
     ///
     /// No automated suite boots the real asset tree, so a spec that drifted
     /// would pass every gate and refuse to start on the deploy host. This
@@ -1734,7 +1735,8 @@ new alice: Assistant();
     /// built artifacts.
     fn shipped_config_binds_to_its_packaged_specs(filename: &str) {
         let root = repo_root();
-        let inputs = DocumentInputs::with_modules(root.join(filename), root.join("config/specs"));
+        let roots = shipped_module_roots(&root, filename);
+        let inputs = DocumentInputs::deployment(root.join(filename), roots.clone());
         let config = match check_config(&inputs) {
             Ok(document) => document.config,
             Err(report) => panic!("{filename} must compile: {report}"),
@@ -1742,8 +1744,22 @@ new alice: Assistant();
         let mut checked = 0;
         for surface in &config.surfaces {
             for component in &surface.components {
-                let spec = root.join(format!("config/specs/{}.brenn", component.kind));
-                let bytes = std::fs::read(&spec).unwrap_or_else(|e| {
+                let holders: Vec<PathBuf> = roots
+                    .iter()
+                    .map(|r| r.join(format!("{}.brenn", component.kind)))
+                    .filter(|spec| spec.exists())
+                    .collect();
+                assert_eq!(
+                    holders.len(),
+                    1,
+                    "{filename} mounts kind {} but {} of its module roots {roots:?} hold \
+                     {}.brenn; exactly one module root packages a kind",
+                    component.kind,
+                    holders.len(),
+                    component.kind,
+                );
+                let spec = &holders[0];
+                let bytes = std::fs::read(spec).unwrap_or_else(|e| {
                     panic!(
                         "{filename} mounts kind {} but {} is unreadable: {e}",
                         component.kind,
@@ -1753,8 +1769,8 @@ new alice: Assistant();
                 assert_eq!(
                     component.spec_sha256,
                     brenn_lib::util::sha256_hex(&bytes),
-                    "{filename} declares kind {} in a file other than {}; the build packages \
-                     that file and boot binds this hash to it",
+                    "{filename} declares kind {} in a file other than {}, the module root that \
+                     packages it; the build packages that file and boot binds this hash to it",
                     component.kind,
                     spec.display(),
                 );
@@ -1808,7 +1824,7 @@ new alice: Assistant();
     /// Every shipped page's chrome is wired whole, and holds exactly the words
     /// the wiring needs.
     ///
-    /// The six in-tree chromes are one `StandardChrome` body, so one edit
+    /// The in-tree chromes are one `StandardChrome` body, so one edit
     /// reaches every page here and every downstream root that stamps it — and
     /// an omitted plane is not refused anywhere
     /// (`TODO(chrome-missing-reserved-plane-silent)`): deleting a binding from
@@ -1818,7 +1834,8 @@ new alice: Assistant();
     /// edit here rather than passing green.
     fn shipped_config_chrome_is_wired_whole(filename: &str) {
         let root = repo_root();
-        let inputs = DocumentInputs::with_modules(root.join(filename), root.join("config/specs"));
+        let inputs =
+            DocumentInputs::deployment(root.join(filename), shipped_module_roots(&root, filename));
         let config = check_config(&inputs)
             .unwrap_or_else(|report| panic!("{filename} must compile: {report}"))
             .config;
@@ -1849,7 +1866,7 @@ new alice: Assistant();
 
             // Every reserved plane, in either direction, against the contract's
             // own list — so a plane the kernel adds goes red here instead of
-            // going quiet on six pages.
+            // going quiet on every page.
             let mut bound: Vec<&str> = surface
                 .subscriptions
                 .iter()
@@ -2028,7 +2045,10 @@ new alice: Assistant();
         assert!(
             run_config_check(
                 &file,
-                &Roots::modules(vec![root.join("config/specs")].into(), Vec::new())
+                &Roots::modules(
+                    shipped_module_roots(&repo_root(), "brenn.e2e.brenn").into(),
+                    Vec::new()
+                )
             ),
             "brenn.e2e.brenn with its retire block excised must still compile; the surface \
              reload spec deletes exactly this text against a live server"
@@ -2300,6 +2320,202 @@ observability {
                 "{address} missing from {message}"
             );
         }
+    }
+
+    /// A surface's config channel declared `non_text` is refused offline: the
+    /// four per-surface channels are declared by hand, as the stamp would,
+    /// with the declaration on the bindings channel.
+    #[test]
+    fn a_non_text_surface_config_channel_is_refused() {
+        let message = shipped_module_refusal(&described_root(
+            r#"
+channel panel_help at "brenn:surface.surface.panel.help" {
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+}
+channel panel_geometry at "brenn:surface.surface.panel.geometry" {
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+}
+channel panel_status at "brenn:surface.surface.panel.status" {
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+}
+channel panel_bindings at "ephemeral:surface.surface.panel.bindings" {
+    push_depth = 1;
+    retain_depth = 1;
+    non_text = true;
+}
+"#,
+            &format!("new commons: SurfaceCommons;\n{KIND_STAMPS}"),
+        ));
+        assert!(
+            message.contains(
+                "surface config channel \"ephemeral:surface.surface.panel.bindings\" is \
+                 declared `non_text` — a page reads its bindings document as text, so the \
+                 declaration would admit only bodies no page can apply. Remove `non_text` from \
+                 its declaration."
+            ),
+            "{message}"
+        );
+    }
+
+    /// A page-local channel a surface binding declares `non_text` passes the
+    /// offline check: the fully stamped root with a second input on a
+    /// `local:` address stating it.
+    #[test]
+    fn a_page_local_non_text_binding_is_accepted() {
+        let document = described_root(
+            "",
+            &format!(
+                "new commons: SurfaceCommons;\n\
+                 new panel_desc: SurfaceDescription(slug = \"panel\");\n{KIND_STAMPS}"
+            ),
+        )
+        .replacen(
+            "    in messages;\n",
+            "    in messages;\n    in frames;\n",
+            1,
+        )
+        .replacen(
+            "        in messages <- feed { push_depth = 4; }\n",
+            "        in messages <- feed { push_depth = 4; }\n        \
+             in frames <- \"local:panel.frames\" { push_depth = 1; non_text = true; }\n",
+            1,
+        );
+        assert!(document.contains("non_text = true"), "{document}");
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let file = dir.path().join("main.brenn");
+        std::fs::write(&file, document).expect("the document is writable");
+        assert!(run_config_check(
+            &file,
+            &Roots::modules(vec![repo_root().join("config/specs")].into(), Vec::new())
+        ));
+    }
+
+    /// A described document the offline check accepts, against the shipped
+    /// module root.
+    fn described_gate_accepts(contents: &str) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let file = dir.path().join("main.brenn");
+        std::fs::write(&file, contents).expect("the document is writable");
+        let roots: RootList = vec![repo_root().join("config/specs")].into();
+        let config = check_config(&DocumentInputs::deployment(file.clone(), roots.clone()))
+            .unwrap_or_else(|report| panic!("the front end must accept this document: {report}"))
+            .config;
+        if let Err(message) = offline_messaging_outcome(&config, &[]) {
+            panic!("the planner refused the document: {message}");
+        }
+        assert!(run_config_check(&file, &Roots::modules(roots, Vec::new())));
+    }
+
+    /// A surface port stating `non_text` on a link to another surface is
+    /// accepted offline: the statement is the link channel's declaration, by
+    /// the fold.
+    #[test]
+    fn a_surface_port_stating_non_text_on_a_spanning_link_is_accepted() {
+        described_gate_accepts(&format!(
+            r#"use @surface-description::*;
+
+surface_description {{
+    prefix = "surface";
+    status_interval_secs = 60;
+}}
+new commons: SurfaceCommons;
+new left_desc: SurfaceDescription(slug = "left");
+new right_desc: SurfaceDescription(slug = "right");
+new talker_desc: KindDescription(kind = "talker");
+new listener_desc: KindDescription(kind = "listener");
+new shell_desc: KindDescription(kind = "shell");
+{preamble}
+component Talker {{
+    {talker}
+    out said;
+}}
+
+component Listener {{
+    {listener}
+    in heard;
+}}
+
+link relay;
+
+surface left {{
+    grants = [];
+    new t: Talker {{
+        grants = [ports];
+        out said -> relay {{ non_text = true; }}
+    }}
+{CHROME}}}
+
+surface right {{
+    grants = [];
+    new l: Listener {{
+        grants = [];
+        in heard <- relay {{ push_depth = 1; retain_depth = 1; }}
+    }}
+{CHROME}}}
+"#,
+            preamble = preamble("log"),
+            talker = processor_header("ports"),
+            listener = processor_header(""),
+        ));
+    }
+
+    /// A surface bound to a `non_text` channel is accepted by the planner,
+    /// offline.
+    #[test]
+    fn a_surface_bound_to_a_non_text_channel_is_accepted() {
+        let document = described_root(
+            r#"
+channel frames at "brenn:alice.frames" {
+    push_depth = 8;
+    retain_depth = 64;
+    standing_retain_depth = 64;
+    non_text = true;
+}
+"#,
+            &format!(
+                "new commons: SurfaceCommons;\n\
+                 new panel_desc: SurfaceDescription(slug = \"panel\");\n{KIND_STAMPS}"
+            ),
+        )
+        .replacen(
+            "        in messages <- feed { push_depth = 4; }\n",
+            "        in messages <- frames { push_depth = 4; }\n",
+            1,
+        );
+        assert!(document.contains("<- frames"), "{document}");
+        described_gate_accepts(&document);
+    }
+
+    /// A surface port stating `non_text` on a channel declared text-only is
+    /// refused by the planner, offline.
+    #[test]
+    fn a_surface_port_stating_non_text_on_a_text_only_channel_is_refused() {
+        let message = boot_gate_refusal(&format!(
+            r#"{preamble}
+surface panel {{
+    grants = [subscribe];
+    new w: Widget {{
+        grants = [log];
+        in messages <- feed {{ push_depth = 4; non_text = true; }}
+    }}
+{CHROME}}}
+"#,
+            preamble = preamble("log")
+        ));
+        assert!(
+            message.contains(
+                "port \"messages\" states `non_text`, but its channel \"brenn:alice.feed\" is \
+                 declared text-only — declare the channel `non_text`, or drop `non_text` from \
+                 the port"
+            ),
+            "{message}"
+        );
     }
 
     /// The per-kind half: a placed kind with no `KindDescription` stamp is

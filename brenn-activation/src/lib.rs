@@ -7,12 +7,13 @@
 //! Both hosts mint it — the wasmtime host on the backend, the kernel on the
 //! surface — and a component sees the same shape under either.
 //!
-//! An envelope is its canonical JSON text — the `envelope-json` of
-//! `processor.wit` — at both placements, and [`ProcessorActivation`] /
-//! [`ProcessorPortWindow`] are that one carrier, named here so neither host
-//! re-declares it. The generic parameter `E` survives only so this crate's own
-//! tests can window `&'static str` bodies; it has exactly one production
-//! instantiation.
+//! What crosses into a guest is an envelope as its canonical JSON text — the
+//! `envelope-json` of `processor.wit` — at both placements, and
+//! [`ProcessorActivation`] / [`ProcessorPortWindow`] are that one carrier, named
+//! here so neither host re-declares it. The parameters `E` (a window element)
+//! and `D` (a parked message) let the backend carry envelopes up to the point
+//! it lowers them for one component, and let this crate's own tests window
+//! `&'static str` bodies.
 //!
 //! This crate carries the *rules* as well as the shapes, and both hosts compile
 //! against it. A rule written on one host's side only is a rule the other host's
@@ -328,6 +329,11 @@
 pub mod schedule;
 pub mod sync;
 
+use std::borrow::Borrow;
+use std::sync::Arc;
+
+use brenn_envelope::{MessageBody, MessageEnvelope};
+
 /// The deepest window either host will serve on one port of a component
 /// activation, for both `push_depth` (the new portion) and `retain_depth` (the
 /// retained context).
@@ -355,16 +361,20 @@ pub const WINDOW_DEPTH_CEILING: u64 = 1_000;
 /// order, whether or not it has new messages — a port with nothing new arrives
 /// as a pure-context window. A component must not assume `ports.len() == 1`, and
 /// must not assume a port's presence means that port is why it woke.
+///
+/// `E` is a window element and `D` a deferred entry's payload. Each host
+/// carries envelopes and bodies up to the component's entry and lowers there,
+/// per contract; [`ProcessorActivation`] is the string contract's form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Activation<E> {
+pub struct Activation<E, D = String> {
     /// One window per bound input port, in config order.
     pub ports: Vec<PortWindow<E>>,
     /// One deferred-window per bound output port, in config order — the
     /// component's own parked (deferred) messages on each output channel, a
     /// snapshot at drain. Separate from `ports`: a future in/out port appears in
     /// both lists, additively.
-    pub deferred: Vec<DeferredWindow>,
+    pub deferred: Vec<DeferredWindow<D>>,
     /// The host's wall clock at drain, epoch milliseconds UTC. Lets a guest
     /// compute an absolute future instant (e.g. for a deferred publish) without
     /// holding a clock of its own. `None` when the host exposes no UTC wall
@@ -397,31 +407,31 @@ pub struct Activation<E> {
 /// own schedule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct DeferredWindow {
+pub struct DeferredWindow<D = String> {
     /// Logical output port name, as declared in config — never a raw channel
     /// address.
     pub port: String,
     /// This component's parked messages on the port's channel, soonest release
     /// first.
-    pub entries: Vec<DeferredEntry>,
+    pub entries: Vec<DeferredEntry<D>>,
 }
 
 /// One parked message in a [`DeferredWindow`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct DeferredEntry {
+pub struct DeferredEntry<D = String> {
     /// Position within the window's `entries` list (which is release-ordered).
     /// The handle a future cancel/edit names; snapshot-relative, valid only
     /// against the window it arrived in.
     pub index: u32,
-    /// The message body the component published, as handed to the deferred
-    /// publish — not an envelope.
+    /// The message the component parked. In the string instantiation this is
+    /// the body as handed to the deferred publish — not an envelope — so a
+    /// component gets back the same opaque string it handed the host.
     ///
-    /// A body rather than the activation's envelope type `E`: what a component
-    /// gets back here is the same opaque string it handed the host, so this half
-    /// of the activation carries the same shape on every hosting even where the
-    /// input windows do not.
-    pub payload: String,
+    /// A parameter of its own rather than the activation's envelope type `E`:
+    /// the string instantiation carries an envelope's JSON in a window and only
+    /// a body here.
+    pub payload: D,
     /// Scheduled release time, epoch milliseconds UTC.
     pub deliver_after: u64,
 }
@@ -537,7 +547,100 @@ impl<E> PortWindow<E> {
     }
 }
 
-impl<E> Activation<E> {
+/// A window's [`PortWindow::dropped`] as the `u32` both contracts' WIT type it,
+/// saturated: the guest reads it as a gap signal, and a saturated count still
+/// says "you lost more than you can count".
+pub fn saturate_dropped(dropped: u64) -> u32 {
+    u32::try_from(dropped).unwrap_or(u32::MAX)
+}
+
+/// A deferred entry's payload as the body the component parked. The backend
+/// carries the parked envelope, the page the body alone.
+pub trait ParkedBody {
+    /// The body the component handed the deferred publish (or its edit).
+    fn parked_body(&self) -> &MessageBody;
+}
+
+impl ParkedBody for MessageBody {
+    fn parked_body(&self) -> &MessageBody {
+        self
+    }
+}
+
+impl ParkedBody for Arc<MessageEnvelope> {
+    fn parked_body(&self) -> &MessageBody {
+        &self.body
+    }
+}
+
+impl<E: Borrow<MessageEnvelope>, D: ParkedBody> Activation<E, D> {
+    /// This activation lowered to the `brenn:processor@0.1.0` carrier, the one
+    /// rule both hosts lower by: each window envelope as its `envelope-json`,
+    /// each parked body as its text. A typed text body reads as its bare text,
+    /// its content type dropped; `dropped` is carried unsaturated.
+    ///
+    /// # Panics
+    ///
+    /// On a non-text body in a window or a deferred entry: neither 0.1.0
+    /// carrier can represent one. Each host refuses such a body before it can
+    /// reach a 0.1.0 component, so reaching this is a host bug.
+    pub fn lower_v0_1(&self) -> ProcessorActivation {
+        Activation {
+            ports: self
+                .ports
+                .iter()
+                .map(|window| PortWindow {
+                    port: window.port.clone(),
+                    // TODO(surface-envelope-json-memo): a served window is
+                    // retained context followed by what is new, so the retained
+                    // prefix is re-encoded on every activation and once per
+                    // subscribing instance.
+                    envelopes: window
+                        .envelopes
+                        .iter()
+                        .map(|envelope| envelope.borrow().to_envelope_json())
+                        .collect(),
+                    new_from: window.new_from,
+                    dropped: window.dropped,
+                })
+                .collect(),
+            deferred: self
+                .deferred
+                .iter()
+                .map(|window| DeferredWindow {
+                    port: window.port.clone(),
+                    entries: window
+                        .entries
+                        .iter()
+                        .map(|entry| DeferredEntry {
+                            index: entry.index,
+                            payload: v0_1_parked_text(entry.payload.parked_body()).to_owned(),
+                            deliver_after: entry.deliver_after,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            now: self.now,
+            sync: self.sync.clone(),
+        }
+    }
+}
+
+/// A parked body as the 0.1.0 `deferred-entry.payload` text.
+///
+/// # Panics
+///
+/// On a non-text body; see [`Activation::lower_v0_1`].
+fn v0_1_parked_text(body: &MessageBody) -> &str {
+    body.as_text().unwrap_or_else(|| {
+        panic!(
+            "0.1.0 deferred-entry.payload cannot carry a non-text body ({})",
+            body.summary()
+        )
+    })
+}
+
+impl<E, D> Activation<E, D> {
     /// Total messages lost to push overflow across every bound port since each
     /// port's previous activation.
     pub fn total_dropped(&self) -> u64 {
@@ -665,7 +768,7 @@ mod tests {
 
         // Every bound port every activation, config order — the ports vec is the
         // whole bound set, not just the ports that woke the instance.
-        let both = Activation {
+        let both: Activation<&str> = Activation {
             ports: vec![window, context_only],
             deferred: vec![],
             now: None,
@@ -709,7 +812,7 @@ mod tests {
         assert_eq!(all_new.new_envelopes(), &["n-1"]);
         assert_eq!(all_new.new_len(), 1);
 
-        let activation = Activation {
+        let activation: Activation<&str> = Activation {
             ports: vec![with_new, context_only, all_new],
             deferred: vec![],
             now: None,
@@ -733,7 +836,7 @@ mod tests {
                 dropped: 0,
             }
         }
-        let mut activation = Activation {
+        let mut activation: Activation<&str> = Activation {
             ports: vec![window("agenda", "snapshot"), window("ack", "dismiss")],
             deferred: vec![],
             now: None,
@@ -764,7 +867,7 @@ mod tests {
                 dropped: 0,
             }
         }
-        let mut activation = Activation {
+        let mut activation: Activation<&str> = Activation {
             ports: vec![window("agenda", "snapshot"), window("ack", "dismiss")],
             deferred: vec![],
             now: None,
@@ -798,7 +901,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "carries the one live request")]
     fn a_sync_window_with_two_requests_is_a_host_bug() {
-        let activation = Activation {
+        let activation: Activation<&str> = Activation {
             ports: vec![PortWindow {
                 port: "ack".to_string(),
                 envelopes: vec!["dismiss", "snooze"],
@@ -818,7 +921,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "carries the window of the port it names")]
     fn a_sync_port_with_no_window_is_a_host_bug() {
-        let activation = Activation {
+        let activation: Activation<&str> = Activation {
             ports: vec![PortWindow {
                 port: "agenda".to_string(),
                 envelopes: vec!["snapshot"],
@@ -897,5 +1000,138 @@ mod tests {
         assert!(report.contains("\"layout\""), "{report}");
         assert!(report.contains('3'), "{report}");
         assert!(report.contains("push_depth"), "{report}");
+    }
+
+    fn envelope(body: MessageBody) -> MessageEnvelope {
+        let publish_ts = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("a literal timestamp parses")
+            .with_timezone(&chrono::Utc);
+        sync::sync_request("p1", "in", body, uuid::Uuid::nil(), publish_ts)
+    }
+
+    /// The activation each host carries to its entry, as the backend's
+    /// elements: a shared envelope in the window and the parked envelope.
+    fn backend_activation(
+        window: MessageBody,
+        parked: MessageBody,
+    ) -> Activation<Arc<MessageEnvelope>, Arc<MessageEnvelope>> {
+        Activation {
+            ports: vec![PortWindow {
+                port: "in".to_string(),
+                envelopes: vec![Arc::new(envelope(window))],
+                new_from: 0,
+                dropped: 7,
+            }],
+            deferred: vec![DeferredWindow {
+                port: "out".to_string(),
+                entries: vec![DeferredEntry {
+                    index: 0,
+                    payload: Arc::new(envelope(parked)),
+                    deliver_after: 42,
+                }],
+            }],
+            now: Some(9),
+            sync: Some("in".to_string()),
+        }
+    }
+
+    /// The same activation as the page's elements: the envelope itself and the
+    /// parked body alone.
+    fn page_activation(
+        window: MessageBody,
+        parked: MessageBody,
+    ) -> Activation<MessageEnvelope, MessageBody> {
+        let backend = backend_activation(window, parked);
+        Activation {
+            ports: backend
+                .ports
+                .iter()
+                .map(|w| PortWindow {
+                    port: w.port.clone(),
+                    envelopes: w.envelopes.iter().map(|e| (**e).clone()).collect(),
+                    new_from: w.new_from,
+                    dropped: w.dropped,
+                })
+                .collect(),
+            deferred: backend
+                .deferred
+                .iter()
+                .map(|w| DeferredWindow {
+                    port: w.port.clone(),
+                    entries: w
+                        .entries
+                        .iter()
+                        .map(|e| DeferredEntry {
+                            index: e.index,
+                            payload: e.payload.body.clone(),
+                            deliver_after: e.deliver_after,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            now: backend.now,
+            sync: backend.sync,
+        }
+    }
+
+    fn jpeg() -> MessageBody {
+        MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, 0xff])
+            .expect("a jpeg body is well formed")
+    }
+
+    /// A window envelope lowers to its `envelope-json` and a parked body to its
+    /// text, a typed text body to exactly its text without its type; both
+    /// hosts' element types lower to the same carrier.
+    #[test]
+    fn the_0_1_lowering_is_the_envelope_json_and_the_body_text_on_both_hosts() {
+        let markdown = MessageBody::from_parts(Some("text/markdown"), b"# hi")
+            .expect("a markdown body is well formed");
+        let lowered = backend_activation(markdown.clone(), markdown.clone()).lower_v0_1();
+        assert_eq!(
+            lowered,
+            Activation {
+                ports: vec![PortWindow {
+                    port: "in".to_string(),
+                    envelopes: vec![envelope(markdown.clone()).to_envelope_json()],
+                    new_from: 0,
+                    dropped: 7,
+                }],
+                deferred: vec![DeferredWindow {
+                    port: "out".to_string(),
+                    entries: vec![DeferredEntry {
+                        index: 0,
+                        payload: "# hi".to_string(),
+                        deliver_after: 42,
+                    }],
+                }],
+                now: Some(9),
+                sync: Some("in".to_string()),
+            }
+        );
+        assert_eq!(
+            page_activation(markdown.clone(), markdown).lower_v0_1(),
+            lowered
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "0.1.0 envelope-json")]
+    fn the_0_1_lowering_panics_on_a_non_text_window_body() {
+        let _ = page_activation(jpeg(), MessageBody::text("parked")).lower_v0_1();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "0.1.0 deferred-entry.payload cannot carry a non-text body (image/jpeg, 3 bytes)"
+    )]
+    fn the_0_1_lowering_panics_on_a_non_text_parked_body() {
+        let _ = backend_activation(MessageBody::text("window"), jpeg()).lower_v0_1();
+    }
+
+    #[test]
+    fn dropped_saturates_to_the_wit_u32() {
+        assert_eq!(saturate_dropped(7), 7);
+        assert_eq!(saturate_dropped(u64::from(u32::MAX)), u32::MAX);
+        assert_eq!(saturate_dropped(u64::from(u32::MAX) + 1), u32::MAX);
     }
 }

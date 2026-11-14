@@ -1,0 +1,21 @@
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "wasm_component", "wasm_guest_cdylib")
+
+policy_srcs()
+
+# Bindings come from `wit_bindgen::generate!` over the crate's own WIT file,
+# read at macro-expansion time.
+wasm_guest_cdylib(
+    name = "brenn-processor-stale-contract-test",
+    compile_data = ["wit/stale-processor.wit"],
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+wasm_component(
+    name = "component",
+    module = ":brenn-processor-stale-contract-test",
+    visibility = ["//visibility:public"],
+)

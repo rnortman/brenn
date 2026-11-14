@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use brenn_attach_proto::AlertSeverity;
-use brenn_envelope::Urgency;
+use brenn_envelope::{GuestBody, Urgency};
 use brenn_surface_schema::telemetry::{InstanceReport, StatusCounters};
 use brenn_surface_schema::{LogLevel, MAX_SURFACE_COMPONENTS};
 use futures_channel::mpsc;
@@ -314,9 +314,9 @@ pub fn invoke_over_stack(
     slot: &std::cell::RefCell<InFlightStack>,
     instance: &str,
     buffer: PublishBuffer,
-    entry: impl FnOnce() -> crate::activation::ActivationOutcome,
+    entry: impl FnOnce() -> crate::activation::ActivationOutcome<GuestBody>,
 ) -> (
-    crate::activation::ActivationOutcome,
+    crate::activation::ActivationOutcome<GuestBody>,
     PublishBuffer,
     Vec<Effect>,
 ) {
@@ -433,9 +433,13 @@ pub type ActivationEntry = Box<
 ///   trap. `catch_unwind` cannot observe a wasm panic, so this boundary is the
 ///   only place the two are distinguishable — collapsing them into `Result` would
 ///   throw the distinction away here and never get it back.
+///
+/// It is handed the page's own [`PageActivation`](crate::activation::PageActivation)
+/// and lowers it for the contract it was registered with.
 #[cfg(target_arch = "wasm32")]
-pub type ActivationEntry =
-    Box<dyn Fn(&brenn_surface_contract::Activation) -> crate::activation::ActivationOutcome>;
+pub type ActivationEntry = Box<
+    dyn Fn(&crate::activation::PageActivation) -> crate::activation::ActivationOutcome<GuestBody>,
+>;
 
 /// The platform half's handle on a running page.
 ///
@@ -480,10 +484,33 @@ impl SurfaceHandle {
     ///
     /// If the control channel is full (an unbounded synchronous burst) or closed
     /// (the run is over).
+    ///
+    /// A native entry is handed the string form of every activation, so it is
+    /// registered on `brenn:processor@0.1.0`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn register_activation(&self, instance: &str, entry: ActivationEntry, mount: bool) {
         self.control(RunnerCommand::RegisterActivation {
             instance: instance.to_owned(),
             entry,
+            contract: brenn_envelope::grants::ProcessorContract::V0_1,
+            mount,
+        });
+    }
+
+    /// The wasm build's registration: `contract` is the one the wrapped entry
+    /// was built for. See the native definition above for the rest.
+    #[cfg(target_arch = "wasm32")]
+    pub fn register_activation(
+        &self,
+        instance: &str,
+        entry: ActivationEntry,
+        contract: brenn_envelope::grants::ProcessorContract,
+        mount: bool,
+    ) {
+        self.control(RunnerCommand::RegisterActivation {
+            instance: instance.to_owned(),
+            entry,
+            contract,
             mount,
         });
     }
@@ -716,18 +743,14 @@ impl SurfaceHandle {
         &self,
         instance: &str,
         port: &str,
-        body: &str,
+        body: brenn_envelope::GuestBody,
         urgency: Option<Urgency>,
     ) -> Option<Result<crate::publish_buffer::Admission, crate::publish_buffer::PublishFault>> {
-        // `body` is borrowed and only owned once the in-flight instance matches:
-        // a refused publish (no activation in flight, or a different instance's)
-        // returns `None` after the instance compare without paying the body's
-        // allocation.
         self.with_in_flight(instance, |buffer| {
             let before = buffer.dropped();
             let answered = match urgency {
-                Some(urgency) => buffer.publish_with_urgency(port, body.to_owned(), urgency),
-                None => buffer.publish(port, body.to_owned()),
+                Some(urgency) => buffer.publish_with_urgency(port, body, urgency),
+                None => buffer.publish(port, body),
             };
             answered.map(|()| crate::publish_buffer::Admission::of(before, buffer.dropped()))
         })
@@ -745,12 +768,12 @@ impl SurfaceHandle {
         &self,
         instance: &str,
         port: &str,
-        body: &str,
+        body: brenn_envelope::GuestBody,
         deliver_after: u64,
     ) -> Option<Result<crate::publish_buffer::Admission, crate::publish_buffer::PublishFault>> {
         self.with_in_flight(instance, |buffer| {
             let before = buffer.dropped();
-            let answered = buffer.publish_deferred(port, body.to_owned(), deliver_after);
+            let answered = buffer.publish_deferred(port, body, deliver_after);
             answered.map(|()| crate::publish_buffer::Admission::of(before, buffer.dropped()))
         })
     }
@@ -777,7 +800,7 @@ impl SurfaceHandle {
         instance: &str,
         port: &str,
         index: u32,
-        body: Option<String>,
+        body: Option<brenn_envelope::GuestBody>,
         deliver_after: Option<u64>,
     ) -> Option<Result<(), crate::publish_buffer::DeferFault>> {
         self.with_in_flight(instance, |buffer| {
@@ -800,9 +823,9 @@ impl SurfaceHandle {
     pub fn try_call_admission(
         &self,
         instance: &str,
-        payload: &str,
-    ) -> Option<Result<(), brenn_surface_contract::CallError>> {
-        self.with_in_flight(instance, |buffer| buffer.admit_call(payload))
+        body: GuestBody,
+    ) -> Option<Result<brenn_envelope::MessageBody, brenn_surface_contract::CallError>> {
+        self.with_in_flight(instance, |buffer| buffer.admit_call(body))
     }
 
     /// [`InFlightStack::with_innermost`] over the shared stack.

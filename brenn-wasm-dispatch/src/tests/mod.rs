@@ -122,6 +122,7 @@ pub fn test_out_spec(channel_address: String) -> brenn_wasm::OutputPortSpec {
             fill_mt: 1_000_000_000,
             capacity_mt: 1_000_000_000,
         },
+        non_text: false,
     }
 }
 
@@ -160,6 +161,8 @@ pub fn brenn_channel(address: &str, sub_slug: &str) -> ChannelEntry {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(sub_slug.to_string()),
@@ -171,6 +174,93 @@ pub fn brenn_channel(address: &str, sub_slug: &str) -> ChannelEntry {
         transport_type: ChannelScheme::Brenn,
         mount: None,
     }
+}
+
+/// `slug`'s input port reading `entry`, at the depths `entry` registers for it.
+pub fn input(slug: &str, port: &str, entry: &ChannelEntry) -> WasmInputPort {
+    let sub = entry
+        .subscribers
+        .iter()
+        .find(|s| s.kind == SubscriberEntryKind::Wasm(slug.to_string()))
+        .unwrap_or_else(|| panic!("{} registers no subscriber {slug}", entry.address));
+    WasmInputPort {
+        port: port.to_string(),
+        sub: ResolvedSubscription {
+            channel_uuid: entry.uuid,
+            channel_address: entry.address.clone(),
+            push_depth: resolve_wasm_window_depth(sub.push_depth, "push_depth", slug),
+            retain_depth: resolve_wasm_window_depth(sub.retain_depth, "retain_depth", slug),
+            noise: NoiseLevel::Silent,
+            wake_min: WakeMin::Normal,
+        },
+        amplification_mt: 1000,
+        non_text: entry.resolved_channel.non_text,
+    }
+}
+
+/// An output port bound to `entry`, as the consumer config carries it.
+pub fn output(port: &str, entry: &ChannelEntry) -> brenn_lib::messaging::config::WasmOutputPort {
+    brenn_lib::messaging::config::WasmOutputPort {
+        port: port.to_string(),
+        channel_uuid: entry.uuid,
+        channel_address: entry.address.clone(),
+        default_urgency: brenn_lib::messaging::Urgency::Normal,
+        budget: brenn_lib::messaging::config::WasmSinkBudget {
+            fill_mt: 1_000_000_000,
+            capacity_mt: 1_000_000_000,
+        },
+        non_text: entry.resolved_channel.non_text,
+    }
+}
+
+/// The consumer config for `component` with these ports.
+pub fn consumer(
+    slug: &str,
+    component: Arc<ProcessorComponent>,
+    messenger: &Arc<brenn_messaging::Messenger>,
+    inputs: Vec<WasmInputPort>,
+    outputs: Vec<brenn_lib::messaging::config::WasmOutputPort>,
+) -> WasmConsumerConfig {
+    WasmConsumerConfig {
+        slug: slug.to_string(),
+        component,
+        notify: Arc::new(Notify::new()),
+        messenger: Arc::clone(messenger),
+        alert_dispatcher: noop_alert_dispatcher().0,
+        inputs,
+        outputs,
+        sync_ports: std::collections::BTreeSet::new(),
+        activation_pacing: unthrottled_pacing(),
+        provider: None,
+    }
+}
+
+/// The output-port specs the component is loaded with, one per bound output.
+pub fn output_specs(
+    outputs: &[brenn_lib::messaging::config::WasmOutputPort],
+) -> std::collections::HashMap<String, brenn_wasm::OutputPortSpec> {
+    outputs
+        .iter()
+        .map(|o| {
+            (
+                o.port.clone(),
+                brenn_wasm::OutputPortSpec {
+                    non_text: o.non_text,
+                    ..test_out_spec(o.channel_address.clone())
+                },
+            )
+        })
+        .collect()
+}
+
+/// FNV-1a over `bytes`, the 64-bit digest the blob fixtures report.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -185,6 +275,49 @@ pub use brenn_lib::access::test_fixtures::wasm_policies_from_entries;
 pub const DEMO_WASM: &str = "brenn-wasm/target/components/brenn_processor_demo.wasm";
 
 pub const MULTIPORT_WASM: &str = "brenn-wasm/target/components/brenn_processor_multiport.wasm";
+
+/// The raw `brenn:processor@0.1.0` fixture, which reports what it was handed
+/// and runs text commands read off its `in` port.
+pub const PAGE_TEST_WASM: &str = "brenn-wasm/target/components/brenn_processor_page_test.wasm";
+
+/// `processor-page-test` as `slug`: its outputs bound as `output_ports` says
+/// (`report` among them, or every report is dropped), its `peer` call port
+/// wired as `calls` says and reaching `sync_caller`.
+pub fn string_contract_component(
+    slug: &str,
+    output_ports: std::collections::HashMap<String, brenn_wasm::OutputPortSpec>,
+    calls: std::collections::HashMap<String, brenn_wasm::ProcessorCallTarget>,
+    sync_caller: brenn_wasm::SyncCallerFn,
+) -> Arc<ProcessorComponent> {
+    let mut input_amplification_mt = test_amp_map();
+    input_amplification_mt.extend(
+        ["feed", "memo", "state", "timer"]
+            .into_iter()
+            .map(|p| (p.to_string(), 1_000)),
+    );
+    let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
+        declared_out_ports: ["memo", "out", "report", "state", "timer"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        output_ports,
+        input_amplification_mt,
+        grants: [ComponentGrant::Ports, ComponentGrant::Calls]
+            .into_iter()
+            .collect(),
+        alerter: noop_proc_alerter(),
+        declared_call_ports: ["peer".to_string()].into_iter().collect(),
+        calls,
+        sync_caller: Some(sync_caller),
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(PAGE_TEST_WASM), slug)
+    }));
+    assert_eq!(
+        component.contract(),
+        brenn_wasm::ProcessorContract::V0_1,
+        "processor-page-test is the string-contract fixture"
+    );
+    component
+}
 
 /// Give `sub` its position on every channel it reads, primed at head — what boot
 /// does before any message reaches the component. A port's delivery state is a
@@ -242,6 +375,7 @@ pub fn build_cfg(
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }],
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
@@ -321,6 +455,7 @@ pub async fn build_multi_channel_setup(
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         })
         .collect();
     let cfg = WasmConsumerConfig {
@@ -401,6 +536,8 @@ pub async fn build_multiport_setup_with_depths(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(out_sub_slug.clone()),
@@ -485,6 +622,7 @@ pub async fn build_multiport_setup_with_depths(
                     wake_min: WakeMin::Normal,
                 },
                 amplification_mt: 1000,
+                non_text: false,
             }
         })
         .collect();
@@ -587,6 +725,8 @@ pub async fn build_two_channel_setup(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(slug.to_string()),
@@ -614,6 +754,8 @@ pub async fn build_two_channel_setup(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(second_sub_slug.to_string()),
@@ -694,6 +836,7 @@ pub async fn build_two_channel_setup(
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }],
         outputs: vec![brenn_lib::messaging::config::WasmOutputPort {
             port: "out".to_string(),
@@ -704,6 +847,7 @@ pub async fn build_two_channel_setup(
                 fill_mt: 1_000_000,
                 capacity_mt: 1_000_000,
             },
+            non_text: false,
         }],
         sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
@@ -727,6 +871,12 @@ pub async fn build_two_channel_setup(
 #[cfg(test)]
 mod alerter;
 #[cfg(test)]
+mod attachments;
+#[cfg(test)]
+mod blobs;
+#[cfg(test)]
+mod body_kinds;
+#[cfg(test)]
 mod fanout;
 #[cfg(test)]
 mod git_forge_parser;
@@ -734,6 +884,8 @@ mod git_forge_parser;
 mod mount;
 #[cfg(test)]
 mod multiport;
+#[cfg(test)]
+mod non_text;
 #[cfg(test)]
 mod pacing;
 #[cfg(test)]
@@ -746,3 +898,5 @@ mod scan;
 mod stop;
 #[cfg(test)]
 mod sync;
+#[cfg(test)]
+mod sync_contracts;

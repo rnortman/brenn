@@ -40,20 +40,20 @@ pub enum LogLevel {
 
 /// One activation window on a bound input port, in the terms this core reads it
 /// by: the port it arrived on, the retained context it rode in with, and the new
-/// envelope documents it carries — each oldest first, as delivered JSON.
+/// envelopes it carries — each oldest first, parsed by the glue.
 ///
 /// A borrowed view rather than either host's own window type: this module
 /// compiles for the host, where it is unit-tested, and for wasm32 against the
 /// guest SDK, whose window is a different type in a different crate universe.
 /// The glue borrows one into the other.
 ///
-/// `context_raw` is carried and never folded. Holding it makes the skip a
+/// `context` is carried and never folded. Holding it makes the skip a
 /// decision this core takes and a host test can pin, rather than something the
 /// caller happened not to hand over.
 pub struct ActivationWindow<'a> {
     pub port: &'a str,
-    pub context_raw: &'a [String],
-    pub new_raw: &'a [String],
+    pub context: &'a [MessageEnvelope],
+    pub new: &'a [MessageEnvelope],
 }
 
 impl ActivationWindow<'_> {
@@ -71,7 +71,7 @@ impl ActivationWindow<'_> {
     /// the operator — the only place the fault is detectable, since latest-wins
     /// is component semantics no config layer knows.
     fn latest_wins_misconfiguration(&self) -> Option<String> {
-        if self.new_raw.len() <= 1 {
+        if self.new.len() <= 1 {
             return None;
         }
         Some(format!(
@@ -79,7 +79,7 @@ impl ActivationWindow<'_> {
              push_depth should be 1 — coalescing to the latest is the \
              subscription's job, not the component's",
             self.port,
-            self.new_raw.len()
+            self.new.len()
         ))
     }
 }
@@ -1020,36 +1020,36 @@ pub fn fold_window(
                     message,
                 });
             }
-            if let Some(raw) = window.new_raw.last() {
-                fold_delivery(core, window.port, raw, now_ms, &mut actions);
+            if let Some(envelope) = window.new.last() {
+                fold_delivery(core, window.port, envelope, now_ms, &mut actions);
             }
         }
         FoldClass::EventStream => {
-            for raw in window.new_raw {
-                fold_delivery(core, window.port, raw, now_ms, &mut actions);
+            for envelope in window.new {
+                fold_delivery(core, window.port, envelope, now_ms, &mut actions);
             }
         }
     }
     actions
 }
 
-/// Fold one delivered envelope's body, or report the envelope as malformed.
+/// Fold one delivered envelope's body, or report a body that is not text.
 ///
-/// A delivery that does not parse as an envelope is host/guest skew, not
-/// untrusted content — but chrome renders the page, so it reports and carries on
-/// rather than trapping and taking the whole surface's shell down with it.
+/// Chrome renders the page, so an unreadable body is reported and the fold
+/// carries on rather than trapping and taking the whole surface's shell down
+/// with it.
 fn fold_delivery(
     core: &mut ChromeCore,
     port: &str,
-    raw: &str,
+    envelope: &MessageEnvelope,
     now_ms: u64,
     actions: &mut Vec<ChromeAction>,
 ) {
-    match serde_json::from_str::<MessageEnvelope>(raw) {
-        Ok(envelope) => actions.extend(fold(core, port, &envelope.body, now_ms)),
-        Err(err) => actions.push(ChromeAction::Log {
+    match envelope.body.as_text() {
+        Some(text) => actions.extend(fold(core, port, text, now_ms)),
+        None => actions.push(ChromeAction::Log {
             level: LogLevel::Error,
-            message: format!("chrome could not read a delivery on port {port:?}: {err}"),
+            message: format!("chrome could not read a delivery on port {port:?}: body is not text"),
         }),
     }
 }
@@ -1492,19 +1492,16 @@ mod tests {
     /// A window on `port` whose first `context.len()` envelopes are retained
     /// context and the rest new.
     fn port_window(port: &str, context: &[String], new: &[String]) -> OwnedWindow {
-        let wrap = |bodies: &[String]| -> Vec<String> {
+        let wrap = |bodies: &[String]| -> Vec<MessageEnvelope> {
             bodies
                 .iter()
-                .map(|body| {
-                    serde_json::to_string(&brenn_surface_test_fixtures::sample_envelope(body))
-                        .expect("the sample envelope serializes")
-                })
+                .map(|body| brenn_surface_test_fixtures::sample_envelope(body))
                 .collect()
         };
         OwnedWindow {
             port: port.to_string(),
-            context_raw: wrap(context),
-            new_raw: wrap(new),
+            context: wrap(context),
+            new: wrap(new),
         }
     }
 
@@ -1512,16 +1509,16 @@ mod tests {
     /// borrows its slices.
     struct OwnedWindow {
         port: String,
-        context_raw: Vec<String>,
-        new_raw: Vec<String>,
+        context: Vec<MessageEnvelope>,
+        new: Vec<MessageEnvelope>,
     }
 
     impl OwnedWindow {
         fn view(&self) -> ActivationWindow<'_> {
             ActivationWindow {
                 port: &self.port,
-                context_raw: &self.context_raw,
-                new_raw: &self.new_raw,
+                context: &self.context,
+                new: &self.new,
             }
         }
     }
@@ -1585,14 +1582,13 @@ mod tests {
         );
     }
 
-    /// A window whose new slice is handed over verbatim, so the fold meets a
-    /// document that is not a `MessageEnvelope`.
-    fn unwrapped_window(port: &str, new: &[&str]) -> OwnedWindow {
-        OwnedWindow {
-            port: port.to_string(),
-            context_raw: Vec::new(),
-            new_raw: new.iter().map(|raw| (*raw).to_string()).collect(),
-        }
+    /// `envelope` with its body replaced by `bytes` typed
+    /// `application/octet-stream`.
+    fn non_text(mut envelope: MessageEnvelope, bytes: &[u8]) -> MessageEnvelope {
+        envelope.body =
+            brenn_envelope::MessageBody::from_parts(Some("application/octet-stream"), bytes)
+                .expect("a binary body builds");
+        envelope
     }
 
     /// The one error log in `actions`, or a panic naming what was there instead.
@@ -1612,15 +1608,25 @@ mod tests {
     }
 
     #[test]
-    fn a_latest_wins_delivery_that_is_not_an_envelope_is_reported_and_folds_nothing() {
-        // Chrome is the one kind that does not fail its activation on a bad
-        // envelope: it renders the page, and trapping would take the shell down
-        // with it. So the arm is a report, and the page it was rendering is
-        // untouched — the theme it already holds still stands.
+    fn a_latest_wins_body_that_is_not_text_is_reported_and_folds_nothing() {
+        // Chrome is the one kind that does not fail its activation on an
+        // unreadable delivery: it renders the page, and trapping would take the
+        // shell down with it. So the arm is a report, and the page it was
+        // rendering is untouched — the theme it already holds still stands.
         let mut c = core();
-        let window = unwrapped_window(THEME, &["{"]);
+        let light = json!({ "v": 1, "theme": "light" }).to_string();
+        let window = OwnedWindow {
+            port: THEME.to_string(),
+            context: Vec::new(),
+            new: vec![non_text(
+                brenn_surface_test_fixtures::sample_envelope(""),
+                light.as_bytes(),
+            )],
+        };
         let actions = fold_window(&mut c, &window.view(), NOW);
-        assert!(only_error(&actions).contains(THEME), "{actions:?}");
+        let error = only_error(&actions);
+        assert!(error.contains(THEME), "{actions:?}");
+        assert!(error.contains("body is not text"), "{actions:?}");
         assert_eq!(c.theme(), Theme::Dark);
         assert!(actions.iter().all(|action| matches!(
             action,
@@ -1632,30 +1638,19 @@ mod tests {
     }
 
     #[test]
-    fn a_well_formed_json_document_that_is_not_an_envelope_is_reported_too() {
-        // The layer under test is the envelope, not the body: a document with
-        // every other field and no `body` parses as JSON and still is not a
-        // delivery, so it must not reach the layout parser.
-        let mut c = core();
-        let window = unwrapped_window(LAYOUT, &[&json!({ "v": 1, "kind": "single" }).to_string()]);
-        let actions = fold_window(&mut c, &window.view(), NOW);
-        assert!(only_error(&actions).contains(LAYOUT), "{actions:?}");
-        assert!(
-            placed(&actions).is_empty(),
-            "the layout parser never saw it: {actions:?}"
-        );
-    }
-
-    #[test]
-    fn an_unreadable_delivery_does_not_stop_its_siblings_in_the_same_window() {
+    fn an_unreadable_body_does_not_stop_its_siblings_in_the_same_window() {
         // An event-stream port folds every new message, so one skewed publisher
         // must cost its own message and nothing else in the window.
         let mut c = core();
-        let good = serde_json::to_string(&brenn_surface_test_fixtures::sample_envelope(
-            &toast_body(ToastSeverity::Warning, "still shown"),
-        ))
-        .expect("the sample envelope serializes");
-        let window = unwrapped_window(TOAST, &["not an envelope", &good]);
+        let good = toast_body(ToastSeverity::Warning, "still shown");
+        let window = OwnedWindow {
+            port: TOAST.to_string(),
+            context: Vec::new(),
+            new: vec![
+                non_text(brenn_surface_test_fixtures::sample_envelope(""), &[0xff]),
+                brenn_surface_test_fixtures::sample_envelope(&good),
+            ],
+        };
         let actions = fold_window(&mut c, &window.view(), NOW);
         assert!(only_error(&actions).contains(TOAST), "{actions:?}");
         assert!(

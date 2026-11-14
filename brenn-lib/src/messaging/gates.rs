@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 
 use crate::access::AppPolicy;
 use crate::config::AppConfig;
-use crate::messaging::{ChannelScheme, is_unreserved_name};
+use crate::messaging::{ChannelScheme, MessageBody, is_unreserved_name};
 use brenn_envelope::grants::AppCapability;
 
 /// Strip `scheme`'s prefix from `addr` and validate the bare name: the prefix
@@ -69,8 +69,10 @@ pub struct BodySizeExceeded {
     pub max: usize,
 }
 
-/// Body-size cap: `body.len() > max` is rejected (`len == max` is allowed).
-pub fn check_body_size(body: &str, max: usize) -> Result<(), BodySizeExceeded> {
+/// Body-size cap on the body's raw byte count, for every kind of body:
+/// `body.len() > max` is rejected (`len == max` is allowed). The content type
+/// does not count toward the cap.
+pub fn check_body_size(body: &MessageBody, max: usize) -> Result<(), BodySizeExceeded> {
     let len = body.len();
     if len > max {
         return Err(BodySizeExceeded { len, max });
@@ -216,12 +218,28 @@ mod tests {
     #[test]
     fn check_body_size_boundary() {
         // len == max is allowed.
-        assert_eq!(check_body_size("abcd", 4), Ok(()));
+        assert_eq!(check_body_size(&"abcd".into(), 4), Ok(()));
         // len < max is allowed.
-        assert_eq!(check_body_size("ab", 4), Ok(()));
+        assert_eq!(check_body_size(&"ab".into(), 4), Ok(()));
         // len == max + 1 is rejected (mirrors the durable `>` comparison).
         assert_eq!(
-            check_body_size("abcde", 4),
+            check_body_size(&"abcde".into(), 4),
+            Err(BodySizeExceeded { len: 5, max: 4 })
+        );
+    }
+
+    /// A non-text body is measured by its raw bytes; its content type, however
+    /// long, is not counted.
+    #[test]
+    fn check_body_size_counts_raw_bytes_of_a_non_text_body() {
+        let ct = "application/x-a-rather-long-content-type-name-that-exceeds-the-cap";
+        let at_cap = MessageBody::from_parts(Some(ct), &[0xff, 0x00, 0xfe, 0x80])
+            .expect("a well-formed binary body");
+        assert_eq!(check_body_size(&at_cap, 4), Ok(()));
+        let over = MessageBody::from_parts(Some(ct), &[0xff, 0x00, 0xfe, 0x80, 0x01])
+            .expect("a well-formed binary body");
+        assert_eq!(
+            check_body_size(&over, 4),
             Err(BodySizeExceeded { len: 5, max: 4 })
         );
     }

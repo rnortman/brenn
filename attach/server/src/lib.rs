@@ -16,6 +16,7 @@
 //! names nothing above itself: the routes that own an attacher — the browser
 //! surface and the remote — build a profile and hand it in.
 
+pub mod blobs;
 pub mod cursor;
 pub mod profile;
 pub mod publish;

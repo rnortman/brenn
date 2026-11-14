@@ -260,10 +260,14 @@ messaging { max_body_bytes = 393216; }
   65 536 (64 KiB). It bounds every message on the bus, a tool result
   included: a result over it is answered to its caller as an `internal` error
   naming the cap, with a Warning alert once per process. Several caps are
-  derived from it — the attach client frame cap (`max_client_frame_bytes`,
-  which adds room for JSON escaping and batch overhead), the MQTT publish
-  payload cap, and a guest's publish and sync-reply caps — so raising it
-  raises them.
+  derived from it — the attach client frame cap, the MQTT publish payload
+  cap, and a guest's publish and sync-reply caps — so raising it raises them.
+  The attach frame cap is per protocol version (`Codec::max_client_frame_bytes`):
+  v4, which writes bodies as JSON strings, allows six times the body cap for
+  escaping plus batch overhead (532 480 bytes at the default); v5, which
+  writes bodies raw, allows the body cap plus the same overhead (204 800
+  bytes). A route sets its websocket read cap to the largest among the
+  versions it serves and checks each frame against its session's own.
 - `default_noise` — a subscription's noise level when it states none. Default
   `silent`.
 - `default_sink` — a channel's sink when it states none. Default `drop`.
@@ -274,6 +278,25 @@ messaging { max_body_bytes = 393216; }
 - `default_send_rate` — the per-sender, per-channel send rate when a channel
   states none, a `{ burst, refill_interval_secs, refill }` table. Default
   `{ burst = 240, refill_interval_secs = 1, refill = 30 }`.
+- `max_blob_bytes` — the largest blob the blob store holds, in bytes: a cap
+  on one blob's extent. Default 67 108 864 (64 MiB). The key bounds what the
+  store holds, not what a component can make: a component's blob is also
+  bounded by the host's per-activation write ceiling, a constant no key
+  moves, so raising this key does not let a component make a larger blob
+  (`docs/security-posture.md` §7.6).
+- `blob_budget_bytes` — the most the blob store holds in total, in bytes.
+  Default 1 073 741 824 (1 GiB). A write that would pass either bound is
+  refused to its producer; nothing is evicted to make room. A budget lowered
+  below what the store already holds is accepted, and new blobs are refused
+  until deletions bring the total under it.
+- `blob_dir` — the directory the blob files live in. Default the database
+  path with `.blobs` appended. The database and this directory are one unit
+  to back up, restore and roll back (`docs/message-bus.md` §2.1.2a). Never
+  give two hosts the same `blob_dir`: each deletes at boot every blob file its
+  own database does not name.
+
+`0` for either blob bound, or a `max_blob_bytes` over `blob_budget_bytes`
+(stated or default), is refused at load.
 
 `messaging` is a restart section (see [What reload converges](#what-reload-converges)).
 
@@ -1009,14 +1032,24 @@ channel bar_layout at "brenn:bar-layout" {
 }
 
 channel at prefix "mqtt:broker:alice/" { push_depth = 4; retain_depth = 16; }
+channel at prefix "mqtt:broker:cam/" {
+  push_depth = 1;
+  retain_depth = 16;
+  standing_retain_depth = 16;
+  non_text = true;
+  untyped_content_type = "application/octet-stream";
+}
 ```
 
 The first **declares** a channel and binds a handle to it: `bar_layout` is now a
 name other statements can reach. The second is a **tuning** — no handle, a
 matcher over a system-minted family, possibly a prefix — which says something
 about channels the system creates rather than creating one. The tunable
-families are `webhook:`, `mqtt:`, `brenn:tools/`, `brenn:tool-results/` and
-`brenn:device-location.` (`docs/message-bus.md` §2.7). A handle and a
+families are `webhook:`, `mqtt:`, `brenn:tools/`, `brenn:tool-results/`,
+`brenn:app-tool-results/` and `brenn:device-location.` (`docs/message-bus.md`
+§2.7). The four tool namespaces — `tools`, `tool-requests`, `tool-results`
+and `app-tool-results` — are reserved channel segments: no channel may be
+declared named `<segment>`, `<segment>.…` or `<segment>/…`. A handle and a
 literal address are disjoint spellings: a channel that is declared is referred
 to by its handle, never by re-spelling its address.
 
@@ -1043,6 +1076,44 @@ copying the module.
 frontier, so every durable (`brenn:`) channel must state it and every other
 scheme is refused for stating it. On a non-durable channel `retain_depth` is the
 whole retention story.
+
+`non_text = true` declares that the channel may carry non-text bodies
+(`docs/message-bus.md` §2.1, §2.1.2); absent or `false`, it is text-only:
+
+```
+channel frames at "ephemeral:cam.frames" { non_text = true; retain_depth = 4; }
+```
+
+A tuning block states it only in the `mqtt:` and `webhook:` families, where
+it selects the raw ingress shape: the transport's payload is the body, typed,
+and its metadata is the envelope's `transport` key, instead of the wrapper JSON
+as untyped text (`docs/message-bus.md` §2.7.1). Every other system-minted
+family is text-only, and a tuning block there is refused for it.
+
+`untyped_content_type = "<media type>"` types an MQTT payload the broker
+delivers with no Content-Type: legal only on an `mqtt:` tuning block that also
+states `non_text = true`, refused on a declaration and on any other family, its
+value a media type the bus accepts (at most 255 bytes). The publisher's own
+Content-Type wins when there is one; the word never looks at the payload's
+bytes. Without it, an untyped payload is untyped text and one that is not UTF-8
+is dropped — so a publisher on MQTT 3.1.1, or one that sets no Content-Type,
+needs it to deliver binary. The `mqtt:broker:cam/` block above is such a raw
+channel.
+
+A `non_text` channel may not be
+bound by a component built against the string contract
+`brenn:processor@0.1.0` — the component's load is refused at boot and at
+reload, naming the port and the channel; a surface instance's kind is judged
+the same way once its artifact is scanned, whether the channel is page-local
+or declared. A surface port may be bound to it: the page's wire is attach v5,
+which carries every body. It is served to a remote whose attach session
+negotiated protocol v5; one on v4 asking for it is answered `Unavailable`. A durable
+channel holding a non-text message cannot later be declared text-only; give it
+a new address instead. A reload does not redeclare a durable channel
+text-only while a `remote`'s publish ACL covers its old or its new address,
+or while a surface of the running configuration may publish to it (an output
+bound to it, or its own config, geometry, status or error channel); that
+change needs a restart.
 
 The address prefix is the contract: it says the blast radius without consulting
 any subscriber table. Which prefixes exist, and what each one promises about
@@ -1303,6 +1374,19 @@ component GmailTools {
   requests and alerts, every time the window fills. Nothing at load refuses
   such a window.
 - `auto_approve` (default `true`) is whether a call skips the approval prompt.
+- `accepts_attachments` (default `false`) is whether a call may hand the tool
+  attachments — blobs named by reference (`docs/component-packages.md`, "Blobs
+  and tool calls"). A boolean; anything else is refused in `auto_approve`'s
+  words. With it, a component calls the tool through `blobs.call-async`, and a
+  conversation is offered a reserved argument, **`attachments`**, naming each
+  attachment as `BrennSend` does (`{"<name the tool sees>": {"message_id",
+  "name"}}`); the host resolves the names and removes the argument before the
+  tool sees its arguments. So `accepts_attachments = true` is refused, at the
+  value, on a tool whose `input_schema` has a top-level property named
+  `attachments`. A call carrying attachments to a tool without the flag is
+  refused before the tool runs. A tool that *returns* attachments needs no
+  flag. Changing the flag on a running deployment needs a restart, like every
+  `provide` key.
 - A `provide` statement takes no sub-blocks. Two statements in one class may not
   name the same tool, nor the same `mcp_name`.
 
@@ -1443,6 +1527,54 @@ names an instance, and the form takes no tail. Five rules, all compile errors:
 it without connecting it, which is how a timer port gets an anonymous
 page-local ring. A claimed port counts as bound for the optionality check.
 
+A consumer's binding tail may also say `non_text = true`: *this port needs a
+channel that may carry non-text bodies*. On a channel the binding synthesizes —
+a link, a free `io`, an `io` on a literal `local:` address — it is the
+declaration, folded like the depths: the channel is `non_text` when any of its
+endpoints says so. This is how a component keeps binary state with no channel
+block:
+
+```
+new motion: Motion { grants = [ports]; io state { push_depth = 0; retain_depth = 1; non_text = true; } }
+```
+
+On a declared channel it is a check: a port saying `non_text = true` bound to
+a channel that does not is refused when the plan is built, naming the port and
+the channel, so `config-check` reports it. A packaged assembly may write it,
+so a kind that keeps binary state can ship the declaration with itself.
+
+On a surface binding whose channel stays on the page the key declares a
+**page-local** channel: a `local:` address outside the reserved `local:brenn/`
+planes, a free `io` port, or a
+link whose endpoints are all on that surface. The page ring is `non_text` when
+any surface binding on its address says so; a server-realm `channel`
+declaration at the same `local:` spelling is not read for it. A surface
+component built against `brenn:processor@0.2.0` then keeps binary state in the
+page, with no base64 — shown on the node rig; `e2e/tests/bytes.spec.ts` runs
+the publish and the read-back in Chromium:
+
+```
+surface kiosk {
+  new viewer: Viewer { io state { push_depth = 0; retain_depth = 1; non_text = true; } }
+}
+```
+
+On a surface binding whose channel leaves the page — a declared `ephemeral:`
+or `brenn:` channel — the key is a check, as on a consumer: stated on a port
+whose channel is declared text-only, it is refused, naming the port and the
+channel; a port that does not state it may be bound to a channel declared
+`non_text`, and a 0.2.0 kind there publishes and is delivered non-text bodies
+over the page's wire — shown on the node rig; `e2e/tests/bytes.spec.ts` runs
+the publish and the delivery in Chromium. On a
+link with an endpoint off the surface the statement is the declaration, by the
+fold. Stated on a reserved plane it is refused. A surface's config channel
+declared `non_text` is refused: a page reads its bindings document as text.
+Those refusals are reported by `config-check`, boot and reload. A surface
+instance whose kind is built against `brenn:processor@0.1.0`, bound by input
+or output to any `non_text` channel, page-local or declared, is refused at
+boot and at reload, naming the port and the channel; `config-check` cannot see
+a kind's contract.
+
 A component placed inside a `surface` runs in the page. The same class placed at
 the top level runs in the backend, and is called a **consumer**:
 
@@ -1532,6 +1664,21 @@ port is neither the class's option nor the instance's to wire:
 
 So a tool-using instance's body holds its `tool` statements and the bindings for
 its own ports, and says nothing at all about `tool-results`.
+
+An agent granted at least one asynchronous registry tool gets a result inbox of
+its own, `brenn:app-tool-results/<app-slug>`, minted by the substrate. It holds
+the attachments of a tool result handed to one of the agent's conversations,
+and only those; a result without attachments is never published there. Nothing
+subscribes to it, and **no policy can reach it**: an `acl` matcher, exact or
+prefix, reaching into `app-tool-results/` is refused when the document is
+resolved, in any list and for any owner, and so is any position an agent
+states on an address in it. A conversation names an attachment there only
+when the host handed it that result (`docs/message-bus.md` §2.7). Size it like
+the component inboxes: `channel at "brenn:app-tool-results/<app-slug>" { ... }`
+for one agent, which must name an agent holding an asynchronous tool grant, or
+`channel at prefix "brenn:app-tool-results/" { ... }` for all of them; a block
+over `brenn:tool-results/` does not reach it. `send_rate` is the host's and is
+refused in either block.
 
 #### The request inbox port
 
@@ -1881,13 +2028,38 @@ it is on an agent.
 Five more declarations, each a body of attrs:
 
 - `remote <name> { … }` — a native daemon that attaches to the bus over the
-  wire, with a token file, transport grants, and ACLs.
+  wire, with a token file, transport grants, and ACLs. Four optional keys
+  bound what it may do:
+  - `publish_burst`, `publish_per_sec` — the per-connection bucket in front of
+    every single `Publish`: burst tokens and sustained refill per second.
+    Default 60 and 1, as a surface's. Zero is refused, and so is a value
+    above the bus's per-sender send rate (`messaging { default_send_rate }`),
+    so the bucket trips no later than the bus does.
+  - `max_sessions` — concurrent sessions admitted for the remote. Default 2,
+    so a reconnect after a netsplit lands while the half-dead session drains;
+    the sessions share one parked set and one send budget.
+  - `max_subscriptions` — concurrent subscriptions per session. Default 256.
+
+  A remote's attach send budget — 256 tokens, refilled one per 15 seconds,
+  drawn by every durable `Publish` and every `PublishBatch` entry — is fixed
+  and has no key (`docs/message-bus.md` §2.1.3).
 - `webhook <name> { … }` — an HTTP ingress endpoint: mount path, content type,
   and named sub-blocks for `signature`, `key`, and `replay_protection`. The
   replay block names its guard by installed package —
   `component = "replay-generic";` — and, unlike a consumer's, that name is
   anchored by no import: a replay component ships no module, so a typo surfaces
   at boot rather than at compile.
+
+  An endpoint whose `webhook:<slug>` channel a tuning block makes raw
+  (`non_text = true`) delivers the request body itself, typed with the
+  endpoint's content type (normalized, without parameters). Such an endpoint
+  states a `transport_ceiling_bytes` within `messaging { max_body_bytes }` —
+  the default ceiling, 1 MiB, is over the default cap of 64 KiB — and a content
+  type the bus accepts; config-check, boot and reload refuse it otherwise. A
+  text content type (`application/json`, the default, or `text/*`) still
+  requires a UTF-8 body; a non-text one such as `application/octet-stream`
+  takes any bytes. A declared parameter is dropped, not applied, so one that
+  would make the type non-text (`text/csv; charset=windows-1252`) is refused.
 - `mqtt_client <name> { … }` — a broker connection; `mqtt:<client>:<topic>`
   addresses name channels through it.
 - `repo <name> { remote = …; }` — a git remote plus a slug, mounted by whichever
@@ -1909,6 +2081,13 @@ is gated at the binding instead. Which of them a host can implement is fixed —
 page has no `store` and no `mqtt`, a top-level consumer has no page to take
 over — and the illegal word is refused by name at the instance rather than left
 out of the vocabulary.
+
+`blobs` grants the `brenn:processor/blobs@0.3.0` interface: reading the
+attachments of the messages an activation is handed, creating blobs, and
+publishing messages that name them. It is top-level only — refused by name on
+a placed instance, since no page host serves blob bytes — and pairs with no
+wiring, like `log`: a component that only reads blobs binds no output. A
+component that publishes with attachments also needs `ports`.
 
 A `surface` or a `remote` — the two attach-route entities, a browser page and
 a native daemon — writes **plane** words instead: `subscribe`, `publish`, and

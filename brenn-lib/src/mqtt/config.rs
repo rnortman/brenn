@@ -27,7 +27,10 @@ use crate::mqtt::address::{parse_mqtt_address, validate_topic_filter_str};
 /// Every MQTT client with write access to a topic this app subscribes to can
 /// inject arbitrary text into the LLM context. This is an inherent property of
 /// inbound MQTT: payloads arrive from the broker as opaque bytes and are treated
-/// as untrusted by Brenn, but the LLM sees them verbatim.
+/// as untrusted by Brenn. A conversation sees a text payload verbatim — inside
+/// the `MqttEnvelope` wrapper on a default channel, as the body on a channel
+/// tuned `non_text` — and a payload that is not text only as a metadata
+/// placeholder. The topic is sender-chosen text it sees in both shapes.
 ///
 /// Mitigation: configure the broker (e.g., mosquitto ACL file or MQTT 5 auth
 /// plugin) to restrict publish rights so only authorised clients can write to

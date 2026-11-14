@@ -23,7 +23,7 @@
 //! the operator log (not a trap) so one buggy publisher cannot brick a bar
 //! showing other publishers' live messages.
 
-use brenn_guest::{Activation, Error, Processor, RetainedState, StateLoss, dom, log, repark};
+use brenn_guest::{Activation, Body, Error, Processor, RetainedState, StateLoss, dom, log, repark};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -83,7 +83,7 @@ impl Protobar {
 struct ProtobarComponent;
 
 impl Processor for ProtobarComponent {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         // Starting from a default state would lose the view and trap on the
         // first `view()`, so an unreadable body fails the activation and the
         // instance takes its error card.
@@ -122,10 +122,10 @@ fn on_activation(activation: &Activation, bar: &mut Protobar) -> Result<(), Erro
                 .on_drops(port, u64::from(window.dropped()))
                 .map_err(|violation| violation_error(&violation))?;
         }
-        for envelope in window.new_raw() {
+        for envelope in window.new_envelopes() {
             let ingest = bar
                 .state
-                .on_message(port, envelope, now)
+                .on_message(port, &envelope?, now)
                 .map_err(|violation| violation_error(&violation))?;
             if let Ingest::Malformed(report) = ingest {
                 log::error(report.log_message("protobar body"));

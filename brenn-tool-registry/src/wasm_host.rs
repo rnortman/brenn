@@ -113,8 +113,9 @@ impl ToolHost for WasmToolHost {
         tool: &str,
         args_json: &str,
         call_id: &str,
+        with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
-        self.resolve_async(tool, args_json, call_id, None)
+        self.resolve_async(tool, args_json, call_id, None, with_attachments)
     }
 }
 
@@ -122,13 +123,16 @@ impl WasmToolHost {
     /// Validate an async call and resolve it into its request envelope. A call
     /// made on behalf of a pending provided-tool call carries that call's id as
     /// `serving`; the executor reads the acting user from the pending record,
-    /// never from the body.
+    /// never from the body. A call `with_attachments` to a tool that takes
+    /// none is refused after every other check, so only a caller granted the
+    /// tool learns it.
     pub(crate) fn resolve_async(
         &self,
         tool: &str,
         args_json: &str,
         call_id: &str,
         serving: Option<&str>,
+        with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
         let grant = self
             .tool_grants
@@ -150,6 +154,9 @@ impl WasmToolHost {
         async_tool
             .check_acl(&args, &grant.acl)
             .map_err(|d| ToolCallError::Denied(d.resource))?;
+        if !async_tool.descriptor().admits_attachments(with_attachments) {
+            return Err(ToolCallError::AttachmentsNotAccepted);
+        }
         // Canonical name from the descriptor (the caller passed it, but the
         // descriptor is the source of truth for the channel name).
         let name = async_tool.descriptor().name;
@@ -179,8 +186,9 @@ mod tests {
     use crate::descriptor::{
         AclDenied, DEFAULT_FAST_BUDGET, Idempotency, ToolClass, ToolDescriptor,
     };
-    use crate::tool::{AsyncTool, FastTool};
+    use crate::tool::{AsyncTool, FastTool, ToolOutput};
     use brenn_lib::tools::AclClause;
+    use brenn_messaging_store::blob::HeldAttachments;
     use brenn_obs::alerting::noop_alert_dispatcher;
     use serde_json::json;
 
@@ -201,6 +209,7 @@ mod tests {
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
                 user_binding: crate::UserBinding::None,
+                accepts_attachments: false,
             })
         }
         fn check_acl(&self, args: &serde_json::Value, acl: &[AclClause]) -> Result<(), AclDenied> {
@@ -231,6 +240,7 @@ mod tests {
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
                 user_binding: crate::UserBinding::None,
+                accepts_attachments: false,
             })
         }
         fn check_acl(&self, args: &serde_json::Value, acl: &[AclClause]) -> Result<(), AclDenied> {
@@ -240,8 +250,9 @@ mod tests {
             &self,
             _ctx: &ToolCtx,
             _args: serde_json::Value,
-        ) -> Result<serde_json::Value, ToolError> {
-            Ok(json!({}))
+            _attachments: HeldAttachments,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(json!({}).into())
         }
     }
 
@@ -254,6 +265,7 @@ mod tests {
         Arc::new(ToolRegistry::new(vec![
             RegisteredTool::Fast(Arc::new(EchoFast)),
             RegisteredTool::Async(Arc::new(StubAsync)),
+            RegisteredTool::Async(Arc::new(crate::testutil::AttachmentEchoTool::new())),
         ]))
     }
 
@@ -349,7 +361,7 @@ mod tests {
         );
         let h = host(grants);
         let req = h
-            .queue_async("apull", r#"{"repo":"brenn"}"#, "call-1")
+            .queue_async("apull", r#"{"repo":"brenn"}"#, "call-1", false)
             .expect("granted async call resolves");
         assert_eq!(req.channel, "brenn:tools/apull");
         assert_eq!(req.reply_to, "brenn:tool-results/sync");
@@ -370,7 +382,7 @@ mod tests {
         );
         let h = host(grants);
         assert_eq!(
-            h.queue_async("echo", r#"{"repo":"brenn"}"#, "c"),
+            h.queue_async("echo", r#"{"repo":"brenn"}"#, "c", false),
             Err(ToolCallError::WrongClass)
         );
     }
@@ -384,7 +396,7 @@ mod tests {
         );
         let h = host(grants);
         assert_eq!(
-            h.queue_async("apull", r#"{"repo":"graf"}"#, "c"),
+            h.queue_async("apull", r#"{"repo":"graf"}"#, "c", false),
             Err(ToolCallError::Denied("graf".to_string()))
         );
     }
@@ -393,7 +405,7 @@ mod tests {
     async fn queue_async_ungranted_is_not_granted() {
         let h = host(BTreeMap::new());
         assert_eq!(
-            h.queue_async("apull", r#"{"repo":"brenn"}"#, "c"),
+            h.queue_async("apull", r#"{"repo":"brenn"}"#, "c", false),
             Err(ToolCallError::NotGranted)
         );
     }
@@ -404,8 +416,62 @@ mod tests {
         grants.insert("apull".to_string(), grant(vec![]));
         let h = host(grants);
         assert!(matches!(
-            h.queue_async("apull", "}{", "c"),
+            h.queue_async("apull", "}{", "c", false),
             Err(ToolCallError::InvalidArgs(_))
         ));
+    }
+
+    /// A call with attachments to a tool that takes none is refused after the
+    /// grant, class, arguments and ACL have all passed; the same call to an
+    /// accepting tool resolves, and the flag changes nothing in the envelope.
+    #[tokio::test]
+    async fn queue_async_with_attachments_needs_an_accepting_tool() {
+        let mut grants = BTreeMap::new();
+        grants.insert(
+            "apull".to_string(),
+            grant(vec![clause(&[("repo", "brenn")])]),
+        );
+        grants.insert(crate::testutil::ATTACHMENT_ECHO.to_string(), grant(vec![]));
+        let h = host(grants);
+        assert_eq!(
+            h.queue_async("apull", r#"{"repo":"brenn"}"#, "c", true),
+            Err(ToolCallError::AttachmentsNotAccepted)
+        );
+        let with = h
+            .queue_async(crate::testutil::ATTACHMENT_ECHO, "{}", "c", true)
+            .expect("an accepting tool takes attachments");
+        let without = h
+            .queue_async(crate::testutil::ATTACHMENT_ECHO, "{}", "c", false)
+            .expect("an accepting tool takes none too");
+        assert_eq!(with, without);
+    }
+
+    /// Every other refusal comes first, so a caller not granted the tool, or
+    /// whose call fails its checks, never learns whether it takes attachments.
+    #[tokio::test]
+    async fn attachments_not_accepted_is_the_last_refusal() {
+        assert_eq!(
+            host(BTreeMap::new()).queue_async("apull", r#"{"repo":"brenn"}"#, "c", true),
+            Err(ToolCallError::NotGranted)
+        );
+        let mut grants = BTreeMap::new();
+        grants.insert(
+            "apull".to_string(),
+            grant(vec![clause(&[("repo", "brenn")])]),
+        );
+        grants.insert("echo".to_string(), grant(vec![]));
+        let h = host(grants);
+        assert_eq!(
+            h.queue_async("echo", "{}", "c", true),
+            Err(ToolCallError::WrongClass)
+        );
+        assert!(matches!(
+            h.queue_async("apull", "}{", "c", true),
+            Err(ToolCallError::InvalidArgs(_))
+        ));
+        assert_eq!(
+            h.queue_async("apull", r#"{"repo":"graf"}"#, "c", true),
+            Err(ToolCallError::Denied("graf".to_string()))
+        );
     }
 }

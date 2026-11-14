@@ -18,7 +18,13 @@ pub(crate) async fn try_publish_from_system(
 ) -> Result<(), (String, PublishResult)> {
     for (address, body) in docs {
         let result = messenger
-            .publish_from_system(component, address, body, Urgency::Normal, None)
+            .publish_from_system(
+                component,
+                address,
+                body.as_str().into(),
+                Urgency::Normal,
+                None,
+            )
             .await;
         match result {
             PublishResult::Ok { .. } => {}

@@ -18,8 +18,11 @@
 //! - a required grant the artifact never imports is a need the code does not
 //!   have, so every deployment of it is granting authority nothing reads.
 //!
-//! The types interface is excluded: every component carries it, it is no
-//! capability, and no grant word names it.
+//! The comparison is made under the component contract the artifact's imports
+//! declare (`ProcessorContract::detect`, matched byte for byte): a grant word
+//! names its interface at that contract's version, and that contract's
+//! type-only interfaces are excluded, since every component of the contract
+//! carries them, they are no capability, and no grant word names them.
 //!
 //! Names are compared *with* their versions, byte for byte against the
 //! canonical name each grant word links. That is deliberately stricter than
@@ -36,19 +39,12 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use brenn_envelope::grants::ComponentGrant;
+use brenn_envelope::grants::{ComponentGrant, ProcessorContract};
 
 use crate::diag::Diagnostic;
 use crate::model::ComponentClass;
 use crate::resolved::Abi;
 use crate::scaffold::select_class;
-
-/// The types-only interface every component imports and no grant names.
-///
-/// Versioned, like every other name this module compares: an artifact carrying
-/// some other version of it is not carrying this one, and the host resolves it
-/// by the same rule it resolves a capability interface by.
-const TYPES_INTERFACE: &str = "brenn:processor/types@0.1.0";
 
 /// Which side of the equality a name failed on.
 ///
@@ -56,6 +52,9 @@ const TYPES_INTERFACE: &str = "brenn:processor/types@0.1.0";
 /// classification rather than a message's prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mismatch {
+    /// The contract the artifact's imports declare, which the comparison was
+    /// made under.
+    pub contract: ProcessorContract,
     /// Interfaces the artifact imports that no required grant names.
     pub undeclared: Vec<String>,
     /// Grants the specification requires whose interface the artifact never
@@ -66,12 +65,16 @@ pub struct Mismatch {
 /// Hold one class's `requires` list equal to one artifact's import profile.
 ///
 /// `imports` is the artifact's fully-qualified import names, in any order,
-/// carrying the versions the artifact declares them at.
+/// carrying the versions the artifact declares them at. Names are compared
+/// byte for byte, the contract's own type-only names included: an artifact
+/// carrying another version of one is not carrying this one.
 pub fn compare(requires: &[ComponentGrant], imports: &[String]) -> Result<(), Mismatch> {
+    let contract = ProcessorContract::detect(imports.iter().map(String::as_str), |a, b| a == b);
+    let type_only = contract.type_only_imports();
     let imported: BTreeSet<&str> = imports
         .iter()
         .map(String::as_str)
-        .filter(|name| *name != TYPES_INTERFACE)
+        .filter(|name| !type_only.contains(name))
         .collect();
     let mut required: BTreeSet<&str> = BTreeSet::new();
     let mut unimported: Vec<ComponentGrant> = Vec::new();
@@ -81,7 +84,7 @@ pub fn compare(requires: &[ComponentGrant], imports: &[String]) -> Result<(), Mi
         // so this is a guard on the direct callers of `compare`; skipping is the
         // only answer that does not invent an interface for a word that names
         // none.
-        let Some(interface) = grant.wit_import() else {
+        let Some(interface) = grant.wit_import(contract) else {
             continue;
         };
         required.insert(interface);
@@ -98,6 +101,7 @@ pub fn compare(requires: &[ComponentGrant], imports: &[String]) -> Result<(), Mi
         return Ok(());
     }
     Err(Mismatch {
+        contract,
         undeclared,
         unimported,
     })
@@ -187,7 +191,7 @@ fn required_grants(
                 word.name.span().clone(),
             ));
         };
-        if grant.wit_import().is_none() {
+        if !grant.names_interface() {
             continue;
         }
         grants.push((grant, word.name.span().clone()));
@@ -205,17 +209,18 @@ fn report(
     mismatch: &Mismatch,
 ) -> Diagnostic {
     let name = class.name.value();
+    let contract = mismatch.contract;
     let mut lines: Vec<String> = Vec::new();
     for import in &mismatch.undeclared {
         let exact = ComponentGrant::ALL
             .into_iter()
-            .find(|grant| grant.wit_import() == Some(import.as_str()));
+            .find(|grant| grant.wit_import(contract) == Some(import.as_str()));
         // A name that matches a canonical interface but not its version is its
         // own diagnosis: proposing a grant word for it would be advice that
         // does not fix it, and calling it unnamed would be false.
-        let versioned = ComponentGrant::ALL
-            .into_iter()
-            .find(|grant| grant.wit_import().map(strip_version) == Some(strip_version(import)));
+        let versioned = ComponentGrant::ALL.into_iter().find(|grant| {
+            grant.wit_import(contract).map(strip_version) == Some(strip_version(import))
+        });
         match (exact, versioned) {
             (Some(grant), _) => lines.push(format!(
                 "the artifact imports `{import}`, which `{name}` does not require; add `{}` to \
@@ -223,10 +228,11 @@ fn report(
                 grant.word()
             )),
             (None, Some(grant)) => lines.push(format!(
-                "the artifact imports `{import}`, but this host links `{}` for `{}`; the two \
-                 versions must be the same name, or the host resolves the import under a rule \
-                 this check does not implement",
-                grant.wit_import().unwrap_or_default(),
+                "the artifact imports `{import}`, but this host links `{}` for `{}` under \
+                 {contract}, the contract the artifact's imports declare; the two versions must \
+                 be the same name, or the host resolves the import under a rule this check does \
+                 not implement",
+                grant.wit_import(contract).unwrap_or_default(),
                 grant.word()
             )),
             (None, None) => lines.push(format!(
@@ -297,6 +303,7 @@ mod tests {
         assert_eq!(
             compare(&requires, &imports),
             Err(Mismatch {
+                contract: ProcessorContract::V0_1,
                 undeclared: vec!["brenn:processor/store@0.1.0".to_string()],
                 unimported: Vec::new(),
             })
@@ -310,6 +317,7 @@ mod tests {
         assert_eq!(
             compare(&requires, &imports),
             Err(Mismatch {
+                contract: ProcessorContract::V0_1,
                 undeclared: Vec::new(),
                 unimported: vec![ComponentGrant::Alert],
             })
@@ -323,6 +331,7 @@ mod tests {
         assert_eq!(
             compare(&requires, &imports),
             Err(Mismatch {
+                contract: ProcessorContract::V0_1,
                 undeclared: vec!["brenn:processor/store@0.1.0".to_string()],
                 unimported: vec![ComponentGrant::Alert],
             })
@@ -345,6 +354,7 @@ mod tests {
             assert_eq!(
                 compare(&requires, &names(&[spelling])),
                 Err(Mismatch {
+                    contract: ProcessorContract::V0_1,
                     undeclared: vec![spelling.to_string()],
                     unimported: vec![ComponentGrant::Config],
                 }),
@@ -361,6 +371,7 @@ mod tests {
         assert_eq!(
             compare(&[], &imports),
             Err(Mismatch {
+                contract: ProcessorContract::V0_1,
                 undeclared: vec!["brenn:processor/types@0.2.0".to_string()],
                 unimported: Vec::new(),
             })
@@ -375,6 +386,7 @@ mod tests {
         assert_eq!(
             compare(&[ComponentGrant::Log], &imports),
             Err(Mismatch {
+                contract: ProcessorContract::V0_1,
                 undeclared: vec!["wasi:logging/log@0.1.0".to_string()],
                 unimported: vec![ComponentGrant::Log],
             })
@@ -387,6 +399,70 @@ mod tests {
     fn a_repeated_import_is_counted_once() {
         let imports = names(&["brenn:processor/ports@0.1.0", "brenn:processor/ports@0.1.0"]);
         assert_eq!(compare(&[ComponentGrant::Ports], &imports), Ok(()));
+    }
+
+    /// A 0.2.0 artifact is held against the 0.2.0 names of `ports` and `calls`
+    /// and the 0.1.0 names of everything else, and its two type-only imports
+    /// are neither side of the comparison.
+    #[test]
+    fn a_v0_2_artifact_is_held_against_its_own_contracts_names() {
+        let requires = [
+            ComponentGrant::Ports,
+            ComponentGrant::Calls,
+            ComponentGrant::Log,
+        ];
+        let imports = names(&[
+            "brenn:processor/bus@0.2.0",
+            "brenn:processor/calls@0.2.0",
+            "brenn:processor/log@0.1.0",
+            "brenn:processor/ports@0.2.0",
+            "brenn:processor/types@0.1.0",
+        ]);
+        assert_eq!(compare(&requires, &imports), Ok(()));
+        assert_eq!(compare(&[], &names(&["brenn:processor/bus@0.2.0"])), Ok(()));
+    }
+
+    /// An artifact mixing the contracts' `ports` is drift in both directions
+    /// under the contract its `bus` import declares.
+    #[test]
+    fn an_artifact_mixing_the_contracts_is_drift() {
+        let imports = names(&["brenn:processor/bus@0.2.0", "brenn:processor/ports@0.1.0"]);
+        assert_eq!(
+            compare(&[ComponentGrant::Ports], &imports),
+            Err(Mismatch {
+                contract: ProcessorContract::V0_2,
+                undeclared: vec!["brenn:processor/ports@0.1.0".to_string()],
+                unimported: vec![ComponentGrant::Ports],
+            })
+        );
+        // The other way round: a 0.1.0 artifact importing a 0.2.0 interface.
+        let imports = names(&["brenn:processor/types@0.1.0", "brenn:processor/calls@0.2.0"]);
+        assert_eq!(
+            compare(&[ComponentGrant::Calls], &imports),
+            Err(Mismatch {
+                contract: ProcessorContract::V0_1,
+                undeclared: vec!["brenn:processor/calls@0.2.0".to_string()],
+                unimported: vec![ComponentGrant::Calls],
+            })
+        );
+    }
+
+    /// Exact matching extends to the marker: a patch release of `bus` is not
+    /// the 0.2.0 contract here, though the host would resolve it.
+    #[test]
+    fn an_import_list_matching_neither_contract_is_drift() {
+        let imports = names(&["brenn:processor/bus@0.2.1", "brenn:processor/ports@0.2.0"]);
+        assert_eq!(
+            compare(&[ComponentGrant::Ports], &imports),
+            Err(Mismatch {
+                contract: ProcessorContract::V0_1,
+                undeclared: vec![
+                    "brenn:processor/bus@0.2.1".to_string(),
+                    "brenn:processor/ports@0.2.0".to_string(),
+                ],
+                unimported: vec![ComponentGrant::Ports],
+            })
+        );
     }
 
     /// The class-level entry point, over a specification as an author writes
@@ -486,7 +562,27 @@ mod tests {
             &["brenn:processor/ports@0.2.0", "brenn:processor/types@0.1.0"],
         );
         assert!(
-            message.contains("this host links `brenn:processor/ports@0.1.0` for `ports`"),
+            message.contains(
+                "this host links `brenn:processor/ports@0.1.0` for `ports` under \
+                 brenn:processor@0.1.0"
+            ),
+            "{message}"
+        );
+    }
+
+    /// The version diagnosis names the contract compared against, which for a
+    /// 0.2.0 artifact is the 0.2.0 name of `ports`.
+    #[test]
+    fn a_version_drifted_import_names_the_contract_compared_against() {
+        let message = refusal(
+            "component Sink {\n    abi = processor; requires = [ports];\n}\n",
+            &["brenn:processor/bus@0.2.0", "brenn:processor/ports@0.1.0"],
+        );
+        assert!(
+            message.contains(
+                "this host links `brenn:processor/ports@0.2.0` for `ports` under \
+                 brenn:processor@0.2.0"
+            ),
             "{message}"
         );
     }

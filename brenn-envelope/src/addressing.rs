@@ -96,10 +96,12 @@ pub fn nondurable_channel_uuid(scheme: ChannelScheme, name: &str) -> Uuid {
 
 /// Reserved channel-name segments owned by the tool substrate: the async-tool
 /// request channels (`brenn:tools/<tool>`), the per-participant result
-/// inboxes (`brenn:tool-results/<slug>`) and the per-provider request inboxes
-/// (`brenn:tool-requests/<slug>`). Operator-declared channel addresses may not
-/// fall in these namespaces.
-pub const RESERVED_CHANNEL_SEGMENTS: [&str; 3] = ["tools", "tool-results", "tool-requests"];
+/// inboxes (`brenn:tool-results/<slug>`), the per-provider request inboxes
+/// (`brenn:tool-requests/<slug>`) and the per-app result inboxes
+/// (`brenn:app-tool-results/<app-slug>`). Operator-declared channel addresses
+/// may not fall in these namespaces.
+pub const RESERVED_CHANNEL_SEGMENTS: [&str; 4] =
+    ["tools", "tool-results", "tool-requests", "app-tool-results"];
 
 /// Reserved namespace of the async-tool request channels (`brenn:tools/<tool>`).
 pub const TOOLS_NAMESPACE: &str = "tools/";
@@ -114,6 +116,23 @@ pub const TOOL_RESULTS_NAMESPACE: &str = "tool-results/";
 /// (`brenn:tool-requests/<slug>`), beside [`TOOL_RESULTS_NAMESPACE`] for the
 /// same reason.
 pub const TOOL_REQUESTS_NAMESPACE: &str = "tool-requests/";
+/// Reserved namespace of the per-app result inboxes
+/// (`brenn:app-tool-results/<app-slug>`), where a tool result that carries
+/// attachments to a conversation rests.
+///
+/// No access policy covers a name in it: a conversation names one of its
+/// messages only by having been handed it. Spelled here because the access
+/// layer, the config language and the tool substrate must agree on it.
+pub const APP_TOOL_RESULTS_NAMESPACE: &str = "app-tool-results/";
+
+/// Is `name` (a scheme-stripped `brenn:` channel name) inside
+/// [`APP_TOOL_RESULTS_NAMESPACE`]?
+///
+/// The exact segment and its `.` form are reserved against declaration by
+/// [`is_reserved_channel`] but name no channel; only the `/` form does.
+pub fn in_app_tool_results_namespace(name: &str) -> bool {
+    name.starts_with(APP_TOOL_RESULTS_NAMESPACE)
+}
 
 /// Logical input port a consumer's async tool-result inbox is delivered on.
 ///
@@ -234,7 +253,8 @@ pub fn in_a_tool_namespace(name: &str) -> bool {
 pub const AUTO_CHANNEL_SEGMENT: &str = "auto";
 
 /// Does `name` (a scheme-stripped channel name) fall in a namespace reserved by
-/// the host — the tool substrate's (`tools`, `tool-results`, `tool-requests`) or the
+/// the host — the tool substrate's (`tools`, `tool-results`, `tool-requests`,
+/// `app-tool-results`) or the
 /// auto-channel machinery's (`auto`)?
 ///
 /// True for an exact segment match or a leading segment followed by a `.`/`/`
@@ -452,7 +472,7 @@ pub fn tuning_boundary_list() -> String {
 }
 
 /// The reserved channel-name segments as a refusal lists them:
-/// `` `tools`, `tool-results` or `tool-requests` ``, in the order of
+/// `` `tools`, `tool-results`, `tool-requests` or `app-tool-results` ``, in the order of
 /// [`RESERVED_CHANNEL_SEGMENTS`].
 pub fn reserved_segment_list() -> String {
     quoted_list(&RESERVED_CHANNEL_SEGMENTS)
@@ -806,6 +826,10 @@ mod tests {
         assert!(!is_reserved_channel("tool-results-archive"));
         assert!(!is_reserved_channel("tool-requests-log"));
         assert!(!is_reserved_channel("alerts.high"));
+        assert!(is_reserved_channel("app-tool-results"));
+        assert!(is_reserved_channel("app-tool-results/pfin"));
+        assert!(is_reserved_channel("app-tool-results.pfin"));
+        assert!(!is_reserved_channel("app-tool-results-archive"));
     }
 
     #[test]
@@ -818,6 +842,7 @@ mod tests {
             TOOLS_NAMESPACE,
             TOOL_RESULTS_NAMESPACE,
             TOOL_REQUESTS_NAMESPACE,
+            APP_TOOL_RESULTS_NAMESPACE,
         ] {
             let segment = namespace.trim_end_matches('/');
             assert!(
@@ -837,6 +862,16 @@ mod tests {
         assert!(!in_a_tool_namespace("tools"));
         assert!(!in_a_tool_namespace("tools.git-repo-pull"));
         assert!(!in_a_tool_namespace("toolsmith/x"));
+        assert!(in_a_tool_namespace("app-tool-results/pfin"));
+        assert!(!in_a_tool_namespace("app-tool-results.pfin"));
+    }
+
+    #[test]
+    fn app_tool_results_namespace_is_its_own() {
+        assert!(in_app_tool_results_namespace("app-tool-results/pfin"));
+        assert!(!in_app_tool_results_namespace("tool-results/pfin"));
+        assert!(!in_app_tool_results_namespace("app-tool-results"));
+        assert!(!in_app_tool_results_namespace("app-tool-results.pfin"));
     }
 
     #[test]
@@ -862,7 +897,7 @@ mod tests {
         assert_eq!(tuning_boundary_list(), "`/`, `.` or `:`");
         assert_eq!(
             reserved_segment_list(),
-            "`tools`, `tool-results` or `tool-requests`"
+            "`tools`, `tool-results`, `tool-requests` or `app-tool-results`"
         );
     }
 

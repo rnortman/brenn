@@ -4,6 +4,454 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Remote attachers can move blob bytes: attach protocol v6.** A native
+  daemon connected over the remote websocket (a "remote attacher") can now
+  read, upload and forward blobs — the large binary attachments on bus
+  messages, e.g. camera frames — instead of seeing only their references.
+  - **For daemon authors:** v6 is v5 plus blob transfer. A session with a
+    blob door (`Welcome.blobs`, `AttachmentFacts::blobs()`) opens an
+    attachment of a message by (channel, message id, attachment name) and
+    reads its bytes by range, uploads a blob of declared size in chunks, and
+    publishes messages naming its blobs by session handle — single publishes
+    and `PublishBatch` entries alike. Forwarding an attachment copies no byte.
+    `brenn-attach-client` gains the `blobs` module (`BlobPlane`), which drives
+    the frames and hands the daemon chunk ranges to read and chunks to write;
+    the crate docs' "For a daemon author: blobs" section walks the loops,
+    handle lifetime and every outcome. v4 and v5 are still served, and a
+    daemon that stays on `exactly(5)` is delivered what it was before:
+    references as metadata, no blob frames. See `docs/message-bus.md` §2.1.2a
+    and §2.1.3.
+  - **BREAKING for operators:** a remote's subscribe ACLs now grant its token
+    the *bytes* of attachments on those channels (v6), not only their
+    references; the tool substrate's channels are excepted. A remote with
+    publish authority is a producer against `blob_budget_bytes`, and every
+    remote session with the blob door — whether or not the remote may
+    publish — can keep up to 4 × `max_blob_bytes` of the pool charged, by
+    uploads or by holding opened attachments. No configuration changes;
+    review remote subscribe matchers. See `docs/security-posture.md` §9a.
+  - **BREAKING for binders of `brenn-attach-client` at the pin bump:**
+    `SUPPORTED_VERSIONS` is 4..=6, so a daemon offering the whole range now
+    negotiates v6; `ClientFrame` and `ServerFrame` gain variants and
+    `PublishOutcome` / `PublishBatchOutcome` gain `AttachmentNotHeld`
+    (exhaustive matches break, deliberately); `ClientFrame::Publish`,
+    `BatchEntry`, `PublishRequest`, `ServerFrame::Welcome` and
+    `AttachmentFacts` gain a field (struct literals break; the constructors do
+    not); `OutboxSteps` and `Discarded` gain `released`, and `Discarded` is no
+    longer `Copy`; a parked flush naming a blob handle is dropped at a detach
+    and reported, and one in flight is forgotten, as every in-flight batch is.
+    Additive: `FlushBatch::handles`, `DeferredOpKind::body`,
+    `store::DeferOp::body`, `Codec::attachments_charged_bytes`, the `blobs`
+    module.
+- **Tool calls can carry blobs (binary attachments).** A tool can now be
+  handed blobs with its arguments and answer with blobs beside its result.
+  - **For agents and app authors:** a tool result with attachments is shown to
+    the conversation as `{"result": …, "message_id": "<uuid>", "attachments":
+    {<name>: {"size", "content_type"}}}`; `BrennSend`, `brenn-tool save` and
+    later tool calls name those attachments by that `message_id` until the
+    conversation's context is reset. A result without attachments is the bare
+    value, as before. A tool that accepts attachments takes an `attachments`
+    argument. See `docs/agent-tool-cli.md`.
+  - **For WASM component authors:** `brenn:processor/blobs@0.3.0` gains
+    `call-async`, `call-async-for` and `complete`, the attachment-carrying
+    forms of the tool-call and provider-answer functions; `brenn-guest` gains
+    matching `*_with_attachments` helpers. A provided tool takes attachments
+    only if its `provide` statement sets `accepts_attachments = true`
+    (default `false`); otherwise such a call is refused
+    `attachments-not-accepted`. Using the new functions also requires the
+    `tools` or `provides` capability they extend. `brenn-guest`'s
+    `ToolResult` and `ToolRequest` gain a public `attachments` field, so code
+    building or exhaustively destructuring them must change at its next pin
+    move. Components using none of this are unaffected. See
+    `docs/component-packages.md`, "Blobs and tool calls".
+- **BREAKING for operators: `app-tool-results` is a reserved channel name.**
+  Each app granted an asynchronous tool gets a private inbox channel,
+  `brenn:app-tool-results/<app-slug>`, holding the attachments of tool results
+  handed to its conversations (default depth 16, tunable with a `[[channel]]`
+  block; `send_rate` is refused). A configuration declaring a channel named
+  `app-tool-results…`, or a matcher reaching into it, is now refused at start.
+  Other configurations need no change. See `docs/message-bus.md` §2.7.
+- **BREAKING for WASM component authors: `blobs.publish`'s error type
+  changed.** It now wraps `ports@0.2.0`'s `publish-error` instead of restating
+  its cases, so a component calling `blobs.publish` must be rebuilt (its
+  source does not change) and its class must require `ports`, as any class
+  that sends already does.
+- A watch of the tool channels (`brenn:tools/`, `brenn:tool-requests/`,
+  `brenn:tool-results/`) now sees attachment names, sizes and content types,
+  but can never save or forward the blobs themselves. See
+  `docs/security-posture.md` §7.6.
+- **BREAKING for operators who install `brenn-tool` by hand: the tool socket
+  protocol is v2.** The server refuses a v1 `brenn-tool` by name
+  ("unsupported protocol version"). The binary at `tool_cli_path` must be the
+  one built with the server.
+- **For agents and app authors: LLM conversations can now forward, save and
+  attach blobs** (large binary attachments on bus messages). A conversation
+  refers to an attachment by the message id and attachment name it was shown,
+  never by a raw blob id, and only for a message it has actually been handed
+  since its context was last reset (start, compaction, a `/` command, or a
+  server restart) and that is still retained on a channel the app may read;
+  refusals say why (`not_read`, `not_retained`, …). `BrennSend` gains
+  `attachments`, forwarding by reference with no bytes copied. Two new
+  `brenn-tool` commands, run from the conversation's shell: `brenn-tool save`
+  writes an attachment or message body to a file (atomically, once every byte
+  has arrived), and `brenn-tool send` publishes with local files attached.
+  No blob bytes pass through the model's context. Apps that disable `Bash`
+  get forwarding only. See `docs/agent-tool-cli.md` and `docs/message-bus.md`
+  §2.1.2a.
+- **For agents and app authors: a content type on a conversation's text.**
+  `BrennSend` and `BrennMessageEdit` take an optional `content_type`, which
+  must be a text type (`text/*`, `application/json`, `+json`, with a UTF-8
+  or US-ASCII charset if any); binary data goes as an attachment instead. An
+  edit replaces body and type together: `body` without `content_type` leaves
+  the message untyped, and `content_type` without `body` is refused.
+- **For WASM component authors: a `blobs` interface, backend only, not yet
+  stable.** A new interface, `brenn:processor/blobs@0.3.0`
+  (`brenn-wasm/wit/processor-0.3.wit`), under a new grant word, `blobs`, lets
+  a component on the backend host open an attachment of a message in its
+  windows by port, index and name, read it by byte range, create a blob by
+  positional writes and seal it, and publish a message naming blobs it opened
+  or made — forwarding one by reference copies no byte. Publishing with
+  attachments needs `ports` as well; `ports.publish` and its siblings still
+  publish no attachments, so republishing a body drops what it carried. A
+  component names the world `brenn:processor/processor@0.3.0`, the 0.2.0 world
+  with `blobs` imported, and is still a 0.2.0 component; `brenn-guest` binds
+  that world and adds `brenn_guest::blobs`, `publish_with_attachments` and
+  `Message::attachments`. A component that does not call the interface
+  imports nothing new. The word is refused on a placed instance, and a
+  surface refuses a component that imports the interface. The interface is
+  not yet declared stable: a shape changes in place only while no tagged
+  brenn release has served it; a shape a tagged release has served changes
+  only as a new version of the interface, served beside the old one for at
+  least one release and announced here; the old version may be removed one
+  release after its replacement, and nothing longer is promised. See
+  `docs/component-packages.md`.
+- **BREAKING for operators: a blob directory records the database it belongs
+  to.** The blob directory now holds a file `owner`, mode 0600, holding the
+  store generation of its database (`messaging_store_identity.generation`).
+  The first boot over an empty directory writes it; every later boot compares
+  it with the database's. A directory whose record names another database,
+  one that holds blob files and no record, and one whose record is not a
+  single generation line stop the boot, naming both generations, before
+  anything is deleted. A fresh database beside an old blob directory used to
+  start, its boot sweep deleting the old files; it now refuses: remove the
+  directory, or point `messaging { blob_dir }` elsewhere, and the host claims
+  a new one. A database restored or moved together with its own directory
+  boots unchanged. To repair a lost record beside the database that owns the
+  files: `sqlite3 <database> "SELECT generation FROM messaging_store_identity"
+  > <blob_dir>/owner`. See `docs/message-bus.md`, the blob section's backup
+  and restore paragraph.
+- **BREAKING for operators: the database and the blob directory are one unit
+  to back up, restore and roll back.** Attachment bytes live in a directory
+  beside the database (`messaging { blob_dir }`, default the database path
+  with `.blobs` appended), and Brenn refuses to start on a database whose
+  messages name a blob that directory no longer holds. Blob files are deleted
+  as their messages are evicted, so a snapshot of the database alone,
+  restored later, can name files that are gone. Back up and snapshot the two
+  together, and prune them together. A component granted `blobs` can
+  publish an attachment onto a durable channel, so a deploy or backup script
+  must cover the directory from this release on. To
+  start a host that refuses: delete the message rows the panic names with
+  `sqlite3`. See `docs/message-bus.md`, the blob section's restore paragraph.
+- **For operators and WASM component authors: a blob store, and attachments
+  on bus messages.** A message can now name large byte objects — blobs — by
+  reference, beside its body, which stays capped at `max_body_bytes`. A blob
+  lives exactly as long as a message the host holds names it, or host code
+  holds it open, and is then deleted: at once when only ring channels ever
+  named it, at the next reap (hourly, and after a cancel) when a durable row
+  did. Each message carries up to 32 named attachments in a new open-header
+  key, `attachments`, a map from name to `{id, size, content_type}`. A 0.2.0
+  component sees the full references in its header, on the backend and on a
+  page, and so does an attach v5 session; a conversation is shown each
+  attachment's name, size and content type without its id; the eviction
+  archive records the references but not the bytes; 0.1.0 components and
+  attach v4 sessions see nothing, byte-identically. A backend component
+  granted `blobs` creates, reads and forwards blobs (the entry below), and a
+  conversation forwards, saves and attaches them by name (the entry above);
+  remotes and pages see references as metadata only and can neither create
+  nor redeem one. Three new keys in the `messaging` section:
+  `max_blob_bytes` (default 64 MiB), `blob_budget_bytes` (default 1 GiB) and
+  `blob_dir`; the store creates its directory, mode 0700, on first boot, and
+  refuses to start if `PRAGMA synchronous` is below `FULL` or the directory
+  holds anything that is not a blob file or its owner record. The database gains a nullable
+  `attachments` column on `messaging_messages`, two tables
+  (`messaging_blobs`, `messaging_blob_refs`) and two triggers on the first
+  boot. See `docs/message-bus.md` §2.1.2a and `docs/config-dsl.md`.
+- **For Rust authors building `brenn-envelope` types:**
+  `MessageEnvelope` and `EnvelopeHeader` gain the `attachments` field, so a
+  struct literal needs it (`Default::default()` is the empty map), and the
+  shape trait `BodyShape` is renamed `EnvelopeShape` and gains a required
+  `serialize_attachments`.
+
+- **For operators and WASM component authors: MQTT and webhook ingress can
+  carry the payload itself.** A tuning block for an `mqtt:` or `webhook:`
+  channel — exact or prefix — may now state `non_text = true`. Such a channel
+  takes the *raw* ingress shape: the body is the payload byte for byte, typed
+  with the MQTT publisher's Content-Type or the webhook endpoint's content
+  type, and the message carries the transport's metadata (client, topic, QoS
+  and receive time; or the endpoint, key id, client address, receive time and
+  headers with credentials redacted) in a new open-header key, `transport`.
+  Binary MQTT payloads and non-UTF-8 webhook bodies reach a 0.2.0 component
+  as bytes; a conversation is shown a non-text body as the usual placeholder
+  with the metadata beside it. Without the opt-in nothing changes: both
+  wrappers, `MqttEnvelope` and `WebhookEnvelope`, are byte-identical and stay
+  the default, so the opt-in is the whole compatibility story — there is no
+  dual period and no shim. An `mqtt:` tuning block that is `non_text` may also
+  state `untyped_content_type = "<media type>"`, which types payloads the
+  broker delivers with no Content-Type (MQTT 3.1.1 publishers, firmware that
+  sets none); without it an untyped payload that is not UTF-8 is dropped. A
+  raw webhook endpoint must state a `transport_ceiling_bytes` within
+  `messaging { max_body_bytes }` and a content type the bus accepts; one with
+  a non-text content type such as `application/octet-stream` accepts any
+  bytes. Narrowing a raw channel back to the default needs a restart.
+  `brenn-guest` gains `mqtt_body()`, `mqtt_transport()` and
+  `webhook_transport()` beside `webhook_body()`, which now names the raw shape
+  when handed it, and `MqttPayloadBody::text()`. The database gains a nullable
+  `transport` column on the first boot. A raw channel's stored messages are
+  not readable by an earlier build: rolling back with them stored is not
+  supported. See `docs/message-bus.md` §2.7.1 and `docs/config-dsl.md`.
+- **For WASM component authors: `brenn:processor@0.2.0` is stable, and the
+  string contract `brenn:processor@0.1.0` is being removed.** The 0.2.0
+  shapes (`bus`, `ports`, `calls` and the `receive` export) are now frozen:
+  a breaking change would be a new version served beside 0.2.0 for a dual
+  period. The contract grows only by new interfaces under new grant words
+  and by new keys in the open message header, which a guest ignores when it
+  does not know them. Nothing changed in the shapes, so 0.2.0 artifacts built
+  at an earlier pin need no rebuild.
+  The string contract is served by this release and the three after it, and
+  is not removed before the out-of-tree components known to us
+  (`brenn-fastmail`, `brenn-component-demo` and one private repository) have
+  moved. Only the string contract's world and its `types`, `ports@0.1.0` and
+  `calls@0.1.0` interfaces go; the other `@0.1.0` interfaces stay. To move,
+  rebuild on a current `brenn-guest` pin. Operators running 0.1.0 components
+  or surface kinds see a `warn!` naming them at boot and after each reload;
+  nothing stops working yet. Surface hosts now also refuse a 0.2.0 kind
+  that imports a `ports` or `calls` interface under a near-miss version or
+  with an extra function. See `docs/component-packages.md`, *Contract
+  evolution*.
+- **For operators and WASM component authors: binary bodies on surface pages
+  are now tested in a real browser.** Until now, the path that carries
+  non-text (binary) message bodies between a surface page and the server had
+  run only in a node.js stand-in. `make e2e` now runs it in Chromium
+  (`e2e/tests/bytes.spec.ts`): a page-hosted `brenn:processor@0.2.0`
+  component stores a binary body on a page-local `io` port and reads it back,
+  and publishes one over the page's websocket and receives it, each checked
+  byte for byte, including a 3,000,000-byte body. A new `make e2e-measure`
+  target runs the browser timing workload on its own; one run's figures are
+  in `docs/page-rig-timings.md`. Those figures show small (~48 KB) delivered
+  rows arriving slower than 1 MiB ones; the cause is not yet established and
+  is tracked as `surface-small-row-delivery-latency` in `TODO.md`. The e2e
+  server now reads its own mounts document, which adds the test component;
+  the dev server and deployments are unchanged.
+
+- **For operators and WASM component authors: the surface page speaks attach
+  protocol v5, and a surface may bind a channel declared `non_text`.** The
+  browser page and the surface route move together from attach v4 to v5 and
+  only v5; v4 is served to remote daemons only. Every publish and every
+  delivery on a surface page, its own bindings document included, is now a
+  binary websocket frame, whatever its body — for chrome and every in-tree
+  0.1.0 component on text bodies as for a 0.2.0 kind's bytes. `make e2e` runs
+  the page's wire in Chromium, text bodies and non-text bodies both (below).
+  **Before deploying this release, run `make e2e`**: `e2e/tests/bar.spec.ts`,
+  `e2e/tests/bytes.spec.ts` and `e2e/tests/surface-reload.spec.ts` load
+  surface pages and are the only tests that run the page's wire in a
+  browser.
+  - A port of a page-hosted `brenn:processor@0.2.0` kind bound to a channel
+    that leaves the page carries typed text with its type, and non-text
+    bodies when the channel is declared `non_text`: published, parked,
+    edited and delivered byte for byte with the content type. A non-text body
+    for a text-only channel is refused to the kind with `text-only-channel`
+    and nothing is sent. Shown on the node rig; `e2e/tests/bytes.spec.ts`
+    runs the publish and the delivery in Chromium.
+  - A surface port that does not state `non_text` may be bound to a channel
+    declared `non_text`. The `non_text` key on a surface binding is refused
+    in two cases: on a reserved `local:brenn/` plane, and on a declared
+    `ephemeral:` or `brenn:` channel that is text-only (reported by
+    `config-check`, boot and reload, naming the port and the channel). A
+    surface config channel declared `non_text` is still refused: a page reads
+    its bindings document as text.
+  - A served surface instance whose kind is built against
+    `brenn:processor@0.1.0`, bound by input or output to any `non_text`
+    channel, page-local or not, is refused at boot and at reload, naming the
+    port, the channel and the fix.
+  - Reload: changing the declaration of a surface's config, geometry or
+    status channel now closes that surface's pages, which reload on the new
+    configuration, as a change to a channel it binds already did; changing
+    the surface error channel's closes every surface's. A reload that
+    redeclares a durable channel text-only while a running surface may
+    publish to it (an output bound to it, or one of its own platform
+    channels) is refused, naming the channel as the reloaded configuration
+    names it; restart instead.
+  - On the surface route a non-text body offered for a text-only channel is a
+    protocol violation: the session is closed, the
+    `attach_protocol_violation` security event is logged and fail2ban sees
+    it. A page is told every channel's declaration and never sends one. On
+    the remote route it is still answered `TextOnlyChannel`.
+  - The surface route's frame cap is v5's, 204 800 bytes at the default body
+    cap, down from 532 480.
+  - The surface bindings document's version is 7: a page older than its
+    server reloads, as at every version move.
+  - Limits on a stream delivered to a surface are in `docs/message-bus.md`
+    §2.1.4; node-rig and Chromium timings of binary rows over the page's wire
+    are in `docs/page-rig-timings.md`.
+
+- **For operators and WASM component authors: `non_text` on a surface's
+  page-local channels.** A surface binding tail (`in`, `out`, `io`) may now
+  state `non_text = true` where its channel stays on the page — a `local:`
+  address outside the reserved `local:brenn/` planes, a free `io` port, or a
+  link whose endpoints are all on that surface; the page ring is `non_text`
+  when any surface binding on its address says so. A page-hosted
+  `brenn:processor@0.2.0` kind then publishes, parks, edits and reads back
+  non-text bodies there with their content type — binary state on an `io`
+  port with no base64. Shown on the node rig; `e2e/tests/bytes.spec.ts` runs
+  the publish and the read-back in Chromium.
+  A served surface instance whose kind is built against
+  `brenn:processor@0.1.0`, bound by input or output to such a channel, is
+  refused at boot and at reload, naming the port and the channel. The key is
+  refused on a reserved plane, and on a channel that leaves the page and is
+  declared text-only (above). Node-rig timings against 0.1.0's base64 in JSON
+  are in `docs/page-rig-timings.md`, with Chromium figures for the binary
+  state.
+- **For WASM component authors: the surface host serves
+  `brenn:processor@0.2.0` beside 0.1.0.** A page-hosted 0.2.0 kind is handed
+  each message as a header plus the body's bytes and content type, as on the
+  backend. On a page it carries typed text on any channel with its type, and
+  any body in a sync call and reply between two 0.2.0 kinds; a non-text body
+  is held at rest on any channel declared `non_text`, page-local or not, and
+  refused with `text-only-channel` elsewhere (above). The server holds a
+  0.2.0 surface kind's artifact to the import names it serves and
+  type-checks its `ports` and `calls` imports and its `receive` export: one
+  that fails either is withheld under a bundle mount and a boot refusal under
+  brenn's own. The page manifest names each kind's contract. A brenn whose
+  surfaces instantiate any 0.1.0 kind names those kinds in one `warn!` at
+  boot and after each applied reload.
+- A page-hosted component's refused publish, edit or call now hands the
+  guest the refusal's diagnostic (`invalid-payload`, `invalid-body`), as the
+  backend does.
+- A page-hosted component's oversize publish is refused with
+  `invalid-payload` and no longer terminates the instance. Before, the
+  refusal reached a `brenn:processor@0.1.0` guest with no payload, the
+  generated glue could not lower it, and the instance failed with
+  `expected a string`.
+- **BREAKING for component authors: `brenn-guest` binds
+  `brenn:processor@0.2.0`.** Every component built on the guest SDK from this
+  pin on is a 0.2.0 artifact; every in-tree SDK component and surface kind is
+  one, with the same bodies on the same channels as before. The one edit
+  every component makes: `Processor::receive` returns
+  `Result<Option<Body>, Error>` (a text reply is `Ok(Some(text.into()))`).
+  Bodies are `Body` (owned, read as bytes, text or JSON, with its content
+  type) and `BodyRef` (borrowed, to publish); `publish`, `publish_deferred`,
+  `repark`, `defer_edit` and calls take any body, and a `&str` is still
+  untyped text. `PortWindow::new_raw`/`context_raw` become
+  `new_messages`/`context_messages` (`Message`: header JSON, `Body`,
+  `envelope()`), `DeferredEntry::payload` becomes `body`, `calls::CallError`
+  is an SDK enum, and `Error` gains `TextOnlyChannel` and `InvalidBody`. The
+  JSON conveniences still publish untyped text. `RetainedState<T, C = Json>`
+  takes a `StateCodec`, so a state can be stored as bytes with no JSON and no
+  base64, on a channel (or surface binding) declared `non_text`; worked
+  example `brenn-wasm/components/processor-sdk-bytes-test`.
+  `surface/page-harness` drives 0.2.0 kinds only. 0.2.0 is stable (the entry
+  above); to stay on 0.1.0 for the rest of its removal period, keep the older
+  pin or write raw 0.1.0 bindings. The full
+  before/after list is in `docs/component-packages.md`, *Contract evolution*.
+- **BREAKING for component authors: `MessageEnvelope.body` is a
+  `MessageBody`.** A message body on the bus is now bytes with an optional
+  content type. Under the current component contract every body a component
+  is handed is still text, delivered exactly as before. Read it with
+  `envelope.text_body()?` or `body.as_text()`; `json_body` and
+  `webhook_body` are unchanged. `MessageEnvelope` no longer implements
+  `Serialize`; use `to_envelope_json`. Paid at the next `brenn-guest` pin
+  bump; no deployed component is affected. See
+  `docs/component-packages.md`.
+- A conversation shown a bus message with a content type sees
+  `content_type` beside the body, and a message whose body is not text sees
+  a `{"binary": true, "content_type": …, "size": …}` placeholder instead of
+  its bytes. The first thing that can publish such a message is a component
+  built against the byte-carrying contract, below; see
+  `docs/message-bus.md` §2.1.2.
+- **For WASM component authors: a byte-carrying component contract,
+  `brenn:processor@0.2.0`.** The backend host now serves it
+  beside the string contract `brenn:processor@0.1.0`. A 0.2.0 component is
+  handed each message as an open JSON header plus the body's bytes and
+  content type, and publishes, parks, edits, calls and replies with bytes and
+  an optional content type; no base64 anywhere. The new WIT is
+  `brenn-wasm/wit/processor-0.2.wit`, read together with `processor.wit`. New
+  refusals a 0.2.0 guest can draw: `invalid-body`, `text-only-channel`,
+  `text-only-peer`. In a sync call between contracts, a 0.2.0 callee may
+  reply with a non-text body to anyone; a 0.1.0 caller handed such a reply
+  traps, and the callee is unaffected. The guest SDK builds 0.2.0 (the
+  `brenn-guest` entry above); a raw 0.2.0 component reads both WIT files.
+  0.2.0 is stable from this release, and 0.1.0's removal period begins with
+  it (the entry above). **No existing
+  component is affected**: 0.1.0 artifacts load and run as before. See
+  `docs/component-packages.md`, *Contract evolution*.
+- **For operators: `non_text` on channels and binding tails.** A channel
+  declared `non_text = true` may carry non-text bodies; every channel is
+  text-only by default, so no existing configuration changes meaning. A
+  consumer's binding tail may say `non_text = true`, which declares a link or
+  free `io` channel `non_text` and is checked against a declared channel. A
+  0.2.0 component's non-text publish to a text-only channel is refused to it,
+  and the backend writes one `warn!` per activation naming the component, the
+  port and the channel, so a missing declaration shows up in the log.
+  Refused, at `config-check`, boot or reload as each can be checked: a 0.1.0
+  component with any port on a `non_text` channel (at boot and reload, naming
+  the component, port and channel); a `non_text` key on a surface binding
+  whose channel is a reserved plane or is declared text-only, and a
+  `non_text` surface config channel; redeclaring a durable channel text-only
+  while it holds a non-text message, and, on reload only, while a `remote`'s
+  publish ACL covers it or a running surface may publish to it (restart
+  instead). A remote attacher on attach protocol v4 subscribing to a
+  `non_text` channel is answered `Unavailable`, which is not a violation and
+  feeds nothing to fail2ban; one on v5 is served it. See
+  `docs/config-dsl.md` and `docs/message-bus.md` §2.1.
+- **For remote daemons: attach protocol v5, served beside v4 on the remote
+  route.** Under v5 the body-carrying frames (`Publish`, `PublishBatch`,
+  `Deliver`, `DeferredView`) are binary websocket messages — a JSON header,
+  then the raw body bytes — so a remote can publish and receive non-text
+  bodies, onto and from channels declared `non_text`, and receives every body
+  with its content type. A non-text body offered for a text-only channel is
+  answered with the new outcome `TextOnlyChannel` and nothing is stored. v5
+  carries no blob transfer. The browser page and the surface route speak v5
+  only (above). **A deployed v4 daemon keeps everything it has, frame for frame**: it
+  negotiates v4 and sees the frames it saw before. It does not get non-text
+  bodies, content types, `non_text` channels, or the non-text entries a v5
+  session of the same remote parked, which are left out of its deferred
+  view. No end date is set for v4's service. Limits on what a remote can
+  sustain are in `docs/message-bus.md` §2.1.3.
+- **BREAKING for daemon authors, at the next `brenn-attach-client` pin
+  bump.** The body-carrying types (`PublishRequest`, `BatchEntry`, deferred
+  edits, `DeferredViewEntry`) hold a `MessageBody` instead of a `String`
+  (`"text".into()` converts); build requests with `PublishRequest::new` and
+  `BatchEntry::new`. `ConnConfig` gains `versions`, the range offered — offer
+  `VersionRange::exactly(5)` to require bytes, or `SUPPORTED_VERSIONS` to
+  keep working against an older server. `TransportConnection::send_text` is
+  `send(WireMessage)` and `TransportEvent` carries one `Message(WireMessage)`.
+  The batch law and frame cap moved onto `Codec`
+  (`AttachmentFacts::codec()`), and `FlushBatch::frame_bytes` and
+  `Outboxes::on_attached` take it. `PublishOutcome` and
+  `PublishBatchOutcome` gain `TextOnlyChannel`; `BatchAnswer` gains
+  `outcome`. A daemon asks `AttachmentFacts::carries` before publishing a
+  body its attachment may not carry. See the `brenn-attach-client` crate
+  documentation.
+- The attach frame cap is per protocol version: v4's is unchanged (532 480
+  bytes at the default body cap); v5's is 204 800. `docs/config-dsl.md`
+  documents the `remote` block's `publish_burst`, `publish_per_sec`,
+  `max_sessions` and `max_subscriptions`.
+- **Slower first start.** The first start of this release rebuilds the
+  message search index once and builds one new index on the message store,
+  both before serving, so it takes longer on a large database. No stored
+  message is rewritten, and the previous release still opens the database.
+- **Notice: the string component contract is being removed.** The backend
+  names loaded `brenn:processor@0.1.0` components, and instantiated 0.1.0
+  surface kinds, in one `warn!` each at boot and after each applied reload;
+  the notice states the removal period and asks for a rebuild against
+  `brenn:processor@0.2.0` (the entry above).
+- In the browser surface, a publish carrying an unrecognized urgency value
+  now traps the component instead of being refused as `invalid-payload`.
+  Such a value can only come from the page glue and the kernel disagreeing,
+  not from a component bug.
+- Development: `make check` now runs the real browser page kernel, the page
+  glue and real transpiled components together in node (the "page rig"),
+  covering publish, retained round trips and sync calls on the page.
+
 ## [0.35.1] — 2026-11-13
 
 - **API-key spend is no longer overcounted.** A key profile's month-to-date

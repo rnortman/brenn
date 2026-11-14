@@ -1,4 +1,4 @@
-.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity example-check xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e dev-mounts dev-bin
+.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity example-check xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e e2e-measure e2e-mounts dev-mounts dev-bin
 # Delete partially-written targets on recipe failure. Without this, a failing
 # recipe leaves the target file with a fresh mtime, causing subsequent
 # incremental builds to skip it entirely.
@@ -322,10 +322,34 @@ DEV_PIDFILE := .dev-server.pid
 # is never served through a stale link.
 DEV_MOUNTS_DIR := .dev-mounts
 DEV_MOUNTS := $(DEV_MOUNTS_DIR)/mounts.brenn
+# The `brenn` mount spec: the dev server's one mount, and the e2e server's first.
+BRENN_MOUNT_SPEC := brenn=components:$(BAZEL_BIN)/brenn-wasm/install_tree,surface:$(BAZEL_BIN)/surface/dist,modules:config/specs
 
 dev-mounts: run-artifacts
 	@./bazel/wasm/dev_mounts.sh $(DEV_MOUNTS_DIR) \
-	    "brenn=components:$(BAZEL_BIN)/brenn-wasm/install_tree,surface:$(BAZEL_BIN)/surface/dist,modules:config/specs" \
+	    "$(BRENN_MOUNT_SPEC)" \
+	    > /dev/null
+
+# The e2e server's mounts: the dev mount (`BRENN_MOUNT_SPEC`), plus
+# `e2e-fixtures`, which serves the `processor-page-bytes-test` fixture kind from
+# its staged assets and its authored spec, and `e2e-sdk-fixtures`, which serves
+# `processor-sdk-bytes-test` the same way. A mount's surface tree is one stage
+# directory, and a kind may sit under only one mount, so each fixture kind has
+# its own. Only `make e2e` reads this document, so neither the dev server nor
+# any deployment serves the fixtures. The `modules:` directories are the ones
+# `shipped_module_roots` in `brenn-lib/src/config/test_fixtures.rs` compiles
+# `brenn.e2e.brenn` against under `make check`; nothing checks that the two
+# agree, so move them together.
+E2E_TARGETS := //surface:processor-page-bytes-test_assets //surface:processor-sdk-bytes-test_assets
+E2E_MOUNTS_DIR := .e2e-mounts
+E2E_MOUNTS := $(E2E_MOUNTS_DIR)/mounts.brenn
+
+e2e-mounts: run-artifacts
+	bazel build $(BAZEL_CONFIG) $(E2E_TARGETS)
+	@./bazel/wasm/dev_mounts.sh $(E2E_MOUNTS_DIR) \
+	    "$(BRENN_MOUNT_SPEC)" \
+	    "e2e-fixtures=surface:$(BAZEL_BIN)/surface/processor-page-bytes-test_assets,modules:brenn-wasm/components/processor-page-bytes-test/spec" \
+	    "e2e-sdk-fixtures=surface:$(BAZEL_BIN)/surface/processor-sdk-bytes-test_assets,modules:brenn-wasm/components/processor-sdk-bytes-test/spec" \
 	    > /dev/null
 
 # Hermetic e2e config server settings, mirrored from brenn.e2e.brenn.
@@ -337,6 +361,8 @@ E2E_BASE_URL := http://127.0.0.1:3100
 # to the document's own directory.
 E2E_LIVE_CONFIG := .e2e-live.brenn
 E2E_DB := target/e2e/brenn.db
+# The default run leaves out the timing workload, which `e2e-measure` selects.
+E2E_PLAYWRIGHT_ARGS := --grep-invert @measure
 
 # Browser-level end-to-end tests (Playwright). Deliberately NOT part of
 # `make check`: needs installed Playwright browsers and a live server. Fresh DB
@@ -354,7 +380,7 @@ E2E_DB := target/e2e/brenn.db
 # TODO(e2e-in-ci): no gate runs this suite, so it can rot red indefinitely —
 # blocked on chromium provisioning on the runner and on the port-3100 server
 # this target boots.
-e2e: run-artifacts dev-mounts dev-bin e2e/node_modules
+e2e: run-artifacts e2e-mounts dev-bin e2e/node_modules
 	@cd e2e && node -e "const{chromium}=require('@playwright/test');const fs=require('fs');const p=chromium.executablePath();if(!fs.existsSync(p)){console.error('ERROR: Playwright chromium browser not installed. Run: cd e2e && npx playwright install chromium');process.exit(1);}"
 	@rm -rf target/e2e
 	@mkdir -p target/e2e
@@ -363,8 +389,8 @@ e2e: run-artifacts dev-mounts dev-bin e2e/node_modules
 	    echo "ERROR: $(E2E_BASE_URL) is already serving before we started — a leaked e2e server or a port clash on 3100. Kill it before running make e2e."; exit 1; \
 	fi; \
 	cp brenn.e2e.brenn $(E2E_LIVE_CONFIG); \
-	invite=$$($(E2E_BIN) --config $(E2E_LIVE_CONFIG) --mounts $(DEV_MOUNTS) invite); \
-	$(TOOL_PATH) $(E2E_BIN) --config $(E2E_LIVE_CONFIG) --mounts $(DEV_MOUNTS) serve & \
+	invite=$$($(E2E_BIN) --config $(E2E_LIVE_CONFIG) --mounts $(E2E_MOUNTS) invite); \
+	$(TOOL_PATH) $(E2E_BIN) --config $(E2E_LIVE_CONFIG) --mounts $(E2E_MOUNTS) serve & \
 	srv=$$!; \
 	trap 'kill $$srv 2>/dev/null || true' EXIT INT TERM; \
 	echo "e2e: server PID $$srv; polling $(E2E_BASE_URL)/auth/login ..."; \
@@ -381,7 +407,12 @@ e2e: run-artifacts dev-mounts dev-bin e2e/node_modules
 	    BRENN_E2E_SERVER_PID=$$srv \
 	    BRENN_E2E_BIN=$(abspath $(E2E_BIN)) \
 	    BRENN_E2E_DB=$(abspath $(E2E_DB)) \
-	    npx playwright test
+	    npx playwright test $(E2E_PLAYWRIGHT_ARGS)
+
+# The Chromium timing workload (`e2e/tests/bytes-measure.spec.ts`), run alone
+# on its own fresh `e2e` server. Hand-run; it prints timings and asserts none.
+e2e-measure: E2E_PLAYWRIGHT_ARGS := --grep @measure
+e2e-measure: e2e
 
 # Start the dev server in the background. Builds what the server reads, then
 # execs the built binary from the workspace root so the relative paths in
@@ -409,4 +440,5 @@ stopdev:
 clean:
 	bazel clean
 	rm -rf target/e2e
+	rm -rf $(E2E_MOUNTS_DIR)
 	rm -f $(E2E_LIVE_CONFIG)

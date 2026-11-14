@@ -40,7 +40,9 @@ mod pfin;
 mod registry_adapter;
 mod timezone;
 
-pub(in crate::active_bridge) use execute::{CallOrigin, ExecuteError, execute_tool};
+pub(in crate::active_bridge) use execute::{
+    CallOrigin, ExecuteError, admit_tool_call, execute_tool,
+};
 pub(crate) use execute::{ToolOutcome, execute_admitted};
 pub(crate) use pfin::render_pending_tool_request;
 

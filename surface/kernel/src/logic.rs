@@ -6,9 +6,10 @@
 //! emits.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 use brenn_attach_proto::AlertSeverity;
-use brenn_envelope::grants::ComponentGrant;
+use brenn_envelope::grants::{ComponentGrant, ProcessorContract};
 
 use crate::PublishStatus;
 use crate::outbound::truncate_report_field;
@@ -206,19 +207,118 @@ pub fn undeclared_port(instance: &str, port: &str) -> (KernelAction, String) {
     (action, reason)
 }
 
-/// The WIT `publish-error` name for a refused buffered publish, as an owned
-/// `String`.
-///
-/// The vocabulary is [`contract::publish_status_str`]. Lives here rather than in
-/// the wasm-only entry wrapper because that wrapper cannot be tested on the host.
-pub fn publish_error_str(err: contract::PublishError) -> String {
-    contract::publish_status_str(Err(err)).to_string()
+/// The report for a registration naming a component contract the kernel does
+/// not serve: the page glue and the kernel are from different builds.
+pub fn unknown_contract(
+    instance: &str,
+    err: &brenn_envelope::grants::UnknownProcessorContract,
+) -> KernelAction {
+    KernelAction::Report {
+        level: LogLevel::Error,
+        message: format!(
+            "dropped processor activation registration: {instance} names an {err}, which this \
+             kernel does not serve"
+        ),
+        subject: Some(instance.to_string()),
+    }
 }
 
-/// The WIT `defer-error` name for a refused buffered control op (cancel / edit),
-/// the twin of [`publish_error_str`] for the deferred-message family.
-pub fn defer_error_str(err: contract::DeferError) -> String {
-    contract::defer_status_str(Err(err)).to_string()
+/// A port or call refusal as a component lifts it: the WIT variant's name, and
+/// its payload for a variant that carries one. The port and call exports hand
+/// it to the glue as `{ tag, val? }`, `val` present exactly when `Some`.
+///
+/// Lives here rather than in the wasm-only exports because they cannot be
+/// tested on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortRefusal {
+    pub tag: &'static str,
+    pub val: Option<String>,
+}
+
+/// Hold that a body refusal was drawn by an instance whose bodies can draw one.
+/// A string-contract body is untyped text, which always builds and every
+/// channel carries, and its call request is untyped text every peer can read.
+///
+/// # Panics
+///
+/// When `body_refusal` and `contract` is the string contract: a kernel bug.
+fn assert_reachable(contract: ProcessorContract, body_refusal: bool, what: &dyn fmt::Debug) {
+    assert!(
+        contract.carries_non_text_bodies() || !body_refusal,
+        "surface kernel: an untyped text body drew a body refusal: {what:?}"
+    );
+}
+
+/// The answer for a refused publish, judged for an instance on `contract`.
+///
+/// # Panics
+///
+/// On a body refusal for a string-contract instance (see [`assert_reachable`]).
+pub fn publish_refusal(err: contract::PublishError, on: ProcessorContract) -> PortRefusal {
+    use contract::PublishError;
+    let body_refusal = matches!(
+        err,
+        PublishError::InvalidBody(_) | PublishError::TextOnlyChannel
+    );
+    assert_reachable(on, body_refusal, &err);
+    let tag = contract::publish_status_str(&Err(err.clone()));
+    let val = match err {
+        PublishError::InvalidPayload(detail) | PublishError::InvalidBody(detail) => Some(detail),
+        PublishError::NotPermitted
+        | PublishError::QuotaExceeded
+        | PublishError::TextOnlyChannel => None,
+    };
+    PortRefusal { tag, val }
+}
+
+/// The answer for a refused deferred-message control op, the twin of
+/// [`publish_refusal`].
+///
+/// # Panics
+///
+/// As [`publish_refusal`].
+pub fn defer_refusal(err: contract::DeferError, on: ProcessorContract) -> PortRefusal {
+    use contract::DeferError;
+    let body_refusal = matches!(
+        err,
+        DeferError::InvalidBody(_) | DeferError::TextOnlyChannel
+    );
+    assert_reachable(on, body_refusal, &err);
+    let tag = contract::defer_status_str(&Err(err.clone()));
+    let val = match err {
+        DeferError::InvalidBody(detail) => Some(detail),
+        DeferError::NotPermitted
+        | DeferError::OutOfRange
+        | DeferError::QuotaExceeded
+        | DeferError::InvalidDeliverAfter
+        | DeferError::TextOnlyChannel => None,
+    };
+    PortRefusal { tag, val }
+}
+
+/// The answer for a refused call.
+///
+/// # Panics
+///
+/// On `invalid-body` or `text-only-peer` for a string-contract caller, whose
+/// request is untyped text (see [`assert_reachable`]).
+pub fn call_refusal(err: &contract::CallError, on: ProcessorContract) -> PortRefusal {
+    use contract::CallError;
+    let body_refusal = matches!(err, CallError::InvalidBody(_) | CallError::TextOnlyPeer);
+    assert_reachable(on, body_refusal, err);
+    let val = match err {
+        CallError::InvalidPayload(detail) | CallError::InvalidBody(detail) => Some(detail.clone()),
+        CallError::NotPermitted
+        | CallError::Unwired
+        | CallError::Refused
+        | CallError::Failed
+        | CallError::QuotaExceeded
+        | CallError::TextOnlyPeer => None,
+    };
+    PortRefusal {
+        tag: contract::call_error_str(err),
+        val,
+    }
 }
 
 /// What the kernel's pre-chrome connect indicator currently shows. This is the
@@ -1877,6 +1977,7 @@ mod tests {
     /// it in.
     fn document(components: Vec<ComponentEntry>, subscriptions: Vec<Binding>) -> BindingsDocument {
         BindingsDocument {
+            wire_channels: vec![],
             v: BINDINGS_DOCUMENT_VERSION,
             components,
             subscriptions,
@@ -1898,7 +1999,7 @@ mod tests {
     /// from `Connected` other than the wiring itself.
     fn connected(bindings: BindingsDocument, alert_granted: bool) -> Event {
         Event::Connected {
-            bindings,
+            bindings: Box::new(bindings),
             participant_id: "surface:deskbar".to_string(),
             session_id: "sess-1".to_string(),
             max_body_bytes: 65_536,
@@ -3509,20 +3610,104 @@ mod tests {
         ));
     }
 
-    /// Each delegation must carry the error through: a helper that lost the
-    /// `Err` would answer `"ok"` and tell a refused component it succeeded.
+    /// Each answer carries the error through, with its payload exactly for a
+    /// variant that has one: a helper that lost the `Err` would tell a refused
+    /// component it succeeded, and one that lost the payload would hide why.
     /// Individual spellings are pinned by the contract's own round-trip test.
     #[test]
-    fn the_error_str_helpers_carry_the_error_into_the_contract_vocabulary() {
-        use contract::{DeferError, PublishError};
+    fn a_refusal_carries_its_word_and_exactly_its_payload() {
+        use contract::{CallError, DeferError, PublishError};
+        let refusal = |tag, val: Option<&str>| PortRefusal {
+            tag,
+            val: val.map(str::to_string),
+        };
         assert_eq!(
-            publish_error_str(PublishError::InvalidPayload),
-            "invalid-payload"
+            publish_refusal(
+                PublishError::InvalidPayload("too big".to_string()),
+                ProcessorContract::V0_1
+            ),
+            refusal("invalid-payload", Some("too big"))
         );
         assert_eq!(
-            defer_error_str(DeferError::InvalidDeliverAfter),
-            "invalid-deliver-after"
+            publish_refusal(PublishError::QuotaExceeded, ProcessorContract::V0_1),
+            refusal("quota-exceeded", None)
         );
+        assert_eq!(
+            publish_refusal(
+                PublishError::InvalidBody("not UTF-8".to_string()),
+                ProcessorContract::V0_2
+            ),
+            refusal("invalid-body", Some("not UTF-8"))
+        );
+        assert_eq!(
+            publish_refusal(PublishError::TextOnlyChannel, ProcessorContract::V0_2),
+            refusal("text-only-channel", None)
+        );
+        assert_eq!(
+            defer_refusal(DeferError::InvalidDeliverAfter, ProcessorContract::V0_1),
+            refusal("invalid-deliver-after", None)
+        );
+        assert_eq!(
+            defer_refusal(
+                DeferError::InvalidBody("bad".to_string()),
+                ProcessorContract::V0_2
+            ),
+            refusal("invalid-body", Some("bad"))
+        );
+        assert_eq!(
+            call_refusal(
+                &CallError::InvalidPayload("big".to_string()),
+                ProcessorContract::V0_1
+            ),
+            refusal("invalid-payload", Some("big"))
+        );
+        assert_eq!(
+            call_refusal(&CallError::TextOnlyPeer, ProcessorContract::V0_2),
+            refusal("text-only-peer", None)
+        );
+    }
+
+    #[test]
+    fn a_registration_naming_no_contract_is_reported_against_the_instance() {
+        let err = "brenn:processor@9.9.9"
+            .parse::<ProcessorContract>()
+            .expect_err("no such contract");
+        match unknown_contract("p1", &err) {
+            KernelAction::Report {
+                level,
+                message,
+                subject,
+            } => {
+                assert_eq!(level, LogLevel::Error);
+                assert!(message.contains("brenn:processor@9.9.9"), "{message}");
+                assert_eq!(subject.as_deref(), Some("p1"));
+            }
+            other => panic!("expected a report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "an untyped text body drew a body refusal")]
+    fn a_body_refusal_on_the_string_publish_path_is_a_kernel_bug() {
+        publish_refusal(
+            contract::PublishError::TextOnlyChannel,
+            ProcessorContract::V0_1,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "an untyped text body drew a body refusal")]
+    fn a_body_refusal_on_the_string_edit_path_is_a_kernel_bug() {
+        defer_refusal(
+            contract::DeferError::InvalidBody("x".to_string()),
+            ProcessorContract::V0_1,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "an untyped text body drew a body refusal")]
+    fn a_text_only_peer_on_the_string_call_path_is_a_kernel_bug() {
+        call_refusal(&contract::CallError::TextOnlyPeer, ProcessorContract::V0_1);
     }
 
     /// The operator-visible half of the vocabulary violation: an `Error`-level

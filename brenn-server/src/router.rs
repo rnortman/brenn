@@ -753,7 +753,7 @@ mod tests {
             _headers: axum::http::HeaderMap,
             _client_ip: std::net::IpAddr,
             _received_at: std::time::SystemTime,
-            _raw_body: String,
+            _body: brenn_webhook::signature::VerifiedBody,
         ) -> Result<(), String> {
             Ok(())
         }

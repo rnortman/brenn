@@ -32,7 +32,7 @@ impl PlanePolicy for TestPlanes {
         !(matches!(origin, Origin::Sub(_)) && self.attacher_only.iter().any(|c| c == channel))
     }
 
-    fn guard(&self, _channel: &str, origin: Origin<'_>, body: String) -> GuardedBody {
+    fn guard(&self, _channel: &str, origin: Origin<'_>, body: MessageBody) -> GuardedBody {
         if let Some(reason) = &self.refuse {
             return GuardedBody::Refused(reason.clone());
         }
@@ -41,7 +41,8 @@ impl PlanePolicy for TestPlanes {
                 Origin::Attacher => "attacher".to_string(),
                 Origin::Sub(sub) => sub.to_string(),
             };
-            return GuardedBody::Carry(format!("{body}|{who}"));
+            let text = body.as_text().expect("the test planes stamp text bodies");
+            return GuardedBody::Carry(format!("{text}|{who}").into());
         }
         GuardedBody::Carry(body)
     }
@@ -72,7 +73,7 @@ fn req<'a>(channel: &'a str, origin: Origin<'a>, body: &str, n: u128) -> RouteRe
     RouteRequest {
         channel,
         origin,
-        body: body.to_string(),
+        body: (body.to_string()).into(),
         stamp: stamp(n),
         urgency: Urgency::Normal,
         deliver_after: None,
@@ -134,7 +135,7 @@ fn the_attacher_publishes_under_its_bare_principal() {
     let held = retained(&stores, PLANE);
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].sender, PRINCIPAL);
-    assert_eq!(held[0].body, "state");
+    assert_eq!(held[0].body.as_text(), Some("state"));
     assert_eq!(held[0].channel, PLANE);
 }
 
@@ -176,10 +177,16 @@ fn a_guards_rewrite_is_what_lands_on_the_channel() {
         ..TestPlanes::default()
     });
     routed(router.route(&mut stores, req(PLANE, Origin::Sub("widget-7"), "claim", 1)));
-    assert_eq!(retained(&stores, PLANE)[0].body, "claim|widget-7");
+    assert_eq!(
+        retained(&stores, PLANE)[0].body.as_text(),
+        Some("claim|widget-7")
+    );
     // And the observer saw the message as its readers will, not as its publisher
     // wrote it.
-    assert_eq!(router.policy().observed[0].body, "claim|widget-7");
+    assert_eq!(
+        router.policy().observed[0].body.as_text(),
+        Some("claim|widget-7")
+    );
 }
 
 #[test]
@@ -204,7 +211,7 @@ fn the_default_policy_carries_every_body_through() {
     let mut router = LocalRouter::new(DefaultPlanes);
     router.set_principal(PRINCIPAL.to_string());
     routed(router.route(&mut stores, req(PLANE, Origin::Attacher, "verbatim", 1)));
-    assert_eq!(retained(&stores, PLANE)[0].body, "verbatim");
+    assert_eq!(retained(&stores, PLANE)[0].body.as_text(), Some("verbatim"));
 }
 
 /// The fan-out: one append, and every reader on the channel is owed it. There is
@@ -273,7 +280,11 @@ fn readers_are_served_confined_messages_in_route_order() {
             },
         )
         .expect("a reader holding a position is served");
-    let bodies: Vec<&str> = window.envelopes.iter().map(|e| e.body.as_str()).collect();
+    let bodies: Vec<&str> = window
+        .envelopes
+        .iter()
+        .map(|e| e.body.as_text().unwrap())
+        .collect();
     assert_eq!(bodies, ["first", "second"]);
     assert_eq!(window.new_from, 0);
 }
@@ -357,7 +368,12 @@ fn schedule_of(
     router
         .parked_for(stores, PLANE, origin)
         .into_iter()
-        .map(|entry| (entry.body, entry.deliver_after))
+        .map(|entry| {
+            (
+                entry.body.as_text().unwrap().to_string(),
+                entry.deliver_after,
+            )
+        })
         .collect()
 }
 
@@ -452,7 +468,7 @@ fn a_schedule_reads_back_in_the_shape_the_peer_answers_for_a_wire_channel() {
     let entries = router.parked_for(&stores, PLANE, Origin::Sub("widget-7"));
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].message_id, Uuid::from_u128(42));
-    assert_eq!(entries[0].body, "body");
+    assert_eq!(entries[0].body, MessageBody::from("body"));
     assert_eq!(entries[0].deliver_after, SOON);
     router.release_due(&mut stores, SOON);
     assert!(
@@ -502,10 +518,10 @@ fn a_release_reaches_every_reader_and_is_observed_at_that_moment() {
     assert_eq!(swept.len(), 1);
     assert_eq!(swept[0].channel, PLANE);
     assert_eq!(swept[0].released.len(), 1);
-    assert_eq!(swept[0].released[0].body, "due");
+    assert_eq!(swept[0].released[0].body.as_text(), Some("due"));
     assert_eq!(swept[0].released[0].sender, PRINCIPAL);
     assert!(swept[0].overflow.is_empty());
-    assert_eq!(retained(&stores, PLANE)[0].body, "due");
+    assert_eq!(retained(&stores, PLANE)[0].body.as_text(), Some("due"));
     assert!(
         stores
             .get(PLANE)
@@ -513,7 +529,7 @@ fn a_release_reaches_every_reader_and_is_observed_at_that_moment() {
             .has_deliverable(&"reader-a".to_string())
     );
     assert_eq!(router.policy().observed.len(), 1);
-    assert_eq!(router.policy().observed[0].body, "due");
+    assert_eq!(router.policy().observed[0].body.as_text(), Some("due"));
 }
 
 /// Only the due channels, in address order, and a release charges retention
@@ -629,7 +645,7 @@ fn an_edit_runs_the_planes_guard_and_its_rewrite_is_what_releases() {
             origin: Origin::Sub("widget-7"),
             message_id: Uuid::from_u128(7),
             op: DeferOp::Edit {
-                body: Some("final".to_string()),
+                body: Some("final".into()),
                 deliver_after: Some(SOON),
             },
             now: NOW,
@@ -642,7 +658,7 @@ fn an_edit_runs_the_planes_guard_and_its_rewrite_is_what_releases() {
         "the guard's rewrite, at the moved deadline"
     );
     let swept = router.release_due(&mut stores, SOON);
-    assert_eq!(swept[0].released[0].body, "final|widget-7");
+    assert_eq!(swept[0].released[0].body.as_text(), Some("final|widget-7"));
 }
 
 #[test]
@@ -661,7 +677,7 @@ fn a_refused_edit_changes_neither_body_nor_schedule() {
             origin: Origin::Sub("widget-7"),
             message_id: Uuid::from_u128(7),
             op: DeferOp::Edit {
-                body: Some("lie".to_string()),
+                body: Some("lie".into()),
                 deliver_after: Some(SOON),
             },
             now: NOW,
@@ -747,7 +763,8 @@ fn a_due_but_unswept_message_is_shown_and_is_beyond_an_ops_reach() {
     );
     let swept = router.release_due(&mut stores, SOON);
     assert_eq!(
-        swept[0].released[0].body, "due",
+        swept[0].released[0].body.as_text(),
+        Some("due"),
         "the sweep still owes it, cancel or no cancel"
     );
 }
@@ -810,4 +827,26 @@ fn a_transportable_channels_schedule_is_not_the_routers_to_answer() {
     stores.ensure("ephemeral:demo", 4);
     let router = router(TestPlanes::default());
     router.parked_for(&stores, "ephemeral:demo", Origin::Attacher);
+}
+
+/// A body parked on a confined channel is viewed as the body it is, type and
+/// all: what a carrier can hold of it is the carrier's to decide.
+#[test]
+fn a_parked_body_is_viewed_as_it_is() {
+    for body in [
+        MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap(),
+        MessageBody::from_parts(Some("application/octet-stream"), &[0xff]).unwrap(),
+    ] {
+        let mut stores = stores(4);
+        let mut router = router(TestPlanes::default());
+        parked_until(router.route(
+            &mut stores,
+            RouteRequest {
+                body: body.clone(),
+                ..scheduled(PLANE, Origin::Attacher, "", 1, SOON)
+            },
+        ));
+        let entries = router.parked_for(&stores, PLANE, Origin::Attacher);
+        assert_eq!(entries[0].body, body);
+    }
 }

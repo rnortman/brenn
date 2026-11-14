@@ -17,7 +17,9 @@
 
 use std::collections::VecDeque;
 
-use brenn_guest::{Activation, Error, Processor, RetainedState, StateLoss, dom, log, publish};
+use brenn_guest::{
+    Activation, Body, Error, Processor, RetainedState, StateLoss, dom, log, publish,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{InPort, SyncPort, port::OUT};
@@ -95,7 +97,7 @@ struct EchoStubComponent;
 impl crate::spec::StatePayload for EchoStub {}
 
 impl Processor for EchoStubComponent {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         // Starting from a default state would lose the view and trap on the
         // first `view()`, so an unreadable body fails the activation and the
         // instance takes its error card.
@@ -165,17 +167,30 @@ fn on_activation(activation: &Activation, echo: &mut EchoStub) -> Result<bool, E
             }
         }
         echo.drops += u64::from(window.dropped());
-        for envelope in window.new_raw() {
+        for message in window.new_messages() {
             // Only new envelopes are rendered: the context is what this
             // instance already scrolled back, still in the window only because
             // retention has not displaced it.
+            let body = message.body();
+            // A text body is shown as the whole envelope in the canonical text
+            // shape; a body with no text form as its header and a summary.
+            // A non-text body always has a content type; the summary is spelled
+            // as `MessageBody::summary` displays one, without copying the body.
+            let shown = match body.content_type() {
+                Some(content_type) if !body.is_text() => format!(
+                    "{} {content_type}, {} bytes",
+                    message.header_json(),
+                    body.as_bytes().len()
+                ),
+                _ => message.envelope()?.to_envelope_json(),
+            };
             let entry = dom::create_element("div");
             dom::set_attribute(entry, "data-echo-message", "");
-            dom::set_text(entry, envelope);
+            dom::set_text(entry, &shown);
             dom::append(echo.view().scrollback, entry);
             echo.entries.push_back(entry);
             new_entries += 1;
-            if envelope.contains(FAIL_AFTER_STORE) {
+            if body.is_text() && body.as_text()?.contains(FAIL_AFTER_STORE) {
                 fail_after_store = true;
             }
         }

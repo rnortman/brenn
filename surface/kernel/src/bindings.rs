@@ -31,8 +31,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use brenn_attach_client::subs::SubscriptionDepths;
-use brenn_envelope::channel_capabilities;
 use brenn_envelope::grants::ComponentGrant;
+use brenn_envelope::{MessageBody, channel_capabilities};
 use brenn_surface_schema::bindings::{BindingsDocument, BindingsError, PlatformSection};
 use brenn_surface_schema::{
     Binding, CallBinding, ComponentEntry, LocalChannel, OutputBinding, RESERVED_LOCAL_CHANNELS,
@@ -59,6 +59,18 @@ pub(crate) fn channel_is_transportable(channel: &str) -> bool {
     channel_capabilities(channel)
         .expect("every surface-bindable scheme carries capabilities")
         .transportable
+}
+
+/// Whether a channel declared `declared_non_text` may carry `body`.
+///
+/// The one rule every publish and edit body from a component passes before it
+/// is buffered, and every delivered row before it is stored, so no store and
+/// no flush holds a body its channel's declaration does not admit.
+/// `declared_non_text` is the channel's declaration in the wiring in force
+/// ([`AppliedBindings::carries_non_text`]), for either class of channel: the
+/// page's wire carries every body, so the declaration is the whole rule.
+pub(crate) fn channel_carries(declared_non_text: bool, body: &MessageBody) -> bool {
+    body.is_text() || declared_non_text
 }
 
 /// One surface's wiring, ready to run on.
@@ -89,6 +101,8 @@ pub struct AppliedBindings {
     wire_depths: BTreeMap<String, SubscriptionDepths>,
     /// Channel → the depth its page-side store is sized to, both classes.
     store_depths: BTreeMap<String, u64>,
+    /// The channels the document declares `non_text`, both classes.
+    non_text_channels: BTreeSet<String>,
     /// Instance id → the port names its component kind declares it may publish
     /// to. Shared rather than copied because every activation of the instance
     /// seeds its buffer with the same set.
@@ -182,6 +196,7 @@ impl AppliedBindings {
         // it: the page's own router accepts publishes on it, and the declared
         // ring depth is the floor under what it retains.
         let mut local_addresses = BTreeSet::new();
+        let mut non_text_channels = BTreeSet::new();
         for lc in &doc.local_channels {
             assert!(
                 local_addresses.insert(lc.channel.as_str()),
@@ -190,6 +205,17 @@ impl AppliedBindings {
             );
             let depth = store_depths.entry(lc.channel.clone()).or_default();
             *depth = (*depth).max(lc.ring_depth);
+            if lc.non_text {
+                non_text_channels.insert(lc.channel.clone());
+            }
+        }
+        // A transportable channel's declaration is the directory's, carried in
+        // the wire table; the document's validation has proved the table names
+        // exactly the transportable channels the bindings do.
+        for wc in &doc.wire_channels {
+            if wc.non_text {
+                non_text_channels.insert(wc.channel.clone());
+            }
         }
 
         let mut input_ports = BTreeSet::new();
@@ -242,6 +268,7 @@ impl AppliedBindings {
             inputs_by_channel,
             wire_depths,
             store_depths,
+            non_text_channels,
             declared_out_ports,
             calls,
             grants,
@@ -318,6 +345,13 @@ impl AppliedBindings {
     /// this table is the only place their parameters come from.
     pub fn local_channels(&self) -> &[LocalChannel] {
         &self.doc.local_channels
+    }
+
+    /// Whether the document declares `channel` — page-local or transportable —
+    /// a channel that may carry non-text bodies. `false` for every other
+    /// channel, declared or not.
+    pub fn carries_non_text(&self, channel: &str) -> bool {
+        self.non_text_channels.contains(channel)
     }
 
     /// The output binding `instance` publishes on through `port`, or `None` for

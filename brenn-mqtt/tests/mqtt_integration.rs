@@ -418,7 +418,7 @@ async fn self_publish_echoes_back_on_same_session() {
     assert_eq!(msg.topic, echo_topic);
     assert_eq!(msg.client, client_slug);
     assert!(
-        matches!(&msg.payload, InboundPayload::Text(t) if t == "echoed"),
+        msg.payload == InboundPayload::new("echoed", None),
         "echo payload mismatch: {:?}",
         msg.payload
     );
@@ -605,7 +605,7 @@ async fn ingress_subscribe_filter_live_delivers() {
     let msg = recv_delivery(&mut rx, "static retained").await;
     assert_eq!(msg.topic, static_topic);
     assert!(
-        matches!(&msg.payload, InboundPayload::Text(t) if t == "static-retained"),
+        msg.payload == InboundPayload::new("static-retained", None),
         "static retained payload mismatch: {:?}",
         msg.payload
     );
@@ -630,7 +630,7 @@ async fn ingress_subscribe_filter_live_delivers() {
     assert_eq!(msg.topic, dyn_topic);
     assert_eq!(msg.qos, 1, "granted QoS must be >= 1 (behavioral)");
     assert!(
-        matches!(&msg.payload, InboundPayload::Text(t) if t == "live-1"),
+        msg.payload == InboundPayload::new("live-1", None),
         "live payload mismatch: {:?}",
         msg.payload
     );
@@ -644,7 +644,7 @@ async fn ingress_subscribe_filter_live_delivers() {
     let msg = recv_delivery(&mut rx, "re-subscribe retained barrier").await;
     assert_eq!(msg.topic, dyn_topic);
     assert!(
-        matches!(&msg.payload, InboundPayload::Text(t) if t.starts_with("__barrier__")),
+        msg.payload.bytes.starts_with(b"__barrier__"),
         "re-subscribe should redeliver the retained barrier, got {:?}",
         msg.payload
     );
@@ -734,7 +734,7 @@ async fn ingress_unsubscribe_filter_live_stops_delivery() {
         "a was unsubscribed; the first delivery must be the control on b"
     );
     assert!(
-        matches!(&msg.payload, InboundPayload::Text(t) if t == "control"),
+        msg.payload == InboundPayload::new("control", None),
         "control payload mismatch: {:?}",
         msg.payload
     );
@@ -986,7 +986,7 @@ async fn reconnect_reasserts_filters_and_fails_pending_publish() {
     let msg = recv_delivery(&mut rx, "pre-drop sentinel").await;
     assert_eq!(msg.topic, sentinel_topic);
     assert!(
-        matches!(&msg.payload, InboundPayload::Text(t) if t == "sentinel"),
+        msg.payload == InboundPayload::new("sentinel", None),
         "pre-drop sentinel payload mismatch: {:?}",
         msg.payload
     );
@@ -1053,7 +1053,7 @@ async fn reconnect_reasserts_filters_and_fails_pending_publish() {
     let msg = recv_delivery(&mut rx, "post-reconnect sentinel").await;
     assert_eq!(msg.topic, sentinel_topic);
     assert!(
-        matches!(&msg.payload, InboundPayload::Text(t) if t == "sentinel"),
+        msg.payload == InboundPayload::new("sentinel", None),
         "post-reconnect sentinel payload mismatch: {:?}",
         msg.payload
     );

@@ -23,7 +23,9 @@
 mod spec;
 
 use crate::spec::{InPort, log};
-use brenn_guest::{Activation, Error, MessageEnvelopeExt, Processor, WebhookEnvelope, serde_json};
+use brenn_guest::{
+    Activation, Body, Error, MessageEnvelopeExt, Processor, WebhookEnvelope, serde_json,
+};
 use serde::{Deserialize, Serialize};
 
 /// Subset of a forge push payload we extract remotes from. Both Forgejo and
@@ -96,7 +98,7 @@ fn extract_remotes(payload: &ForgePayload) -> Vec<String> {
 }
 
 impl Processor for GitForgeParser {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         for window in activation.port_windows() {
             let in_port = InPort::of(window)?;
             let port = in_port.name();

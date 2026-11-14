@@ -167,6 +167,8 @@ async fn err_outcome_acks_push_row_at_activation_start() {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
+            untyped_content_type: None,
         },
         subscribers: vec![SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(slug.to_string()),
@@ -253,6 +255,7 @@ async fn err_outcome_acks_push_row_at_activation_start() {
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }],
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
@@ -813,10 +816,11 @@ async fn a_deferred_op_naming_another_senders_parked_message_panics() {
             other,
             &[WasmPublish {
                 channel_address: "brenn:e2e-out",
-                body: "not-yours",
+                body: "not-yours".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(Utc::now() + chrono::Duration::seconds(60)),
+                attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
             }],
         )
         .await;
@@ -907,6 +911,7 @@ async fn build_ring_backed_consumer(
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+            non_text: false,
         }],
         outputs: vec![],
         sync_ports: std::collections::BTreeSet::new(),
@@ -931,13 +936,14 @@ async fn append_ring_message(
         .append(NewMessage {
             source: "test".to_string(),
             sender: "publisher".to_string(),
-            body,
+            body: body.into(),
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Ephemeral,
             reply_to: None,
             delivery_deadline: None,
             impetus: None,
             publish_ts_ns: Utc::now().timestamp_nanos_opt().unwrap(),
+            attachments: brenn_messaging_store::blob::HeldAttachments::none(),
         })
         .await;
 }
@@ -1024,6 +1030,7 @@ async fn build_mixed_class_consumer(
             wake_min: WakeMin::Normal,
         },
         amplification_mt: 1000,
+        non_text: false,
     };
     let cfg = WasmConsumerConfig {
         slug: slug.to_string(),
@@ -1191,6 +1198,8 @@ fn trigger_channel() -> brenn_lib::messaging::config::ChannelConfigRaw {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     }
 }
 
@@ -1214,6 +1223,7 @@ fn demo_consumer_raw(slug: &str) -> brenn_lib::messaging::config::WasmConsumerCo
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         subscribe_acl: vec![ChannelMatcherRaw::Exact("e2e-trigger".to_string())],
         ..brenn_messaging_boot::test_fixtures::minimal_wasm_consumer()
@@ -1232,6 +1242,7 @@ fn free_input_raw(port: &str) -> brenn_lib::messaging::config::WasmConsumerSubsc
         noise: None,
         wake_min: None,
         amplification: None,
+        non_text: false,
     }
 }
 
@@ -1364,7 +1375,7 @@ async fn owed_pairs(
     brenn_messaging::testutils::owed_everywhere(messenger, subscriber)
         .await
         .into_iter()
-        .map(|(address, envelope)| (address, envelope.body.clone()))
+        .map(|(address, envelope)| (address, envelope.body.as_text().unwrap().to_owned()))
         .collect()
 }
 
@@ -1493,6 +1504,7 @@ fn link_config() -> brenn_lib::config::BrennConfig {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         ..demo_consumer_raw("producer")
     }
@@ -1521,6 +1533,7 @@ fn link_config() -> brenn_lib::config::BrennConfig {
                     io_port: false,
                     push_depth: None,
                     retain_depth: None,
+                    non_text: false,
                 },
                 LinkEndpointRaw {
                     host: LinkHostRaw::Wasm {
@@ -1532,6 +1545,7 @@ fn link_config() -> brenn_lib::config::BrennConfig {
                     io_port: false,
                     push_depth: Some(Depth::Bounded(4)),
                     retain_depth: Some(Depth::Bounded(4)),
+                    non_text: false,
                 },
             ],
         }],
@@ -1583,7 +1597,7 @@ async fn a_third_party_publishing_to_an_anonymous_auto_channel_is_denied() {
             PublishOrigin::Conversation { id: 1 },
             "graf",
             &auto_address,
-            "intruder",
+            "intruder".into(),
             Urgency::Normal,
             None,
             None,
@@ -1824,6 +1838,7 @@ fn recycler_config(store_path: &std::path::Path) -> brenn_lib::config::BrennConf
                         noise: None,
                         wake_min: None,
                         amplification: None,
+                        non_text: false,
                     },
                     WasmConsumerSubscriptionRaw {
                         channel: Some(RECYCLER_SPEAK.to_string()),
@@ -1833,6 +1848,7 @@ fn recycler_config(store_path: &std::path::Path) -> brenn_lib::config::BrennConf
                         noise: None,
                         wake_min: None,
                         amplification: None,
+                        non_text: false,
                     },
                 ],
                 io_ports: vec![io_port_raw(
@@ -1847,6 +1863,7 @@ fn recycler_config(store_path: &std::path::Path) -> brenn_lib::config::BrennConf
                     urgency: None,
                     publish_per_activation: None,
                     publish_capacity: None,
+                    non_text: false,
                 }],
                 subscribe_acl: vec![
                     ChannelMatcherRaw::Exact("recycler-e2e.utterance".to_string()),
@@ -2111,6 +2128,8 @@ mod peer_calls {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![SubscriberEntry {
                 kind: SubscriberEntryKind::Wasm(reader.to_string()),
@@ -2177,7 +2196,7 @@ mod peer_calls {
             let inner = crate::consumers::sync_caller_over(Arc::clone(&router));
             let log = Arc::clone(&hops);
             let caller: brenn_wasm::SyncCallerFn = Arc::new(
-                move |target_slug: &str, target_port: &str, body: String, chain: &[String]| {
+                move |target_slug: &str, target_port: &str, body, chain: &[String]| {
                     log.lock()
                         .unwrap()
                         .push((target_slug.to_string(), chain.to_vec()));
@@ -2218,6 +2237,7 @@ mod peer_calls {
                         fill_mt: 1_000_000,
                         capacity_mt: 1_000_000,
                     },
+                    non_text: false,
                 }],
                 sync_ports: [ANSWER.to_string()].into_iter().collect(),
                 activation_pacing: unthrottled_pacing(),
@@ -2263,12 +2283,19 @@ mod peer_calls {
         let (router, messenger, hops, _handles, _stores) = wire_chain(&["caller", "callee"]).await;
 
         let answer = router
-            .sync_call("caller", ANSWER, "call:leaf".to_string(), &[])
+            .sync_call(
+                "caller",
+                ANSWER,
+                brenn_envelope::MessageBody::text("call:leaf"),
+                &[],
+            )
             .await;
 
         assert_eq!(
             answer,
-            brenn_activation::sync::SyncAnswer::Ok(Some("via:answer:leaf".to_string())),
+            brenn_activation::sync::SyncAnswer::Ok(Some(brenn_envelope::MessageBody::text(
+                "via:answer:leaf"
+            ))),
             "the caller answered with what its peer replied"
         );
         assert_eq!(
@@ -2292,12 +2319,19 @@ mod peer_calls {
         let (router, messenger, hops, _handles, _stores) = wire_chain(&["a", "b", "c"]).await;
 
         let answer = router
-            .sync_call("a", ANSWER, "call:call:leaf".to_string(), &[])
+            .sync_call(
+                "a",
+                ANSWER,
+                brenn_envelope::MessageBody::text("call:call:leaf"),
+                &[],
+            )
             .await;
 
         assert_eq!(
             answer,
-            brenn_activation::sync::SyncAnswer::Ok(Some("via:via:answer:leaf".to_string())),
+            brenn_activation::sync::SyncAnswer::Ok(Some(brenn_envelope::MessageBody::text(
+                "via:via:answer:leaf"
+            ))),
             "each hop wrapped the one below it"
         );
         assert_eq!(

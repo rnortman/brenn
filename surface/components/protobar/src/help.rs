@@ -103,7 +103,7 @@ fn slot_semantics(out: &mut String) {
 mod tests {
     use super::*;
     use crate::logic::{Ingest, ProtobarState};
-    use brenn_surface_test_fixtures::sample_envelope_json;
+    use brenn_surface_test_fixtures::sample_envelope;
 
     /// A fixed render clock; nothing here depends on its value.
     fn now() -> chrono::DateTime<chrono::Utc> {
@@ -159,7 +159,7 @@ mod tests {
             let mut state = ProtobarState::new();
             let body = serde_json::json!({ "text": "x", "priority": urgency.as_str() });
             assert_eq!(
-                state.on_message("messages", &sample_envelope_json(&body.to_string()), now()),
+                state.on_message("messages", &sample_envelope(&body.to_string()), now()),
                 Ok(Ingest::Accepted),
                 "documented priority {} is rejected by the parser",
                 urgency.as_str()
@@ -169,7 +169,7 @@ mod tests {
         let body = serde_json::json!({ "text": "x", "priority": "never" });
         assert!(
             matches!(
-                state.on_message("messages", &sample_envelope_json(&body.to_string()), now()),
+                state.on_message("messages", &sample_envelope(&body.to_string()), now()),
                 Ok(Ingest::Malformed(_))
             ),
             "`never` is not a priority level; the doc must not have grown one"
@@ -188,7 +188,7 @@ mod tests {
             let mut state = ProtobarState::new();
             let body = serde_json::json!({ "text": "x", "format": format });
             assert_eq!(
-                state.on_message("messages", &sample_envelope_json(&body.to_string()), now()),
+                state.on_message("messages", &sample_envelope(&body.to_string()), now()),
                 Ok(Ingest::Accepted),
                 "documented format {format} is rejected by the parser"
             );
@@ -206,7 +206,7 @@ mod tests {
             let mut state = ProtobarState::new();
             let body = serde_json::json!({ key: "x" });
             let outcome = state
-                .on_message("messages", &sample_envelope_json(&body.to_string()), now())
+                .on_message("messages", &sample_envelope(&body.to_string()), now())
                 .expect("a well-formed envelope on the bound port");
             let claimed = match outcome {
                 Ingest::Malformed(_) => true,

@@ -20,6 +20,10 @@ COMPONENT_NAMES = [
     "google-gmail-organize",
     "google-gmail-read",
     "google-maps-tools",
+    "processor-blob-caller-test",
+    "processor-blob-provider-test",
+    "processor-blobs-test",
+    "processor-bytes-test",
     "processor-call-test",
     "processor-config",
     "processor-demo",
@@ -29,7 +33,11 @@ COMPONENT_NAMES = [
     "processor-mem-exhaust",
     "processor-mqtt-test",
     "processor-multiport",
+    "processor-page-bytes-test",
+    "processor-page-test",
     "processor-provider-test",
+    "processor-sdk-bytes-test",
+    "processor-stale-contract-test",
     "processor-store-rt",
     "processor-tool-test",
     "processor-transplant",
@@ -244,7 +252,7 @@ filegroup(
 
 # Generated once and copied into each crate that compiles the `brenn:processor`
 # world directly, without the guest SDK: processor-exhaust,
-# processor-mem-exhaust, processor-mqtt-test, processor-tool-test.
+# processor-mem-exhaust, processor-tool-test.
 wit_bindgen_rust(
     name = "processor_bindings",
     out = "processor_bindings.rs",
@@ -278,6 +286,7 @@ rust_library(
         "//brenn-budget",
         "//brenn-common",
         "//brenn-envelope",
+        "//brenn-messaging-store",
     ],
 )
 
@@ -312,6 +321,48 @@ rust_test(
 # reason `extra_data` does. A suite reading the WIT at macro-expansion time
 # names `:wit` itself, so a `processor.wit` edit re-runs that suite alone.
 WASM_TEST_SUITES = [
+    (
+        "artifact_contracts",
+        [
+            "chrome",
+            "conversation-recycler",
+            "echo-stub",
+            "git-forge-parser",
+            "git-sync-consumer",
+            "google-calendar-read",
+            "google-calendar-write",
+            "google-gmail-compose",
+            "google-gmail-organize",
+            "google-gmail-read",
+            "google-maps-tools",
+            "meeting",
+            "mode-clock",
+            "processor-blob-caller-test",
+            "processor-blob-provider-test",
+            "processor-blobs-test",
+            "processor-call-test",
+            "processor-config",
+            "processor-demo",
+            "processor-dual",
+            "processor-exhaust",
+            "processor-log",
+            "processor-mem-exhaust",
+            "processor-mqtt-test",
+            "processor-multiport",
+            "processor-page-test",
+            "processor-provider-test",
+            "processor-sdk-bytes-test",
+            "processor-store-rt",
+            "processor-tool-test",
+            "processor-transplant",
+            "protobar",
+            "replay",
+            "replay-generic",
+        ],
+        ["deployed-components.txt"],
+        [],
+        [],
+    ),
     (
         "surface_dom",
         [
@@ -351,10 +402,32 @@ WASM_TEST_SUITES = [
         [],
         [],
     ),
+    (
+        "blobs",
+        ["processor-blobs-test"],
+        [],
+        # The seam is a real `BlobStore`.
+        ["//brenn-messaging-store"],
+        [],
+    ),
+    (
+        "bytes_contract",
+        [
+            "processor-blobs-test",
+            "processor-bytes-test",
+            "processor-exhaust",
+            "processor-stale-contract-test",
+        ],
+        [],
+        [],
+        [],
+    ),
     ("feature_envelope", ["processor-demo", "replay"], [], [], []),
     (
         "grants",
         [
+            "processor-blobs-test",
+            "processor-bytes-test",
             "processor-config",
             "processor-demo",
             "processor-dual",
@@ -362,10 +435,13 @@ WASM_TEST_SUITES = [
             "processor-log",
             "processor-mem-exhaust",
             "processor-multiport",
+            "processor-page-bytes-test",
+            "processor-page-test",
             "processor-store-rt",
         ],
         [],
-        [],
+        # The stub blob seam names the store's types.
+        ["//brenn-messaging-store"],
         [],
     ),
     ("instantiation_fail", ["processor-exhaust"], [], [], []),
@@ -384,7 +460,9 @@ WASM_TEST_SUITES = [
     ("replay_engine", ["replay"], [], [], []),
     ("replay_engine_bounds", ["replay", "replay-fault-test"], [], [], []),
     ("replay_generic_engine", ["replay-generic"], [], [], []),
+    ("sdk_bytes", ["processor-sdk-bytes-test"], [], [], []),
     ("store_round_trip", ["replay-fault-test"], [], [], []),
+    ("string_contract", ["processor-page-test"], [], [], []),
 ]
 
 # Sized `large` (900s ceiling, ~300MB resource estimate) as a family.

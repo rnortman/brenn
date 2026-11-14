@@ -4,6 +4,7 @@
 //! only for the wasm32 (browser) target; the host build excludes it and unit-
 //! tests the pure core instead.
 
+use crate::activation::PageActivation;
 use crate::contract::ActivationError;
 use crate::contract::{
     ENTRY_REPLY_FIELD, PROCESSOR_START, SURFACE_FAILURE, SURFACE_READY, SURFACE_RELOAD,
@@ -12,6 +13,8 @@ use crate::contract::{
 use crate::front::SurfaceHandle;
 use crate::schema::LogLevel;
 use crate::{ActivationEntry, ActivationOutcome};
+use brenn_envelope::grants::ProcessorContract;
+use brenn_envelope::{GuestBody, MessageBody};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -642,15 +645,20 @@ pub(crate) fn count_admission(instance: &str, admission: crate::publish_buffer::
 /// Wrap a component's registered `entry` function into the kernel's
 /// [`ActivationEntry`] — the kernel's half of the call convention.
 ///
-/// One encode per activation (not per message, which is the whole point): the
-/// activation is serialized to JSON and passed as the single argument. The return
-/// value is the outcome, in four shapes:
+/// The activation crosses once per call, in the form `contract` reads:
+///
+/// - `brenn:processor@0.1.0` — lowered to its string form ([`lower_v0_1`]) and
+///   serialized to one JSON string, the single argument.
+/// - `brenn:processor@0.2.0` — built as the JS record the glue destructures
+///   ([`activation_to_js`]), each body's bytes copied once into a fresh
+///   `Uint8Array`. No encoding of any body.
+///
+/// The return value is the outcome, in four shapes:
 ///
 /// - `undefined`/`null` → ok with no reply; the buffer flushes.
-/// - an object carrying a string [`ENTRY_REPLY_FIELD`] → ok with that reply, the
-///   buffer flushing the same way — but **only** on an activation whose `sync`
-///   field names a port. A reply to a question nobody asked is a contract break,
-///   so on an async activation it is a trap.
+/// - an object carrying a [`ENTRY_REPLY_FIELD`] of the contract's body shape →
+///   ok with that reply, the buffer flushing the same way. Whether anything
+///   asked for it is ruled where the completion is taken.
 /// - a string → err, carrying the component's own account. The buffer is
 ///   discarded, the instance keeps running.
 /// - a thrown exception → trap. `Function::call1` gives it back as `Err`, which is
@@ -660,7 +668,13 @@ pub(crate) fn count_admission(instance: &str, admission: crate::publish_buffer::
 /// Any other return type is a non-conformant module: reported as a trap rather
 /// than read as an ok, because an entry that answered gibberish did not tell us it
 /// succeeded, and treating it as success would flush publishes on its say-so.
-pub fn wrap_activation_entry(instance: &str, entry: js_sys::Function) -> ActivationEntry {
+///
+/// [`lower_v0_1`]: brenn_activation::Activation::lower_v0_1
+pub fn wrap_activation_entry(
+    instance: &str,
+    entry: js_sys::Function,
+    contract: ProcessorContract,
+) -> ActivationEntry {
     let instance = instance.to_string();
     Box::new(move |activation| {
         // Count what this activation actually delivers, before the entry can
@@ -678,13 +692,19 @@ pub fn wrap_activation_entry(instance: &str, entry: js_sys::Function) -> Activat
         if dropped > 0 {
             bump_instance(&instance, |c| &mut c.drops, dropped);
         }
-        let json = serde_json::to_string(activation)
-            .expect("surface kernel: an Activation serializes to JSON");
-        match entry.call1(&JsValue::NULL, &JsValue::from_str(&json)) {
+        let argument = match contract {
+            ProcessorContract::V0_1 => {
+                let json = serde_json::to_string(&activation.lower_v0_1())
+                    .expect("surface kernel: an Activation serializes to JSON");
+                JsValue::from_str(&json)
+            }
+            ProcessorContract::V0_2 => activation_to_js(activation),
+        };
+        match entry.call1(&JsValue::NULL, &argument) {
             Ok(value) if value.is_undefined() || value.is_null() => ActivationOutcome::Ok(None),
             Ok(value) => match value.as_string() {
                 Some(message) => ActivationOutcome::Err(ActivationError { message }),
-                None => classify_reply(&value),
+                None => classify_reply(&value, contract),
             },
             Err(thrown) => ActivationOutcome::Trap(js_error_message(&thrown)),
         }
@@ -692,18 +712,34 @@ pub fn wrap_activation_entry(instance: &str, entry: js_sys::Function) -> Activat
 }
 
 /// Classify an activation entry's non-string, non-nullish return: an object
-/// carrying a string [`ENTRY_REPLY_FIELD`] is a reply, anything else is a trap.
+/// carrying a [`ENTRY_REPLY_FIELD`] of the contract's body shape is a reply —
+/// a string under 0.1.0, a `{ contentType, bytes }` body under 0.2.0 — and
+/// anything else is a trap.
 ///
-/// Shape only. Whether a reply was *asked for*, and whether it fits the page's
-/// body cap, are facts about the activation rather than about the return, and
-/// they are ruled on where the completion is taken — one seam for both rules,
-/// reached by every invocation this kernel has rather than by this one alone.
-fn classify_reply(value: &JsValue) -> ActivationOutcome {
-    let reply = value
+/// Shape only. Whether a reply was *asked for*, whether it builds, and whether it
+/// fits the page's body cap are facts about the activation or the body rather
+/// than about the return, and they are ruled on where the completion is taken —
+/// one seam for every rule, reached by every invocation this kernel has rather
+/// than by this one alone.
+fn classify_reply(value: &JsValue, contract: ProcessorContract) -> ActivationOutcome<GuestBody> {
+    let field = value
         .is_object()
         .then(|| Reflect::get(value, &JsValue::from_str(ENTRY_REPLY_FIELD)).ok())
         .flatten()
-        .and_then(|field| field.as_string());
+        .filter(|field| !field.is_undefined());
+    let reply = match (contract, field) {
+        (ProcessorContract::V0_1, Some(field)) => field.as_string().map(GuestBody::Text),
+        (ProcessorContract::V0_2, Some(field)) => match guest_body_from_js(&field) {
+            Ok(body) => Some(body),
+            Err(detail) => {
+                return ActivationOutcome::Trap(format!(
+                    "activation entry replied with a body the kernel cannot read ({detail}): the \
+                     page glue and the kernel disagree on the body shape"
+                ));
+            }
+        },
+        (_, None) => None,
+    };
     match reply {
         Some(reply) => ActivationOutcome::Ok(Some(reply)),
         None => ActivationOutcome::Trap(
@@ -711,6 +747,140 @@ fn classify_reply(value: &JsValue) -> ActivationOutcome {
                 .to_string(),
         ),
     }
+}
+
+/// Set one property on a freshly built object. A fresh plain object refuses no
+/// property, so a failure is a broken JS environment.
+pub(crate) fn set(target: &JsValue, key: &str, value: &JsValue) {
+    Reflect::set(target, &JsValue::from_str(key), value)
+        .expect("surface kernel: a fresh object refused a property");
+}
+
+/// A body as the 0.2.0 glue lowers it: `{ contentType, bytes }`, the bytes
+/// copied once from kernel memory into a fresh `Uint8Array` on the JS heap.
+///
+/// A copy, never a view over kernel memory: a view dies when that memory grows,
+/// and the guest re-enters the kernel through every port import while it still
+/// holds the record.
+pub fn body_to_js(body: &MessageBody) -> JsValue {
+    let object: JsValue = Object::new().into();
+    let content_type = match body.content_type() {
+        Some(content_type) => JsValue::from_str(content_type),
+        None => JsValue::UNDEFINED,
+    };
+    set(&object, "contentType", &content_type);
+    set(
+        &object,
+        "bytes",
+        &js_sys::Uint8Array::from(body.as_bytes()).into(),
+    );
+    object
+}
+
+/// A component's body as the 0.2.0 glue lifted it, read into a [`GuestBody`]:
+/// `bytes` a `Uint8Array` (one copy into kernel memory), `contentType` a string,
+/// `undefined` or `null`.
+///
+/// Any other shape is glue drift — the glue is generated from the contract and
+/// never hands anything else — so the caller traps the instance on `Err`.
+pub fn guest_body_from_js(value: &JsValue) -> Result<GuestBody, String> {
+    if !value.is_object() {
+        return Err("a 0.2.0 body is not an object".to_string());
+    }
+    let bytes = Reflect::get(value, &JsValue::from_str("bytes"))
+        .map_err(|_| "a 0.2.0 body's bytes could not be read".to_string())?;
+    let bytes = bytes
+        .dyn_into::<js_sys::Uint8Array>()
+        .map_err(|_| "a 0.2.0 body's bytes are not a Uint8Array".to_string())?
+        .to_vec();
+    let content_type = Reflect::get(value, &JsValue::from_str("contentType"))
+        .map_err(|_| "a 0.2.0 body's content type could not be read".to_string())?;
+    let content_type = if content_type.is_undefined() || content_type.is_null() {
+        None
+    } else {
+        Some(
+            content_type
+                .as_string()
+                .ok_or_else(|| "a 0.2.0 body's content type is not a string".to_string())?,
+        )
+    };
+    Ok(GuestBody::Parts {
+        content_type,
+        bytes,
+    })
+}
+
+/// A page activation as the 0.2.0 glue destructures `receive`'s argument:
+///
+/// `{ ports: [{ port, envelopes: [{ header, body }], newFrom, dropped }],
+///    deferred: [{ port, entries: [{ index, body, deliverAfter }] }], now, sync }`
+///
+/// `header` is the envelope without its body as JSON text, `body` is
+/// [`body_to_js`], every `u64` is a `BigInt`, `dropped` saturates to the
+/// contract's `u32`, and an absent option is `undefined`. Every field, always:
+/// the canonical ABI traps on a missing one.
+pub fn activation_to_js(activation: &PageActivation) -> JsValue {
+    let ports = js_sys::Array::new();
+    for window in &activation.ports {
+        let envelopes = js_sys::Array::new();
+        for envelope in &window.envelopes {
+            let lowered: JsValue = Object::new().into();
+            // TODO(surface-envelope-json-memo): a served window is retained
+            // context followed by what is new, so the retained prefix's headers
+            // are re-encoded on every activation and once per subscribing
+            // instance.
+            set(
+                &lowered,
+                "header",
+                &JsValue::from_str(&envelope.to_header_json()),
+            );
+            set(&lowered, "body", &body_to_js(&envelope.body));
+            envelopes.push(&lowered);
+        }
+        let lowered: JsValue = Object::new().into();
+        set(&lowered, "port", &JsValue::from_str(&window.port));
+        set(&lowered, "envelopes", &envelopes.into());
+        set(&lowered, "newFrom", &JsValue::from(window.new_from));
+        set(
+            &lowered,
+            "dropped",
+            &JsValue::from(brenn_activation::saturate_dropped(window.dropped)),
+        );
+        ports.push(&lowered);
+    }
+    let deferred = js_sys::Array::new();
+    for window in &activation.deferred {
+        let entries = js_sys::Array::new();
+        for entry in &window.entries {
+            let lowered: JsValue = Object::new().into();
+            set(&lowered, "index", &JsValue::from(entry.index));
+            set(&lowered, "body", &body_to_js(&entry.payload));
+            set(
+                &lowered,
+                "deliverAfter",
+                &js_sys::BigInt::from(entry.deliver_after).into(),
+            );
+            entries.push(&lowered);
+        }
+        let lowered: JsValue = Object::new().into();
+        set(&lowered, "port", &JsValue::from_str(&window.port));
+        set(&lowered, "entries", &entries.into());
+        deferred.push(&lowered);
+    }
+    let lowered: JsValue = Object::new().into();
+    set(&lowered, "ports", &ports.into());
+    set(&lowered, "deferred", &deferred.into());
+    let now = match activation.now {
+        Some(now) => js_sys::BigInt::from(now).into(),
+        None => JsValue::UNDEFINED,
+    };
+    set(&lowered, "now", &now);
+    let sync = match &activation.sync {
+        Some(port) => JsValue::from_str(port),
+        None => JsValue::UNDEFINED,
+    };
+    set(&lowered, "sync", &sync);
+    lowered
 }
 
 /// The operator's account of a thrown activation entry.
@@ -851,7 +1021,7 @@ pub fn install_status_timer(interval_secs: u32, callback: impl Fn() + 'static) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::Activation;
+    use crate::activation::PageActivation;
     use crate::wasm_test_util::{capture_window_event, fresh_root, str_field};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -864,19 +1034,21 @@ mod tests {
     /// `(port, new_envelopes, dropped)`. This is the sole drop/delivery counting
     /// site now — the per-message dialect markers are gone.
     fn count_activation(instance: &str, windows: &[(&str, u64, u64)]) {
-        let entry = wrap_activation_entry(instance, js_entry("return undefined;"));
+        let entry = wrap_activation_entry(
+            instance,
+            js_entry("return undefined;"),
+            ProcessorContract::V0_1,
+        );
         let ports = windows
             .iter()
-            .map(|(port, new, dropped)| crate::contract::PortWindow {
+            .map(|(port, new, dropped)| brenn_activation::PortWindow {
                 port: (*port).to_string(),
-                envelopes: (0..*new)
-                    .map(|i| brenn_surface_test_fixtures::sample_envelope_json(&format!("m{i}")))
-                    .collect(),
+                envelopes: (0..*new).map(|i| envelope(&format!("m{i}"))).collect(),
                 new_from: 0,
                 dropped: *dropped,
             })
             .collect();
-        let _ = entry(&Activation {
+        let _ = entry(&PageActivation {
             ports,
             deferred: vec![],
             now: None,
@@ -894,11 +1066,18 @@ mod tests {
     /// A minimal activation to feed the wrapper; its contents are irrelevant to
     /// the return-value classification these tests pin, apart from `sync`, which
     /// gates the reply shape.
-    fn one_port_activation() -> crate::contract::Activation {
-        crate::contract::Activation {
-            ports: vec![crate::contract::PortWindow {
+    /// A sample envelope carrying `body`, as the page's stores hold it.
+    fn envelope(body: &str) -> brenn_envelope::MessageEnvelope {
+        brenn_surface_test_fixtures::parse_envelope(
+            &brenn_surface_test_fixtures::sample_envelope_json(body),
+        )
+    }
+
+    fn one_port_activation() -> PageActivation {
+        PageActivation {
+            ports: vec![brenn_activation::PortWindow {
                 port: "messages".to_string(),
-                envelopes: vec![brenn_surface_test_fixtures::sample_envelope_json("m")],
+                envelopes: vec![envelope("m")],
                 new_from: 0,
                 dropped: 0,
             }],
@@ -910,11 +1089,16 @@ mod tests {
 
     /// The same activation, but sync-caused: a reply is an answer someone asked
     /// for.
-    fn sync_activation() -> crate::contract::Activation {
-        crate::contract::Activation {
+    fn sync_activation() -> PageActivation {
+        PageActivation {
             sync: Some("ack".to_string()),
             ..one_port_activation()
         }
+    }
+
+    /// The string contract's wrapper over `entry`.
+    fn wrap_v0_1(instance: &str, entry: js_sys::Function) -> ActivationEntry {
+        wrap_activation_entry(instance, entry, ProcessorContract::V0_1)
     }
 
     #[wasm_bindgen_test]
@@ -924,16 +1108,16 @@ mod tests {
 
         // undefined / null → ok (buffer flushes).
         assert!(matches!(
-            wrap_activation_entry(i, js_entry("return undefined;"))(&activation),
+            wrap_v0_1(i, js_entry("return undefined;"))(&activation),
             ActivationOutcome::Ok(None)
         ));
         assert!(matches!(
-            wrap_activation_entry(i, js_entry("return null;"))(&activation),
+            wrap_v0_1(i, js_entry("return null;"))(&activation),
             ActivationOutcome::Ok(None)
         ));
 
         // A returned string → err carrying the component's own account.
-        match wrap_activation_entry(i, js_entry("return 'declined';"))(&activation) {
+        match wrap_v0_1(i, js_entry("return 'declined';"))(&activation) {
             ActivationOutcome::Err(ActivationError { message }) => {
                 assert_eq!(message, "declined");
             }
@@ -942,22 +1126,22 @@ mod tests {
 
         // Any other return type is non-conformant → trap, never read as ok.
         assert!(matches!(
-            wrap_activation_entry(i, js_entry("return 42;"))(&activation),
+            wrap_v0_1(i, js_entry("return 42;"))(&activation),
             ActivationOutcome::Trap(_)
         ));
 
         // An object carrying a string reply → ok with that reply, but only on the
         // activation that asked. On an async one it is an answer nobody wanted, and
         // reading it as ok would flush a buffer built under a misapprehension.
-        match wrap_activation_entry(i, js_entry("return { reply: '{\"cancel\":true}' };"))(
-            &sync_activation(),
-        ) {
-            ActivationOutcome::Ok(Some(reply)) => assert_eq!(reply, "{\"cancel\":true}"),
+        match wrap_v0_1(i, js_entry("return { reply: '{\"cancel\":true}' };"))(&sync_activation()) {
+            ActivationOutcome::Ok(Some(reply)) => {
+                assert_eq!(reply, GuestBody::Text("{\"cancel\":true}".to_string()))
+            }
             other => panic!("expected Ok with a reply, got {other:?}"),
         }
         assert!(
             matches!(
-                wrap_activation_entry(i, js_entry("return { reply: 'anything' };"))(&activation),
+                wrap_v0_1(i, js_entry("return { reply: 'anything' };"))(&activation),
                 ActivationOutcome::Trap(_)
             ),
             "a reply to an async activation is a contract break, not an ok"
@@ -969,7 +1153,7 @@ mod tests {
             for activation in [&activation, &sync_activation()] {
                 assert!(
                     matches!(
-                        wrap_activation_entry(i, js_entry(shape))(activation),
+                        wrap_v0_1(i, js_entry(shape))(activation),
                         ActivationOutcome::Trap(_)
                     ),
                     "{shape} is not a conformant reply"
@@ -978,13 +1162,13 @@ mod tests {
         }
 
         // A thrown Error → trap carrying the Error's message.
-        match wrap_activation_entry(i, js_entry("throw new Error('boom');"))(&activation) {
+        match wrap_v0_1(i, js_entry("throw new Error('boom');"))(&activation) {
             ActivationOutcome::Trap(message) => assert_eq!(message, "boom"),
             other => panic!("expected Trap, got {other:?}"),
         }
 
         // A thrown non-Error → trap, falling back to the value's string form.
-        match wrap_activation_entry(i, js_entry("throw 'plain';"))(&activation) {
+        match wrap_v0_1(i, js_entry("throw 'plain';"))(&activation) {
             ActivationOutcome::Trap(message) => assert_eq!(message, "plain"),
             other => panic!("expected Trap, got {other:?}"),
         }
@@ -1627,6 +1811,28 @@ mod tests {
         let before = errors_now();
         render_error_card("wbt-errctr-card-i", "wbt-errctr-card", "boom");
         assert_eq!(errors_now(), before);
+    }
+
+    /// A 0.2.0 reply object whose body the kernel cannot read is a trap that
+    /// keeps the reader's account; an object with no reply is the generic trap.
+    #[wasm_bindgen_test]
+    fn a_0_2_0_reply_the_kernel_cannot_read_traps_with_its_cause() {
+        let body = js_sys::Object::new();
+        set(&body, "bytes", &JsValue::from_str("not bytes"));
+        let returned = js_sys::Object::new();
+        set(&returned, ENTRY_REPLY_FIELD, &body);
+        match classify_reply(&returned, ProcessorContract::V0_2) {
+            ActivationOutcome::Trap(detail) => {
+                assert!(detail.contains("not a Uint8Array"), "{detail}");
+                assert!(detail.contains("disagree on the body shape"), "{detail}");
+            }
+            other => panic!("expected a trap, got {other:?}"),
+        }
+
+        match classify_reply(&js_sys::Object::new(), ProcessorContract::V0_2) {
+            ActivationOutcome::Trap(detail) => assert!(detail.contains("nor a reply object")),
+            other => panic!("expected a trap, got {other:?}"),
+        }
     }
 
     // ── window seam ───────────────────────────────────────────────────────

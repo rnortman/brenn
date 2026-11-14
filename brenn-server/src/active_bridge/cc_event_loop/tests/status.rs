@@ -397,3 +397,36 @@ async fn compact_boundary_ignored_when_not_compacting() {
         "compact_boundary_seen must remain false when CompactBoundary arrives outside Compacting"
     );
 }
+
+/// A compaction boundary clears the conversation's read record, whatever the
+/// compaction phase.
+#[tokio::test]
+async fn compact_boundary_clears_the_read_record() {
+    for phase in [CompactionPhase::Compacting, CompactionPhase::Normal] {
+        let messenger = brenn_messaging::testutils::empty_directory_messenger("compact");
+        let (bridge, event_tx, _broadcast_rx, _ab) =
+            super::super::super::test_support::test_bridge_with_config(
+                crate::active_bridge::test_fixtures::TestBridgeConfig {
+                    messenger: Some(messenger.clone()),
+                    ..Default::default()
+                },
+                brenn_obs::alerting::noop_alert_dispatcher().0,
+            )
+            .await;
+        bridge.compaction.lock().await.phase = phase;
+        let read = uuid::Uuid::new_v4();
+        messenger.note_conversation_sent(bridge.conversation_id, read, "brenn:somewhere");
+
+        let fence = event_fence(&bridge);
+        event_tx
+            .send(SessionEvent::CompactBoundary { metadata: None })
+            .await
+            .unwrap();
+        await_fence(fence).await;
+
+        assert!(
+            !messenger.conversation_has_read(bridge.conversation_id, read),
+            "the boundary must clear the record"
+        );
+    }
+}

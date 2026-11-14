@@ -66,7 +66,7 @@ impl StatusSink for MessengerSink {
                 .publish_from_system(
                     AGENT_STATUS_COMPONENT,
                     address,
-                    &body,
+                    body.into(),
                     brenn_messaging::Urgency::Normal,
                     None,
                 )

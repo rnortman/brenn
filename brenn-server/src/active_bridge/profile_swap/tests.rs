@@ -152,6 +152,21 @@ async fn swappable_bridge(
     broadcast::Receiver<WsServerMessage>,
     mpsc::Receiver<OutgoingEnvelope>,
 ) {
+    swappable_bridge_with(host, allowed, running, None).await
+}
+
+/// [`swappable_bridge`], with `messenger` on the bridge.
+async fn swappable_bridge_with(
+    host: Arc<dyn ProfileSwapHost>,
+    allowed: &[&str],
+    running: &str,
+    messenger: Option<Arc<brenn_messaging::Messenger>>,
+) -> (
+    Arc<ActiveBridge>,
+    mpsc::Sender<SessionEvent>,
+    broadcast::Receiver<WsServerMessage>,
+    mpsc::Receiver<OutgoingEnvelope>,
+) {
     let (alerts, _h) = noop_alert_dispatcher();
     let (bridge, event_tx, event_rx, broadcast_rx, alerts, _ab) = make_bridge_no_loop(
         "testapp",
@@ -159,6 +174,7 @@ async fn swappable_bridge(
         TestBridgeConfig {
             cc_profiles: Some(goal_for("testapp", allowed)),
             swap_host: Some(host),
+            messenger,
             ..Default::default()
         },
     )
@@ -318,6 +334,52 @@ async fn swap_while_idle_replaces_the_session_and_reports_the_new_models() {
         .expect("no send reached the replacement")
         .expect("recording channel closed");
     assert!(format!("{:?}", envelope.msg).contains("after the swap"));
+}
+
+/// Swap the profile of a bridge with a `Messenger`, its conversation holding a
+/// stored CC session id when `resumable`, and answer whether the conversation's
+/// read record survived the swap.
+async fn read_record_survives_a_swap(resumable: bool) -> bool {
+    let messenger = brenn_messaging::testutils::empty_directory_messenger("swap");
+    let (replacement, _new_outgoing) = CcSession::recording_for_test();
+    let host = FakeHost::spawning(replacement);
+    let (bridge, event_tx, mut broadcast_rx, _old_outgoing) = swappable_bridge_with(
+        host.clone(),
+        &["spare", "main"],
+        "main",
+        Some(messenger.clone()),
+    )
+    .await;
+    if resumable {
+        let conn = bridge.db.lock().await;
+        brenn_db::conversation::set_cc_session_id(&conn, bridge.conversation_id, "sess-1");
+    }
+    let read = uuid::Uuid::new_v4();
+    messenger.note_conversation_sent(bridge.conversation_id, read, "brenn:somewhere");
+
+    ack_the_swap_death(bridge.clone(), event_tx.clone());
+    bridge.reconsider_profile();
+    broadcasts_until(&mut broadcast_rx, |m| {
+        matches!(
+            m,
+            WsServerMessage::Status {
+                state: CcState::Idle
+            }
+        )
+    })
+    .await;
+    assert_eq!(host.asked_for().len(), 1, "the swap respawned");
+    messenger.conversation_has_read(bridge.conversation_id, read)
+}
+
+#[tokio::test]
+async fn a_swap_with_no_session_to_resume_clears_the_read_record() {
+    assert!(!read_record_survives_a_swap(false).await);
+}
+
+#[tokio::test]
+async fn a_swap_that_resumes_the_session_keeps_the_read_record() {
+    assert!(read_record_survives_a_swap(true).await);
 }
 
 #[tokio::test]
@@ -555,7 +617,10 @@ async fn a_goal_that_moves_again_before_the_lock_abandons_the_swap() {
     let held = bridge.session.lock().await;
     bridge.reconsider_profile();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(goal.apply(GOAL_ADDR, "third"), vec!["testapp".to_string()]);
+    assert_eq!(
+        goal.apply(GOAL_ADDR, &"third".into()),
+        vec!["testapp".to_string()]
+    );
     drop(held);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -818,7 +883,7 @@ async fn a_respawn_mounts_the_bridges_tool_socket() {
             credential: ClaudeCredential::OauthToken(SecretString::new("token".to_string())),
         },
         model: None,
-        resume_session_id: None,
+        session_start: SessionStart::begin(None, 7, None),
         events,
     });
     let container = config.container.expect("containerized");

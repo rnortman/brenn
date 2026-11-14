@@ -172,7 +172,7 @@ async fn peer_publish(m: &Messenger, peer: &Peer, addr: &str) -> PublishResult {
         },
         peer.slug,
         addr,
-        "body",
+        "body".into(),
         Urgency::Normal,
         None,
         None,

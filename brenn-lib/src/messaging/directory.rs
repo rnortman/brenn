@@ -102,6 +102,37 @@ impl ChannelEntry {
         }
     }
 
+    /// Whether this channel may hold `body`: a text body goes anywhere, a
+    /// non-text body only to a channel declared `non_text`.
+    ///
+    /// The question a door asks before it admits a body, and the one
+    /// [`assert_may_hold`](Self::assert_may_hold) asserts where the body is
+    /// stored.
+    pub fn may_hold(&self, body: &brenn_envelope::MessageBody) -> bool {
+        body.is_text() || self.resolved_channel.non_text
+    }
+
+    /// Asserts that this channel may hold `body` ([`may_hold`](Self::may_hold)).
+    ///
+    /// Called where a body enters a store. Every door that can construct a
+    /// non-text body refuses one for a text-only channel before it gets here,
+    /// so a failure is a host bug, and storing the body would put it in front
+    /// of readers that can only represent text.
+    ///
+    /// # Panics
+    ///
+    /// If `body` is not text and the channel is text-only.
+    pub fn assert_may_hold(&self, body: &brenn_envelope::MessageBody) {
+        assert!(
+            self.may_hold(body),
+            "channel {:?} is text-only and a host path is storing a non-text body ({}) on \
+             it — the door that admitted it must refuse a non-text body for a text-only \
+             channel",
+            self.address,
+            body.summary(),
+        );
+    }
+
     /// The `App`-kind subscriber for `app_slug`, if this app subscribes to the
     /// channel.
     ///

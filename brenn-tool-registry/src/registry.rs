@@ -12,9 +12,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
+use brenn_envelope::tool_schema::{ATTACHMENTS_ARGUMENT, declares_attachments_argument};
 use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::ParticipantId;
 use brenn_lib::tools::{ResolvedRateLimit, ResolvedToolGrant};
+use brenn_messaging_store::blob::HeldAttachments;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use indexmap::IndexMap;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -25,7 +27,7 @@ use super::descriptor::{
 };
 use super::provided::ProvidedTool;
 use super::rate_limit::RateLimiter;
-use super::tool::{ActingUser, RegisteredTool, ToolCtx};
+use super::tool::{ActingUser, RegisteredTool, ToolCtx, ToolOutput};
 
 /// The `internal` detail of a provided tool's call whose ceiling passed while
 /// it waited for admission ([`ToolRegistry::admit_async_by`]).
@@ -130,8 +132,10 @@ impl ToolRegistry {
     /// name; a `RequiresKey` tool (dedupe table not built this cycle, and it
     /// must cover replay from a re-created executor position as well as a
     /// retrying caller — see `TODO(tool-registry-idempotency-dedupe)`); a fast
-    /// tool whose declared budget exceeds `MAX_FAST_BUDGET`; or an async tool
-    /// with `max_concurrency == 0`.
+    /// tool whose declared budget exceeds `MAX_FAST_BUDGET`; an async tool
+    /// with `max_concurrency == 0`; a fast tool that accepts attachments; or a
+    /// tool that accepts attachments and whose input schema declares a
+    /// top-level property [`ATTACHMENTS_ARGUMENT`].
     pub fn new(tools: Vec<RegisteredTool>) -> Self {
         Self::with_provided(tools, Vec::new())
     }
@@ -209,6 +213,8 @@ impl ToolRegistry {
         let mcp_name = desc.mcp_name;
         let class = desc.class;
         let idempotency = desc.idempotency;
+        let accepts_attachments = desc.accepts_attachments;
+        let schema_reserves_attachments = declares_attachments_argument(&desc.input_schema);
 
         // (the key in a cross-kind message, the key in a native duplicate's
         // message, the key, its current holder)
@@ -254,6 +260,17 @@ impl ToolRegistry {
             ),
             "tool {name:?}: RegisteredTool variant disagrees with descriptor class {class:?}",
         );
+        if accepts_attachments {
+            assert!(
+                matches!(class, ToolClass::Async { .. }),
+                "tool {name:?}: a fast tool cannot accept attachments",
+            );
+            assert!(
+                !schema_reserves_attachments,
+                "tool {name:?}: accepts attachments and its input schema declares a property \
+                 {ATTACHMENTS_ARGUMENT:?}, the argument a conversation names attachments in",
+            );
+        }
         match class {
             ToolClass::Fast { budget } => {
                 assert!(
@@ -399,6 +416,24 @@ impl ToolRegistry {
                     );
                 }
             }
+        }
+    }
+
+    /// The guard every call site that reaches `execute` runs first: a call
+    /// carrying attachments to a tool that does not accept them is
+    /// `InvalidArgs`.
+    pub fn check_attachments(
+        tool: &RegisteredTool,
+        attachments: &HeldAttachments,
+    ) -> Result<(), ToolError> {
+        let desc = tool.descriptor();
+        if desc.admits_attachments(!attachments.is_empty()) {
+            Ok(())
+        } else {
+            Err(ToolError::InvalidArgs(format!(
+                "tool {} takes no attachments",
+                desc.name
+            )))
         }
     }
 
@@ -551,7 +586,9 @@ impl ToolRegistry {
     /// The caller must already have confirmed the grant (the adapter checks it
     /// at PreToolUse and re-reads it here); `grant` is that resolved grant.
     /// `acting_user` is the conversation's owner, passed through to the tool.
-    /// Returns the tool's raw output value or a typed [`ToolError`].
+    /// `attachments` are handed to the tool, which must accept them
+    /// ([`ToolRegistry::check_attachments`]). Returns the tool's output — its
+    /// value and the attachments it answers with — or a typed [`ToolError`].
     #[allow(clippy::too_many_arguments)]
     pub async fn invoke_for_llm(
         &self,
@@ -561,13 +598,15 @@ impl ToolRegistry {
         acting_conversation_id: Option<i64>,
         acting_user: Option<ActingUser>,
         args: serde_json::Value,
+        attachments: HeldAttachments,
         alert: &AlertDispatcher,
-    ) -> Result<serde_json::Value, ToolError> {
+    ) -> Result<ToolOutput, ToolError> {
         // Unknown tool is indistinguishable from ungranted (oracle closure).
         let tool = self
             .get_by_mcp_name(mcp_name)
             .ok_or(ToolError::NotGranted)?
             .clone();
+        Self::check_attachments(&tool, &attachments)?;
         let name = tool.descriptor().name;
         let rate_limit = grant.rate_limit;
         // TODO(reload-grant-reaches-queued-calls): `ctx.grant` is fixed here,
@@ -587,7 +626,10 @@ impl ToolRegistry {
             // Fast class: the shared sync guard (ACL, immediate rate check, budget
             // timing/alert). A sync call cannot wait, so an empty bucket errors.
             // `invoke_fast` emits the invocation log line itself.
-            RegisteredTool::Fast(_) => return self.invoke_fast(name, &ctx, args, alert),
+            // No fast tool accepts attachments, so `attachments` is empty here.
+            RegisteredTool::Fast(_) => {
+                return self.invoke_fast(name, &ctx, args, alert).map(Into::into);
+            }
             RegisteredTool::Async(t) => {
                 if let Err(denied) = t.check_acl(&args, &grant.acl) {
                     Err(denied.into())
@@ -602,7 +644,7 @@ impl ToolRegistry {
                         .admit_async_by(deadline, ctx.caller.as_str(), name, rate_limit, alert)
                         .await
                     {
-                        Ok(_permit) => t.execute(&ctx, args).await,
+                        Ok(_permit) => t.execute(&ctx, args, attachments).await,
                         Err(e) => Err(e),
                     }
                 } else {
@@ -612,7 +654,7 @@ impl ToolRegistry {
                     let _permit = self
                         .admit_async(ctx.caller.as_str(), name, rate_limit, alert)
                         .await;
-                    t.execute(&ctx, args).await
+                    t.execute(&ctx, args, attachments).await
                 }
             }
         };
@@ -685,6 +727,7 @@ mod tests {
             idempotency,
             auto_approve: true,
             user_binding: UserBinding::None,
+            accepts_attachments: false,
         }
     }
 
@@ -736,8 +779,9 @@ mod tests {
                 &self,
                 _ctx: &ToolCtx,
                 _args: serde_json::Value,
-            ) -> Result<serde_json::Value, ToolError> {
-                Ok(json!({}))
+                _attachments: HeldAttachments,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(json!({}).into())
             }
         }
         let reg = ToolRegistry::new(vec![RegisteredTool::Async(Arc::new(AsyncStub(
@@ -928,8 +972,9 @@ mod tests {
             &self,
             _ctx: &ToolCtx,
             _args: serde_json::Value,
-        ) -> Result<serde_json::Value, ToolError> {
-            Ok(json!({ "ok": true }))
+            _attachments: HeldAttachments,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(json!({ "ok": true }).into())
         }
     }
 
@@ -962,6 +1007,7 @@ mod tests {
                 None,
                 None,
                 json!({}),
+                HeldAttachments::none(),
                 &alert,
             )
             .await;
@@ -974,6 +1020,7 @@ mod tests {
                 None,
                 None,
                 json!({}),
+                HeldAttachments::none(),
                 &alert,
             )
             .await;
@@ -1013,6 +1060,7 @@ mod tests {
                 None,
                 None,
                 json!({}),
+                HeldAttachments::none(),
                 &alert,
             )
             .await;
@@ -1060,6 +1108,7 @@ mod tests {
             None,
             None,
             json!({}),
+            HeldAttachments::none(),
             &alert,
         )
         .await
@@ -1072,6 +1121,7 @@ mod tests {
             None,
             None,
             json!({}),
+            HeldAttachments::none(),
             &alert,
         )
         .await
@@ -1256,11 +1306,12 @@ mod tests {
                 Some(3),
                 Some(user),
                 json!({}),
+                HeldAttachments::none(),
                 &alert,
             )
             .await
             .expect("acting-user call succeeds");
-        assert_eq!(out, json!({ "id": 7, "username": "alice" }));
+        assert_eq!(out.value, json!({ "id": 7, "username": "alice" }));
     }
 
     #[tokio::test]
@@ -1275,6 +1326,7 @@ mod tests {
                 None,
                 None,
                 json!({}),
+                HeldAttachments::none(),
                 &alert,
             )
             .await
@@ -1283,6 +1335,217 @@ mod tests {
             matches!(&err, ToolError::Denied(d) if d.starts_with("acting: acts as the acting user")),
             "{err:?}"
         );
+    }
+
+    // --- attachments ---
+
+    use crate::testutil::{ATTACHMENT_ECHO_MCP, AttachmentEchoTool};
+    use brenn_envelope::AttachmentName;
+    use brenn_messaging_store::blob::{BlobLimits, BlobStore};
+    use brenn_messaging_store::testutils::{held, seal_bytes};
+
+    fn blob_store() -> (tempfile::TempDir, Arc<BlobStore>) {
+        let dir = tempfile::tempdir().expect("a blob directory");
+        let store = BlobStore::for_tests(
+            dir.path(),
+            BlobLimits {
+                max_blob_bytes: 1 << 20,
+                budget_bytes: 4 << 20,
+            },
+        );
+        (dir, store)
+    }
+
+    /// The host-implemented tool is handed the call's attachments through the
+    /// trait and returns them; the output's holds keep the blob alive after
+    /// the caller lets go, and dropping the output releases it.
+    #[tokio::test]
+    async fn an_accepting_tool_receives_and_returns_attachments() {
+        let (_dir, store) = blob_store();
+        let photo = seal_bytes(&store, "image/png", b"png bytes");
+        let photo_id = photo.id().clone();
+        let reg = ToolRegistry::new(vec![RegisteredTool::Async(Arc::new(
+            AttachmentEchoTool::new(),
+        ))]);
+        let (alert, _h) = brenn_obs::alerting::noop_alert_dispatcher();
+        let out = reg
+            .invoke_for_llm(
+                ATTACHMENT_ECHO_MCP,
+                caller(),
+                grant(vec![]),
+                None,
+                None,
+                json!({}),
+                held(&[("photo", &photo)]),
+                &alert,
+            )
+            .await
+            .expect("the echo answers");
+        assert_eq!(
+            out.value,
+            json!({
+                "args": {},
+                "received": { "photo": { "size": 9, "content_type": "image/png" } }
+            })
+        );
+        let returned = out
+            .attachments
+            .refs()
+            .get(&AttachmentName::new("photo").unwrap())
+            .expect("returned under the same name");
+        assert_eq!(returned.id, photo_id, "by reference: the same blob");
+        drop(photo);
+        assert_eq!(store.usage().sealed, 1, "the output holds the blob");
+        drop(out);
+        assert_eq!(store.usage().sealed, 0, "nothing holds it now");
+    }
+
+    /// A tool that takes no attachments, fast or async, is refused a call
+    /// carrying any before its `execute` runs; the same tool takes the call
+    /// without them.
+    #[tokio::test]
+    async fn a_tool_that_takes_no_attachments_is_refused_them_before_execute() {
+        struct RunsOnce(ToolDescriptor, std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl AsyncTool for RunsOnce {
+            fn descriptor(&self) -> &ToolDescriptor {
+                &self.0
+            }
+            fn check_acl(
+                &self,
+                _args: &serde_json::Value,
+                _acl: &[AclClause],
+            ) -> Result<(), AclDenied> {
+                Ok(())
+            }
+            async fn execute(
+                &self,
+                _ctx: &ToolCtx,
+                _args: serde_json::Value,
+                _attachments: HeldAttachments,
+            ) -> Result<ToolOutput, ToolError> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!({}).into())
+            }
+        }
+        let (_dir, store) = blob_store();
+        let photo = seal_bytes(&store, "image/png", b"png bytes");
+        let plain = Arc::new(RunsOnce(
+            descriptor(
+                "plain",
+                "mcp__brenn__Plain",
+                ToolClass::Async { max_concurrency: 1 },
+                &[],
+                Idempotency::Natural,
+            ),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let reg = ToolRegistry::new(vec![
+            RegisteredTool::Async(plain.clone()),
+            fast("quick", "mcp__brenn__Quick", &[]),
+        ]);
+        let (alert, _h) = brenn_obs::alerting::noop_alert_dispatcher();
+        for (mcp_name, name) in [
+            ("mcp__brenn__Plain", "plain"),
+            ("mcp__brenn__Quick", "quick"),
+        ] {
+            let refused = reg
+                .invoke_for_llm(
+                    mcp_name,
+                    caller(),
+                    grant(vec![]),
+                    None,
+                    None,
+                    json!({}),
+                    held(&[("photo", &photo)]),
+                    &alert,
+                )
+                .await
+                .map(|o| o.value);
+            assert_eq!(
+                refused,
+                Err(ToolError::InvalidArgs(format!(
+                    "tool {name} takes no attachments"
+                )))
+            );
+        }
+        assert_eq!(plain.1.load(std::sync::atomic::Ordering::SeqCst), 0);
+        reg.invoke_for_llm(
+            "mcp__brenn__Plain",
+            caller(),
+            grant(vec![]),
+            None,
+            None,
+            json!({}),
+            HeldAttachments::none(),
+            &alert,
+        )
+        .await
+        .expect("no attachments, no refusal");
+        assert_eq!(plain.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "tool \"quick\": a fast tool cannot accept attachments")]
+    fn a_fast_tool_that_accepts_attachments_panics_at_registration() {
+        let mut d = descriptor(
+            "quick",
+            "mcp__brenn__Quick",
+            ToolClass::Fast {
+                budget: DEFAULT_FAST_BUDGET,
+            },
+            &[],
+            Idempotency::Natural,
+        );
+        d.accepts_attachments = true;
+        ToolRegistry::new(vec![RegisteredTool::Fast(Arc::new(StubTool {
+            descriptor: d,
+        }))]);
+    }
+
+    fn schema_with_attachments_property() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": { "attachments": { "type": "array" } },
+        })
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "tool \"grab\": accepts attachments and its input schema declares a \
+                               property \"attachments\""
+    )]
+    fn an_accepting_tool_with_an_attachments_property_panics_at_registration() {
+        let mut d = descriptor(
+            "grab",
+            "mcp__brenn__Grab",
+            ToolClass::Async { max_concurrency: 1 },
+            &[],
+            Idempotency::Natural,
+        );
+        d.accepts_attachments = true;
+        d.input_schema = schema_with_attachments_property();
+        ToolRegistry::new(vec![RegisteredTool::Async(Arc::new(AsyncStubTool {
+            descriptor: d,
+        }))]);
+    }
+
+    /// A tool that takes no attachments may name an argument `attachments` of
+    /// its own.
+    #[test]
+    fn a_tool_that_takes_no_attachments_may_have_an_attachments_property() {
+        let mut d = descriptor(
+            "grab",
+            "mcp__brenn__Grab",
+            ToolClass::Async { max_concurrency: 1 },
+            &[],
+            Idempotency::Natural,
+        );
+        d.input_schema = schema_with_attachments_property();
+        let reg = ToolRegistry::new(vec![RegisteredTool::Async(Arc::new(AsyncStubTool {
+            descriptor: d,
+        }))]);
+        assert!(reg.get("grab").is_some());
     }
 
     // --- provided tools ---
@@ -1414,6 +1677,7 @@ mod tests {
                     Some(3),
                     None,
                     json!({ "q": "x" }),
+                    HeldAttachments::none(),
                     &alert,
                 )
                 .await
@@ -1428,9 +1692,12 @@ mod tests {
             "the permit is held across the provider's wait"
         );
         runtime
-            .complete(PROVIDER, &id, Ok(json!({ "echoed": "x" })))
+            .complete(PROVIDER, &id, Ok(json!({ "echoed": "x" }).into()))
             .unwrap();
-        assert_eq!(call.await.unwrap(), Ok(json!({ "echoed": "x" })));
+        assert_eq!(
+            call.await.unwrap().map(|o| o.value),
+            Ok(json!({ "echoed": "x" }))
+        );
         assert_eq!(
             reg.concurrency("echo-for-user")
                 .unwrap()
@@ -1469,11 +1736,12 @@ mod tests {
                 Some(3),
                 None,
                 json!({}),
+                HeldAttachments::none(),
                 &alert,
             )
             .await;
         assert_eq!(
-            out,
+            out.map(|o| o.value),
             Err(ToolError::Internal(
                 PROVIDED_ADMISSION_CEILING_DETAIL.to_string()
             ))

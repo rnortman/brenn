@@ -8,7 +8,9 @@
 //! own inbox `brenn:tool-requests/<slug>`, and awaits a completion until the
 //! call's deadline. The request body names no caller and no user: the acting
 //! user stays on the host-side record, where a nested call made on the
-//! request's behalf reads it.
+//! request's behalf reads it. The call's attachments ride the request
+//! message's envelope under the caller's names, and a completion's ride the
+//! outcome to the waiter.
 //!
 //! A pending record lives exactly as long as the `execute` future that minted
 //! it: the [`PendingGuard`] owns the record and removes it on drop, whether the
@@ -24,6 +26,7 @@ use brenn_lib::messaging::config::ProvidedToolDecl;
 use brenn_lib::messaging::{ParticipantId, Urgency, canonical_address};
 use brenn_lib::tools::AclClause;
 use brenn_messaging::{Messenger, PublishResult};
+use brenn_messaging_store::blob::HeldAttachments;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -38,7 +41,7 @@ use super::descriptor::{
     ToolError, UserBinding,
 };
 use super::executor::TOOL_EXECUTOR_COMPONENT;
-use super::tool::{ActingUser, AsyncTool, ToolCtx};
+use super::tool::{ActingUser, AsyncTool, ToolCtx, ToolOutput};
 
 /// The largest serialized `ok` value a provider may complete with: the async
 /// result cap less the executor's envelope margin, so a completed value never
@@ -112,7 +115,7 @@ struct PendingCall {
     acting_user: Option<ActingUser>,
     /// The call's deadline; the waiter answers for it then at the latest.
     deadline: Instant,
-    completion: oneshot::Sender<Result<Value, ToolError>>,
+    completion: oneshot::Sender<Result<ToolOutput, ToolError>>,
 }
 
 /// What a nested call serving a pending call inherits from it: the acting
@@ -200,12 +203,14 @@ impl ProviderRuntime {
     /// The record is consumed: a second completion is `NotPending`.
     ///
     /// An `outcome` a provider may not give leaves the record pending and is
-    /// refused as `InvalidOutcome`, so the provider can answer again.
+    /// refused as `InvalidOutcome`, so the provider can answer again. Only the
+    /// value is weighed; an `ok` outcome's attachments travel to the waiter
+    /// with it, and a refused or undeliverable outcome's holds drop.
     pub fn complete(
         &self,
         instance: &str,
         id: &str,
-        outcome: Result<Value, ToolError>,
+        outcome: Result<ToolOutput, ToolError>,
     ) -> Result<(), CompleteError> {
         let mut pending = self.lock();
         match pending.get(id) {
@@ -272,7 +277,7 @@ impl ProviderRuntime {
 /// Send `outcome` to the record's waiter. The waiter may have gone between the
 /// record's removal and this send (its guard found nothing to remove); the
 /// answer then has no one to reach, which is the caller's own choice.
-fn deliver(id: &str, record: PendingCall, outcome: Result<Value, ToolError>) {
+fn deliver(id: &str, record: PendingCall, outcome: Result<ToolOutput, ToolError>) {
     let PendingCall {
         instance,
         tool,
@@ -288,9 +293,9 @@ fn deliver(id: &str, record: PendingCall, outcome: Result<Value, ToolError>) {
 /// Whether a provider may answer with `outcome`: the error kinds a tool's own
 /// `execute` produces, with the answer — the `ok` value or the error's detail,
 /// serialized — within [`PROVIDED_RESULT_BUDGET`].
-fn provider_outcome_admissible(outcome: &Result<Value, ToolError>) -> Result<(), String> {
+fn provider_outcome_admissible(outcome: &Result<ToolOutput, ToolError>) -> Result<(), String> {
     let (what, len) = match outcome {
-        Ok(value) => (
+        Ok(ToolOutput { value, .. }) => (
             "result",
             serde_json::to_string(value)
                 .expect("a JSON value serializes")
@@ -327,7 +332,7 @@ fn provider_outcome_admissible(outcome: &Result<Value, ToolError>) -> Result<(),
 pub struct PendingGuard {
     id: PendingId,
     runtime: Arc<ProviderRuntime>,
-    rx: oneshot::Receiver<Result<Value, ToolError>>,
+    rx: oneshot::Receiver<Result<ToolOutput, ToolError>>,
 }
 
 impl PendingGuard {
@@ -390,6 +395,7 @@ impl ProvidedTool {
                 idempotency: Idempotency::Natural,
                 auto_approve: decl.auto_approve,
                 user_binding: UserBinding::ActingOrLentUser,
+                accepts_attachments: decl.accepts_attachments,
             },
             instance: instance.to_string(),
             runtime,
@@ -412,7 +418,12 @@ impl AsyncTool for ProvidedTool {
         Ok(())
     }
 
-    async fn execute(&self, ctx: &ToolCtx, args: Value) -> Result<Value, ToolError> {
+    async fn execute(
+        &self,
+        ctx: &ToolCtx,
+        args: Value,
+        attachments: HeldAttachments,
+    ) -> Result<ToolOutput, ToolError> {
         let name = self.descriptor.name;
         let deadline = ctx
             .deadline
@@ -431,12 +442,14 @@ impl AsyncTool for ProvidedTool {
         match self
             .runtime
             .messenger()
-            .publish_from_system(
+            .publish_from_system_with_attachments(
                 TOOL_EXECUTOR_COMPONENT,
                 &address,
-                &body,
+                body.as_str().into(),
                 Urgency::Normal,
                 None,
+                None,
+                attachments,
             )
             .await
         {
@@ -519,6 +532,7 @@ pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::testutil::ExecuteValue;
 
     pub(crate) const PROVIDER: &str = "prov";
 
@@ -531,6 +545,7 @@ pub(crate) mod tests {
             input_schema: json!({ "type": "object" }),
             max_concurrency,
             auto_approve: false,
+            accepts_attachments: false,
         }
     }
 
@@ -571,6 +586,23 @@ pub(crate) mod tests {
 
     /// [`messenger`] with `send_rate` set on the request inbox's entry.
     async fn messenger_with(send_rate: SendRate) -> Arc<Messenger> {
+        built_messenger(send_rate, false).await.0
+    }
+
+    /// [`messenger`] with a blob store, and the directory the store is over.
+    pub(crate) async fn blob_messenger() -> (Arc<Messenger>, brenn_messaging::testutils::TempBlobDir)
+    {
+        let (messenger, dir) = built_messenger(SendRate::default(), true).await;
+        (messenger, dir.expect("a blob store was installed"))
+    }
+
+    async fn built_messenger(
+        send_rate: SendRate,
+        blobs: bool,
+    ) -> (
+        Arc<Messenger>,
+        Option<brenn_messaging::testutils::TempBlobDir>,
+    ) {
         let db = brenn_messaging_store::db::init_db_memory();
         let mut inbox = test_channel_entry(
             &request_inbox_name(PROVIDER),
@@ -595,6 +627,12 @@ pub(crate) mod tests {
             Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
             MessagingGlobalConfig::default(),
         );
+        let (messenger, blob_dir) = if blobs {
+            let (messenger, dir) = brenn_messaging::testutils::install_blob_store(messenger).await;
+            (messenger, Some(dir))
+        } else {
+            (messenger, None)
+        };
         let mut grants = GrantSet::default();
         grants.insert(AppCapability::MessagingSubscribe);
         let mut acls = AclSet::default();
@@ -623,7 +661,7 @@ pub(crate) mod tests {
             Depth::Unbounded,
         )
         .await;
-        messenger
+        (messenger, blob_dir)
     }
 
     /// Every request published to the provider's inbox so far, decoded.
@@ -631,7 +669,9 @@ pub(crate) mod tests {
         brenn_messaging::testutils::owed_everywhere(messenger, &ParticipantId::for_wasm(PROVIDER))
             .await
             .iter()
-            .map(|(_, env)| serde_json::from_str(&env.body).expect("request body is JSON"))
+            .map(|(_, env)| {
+                serde_json::from_str(env.body.as_text().unwrap()).expect("request body is JSON")
+            })
             .collect()
     }
 
@@ -668,19 +708,25 @@ pub(crate) mod tests {
         assert_eq!(rt.acting_user_for(PROVIDER, &id), Some(Some(alice())));
         assert_eq!(rt.acting_user_for("other", &id), None);
         assert_eq!(
-            rt.complete("other", &id, Ok(json!(1))),
+            rt.complete("other", &id, Ok(json!(1).into())),
             Err(CompleteError::NotPending)
         );
         assert_eq!(
-            rt.complete(PROVIDER, "0".repeat(32).as_str(), Ok(json!(1))),
+            rt.complete(PROVIDER, "0".repeat(32).as_str(), Ok(json!(1).into())),
             Err(CompleteError::NotPending)
         );
 
-        assert_eq!(rt.complete(PROVIDER, &id, Ok(json!({ "a": 1 }))), Ok(()));
-        assert_eq!((&mut guard.rx).await.unwrap(), Ok(json!({ "a": 1 })));
+        assert_eq!(
+            rt.complete(PROVIDER, &id, Ok(json!({ "a": 1 }).into())),
+            Ok(())
+        );
+        assert_eq!(
+            (&mut guard.rx).await.unwrap().map(|o| o.value),
+            Ok(json!({ "a": 1 }))
+        );
         assert_eq!(rt.acting_user_for(PROVIDER, &id), None);
         assert_eq!(
-            rt.complete(PROVIDER, &id, Ok(json!(2))),
+            rt.complete(PROVIDER, &id, Ok(json!(2).into())),
             Err(CompleteError::NotPending)
         );
     }
@@ -705,7 +751,7 @@ pub(crate) mod tests {
         drop(guard);
         assert_eq!(rt.acting_user_for(PROVIDER, &id), None);
         assert_eq!(
-            rt.complete(PROVIDER, &id, Ok(json!(1))),
+            rt.complete(PROVIDER, &id, Ok(json!(1).into())),
             Err(CompleteError::NotPending)
         );
     }
@@ -732,7 +778,7 @@ pub(crate) mod tests {
             }
         }
         let over = "x".repeat(PROVIDED_RESULT_BUDGET);
-        match rt.complete(PROVIDER, &id, Ok(json!(over))) {
+        match rt.complete(PROVIDER, &id, Ok(json!(over).into())) {
             Err(CompleteError::InvalidOutcome(detail)) => {
                 assert!(
                     detail.contains(&PROVIDED_RESULT_BUDGET.to_string()),
@@ -761,8 +807,14 @@ pub(crate) mod tests {
         }
         // A value exactly at the budget is accepted (two bytes of quotes).
         let at = "x".repeat(PROVIDED_RESULT_BUDGET - 2);
-        assert_eq!(rt.complete(PROVIDER, &id, Ok(json!(at.clone()))), Ok(()));
-        assert_eq!((&mut guard.rx).await.unwrap(), Ok(json!(at)));
+        assert_eq!(
+            rt.complete(PROVIDER, &id, Ok(json!(at.clone()).into())),
+            Ok(())
+        );
+        assert_eq!(
+            (&mut guard.rx).await.unwrap().map(|o| o.value),
+            Ok(json!(at))
+        );
     }
 
     /// Every error kind a tool's own `execute` produces is a provider's to give.
@@ -777,7 +829,7 @@ pub(crate) mod tests {
             let mut guard = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
             let id = guard.id().as_str().to_string();
             assert_eq!(rt.complete(PROVIDER, &id, Err(answer.clone())), Ok(()));
-            assert_eq!((&mut guard.rx).await.unwrap(), Err(answer));
+            assert_eq!((&mut guard.rx).await.unwrap().map(|o| o.value), Err(answer));
         }
     }
 
@@ -791,7 +843,7 @@ pub(crate) mod tests {
         let mut done = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
         let foreign = rt.begin("other", "echo-for-user", &pending_ctx(None));
         let done_id = done.id().as_str().to_string();
-        rt.complete(PROVIDER, &done_id, Ok(json!("answered")))
+        rt.complete(PROVIDER, &done_id, Ok(json!("answered").into()))
             .unwrap();
 
         rt.fail_delivered(
@@ -811,12 +863,15 @@ pub(crate) mod tests {
             "the failed record is gone while its guard still holds"
         );
         assert_eq!(
-            (&mut live.rx).await.unwrap(),
+            (&mut live.rx).await.unwrap().map(|o| o.value),
             Err(ToolError::Internal(
                 "provider activation failed: trap".to_string()
             ))
         );
-        assert_eq!((&mut done.rx).await.unwrap(), Ok(json!("answered")));
+        assert_eq!(
+            (&mut done.rx).await.unwrap().map(|o| o.value),
+            Ok(json!("answered"))
+        );
         assert_eq!(
             rt.acting_user_for("other", foreign.id().as_str()),
             Some(None)
@@ -837,9 +892,17 @@ pub(crate) mod tests {
         assert!(d.acl_keys.is_empty());
         assert_eq!(d.idempotency, Idempotency::Natural);
         assert!(!d.auto_approve);
+        assert!(!d.accepts_attachments);
         assert_eq!(d.user_binding, UserBinding::ActingOrLentUser);
         assert_eq!(tool.instance(), PROVIDER);
         assert_eq!(tool.check_acl(&json!({ "anything": 1 }), &[]), Ok(()));
+
+        let accepting = ProvidedToolDecl {
+            accepts_attachments: true,
+            ..decl(1)
+        };
+        let tool = ProvidedTool::new(PROVIDER, &accepting, runtime());
+        assert!(tool.descriptor().accepts_attachments);
     }
 
     /// `execute` hands the request to the provider's inbox — id, tool and args,
@@ -856,7 +919,7 @@ pub(crate) mod tests {
         let call = tokio::spawn({
             let tool = tool.clone();
             async move {
-                tool.execute(&ctx(Some(alice()), Some(deadline)), json!({ "q": "x" }))
+                tool.execute_value(&ctx(Some(alice()), Some(deadline)), json!({ "q": "x" }))
                     .await
             }
         });
@@ -868,7 +931,7 @@ pub(crate) mod tests {
         );
         assert_eq!(rt.acting_user_for(PROVIDER, &id), Some(Some(alice())));
 
-        rt.complete(PROVIDER, &id, Ok(json!({ "echoed": "x" })))
+        rt.complete(PROVIDER, &id, Ok(json!({ "echoed": "x" }).into()))
             .unwrap();
         assert_eq!(call.await.unwrap(), Ok(json!({ "echoed": "x" })));
         assert_eq!(rt.acting_user_for(PROVIDER, &id), None);
@@ -886,7 +949,9 @@ pub(crate) mod tests {
         let tool = ProvidedTool::new(PROVIDER, &decl(1), rt.clone());
 
         let deadline = Instant::now() + Duration::from_millis(100);
-        let result = tool.execute(&ctx(None, Some(deadline)), json!({})).await;
+        let result = tool
+            .execute_value(&ctx(None, Some(deadline)), json!({}))
+            .await;
         assert_eq!(
             result,
             Err(ToolError::Internal(
@@ -900,7 +965,7 @@ pub(crate) mod tests {
             .to_string();
         assert_eq!(rt.acting_user_for(PROVIDER, &id), None);
         assert_eq!(
-            rt.complete(PROVIDER, &id, Ok(json!(1))),
+            rt.complete(PROVIDER, &id, Ok(json!(1).into())),
             Err(CompleteError::NotPending)
         );
 
@@ -923,7 +988,7 @@ pub(crate) mod tests {
         let tool = ProvidedTool::new(PROVIDER, &decl(1), rt.clone());
 
         let args = json!({ "q": "x".repeat(70_000) });
-        let result = tool.execute(&pending_ctx(Some(alice())), args).await;
+        let result = tool.execute_value(&pending_ctx(Some(alice())), args).await;
         let Err(ToolError::InvalidArgs(detail)) = result else {
             panic!("expected invalid_args, got {result:?}");
         };
@@ -955,11 +1020,11 @@ pub(crate) mod tests {
 
         let first = tokio::spawn({
             let tool = tool.clone();
-            async move { tool.execute(&pending_ctx(None), json!({})).await }
+            async move { tool.execute_value(&pending_ctx(None), json!({})).await }
         });
         let id = published_id(&messenger).await;
 
-        let second = tool.execute(&pending_ctx(None), json!({})).await;
+        let second = tool.execute_value(&pending_ctx(None), json!({})).await;
         assert_eq!(second, Err(ToolError::RateLimited));
         assert_eq!(requests(&messenger).await.len(), 1);
         assert_eq!(
@@ -968,7 +1033,8 @@ pub(crate) mod tests {
             "only the published call is pending"
         );
 
-        rt.complete(PROVIDER, &id, Ok(json!("done"))).unwrap();
+        rt.complete(PROVIDER, &id, Ok(json!("done").into()))
+            .unwrap();
         assert_eq!(first.await.unwrap(), Ok(json!("done")));
     }
 
@@ -985,7 +1051,7 @@ pub(crate) mod tests {
         let call = tokio::spawn({
             let tool = tool.clone();
             async move {
-                tool.execute(&ctx(Some(alice()), Some(deadline)), json!({}))
+                tool.execute_value(&ctx(Some(alice()), Some(deadline)), json!({}))
                     .await
             }
         });
@@ -995,7 +1061,7 @@ pub(crate) mod tests {
         assert!(call.await.unwrap_err().is_cancelled());
         assert_eq!(rt.acting_user_for(PROVIDER, &id), None);
         assert_eq!(
-            rt.complete(PROVIDER, &id, Ok(json!(1))),
+            rt.complete(PROVIDER, &id, Ok(json!(1).into())),
             Err(CompleteError::NotPending)
         );
     }
@@ -1006,7 +1072,7 @@ pub(crate) mod tests {
     #[should_panic(expected = "admitted without a deadline")]
     async fn execute_without_a_deadline_panics() {
         let tool = ProvidedTool::new(PROVIDER, &decl(1), runtime());
-        tool.execute(&ctx(None, None), json!({}))
+        tool.execute_value(&ctx(None, None), json!({}))
             .await
             .expect("execute panics before answering");
     }
@@ -1033,5 +1099,114 @@ pub(crate) mod tests {
         assert!(std::ptr::eq(a.mcp_name, b.mcp_name));
         assert!(std::ptr::eq(a.description, b.description));
         assert_eq!(a.mcp_name, "mcp__brenn__EchoForUser");
+    }
+
+    // --- attachments ---
+
+    use brenn_envelope::AttachmentName;
+    use brenn_messaging_store::testutils::{held, seal_bytes};
+
+    fn attachment(name: &str) -> AttachmentName {
+        AttachmentName::new(name).unwrap()
+    }
+
+    /// The caller's attachments ride the request message under the caller's
+    /// names, by reference, and the body is unchanged; a completion's
+    /// attachments reach the waiter with its value.
+    #[tokio::test]
+    async fn a_call_hands_its_attachments_to_the_provider_and_gets_the_completions_back() {
+        let (messenger, _blob_dir) = blob_messenger().await;
+        let store = messenger.blob_store().unwrap().clone();
+        let rt = runtime();
+        rt.attach(messenger.clone());
+        let tool = Arc::new(ProvidedTool::new(PROVIDER, &decl(1), rt.clone()));
+        let photo = seal_bytes(&store, "image/png", b"png bytes");
+        let photo_id = photo.id().clone();
+        let call = tokio::spawn({
+            let tool = tool.clone();
+            let handed = held(&[("photo", &photo)]);
+            async move {
+                tool.execute(&pending_ctx(Some(alice())), json!({ "q": 1 }), handed)
+                    .await
+            }
+        });
+        let id = published_id(&messenger).await;
+        let owed = brenn_messaging::testutils::owed_everywhere(
+            &messenger,
+            &ParticipantId::for_wasm(PROVIDER),
+        )
+        .await;
+        let request = &owed[0].1;
+        assert_eq!(
+            request.attachments.get(&attachment("photo")).unwrap().id,
+            photo_id
+        );
+        let body: Value = serde_json::from_str(request.body.as_text().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({ "v": 1, "id": id, "tool": "echo-for-user", "args": { "q": 1 } })
+        );
+
+        let answer = seal_bytes(&store, "text/plain", b"answer");
+        let answer_id = answer.id().clone();
+        rt.complete(
+            PROVIDER,
+            &id,
+            Ok(ToolOutput {
+                value: json!({ "done": true }),
+                attachments: held(&[("answer", &answer)]),
+            }),
+        )
+        .unwrap();
+        drop((photo, answer));
+        let output = call.await.unwrap().expect("the call is answered");
+        assert_eq!(output.value, json!({ "done": true }));
+        assert_eq!(
+            output
+                .attachments
+                .refs()
+                .get(&attachment("answer"))
+                .unwrap()
+                .id,
+            answer_id
+        );
+        assert_eq!(store.usage().sealed, 2, "one blob per blob, no copy");
+    }
+
+    /// A refused completion and one for an id no longer pending each drop
+    /// their holds at once; a refused one leaves the call pending.
+    #[tokio::test]
+    async fn a_completion_that_is_not_accepted_releases_its_attachments() {
+        let (messenger, _blob_dir) = blob_messenger().await;
+        let store = messenger.blob_store().unwrap().clone();
+        let rt = runtime();
+        let guard = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+        let id = guard.id().as_str().to_string();
+        let outcome = |value: Value| {
+            let made = seal_bytes(&store, "text/plain", b"made");
+            Ok(ToolOutput {
+                value,
+                attachments: held(&[("made", &made)]),
+            })
+        };
+
+        let over = "x".repeat(PROVIDED_RESULT_BUDGET);
+        assert!(matches!(
+            rt.complete(PROVIDER, &id, outcome(json!(over))),
+            Err(CompleteError::InvalidOutcome(_))
+        ));
+        assert_eq!(
+            store.usage().sealed,
+            0,
+            "the refused outcome's blob is gone"
+        );
+        assert!(rt.serving(PROVIDER, &id).is_some(), "still pending");
+
+        drop(guard);
+        assert_eq!(
+            rt.complete(PROVIDER, &id, outcome(json!(1))),
+            Err(CompleteError::NotPending)
+        );
+        assert_eq!(store.usage().sealed, 0, "nobody waits: the blob is gone");
     }
 }

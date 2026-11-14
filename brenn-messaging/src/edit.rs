@@ -36,7 +36,9 @@ pub enum CancelResult {
 /// column unchanged". For nullable columns, `Some(None)` means "clear to NULL".
 #[derive(Debug, Default)]
 pub struct EditFields {
-    pub body: Option<String>,
+    /// The new body. It replaces the stored body and its content type
+    /// together: an untyped body leaves the message untyped.
+    pub body: Option<super::MessageBody>,
     /// `None` = leave; `Some(None)` = clear reply_to to NULL.
     pub reply_to: Option<Option<String>>,
     /// `None` = leave; `Some(None)` = deliver immediately (clear schedule).
@@ -49,8 +51,9 @@ pub struct EditFields {
 /// Outcome of `Messenger::edit`.
 #[derive(Debug)]
 pub enum EditResult {
-    /// Edit applied; returns the updated envelope.
-    Ok { envelope: MessageEnvelope },
+    /// Edit applied; returns the updated envelope, boxed so the other
+    /// variants do not carry its size.
+    Ok { envelope: Box<MessageEnvelope> },
     /// No `messaging_messages` row with that UUID.
     UnknownMessage,
     /// Message exists but the `sender` string does not match the caller.
@@ -127,6 +130,10 @@ impl Messenger {
                  withdrawal under one lock acquisition"
             );
         }
+
+        // 3. The withdrawn row's blobs: the delete released its references, and
+        //    the reap takes the lock released above.
+        self.reap_blobs().await;
 
         // 4. Kick the dispatcher — the cancel may have been the earliest parked
         //    message in the release timer.
@@ -246,7 +253,7 @@ impl Messenger {
 
         // 7. Apply to DB (inside a transaction with A3 re-check).
         let applied = EditFieldsApplied {
-            body: fields.body.as_deref(),
+            body: fields.body.as_ref(),
             reply_to_uuid: reply_to_resolved,
             deliver_after: applied_deliver_after,
             delivery_deadline: fields.delivery_deadline,
@@ -285,7 +292,9 @@ impl Messenger {
                 .unwrap_or_else(|| panic!("messaging: edited message {message_uuid} vanished"))
         };
 
-        EditResult::Ok { envelope }
+        EditResult::Ok {
+            envelope: Box::new(envelope),
+        }
     }
 
     /// List the still-parked messages authored by this app's sender. Optionally
@@ -467,6 +476,8 @@ mod tests {
                 noise: crate::config::NoiseLevel::Silent,
                 sink: crate::config::Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![crate::SubscriberEntry {
                 kind: crate::SubscriberEntryKind::App("pa-alice".to_string()),
@@ -549,7 +560,7 @@ mod tests {
                 crate::PublishOrigin::Conversation { id: 1 },
                 "pa-bob",
                 &canonical_address("pa-alice"),
-                body,
+                body.into(),
                 crate::Urgency::Normal,
                 None,
                 deliver_after,
@@ -616,6 +627,56 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(100), kick_notified)
             .await
             .expect("dispatch_kick not fired");
+    }
+
+    /// The withdrawal releases the parked row's blob references and the cancel
+    /// reaps them: a blob only the withdrawn message named is gone when the
+    /// cancel returns.
+    #[tokio::test]
+    async fn cancel_deletes_the_blob_only_the_withdrawn_message_named() {
+        let (m, _, _, _, _) = build_messenger(0).await;
+        let (m, blobs) = crate::testutils::install_blob_store(m).await;
+        let photo = crate::testutils::seal_blob(&m, b"withdrawn");
+        let id = photo.id().clone();
+        let entry = m
+            .directory()
+            .resolve(&canonical_address("pa-alice"))
+            .unwrap();
+        let parked = m
+            .store_for(&entry)
+            .park(
+                crate::store::NewMessage {
+                    source: "test-source".to_string(),
+                    sender: "app:pa-bob@test-source".to_string(),
+                    body: "with a photo".into(),
+                    urgency: crate::Urgency::Normal,
+                    envelope_type: ChannelScheme::Brenn,
+                    reply_to: None,
+                    delivery_deadline: None,
+                    impetus: None,
+                    publish_ts_ns: db::utc_to_ns(Utc::now()),
+                    attachments: brenn_messaging_store::blob::HeldAttachments::new([(
+                        crate::AttachmentName::new("photo").unwrap(),
+                        photo,
+                    )])
+                    .unwrap(),
+                },
+                Utc::now() + chrono::Duration::seconds(3600),
+            )
+            .await
+            .expect("park");
+        assert!(blobs.holds_file(&id));
+
+        let result = m.cancel("pa-bob", parked.message_uuid).await;
+        assert!(
+            matches!(result, CancelResult::Ok { .. }),
+            "expected Ok, got {result:?}"
+        );
+        assert!(!blobs.holds_file(&id));
+        assert!(matches!(
+            m.retain_blob(&id).await,
+            Err(brenn_messaging_store::blob::BlobError::NotFound)
+        ));
     }
 
     /// A refused cancel changes nothing: the message it named is in retention and
@@ -736,7 +797,7 @@ mod tests {
                 "pa-bob",
                 Uuid::new_v4(),
                 EditFields {
-                    body: Some("x".to_string()),
+                    body: Some(crate::MessageBody::text("x")),
                     ..Default::default()
                 },
             )
@@ -754,7 +815,7 @@ mod tests {
                 "pa-alice",
                 mid,
                 EditFields {
-                    body: Some("hacked".to_string()),
+                    body: Some(crate::MessageBody::text("hacked")),
                     ..Default::default()
                 },
             )
@@ -786,7 +847,7 @@ mod tests {
                 "pa-bob",
                 mid,
                 EditFields {
-                    body: Some("toolong".to_string()),
+                    body: Some(crate::MessageBody::text("toolong")),
                     ..Default::default()
                 },
             )
@@ -1028,7 +1089,7 @@ mod tests {
                 "pa-bob",
                 mid,
                 EditFields {
-                    body: Some("new".to_string()),
+                    body: Some(crate::MessageBody::text("new")),
                     ..Default::default()
                 },
             )
@@ -1053,7 +1114,7 @@ mod tests {
                 "pa-bob",
                 mid,
                 EditFields {
-                    body: Some("updated".to_string()),
+                    body: Some(crate::MessageBody::text("updated")),
                     ..Default::default()
                 },
             )
@@ -1162,7 +1223,7 @@ mod tests {
                 "pa-bob",
                 mid,
                 EditFields {
-                    body: Some("new body".to_string()),
+                    body: Some(crate::MessageBody::text("new body")),
                     ..Default::default()
                 },
             )
@@ -1171,6 +1232,45 @@ mod tests {
             EditResult::Ok { envelope } => assert_eq!(envelope.message_id, mid),
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    /// The body and its content type are replaced together: a typed body is
+    /// stored with its type, and a later untyped body leaves the message
+    /// untyped.
+    #[tokio::test]
+    async fn edit_replaces_the_content_type_with_the_body() {
+        let (m, _, _, _, _) = build_messenger(0).await;
+        let future = Utc::now() + chrono::Duration::seconds(3600);
+        let mid = publish_one(&m, "orig", Some(future)).await;
+        let edit_to = |body: crate::MessageBody| {
+            let m = &m;
+            async move {
+                match m
+                    .edit(
+                        "pa-bob",
+                        mid,
+                        EditFields {
+                            body: Some(body),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    EditResult::Ok { envelope } => envelope,
+                    other => panic!("expected Ok, got {other:?}"),
+                }
+            }
+        };
+
+        let typed =
+            crate::MessageBody::from_parts(Some("application/json"), br#"{"a":1}"#).unwrap();
+        let envelope = edit_to(typed).await;
+        assert_eq!(envelope.body.content_type(), Some("application/json"));
+        assert_eq!(envelope.body.as_text(), Some(r#"{"a":1}"#));
+
+        let envelope = edit_to(crate::MessageBody::text("plain")).await;
+        assert_eq!(envelope.body.content_type(), None);
+        assert_eq!(envelope.body.as_text(), Some("plain"));
     }
 
     // -----------------------------------------------------------------------
@@ -1228,8 +1328,8 @@ mod tests {
         let _ = publish_one(&m, "sooner", Some(t1)).await;
         let list = m.list_pending("pa-bob", None).await;
         assert_eq!(list.len(), 2);
-        assert_eq!(list[0].body, "sooner");
-        assert_eq!(list[1].body, "later");
+        assert_eq!(list[0].body.as_text(), Some("sooner"));
+        assert_eq!(list[1].body.as_text(), Some("later"));
     }
 
     #[tokio::test]
@@ -1331,7 +1431,7 @@ mod tests {
                 "no-such-app",
                 mid,
                 EditFields {
-                    body: Some("changed".to_string()),
+                    body: Some(crate::MessageBody::text("changed")),
                     ..Default::default()
                 },
             )

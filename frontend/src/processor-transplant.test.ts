@@ -9,21 +9,23 @@
 //
 // This half hosts the *real* transpiled tree — the emitted glue and its core
 // wasm modules, instantiated through the `--instantiation async` entry point the
-// bootstrap loader uses — and lifts each activation through the production
-// `activationEntry` from `surface.ts`, the same function the kernel registers.
-// So the `deferred` windows and `now` a scripted activation names cross into the
-// guest by the code path a real page uses, field renaming and `bigint` widening
-// included; a lift that lost either would fail here. What the harness still
-// supplies itself is the surrounding contract the kernel supplies in the
+// bootstrap loader uses — and hands each activation through the production
+// `activationEntryBytes` from `surface.ts`, the same function the kernel
+// registers for a `brenn:processor@0.2.0` kind. The kernel builds that record
+// itself in the browser; here the script is written in the same shape — the
+// glue's camel-cased fields, `bigint` clocks, bodies as a content type and a
+// `Uint8Array` — so the `deferred` windows and `now` a scripted activation
+// names cross into the guest through the glue's own lift. What the harness
+// still supplies itself is the surrounding contract the kernel supplies in the
 // browser: the four surface imports, and buffer-during-receive /
 // flush-iff-ok. The kernel's own implementation of that contract is pinned
 // separately (`surface/kernel/src/logic.rs` core tests and the loader cases in
 // `surface.test.ts`); what is under test here is the guest on the transpiled
 // hosting, which is the half the wasmtime run cannot reach.
 //
-// The envelopes here are fabricated JSON strings, not bytes the kernel
-// produced. The golden activation (`surface-activation-golden.test.ts`) pins
-// the kernel's serialized bytes against this same transpiled tree.
+// The envelopes here are fabricated headers and bodies, not records the kernel
+// produced. The kernel's own crossing is run by the page rig, against real
+// 0.2.0 guests.
 //
 // Wire class: the script is `brenn:`-bound throughout. That is an owner scoping
 // decision, not doctrine — backend WASM consumers cannot bind `ephemeral:`
@@ -36,7 +38,12 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { activationEntry, type KernelActivation } from "./surface.js";
+import {
+    activationEntryBytes,
+    type Body,
+    type BytesProcessorInstance,
+    type KernelActivation,
+} from "./surface.js";
 import {
     REPO_ROOT,
     instantiateTranspiled,
@@ -116,22 +123,74 @@ function hasOwn(target: object, key: string): boolean {
     return Object.prototype.hasOwnProperty.call(target, key);
 }
 
+/** The glue's record for an envelope: its header JSON and its body. */
+interface GlueEnvelope {
+    header: string;
+    body: Body;
+}
+
+/** The activation record the 0.2.0 glue lifts into the guest. */
+interface GlueActivation {
+    ports: {
+        port: string;
+        envelopes: GlueEnvelope[];
+        newFrom: number;
+        dropped: number;
+    }[];
+    deferred: {
+        port: string;
+        entries: { index: number; body: Body; deliverAfter: bigint }[];
+    }[];
+    now: bigint | undefined;
+    sync: string | undefined;
+}
+
+/** An untyped text body, as every body in the script is. */
+function text(body: string): Body {
+    return { contentType: undefined, bytes: new TextEncoder().encode(body) };
+}
+
 /**
- * Expand an `(id, body)` pair into the canonical `MessageEnvelope` JSON using
- * the script's fixed non-identifying fields. The wasmtime half performs the
- * identical expansion — the script names the identity, both harnesses supply
- * the same frame around it.
+ * The text of a body the guest handed over. Every body this probe publishes
+ * is untyped text, so anything else is the fixture or the seam having changed.
+ */
+function textOf(body: Body): string {
+    if (body.contentType !== undefined && body.contentType !== null) {
+        throw new Error(`the probe handed over a typed body (${body.contentType})`);
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(body.bytes);
+}
+
+/**
+ * Expand an `(id, body)` pair into an envelope using the script's fixed
+ * non-identifying fields: the header JSON, and the body as untyped text. The
+ * wasmtime half performs the same expansion — the script names the identity,
+ * both harnesses supply the same frame around it.
  */
 function envelope(
     pair: { id: string; body: string },
     overrides: Record<string, unknown> = {},
-): string {
-    return JSON.stringify({
-        ...script.envelope_template,
-        message_id: pair.id,
-        body: pair.body,
-        ...overrides,
-    });
+): GlueEnvelope {
+    return {
+        header: JSON.stringify({
+            ...script.envelope_template,
+            message_id: pair.id,
+            ...overrides,
+        }),
+        body: text(pair.body),
+    };
+}
+
+/** The script's deferred windows, in the glue's record shape. */
+function deferred(windows: KernelActivation["deferred"]): GlueActivation["deferred"] {
+    return windows.map((window) => ({
+        port: window.port,
+        entries: window.entries.map((entry) => ({
+            index: entry.index,
+            body: text(entry.payload),
+            deliverAfter: BigInt(entry.deliver_after),
+        })),
+    }));
 }
 
 /**
@@ -152,14 +211,14 @@ function emptyBuffer(): Buffer {
 }
 
 /**
- * One instantiated guest behind the production `activationEntry`, with the
- * buffer its publishes land in.
+ * One instantiated guest behind the production `activationEntryBytes`, with
+ * the buffer its publishes land in.
  *
  * Shared by the transcript run and the reply pin, so both drive the same real
  * transpiled tree through the same seam.
  */
 interface Harness {
-    entry: (activation: string) => string | { reply: string } | undefined;
+    entry: (activation: GlueActivation) => string | { reply: Body } | undefined;
     reset: () => void;
     buffer: () => Buffer;
 }
@@ -174,7 +233,7 @@ interface Harness {
  */
 async function harness(): Promise<Harness> {
     let buffer = emptyBuffer();
-    const instance = await instantiateTranspiled(KIND, {
+    const instance = await instantiateTranspiled<BytesProcessorInstance>("surface/dist", KIND, {
         "brenn:processor/config": {
             get: (key: string): string | undefined =>
                 hasOwn(script.config, key) ? script.config[key] : undefined,
@@ -185,17 +244,13 @@ async function harness(): Promise<Harness> {
         // an unsatisfiable `log` would fail instantiation outright.
         "brenn:processor/log": { log: () => {} },
         "brenn:processor/ports": {
-            publish: (port: string, payload: string) => {
-                buffer.publishes.push({ port, body: payload });
+            publish: (port: string, body: Body) => {
+                buffer.publishes.push({ port, body: textOf(body) });
             },
-            publishDeferred: (
-                port: string,
-                payload: string,
-                deliverAfter: bigint,
-            ) => {
+            publishDeferred: (port: string, body: Body, deliverAfter: bigint) => {
                 buffer.deferredPublishes.push({
                     port,
-                    body: payload,
+                    body: textOf(body),
                     deliver_after: Number(deliverAfter),
                 });
             },
@@ -205,7 +260,7 @@ async function harness(): Promise<Harness> {
             deferEdit: (
                 port: string,
                 index: number,
-                payload: string | undefined,
+                body: Body | undefined,
                 deliverAfter: bigint | undefined,
             ) => {
                 buffer.ops.push({
@@ -214,7 +269,7 @@ async function harness(): Promise<Harness> {
                     index,
                     // `undefined` is the absent half; the transcript spells
                     // absence `null`, which is what JSON can carry.
-                    payload: payload === undefined ? null : payload,
+                    payload: body === undefined ? null : textOf(body),
                     deliver_after:
                         deliverAfter === undefined
                             ? null
@@ -224,7 +279,7 @@ async function harness(): Promise<Harness> {
         },
     });
     return {
-        entry: activationEntry(instance),
+        entry: activationEntryBytes(instance),
         reset: () => {
             buffer = emptyBuffer();
         },
@@ -246,25 +301,26 @@ async function runScript(): Promise<TranscriptEntry[]> {
     for (const activation of script.activations) {
         const { entry, reset, buffer } = await harness();
         reset();
-        const record: KernelActivation = {
+        const record: GlueActivation = {
             ports: activation.ports.map((p) => ({
                 port: p.port,
                 envelopes: p.envelopes.map((pair) => envelope(pair)),
-                new_from: p.new_from,
+                newFrom: p.new_from,
                 dropped: p.dropped,
             })),
-            deferred: activation.deferred,
-            now: activation.now,
+            deferred: deferred(activation.deferred),
+            // option<u64>: null is absence, not a zero clock.
+            now: activation.now === null ? undefined : BigInt(activation.now),
             // The transcript scripts asynchronous deliveries only: nothing on
             // the backend side of the parity can be a sync call, so there is
             // nothing for the surface side to mirror.
-            sync: null,
+            sync: undefined,
         };
         let outcome: TranscriptEntry["outcome"];
-        let answer: string | { reply: string } | undefined;
+        let answer: string | { reply: Body } | undefined;
         let trapped = false;
         try {
-            answer = entry(JSON.stringify(record));
+            answer = entry(record);
         } catch {
             trapped = true;
         }
@@ -280,7 +336,7 @@ async function runScript(): Promise<TranscriptEntry[]> {
             // green on an invariant nothing asserted: the script carries no sync
             // call, so a reply here is the fixture or the seam having changed.
             throw new Error(
-                `scripted activation answered a reply: ${JSON.stringify(answer)}`,
+                `scripted activation answered a reply: ${textOf(answer.reply)}`,
             );
         }
         if (outcome !== "ok") {
@@ -309,7 +365,7 @@ describe("processor transplant — surface hosting", () => {
         // Mirrors the wasmtime half's posture on a missing artifact: fail with
         // the command that fixes it, never skip. A silently skipped parity test
         // asserts the invariant on one host while reporting green.
-        requireTranspiledTree(KIND);
+        requireTranspiledTree("surface/dist", KIND);
         transcript = await runScript();
     });
 
@@ -320,10 +376,10 @@ describe("processor transplant — surface hosting", () => {
     it("carries a sync port in and a reply back out of a real guest", async () => {
         // The transcript cannot cover this: no backend activation is a sync
         // call, so the scripted half of the parity has nothing to mirror. What
-        // is under test is jco's own lift of the world's `option<string>` in
-        // both directions — `sync` reaching the guest as a port name, and
-        // `ok(some(..))` arriving as the reply object the kernel reads — on the
-        // real transpiled tree rather than a hand-written mock of it.
+        // is under test is jco's own lift in both directions — the world's
+        // `option<string>` `sync` reaching the guest as a port name, and
+        // `ok(some(body))` arriving as the reply object the kernel reads — on
+        // the real transpiled tree rather than a hand-written mock of it.
         //
         // The activation carries an ordinary delivery beside the request, which
         // is what makes the guest SDK's sync accessors observable: the request
@@ -334,56 +390,49 @@ describe("processor transplant — surface hosting", () => {
         const { entry, reset } = await harness();
         reset();
         const port = "brenn:mount";
-        const answered = entry(
-            JSON.stringify({
-                ports: [
-                    {
-                        port,
-                        // A request is attributed to its own target, by the bare
-                        // name the page knows the instance by — the shape the
-                        // kernel mints, which the guest reports back.
-                        envelopes: [envelope({
-                            id: "9a1d0a3e-0000-4000-8000-00000000f1ed",
-                            body: "__reply__",
-                        }, { source: "transplant", sender: "transplant" })],
-                        new_from: 0,
-                        dropped: 0,
-                    },
-                    {
-                        port: "in",
-                        envelopes: [envelope({
-                            id: "9a1d0a3e-0000-4000-8000-00000000f1ee",
-                            body: "delivered",
-                        })],
-                        new_from: 0,
-                        dropped: 0,
-                    },
-                ],
-                deferred: [],
-                now: null,
-                sync: port,
-            } satisfies KernelActivation),
-        );
-        expect(answered).toEqual({
-            reply:
-                `replied:${port}:mount=true:classified=undeclared:` +
+        const answered = entry({
+            ports: [
+                {
+                    port,
+                    // A request is attributed to its own target, by the bare
+                    // name the page knows the instance by — the shape the
+                    // kernel mints, which the guest reports back.
+                    envelopes: [envelope({
+                        id: "9a1d0a3e-0000-4000-8000-00000000f1ed",
+                        body: "__reply__",
+                    }, { source: "transplant", sender: "transplant" })],
+                    newFrom: 0,
+                    dropped: 0,
+                },
+                {
+                    port: "in",
+                    envelopes: [envelope({
+                        id: "9a1d0a3e-0000-4000-8000-00000000f1ee",
+                        body: "delivered",
+                    })],
+                    newFrom: 0,
+                    dropped: 0,
+                },
+            ],
+            deferred: [],
+            now: undefined,
+            sync: port,
+        });
+        if (answered === undefined || typeof answered === "string") {
+            throw new Error(`the sync call answered no reply: ${answered}`);
+        }
+        expect(textOf(answered.reply)).toBe(
+            `replied:${port}:mount=true:classified=undeclared:` +
                 `request=__reply__:` +
                 `bare-identity=true:delivered=[in]`,
-        });
+        );
 
         // And the other arm from the same instance: an activation naming no
         // sync port answers nothing at all, which is a bare `undefined` and not
         // a reply object carrying a null.
         reset();
         expect(
-            entry(
-                JSON.stringify({
-                    ports: [],
-                    deferred: [],
-                    now: null,
-                    sync: null,
-                } satisfies KernelActivation),
-            ),
+            entry({ ports: [], deferred: [], now: undefined, sync: undefined }),
         ).toBeUndefined();
     });
 

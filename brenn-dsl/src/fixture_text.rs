@@ -186,7 +186,7 @@ mod tests {
         let words: Vec<&str> = ComponentGrant::ALL
             .into_iter()
             .filter(|grant| grant.illegal_on(ComponentHost::Surface).is_none())
-            .filter(|grant| grant.wit_import().is_none())
+            .filter(|grant| !grant.names_interface())
             .map(ComponentGrant::word)
             .collect();
         format!(

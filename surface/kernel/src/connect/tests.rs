@@ -20,6 +20,7 @@ use uuid::Uuid;
 use super::*;
 use crate::registry::{Registrations, new_stores, reconcile_stores};
 use crate::test_support::{frames, pages};
+use brenn_envelope::grants::ProcessorContract;
 
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
 const WIRE: &str = "brenn:site.bar.in";
@@ -64,6 +65,7 @@ fn ack(replay_count: u32) -> SubscribeAck {
 /// shape for a document to be valid and for a second version of it to differ.
 fn doc(kind: &str) -> BindingsDocument {
     imply_vocabularies(BindingsDocument {
+        wire_channels: vec![],
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![ComponentEntry {
             instance: "chrome".to_string(),
@@ -96,6 +98,7 @@ fn doc(kind: &str) -> BindingsDocument {
             ring_depth: reserved_local_channel(LOCAL_THEME_CHANNEL)
                 .map(|r| r.ring_depth)
                 .expect("the theme plane is reserved"),
+            non_text: false,
         }],
         chrome_instance: "chrome".to_string(),
         platform: PlatformSection {
@@ -186,8 +189,14 @@ fn the_application_channels_wait_for_phase_two() {
 
     // Registered while the surface has no wiring: nothing to reconcile against.
     assert!(
-        regs.register("chrome", connect.bindings(), &mut stores, &mut subs)
-            .is_empty()
+        regs.register(
+            "chrome",
+            ProcessorContract::V0_1,
+            connect.bindings(),
+            &mut stores,
+            &mut subs
+        )
+        .is_empty()
     );
     assert_eq!(subs.refcount(WIRE), 0);
     assert!(!subs.is_active(WIRE));

@@ -47,6 +47,7 @@ fn subscription(instance: &str, port: &str) -> Binding {
 /// `chrome` with no bound input, `p1` with two.
 fn doc() -> BindingsDocument {
     imply_vocabularies(BindingsDocument {
+        wire_channels: vec![],
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![component("chrome"), component("p1")],
         subscriptions: vec![subscription("p1", "in"), subscription("p1", "aux")],
@@ -312,11 +313,12 @@ fn a_death_the_kernel_folded_shows_up_as_degraded_with_its_reason() {
     // only thing moving health here is the death.
     let mut wiring = doc();
     wiring.subscriptions.clear();
+    wiring.wire_channels.clear();
     let bindings = applied(&wiring);
 
     let mut core = KernelCore::new();
     core.on_event(&Event::Connected {
-        bindings: wiring,
+        bindings: Box::new(wiring),
         participant_id: "surface:bar".to_string(),
         session_id: "sess-1".to_string(),
         max_body_bytes: 65_536,

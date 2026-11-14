@@ -226,7 +226,7 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
             PublishOrigin::Conversation { id: sender_conv_id },
             &job.owner_app_slug,
             &action_to,
-            &action_body,
+            action_body.as_str().into(),
             action_urgency,
             action_reply_to.as_deref(),
             None, // no deliver_after on automation fires
@@ -874,6 +874,8 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![SubscriberEntry {
                 kind: SubscriberEntryKind::App("test-app".to_string()),

@@ -22,7 +22,7 @@
 //! recorded at its last render *is* what the user saw when they pressed.
 
 use brenn_guest::{
-    Activation, Error, Processor, RetainedState, StateLoss, dom, log, publish, repark,
+    Activation, Body, Error, Processor, RetainedState, StateLoss, dom, log, publish, repark,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -98,7 +98,7 @@ impl Panel {
 struct MeetingComponent;
 
 impl Processor for MeetingComponent {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         // Starting from a default state would lose the view and trap on the
         // first `view()`, so an unreadable body fails the activation and the
         // instance takes its error card.
@@ -140,12 +140,13 @@ fn on_activation(activation: &Activation, panel: &mut Panel) -> Result<(), Error
         if matches!(InPort::of(window)?, InPort::Tick) {
             continue;
         }
+        let new = window.new_envelopes().collect::<Result<Vec<_>, _>>()?;
         let notes = panel
             .state
             .on_window(
                 ActivationWindow {
                     port: window.port(),
-                    new_raw: window.new_raw(),
+                    new: &new,
                     dropped: u64::from(window.dropped()),
                 },
                 now,

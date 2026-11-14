@@ -26,6 +26,7 @@ use crate::test_support::pages;
 use crate::test_support::pages::BODY_CAP;
 
 use super::*;
+use brenn_envelope::grants::ProcessorContract;
 
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
 const WIRE: &str = "ephemeral:site.bar.out";
@@ -189,7 +190,7 @@ fn route_on(page: &mut SurfacePage, channel: &str, seed: u128, body: &str) {
         RouteRequest {
             channel,
             origin: Origin::Sub("p1"),
-            body: body.to_string(),
+            body: (body.to_string()).into(),
             stamp: stamp(seed),
             urgency: Urgency::Normal,
             deliver_after: None,
@@ -210,7 +211,7 @@ fn park_on(page: &mut SurfacePage, channel: &str, seed: u128, body: &str, releas
         RouteRequest {
             channel,
             origin: Origin::Sub("p1"),
-            body: body.to_string(),
+            body: (body.to_string()).into(),
             stamp: stamp(seed),
             urgency: Urgency::Normal,
             deliver_after: Some(release_at),
@@ -234,11 +235,13 @@ fn buffer(page: &SurfacePage, instance: &str) -> PublishBuffer {
             OutputSpec {
                 channel: binding.channel.clone(),
                 default_urgency: binding.urgency,
+                non_text: bindings.carries_non_text(&binding.channel),
             },
         );
         sink_mt.insert(binding.port.clone(), 1_000_000);
     }
     PublishBuffer::new(
+        instance,
         outputs,
         bindings.declared_out_ports(instance),
         sink_mt,
@@ -252,7 +255,7 @@ fn buffer(page: &SurfacePage, instance: &str) -> PublishBuffer {
 fn done(
     page: &SurfacePage,
     instance: &str,
-    outcome: ActivationOutcome,
+    outcome: ActivationOutcome<brenn_envelope::GuestBody>,
     buffer: PublishBuffer,
 ) -> Completed {
     let stamps = stamps(buffer.len());
@@ -274,7 +277,7 @@ fn retained(page: &SurfacePage, channel: &str) -> Vec<String> {
         .get(channel)
         .expect("the fixture hosts the channel")
         .retained()
-        .map(|(envelope, _)| envelope.body.clone())
+        .map(|(envelope, _)| envelope.body.as_text().unwrap().to_owned())
         .collect()
 }
 
@@ -316,7 +319,7 @@ fn a_reader_owed_a_message_is_assembled_and_left_in_flight() {
         window
             .envelopes
             .iter()
-            .map(|e| brenn_surface_test_fixtures::parse_envelope(e).body)
+            .map(|e| e.body.as_text().unwrap().to_owned())
             .collect::<Vec<_>>(),
         vec!["hello".to_string()]
     );
@@ -350,13 +353,16 @@ fn an_assembled_buffer_enforces_the_attachments_body_cap() {
     assert!(
         activation
             .buffer
-            .publish("out", "x".repeat(BODY_CAP as usize + 1))
+            .publish(
+                "out",
+                brenn_envelope::GuestBody::Text("x".repeat(BODY_CAP as usize + 1))
+            )
             .is_err()
     );
     assert!(
         activation
             .buffer
-            .publish("out", "small".to_string())
+            .publish("out", brenn_envelope::GuestBody::Text("small".to_string()))
             .is_ok()
     );
 }
@@ -376,7 +382,10 @@ fn the_body_cap_survives_a_detach() {
     assert!(
         activation
             .buffer
-            .publish("out", "x".repeat(BODY_CAP as usize + 1))
+            .publish(
+                "out",
+                brenn_envelope::GuestBody::Text("x".repeat(BODY_CAP as usize + 1))
+            )
             .is_err()
     );
 }
@@ -400,14 +409,17 @@ fn a_reattachment_replaces_the_body_cap() {
     assert!(
         activation
             .buffer
-            .publish("out", "x".repeat(BODY_CAP as usize / 2 + 1))
+            .publish(
+                "out",
+                brenn_envelope::GuestBody::Text("x".repeat(BODY_CAP as usize / 2 + 1))
+            )
             .is_err(),
         "a body the attachment that went away would have taken"
     );
     assert!(
         activation
             .buffer
-            .publish("out", "small".to_string())
+            .publish("out", brenn_envelope::GuestBody::Text("small".to_string()))
             .is_ok()
     );
 }
@@ -445,10 +457,16 @@ fn an_ok_completion_commits_both_classes() {
     let mut page = standard();
     let mut buffer = buffer(&page, "p1");
     buffer
-        .publish("out", "to the peer".to_string())
+        .publish(
+            "out",
+            brenn_envelope::GuestBody::Text("to the peer".to_string()),
+        )
         .expect("bound");
     buffer
-        .publish("notes", "to the page".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("to the page".to_string()),
+        )
         .expect("bound");
 
     let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
@@ -471,10 +489,16 @@ fn an_err_completion_discards_the_work_and_counts_the_failure() {
     let mut page = standard();
     let mut buffer = buffer(&page, "p1");
     buffer
-        .publish("out", "never sent".to_string())
+        .publish(
+            "out",
+            brenn_envelope::GuestBody::Text("never sent".to_string()),
+        )
         .expect("bound");
     buffer
-        .publish("notes", "never routed".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("never routed".to_string()),
+        )
         .expect("bound");
 
     let completed = done(
@@ -529,7 +553,10 @@ fn a_completion_for_a_deregistered_instance_is_absorbed() {
     let mut page = standard();
     let mut buffer = buffer(&page, "p1");
     buffer
-        .publish("notes", "orphan".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("orphan".to_string()),
+        )
         .expect("bound");
     let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
     page.registrations
@@ -542,7 +569,7 @@ fn a_completion_for_a_deregistered_instance_is_absorbed() {
         completion,
         Completion {
             absorbed: true,
-            ..Completion::nothing("p1".to_string(), ActivationOutcome::Ok(None))
+            ..Completion::nothing("p1".to_string(), super::absorbed_outcome())
         }
     );
     assert!(retained(&page, NOTES).is_empty());
@@ -559,13 +586,17 @@ fn a_completion_for_a_reregistered_instance_is_absorbed() {
     let mut page = standard();
     let mut buffer = buffer(&page, "p1");
     buffer
-        .publish("notes", "from the previous mount".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("from the previous mount".to_string()),
+        )
         .expect("bound");
     let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
     page.registrations
         .deregister("p1", &mut page.stores, &mut page.subs);
     page.registrations.register(
         "p1",
+        ProcessorContract::V0_1,
         page.connect.bindings(),
         &mut page.stores,
         &mut page.subs,
@@ -592,10 +623,16 @@ fn a_completion_for_an_instance_killed_mid_flight_is_absorbed() {
     let mut page = standard();
     let mut buffer = buffer(&page, "p1");
     buffer
-        .publish("notes", "confined".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("confined".to_string()),
+        )
         .expect("bound");
     buffer
-        .publish("out", "on the wire".to_string())
+        .publish(
+            "out",
+            brenn_envelope::GuestBody::Text("on the wire".to_string()),
+        )
         .expect("bound");
     let killed = kill(&mut page, "p1", NOW, NOW_MS);
     assert!(killed.first);
@@ -608,6 +645,11 @@ fn a_completion_for_an_instance_killed_mid_flight_is_absorbed() {
     let completion = on_activation_done(&mut page, completed, NOW, NOW_MS);
 
     assert!(completion.absorbed);
+    assert!(
+        matches!(completion.outcome, ActivationOutcome::Trap(_)),
+        "a sync caller is not told a dead callee answered ok: {:?}",
+        completion.outcome
+    );
     assert!(
         completion.steps.frames.is_empty(),
         "the batch of a terminal instance never reaches the wire"
@@ -634,7 +676,10 @@ fn a_confined_append_charges_the_position_it_evicted() {
     route(&mut page, 0xa1, "unread");
     let mut buffer = buffer(&page, "p1");
     buffer
-        .publish("notes", "evicts it".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("evicts it".to_string()),
+        )
         .expect("bound");
 
     let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
@@ -664,7 +709,10 @@ fn a_softer_rung_counts_an_eviction_without_announcing_it() {
     route(&mut page, 0xa1, "unread");
     let mut buffer = buffer(&page, "p1");
     buffer
-        .publish("notes", "evicts it".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("evicts it".to_string()),
+        )
         .expect("bound");
 
     let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
@@ -686,7 +734,9 @@ fn a_kill_strips_positions_and_discards_a_queued_flush() {
     let mut page = standard();
     page.on_detached();
     let mut buffer = buffer(&page, "p2");
-    buffer.publish("out", "queued".to_string()).expect("bound");
+    buffer
+        .publish("out", brenn_envelope::GuestBody::Text("queued".to_string()))
+        .expect("bound");
     let completed = done(&page, "p2", ActivationOutcome::Ok(None), buffer);
     on_activation_done(&mut page, completed, NOW, NOW_MS);
     route(&mut page, 0xa1, "unread");
@@ -860,7 +910,12 @@ fn the_release_deadline_is_stated_only_when_it_moves() {
 fn the_retry_tick_offers_a_refused_head_again() {
     let mut page = standard();
     let mut buffer = buffer(&page, "p1");
-    buffer.publish("out", "metered".to_string()).expect("bound");
+    buffer
+        .publish(
+            "out",
+            brenn_envelope::GuestBody::Text("metered".to_string()),
+        )
+        .expect("bound");
     let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
     let completion = on_activation_done(&mut page, completed, NOW, NOW_MS);
     let correlation = correlation_of(&completion.steps.frames[0]);

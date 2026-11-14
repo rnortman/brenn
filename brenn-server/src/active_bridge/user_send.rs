@@ -173,10 +173,172 @@ pub(crate) async fn accept_user_send(
             .await;
     }
 
+    // CC may act on a turn that begins with `/` as a command that resets its
+    // context; the command table is CC's, so any such turn clears the read
+    // record, whether or not CC acts on it and whether or not the send lands.
+    // The clear and the send run under the bus-delivery lock: a batch is then
+    // either sent and recorded before the clear, or read after it and sent
+    // behind the turn, never recorded after a clear it was sent ahead of.
+    let _delivering = if send.cc_text.trim_start().starts_with('/') {
+        let delivering = bridge.bus_delivery.lock().await;
+        bridge.forget_conversation_reads();
+        Some(delivering)
+    } else {
+        None
+    };
+
     if send.extra_blocks.is_empty() {
         bridge.send_message(&send.cc_text).await.err()
     } else {
         let msg = brenn_cc::protocol::user_message_with_context(&send.cc_text, &send.extra_blocks);
         bridge.send_outgoing(msg).await.err()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brenn_obs::alerting::noop_alert_dispatcher;
+
+    use super::*;
+    use crate::active_bridge::test_fixtures::TestBridgeConfig;
+    use crate::active_bridge::test_support::make_bridge_no_loop;
+
+    /// What a CC session sends, while the test holds it.
+    type Outgoing = Option<tokio::sync::mpsc::Receiver<brenn_cc::session::OutgoingEnvelope>>;
+
+    /// A bridge with a `Messenger` whose conversation has read one message,
+    /// with a live CC session when `live`.
+    async fn bridge_with_a_read(
+        live: bool,
+    ) -> (
+        Arc<ActiveBridge>,
+        Arc<brenn_messaging::Messenger>,
+        uuid::Uuid,
+        Outgoing,
+    ) {
+        let messenger = brenn_messaging::testutils::empty_directory_messenger("user-send");
+        let (bridge, ..) = make_bridge_no_loop(
+            "testapp",
+            noop_alert_dispatcher().0,
+            TestBridgeConfig {
+                messenger: Some(messenger.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let outgoing = if live {
+            Some(bridge.install_recording_session_for_test().await)
+        } else {
+            None
+        };
+        let read = uuid::Uuid::new_v4();
+        messenger.note_conversation_sent(bridge.conversation_id, read, "brenn:somewhere");
+        (bridge, messenger, read, outgoing)
+    }
+
+    fn turn(cc_text: &str) -> AcceptedSend<'_> {
+        AcceptedSend {
+            text: cc_text,
+            cc_text: cc_text.to_string(),
+            extra_blocks: Vec::new(),
+            sender_user_id: 1,
+            sender_tz: None,
+            sender_device_id: None,
+            attachments: Vec::new(),
+            selected_tasks: Vec::new(),
+            origin: SendOrigin::LegacyWs {
+                username: "alice".to_string(),
+                timestamp: "now".to_string(),
+            },
+            interstitial: None,
+            restores_impetus_pool: false,
+        }
+    }
+
+    /// Accept a turn whose CC text is `cc_text` on a live bridge, and answer
+    /// whether the read record survived it.
+    async fn record_survives(cc_text: &str) -> bool {
+        let (bridge, messenger, read, _outgoing) = bridge_with_a_read(true).await;
+        let mut send = turn("typed");
+        send.cc_text = cc_text.to_string();
+        assert_eq!(accept_user_send(&bridge, send).await, None);
+        messenger.conversation_has_read(bridge.conversation_id, read)
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_begins_with_a_slash_clears_the_read_record() {
+        for cc_text in [
+            "/clear",
+            "/new",
+            "/clear later",
+            "  /clear",
+            "\n/clear",
+            "/clear\n[Attached: scan.pdf]",
+            "/home/alice/notes.txt is the file",
+        ] {
+            assert!(!record_survives(cc_text).await, "{cc_text:?} must clear");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_no_leading_slash_keeps_the_read_record() {
+        for cc_text in [
+            "[alice 2026-03-26 14:32 UTC] /clear",
+            "please run /clear",
+            "plain text",
+            "",
+        ] {
+            assert!(record_survives(cc_text).await, "{cc_text:?} must not clear");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bus_chat_command_is_prefixed_and_keeps_the_read_record() {
+        let now = chrono::Utc::now().with_timezone(&chrono_tz::UTC);
+        let cc_text = brenn_render::cc_message_prefix::build_cc_message_text(
+            "/clear",
+            "surface:alice",
+            None,
+            &now,
+            true,
+            true,
+            false,
+        );
+        assert!(
+            record_survives(&cc_text).await,
+            "{cc_text:?} must not clear"
+        );
+    }
+
+    /// A bus batch already sent and not yet recorded when a slash-led turn
+    /// arrives is recorded before the clear, so the clear removes it.
+    #[tokio::test]
+    async fn a_slash_turn_waits_for_a_delivery_in_flight_and_clears_its_batch() {
+        let (bridge, messenger, read, _outgoing) = bridge_with_a_read(true).await;
+        let delivering = bridge.bus_delivery.lock().await;
+        let accepted = tokio::spawn({
+            let bridge = bridge.clone();
+            async move { accept_user_send(&bridge, turn("/clear")).await }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            messenger.conversation_has_read(bridge.conversation_id, read),
+            "the clear waits for the delivery in flight"
+        );
+        let batch = uuid::Uuid::new_v4();
+        messenger.note_conversation_sent(bridge.conversation_id, batch, "brenn:somewhere");
+        drop(delivering);
+        assert_eq!(accepted.await.unwrap(), None);
+        assert!(!messenger.conversation_has_read(bridge.conversation_id, read));
+        assert!(!messenger.conversation_has_read(bridge.conversation_id, batch));
+    }
+
+    #[tokio::test]
+    async fn a_slash_turn_to_a_dead_session_clears_and_reports_the_send_error() {
+        let (bridge, messenger, read, _outgoing) = bridge_with_a_read(false).await;
+        assert!(accept_user_send(&bridge, turn("/clear")).await.is_some());
+        assert!(!messenger.conversation_has_read(bridge.conversation_id, read));
     }
 }

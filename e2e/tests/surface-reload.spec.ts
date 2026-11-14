@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { CHAIN_TIMEOUT, openSurface } from "./echo-stub";
 
 /**
  * Browser e2e for what a live page does when the surface under it is
@@ -28,14 +29,13 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  * console — not the pre-chrome connect indicator, which is gone once chrome has
  * mounted.
  *
- * Runs after `bar.spec.ts` (single worker, alphabetical file order) because it
- * mutates the document those specs' surfaces are declared in. The original
+ * Runs after `bar.spec.ts` and `bytes.spec.ts` (single worker, alphabetical
+ * file order) because it mutates the document those specs' surfaces are
+ * declared in. The original
  * bytes are restored, and one more reload applied, in `test.afterAll` — so a
  * failure here leaves the harness's copy rewritten, but never the checked-in
  * document.
  */
-
-const CHAIN_TIMEOUT = 20_000;
 
 /**
  * How long to keep watching for a navigation or a reconnect that must not
@@ -148,11 +148,6 @@ function retireFeeder(doc: string): string {
   // in front of whatever follows, which does not parse.
   const head = doc.lastIndexOf("\n\n", begin);
   return doc.slice(0, head + 1) + doc.slice(end + endMarker.length);
-}
-
-/** Open a surface page and wait for its document to finish loading. */
-async function openSurface(page: Page, slug: string): Promise<void> {
-  await page.goto(`/surface/${slug}`, { waitUntil: "load" });
 }
 
 /** The `#surface-root` element that carries `data-layout` / `data-skin`. */

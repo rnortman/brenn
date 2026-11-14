@@ -126,8 +126,15 @@ impl AppPolicy {
 
     /// Does some `brenn_subscribe` matcher cover `channel`? Shared ACL-matcher
     /// half of the brenn dynamic-subscribe and delivery decisions.
+    ///
+    /// Never for a name in the app result-inbox namespace, whatever the
+    /// matchers say: an app's result inbox holds every one of its
+    /// conversations' tool results, and a conversation may name one only by
+    /// having been handed it. Reach by policy would let a conversation read
+    /// another's results and, through its read record, name their attachments.
     fn brenn_acl_covers(&self, channel: &str) -> bool {
-        Self::acl_covers(&self.acls.brenn_subscribe, channel)
+        !crate::messaging::in_app_tool_results_namespace(channel)
+            && Self::acl_covers(&self.acls.brenn_subscribe, channel)
     }
 
     /// Does some `webhook` matcher exactly match `endpoint`? Shared ACL-matcher
@@ -878,6 +885,34 @@ mod tests {
         // webhook: routes through allows_webhook_delivery (exact).
         assert!(p.allows_channel_access("webhook:github"));
         assert!(!p.allows_channel_access("webhook:gitlab"));
+    }
+
+    #[test]
+    fn no_matcher_covers_an_app_result_inbox() {
+        // Built in code, past the resolver that refuses such matchers: the rule
+        // holds at the decision itself, for exact and prefix matchers alike.
+        let acls = AclSet {
+            brenn_subscribe: vec![
+                ChannelMatcher::Exact("app-tool-results/pfin".to_string()),
+                ChannelMatcher::Prefix("app-tool-results/".to_string()),
+                ChannelMatcher::Prefix("tool-results/".to_string()),
+            ],
+            ..AclSet::default()
+        };
+        let p = policy(
+            &[
+                AppCapability::MessagingSubscribe,
+                AppCapability::DynamicSubscribe,
+            ],
+            acls,
+        );
+        assert!(!p.allows_channel_access("brenn:app-tool-results/pfin"));
+        assert!(!p.allows_channel_access("brenn:app-tool-results/graf"));
+        assert!(!p.allows_brenn_dynamic_subscribe("app-tool-results/pfin"));
+        assert!(!p.allows_brenn_delivery("app-tool-results/pfin"));
+        // A component's result inbox stays reachable by its own prefix.
+        assert!(p.allows_channel_access("brenn:tool-results/mailer"));
+        assert!(p.allows_brenn_dynamic_subscribe("tool-results/mailer"));
     }
 
     #[test]

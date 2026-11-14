@@ -1,0 +1,21 @@
+/// The page host's test fixture, on the `brenn:processor@0.1.0` contract. It is
+/// driven by text commands on `in` and publishes one report per activation on
+/// `report`: every window it was handed other than `in` and `state` (each
+/// envelope as the hex of its text), its deferred view, the sync port, and the
+/// result of every command. `memo`, `timer` and `out` are where its commands
+/// publish, park and edit bodies; `state` carries its base64 state workload;
+/// `ask` is where a caller asks it for a reply, and `peer` is where it calls
+/// one.
+component ProcessorPageTest {
+  abi = processor;
+  requires = [ports, calls];
+  in in;
+  optional in feed;
+  optional io memo;
+  optional io state;
+  optional io timer;
+  sync ask;
+  call peer;
+  optional out out;
+  out report;
+}

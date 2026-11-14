@@ -350,7 +350,6 @@ copy_to_directory(
     srcs = [
         "//brenn-wasm/components/processor-transplant:transplant.json",
         "//surface:dist",
-        "//surface/test-fixtures:activation.json",
         ":ts_src",
     ],
     replace_prefixes = {"frontend/ts_src": "frontend"},
@@ -360,20 +359,27 @@ copy_to_directory(
 
 TRANSPILED_TESTS = [
     "src/processor-transplant.test.ts",
+]
+
+# The page rig runs in its own target, below, with the golden activation, whose
+# guest is the rig's string-contract fixture kind.
+PAGE_RIG_TESTS = [
+    "src/page-rig/page-rig.test.ts",
+    "src/page-rig/page-rig-measure.test.ts",
     "src/surface-activation-golden.test.ts",
 ]
 
 vitest_bin.vitest_test(
     name = "vitest",
     size = "medium",
-    # Neither file has a skip path — absent its tree each fails naming the
-    # command that builds it — so both are excluded here rather than left to
-    # bail.
+    # None of these files has a skip path — absent its tree each fails naming
+    # the command or target that builds it — so all are excluded here rather
+    # than left to bail.
     args = [
         "run",
     ] + [
         arg
-        for test in TRANSPILED_TESTS
+        for test in TRANSPILED_TESTS + PAGE_RIG_TESTS
         for arg in [
             "--exclude",
             "**/" + test,
@@ -398,5 +404,64 @@ vitest_bin.vitest_test(
         ":node_modules",
         ":vitest_transpiled_root",
     ],
+    target_compatible_with = HOST_ONLY,
+)
+
+# ---------------------------------------------------------------------------
+# The page rig
+# ---------------------------------------------------------------------------
+# The production kernel bundle, the production `surface.ts` and a transpiled
+# kind, brought up by the page's own `bootstrap` in node against a scripted
+# attach peer. Its closure is the kernel and the one fixture kind, not
+# `//surface:dist`, so an edit to a shipped component does not rerun it.
+
+copy_to_directory(
+    name = "vitest_page_rig_root",
+    testonly = True,
+    srcs = [
+        "//surface:page_rig_dist",
+        "//surface/test-fixtures:activation.json",
+        "//surface/test-fixtures/peer:page_rig_kit.json",
+        ":ts_src",
+    ],
+    replace_prefixes = {"frontend/ts_src": "frontend"},
+    root_paths = [],
+    target_compatible_with = HOST_ONLY,
+)
+
+vitest_bin.vitest_test(
+    name = "vitest_page_rig",
+    size = "medium",
+    args = [
+        "run",
+        "src/page-rig/page-rig.test.ts",
+        "src/surface-activation-golden.test.ts",
+    ],
+    chdir = package_name() + "/vitest_page_rig_root/frontend",
+    data = [
+        ":node_modules",
+        ":vitest_page_rig_root",
+    ],
+    target_compatible_with = HOST_ONLY,
+)
+
+# The state workload at three sizes on each contract — 0.1.0 base64 in JSON,
+# 0.2.0 binary at rest on a `non_text` page-local channel — and binary rows of
+# the same sizes delivered over the socket to a 0.2.0 kind, in one run: timings
+# printed, nothing asserted on time. Run by hand with
+# `bazel test --test_output=all`; `docs/page-rig-timings.md` records a run.
+vitest_bin.vitest_test(
+    name = "page_rig_measure",
+    size = "large",
+    args = [
+        "run",
+        "src/page-rig/page-rig-measure.test.ts",
+    ],
+    chdir = package_name() + "/vitest_page_rig_root/frontend",
+    data = [
+        ":node_modules",
+        ":vitest_page_rig_root",
+    ],
+    tags = ["manual"],
     target_compatible_with = HOST_ONLY,
 )

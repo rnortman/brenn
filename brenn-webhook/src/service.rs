@@ -12,6 +12,8 @@ use http::HeaderMap;
 use brenn_lib::wasm_package::Verified;
 use brenn_lib::webhook::config::ResolvedWebhookEndpoint;
 
+use crate::signature::VerifiedBody;
+
 // ---------------------------------------------------------------------------
 // WebhookEventRouter trait
 // ---------------------------------------------------------------------------
@@ -29,10 +31,11 @@ pub trait WebhookEventRouter: Send + Sync + 'static {
     /// reading its body.
     ///
     /// All HTTP transport metadata is passed through so the implementation
-    /// can build a `WebhookEnvelope` carrying headers, key_id, client IP,
-    /// and received-at timestamp. Returns `Err(String)` if delivery fails
-    /// so the HTTP handler can return 500 to the caller instead of silently
-    /// returning 204.
+    /// can record headers, key_id, client IP and received-at timestamp beside
+    /// the body. `body` is in the shape it was verified for; the
+    /// implementation publishes it only onto a channel of that shape.
+    /// Returns `Err(String)` if delivery fails so the HTTP handler can return
+    /// 500 to the caller instead of silently returning 204.
     async fn deliver_inbound(
         &self,
         endpoint: &Arc<ResolvedWebhookEndpoint>,
@@ -40,7 +43,7 @@ pub trait WebhookEventRouter: Send + Sync + 'static {
         headers: HeaderMap,
         client_ip: IpAddr,
         received_at: SystemTime,
-        raw_body: String,
+        body: VerifiedBody,
     ) -> Result<(), String>;
 }
 
@@ -316,7 +319,7 @@ mod tests {
             _headers: HeaderMap,
             _client_ip: IpAddr,
             _received_at: SystemTime,
-            _raw_body: String,
+            _body: VerifiedBody,
         ) -> Result<(), String> {
             Ok(())
         }

@@ -129,6 +129,8 @@ fn channel_at(address: &str) -> ChannelConfigRaw {
         sink: None,
         wake_min: None,
         send_rate: None,
+        non_text: false,
+        untyped_content_type: None,
     }
 }
 
@@ -232,6 +234,7 @@ fn attrless_subscription(port: &str, channel: &str) -> WasmConsumerSubscriptionR
         noise: None,
         wake_min: None,
         amplification: None,
+        non_text: false,
     }
 }
 
@@ -246,6 +249,7 @@ fn tick_io_port() -> WasmConsumerIoPortRaw {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 
@@ -310,6 +314,7 @@ fn surface_input(instance: &str, port: &str, channel: &str) -> SurfaceSubscripti
         retain_depth: None,
         noise: None,
         wake_min: None,
+        non_text: false,
     }
 }
 
@@ -322,6 +327,7 @@ fn surface_output(instance: &str, port: &str, channel: &str) -> SurfaceOutputRaw
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 
@@ -337,6 +343,7 @@ fn surface_io_port(instance: &str, port: &str) -> SurfaceIoPortRaw {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     }
 }
 
@@ -978,6 +985,9 @@ messaging {
     default_wake_min = high;
     default_send_rate = { burst = 5, refill_interval_secs = 61, refill = 3 };
     archive_path = "/var/lib/brenn/archive";
+    max_blob_bytes = 1048577;
+    blob_budget_bytes = 2097153;
+    blob_dir = "/var/lib/brenn/blobs";
 }
 
 observability {
@@ -1193,6 +1203,9 @@ container cc {
                     refill: 3,
                 },
                 archive_path: Some(PathBuf::from("/var/lib/brenn/archive")),
+                max_blob_bytes: 1_048_577,
+                blob_budget_bytes: 2_097_153,
+                blob_dir: Some(PathBuf::from("/var/lib/brenn/blobs")),
             },
             observability: ObservabilityConfig {
                 usage: UsageObservabilityConfig {
@@ -2116,6 +2129,108 @@ fn a_fatal_global_default_noise_is_refused_on_the_word() {
         diagnostic.message
     );
     assert_eq!(diagnostic.span.text_str(), Some("fatal"));
+}
+
+/// The blob store's bounds refuse zero on either key, on the stated word.
+#[test]
+fn a_zero_blob_bound_is_refused_on_the_word() {
+    for key in ["max_blob_bytes", "blob_budget_bytes"] {
+        let diagnostic = refusal(&format!("messaging {{ {key} = 0; }}"));
+        assert_eq!(
+            diagnostic.message,
+            format!("`{key}` must be at least 1"),
+            "{}",
+            diagnostic.render()
+        );
+        assert_eq!(diagnostic.span.text_str(), Some("0"));
+    }
+}
+
+/// A refused per-blob cap is not checked against the budget: the default it
+/// falls back to is not what the operator wrote, so the refusal on the word is
+/// the only one.
+#[test]
+fn a_refused_blob_cap_is_not_also_checked_against_the_budget() {
+    for stated in ["0", "-1", r#""64M""#] {
+        let diagnostic = refusal(&format!(
+            "messaging {{ max_blob_bytes = {stated}; blob_budget_bytes = 1024; }}"
+        ));
+        assert!(
+            diagnostic.message.starts_with("`max_blob_bytes`")
+                && !diagnostic.message.contains("above `blob_budget_bytes`"),
+            "{}",
+            diagnostic.render()
+        );
+        assert_eq!(diagnostic.span.text_str(), Some(stated));
+    }
+}
+
+/// A per-blob cap above the budget admits a blob the store could never hold:
+/// refused whether the budget is stated or the default, on the cap's word when
+/// it is stated and on the block when it is the default.
+#[test]
+fn a_blob_cap_above_the_budget_is_refused() {
+    let stated = refusal("messaging { max_blob_bytes = 2048; blob_budget_bytes = 1024; }");
+    assert!(
+        stated
+            .message
+            .starts_with("`max_blob_bytes` is 2048, above `blob_budget_bytes` 1024"),
+        "{}",
+        stated.render()
+    );
+    assert_eq!(stated.span.text_str(), Some("2048"));
+
+    let over_default = refusal("messaging { max_blob_bytes = 2147483648; }");
+    assert!(
+        over_default
+            .message
+            .starts_with("`max_blob_bytes` is 2147483648, above `blob_budget_bytes` 1073741824"),
+        "{}",
+        over_default.render()
+    );
+    assert_eq!(over_default.span.text_str(), Some("2147483648"));
+
+    let under_lowered_budget = refusal("messaging { blob_budget_bytes = 1024; }");
+    assert!(
+        under_lowered_budget
+            .message
+            .starts_with("`max_blob_bytes` is 67108864, above `blob_budget_bytes` 1024"),
+        "{}",
+        under_lowered_budget.render()
+    );
+    assert_eq!(under_lowered_budget.span.text_str(), Some("messaging"));
+}
+
+/// A per-blob cap equal to the budget is the largest the store admits.
+#[test]
+fn a_blob_cap_equal_to_the_budget_is_accepted() {
+    let config = config_from_dsl("messaging { max_blob_bytes = 1024; blob_budget_bytes = 1024; }");
+    assert_eq!(config.messaging.max_blob_bytes, 1024);
+    assert_eq!(config.messaging.blob_budget_bytes, 1024);
+}
+
+/// Unstated, the three blob keys take their defaults, and the directory sits
+/// beside the database; stated, the directory is taken as given.
+#[test]
+fn the_blob_keys_default_and_the_directory_sits_beside_the_database() {
+    let config = config_from_dsl("messaging { default_send_budget = 100; }");
+    assert_eq!(config.messaging.max_blob_bytes, 64 * 1024 * 1024);
+    assert_eq!(config.messaging.blob_budget_bytes, 1024 * 1024 * 1024);
+    assert_eq!(config.messaging.blob_dir, None);
+    assert_eq!(
+        config
+            .messaging
+            .blob_dir_beside(std::path::Path::new("/var/lib/brenn/brenn.db")),
+        PathBuf::from("/var/lib/brenn/brenn.db.blobs")
+    );
+
+    let stated = config_from_dsl(r#"messaging { blob_dir = "/srv/blobs"; }"#);
+    assert_eq!(
+        stated
+            .messaging
+            .blob_dir_beside(std::path::Path::new("/var/lib/brenn/brenn.db")),
+        PathBuf::from("/srv/blobs")
+    );
 }
 
 /// A log level goes through the config module's own level parser, so lowering
@@ -3823,6 +3938,7 @@ new router: Router {
                         noise: Some(NoiseLevel::Metered),
                         wake_min: Some(WakeMin::Low),
                         amplification: Some(0.5),
+                        non_text: false,
                     },
                     WasmConsumerSubscriptionRaw {
                         port: "feed".to_string(),
@@ -3832,6 +3948,7 @@ new router: Router {
                         noise: None,
                         wake_min: None,
                         amplification: None,
+                        non_text: false,
                     },
                     WasmConsumerSubscriptionRaw {
                         port: "status".to_string(),
@@ -3841,6 +3958,7 @@ new router: Router {
                         noise: None,
                         wake_min: None,
                         amplification: None,
+                        non_text: false,
                     },
                     WasmConsumerSubscriptionRaw {
                         port: "hook".to_string(),
@@ -3850,6 +3968,7 @@ new router: Router {
                         noise: None,
                         wake_min: None,
                         amplification: None,
+                        non_text: false,
                     },
                 ],
                 outputs: vec![
@@ -3859,6 +3978,7 @@ new router: Router {
                         urgency: Some(Urgency::Low),
                         publish_per_activation: None,
                         publish_capacity: None,
+                        non_text: false,
                     },
                     WasmConsumerOutputRaw {
                         port: "outbound".to_string(),
@@ -3866,6 +3986,7 @@ new router: Router {
                         urgency: Some(Urgency::High),
                         publish_per_activation: Some(2.0),
                         publish_capacity: Some(3.5),
+                        non_text: false,
                     },
                 ],
                 io_ports: vec![
@@ -3879,6 +4000,7 @@ new router: Router {
                         urgency: None,
                         publish_per_activation: None,
                         publish_capacity: None,
+                        non_text: false,
                     },
                     WasmConsumerIoPortRaw {
                         port: "tick".to_string(),
@@ -3890,6 +4012,7 @@ new router: Router {
                         urgency: Some(Urgency::Low),
                         publish_per_activation: Some(1.0),
                         publish_capacity: Some(1.0),
+                        non_text: false,
                     },
                 ],
                 subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
@@ -4141,6 +4264,7 @@ new reserved: Reserved {
                     urgency: None,
                     publish_per_activation: None,
                     publish_capacity: None,
+                    non_text: false,
                 }],
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.utterance".to_string(),
@@ -4367,6 +4491,7 @@ new fan: Fan {
                     urgency: None,
                     publish_per_activation: None,
                     publish_capacity: None,
+                    non_text: false,
                 }],
                 subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
                 publish_acl: vec![ChannelMatcherRaw::Exact("alice-digests".to_string())],
@@ -4438,6 +4563,7 @@ new sink: Sink {
                     urgency: Some(Urgency::Low),
                     publish_per_activation: Some(1.0),
                     publish_capacity: Some(1.0),
+                    non_text: false,
                 }],
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.acks".to_string(),
@@ -4491,6 +4617,7 @@ new sink: Sink {
                     urgency: None,
                     publish_per_activation: None,
                     publish_capacity: None,
+                    non_text: false,
                 }],
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.acks".to_string(),
@@ -5388,7 +5515,7 @@ surface alice_pod {
     assert_eq!(
         refusal.message,
         "`amplification` is not a key of the `heard` port of instance `widget` of surface \
-         `alice_pod`; expected `push_depth`, `retain_depth`, `noise` or `wake_min`"
+         `alice_pod`; expected `push_depth`, `retain_depth`, `noise`, `wake_min` or `non_text`"
     );
     assert_eq!(
         refusal.line_col(),
@@ -5433,7 +5560,7 @@ surface alice_pod {
         refusal.message,
         "`amplification` is not a key of the `tick` port of instance `widget` of surface \
          `alice_pod`; expected `push_depth`, `retain_depth`, `noise`, `urgency`, \
-         `publish_per_activation` or `publish_capacity`"
+         `publish_per_activation`, `publish_capacity` or `non_text`"
     );
     assert_eq!(
         refusal.line_col(),
@@ -6618,6 +6745,7 @@ fn a_providing_class_lowers_its_tools_onto_the_consumer() {
                 input_schema: serde_json::json!({ "type": "object" }),
                 max_concurrency: 4,
                 auto_approve: false,
+                accepts_attachments: false,
             },
             ProvidedToolDecl {
                 name: "mail-read".to_string(),
@@ -6626,6 +6754,7 @@ fn a_providing_class_lowers_its_tools_onto_the_consumer() {
                 input_schema: serde_json::json!({ "type": "object" }),
                 max_concurrency: 1,
                 auto_approve: true,
+                accepts_attachments: false,
             },
         ]
     );
@@ -6721,6 +6850,7 @@ fn the_tool_result_inbox_port_never_reaches_the_lowered_consumer() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }]
     );
     assert_eq!(
@@ -6731,6 +6861,7 @@ fn the_tool_result_inbox_port_never_reaches_the_lowered_consumer() {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }]
     );
     assert_eq!(consumer.io_ports, vec![]);
@@ -6805,6 +6936,7 @@ fn a_link_lowers_to_its_endpoint_set() {
                     io_port: false,
                     push_depth: None,
                     retain_depth: None,
+                    non_text: false,
                 },
                 LinkEndpointRaw {
                     host: LinkHostRaw::Surface {
@@ -6817,6 +6949,7 @@ fn a_link_lowers_to_its_endpoint_set() {
                     io_port: false,
                     push_depth: Some(Depth::Bounded(8)),
                     retain_depth: Some(Depth::Bounded(16)),
+                    non_text: false,
                 },
                 LinkEndpointRaw {
                     host: LinkHostRaw::Surface {
@@ -6829,6 +6962,7 @@ fn a_link_lowers_to_its_endpoint_set() {
                     io_port: true,
                     push_depth: Some(Depth::Bounded(2)),
                     retain_depth: Some(Depth::Bounded(4)),
+                    non_text: false,
                 },
             ],
         }],

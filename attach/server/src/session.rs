@@ -14,13 +14,13 @@ mod tests;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Display;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::extract::ws::Message;
 use brenn_attach_proto::{
-    AlertSeverity as ProtoAlertSeverity, ClientFrame, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES,
-    ServerFrame,
+    AlertSeverity as ProtoAlertSeverity, ClientFrame, Codec, MAX_ALERT_BODY_BYTES,
+    MAX_ALERT_TITLE_BYTES, SUPPORTED_VERSIONS, ServerFrame, VersionRange, WireMessage,
 };
 use brenn_common::sanitize_untrusted_str;
 use brenn_lib::access::AppPolicy;
@@ -34,6 +34,11 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{Instrument, info, info_span, warn};
 use uuid::Uuid;
 
+use super::blobs::{
+    BlobCounters, BlobDoor, BlobOpenRequest, BlobReadRequest, BlobTable, ReadGuard,
+    handle_blob_close, handle_blob_create, handle_blob_open, handle_blob_read, handle_blob_seal,
+    handle_blob_write,
+};
 use super::profile::AttachProfile;
 use super::publish::{
     PublishBatchRequest, PublishRequest, admit_attribution_or_violate, handle_publish,
@@ -52,6 +57,33 @@ use super::subscription::{
 /// Outbound frame queue depth. A slow reader fills this, then the delivery path
 /// blocks (backpressure at the socket) rather than dropping control frames.
 pub const OUTBOUND_QUEUE_FRAMES: usize = 256;
+
+/// One item of the writer queue: a frame, and for a read answer carrying
+/// bytes the guard that counts it in flight until the writer has written it.
+pub struct Outbound {
+    pub frame: ServerFrame,
+    #[expect(
+        dead_code,
+        reason = "held for its drop, which ends the read's count once the frame is written"
+    )]
+    read_guard: Option<ReadGuard>,
+}
+
+impl Outbound {
+    /// The frame, dropping any guard with the item.
+    pub fn into_frame(self) -> ServerFrame {
+        self.frame
+    }
+}
+
+impl From<ServerFrame> for Outbound {
+    fn from(frame: ServerFrame) -> Self {
+        Outbound {
+            frame,
+            read_guard: None,
+        }
+    }
+}
 
 /// Immutable per-connection context every frame handler reads but none mutates.
 /// Built once when the session starts and passed as `&AttachSessionCtx`, so
@@ -93,10 +125,66 @@ pub struct AttachSessionCtx {
     pub ip: IpAddr,
     /// Outbound frame sender to the writer task. Owning it here means dropping
     /// the context at teardown closes the channel and exits the writer.
-    pub tx: mpsc::Sender<ServerFrame>,
+    pub tx: mpsc::Sender<Outbound>,
+    /// The transport version the two `Hello` frames agreed on. Set once, by the
+    /// opening sequence, before any frame handler runs; read through
+    /// [`AttachSessionCtx::version`]. Shared with the writer task, which encodes
+    /// with it.
+    pub(crate) negotiated_version: Arc<OnceLock<u32>>,
+    /// This attachment's blob door, or `None` when it has none. Set once by
+    /// the opening sequence, beside the version it depends on; `Welcome`
+    /// advertises it and every blob frame and publish asks it, so the two
+    /// cannot disagree.
+    pub(crate) blob_door: OnceLock<Option<BlobDoor>>,
 }
 
 impl AttachSessionCtx {
+    /// The transport version this attachment speaks.
+    ///
+    /// # Panics
+    ///
+    /// Before the opening sequence agreed one. Every frame handler runs after
+    /// `Welcome`, so a handler reaching this unset is a host bug.
+    pub fn version(&self) -> u32 {
+        *self
+            .negotiated_version
+            .get()
+            .expect("a frame handler runs only after the opening sequence agreed a version")
+    }
+
+    /// The codec of the negotiated version.
+    ///
+    /// # Panics
+    ///
+    /// As [`AttachSessionCtx::version`].
+    pub fn codec(&self) -> Codec {
+        Codec::negotiated(self.version())
+    }
+
+    /// This attachment's blob door, if it has one.
+    ///
+    /// # Panics
+    ///
+    /// Before the opening sequence set it, as [`AttachSessionCtx::version`].
+    pub fn blob_door(&self) -> Option<&BlobDoor> {
+        self.blob_door
+            .get()
+            .expect("a frame handler runs only after the opening sequence set the blob door")
+            .as_ref()
+    }
+
+    /// Set the blob door for the agreed `version`.
+    ///
+    /// # Panics
+    ///
+    /// If it was already set: the opening sequence runs once.
+    pub(crate) fn open_blob_door(&self, version: u32) {
+        let door = BlobDoor::for_session(version, self.profile.as_ref(), &self.messenger);
+        if self.blob_door.set(door).is_err() {
+            panic!("the blob door is set once per attachment");
+        }
+    }
+
     /// A protocol violation on this attachment, named by attacher and account.
     ///
     /// One spelling for every plane, so the security log line that feeds
@@ -138,8 +226,11 @@ pub enum FrameOutcome {
 /// not counted here.
 #[derive(Default)]
 pub struct SessionCounters {
-    /// Inbound text (application) frames dispatched. Binary-frame and
-    /// cap-overflow violations tear down before this counts them.
+    /// Inbound websocket messages read, text or binary, counted before the
+    /// session version's frame cap or its decoder is applied: a message refused
+    /// as over that cap or as undecodable is counted, then tears the session
+    /// down. A message over the websocket read cap arrives as a read error and
+    /// is not counted.
     pub frames_in: u64,
     /// Server frames the session task enqueued to the writer.
     pub frames_out: u64,
@@ -157,6 +248,16 @@ pub struct SessionCounters {
     /// them out of the transport-reject count so escalation is not conflated
     /// with an internal disagreement.
     pub publish_body_cap_disagreement: u64,
+    /// `Publish` and `PublishBatch` frames answered `TextOnlyChannel`: a
+    /// non-text body offered to a channel not declared `non_text`. One per
+    /// refused frame, whatever the batch held. Drives the first-occurrence warn.
+    pub publish_text_only_refused: u64,
+    /// Deferred-view entries left out of a frame because this session's version
+    /// cannot carry their bodies — a sibling session's non-text parked entries.
+    pub deferred_view_entries_omitted: u64,
+    /// The `(channel, attribution)` views this session has already logged an
+    /// omission for, so each is logged once per session.
+    pub(crate) deferred_view_omission_logged: HashSet<(String, Option<String>)>,
     /// `Alert` frames dispatched to the process alert dispatcher (granted, and
     /// within the per-connection alert bucket) — the operator's count of how
     /// many times this attachment paged.
@@ -174,6 +275,8 @@ pub struct SessionCounters {
     /// the attacher's own publishes name no attribution and have no column here.
     /// The totals are the session's; this is the attributable part of them.
     pub by_attribution: BTreeMap<String, AttributionPublishCounters>,
+    /// The blob plane's counts.
+    pub blobs: BlobCounters,
 }
 
 /// One sub-identity's publish outcomes within a session ([`SessionCounters`]).
@@ -239,11 +342,34 @@ pub fn sanitize_client_detail(s: &str) -> String {
 /// Send one `ServerFrame` to the writer, counting it and mapping a closed
 /// channel (writer gone) to `Disconnect`.
 pub async fn send_frame(
-    tx: &mpsc::Sender<ServerFrame>,
+    tx: &mpsc::Sender<Outbound>,
     frame: ServerFrame,
     counters: &mut SessionCounters,
 ) -> FrameOutcome {
-    match tx.send(frame).await {
+    send_outbound(tx, Outbound::from(frame), counters).await
+}
+
+/// [`send_frame`] for a read answer carrying bytes, with the guard that
+/// counts it in flight until the writer has written it.
+pub(crate) async fn send_read_answer(
+    tx: &mpsc::Sender<Outbound>,
+    frame: ServerFrame,
+    read_guard: ReadGuard,
+    counters: &mut SessionCounters,
+) -> FrameOutcome {
+    let outbound = Outbound {
+        frame,
+        read_guard: Some(read_guard),
+    };
+    send_outbound(tx, outbound, counters).await
+}
+
+async fn send_outbound(
+    tx: &mpsc::Sender<Outbound>,
+    outbound: Outbound,
+    counters: &mut SessionCounters,
+) -> FrameOutcome {
+    match tx.send(outbound).await {
         Ok(()) => {
             counters.frames_out += 1;
             FrameOutcome::Continue
@@ -305,6 +431,9 @@ pub struct SessionState {
     pub cursors: WireCursors,
     pub buckets: SessionBuckets,
     pub counters: SessionCounters,
+    /// The session's blob handles. Dropped with the session: nothing it holds
+    /// outlives the attachment.
+    pub blobs: BlobTable,
 }
 
 impl SessionState {
@@ -321,6 +450,7 @@ impl SessionState {
             cursors: WireCursors::new(store_incarnation),
             buckets: SessionBuckets::new(profile),
             counters: SessionCounters::default(),
+            blobs: BlobTable::default(),
         }
     }
 }
@@ -342,6 +472,10 @@ pub struct AttachSessionParams<S> {
     pub account: String,
     pub ip: IpAddr,
     pub max_body_bytes: usize,
+    /// The transport versions this route serves, within
+    /// [`SUPPORTED_VERSIONS`]; the `Hello` states it and negotiation picks from
+    /// it.
+    pub versions: VersionRange,
     /// The cadence the writer probes on and the attacher's inbound-silence rule
     /// is measured in, advertised in `Welcome`.
     pub heartbeat_secs: u32,
@@ -424,6 +558,7 @@ where
         account,
         ip,
         max_body_bytes,
+        versions,
         heartbeat_secs,
         store_incarnation,
         ident,
@@ -434,17 +569,31 @@ where
         mut close_rx,
         socket,
     } = params;
+    assert!(
+        SUPPORTED_VERSIONS.contains_range(versions),
+        "attach session: served range {}..={} is empty or outside this build's",
+        versions.min,
+        versions.max
+    );
     let heartbeat = Duration::from_secs(u64::from(heartbeat_secs));
+    let negotiated_version = Arc::new(OnceLock::new());
 
     let (sink, mut ws_stream) = socket.split();
-    let (tx, rx) = mpsc::channel::<ServerFrame>(OUTBOUND_QUEUE_FRAMES);
+    let (tx, rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE_FRAMES);
     // The writer owns the sink, so a close frame is the writer's to send: this
     // task decides the reason and hands it over.
     let (writer_close_tx, writer_close_rx) = oneshot::channel::<CloseReason>();
     // Instrument the writer with the session span so its logs carry the same
     // attacher/session/account/ip attribution as this task's.
     let writer = tokio::spawn(
-        writer_task(sink, rx, writer_close_rx, heartbeat).instrument(tracing::Span::current()),
+        writer_task(
+            sink,
+            rx,
+            writer_close_rx,
+            heartbeat,
+            Arc::clone(&negotiated_version),
+        )
+        .instrument(tracing::Span::current()),
     );
 
     // The shared per-connection context. It owns `tx`, so dropping it at teardown
@@ -460,13 +609,19 @@ where
         account,
         ip,
         tx,
+        negotiated_version,
+        blob_door: OnceLock::new(),
     };
 
+    // Declared after `guard` and `ctx` so an unwinding panic drops the blob table
+    // inside `state` before the guard releases the registry slot, the same order
+    // as the teardown below.
     let mut state = SessionState::new(ctx.profile.as_ref(), active_channels, store_incarnation);
 
     let violation_detail = match open_attachment(
         &ctx,
         &mut ws_stream,
+        versions,
         heartbeat_secs,
         &ident,
         &mut state.counters,
@@ -515,16 +670,34 @@ where
         );
     }
 
+    // Single teardown path. The blob table goes first: every upload is deleted
+    // and every hold given up, off the task because a dropped writer unlinks
+    // its file, as can a dropped hold. It must precede the unregister, because
+    // releasing the registry slot is what lets the attacher attach again, and
+    // the writer's drain after it can be held open by a peer that reads slowly;
+    // so a session that no longer counts against `max_sessions` holds no blob.
+    // The order holds for a session that runs to completion or unwinds; nothing
+    // drops a running session's future short of runtime shutdown, and a caller
+    // that starts doing so must make the table's drop precede the slot's
+    // release there too.
+    std::mem::take(&mut state.blobs).drop_off_task().await;
+
     // Remove this attachment's registration and read the post-removal count in
     // one step, before the context drops, so the route's terminal action has an
     // uncontested answer to "was that the last one".
+    //
+    // TODO(attach-ended-session-drain-unbounded): from here the session is
+    // counted by nothing while its writer drains, and the drain has no overall
+    // deadline.
     let remaining = guard.unregister_returning_remaining();
+    // Unset when the opening sequence never finished.
+    let had_blob_door = ctx.blob_door.get().is_some_and(Option::is_some);
 
-    // Single teardown path: drop the context (its `tx` is the writer sender, so
-    // the writer exits and the socket closes), await the writer, drop the guard
-    // (slot released even on panic). The active set needs no explicit teardown:
-    // the fan-out reaches this attachment only through its registry handle, and
-    // unregistering above is what removes it.
+    // Drop the context (its `tx` is the writer sender, so the writer exits and
+    // the socket closes), await the writer, drop the guard (slot released even
+    // on panic). The active set needs no explicit teardown: the fan-out reaches
+    // this attachment only through its registry handle, and unregistering above
+    // is what removes it.
     drop(ctx);
     writer.await.expect("attach writer task panicked");
     drop(guard);
@@ -538,6 +711,8 @@ where
         publish_rate_limited = state.counters.publish_rate_limited,
         publish_body_too_large = state.counters.publish_body_too_large,
         publish_body_cap_disagreement = state.counters.publish_body_cap_disagreement,
+        publish_text_only_refused = state.counters.publish_text_only_refused,
+        deferred_view_entries_omitted = state.counters.deferred_view_entries_omitted,
         alerts_dispatched = state.counters.alerts_dispatched,
         alerts_suppressed = state.counters.alerts_suppressed,
         // Rendered via `Debug` on a `BTreeMap`, so the breakdown is one
@@ -545,6 +720,8 @@ where
         // extra lines per detach. Keys are declared attributions, not client
         // strings.
         by_attribution = ?state.counters.by_attribution,
+        // `None` for an attachment without a blob door, which counts nothing.
+        blobs = ?had_blob_door.then_some(&state.counters.blobs),
         "attachment detached"
     );
     AttachSessionOutcome {
@@ -564,6 +741,7 @@ where
 async fn open_attachment<St>(
     ctx: &AttachSessionCtx,
     ws_stream: &mut St,
+    versions: VersionRange,
     heartbeat_secs: u32,
     ident: &str,
     counters: &mut SessionCounters,
@@ -571,11 +749,13 @@ async fn open_attachment<St>(
 where
     St: Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
-    if let FrameOutcome::Disconnect = send_frame(&ctx.tx, server_hello(ident), counters).await {
+    if let FrameOutcome::Disconnect =
+        send_frame(&ctx.tx, server_hello(versions, ident), counters).await
+    {
         return Opening::Closed(None);
     }
 
-    let version = match read_client_hello(ws_stream, HELLO_TIMEOUT).await {
+    let version = match read_client_hello(ws_stream, HELLO_TIMEOUT, versions).await {
         Handshake::Agreed(version) => version,
         Handshake::Incompatible(peer) => {
             // Both ranges have already crossed, so each end closes on its own
@@ -590,6 +770,10 @@ where
         Handshake::Violation(rule) => return Opening::Closed(Some(ctx.violation_detail(rule))),
         Handshake::Disconnect => return Opening::Closed(None),
     };
+    ctx.negotiated_version
+        .set(version)
+        .expect("the opening sequence runs once per attachment");
+    ctx.open_blob_door(version);
 
     match send_frame(&ctx.tx, welcome(ctx, version, heartbeat_secs), counters).await {
         FrameOutcome::Continue => {}
@@ -701,41 +885,28 @@ where
                 }
             }
             incoming = ws_stream.next() => {
-                match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        state.counters.frames_in += 1;
-                        match handle_client_frame(ctx, text.as_str(), state).await {
-                            FrameOutcome::Continue => last_inbound = Instant::now(),
-                            FrameOutcome::Violation(detail) => return ReadExit::Violation(detail),
-                            // Writer gone (socket died mid-send): tear down.
-                            FrameOutcome::Disconnect => return ReadExit::Peer,
+                let msg = match incoming {
+                    // Text is copied out: a `String` cannot take the buffer
+                    // without checking its UTF-8 again.
+                    Some(Ok(Message::Text(text))) => WireMessage::Text(text.as_str().to_string()),
+                    // Whether a binary message is a frame is the negotiated
+                    // version's to say, as for a text one. The payload's
+                    // buffer is taken over, not copied, when nothing else
+                    // holds it.
+                    Some(Ok(Message::Binary(bytes))) => WireMessage::Binary(Vec::from(bytes)),
+                    other => {
+                        if let Some(exit) = read_non_frame(ctx, other, &mut last_inbound) {
+                            return exit;
                         }
+                        continue;
                     }
-                    // The protocol is JSON text in both directions, so a binary
-                    // frame is not a frame this attachment could have meant.
-                    Some(Ok(Message::Binary(_))) => {
-                        return ReadExit::Violation(ctx.violation_detail("binary frame"));
-                    }
-                    // Inbound pings are auto-ponged by axum; an inbound pong is
-                    // the peer answering our liveness probe.
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
-                        last_inbound = Instant::now();
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        info!("attachment closed by peer");
-                        return ReadExit::Peer;
-                    }
-                    Some(Err(e)) => {
-                        return match classify_read_error(e) {
-                            InboundError::Oversized => ReadExit::Violation(
-                                ctx.violation_detail("inbound frame exceeds size cap"),
-                            ),
-                            InboundError::Transport(detail) => {
-                                warn!("attachment WS read error: {detail}");
-                                ReadExit::Peer
-                            }
-                        };
-                    }
+                };
+                state.counters.frames_in += 1;
+                match handle_client_message(ctx, msg, state).await {
+                    FrameOutcome::Continue => last_inbound = Instant::now(),
+                    FrameOutcome::Violation(detail) => return ReadExit::Violation(detail),
+                    // Writer gone (socket died mid-send): tear down.
+                    FrameOutcome::Disconnect => return ReadExit::Peer,
                 }
             }
             // Host-initiated close. Must leave through the ordinary detach
@@ -756,22 +927,73 @@ where
     }
 }
 
-/// Parse and dispatch one inbound frame.
-///
-/// Unparseable input — malformed JSON, an unknown `type`, a field the negotiated
-/// schema does not have — is a violation: both ends agreed which schema is in
-/// force, so unparseable traffic is a bug or tampering, never skew. Each plane
-/// owns what its own frames cost; the two this function decides are the second
-/// `Hello` (there is no re-negotiation) and the `Subscribe`/`Unsubscribe` token,
-/// charged here so both frames draw one bucket.
-async fn handle_client_frame(
+/// Answer one socket read that is not a text or binary message: `None` to keep
+/// reading, or why the read loop ends.
+fn read_non_frame(
     ctx: &AttachSessionCtx,
-    text: &str,
+    incoming: Option<Result<Message, axum::Error>>,
+    last_inbound: &mut Instant,
+) -> Option<ReadExit> {
+    match incoming {
+        Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+            unreachable!("text and binary messages are frames, read by the caller")
+        }
+        // Inbound pings are auto-ponged by axum; an inbound pong is the peer
+        // answering our liveness probe.
+        Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+            *last_inbound = Instant::now();
+            None
+        }
+        Some(Ok(Message::Close(_))) | None => {
+            info!("attachment closed by peer");
+            Some(ReadExit::Peer)
+        }
+        Some(Err(e)) => Some(match classify_read_error(e) {
+            InboundError::Oversized => {
+                ReadExit::Violation(ctx.violation_detail("inbound frame exceeds size cap"))
+            }
+            InboundError::Transport(detail) => {
+                warn!("attachment WS read error: {detail}");
+                ReadExit::Peer
+            }
+        }),
+    }
+}
+
+/// Hold one inbound message to the negotiated version's frame cap, decode it
+/// with that version's codec, and dispatch the frame.
+///
+/// The route's websocket read cap is the largest of every version it serves,
+/// so a message under it may still be over this session's own; that is the
+/// same violation as one the transport refused. A message the codec cannot
+/// decode is a violation named by the codec's rule: both ends agreed which
+/// schema is in force, so undecodable traffic is a bug or tampering, never
+/// skew, and nothing is decoded a second way.
+async fn handle_client_message(
+    ctx: &AttachSessionCtx,
+    msg: WireMessage,
     state: &mut SessionState,
 ) -> FrameOutcome {
-    let Ok(frame) = serde_json::from_str::<ClientFrame>(text) else {
-        return ctx.violation("unparseable client frame");
-    };
+    let codec = ctx.codec();
+    if msg.len() > codec.max_client_frame_bytes(ctx.max_body_bytes) {
+        return ctx.violation("inbound frame exceeds size cap");
+    }
+    match codec.decode_client(msg) {
+        Ok(frame) => handle_client_frame(ctx, frame, state).await,
+        Err(err) => ctx.violation(err.rule()),
+    }
+}
+
+/// Dispatch one inbound frame.
+///
+/// Each plane owns what its own frames cost; the two this function decides are
+/// the second `Hello` (there is no re-negotiation) and the
+/// `Subscribe`/`Unsubscribe` token, charged here so both frames draw one bucket.
+async fn handle_client_frame(
+    ctx: &AttachSessionCtx,
+    frame: ClientFrame,
+    state: &mut SessionState,
+) -> FrameOutcome {
     match frame {
         // The handshake happens once, before any other frame; a version in force
         // is in force for the connection's life.
@@ -811,6 +1033,7 @@ async fn handle_client_frame(
             body,
             urgency,
             correlation,
+            attachments,
         } => {
             handle_publish(
                 ctx,
@@ -821,6 +1044,8 @@ async fn handle_client_frame(
                     body: &body,
                     urgency,
                     correlation,
+                    attachments: &attachments,
+                    blobs: &state.blobs,
                 },
                 &mut state.counters,
             )
@@ -839,6 +1064,7 @@ async fn handle_client_frame(
                     correlation,
                     publishes: &publishes,
                     deferred_ops: &deferred_ops,
+                    blobs: &state.blobs,
                 },
                 &mut state.counters,
             )
@@ -858,6 +1084,80 @@ async fn handle_client_frame(
             &title,
             &body,
         ),
+        ClientFrame::BlobCreate {
+            handle,
+            content_type,
+            size,
+        } => {
+            handle_blob_create(
+                ctx,
+                &mut state.blobs,
+                handle,
+                &content_type,
+                size,
+                &mut state.counters,
+            )
+            .await
+        }
+        ClientFrame::BlobWrite {
+            handle,
+            offset,
+            bytes,
+        } => {
+            handle_blob_write(
+                ctx,
+                &mut state.blobs,
+                handle,
+                offset,
+                bytes,
+                &mut state.counters,
+            )
+            .await
+        }
+        ClientFrame::BlobSeal { handle } => {
+            handle_blob_seal(ctx, &mut state.blobs, handle, &mut state.counters).await
+        }
+        ClientFrame::BlobOpen {
+            handle,
+            channel,
+            message_id,
+            name,
+        } => {
+            handle_blob_open(
+                ctx,
+                &mut state.blobs,
+                BlobOpenRequest {
+                    handle,
+                    channel: &channel,
+                    message_id,
+                    name: &name,
+                },
+                &mut state.counters,
+            )
+            .await
+        }
+        ClientFrame::BlobRead {
+            correlation,
+            handle,
+            offset,
+            len,
+        } => {
+            handle_blob_read(
+                ctx,
+                &mut state.blobs,
+                BlobReadRequest {
+                    correlation,
+                    handle,
+                    offset,
+                    len,
+                },
+                &mut state.counters,
+            )
+            .await
+        }
+        ClientFrame::BlobClose { handle } => {
+            handle_blob_close(ctx, &mut state.blobs, handle, &mut state.counters).await
+        }
     }
 }
 

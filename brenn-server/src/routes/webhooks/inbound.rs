@@ -10,10 +10,11 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Extension, OriginalUri, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use brenn_lib::messaging::WEBHOOK_ADDRESS_PREFIX;
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 use brenn_wasm::{CheckInput, Header, ReplayError};
-use brenn_webhook::signature::{VerifiedRequest, WebhookRejection, verify_request};
+use brenn_webhook::signature::{IngressShape, VerifiedRequest, WebhookRejection, verify_request};
 use futures::StreamExt;
 
 use crate::client_ip::ClientIp;
@@ -87,6 +88,11 @@ pub async fn receive(
     }
     let body = Bytes::from(buffered);
 
+    // Read once the body is whole, so the time between this read and the
+    // router's lookup of the same channel does not include an upload whose
+    // length the sender controls.
+    let shape = ingress_shape(&state, &endpoint_slug);
+
     // Shared by verify_request (skew check) and the replay component (replay
     // skew check and nonce ordering key): the two timestamps must be the same
     // instant.
@@ -120,7 +126,7 @@ pub async fn receive(
     }
 
     let content_type = headers.get(axum::http::header::CONTENT_TYPE);
-    let result = verify_request(&endpoint, content_type, &headers, body, received_at);
+    let result = verify_request(&endpoint, shape, content_type, &headers, body, received_at);
 
     match result {
         Err(rejection) => {
@@ -188,6 +194,10 @@ pub async fn receive(
 
                 // `ReplayComponent::check` drives wasmtime + SQLite
                 // synchronously; must not block the async executor.
+                // TODO(webhook-replay-recorded-before-publish): an accepted check
+                // records the delivery before `deliver_inbound` runs below, so a 500
+                // from the delivery leaves it recorded and the sender's retry is
+                // refused as a replay duplicate.
                 let join = tokio::task::spawn_blocking(move || component.check(&check_input));
                 let (verdict, quota_hit) = join.await.unwrap_or_else(|je| {
                     // JoinError::is_panic() → re-propagate the panic so the
@@ -294,6 +304,25 @@ pub async fn receive(
                 }
             }
         }
+    }
+}
+
+/// The shape the endpoint's channel publishes in, read from the channel's
+/// directory entry. The endpoint and the entry need not be of one plan while a
+/// reload commits; the router checks the pair it publishes under. With no
+/// entry the request is verified wrapped and the router answers the retired
+/// channel.
+fn ingress_shape(state: &AppState, endpoint_slug: &str) -> IngressShape {
+    let address = format!("{WEBHOOK_ADDRESS_PREFIX}{endpoint_slug}");
+    let raw = state
+        .messenger
+        .as_ref()
+        .and_then(|messenger| messenger.directory().resolve(&address))
+        .is_some_and(|channel| channel.resolved_channel.non_text);
+    if raw {
+        IngressShape::Raw
+    } else {
+        IngressShape::Wrapped
     }
 }
 
@@ -464,6 +493,7 @@ mod tests {
     use brenn_webhook::service::{
         EndpointRuntime, ReplayGuard, WebhookEventRouter, WebhookService,
     };
+    use brenn_webhook::signature::VerifiedBody;
     use tower::ServiceExt;
 
     use super::*;
@@ -480,7 +510,7 @@ mod tests {
         key_id: String,
         headers: Vec<(String, String)>,
         client_ip: IpAddr,
-        raw_body: String,
+        body: VerifiedBody,
         urgency: Urgency,
     }
 
@@ -510,7 +540,7 @@ mod tests {
             headers: HeaderMap,
             client_ip: IpAddr,
             _received_at: std::time::SystemTime,
-            raw_body: String,
+            body: VerifiedBody,
         ) -> Result<(), String> {
             let endpoint_slug = endpoint.slug.as_str();
             let owner = &endpoint.owner;
@@ -529,7 +559,7 @@ mod tests {
                 key_id: key_id.to_owned(),
                 headers: headers_vec,
                 client_ip,
-                raw_body,
+                body,
                 urgency,
             });
             Ok(())
@@ -717,7 +747,10 @@ mod tests {
         assert_eq!(d.endpoint_slug, TEST_SLUG);
         assert_eq!(d.owning_app_slug, TEST_APP_SLUG);
         assert_eq!(d.key_id, TEST_KEY_ID);
-        assert_eq!(d.raw_body, std::str::from_utf8(body).unwrap());
+        assert_eq!(
+            d.body,
+            VerifiedBody::Wrapped(std::str::from_utf8(body).unwrap().to_string())
+        );
         assert_eq!(d.urgency, Urgency::Normal);
         // Headers and client_ip are now threaded through.
         assert!(
@@ -1063,7 +1096,7 @@ mod tests {
             _headers: HeaderMap,
             _client_ip: IpAddr,
             _received_at: std::time::SystemTime,
-            _raw_body: String,
+            _body: VerifiedBody,
         ) -> Result<(), String> {
             Err("injected delivery failure".to_string())
         }
@@ -1429,6 +1462,8 @@ mod tests {
                     noise: NoiseLevel::Silent,
                     sink: Sink::Drop,
                     wake_min: brenn_lib::messaging::WakeMin::Normal,
+                    non_text: false,
+                    untyped_content_type: None,
                 },
                 subscribers: vec![SubscriberEntry {
                     kind: SubscriberEntryKind::App(TEST_APP_SLUG.to_string()),
@@ -1564,7 +1599,7 @@ mod tests {
 
         // Assert the envelope body is valid WebhookEnvelope JSON with credential
         // header masked and endpoint_slug correct.
-        let wh: WebhookEnvelope = serde_json::from_str(&envelope.body)
+        let wh: WebhookEnvelope = serde_json::from_str(envelope.body.as_text().unwrap())
             .expect("envelope.body must be valid WebhookEnvelope JSON");
         assert_eq!(wh.endpoint_slug, TEST_SLUG);
 
@@ -1618,6 +1653,133 @@ mod tests {
             kid_entry.1, TEST_KEY_ID,
             "identifier header must not be masked"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Raw shape: the endpoint's channel is `non_text`
+    // -----------------------------------------------------------------------
+
+    /// Give `state` a messenger whose directory holds `webhook:<TEST_SLUG>` as a
+    /// `non_text` channel, so the handler verifies requests for the raw shape.
+    fn with_raw_channel(state: &mut crate::state::AppState) {
+        use brenn_lib::messaging::{
+            ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, NoiseLevel,
+            ResolvedChannel, WakeMin, webhook_channel_uuid_from_slug,
+        };
+        use brenn_messaging::config::{Depth, Sink};
+        let entry = ChannelEntry {
+            uuid: webhook_channel_uuid_from_slug(TEST_SLUG),
+            address: format!("{WEBHOOK_ADDRESS_PREFIX}{TEST_SLUG}"),
+            description: None,
+            resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
+                push_depth: Depth::Unbounded,
+                retain_depth: Depth::Unbounded,
+                standing_retain_depth: Depth::Unbounded,
+                noise: NoiseLevel::Silent,
+                sink: Sink::Drop,
+                wake_min: WakeMin::Normal,
+                non_text: true,
+                untyped_content_type: None,
+            },
+            subscribers: vec![],
+            transport_type: ChannelScheme::Webhook,
+            mount: Some(TEST_MOUNT.to_string()),
+        };
+        state.messenger = Some(brenn_messaging::Messenger::new(
+            crate::test_support::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![entry])),
+            Arc::from("webhook-test"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
+            MessagingGlobalConfig::default(),
+        ));
+    }
+
+    /// A router over the phonebuddy endpoint declaring `content_type`, whose
+    /// channel is raw.
+    fn raw_test_router(content_type: &str, capture: Arc<CapturingRouter>) -> Router {
+        let mut endpoint = phonebuddy_endpoint();
+        Arc::get_mut(&mut endpoint)
+            .expect("sole reference")
+            .content_type = content_type.to_string();
+        let svc = WebhookService::for_test(vec![endpoint]);
+        svc.set_router(capture as Arc<dyn WebhookEventRouter>);
+        let (alert_dispatcher, _handle) = AlertDispatcher::noop();
+        let mut state =
+            crate::state::AppState::for_test(crate::test_support::init_db_memory(), None);
+        state.alert_dispatcher = alert_dispatcher;
+        state.webhook = svc;
+        with_raw_channel(&mut state);
+        wire(state, false)
+    }
+
+    /// A raw endpoint with a non-text type: a signed body that is not UTF-8 is
+    /// accepted and handed over as the bytes received.
+    #[tokio::test]
+    async fn raw_non_text_endpoint_accepts_a_signed_non_utf8_body() {
+        let capture = CapturingRouter::new();
+        let router = raw_test_router("application/octet-stream", Arc::clone(&capture));
+        let body = vec![0xff, 0x00, 0xfe, 0xfd];
+        let sig = sign_v1hex(&body);
+        let resp = post_to_endpoint(
+            router,
+            body.clone(),
+            Some("application/octet-stream"),
+            Some(&sig),
+            Some(TEST_KEY_ID),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let deliveries = capture.drain();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].body, VerifiedBody::Raw(body.into()));
+    }
+
+    /// A bad signature over the same bytes is 401 on a raw endpoint.
+    #[tokio::test]
+    async fn raw_non_text_endpoint_refuses_a_bad_signature() {
+        let capture = CapturingRouter::new();
+        let router = raw_test_router("application/octet-stream", Arc::clone(&capture));
+        let body = vec![0xff, 0x00, 0xfe, 0xfd];
+        let bad_sig = format!("v1={}", brenn_lib::util::hmac_sha256_hex(b"bad", &body));
+        let resp = post_to_endpoint(
+            router,
+            body,
+            Some("application/octet-stream"),
+            Some(&bad_sig),
+            Some(TEST_KEY_ID),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(resp_bytes.as_ref(), br#"{"error":"auth"}"#);
+        assert!(capture.drain().is_empty());
+    }
+
+    /// A raw endpoint with a text type refuses a body that is not UTF-8 exactly
+    /// as a wrapped one does: 400, the schema body, the schema-violation event.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn raw_text_endpoint_refuses_a_non_utf8_body_with_400() {
+        let capture = CapturingRouter::new();
+        let router = raw_test_router("application/json", Arc::clone(&capture));
+        let body = vec![0xff, 0xfe, 0xfd];
+        let sig = sign_v1hex(&body);
+        let resp = post_to_endpoint(
+            router,
+            body,
+            Some("application/json"),
+            Some(&sig),
+            Some(TEST_KEY_ID),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(resp_bytes.as_ref(), br#"{"error":"schema"}"#);
+        assert!(logs_contain("event_type=schema_violation"));
+        assert!(capture.drain().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1781,7 +1943,55 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NO_CONTENT, "expected 204");
             let deliveries = capture.drain();
             assert_eq!(deliveries.len(), 1, "expected one delivery");
-            assert_eq!(deliveries[0].raw_body, std::str::from_utf8(&body).unwrap());
+            assert_eq!(
+                deliveries[0].body,
+                VerifiedBody::Wrapped(std::str::from_utf8(&body).unwrap().to_string())
+            );
+        }
+
+        /// On a raw endpoint the replay component is handed the body as
+        /// received: it is accepted once, delivered raw, and a replay of its
+        /// nonce refused.
+        #[tokio::test]
+        async fn replay_on_a_raw_endpoint_checks_the_received_bytes() {
+            let db = NamedTempFile::new().unwrap();
+            let component = Arc::new(ReplayComponent::load(
+                "phonebuddy",
+                &replay_artifact(),
+                db.path(),
+                brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
+                std::collections::HashMap::new(),
+            ));
+            component.open_store();
+            let capture = CapturingRouter::new();
+            let svc = replay_protected_service(phonebuddy_endpoint(), db.path(), component);
+            svc.set_router(Arc::clone(&capture) as Arc<dyn WebhookEventRouter>);
+            let (alert_dispatcher, _handle) = AlertDispatcher::noop();
+            let mut state =
+                crate::state::AppState::for_test(crate::test_support::init_db_memory(), None);
+            state.alert_dispatcher = alert_dispatcher;
+            state.webhook = svc;
+            with_raw_channel(&mut state);
+            let router = wire(state, false);
+
+            let t = now_ms();
+            let body = envelope("client1", &ms_to_sent_at(t), &nonce(1));
+            let first = post_envelope(router.clone(), body.clone(), None).await;
+            assert_eq!(first.status(), StatusCode::NO_CONTENT);
+            let deliveries = capture.drain();
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0].body, VerifiedBody::Raw(body.into()));
+
+            // The same nonce, later: the component read the nonce out of the
+            // first body's bytes.
+            let replayed = envelope("client1", &ms_to_sent_at(t + 1), &nonce(1));
+            let second = post_envelope(router, replayed, None).await;
+            assert_eq!(second.status(), StatusCode::CONFLICT);
+            let resp_bytes = axum::body::to_bytes(second.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(resp_bytes.as_ref(), br#"{"error":"replay-duplicate"}"#);
+            assert!(capture.drain().is_empty());
         }
 
         /// A request that finds its endpoint's replay store with no component
@@ -2817,7 +3027,10 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NO_CONTENT, "expected 204");
             let deliveries = capture.drain();
             assert_eq!(deliveries.len(), 1, "expected one delivery");
-            assert_eq!(deliveries[0].raw_body, "hello from cron");
+            assert_eq!(
+                deliveries[0].body,
+                VerifiedBody::Wrapped("hello from cron".to_string())
+            );
         }
 
         // ── Verbatim replay → 409 (acceptance 2a) ────────────────────────────

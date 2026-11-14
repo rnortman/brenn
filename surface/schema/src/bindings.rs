@@ -23,14 +23,15 @@ use serde::{Deserialize, Serialize};
 use brenn_envelope::is_local_channel;
 
 use crate::{
-    Binding, CallBinding, ComponentEntry, LocalChannel, LogLevel, OutputBinding,
-    reserved_local_channel, surface_bindable_address,
+    Binding, CallBinding, ComponentEntry, LocalChannel, LogLevel, OutputBinding, WireChannel,
+    is_reserved_local_namespace, reserved_local_channel, surface_bindable_address,
+    wire_bound_address,
 };
 
 /// The body-schema version stamped on every bindings document. Bumped whenever
 /// the document's shape changes; a reader that does not recognize the value
 /// refuses the document rather than guessing at its fields.
-pub const BINDINGS_DOCUMENT_VERSION: u32 = 5;
+pub const BINDINGS_DOCUMENT_VERSION: u32 = 7;
 
 /// Lowest admissible [`PlatformSection::status_interval_secs`]. The status
 /// channel is a heartbeat, not a meter: below this the kernel would write
@@ -76,6 +77,11 @@ pub struct BindingsDocument {
     /// *is* the declaration — so this table is the only place their per-channel
     /// parameters can be resolved. Deduped, in first-binding order.
     pub local_channels: Vec<LocalChannel>,
+    /// Every distinct transportable channel some binding above names, with the
+    /// directory's declaration of whether it may carry non-text bodies. The
+    /// page learns a transportable channel's declaration from nowhere else.
+    /// Deduped, in first-binding order (subscriptions, then outputs).
+    pub wire_channels: Vec<WireChannel>,
     /// The `instance` id of this surface's chrome component: the singleton the
     /// kernel treats specially (pre-chrome connect-indicator handoff and
     /// chrome-death-is-fatal). One field rather than a per-entry flag makes the
@@ -153,6 +159,17 @@ impl BindingsDocument {
         }
         doc.validate()?;
         Ok(doc)
+    }
+
+    /// Every channel a binding names that the wire table must declare
+    /// ([`wire_bound_address`]), in first-binding order — subscriptions, then
+    /// outputs — repeats included.
+    pub fn bound_wire_channels(&self) -> impl Iterator<Item = &str> {
+        self.subscriptions
+            .iter()
+            .map(|b| b.channel.as_str())
+            .chain(self.outputs.iter().map(|b| b.channel.as_str()))
+            .filter(|c| wire_bound_address(c))
     }
 
     /// Check the document's internal consistency.
@@ -334,6 +351,22 @@ impl BindingsDocument {
                 ));
             }
         }
+        // Only an unreserved page-local channel belongs in this table with
+        // `non_text`: a transportable channel's declaration is the directory's
+        // and is carried in `wire_channels`, and the kernel and chrome read
+        // every reserved plane as text, so a declaration there would admit a
+        // body some reader cannot represent.
+        for lc in &self.local_channels {
+            if lc.non_text
+                && (!is_local_channel(&lc.channel) || is_reserved_local_namespace(&lc.channel))
+            {
+                return Err(format!(
+                    "bindings document declares {} `non_text`, which only an unreserved \
+                     page-local channel may be",
+                    lc.channel
+                ));
+            }
+        }
         // Inputs and outputs are separate structs (an output carries a default
         // urgency an input has nothing to say about), and the channel rules read
         // only the address — so walk the channels, not the bindings.
@@ -363,6 +396,38 @@ impl BindingsDocument {
                      entry for it"
                 ));
             }
+        }
+        // The wire table states each transportable channel's declaration once,
+        // and states it for exactly the transportable channels the bindings
+        // name: an entry nothing binds, or a bound channel with no entry, means
+        // the table and the bindings were not written from one plan.
+        let mut wire_addresses = BTreeSet::new();
+        for wc in &self.wire_channels {
+            if !wire_addresses.insert(wc.channel.as_str()) {
+                return Err(format!(
+                    "bindings document declares wire channel {} twice",
+                    wc.channel
+                ));
+            }
+            if !wire_bound_address(&wc.channel) {
+                return Err(format!(
+                    "bindings document declares wire channel {}, which is not a transportable \
+                     surface-bindable address",
+                    wc.channel
+                ));
+            }
+        }
+        let bound_wire: BTreeSet<&str> = self.bound_wire_channels().collect();
+        if let Some(missing) = bound_wire.difference(&wire_addresses).next() {
+            return Err(format!(
+                "bindings document binds transportable channel {missing} but declares no wire \
+                 channel entry for it"
+            ));
+        }
+        if let Some(unbound) = wire_addresses.difference(&bound_wire).next() {
+            return Err(format!(
+                "bindings document declares wire channel {unbound}, which no binding names"
+            ));
         }
         // A reserved control plane's ring depth is contract-fixed, so a router
         // entry that restates it must restate it *exactly*. Never silently
@@ -579,6 +644,13 @@ mod tests {
         }
     }
 
+    fn wire(channel: &str, non_text: bool) -> WireChannel {
+        WireChannel {
+            channel: channel.to_string(),
+            non_text,
+        }
+    }
+
     /// A valid document: a bound component plus the chrome singleton, one
     /// durable input, one local output, and a fully declared platform section.
     fn doc() -> BindingsDocument {
@@ -592,7 +664,9 @@ mod tests {
                 ring_depth: reserved_local_channel(LOCAL_THEME_CHANNEL)
                     .expect("the theme plane is reserved")
                     .ring_depth,
+                non_text: false,
             }],
+            wire_channels: vec![wire("brenn:site.bar.in", false)],
             calls: vec![],
             chrome_instance: "chrome".to_string(),
             platform: PlatformSection {
@@ -757,6 +831,198 @@ mod tests {
         assert_ne!(before, after.to_body());
     }
 
+    /// [`doc`] with a page-local `notes` channel declared `non_text`, bound
+    /// by `p1`'s output.
+    fn doc_with_non_text_channel() -> BindingsDocument {
+        let mut doc = doc();
+        doc.outputs.push(OutputBinding {
+            port: "alt".to_string(),
+            ..output("p1", "local:bar/notes")
+        });
+        doc.local_channels.push(LocalChannel {
+            channel: "local:bar/notes".to_string(),
+            ring_depth: 1,
+            non_text: true,
+        });
+        doc
+    }
+
+    #[test]
+    fn a_non_text_channel_round_trips_through_its_body() {
+        let doc = doc_with_non_text_channel();
+        let body = doc.to_body();
+        assert!(body.contains(r#""non_text":true"#), "{body}");
+        assert_eq!(BindingsDocument::parse(&body).unwrap(), doc);
+    }
+
+    /// The flag has no default: a body without it was written by another build
+    /// and is refused at the parse, not read as text-only.
+    #[test]
+    fn a_local_channel_without_the_flag_fails_the_parse() {
+        let body = doc().to_body();
+        let stripped = body.replacen(r#","non_text":false"#, "", 1);
+        assert_ne!(stripped, body, "the fixture carries a flag to strip");
+        let err = BindingsDocument::parse(&stripped).expect_err("the flag is required");
+        assert!(err.contains("non_text"), "unexpected: {err}");
+    }
+
+    /// A version-6 document is another build's and is refused whatever it
+    /// holds.
+    #[test]
+    fn rejects_a_version_6_document() {
+        let mut doc = doc();
+        doc.v = 6;
+        let err = BindingsDocument::parse(&doc.to_body()).expect_err("version 6 is refused");
+        assert!(err.contains("schema version 6"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn the_document_version_is_7() {
+        assert_eq!(BINDINGS_DOCUMENT_VERSION, 7);
+    }
+
+    /// [`doc`] with `p1`'s `alt` port publishing onto an `ephemeral:` channel
+    /// declared `non_text`.
+    fn doc_with_non_text_wire_channel() -> BindingsDocument {
+        let mut doc = doc();
+        doc.outputs.push(OutputBinding {
+            port: "alt".to_string(),
+            ..output("p1", "ephemeral:site.bar.frames")
+        });
+        doc.wire_channels
+            .push(wire("ephemeral:site.bar.frames", true));
+        doc
+    }
+
+    #[test]
+    fn a_wire_channel_table_round_trips_through_its_body() {
+        let doc = doc_with_non_text_wire_channel();
+        let body = doc.to_body();
+        assert!(
+            body.contains(r#""wire_channels":[{"channel":"brenn:site.bar.in","non_text":false},{"channel":"ephemeral:site.bar.frames","non_text":true}]"#),
+            "{body}"
+        );
+        assert_eq!(BindingsDocument::parse(&body).unwrap(), doc);
+    }
+
+    /// The flag has no default on a wire entry either.
+    #[test]
+    fn a_wire_channel_without_the_flag_fails_the_parse() {
+        let body = doc().to_body();
+        let stripped = body.replacen(
+            r#"{"channel":"brenn:site.bar.in","non_text":false}"#,
+            r#"{"channel":"brenn:site.bar.in"}"#,
+            1,
+        );
+        assert_ne!(stripped, body, "the fixture carries a wire entry to strip");
+        let err = BindingsDocument::parse(&stripped).expect_err("the flag is required");
+        assert!(err.contains("non_text"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_a_repeated_wire_channel() {
+        let mut doc = doc();
+        doc.wire_channels.push(wire("brenn:site.bar.in", true));
+        let err = doc.validate().expect_err("a channel has one declaration");
+        assert!(
+            err.contains("brenn:site.bar.in") && err.contains("twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_page_local_address_in_the_wire_table() {
+        let mut doc = doc();
+        doc.wire_channels.push(wire(LOCAL_THEME_CHANNEL, false));
+        let err = doc
+            .validate()
+            .expect_err("a page-local channel's entry is in the local table");
+        assert!(
+            err.contains(LOCAL_THEME_CHANNEL) && err.contains("not a transportable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_unbindable_address_in_the_wire_table() {
+        let mut doc = doc();
+        doc.wire_channels.push(wire("mqtt:sensors/kitchen", false));
+        let err = doc.validate().expect_err("mqtt does not bind to a surface");
+        assert!(err.contains("not a transportable"), "{err}");
+    }
+
+    /// Both directions of a binding count: a bound input and a bound output
+    /// each need their entry.
+    #[test]
+    fn rejects_a_bound_transportable_channel_missing_from_the_wire_table() {
+        let mut missing_input = doc();
+        missing_input.wire_channels.clear();
+        let err = missing_input
+            .validate()
+            .expect_err("the input's channel has no declaration");
+        assert!(
+            err.contains("brenn:site.bar.in") && err.contains("no wire channel entry"),
+            "{err}"
+        );
+
+        let mut missing_output = doc_with_non_text_wire_channel();
+        missing_output.wire_channels.pop();
+        let err = missing_output
+            .validate()
+            .expect_err("the output's channel has no declaration");
+        assert!(
+            err.contains("ephemeral:site.bar.frames") && err.contains("no wire channel entry"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_wire_channel_no_binding_names() {
+        let mut doc = doc();
+        doc.wire_channels
+            .push(wire("ephemeral:site.bar.elsewhere", false));
+        let err = doc
+            .validate()
+            .expect_err("an entry nothing binds was not written from the plan");
+        assert!(
+            err.contains("ephemeral:site.bar.elsewhere") && err.contains("no binding names"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_text_on_a_reserved_plane() {
+        let mut doc = doc();
+        doc.local_channels[0].non_text = true;
+        let err = doc
+            .validate()
+            .expect_err("the kernel and chrome read a reserved plane as text");
+        assert!(
+            err.contains(LOCAL_THEME_CHANNEL) && err.contains("unreserved page-local"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A transportable address in the local table is refused for `non_text`
+    /// by the rule on the flag itself, whatever else is wrong with it: its
+    /// declaration belongs in the wire table.
+    #[test]
+    fn rejects_non_text_on_a_transportable_entry() {
+        let mut doc = doc();
+        doc.local_channels.push(LocalChannel {
+            channel: "ephemeral:site.bar.notes".to_string(),
+            ring_depth: 1,
+            non_text: true,
+        });
+        let err = doc
+            .validate()
+            .expect_err("a transportable declaration is the wire table's");
+        assert!(
+            err.contains("ephemeral:site.bar.notes") && err.contains("unreserved page-local"),
+            "unexpected: {err}"
+        );
+    }
+
     #[test]
     fn rejects_an_unreadable_version() {
         let mut doc = doc();
@@ -866,6 +1132,8 @@ mod tests {
         let mut doc = doc();
         doc.outputs
             .push(output("ghost", "brenn:site.bar.elsewhere"));
+        doc.wire_channels
+            .push(wire("brenn:site.bar.elsewhere", false));
         let err = doc.validate().expect_err("the instance is absent");
         assert!(err.contains("absent from the component list"), "{err}");
     }
@@ -899,6 +1167,7 @@ mod tests {
         let mut second = subscription("p1", "brenn:site.bar.other");
         second.port = "alt".to_string();
         doc.subscriptions.push(second);
+        doc.wire_channels.push(wire("brenn:site.bar.other", false));
         assert!(doc.validate().is_ok(), "distinct ports are not a conflict");
     }
 
@@ -910,10 +1179,12 @@ mod tests {
         doc.local_channels.push(LocalChannel {
             channel: "local:bar/notes".to_string(),
             ring_depth: 4,
+            non_text: false,
         });
         doc.local_channels.push(LocalChannel {
             channel: "local:bar/notes".to_string(),
             ring_depth: 8,
+            non_text: false,
         });
         let err = doc
             .validate()
@@ -932,6 +1203,7 @@ mod tests {
         let mut second = output("p1", "brenn:site.bar.out");
         second.port = "alt".to_string();
         doc.outputs.push(second);
+        doc.wire_channels.push(wire("brenn:site.bar.out", false));
         assert!(doc.validate().is_ok(), "distinct ports are not a conflict");
     }
 

@@ -201,6 +201,8 @@ fn validate_resolves_messaging_layer_for_apps_with_messaging_blocks() {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     };
 
     let config = BrennConfig {

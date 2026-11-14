@@ -53,6 +53,7 @@ fn bar() -> ResolvedSurface {
         ring_depth: reserved_local_channel(LOCAL_THEME_CHANNEL)
             .expect("the theme plane is reserved")
             .ring_depth,
+        non_text: false,
     });
     surface
 }
@@ -86,6 +87,46 @@ fn document_carries_every_resolved_section() {
     assert_eq!(doc.calls[0].target_instance, "mode");
     assert_eq!(doc.calls[0].target_port, "press");
     assert!(doc.validate().is_ok(), "the builder writes valid documents");
+}
+
+/// The wire table is copied from the resolved surface, entry for entry and in
+/// its order, declaration included; a page-local channel is not in it.
+#[test]
+fn document_carries_the_wire_channel_table() {
+    let mut surface = bar();
+    surface
+        .outputs
+        .push(brenn_lib::messaging::config::SurfaceOutput {
+            channel_address: "ephemeral:bar-frames".to_string(),
+            ..surface.outputs[0].clone()
+        });
+    surface.outputs.last_mut().expect("just pushed").port = "spare".to_string();
+    surface
+        .wire_channels
+        .push(brenn_lib::messaging::config::ResolvedWireChannel {
+            address: "ephemeral:bar-frames".to_string(),
+            non_text: true,
+        });
+    let doc = build_bindings_document(&surface, &params());
+    assert_eq!(
+        doc.wire_channels,
+        vec![
+            WireChannel {
+                channel: "brenn:bar-a".to_string(),
+                non_text: false,
+            },
+            WireChannel {
+                channel: "ephemeral:bar-frames".to_string(),
+                non_text: true,
+            },
+        ]
+    );
+    assert!(doc.validate().is_ok(), "the builder writes valid documents");
+    let body = doc.to_body();
+    assert!(
+        body.contains(r#"{"channel":"ephemeral:bar-frames","non_text":true}"#),
+        "{body}"
+    );
 }
 
 #[test]
@@ -205,6 +246,45 @@ fn a_published_body_parses_back() {
     let docs = build_bindings_documents(std::slice::from_ref(&bar()), &params());
     let parsed = BindingsDocument::parse(&docs[0].1).expect("the builder writes readable bodies");
     assert_eq!(parsed, build_bindings_document(&bar(), &params()));
+}
+
+/// A page-local channel's `non_text` declaration reaches the page's router
+/// table, and moves the document's bytes when it flips.
+#[test]
+fn a_local_channels_non_text_declaration_reaches_the_document() {
+    let text = bar();
+    let mut declared = bar();
+    declared.outputs[0].channel_address = "local:bar/state".to_string();
+    declared.local_channels = vec![ResolvedLocalChannel {
+        address: "local:bar/state".to_string(),
+        ring_depth: 1,
+        non_text: true,
+    }];
+    let doc = build_bindings_document(&declared, &params());
+    assert_eq!(
+        doc.local_channels,
+        vec![LocalChannel {
+            channel: "local:bar/state".to_string(),
+            ring_depth: 1,
+            non_text: true,
+        }]
+    );
+    let mut flipped = declared.clone();
+    flipped.local_channels[0].non_text = false;
+    let flipped = build_bindings_documents(std::slice::from_ref(&flipped), &params());
+    let declared = build_bindings_documents(std::slice::from_ref(&declared), &params());
+    assert_ne!(declared[0].1, flipped[0].1);
+    assert!(!build_bindings_document(&text, &params()).local_channels[0].non_text);
+}
+
+/// The builder validates what it wrote, so a resolver that let `non_text` onto
+/// a reserved plane is caught on the server rather than in a page's reload loop.
+#[test]
+#[should_panic(expected = "which only an unreserved page-local channel may be")]
+fn build_panics_on_non_text_on_a_reserved_plane() {
+    let mut broken = bar();
+    broken.local_channels[0].non_text = true;
+    build_bindings_documents(std::slice::from_ref(&broken), &params());
 }
 
 /// A local binding whose router entry was lost is unresolvable wiring — the

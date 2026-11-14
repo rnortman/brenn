@@ -34,9 +34,8 @@ pub fn run_check_wit(repo_root: &Path) -> bool {
                 // different generator invocations (the pinned CLI for Family A, the
                 // `wit_bindgen::generate!` macro in the brenn-guest SDK for Family B),
                 // so a world-moving generator change on either path must fail here.
-                let (wit_path, world_name) =
-                    wit_source_for_crate(&wasm_crate.family, &wasm_crate.dir, repo_root);
-                if !check_world_equivalence(&wit_path, &world_name, &artifact) {
+                let source = wit_source_for_crate(&wasm_crate.family, &wasm_crate.dir, repo_root);
+                if !check_world_equivalence(&source, &artifact) {
                     ok = false;
                 }
             }
@@ -209,26 +208,43 @@ fn interface_is_wasi(resolve: &Resolve, id: wit_parser::InterfaceId) -> bool {
         .is_some_and(|pkg| resolve.packages[pkg].name.namespace == "wasi")
 }
 
-/// Derive the WIT file path and world name for a raw-bindings crate from its Cargo.toml.
+/// The WIT source a crate's artifact is compared against: the file declaring
+/// its world, the files read before it, and the world's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WitSource {
+    /// The file the world is declared in.
+    path: PathBuf,
+    /// Files pushed into the resolve before `path`, in order: the packages a
+    /// two-file world imports from.
+    resolve_with: Vec<PathBuf>,
+    /// The world's name, package-qualified where more than one package is
+    /// resolved.
+    world: String,
+}
+
+/// Derive the WIT source for a raw-bindings crate from its Cargo.toml.
 ///
-/// Reads `package.metadata.component.target.path` (the same TOML key that cargo-component
-/// used to locate the WIT file). Returns (absolute_wit_path, world_name) where world_name
-/// is derived as the WIT filename stem (e.g. "processor.wit" → "processor").
+/// Reads `package.metadata.component.target`: `path` (the WIT file), and two
+/// optional keys, `world` (a world name, which may be package-qualified) and
+/// `resolve_with` (an ordered list of WIT files read before `path`). Paths are relative to the crate. With
+/// `world` absent the world name is the WIT filename stem (e.g. "processor.wit"
+/// → "processor"); with `resolve_with` absent `path` is read alone.
 ///
 /// Panics if the metadata is absent or unparseable — all WasmComponent crates must have it
 /// (it is how `discover.rs` classifies them as WasmComponent in the first place).
-fn wit_path_for_crate(crate_dir: &Path) -> (PathBuf, String) {
+fn wit_path_for_crate(crate_dir: &Path) -> WitSource {
     let cargo_toml = crate_dir.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_toml)
         .unwrap_or_else(|e| panic!("xtask check-wit: failed to read {cargo_toml:?}: {e}"));
     let parsed: toml::Value = toml::from_str(&content)
         .unwrap_or_else(|e| panic!("xtask check-wit: failed to parse {cargo_toml:?}: {e}"));
 
-    let wit_path_str = parsed
+    let target = parsed
         .get("package")
         .and_then(|p| p.get("metadata"))
         .and_then(|m| m.get("component"))
-        .and_then(|c| c.get("target"))
+        .and_then(|c| c.get("target"));
+    let wit_path_str = target
         .and_then(|t| t.get("path"))
         .and_then(|p| p.as_str())
         .unwrap_or_else(|| {
@@ -238,20 +254,60 @@ fn wit_path_for_crate(crate_dir: &Path) -> (PathBuf, String) {
             )
         });
 
-    // Resolve relative to crate_dir (the path in Cargo.toml is relative to the crate).
-    let wit_path = crate_dir.join(wit_path_str);
-    let wit_path = wit_path.canonicalize().unwrap_or_else(|e| {
-        panic!("xtask check-wit: failed to canonicalize WIT path {wit_path:?}: {e}")
-    });
+    let canonical = |rel: &str| {
+        let wit_path = crate_dir.join(rel);
+        wit_path.canonicalize().unwrap_or_else(|e| {
+            panic!("xtask check-wit: failed to canonicalize WIT path {wit_path:?}: {e}")
+        })
+    };
+    let wit_path = canonical(wit_path_str);
 
-    // Derive world name from WIT filename stem (e.g. "processor.wit" → "processor").
-    let world_name = wit_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_else(|| panic!("xtask check-wit: could not derive world name from {wit_path:?}"))
-        .to_owned();
+    let resolve_with = match target.and_then(|t| t.get("resolve_with")) {
+        None => Vec::new(),
+        Some(list) => list
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "xtask check-wit: package.metadata.component.target.resolve_with in \
+                     {cargo_toml:?} is not a list"
+                )
+            })
+            .iter()
+            .map(|v| {
+                canonical(v.as_str().unwrap_or_else(|| {
+                    panic!(
+                        "xtask check-wit: package.metadata.component.target.resolve_with in \
+                         {cargo_toml:?} holds a non-string {v:?}"
+                    )
+                }))
+            })
+            .collect(),
+    };
 
-    (wit_path, world_name)
+    let world = match target.and_then(|t| t.get("world")) {
+        Some(w) => w
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "xtask check-wit: package.metadata.component.target.world in {cargo_toml:?} \
+                     is not a string"
+                )
+            })
+            .to_owned(),
+        None => wit_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| {
+                panic!("xtask check-wit: could not derive world name from {wit_path:?}")
+            })
+            .to_owned(),
+    };
+
+    WitSource {
+        path: wit_path,
+        resolve_with,
+        world,
+    }
 }
 
 /// The WIT source and world name a crate's artifact is compared against, by family.
@@ -261,19 +317,25 @@ fn wit_path_for_crate(crate_dir: &Path) -> (PathBuf, String) {
 /// `wit_bindgen::generate!` invocation in the brenn-guest SDK, which every Family B
 /// crate consumes, so the source is the same file and world for all of them and is
 /// stated here. `guest_sdk_world_is_processor` keeps that statement honest.
-fn wit_source_for_crate(family: &Family, crate_dir: &Path, repo_root: &Path) -> (PathBuf, String) {
+fn wit_source_for_crate(family: &Family, crate_dir: &Path, repo_root: &Path) -> WitSource {
     match family {
         Family::Raw => wit_path_for_crate(crate_dir),
         Family::Guest => {
-            let wit_path = repo_root
-                .join("brenn-wasm")
-                .join("wit")
-                .join(GUEST_SDK_WIT_FILE);
-            let wit_path = wit_path.canonicalize().unwrap_or_else(|e| {
-                panic!("xtask check-wit: failed to canonicalize WIT path {wit_path:?}: {e}")
-            });
+            let canonical = |file: &str| {
+                let wit_path = repo_root.join("brenn-wasm").join("wit").join(file);
+                wit_path.canonicalize().unwrap_or_else(|e| {
+                    panic!("xtask check-wit: failed to canonicalize WIT path {wit_path:?}: {e}")
+                })
+            };
             guest_sdk_world_is_processor(repo_root);
-            (wit_path, GUEST_SDK_WORLD.to_string())
+            WitSource {
+                path: canonical(GUEST_SDK_WIT_FILE),
+                resolve_with: GUEST_SDK_RESOLVE_WITH
+                    .iter()
+                    .map(|file| canonical(file))
+                    .collect(),
+                world: GUEST_SDK_WORLD.to_string(),
+            }
         }
         Family::Sdk | Family::Library => {
             panic!("xtask check-wit: {family:?} crates carry no artifact to compare")
@@ -281,9 +343,23 @@ fn wit_source_for_crate(family: &Family, crate_dir: &Path, repo_root: &Path) -> 
     }
 }
 
-/// The WIT file and world the brenn-guest SDK generates its bindings from.
-const GUEST_SDK_WIT_FILE: &str = "processor.wit";
-const GUEST_SDK_WORLD: &str = "processor";
+/// The WIT files and world the brenn-guest SDK generates its bindings from:
+/// the 0.3.0 world (the 0.2.0 world with `blobs` imported), read after the
+/// 0.1.0 and 0.2.0 files whose interfaces it imports, in that order.
+const GUEST_SDK_WIT_FILE: &str = "processor-0.3.wit";
+const GUEST_SDK_RESOLVE_WITH: &[&str] = &["processor.wit", "processor-0.2.wit"];
+const GUEST_SDK_WORLD: &str = "brenn:processor/processor@0.3.0";
+
+/// The `path` list of the SDK's `generate!`, as written there: every
+/// `resolve_with` file, then the world's own file.
+fn guest_sdk_path_list() -> String {
+    let files: Vec<String> = GUEST_SDK_RESOLVE_WITH
+        .iter()
+        .chain(core::iter::once(&GUEST_SDK_WIT_FILE))
+        .map(|file| format!("\"../../wit/{file}\""))
+        .collect();
+    format!("path: [{}]", files.join(", "))
+}
 
 /// Liveness guard for the hard-coded Family B mapping above: the SDK's `generate!`
 /// invocation must still name that file and world. If someone repoints or splits it,
@@ -300,7 +376,7 @@ fn guest_sdk_world_is_processor(repo_root: &Path) {
         .unwrap_or_else(|e| panic!("xtask check-wit: failed to read {sdk_bindings:?}: {e}"));
     for needle in [
         &format!("world: \"{GUEST_SDK_WORLD}\""),
-        &format!("path: \"../../wit/{GUEST_SDK_WIT_FILE}\""),
+        &guest_sdk_path_list(),
     ] {
         assert!(
             content.contains(needle.as_str()),
@@ -344,8 +420,10 @@ fn guest_sdk_world_is_processor(repo_root: &Path) {
 /// world unguarded. `wit_source_for_crate` supplies each family's source.
 ///
 /// Fails closed on anything that does not decode as a component, mirroring `wasi_imports`.
-fn check_world_equivalence(wit_path: &Path, world_name: &str, artifact: &LoadedArtifact) -> bool {
-    let source = source_world_signature(wit_path, world_name);
+fn check_world_equivalence(wit_source: &WitSource, artifact: &LoadedArtifact) -> bool {
+    let source = source_world_signature(wit_source);
+    let world_name = &wit_source.world;
+    let wit_path = &wit_source.path;
 
     match world_conformance(artifact.world(), &source) {
         Ok(()) => true,
@@ -368,8 +446,14 @@ fn check_world_equivalence(wit_path: &Path, world_name: &str, artifact: &LoadedA
 /// Every failure here is a broken repo state, not a gate outcome: the WIT file is
 /// hand-written, in-tree, and read by the build itself, so a parse error or a missing
 /// world means something is wrong with the checkout rather than with an artifact.
-fn source_world_signature(wit_path: &Path, world_name: &str) -> WorldSignature {
+fn source_world_signature(source: &WitSource) -> WorldSignature {
+    let (wit_path, world_name) = (&source.path, source.world.as_str());
     let mut resolve = Resolve::new();
+    for dep in &source.resolve_with {
+        resolve.push_file(dep).unwrap_or_else(|e| {
+            panic!("xtask check-wit: failed to parse WIT source {dep:?}: {e:?}")
+        });
+    }
     let pkg = resolve.push_file(wit_path).unwrap_or_else(|e| {
         panic!("xtask check-wit: failed to parse WIT source {wit_path:?}: {e:?}")
     });
@@ -542,16 +626,71 @@ path = "wit/processor.wit"
         )
         .unwrap();
 
-        let (returned_path, world_name) = wit_path_for_crate(root);
+        let source = wit_path_for_crate(root);
 
         assert_eq!(
-            returned_path,
+            source.path,
             wit_file.canonicalize().unwrap(),
             "returned path should be the canonical path of the WIT file"
         );
         assert_eq!(
-            world_name, "processor",
+            source.world, "processor",
             "world name should be derived from WIT filename stem"
+        );
+        assert!(
+            source.resolve_with.is_empty(),
+            "with no resolve_with key the file is read alone"
+        );
+    }
+
+    /// The `world` and `resolve_with` keys name a world declared in a second
+    /// file that imports the first, and the source signature resolves it.
+    #[test]
+    fn wit_path_for_crate_reads_a_two_file_world() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let wit_dir = root.join("wit");
+        fs::create_dir_all(&wit_dir).unwrap();
+        let base = wit_dir.join("base.wit");
+        fs::write(
+            &base,
+            "package example:base@0.1.0;\ninterface log { log: func(m: string); }\n\
+             world base { import log; }",
+        )
+        .unwrap();
+        let next = wit_dir.join("next.wit");
+        fs::write(
+            &next,
+            "package example:base@0.2.0;\ninterface bus { record body { bytes: list<u8> } }\n\
+             world base { use bus.{body}; import example:base/log@0.1.0; \
+             export receive: func(b: body); }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "two-file"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.component.target]
+path = "wit/next.wit"
+world = "example:base/base@0.2.0"
+resolve_with = ["wit/base.wit"]
+"#,
+        )
+        .unwrap();
+
+        let source = wit_path_for_crate(root);
+        assert_eq!(source.path, next.canonicalize().unwrap());
+        assert_eq!(source.resolve_with, vec![base.canonicalize().unwrap()]);
+        assert_eq!(source.world, "example:base/base@0.2.0");
+
+        let signature = source_world_signature(&source);
+        assert!(
+            signature.imports.contains_key("example:base/log@0.1.0")
+                && signature.exports.contains_key("receive"),
+            "the 0.2.0 world imports the 0.1.0 interface and exports receive: {signature:?}"
         );
     }
 
@@ -779,8 +918,8 @@ edition = "2021"
         LoadedArtifact::load(&crate_dir, &artifact_dir);
     }
 
-    /// A repo root carrying the two files the Family B mapping reads: the SDK's
-    /// `generate!` invocation and the WIT file it names.
+    /// A repo root carrying the files the Family B mapping reads: the SDK's
+    /// `generate!` invocation and the WIT files it names.
     fn temp_repo_with_guest_sdk(generate_invocation: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
@@ -797,12 +936,24 @@ edition = "2021"
             "package test:processor@0.1.0;\nworld processor {}\n",
         )
         .unwrap();
+        fs::write(
+            wit_dir.join("processor-0.2.wit"),
+            "package test:processor@0.2.0;\nworld processor {}\n",
+        )
+        .unwrap();
+        fs::write(
+            wit_dir.join("processor-0.3.wit"),
+            "package test:processor@0.3.0;\nworld processor {}\n",
+        )
+        .unwrap();
         fs::write(sdk_src.join("bindings.rs"), generate_invocation).unwrap();
         tmp
     }
 
-    const REAL_SDK_GENERATE: &str = "wit_bindgen::generate!({\n    world: \"processor\",\n    \
-         path: \"../../wit/processor.wit\",\n});\n";
+    const REAL_SDK_GENERATE: &str = "wit_bindgen::generate!({\n    \
+         world: \"brenn:processor/processor@0.3.0\",\n    \
+         path: [\"../../wit/processor.wit\", \"../../wit/processor-0.2.wit\", \
+         \"../../wit/processor-0.3.wit\"],\n});\n";
 
     /// Family B crates carry no WIT path in Cargo metadata, so the mapping is the SDK's
     /// own world — the same file and world for every guest crate.
@@ -811,16 +962,20 @@ edition = "2021"
         let tmp = temp_repo_with_guest_sdk(REAL_SDK_GENERATE);
         let root = tmp.path();
         // The crate dir is never consulted for a guest crate; pass the repo root itself.
-        let (wit_path, world) = wit_source_for_crate(&Family::Guest, root, root);
-        assert_eq!(
-            wit_path,
+        let source = wit_source_for_crate(&Family::Guest, root, root);
+        let wit = |file: &str| {
             root.join("brenn-wasm")
                 .join("wit")
-                .join("processor.wit")
+                .join(file)
                 .canonicalize()
                 .unwrap()
+        };
+        assert_eq!(source.path, wit("processor-0.3.wit"));
+        assert_eq!(source.world, "brenn:processor/processor@0.3.0");
+        assert_eq!(
+            source.resolve_with,
+            vec![wit("processor.wit"), wit("processor-0.2.wit")]
         );
-        assert_eq!(world, "processor");
     }
 
     /// The liveness guard on that hard-coded mapping: an SDK repointed at another world
@@ -831,7 +986,20 @@ edition = "2021"
     fn wit_source_for_crate_panics_when_the_guest_sdk_repoints() {
         let tmp = temp_repo_with_guest_sdk(
             "wit_bindgen::generate!({\n    world: \"something-else\",\n    \
-             path: \"../../wit/processor.wit\",\n});\n",
+             path: [\"../../wit/processor.wit\", \"../../wit/processor-0.2.wit\", \
+             \"../../wit/processor-0.3.wit\"],\n});\n",
+        );
+        wit_source_for_crate(&Family::Guest, tmp.path(), tmp.path());
+    }
+
+    /// The guard reads the whole path list: an SDK that drops a file from it is
+    /// repointed as surely as one naming another world.
+    #[test]
+    #[should_panic(expected = "no longer contains")]
+    fn wit_source_for_crate_panics_when_the_guest_sdk_drops_a_file() {
+        let tmp = temp_repo_with_guest_sdk(
+            "wit_bindgen::generate!({\n    world: \"brenn:processor/processor@0.3.0\",\n    \
+             path: [\"../../wit/processor.wit\", \"../../wit/processor-0.3.wit\"],\n});\n",
         );
         wit_source_for_crate(&Family::Guest, tmp.path(), tmp.path());
     }

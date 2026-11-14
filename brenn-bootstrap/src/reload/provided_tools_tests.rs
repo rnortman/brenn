@@ -24,7 +24,7 @@ use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::{ParticipantId, SubscriberEntryKind};
 use brenn_lib::tools::ResolvedToolGrant;
 use brenn_messaging::config_reload::{Outcome, ReloadStatus};
-use brenn_tool_registry::TOOL_EXECUTOR_COMPONENT;
+use brenn_tool_registry::{HeldAttachments, TOOL_EXECUTOR_COMPONENT};
 use serde_json::{Value, json};
 
 use super::NEEDS_RESTART;
@@ -330,7 +330,7 @@ async fn trigger(booted: &Booted) {
             brenn_messaging::PublishOrigin::Conversation { id: 1 },
             READER,
             "brenn:work",
-            r#"{"go":true}"#,
+            r#"{"go":true}"#.into(),
             brenn_messaging::Urgency::Normal,
             None,
             None,
@@ -379,12 +379,14 @@ async fn agent_calls_echo(booted: &Booted) -> Value {
                 username: "alice".to_string(),
             }),
             echo_args(),
+            HeldAttachments::none(),
             &env.alert_dispatcher,
         ),
     )
     .await
     .expect("the provider answers")
     .expect("the call succeeds")
+    .value
 }
 
 fn assert_channel_added(status: &ReloadStatus, address: &str) {
@@ -731,7 +733,7 @@ fn gated_tool(
 ) -> brenn_tool_registry::RegisteredTool {
     use brenn_tool_registry::ToolError;
     use brenn_tool_registry::descriptor::{AclDenied, Idempotency, ToolClass, ToolDescriptor};
-    use brenn_tool_registry::tool::{AsyncTool, RegisteredTool, ToolCtx};
+    use brenn_tool_registry::tool::{AsyncTool, RegisteredTool, ToolCtx, ToolOutput};
 
     struct Gated {
         descriptor: ToolDescriptor,
@@ -750,14 +752,19 @@ fn gated_tool(
         ) -> Result<(), AclDenied> {
             Ok(())
         }
-        async fn execute(&self, _ctx: &ToolCtx, _args: Value) -> Result<Value, ToolError> {
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _args: Value,
+            _attachments: HeldAttachments,
+        ) -> Result<ToolOutput, ToolError> {
             let n = self.entered.fetch_add(1, Ordering::SeqCst) + 1;
             self.gate
                 .acquire()
                 .await
                 .expect("the gate stays open")
                 .forget();
-            Ok(json!({ "call": n }))
+            Ok(json!({ "call": n }).into())
         }
     }
     RegisteredTool::Async(Arc::new(Gated {
@@ -771,6 +778,7 @@ fn gated_tool(
             idempotency: Idempotency::Natural,
             auto_approve: true,
             user_binding: brenn_tool_registry::UserBinding::None,
+            accepts_attachments: false,
         },
         gate,
         entered,
@@ -809,9 +817,11 @@ async fn an_unchanged_tool_keeps_its_bound_across_the_swap() {
                     None,
                     None,
                     json!({}),
+                    HeldAttachments::none(),
                     &alert,
                 )
                 .await
+                .map(|output| output.value)
         })
     };
     let before = booted.driver.env().tool_registry.load();

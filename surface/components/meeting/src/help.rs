@@ -176,7 +176,7 @@ mod tests {
     use super::*;
 
     use crate::logic::{AckAction, AckKind, IngestOutcome, MeetingState};
-    use brenn_surface_test_fixtures::{json_blocks, sample_envelope_json_at as envelope_json};
+    use brenn_surface_test_fixtures::{json_blocks, sample_envelope_at};
 
     /// A render clock inside the example meeting's ambient window.
     fn now() -> DateTime<Utc> {
@@ -205,7 +205,7 @@ mod tests {
             .replace("<string>", "Standup");
         let mut state = MeetingState::new();
         let outcome = state
-            .on_message(AGENDA, &envelope_json(&body, EXAMPLE_START), now())
+            .on_message(AGENDA, &sample_envelope_at(&body, EXAMPLE_START), now())
             .expect("a well-formed envelope on the agenda port");
         assert_eq!(
             outcome,
@@ -226,7 +226,7 @@ mod tests {
             let mut state = MeetingState::new();
             assert_eq!(
                 state
-                    .on_message(ACKS, &envelope_json(ack, EXAMPLE_START), now())
+                    .on_message(ACKS, &sample_envelope_at(ack, EXAMPLE_START), now())
                     .expect("a well-formed envelope on the ack port"),
                 IngestOutcome::Accepted { warnings: vec![] },
                 "documented ack body is not accepted: {ack}"

@@ -16,6 +16,8 @@ pub(super) fn default_resolved_channel() -> ResolvedChannel {
         noise: NoiseLevel::Silent,
         sink: Sink::Drop,
         wake_min: WakeMin::Normal,
+        non_text: false,
+        untyped_content_type: None,
     }
 }
 
@@ -50,7 +52,7 @@ pub(super) fn insert_msg(
         channel_uuid,
         "src",
         sender,
-        body,
+        &body.into(),
         Urgency::Low, // Low is the mapping for old 'none' (no eager wake at default wake_min=Normal)
         brenn_lib::messaging::ChannelScheme::Brenn,
         None,

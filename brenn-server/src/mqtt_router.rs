@@ -1,10 +1,12 @@
 //! `MqttEventRouterImpl` — inbound MQTT delivery adapter (client-in-address model).
 //!
 //! Implements `brenn_mqtt::MqttEventRouter` against `AppState`. Mirrors
-//! `webhook_router.rs`: an inbound MQTT message is wrapped in a typed
-//! `MqttEnvelope` and published to its `mqtt:<client>:<topic>` bus channel via
-//! `Messenger::publish_transport_ingress`. There is no singleton conversation,
-//! no `submit_ingress`, and no per-app conversation cache.
+//! `webhook_router.rs`: an inbound MQTT message is published to its
+//! `mqtt:<client>:<topic>` bus channel via `Messenger::publish_transport_ingress`
+//! — wrapped in a typed `MqttEnvelope` on a text-only channel, or as the payload
+//! itself with `TransportMeta::Mqtt` on a channel declared `non_text`. There is
+//! no singleton conversation, no `submit_ingress`, and no per-app conversation
+//! cache.
 //!
 //! Uses the same deferred-state pattern as `WebhookEventRouterImpl`: the
 //! `AppState` is not yet constructed when the connection supervisors are spawned,
@@ -21,9 +23,15 @@
 
 use std::sync::RwLock;
 
-use brenn_lib::messaging::{MqttEnvelope, MqttPayloadBody, Urgency};
+use brenn_common::sanitize_untrusted_str;
+use brenn_envelope::body::MAX_CONTENT_TYPE_LEN;
+use brenn_lib::messaging::{
+    BodyError, ChannelEntry, MessageBody, MqttEnvelope, MqttPayloadBody, MqttTransport,
+    TransportMeta, Urgency,
+};
 use brenn_lib::mqtt::address::mqtt_topic_matches;
-use brenn_mqtt::payload::InboundPayload;
+use brenn_messaging::IngressMessage;
+use brenn_mqtt::payload::{InboundClass, InboundPayload, classify_inbound};
 use brenn_mqtt::service::MqttEventRouter;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
@@ -254,16 +262,6 @@ impl MqttEventRouter for MqttEventRouterImpl {
             return;
         }
 
-        // Build the payload body once (shared across all matched channels). Binary
-        // payloads are represented as a placeholder; raw bytes are NOT forwarded to
-        // the LLM/browser (prompt-injection trust boundary).
-        let payload_body = match &payload {
-            InboundPayload::Text(text) => MqttPayloadBody::Text { text: text.clone() },
-            InboundPayload::Binary { content_type, .. } => MqttPayloadBody::Binary {
-                binary_placeholder: true,
-                content_type: content_type.clone(),
-            },
-        };
         let received_at = chrono::Utc::now();
 
         let messenger = state.messenger.as_ref().unwrap_or_else(|| {
@@ -274,17 +272,13 @@ impl MqttEventRouter for MqttEventRouterImpl {
             )
         });
 
-        for route in matches {
-            let envelope = MqttEnvelope {
-                client_slug: client_slug.to_string(),
-                topic: topic.to_string(),
-                payload: payload_body.clone(),
-                received_at,
-                qos,
-            };
-            let envelope_json =
-                serde_json::to_string(&envelope).expect("MqttEnvelope serialization is infallible");
+        // Each shape's body is built at most once per message and shared by every
+        // matched channel of that shape: the wrapper JSON on the first wrapped
+        // channel, a raw body once per distinct typing among the raw channels.
+        let mut wrapped: Option<String> = None;
+        let mut raw_bodies: Vec<RawMemo> = Vec::new();
 
+        for route in matches {
             // Resolve the mqtt:<client>:<topic> channel by its derived UUID. It was
             // derived from this channel at startup and upserted, so an unresolvable
             // channel is a host-internal invariant violation: panic (fail-fast).
@@ -299,18 +293,196 @@ impl MqttEventRouter for MqttEventRouterImpl {
                     )
                 });
 
+            // The shape is the channel entry's, read from the entry the message is
+            // published on.
+            let message = if channel.resolved_channel.non_text {
+                let typing = raw_typing(&payload, &channel);
+                let memo = raw_bodies
+                    .iter()
+                    .find(|((ct, source), _)| ct.as_deref() == typing.0 && *source == typing.1);
+                let built = match memo {
+                    Some((_, built)) => built.clone(),
+                    None => {
+                        let built = raw_body(&payload, typing, messenger.max_body_bytes());
+                        raw_bodies.push(((typing.0.map(str::to_owned), typing.1), built.clone()));
+                        built
+                    }
+                };
+                match built {
+                    Ok(body) => IngressMessage::Raw {
+                        body,
+                        transport: TransportMeta::Mqtt(MqttTransport {
+                            client_slug: client_slug.to_string(),
+                            topic: topic.to_string(),
+                            qos,
+                            received_at,
+                        }),
+                    },
+                    Err(refusal) => {
+                        tracing::warn!(
+                            client = client_slug,
+                            topic,
+                            channel = %channel.address,
+                            size = payload.bytes.len(),
+                            reason = %refusal,
+                            "mqtt_router: inbound payload refused for a raw channel — dropped \
+                             for this channel"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                let json = wrapped.get_or_insert_with(|| {
+                    // A binary payload is a placeholder in the wrapper; its bytes
+                    // are not carried.
+                    let payload_body =
+                        match classify_inbound(&payload.bytes, payload.content_type.as_deref()) {
+                            InboundClass::Text(text) => MqttPayloadBody::Text {
+                                text: text.to_owned(),
+                            },
+                            InboundClass::Binary => MqttPayloadBody::Binary {
+                                binary_placeholder: true,
+                                content_type: payload.content_type.clone(),
+                            },
+                        };
+                    serde_json::to_string(&MqttEnvelope {
+                        client_slug: client_slug.to_string(),
+                        topic: topic.to_string(),
+                        payload: payload_body,
+                        received_at,
+                        qos,
+                    })
+                    .expect("MqttEnvelope serialization is infallible")
+                });
+                IngressMessage::Wrapped(json.clone())
+            };
+
             // source == "mqtt:<client>:<topic>", sender == client_slug (provenance).
             messenger
                 .publish_transport_ingress(
                     channel,
                     &route.channel_address,
                     client_slug,
-                    &envelope_json,
+                    message,
                     route.urgency,
                 )
                 .await;
         }
     }
+}
+
+/// Whose statement typed a raw payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeSource {
+    /// The broker delivered the publisher's Content-Type.
+    Publisher,
+    /// The payload had none; the channel's `untyped_content_type` typed it.
+    Channel,
+    /// The payload had none and the channel declares none: untyped text.
+    Untyped,
+}
+
+/// Why a payload was not published on a raw channel. Outside input, so a
+/// log line and a drop, never a panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RawRefusal {
+    /// Longer than the bus's body cap.
+    OverCap { cap: usize },
+    /// The content type is not a media type the bus accepts.
+    InvalidContentType {
+        content_type: String,
+        source: TypeSource,
+    },
+    /// The payload is typed as text and is not UTF-8.
+    NotUtf8 {
+        content_type: Option<String>,
+        source: TypeSource,
+    },
+}
+
+impl std::fmt::Display for RawRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let origin = |source: &TypeSource| match source {
+            TypeSource::Publisher => "the publisher's Content-Type",
+            TypeSource::Channel => "the channel's untyped_content_type",
+            TypeSource::Untyped => "no content type",
+        };
+        match self {
+            RawRefusal::OverCap { cap } => {
+                write!(f, "payload is over the {cap}-byte messaging.max_body_bytes")
+            }
+            RawRefusal::InvalidContentType {
+                content_type,
+                source,
+            } => write!(
+                f,
+                "content type \"{content_type}\" ({}) is not a media type the bus accepts",
+                origin(source)
+            ),
+            RawRefusal::NotUtf8 {
+                content_type: Some(content_type),
+                source,
+            } => write!(
+                f,
+                "payload typed \"{content_type}\" ({}) is a text type and is not UTF-8",
+                origin(source)
+            ),
+            RawRefusal::NotUtf8 {
+                content_type: None, ..
+            } => f.write_str(
+                "payload has no Content-Type and is not UTF-8, so it is not untyped text; \
+                 state untyped_content_type in the channel's tuning block to type such payloads",
+            ),
+        }
+    }
+}
+
+/// The content type a raw payload is typed with and whose statement it is:
+/// the publisher's Content-Type when the broker delivered one, otherwise the
+/// channel's `untyped_content_type`, otherwise none (untyped text).
+type RawTyping<'a> = (Option<&'a str>, TypeSource);
+
+/// A raw body already built for one message, by the typing it was built under.
+type RawMemo = (
+    (Option<String>, TypeSource),
+    Result<MessageBody, RawRefusal>,
+);
+
+/// The typing of `payload` on the raw channel `channel`.
+fn raw_typing<'a>(payload: &'a InboundPayload, channel: &'a ChannelEntry) -> RawTyping<'a> {
+    match (
+        payload.content_type.as_deref(),
+        channel.resolved_channel.untyped_content_type.as_deref(),
+    ) {
+        (Some(ct), _) => (Some(ct), TypeSource::Publisher),
+        (None, Some(ct)) => (Some(ct), TypeSource::Channel),
+        (None, None) => (None, TypeSource::Untyped),
+    }
+}
+
+/// The raw body of `payload` under `typing`, judged by the bus's own rule. A
+/// logged content type is truncated to the bus's content-type limit.
+fn raw_body(
+    payload: &InboundPayload,
+    (content_type, source): RawTyping<'_>,
+    max_body_bytes: usize,
+) -> Result<MessageBody, RawRefusal> {
+    if payload.bytes.len() > max_body_bytes {
+        return Err(RawRefusal::OverCap {
+            cap: max_body_bytes,
+        });
+    }
+    let logged = || content_type.map(|ct| sanitize_untrusted_str(ct, MAX_CONTENT_TYPE_LEN));
+    MessageBody::from_parts(content_type, &payload.bytes).map_err(|error| match error {
+        BodyError::InvalidContentType { .. } => RawRefusal::InvalidContentType {
+            content_type: logged().unwrap_or_default(),
+            source,
+        },
+        BodyError::NotUtf8 { .. } => RawRefusal::NotUtf8 {
+            content_type: logged(),
+            source,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -357,6 +529,8 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers,
             transport_type: ChannelScheme::Mqtt,
@@ -500,7 +674,7 @@ mod tests {
             .deliver_inbound(
                 "homeassistant",
                 "home/kitchen/state",
-                InboundPayload::Text("22.5".to_string()),
+                InboundPayload::new("22.5", None),
                 1,
             )
             .await;
@@ -559,10 +733,10 @@ mod tests {
             .deliver_inbound(
                 "broker1",
                 "data/blob",
-                InboundPayload::Binary {
-                    base64: "AAEC".to_string(),
-                    content_type: Some("application/octet-stream".to_string()),
-                },
+                InboundPayload::new(
+                    vec![0u8, 1, 2],
+                    Some("application/octet-stream".to_string()),
+                ),
                 0,
             )
             .await;
@@ -621,7 +795,7 @@ mod tests {
             .deliver_inbound(
                 "homeassistant",
                 "home/kitchen/state",
-                InboundPayload::Text("22.5".to_string()),
+                InboundPayload::new("22.5", None),
                 1,
             )
             .await;
@@ -673,7 +847,7 @@ mod tests {
             .deliver_inbound(
                 "homeassistant",
                 "home/kitchen/state",
-                InboundPayload::Text("22.5".to_string()),
+                InboundPayload::new("22.5", None),
                 1,
             )
             .await;
@@ -722,7 +896,7 @@ mod tests {
                 .deliver_inbound(
                     "homeassistant",
                     "home/kitchen/state",
-                    InboundPayload::Text(reading.to_string()),
+                    InboundPayload::new(reading.to_string(), None),
                     1,
                 )
                 .await;
@@ -785,7 +959,7 @@ mod tests {
             .deliver_inbound(
                 "b1",
                 "home/kitchen/state",
-                InboundPayload::Text("x".to_string()),
+                InboundPayload::new("x", None),
                 0,
             )
             .await;
@@ -839,7 +1013,7 @@ mod tests {
             .deliver_inbound(
                 "homeassistant",
                 "home/kitchen/state/extra",
-                InboundPayload::Text("x".to_string()),
+                InboundPayload::new("x", None),
                 0,
             )
             .await;
@@ -873,7 +1047,7 @@ mod tests {
             .deliver_inbound(
                 "other-client",
                 "home/kitchen/state",
-                InboundPayload::Text("x".to_string()),
+                InboundPayload::new("x", None),
                 0,
             )
             .await;
@@ -914,7 +1088,7 @@ mod tests {
             .deliver_inbound(
                 "homeassistant",
                 "home/kitchen/state",
-                InboundPayload::Text("pre".to_string()),
+                InboundPayload::new("pre", None),
                 0,
             )
             .await;
@@ -931,7 +1105,7 @@ mod tests {
             .deliver_inbound(
                 "homeassistant",
                 "home/kitchen/state",
-                InboundPayload::Text("post".to_string()),
+                InboundPayload::new("post", None),
                 0,
             )
             .await;
@@ -976,7 +1150,7 @@ mod tests {
             .deliver_inbound(
                 "homeassistant",
                 "home/kitchen/state",
-                InboundPayload::Text("x".to_string()),
+                InboundPayload::new("x", None),
                 0,
             )
             .await;
@@ -1026,7 +1200,7 @@ mod tests {
             .deliver_inbound(
                 "homeassistant",
                 "home/kitchen/state",
-                InboundPayload::Text("pre".to_string()),
+                InboundPayload::new("pre", None),
                 0,
             )
             .await;
@@ -1043,7 +1217,7 @@ mod tests {
             .deliver_inbound(
                 "homeassistant",
                 "home/kitchen/state",
-                InboundPayload::Text("post".to_string()),
+                InboundPayload::new("post", None),
                 0,
             )
             .await;
@@ -1079,7 +1253,7 @@ mod tests {
             .deliver_inbound(
                 "broker1",
                 "home/kitchen/state",
-                InboundPayload::Text("x".to_string()),
+                InboundPayload::new("x", None),
                 0,
             )
             .await;
@@ -1118,7 +1292,7 @@ mod tests {
             .deliver_inbound(
                 "homeassistant",
                 "home/kitchen/state",
-                InboundPayload::Text("22.5".to_string()),
+                InboundPayload::new("22.5", None),
                 1,
             )
             .await;
@@ -1152,6 +1326,296 @@ mod tests {
         assert_eq!(
             stored_urgency, "high",
             "the client's configured urgency must be threaded into the stored row"
+        );
+    }
+
+    // --- the raw ingress shape ---
+
+    /// An `mqtt:` channel entry declared `non_text`, with `untyped_content_type`.
+    fn raw_mqtt_channel_entry(address: &str, untyped_content_type: Option<&str>) -> ChannelEntry {
+        let mut entry = mqtt_channel_entry(address, None);
+        entry.resolved_channel.non_text = true;
+        entry.resolved_channel.untyped_content_type = untyped_content_type.map(str::to_owned);
+        entry
+    }
+
+    /// One router over one raw channel `mqtt:broker:cam/#`.
+    fn raw_router(untyped_content_type: Option<&str>) -> (MqttEventRouterImpl, brenn_db::Db) {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        state.messenger = Some(messenger_with_channels(
+            db.clone(),
+            vec![raw_mqtt_channel_entry(
+                "mqtt:broker:cam/#",
+                untyped_content_type,
+            )],
+            None,
+        ));
+        let router = MqttEventRouterImpl::new();
+        router.set_state(state, vec![route("broker", "cam/#", Urgency::Normal)]);
+        (router, db)
+    }
+
+    /// One stored row: body bytes, content type, transport column.
+    type StoredRow = (Vec<u8>, Option<String>, Option<String>);
+
+    /// Every stored row on `address`, oldest first.
+    async fn stored_rows(db: &brenn_db::Db, address: &str) -> Vec<StoredRow> {
+        let uuid = mqtt_channel_uuid_from_address(address);
+        let conn = db.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT body, content_type, transport FROM messaging_messages \
+                 WHERE channel_uuid = ?1 ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([uuid.as_bytes().to_vec()], |r| {
+            let body = match r.get::<_, rusqlite::types::Value>(0)? {
+                rusqlite::types::Value::Blob(b) => b,
+                rusqlite::types::Value::Text(t) => t.into_bytes(),
+                other => panic!("unexpected body column {other:?}"),
+            };
+            Ok((body, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    async fn deliver(router: &MqttEventRouterImpl, bytes: &[u8], content_type: Option<&str>) {
+        router
+            .deliver_inbound(
+                "broker",
+                "cam/front",
+                InboundPayload::new(bytes.to_vec(), content_type.map(str::to_owned)),
+                1,
+            )
+            .await;
+    }
+
+    /// The one stored row on the raw fixture channel, checking its transport
+    /// is the delivery's.
+    async fn the_raw_row(db: &brenn_db::Db) -> (Vec<u8>, Option<String>) {
+        let mut rows = stored_rows(db, "mqtt:broker:cam/#").await;
+        assert_eq!(rows.len(), 1, "exactly one stored message");
+        let (body, content_type, transport) = rows.remove(0);
+        let transport: TransportMeta =
+            serde_json::from_str(&transport.expect("a raw row carries transport")).unwrap();
+        let TransportMeta::Mqtt(transport) = transport else {
+            panic!("expected mqtt transport, got {transport:?}");
+        };
+        assert_eq!(transport.client_slug, "broker");
+        assert_eq!(
+            transport.topic, "cam/front",
+            "the actual topic, not the filter"
+        );
+        assert_eq!(transport.qos, 1);
+        (body, content_type)
+    }
+
+    const NOT_UTF8: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0];
+
+    #[tokio::test]
+    async fn raw_publisher_non_text_type_is_stored_byte_exact() {
+        let (router, db) = raw_router(None);
+        deliver(&router, NOT_UTF8, Some("image/jpeg")).await;
+        assert_eq!(
+            the_raw_row(&db).await,
+            (NOT_UTF8.to_vec(), Some("image/jpeg".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_publisher_text_type_over_utf8_is_a_typed_text_body() {
+        let (router, db) = raw_router(None);
+        deliver(&router, br#"{"t":22.5}"#, Some("application/json")).await;
+        assert_eq!(
+            the_raw_row(&db).await,
+            (
+                br#"{"t":22.5}"#.to_vec(),
+                Some("application/json".to_owned())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_untyped_utf8_with_no_declaration_is_untyped_text() {
+        let (router, db) = raw_router(None);
+        deliver(&router, b"22.5", None).await;
+        assert_eq!(the_raw_row(&db).await, (b"22.5".to_vec(), None));
+    }
+
+    #[tokio::test]
+    async fn raw_untyped_payload_takes_a_declared_non_text_type_utf8_or_not() {
+        let (router, db) = raw_router(Some("application/octet-stream"));
+        deliver(&router, NOT_UTF8, None).await;
+        deliver(&router, b"22.5", None).await;
+        let rows = stored_rows(&db, "mqtt:broker:cam/#").await;
+        let stored: Vec<_> = rows.into_iter().map(|(b, ct, _)| (b, ct)).collect();
+        let octet = Some("application/octet-stream".to_owned());
+        assert_eq!(
+            stored,
+            vec![
+                (NOT_UTF8.to_vec(), octet.clone()),
+                (b"22.5".to_vec(), octet)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_untyped_utf8_takes_a_declared_text_type() {
+        let (router, db) = raw_router(Some("text/plain"));
+        deliver(&router, b"22.5", None).await;
+        assert_eq!(
+            the_raw_row(&db).await,
+            (b"22.5".to_vec(), Some("text/plain".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_publisher_type_wins_over_the_declared_one() {
+        let (router, db) = raw_router(Some("application/octet-stream"));
+        deliver(&router, NOT_UTF8, Some("image/png")).await;
+        assert_eq!(
+            the_raw_row(&db).await,
+            (NOT_UTF8.to_vec(), Some("image/png".to_owned()))
+        );
+    }
+
+    /// Each refused input stores nothing and logs the reason.
+    async fn assert_dropped(
+        untyped_content_type: Option<&str>,
+        bytes: &[u8],
+        content_type: Option<&str>,
+    ) {
+        let (router, db) = raw_router(untyped_content_type);
+        deliver(&router, bytes, content_type).await;
+        assert!(
+            stored_rows(&db, "mqtt:broker:cam/#").await.is_empty(),
+            "a refused payload must store nothing"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn raw_malformed_publisher_type_is_dropped_whatever_the_channel_declares() {
+        assert_dropped(None, b"x", Some("not a type")).await;
+        assert_dropped(Some("application/octet-stream"), b"x", Some("")).await;
+        let long = format!("application/{}", "x".repeat(300));
+        assert_dropped(None, b"x", Some(&long)).await;
+        assert!(logs_contain("the publisher's Content-Type"));
+        assert!(logs_contain("is not a media type the bus accepts"));
+        assert!(
+            !logs_contain(&long),
+            "a logged content type is truncated, never the whole property"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn raw_publisher_text_type_over_non_utf8_is_dropped() {
+        assert_dropped(None, NOT_UTF8, Some("text/plain")).await;
+        assert!(logs_contain("is a text type and is not UTF-8"));
+        assert!(logs_contain("the publisher's Content-Type"));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn raw_untyped_non_utf8_with_no_declaration_is_dropped_naming_the_remedy() {
+        assert_dropped(None, NOT_UTF8, None).await;
+        assert!(logs_contain("state untyped_content_type"));
+        assert!(logs_contain("cam/front"));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn raw_untyped_non_utf8_under_a_declared_text_type_is_dropped() {
+        assert_dropped(Some("text/plain"), NOT_UTF8, None).await;
+        assert!(logs_contain("the channel's untyped_content_type"));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn raw_payload_over_the_body_cap_is_dropped() {
+        let cap = MessagingGlobalConfig::default().max_body_bytes;
+        assert_dropped(Some("application/octet-stream"), &vec![0u8; cap + 1], None).await;
+        assert!(logs_contain("messaging.max_body_bytes"));
+    }
+
+    #[tokio::test]
+    async fn raw_payload_at_the_body_cap_is_stored() {
+        let cap = MessagingGlobalConfig::default().max_body_bytes;
+        let (router, db) = raw_router(Some("application/octet-stream"));
+        deliver(&router, &vec![7u8; cap], None).await;
+        assert_eq!(the_raw_row(&db).await.0.len(), cap);
+    }
+
+    /// One inbound message matching a raw and a wrapped channel is stored once in
+    /// each shape, and the wrapped JSON is pinned byte for byte.
+    #[tokio::test]
+    async fn one_message_on_a_raw_and_a_wrapped_channel_is_stored_in_each_shape() {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        state.messenger = Some(messenger_with_channels(
+            db.clone(),
+            vec![
+                raw_mqtt_channel_entry("mqtt:broker:cam/#", None),
+                mqtt_channel_entry("mqtt:broker:cam/+", None),
+            ],
+            None,
+        ));
+        let router = MqttEventRouterImpl::new();
+        router.set_state(
+            state,
+            vec![
+                route("broker", "cam/#", Urgency::Normal),
+                route("broker", "cam/+", Urgency::Normal),
+            ],
+        );
+        deliver(&router, NOT_UTF8, Some("image/jpeg")).await;
+
+        assert_eq!(
+            the_raw_row(&db).await,
+            (NOT_UTF8.to_vec(), Some("image/jpeg".to_owned()))
+        );
+        let wrapped = stored_rows(&db, "mqtt:broker:cam/+").await;
+        assert_eq!(wrapped.len(), 1);
+        let (body, content_type, transport) = &wrapped[0];
+        assert_eq!((content_type, transport), (&None, &None));
+        let body = std::str::from_utf8(body).unwrap();
+        let received_at = received_at_of(body);
+        assert_eq!(
+            body,
+            format!(
+                r#"{{"client_slug":"broker","topic":"cam/front","payload":{{"binary_placeholder":true,"content_type":"image/jpeg"}},"received_at":"{received_at}","qos":1}}"#
+            )
+        );
+    }
+
+    /// The `received_at` string of a stored wrapper.
+    fn received_at_of(body: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        value["received_at"].as_str().unwrap().to_owned()
+    }
+
+    /// The wrapped JSON for a text payload, pinned against a literal.
+    #[tokio::test]
+    async fn wrapped_text_payload_json_is_pinned() {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        state.messenger = Some(messenger_with_channels(
+            db.clone(),
+            vec![mqtt_channel_entry("mqtt:broker:cam/+", None)],
+            None,
+        ));
+        let router = MqttEventRouterImpl::new();
+        router.set_state(state, vec![route("broker", "cam/+", Urgency::Normal)]);
+        deliver(&router, b"22.5", None).await;
+        let rows = stored_rows(&db, "mqtt:broker:cam/+").await;
+        let body = std::str::from_utf8(&rows[0].0).unwrap();
+        let received_at = received_at_of(body);
+        assert_eq!(
+            body,
+            format!(
+                r#"{{"client_slug":"broker","topic":"cam/front","payload":{{"text":"22.5"}},"received_at":"{received_at}","qos":1}}"#
+            )
         );
     }
 }

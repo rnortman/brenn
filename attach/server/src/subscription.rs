@@ -34,11 +34,12 @@ use brenn_lib::messaging::{ChannelEntry, MessageEnvelope};
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
 use brenn_messaging::{GapReason as BusGapReason, Replay};
 use brenn_messaging_store::store::{ResumeCursor, gap_suffix};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::cursor::{self, CursorState};
 use super::profile::{AttachProfile, SubscriptionFacts};
+use super::publish::entries_for_session;
 use super::registry::{DeferredViewPush, LiveDelivery, SessionPush};
 use super::session::{AttachSessionCtx, FrameOutcome, SessionCounters, sanitize_client_detail};
 
@@ -239,6 +240,8 @@ pub struct PassRow {
 ///
 /// A pass with no rows writes no frame: the wire's `rows` list is never empty,
 /// and a send path that found nothing to serve has nothing to say.
+// TODO(attach-replay-pass-frame-size): a pass's frame has no size bound short
+// of the transport's own message limit.
 pub async fn send_pass(
     ctx: &AttachSessionCtx,
     cursors: &mut WireCursors,
@@ -249,6 +252,7 @@ pub async fn send_pass(
     if pass.is_empty() {
         return FrameOutcome::Continue;
     }
+    let carries_non_text = brenn_attach_proto::carries_non_text_bodies(ctx.version());
     let rows = pass
         .into_iter()
         .map(
@@ -257,6 +261,12 @@ pub async fn send_pass(
                  dropped,
                  retained_seq,
              }| {
+                // A v4 frame carries a body as its text, so a session on a
+                // version without non-text bodies is checked here, where the
+                // row is built, rather than when the queued frame is written.
+                if !carries_non_text {
+                    envelope.require_text_body("attach v4 Deliver");
+                }
                 let (seq, cursor) = cursors.next(channel, retained_seq);
                 DeliverRow {
                     envelope,
@@ -274,7 +284,10 @@ pub async fn send_pass(
     super::session::send_frame(&ctx.tx, frame, counters).await
 }
 
-/// Write one deferred-view snapshot to this connection.
+/// Write one deferred-view snapshot to this connection, holding the entries its
+/// version can carry. A view left empty by that cut is still written: each
+/// view replaces the last, and an empty one says nothing this session can see
+/// is standing.
 pub async fn send_deferred_view(
     ctx: &AttachSessionCtx,
     view: DeferredViewPush,
@@ -285,6 +298,7 @@ pub async fn send_deferred_view(
         attribution,
         entries,
     } = view;
+    let entries = entries_for_session(ctx, &channel, attribution.as_deref(), entries, counters);
     let frame = ServerFrame::DeferredView {
         channel,
         attribution,
@@ -689,6 +703,28 @@ pub async fn handle_subscribe(
         );
         return super::session::send_frame(&ctx.tx, result, counters).await;
     };
+
+    // A channel declared `non_text` may hold bodies this session's frames
+    // cannot carry. The ask is conforming — the attacher cannot see the
+    // declaration — so it is answered `Unavailable` and opens nothing.
+    if entry.resolved_channel.non_text
+        && !brenn_attach_proto::carries_non_text_bodies(ctx.version())
+    {
+        let result = ServerFrame::SubscribeResult {
+            channel: channel.to_string(),
+            outcome: SubscribeOutcome::Unavailable,
+            replay_count: 0,
+            gap: None,
+        };
+        info!(
+            attacher = %ctx.profile.attacher().as_str(),
+            channel = %entry.address,
+            version = ctx.version(),
+            "attach subscribe: channel is declared non_text and this protocol version carries \
+             only text; answering Unavailable"
+        );
+        return super::session::send_frame(&ctx.tx, result, counters).await;
+    }
 
     // Activate before the store read: from here the router queues live rows. A
     // row the replay below also serves arrives at the live arm at or below the

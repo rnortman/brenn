@@ -294,9 +294,10 @@ impl SystemInbox {
     /// the channel's window, sized for the outage the operator intends to
     /// survive, not forever. So a fresh position re-runs at most a window's
     /// worth of already-handled messages, and anything dropped past the window
-    /// is counted, not silent. Handlers must tolerate that repeat — for the tool
-    /// executor it is the `Idempotency::Natural` contract every async tool
-    /// declares.
+    /// is stepped over silently: the participant's overflow rung is `Silent`,
+    /// which keeps no count and raises no alert. Handlers must tolerate the
+    /// repeat — for the tool executor it is the `Idempotency::Natural` contract
+    /// every async tool declares.
     ///
     /// Runs before the first window read; a push-enabled window read without a
     /// position panics.
@@ -629,7 +630,7 @@ mod tests {
             channel_uuid,
             "test",
             "wasm:someone",
-            body,
+            &body.into(),
             Urgency::Normal,
             ChannelScheme::Brenn,
             None,
@@ -645,7 +646,10 @@ mod tests {
     }
 
     fn bodies(batch: &[(MessageSeq, MessageEnvelope)]) -> Vec<String> {
-        batch.iter().map(|(_, env)| env.body.clone()).collect()
+        batch
+            .iter()
+            .map(|(_, env)| env.body.as_text().unwrap().to_owned())
+            .collect()
     }
 
     /// A system participant's positions are never torn down, and each is
@@ -684,7 +688,10 @@ mod tests {
             .expect("the channel the rows landed on");
         assert_eq!(address, "brenn:inbox/reqs");
         assert_eq!(
-            window.entries.last().map(|(_, env)| env.body.as_str()),
+            window
+                .entries
+                .last()
+                .map(|(_, env)| env.body.as_text().unwrap()),
             Some("latest"),
             "newest last"
         );
@@ -963,7 +970,7 @@ mod tests {
                     let tx = tx.clone();
                     async move {
                         for (_, env) in batch {
-                            tx.send(env.body).unwrap();
+                            tx.send(env.body.as_text().unwrap().to_owned()).unwrap();
                         }
                     }
                 })

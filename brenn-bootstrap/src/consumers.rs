@@ -15,7 +15,7 @@ use brenn_lib::wasm_package::Verified;
 use brenn_messaging::Messenger;
 use brenn_obs::alerting::AlertDispatcher;
 use tokio::sync::Notify;
-use tracing::info;
+use tracing::{info, warn};
 
 /// The environment-free half of a `[[wasm_consumer]]`'s `ProcessorLoadSpec`:
 /// everything derivable from the resolved consumer alone. The remaining fields
@@ -58,6 +58,7 @@ pub(crate) fn lower_consumer_load_parts(
                         fill_mt: o.budget.fill_mt,
                         capacity_mt: o.budget.capacity_mt,
                     },
+                    non_text: o.non_text,
                 },
             )
         })
@@ -90,7 +91,7 @@ pub(crate) fn lower_consumer_load_parts(
         .iter()
         .inspect(|g| {
             assert!(
-                g.wit_import().is_some(),
+                g.names_interface(),
                 "consumer {:?}: granted `{}`, which names no WIT interface and belongs to a \
                  page — a top-level consumer has no page, and the config front end refuses \
                  the word",
@@ -196,6 +197,182 @@ pub(crate) fn assert_store_parent_exists(slug: &str, store_path: &std::path::Pat
         store_path,
     );
 }
+
+/// Refuse a component whose contract carries only text when any port it binds,
+/// input or output, is on a channel declared `non_text`.
+///
+/// Output ports count as well as inputs: a component reads its own parked
+/// messages back through its deferred view, so a 0.1.0 build bound to an output
+/// a 0.2.0 build once parked a non-text body on would be handed that body as a
+/// string. The tool inboxes are system channels and never `non_text`.
+///
+/// Asked after the artifact is loaded, because the contract is a fact of the
+/// artifact's imports and the configuration does not state it.
+///
+/// # Panics
+///
+/// On the first such port, naming the component, the port, the channel and
+/// both contracts. At boot that stops the process before any consumer starts;
+/// at reload the panic is caught and the reload refused.
+pub(crate) fn assert_contract_carries_bound_channels(
+    consumer: &ResolvedWasmConsumer,
+    contract: brenn_wasm::ProcessorContract,
+) {
+    if contract.carries_non_text_bodies() {
+        return;
+    }
+    let inputs = consumer
+        .inputs
+        .iter()
+        .map(|i| ("input", &i.port, &i.sub.channel_address, i.non_text));
+    let outputs = consumer
+        .outputs
+        .iter()
+        .map(|o| ("output", &o.port, &o.channel_address, o.non_text));
+    if let Some((direction, port, channel, _)) =
+        inputs.chain(outputs).find(|(_, _, _, non_text)| *non_text)
+    {
+        panic!(
+            "consumer {:?}: its {direction} port {port:?} is bound to {channel}, a channel \
+             declared `non_text`, and the component is built against {}, which carries only \
+             text — bind the port to a text-only channel, or load a build of the component \
+             against {}",
+            consumer.slug,
+            brenn_wasm::ProcessorContract::V0_1,
+            brenn_wasm::ProcessorContract::V0_2,
+        );
+    }
+}
+
+/// The string contract's removal period, in the one wording every text that
+/// states it carries: both WIT headers, `docs/component-packages.md` and the
+/// two notices below. A literal, so `concat!` can build the notices from it;
+/// `period_tests` fails until every text carries this wording.
+macro_rules! string_contract_period {
+    () => {
+        "the string contract is served by the release that declares brenn:processor@0.2.0 \
+         stable and by the three brenn releases after it, and no release before the fourth \
+         after it removes it"
+    };
+}
+
+/// The title of the `CHANGELOG.md` entry whose release heading names the
+/// declaring release.
+macro_rules! declaration_entry_title {
+    () => {
+        "brenn:processor@0.2.0 is stable"
+    };
+}
+
+/// What both notices tell the operator to do and where to look, from the
+/// sentence after the consequence clause to the end.
+macro_rules! string_contract_rebuild {
+    () => {
+        concat!(
+            " Rebuild them against brenn:processor@0.2.0, which a brenn-guest pin at or after \
+             the declaring release builds. The declaring release is the one whose CHANGELOG.md \
+             heading holds the entry \"",
+            declaration_entry_title!(),
+            "\"."
+        )
+    };
+}
+
+#[cfg(test)]
+const STRING_CONTRACT_PERIOD: &str = string_contract_period!();
+
+#[cfg(test)]
+const DECLARATION_ENTRY_TITLE: &str = declaration_entry_title!();
+
+/// The text of the notice [`warn_string_contract_components`] writes.
+pub(crate) const STRING_CONTRACT_NOTICE: &str = concat!(
+    "components built against the string component contract brenn:processor@0.1.0 are loaded, \
+     and that contract is being removed: ",
+    string_contract_period!(),
+    "; a brenn without it refuses these components at boot.",
+    string_contract_rebuild!()
+);
+
+/// The slugs of the components in `running` built against the string
+/// contract, sorted.
+pub(crate) fn string_contract_slugs<'a>(
+    running: impl IntoIterator<Item = (&'a str, brenn_wasm::ProcessorContract)>,
+) -> Vec<&'a str> {
+    let mut slugs: Vec<&str> = running
+        .into_iter()
+        .filter_map(|(slug, contract)| match contract {
+            brenn_wasm::ProcessorContract::V0_1 => Some(slug),
+            brenn_wasm::ProcessorContract::V0_2 => None,
+        })
+        .collect();
+    slugs.sort_unstable();
+    slugs
+}
+
+/// Tell the operator, in one `warn!`, which running components are built
+/// against the string contract, when any are; nothing otherwise.
+///
+/// `running` must be the whole running set, so the line describes what is
+/// running. It states the string contract's removal period and asks for a
+/// rebuild against the byte-carrying contract. A log line and not an alert,
+/// because the period is counted in releases and nothing stops working at the
+/// release that writes it: it reaches the console and the diagnostic file and
+/// pages nobody.
+pub(crate) fn warn_string_contract_components<'a>(
+    running: impl IntoIterator<Item = (&'a str, brenn_wasm::ProcessorContract)>,
+) {
+    let slugs = string_contract_slugs(running);
+    if slugs.is_empty() {
+        return;
+    }
+    // TODO(string-contract-removal): this notice leaves with the string contract.
+    warn!(count = slugs.len(), slugs = ?slugs, "{STRING_CONTRACT_NOTICE}");
+}
+
+/// The text of the notice [`warn_string_contract_surface_kinds`] writes.
+pub(crate) const STRING_CONTRACT_SURFACE_NOTICE: &str = concat!(
+    "surface component kinds built against the string component contract \
+     brenn:processor@0.1.0 are instantiated, and that contract is being removed: ",
+    string_contract_period!(),
+    "; a brenn without it does not run these kinds.",
+    string_contract_rebuild!()
+);
+
+/// The served kinds on the string contract that some surface in `surfaces`
+/// instantiates, sorted and deduplicated. A withheld kind is not served and
+/// is not listed.
+pub(crate) fn string_contract_surface_kinds<'a>(
+    roots: &brenn_surface_server::SurfaceRoots,
+    surfaces: &'a [brenn_lib::messaging::config::ResolvedSurface],
+) -> Vec<&'a str> {
+    let mut kinds: Vec<&str> = surfaces
+        .iter()
+        .flat_map(|surface| &surface.components)
+        .map(|component| component.kind.as_str())
+        .filter(|kind| roots.kind_contract(kind) == Some(brenn_wasm::ProcessorContract::V0_1))
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    kinds
+}
+
+/// Tell the operator, in one `warn!`, which instantiated surface kinds are
+/// built against the string contract, when any are; nothing otherwise.
+///
+/// `surfaces` must be every configured surface, so the line describes what
+/// pages run.
+pub(crate) fn warn_string_contract_surface_kinds(
+    roots: &brenn_surface_server::SurfaceRoots,
+    surfaces: &[brenn_lib::messaging::config::ResolvedSurface],
+) {
+    let kinds = string_contract_surface_kinds(roots, surfaces);
+    if kinds.is_empty() {
+        return;
+    }
+    // TODO(string-contract-removal): this notice leaves with the string contract.
+    warn!(count = kinds.len(), kinds = ?kinds, "{STRING_CONTRACT_SURFACE_NOTICE}");
+}
+
 /// The process-wide services a consumer's load spec is wired to.
 ///
 /// One value for the whole walk: every field is a service the process built
@@ -219,6 +396,11 @@ pub(crate) struct ConsumerLoadContext<'a> {
     /// over it; `None` is a host with no router, where such a consumer cannot
     /// be loaded at all.
     pub sync_router: Option<Arc<brenn_server::messaging_router::WakeRouterImpl>>,
+    /// The blob store as a component reaches it, built once by
+    /// [`brenn_wasm_dispatch::blob_host_over`]. A consumer holding the `blobs`
+    /// grant is loaded with it; `None` is a host with no blob store, where such
+    /// a consumer cannot be loaded at all.
+    pub blob_host: Option<brenn_wasm::BlobHostFn>,
 }
 
 /// A loaded consumer: the instantiated component, what the package bound, and
@@ -348,6 +530,20 @@ pub(crate) fn load_consumer(
     } else {
         None
     };
+    // Blob seam. Set iff the consumer holds the `Blobs` grant — the `blobs`
+    // interface is linked iff this is `Some`, and `ProcessorComponent::load`
+    // re-asserts that invariant.
+    let blob_host: Option<brenn_wasm::BlobHostFn> = consumer
+        .grants
+        .contains(&brenn_lib::messaging::ComponentGrant::Blobs)
+        .then(|| {
+            ctx.blob_host.clone().unwrap_or_else(|| {
+                panic!(
+                    "consumer {}: holds the `blobs` grant on a host with no blob store",
+                    consumer.slug,
+                )
+            })
+        });
     let calls: std::collections::HashMap<String, brenn_wasm::ProcessorCallTarget> = consumer
         .calls
         .iter()
@@ -388,8 +584,10 @@ pub(crate) fn load_consumer(
             declared_call_ports: consumer.call_ports.clone(),
             calls,
             sync_caller,
+            blob_host,
         },
     );
+    assert_contract_carries_bound_channels(consumer, component.contract());
     let store_path_present = consumer.store_path.is_some();
     info!(
         slug = %consumer.slug,
@@ -452,7 +650,10 @@ pub(crate) fn sync_caller_over(
 ) -> brenn_wasm::SyncCallerFn {
     let handle = tokio::runtime::Handle::current();
     Arc::new(
-        move |target_slug: &str, target_port: &str, body: String, chain: &[String]| {
+        move |target_slug: &str,
+              target_port: &str,
+              body: brenn_envelope::MessageBody,
+              chain: &[String]| {
             let router = router.clone();
             let target_slug = target_slug.to_string();
             let target_port = target_port.to_string();
@@ -546,6 +747,85 @@ pub(crate) fn fixture_artifact(file_name: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// The string contract's removal period reads the same in every text that
+    /// states it, so lengthening it in one text and not the others fails here.
+    ///
+    /// Only the file texts can drift: the notices are built from the same
+    /// macros as the constants they are checked against, so their checks fail
+    /// only if a notice stops being built from them. That the `CHANGELOG.md`
+    /// entry carries the title the notices quote is held by review; no test
+    /// reads `CHANGELOG.md`.
+    mod period_tests {
+        use super::super::{
+            DECLARATION_ENTRY_TITLE, STRING_CONTRACT_NOTICE, STRING_CONTRACT_PERIOD,
+            STRING_CONTRACT_SURFACE_NOTICE,
+        };
+
+        /// The texts an out-of-tree author reads at their pin, relative to
+        /// the repository root.
+        const TEXTS: [&str; 3] = [
+            "brenn-wasm/wit/processor.wit",
+            "brenn-wasm/wit/processor-0.2.wit",
+            "docs/component-packages.md",
+        ];
+
+        /// `text` with WIT doc markers and backticks removed and every run of
+        /// whitespace collapsed to one space, so a line break or code font
+        /// does not change the wording.
+        fn normalized(text: &str) -> String {
+            text.replace("///", " ")
+                .replace('`', "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        #[test]
+        fn every_text_states_the_period_in_one_wording() {
+            for relative in TEXTS {
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join(relative);
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                assert!(
+                    normalized(&text).contains(STRING_CONTRACT_PERIOD),
+                    "{relative} does not state the string contract's removal period as \
+                     `string_contract_period!` in brenn-bootstrap/src/consumers.rs words it"
+                );
+            }
+            for notice in [STRING_CONTRACT_NOTICE, STRING_CONTRACT_SURFACE_NOTICE] {
+                assert!(
+                    notice.contains(STRING_CONTRACT_PERIOD),
+                    "notice {notice:?} does not state the period"
+                );
+            }
+        }
+
+        #[test]
+        fn the_notices_say_what_to_do_and_where_to_look() {
+            for notice in [STRING_CONTRACT_NOTICE, STRING_CONTRACT_SURFACE_NOTICE] {
+                for needed in [
+                    "brenn:processor@0.1.0",
+                    "Rebuild",
+                    "brenn-guest",
+                    DECLARATION_ENTRY_TITLE,
+                ] {
+                    assert!(
+                        notice.contains(needed),
+                        "notice {notice:?} lacks {needed:?}"
+                    );
+                }
+                for stale in ["no removal is scheduled", "nothing needs to change"] {
+                    assert!(
+                        !notice.contains(stale),
+                        "notice {notice:?} still says {stale:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The verify-then-load pair, over a package on disk.
     ///
     /// The unit checks live in `brenn-lib`; what is pinned here is that the boot
@@ -616,6 +896,7 @@ mod tests {
                 declared_call_ports: Default::default(),
                 calls: Default::default(),
                 sync_caller: None,
+                blob_host: None,
             }
         }
 
@@ -896,9 +1177,132 @@ mod tests {
                 input_schema: serde_json::json!({ "type": "object" }),
                 max_concurrency: 1,
                 auto_approve: false,
+                accepts_attachments: false,
             });
         let provider = consumer_provider(&consumer, &runtime).expect("a providing consumer");
         assert!(Arc::ptr_eq(&provider, &runtime));
+    }
+
+    /// [`tool_consumer`] with one input port on `brenn:frames` and one output
+    /// port on `brenn:digest`, each bound to a channel whose `non_text` is the
+    /// one given.
+    fn bound_consumer(
+        input_non_text: bool,
+        output_non_text: bool,
+    ) -> brenn_lib::messaging::config::ResolvedWasmConsumer {
+        use brenn_lib::messaging::config::{
+            ResolvedSubscription, WasmInputPort, WasmOutputPort, WasmSinkBudget,
+        };
+        use brenn_lib::messaging::{Depth, NoiseLevel, Urgency, WakeMin};
+        let mut consumer = tool_consumer(&[brenn_lib::messaging::ComponentGrant::Ports], &[]);
+        consumer.inputs.push(WasmInputPort {
+            port: "frames".to_string(),
+            sub: ResolvedSubscription {
+                channel_uuid: uuid::Uuid::from_u128(1),
+                channel_address: "brenn:frames".to_string(),
+                push_depth: Depth::Bounded(1),
+                retain_depth: Depth::Bounded(1),
+                noise: NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+            non_text: input_non_text,
+        });
+        consumer.outputs.push(WasmOutputPort {
+            port: "digest".to_string(),
+            channel_uuid: uuid::Uuid::from_u128(2),
+            channel_address: "brenn:digest".to_string(),
+            default_urgency: Urgency::Normal,
+            budget: WasmSinkBudget {
+                fill_mt: 1000,
+                capacity_mt: 1000,
+            },
+            non_text: output_non_text,
+        });
+        consumer
+    }
+
+    #[test]
+    fn a_string_contract_component_on_text_only_channels_passes() {
+        assert_contract_carries_bound_channels(
+            &bound_consumer(false, false),
+            brenn_wasm::ProcessorContract::V0_1,
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "its input port \"frames\" is bound to brenn:frames, a channel \
+                               declared `non_text`, and the component is built against \
+                               brenn:processor@0.1.0"
+    )]
+    fn a_string_contract_component_reading_a_non_text_channel_panics() {
+        assert_contract_carries_bound_channels(
+            &bound_consumer(true, false),
+            brenn_wasm::ProcessorContract::V0_1,
+        );
+    }
+
+    /// The deferred view hands a component its own parked bodies, so an
+    /// output port is a reader too.
+    #[test]
+    #[should_panic(expected = "its output port \"digest\" is bound to brenn:digest")]
+    fn a_string_contract_component_writing_a_non_text_channel_panics() {
+        assert_contract_carries_bound_channels(
+            &bound_consumer(false, true),
+            brenn_wasm::ProcessorContract::V0_1,
+        );
+    }
+
+    #[test]
+    fn a_byte_contract_component_binds_any_channel() {
+        assert_contract_carries_bound_channels(
+            &bound_consumer(true, true),
+            brenn_wasm::ProcessorContract::V0_2,
+        );
+    }
+
+    #[test]
+    fn the_string_contract_slugs_are_the_0_1_components_sorted() {
+        use brenn_wasm::ProcessorContract::{V0_1, V0_2};
+        assert_eq!(
+            string_contract_slugs([("zeta", V0_1), ("frames", V0_2), ("alpha", V0_1)]),
+            ["alpha", "zeta"],
+        );
+        assert!(string_contract_slugs([("frames", V0_2)]).is_empty());
+        assert!(string_contract_slugs(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn the_string_contract_surface_kinds_are_the_instantiated_0_1_kinds_sorted() {
+        use brenn_surface_server::fixtures_config::SurfaceFixture;
+        use brenn_wasm::ProcessorContract::{V0_1, V0_2};
+        let root =
+            |contract| brenn_surface_server::KindRoot::for_test_with_contract("/s", contract);
+        let roots = brenn_surface_server::SurfaceRoots {
+            kernel: None,
+            withheld: Default::default(),
+            kinds: [
+                ("zeta".to_string(), root(V0_1)),
+                ("frames".to_string(), root(V0_2)),
+                ("alpha".to_string(), root(V0_1)),
+                ("idle".to_string(), root(V0_1)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let surfaces = [
+            SurfaceFixture::new("one", "zeta").build(),
+            SurfaceFixture::new("two", "alpha").build(),
+            SurfaceFixture::new("three", "frames").build(),
+            SurfaceFixture::new("four", "zeta").build(),
+        ];
+        assert_eq!(
+            string_contract_surface_kinds(&roots, &surfaces),
+            ["alpha", "zeta"]
+        );
+        assert!(string_contract_surface_kinds(&roots, &surfaces[2..3]).is_empty());
+        assert!(string_contract_surface_kinds(&roots, &[]).is_empty());
     }
 
     /// The host-side half of `store_path` resolution: an existing parent
@@ -935,6 +1339,7 @@ mod tests {
             provider_runtime: &brenn_tool_registry::ProviderRuntime::new(alert_dispatcher.clone()),
             max_payload_bytes: 1024,
             sync_router: None,
+            blob_host: None,
         };
         let mut consumer = tool_consumer(&[brenn_lib::messaging::ComponentGrant::Ports], &[]);
         consumer.store_path = Some(std::path::PathBuf::from(

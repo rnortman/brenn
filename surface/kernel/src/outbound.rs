@@ -35,12 +35,12 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::{
     BatchAnswer, Discarded, FlushBatch, OutboxSteps, Outboxes, PendingPublishes, PublishRequest,
 };
-use brenn_attach_proto::{ClientFrame, PublishBatchOutcome, PublishOutcome, check_batch_legality};
-use brenn_envelope::Urgency;
+use brenn_attach_proto::{ClientFrame, PublishBatchOutcome, PublishOutcome};
+use brenn_envelope::{MessageBody, Urgency};
 use brenn_surface_schema::telemetry::ErrorReportDocument;
 use brenn_surface_schema::{LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES};
 
-use crate::bindings::AppliedBindings;
+use crate::bindings::{AppliedBindings, channel_carries};
 
 /// The urgency the kernel states on the documents it writes about itself.
 ///
@@ -346,8 +346,9 @@ impl SurfaceOutbound {
         let request = PublishRequest {
             channel: out.channel.to_string(),
             attribution: Some(req.instance.clone()),
-            body: req.body,
+            body: req.body.into(),
             urgency: out.urgency,
+            attachments: Vec::new(),
         };
         let tag = PublishTag::Port {
             instance: req.instance,
@@ -392,8 +393,9 @@ impl SurfaceOutbound {
             // attributed to the component it is about and draws down that
             // component's send budget rather than its neighbours'.
             attribution: report.subject.map(str::to_owned),
-            body,
+            body: body.into(),
             urgency: PLATFORM_URGENCY,
+            attachments: Vec::new(),
         };
         Some(self.send(PublishTag::ErrorReport, request))
     }
@@ -413,8 +415,9 @@ impl SurfaceOutbound {
         let request = PublishRequest {
             channel: kind.channel(bindings).to_string(),
             attribution: None,
-            body,
+            body: body.into(),
             urgency: PLATFORM_URGENCY,
+            attachments: Vec::new(),
         };
         self.send(PublishTag::Telemetry(kind), request)
     }
@@ -440,6 +443,15 @@ impl SurfaceOutbound {
         outcome: PublishOutcome,
     ) -> Result<Option<PublishAnswer>, String> {
         let tag = self.pending.on_result(correlation)?;
+        // The surface route answers a non-text body offered to a text-only
+        // channel with a protocol close, never with this outcome, so a peer that
+        // sends it is not the server this page was built against.
+        if outcome == PublishOutcome::TextOnlyChannel {
+            return Err(format!(
+                "PublishResult {correlation:?} answered {outcome:?}, which the surface route \
+                 never sends"
+            ));
+        }
         match tag {
             PublishTag::Port {
                 instance,
@@ -467,6 +479,10 @@ impl SurfaceOutbound {
                 PublishOutcome::Failed => Err(format!(
                     "PublishResult refused a {kind:?} document the wiring names: {outcome:?}"
                 )),
+                PublishOutcome::TextOnlyChannel => {
+                    unreachable!("refused above: the surface route never sends {outcome:?}")
+                }
+                PublishOutcome::AttachmentNotHeld => not_a_v5_outcome(),
             },
         }
     }
@@ -649,9 +665,10 @@ impl SurfaceOutbound {
     /// A queued flush was composed under the previous attachment's contract, and a
     /// reconnect can hand the page a different one. Every gate the peer answers
     /// with a violation rather than an outcome is re-checked here, and there are
-    /// three: a channel the new wiring no longer binds to this instance, the
-    /// batch legality law against the new `max_body_bytes`, and the composed
-    /// frame against the new `max_frame_bytes`. The caps are one operator knob —
+    /// four: a channel the new wiring no longer binds to this instance, a
+    /// non-text body on a channel the new wiring declares text-only, the batch
+    /// legality law against the new `max_body_bytes`, and the composed frame
+    /// against the new `max_frame_bytes`. The caps are one operator knob —
     /// the frame cap is derived from the body cap — which an operator can lower on
     /// a restart with no build change and so no forced reload. The channel gate
     /// applies to the flush's control ops as well, and the legality law charges
@@ -671,10 +688,12 @@ impl SurfaceOutbound {
         facts: &AttachmentFacts,
         now: Millis,
     ) -> OutboxSteps<String> {
-        self.outboxes
-            .on_attached(facts.max_body_bytes as usize, now, |instance, batch| {
-                survives(bindings, instance, batch, Some(facts))
-            })
+        self.outboxes.on_attached(
+            facts.codec(),
+            facts.max_body_bytes as usize,
+            now,
+            |instance, batch| survives(bindings, instance, batch, Some(facts)),
+        )
     }
 
     /// The attachment went away: outstanding flushes die with it, queued ones
@@ -711,7 +730,7 @@ impl SurfaceOutbound {
 }
 
 /// Whether a flush passes every gate the peer answers with a violation. See
-/// [`SurfaceOutbound::on_attached`] for why these three and no others.
+/// [`SurfaceOutbound::on_attached`] for why these four and no others.
 ///
 /// `facts` of `None` asks the wiring half alone, which is the only half that has
 /// an answer while detached.
@@ -722,8 +741,16 @@ fn survives(
     facts: Option<&AttachmentFacts>,
 ) -> bool {
     let admits = |channel: &str| publishes_on(bindings, instance, channel);
-    batch.entries.iter().all(|entry| admits(&entry.channel))
-        && batch.ops.iter().all(|op| admits(&op.channel))
+    let carries = |channel: &str, body: &MessageBody| {
+        channel_carries(bindings.carries_non_text(channel), body)
+    };
+    batch
+        .entries
+        .iter()
+        .all(|entry| admits(&entry.channel) && carries(&entry.channel, &entry.body))
+        && batch.ops.iter().all(|op| {
+            admits(&op.channel) && op.op.body().is_none_or(|body| carries(&op.channel, body))
+        })
         && facts.is_none_or(|facts| fits_the_caps(instance, batch, facts))
 }
 
@@ -737,10 +764,13 @@ fn survives(
 /// attachment, and a peer built against a different derivation would state a
 /// different one.
 fn fits_the_caps(instance: &str, batch: &FlushBatch, facts: &AttachmentFacts) -> bool {
-    check_batch_legality(&batch.entries, &batch.ops, facts.max_body_bytes as usize).is_ok()
-        // Last, because it is the one gate that has to serialize the flush to
+    let codec = facts.codec();
+    codec
+        .check_batch_legality(&batch.entries, &batch.ops, facts.max_body_bytes as usize)
+        .is_ok()
+        // Last, because it is the one gate that has to encode the flush to
         // answer.
-        && batch.frame_bytes(Some(instance)) as u64 <= facts.max_frame_bytes
+        && batch.frame_bytes(codec, Some(instance)) as u64 <= facts.max_frame_bytes
 }
 
 /// The caller-facing status of one wire outcome.
@@ -750,5 +780,13 @@ fn publish_status(outcome: PublishOutcome) -> PublishStatus {
         PublishOutcome::RateLimited => PublishStatus::RateLimited,
         PublishOutcome::BodyTooLarge { len, max } => PublishStatus::BodyTooLarge { len, max },
         PublishOutcome::Failed => PublishStatus::Failed,
+        PublishOutcome::TextOnlyChannel => {
+            unreachable!("refused where the result is settled: the surface route never sends it")
+        }
+        PublishOutcome::AttachmentNotHeld => not_a_v5_outcome(),
     }
+}
+
+fn not_a_v5_outcome() -> ! {
+    panic!("surface client: attach v5, which the page speaks, has no AttachmentNotHeld outcome")
 }

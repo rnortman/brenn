@@ -31,6 +31,9 @@ POLICY_SRC_EXCLUDE = [
     "**/.*.local.*",
     ".claude/scheduled_tasks.lock",
     "e2e/.auth/**",
+    # The live configuration copy `make e2e` writes at the workspace root and
+    # leaves behind on any exit; gitignored, so outside `git ls-files` too.
+    ".e2e-live.brenn",
     "rust-project.json",
 ]
 

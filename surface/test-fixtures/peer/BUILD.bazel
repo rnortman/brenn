@@ -1,0 +1,62 @@
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# The attach-peer and bindings builders, kept out of `//surface/test-fixtures`
+# so the component suites that link that crate do not link the attachment
+# client.
+rust_library(
+    name = "peer",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "brenn_surface_test_peer",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//surface/kernel:__pkg__"],
+    deps = all_crate_deps(normal = True) + [
+        "//attach/client",
+        "//attach/proto",
+        "//brenn-envelope",
+        "//surface/schema",
+    ],
+)
+
+rust_test(
+    name = "peer_test",
+    crate = ":peer",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    target_compatible_with = HOST_ONLY,
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "peer_doc_test",
+    crate = ":peer",
+    target_compatible_with = HOST_ONLY,
+)
+
+# Prints the page rig's kit: every frame and document its scripted peer sends,
+# serialized from the Rust types at build time.
+rust_binary(
+    name = "page_rig_kit",
+    testonly = True,
+    srcs = ["page_rig_kit.rs"],
+    edition = "2024",
+    target_compatible_with = HOST_ONLY,
+    deps = all_crate_deps(normal = True) + [":peer"],
+)
+
+genrule(
+    name = "page_rig_kit_json",
+    testonly = True,
+    outs = ["page_rig_kit.json"],
+    cmd = "$(execpath :page_rig_kit) > $@",
+    target_compatible_with = HOST_ONLY,
+    tools = [":page_rig_kit"],
+    visibility = ["//frontend:__pkg__"],
+)

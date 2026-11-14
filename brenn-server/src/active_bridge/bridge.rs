@@ -202,7 +202,9 @@ pub struct ActiveBridge {
     /// dispatcher fan-out, and the wake walk — and the read is pure, so two of
     /// them running at once would each read the same unseen suffix and each send
     /// it. Held across the whole sequence, so the second caller reads a position
-    /// that has already moved and sends nothing.
+    /// that has already moved and sends nothing. A slash-led user turn holds it
+    /// across its read-record clear and its send, so no batch sent ahead of the
+    /// turn is recorded after the clear.
     pub(in crate::active_bridge) bus_delivery: tokio::sync::Mutex<()>,
     /// Rung when this conversation's chat command channel may have something
     /// new. The chat adapter waits on it; permits coalesce, so a burst of
@@ -514,19 +516,27 @@ impl ActiveBridge {
         // an early return below drops it, which removes the directory.
         let tool_socket = bind_tool_socket(app_config, conversation_id)?;
 
+        // A spawn with no session to resume starts an empty context, whatever
+        // an earlier bridge of this conversation handed its own. `begin` clears
+        // only on the `Messenger` and the conversation id it is given, and no
+        // test runs this function: both must be this bridge's own.
+        // TODO(test-spawn-new-unreachable-in-test-build)
+        let session_start = super::cc_spawn_config::SessionStart::begin(
+            messenger.as_deref(),
+            conversation_id,
+            resume_session_id,
+        );
+
         // Run start hooks for new conversations (not resume).
-        let hook_warnings = if resume_session_id.is_none() {
+        let hook_warnings = if !session_start.is_resume() {
             let hook_result = brenn_hooks::run_start_hooks(app_config, conversation_id).await?;
             hook_result.warnings
         } else {
             Vec::new()
         };
 
-        let (model, spawn_model) = spawn_model_and_seed(
-            model_override,
-            &app_config.model,
-            resume_session_id.is_some(),
-        );
+        let (model, spawn_model) =
+            spawn_model_and_seed(model_override, &app_config.model, session_start.is_resume());
 
         let config = build_cc_session_config(super::cc_spawn_config::CcSpawnInputs {
             app_config,
@@ -535,7 +545,7 @@ impl ActiveBridge {
             tool_cli_path,
             model,
             container_name_suffix,
-            resume_session_id,
+            session_start,
             transcript: transcript.clone(),
             alert_dispatcher: alert_dispatcher.clone(),
             user_tz,
@@ -849,6 +859,15 @@ impl ActiveBridge {
     /// no messaging configured.
     pub fn messenger(&self) -> Option<&Arc<brenn_messaging::Messenger>> {
         self.messenger.as_ref()
+    }
+
+    /// Clear this conversation's read record: its CC context no longer holds
+    /// the bus messages the host handed it. Nothing to clear without a
+    /// `Messenger`.
+    pub(crate) fn forget_conversation_reads(&self) {
+        if let Some(messenger) = &self.messenger {
+            messenger.forget_conversation_reads(self.conversation_id);
+        }
     }
 
     /// PWA push service handle. `None` when no app has `pwa_push.enabled`.

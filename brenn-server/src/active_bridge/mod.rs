@@ -8,6 +8,7 @@
 //! tabs are connected.
 
 mod approval_dispatch;
+mod blob_transfer;
 mod brenn_tools;
 mod bridge;
 mod bridge_io;

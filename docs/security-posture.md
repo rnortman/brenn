@@ -363,6 +363,31 @@ device is sharing it publishes a `stopped` fact for it, and it deletes
 nothing. It is ungated because the consent outlives the grant: a stop the
 gate refused would leave the device sharing when the grant returns.
 
+**The surface route's wire.** A surface page attaches over the attach
+protocol at version 5 and only 5: the route offers no range and no fallback,
+and a page offering anything else is closed as incompatible. Every publish and
+every delivery is a binary frame, whatever its body. A frame malformed for v5
+— a text message of a binary kind, a binary message of a text kind, a header
+whose lengths disagree with the bytes after it, a malformed content type, a
+text body that is not UTF-8 — is a violation with no fallback decoding: the
+session is closed, the `attach_protocol_violation` security event is logged,
+and it is fail2ban signal. The websocket read cap and the frame cap are v5's,
+204 800 bytes at the default body cap; a frame over it is the over-cap
+violation. A page's bytes and content types are its assertion, as a remote's
+and a guest's are: the type is validated for syntax and, for a text type, the
+bytes for UTF-8, and the two are **never checked against each other**. A
+non-text body is admitted only onto a channel declared `non_text`. Offered for
+a text-only channel, it is a protocol violation on this route, where on the
+remote route (§9a) it is answered `TextOnlyChannel`: the page is handed every
+channel's declaration in its bindings document before it may publish, and its
+kernel refuses such a body to the component synchronously, so no conforming
+page ever sends one, whereas a remote cannot see the declaration. A reload
+closes a surface's sessions, and waits for them to end, before it replaces any
+directory entry they may name — a channel the surface binds, or its config,
+geometry, status or error channel — so a page's publish never meets an entry
+changing under it; a reload that would make a durable channel text-only while
+a running surface may publish to it is refused and needs a restart.
+
 **What the reviewer verifies:** authority comes from the session everywhere; the
 inbound schema is closed and rejects+signals unknowns; every security-relevant
 field is bound/allowlisted at intake; state-changing entry points carry CSRF-
@@ -713,7 +738,236 @@ fail-closed and the data path surfaces unknowns; the approval gate authorizes
 every privileged action and what-runs equals what-was-approved; browser-
 contributed auto-approve patterns are validated and scoped; every CC-influenced
 sink (subprocess args, filesystem paths, markup) is guarded per the policies
-above.
+above; and no bus message body that is not text reaches a conversation's
+context or markup except as the §7.5 placeholder.
+
+### 7.5 Bus message bodies in a conversation's context
+
+A bus message body is bytes with an optional content type, and is *text* or
+*not text* by one rule (`is_text_content_type`; `docs/message-bus.md` §2.1.2).
+
+- **A text body reaches a conversation as text** — pushed batches,
+  `MessageChannelGet`, `BrennPendingList` and the `BrennMessageEdit` result —
+  with its `content_type` beside it when it has one.
+- **A body that is not text reaches a conversation only as a metadata
+  placeholder**: `{"binary": true, "content_type": …, "size": …}`. The legacy
+  UI's message card shows the same thing as one escaped line
+  (`binary body: <content type>, <size> bytes`).
+- **A tool result that carries attachments reaches a conversation as its
+  JSON value beside each attachment's name, size and content type** and the
+  id of the message holding them on the app's result inbox — never a blob id
+  and never the bytes (§7.6). The value is the tool's, as for any tool result.
+- **No path decodes, base64-encodes or lossily converts a body's bytes into a
+  conversation's context or into markup.** `from_utf8_lossy` and its kin are
+  not used on a body anywhere.
+- **At the transport edge the same rule holds in both ingress shapes**
+  (`docs/message-bus.md` §2.7.1). On a wrapped channel, the default, a broker
+  payload that is not text arrives as metadata inside the wrapper
+  (`MqttPayloadBody::Binary`) and its bytes reach no channel. On a channel
+  whose tuning block states `non_text = true` the payload's bytes are the
+  body; a conversation is shown a non-text one as the placeholder above, with
+  the message's `transport` metadata beside it. In both shapes the topic and
+  the webhook request headers (credential values redacted) are sender-chosen
+  text that reaches a conversation's context, as they did inside the wrapper.
+
+The first producer of such bodies on the bus is a WASM component built against
+the byte-carrying contract `brenn:processor@0.2.0` (§8), publishing onto a
+channel declared `non_text`; a conversation subscribed to that channel is
+shown the placeholder, under this rule unchanged.
+
+The reason is the model's context, not the wire: bytes shown to a model are
+either noise it will misread or an injection channel nobody reviewed, and a
+lossy decoding is both.
+
+**The save command is not a host path into the context.** `brenn-tool save`
+writes a non-text body's bytes, or an attachment's, to a file in the
+conversation's own environment, by the conversation's own act (§7.6). The
+host never renders them; after the save they are a file like any other there,
+and what the conversation then does with that file is its own business, as
+with a file it downloaded. A *host* path that puts a non-text body's bytes, or
+any encoding of them, in front of a model is a finding.
+
+### 7.6 The blob store and attachments
+
+A message may name blobs — immutable byte objects in the host's blob store —
+by reference (`docs/message-bus.md` §2.1.2a).
+
+- **Host code and components granted `blobs` write the store.** A backend
+  WASM component granted `blobs` reads and writes it through
+  `brenn:processor/blobs@0.3.0`. It can name only a blob the host handed it in
+  this activation — an attachment of a message in its windows, named by port,
+  index and attachment name, looked up in a table the host built from what it
+  delivered — or one it made in this activation, and it names either by a
+  resource handle, never by id: no function of the interface takes an id, so
+  an id read from a header, a body or a component's own store opens nothing.
+  A handle dies with the activation, except one a tool completion named
+  (below). Publishing with attachments needs `ports` as well. A conversation
+  forwards, saves and attaches blobs by name (below). A remote on attach v6
+  does both — reads an attachment's bytes and, with publish authority, creates
+  a blob — through the session's blob door reviewed in §9a; pages still
+  cannot. Host code's
+  `Messenger::publish_from_system_with_attachments` carries the tool
+  substrate's requests and results, and `Messenger::publish_with_attachments`
+  a conversation's sends. Every later door that admits an outside producer or
+  reader is a boundary change to review here.
+- **A tool call is a path for a blob between principals.** An asynchronous
+  registry call and its result carry attachments by reference
+  (`docs/message-bus.md` §2.1.2a). A caller gives a tool read access to
+  exactly the blobs it names, and it can name only blobs it could itself read:
+  a component by handle, a conversation by a name `admit_conversation_name`
+  admits. A tool gives its caller the blobs it answers with. Neither side
+  learns an id, and a provider still learns no caller (§8.4). A tool takes
+  attachments only if its declaration says so, checked before it runs; a
+  provider's completion holds the blobs it names past its activation's
+  `Err` or trap, and they drop with the call if its waiter is gone. A blob
+  handed to a provided tool stays on the provider's request inbox for that
+  inbox's window, whatever becomes of the call: handing a provider a blob is
+  giving it that blob.
+- **What an app's result inbox exposes: nothing to any policy.** A tool
+  result that carries attachments to a conversation is published on
+  `brenn:app-tool-results/<app-slug>` and written into the calling
+  conversation's read record, and into no other's. `AppPolicy::brenn_acl_covers`
+  answers no for the namespace whatever an app's matchers say, so no
+  conversation lists, reads, subscribes to or is delivered from any app's
+  result inbox, its own included; `resolve_channel` refuses an authored
+  matcher reaching into the namespace, for any owner, and the config language
+  refuses an agent's position there. `admit_named` admits a name on the app's
+  own inbox by the read record alone. So a result's attachments reach only
+  the conversation that made the call — not another conversation of the same
+  app, not another app, not another user — and that conversation cannot name
+  them again after its context is reset.
+- **A policy over the tool substrate is a watch of the traffic, never of its
+  blobs.** The three older tool channels now carry blobs: a request on
+  `brenn:tools/<tool>` carries what a component hands a tool, a request on
+  `brenn:tool-requests/<slug>` carries what any caller — a conversation
+  included — hands a provided tool, and a result on `brenn:tool-results/<slug>`
+  carries what a tool answers a component with. An app whose policy covers
+  them — an authored `acl` matcher, exact or prefix, read with
+  `MessageChannelGet` or subscribed with `MessageSubscribe` — reads the call
+  traffic of every user, and is shown each attachment's name, size and content
+  type. No attachment on a channel of the four tool namespaces can be named by
+  a conversation except on its own app's result inbox: `admit_named` refuses
+  it `tool_channel_attachment` after the policy check and before any lookup or
+  hold, whatever the policy says and however it came to cover the channel.
+  Naming such a message's body is unaffected. A remote's `BlobOpen` on these
+  channels is refused `ToolChannel` by the same check, in
+  `Messenger::admit_retained_part`, the admission both doors call, whatever
+  the remote's subscribe matchers cover. Any later door that lets a
+  participant read an attachment by policy must exclude these channels the
+  same way.
+- **Who may redeem what: a conversation, by (message id, attachment name).** A
+  conversation is still never shown an id. It names an attachment by the id
+  of the message that carries it and the attachment's name, and one function,
+  `Messenger::admit_conversation_name`, admits the name only when both hold of
+  that one message: the host handed it to this conversation since the
+  conversation's context was last reset as the host sees it (start,
+  compaction, a user turn beginning with `/`; the record is in memory and lost
+  at restart), and it is still inside the window of a channel the app's
+  policy lets it read now. `docs/message-bus.md` §2.1.2a states the rule. An
+  admitted name is held under the store's own lock, so the blob cannot lose
+  its last holder between the check and the hold. A refusal of a name the
+  host never handed over (`not_read`, `channel_not_readable`), or of an
+  attachment on a tool-substrate channel (`tool_channel_attachment`, above),
+  is logged at `warn` with app, conversation and message id: it is a
+  mis-copied id, an injected one, or a model reaching for another principal's
+  blob.
+- **What the rule does not close.** A conversation induced — by text it read —
+  to forward or save a blob it legitimately holds does so: the rule bounds
+  what it can name, not why it names it, and forwarding is a `BrennSend` under
+  every policy `BrennSend` already has. Two resets of the conversation's
+  context are not seen by the host: a resume Claude Code answers with a fresh
+  session, after which the read record still stands, and a slash command a
+  user sends while a turn is running, where messages handed over before Claude
+  Code acts on the command stay in the record (`blob-handle-integrity` in
+  `TODO.md`). A slash command sent to an idle conversation is closed: the host
+  clears the record at every user turn that begins with `/`. What either gap
+  admits is bounded: a message the host did hand this conversation, still
+  retained on a channel its app may read.
+- **Attachment bytes reach a file the model can open.** `brenn-tool save`
+  writes them into the conversation's environment (§7.5); from there the
+  conversation can read them with its own tools. That is the conversation's
+  act on bytes it may name, not a host rendering.
+- **A conversation is a producer.** `brenn-tool send` seals a new blob per
+  attached file. Each file is reserved at its declared size before any byte
+  crosses, so `max_blob_bytes` and `blob_budget_bytes` refuse it up front; one
+  send's files together are at most `max_blob_bytes`; with eight open socket
+  connections per conversation, at most `8 × max_blob_bytes` is charged and
+  unsealed at once. A send refused at publish, or a connection that drops,
+  leaves no blob. Nothing bounds a conversation over time: over many sends it
+  can fill the pool as a component can (`blob-budget-per-component`).
+- **A remote is a producer, and a holder.** A remote session on attach v6 with
+  publish authority creates blobs, each reserved at its declared size before
+  any byte crosses. Every v6 session with the door — subscribe-only included —
+  can keep up to `max_bytes_held` (4 × `max_blob_bytes`) of the pool charged:
+  the declared sizes of its uploads plus the sizes of the blobs it holds,
+  sealed uploads and opened attachments alike, counted per handle, with at
+  most 64 handles. An opened attachment stays charged by the session's hold
+  after its message is evicted, which is why opens count. Over the bound a
+  create or an open is refused `BytesHeldLimit`. Everything the session holds
+  is let go when it ends. The bound is on what the session holds: a blob a
+  durable row named stays charged after the session lets go of it until the
+  next reap, as for every holder. Across a remote's sessions the bound multiplies by
+  `max_sessions`; nothing bounds a remote over time: over many uploads it
+  fills the pool through the windows of the channels it publishes to, as a
+  component does (`blob-budget-per-component`).
+- **What bounds one activation.** Host constants, not configuration: 1 MiB per
+  read and per write call, 64 live `blob` and `writer` handles together,
+  4,096 calls of `open`, `read`, `create`, `write` and `seal`, and 64 MiB of
+  accepted writes summed over the activation. That last is the host's fixed
+  per-activation write bound, apart from `max_blob_bytes`: since a writer does
+  not outlive its activation and `seal` needs the whole extent written, no
+  component can make a blob larger than that bound, however high
+  `max_blob_bytes` is set. Each refusal is typed, and the
+  host logs one `warn` per activation that hit a bound, naming the component,
+  even when the guest swallows the error. Calls the store refuses — over its
+  budget, or its filesystem failing (`storage-failed`) — are counted the same
+  way into one `warn` per activation, and the activation's first storage
+  failure is logged at `error` with its I/O error, so a guest retrying in a
+  loop writes one line, not one per call.
+- **What does not bound a component.** Over many activations a component can
+  fill the store: each activation may write 64 MiB, and what it publishes
+  lives as long as the channels' windows hold it. The store's budget is one
+  pool for every producer, so one component, or one conversation attaching
+  files, can drive it to `budget-exhausted` for all of them. What limits a
+  component's rate is the per-sink publish budget and the windows' depths;
+  what tells the operator is the post-activation warning that counts the
+  component's budget refusals. A conversation's rate is limited by its send
+  budget and rate. A tool call's blobs rest on the rows of the call — the
+  request on `brenn:tools/<tool>` and on a provider's request inbox, and the
+  result on the caller's inbox, a component's or an app's — each for that
+  channel's window, so a caller fills the pool through the channels of the
+  tools it calls, and a provider through its callers' inboxes; after a
+  restart an app's result inbox holds blobs no conversation can name until its
+  window turns over. A per-producer share of the budget is
+  `blob-budget-per-component` in `TODO.md`.
+- **A bounded shared resource.** The store is one pool for every producer,
+  bounded by `max_blob_bytes` per blob and `blob_budget_bytes` in total, both
+  charged on a blob's extent before any byte is written, so a sparse write
+  far out pays for everything below it. Over either bound a write is refused;
+  nothing is evicted and nothing waits. A blob stays charged until its file
+  is unlinked, which bounds the disk a pending reap holds.
+- **The id is an unguessable capability nobody outside the host can
+  redeem.** 128 random bits, not derived from content. Redemption also
+  requires that the blob still has a holder; an id whose holders are gone is
+  refused even while its file awaits the reap. A conversation is shown each
+  attachment's name, size and content type, never its id and never its
+  bytes in its context (§7.5's reason applies). A component is shown ids in
+  its envelope headers and can redeem none of them by id. No door redeems by
+  id: a component names by handle, a conversation by (message id,
+  attachment name), under the rule above, and a remote by session handle,
+  obtained by (channel, message id, attachment name) or by its own upload.
+- **The attachment name is the bound on producer text a conversation sees.**
+  1 to 64 bytes of `[A-Za-z0-9._-]`, starting alphanumeric, refused at
+  construction: no whitespace, no markup, no control characters.
+- **The directory.** Created mode 0700 if absent; each blob file is created
+  exclusively with mode 0600. At boot the store refuses to start on a
+  directory entry it does not recognise as a blob file or its owner record,
+  rather than sweeping something it did not create. The owner record, a
+  mode-0600 file `owner` holding the database's store generation, ties the
+  directory to one database: a store refuses a directory whose record names
+  another database, or that holds blob files and no record, before it deletes
+  anything, so a host pointed at another host's directory cannot sweep it
+  even while that host is down and its lock is free.
 
 ---
 
@@ -795,6 +1049,21 @@ internally-originated.
   The boot panic remains the primary structural check; the read gate is what
   keeps enforcement from resting on that check holding forever. A delivery path
   that reads a channel without consulting the predicate is a finding.
+- **A guest built against the byte-carrying contract hands the host arbitrary
+  bytes and a content type.** Under `brenn:processor@0.2.0` a publish, a
+  deferred publish or edit, a sync call and a sync reply each carry a body of
+  bytes with an optional content type, not a string. The host validates the
+  content type's syntax and, for a text type, that the bytes are UTF-8, in one
+  place (`MessageBody::from_parts`), before the body reaches any gate that
+  spends; the size caps count raw bytes. The content type is the guest's
+  assertion and is **never checked against the bytes**: it carries exactly the
+  trust of the body it labels, and a downstream decision that treats it as
+  verified is a finding. A non-text body is admitted only onto a channel
+  declared `non_text`, and every reader that can only represent text — a 0.1.0
+  component, on the backend or hosted on a surface page, an attach v4
+  session — is refused at binding or at subscribe rather than at delivery (an attach v4 session's deferred view
+  leaves out a non-text entry a v5 sibling session parked); a store write of a non-text body to a
+  text-only channel panics as a host bug.
 
 **What the reviewer verifies:** capabilities are deny-by-default and
 structurally enforced; no ambient access exists; every engine that compiles guest
@@ -828,6 +1097,13 @@ the code to:
   whole. The route disables the router's global limit deliberately: an endpoint
   whose ceiling is above it must serve, and a per-endpoint ceiling that some
   outer layer silently overrode would be a limit nobody could reason about.
+- **A body that is not UTF-8 is refused before authentication** — 400
+  `{"error":"schema"}` and a `SchemaViolation` event — on every default
+  endpoint, and on an endpoint whose channel takes the raw ingress shape only
+  when the endpoint's content type is a text type. A raw endpoint with a
+  non-text type accepts any bytes, and authentication runs over them as
+  received; its `transport_ceiling_bytes` may not exceed the bus's
+  `max_body_bytes`.
 
 The endpoint table is swapped by a reload rather than rebuilt, so a request
 holds the endpoint it resolved at arrival for its whole life: the scheme it was
@@ -958,8 +1234,9 @@ A component class may declare `provide <tool>` statements; each becomes a
 registry tool that agents, `brenn-tool` and other components call like any
 other (`docs/config-dsl.md`, "Tool grants"). The component serves a call as an
 ordinary activation on its reserved `tool-requests` port, and answers it
-through `provides.complete`. It may act for the caller's user through
-`provides.call-async-for`.
+through `provides.complete`, or `blobs.complete` to answer with blobs. It may
+act for the caller's user through `provides.call-async-for` or
+`blobs.call-async-for`. A request and a result may carry attachments (§7.6).
 
 **Trust decision: a provider decides nothing about its own authority.**
 Admission happens before the provider sees a request. That covers the grant,
@@ -1156,6 +1433,114 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   the route answers `503` with a warning and no security event: a remote at its
   cap is an operator's topology or a netsplit corpse awaiting the heartbeat
   watchdog, and banning the pod's IP for either turns a transient into an outage.
+- **The route serves three wire versions and decodes once; v6 is strict, v4
+  and v5 strict but for one gap.** It serves attach protocol v4 (every frame
+  JSON text, bodies strings), v5 (the body-carrying frames binary: a
+  big-endian `u32` header length, a strict JSON header with a
+  `{len, content_type}` descriptor per body, then the raw bodies) and v6 (v5
+  plus the blob transfer frames below), negotiated by the frozen `Hello`. v6
+  refuses an unknown key in every frame; v4 and v5 accept an unknown key
+  beside the tag of a field-less tagged variant — from a client, a
+  `PublishBatch` deferred op `cancel` — without a violation, until
+  `attach-tagged-unit-variant-strictness` in `TODO.md` is done. A frame
+  malformed for the session's version is a violation with no fallback
+  decoding: a binary message under v4, a text message of a binary kind or a
+  binary message of a text kind under v5 and v6, a header whose lengths
+  disagree with the bytes after it, a malformed content type, a text body
+  that is not UTF-8. The decoder compares every peer-supplied length with the
+  bytes that remain and never sums them, so no input makes it panic or wrap.
+  The websocket read cap is set at the upgrade, before a version is agreed, to
+  the largest frame cap among the served versions; after negotiation each
+  frame is checked against its own version's cap (204 800 bytes for v5 and
+  274 432 for v6 at the default body cap, against v4's 532 480), and a frame
+  over it is the existing over-cap violation.
+- **The transfer frames are strict and every number is a checked `u64`.** v6's
+  blob frames are strict like the rest: an unknown field, `attachments` given
+  as anything but a list, an attachment name outside the grammar, a
+  `BlobWrite` or `BlobReadResult` whose `len` disagrees with its body section
+  in either direction, a text `BlobWrite` or a binary `BlobRead` are
+  violations. Offsets, lengths and sizes are `u64` from the peer, and every
+  `offset + len` is a checked addition: overflow is `OutOfRange` for a read
+  and a violation for a write, never a wrap or a panic.
+- **Blob authority is the profile's, re-derived per frame.** A session has a
+  blob door only on v6, with a profile that grants one and a host with a blob
+  store; `Welcome.blobs` says so, and without it every blob frame and every
+  publish with attachments is a violation. `BlobOpen` names an attachment by
+  (channel, message id, attachment name), never by blob id, and is admitted
+  only when the profile grants subscribe authority over the channel, asked at
+  that open — outside it the same violation a `Subscribe` there is — and the
+  message is inside the **channel's** window, not the remote's subscribe
+  depth or ceiling. The tool substrate's channels are refused `ToolChannel`
+  by the admission the conversation door shares (§7.6), logged at `warn` on a
+  session's first. `BlobCreate` needs the door's `upload`, granted only to a
+  remote with publish authority on some channel; a publish naming handles is
+  judged by the existing publish authority for its channel.
+- **What a stolen token now reaches.** On v6, the bytes of every attachment of
+  every message in the window of every channel the remote may subscribe to,
+  the tool channels excepted — where a v5 token reached their references
+  only — and the ability to keep up to `max_bytes_held` (4 × `max_blob_bytes`)
+  of the pool charged per session, by uploads or by holding opened attachments
+  past their messages' eviction (the second is open to a subscribe-only
+  remote), refused beyond that with a typed `BytesHeldLimit` on create and on
+  open. The bound is on what the session holds: a blob a durable row named,
+  once the session lets go of it, stays charged until the next reap, as it
+  does for every holder (`docs/message-bus.md` §2.1.2a). A remote with publish
+  authority is a producer against `blob_budget_bytes` as well (§7.6).
+- **The session is the holder, and nothing survives a detach.** Handles are
+  client-minted and attachment-scoped; the table holds every blob the session
+  names and is dropped when the session ends, however it ends: an unsealed
+  upload's bytes are deleted, holds are let go. A handle carries no
+  attribution and outlives no attachment. The table is dropped before the
+  session's place in the remote's session count is released, so a session that
+  no longer counts against `max_sessions` holds no blob, and the per-session
+  bound times `max_sessions` bounds what a remote's sessions hold at any
+  moment. That closes the blob half only. The writer's queued frames — at most
+  four read answers among them — are not blobs: an ended session's writer keeps
+  them until they are written or its watchdog stops it, which can be after the
+  slot is free. The number of ended sessions whose writers are still draining
+  is not bounded — nothing counts them and the drain has no overall deadline —
+  so the memory their queues pin is not bounded per remote
+  (`attach-ended-session-drain-unbounded` in `TODO.md`).
+- **A pipelined frame is answered, not punished.** A client may send a whole
+  sequence — create, writes, seal, publish, close — without waiting, so every
+  frame valid in the state its predecessors would leave is an answer or a
+  no-op in the state a refused predecessor leaves; only states no refusal
+  produces are violations. The table a reviewer checks a new blob frame
+  against (a handle is absent, a writer, or held):
+
+  | Frame | absent | writer | held |
+  |---|---|---|---|
+  | `BlobCreate`, `BlobOpen` | proceeds | violation | violation |
+  | `BlobWrite` | dropped, counted | written | violation |
+  | `BlobSeal` | answer `UnknownHandle` | answer `Ok` or `Incomplete` | violation |
+  | `BlobRead` | answer `UnknownHandle` | answer `NotSealed` | read |
+  | a publish naming it | answer `AttachmentNotHeld` | answer `AttachmentNotHeld` | published |
+  | `BlobClose` | no-op, counted | bytes deleted | hold dropped |
+
+  `NotRetained`, `NoSuchAttachment`, `ToolChannel` and `NotSealed` are answers
+  and never fail2ban signal; a channel outside subscribe authority is a
+  violation. Each per-session bound — 64 handles, `max_bytes_held`, four read
+  answers in flight — is a typed answer advertised in `Welcome`, and a
+  session's first refusal of each is logged at `warn`.
+- **A remote's bytes and content types are its assertion.** A v5 remote
+  publishes bodies of bytes with a content type; the type is validated for
+  syntax and, for a text type, the bytes for UTF-8 (`MessageBody::from_parts`),
+  and is **never checked against the bytes**, exactly as a guest's (§8). A
+  non-text body is admitted only onto a channel declared `non_text`. Offered
+  for a text-only channel, it is refused by the attach handler before the bus
+  is asked, answered `TextOnlyChannel` with nothing stored: a conforming
+  client's ordinary mistake (it cannot see the declaration), so not a
+  violation and not fail2ban signal (on the surface route the same body is a
+  violation; §6). On the remote route, offered for a channel the directory does
+  not hold at that moment — deprovisioned, or mid-reload — it is answered as an
+  absent channel is (`Failed` for a single publish, the entry dropped from a
+  batch) and is never handed to the bus, whose own later read could find an
+  entry the handler never checked. A refused single publish has already
+  spent a connection-bucket token and a refused batch its send-budget draw, so
+  a client looping on the mistake is metered like any other publisher. Each
+  refusal is counted on the session's detach line, and the first on a
+  connection is a warning naming the channel and the body's content type and
+  size, never its bytes.
 
 **Accepted risks:**
 
@@ -1173,6 +1558,37 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   same transport: the durable resume seq is the global message rowid (§6.1), the
   subscribe-op bucket is per-connection (§6.2), and durable publish writes are
   gated only by that per-connection bucket (§6.3).
+- **Transfer frames are unmetered, and an unmetered `BlobOpen` on a durable
+  channel contends for the host's one database lock.** `BlobWrite` and
+  `BlobRead` are bounded in space (blob size, the pool, the session's handle
+  and bytes-held bounds, the in-flight read window) and by the socket in time,
+  with no rate: a camera at 15 frames a second of 300 KB is 4.5 MB/s of
+  legitimate upload, so a default byte rate that admits it bounds nothing. A
+  session can keep one 256 KiB disk operation in progress, continuously.
+  `BlobOpen` on a `brenn:` channel runs its admission under the messenger's
+  database lock — one lookup by message id and one count of the channel's
+  newer retained rows; on an `ephemeral:` channel it takes only that ring's
+  lock.
+  - *What it enables:* a remote token, or a stolen one, looping
+    `BlobOpen`/`BlobClose` over a durable channel it may subscribe to slows
+    every durable publish and read on the host. Nothing but the session's
+    open counter records the loop.
+  - *Why it is bounded:* the lock grants in arrival order and a session
+    handles one frame at a time, so each session has at most one admission
+    waiting or running; another publisher waits behind at most one admission
+    per looping session — two per remote at the default `max_sessions` —
+    never indefinitely. One admission is an indexed lookup plus a count
+    bounded by the channel's retained rows: sustained degradation, not a stall
+    and not growth.
+  - *Why it is accepted:* it is the exposure §6.5 accepts for another
+    unmetered, database-reading frame family, on the same grounds — a
+    household deployment whose remotes the operator admits — and an open's
+    legitimate rate on a durable channel is whatever its publishers' rate is.
+  - *What a later meter costs:* `BlobOpenOutcome` has no rate refusal and a
+    conforming reader's open cannot be made a violation, so metering opens is
+    a new wire version.
+  - *Revisit trigger:* a remote outside the operator's trust, or an admission
+    whose cost stops being bounded by the channel's window.
 
 **What the reviewer verifies:** the token is file-backed, mode-checked, and
 compared in constant time — the comparison is digest-based and fixed-width, so
@@ -1182,7 +1598,18 @@ dummy digest for exactly the same work; every authentication failure is
 indistinguishable to the caller and produces exactly one `AuthFailure`; the
 profile's scheme match is exhaustive and denies by default; the subscription cap
 is enforced; the slug is sanitized wherever it reaches a log or event; the cap
-rejection emits no security event.
+rejection emits no security event. For the blob door: every v6 frame decodes
+strictly and every peer-supplied `offset + len` is a checked addition; the door
+exists only where the version, the profile's grant and the store all allow it,
+and `Welcome.blobs` agrees with the handlers; `BlobOpen` re-derives subscribe
+authority from the profile at every open, admits by the channel's window and
+refuses the tool channels through `Messenger::admit_retained_part`, and no blob
+frame takes or returns a blob id; `BlobCreate` needs `upload`; each frame
+behaves per the handle-state table above, so a pipelined frame behind a refusal
+is an answer or a no-op; the handle bound and the bytes-held bound are checked
+on both create and open — opens count their blob's size — and the read window
+is held in the writer queue; the session's table is dropped at every kind of
+session end, before its registry slot is released; and `BlobOpen` stays unmetered only under the accepted risk above.
 
 ---
 
@@ -1503,6 +1930,25 @@ nothing to what a bare CC can already do as that uid.
   connection under a byte cap; a bounded time to send it; a bounded number of
   open requests per conversation, beyond which a connection is answered `busy`
   before any of its bytes are read. No waiting gate sits in front of any tool.
+- **Raw bytes follow the request line for two ops, and stay bounded.** `save`
+  answers a header line and then the blob's or body's bytes; `send_files`
+  declares each file's size, is answered a go-ahead line only after every
+  check that needs no byte — the tool's admission, the `BrennSend` argument
+  checks, each forwarded name, each declaration, and a reservation of every
+  file's declared size in the blob store — and then reads exactly the
+  declared bytes. The request line keeps its byte cap and deadline; the byte
+  phase has its own fixed deadline (300 s), after which the server ends the
+  transfer; one send's files together are at most `max_blob_bytes`; a
+  transfer holds its connection's permit until it ends, so the bound on open
+  requests is a bound on open transfers. A transfer that ends early or hits
+  the deadline is logged, not signalled: it is what a shell timeout killing
+  the client looks like. The violations of the request line are signalled as
+  for every op.
+- **The server opens no path the conversation names.** `brenn-tool`, running
+  in the conversation's environment as the conversation, opens and writes the
+  files; only bytes cross the socket. For a bare app `brenn-tool` runs as the
+  server's uid with no container, and this section claims no confinement of
+  what it can open there.
 - **The listener carries the container's label, never the server's widened
   policy.** Where the host confines containers with SELinux, the socket is
   created under the context configured on the container definition, so the

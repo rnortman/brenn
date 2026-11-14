@@ -706,6 +706,7 @@ fn sdk_module(grant: ComponentGrant) -> Option<&'static str> {
         ComponentGrant::Tools => Some("tools"),
         ComponentGrant::Calls => Some("calls"),
         ComponentGrant::Provides => Some("provides"),
+        ComponentGrant::Blobs => Some("blobs"),
         ComponentGrant::Dom => Some("dom"),
         ComponentGrant::PageDom => Some("page_dom"),
         ComponentGrant::Ports | ComponentGrant::Takeover => None,

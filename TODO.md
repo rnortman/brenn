@@ -62,6 +62,652 @@ an operator action removes a named key profile's `exhausted` flag from
 and `docs/claude-accounts.md` describes the action. The
 `TODO(claude-key-flag-operator-clear)` comment sits in
 `AccountLedger::turn`, where a successful turn removes the flag.
+## `surface-small-row-delivery-latency`
+
+In the Chromium timing run (`make e2e-measure`, `docs/page-rig-timings.md`,
+"`0.2.0 binary row delivered`, Chromium"), a 49,149-byte binary row emitted by
+a page-hosted kind and delivered back to it over the page's websocket took
+about 45 ms from click to delivery report on every one of 100 samples, against
+about 25 ms for a 1,048,576-byte row; the browser state chains on the same page
+take 2-6 ms. The cause is not established. About 40 ms on small frames only has
+the shape of Nagle's algorithm meeting a delayed acknowledgement, and the
+server's listener (`axum::serve` in `brenn-bootstrap/src/lib.rs`) does not set
+`TCP_NODELAY`. Done when the extra latency is located (which hop: the page's
+send, the server's write of the `Deliver`, or a kernel flush timer) and either
+removed or explained in the timings document. Changing the server's socket
+options affects every HTTP and websocket route and wants a ruling. Code site
+(`TODO(surface-small-row-delivery-latency)`): `axum::serve` in
+`brenn-bootstrap/src/lib.rs`.
+
+## `efficiency-surface-type-check-recompiles-every-kind-every-scan`
+
+Every surface asset scan — at boot and at every reload, inline in the
+reload's prepare — runs `brenn_wasm::check_surface_component` on every
+`brenn:processor@0.2.0` kind any declared mount offers, instantiated or
+not: a full compile of the artifact under a freshly built wasmtime
+`Engine`. A reload that changes nothing about a kind compiles it again, so
+reload and boot latency grow by one compile per offered 0.2.0 kind. Every
+in-tree kind is on 0.2.0, so every scan compiles all six served kinds
+(chrome, echo-stub, meeting, mode-clock, processor-transplant, protobar;
+2,346,992 B together). The build compiles wasmtime's compiler crates
+optimized in every mode (`crate.annotation` list in `MODULE.bazel`), which
+is what keeps a dev-build scan within seconds. Measured `elapsed_ms` per
+kind, one scan, on "surface byte-contract artifact checked":
+
+| kind | B | dev, compiler unoptimized | dev, compiler optimized | `-c opt` |
+|---|---:|---:|---:|---:|
+| chrome | 493,966 | 13,017 | 1,319–1,494 | 457 |
+| echo-stub | 305,978 | 7,743 | 853–907 | 297 |
+| meeting | 401,116 | 10,873 | 1,095–1,166 | 367 |
+| mode-clock | 287,399 | 7,614 | 784–895 | 265 |
+| processor-transplant | 248,399 | 6,398 | 673–718 | 229 |
+| protobar | 610,134 | about 16,000, projected | 1,460–1,596 | 509 |
+| six-kind scan | 2,346,992 | about 61,600 | 6,287–6,541 | 2,124 |
+
+The unoptimized-compiler server did not finish booting within `make e2e`'s
+60 s wait, so protobar's figure is projected at that run's 26–27 ms per KB.
+The optimized dev column is four scans (boot and three reloads); the other
+two are one boot each. Needed: a decision on the memo's key and its
+soundness. The record's `source_sha256` is the cheap key, but at kind
+grain it is the record's word, not a hash of the artifact (the artifact is
+hashed only for instantiated kinds, in `verify_processor_artifacts_in`),
+and this check is the only thing that keeps a page from silently
+misreading an artifact that does not have the contract's shape; so either
+an argument that a verdict reused on the record's word cannot reach a page
+unverified, or a hash pass the memo pays for. Building the check's `Engine`
+once per scan is a smaller step that does not touch the compile, where the
+time goes.
+Code site: `surface/server/src/processor_assets.rs`, at the
+`check_surface_component` call in `read_processor_record_or_version_in`.
+Done when an unchanged 0.2.0 artifact is not recompiled by a reload.
+
+## `stale-contract-import-side-fixture`
+
+The refusal of a `brenn:processor@0.2.0` artifact whose *imported*
+`ports@0.2.0` or `calls@0.2.0` function differs from the host's is pinned
+on the surface server's check (`brenn-wasm/tests/bytes_contract.rs`: a
+wrong type under the served name, a wrong type under an aliased name, and
+a function the host does not have) and by no test on the backend host.
+That `ProcessorComponent::load` refuses such an artifact rests on a
+reading of wasmtime's `instantiate_pre` against the typed definitions the
+backend links. The export side is pinned on both hosts by
+`brenn-wasm/components/processor-stale-contract-test`. Needed: a backend
+test that loads an artifact whose only fault is the type of an imported
+`ports@0.2.0` function, with `ports` granted, and shows the refusal is by
+type — the load's panic words it as an import not linked, for a missing
+grant and a wrong type alike, so the test needs the message to carry
+wasmtime's whole account or some other way to tell the two apart. Done
+when that test refuses it by type at load. Code site
+(`TODO(stale-contract-import-side-fixture)`): `brenn-wasm/src/lib.rs`, the
+`instantiate_pre` step of `ProcessorComponent::load`.
+
+## `surface-check-untyped-imports`
+
+`brenn_wasm::check_surface_component` type-checks a 0.2.0 surface kind's
+`ports@0.2.0` and `calls@0.2.0` imports (and through them every `bus@0.2.0`
+type they use) and its `receive` export, under any import name the check
+accepts. The functions of every other interface a surface host serves —
+`log`, `alert`, `config`, `dom` and `page-dom`, all at `@0.1.0` — are
+stubbed untyped by the check's stub pass, which accepts any type. The jco
+glue on the page checks nothing against the host, so a kind bound by hand
+with a wrong-typed function of one of these interfaces passes the check, is
+served, and is misread on the page. The backend host links typed
+definitions for every interface it serves and has no such gap. Closing it
+means linking typed definitions on the surface check: the backend's own for
+`log`, `alert` and `config`, and typed trap stubs generated from the WIT for
+`dom` and `page-dom`, which have no backend definition. The stub pass
+defines nothing under a name that is a semver-compatible alias of a typed
+definition's name: wasmtime then resolves an aliased import to the typed
+definition and refuses a function that definition does not have, where a
+stub under the alias's own name would be found first and shadow it. So each
+interface that gains a typed definition joins the names the stub pass
+skips, in the same change, and that change adds a fixture importing that
+interface under a semver-compatible alias with a wrong-typed function,
+refused by type: nothing in the code ties a typed definition to its name in
+the skip list, and that fixture is what fails when the name is forgotten.
+When every interface has a typed definition the stub pass is deleted.
+Tightening the check withholds an out-of-tree kind that is served today,
+and it is done all the same: a kind that would be misread on the page is
+refused before it is served. It is a correction to the host, not a change
+to the contract, and it draws no dual period: `brenn:processor@0.2.0`'s
+promise is to artifacts that have the shapes the WIT files state for every
+interface they import, and says that a host which accepts one that does not
+may come to refuse it (`brenn-wasm/wit/processor-0.2.wit`). A kind whose
+wrong-typed import was never built against those files is misread today;
+refusing it takes nothing from any artifact the promise is made to. The
+release that tightens the check says so in a `CHANGELOG.md` entry headed
+for component authors, and that entry is the whole announcement. Done when
+`check_surface_component` refuses, by type, a 0.2.0 kind any of whose
+imported functions does not have the type the WIT files state (an interface
+that carries types only, `bus@0.2.0` or `types@0.1.0`, is held where a
+function or `receive` uses its types; a type nothing uses crosses no
+boundary and no host compares it); tests pin that refusal with two fixtures
+whose only fault is the type of a function imported from an interface
+outside `ports@0.2.0` and `calls@0.2.0`, one under the served name and one
+under a semver-compatible alias of it; the `CHANGELOG.md` entry for
+component authors in the release that carries the change says which
+artifacts are now refused; and `docs/component-packages.md`, *Contract
+evolution*, no longer says a surface host leaves any import untyped — the
+paragraph "The shapes do not change." (its "on a surface those three alone"
+and "a surface host today") and the **On a surface.** bullet state what the
+check then type-checks. Code site (`TODO(surface-check-untyped-imports)`):
+`brenn-wasm/src/lib.rs`, the stub pass of `check_surface_component`.
+
+## `byte-body-ceiling-per-activation`
+
+Owner ruling wanted: one activation's publishes are capped at 4 MiB in total
+by the constant `MAX_PUBLISH_BYTES_PER_ACTIVATION`
+(`brenn-budget/src/lib.rs`), and nothing else bounds a non-transportable
+channel's body by size, so under the byte-carrying contract
+`brenn:processor@0.2.0` the binary state a component can hold in one message
+on an `io` port tops out at 4 MiB raw (about 3,000,000 B today as base64), on
+the backend and on the surface. The binary-bus project's spec asks for
+"storing large state in binary" on a surface `io` port and routes large
+objects to blobs; nobody has ruled where one ends and the other begins.
+Options: (a) leave the constant — state above 4 MiB is a blob's job and waits
+for the blob slices; costs nothing now; (b) raise the constant — a larger
+host-memory backstop for every component on both hosts; (c) make it a
+per-channel or operator setting — new configuration surface, and the
+constant's own doc treats it as a fixed backstop. Under (b) or (c) the change
+belongs with the surface host's byte path. Code site
+(`TODO(byte-body-ceiling-per-activation)`): the constant.
+
+## `attach-v4-beside-v5`
+
+Owner ruling wanted: whether, and for how long, the remote route serves
+attach protocol v4 beside v5 and v6. The route serves v4, v5 and v6, and the
+server holds sessions of all three at once. The owner's spec for the binary bus asks for
+a dual period for the WIT component contract only; the dual service of two
+wire versions was chosen by the project's owner-proxy, against the
+repository's no-backward-compat default, because the remote route has no
+build-id gate and a daemon deploys on its own schedule
+(`brenn-server/src/routes/remote.rs`), and an out-of-tree daemon (the pod
+bridge) takes `brenn-attach-client` by pin. Questions: (1) Is v4 served at all
+past that release? Options: (a) until the known out-of-tree daemons have
+moved, then removed — needs someone to say what the pod pins; (b) to the same
+end as the string component contract's period (`string-contract-removal`);
+(c) a fixed number of releases or a date; (d) a hard cut — remove v4 at the
+next release; a v4 daemon then fails negotiation until rebuilt at a new pin,
+and the server's per-version reader and writer and the client crate's v4 codec
+go. The browser page and the surface route speak v5 only, so v4 is served to
+remote daemons only and everything removing it removes is the remote route's
+dual service: the v4 codec, `attach/proto/src/wire/v4.rs` (920 lines, 712 of
+them outside its test module) with its test files `v4/fixtures.rs` and
+`v4/schema_tests.rs` (1,266 lines), about 2,190 lines in all, plus the
+`Version::V4` dispatch arms in `attach/proto/src/wire/mod.rs` and the server's
+v4-only branches (the `Unavailable` answer to a `non_text` subscribe, the v4
+`Deliver` text assertion, the deferred view's cut of non-text entries), a few
+dozen lines. The page is not part of the question. (2) Answered: blob
+transfer for remote attachers arrived as v6, and three versions are served,
+ruled by the project's owner-proxy. (3) Where is a version's removal announced
+to daemon authors, now that three are served, and does v5 get a removal rule of
+its own or only v4? Until ruled, v4 and v5 stay served, and no document or log
+line names a removal release. Code site (`TODO(attach-v4-beside-v5)`):
+`SUPPORTED_VERSIONS` in `attach/proto/src/lib.rs`, the range 4..=6 the remote
+route serves.
+
+## `remote-send-budget-knob`
+
+Owner ruling wanted: a remote attacher's send budget is 256 tokens refilled
+one per 15 seconds, fixed in code and shared by all its sessions, so a remote
+sustains four messages a minute onto a durable channel and four `PublishBatch`
+entries a minute onto any channel, and no operator setting raises it; the
+connection bucket and the channel send rate beside it are operator settings.
+Options: leave it (durable channels and batches are not a remote's streaming
+carriers; ephemeral single publishes are); give the `remote` block a budget
+setting bounded as `publish_burst` is; or exempt ephemeral-only batches from
+the draw, as an ephemeral single publish is exempt. A publish carrying
+attachments draws what the same publish without them draws. Code site
+(`TODO(remote-send-budget-knob)`): `brenn-messaging-boot/src/plan.rs`, where a
+remote's budget is assigned.
+
+## `attach-replay-pass-frame-size`
+
+A subscribe replay or a catch-up drain is written as one `Deliver` frame
+holding up to `max(push_depth, retain_depth)` rows, and no bound on that
+frame's size was found at either end short of the native client's library
+default (64 MiB a message). A subscription whose window times the body cap
+exceeds it would fail the transport on every reconnect. Needs a design:
+splitting a pass changes how many delivery points it is. A delivered row's
+header carries up to 32 attachment references (about 13 KiB) that no frame
+bound counts, and a v6 reader fetches from them. Code site
+(`TODO(attach-replay-pass-frame-size)`): `send_pass` in
+`attach/server/src/subscription.rs`.
+
+## `attach-ended-session-drain-unbounded`
+
+An attach session that has ended gives up its place in its attacher's session
+count before its writer task has finished writing the frames still queued
+(`attach_session`'s teardown in `attach/server/src/session.rs`: the
+unregister, then the context's drop, then the writer's await). From then on
+nothing counts it: the session caps count registry entries, and there is no
+cap on ended sessions still draining or on open sockets, per attacher, per
+address or for the server; the global per-address request bucket limits how
+fast attachments start, not how many exist. The drain has no overall
+deadline, only the per-write watchdog of three heartbeats (60 s at the fixed
+20 s heartbeat), so against a peer that completes each write just inside it
+the writer lives for 256 queued frames times the watchdog — over four hours,
+longer with the ticker's pings between them. What one such session pins is
+its queue: up to `OUTBOUND_QUEUE_FRAMES` (256) frames, and a `Deliver` frame
+has no byte bound (`attach-replay-pass-frame-size`). The exits that leave the
+socket open are a protocol violation, a host close and a liveness reap; after
+a peer Close the websocket stack refuses further writes and the writer exits.
+So an authenticated attacher that ends sessions by such an exit, reads slowly
+and attaches again accumulates ended sessions' queues in host memory with no
+bound per attacher. This holds for every served attach version (v4, v5, v6)
+and for the surface route, which share the teardown. The blob pool is not
+part of it: the session's blob table is dropped before the slot is released,
+so a draining session holds no blob.
+
+The work is to bound it. Needs a design, because each way costs something:
+(a) an overall deadline on an ended session's drain — frames a slow peer
+would still have been sent are dropped at the deadline, so its length is the
+decision; (b) count ended-but-draining sessions against the session caps, or
+a cap of their own — a second count beside the registry's, and an attacher at
+it waits on its own old socket; (c) release the slot only after the writer
+has exited — no new count, but every session's slot, and the surface route's
+last-detach decision, then wait on a peer that will not read for as long as
+the drain runs, so it is tolerable only with (a). Done when the memory ended
+sessions' queues can pin is bounded per attacher by a figure
+`docs/security-posture.md` §9a states, and a test pins it: sessions ended by
+a violation against a sink that has stopped accepting writes, repeated past
+the bound, asserting on what the host still holds for them (writer tasks
+alive, or the attach refused) and not on a log line. Code site
+(`TODO(attach-ended-session-drain-unbounded)`): the unregister in
+`attach_session`'s teardown, `attach/server/src/session.rs`.
+
+## `attach-tagged-unit-variant-strictness`
+
+v4's and v5's schemas are documented as strict, but serde's
+`deny_unknown_fields` does not refuse an extra key beside the tag of an
+internally tagged *unit* variant: their decoders accept a client's
+`PublishBatch` op `{"kind":"cancel","x":0}` as a cancel rather than refusing it
+as a violation, and read the same looseness in `Heartbeat`, the publish and
+subscribe outcomes and the gap reason. Both versions are to refuse it: no
+conforming peer writes the key, so the bytes a conforming peer writes, and the
+pinned fixtures, do not change, and no wire version is needed. v6 writes each
+such variant as a field-less struct variant, which writes the same bytes and
+refuses the key. Done = every internally tagged unit variant in v4's and v5's
+schemas refuses an unknown key — at the server as a violation — with a test per
+enum. The variants are in three files: `OpKind`, `Heartbeat`, `Outcome` and
+`BatchOutcome` in each of `attach/proto/src/wire/v4.rs` and
+`attach/proto/src/wire/v5.rs`, and `SubscribeOutcome` and `GapReason` in
+`attach/proto/src/lib.rs`. Those last two are public in-memory types that v4
+and v5 serialize directly, so rewriting their variants in place changes the API
+every binder of the crate sees. Code site
+(`TODO(attach-tagged-unit-variant-strictness)`): `OpKind` in
+`attach/proto/src/wire/v5.rs`, one of the sites above.
+
+## `attach-client-blob-conveniences`
+
+`brenn-attach-client`'s blob plane hands a daemon chunk ranges to read and
+chunks to write; the daemon owns the file I/O and the loop. No one-call form
+moves a whole blob to or from a file. The plane and the driver are complete
+without one. Done = a Rust daemon downloads an attachment to a file and uploads
+a file as a blob in one call each, on the native transport, with a test of each
+against the real server. Code site (`TODO(attach-client-blob-conveniences)`):
+the module docs of `attach/client/src/blobs.rs`.
+
+## `attach-blob-write-io-failure-test`
+
+The attach server's `BlobWrite` handler has an arm for a filesystem error from
+the blob store: the range stays unwritten, the error is logged on the
+session's first and counted after, and the seal then answers `Incomplete`. No
+test reaches it, because nothing in the tree can make a `BlobWriter`'s write
+fail: the store has no fault seam, and an open file stays writable whatever is
+done to its path. The answers a client gets behind an `Incomplete` seal are
+tested from a gap left by the client instead. Reaching the arm needs a way to
+fail a write, which is a choice about the blob store's test surface (a seam in
+`brenn-messaging-store` behind its `testutils` feature, or a filesystem that
+refuses). Done = a test fails a write mid-upload through the attach server and
+sees the range unwritten, the error counted once in the session's counters,
+the seal answered `Incomplete` naming that range, and the session still up.
+Code site (`TODO(attach-blob-write-io-failure-test)`): the incomplete-seal test
+in `attach/server/src/blobs/tests.rs`.
+
+## `string-contract-removal`
+
+Remove the string component contract `brenn:processor@0.1.0` when both
+conditions hold: the release that declared `brenn:processor@0.2.0` stable and
+the three brenn releases after it have been tagged (the declaring release is
+the one whose `CHANGELOG.md` heading holds the entry "`brenn:processor@0.2.0`
+is stable"; a release is a `v*` tag with its own `CHANGELOG.md` heading), and
+the owner's three known out-of-tree component repositories have moved to
+0.2.0: `brenn-fastmail`, `brenn-component-demo`, and a third, the owner's
+private components repository, whose name this tree's scrub gate does not
+admit. The count of three was ruled by the binary-bus project's owner-proxy
+on the owner's instruction that the proxy decides, not by the owner in
+person. The owner may lengthen it at any time by editing the texts that state
+it — both WIT headers, `docs/component-packages.md`, and the period's one Rust
+spelling, `string_contract_period!` in `brenn-bootstrap/src/consumers.rs`,
+from which both notices are built; the agreement test there fails until all
+of them match — and may shorten it only before the declaring release is
+tagged; after that it is a published promise to component authors. What
+removal takes: on the backend, the 0.1.0 `ProcessorPre` arm, the string
+activation lowering and the 0.1.0 names in the grant-to-import mapping and
+the parity gate; on the page and the surface server, the 0.1.0 `ports` import
+shape and the JSON activation lift; in `processor.wit`, the 0.1.0 activation
+records, `ports`, `calls` and world, the file remaining as the home of the
+interfaces 0.2.0 imports unchanged; the raw 0.1.0 fixtures and
+`brenn-wasm/tests/string_contract.rs`; the two notices, with the period
+agreement test beside them, its three `data` entries in
+`brenn-bootstrap/BUILD.bazel` and the `component-packages.md` line in
+`docs/BUILD.bazel`. After removal a 0.1.0 artifact is a boot refusal naming
+the contract and the release that dropped it. Done = no host serves 0.1.0 and
+the texts say which release dropped it. Code sites
+(`TODO(string-contract-removal)`): the two notices in
+`brenn-bootstrap/src/consumers.rs`.
+
+## `blob-attachment-host-sites`
+
+When a surface host serves the `blobs` interface, its attachment-carrying
+publishes must be pushed into the page's one per-activation publish buffer,
+`PublishBuffer::entries`, and not a buffer of their own merged at flush. The
+contract promises the flush in call order, and a second buffer loses the order
+between `ports` and `blobs`. The backend host already pushes `blobs.publish`
+into `ProcessorData::publish_buffer`. Done = the slice serving the interface on
+a surface pushes its attachment-carrying publishes into
+`PublishBuffer::entries`, with a test of the order across the two interfaces.
+Code site (`TODO(blob-attachment-host-sites)`): `PublishBuffer::entries` in
+`surface/kernel/src/publish_buffer.rs`.
+
+## `blob-handle-integrity`
+
+A conversation names a blob as (message id, attachment name), and the host admits
+the name only for a message it has handed the conversation since the conversation's
+context was last reset. The host clears that record at a compaction boundary, at a
+spawn with no session to resume, and at every user turn whose text as Claude Code
+receives it begins with `/`, since Claude Code may act on such a turn as a command
+that resets its context. Two resets are not covered, and after either the host admits
+a name from a context that no longer holds the message. First, a `--resume` that
+Claude Code answers with a fresh session. Second, a slash command sent while a turn
+is running: the record is cleared at the send, the running turn can still be handed
+messages, and Claude Code resets its context when it reaches the command, so those
+messages stay in the record. Both need a signal from Claude Code that the context
+was reset. The candidate is the session id in the init frame, which the host stores
+at every init frame and compares with nothing; it is not established whether an
+ordinary resume always reports the id it was given, nor what Claude Code emits when
+it acts on a queued slash command. What the gap admits is bounded: the message is
+one the host did hand this conversation, and it must still be retained on a channel
+the app may read. Done = the record is cleared at both resets, with a test of each,
+by a signal whose behaviour was observed against the supported Claude Code version;
+or the documents record that the gap is accepted and why.
+
+## `conversation-blob-name-per-message`
+
+A conversation names an attachment as (message id, attachment name), and the host
+admits the name only while that same message is retained on a channel the
+conversation's app may read and has been put into the conversation's context since
+its start or last compaction. A blob the conversation was shown under one message,
+since evicted, that another retained message on a readable channel still names is
+refused until the conversation reads that other message, which it has no way to find
+from the refusal. The rule as first stated asked both conditions of the blob, not of
+one message, and admits that case. Admitting by blob needs the read record to keep the
+blob each read name resolved to, and a lookup from a blob to the retained messages
+naming it — `messaging_blob_refs` for durable channels; ring channels have no such
+index — with the read policy applied to each. Done = a conversation forwards and saves
+an attachment of an evicted message it read while another readable retained message
+names the same blob, and is refused when none does, each with a test; or the
+documents record that the per-message rule is final and why. A remote
+attacher's `BlobOpen` (attach v6) goes through the same admission and has the
+same per-message property.
+
+## `tool-channel-attachment-watch-authority`
+
+On the four tool-substrate namespaces (`brenn:tools/`, `brenn:tool-requests/`,
+`brenn:tool-results/`, `brenn:app-tool-results/`) a conversation names an attachment
+only on its own app's result inbox. An app whose policy covers the other three reads
+the calls and is shown each attachment's name, size and content type; `BrennSend`,
+`brenn-tool save` and a tool call naming one are refused `tool_channel_attachment`. The
+handle rule this project was given asks two things of a handle — it is in the retained
+buffer of a channel the conversation has access to, and the conversation has read a
+message containing it — and such a watcher meets both, so the refusal is a restriction
+the rule does not state, made so that an upgrade does not widen a grant written when
+tool-call traffic held no files into a read of every file any user hands a tool. Build,
+if a watcher that reaches the files is wanted: an opt-in authority in configuration,
+stated separately from the channel matcher, that lets an app's conversations name
+attachments on the tool-substrate channels it reads, with `docs/security-posture.md`
+§7.6 stating the cross-user reach it grants. Done = an app holding the authority saves
+an attachment of a tool request it read and an app with the matcher alone is still
+refused, each with a test; or `docs/security-posture.md` §7.6 records that no policy
+ever reaches a tool call's attachments and why. A remote attacher's `BlobOpen` on the
+same channels is refused `ToolChannel` by the same check, and an authority that opens
+them to an app would have to say whether it reaches a remote. Code site
+(`TODO(tool-channel-attachment-watch-authority)`): the Tool-family check in
+`Messenger::admit_retained_part` (`brenn-messaging/src/retained_part.rs`), the
+admission every door that names a message's attachment calls.
+
+## `conversation-blob-files-without-shell`
+
+Saving an attachment or a non-text body to a file, and attaching a file to a send, exist
+only as `brenn-tool` commands, which a conversation runs through its shell tool. An app
+that lists `Bash` in `disabled_tools` gets forwarding by reference and neither of the two:
+its conversations see attachment metadata they cannot turn into bytes. A tool call now
+carries a blob by reference (an accepting registry tool's `attachments` argument, and a
+result's attachments named by its `message_id`), so a tool could be the route. What
+stands in the way is unchanged: a host tool that writes a file opens a path the
+conversation names under a tree the agent can rewrite, which is
+`security-host-paths-follow-agent-symlinks`; this entry waits on a
+safe-path answer there, or on another route that moves no bytes through the model's
+context. Done = a conversation without the shell tool saves an attachment to a file and
+attaches a file to a send, each with a test; or the documents record that it never will
+and why. Code site (`TODO(conversation-blob-files-without-shell)`): the sentence of the
+`BrennSend` tool description in `brenn-lib/src/integration.rs` that sends a conversation
+to `brenn-tool` for files.
+
+## `blob-mutability`
+
+Mutable blobs are not built by the binary-bus project's blob slices, which
+make a blob immutable once sealed; the owner asked that the design not
+entrench against them. The owner's case: "A pipeline that contributes some new
+data or mutates some of the data at each step. If you want that to be
+zero-copy, you have to mutate the blob in place", with the condition that
+applications "should be allowed to gain a contract guarantee that their blob
+is in fact immutable or does not mutate underneath them", ranked "low
+priority; something we ideally do not entrench against right now", and "if
+entrenching against it buys us substantial benefits (simplicity for example)
+then I can be talked into it." Two things to do: the blob store and `blobs`
+interface designs say what they would cost to extend to in-place mutation, and
+name any choice that forecloses it with what it buys; and decide whether
+in-place mutable blobs are built at all. Done = the owner rules build or
+never, after the immutable design exists. (The owner's notes after cycle 1.)
+The store's half of the first is written: the rustdoc of the `blob` module in
+`brenn-messaging-store/src/blob/mod.rs` and the blob section of
+`docs/message-bus.md` (§2.1.2a) state the cost of extending the store, and no
+store choice forecloses mutation. Three lean on immutability and are named
+there: `size` and `content_type` copied into every reference, bytes synced
+once when a durable row first names them, and reads that take no lock. The
+`blobs` interface's half is written too: the header of
+`brenn-wasm/wit/processor-0.3.wit` and the "Blobs and mutability" paragraph of
+`docs/component-packages.md` state what mutation would add to the interface,
+and no choice of the interface forecloses it. Three lean on immutability and
+are named there: `blob` has `read` and no `write`, `size` and `content-type`
+are fixed on a handle, and forwarding shares the blob rather than copying it.
+The build-or-never ruling remains.
+
+## `blobs-interface-stable-declaration`
+
+The `blobs` component interface (`brenn:processor/blobs@0.3.0`) is served by
+the backend host and is not yet declared stable: its file says its shapes are
+expected to change, because no surface host serves it and the surface is where
+a synchronous host must answer a range read without the network. (Its other
+reason, that tool calls did not carry blobs, is discharged: `call-async`,
+`call-async-for` and `complete` of the interface carry them.) Until the
+declaration the rule is: a shape changes in place only while no tagged brenn
+release has served it; a shape a tagged release has served changes only as a
+new version of the interface, served beside the old one for at least one
+release and announced in `CHANGELOG.md`, because brenn releases first and
+out-of-tree components follow — there is no lockstep upgrade. The old version
+may be removed one release after its replacement; nothing longer is promised.
+Declare it stable — the same promise `brenn:processor@0.2.0` carries, in its
+WIT header, `docs/component-packages.md` and a `CHANGELOG.md` entry for
+component authors — once a surface host serves the same interface, or once it
+is decided that surfaces get a different one. Done = the declaration is in
+those three texts, or this entry records why surfaces take another interface
+and the declaration is made for the backend alone. Code site
+(`TODO(blobs-interface-stable-declaration)`): the status paragraph of
+`brenn-wasm/wit/processor-0.3.wit`.
+
+## `blobs-on-sync-calls`
+
+`tools.call-fast` and `calls.call` carry no attachments. Both return to the
+caller inside its activation: a fast call's result is a return value and a
+sync call's request and answer cross a host-side channel, none of them a bus
+message, so the route the asynchronous tool call takes — attachments on the
+request and result messages — does not reach them. A component that wants to
+hand a blob to a fast tool or to a sync callee, or get one back, must use the
+asynchronous call or a published message. Build it if a caller needs it: a
+form of each call taking and returning `blob` handles, the holds passed across
+the call by the host, under the rule that a component names a blob only by a
+handle. Done = a fixture hands a blob over `calls.call` and over
+`tools.call-fast` and reads one from each answer, by reference; or the
+documents record that these forms never carry blobs and why. Code site
+(`TODO(blobs-on-sync-calls)`): the sentence of
+`brenn-wasm/wit/processor-0.3.wit` that says these two forms carry no
+attachments.
+
+## `blobs-parked-message-attachments`
+
+A component cannot see or change the attachments of its own parked messages.
+The deferred window carries a parked message's body, index and release time
+and no header, `blobs.open` reaches port windows only, and `ports.defer-edit`
+replaces body and time. So a component that cancels a parked message to send
+it again cannot re-attach what it carried. Decide how a parked message's
+attachments are shown (the deferred entry's shape is frozen in `bus@0.2.0`, so
+it is a function of `blobs`) and whether an edit may replace them, which also
+replaces the trigger that refuses an update of `messaging_messages.attachments`.
+Done = a component opens an attachment of one of its parked messages by
+reference and, if edits are admitted, replaces a parked message's attachments,
+with tests on a durable and a ring channel. Code site
+(`TODO(blobs-parked-message-attachments)`): the deferred-window sentence of
+`brenn-wasm/wit/processor-0.3.wit`.
+
+## `blob-budget-per-component`
+
+The blob store's budget (`blob_budget_bytes`) is one pool. A component granted
+`blobs` may write 64 MiB per activation, and what it publishes lives as long as
+its channels' windows hold it, so over many activations one component can
+exhaust the pool and every other producer is then refused `budget-exhausted`.
+A conversation is a producer against the same pool too, through a file it
+attaches with `brenn-tool send`: bounded per send (its files together at most
+`max_blob_bytes`) and in flight (eight open socket connections), and not over
+time, so over many sends one conversation can exhaust the pool as a component
+can. A tool call's blobs rest on the rows of the call — the request on
+`brenn:tools/<tool>` and on a provider's `brenn:tool-requests/<slug>`, and the
+result on the caller's inbox, a component's `brenn:tool-results/<slug>` or an
+app's `brenn:app-tool-results/<app-slug>` — each for that channel's window, so
+a caller fills the pool through the channels of the tools it calls and a
+provider through its callers' inboxes, as well as through their own
+publishes; and after a restart an app's inbox holds blobs no conversation can
+name until its window turns over. A remote attacher on attach v6 is a
+producer against the same pool — bounded per session at 64 handles and
+4 × `max_blob_bytes` held, uploads and opened attachments together, across its
+sessions by `max_sessions`, and not over time. Decide whether a component or a
+conversation gets a share of the budget, who is charged for a blob that is
+forwarded and so held by messages of several producers — a blob handed to a
+tool or returned by one included — and whether the share is operator
+configuration. Done = one
+producer, component or conversation, at its share cannot cause another
+producer's write to be refused, with a test, and `docs/security-posture.md`
+§7.6 no longer states the exposure for either. Code site
+(`TODO(blob-budget-per-component)`):
+`PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION` in `brenn-wasm/src/lib.rs`.
+
+## `blob-durable-sync-on-async-task`
+
+`HeldAttachments::make_durable` fsyncs each blob file and the blob directory on
+the async task that publishes: inside `DbStore::append` and `park`, and in the
+pre-lock passes of `publish_from_wasm` and `publish_batch_from_attacher`. An
+attach session's task is one such caller: its whole select loop — pushes,
+drains, liveness — stops for the sync. Done = no blob fsync runs on an async
+worker thread on any door, with the sync still complete before the row that
+names the blob commits. Code site (`TODO(blob-durable-sync-on-async-task)`):
+`HeldAttachments::make_durable` in `brenn-messaging-store/src/blob/durable.rs`.
+
+## `blobs-surface-store-budget-refusal`
+
+On the backend host `budget-exhausted` from `blobs.create` and `blobs.write` is
+the blob store's own answer, given while the guest runs. A surface host that
+buffers a fresh blob in page memory and uploads it at the flush learns the
+backend store's verdict only after the guest has returned `ok`, where no
+variant of the interface reaches the component, so a refusal there loses the
+flush. The per-blob cap is static and can be mirrored into the kernel as the
+body cap is; the store's budget is a moving total the page cannot know. The
+slice that serves `blobs` on a surface decides between accepting a lost,
+announced flush for a blob the backend refuses and a change of shape that
+brings the verdict back to the component — which the interface's undeclared
+status (`blobs-interface-stable-declaration`) keeps open — and likewise whether
+a page fetches a binding's attachments before it activates a kind, answering
+`not-found` for one it could not fetch, or fetches lazily, which wants one more
+`open-error` variant. Done = the surface slice's documents state which, with a
+test of a page-made blob the backend store refuses, and
+`blobs-interface-stable-declaration` is not discharged before this is. Code
+site (`TODO(blobs-surface-store-budget-refusal)`): the `budget-exhausted` case
+of `create-error` in `brenn-wasm/wit/processor-0.3.wit`.
+
+## `correctness-brenn-scheme-send-text-shown-to-ephemeral-only-app`
+
+An app is offered `BrennSend` when it holds `MessagingPublish` or
+`EphemeralPublish`, but a `brenn:` publish needs `MessagingPublish`: the
+publish gate picks the grant from the target's scheme
+(`brenn-messaging/src/publish/mod.rs`), and an app without it gets
+`MissingSender`, which `BrennSend` raises as a `BrennPublishDenied` security
+event. An agent whose `publish` entries name only `ephemeral:` addresses
+lowers to exactly that app. It is still told to send to `brenn:`:
+`MessageChannelList` says "Use BrennSend to send to `brenn:` addresses",
+`MessageChannelGet` says "Use BrennSend to publish to `brenn:`", and
+`BrennSend`'s own description presents `brenn:` first among its two schemes,
+all in `messaging_virtual_tools` (`brenn-lib/src/integration.rs`), which is
+told only whether `BrennSend` is offered. The test
+`with_brennsend_the_messaging_texts_name_it` pins the first two sentences
+verbatim for an `EphemeralPublish` app and changes with the fix.
+
+Code site (`TODO(correctness-brenn-scheme-send-text-shown-to-ephemeral-only-app)`):
+the head of `messaging_virtual_tools` in `brenn-lib/src/integration.rs`.
+
+Done = no messaging tool text directs an app without `MessagingPublish` to
+send to `brenn:`, with a test for an `EphemeralPublish`-only app over every
+messaging tool's description and schema.
+
+## `correctness-no-single-instance-guard-before-startup-side-effects`
+
+Nothing stops a second `brenn serve` from starting beside a running one on the
+same host and database: `run_server` (`brenn-bootstrap/src/lib.rs`) never checks
+for another instance. Before anything refuses it, the second process does the
+following, in this order. It overwrites the running instance's PID file when
+`server.pid_file` is set (`write_pid_file` writes and renames without reading).
+It pulls each hooked app's `auto_pull` mounts and runs its startup hooks
+(`apps::run_startup_hooks`). When any app uses `container_spawn` it
+force-removes every `brenn-managed` container of the Unix user, running ones
+included (`cleanup::cleanup_stale_containers`), which are the running
+instance's conversation containers; that function's comment states one
+instance per Unix user as a standing constraint, and no code enforces it. It
+opens the database and runs migrations (`init_db`). It closes every open usage
+session, those the running instance is still writing included
+(`close_open_sessions_on_startup`). The PID file, the hooks and the container
+sweep precede the database open. That list is not the whole of startup. More
+runs after the session close and before the refusal, among it a spawned prune
+of usage data older than 90 days (`prune_usage_before`), the start of the
+repo-sync manager when sync-enabled clones are configured, which queues a
+cold-start poll for every remote (`repo_sync::start_repo_sync`), and a
+rewrite of every app's `virtual-tools.json` (`apps::write_virtual_tools`);
+trace `run_server` afresh when designing the guard. Two later steps can refuse
+the second process, and neither is guaranteed to: the blob directory's lock in
+`BlobStore::open`, only when messaging is configured and both processes resolve
+the same `blob_dir`; and the panic on `TcpListener::bind`, the last step of
+startup, only when both bind the same `server.bind_address`. A second process
+that passes both may run as a full server beside the first, on the same
+database. The blob directory's lock is not this guard: it covers the blob store only, is
+taken after every step named above, and is not taken at all without a
+messaging configuration. `brenn invite` and `brenn-cli device` open and write
+the same database while the server runs, by design, so the guard is `serve`'s
+alone. Decide what the guard is keyed on — the database, the Unix user the
+container sweep already assumes, or both — and what holds it. Done = a second
+`brenn serve` against a database a running `brenn serve` holds refuses to start
+before it overwrites the PID file, runs a startup hook, removes a container or
+closes a usage session, with a test. The
+`TODO(correctness-no-single-instance-guard-before-startup-side-effects)`
+comment sits in `run_server`, above the PID file write.
 
 ## `kit-payload-reader-cannot-read-304`
 
@@ -94,18 +740,19 @@ compile-time `MAX_RESPONSE_BYTES_CEILING` (512 KiB, tied to
 `api-request-read-limit-vs-bus-cap`). What the component then answers its own
 caller is bounded again, by the provider kit's `COMPACT_RESULT_CEILING`
 (256 KiB) and the bus cap. A WebDAV file component or a mail-attachment tool
-built on the provider kit is therefore limited to small files. Decide
-between: (a) raising the caps to a stated size, with what that costs in
-memory per call and on the bus; (b) a route for a body that does not ride in
-the call — the host holds the bytes and the component names them by handle,
-for upload and for download — which is also what delivering a file to a user
-(`agent-file-delivery-beyond-markdown`) and attachments on the bus
-(`chat-bus-attachments`) would use; (c) keeping the caps and documenting them
-as the limit of what a provider component transfers. Under (b) the provider
-kit's contract probably changes, which components built outside this
-repository pay for at their next pin move. Done = the decision recorded here,
-and for (a) or (b) a component test that uploads and downloads a body larger
-than today's caps through the kit. The
+built on the provider kit is therefore limited to small files. The route is
+decided: a body that does not ride in the call, named by attachment on the
+tool call — the host holds the bytes and the component names them by handle,
+for upload and for download. The tool-call path it needs is built: a tool
+call and its result carry attachments by reference
+(`blobs.call-async`, `blobs.call-async-for` and `blobs.complete` in
+`brenn-wasm/wit/processor-0.3.wit`; `accepts_attachments` on a `provide`
+statement). What remains is `api-request` itself taking a request body and
+answering a response body as attachments, the provider kit's forms for
+handing and receiving them (its contract changes, which components built
+outside this repository pay for at their next pin move), and the component
+test. Done = a component test that uploads and downloads a body larger than
+today's caps through the kit. The
 `TODO(api-request-body-caps-bound-file-transfer)` comments sit at
 `MAX_ARGS_BYTES` and `MAX_ASYNC_RESULT_BYTES` in
 `brenn-tool-registry/src/descriptor.rs`.
@@ -122,7 +769,12 @@ even the markdown artifact is absent. Inbound attachments exist in the
 legacy TypeScript UI (the upload route) and not on the bus
 (`chat-bus-attachments`); this entry is the outbound half. The gap surfaced
 in the Fastmail tooling, whose mail-filter export and import route and mail
-attachments would be its first callers. Done is a delivery path for a
+attachments would be its first callers. The bus has a carrier for such a file
+now: an attachment on a message, which a conversation can make from a file
+with `brenn-tool send` and a component through `blobs`. What is missing is a
+surface page that reads a blob. The delivery path is a message attachment read
+on the user's surface, built with or after the work that serves `blobs` on a
+surface page; its shape is not decided. Done is a delivery path for a
 non-markdown file from a tool result or a component to the user's surface.
 The `TODO(agent-file-delivery-beyond-markdown)` comment sits at the
 `DisplayFile` handler's read in
@@ -453,6 +1105,34 @@ Done = every module that registers this toolchain block runs the host-library
 check against its own pinned distribution, and the manual-`readelf` sentence
 is gone from their `llvm_version` comments.
 
+## `test-missing-codec-encode-failure-loss-path`
+
+A `StateCodec::encode` that refuses a value is answered by the component's
+`StateLoss` in `RetainedState::store_or_report`: under `FailActivation` the
+activation fails with "retained state on port … failed to encode", under
+`Recover` the error is logged and the activation succeeds with nothing
+stored. That is the intended behaviour, and the rustdoc of
+`StateCodec::encode` and of `StateLoss` states it: an encode refusal depends
+on the value, as an over-size state does, so a later activation with a
+different value can succeed, and the `Json` codec's serialize error took the
+same path before `StateCodec` existed. Only a store the host refuses for a
+reason no value can repair (`TextOnlyChannel`, `InvalidBody`) fails the
+activation under either answer.
+
+No test makes a codec refuse to encode: `processor-sdk-bytes-test`'s codec
+refuses only on decode, and no fixture's JSON state can fail to serialize.
+The test needs a refusing codec in a real component, and
+`processor-sdk-bytes-test` is the documented worked example of a byte
+codec: a value its codec refuses only to be tested would make it a worse
+one to copy, so where the refusing codec lives is to be settled with the
+test.
+
+Code site (`TODO(test-missing-codec-encode-failure-loss-path)`):
+`brenn-wasm/components/guest/src/lib.rs`, `RetainedState::store_or_report`.
+
+Done = a test drives a real component's codec refusal to encode under both
+`StateLoss` answers.
+
 ## `test-selinux-positive-paths-silently-skip`
 
 The SELinux labelling tests that need a kernel accepting a context
@@ -469,6 +1149,45 @@ Code sites (`TODO(test-selinux-positive-paths-silently-skip)`):
 `brenn-lib/src/selinux.rs`, at `test_context`.
 
 Done = an SELinux-enforcing lane runs these tests, and a skip there fails.
+
+## `test-spawn-new-unreachable-in-test-build`
+
+`ActiveBridge::spawn_new` is the function every ordinary wake of a conversation
+goes through, and nothing it does is tested. It is compiled out of reach of
+the test build: it is marked dead code there, its one caller
+(`spawn_and_register_bridge` in `brenn-server/src/state.rs`) and the export of
+`SpawnContext` are `#[cfg(not(test))]`, and tests build a bridge with
+`inject_for_test` instead. The program it starts is fixed in `brenn-cc` —
+`claude`, or `podman` for a containerised app — and the one override, the
+`program_override` of `CcSession::spawn_inner`, is private to that crate.
+
+A test of it needs `spawn_new` and `SpawnContext` compiled and reachable in
+`brenn-server`'s test build; a way for `brenn-server` to replace the spawned
+program, which is a test seam on the process spawn across the two crates and
+whose shape is to be settled with the test; a stub program that answers the
+init handshake; and a fixture that fills every field of `SpawnContext`.
+
+One thing is known to rest on it today. A conversation that starts with an
+empty context has its read record cleared — the record of the messages whose
+attachments it may name — by `SessionStart::begin`. The compiler holds that
+`spawn_new` makes that call and unit tests hold what the call does; nothing
+holds what `spawn_new` passes it. `begin` takes an optional `Messenger`,
+because a server with no messaging configured has none, so a call given no
+`Messenger`, or another conversation's id, compiles, leaves this
+conversation's record as it was and fails no test. The conversation then
+keeps the record of its previous context and the host admits a name from it;
+the message is one the host did hand this conversation, and it must still be
+retained on a channel its app may read. The clear therefore holds only while
+`spawn_new` hands `begin` the bridge's `Messenger` and its own conversation
+id. The profile swap makes the same call, and its tests run it.
+
+Code site (`TODO(test-spawn-new-unreachable-in-test-build)`):
+`brenn-server/src/active_bridge/bridge.rs`, at the `SessionStart::begin` call
+in `spawn_new`.
+
+Done = a test runs `spawn_new` against a stub program, and fails when the
+`SessionStart::begin` call there is given no `Messenger` or another
+conversation's id.
 
 ## `harness-flush-on-err`
 
@@ -777,9 +1496,21 @@ nothing says so; that has already happened once, to the kernel's publish-route
 test, when a per-instance grant gate landed against a fixture that granted
 nothing. And a suite that never runs answers no behavioral question — these are
 the XSS-adjacent text-not-markup pins, the DOM seam, mount/unmount, port
-dispatch, and the whole sync-call seam (the `brenn-activation-sync` listener,
-the door's answer vocabulary, the publish route's buffered/refused split), which
-exists only in the browser and is pinned only here.
+dispatch, and the sync-call seam's remaining arms — the `brenn-activation-sync`
+listener, a `dom` peer, the door's refusal answers — which no gate runs.
+
+A node rig (`//frontend:vitest_page_rig`) now runs the production kernel
+bundle with the production page glue and a transpiled kind against a
+scripted attach peer under `make check`, and through it pins the publish
+route, a refused publish, the deferred view, the activation crossing and
+one sync call, for headless kinds, and the page's binary socket: every frame
+is binary at attach v5 over a `WebSocket` stand-in, and non-text bodies are
+delivered, published, parked and edited on a transportable channel declared
+`non_text`. It runs node's WebAssembly engine with
+stand-in browser globals: it does not compile or run the
+`wasm-bindgen-test` suites, and it covers nothing that needs a real DOM —
+the text-not-markup pins, the DOM capability host, mount and unmount stay
+uncovered and are what this entry is still for.
 
 Done when a gate runs them. Two things have to land, in order. First a Bazel
 rule that drives `wasm-bindgen-test-runner` against a WebDriver browser — no
@@ -797,8 +1528,9 @@ the browser suite over the live DOM capability host, which is the whole of what
 the five migrated kinds render through and is compiled by nothing in CI. The
 `calls` seam is the other one: `surface/kernel/src/entry.rs`'s
 `brenn_processor_call` and `surface/kernel/src/sync_door.rs`'s `SyncDoor::call`
-are browser-only compositions — each decision they make is pinned natively, the
-order they ask them in is not.
+are wasm32-only compositions — each decision they make is pinned natively, and
+the node rig runs their order for one admitted call between headless kinds; the
+refusal arms and a `dom` peer are run by nothing.
 
 ---
 
@@ -876,7 +1608,9 @@ not by `make check`, and not by `.github/workflows/ci.yml`. Only an operator run
 by hand answers anything, and four of its six specs sat red — a stale
 component-element selector — for an unbounded span before anyone noticed. The
 suite covers layout switching, malformed-layout last-good retention,
-per-instance content isolation, and reload/durable-snapshot restore; acceptance
+per-instance content isolation, reload/durable-snapshot restore, and the
+surface byte path (a 0.2.0 kind's non-text bodies at rest on the page and over
+the page's binary websocket); acceptance
 decisions have already leaned on one of those specs while it was dead, which is
 the specific harm an ungated suite does.
 
@@ -891,7 +1625,11 @@ project's deploys. Landing the CI step before both hold turns main red on
 every push, which is also the auto-deploy-to-staging path.
 
 Until then the operator-side trigger stands in for the gate: run `make e2e`
-before tagging a release, and after any change under `surface/`.
+before tagging a release, and after any change under `surface/`. Also run it
+before deploying a commit at or above the one that moved the page's wire to
+attach v5: `e2e/tests/bar.spec.ts`, `e2e/tests/bytes.spec.ts` and
+`e2e/tests/surface-reload.spec.ts` load surface pages and are the only tests
+that run the page's binary websocket in a browser.
 
 One of the two blockers is answered elsewhere, which narrows this one.
 `brenn-component-demo` runs the same recipe — build the artifacts, mint an
@@ -914,8 +1652,8 @@ Code site (`TODO(e2e-in-ci)`): `Makefile`, the `e2e` target.
 
 ## `e2e-tag-scheme-tie`
 
-`e2e/tests/bar.spec.ts` (`echoStubHost`) locates a mounted component by the
-attributes the kernel stamps on its host element, `data-kind` and
+`e2e/tests/echo-stub.ts` (`echoStubHost`, shared by every spec that drives an
+echo-stub) locates a mounted component by the attributes the kernel stamps on its host element, `data-kind` and
 `data-instance`, re-encoding in TypeScript a naming whose only home is
 `mount_host` (`surface/kernel/src/dom.rs`). Nothing mechanical ties the two — a
 comment is the whole link, and a comment does not break a build. That drift already
@@ -934,7 +1672,7 @@ spec imports. Needs a design call first: the e2e/TS side deliberately has no
 bundler and no `ts-rs` bridge, so who emits the constant, when it runs, and
 which gate proves it current is a new seam rather than a local edit.
 
-Code site (`TODO(e2e-tag-scheme-tie)`): `e2e/tests/bar.spec.ts`, `echoStubHost`.
+Code site (`TODO(e2e-tag-scheme-tie)`): `e2e/tests/echo-stub.ts`, `echoStubHost`.
 
 ---
 
@@ -1015,6 +1753,13 @@ is green everywhere and never moves the display. The in-tree placeholders were
 written that way once and are now `ephemeral:`, so nothing in this repository
 exhibits it — the hole is what an out-of-tree author walks into.
 
+The joined document is wrong in a second way: a server-realm `local:`
+declaration stating `non_text`, handed to a surface binding by handle, does
+not make the page ring carry non-text bodies. The page ring's declaration is
+the surface binding tail's alone, so the page refuses a non-text publish there
+as `text-only-channel` while the declaration the operator wrote says
+otherwise.
+
 The DSL already refuses the mirror case: a literal address spelling a channel
 the same authority root declares is refused as "one-spelling", because two
 names for one thing is an error. Two names that are *not* one thing, joinable
@@ -1051,6 +1796,22 @@ the changed set.
 
 Code site (`TODO(chrome-stale-sections-on-shrink)`):
 `surface/chrome/src/logic.rs` (`ChromeCore::on_surface_state`).
+
+## `ingress-oversize-payload-as-blob`
+
+A raw (`non_text`) MQTT or webhook ingress channel refuses a payload larger
+than a bus body may be (`messaging.max_body_bytes`; a raw webhook endpoint's
+`transport_ceiling_bytes` lies within it), and the design that built the raw
+shape left such payloads to blobs. The blob store and message attachments now
+exist in the host, and no transport adaptor uses them. Decide whether an
+oversize payload on a raw ingress channel is published as a message whose
+attachment is the payload — under what opt-in, with what body, and against
+which bound, since an unauthenticated or merely signed sender then writes to
+the blob store's global budget — or stays refused. Done = the decision
+recorded here and, if built, a webhook and an MQTT test carrying a payload
+larger than `max_body_bytes` to a component as an attachment reference. Code
+site (`TODO(ingress-oversize-payload-as-blob)`): the size refusal in
+`Messenger::publish_transport_ingress` (`brenn-messaging/src/publish/mod.rs`).
 
 ## `ingress-retirement`
 
@@ -1356,9 +2117,10 @@ resume path.
 The surface-half transplant parity test
 (`frontend/src/processor-transplant.test.ts`) exercises the real
 jco-transpiled artifact, but under node's WebAssembly engine rather than a
-real browser engine. The harness resolves artifacts by filesystem path: it
-dynamic-imports a `file://` URL and reads the core wasm bytes with
-`readFileSync`. The wasm-bindgen headless-browser runner has no filesystem, so
+real browser engine. The harness
+(`frontend/src/test-helpers/transpiled-processor.ts`) resolves artifacts by
+filesystem path: it dynamic-imports a `file://` URL and reads the core wasm
+bytes with `readFileSync`. The wasm-bindgen headless-browser runner has no filesystem, so
 the test cannot move there as written.
 
 The residual uncovered case is narrow and specific: **the transpiled guest
@@ -1372,9 +2134,13 @@ Done when `surface/dist` is served in the browser test fixture and those two
 filesystem calls (the `file://` dynamic import and the `readFileSync` of core
 wasm) are swapped for `fetch`.
 
+`e2e/tests/bytes.spec.ts` runs a jco-transpiled `brenn:processor@0.2.0`
+guest in Chromium, loaded by the page's own `fetch`; no e2e surface
+instantiates the transplant guest, so this entry's case is still open.
+
 Code site (`TODO(processor-transplant-browser-engine)`):
-`frontend/src/processor-transplant.test.ts`, the header note on how artifacts
-are resolved.
+`frontend/src/test-helpers/transpiled-processor.ts`, the header note on how
+artifacts are resolved.
 
 ---
 
@@ -1718,8 +2484,12 @@ resolve against, and a partial send (text without the files) would silently
 misrepresent what the peer asked for. Lifting the restriction needs a decision
 about how a bus peer acquires and proves ownership of an upload; the schema
 field is already in place so the change is purely additive when that decision
-lands. Done when a bus `send` with attachments resolves them and reaches the
-harness with the files attached.
+lands. A candidate answer exists now and is not decided: the command message's
+own bus attachments, which the peer can only name if it made or was handed the
+blobs. The command's attachments come from a page, so this is built with or
+after the work that lets a surface page make a blob and publish a message
+naming it, and not before. Done when a bus `send` with attachments resolves
+them and reaches the harness with the files attached.
 
 Code sites (`TODO(chat-bus-attachments)`): `brenn-envelope/src/chat.rs`, the
 `attachments` field on `ChatCommand::Send`; the rejection itself in
@@ -1777,8 +2547,10 @@ because no conversation-deletion path exists in the tree yet. Whoever builds
 conversation deletion has to call it in the deletion's own transaction; a delete
 that does not will leak a directory entry, two channel rows, the whole retained
 record, and a cursor row per deleted conversation, with nothing failing to say
-so. Done when conversation deletion tears the chat family down with the
-conversation.
+so. The deletion path follows its commit with `Messenger::reap_blobs`, outside the
+database lock, so the torn-down channels' blobs are deleted then and not at the
+next hourly pass. Done when conversation deletion tears the chat family down with
+the conversation.
 
 Code site (`TODO(chat-deletion-teardown)`):
 `brenn-messaging/src/chat_provision.rs`, on
@@ -2488,9 +3260,29 @@ the pure-logic code into a host-buildable module the guest crate includes, or a
 wasm32 test rule (which is the same missing rule work `surface-wasm-test-in-ci`
 describes, without the browser half).
 
+The guest SDK has no test target either: `brenn-guest` is a wasm32-only
+`wasm_guest_library` whose bindings do not compile off wasm32, so its helpers
+are tested only through real components under the `brenn-wasm` suites.
+`brenn-wasm/tests/sdk_bytes.rs` runs, through the
+`processor-sdk-bytes-test` fixture: `text_body` on text and non-text bodies;
+`Message` and `Body` accessors (`as_text` on both arms, `json`,
+`content_type`, `as_bytes`); the byte publish; `RetainedState` with a byte
+codec; a stored body it cannot read, under both `StateLoss` answers by its
+content-type check and under `FailActivation` by the codec's own decode error,
+which reaches the same arm of `around_on`; and its `TextOnlyChannel` refusal
+under both answers. A codec that refuses to encode is not run
+(`test-missing-codec-encode-failure-loss-path`). The existing suites
+run `json_body`, `webhook_body`, `publish_json`, the deferred ops, calls and
+JSON `RetainedState` through real components. Still with no test of its own:
+`calls::CallPort::call_json`'s refusal of a non-text reply — `Body::as_text`'s
+non-text arm, which is run, behind a `?` on `try_call`'s reply, which the call
+suites run; reaching the composition needs a fixture holding `calls` and a
+wired non-text callee on every host's bindings.
+
 Code sites (`TODO(wasm-guest-tests-unrun)`):
 `brenn-wasm/components/replay/BUILD.bazel` and
-`brenn-wasm/components/replay-generic/BUILD.bazel`, above the guest cdylib.
+`brenn-wasm/components/replay-generic/BUILD.bazel`, above the guest cdylib;
+`brenn-wasm/components/guest/src/lib.rs`, above `CallPort::call_json`.
 
 
 ## `sw-registration-csp-blocked`
@@ -2791,9 +3583,14 @@ of the `Option<View>`/`expect`/mount-arm idiom deleted.
 ## `surface-envelope-json-memo`
 
 A served window is retained context followed by what is new, so encoding
-envelopes at window assembly re-encodes the retained prefix on every activation,
-and re-encodes the same envelope once per subscribing instance. The envelope was
-itself decoded from JSON at frame parse and that wire text was discarded. The
+envelopes where an activation is lowered for its guest — the whole envelope for
+a 0.1.0 instance, its header for a 0.2.0 one — re-encodes the retained prefix
+on every activation,
+and re-encodes the same envelope once per subscribing instance. On the page's
+wire (attach v5) a delivered row is its header as JSON inside the frame's
+header and its body as raw bytes after it (`attach/proto/src/wire/v5.rs`), so
+the header is decoded from JSON at frame parse and that text discarded, and no
+whole-envelope JSON is on the wire at all. The
 steady-state cost per envelope is one decode plus (retain_depth × activations ×
 subscribers) encodes, on the browser's delivery hot path — work that grows with
 the product of retain depth and message rate rather than with new messages. It
@@ -2802,14 +3599,19 @@ someone widens a retain window to survive a longer outage, which is the sizing
 knob the message-bus doc tells them to reach for.
 
 The fix is memoisation: keep the JSON beside the envelope in the channel store
-entry (an `Rc<str>` computed at insert, or the wire text the frame already
-carried), and clone it at window assembly. That changes `attach/client`'s store
+entry, and clone it at window assembly. The wire carries only the header's
+text, in the shape a 0.2.0 instance is handed (`HeaderShape`, which
+`MessageEnvelope::to_header_json` writes), so keeping wire text can serve the
+0.2.0 lowering only; the whole envelope a 0.1.0 instance is handed can only be
+computed at insert. That changes `attach/client`'s store
 entry and `ServedWindow`, which is vocabulary shared with the non-surface attach
 client and which the envelope-lowering design deliberately left holding decoded
 envelopes — so it wants a design cycle, not a drive-by.
 
-Code site (`TODO(surface-envelope-json-memo)`):
-`surface/kernel/src/activation.rs`, at `window_ports`.
+Code sites (`TODO(surface-envelope-json-memo)`):
+`brenn-activation/src/lib.rs`, at `Activation::lower_v0_1`'s
+`to_envelope_json`, and `surface/kernel/src/dom.rs`, at `activation_to_js`'s
+`to_header_json`.
 
 Done = an envelope is encoded once per page lifetime, and a wider retain depth
 costs no extra encoding.
@@ -3116,6 +3918,71 @@ Code site (`TODO(system-participant-noise-inert)`):
 Done = a tuning block's `noise` is either enacted by the system participant
 subscribed to that channel or refused at load, with no family in between.
 
+## `tool-request-window-overflow-silent`
+
+A tool call pushed past its request channel's window is lost with no answer and no log
+line. The tool executor drains `brenn:tools/<tool>` as a system participant whose window
+is the channel's `retain_depth` and whose overflow rung is `Silent`: each drain serves
+the window's newest unseen requests and steps over the older ones. A stepped-over call
+gets no result, so the component that made it is never answered, and nothing records
+that it happened; the blobs it carried go when GC evicts its row. The defaults guarantee
+the case: one activation may queue 64 asynchronous calls
+(`PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION`, `brenn-wasm/src/lib.rs`) and a request
+channel's default window is 16 (`TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH`,
+`brenn-lib/src/messaging/config.rs`), so a burst of more than 16 calls to one tool that
+lands before the executor's next drain loses all but the newest 16. The host admits a
+burst that its own default sizing then drops. `docs/message-bus.md`, the tool-channel
+section, states the behaviour and tells the operator to size the window; that is not
+enough for a default.
+
+Two things are to be done. Make the default sizing and the per-activation call cap
+cohere, so that a burst the host admits in one activation is not lost under defaults.
+The window's default also sets how long a handed blob rests on a request row and how
+many requests a fresh executor position re-runs, and the cap is shared with fast calls
+and with `MAX_FAST_CALLS_PER_ACTIVATION` in `brenn-tool-registry/src/descriptor.rs`;
+the change weighs those. And make a request the executor steps over observable: a log
+line or alert naming the tool and how many were skipped, at the drain in
+`brenn-messaging/src/system.rs` (`SystemInbox::dequeue_batch`), whatever
+`system-participant-noise-inert` settles about a block's `noise`.
+
+The bus has no backpressure and gets none: no blocking publish, no flow control, no
+redelivery. Loss by overflow stays the bus's rule, and a window an operator sized too
+small for the traffic still drops oldest. What is to be fixed is defaults that guarantee
+the loss and the silence around it.
+
+Code site (`TODO(tool-request-window-overflow-silent)`):
+`brenn-lib/src/messaging/config.rs`, at `TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH`.
+
+Done = under default sizing, the largest burst one activation may queue to one tool is
+served whole when the executor was caught up (a test), and a stepped-over request is
+logged; or the documents record, beside the two constants, the decision that the
+mismatch stands and why.
+
+## `agent-tool-namespace-subscribe-boot`
+
+The config language lets an agent, and only an agent, `subscribe` to a literal address
+in `brenn:tools/`, `brenn:tool-requests/` or `brenn:tool-results/` — the carve-out in
+`brenn-dsl/src/derive.rs` for an operator watching the tool substrate — and derives an
+exact `acl` entry from it (`brenn-dsl/tests/authority.rs`,
+`a_tool_namespace_address_stays_a_literal_and_derives_an_entry`). Nothing lowers and
+boots such a document. Read statically, `resolve_app_messaging`
+(`brenn-lib/src/messaging/config.rs`) resolves every static subscription through the
+config-time directory, which holds declared channels only, and panics on an address it
+does not find; the tool channels are minted into the runtime directory later, by boot
+planning. If that reading holds, the language accepts a document that cannot start.
+
+First establish which it is, with a test that lowers and boots an agent holding
+`subscribe "brenn:tool-requests/<slug>"`. If it does not boot, the fix is a choice:
+either a static subscription resolves against the channels boot will mint, or the
+carve-out goes and the language refuses the line, leaving an authored `acl` matcher with
+`MessageChannelGet` or `MessageSubscribe` as the way to watch the substrate.
+
+Code site (`TODO(agent-tool-namespace-subscribe-boot)`): `brenn-dsl/src/derive.rs`, at
+the comment "An agent watches the substrate through the other three namespaces".
+
+Done = a test boots such a document, or the language refuses it; no document the
+language accepts fails at start for this reason.
+
 ## `wasm-window-byte-cap`
 
 A WASM input window is capped by count (`WINDOW_DEPTH_CEILING` = 1000) and not by bytes. A providing instance's request inbox is Σ `max_concurrency` deep (up to `PROVIDER_CONCURRENCY_CEILING` = 1000) with each request's args up to `MAX_ARGS_BYTES` (64 KiB), and its `tool-results` inbox is `retain_depth` deep with each result up to `[messaging] max_body_bytes`; either window, full of maximal messages, can exceed the guest's `PROCESSOR_MAX_MEMORY_BYTES` (16 MiB) and trap the activation every time the window fills. The host alerts the trap and fails that activation's new requests, but no check at config resolution or boot refuses such a window. Decide whether boot or the config language should refuse a window whose worst-case bytes exceed guest memory, and if so against what arithmetic: Σ × `MAX_ARGS_BYTES` for a request inbox, depth × `max_body_bytes` for every other input window, both before parsing, against `PROCESSOR_MAX_MEMORY_BYTES` or some fraction of it that leaves the guest room to parse. Raising `PROVIDER_CONCURRENCY_CEILING` from 32 to 1000 widened the request-window side of this; the result-window side predates it. A provider built on `brenn-provider-kit` also reads its live requests' store rows into guest memory beside that window — each live request is one in-flight or one backlog row carrying its args, so up to Σ rows, scanned one namespace at a time — so a request-side arithmetic for such a provider is up to twice Σ × `MAX_ARGS_BYTES`. Done is a refusal with a stated arithmetic at the place depths resolve, or a documented decision beside `WINDOW_DEPTH_CEILING` that the window's weight stays the operator's.
@@ -3395,7 +4262,10 @@ The shape is a port attribute in the *specification* — `io state retained;`, o
 a `retained` marker on the port declaration — that the DSL resolves to the pair
 and refuses to let a binding override, the way the free-`io` form already
 claims a port without an arrow. One declaration in `config/specs/<kind>.brenn`,
-zero per instance.
+zero per instance. A state port whose `StateCodec` publishes a non-text body
+also needs `non_text = true` on its binding on a surface (or on the channel on
+the backend), a third value transcribed per instance that the same attribute
+could carry.
 
 Not a patch: it adds vocabulary to the config DSL, which is a grammar every
 out-of-tree bundle author and every operator reads, and it has to settle what a
@@ -3465,48 +4335,69 @@ way it discovers a panel's, by reading two channels the `.index` names.
 Code sites (`TODO(component-descriptions-both-placements)`):
 brenn-lib/src/wasm_package.rs, at `PackageRecord`.
 
+## `tool-text-names-unoffered-tools`
+
+A tool's description, a field description in its schema, and a refusal it
+answers can each direct a conversation to another tool by name. The three send
+tools are offered by grant: `BrennSend` with `MessagingPublish` or
+`EphemeralPublish`, `PwaPushSend` with `PwaPush`, `MqttSend` with
+`MqttPublish`. A text that names one of them unconditionally tells a
+conversation without the grant to use a tool it is not offered.
+
+The messaging tools name `BrennSend` only to a conversation that is offered
+it. What is left, in `brenn-lib/src/integration.rs`: `MessageChannelList` and
+`PwaPushChannelGet`, both always offered, name `PwaPushSend`; `BrennSend`
+names `PwaPushSend`; `PwaPushSend` names `BrennSend`, once as the tool its
+send budget is shared with; `MqttSend` names both. Each function that builds
+these descriptions is given its own tool's grant and no other;
+`core_virtual_tools` reads all three.
+
+The answers a send tool gives a wrong address do the same. Every refusal of
+an address of another send tool's scheme names that tool, in
+`brenn-server/src/messaging_intercept.rs`,
+`brenn-server/src/pwa_push_intercept.rs` and
+`brenn-server/src/mqtt_intercept.rs`. The `WrongProtocol` error texts in
+`brenn-lib/src/mqtt/error.rs` and `brenn-webhook/src/error.rs` name the other
+send tools too; `MqttSend` answers with the first, and the second has no
+caller that reaches a conversation.
+
+Code site (`TODO(tool-text-names-unoffered-tools)`):
+`brenn-lib/src/integration.rs`, in `core_virtual_tools`, where the three
+grants are read and each is handed to one function.
+
+Done = no description shown to a conversation names a tool that conversation
+is not offered, with a test over the combinations of the three grants; and
+every refusal or error text a tool answers with follows the same rule, or the
+documents record why such a text may name a tool the conversation lacks.
+
 
 ## `guest-envelope-accessors`
 
-`brenn-guest` ships half of the reads a backend consumer actually makes, and an
-out-of-tree consumer restates the other half privately against brenn's own
+`brenn-guest` exposes a port window only as its two halves, and an
+out-of-tree consumer restates the join privately against brenn's own
 contract.
 
-- **MQTT body.** `MessageEnvelopeExt` has `webhook_body()` and nothing for
-  MQTT, though `docs/message-bus.md` says a backend consumer may subscribe to
-  an MQTT input; `MqttEnvelope` and `MqttPayloadBody` are not re-exported, so
-  a consumer that reads one takes a direct dependency on `brenn-envelope` and
-  hand-matches `Text`/`Binary` to reach the text. Two accessors close it:
-  `MessageEnvelopeExt::mqtt_body()` built like `webhook_body()` (scheme guard
-  first, then the body parse), and `MqttPayloadBody::text(&self) ->
-  Option<&str>` in `brenn-envelope`, beside the enum and its trust-boundary
-  comment, with the binary-is-a-placeholder reading in its rustdoc. Re-export
-  both MQTT types from `brenn-guest` beside `WebhookEnvelope`.
 - **Whole window.** A stateless consumer rebuilds its picture from the whole
   window on every activation, context then new, oldest to newest — the WIT
   ordering guarantee. `PortWindow` holds that ordered vector but exposes only
   the two halves, and states the join in a private field comment, so every
-  consumer chains `context_envelopes()` with `new_envelopes()` by hand. Add
-  `PortWindow::envelopes()` over the vector directly (not by chaining the two
-  opaque iterators), preferably `impl DoubleEndedIterator` so a newest-first
-  walk is `.rev()`. Whether it keeps the "context envelope JSON" / "envelope
-  JSON" error distinction is this crate's call. Its rustdoc, and the public
-  rustdoc on the two existing halves, state the ordering and the
-  channel-wide-context caveat (`processor.wit`, context is most-recent on the
-  channel, not a delivery log); the stale `processor.wit:NN-NN` line citations
-  in the guest crate ride the same change.
+  consumer chains `context_messages()` with `new_messages()` (or
+  `context_envelopes()` with `new_envelopes()`) by hand. Add
+  `PortWindow::messages()` over the vector directly, and an `envelopes()`
+  beside it (not by chaining the two opaque iterators), preferably
+  `impl DoubleEndedIterator` so a newest-first walk is `.rev()`. Their
+  rustdoc, and the public rustdoc on the existing halves, state the ordering
+  and the channel-wide-context caveat (`processor.wit`, context is
+  most-recent on the channel, not a delivery log).
 
-The guest crate has no test lane of its own; `brenn-envelope` does, and
-`text()` is tested there. The window ordering wants an assertion wherever the
-guest's window construction can be exercised.
+The guest crate has no test lane of its own; the window ordering wants an
+assertion wherever the guest's window construction can be exercised.
 
-Done = a consumer reads an MQTT payload's text and its whole window in order
-through `brenn-guest` alone, with no direct `brenn-envelope` dependency and no
-private restatement of either contract.
+Done = a consumer reads its whole window in order through `brenn-guest`
+alone, with no private restatement of the contract.
 
 Code sites (`TODO(guest-envelope-accessors)`):
-brenn-wasm/components/guest/src/lib.rs, at `PortWindow` and at
-`MessageEnvelopeExt`; brenn-envelope/src/lib.rs, at `MqttPayloadBody`.
+brenn-wasm/components/guest/src/lib.rs, at `PortWindow`.
 
 
 ## `guest-alert-damping`
@@ -3655,24 +4546,21 @@ serves, logs no `unrecognized_url` events, and shows the Brenn icon.
 
 ## `guest-binary-body`
 
-`brenn-wasm/components/guest/BUILD.bazel` exports `serde` and `serde_json`
-from the guest hub so an out-of-tree crate can derive against the instance
-brenn-guest's bounds demand, and nothing else. An out-of-tree kind whose
-retained state outgrows JSON therefore has no format crate it can link: a
-`bincode` or `postcard` from its own hub implements against another serde
-instance, and a base64 crate from its own hub is a second hub in the guest.
-One out-of-tree kind already hand-writes both — a fixed-width layout and
-RFC 4648 base64 — and tracks it under the same slug. The base64 is there because
-`ports.publish` takes a `string` (`brenn-wasm/wit/processor.wit`), so a
-binary body pays 4/3 against `max_body_bytes`.
-
-Two shapes, and the choice is a design question: two more aliases from
-`wasm_crates` — a fixed-width binary format (`bincode` with fixed int
-encoding; `postcard`'s varints make a body's length depend on handle values,
-which an exact size projection cannot have) and a base64 crate — which is
-cheap and keeps the 4/3; or a byte payload on the port, which removes the
-4/3 and is a contract change on every host, harness and SDK. Decide when a
-second out-of-tree kind needs a binary body.
+The guest SDK's port carries bytes (`brenn:processor@0.2.0`) and
+`RetainedState` takes a `StateCodec`, so a binary state needs no base64 and no
+JSON: an author implements `StateCodec` for the state type and binds the state
+port's channel `non_text` (worked example:
+`brenn-wasm/components/processor-sdk-bytes-test`). What remains is the derive.
+`brenn-wasm/components/guest/BUILD.bazel` exports `serde` and `serde_json` from
+the guest hub so an out-of-tree crate can derive against the instance
+brenn-guest's bounds demand, and nothing else; a serde format crate from the
+author's own hub implements against another serde instance. Needed: a
+fixed-width serde format a guest can link against the hub's serde instance —
+either a crate exported from the guest hub or a serializer the SDK owns.
+`bincode` with fixed int encoding is the known candidate and is flagged
+unmaintained (RUSTSEC-2025-0141), so exporting it needs the owner's `ignore`
+in `deny.toml` or another choice; `postcard`'s varints make a body's length
+depend on handle values, which an exact size projection cannot have.
 
 Code sites (`TODO(guest-binary-body)`):
 `brenn-wasm/components/guest/BUILD.bazel`, at the `serde` alias.
@@ -3861,3 +4749,72 @@ across such a reload. The `TODO(reload-grant-reaches-queued-calls)` comment
 sits where `invoke_for_llm` builds the call's context in
 `brenn-tool-registry/src/registry.rs`.
 
+
+## `mqtt-ingress-text-rule`
+
+The default MQTT ingress shape (`MqttEnvelope`) calls a payload text only when it is valid UTF-8
+and has no Content-Type or one starting with `text/`, case-sensitively (`classify_inbound`,
+`brenn-mqtt/src/payload.rs`). The bus's own rule (`is_text_content_type`,
+`brenn-envelope/src/body.rs`) also counts `application/json` and `+json` types,
+case-insensitively. So a UTF-8 JSON payload published with `Content-Type: application/json`
+reaches a default `mqtt:` channel as a placeholder with no bytes, and publishers are told to omit
+the Content-Type. Aligning the default path with the bus rule turns placeholders into
+`{"text": …}` for existing consumers of an external contract, so it was not done with the raw
+ingress shape, where the bus rule applies. Decide: align the default classification (a behaviour
+change to announce in `CHANGELOG.md`), or leave it and document the raw shape as the answer.
+Done = the default path uses the bus rule, or `docs/message-bus.md` says why it does not. Code
+site: `classify_inbound`.
+
+
+## `quality-resolved-channel-literal-fallout-recurs-per-field`
+
+Tests build `ChannelEntry` and `ResolvedChannel` by full struct literal at about a hundred sites
+across the tree (`brenn-messaging/src/query.rs`, `brenn-server/src/active_bridge/test_fixtures.rs`,
+`brenn-server/src/webhook_router.rs`, `brenn-server/src/mqtt_router.rs`,
+`brenn-server/src/routes/webhooks/inbound.rs`, `surface/`, the `brenn-lib` messaging config
+tests, …), most restating the same unbounded, silent, drop, text-only channel that
+`brenn_lib::messaging::test_support::test_channel_entry` already builds. Every field added to
+`ResolvedChannel` costs one mechanical line per site (`untyped_content_type` cost about 125),
+and the blob work's next field will cost the same. Decide which test literals must keep forcing
+a decision on each new field, as production constructors do, and move the rest onto
+`test_channel_entry` or a `ResolvedChannel` test constructor in the same module, spread with
+`..`. Done = a new `ResolvedChannel` field needs no edit outside production constructors, the
+shared test constructors and the tests that state it on purpose. Code site:
+`test_channel_entry` in `brenn-lib/src/messaging/test_support.rs`.
+
+## `webhook-replay-recorded-before-publish`
+
+A replay-protected webhook endpoint records a delivery in its replay store before the router
+publishes it: the inbound handler (`brenn-server/src/routes/webhooks/inbound.rs`) calls the
+replay component's `check` and, on an accepted verdict, only then `deliver_inbound`. Every 500
+answered after that point — an endpoint retired mid-request, a WASM owner missing from the
+channel's subscribers, an endpoint and channel of different plans during a reload's commit
+(shape, size or type mismatch on a raw channel), any other `deliver_inbound` error — leaves
+the delivery recorded and nothing published. Where the mount still answers, the sender's retry
+is refused 409 as a duplicate and raises a replay security event, which feeds fail2ban and the
+phone alert, against a sender that behaved correctly; the message is lost. The `brenn:replay`
+world exports `check` alone (`brenn-wasm/wit/replay.wit`), an external contract out-of-tree
+replay components implement, so no call releases a record today. Make a delivery count as
+seen only once it is published: release the record when the publish fails, record it after
+the publish succeeds, or hold the store's write open until the publish returns — whichever
+the replay contract allows without opening a real replay window for two concurrent copies of
+one delivery. Done = a correctly signed retry after a post-replay-check 500 is never refused
+as a replay duplicate and raises no replay security event: it meets the answer a first
+attempt would meet at that moment, and is published exactly once when that answer is
+success. Tests: one for the reload-mismatch path, where the retry after the reload is
+accepted and published once; one for an error that persists, a WASM owner missing from the
+channel's subscribers, where the retry is answered 500 again and not 409.
+`docs/message-bus.md` §2.7.1 then drops the sentence describing the loss. Code sites: the
+replay check and the `deliver_inbound` call in the inbound handler.
+
+## `boot-log-capture-tests-flaky`
+
+Two log-capture tests in `brenn-messaging-boot` failed once under the full parallel
+`make check` with no log lines captured — `every_injected_grant_is_boot_logged`
+(`src/auto_tests.rs`) and `boot_logs_every_injected_auto_grant` (`src/build_tests.rs`),
+both `#[tracing_test::traced_test]` — and passed when run alone and on the next full
+run. The cause is not established. `make check` is the pre-commit gate, and a test that
+fails there at random teaches retry-until-green. Done = the cause is found and both
+tests pass reliably under the full parallel `make check`, or they are shown to have
+failed for a real reason and that is fixed; a retry is not a fix. Code sites
+(`TODO(boot-log-capture-tests-flaky)`): the two tests.

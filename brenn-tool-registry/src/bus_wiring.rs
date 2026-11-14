@@ -1,7 +1,7 @@
 //! Bootstrap-time derivations that connect the async tool substrate to the
 //! messaging bus: the programmatic `brenn:tools/<tool>` request channels,
-//! `brenn:tool-results/<slug>` inboxes and providers' `brenn:tool-requests/<slug>`
-//! inboxes, the `system:tool-executor` publish policy, and the per-consumer bus
+//! `brenn:tool-results/<slug>` inboxes, providers' `brenn:tool-requests/<slug>`
+//! inboxes and apps' `brenn:app-tool-results/<app-slug>` inboxes, the `system:tool-executor` publish policy, and the per-consumer bus
 //! grants derived from a tool grant or a provided tool.
 //!
 //! These are pure functions over resolved config/policy types so the delicate
@@ -11,8 +11,8 @@
 //! finalize/rebuild path every other channel and subscription flows through.
 
 use brenn_envelope::addressing::{
-    PROVIDER_CONCURRENCY_CEILING, TOOL_REQUEST_INPUT_PORT, TOOL_REQUESTS_NAMESPACE,
-    TOOL_RESULT_INPUT_PORT, TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE,
+    APP_TOOL_RESULTS_NAMESPACE, PROVIDER_CONCURRENCY_CEILING, TOOL_REQUEST_INPUT_PORT,
+    TOOL_REQUESTS_NAMESPACE, TOOL_RESULT_INPUT_PORT, TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE,
 };
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::acl::{AclSet, ChannelMatcher};
@@ -23,7 +23,8 @@ use brenn_lib::messaging::config::{
     WasmInputPort, resolve_system_channel, resolve_wasm_window_depth,
 };
 use brenn_lib::messaging::{
-    ChannelEntry, ChannelScheme, canonical_address, tool_channel_uuid_from_address,
+    ChannelEntry, ChannelScheme, app_tool_result_inbox_address, canonical_address,
+    tool_channel_uuid_from_address,
 };
 
 use super::executor::TOOL_EXECUTOR_COMPONENT;
@@ -115,6 +116,42 @@ pub fn result_inbox_entry(
     system_entry(address, resolved_channel)
 }
 
+/// The `brenn:app-tool-results/<app-slug>` inbox for one app: where a tool
+/// result that carries attachments to one of the app's conversations rests.
+///
+/// It has no subscriber, no input port and no derived grant: no policy covers
+/// the namespace, and a conversation names one of its messages only by having
+/// been handed it. Its window is what keeps a handed result's attachments
+/// nameable, so `standing_retain_depth` is the number that matters. Depths,
+/// `noise`, `wake_min` and `sink` resolve from the operator's tuning and
+/// defaults; the send rate is [`TOOL_INBOX_SEND_RATE`], as for a consumer's
+/// inbox.
+pub fn app_result_inbox_entry(
+    app_slug: &str,
+    tuning: &SystemChannelTuning,
+    defaults: &MessagingGlobalConfig,
+) -> ChannelEntry {
+    let address = app_tool_result_inbox_address(app_slug);
+    let mut resolved_channel = resolve_system_channel(&address, tuning, defaults);
+    resolved_channel.send_rate = TOOL_INBOX_SEND_RATE;
+    system_entry(address, resolved_channel)
+}
+
+/// The result inbox of each of `apps` whose policy grants an asynchronous
+/// tool, with the app's slug; an app granted only fast tools, or none, gets
+/// none.
+pub fn app_result_inbox_entries<'a>(
+    registry: &ToolRegistry,
+    apps: impl IntoIterator<Item = (&'a str, &'a AppPolicy)>,
+    tuning: &SystemChannelTuning,
+    defaults: &MessagingGlobalConfig,
+) -> Vec<(&'a str, ChannelEntry)> {
+    apps.into_iter()
+        .filter(|(_, policy)| !consumer_async_tools(registry, policy).is_empty())
+        .map(|(slug, _)| (slug, app_result_inbox_entry(slug, tuning, defaults)))
+        .collect()
+}
+
 /// The synthetic `ResolvedSubscription` for a consumer's own result inbox, folded
 /// into the consumer's directory + DB subscriptions so a result publish reaches it
 /// as an ordinary wasm delivery.
@@ -155,6 +192,7 @@ pub fn inbox_input_port(slug: &str, ch: &ResolvedChannel) -> WasmInputPort {
         port: TOOL_RESULT_INPUT_PORT.to_string(),
         sub: inbox_subscription(slug, ch),
         amplification_mt: MILLITOKENS_PER_PUBLISH,
+        non_text: ch.non_text,
     }
 }
 
@@ -257,6 +295,7 @@ pub fn request_input_port(slug: &str, ch: &ResolvedChannel) -> WasmInputPort {
         port: TOOL_REQUEST_INPUT_PORT.to_string(),
         sub: request_inbox_subscription(slug, ch),
         amplification_mt: MILLITOKENS_PER_PUBLISH,
+        non_text: ch.non_text,
     }
 }
 
@@ -326,8 +365,10 @@ pub fn tool_executor_spec(
 
 /// The bootstrap-built `system:tool-executor` policy: subscribe on every
 /// `brenn:tools/*` request channel (to receive requests), publish on
-/// `brenn:tool-results/*` (to deliver results) and on `brenn:tool-requests/*`
-/// (to hand a provided tool's call to its provider) — nothing else. Built in code, not
+/// `brenn:tool-results/*` (to deliver results), on `brenn:tool-requests/*`
+/// (to hand a provided tool's call to its provider) and on
+/// `brenn:app-tool-results/*` (to rest a conversation's result attachments) —
+/// nothing else. Built in code, not
 /// config, because the executor is substrate, not an operator participant.
 pub fn tool_executor_system_policy() -> AppPolicy {
     let mut grants = GrantSet::default();
@@ -340,6 +381,9 @@ pub fn tool_executor_system_policy() -> AppPolicy {
         .push(ChannelMatcher::Prefix(TOOL_RESULTS_NAMESPACE.to_string()));
     acls.brenn_publish
         .push(ChannelMatcher::Prefix(TOOL_REQUESTS_NAMESPACE.to_string()));
+    acls.brenn_publish.push(ChannelMatcher::Prefix(
+        APP_TOOL_RESULTS_NAMESPACE.to_string(),
+    ));
     AppPolicy {
         grants,
         acls,
@@ -377,8 +421,9 @@ mod tests {
             &self,
             _c: &ToolCtx,
             _a: Value,
-        ) -> Result<Value, crate::descriptor::ToolError> {
-            Ok(json!({}))
+            _h: crate::HeldAttachments,
+        ) -> Result<crate::ToolOutput, crate::descriptor::ToolError> {
+            Ok(json!({}).into())
         }
     }
     struct FastStub(ToolDescriptor);
@@ -409,6 +454,7 @@ mod tests {
             idempotency: Idempotency::Natural,
             auto_approve: true,
             user_binding: crate::UserBinding::None,
+            accepts_attachments: false,
         }
     }
 
@@ -479,8 +525,49 @@ mod tests {
         // request inboxes.
         assert!(policy.allows_brenn_publish("tool-results/sync"));
         assert!(policy.allows_brenn_publish("tool-requests/gmail"));
+        assert!(policy.allows_brenn_publish("app-tool-results/home"));
         assert!(!policy.allows_brenn_publish("tools/apull"));
         assert!(!policy.allows_channel_access("brenn:tool-requests/gmail"));
+        // Publishing there is not reading there: no policy covers an app inbox.
+        assert!(!policy.allows_channel_access("brenn:app-tool-results/home"));
+    }
+
+    #[test]
+    fn an_app_inbox_entry_is_unsubscribed_at_the_host_send_rate() {
+        let defaults = MessagingGlobalConfig::default();
+        let inbox = app_result_inbox_entry("home", &SystemChannelTuning::default(), &defaults);
+        assert_eq!(inbox.address, "brenn:app-tool-results/home");
+        assert_eq!(
+            inbox.uuid,
+            tool_channel_uuid_from_address("brenn:app-tool-results/home")
+        );
+        assert!(inbox.subscribers.is_empty());
+        assert_eq!(inbox.transport_type, ChannelScheme::Brenn);
+        assert_eq!(inbox.resolved_channel.send_rate, TOOL_INBOX_SEND_RATE);
+        // The namespace differs from a consumer's inbox whatever the slugs.
+        let component = result_inbox_entry("home", &SystemChannelTuning::default(), &defaults);
+        assert_ne!(inbox.uuid, component.uuid);
+    }
+
+    #[test]
+    fn only_an_app_granted_an_async_tool_gets_an_inbox() {
+        let reg = registry();
+        let (pulls, fast, none) = (
+            policy_with_grants(&["apull", "afast"]),
+            policy_with_grants(&["afast"]),
+            policy_with_grants(&[]),
+        );
+        let entries = app_result_inbox_entries(
+            &reg,
+            [("pulls", &pulls), ("fast", &fast), ("none", &none)],
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
+        let found: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(slug, entry)| (*slug, entry.address.as_str()))
+            .collect();
+        assert_eq!(found, [("pulls", "brenn:app-tool-results/pulls")]);
     }
 
     #[test]
@@ -658,6 +745,7 @@ mod tests {
             input_schema: json!({ "type": "object" }),
             max_concurrency,
             auto_approve: true,
+            accepts_attachments: false,
         }
     }
 

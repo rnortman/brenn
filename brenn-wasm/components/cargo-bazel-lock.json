@@ -1,5 +1,5 @@
 {
-  "checksum": "ddfe793ae73340c9b3832113cf3ffe7158ef973117dc352ab61a42f3cb3931a5",
+  "checksum": "ef2a79dc28f88f327cccbfcb48023275e33aff6a9c3380c32f0d724d937b279c",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -612,6 +612,87 @@
       "license_ids": [],
       "license_file": null
     },
+    "brenn-processor-blob-caller-test 0.1.0": {
+      "name": "brenn-processor-blob-caller-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-blob-provider-test 0.1.0": {
+      "name": "brenn-processor-blob-provider-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-blobs-test 0.1.0": {
+      "name": "brenn-processor-blobs-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-bytes-test 0.1.0": {
+      "name": "brenn-processor-bytes-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "wit-bindgen 0.60.0",
+              "target": "wit_bindgen"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
     "brenn-processor-call-test 0.1.0": {
       "name": "brenn-processor-call-test",
       "version": "0.1.0",
@@ -785,15 +866,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "deps": {
-          "common": [
-            {
-              "id": "wit-bindgen-rt 0.44.0",
-              "target": "wit_bindgen_rt"
-            }
-          ],
-          "selects": {}
-        },
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -832,6 +904,68 @@
       "license_ids": [],
       "license_file": null
     },
+    "brenn-processor-page-bytes-test 0.1.0": {
+      "name": "brenn-processor-page-bytes-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            },
+            {
+              "id": "wit-bindgen 0.60.0",
+              "target": "wit_bindgen"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-page-test 0.1.0": {
+      "name": "brenn-processor-page-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            },
+            {
+              "id": "wit-bindgen 0.60.0",
+              "target": "wit_bindgen"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
     "brenn-processor-provider-test 0.1.0": {
       "name": "brenn-processor-provider-test",
       "version": "0.1.0",
@@ -843,6 +977,60 @@
         "compile_data_glob": [
           "**"
         ],
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-sdk-bytes-test 0.1.0": {
+      "name": "brenn-processor-sdk-bytes-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-stale-contract-test 0.1.0": {
+      "name": "brenn-processor-stale-contract-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "wit-bindgen 0.60.0",
+              "target": "wit_bindgen"
+            }
+          ],
+          "selects": {}
+        },
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -4344,6 +4532,10 @@
     "brenn-google-maps-tools 0.1.0": "brenn-wasm/components/google-maps-tools",
     "brenn-google-workspace 0.1.0": "brenn-wasm/components/host-crates/brenn-google-workspace",
     "brenn-guest 0.1.0": "brenn-wasm/components/guest",
+    "brenn-processor-blob-caller-test 0.1.0": "brenn-wasm/components/processor-blob-caller-test",
+    "brenn-processor-blob-provider-test 0.1.0": "brenn-wasm/components/processor-blob-provider-test",
+    "brenn-processor-blobs-test 0.1.0": "brenn-wasm/components/processor-blobs-test",
+    "brenn-processor-bytes-test 0.1.0": "brenn-wasm/components/processor-bytes-test",
     "brenn-processor-call-test 0.1.0": "brenn-wasm/components/processor-call-test",
     "brenn-processor-config 0.1.0": "brenn-wasm/components/processor-config",
     "brenn-processor-demo 0.1.0": "brenn-wasm/components/processor-demo",
@@ -4353,7 +4545,11 @@
     "brenn-processor-mem-exhaust 0.1.0": "brenn-wasm/components/processor-mem-exhaust",
     "brenn-processor-mqtt-test 0.1.0": "brenn-wasm/components/processor-mqtt-test",
     "brenn-processor-multiport 0.1.0": "brenn-wasm/components/processor-multiport",
+    "brenn-processor-page-bytes-test 0.1.0": "brenn-wasm/components/processor-page-bytes-test",
+    "brenn-processor-page-test 0.1.0": "brenn-wasm/components/processor-page-test",
     "brenn-processor-provider-test 0.1.0": "brenn-wasm/components/processor-provider-test",
+    "brenn-processor-sdk-bytes-test 0.1.0": "brenn-wasm/components/processor-sdk-bytes-test",
+    "brenn-processor-stale-contract-test 0.1.0": "brenn-wasm/components/processor-stale-contract-test",
     "brenn-processor-store-rt 0.1.0": "brenn-wasm/components/processor-store-rt",
     "brenn-processor-tool-test 0.1.0": "brenn-wasm/components/processor-tool-test",
     "brenn-processor-transplant 0.1.0": "brenn-wasm/components/processor-transplant",

@@ -1,9 +1,13 @@
 //! Envelope frames for tests, built through the one canonical serializer.
 //!
 //! A test host — the page harness, an out-of-tree component's own suite —
-//! windows envelope text at a guest exactly as a real host does. That text is
-//! [`MessageEnvelope::to_envelope_json`] and nothing else: a hand-written JSON
-//! object beside it is a second wire format that no host produces and that
+//! windows envelopes at a guest exactly as a real host does, starting from
+//! [`fixture_envelope`]. A `brenn:processor@0.2.0` window entry is the
+//! envelope's [`MessageEnvelope::to_header_json`] beside its body's content
+//! type and bytes. A `brenn:processor@0.1.0` entry is the envelope's text,
+//! [`MessageEnvelope::to_envelope_json`], which [`envelope`] and
+//! [`envelope_on`] build for a suite driving a 0.1.0 guest. A hand-written JSON
+//! object beside either is a second wire format that no host produces and that
 //! stops matching the moment the frame gains or renames a field.
 //!
 //! Placement-neutral on purpose. A component that runs on the backend and on
@@ -13,7 +17,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{ChannelScheme, MessageEnvelope, Urgency};
+use crate::{ChannelScheme, MessageBody, MessageEnvelope, Urgency};
 
 /// The activation clock every fixture here stamps. Fixed: a moving one would be
 /// a transcript that changes for no reason.
@@ -50,6 +54,16 @@ pub fn envelope(id: &str, body: &str) -> String {
 /// `envelope_type` is the channel's scheme, and a fixture that disagrees with
 /// itself is worse than no fixture.
 pub fn envelope_on(channel: &str, id: &str, body: &str) -> String {
+    fixture_envelope(channel, id, MessageBody::text(body)).to_envelope_json()
+}
+
+/// The fixture envelope itself, carrying any body, for a test of a host path
+/// that takes the struct rather than its text.
+///
+/// # Panics
+///
+/// As [`envelope_on`].
+pub fn fixture_envelope(channel: &str, id: &str, body: MessageBody) -> MessageEnvelope {
     let scheme = ChannelScheme::of(channel)
         .unwrap_or_else(|| panic!("fixture channel {channel:?} carries no scheme prefix"));
     MessageEnvelope {
@@ -58,15 +72,16 @@ pub fn envelope_on(channel: &str, id: &str, body: &str) -> String {
         channel: channel.to_string(),
         sender: "fixture".to_string(),
         publish_ts: publish_ts(),
-        body: body.to_string(),
+        body,
         reply_to: None,
         delivery_deadline: None,
         deliver_after: None,
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: scheme,
+        transport: None,
+        attachments: Default::default(),
     }
-    .to_envelope_json()
 }
 
 /// The fixed publish timestamp, [`NOW_MS`] read as an instant.
@@ -83,7 +98,7 @@ mod tests {
     fn a_fixture_frame_parses_as_the_envelope_it_was_built_from() {
         let text = envelope("delivery", "{\"n\":1}");
         let parsed: MessageEnvelope = serde_json::from_str(&text).expect("frame round-trips");
-        assert_eq!(parsed.body, "{\"n\":1}");
+        assert_eq!(parsed.body.as_text(), Some("{\"n\":1}"));
         assert_eq!(parsed.channel, FIXTURE_CHANNEL);
         assert_eq!(parsed.envelope_type, ChannelScheme::Brenn);
         assert_eq!(parsed.message_id, message_id("delivery"));

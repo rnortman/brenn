@@ -199,6 +199,8 @@ fn chat_channel_entry(
             noise,
             sink: defaults.default_sink,
             wake_min,
+            non_text: false,
+            untyped_content_type: None,
         },
         subscribers,
         transport_type: scheme,
@@ -323,7 +325,10 @@ impl Messenger {
     /// so nothing calls this; the one that gets built has to — and has to
     /// follow it with [`Messenger::republish_chat_roster`], outside the
     /// database lock, so peers learn the conversation is gone rather than
-    /// discovering it as a failed publish.
+    /// discovering it as a failed publish. It follows its commit with
+    /// [`Messenger::reap_blobs`], outside the database lock, too, so the
+    /// torn-down channels' blobs are deleted then and not at the next hourly
+    /// pass.
     ///
     /// The durable half is atomic — cursors, pending pushes, and messages all
     /// reference the channel row, so a partial teardown leaves dangling
@@ -551,6 +556,10 @@ mod tests {
         WakeRouter,
     };
     use brenn_lib::config::AppConfig;
+    use brenn_messaging_store::blob::BlobError;
+
+    use crate::BlobId;
+    use crate::testutils::{TempBlobDir, covering_system_publisher, publish_attached, redeem_all};
 
     const APP: &str = "pa-bob";
 
@@ -786,7 +795,7 @@ mod tests {
 
         for addr in [&out, &stream] {
             let result = m
-                .publish_from_conversation(7, APP, addr, "body", Urgency::Normal)
+                .publish_from_conversation(7, APP, addr, "body".into(), Urgency::Normal)
                 .await;
             assert!(
                 matches!(result, crate::publish::PublishResult::Ok { .. }),
@@ -915,7 +924,7 @@ mod tests {
                     conversation_id,
                     APP,
                     &chat_address("chat", APP, ChatLeaf::Out, conversation_id),
-                    "body",
+                    "body".into(),
                     Urgency::Normal,
                 )
                 .await;
@@ -966,7 +975,7 @@ mod tests {
                 7,
                 APP,
                 &chat_address("chat", APP, ChatLeaf::Out, 7),
-                "body",
+                "body".into(),
                 Urgency::Normal,
             )
             .await;
@@ -1045,7 +1054,7 @@ mod tests {
         }
 
         let result = m
-            .publish_from_conversation(7, APP, &address, "command", Urgency::Normal)
+            .publish_from_conversation(7, APP, &address, "command".into(), Urgency::Normal)
             .await;
         assert!(
             matches!(result, crate::publish::PublishResult::Ok { .. }),
@@ -1087,7 +1096,7 @@ mod tests {
             m.provision_conversation_chat_channels(&conn, APP, 7);
         }
         for body in ["first", "second", "third"] {
-            m.publish_from_conversation(7, APP, &address, body, Urgency::Normal)
+            m.publish_from_conversation(7, APP, &address, body.into(), Urgency::Normal)
                 .await;
         }
         let uuid = leaf_uuid(&m, 7, ChatLeaf::In);
@@ -1150,7 +1159,7 @@ mod tests {
             .expect("the conversation holds a position on its command channel")
             .new_entries()
             .iter()
-            .map(|(_, env)| env.body.clone())
+            .map(|(_, env)| env.body.as_text().unwrap().to_owned())
             .collect()
     }
 
@@ -1268,7 +1277,7 @@ mod tests {
         }
         let address = chat_address("chat", APP, ChatLeaf::In, 7);
         let result = m
-            .publish_from_conversation(7, APP, &address, "a command", Urgency::Normal)
+            .publish_from_conversation(7, APP, &address, "a command".into(), Urgency::Normal)
             .await;
         assert!(
             matches!(result, crate::publish::PublishResult::Ok { .. }),
@@ -1301,7 +1310,7 @@ mod tests {
             m.provision_conversation_chat_channels(&conn, APP, 7);
         }
         let address = chat_address("chat", APP, ChatLeaf::In, 7);
-        m.publish_from_conversation(7, APP, &address, "a quiet command", Urgency::Low)
+        m.publish_from_conversation(7, APP, &address, "a quiet command".into(), Urgency::Low)
             .await;
 
         m.wake_owed_subscribers(chrono::Utc::now()).await;
@@ -1332,7 +1341,7 @@ mod tests {
         }
         let address = chat_address("chat", APP, ChatLeaf::Wake, 7);
         let result = m
-            .publish_from_conversation(7, APP, &address, "", Urgency::VeryLow)
+            .publish_from_conversation(7, APP, &address, "".into(), Urgency::VeryLow)
             .await;
         assert!(
             matches!(result, crate::publish::PublishResult::Ok { .. }),
@@ -1356,7 +1365,7 @@ mod tests {
             insert_conversation(&conn, 7, APP);
             m.provision_conversation_chat_channels(&conn, APP, 7);
         }
-        m.publish_from_conversation(7, APP, &address, "a command", Urgency::Normal)
+        m.publish_from_conversation(7, APP, &address, "a command".into(), Urgency::Normal)
             .await;
 
         let report = m.reconcile_subscriber_cursors(&[]).await;
@@ -1399,6 +1408,123 @@ mod tests {
         assert_eq!(table_counts(&conn), (0, 0, 0, 0, 0));
     }
 
+    const BLOB_PUBLISHER: &str = "chat-blob-producer";
+
+    /// [`messenger`] with a blob store and a system component allowed to
+    /// publish onto `brenn:` and `ephemeral:` channels, with conversations 7
+    /// and 8 provisioned.
+    /// Conversation 7's command channel holds one message naming `only` and
+    /// `shared`; conversation 8's holds one naming `shared`. Every producer
+    /// hold is gone, so the rows are the blobs' only holders.
+    async fn teardown_blob_fixture() -> (Arc<Messenger>, brenn_db::Db, TempBlobDir, BlobId, BlobId)
+    {
+        let (m, db) = messenger().await;
+        let m = m.with_subscriber_registrations(covering_system_publisher(BLOB_PUBLISHER));
+        let (m, blobs) = crate::testutils::install_blob_store(m).await;
+        {
+            let conn = db.lock().await;
+            for id in [7, 8] {
+                insert_conversation(&conn, id, APP);
+                m.provision_conversation_chat_channels(&conn, APP, id);
+            }
+        }
+        let only = crate::testutils::seal_blob(&m, b"conversation seven's");
+        let shared = crate::testutils::seal_blob(&m, b"both conversations'");
+        let ids = (only.id().clone(), shared.id().clone());
+        for (id, holds) in [
+            (7, vec![("photo", &only), ("doc", &shared)]),
+            (8, vec![("doc", &shared)]),
+        ] {
+            let address = chat_address("chat", APP, ChatLeaf::In, id);
+            publish_attached(
+                &m,
+                BLOB_PUBLISHER,
+                &address,
+                "with attachments",
+                &holds,
+                None,
+            )
+            .await;
+        }
+        drop((only, shared));
+        (m, db, blobs, ids.0, ids.1)
+    }
+
+    /// Teardown called with no transaction open: its deletes commit at once,
+    /// the blob only the torn-down conversation named is unredeemable from
+    /// then, and the next reap deletes its bytes. The sibling's blob stays.
+    #[tokio::test]
+    async fn teardown_without_a_transaction_leaves_its_blobs_to_the_reap() {
+        let (m, db, blobs, only, shared) = teardown_blob_fixture().await;
+        {
+            let conn = db.lock().await;
+            assert_eq!(m.deprovision_conversation_chat_channels(&conn, APP, 7), 4);
+        }
+        assert!(matches!(
+            redeem_all(&m, &only).await,
+            Err(BlobError::NotFound)
+        ));
+        assert!(blobs.holds_file(&only), "the bytes wait for the reap");
+
+        let reaped = m.reap_blobs().await;
+
+        assert_eq!(reaped.blobs, 1);
+        assert!(!blobs.holds_file(&only));
+        assert_eq!(
+            redeem_all(&m, &shared).await.unwrap(),
+            b"both conversations'"
+        );
+    }
+
+    /// Teardown inside the caller's transaction: the bytes stay on disk until
+    /// the caller commits and a reap runs.
+    #[tokio::test]
+    async fn teardown_inside_a_committed_transaction_leaves_its_blobs_to_the_reap() {
+        let (m, db, blobs, only, shared) = teardown_blob_fixture().await;
+        {
+            let conn = db.lock().await;
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            m.deprovision_conversation_chat_channels(&conn, APP, 7);
+            assert!(
+                blobs.holds_file(&only),
+                "nothing is unlinked inside the transaction"
+            );
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        assert!(blobs.holds_file(&only), "nor at the commit");
+        assert!(matches!(
+            redeem_all(&m, &only).await,
+            Err(BlobError::NotFound)
+        ));
+
+        assert_eq!(m.reap_blobs().await.blobs, 1);
+        assert!(!blobs.holds_file(&only));
+        assert_eq!(
+            redeem_all(&m, &shared).await.unwrap(),
+            b"both conversations'"
+        );
+    }
+
+    /// Teardown inside a transaction the caller rolls back: the message rows
+    /// and their references come back, and so the blob stays readable.
+    #[tokio::test]
+    async fn teardown_inside_a_rolled_back_transaction_keeps_its_blobs() {
+        let (m, db, blobs, only, _shared) = teardown_blob_fixture().await;
+        {
+            let conn = db.lock().await;
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            m.deprovision_conversation_chat_channels(&conn, APP, 7);
+            conn.execute_batch("ROLLBACK").unwrap();
+        }
+
+        assert_eq!(m.reap_blobs().await.blobs, 0);
+        assert!(blobs.holds_file(&only));
+        assert_eq!(
+            redeem_all(&m, &only).await.unwrap(),
+            b"conversation seven's"
+        );
+    }
+
     /// The chat seam and the ambience-injection seam coexist without touching.
     /// A conversation's own command channel must never reach
     /// `conversation_delivery`, which is what the injection renderer drains: a
@@ -1422,7 +1548,7 @@ mod tests {
                 7,
                 APP,
                 &chat_address("chat", APP, leaf, 7),
-                "a command, and a record entry",
+                "a command, and a record entry".into(),
                 Urgency::Normal,
             )
             .await;
@@ -1483,7 +1609,7 @@ mod tests {
             Depth::Bounded(10),
         )
         .await;
-        m.publish_from_conversation(7, APP, &address, "a command", Urgency::Normal)
+        m.publish_from_conversation(7, APP, &address, "a command".into(), Urgency::Normal)
             .await;
 
         m.wake_owed_subscribers(chrono::Utc::now()).await;

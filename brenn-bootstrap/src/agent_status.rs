@@ -47,7 +47,15 @@ pub(crate) async fn boot(
                 "system:{AGENT_STATUS_COMPONENT} subscribes to the accounts channel alone"
             );
             assert_ledger_writer(&envelope.sender);
-            retained_accounts = Some(envelope.body.clone());
+            let Some(text) = envelope.body.as_text() else {
+                panic!(
+                    "the latest message on {ACCOUNTS_ADDRESS} has a non-text body ({}); the \
+                     ledger is JSON text; clear the accounts channel to start every profile at \
+                     zero",
+                    envelope.body.summary()
+                );
+            };
+            retained_accounts = Some(text.to_owned());
         },
     )
     .await;
@@ -120,10 +128,16 @@ mod tests {
         )])
     }
 
+    /// [`messenger_with`] over text-only channels.
+    fn messenger() -> Arc<Messenger> {
+        messenger_with(false)
+    }
+
     /// The durable accounts and ended channels, with the participant's
     /// subscription folded in and its real code-built policy registered. The
-    /// ephemeral sessions channel is only looked up by the spec here.
-    fn messenger() -> Arc<Messenger> {
+    /// ephemeral sessions channel is only looked up by the spec here. The
+    /// accounts channel may hold a non-text body iff `accounts_non_text`.
+    fn messenger_with(accounts_non_text: bool) -> Arc<Messenger> {
         let entry = |address: &'static str| {
             let (scheme, name) = ChannelScheme::split(address).expect("a schemed address");
             let mut entry = test_channel_entry(name, vec![]);
@@ -131,6 +145,7 @@ mod tests {
             entry.transport_type = scheme;
             entry.resolved_channel.retain_depth = Depth::Bounded(1);
             entry.resolved_channel.standing_retain_depth = Depth::Bounded(1);
+            entry.resolved_channel.non_text = accounts_non_text && address == ACCOUNTS_ADDRESS;
             entry
         };
         let declared = [
@@ -171,7 +186,8 @@ mod tests {
             .find(|(address, _)| address == ACCOUNTS_ADDRESS)
             .expect("the participant reads the accounts channel");
         let (_, envelope) = window.entries.last().expect("a retained accounts body");
-        decode(&envelope.body).expect("an accounts body")
+        decode(envelope.body.as_text().expect("the accounts body is text"))
+            .expect("an accounts body")
     }
 
     /// The boot read and the boot publish, through a real durable channel: the
@@ -210,7 +226,7 @@ mod tests {
             .publish_from_system(
                 AGENT_STATUS_COMPONENT,
                 ACCOUNTS_ADDRESS,
-                &brenn_envelope::agent::encode(&spent),
+                brenn_envelope::agent::encode(&spent).into(),
                 Urgency::Normal,
                 None,
             )
@@ -243,7 +259,7 @@ mod tests {
             .publish_from_system(
                 AGENT_STATUS_COMPONENT,
                 "brenn:elsewhere",
-                "{}",
+                "{}".into(),
                 Urgency::Normal,
                 None,
             )
@@ -256,6 +272,32 @@ mod tests {
     #[should_panic(expected = "remove that principal's publish grant")]
     fn a_ledger_written_by_another_principal_panics() {
         assert_ledger_writer("app:assistant");
+    }
+
+    /// A retained ledger body that is not text is not seeded from: boot panics
+    /// rather than start every profile at zero over the operator's record.
+    /// The accounts channel is declared `non_text` here so the store admits
+    /// the body and the seed's own check is the one that fires.
+    #[tokio::test]
+    #[should_panic(expected = "has a non-text body")]
+    async fn a_non_text_ledger_body_panics_at_boot() {
+        let messenger = messenger_with(true);
+        let body = brenn_envelope::body::MessageBody::from_parts(
+            Some("application/octet-stream"),
+            b"\x00\x01",
+        )
+        .expect("a well-formed binary body");
+        let outcome = messenger
+            .publish_from_system(
+                AGENT_STATUS_COMPONENT,
+                ACCOUNTS_ADDRESS,
+                body,
+                Urgency::Normal,
+                None,
+            )
+            .await;
+        assert!(matches!(outcome, PublishResult::Ok { .. }), "{outcome:?}");
+        boot(&profiles(), Some(messenger), Some(Arc::new(Notify::new()))).await;
     }
 
     /// Without the channels the reporter publishes nothing and attaches nothing.

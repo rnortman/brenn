@@ -47,6 +47,10 @@
 //! `calls` capability is not hosted here: [`Kind::compile`] refuses a class
 //! that grants it.
 //!
+//! The harness hosts the byte-carrying contract, `brenn:processor@0.2.0`, and
+//! only that: a body crosses as an optional content type and bytes, recorded
+//! as a [`Body`]. A string-contract artifact does not instantiate here.
+//!
 //! The artifact and the specification both arrive as paths, so a consumer
 //! outside this repository points the harness at whatever its own build
 //! produced.
@@ -56,23 +60,105 @@ use std::path::Path;
 use std::sync::Arc;
 
 use brenn_envelope::grants::ComponentGrant;
-use brenn_envelope::testutils::{NOW_MS, envelope};
+use brenn_envelope::testutils::{FIXTURE_CHANNEL, NOW_MS, fixture_envelope};
+use brenn_envelope::{MessageBody, is_text_content_type};
 use brenn_surface_contract::{
     MOUNT_SYNC_PORT, dom_attribute_allowed, dom_attribute_value_allowed, dom_tag_allowed,
 };
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};
 
-/// The `brenn:processor` world, generated from the same WIT both the kernel and
-/// the guest SDK read.
+/// The `brenn:processor@0.2.0` world, generated from the same WIT both the
+/// kernel and the guest SDK read: `processor.wit` first, whose unchanged
+/// interfaces the 0.2.0 package imports.
 pub mod bindings {
     wasmtime::component::bindgen!({
-        world: "processor",
-        path: "processor.wit",
+        world: "brenn:processor/processor@0.2.0",
+        path: ["processor.wit", "processor-0.2.wit"],
     });
 }
 
-pub use bindings::brenn::processor::{alert, config, dom, log, page_dom, ports, types};
+pub use bindings::brenn::processor0_1_0::{alert, config, dom, log, page_dom};
+pub use bindings::brenn::processor0_2_0::{bus, ports};
+
+/// A body as it crossed the boundary: an optional content type and bytes. No
+/// content type is untyped text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Body {
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+impl Body {
+    /// An untyped text body, which is what every text publish is.
+    pub fn text(text: &str) -> Body {
+        Body {
+            content_type: None,
+            bytes: text.as_bytes().to_vec(),
+        }
+    }
+
+    /// A body of the given content type.
+    pub fn typed(content_type: &str, bytes: Vec<u8>) -> Body {
+        Body {
+            content_type: Some(content_type.to_string()),
+            bytes,
+        }
+    }
+
+    /// The body's text: `None` unless the content type is a text type (no
+    /// content type included) and the bytes are UTF-8.
+    pub fn as_text(&self) -> Option<&str> {
+        if !is_text_content_type(self.content_type.as_deref()) {
+            return None;
+        }
+        std::str::from_utf8(&self.bytes).ok()
+    }
+
+    /// `<content type>, <n> bytes`, the content type `untyped text` when there
+    /// is none — spelled as [`brenn_envelope::MessageBody::summary`] displays a
+    /// body.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}, {} bytes",
+            self.content_type.as_deref().unwrap_or("untyped text"),
+            self.bytes.len()
+        )
+    }
+
+    /// How a transcript line shows the body: an untyped text body as its
+    /// quoted text, any other as its content type and length.
+    fn render(&self) -> String {
+        match (&self.content_type, std::str::from_utf8(&self.bytes)) {
+            (None, Ok(text)) => format!("{text:?}"),
+            _ => format!("<{}>", self.describe()),
+        }
+    }
+
+    fn from_wit(body: bus::Body) -> Body {
+        Body {
+            content_type: body.content_type,
+            bytes: body.bytes,
+        }
+    }
+
+    fn to_wit(&self) -> bus::Body {
+        bus::Body {
+            content_type: self.content_type.clone(),
+            bytes: self.bytes.clone(),
+        }
+    }
+}
+
+/// One accepted publish or park: the port, the body, and for a parked message
+/// its release time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Published {
+    pub port: String,
+    pub body: Body,
+    /// `Some` for a parked message, `None` for a publish.
+    pub deliver_after: Option<u64>,
+}
 
 /// What a class declares: the grants the page links and the port vocabulary it
 /// holds the guest to.
@@ -161,9 +247,9 @@ pub struct Page {
     /// Every guest-visible call, in call order.
     pub transcript: Vec<String>,
     /// What the component published and where, in call order.
-    pub published: Vec<(String, String)>,
+    pub published: Vec<Published>,
     /// What it parked and where, in call order.
-    pub parked: Vec<(String, String, u64)>,
+    pub parked: Vec<Published>,
     /// What it alerted on, in call order.
     pub alerts: Vec<Alert>,
     /// What every publish answers. `None` is acceptance.
@@ -336,13 +422,28 @@ impl Page {
         self.instance_wrappers[instance]
     }
 
-    /// The payloads accepted on `port`, in publish order.
+    /// The text bodies accepted on `port`, in publish order.
+    ///
+    /// Panics, naming the body, on one that is not text: a suite reading a
+    /// byte port reads [`Self::bodies_on`].
     pub fn published_on(&self, port: &str) -> Vec<&str> {
-        self.published
-            .iter()
-            .filter(|(on, _)| on == port)
-            .map(|(_, payload)| payload.as_str())
+        self.bodies_on(port)
+            .into_iter()
+            .map(|published| {
+                published.body.as_text().unwrap_or_else(|| {
+                    panic!(
+                        "the body published on {port:?} is not text ({}); read it with \
+                         `bodies_on`",
+                        published.body.describe()
+                    )
+                })
+            })
             .collect()
+    }
+
+    /// The publishes accepted on `port`, in publish order.
+    pub fn bodies_on(&self, port: &str) -> Vec<&Published> {
+        self.published.iter().filter(|p| p.port == port).collect()
     }
 
     fn record(&mut self, line: String) {
@@ -614,59 +715,68 @@ impl Page {
             .or(self.publish_answer.as_ref())
             .cloned()
     }
+
+    /// Answer a publish or a park as scripted, recording it when accepted.
+    fn accept(
+        &mut self,
+        port: String,
+        body: Body,
+        deliver_after: Option<u64>,
+    ) -> Result<(), ports::PublishError> {
+        if let Some(refusal) = self.publish_refusal(&port) {
+            return Err(refusal);
+        }
+        let record = Published {
+            port,
+            body,
+            deliver_after,
+        };
+        match deliver_after {
+            None => self.published.push(record),
+            Some(_) => self.parked.push(record),
+        }
+        Ok(())
+    }
 }
 
 // TODO(harness-flush-on-err): every port call below is recorded as kept; the
 // kernel discards a failed activation's buffer, and the harness does not.
 impl ports::Host for Page {
-    fn publish(&mut self, port: String, payload: String) -> Result<(), ports::PublishError> {
+    fn publish(&mut self, port: String, body: bus::Body) -> Result<(), ports::PublishError> {
+        let body = Body::from_wit(body);
         self.assert_outbound(&port);
-        self.record(format!("ports.publish({port}, {payload:?})"));
-        match self.publish_refusal(&port) {
-            None => {
-                self.published.push((port, payload));
-                Ok(())
-            }
-            Some(refusal) => Err(refusal),
-        }
+        self.record(format!("ports.publish({port}, {})", body.render()));
+        self.accept(port, body, None)
     }
 
     fn publish_with_urgency(
         &mut self,
         port: String,
-        payload: String,
+        body: bus::Body,
         urgency: ports::Urgency,
     ) -> Result<(), ports::PublishError> {
+        let body = Body::from_wit(body);
         self.assert_outbound(&port);
         self.record(format!(
-            "ports.publish-with-urgency({port}, {payload:?}, {urgency:?})"
+            "ports.publish-with-urgency({port}, {}, {urgency:?})",
+            body.render()
         ));
-        match self.publish_refusal(&port) {
-            None => {
-                self.published.push((port, payload));
-                Ok(())
-            }
-            Some(refusal) => Err(refusal),
-        }
+        self.accept(port, body, None)
     }
 
     fn publish_deferred(
         &mut self,
         port: String,
-        payload: String,
+        body: bus::Body,
         deliver_after: u64,
     ) -> Result<(), ports::PublishError> {
+        let body = Body::from_wit(body);
         self.assert_outbound(&port);
         self.record(format!(
-            "ports.publish-deferred({port}, {payload:?}, {deliver_after})"
+            "ports.publish-deferred({port}, {}, {deliver_after})",
+            body.render()
         ));
-        match self.publish_refusal(&port) {
-            None => {
-                self.parked.push((port, payload, deliver_after));
-                Ok(())
-            }
-            Some(refusal) => Err(refusal),
-        }
+        self.accept(port, body, Some(deliver_after))
     }
 
     fn defer_cancel(&mut self, port: String, index: u32) -> Result<(), ports::DeferError> {
@@ -681,12 +791,16 @@ impl ports::Host for Page {
         &mut self,
         port: String,
         index: u32,
-        payload: Option<String>,
+        body: Option<bus::Body>,
         deliver_after: Option<u64>,
     ) -> Result<(), ports::DeferError> {
         self.assert_outbound(&port);
+        let body = match body {
+            Some(body) => format!("Some({})", Body::from_wit(body).render()),
+            None => String::from("None"),
+        };
         self.record(format!(
-            "ports.defer-edit({port}, {index}, {payload:?}, {deliver_after:?})"
+            "ports.defer-edit({port}, {index}, {body}, {deliver_after:?})"
         ));
         Ok(())
     }
@@ -790,7 +904,7 @@ pub struct Harness {
 /// discard a refusal or a trap earns is applied here.
 struct RetainedState {
     port: String,
-    body: Option<String>,
+    body: Option<Body>,
 }
 
 impl Harness {
@@ -906,14 +1020,20 @@ impl Harness {
         self
     }
 
-    /// Put `body` on the retained-state port as though the instance had
-    /// published it, for a script about what a kind does with a state body it
-    /// did not write — a version skew across a deploy, most of all.
-    pub fn seeding_state(mut self, body: &str) -> Harness {
+    /// Put `body` on the retained-state port as untyped text, as though the
+    /// instance had published it, for a script about what a kind does with a
+    /// state body it did not write — a version skew across a deploy, most of
+    /// all.
+    pub fn seeding_state(self, body: &str) -> Harness {
+        self.seeding_state_body(Body::text(body))
+    }
+
+    /// [`Self::seeding_state`] with any body: a typed or a non-text one.
+    pub fn seeding_state_body(mut self, body: Body) -> Harness {
         self.state
             .as_mut()
             .expect("seed a state port this instance retains")
-            .body = Some(body.to_string());
+            .body = Some(body);
         self
     }
 
@@ -927,7 +1047,7 @@ impl Harness {
 
     /// Drive one activation that answers nothing, which is every activation but
     /// a sync call the component replies to.
-    pub fn call(&mut self, activation: types::Activation) {
+    pub fn call(&mut self, activation: bus::Activation) {
         let reply = self.call_returning(activation);
         assert_eq!(
             reply, None,
@@ -941,7 +1061,7 @@ impl Harness {
     /// action, a mount answering the kernel — and that answer is the only
     /// observable output of an activation that touches neither the page nor a
     /// port, so it is reachable rather than asserted away.
-    pub fn call_returning(&mut self, activation: types::Activation) -> Option<String> {
+    pub fn call_returning(&mut self, activation: bus::Activation) -> Option<Body> {
         self.receive(&activation)
             .expect("the activation did not trap")
             .expect("the activation was not refused")
@@ -955,8 +1075,8 @@ impl Harness {
     /// one host and quarantined on another — reads them here instead.
     pub fn receive(
         &mut self,
-        activation: &types::Activation,
-    ) -> wasmtime::Result<Result<Option<String>, types::ReceiveError>> {
+        activation: &bus::Activation,
+    ) -> wasmtime::Result<Result<Option<Body>, bus::ReceiveError>> {
         self.assert_declared(activation);
         let activation = self.windowed(activation);
         // A fresh store and a fresh instance per activation: its statics, its
@@ -983,7 +1103,7 @@ impl Harness {
         if matches!(outcome, Ok(Ok(_))) {
             self.retain_state(published_from);
         }
-        outcome
+        outcome.map(|answer| answer.map(|reply| reply.map(Body::from_wit)))
     }
 
     /// A scripted activation names only what the class declares: a sync cause
@@ -993,7 +1113,7 @@ impl Harness {
     /// The window named by the sync cause is exempt from the inbound rule: a
     /// sync-call activation carries its one synthesized request as a window on
     /// the sync port itself.
-    fn assert_declared(&self, activation: &types::Activation) {
+    fn assert_declared(&self, activation: &bus::Activation) {
         let declared = self.store.data().declared();
         if let Some(cause) = &activation.sync {
             assert!(
@@ -1017,7 +1137,7 @@ impl Harness {
 
     /// The caller's activation with the retained-state window appended, where
     /// this instance has one.
-    fn windowed(&self, activation: &types::Activation) -> types::Activation {
+    fn windowed(&self, activation: &bus::Activation) -> bus::Activation {
         let Some(state) = &self.state else {
             return activation.clone();
         };
@@ -1029,12 +1149,12 @@ impl Harness {
         // The WIT records derive `Clone`; a harness that appends a window of
         // its own must not edit the caller's script.
         let mut activation = activation.clone();
-        let envelopes: Vec<String> = state
+        let envelopes: Vec<bus::Envelope> = state
             .body
             .iter()
-            .map(|body| envelope("state", body))
+            .map(|body| wit_envelope("state", body))
             .collect();
-        activation.ports.push(types::PortWindow {
+        activation.ports.push(bus::PortWindow {
             port: state.port.clone(),
             // Wholly context: a sampled port holds no position, so nothing on
             // it is ever new to the instance that wrote it.
@@ -1058,8 +1178,8 @@ impl Harness {
         let newest = self.store.data().published[published_from..]
             .iter()
             .rev()
-            .find(|(p, _)| *p == port)
-            .map(|(_, body)| body.clone());
+            .find(|published| published.port == port)
+            .map(|published| published.body.clone());
         if let Some(body) = newest {
             self.state
                 .as_mut()
@@ -1074,7 +1194,7 @@ impl Harness {
     /// else: the message the component wrote goes to its own log pipeline, not
     /// into the error. So the assertion available here is the fact of the trap,
     /// which is what makes the instance terminal and earns it an error card.
-    pub fn call_expecting_a_trap(&mut self, activation: types::Activation) {
+    pub fn call_expecting_a_trap(&mut self, activation: bus::Activation) {
         let error = self
             .receive(&activation)
             .expect_err("the activation must trap");
@@ -1085,10 +1205,7 @@ impl Harness {
     /// Drive one activation expecting the component to refuse it and keep
     /// running — a wiring bug rather than a memory one, which costs the page
     /// its activation and not its instance.
-    pub fn call_expecting_a_refusal(
-        &mut self,
-        activation: types::Activation,
-    ) -> types::ReceiveError {
+    pub fn call_expecting_a_refusal(&mut self, activation: bus::Activation) -> bus::ReceiveError {
         self.receive(&activation)
             .expect("a refused activation does not trap")
             .expect_err("the activation must be refused")
@@ -1104,13 +1221,29 @@ impl Harness {
     }
 }
 
+/// One fixture envelope as the world carries it: the header of the fixture
+/// frame minted under `id`, and `body`.
+fn wit_envelope(id: &str, body: &Body) -> bus::Envelope {
+    bus::Envelope {
+        // The header carries no body field, so the frame is minted around an
+        // empty one.
+        header: fixture_envelope(FIXTURE_CHANNEL, id, MessageBody::text("")).to_header_json(),
+        body: body.to_wit(),
+    }
+}
+
 /// A sync-call activation on `port`, carrying the one synthesized request the
-/// kernel mints for it and nothing else.
-pub fn sync_call(port: &str, request: String) -> types::Activation {
-    types::Activation {
-        ports: vec![types::PortWindow {
+/// kernel mints for it — `request`, as an untyped text body — and nothing
+/// else.
+pub fn sync_call(port: &str, request: &str) -> bus::Activation {
+    sync_call_as(port, "request", request)
+}
+
+fn sync_call_as(port: &str, id: &str, request: &str) -> bus::Activation {
+    bus::Activation {
+        ports: vec![bus::PortWindow {
             port: port.to_string(),
-            envelopes: vec![request],
+            envelopes: vec![wit_envelope(id, &Body::text(request))],
             new_from: 0,
             dropped: 0,
         }],
@@ -1122,19 +1255,19 @@ pub fn sync_call(port: &str, request: String) -> types::Activation {
 
 /// The mount activation, as the runner mints it: the reserved port, an empty
 /// synthesized body, and whatever input was already pending — here, none.
-pub fn mount() -> types::Activation {
-    sync_call(MOUNT_SYNC_PORT, envelope("mount", "{}"))
+pub fn mount() -> bus::Activation {
+    sync_call_as(MOUNT_SYNC_PORT, "mount", "{}")
 }
 
 /// A gesture, as the kernel's listener synthesizes it: the event, the listening
 /// node and the nearest handle-mapped ancestor of what was hit.
-pub fn gesture(port: &str, listener: u64) -> types::Activation {
+pub fn gesture(port: &str, listener: u64) -> bus::Activation {
     gesture_at(port, listener, listener)
 }
 
 /// A gesture whose target is not the listening node — a click that landed on a
 /// descendant of a delegated listener, or on the gap between them.
-pub fn gesture_at(port: &str, listener: u64, target: u64) -> types::Activation {
+pub fn gesture_at(port: &str, listener: u64, target: u64) -> bus::Activation {
     gesture_with(port, "click", listener, target, &GestureDetail::default())
 }
 
@@ -1155,7 +1288,7 @@ pub fn gesture_with(
     listener: u64,
     target: u64,
     detail: &GestureDetail,
-) -> types::Activation {
+) -> bus::Activation {
     gesture_body(
         port,
         &GestureBody {
@@ -1171,28 +1304,35 @@ pub fn gesture_with(
 /// A gesture carrying `body` verbatim — every field the kernel's listener
 /// writes, `child` among them. The harness derives nothing from its fake tree:
 /// the suite scripts the body a hit would produce.
-pub fn gesture_body(port: &str, body: &GestureBody) -> types::Activation {
+pub fn gesture_body(port: &str, body: &GestureBody) -> bus::Activation {
     let body = serde_json::to_string(body).expect("a gesture body serializes");
-    sync_call(port, envelope("gesture", &body))
+    sync_call_as(port, "gesture", &body)
 }
 
 /// An ordinary delivery on `port`: `context` is what the instance has already
 /// seen, `new` is what this activation brings, `dropped` is what the window
-/// lost.
-pub fn delivery_on(port: &str, context: &[&str], new: &[&str], dropped: u32) -> types::Activation {
-    let mut envelopes: Vec<String> = context
+/// lost. Every body is untyped text.
+pub fn delivery_on(port: &str, context: &[&str], new: &[&str], dropped: u32) -> bus::Activation {
+    let context: Vec<Body> = context.iter().map(|body| Body::text(body)).collect();
+    let new: Vec<Body> = new.iter().map(|body| Body::text(body)).collect();
+    delivery_of(port, &context, &new, dropped)
+}
+
+/// [`delivery_on`] with any bodies: typed text, or bytes.
+pub fn delivery_of(port: &str, context: &[Body], new: &[Body], dropped: u32) -> bus::Activation {
+    let mut envelopes: Vec<bus::Envelope> = context
         .iter()
         .enumerate()
-        .map(|(i, body)| envelope(&format!("c{i}"), body))
+        .map(|(i, body)| wit_envelope(&format!("c{i}"), body))
         .collect();
     let new_from = envelopes.len() as u32;
     envelopes.extend(
         new.iter()
             .enumerate()
-            .map(|(i, body)| envelope(&format!("m{i}"), body)),
+            .map(|(i, body)| wit_envelope(&format!("m{i}"), body)),
     );
-    types::Activation {
-        ports: vec![types::PortWindow {
+    bus::Activation {
+        ports: vec![bus::PortWindow {
             port: port.to_string(),
             envelopes,
             new_from,
@@ -1207,9 +1347,13 @@ pub fn delivery_on(port: &str, context: &[&str], new: &[&str], dropped: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bindings::brenn::processor::ports::Host as _;
+    use bindings::brenn::processor0_1_0::dom::Host as _;
+    use bindings::brenn::processor0_2_0::ports::Host as _;
 
-    use bindings::brenn::processor::dom::Host as _;
+    /// An untyped text body as the guest hands one over.
+    fn text(body: &str) -> bus::Body {
+        Body::text(body).to_wit()
+    }
 
     fn echo_stub_spec() -> String {
         std::env::var("ECHO_STUB_SPEC").expect("the build names the specification")
@@ -1232,7 +1376,7 @@ mod tests {
     fn publishing_with_urgency_records_and_publishes() {
         let mut page = Page::new();
         page.declare(echo_stub_declared());
-        page.publish_with_urgency("out".to_string(), "{}".to_string(), ports::Urgency::High)
+        page.publish_with_urgency("out".to_string(), text("{}"), ports::Urgency::High)
             .expect("the bus accepts it");
         assert_eq!(page.published_on("out"), vec!["{}"]);
         assert_eq!(
@@ -1248,8 +1392,7 @@ mod tests {
         let mut page = Page::new();
         page.declare(echo_stub_declared());
         page.publish_answer = Some(ports::PublishError::NotPermitted);
-        let answer =
-            page.publish_with_urgency("out".to_string(), "{}".to_string(), ports::Urgency::Low);
+        let answer = page.publish_with_urgency("out".to_string(), text("{}"), ports::Urgency::Low);
         assert!(matches!(answer, Err(ports::PublishError::NotPermitted)));
         assert!(page.published.is_empty());
     }
@@ -1260,13 +1403,8 @@ mod tests {
     fn editing_a_parked_message_is_recorded() {
         let mut page = Page::new();
         page.declare(echo_stub_declared());
-        page.defer_edit(
-            "out".to_string(),
-            0,
-            Some("{}".to_string()),
-            Some(NOW_MS + 1_000),
-        )
-        .expect("the edit is accepted");
+        page.defer_edit("out".to_string(), 0, Some(text("{}")), Some(NOW_MS + 1_000))
+            .expect("the edit is accepted");
         assert_eq!(
             page.transcript,
             vec![format!(
@@ -1276,13 +1414,104 @@ mod tests {
         );
     }
 
+    /// A typed or non-text body is recorded byte for byte with its content
+    /// type, shown in the transcript by type and length, and refused by the
+    /// text reader by name.
+    #[test]
+    fn a_byte_publish_is_recorded_with_its_content_type() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        let bytes = vec![0xff, 0x00, 0x80];
+        page.publish(
+            "state".to_string(),
+            Body::typed("application/octet-stream", bytes.clone()).to_wit(),
+        )
+        .expect("the bus accepts it");
+        page.publish(
+            "out".to_string(),
+            Body::typed("text/markdown", b"# hi".to_vec()).to_wit(),
+        )
+        .expect("the bus accepts it");
+        assert_eq!(
+            page.bodies_on("state"),
+            vec![&Published {
+                port: "state".to_string(),
+                body: Body::typed("application/octet-stream", bytes),
+                deliver_after: None,
+            }]
+        );
+        assert_eq!(page.published_on("out"), vec!["# hi"]);
+        assert_eq!(
+            page.transcript,
+            vec![
+                "ports.publish(state, <application/octet-stream, 3 bytes>)".to_string(),
+                "ports.publish(out, <text/markdown, 4 bytes>)".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is not text (application/octet-stream, 1 bytes)")]
+    fn reading_a_byte_publish_as_text_panics() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        page.publish(
+            "state".to_string(),
+            Body::typed("application/octet-stream", vec![1]).to_wit(),
+        )
+        .expect("the bus accepts it");
+        page.published_on("state");
+    }
+
+    /// A parked publish lands in its own record with its release time.
+    #[test]
+    fn a_deferred_publish_is_parked_with_its_release_time() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        page.publish_deferred("out".to_string(), text("{}"), NOW_MS)
+            .expect("the bus accepts it");
+        assert!(page.published.is_empty());
+        assert_eq!(
+            page.parked,
+            vec![Published {
+                port: "out".to_string(),
+                body: Body::text("{}"),
+                deliver_after: Some(NOW_MS),
+            }]
+        );
+    }
+
+    /// A scripted delivery carries each body as given, under a header that
+    /// reads as an envelope and holds no body of its own.
+    #[test]
+    fn a_delivery_carries_its_bodies_byte_exact() {
+        let bytes = Body::typed("application/octet-stream", vec![0xfe, 0xff]);
+        let activation = delivery_of(
+            "messages",
+            &[Body::text("seen")],
+            std::slice::from_ref(&bytes),
+            2,
+        );
+        let window = &activation.ports[0];
+        assert_eq!((window.new_from, window.dropped), (1, 2));
+        assert_eq!(
+            Body::from_wit(window.envelopes[0].body.clone()),
+            Body::text("seen")
+        );
+        assert_eq!(Body::from_wit(window.envelopes[1].body.clone()), bytes);
+        let header: serde_json::Value =
+            serde_json::from_str(&window.envelopes[1].header).expect("header JSON");
+        assert_eq!(header["channel"], FIXTURE_CHANNEL);
+        assert!(header.get("body").is_none(), "{header}");
+    }
+
     /// Every host function reads the page's vocabulary, so a page nobody
     /// declared has no answer to give; the panic names both ways to stamp one.
     #[test]
     #[should_panic(expected = "Page::declare")]
     fn a_host_call_on_an_undeclared_page_names_both_routes() {
         let mut page = Page::new();
-        let _ = page.publish("out".to_string(), "{}".to_string());
+        let _ = page.publish("out".to_string(), text("{}"));
     }
 
     #[test]
@@ -1313,7 +1542,7 @@ mod tests {
     fn publishing_on_an_undeclared_port_panics() {
         let mut page = Page::new();
         page.declare(echo_stub_declared());
-        let _ = page.publish("no-such-port".to_string(), "{}".to_string());
+        let _ = page.publish("no-such-port".to_string(), text("{}"));
     }
 
     /// An `io` port publishes like an `out` one: it is the same half of the
@@ -1322,9 +1551,9 @@ mod tests {
     fn publishing_on_an_out_or_io_port_is_recorded() {
         let mut page = Page::new();
         page.declare(echo_stub_declared());
-        page.publish("out".to_string(), "{}".to_string())
+        page.publish("out".to_string(), text("{}"))
             .expect("the bus accepts it");
-        page.publish("state".to_string(), "[]".to_string())
+        page.publish("state".to_string(), text("[]"))
             .expect("the bus accepts it");
         assert_eq!(page.published_on("out"), vec!["{}"]);
         assert_eq!(page.published_on("state"), vec!["[]"]);
@@ -1416,11 +1645,8 @@ mod tests {
     fn publishing_with_urgency_on_an_undeclared_port_panics() {
         let mut page = Page::new();
         page.declare(echo_stub_declared());
-        let _ = page.publish_with_urgency(
-            "no-such-port".to_string(),
-            "{}".to_string(),
-            ports::Urgency::High,
-        );
+        let _ =
+            page.publish_with_urgency("no-such-port".to_string(), text("{}"), ports::Urgency::High);
     }
 
     #[test]
@@ -1428,7 +1654,7 @@ mod tests {
     fn publishing_deferred_on_an_undeclared_port_panics() {
         let mut page = Page::new();
         page.declare(echo_stub_declared());
-        let _ = page.publish_deferred("no-such-port".to_string(), "{}".to_string(), NOW_MS);
+        let _ = page.publish_deferred("no-such-port".to_string(), text("{}"), NOW_MS);
     }
 
     /// A deferred op names its port as a publish does, and the hosts hold it to
@@ -1446,7 +1672,7 @@ mod tests {
     fn editing_a_deferred_on_an_undeclared_port_panics() {
         let mut page = Page::new();
         page.declare(echo_stub_declared());
-        let _ = page.defer_edit("no-such-port".to_string(), 0, Some("{}".to_string()), None);
+        let _ = page.defer_edit("no-such-port".to_string(), 0, Some(text("{}")), None);
     }
 
     /// An `io` port takes a deferred op like an `out` one.
@@ -1496,13 +1722,10 @@ mod tests {
     }
 
     /// The synthesized request of a sync-call activation, parsed.
-    fn body_sent(activation: &types::Activation) -> serde_json::Value {
-        let envelope: serde_json::Value =
-            serde_json::from_str(&activation.ports[0].envelopes[0]).expect("envelope JSON");
-        let body = envelope["body"]
-            .as_str()
-            .expect("the envelope carries a body");
-        serde_json::from_str(body).expect("the body is JSON")
+    fn body_sent(activation: &bus::Activation) -> serde_json::Value {
+        let body = &activation.ports[0].envelopes[0].body;
+        assert_eq!(body.content_type, None, "a gesture body is untyped text");
+        serde_json::from_slice(&body.bytes).expect("the body is JSON")
     }
 
     /// The detail objects land under the contract's names, and an unset one is

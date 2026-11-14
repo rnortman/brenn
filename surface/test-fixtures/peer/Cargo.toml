@@ -1,0 +1,15 @@
+[package]
+name = "brenn-surface-test-peer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The scripted attach peer's frames, the fixture bindings documents, and the page rig's kit, shared by the kernel's suites and the page rig"
+
+[dependencies]
+brenn-attach-client = { version = "0.1.0", path = "../../../attach/client" }
+brenn-attach-proto = { version = "0.1.0", path = "../../../attach/proto" }
+brenn-envelope = { path = "../../../brenn-envelope" }
+brenn-surface-schema = { version = "0.1.0", path = "../../schema" }
+chrono = { version = "0.4.44", default-features = false, features = ["serde", "alloc"] }
+serde_json = "1.0.149"
+uuid = { version = "1.23.0", features = ["serde"] }

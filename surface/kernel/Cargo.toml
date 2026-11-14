@@ -76,6 +76,7 @@ web-sys = { version = "0.3.102", features = [
 # so the browser bundle is unaffected.
 [dev-dependencies]
 brenn-surface-test-fixtures = { path = "../test-fixtures" }
+brenn-surface-test-peer = { path = "../test-fixtures/peer" }
 
 # Driver tests use paused virtual time (`start_paused`) to drive backoff,
 # handshake-timeout, and liveness deadlines deterministically.

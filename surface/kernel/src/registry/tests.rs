@@ -17,6 +17,7 @@ use brenn_surface_schema::{
 
 use super::*;
 use crate::test_support::bindings::imply_vocabularies;
+use brenn_envelope::grants::ProcessorContract;
 
 const WIRE: &str = "brenn:site.bar.in";
 const OTHER_WIRE: &str = "ephemeral:site.bar.signal";
@@ -52,6 +53,7 @@ fn subscription(instance: &str, port: &str, channel: &str, push: u64, retain: u6
 /// store.
 fn doc(subscriptions: Vec<Binding>) -> BindingsDocument {
     imply_vocabularies(BindingsDocument {
+        wire_channels: vec![],
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![component("p1"), component("p2"), component("chrome")],
         subscriptions,
@@ -68,6 +70,7 @@ fn doc(subscriptions: Vec<Binding>) -> BindingsDocument {
             ring_depth: reserved_local_channel(LOCAL_THEME_CHANNEL)
                 .expect("the theme plane is reserved")
                 .ring_depth,
+            non_text: false,
         }],
         chrome_instance: "chrome".to_string(),
         platform: PlatformSection {
@@ -156,6 +159,8 @@ fn env(channel: &str, body: &str) -> MessageEnvelope {
         impetus: None,
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
+        transport: None,
+        attachments: Default::default(),
     }
 }
 
@@ -290,6 +295,7 @@ fn a_dropped_store_reports_the_schedules_that_died_with_it() {
     doc.local_channels.push(LocalChannel {
         channel: plain.to_string(),
         ring_depth: 4,
+        non_text: false,
     });
     let with_plain = AppliedBindings::apply(&doc.to_body()).expect("applies");
     reconcile_stores(&with_plain, &mut stores);
@@ -312,12 +318,270 @@ fn a_dropped_store_reports_the_schedules_that_died_with_it() {
     );
 }
 
+const BLOB: &str = "local:site.blob";
+
+/// The standard wiring plus `BLOB` at depth 4, declared `non_text` or not, with
+/// `p2` reading it.
+fn applied_with_blob(non_text: bool) -> AppliedBindings {
+    let mut doc = doc(vec![subscription("p2", "blob", BLOB, 2, 2)]);
+    doc.local_channels.push(LocalChannel {
+        channel: BLOB.to_string(),
+        ring_depth: 4,
+        non_text,
+    });
+    AppliedBindings::apply(&doc.to_body()).expect("applies")
+}
+
+/// An envelope whose body is not text.
+fn bytes_env(channel: &str, bytes: &[u8]) -> MessageEnvelope {
+    MessageEnvelope {
+        body: brenn_envelope::MessageBody::from_parts(Some("application/octet-stream"), bytes)
+            .expect("a well-formed byte body"),
+        ..env(channel, &format!("{bytes:?}"))
+    }
+}
+
+fn blob_store(stores: &SurfaceStores) -> &brenn_attach_client::store::ChannelStore<BindingKey> {
+    stores.get(BLOB).expect("the blob channel has a store")
+}
+
+#[test]
+fn a_store_holding_non_text_is_recreated_empty_when_its_channel_stops_declaring_it() {
+    let declared = applied_with_blob(true);
+    let mut stores = stores_for(&declared);
+    let mut subs = plane();
+    let mut regs = Registrations::new();
+    regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&declared),
+        &mut stores,
+        &mut subs,
+    );
+    let store = stores.get_mut(BLOB).expect("blob store");
+    store.insert(bytes_env(BLOB, &[0xff, 0x00]));
+    store.insert(env(BLOB, "text beside it"));
+    store
+        .park("surface:bar#p1", bytes_env(BLOB, &[0xfe]), 9_000)
+        .expect("within the cap");
+
+    let undeclared = applied_with_blob(false);
+    let report = reconcile_stores(&undeclared, &mut stores);
+    regs.reconcile(&undeclared, &mut stores, &mut subs);
+
+    assert_eq!(
+        report.lost_schedules,
+        vec![(BLOB.to_string(), vec!["surface:bar#p1".to_string()])],
+        "the parked sender is reported as for a removed channel"
+    );
+    assert_eq!(
+        report.retired,
+        vec![(
+            BLOB.to_string(),
+            vec![CursorOverflow {
+                subscriber: BindingKey::new("p2", "blob"),
+                evicted: 2,
+            }],
+        )],
+        "the surviving reader is charged for the two messages it was owed"
+    );
+    let store = blob_store(&stores);
+    assert_eq!(store.retained().count(), 0, "dropped whole, text included");
+    assert_eq!(store.parked().count(), 0);
+    assert_eq!(store.depth(), 4, "recreated at the document's depth");
+    assert!(
+        !store.has_deliverable(&BindingKey::new("p2", "blob")),
+        "the reader is primed onto an empty store"
+    );
+}
+
+#[test]
+fn a_store_whose_only_non_text_body_is_parked_is_recreated_empty() {
+    let mut stores = stores_for(&applied_with_blob(true));
+    let store = stores.get_mut(BLOB).expect("blob store");
+    store.insert(env(BLOB, "text only in the ring"));
+    store
+        .park("surface:bar#p1", bytes_env(BLOB, &[0xfe]), 9_000)
+        .expect("within the cap");
+
+    let report = reconcile_stores(&applied_with_blob(false), &mut stores);
+
+    assert_eq!(
+        report.lost_schedules,
+        vec![(BLOB.to_string(), vec!["surface:bar#p1".to_string()])]
+    );
+    let store = blob_store(&stores);
+    assert_eq!(store.retained().count(), 0, "dropped whole, text included");
+    assert_eq!(
+        store.parked().count(),
+        0,
+        "the non-text schedule went with it"
+    );
+}
+
+#[test]
+fn a_removed_channel_holding_non_text_is_dropped_as_removed() {
+    let declared = applied_with_blob(true);
+    let mut stores = stores_for(&declared);
+    let mut subs = plane();
+    let mut regs = Registrations::new();
+    regs.register(
+        "p2",
+        ProcessorContract::V0_2,
+        Some(&declared),
+        &mut stores,
+        &mut subs,
+    );
+    let store = stores.get_mut(BLOB).expect("blob store");
+    store.insert(bytes_env(BLOB, &[0xff]));
+    store
+        .park("surface:bar#p1", bytes_env(BLOB, &[0xfe]), 9_000)
+        .expect("within the cap");
+
+    let report = reconcile_stores(&applied(standard()), &mut stores);
+
+    assert!(
+        stores.get(BLOB).is_none(),
+        "no binding names it, so no store"
+    );
+    assert_eq!(
+        report.lost_schedules,
+        vec![(BLOB.to_string(), vec!["surface:bar#p1".to_string()])]
+    );
+    assert!(
+        report.retired.is_empty(),
+        "the binding went with the channel, so nothing survives to be owed: {:?}",
+        report.retired
+    );
+}
+
+#[test]
+fn a_store_holding_only_text_survives_a_change_of_declaration() {
+    let mut stores = stores_for(&applied_with_blob(true));
+    let store = stores.get_mut(BLOB).expect("blob store");
+    store.insert(env(BLOB, "one"));
+    store.insert(env(BLOB, "two"));
+    store
+        .park("surface:bar#p1", env(BLOB, "later"), 9_000)
+        .expect("within the cap");
+    let before: Vec<u64> = blob_store(&stores).retained().map(|(_, seq)| seq).collect();
+
+    let report = reconcile_stores(&applied_with_blob(false), &mut stores);
+
+    assert!(report.lost_schedules.is_empty());
+    let store = blob_store(&stores);
+    assert_eq!(
+        store
+            .retained()
+            .map(|(envelope, seq)| (envelope.body.as_text().unwrap().to_owned(), seq))
+            .collect::<Vec<_>>(),
+        vec![
+            ("one".to_string(), before[0]),
+            ("two".to_string(), before[1])
+        ],
+        "contents and positions intact"
+    );
+    assert_eq!(store.parked().count(), 1);
+}
+
+#[test]
+fn reapplying_a_declaring_document_keeps_a_non_text_store() {
+    let declared = applied_with_blob(true);
+    let mut stores = stores_for(&declared);
+    let store = stores.get_mut(BLOB).expect("blob store");
+    store.insert(bytes_env(BLOB, &[0xff]));
+    store
+        .park("surface:bar#p1", bytes_env(BLOB, &[0xfe]), 9_000)
+        .expect("within the cap");
+
+    let report = reconcile_stores(&applied_with_blob(true), &mut stores);
+
+    assert!(report.lost_schedules.is_empty());
+    let store = blob_store(&stores);
+    assert_eq!(store.retained().count(), 1);
+    assert_eq!(store.parked().count(), 1);
+}
+
+/// The standard wiring with `WIRE`, a transportable channel, declared
+/// `non_text` or not.
+fn applied_with_wire_declared(non_text: bool) -> AppliedBindings {
+    let mut doc = doc(standard());
+    for wire in &mut doc.wire_channels {
+        if wire.channel == WIRE {
+            wire.non_text = non_text;
+        }
+    }
+    AppliedBindings::apply(&doc.to_body()).expect("applies")
+}
+
+/// A transportable channel's store answers to its declaration by the same rule
+/// as a page-local one: kept while a document declares it `non_text`, dropped
+/// whole and recreated empty, its readers charged, when one stops.
+#[test]
+fn a_transportable_store_holding_non_text_is_kept_or_dropped_by_its_declaration() {
+    let declared = applied_with_wire_declared(true);
+    let mut stores = stores_for(&declared);
+    let mut subs = plane();
+    let mut regs = Registrations::new();
+    regs.register(
+        "p1",
+        ProcessorContract::V0_2,
+        Some(&declared),
+        &mut stores,
+        &mut subs,
+    );
+    let store = stores.get_mut(WIRE).expect("wire store");
+    store.insert(bytes_env(WIRE, &[0xff, 0x00]));
+    store.insert(env(WIRE, "text beside it"));
+
+    let report = reconcile_stores(&applied_with_wire_declared(true), &mut stores);
+    assert!(report.lost_schedules.is_empty() && report.retired.is_empty());
+    assert_eq!(
+        stores.get(WIRE).expect("wire store").retained().count(),
+        2,
+        "a document that still declares the channel keeps the store"
+    );
+
+    let text_only = applied_with_wire_declared(false);
+    let report = reconcile_stores(&text_only, &mut stores);
+    regs.reconcile(&text_only, &mut stores, &mut subs);
+    let (channel, overflow) = report
+        .retired
+        .first()
+        .expect("the reader still bound to the channel is charged");
+    assert_eq!(channel, WIRE);
+    assert!(
+        overflow
+            .iter()
+            .any(|o| o.subscriber == BindingKey::new("p1", "in") && o.evicted == 2),
+        "{overflow:?}"
+    );
+    let store = stores.get(WIRE).expect("the channel is still bound");
+    assert_eq!(store.retained().count(), 0, "dropped whole, text included");
+    assert_eq!(store.depth(), 9, "recreated at the document's depth");
+}
+
+#[test]
+#[should_panic(expected = "reserved plane local:brenn/theme holds a non-text body")]
+fn a_non_text_body_on_a_reserved_plane_panics_the_reconcile() {
+    let bindings = applied(standard());
+    let mut stores = stores_for(&bindings);
+    stores
+        .get_mut(LOCAL_THEME_CHANNEL)
+        .expect("theme store")
+        .insert(bytes_env(LOCAL_THEME_CHANNEL, &[0xff]));
+    reconcile_stores(&bindings, &mut stores);
+}
+
 #[test]
 fn registering_before_the_first_document_holds_nothing() {
     let mut stores = new_stores(EPOCH);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    assert!(regs.register("p1", None, &mut stores, &mut subs).is_empty());
+    assert!(
+        regs.register("p1", ProcessorContract::V0_1, None, &mut stores, &mut subs)
+            .is_empty()
+    );
     assert!(regs.is_registered("p1"));
     assert!(subs.held_channels().is_empty());
 }
@@ -329,7 +593,13 @@ fn a_registration_takes_a_position_per_binding_and_one_subscription() {
     let mut subs = plane();
     let mut regs = Registrations::new();
 
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert_eq!(
         subscribed(&frames),
         vec![(WIRE, 8, 9)],
@@ -349,9 +619,21 @@ fn two_instances_on_one_channel_share_one_subscription() {
     let mut subs = plane();
     let mut regs = Registrations::new();
 
-    let first = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let first = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &first);
-    let second = regs.register("p2", Some(&bindings), &mut stores, &mut subs);
+    let second = regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert!(
         subscribed(&second).is_empty(),
         "the channel is already open; the second instance only takes a reference"
@@ -374,7 +656,13 @@ fn a_position_coming_into_existence_is_primed_from_the_retained_tail() {
         .insert(env(WIRE, "published before it bound"));
     let mut subs = plane();
     let mut regs = Registrations::new();
-    regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
 
     let store = stores.get_mut(WIRE).expect("wire store");
     for port in ["in", "aux"] {
@@ -396,7 +684,13 @@ fn a_depth_zero_binding_holds_no_position_and_still_subscribes() {
     let mut subs = plane();
     let mut regs = Registrations::new();
 
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert_eq!(
         subscribed(&frames),
         vec![(WIRE, 0, 5)],
@@ -414,7 +708,13 @@ fn a_second_reconcile_changes_nothing_and_re_primes_nothing() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     let store = stores.get_mut(WIRE).expect("wire store");
@@ -449,7 +749,13 @@ fn a_binding_that_vanished_loses_its_position_and_its_reference() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     // `p1/aux` gone, the rest of the wiring — and so the channel's fold —
@@ -475,7 +781,13 @@ fn the_last_binding_off_a_channel_closes_its_subscription() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     let unwired = applied(vec![subscription("p2", "theme", LOCAL_THEME_CHANNEL, 1, 0)]);
@@ -495,7 +807,13 @@ fn a_port_rebound_to_another_channel_moves_its_position() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     let rebound = applied(vec![subscription("p1", "in", OTHER_WIRE, 4, 0)]);
@@ -516,7 +834,13 @@ fn a_changed_fold_closes_the_subscription_and_states_it_afresh() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     let deeper = applied(vec![subscription("p1", "in", WIRE, 4, 6)]);
@@ -540,7 +864,13 @@ fn a_changed_fold_restates_a_subscription_still_awaiting_its_result() {
     let mut regs = Registrations::new();
     // Deliberately unanswered: a second document can arrive before the first
     // document's subscribes come back.
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert_eq!(subscribed(&frames), vec![(WIRE, 4, 0)]);
 
     let deeper = applied(vec![subscription("p1", "in", WIRE, 4, 6)]);
@@ -578,8 +908,20 @@ fn a_changed_fold_restates_a_pending_channel_two_instances_hold() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    regs.register("p1", Some(&bindings), &mut stores, &mut subs);
-    regs.register("p2", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
+    regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert_eq!(subs.refcount(WIRE), 2);
 
     // Both holders are released before either is retaken, so the restatement is
@@ -603,9 +945,21 @@ fn deregistration_drops_the_positions_and_releases_the_references() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
-    let frames = regs.register("p2", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
 
     let frames = regs.deregister("p1", &mut stores, &mut subs);
@@ -633,9 +987,21 @@ fn a_failed_instance_loses_its_positions_and_keeps_its_references() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
-    regs.register("p2", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
 
     assert!(regs.fail("p1", &mut stores), "the transition is reported");
     assert!(!regs.fail("p1", &mut stores), "and reported once");
@@ -666,9 +1032,21 @@ fn a_failed_instances_references_are_diffed_against_a_changed_document() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    let frames = regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     ack(&mut subs, &frames);
-    regs.register("p2", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p2",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert!(regs.fail("p1", &mut stores), "the transition is reported");
     assert_eq!(subs.refcount(WIRE), 3);
 
@@ -705,8 +1083,20 @@ fn registering_an_instance_twice_panics() {
     let mut stores = stores_for(&bindings);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    regs.register("p1", Some(&bindings), &mut stores, &mut subs);
-    regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
+    regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
 }
 
 #[test]
@@ -735,7 +1125,13 @@ fn reconciling_before_the_stores_panics() {
     let mut stores = new_stores(EPOCH);
     let mut subs = plane();
     let mut regs = Registrations::new();
-    regs.register("p1", Some(&bindings), &mut stores, &mut subs);
+    regs.register(
+        "p1",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
 }
 
 #[test]
@@ -745,7 +1141,13 @@ fn an_instance_the_document_never_wires_holds_nothing() {
     let mut subs = plane();
     let mut regs = Registrations::new();
 
-    let frames = regs.register("chrome", Some(&bindings), &mut stores, &mut subs);
+    let frames = regs.register(
+        "chrome",
+        ProcessorContract::V0_1,
+        Some(&bindings),
+        &mut stores,
+        &mut subs,
+    );
     assert!(frames.is_empty());
     assert!(subs.held_channels().is_empty());
     assert!(regs.instances().eq(["chrome"]));

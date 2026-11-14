@@ -19,6 +19,7 @@ processor/chrome/chrome.core3.wasm
 processor/chrome/chrome.d.ts
 processor/chrome/chrome.js
 processor/chrome/chrome.spec.brenn
+processor/chrome/interfaces/brenn-processor-bus.d.ts
 processor/chrome/interfaces/brenn-processor-dom.d.ts
 processor/chrome/interfaces/brenn-processor-log.d.ts
 processor/chrome/interfaces/brenn-processor-page-dom.d.ts
@@ -32,11 +33,13 @@ processor/echo-stub/echo-stub.core3.wasm
 processor/echo-stub/echo-stub.d.ts
 processor/echo-stub/echo-stub.js
 processor/echo-stub/echo-stub.spec.brenn
+processor/echo-stub/interfaces/brenn-processor-bus.d.ts
 processor/echo-stub/interfaces/brenn-processor-dom.d.ts
 processor/echo-stub/interfaces/brenn-processor-log.d.ts
 processor/echo-stub/interfaces/brenn-processor-ports.d.ts
 processor/echo-stub/interfaces/brenn-processor-types.d.ts
 processor/echo-stub/manifest.json
+processor/meeting/interfaces/brenn-processor-bus.d.ts
 processor/meeting/interfaces/brenn-processor-dom.d.ts
 processor/meeting/interfaces/brenn-processor-log.d.ts
 processor/meeting/interfaces/brenn-processor-ports.d.ts
@@ -49,10 +52,10 @@ processor/meeting/meeting.core3.wasm
 processor/meeting/meeting.d.ts
 processor/meeting/meeting.js
 processor/meeting/meeting.spec.brenn
+processor/mode-clock/interfaces/brenn-processor-bus.d.ts
 processor/mode-clock/interfaces/brenn-processor-dom.d.ts
 processor/mode-clock/interfaces/brenn-processor-log.d.ts
 processor/mode-clock/interfaces/brenn-processor-ports.d.ts
-processor/mode-clock/interfaces/brenn-processor-types.d.ts
 processor/mode-clock/manifest.json
 processor/mode-clock/mode-clock.component.wasm
 processor/mode-clock/mode-clock.core.wasm
@@ -61,10 +64,10 @@ processor/mode-clock/mode-clock.core3.wasm
 processor/mode-clock/mode-clock.d.ts
 processor/mode-clock/mode-clock.js
 processor/mode-clock/mode-clock.spec.brenn
+processor/processor-transplant/interfaces/brenn-processor-bus.d.ts
 processor/processor-transplant/interfaces/brenn-processor-config.d.ts
 processor/processor-transplant/interfaces/brenn-processor-log.d.ts
 processor/processor-transplant/interfaces/brenn-processor-ports.d.ts
-processor/processor-transplant/interfaces/brenn-processor-types.d.ts
 processor/processor-transplant/manifest.json
 processor/processor-transplant/processor-transplant.component.wasm
 processor/processor-transplant/processor-transplant.core.wasm
@@ -73,6 +76,7 @@ processor/processor-transplant/processor-transplant.core3.wasm
 processor/processor-transplant/processor-transplant.d.ts
 processor/processor-transplant/processor-transplant.js
 processor/processor-transplant/processor-transplant.spec.brenn
+processor/protobar/interfaces/brenn-processor-bus.d.ts
 processor/protobar/interfaces/brenn-processor-dom.d.ts
 processor/protobar/interfaces/brenn-processor-log.d.ts
 processor/protobar/interfaces/brenn-processor-ports.d.ts

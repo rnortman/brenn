@@ -13,7 +13,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
+use brenn_envelope::{ChannelScheme, MessageBody, MessageEnvelope, Urgency};
 use brenn_queue::{QuotaExceeded, ReplayDecision};
 
 /// Why a replay carries a gap (a discontinuity the consumer must be told about).
@@ -24,23 +24,26 @@ use crate::store::RingStore;
 use crate::store::ring::Appended;
 use crate::{ChannelEntry, Messenger, ParticipantId};
 use brenn_lib::access::AppPolicy;
+use brenn_messaging_store::blob::{BlobHolds, HeldAttachments};
 
 /// The decision a replay reached, alongside the replayed messages.
 pub type Replay = ReplayDecision;
 
 /// One entry of an activation flush the caller has already paid for: what to
-/// publish, at which urgency and stamp. Where it goes is a
+/// publish, at which urgency and stamp, naming which blobs. Where it goes is a
 /// [`PrepaidDestination`], resolved separately.
 ///
 /// A struct rather than a parameter list because the two entry points that take
 /// it — [`Messenger::publish_prepaid`] and [`Messenger::park_prepaid`] — must
 /// take *exactly* the same admitted entry.
-pub struct PrepaidEntry<'a> {
-    pub body: &'a str,
+pub struct PrepaidEntry {
+    pub body: MessageBody,
     pub urgency: Urgency,
     /// Assigned by the caller in call order across the whole flush, before it was
     /// split by class, so call order stays visible across the class boundary.
     pub publish_ts: DateTime<Utc>,
+    /// The blobs the message names, held: the ring entry keeps these holds.
+    pub attachments: HeldAttachments,
 }
 
 /// Where an activation flush's entries land: the resolved channel and the ring
@@ -167,10 +170,10 @@ impl Messenger {
     pub async fn publish_prepaid(
         &self,
         dest: &PrepaidDestination,
-        entry: PrepaidEntry<'_>,
+        entry: PrepaidEntry,
     ) -> Appended {
-        let envelope = self.prepaid_envelope(dest, entry);
-        let appended = dest.store.append(envelope);
+        let (envelope, holds) = self.prepaid_envelope(dest, entry);
+        let appended = dest.store.append(envelope, holds);
         // Resolved after the append, not memoized on the destination: a
         // subscriber can mint its directory entry mid-flush, and one minted
         // before this read holds a position no earlier resolution would have
@@ -207,14 +210,15 @@ impl Messenger {
     pub fn park_prepaid(
         &self,
         dest: &PrepaidDestination,
-        entry: PrepaidEntry<'_>,
+        entry: PrepaidEntry,
         release_at: DateTime<Utc>,
     ) -> Result<Uuid, QuotaExceeded> {
-        let envelope = self.prepaid_envelope(dest, entry);
-        dest.store.park(envelope, release_at)
+        let (envelope, holds) = self.prepaid_envelope(dest, entry);
+        dest.store.park(envelope, holds, release_at)
     }
 
-    /// The per-entry gate every prepaid entry passes, and the envelope it mints.
+    /// The per-entry gate every prepaid entry passes, the envelope it mints
+    /// naming the entry's attachments, and the holds on the blobs they name.
     /// Shared by the immediate and the parking entry points so one admitted
     /// entry cannot be admitted by two slightly different rules.
     ///
@@ -224,14 +228,15 @@ impl Messenger {
     fn prepaid_envelope(
         &self,
         dest: &PrepaidDestination,
-        entry: PrepaidEntry<'_>,
-    ) -> MessageEnvelope {
+        entry: PrepaidEntry,
+    ) -> (MessageEnvelope, BlobHolds) {
         let PrepaidEntry {
             body,
             urgency,
             publish_ts,
+            attachments,
         } = entry;
-        if let Err(e) = check_body_size(body, self.defaults.max_body_bytes) {
+        if let Err(e) = check_body_size(&body, self.defaults.max_body_bytes) {
             panic!(
                 "prepaid publish: bound output {addr:?} carries a {len}-byte body over the \
                  {max}-byte cap — the caller rejects an over-cap entry as a violation before \
@@ -241,21 +246,26 @@ impl Messenger {
                 max = e.max,
             );
         }
+        dest.entry.assert_may_hold(&body);
+        let (attachments, holds) = attachments.into_parts();
 
-        MessageEnvelope {
+        let envelope = MessageEnvelope {
             message_id: Uuid::new_v4(),
             source: self.source().into(),
             channel: dest.entry.address.clone(),
             sender: dest.sender.as_str().into(),
             publish_ts,
-            body: body.to_string(),
+            body,
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
             impetus: None,
             urgency,
             envelope_type: dest.scheme,
-        }
+            transport: None,
+            attachments,
+        };
+        (envelope, holds)
     }
 }
 
@@ -336,9 +346,10 @@ mod tests {
                 .publish_prepaid(
                     dest,
                     PrepaidEntry {
-                        body,
+                        body: body.into(),
                         urgency: Urgency::Normal,
                         publish_ts: Utc::now(),
+                        attachments: HeldAttachments::none(),
                     },
                 )
                 .await
@@ -376,9 +387,10 @@ mod tests {
             .park_prepaid(
                 &dest,
                 PrepaidEntry {
-                    body: "scheduled",
+                    body: "scheduled".into(),
                     urgency: Urgency::Normal,
                     publish_ts: now,
+                    attachments: HeldAttachments::none(),
                 },
                 later,
             )
@@ -400,7 +412,7 @@ mod tests {
             released
                 .messages
                 .iter()
-                .map(|r| r.envelope.body.as_str())
+                .map(|r| r.envelope.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["scheduled"],
             "the release moves it onto the channel"
@@ -419,9 +431,10 @@ mod tests {
             messenger.park_prepaid(
                 &dest,
                 PrepaidEntry {
-                    body,
+                    body: body.into(),
                     urgency: Urgency::Normal,
                     publish_ts: Utc::now(),
+                    attachments: HeldAttachments::none(),
                 },
                 later,
             )
@@ -439,7 +452,7 @@ mod tests {
                 .release_due(later)
                 .messages
                 .iter()
-                .map(|r| r.envelope.body.as_str())
+                .map(|r| r.envelope.body.as_text().unwrap())
                 .collect::<Vec<_>>(),
             vec!["first"],
             "the refusal left the schedule that was already there"

@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 
-use crate::test_support::bindings::{body_with_unknown_grant, imply_vocabularies};
+use crate::test_support::bindings::{body_with_unknown_grant, call, imply_vocabularies};
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Binding, CallBinding, ComponentEntry, LOCAL_LINK_STATE_CHANNEL, LOCAL_THEME_CHANNEL,
-    LOCAL_TOAST_CHANNEL, LocalChannel, LogLevel, NoiseLevel, OutputBinding, Urgency,
-    reserved_local_channel,
+    Binding, ComponentEntry, LOCAL_LINK_STATE_CHANNEL, LOCAL_THEME_CHANNEL, LOCAL_TOAST_CHANNEL,
+    LocalChannel, LogLevel, NoiseLevel, OutputBinding, Urgency, reserved_local_channel,
 };
 
 use super::AppliedBindings;
@@ -57,6 +56,7 @@ fn local(channel: &str) -> LocalChannel {
         ring_depth: reserved_local_channel(channel)
             .map(|r| r.ring_depth)
             .unwrap_or(3),
+        non_text: false,
     }
 }
 
@@ -65,6 +65,7 @@ fn local(channel: &str) -> LocalChannel {
 /// something to say.
 fn doc() -> BindingsDocument {
     imply_vocabularies(BindingsDocument {
+        wire_channels: vec![],
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![component("p1"), component("p2"), component("chrome")],
         subscriptions: vec![
@@ -227,12 +228,7 @@ fn doc_with_call() -> BindingsDocument {
     let mut doc = doc();
     doc.components[0].call_ports = vec!["lookup".to_string()];
     doc.components[1].sync_ports = vec!["resolve".to_string()];
-    doc.calls = vec![CallBinding {
-        instance: "p1".to_string(),
-        port: "lookup".to_string(),
-        target_instance: "p2".to_string(),
-        target_port: "resolve".to_string(),
-    }];
+    doc.calls = vec![call("p1", "lookup", "p2", "resolve")];
     doc
 }
 
@@ -318,6 +314,7 @@ fn a_declared_local_channel_gets_a_store_at_its_ring_depth() {
     doc.local_channels.push(LocalChannel {
         channel: "local:page/scratch".to_string(),
         ring_depth: 5,
+        non_text: false,
     });
     let applied = applied(&doc);
     assert_eq!(
@@ -401,4 +398,79 @@ fn the_parsed_document_is_kept() {
     let applied = applied(&doc());
     assert_eq!(applied.document().v, BINDINGS_DOCUMENT_VERSION);
     assert_eq!(applied.document().subscriptions.len(), 3);
+}
+
+#[test]
+fn channel_carries_admits_text_everywhere_and_non_text_where_declared() {
+    use super::channel_carries;
+    use brenn_envelope::MessageBody;
+
+    let untyped = MessageBody::text("a,b");
+    let typed = MessageBody::from_parts(Some("text/csv"), b"a,b").expect("typed text");
+    let binary = MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8]).expect("binary");
+    for declared in [false, true] {
+        assert!(channel_carries(declared, &untyped), "untyped, {declared}");
+        assert!(channel_carries(declared, &typed), "typed text, {declared}");
+    }
+    assert!(channel_carries(true, &binary));
+    assert!(!channel_carries(false, &binary));
+}
+
+#[test]
+fn carries_non_text_answers_the_documents_declaration() {
+    const BLOB: &str = "local:page/blob";
+    const NOTES: &str = "local:page/notes";
+    let applied = applied_with_blob(true);
+    assert!(applied.carries_non_text(BLOB));
+    assert!(!applied.carries_non_text(NOTES), "declared text-only");
+    assert!(!applied.carries_non_text(WIRE), "a wire channel");
+    assert!(
+        !applied.carries_non_text("local:page/undeclared"),
+        "a channel the document does not name"
+    );
+    assert!(
+        !applied.same_wiring_as(&applied_with_blob(false)),
+        "the declaration is part of the wiring"
+    );
+}
+
+/// The wire table is the other half of the declaration: a transportable channel
+/// it declares `non_text` answers so, one it declares text-only does not, and
+/// the flag is part of the wiring.
+#[test]
+fn carries_non_text_answers_the_wire_tables_declaration() {
+    let declared_with = |non_text: bool| {
+        let mut document = doc();
+        let entry = document
+            .wire_channels
+            .iter_mut()
+            .find(|w| w.channel == OTHER_WIRE)
+            .expect("the fixture's output channel has a wire entry");
+        entry.non_text = non_text;
+        applied(&document)
+    };
+    let declared = declared_with(true);
+    assert!(declared.carries_non_text(OTHER_WIRE));
+    assert!(!declared.carries_non_text(WIRE), "declared text-only");
+    assert!(
+        !declared.carries_non_text("ephemeral:site.bar.undeclared"),
+        "a channel the document does not name"
+    );
+    let text_only = declared_with(false);
+    assert!(!text_only.carries_non_text(OTHER_WIRE));
+    assert!(
+        !declared.same_wiring_as(&text_only),
+        "the declaration is part of the wiring"
+    );
+}
+
+/// The standard document plus `local:page/blob`, declared or not.
+fn applied_with_blob(non_text: bool) -> AppliedBindings {
+    let mut document = doc();
+    document.local_channels.push(LocalChannel {
+        non_text,
+        ..local("local:page/blob")
+    });
+    document.local_channels.push(local("local:page/notes"));
+    applied(&document)
 }

@@ -72,6 +72,17 @@ pub fn run_messaging_migrations(conn: &Connection) {
             -- is additive by design and the decoder panics on an unknown value
             -- (the host wrote every row).
             impetus             TEXT,
+            -- The body's content type, verbatim; NULL for untyped text. `body`
+            -- holds a TEXT value for a text body and a BLOB value otherwise
+            -- (`body_column`), and the full-text index covers the TEXT rows.
+            content_type        TEXT,
+            -- `TransportMeta` JSON on a row a transport adaptor published with
+            -- the payload as the body; NULL on every other row. The decoder
+            -- panics on a value that does not parse (the host wrote every row).
+            transport           TEXT,
+            -- `Attachments` JSON on a row that names blobs; NULL on every other
+            -- row. Written at insert only (`messaging_messages_blob_au`).
+            attachments         TEXT,
             -- Non-brenn envelope rows must never have deliver_after or delivery_deadline;
             -- those are bus-only dispatch fields. This constraint makes the
             -- invariant machine-enforced rather than convention-enforced.
@@ -83,26 +94,6 @@ pub fn run_messaging_migrations(conn: &Connection) {
             ON messaging_messages(deliver_after)
             WHERE deliver_after IS NOT NULL;
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS messaging_messages_fts USING fts5(
-            body,
-            content='messaging_messages',
-            content_rowid='id'
-        );
-        CREATE TRIGGER IF NOT EXISTS messaging_messages_ai
-            AFTER INSERT ON messaging_messages BEGIN
-                INSERT INTO messaging_messages_fts(rowid, body) VALUES (new.id, new.body);
-            END;
-        CREATE TRIGGER IF NOT EXISTS messaging_messages_ad
-            AFTER DELETE ON messaging_messages BEGIN
-                INSERT INTO messaging_messages_fts(messaging_messages_fts, rowid, body)
-                VALUES ('delete', old.id, old.body);
-            END;
-        CREATE TRIGGER IF NOT EXISTS messaging_messages_au
-            AFTER UPDATE OF body ON messaging_messages BEGIN
-                INSERT INTO messaging_messages_fts(messaging_messages_fts, rowid, body)
-                VALUES ('delete', old.id, old.body);
-                INSERT INTO messaging_messages_fts(rowid, body) VALUES (new.id, new.body);
-            END;
 
         -- Durable dynamic (runtime-created) subscriptions, carrying a
         -- transport-specific MQTT `qos` column (NULL for brenn:/webhook:) and a
@@ -192,6 +183,20 @@ pub fn run_messaging_migrations(conn: &Connection) {
         conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN impetus TEXT;")
             .expect("failed to add messaging_messages.impetus column");
     }
+    if !brenn_db::column_exists(conn, "messaging_messages", "content_type") {
+        conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN content_type TEXT;")
+            .expect("failed to add messaging_messages.content_type column");
+    }
+    if !brenn_db::column_exists(conn, "messaging_messages", "transport") {
+        conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN transport TEXT;")
+            .expect("failed to add messaging_messages.transport column");
+    }
+    if !brenn_db::column_exists(conn, "messaging_messages", "attachments") {
+        conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN attachments TEXT;")
+            .expect("failed to add messaging_messages.attachments column");
+    }
+    ensure_text_body_fts(conn);
+    ensure_blob_tables(conn);
     if !brenn_db::column_exists(conn, "messaging_channels", "last_retained_seq") {
         conn.execute_batch(
             "ALTER TABLE messaging_channels
@@ -221,6 +226,16 @@ pub fn run_messaging_migrations(conn: &Connection) {
             WHERE retained_seq IS NOT NULL;",
     )
     .expect("failed to create idx_messaging_messages_retained_seq");
+
+    // The rows whose body is a BLOB value, which are exactly the non-text bodies
+    // (`body_column`), by channel: what `channels_holding_non_text_rows` reads.
+    // Nearly every row is text, so the index holds nearly nothing.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messaging_messages_non_text_channel
+            ON messaging_messages(channel_uuid)
+            WHERE typeof(body) = 'blob';",
+    )
+    .expect("failed to create idx_messaging_messages_non_text_channel");
 
     // WASM consumer failure quarantine table.
     // One row per failed batch; used as the durable audit/replay surface for
@@ -302,6 +317,148 @@ pub fn run_messaging_migrations(conn: &Connection) {
     drop_subscriptions_mirror(conn);
 
     delete_bus_pending_pushes(conn);
+}
+
+/// The full-text index's content: the rows whose body is a TEXT value. A BLOB
+/// body is a non-text body and is never tokenized.
+const FTS_CONTENT_VIEW_DDL: &str = "
+    CREATE VIEW IF NOT EXISTS messaging_messages_text AS
+        SELECT id, body FROM messaging_messages WHERE typeof(body) = 'text';";
+
+/// The full-text index over [`FTS_CONTENT_VIEW_DDL`]'s view.
+const FTS_TABLE_DDL: &str = "
+    CREATE VIRTUAL TABLE messaging_messages_fts USING fts5(
+        body,
+        content='messaging_messages_text',
+        content_rowid='id'
+    );";
+
+/// The three triggers that keep the index equal to its content view: each
+/// statement acts only when the body value it names is TEXT. The update trigger
+/// is one trigger with two statements because SQLite orders statements within a
+/// trigger but not triggers against each other, and the old body's tokens must
+/// be removed before the new body's are added.
+const FTS_TRIGGERS_DDL: &str = "
+    DROP TRIGGER IF EXISTS messaging_messages_ai;
+    DROP TRIGGER IF EXISTS messaging_messages_ad;
+    DROP TRIGGER IF EXISTS messaging_messages_au;
+    CREATE TRIGGER messaging_messages_ai
+        AFTER INSERT ON messaging_messages BEGIN
+            INSERT INTO messaging_messages_fts(rowid, body)
+                SELECT new.id, new.body WHERE typeof(new.body) = 'text';
+        END;
+    CREATE TRIGGER messaging_messages_ad
+        AFTER DELETE ON messaging_messages BEGIN
+            INSERT INTO messaging_messages_fts(messaging_messages_fts, rowid, body)
+                SELECT 'delete', old.id, old.body WHERE typeof(old.body) = 'text';
+        END;
+    CREATE TRIGGER messaging_messages_au
+        AFTER UPDATE OF body ON messaging_messages BEGIN
+            INSERT INTO messaging_messages_fts(messaging_messages_fts, rowid, body)
+                SELECT 'delete', old.id, old.body WHERE typeof(old.body) = 'text';
+            INSERT INTO messaging_messages_fts(rowid, body)
+                SELECT new.id, new.body WHERE typeof(new.body) = 'text';
+        END;";
+
+/// Bring the full-text index to its current form: content is the
+/// `messaging_messages_text` view, and the triggers index TEXT bodies only.
+///
+/// Idempotent, run on every boot, in one transaction, so a crash leaves the
+/// previous index and triggers in place and the next boot repeats the step.
+/// Where the index is missing, or its stored definition does not name the view
+/// as its content (a database created before bodies could be BLOB values), the
+/// index is replaced and rebuilt from the view; rows of `messaging_messages`
+/// are not rewritten. The triggers are dropped and recreated unconditionally:
+/// `CREATE TRIGGER IF NOT EXISTS` would keep an older trigger text under the
+/// same name.
+fn ensure_text_body_fts(conn: &Connection) {
+    conn.execute_batch(FTS_CONTENT_VIEW_DDL)
+        .expect("failed to create messaging_messages_text view");
+
+    let fts_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messaging_messages_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("query messaging_messages_fts definition");
+    let current = fts_sql
+        .as_deref()
+        .is_some_and(|sql| sql.contains("content='messaging_messages_text'"));
+    let tx = conn
+        .unchecked_transaction()
+        .expect("begin messaging_messages_fts transaction");
+    if !current {
+        tx.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS messaging_messages_ai;
+             DROP TRIGGER IF EXISTS messaging_messages_ad;
+             DROP TRIGGER IF EXISTS messaging_messages_au;
+             DROP TABLE IF EXISTS messaging_messages_fts;
+             {FTS_TABLE_DDL}
+             INSERT INTO messaging_messages_fts(messaging_messages_fts) VALUES ('rebuild');"
+        ))
+        .expect("failed to rebuild messaging_messages_fts over messaging_messages_text");
+    }
+    tx.execute_batch(FTS_TRIGGERS_DDL)
+        .expect("failed to create messaging_messages FTS triggers");
+    tx.commit()
+        .expect("commit messaging_messages_fts transaction");
+}
+
+/// The blob tables: one row per blob a durable message has named, one row per
+/// message and blob it names.
+///
+/// `refs` is the number of `messaging_blob_refs` rows naming the blob; the
+/// partial index finds the blobs no row names. `message_id` carries no foreign
+/// key: the delete trigger owns that edge, and a foreign key without a cascade
+/// would refuse the message delete.
+const BLOB_TABLES_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS messaging_blobs (
+        id            TEXT PRIMARY KEY,
+        size          INTEGER NOT NULL,
+        content_type  TEXT NOT NULL,
+        refs          INTEGER NOT NULL DEFAULT 0 CHECK (refs >= 0)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS idx_messaging_blobs_unreferenced
+        ON messaging_blobs(id) WHERE refs = 0;
+    CREATE TABLE IF NOT EXISTS messaging_blob_refs (
+        message_id  INTEGER NOT NULL,
+        blob_id     TEXT NOT NULL REFERENCES messaging_blobs(id),
+        PRIMARY KEY (message_id, blob_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS idx_messaging_blob_refs_blob
+        ON messaging_blob_refs(blob_id);";
+
+/// The triggers that keep `messaging_blobs.refs` equal to its reference rows
+/// whichever statement deletes a message row, and refuse the one update that
+/// could detach a row from its references.
+const BLOB_TRIGGERS_DDL: &str = "
+    DROP TRIGGER IF EXISTS messaging_messages_blob_ad;
+    DROP TRIGGER IF EXISTS messaging_messages_blob_au;
+    CREATE TRIGGER messaging_messages_blob_ad
+        AFTER DELETE ON messaging_messages WHEN old.attachments IS NOT NULL BEGIN
+            UPDATE messaging_blobs SET refs = refs - 1
+             WHERE id IN (SELECT blob_id FROM messaging_blob_refs WHERE message_id = old.id);
+            DELETE FROM messaging_blob_refs WHERE message_id = old.id;
+        END;
+    CREATE TRIGGER messaging_messages_blob_au
+        BEFORE UPDATE OF attachments ON messaging_messages BEGIN
+            SELECT RAISE(ABORT, 'messaging_messages.attachments is written at insert only');
+        END;";
+
+/// Create the blob tables and recreate their triggers, in one transaction, on
+/// every boot: `CREATE TRIGGER IF NOT EXISTS` would keep an older trigger text
+/// under the same name.
+fn ensure_blob_tables(conn: &Connection) {
+    let tx = conn
+        .unchecked_transaction()
+        .expect("begin blob tables transaction");
+    tx.execute_batch(BLOB_TABLES_DDL)
+        .expect("failed to create blob tables");
+    tx.execute_batch(BLOB_TRIGGERS_DDL)
+        .expect("failed to create blob triggers");
+    tx.commit().expect("commit blob tables transaction");
 }
 
 /// Drop the flat `messaging_subscriptions` mirror.
@@ -1006,13 +1163,14 @@ mod tests {
             .append(crate::store::NewMessage {
                 source: "s".to_string(),
                 sender: "x".to_string(),
-                body: "m3".to_string(),
+                body: "m3".into(),
                 urgency: brenn_lib::messaging::Urgency::Low,
                 envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
                 reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: 0,
+                attachments: crate::blob::HeldAttachments::none(),
             })
             .await;
         assert_eq!(
@@ -1048,7 +1206,7 @@ mod tests {
         let bodies: Vec<String> = trailing
             .messages
             .iter()
-            .map(|m| m.message.body.clone())
+            .map(|m| m.message.body.as_text().unwrap().to_owned())
             .collect();
         assert_eq!(bodies, ["m2", "m3"], "migrated rows replay in seq order");
     }
@@ -1199,9 +1357,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// The three FTS triggers (after-insert, after-delete, after-update-of-body)
-    /// are pure DDL with no migration; nothing else in this module exercises
-    /// their bodies. Insert/update/delete a message and assert the FTS shadow
-    /// table tracks the body so a typo in any trigger body fails here.
+    /// on text bodies. Insert/update/delete a message and assert the FTS shadow
+    /// table tracks the body so a typo in any trigger body fails here; non-text
+    /// bodies are covered in `db::tests::body`.
     #[test]
     fn fts_triggers_track_message_body() {
         let db = init_db_memory();

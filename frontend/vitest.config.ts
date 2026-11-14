@@ -29,7 +29,12 @@ export default defineConfig({
                 // ESM, untransformed. Externalizing hands them to node's own
                 // loader instead of vite's resolver, which cannot reach outside
                 // the root anyway.
-                external: [/[\\/]surface[\\/]dist[\\/]processor[\\/]/],
+                // The page rig's staged kernel bundle and kind load the same way,
+                // for the same reason.
+                external: [
+                    /[\\/]surface[\\/]dist[\\/]processor[\\/]/,
+                    /[\\/]surface[\\/]page-rig-dist[\\/]/,
+                ],
             },
         },
     },

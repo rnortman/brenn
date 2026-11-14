@@ -48,6 +48,28 @@ rust_test(
     deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
 )
 
+# The blob cycle measurement: the ignored `blob_cycle::measure` test, which
+# runs ten thousand create, write, seal, publish and evict cycles on an
+# `ephemeral:` channel and prints cycles per second, asserting nothing on time.
+# Run by hand with `bazel test --test_output=all`; `docs/blob-store-timings.md`
+# records a run.
+rust_test(
+    name = "blob_cycle_measure",
+    size = "large",
+    args = [
+        "--ignored",
+        "--exact",
+        "blob_cycle::measure",
+        "--nocapture",
+    ],
+    crate = ":brenn-messaging",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    tags = ["manual"],
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
+)
+
 rust_doc_test(
     name = "brenn-messaging_doc_test",
     crate = ":brenn-messaging",

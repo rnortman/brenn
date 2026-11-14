@@ -10,6 +10,7 @@
 use brenn_attach_client::Millis;
 use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_proto::SubscribeOutcome;
+use brenn_envelope::grants::ProcessorContract;
 use brenn_surface_schema::bindings::BindingsDocument;
 use uuid::Uuid;
 
@@ -33,13 +34,14 @@ pub(crate) const BODY_CAP: u64 = 4_096;
 /// the contract lands here alone.
 pub(crate) fn facts() -> AttachmentFacts {
     AttachmentFacts {
-        version: brenn_attach_proto::SUPPORTED_VERSIONS.max,
+        version: brenn_surface_schema::SURFACE_ATTACH_VERSION,
         participant_id: PRINCIPAL.to_string(),
         session_id: SESSION_ID.to_string(),
         heartbeat_secs: 20,
         max_body_bytes: BODY_CAP,
         max_frame_bytes: 65_536,
         alert_granted: false,
+        blobs: None,
     }
 }
 
@@ -65,8 +67,13 @@ pub(crate) fn attached_page(
 /// requires — a fixture holding one without the other is a page no pass can drive.
 pub(crate) fn mount(page: &mut SurfacePage, instances: &[&str]) {
     for instance in instances {
-        page.registrations
-            .register(instance, None, &mut page.stores, &mut page.subs);
+        page.registrations.register(
+            instance,
+            ProcessorContract::V0_1,
+            None,
+            &mut page.stores,
+            &mut page.subs,
+        );
         page.schedules.track(instance, false);
     }
 }

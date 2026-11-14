@@ -48,6 +48,7 @@ use brenn_attach_client::Millis;
 use brenn_attach_client::conn::ConnEvent;
 use brenn_attach_client::router::MessageStamp;
 use brenn_attach_proto::ServerFrame;
+use brenn_envelope::grants::ProcessorContract;
 
 use crate::activation::{ActivationOutcome, ReadyActivation};
 use crate::command::{self, Command};
@@ -69,8 +70,12 @@ pub enum Input {
     Command(Command),
     /// An instance registered its activation entry. The entry is a callback that
     /// does not cross this boundary, so this carries only the identity the page
-    /// needs to give it positions, subscriptions, an outbox, and scheduler state.
-    ActivationRegistered { instance: String },
+    /// needs to give it positions, subscriptions, an outbox, and scheduler state,
+    /// and the contract its entry speaks.
+    ActivationRegistered {
+        instance: String,
+        contract: ProcessorContract,
+    },
     /// An instance's activation entry was withdrawn. Its positions, its
     /// subscription references and its outbox go with it; the channels' stores do
     /// not.
@@ -316,7 +321,9 @@ fn route(
             let outcome = command::on_command(page, command);
             reactions.command(page, outcome, now, now_ms);
         }
-        Input::ActivationRegistered { instance } => on_registered(page, &instance, reactions),
+        Input::ActivationRegistered { instance, contract } => {
+            on_registered(page, &instance, contract, reactions)
+        }
         Input::ActivationDeregistered { instance } => on_deregistered(page, &instance, reactions),
         Input::ActivationDone(done) => {
             fold_completion(page, *done, reactions, now, now_ms);
@@ -348,7 +355,12 @@ fn route(
 /// If the instance is already registered, or already scheduled. Both are the
 /// fail-fast backstop behind the caller's own registration gate: a second entry
 /// for one instance would silently orphan the first one's positions.
-fn on_registered(page: &mut SurfacePage, instance: &str, reactions: &mut Reactions) {
+fn on_registered(
+    page: &mut SurfacePage,
+    instance: &str,
+    contract: ProcessorContract,
+    reactions: &mut Reactions,
+) {
     let frames = {
         let SurfacePage {
             connect,
@@ -360,7 +372,7 @@ fn on_registered(page: &mut SurfacePage, instance: &str, reactions: &mut Reactio
             ..
         } = page;
         let wiring = connect.bindings();
-        let frames = registrations.register(instance, wiring, stores, subs);
+        let frames = registrations.register(instance, contract, wiring, stores, subs);
         schedules.track(instance, wiring.is_some());
         // An instance no document declares has no depth to open an outbox at, and
         // no channel it could publish on either.

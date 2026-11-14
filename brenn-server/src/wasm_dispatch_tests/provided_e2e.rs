@@ -48,6 +48,7 @@ fn echo_for_user() -> ProvidedToolDecl {
         input_schema: json!({ "type": "object" }),
         max_concurrency: 2,
         auto_approve: true,
+        accepts_attachments: false,
     }
 }
 
@@ -117,6 +118,7 @@ async fn rig(provider_acl: Vec<&[(&str, &str)]>, caller_args: Value) -> Rig {
             tool: "echo-for-user",
             args: caller_args,
         }),
+        conversations: None,
     })
     .await;
 
@@ -348,11 +350,15 @@ async fn another_instance_cannot_complete_or_act_for_a_request() {
     let other = r.host_for("other");
     let nested = json!({ "provider": "stub", "method": "GET", "host": r.host, "path": "/" });
     assert!(matches!(
-        other.queue_async_for(&id, "api-request", &nested.to_string(), "c1"),
+        other.queue_async_for(&id, "api-request", &nested.to_string(), "c1", false),
         Err(ToolCallError::Denied(_))
     ));
     assert_eq!(
-        other.complete(&id, r#"{"ok": "hijacked"}"#),
+        other.complete(
+            &id,
+            r#"{"ok": "hijacked"}"#,
+            brenn_wasm::HeldAttachments::none()
+        ),
         Err(ProvidesCallError::NotPending)
     );
 

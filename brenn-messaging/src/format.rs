@@ -9,8 +9,10 @@
 //! `brenn::markdown::render_markdown`.
 
 use serde::Serialize;
+use serde::ser::SerializeStruct;
 
 use super::{ChannelScheme, MessageEnvelope};
+use brenn_lib::messaging::{Attachments, EnvelopeShape, MessageBody, write_attachment_metadata};
 
 /// Heading line that introduces the messaging sub-block in a wake drain.
 pub const MESSAGING_BATCH_HEADING: &str = "[Brenn messages]";
@@ -66,6 +68,86 @@ pub fn batch_heading(envelopes: &[MessageEnvelope]) -> &'static str {
     heading
 }
 
+/// The conversation shape: how a conversation is shown a message.
+///
+/// A text body is its text, followed by `content_type` when it has one. A
+/// non-text body is never shown as bytes: `body` is the placeholder
+/// `{"binary":true,"content_type":…,"size":…}`, which no text body can forge
+/// because a text body is always a JSON string.
+///
+/// Each attachment is shown by name with its size and content type; the blob's
+/// id is not written.
+pub struct ConversationShape;
+
+impl EnvelopeShape for ConversationShape {
+    fn serialize_body<S: SerializeStruct>(body: &MessageBody, out: &mut S) -> Result<(), S::Error> {
+        match body.as_text() {
+            Some(text) => {
+                out.serialize_field("body", text)?;
+                if let Some(content_type) = body.content_type() {
+                    out.serialize_field("content_type", content_type)?;
+                }
+                Ok(())
+            }
+            // A non-text body reaches a conversation only as this metadata
+            // placeholder; its bytes reach a file through `brenn-tool save`.
+            None => out.serialize_field(
+                "body",
+                &BinaryPlaceholder {
+                    binary: true,
+                    content_type: body
+                        .content_type()
+                        .expect("a non-text body always has a content type"),
+                    size: body.len(),
+                },
+            ),
+        }
+    }
+
+    fn serialize_attachments<S: SerializeStruct>(
+        attachments: &Attachments,
+        out: &mut S,
+    ) -> Result<(), S::Error> {
+        write_attachment_metadata(attachments, out)
+    }
+}
+
+/// What a conversation is shown for a tool result that carries attachments:
+/// `{"result": <value>, "message_id": <uuid>, "attachments": {…}}`, the
+/// attachments in the conversation shape's metadata form, with no blob id.
+pub struct HandedToolResultShape<'a> {
+    /// The tool's JSON value.
+    pub value: &'a serde_json::Value,
+    /// The inbox message the attachments are named by.
+    pub handed: &'a crate::HandedToolResult,
+}
+
+impl Serialize for HandedToolResultShape<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("HandedToolResult", 3)?;
+        out.serialize_field("result", self.value)?;
+        out.serialize_field("message_id", &self.handed.message_id)?;
+        write_attachment_metadata(&self.handed.attachments, &mut out)?;
+        out.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BinaryPlaceholder<'a> {
+    binary: bool,
+    content_type: &'a str,
+    size: usize,
+}
+
+/// A run of envelopes serialized as a JSON array in the conversation shape.
+pub struct ConversationEnvelopes<'a>(pub &'a [MessageEnvelope]);
+
+impl Serialize for ConversationEnvelopes<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|e| e.shaped::<ConversationShape>()))
+    }
+}
+
 /// Format a single envelope as the LLM-facing single-message text.
 /// Used by the immediate dispatch path when the target bridge is active.
 ///
@@ -78,8 +160,8 @@ pub fn batch_heading(envelopes: &[MessageEnvelope]) -> &'static str {
 /// ```
 pub fn format_messaging_event_single(env: &MessageEnvelope) -> String {
     let heading = single_heading(env);
-    let json = serde_json::to_string(env)
-        .expect("MessageEnvelope serialization cannot fail (all fields owned)");
+    let json = serde_json::to_string(&env.shaped::<ConversationShape>())
+        .expect("the conversation shape serializes every body");
     format!("{heading}{MESSAGING_HEADING_SEPARATOR}{json}")
 }
 
@@ -102,11 +184,8 @@ pub fn format_messaging_event_batch(envelopes: &[MessageEnvelope]) -> Option<Str
         return None;
     }
     let heading = batch_heading(envelopes);
-    // Compact (non-pretty) JSON. The LLM gets canonical envelope JSON.
-    #[derive(Serialize)]
-    struct Wrapper<'a>(&'a [MessageEnvelope]);
-    let json = serde_json::to_string(&Wrapper(envelopes))
-        .expect("MessageEnvelope batch serialization cannot fail");
+    let json = serde_json::to_string(&ConversationEnvelopes(envelopes))
+        .expect("the conversation shape serializes every body");
     Some(format!("{heading}{MESSAGING_HEADING_SEPARATOR}{json}"))
 }
 
@@ -131,6 +210,8 @@ mod tests {
             impetus: None,
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Brenn,
+            transport: None,
+            attachments: Default::default(),
         }
     }
 
@@ -232,5 +313,181 @@ mod tests {
             &text[..text.len().min(60)]
         );
         assert!(!text.starts_with(MESSAGING_BATCH_HEADING));
+    }
+
+    fn fixed(body: MessageBody) -> MessageEnvelope {
+        MessageEnvelope {
+            message_id: Uuid::nil(),
+            publish_ts: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            body,
+            ..env("")
+        }
+    }
+
+    const FIXED_HEAD: &str = r#"{"message_id":"00000000-0000-0000-0000-000000000000","source":"src","channel":"brenn:test","sender":"alice","publish_ts":"2023-11-14T22:13:20Z","#;
+    const FIXED_TAIL: &str = r#""urgency":"normal","envelope_type":"brenn"}"#;
+
+    /// An untyped text body is shown exactly as the text shape writes it, by
+    /// both formatters.
+    #[test]
+    fn an_untyped_text_body_is_the_text_shape() {
+        let e = fixed(MessageBody::text("hi"));
+        let json = format!(r#"{FIXED_HEAD}"body":"hi",{FIXED_TAIL}"#);
+        assert_eq!(e.to_envelope_json(), json);
+        assert_eq!(
+            format_messaging_event_single(&e),
+            format!("{MESSAGING_SINGLE_HEADING}\n\n{json}")
+        );
+        assert_eq!(
+            format_messaging_event_batch(std::slice::from_ref(&e)).unwrap(),
+            format!("{MESSAGING_BATCH_HEADING}\n\n[{json}]")
+        );
+    }
+
+    #[test]
+    fn a_typed_text_body_carries_its_content_type() {
+        let body = MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+        let text = format_messaging_event_single(&fixed(body));
+        assert!(
+            text.ends_with(&format!(
+                r##"{FIXED_HEAD}"body":"# hi","content_type":"text/markdown",{FIXED_TAIL}"##
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_non_text_body_is_a_placeholder_without_its_bytes() {
+        let body = MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, b'Z', b'Q']).unwrap();
+        let batch = format_messaging_event_batch(&[fixed(body)]).unwrap();
+        assert!(
+            batch.ends_with(&format!(
+                r#"[{FIXED_HEAD}"body":{{"binary":true,"content_type":"image/jpeg","size":4}},{FIXED_TAIL}]"#
+            )),
+            "{batch}"
+        );
+        assert!(!batch.contains("ZQ"), "{batch}");
+    }
+
+    /// A text body whose text is the placeholder's JSON stays a JSON string.
+    #[test]
+    fn a_text_body_cannot_forge_the_placeholder() {
+        let forged = r#"{"binary":true,"content_type":"image/jpeg","size":4}"#;
+        let text = format_messaging_event_single(&fixed(MessageBody::text(forged)));
+        let json: serde_json::Value =
+            serde_json::from_str(text.strip_prefix(MESSAGING_SINGLE_HEADING).unwrap().trim())
+                .unwrap();
+        assert_eq!(json["body"], serde_json::Value::String(forged.to_string()));
+    }
+
+    /// The transport metadata follows `envelope_type` in the conversation
+    /// shape, beside the placeholder of a non-text body.
+    #[test]
+    fn transport_metadata_follows_envelope_type() {
+        let body = MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, b'Z']).unwrap();
+        let e = MessageEnvelope {
+            channel: "mqtt:broker:cam/front".into(),
+            envelope_type: ChannelScheme::Mqtt,
+            transport: Some(crate::TransportMeta::Mqtt(crate::MqttTransport {
+                client_slug: "broker".into(),
+                topic: "cam/front".into(),
+                qos: 0,
+                received_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            })),
+            ..fixed(body)
+        };
+        let text = format_messaging_event_single(&e);
+        assert!(text.starts_with(MQTT_SINGLE_HEADING), "{text}");
+        assert!(
+            text.ends_with(concat!(
+                r#""body":{"binary":true,"content_type":"image/jpeg","size":3},"#,
+                r#""urgency":"normal","envelope_type":"mqtt","#,
+                r#""transport":{"mqtt":{"client_slug":"broker","topic":"cam/front","qos":0,"#,
+                r#""received_at":"2023-11-14T22:13:20Z"}}}"#
+            )),
+            "{text}"
+        );
+    }
+
+    fn with_attachments(body: MessageBody) -> MessageEnvelope {
+        use brenn_lib::messaging::{AttachmentName, Attachments, BlobId, BlobRef};
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            AttachmentName::new("photo").unwrap(),
+            BlobRef {
+                id: BlobId::new("5f0c".repeat(8)),
+                size: 102_400,
+                content_type: "image/jpeg".into(),
+            },
+        );
+        map.insert(
+            AttachmentName::new("notes.txt").unwrap(),
+            BlobRef {
+                id: BlobId::new("9e1d".repeat(8)),
+                size: 7,
+                content_type: "text/plain".into(),
+            },
+        );
+        MessageEnvelope {
+            attachments: Attachments::from_map(map),
+            ..fixed(body)
+        }
+    }
+
+    const ATTACHMENT_METADATA: &str = concat!(
+        r#""attachments":{"notes.txt":{"size":7,"content_type":"text/plain"},"#,
+        r#""photo":{"size":102400,"content_type":"image/jpeg"}}"#
+    );
+
+    /// A conversation is shown each attachment's name, size and content type,
+    /// last, and never the blob's id — in the single and the batch text.
+    #[test]
+    fn attachments_are_shown_by_name_size_and_content_type_without_the_id() {
+        let e = with_attachments(MessageBody::text("see attached"));
+        let tail = &FIXED_TAIL[..FIXED_TAIL.len() - 1];
+        let json = format!(r#"{FIXED_HEAD}"body":"see attached",{tail},{ATTACHMENT_METADATA}}}"#);
+        let single = format_messaging_event_single(&e);
+        assert_eq!(single, format!("{MESSAGING_SINGLE_HEADING}\n\n{json}"));
+        let batch = format_messaging_event_batch(&[e.clone(), e]).unwrap();
+        assert_eq!(
+            batch,
+            format!("{MESSAGING_BATCH_HEADING}\n\n[{json},{json}]")
+        );
+        for text in [&single, &batch] {
+            assert!(!text.contains("5f0c5f0c"), "{text}");
+            assert!(!text.contains("9e1d9e1d"), "{text}");
+        }
+    }
+
+    /// A tool result handed with attachments is the value, the inbox message's
+    /// id, and the attachments as the conversation shape writes them: no blob id.
+    #[test]
+    fn a_handed_tool_result_shows_the_value_message_id_and_attachment_metadata() {
+        let e = with_attachments(MessageBody::text(""));
+        let handed = crate::HandedToolResult {
+            message_id: e.message_id,
+            attachments: e.attachments.clone(),
+        };
+        let value = serde_json::json!({ "pages": 3 });
+        let text = serde_json::to_string(&HandedToolResultShape {
+            value: &value,
+            handed: &handed,
+        })
+        .unwrap();
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"result":{{"pages":3}},"message_id":"{}",{ATTACHMENT_METADATA}}}"#,
+                e.message_id
+            )
+        );
+        assert!(!text.contains("5f0c5f0c"), "{text}");
+    }
+
+    /// Without attachments the conversation text has no `attachments` key.
+    #[test]
+    fn no_attachments_writes_no_key() {
+        let text = format_messaging_event_single(&fixed(MessageBody::text("hi")));
+        assert!(!text.contains("attachments"), "{text}");
     }
 }

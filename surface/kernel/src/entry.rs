@@ -17,6 +17,10 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::Element;
 
 use brenn_attach_client::conn::ConnConfig;
+use brenn_attach_proto::VersionRange;
+use brenn_envelope::grants::ProcessorContract;
+use brenn_envelope::{GuestBody, MessageBody};
+use brenn_surface_schema::SURFACE_ATTACH_VERSION;
 
 use crate::WebSysConnector;
 use crate::front::{self, EventStream, SurfaceHandle};
@@ -92,6 +96,8 @@ pub fn start() -> KernelHandle {
         // a deploy restart decorrelates its reconnects.
         backoff_jitter_seed: crate::entropy::seed(),
         terminal_close_codes: crate::logic::ClosePolicy::terminal_codes(),
+        // The surface route serves this one version, and the page moves with it.
+        versions: VersionRange::exactly(SURFACE_ATTACH_VERSION),
     };
     // The page's store epoch, minted here for the same reason as the jitter seed:
     // nothing below this edge reads entropy. `Uuid::new_v4` reads the platform
@@ -287,70 +293,117 @@ fn ports_granted(
     }
 }
 
+/// The value a `ports` or `calls` export throws to trap its caller: a JS
+/// `Error` carrying `message`.
+///
+/// Those imports return a WIT `result`, so the transpiled glue catches what the
+/// kernel throws and lifts it as the error variant — unless it is an `Error`,
+/// which the glue rethrows as the guest's trap. Any other thrown value would be
+/// read as a variant and fail that lift with the glue's own complaint in place
+/// of `message`.
+fn glue_trap(message: &str) -> JsValue {
+    js_sys::Error::new(message).into()
+}
+
 /// Lift a port-vocabulary violation into the thrown value the loader's shim turns
 /// into a trap, writing the breadcrumb on the way out.
 ///
-/// The four headless port exports answer `Ok(String)` for everything the
-/// contract has a word for and `Err` for the one thing it does not: a publish to
-/// a port the component's specification never declared. That is the DOM family's
-/// treatment of a call with no answer, applied to the port family for the same
-/// reason — the component's behaviour contradicts the specification its artifact
-/// is hash-bound to, and there is nothing to carry on with.
+/// The port exports answer `Ok` for everything the contract has a word for and
+/// `Err` for the one thing it does not: a publish to a port the component's
+/// specification never declared. That is the DOM family's treatment of a call
+/// with no answer, applied to the port family for the same reason — the
+/// component's behaviour contradicts the specification its artifact is
+/// hash-bound to, and there is nothing to carry on with.
 fn undeclared_port_trap(host: &ProcessorHost, instance: &str, port: &str) -> JsValue {
     let (report, reason) = crate::logic::undeclared_port(instance, port);
     dom::apply_actions(std::slice::from_ref(&report), &host.handle);
-    JsValue::from_str(&reason)
+    glue_trap(&reason)
 }
 
-/// The answer a port export gives for one buffer verdict: the WIT variant name
-/// for a refusal, a trap for a violation.
+/// A refusal as the glue lowers a WIT variant: `{ tag, val }`, `val` present
+/// exactly for a variant that carries a payload.
+fn refusal_to_js(refusal: &crate::logic::PortRefusal) -> JsValue {
+    let object: JsValue = js_sys::Object::new().into();
+    dom::set(&object, "tag", &JsValue::from_str(refusal.tag));
+    if let Some(val) = &refusal.val {
+        dom::set(&object, "val", &JsValue::from_str(val));
+    }
+    object
+}
+
+/// The answer a port export gives for one buffer verdict: the variant the
+/// guest lifts for a refusal, a trap for a violation.
 fn port_answer<E>(
     host: &ProcessorHost,
     instance: &str,
     fault: crate::publish_buffer::PortFault<E>,
-    variant: impl FnOnce(E) -> String,
-) -> Result<String, JsValue> {
+    refusal: impl FnOnce(E) -> crate::logic::PortRefusal,
+) -> Result<JsValue, JsValue> {
     match fault {
-        crate::publish_buffer::PortFault::Refused(err) => Ok(variant(err)),
+        crate::publish_buffer::PortFault::Refused(err) => Ok(refusal_to_js(&refusal(err))),
         crate::publish_buffer::PortFault::Undeclared(port) => {
             Err(undeclared_port_trap(host, instance, &port))
         }
     }
 }
 
-/// A processor instance's `ports.publish` / `ports.publish-with-urgency` import.
-///
-/// `instance` comes from the loader's own closure over the manifest entry it
-/// instantiated the module for — never from the component, exactly as the DOM
-/// path's instance comes from the executor's element registry rather than the
-/// event detail.
+/// `not-permitted`, the answer to a port call the instance may not make.
+fn not_permitted() -> Result<JsValue, JsValue> {
+    Ok(refusal_to_js(&crate::logic::PortRefusal {
+        tag: "not-permitted",
+        val: None,
+    }))
+}
+
+/// A 0.2.0 body the glue handed over, or the trap its drift is.
+fn body_from_glue(instance: &str, port: &str, body: &JsValue) -> Result<GuestBody, JsValue> {
+    dom::guest_body_from_js(body).map_err(|detail| {
+        glue_trap(&format!(
+            "surface kernel: '{instance}' handed port '{port}' a body the kernel cannot read \
+             ({detail}): the page glue and the kernel disagree on the body shape"
+        ))
+    })
+}
+
+/// Read a publish's urgency. An urgency outside the WIT enum is transpile-glue
+/// drift, not a component typo: it traps the instance rather than answering
+/// with a refusal the guest could carry on past.
+fn publish_urgency(
+    instance: &str,
+    port: &str,
+    urgency: Option<String>,
+) -> Result<Option<crate::Urgency>, JsValue> {
+    match urgency {
+        Some(raw) => match crate::Urgency::parse(&raw) {
+            Some(urgency) => Ok(Some(urgency)),
+            None => Err(glue_trap(&format!(
+                "surface kernel: '{instance}' published on '{port}' with urgency {raw:?}, which \
+                 the kernel does not recognize: the page glue and the kernel disagree on the \
+                 urgency enum"
+            ))),
+        },
+        None => Ok(None),
+    }
+}
+
+/// The publish both contracts' exports run once they hold a [`GuestBody`].
 ///
 /// A processor only ever publishes from inside its own `receive`, so the buffered
 /// path always takes it: the publish joins that activation's buffer, is
-/// quota-checked inline, and flushes only if the entry returns ok. The answer is
-/// the WIT `publish-error` string the guest lifts, or the empty string for ok. A
-/// `None` from `try_buffered_publish` means no activation of this instance is in
-/// flight — a component publishing outside `receive`, which its world gives it no
-/// way to do — so it is refused, exactly as the DOM seam refuses one.
-#[wasm_bindgen]
-pub fn brenn_processor_publish(
+/// quota-checked inline, and flushes only if the entry returns ok. A `None` from
+/// `try_buffered_publish` means no activation of this instance is in flight — a
+/// component publishing outside `receive`, which its world gives it no way to do
+/// — so it is refused, exactly as the DOM seam refuses one.
+fn publish_body(
     instance: &str,
     port: &str,
-    body: &str,
-    urgency: Option<String>,
-) -> Result<String, JsValue> {
-    let urgency = match urgency {
-        Some(raw) => match crate::Urgency::parse(&raw) {
-            Some(urgency) => Some(urgency),
-            // The guest's WIT enum lifts to a fixed string set, so an
-            // unrecognized value is transpile-glue drift, not a component typo.
-            None => return Ok("invalid-payload".to_string()),
-        },
-        None => None,
-    };
+    body: GuestBody,
+    urgency: Option<crate::Urgency>,
+    contract: ProcessorContract,
+) -> Result<JsValue, JsValue> {
     with_processor_host("processor publish", |host| {
         if !ports_granted(&host.core, &host.handle, instance, "ports.publish") {
-            return Ok("not-permitted".to_string());
+            return not_permitted();
         }
         match host
             .handle
@@ -358,37 +411,37 @@ pub fn brenn_processor_publish(
         {
             Some(Ok(admission)) => {
                 dom::count_admission(instance, admission);
-                Ok(String::new())
+                Ok(JsValue::UNDEFINED)
             }
-            Some(Err(fault)) => port_answer(host, instance, fault, crate::logic::publish_error_str),
+            Some(Err(fault)) => port_answer(host, instance, fault, |err| {
+                crate::logic::publish_refusal(err, contract)
+            }),
             // TODO(surface-wasm-test-in-ci): this None arm (absent host slot →
             // "not-permitted") depends on the live wasm host slot and can only
-            // be pinned by the browser test runner, unlike the variant map,
+            // be pinned by the browser test runner, unlike the refusal map,
             // which is natively tested in `logic`.
-            None => Ok("not-permitted".to_string()),
+            None => not_permitted(),
         }
     })
 }
 
-/// A processor instance's `ports.publish-deferred` import. `deliver_after` is
-/// epoch milliseconds UTC, the instant the message becomes observable; a value at
-/// or before the flush's own clock reading publishes immediately, exactly like
-/// `publish`.
+/// The deferred publish both contracts' exports run. `deliver_after` is epoch
+/// milliseconds UTC, the instant the message becomes observable; a value at or
+/// before the flush's own clock reading publishes immediately.
 ///
-/// Buffered on the same terms as [`brenn_processor_publish`], for the same reason:
-/// a schedule an activation staged and then failed on must not exist. The answer
-/// is the WIT `publish-error` string, or the empty string for ok — deferral adds no
-/// error vocabulary to the publish family.
-#[wasm_bindgen]
-pub fn brenn_processor_publish_deferred(
+/// Buffered on the same terms as [`publish_body`], for the same reason: a
+/// schedule an activation staged and then failed on must not exist. Deferral adds
+/// no error vocabulary to the publish family.
+fn publish_deferred_body(
     instance: &str,
     port: &str,
-    body: &str,
+    body: GuestBody,
     deliver_after: u64,
-) -> Result<String, JsValue> {
+    contract: ProcessorContract,
+) -> Result<JsValue, JsValue> {
     with_processor_host("processor deferred publish", |host| {
         if !ports_granted(&host.core, &host.handle, instance, "ports.publish-deferred") {
-            return Ok("not-permitted".to_string());
+            return not_permitted();
         }
         match host
             .handle
@@ -396,47 +449,152 @@ pub fn brenn_processor_publish_deferred(
         {
             Some(Ok(admission)) => {
                 dom::count_admission(instance, admission);
-                Ok(String::new())
+                Ok(JsValue::UNDEFINED)
             }
-            Some(Err(fault)) => port_answer(host, instance, fault, crate::logic::publish_error_str),
-            None => Ok("not-permitted".to_string()),
+            Some(Err(fault)) => port_answer(host, instance, fault, |err| {
+                crate::logic::publish_refusal(err, contract)
+            }),
+            None => not_permitted(),
         }
     })
 }
 
-/// A processor instance's `ports.defer-cancel` import: unpark one message this
-/// instance already scheduled on `port`'s channel, named by its `index` into the
-/// deferred window this activation was handed.
+/// The deferred-message edit both contracts' exports run: rewrite one message
+/// this instance already scheduled on `port`'s channel — its body, its release
+/// time, or both. An absent argument leaves that half alone.
 ///
-/// Buffered like a publish, so an err or trap cancels nothing. The answer is the
-/// WIT `defer-error` string, or the empty string for ok. Note what ok does *not*
-/// promise: the named message may release between this call and the flush, which
-/// the WIT rules a benign race the host logs and counts — the component has
-/// already returned by then, so it is not a refusal.
+/// Same buffered semantics, index resolution, and race treatment as
+/// [`brenn_processor_defer_cancel`].
+fn defer_edit_body(
+    instance: &str,
+    port: &str,
+    index: u32,
+    body: Option<GuestBody>,
+    deliver_after: Option<u64>,
+    contract: ProcessorContract,
+) -> Result<JsValue, JsValue> {
+    with_processor_host("processor defer edit", |host| {
+        if !ports_granted(&host.core, &host.handle, instance, "ports.defer-edit") {
+            return not_permitted();
+        }
+        match host
+            .handle
+            .try_buffered_defer_edit(instance, port, index, body, deliver_after)
+        {
+            Some(Ok(())) => Ok(JsValue::UNDEFINED),
+            Some(Err(fault)) => port_answer(host, instance, fault, |err| {
+                crate::logic::defer_refusal(err, contract)
+            }),
+            None => not_permitted(),
+        }
+    })
+}
+
+/// A `brenn:processor@0.1.0` instance's `ports.publish` /
+/// `ports.publish-with-urgency` import.
+///
+/// `instance` comes from the loader's own closure over the manifest entry it
+/// instantiated the module for — never from the component, exactly as the DOM
+/// path's instance comes from the executor's element registry rather than the
+/// event detail.
+///
+/// Answers `undefined` for ok, `{ tag, val? }` for a refusal the glue throws as
+/// the WIT `publish-error` variant, and throws for a trap.
+#[wasm_bindgen]
+pub fn brenn_processor_publish(
+    instance: &str,
+    port: &str,
+    body: &str,
+    urgency: Option<String>,
+) -> Result<JsValue, JsValue> {
+    let urgency = publish_urgency(instance, port, urgency)?;
+    publish_body(
+        instance,
+        port,
+        GuestBody::Text(body.to_owned()),
+        urgency,
+        ProcessorContract::V0_1,
+    )
+}
+
+/// A `brenn:processor@0.2.0` instance's `ports.publish` /
+/// `ports.publish-with-urgency` import: `body` is the glue's
+/// `{ contentType, bytes }`. Answers as [`brenn_processor_publish`].
+#[wasm_bindgen]
+pub fn brenn_processor_publish_body(
+    instance: &str,
+    port: &str,
+    body: JsValue,
+    urgency: Option<String>,
+) -> Result<JsValue, JsValue> {
+    let urgency = publish_urgency(instance, port, urgency)?;
+    let body = body_from_glue(instance, port, &body)?;
+    publish_body(instance, port, body, urgency, ProcessorContract::V0_2)
+}
+
+/// A `brenn:processor@0.1.0` instance's `ports.publish-deferred` import; see
+/// [`publish_deferred_body`].
+#[wasm_bindgen]
+pub fn brenn_processor_publish_deferred(
+    instance: &str,
+    port: &str,
+    body: &str,
+    deliver_after: u64,
+) -> Result<JsValue, JsValue> {
+    publish_deferred_body(
+        instance,
+        port,
+        GuestBody::Text(body.to_owned()),
+        deliver_after,
+        ProcessorContract::V0_1,
+    )
+}
+
+/// A `brenn:processor@0.2.0` instance's `ports.publish-deferred` import.
+#[wasm_bindgen]
+pub fn brenn_processor_publish_deferred_body(
+    instance: &str,
+    port: &str,
+    body: JsValue,
+    deliver_after: u64,
+) -> Result<JsValue, JsValue> {
+    let body = body_from_glue(instance, port, &body)?;
+    publish_deferred_body(instance, port, body, deliver_after, ProcessorContract::V0_2)
+}
+
+/// A processor instance's `ports.defer-cancel` import, on either contract: unpark
+/// one message this instance already scheduled on `port`'s channel, named by its
+/// `index` into the deferred window this activation was handed.
+///
+/// Buffered like a publish, so an err or trap cancels nothing. Answers
+/// `undefined` for ok and `{ tag }` for the WIT `defer-error` it refused with.
+/// Note what ok does *not* promise: the named message may release between this
+/// call and the flush, which the WIT rules a benign race the host logs and
+/// counts — the component has already returned by then, so it is not a refusal.
+/// A cancel carries no body, so no body refusal can answer it on either
+/// contract.
 #[wasm_bindgen]
 pub fn brenn_processor_defer_cancel(
     instance: &str,
     port: &str,
     index: u32,
-) -> Result<String, JsValue> {
+) -> Result<JsValue, JsValue> {
     with_processor_host("processor defer cancel", |host| {
         if !ports_granted(&host.core, &host.handle, instance, "ports.defer-cancel") {
-            return Ok("not-permitted".to_string());
+            return not_permitted();
         }
         match host.handle.try_buffered_defer_cancel(instance, port, index) {
-            Some(Ok(())) => Ok(String::new()),
-            Some(Err(fault)) => port_answer(host, instance, fault, crate::logic::defer_error_str),
-            None => Ok("not-permitted".to_string()),
+            Some(Ok(())) => Ok(JsValue::UNDEFINED),
+            Some(Err(fault)) => port_answer(host, instance, fault, |err| {
+                crate::logic::defer_refusal(err, ProcessorContract::V0_1)
+            }),
+            None => not_permitted(),
         }
     })
 }
 
-/// A processor instance's `ports.defer-edit` import: rewrite one message this
-/// instance already scheduled on `port`'s channel — its body, its release time, or
-/// both. An absent argument leaves that half alone.
-///
-/// Same buffered semantics, index resolution, and race treatment as
-/// [`brenn_processor_defer_cancel`].
+/// A `brenn:processor@0.1.0` instance's `ports.defer-edit` import; see
+/// [`defer_edit_body`].
 #[wasm_bindgen]
 pub fn brenn_processor_defer_edit(
     instance: &str,
@@ -444,20 +602,40 @@ pub fn brenn_processor_defer_edit(
     index: u32,
     body: Option<String>,
     deliver_after: Option<u64>,
-) -> Result<String, JsValue> {
-    with_processor_host("processor defer edit", |host| {
-        if !ports_granted(&host.core, &host.handle, instance, "ports.defer-edit") {
-            return Ok("not-permitted".to_string());
-        }
-        match host
-            .handle
-            .try_buffered_defer_edit(instance, port, index, body, deliver_after)
-        {
-            Some(Ok(())) => Ok(String::new()),
-            Some(Err(fault)) => port_answer(host, instance, fault, crate::logic::defer_error_str),
-            None => Ok("not-permitted".to_string()),
-        }
-    })
+) -> Result<JsValue, JsValue> {
+    defer_edit_body(
+        instance,
+        port,
+        index,
+        body.map(GuestBody::Text),
+        deliver_after,
+        ProcessorContract::V0_1,
+    )
+}
+
+/// A `brenn:processor@0.2.0` instance's `ports.defer-edit` import: `body` is the
+/// glue's `{ contentType, bytes }`, or `undefined` to leave the body alone.
+#[wasm_bindgen]
+pub fn brenn_processor_defer_edit_body(
+    instance: &str,
+    port: &str,
+    index: u32,
+    body: JsValue,
+    deliver_after: Option<u64>,
+) -> Result<JsValue, JsValue> {
+    let body = if body.is_undefined() || body.is_null() {
+        None
+    } else {
+        Some(body_from_glue(instance, port, &body)?)
+    };
+    defer_edit_body(
+        instance,
+        port,
+        index,
+        body,
+        deliver_after,
+        ProcessorContract::V0_2,
+    )
 }
 
 /// Ask [`KernelCore::component_calls_gate`] whether `instance` may call a peer,
@@ -479,35 +657,20 @@ fn calls_granted(core: &Rc<RefCell<KernelCore>>, handle: &SurfaceHandle, instanc
 }
 
 /// The thrown value one `call-error` lifts from: the shape jco's import glue
-/// reads a `result`'s error out of.
-///
-/// `{ payload: { tag, val } }`, the same envelope the port family's refusals are
-/// thrown in — and the only variant with a `val` is `invalid-payload`, which
-/// carries the host's account of what was wrong with the payload.
-fn call_error_thrown(error: &crate::contract::CallError) -> JsValue {
-    let payload = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &payload,
-        &JsValue::from_str("tag"),
-        &JsValue::from_str(crate::contract::call_error_str(error)),
-    )
-    .expect("surface kernel: a fresh object refused a property");
-    if let crate::contract::CallError::InvalidPayload(detail) = error {
-        js_sys::Reflect::set(
-            &payload,
-            &JsValue::from_str("val"),
-            &JsValue::from_str(detail),
-        )
-        .expect("surface kernel: a fresh object refused a property");
-    }
-    let thrown = js_sys::Object::new();
-    js_sys::Reflect::set(&thrown, &JsValue::from_str("payload"), &payload)
-        .expect("surface kernel: a fresh object refused a property");
-    thrown.into()
+/// reads a `result`'s error out of, `{ payload: { tag, val? } }`.
+fn call_error_thrown(error: &crate::contract::CallError, contract: ProcessorContract) -> JsValue {
+    let thrown: JsValue = js_sys::Object::new().into();
+    dom::set(
+        &thrown,
+        "payload",
+        &refusal_to_js(&crate::logic::call_refusal(error, contract)),
+    );
+    thrown
 }
 
-/// A processor instance's `calls.call` import: one synchronous call to the peer
-/// the document wired `port` to, answered inline.
+/// The call both contracts' exports run once they hold a [`GuestBody`]: one
+/// synchronous call to the peer the document wired `port` to, answered inline
+/// with the peer's reply body.
 ///
 /// `instance` is the caller, from the loader's own closure over the manifest
 /// entry — never a name the component supplied, exactly as on the publish family.
@@ -518,7 +681,7 @@ fn call_error_thrown(error: &crate::contract::CallError) -> JsValue {
 /// import: a caller that later errs or traps does not retract what its peer
 /// published.
 ///
-/// Both answers travel as a thrown value, because that is how jco's glue lifts a
+/// Both failures travel as a thrown value, because that is how jco's glue lifts a
 /// `result`: an `Err` here is thrown into the guest's own call. A [`CallError`]
 /// is thrown as the variant envelope the guest lifts and carries on from
 /// ([`call_error_thrown`]); a port outside the caller's declared `call`
@@ -531,16 +694,17 @@ fn call_error_thrown(error: &crate::contract::CallError) -> JsValue {
 /// [`crate::publish_buffer::PublishBuffer::admit_call`], the answer in
 /// [`crate::calls::call_answer`], the stack discipline in
 /// [`crate::front::InFlightStack`]. TODO(surface-wasm-test-in-ci): the order
-/// they are asked in, and this export itself, are browser-only and pinned by
-/// nothing that runs.
+/// they are asked in, and this export itself, are wasm32-only; the node page rig
+/// drives them for admitted calls between headless kinds, and their other arms
+/// run nowhere.
 ///
 /// [`CallError`]: crate::contract::CallError
-#[wasm_bindgen]
-pub fn brenn_processor_call(
+fn call_body(
     instance: &str,
     port: &str,
-    payload: String,
-) -> Result<Option<String>, JsValue> {
+    body: GuestBody,
+    contract: ProcessorContract,
+) -> Result<Option<MessageBody>, JsValue> {
     with_processor_host("processor call", |host| {
         // The declared vocabulary first, and before any budget is spent: a name
         // the specification does not contain is not a refusal the component could
@@ -548,27 +712,70 @@ pub fn brenn_processor_call(
         if !host.core.borrow().declares_call_port(instance, port) {
             return Err(undeclared_port_trap(host, instance, port));
         }
+        let thrown = |err: &crate::contract::CallError| call_error_thrown(err, contract);
         if !calls_granted(&host.core, &host.handle, instance) {
-            return Err(call_error_thrown(&crate::contract::CallError::NotPermitted));
+            return Err(thrown(&crate::contract::CallError::NotPermitted));
         }
         // The caller's own activation is the budget authority, so a call from
         // outside one — or from a caller that is not the entry on the stack — has
         // nothing to charge and is refused on that ground alone.
-        match host.handle.try_call_admission(instance, &payload) {
-            Some(Ok(())) => {}
-            Some(Err(refusal)) => return Err(call_error_thrown(&refusal)),
+        let request = match host.handle.try_call_admission(instance, body) {
+            Some(Ok(request)) => request,
+            Some(Err(refusal)) => return Err(thrown(&refusal)),
             // TODO(surface-wasm-test-in-ci): this None arm (no in-flight
             // activation → "not-permitted") depends on the live wasm host slot
             // and can only be pinned by the browser test runner.
-            None => return Err(call_error_thrown(&crate::contract::CallError::NotPermitted)),
-        }
-        match host.door.call(instance, port, payload) {
+            None => return Err(thrown(&crate::contract::CallError::NotPermitted)),
+        };
+        match host.door.call(instance, port, request) {
             // A declared port the deployer left unbound reaches nobody. A
             // deployment fact, not a component bug, so it is answered.
-            None => Err(call_error_thrown(&crate::contract::CallError::Unwired)),
-            Some(answer) => crate::calls::call_answer(instance, port, answer)
-                .map_err(|err| call_error_thrown(&err)),
+            None => Err(thrown(&crate::contract::CallError::Unwired)),
+            Some(answer) => {
+                crate::calls::call_answer(instance, port, answer).map_err(|err| thrown(&err))
+            }
         }
+    })
+}
+
+/// A `brenn:processor@0.1.0` instance's `calls.call` import; see [`call_body`].
+///
+/// The reply is read as text, a typed reply losing its type as on a channel; a
+/// non-text reply is thrown as [`glue_trap`], the caller's trap — the callee
+/// has already run and flushed.
+#[wasm_bindgen]
+pub fn brenn_processor_call(
+    instance: &str,
+    port: &str,
+    payload: String,
+) -> Result<Option<String>, JsValue> {
+    let reply = call_body(
+        instance,
+        port,
+        GuestBody::Text(payload),
+        ProcessorContract::V0_1,
+    )?;
+    reply
+        .map(|reply| {
+            crate::calls::v0_1_reply(instance, port, &reply).map_err(|trap| glue_trap(&trap))
+        })
+        .transpose()
+}
+
+/// A `brenn:processor@0.2.0` instance's `calls.call` import: the request is the
+/// glue's `{ contentType, bytes }` and so is the reply, `undefined` for a peer
+/// that replied nothing. Throws as [`call_body`] does.
+#[wasm_bindgen]
+pub fn brenn_processor_call_body(
+    instance: &str,
+    port: &str,
+    body: JsValue,
+) -> Result<JsValue, JsValue> {
+    let body = body_from_glue(instance, port, &body)?;
+    let reply = call_body(instance, port, body, ProcessorContract::V0_2)?;
+    Ok(match reply {
+        Some(reply) => dom::body_to_js(&reply),
+        None => JsValue::UNDEFINED,
     })
 }
 
@@ -628,9 +835,22 @@ pub fn brenn_processor_config_get(instance: &str, key: &str) -> Option<String> {
 /// grant, in the core that emits the host element — and the entry is forwarded
 /// with it. Returns whether the registration was admitted, so the loader can
 /// tell a refusal from success without reading kernel state.
+///
+/// `contract` is the component contract the entry was built for, as the page
+/// manifest names it; the entry is handed every activation in that contract's
+/// form. A value that names no contract is a refused registration with a
+/// report, as an unknown instance is.
 #[wasm_bindgen]
-pub fn brenn_processor_register(instance: &str, entry: js_sys::Function) -> bool {
+pub fn brenn_processor_register(instance: &str, entry: js_sys::Function, contract: &str) -> bool {
     with_processor_host("processor register", |host| {
+        let contract = match contract.parse::<ProcessorContract>() {
+            Ok(contract) => contract,
+            Err(err) => {
+                let report = crate::logic::unknown_contract(instance, &err);
+                dom::apply_actions(std::slice::from_ref(&report), &host.handle);
+                return false;
+            }
+        };
         let ProcessorRegistration {
             admitted,
             mount,
@@ -640,7 +860,8 @@ pub fn brenn_processor_register(instance: &str, entry: js_sys::Function) -> bool
         if admitted {
             host.handle.register_activation(
                 instance,
-                dom::wrap_activation_entry(instance, entry),
+                dom::wrap_activation_entry(instance, entry, contract),
+                contract,
                 mount,
             );
         }

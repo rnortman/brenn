@@ -51,6 +51,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use brenn_envelope::MessageBody;
 use brenn_envelope::grants::ComponentGrant;
 use js_sys::Reflect;
 use wasm_bindgen::JsCast;
@@ -537,11 +538,14 @@ impl DomHost {
             detail: gesture_detail(fired, &listening),
         };
         let body = serde_json::to_string(&body).expect("dom: serializing a gesture body");
-        match self.door.request(instance, port, body) {
-            SyncAnswer::Ok(Some(reply)) if cancels(&reply) => fired.prevent_default(),
+        match self.door.request(instance, port, MessageBody::text(body)) {
+            SyncAnswer::Ok(Some(reply)) if reply.as_text().is_some_and(cancels) => {
+                fired.prevent_default()
+            }
             // Anything else lets the event proceed: no reply, a reply that did not
-            // ask, an err, a trap, or a refusal. Cancelling a user's gesture is an
-            // act, and only an answer that asked for it gets one.
+            // ask — a non-text one included — an err, a trap, or a refusal.
+            // Cancelling a user's gesture is an act, and only an answer that asked
+            // for it gets one.
             _ => {}
         }
     }
@@ -975,7 +979,7 @@ mod tests {
 
         let core = Rc::new(RefCell::new(KernelCore::new()));
         core.borrow_mut().on_event(&SessionEvent::Connected {
-            bindings: doc.clone(),
+            bindings: Box::new(doc.clone()),
             participant_id: pages::PRINCIPAL.to_string(),
             session_id: pages::SESSION_ID.to_string(),
             max_body_bytes: pages::BODY_CAP,

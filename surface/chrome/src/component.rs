@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 
 use brenn_envelope::MessageEnvelope;
 use brenn_guest::{
-    Activation, Error, Processor, RetainedState, StateLoss, dom, log, page_dom, publish, repark,
+    Activation, Body, Error, Processor, RetainedState, StateLoss, dom, log, page_dom, publish,
+    repark,
 };
 use serde::{Deserialize, Serialize};
 
@@ -147,7 +148,7 @@ impl Chrome {
 struct ChromeComponent;
 
 impl Processor for ChromeComponent {
-    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         // Starting from a default state would lose the page furniture and build
         // a second banner over the first, so an unreadable body fails the
         // activation and chrome takes its error card.
@@ -185,18 +186,22 @@ fn on_activation(activation: &Activation, chrome: &mut Chrome) -> Result<(), Err
         on_gesture(port, activation, chrome)?;
     }
     for window in activation.delivered_windows() {
-        match InPort::of(window)? {
-            // The wake's payload is irrelevant — the wake is the message.
-            InPort::ToastTick => continue,
-            InPort::SurfaceState => identify_self(chrome, window.new_raw()),
-            _ => {}
+        let port = InPort::of(window)?;
+        // The wake's payload is irrelevant — the wake is the message.
+        if matches!(port, InPort::ToastTick) {
+            continue;
+        }
+        let context = readable(window.port(), window.context_envelopes());
+        let new = readable(window.port(), window.new_envelopes());
+        if matches!(port, InPort::SurfaceState) {
+            identify_self(chrome, &new);
         }
         let actions = fold_window(
             &mut chrome.core,
             &ActivationWindow {
                 port: window.port(),
-                context_raw: window.context_raw(),
-                new_raw: window.new_raw(),
+                context: &context,
+                new: &new,
             },
             now_ms,
         );
@@ -212,6 +217,28 @@ fn on_activation(activation: &Activation, chrome: &mut Chrome) -> Result<(), Err
         chrome.core.next_wake(now_ms),
     );
     Ok(())
+}
+
+/// The window entries on `port` that read as envelopes.
+///
+/// An entry that does not is host/guest skew, not untrusted content — but chrome
+/// renders the page, so it logs the entry and folds the rest rather than failing
+/// the activation and taking the whole surface's shell down with it.
+fn readable(
+    port: &str,
+    entries: impl Iterator<Item = Result<MessageEnvelope, Error>>,
+) -> Vec<MessageEnvelope> {
+    entries
+        .filter_map(|entry| match entry {
+            Ok(envelope) => Some(envelope),
+            Err(err) => {
+                log::error(format!(
+                    "chrome could not read a delivery on port {port:?}: {err}"
+                ));
+                None
+            }
+        })
+        .collect()
 }
 
 /// Dismiss the toast the click landed on.
@@ -245,7 +272,7 @@ fn on_gesture(port: SyncPort, activation: &Activation, chrome: &mut Chrome) -> R
 /// that directly. Handles are canonical per element within an instance,
 /// so the wrapper chrome's own host element hangs under is the same handle
 /// `page-dom` returns for chrome's row and for no other.
-fn identify_self(chrome: &mut Chrome, new_raw: &[String]) {
+fn identify_self(chrome: &mut Chrome, new: &[MessageEnvelope]) {
     if chrome.identified {
         return;
     }
@@ -254,13 +281,13 @@ fn identify_self(chrome: &mut Chrome, new_raw: &[String]) {
     };
     // Latest-wins, as the fold reads it: the newest roster is the whole current
     // set, so an older one can only name a subset of it.
-    let Some(raw) = new_raw.last() else {
+    let Some(envelope) = new.last() else {
         return;
     };
-    let Ok(envelope) = serde_json::from_str::<MessageEnvelope>(raw) else {
+    let Some(text) = envelope.body.as_text() else {
         return;
     };
-    let Ok(body) = serde_json::from_str::<SurfaceStateBody>(&envelope.body) else {
+    let Ok(body) = serde_json::from_str::<SurfaceStateBody>(text) else {
         return;
     };
     for row in &body.instances {

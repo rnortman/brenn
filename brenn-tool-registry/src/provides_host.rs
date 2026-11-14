@@ -10,12 +10,14 @@
 
 use std::sync::Arc;
 
+use brenn_messaging_store::blob::HeldAttachments;
 use brenn_wasm::{ProvidesCallError, ProvidesHost, QueuedToolRequest, ToolCallError};
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::descriptor::{MAX_ASYNC_RESULT_BYTES, ToolError};
 use super::provided::{CompleteError, ProviderRuntime};
+use super::tool::ToolOutput;
 use super::wasm_host::WasmToolHost;
 
 // The WASM host refuses outcome text over its cap before this host parses it.
@@ -79,8 +81,22 @@ fn parse_outcome(outcome_json: &str) -> Result<Result<Value, ToolError>, String>
 }
 
 impl ProvidesHost for WasmProvidesHost {
-    fn complete(&self, id: &str, outcome_json: &str) -> Result<(), ProvidesCallError> {
-        let outcome = parse_outcome(outcome_json).map_err(ProvidesCallError::InvalidOutcome)?;
+    fn complete(
+        &self,
+        id: &str,
+        outcome_json: &str,
+        attachments: HeldAttachments,
+    ) -> Result<(), ProvidesCallError> {
+        let outcome =
+            match parse_outcome(outcome_json).map_err(ProvidesCallError::InvalidOutcome)? {
+                Ok(value) => Ok(ToolOutput { value, attachments }),
+                Err(_) if !attachments.is_empty() => {
+                    return Err(ProvidesCallError::InvalidOutcome(
+                        "an error outcome carries no attachments".to_string(),
+                    ));
+                }
+                Err(e) => Err(e),
+            };
         self.runtime
             .complete(&self.slug, id, outcome)
             .map_err(|e| match e {
@@ -95,6 +111,7 @@ impl ProvidesHost for WasmProvidesHost {
         tool: &str,
         args_json: &str,
         call_id: &str,
+        with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
         if self.runtime.serving(&self.slug, serving).is_none() {
             return Err(ToolCallError::Denied(
@@ -103,7 +120,7 @@ impl ProvidesHost for WasmProvidesHost {
             ));
         }
         self.tools
-            .resolve_async(tool, args_json, call_id, Some(serving))
+            .resolve_async(tool, args_json, call_id, Some(serving), with_attachments)
     }
 }
 
@@ -112,7 +129,7 @@ mod tests {
     use super::*;
     use crate::provided::ProvidedTool;
     use crate::provided::tests::{PROVIDER, decl, messenger, pending_ctx, published_id};
-    use crate::testutil::{clause, git_repo_pull_only, grant};
+    use crate::testutil::{ExecuteValue, clause, git_repo_pull_only, grant};
     use crate::tool::{ActingUser, AsyncTool};
     use brenn_obs::alerting::noop_alert_dispatcher;
     use serde_json::json;
@@ -157,7 +174,7 @@ mod tests {
                 id: 1,
                 username: "alice".to_string(),
             }));
-            tool.execute(&ctx, json!({ "q": 1 })).await
+            tool.execute_value(&ctx, json!({ "q": 1 })).await
         });
         let id = published_id(&messenger).await;
         InFlight { runtime, id, call }
@@ -167,7 +184,7 @@ mod tests {
     async fn a_completion_answers_the_caller_with_the_outcome() {
         let f = in_flight().await;
         host(&f.runtime, PROVIDER)
-            .complete(&f.id, r#"{"ok": {"n": 1}}"#)
+            .complete(&f.id, r#"{"ok": {"n": 1}}"#, HeldAttachments::none())
             .unwrap();
         assert_eq!(f.call.await.unwrap(), Ok(json!({ "n": 1 })));
     }
@@ -182,7 +199,7 @@ mod tests {
             let f = in_flight().await;
             let outcome = json!({ "err": { "kind": kind, "detail": "d" } }).to_string();
             host(&f.runtime, PROVIDER)
-                .complete(&f.id, &outcome)
+                .complete(&f.id, &outcome, HeldAttachments::none())
                 .unwrap();
             assert_eq!(f.call.await.unwrap(), Err(want));
         }
@@ -203,14 +220,15 @@ mod tests {
             r#"{"err": {"kind": "internal"}}"#,
             r#"{"err": {"kind": "rate_limited", "detail": ""}}"#,
         ] {
-            let refused = host.complete(&f.id, outcome);
+            let refused = host.complete(&f.id, outcome, HeldAttachments::none());
             assert!(
                 matches!(refused, Err(ProvidesCallError::InvalidOutcome(_))),
                 "{outcome}: {refused:?}"
             );
         }
         assert!(f.runtime.serving(PROVIDER, &f.id).is_some());
-        host.complete(&f.id, r#"{"ok": null}"#).unwrap();
+        host.complete(&f.id, r#"{"ok": null}"#, HeldAttachments::none())
+            .unwrap();
         assert_eq!(f.call.await.unwrap(), Ok(Value::Null));
     }
 
@@ -220,7 +238,7 @@ mod tests {
         let made_up = "0".repeat(32);
         for (slug, id) in [("other", f.id.as_str()), (PROVIDER, made_up.as_str())] {
             assert_eq!(
-                host(&f.runtime, slug).complete(id, r#"{"ok": 1}"#),
+                host(&f.runtime, slug).complete(id, r#"{"ok": 1}"#, HeldAttachments::none()),
                 Err(ProvidesCallError::NotPending)
             );
         }
@@ -233,7 +251,7 @@ mod tests {
         let guard = runtime.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
         let id = guard.id().as_str();
         let queued = host(&runtime, PROVIDER)
-            .queue_async_for(id, "git-repo-pull", r#"{"repos":["r"]}"#, "c1")
+            .queue_async_for(id, "git-repo-pull", r#"{"repos":["r"]}"#, "c1", false)
             .unwrap();
         assert_eq!(queued.channel, "brenn:tools/git-repo-pull");
         assert_eq!(queued.reply_to, format!("brenn:tool-results/{PROVIDER}"));
@@ -259,14 +277,40 @@ mod tests {
         let guard = runtime.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
         let id = guard.id().as_str().to_string();
         let args = r#"{"repos":["r"]}"#;
-        let foreign = host(&runtime, "other").queue_async_for(&id, "git-repo-pull", args, "c1");
+        let foreign =
+            host(&runtime, "other").queue_async_for(&id, "git-repo-pull", args, "c1", false);
         assert!(
             matches!(foreign, Err(ToolCallError::Denied(_))),
             "{foreign:?}"
         );
         drop(guard);
-        let ended = host(&runtime, PROVIDER).queue_async_for(&id, "git-repo-pull", args, "c1");
+        let ended =
+            host(&runtime, PROVIDER).queue_async_for(&id, "git-repo-pull", args, "c1", false);
         assert!(matches!(ended, Err(ToolCallError::Denied(_))), "{ended:?}");
+    }
+
+    /// A nested call with attachments is judged by the same rule as
+    /// `call-async`'s: a tool that takes none refuses them, last.
+    #[tokio::test]
+    async fn a_nested_call_with_attachments_needs_an_accepting_tool() {
+        let runtime = runtime();
+        let guard = runtime.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+        let host = host(&runtime, PROVIDER);
+        let id = guard.id().as_str();
+        assert_eq!(
+            host.queue_async_for(id, "git-repo-pull", r#"{"repos":["r"]}"#, "c1", true),
+            Err(ToolCallError::AttachmentsNotAccepted)
+        );
+        assert!(matches!(
+            host.queue_async_for(
+                id,
+                "git-repo-pull",
+                r#"{"repos":["elsewhere"]}"#,
+                "c1",
+                true
+            ),
+            Err(ToolCallError::Denied(_))
+        ));
     }
 
     /// Serving a pending id lends no grant: the nested call is admitted by
@@ -278,11 +322,17 @@ mod tests {
         let id = guard.id().as_str();
         let host = host(&runtime, PROVIDER);
         assert_eq!(
-            host.queue_async_for(id, "api-request", "{}", "c1"),
+            host.queue_async_for(id, "api-request", "{}", "c1", false),
             Err(ToolCallError::NotGranted)
         );
         assert!(matches!(
-            host.queue_async_for(id, "git-repo-pull", r#"{"repos":["elsewhere"]}"#, "c1"),
+            host.queue_async_for(
+                id,
+                "git-repo-pull",
+                r#"{"repos":["elsewhere"]}"#,
+                "c1",
+                false
+            ),
             Err(ToolCallError::Denied(_))
         ));
     }
@@ -306,9 +356,64 @@ mod tests {
                 guard.id().as_str(),
                 "git-repo-pull",
                 r#"{"repos":["r"]}"#,
-                "c1"
+                "c1",
+                false
             ),
             Err(ToolCallError::NotGranted)
+        );
+    }
+
+    /// An `ok` completion's attachments reach the caller beside the value; an
+    /// `err` completion with any is refused `invalid-outcome`, its holds drop,
+    /// and the call stays pending for a valid answer.
+    #[tokio::test]
+    async fn a_completions_attachments_ride_an_ok_outcome_only() {
+        use crate::provided::tests::blob_messenger;
+        use brenn_messaging_store::testutils::{held, seal_bytes};
+
+        let runtime = runtime();
+        let (messenger, _blob_dir) = blob_messenger().await;
+        let store = messenger.blob_store().unwrap().clone();
+        runtime.attach(messenger.clone());
+        let tool = Arc::new(ProvidedTool::new(PROVIDER, &decl(1), runtime.clone()));
+        let call = tokio::spawn(async move {
+            tool.execute(&pending_ctx(None), json!({}), HeldAttachments::none())
+                .await
+        });
+        let id = published_id(&messenger).await;
+        let host = host(&runtime, PROVIDER);
+
+        let made = seal_bytes(&store, "text/plain", b"made");
+        let err = json!({ "err": { "kind": "internal", "detail": "d" } }).to_string();
+        assert_eq!(
+            host.complete(&id, &err, held(&[("made", &made)])),
+            Err(ProvidesCallError::InvalidOutcome(
+                "an error outcome carries no attachments".to_string()
+            ))
+        );
+        assert!(runtime.serving(PROVIDER, &id).is_some(), "still pending");
+        drop(made);
+        assert_eq!(
+            store.usage().sealed,
+            0,
+            "the refused completion held it last"
+        );
+
+        let made = seal_bytes(&store, "text/plain", b"made");
+        let made_id = made.id().clone();
+        host.complete(&id, r#"{"ok": {"n": 1}}"#, held(&[("made", &made)]))
+            .unwrap();
+        drop(made);
+        let output = call.await.unwrap().expect("answered");
+        assert_eq!(output.value, json!({ "n": 1 }));
+        assert_eq!(
+            output
+                .attachments
+                .refs()
+                .get(&brenn_envelope::AttachmentName::new("made").unwrap())
+                .unwrap()
+                .id,
+            made_id
         );
     }
 }

@@ -806,6 +806,7 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
             max_concurrency,
             auto_approve: true,
+            accepts_attachments: false,
         }
     }
 
@@ -901,6 +902,8 @@ mod tests {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
+            untyped_content_type: None,
         });
         candidate.wasm_consumers = vec![WasmConsumerConfigRaw::minimal(
             "sifter",

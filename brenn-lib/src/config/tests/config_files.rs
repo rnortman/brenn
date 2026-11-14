@@ -12,7 +12,8 @@ use crate::config::brenn::check_config;
 
 fn load_config_file(filename: &str) -> BrennConfig {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let inputs = DocumentInputs::with_modules(root.join(filename), root.join("config/specs"));
+    let inputs =
+        DocumentInputs::deployment(root.join(filename), shipped_module_roots(&root, filename));
     check_config(&inputs)
         .unwrap_or_else(|report| panic!("{filename} must load: {report}"))
         .config

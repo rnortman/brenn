@@ -1141,6 +1141,16 @@ vocabulary! {
         /// a tuning — a tuning matches a family the system mints, so it names no
         /// single document contract.
         opt doctype: V,
+        /// Whether the channel may carry non-text bodies; absent is text-only.
+        /// Legal on a declaration, and on a tuning of the `mqtt:` or `webhook:`
+        /// family, where it selects the raw ingress shape; refused on any
+        /// other tuning — those families are written and read by host code
+        /// that parses text.
+        opt non_text: V,
+        /// The content type of a payload the broker delivers with none: a
+        /// media type. Legal only on an `mqtt:` tuning that states
+        /// `non_text = true`.
+        opt untyped_content_type: V,
     }
 
     /// A `surface` body's attrs.
@@ -1381,6 +1391,11 @@ vocabulary! {
         opt noise: Word,
         opt wake_min: Word,
         opt amplification: V,
+        /// The port needs a channel that may carry non-text bodies: the
+        /// declaration of a channel the bindings synthesize, a check against a
+        /// declared one. On a surface port, legal only where the port's channel
+        /// is page-local.
+        opt non_text: V,
     }
 
     /// An `out` binding's tail: the union across the consumer and surface
@@ -1393,6 +1408,8 @@ vocabulary! {
         opt urgency: Word,
         opt publish_per_activation: V,
         opt publish_capacity: V,
+        /// As on an `in` tail.
+        opt non_text: V,
     }
 
     /// An `io` binding's tail: a port that reads and writes, so the union of
@@ -1412,6 +1429,8 @@ vocabulary! {
         opt amplification: V,
         opt publish_per_activation: V,
         opt publish_capacity: V,
+        /// As on an `in` tail.
+        opt non_text: V,
     }
 }
 
@@ -1584,6 +1603,7 @@ vocabulary! {
         req input_schema: V,
         opt max_concurrency: V,
         opt auto_approve: V,
+        opt accepts_attachments: V,
     }
 
     /// The `handler` block of an attachment target: the union of every handler
@@ -1996,6 +2016,9 @@ vocabulary! {
         opt default_wake_min: Word,
         opt archive_path: V,
         opt default_send_rate: V,
+        opt max_blob_bytes: V,
+        opt blob_budget_bytes: V,
+        opt blob_dir: V,
     }
 
     /// The `observability` section. The usage sub-section is a `usage`
@@ -2661,7 +2684,12 @@ mod tests {
     fn a_vocabulary_states_its_keys_as_data() {
         assert_eq!(
             OutTail::<()>::KEYS,
-            ["urgency", "publish_per_activation", "publish_capacity"]
+            [
+                "urgency",
+                "publish_per_activation",
+                "publish_capacity",
+                "non_text"
+            ]
         );
         assert_eq!(
             SubscribeTail::KEYS,

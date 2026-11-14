@@ -1,0 +1,33 @@
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "guest_spec_scaffold", "wasm_component", "wasm_guest_cdylib")
+
+policy_srcs()
+
+# Staged for the page host by `//surface:processor-sdk-bytes-test_assets`, which
+# also holds the specification to the artifact's imports.
+exports_files(["spec/processor-sdk-bytes-test.brenn"])
+
+# Bindings come from the brenn-guest SDK's `generate!`; this crate names no
+# WIT of its own. The port surface is generated from the specification beside
+# it.
+guest_spec_scaffold(
+    name = "spec",
+    spec = "spec/processor-sdk-bytes-test.brenn",
+)
+
+wasm_guest_cdylib(
+    name = "brenn-processor-sdk-bytes-test",
+    generated_srcs = {"src/spec.rs": ":spec"},
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-wasm/components/guest:brenn-guest",
+    ],
+)
+
+wasm_component(
+    name = "component",
+    module = ":brenn-processor-sdk-bytes-test",
+    visibility = ["//visibility:public"],
+)

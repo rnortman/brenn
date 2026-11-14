@@ -1,0 +1,11 @@
+/// Blob-carrying tool caller test fixture. Each new message on `in` names a
+/// tool call and the blobs it carries; each result on `tool-results` is read
+/// back and reported on `out`. Every tool call carries attachments and every
+/// publish goes through `blobs.publish`.
+component ProcessorBlobCallerTest {
+  abi = processor;
+  requires = [ports, log, tools, blobs];
+  in in;
+  in tool-results;
+  out out;
+}

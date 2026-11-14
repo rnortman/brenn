@@ -21,8 +21,9 @@ use indexmap::IndexMap;
 
 use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::config::{ResolvedSurface, ResolvedWasmConsumer};
+use brenn_lib::messaging::remote::RemoteFacts;
 use brenn_lib::messaging::{
-    ChannelEntry, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
+    ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
 };
 use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
 use brenn_lib::wasm_package::Verified;
@@ -35,7 +36,7 @@ use super::dynamic::{
     DynamicSnapshot, dormant_rows_the_reload_cannot_follow, dynamic_ingress, folded_now,
 };
 use super::mqtt::{MqttClientsDelta, MqttDelta, MqttIngressSet, mqtt_delta};
-use super::surfaces::{SurfaceClosure, SurfaceDelta, surface_delta};
+use super::surfaces::{SurfaceClosure, SurfaceDelta, SurfacePlatform, surface_delta};
 use super::tools::ToolsDelta;
 use super::webhook::WebhookDelta;
 
@@ -299,13 +300,15 @@ fn same_channel(a: &ChannelEntry, b: &ChannelEntry) -> bool {
 ///
 /// `kinds_changed` is the caller's comparison of the two sides' surface asset
 /// scans: it is asked for before the delta is built, so the answer is passed in
-/// rather than computed a second time here.
+/// rather than computed a second time here. `platform` derives the channels a
+/// surface's sessions name besides its bindings.
 pub(crate) fn plan_delta(
     baseline: &PlanFacts<'_>,
     candidate: &PlanFacts<'_>,
     kinds_changed: BTreeSet<String>,
     agents: &AgentInputs<'_>,
     live: &LiveFacts<'_>,
+    platform: SurfacePlatform<'_>,
 ) -> PlanDelta {
     let old_entries = Entries::of(baseline.directory);
     let new_entries = Entries::of(candidate.directory);
@@ -379,6 +382,7 @@ pub(crate) fn plan_delta(
             moved_channels: &moved_channels,
             moved_addresses: &moved_addresses,
             kinds_changed: &delta.kinds_changed,
+            platform,
         },
     );
 
@@ -803,6 +807,147 @@ impl Movers<'_> {
     }
 }
 
+/// Every durable channel this delta takes from `non_text` to text-only while a
+/// `[[remote]]` may publish to it, as refusal lines.
+///
+/// A reload neither re-plans nor retires a remote, and the attach door decides
+/// whether to admit a non-text body against the live directory, which holds the
+/// old `non_text` entry until the commit's channel walk replaces it. The commit
+/// reaches that walk only after the retirement waits, which are unbounded, so a
+/// remote's ordinary traffic can store a non-text row on a channel the
+/// candidate declares text-only: before the commit's second store check that
+/// row kills the process mid-walk, after it the row is kept unseen, and either
+/// way the next boot refuses to start over it. A restart has no such window:
+/// every writer stops first, and the door answers the first publish after it
+/// against the new declaration.
+///
+/// Read off the `[[remote]]` blocks, which level 1 holds equal on both sides. A
+/// remote whose durable publish ACL covers the address refuses the reload
+/// whatever version it attaches at, prefix grants included: the version is a
+/// per-connection fact, and this rule must hold for a remote that connects
+/// while the commit runs. Only durable channels: an ephemeral channel's ring
+/// leaves with its old entry, so nothing written in the window outlives it.
+///
+/// Both addresses are asked about. Until the walk, a remote writes through the
+/// old entry by naming the old address, and a change that keeps its uuid can
+/// rename the channel as well as narrow it. The line names the new address,
+/// as [`text_only_flips_under_surface_publishers`] does.
+pub(crate) fn text_only_flips_under_remote_publishers(
+    delta: &PlanDelta,
+    remotes: &[RemoteFacts],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for change in text_only_narrowings(delta) {
+        let bares: Vec<&str> = [&change.old.address, &change.new.address]
+            .into_iter()
+            .filter_map(|address| durable_bare(address))
+            .collect();
+        for remote in remotes {
+            if bares
+                .iter()
+                .any(|bare| remote.policy().allows_brenn_publish(bare))
+            {
+                out.push(format!(
+                    "{} is changed to text-only but remote {:?} may publish to it: \
+                     {NEEDS_RESTART}",
+                    change.new.address,
+                    remote.slug(),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Every durable channel this delta takes from `non_text` to text-only while a
+/// surface of the running plan may publish to it, as refusal lines.
+///
+/// The window is the remote rule's: until the commit's channel walk, the attach
+/// door admits a non-text body against the old `non_text` entry, and the
+/// retirement waits before the walk are unbounded. A page's row stored there
+/// kills the process at the commit's second store check, or outlives the
+/// reload and refuses the next boot — a server death an untrusted client
+/// times. A restart has no such window.
+///
+/// A surface may publish onto every channel one of its outputs names and onto
+/// its platform channels. The baseline's surfaces and the old address only:
+/// until the walk an attached page writes through the entry it was attached
+/// under, by the address its running plan gave it. Only durable channels: an
+/// ephemeral channel's ring leaves with its old entry, and a surface whose
+/// channel moved has its sessions closed before the walk. The line names the
+/// new address, as [`text_only_flips_under_remote_publishers`] does.
+pub(crate) fn text_only_flips_under_surface_publishers(
+    delta: &PlanDelta,
+    baseline: &[ResolvedSurface],
+    platform: SurfacePlatform<'_>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for change in text_only_narrowings(delta) {
+        let address = &change.old.address;
+        if durable_bare(address).is_none() {
+            continue;
+        }
+        for surface in baseline {
+            let publishes = surface
+                .outputs
+                .iter()
+                .any(|output| output.channel_address == *address)
+                || platform.channels(surface).contains(address);
+            if publishes {
+                out.push(format!(
+                    "{} is changed to text-only but surface {:?} may publish to it: \
+                     {NEEDS_RESTART}",
+                    change.new.address, surface.slug,
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Every ingress channel this delta takes from `non_text` to text-only, as
+/// refusal lines.
+///
+/// The transport adaptor publishes onto an `mqtt:` or `webhook:` channel in
+/// the shape it read off the entry, and a reload does not pause it: a payload
+/// already past that decision stores a non-text body on a channel the commit
+/// has just made text-only. A restart stops the adaptor first. Widening needs
+/// no rule: a wrapped message in flight lands as text, which any channel holds.
+pub(crate) fn ingress_narrowings_under_their_transport(delta: &PlanDelta) -> Vec<String> {
+    text_only_narrowings(delta)
+        .filter(|change| {
+            matches!(
+                ChannelScheme::of(&change.new.address),
+                Some(ChannelScheme::Mqtt | ChannelScheme::Webhook)
+            )
+        })
+        .map(|change| {
+            format!(
+                "{} is changed to text-only but its transport publishes onto it and a \
+                 reload does not pause it: {NEEDS_RESTART}",
+                change.new.address,
+            )
+        })
+        .collect()
+}
+
+/// Every channel change this delta makes from `non_text` to text-only: the
+/// changes the reload's text-only rules judge, each against its own writers.
+fn text_only_narrowings(delta: &PlanDelta) -> impl Iterator<Item = &ChannelChange> {
+    delta.channels_changed.iter().filter(|change| {
+        change.old.resolved_channel.non_text && !change.new.resolved_channel.non_text
+    })
+}
+
+/// `address`'s bare name when it is durable (`brenn:`), the only class the
+/// text-only rules guard.
+fn durable_bare(address: &str) -> Option<&str> {
+    match ChannelScheme::split(address) {
+        Some((ChannelScheme::Brenn, bare)) => Some(bare),
+        _ => None,
+    }
+}
+
 /// A subscriber as a refusal names it: the kind an operator reads in the
 /// document, and the slug they look it up by.
 fn describe(kind: &SubscriberEntryKind) -> String {
@@ -919,6 +1064,13 @@ mod tests {
     > = std::sync::LazyLock::new(IndexMap::new);
     static NO_CLIENTS_STOPPING: BTreeSet<String> = BTreeSet::new();
 
+    /// The surface platform every plan here is compared under: the default
+    /// `[surface_description]` prefix and no surface error channel.
+    const TEST_PLATFORM: SurfacePlatform<'static> = SurfacePlatform {
+        prefix: "surface",
+        error_channel: None,
+    };
+
     /// A process holding no dynamic subscription at all and stopping no broker
     /// client, which is every case in this module: they are about two plans,
     /// and neither a dynamic subscription nor a client delta is in either.
@@ -931,6 +1083,7 @@ mod tests {
         }
     }
 
+    use brenn_lib::access::raw::ChannelMatcherRaw;
     /// Every plan in this module is compared with an empty `kinds_changed`:
     /// these cases are about channels and consumers, and a kind set that never
     /// moves keeps the surface delta's kind closure out of them.
@@ -1051,6 +1204,7 @@ mod tests {
             BTreeSet::new(),
             &no_agents(),
             &no_live(),
+            TEST_PLATFORM,
         )
     }
 
@@ -1092,6 +1246,7 @@ mod tests {
             BTreeSet::new(),
             &no_agents(),
             &no_live(),
+            TEST_PLATFORM,
         )
     }
 
@@ -1396,6 +1551,7 @@ mod tests {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }];
         let mut reader = consumer("reader", &[]);
         reader.subscriptions = vec![WasmConsumerSubscriptionRaw {
@@ -1406,6 +1562,7 @@ mod tests {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }];
         after.wasm_consumers = vec![producer, reader];
         after.links = vec![LinkConfigRaw {
@@ -1422,6 +1579,7 @@ mod tests {
                     io_port: false,
                     push_depth: None,
                     retain_depth: None,
+                    non_text: false,
                 },
                 LinkEndpointRaw {
                     host: LinkHostRaw::Wasm {
@@ -1433,6 +1591,7 @@ mod tests {
                     io_port: false,
                     push_depth: Some(Depth::Bounded(4)),
                     retain_depth: Some(Depth::Bounded(4)),
+                    non_text: false,
                 },
             ],
         }];
@@ -1441,7 +1600,14 @@ mod tests {
         let (plan_a, plan_b) = (plan_of(&before), plan_of(&after));
         let (records_a, records_b) = (records(&plan_a, "aa"), records(&plan_b, "aa"));
         let (old, new) = (facts(&plan_a, &records_a), facts(&plan_b, &records_b));
-        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
 
         assert_eq!(
             delta.consumers_added,
@@ -1493,6 +1659,7 @@ mod tests {
                     noise: None,
                     wake_min: None,
                     amplification: None,
+                    non_text: false,
                 }];
             listener.mqtt_subscribe_acl = vec![brenn_lib::access::raw::MqttSubMatcherRaw {
                 client: "ha".to_string(),
@@ -1507,7 +1674,14 @@ mod tests {
             let (plan_a, plan_b) = (plan_of(before), plan_of(after));
             let (records_a, records_b) = (records(&plan_a, "aa"), records(&plan_b, "aa"));
             let (old, new) = (facts(&plan_a, &records_a), facts(&plan_b, &records_b));
-            let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+            let delta = plan_delta(
+                &old,
+                &new,
+                BTreeSet::new(),
+                &no_agents(),
+                &no_live(),
+                TEST_PLATFORM,
+            );
             let moved: Vec<&str> = if direction == "added" {
                 addresses(&delta.channels_added)
             } else {
@@ -1585,7 +1759,14 @@ mod tests {
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         // The delta does hold the UNSUBSCRIBE; the refusal is what stops it
         // from ever being issued.
         assert_eq!(delta.mqtt.unsubscribed(), vec![ADDRESS.to_string()]);
@@ -1648,7 +1829,14 @@ mod tests {
                 mqtt_ingress: &ingress,
                 surfaces: &[],
             };
-            let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+            let delta = plan_delta(
+                &old,
+                &new,
+                BTreeSet::new(),
+                &no_agents(),
+                &no_live(),
+                TEST_PLATFORM,
+            );
             assert_eq!(delta.channels_added.len(), 1);
             assert_eq!(
                 convergibility_refusals(&old, &new, &delta, &live),
@@ -1689,6 +1877,7 @@ mod tests {
             BTreeSet::new(),
             &no_agents(),
             &no_live(),
+            TEST_PLATFORM,
         );
         assert_eq!(
             delta
@@ -1777,7 +1966,14 @@ mod tests {
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let mut delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let mut delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         assert_eq!(delta.channels_changed.len(), 1);
         delta.consumers_changed = moving.iter().map(|slug| (*slug).to_string()).collect();
         convergibility_refusals(&old, &new, &delta, &before)
@@ -1826,7 +2022,14 @@ mod tests {
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let mut delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let mut delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         assert_eq!(delta.channels_changed.len(), 1);
         delta.agents_changed = agents.iter().map(|slug| changed_agent(slug)).collect();
         convergibility_refusals(&old, &new, &delta, &before)
@@ -1897,7 +2100,14 @@ mod tests {
             directory: after,
             ..old
         };
-        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         convergibility_refusals(&old, &new, &delta, before)
     }
 
@@ -1968,7 +2178,14 @@ mod tests {
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let mut delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let mut delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         delta.agents_changed = vec![changed_agent("assistant")];
         assert!(convergibility_refusals(&old, &new, &delta, &before).is_empty());
     }
@@ -1997,7 +2214,14 @@ mod tests {
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         let _ = convergibility_refusals(&old, &new, &delta, &before);
     }
 
@@ -2059,7 +2283,14 @@ mod tests {
         let surface =
             || brenn_surface_server::fixtures_config::SurfaceFixture::new("wall", "chart").build();
 
-        let stationary = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let stationary = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         assert_eq!(
             convergibility_refusals(&old, &new, &stationary, &before),
             vec![
@@ -2069,7 +2300,14 @@ mod tests {
             ],
         );
 
-        let mut moving = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let mut moving = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         moving
             .surfaces
             .changed
@@ -2111,7 +2349,14 @@ mod tests {
         let old = facts(&before);
         let new = facts(&after);
 
-        let mut delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let mut delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         assert!(
             delta.channels_changed.is_empty() && delta.channels_removed.is_empty(),
             "the channel itself did not move",
@@ -2148,7 +2393,14 @@ mod tests {
         };
         let old = facts(&before);
         let new = facts(&after);
-        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         let _ = convergibility_refusals(&old, &new, &delta, &before);
     }
 
@@ -2261,7 +2513,14 @@ mod tests {
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         assert!(delta.is_empty(), "a subscriber list is not an identity");
         assert!(convergibility_refusals(&old, &new, &delta, &before).is_empty());
     }
@@ -2298,7 +2557,14 @@ mod tests {
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         assert_eq!(delta.channels_removed.len(), 1);
         assert_eq!(
             convergibility_refusals(&old, &new, &delta, &live),
@@ -2341,7 +2607,14 @@ mod tests {
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let delta = plan_delta(
+            &old,
+            &new,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+            TEST_PLATFORM,
+        );
         convergibility_refusals(&old, &new, &delta, &before);
     }
 
@@ -2473,5 +2746,433 @@ mod tests {
             .push(revoking("writer", ADDRESS, &rows[1]));
         let (_, after) = dynamic_ingress_sides(&facts, &facts, &delta, &live);
         assert!(after.is_empty(), "nobody holds it any more");
+    }
+
+    /// A `[[remote]]` publishing to `exact` on the durable plane. Resolved
+    /// without its token, which only commit reads.
+    fn remote_publishing(slug: &str, exact: &str) -> RemoteFacts {
+        remote_with_acls(
+            slug,
+            vec![ChannelMatcherRaw::Exact(exact.to_string())],
+            vec![],
+        )
+    }
+
+    /// A remote granted publish under the two ACLs as stated.
+    fn remote_with_acls(
+        slug: &str,
+        publish_acl: Vec<ChannelMatcherRaw>,
+        ephemeral_publish_acl: Vec<ChannelMatcherRaw>,
+    ) -> RemoteFacts {
+        let raw = brenn_lib::messaging::remote::RemoteConfigRaw {
+            slug: slug.to_string(),
+            token_file: std::path::PathBuf::from("/nonexistent/token"),
+            grants: [
+                (!publish_acl.is_empty()).then_some(brenn_lib::messaging::AttachGrant::Publish),
+                (!ephemeral_publish_acl.is_empty())
+                    .then_some(brenn_lib::messaging::AttachGrant::EphemeralPublish),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            subscribe_acl: vec![],
+            ephemeral_subscribe_acl: vec![],
+            publish_acl,
+            ephemeral_publish_acl,
+            publish_burst: None,
+            publish_per_sec: None,
+            max_sessions: None,
+            max_subscriptions: None,
+        };
+        brenn_lib::messaging::remote::resolve_remote_facts_all(
+            &[raw],
+            &brenn_lib::messaging::config::MessagingGlobalConfig::default(),
+        )
+        .pop()
+        .expect("one remote")
+    }
+
+    /// `brenn:work` declared `non_text` or not, otherwise the base document.
+    fn work_declared(non_text: bool) -> BrennConfig {
+        let mut config = base();
+        let work = config
+            .channels
+            .iter_mut()
+            .find(|channel| channel.address.as_deref() == Some("brenn:work"))
+            .expect("the base declares brenn:work");
+        work.non_text = non_text;
+        config
+    }
+
+    /// Taking a durable channel from `non_text` to text-only is refused while a
+    /// remote may publish to it, and only then: the remote keeps writing
+    /// through the old declaration for as long as the commit's retirements
+    /// wait, and a reload does not retire it.
+    #[test]
+    fn a_text_only_flip_under_a_publishing_remote_is_refused() {
+        let pod = remote_publishing("pod", "work");
+        let elsewhere = remote_publishing("elsewhere", "other");
+        let to_text_only = delta_between(&work_declared(true), &work_declared(false), "aa", "aa");
+        let to_non_text = delta_between(&work_declared(false), &work_declared(true), "aa", "aa");
+        assert_eq!(
+            addresses(
+                &to_text_only
+                    .channels_changed
+                    .iter()
+                    .map(|change| Arc::clone(&change.new))
+                    .collect::<Vec<_>>()
+            ),
+            vec!["brenn:work"],
+            "the declaration is a retune of the one entry",
+        );
+
+        assert_eq!(
+            text_only_flips_under_remote_publishers(
+                &to_text_only,
+                &[pod.clone(), elsewhere.clone()]
+            ),
+            vec![
+                "brenn:work is changed to text-only but remote \"pod\" may publish to it: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+        );
+        assert!(
+            text_only_flips_under_remote_publishers(&to_text_only, &[elsewhere]).is_empty(),
+            "a remote whose ACL does not cover the channel cannot write to it",
+        );
+        assert!(
+            text_only_flips_under_remote_publishers(&to_non_text, &[pod]).is_empty(),
+            "widening a channel to non-text strands nothing",
+        );
+    }
+
+    /// A prefix grant covers the channel as an exact one does.
+    #[test]
+    fn a_text_only_flip_under_a_prefix_granted_remote_is_refused() {
+        let frames = |non_text: bool| {
+            let mut config = base();
+            config.channels.push(ChannelConfigRaw {
+                non_text,
+                ..durable(
+                    "brenn:pod.frames",
+                    "5f1d1a9e-0000-4000-8000-0000000000f1",
+                    4,
+                    None,
+                )
+            });
+            config
+        };
+        let pod = remote_with_acls(
+            "pod",
+            vec![ChannelMatcherRaw::Prefix("pod.".to_string())],
+            vec![],
+        );
+        let delta = delta_between(&frames(true), &frames(false), "aa", "aa");
+        assert_eq!(
+            text_only_flips_under_remote_publishers(&delta, &[pod]),
+            vec![
+                "brenn:pod.frames is changed to text-only but remote \"pod\" may publish to it: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// A change that keeps its uuid can rename the channel as it narrows it.
+    /// Until the commit's walk the remote writes through the old entry, by the
+    /// old address, so a grant on either address refuses the reload.
+    #[test]
+    fn a_text_only_flip_that_renames_is_refused_for_a_grant_on_either_address() {
+        let mut renamed = work_declared(false);
+        renamed
+            .channels
+            .iter_mut()
+            .find(|channel| channel.address.as_deref() == Some("brenn:work"))
+            .expect("the base declares brenn:work")
+            .address = Some("brenn:rest".to_string());
+        let delta = delta_between(&work_declared(true), &renamed, "aa", "aa");
+        let [change] = delta.channels_changed.as_slice() else {
+            panic!(
+                "one pinned uuid, one changed entry: {:?}",
+                delta.channels_changed.len()
+            );
+        };
+        assert_eq!(
+            (change.old.address.as_str(), change.new.address.as_str()),
+            ("brenn:work", "brenn:rest"),
+        );
+
+        let old_grant = remote_publishing("old", "work");
+        let new_grant = remote_publishing("new", "rest");
+        let neither = remote_publishing("neither", "other");
+        assert_eq!(
+            text_only_flips_under_remote_publishers(&delta, &[old_grant, new_grant, neither]),
+            vec![
+                "brenn:rest is changed to text-only but remote \"old\" may publish to it: \
+                 this change needs a restart"
+                    .to_string(),
+                "brenn:rest is changed to text-only but remote \"new\" may publish to it: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// `webhook:gh-events` with a tuning block, raw or wrapped.
+    fn webhook_tuned(non_text: bool) -> BrennConfig {
+        let mut config = BrennConfig::default();
+        config.channels.push(surface_index_channel());
+        let mut endpoint = webhook_endpoint_raw("gh-events");
+        // Within the default body cap, as a raw endpoint's ceiling must be.
+        endpoint.transport_ceiling_bytes = 65_536;
+        config.webhook_endpoints = vec![endpoint];
+        let mut tuning = durable("webhook:gh-events", "", 4, None);
+        tuning.uuid = None;
+        tuning.non_text = non_text;
+        config.channels.push(tuning);
+        config
+    }
+
+    /// Narrowing an ingress channel is refused whoever subscribes to it: the
+    /// transport keeps publishing through the commit. Widening is not.
+    #[test]
+    fn an_ingress_narrowing_is_refused() {
+        let narrowed = delta_between(&webhook_tuned(true), &webhook_tuned(false), "aa", "aa");
+        assert_eq!(
+            ingress_narrowings_under_their_transport(&narrowed),
+            vec![
+                "webhook:gh-events is changed to text-only but its transport publishes onto \
+                 it and a reload does not pause it: this change needs a restart"
+                    .to_string(),
+            ],
+        );
+        let widened = delta_between(&webhook_tuned(false), &webhook_tuned(true), "aa", "aa");
+        assert_eq!(addresses_changed(&widened), vec!["webhook:gh-events"]);
+        assert!(ingress_narrowings_under_their_transport(&widened).is_empty());
+        let declared = delta_between(&work_declared(true), &work_declared(false), "aa", "aa");
+        assert!(
+            ingress_narrowings_under_their_transport(&declared).is_empty(),
+            "a declared channel's narrowing is judged by its own writers' rules",
+        );
+    }
+
+    /// A static `mqtt:` channel minted by a consumer subscription, under a raw
+    /// tuning block stating `untyped_content_type` or not.
+    fn mqtt_raw_tuned(untyped_content_type: Option<&str>) -> BrennConfig {
+        let mut config = base();
+        config
+            .mqtt_clients
+            .push(brenn_messaging_boot::test_fixtures::minimal_mqtt_client(
+                "ha",
+            ));
+        let mut listener = consumer("listener", &[]);
+        listener.subscriptions = vec![brenn_lib::messaging::config::WasmConsumerSubscriptionRaw {
+            channel: Some("mqtt:ha:cam/+/frame".to_string()),
+            port: "in".to_string(),
+            push_depth: Some(Depth::Bounded(4)),
+            retain_depth: Some(Depth::Bounded(4)),
+            noise: None,
+            wake_min: None,
+            amplification: None,
+            non_text: true,
+        }];
+        listener.mqtt_subscribe_acl = vec![brenn_lib::access::raw::MqttSubMatcherRaw {
+            client: "ha".to_string(),
+            topic_filter: "cam/#".to_string(),
+        }];
+        config.wasm_consumers = vec![listener];
+        let mut tuning = ChannelConfigRaw {
+            address: None,
+            address_prefix: Some("mqtt:ha:cam/".to_string()),
+            ..durable("unused", "", 4, None)
+        };
+        tuning.uuid = None;
+        tuning.non_text = true;
+        tuning.untyped_content_type = untyped_content_type.map(str::to_string);
+        config.channels.push(tuning);
+        config
+    }
+
+    /// The declared type is part of the resolved channel, so changing it alone
+    /// moves the channel and the subscriber rules judge it.
+    #[test]
+    fn a_changed_untyped_content_type_moves_the_channel() {
+        let delta = delta_between(
+            &mqtt_raw_tuned(None),
+            &mqtt_raw_tuned(Some("application/octet-stream")),
+            "aa",
+            "aa",
+        );
+        assert_eq!(addresses_changed(&delta), vec!["mqtt:ha:cam/+/frame"]);
+        let [change] = delta.channels_changed.as_slice() else {
+            panic!("one changed entry");
+        };
+        assert_eq!(
+            change.new.resolved_channel.untyped_content_type.as_deref(),
+            Some("application/octet-stream"),
+        );
+        assert!(ingress_narrowings_under_their_transport(&delta).is_empty());
+    }
+
+    fn addresses_changed(delta: &PlanDelta) -> Vec<&str> {
+        delta
+            .channels_changed
+            .iter()
+            .map(|change| change.new.address.as_str())
+            .collect()
+    }
+
+    /// An ephemeral channel's flip is not refused: its ring leaves with the old
+    /// entry, so nothing a remote writes in the window outlives the reload.
+    #[test]
+    fn an_ephemeral_text_only_flip_under_a_publishing_remote_is_not_refused() {
+        let feed = |non_text: bool| {
+            let mut config = base();
+            config.channels.push(ChannelConfigRaw {
+                uuid: None,
+                standing_retain_depth: None,
+                non_text,
+                ..durable_channel("ephemeral:feed", Depth::Bounded(1))
+            });
+            config
+        };
+        let delta = delta_between(&feed(true), &feed(false), "aa", "aa");
+        assert_eq!(
+            addresses(
+                &delta
+                    .channels_changed
+                    .iter()
+                    .map(|change| Arc::clone(&change.new))
+                    .collect::<Vec<_>>()
+            ),
+            vec!["ephemeral:feed"],
+        );
+        let pod = remote_with_acls(
+            "pod",
+            vec![ChannelMatcherRaw::Exact("feed".to_string())],
+            vec![ChannelMatcherRaw::Exact("feed".to_string())],
+        );
+        assert!(text_only_flips_under_remote_publishers(&delta, &[pod]).is_empty());
+    }
+
+    /// A one-component surface of kind `chart` writing `writes`, if any.
+    fn surface_writing(slug: &str, writes: Option<&str>) -> ResolvedSurface {
+        let mut fixture = brenn_surface_server::fixtures_config::SurfaceFixture::new(slug, "chart");
+        if let Some(address) = writes {
+            fixture = fixture.output(address, "chart", "out");
+        }
+        fixture.build()
+    }
+
+    /// A surface with an output on the channel refuses its flip to text-only;
+    /// one writing elsewhere, and the flip the other way, refuse nothing.
+    #[test]
+    fn a_text_only_flip_under_a_surface_output_is_refused() {
+        let to_text_only = delta_between(&work_declared(true), &work_declared(false), "aa", "aa");
+        let to_non_text = delta_between(&work_declared(false), &work_declared(true), "aa", "aa");
+        let writer = surface_writing("wall", Some("brenn:work"));
+        let elsewhere = surface_writing("kiosk", Some("brenn:other"));
+        assert_eq!(
+            text_only_flips_under_surface_publishers(
+                &to_text_only,
+                &[writer.clone(), elsewhere.clone()],
+                TEST_PLATFORM,
+            ),
+            vec![
+                "brenn:work is changed to text-only but surface \"wall\" may publish to it: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+        );
+        assert!(
+            text_only_flips_under_surface_publishers(&to_text_only, &[elsewhere], TEST_PLATFORM)
+                .is_empty(),
+            "a surface that writes elsewhere cannot write to it",
+        );
+        assert!(
+            text_only_flips_under_surface_publishers(&to_non_text, &[writer], TEST_PLATFORM)
+                .is_empty(),
+            "widening a channel to non-text strands nothing",
+        );
+    }
+
+    /// A surface's platform channels are publishable by its pages without any
+    /// output naming them: its own status channel, and the error channel every
+    /// surface reports onto.
+    #[test]
+    fn a_text_only_flip_of_a_platform_channel_is_refused() {
+        const STATUS: &str = "brenn:surface.surface.wall.status";
+        const ERRORS: &str = "brenn:surface-errors";
+        let declared = |non_text: bool| {
+            let mut config = base();
+            for (address, uuid) in [
+                (STATUS, "5f1d1a9e-0000-4000-8000-0000000000a1"),
+                (ERRORS, "5f1d1a9e-0000-4000-8000-0000000000a2"),
+            ] {
+                config.channels.push(ChannelConfigRaw {
+                    non_text,
+                    ..durable(address, uuid, 4, None)
+                });
+            }
+            config
+        };
+        let delta = delta_between(&declared(true), &declared(false), "aa", "aa");
+        let surfaces = [
+            surface_writing("wall", None),
+            surface_writing("kiosk", None),
+        ];
+        assert_eq!(
+            text_only_flips_under_surface_publishers(&delta, &surfaces, TEST_PLATFORM),
+            vec![format!(
+                "{STATUS} is changed to text-only but surface \"wall\" may publish to it: \
+                     this change needs a restart"
+            ),],
+            "with no error channel configured, the error address is nobody's",
+        );
+        let with_errors = SurfacePlatform {
+            error_channel: Some(ERRORS),
+            ..TEST_PLATFORM
+        };
+        let mut refusals = text_only_flips_under_surface_publishers(&delta, &surfaces, with_errors);
+        refusals.sort();
+        let mut expected: Vec<String> = [(ERRORS, "kiosk"), (ERRORS, "wall"), (STATUS, "wall")]
+            .into_iter()
+            .map(|(address, slug)| {
+                format!(
+                    "{address} is changed to text-only but surface {slug:?} may publish to it: \
+                     this change needs a restart"
+                )
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(refusals, expected);
+    }
+
+    /// An ephemeral channel's flip is not refused: its ring leaves with the old
+    /// entry, and the surface writing it is promoted, so its sessions close
+    /// before the walk.
+    #[test]
+    fn an_ephemeral_text_only_flip_under_a_surface_output_is_not_refused() {
+        let feed = |non_text: bool| {
+            let mut config = base();
+            config.channels.push(ChannelConfigRaw {
+                uuid: None,
+                standing_retain_depth: None,
+                non_text,
+                ..durable_channel("ephemeral:feed", Depth::Bounded(1))
+            });
+            config
+        };
+        let delta = delta_between(&feed(true), &feed(false), "aa", "aa");
+        assert_eq!(delta.channels_changed.len(), 1);
+        assert!(
+            text_only_flips_under_surface_publishers(
+                &delta,
+                &[surface_writing("wall", Some("ephemeral:feed"))],
+                TEST_PLATFORM,
+            )
+            .is_empty()
+        );
     }
 }

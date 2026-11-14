@@ -31,6 +31,40 @@ pub(crate) fn conversation_container_suffix(conversation_id: i64) -> String {
     format!("conv{conversation_id}")
 }
 
+/// The context a CC spawn begins with: a session to resume, or an empty one.
+///
+/// The session id reaches [`build_cc_session_config`] only inside this value,
+/// and its one constructor, [`SessionStart::begin`], clears the read record of
+/// the conversation it is given when the context is empty. A spawn path that
+/// does not call `begin` cannot build its config.
+#[derive(Clone)]
+pub(crate) struct SessionStart {
+    resume_session_id: Option<String>,
+}
+
+impl SessionStart {
+    /// Decide the spawn's starting context. With no session to resume, the
+    /// conversation's CC context starts empty, so its read record on
+    /// `messenger` is cleared; with no `Messenger` there is no record.
+    pub(crate) fn begin(
+        messenger: Option<&brenn_messaging::Messenger>,
+        conversation_id: i64,
+        resume_session_id: Option<String>,
+    ) -> Self {
+        if resume_session_id.is_none()
+            && let Some(messenger) = messenger
+        {
+            messenger.forget_conversation_reads(conversation_id);
+        }
+        Self { resume_session_id }
+    }
+
+    /// Whether the spawn resumes a stored CC session.
+    pub(crate) fn is_resume(&self) -> bool {
+        self.resume_session_id.is_some()
+    }
+}
+
 /// Everything a CC spawn needs that is not already on the app's config.
 ///
 /// A struct rather than an argument list because there are two spawn paths —
@@ -47,7 +81,7 @@ pub(crate) struct CcSpawnInputs<'a> {
     /// runs until then.
     pub model: String,
     pub container_name_suffix: String,
-    pub resume_session_id: Option<String>,
+    pub session_start: SessionStart,
     pub transcript: Arc<TranscriptWriter>,
     pub alert_dispatcher: AlertDispatcher,
     /// Becomes `GRAF_USER_TZ` in CC's environment so graf MCP calls compute
@@ -70,13 +104,14 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
         tool_cli_path,
         model,
         container_name_suffix,
-        resume_session_id,
+        session_start,
         transcript,
         alert_dispatcher,
         user_tz,
         server_shutting_down,
         cc_profile,
     } = inputs;
+    let SessionStart { resume_session_id } = session_start;
     // Register hooks for ALL tools (matcher = None = wildcard).
     //
     // PreToolUse: intercept brenn noop tools (DisplayFile, ProposeReconciliation),
@@ -307,10 +342,18 @@ fn registry_virtual_tools(
                     desc.name, desc.mcp_name,
                 )
             });
+        let (description, input_schema) = if desc.accepts_attachments {
+            (
+                format!("{}{ACCEPTS_ATTACHMENTS_SENTENCE}", desc.description),
+                with_attachments_argument(desc.name, &desc.input_schema),
+            )
+        } else {
+            (desc.description.to_string(), desc.input_schema.clone())
+        };
         out.push(brenn_lib::integration::VirtualToolDef {
             name: short.to_string(),
-            description: desc.description.to_string(),
-            input_schema: desc.input_schema.clone(),
+            description,
+            input_schema,
             // A tool the hook path would prompt for has no approval leg as a
             // command.
             cli: if desc.auto_approve {
@@ -321,6 +364,51 @@ fn registry_virtual_tools(
         });
     }
     out
+}
+
+/// The sentence appended to the description of a registry tool that accepts
+/// attachments.
+const ACCEPTS_ATTACHMENTS_SENTENCE: &str = "\n\nThis tool takes attachments: name them in \
+     `attachments` as in BrennSend, each key the name the tool sees and each value \
+     {\"message_id\": …, \"name\": …} naming an attachment of a message this conversation was \
+     shown.";
+
+/// The description of the reserved `attachments` argument.
+const ATTACHMENTS_ARGUMENT_DESCRIPTION: &str = "Optional. Attachments to hand the tool by \
+     reference, at most 32: each key is the name the tool sees, each value {\"message_id\": \
+     \"<uuid>\", \"name\": \"<attachment name>\"} naming an attachment of a message this \
+     conversation was shown.";
+
+/// `schema` with the reserved `attachments` argument added to its top-level
+/// `properties`, which is created when the schema has none.
+///
+/// Panics if the schema already declares the property: registration refuses
+/// such a tool, so reaching here with one is that check bypassed.
+fn with_attachments_argument(tool: &str, schema: &serde_json::Value) -> serde_json::Value {
+    use brenn_envelope::tool_schema::ATTACHMENTS_ARGUMENT;
+
+    let mut schema = schema.clone();
+    let fields = schema
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("tool {tool:?}: an input schema is a JSON object"));
+    let properties = fields
+        .entry("properties")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("tool {tool:?}: `properties` of an input schema is an object"));
+    let previous = properties.insert(
+        ATTACHMENTS_ARGUMENT.to_string(),
+        serde_json::json!({
+            "type": "object",
+            "description": ATTACHMENTS_ARGUMENT_DESCRIPTION,
+        }),
+    );
+    assert!(
+        previous.is_none(),
+        "tool {tool:?} accepts attachments and its schema declares {ATTACHMENTS_ARGUMENT:?} \
+         (registration refuses such a tool)"
+    );
+    schema
 }
 
 /// Every virtual tool one agent is offered: core virtual tools + granted
@@ -803,6 +891,20 @@ mod tests {
         user_tz: chrono_tz::Tz,
         cc_profile: Option<brenn_cc_profile::ResolvedProfile>,
     ) -> CcSessionConfig {
+        run_build_cc_session_config_from(
+            app_config,
+            user_tz,
+            cc_profile,
+            SessionStart::begin(None, 7, None),
+        )
+    }
+
+    fn run_build_cc_session_config_from(
+        app_config: &brenn_lib::config::AppConfig,
+        user_tz: chrono_tz::Tz,
+        cc_profile: Option<brenn_cc_profile::ResolvedProfile>,
+        session_start: SessionStart,
+    ) -> CcSessionConfig {
         let dir = tempfile::tempdir().unwrap();
         let transcript =
             Arc::new(brenn_obs::transcript::TranscriptWriter::new(dir.path(), "test.log").unwrap());
@@ -814,7 +916,7 @@ mod tests {
             tool_cli_path: Path::new("/opt/brenn/brenn-tool"),
             model: "sonnet".to_string(),
             container_name_suffix: "conv-test".to_string(),
-            resume_session_id: None,
+            session_start,
             transcript,
             alert_dispatcher,
             user_tz,
@@ -1164,6 +1266,97 @@ mod tests {
         );
     }
 
+    /// A tool that accepts attachments is declared with the reserved
+    /// `attachments` argument and the sentence saying so; one that does not
+    /// is declared exactly as its descriptor states.
+    #[test]
+    fn only_an_accepting_tool_is_declared_with_the_attachments_argument() {
+        use brenn_lib::tools::ResolvedToolGrant;
+        use brenn_tool_registry::testutil::{ATTACHMENT_ECHO, AttachmentEchoTool};
+        use brenn_tool_registry::{RegisteredTool, ToolRegistry};
+
+        let pull = brenn_tool_registry::testutil::git_repo_pull_only();
+        let (pull_schema, pull_description) = {
+            let desc = pull.get("git-repo-pull").unwrap().descriptor();
+            (desc.input_schema.clone(), desc.description)
+        };
+        let mut tools: Vec<RegisteredTool> = vec![RegisteredTool::Async(std::sync::Arc::new(
+            AttachmentEchoTool::new(),
+        ))];
+        tools.push(pull.get("git-repo-pull").expect("the pull tool").clone());
+        let registry = ToolRegistry::new(tools);
+        let mut policy = brenn_lib::access::AppPolicy::default();
+        for name in [ATTACHMENT_ECHO, "git-repo-pull"] {
+            policy.tool_grants.insert(
+                name.to_string(),
+                ResolvedToolGrant {
+                    acl: vec![],
+                    rate_limit: None,
+                },
+            );
+        }
+        let declared = registry_virtual_tools(&policy, &registry);
+        let echo = declared
+            .iter()
+            .find(|t| t.name == "AttachmentEcho")
+            .expect("the echo is declared");
+        assert_eq!(
+            echo.input_schema,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "attachments": {
+                        "type": "object",
+                        "description": ATTACHMENTS_ARGUMENT_DESCRIPTION,
+                    },
+                },
+            })
+        );
+        assert_eq!(
+            echo.description,
+            format!("Echo the attachments handed to it.{ACCEPTS_ATTACHMENTS_SENTENCE}")
+        );
+        assert_eq!(
+            brenn_envelope::tool_schema::check_input_schema(&echo.input_schema),
+            Ok(())
+        );
+
+        let pull = declared
+            .iter()
+            .find(|t| t.name == "GitRepoPull")
+            .expect("the pull is declared");
+        assert_eq!(pull.input_schema, pull_schema);
+        assert_eq!(pull.description, pull_description);
+        assert!(
+            brenn_lib::tool_input::validate_tool_input(
+                "GitRepoPull",
+                &pull.input_schema,
+                &serde_json::json!({ "repos": [], "attachments": {} }),
+            )
+            .unwrap_err()
+            .starts_with("unknown argument(s): [\"attachments\"]")
+        );
+    }
+
+    /// The argument joins a schema's existing properties.
+    #[test]
+    fn the_attachments_argument_joins_existing_properties() {
+        let schema = with_attachments_argument(
+            "t",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } },
+                "required": ["q"],
+            }),
+        );
+        assert_eq!(
+            schema["properties"]["q"],
+            serde_json::json!({ "type": "string" })
+        );
+        assert_eq!(schema["properties"]["attachments"]["type"], "object");
+        assert_eq!(schema["required"], serde_json::json!(["q"]));
+    }
+
     // -----------------------------------------------------------------------
     // compute_allowed_tools
     // -----------------------------------------------------------------------
@@ -1503,5 +1696,58 @@ mod tests {
                 "{var}: {message}"
             );
         }
+    }
+
+    /// A messenger whose read record holds one message for each of
+    /// conversations 7 and 8, with the two message ids.
+    fn messenger_with_reads() -> (Arc<brenn_messaging::Messenger>, uuid::Uuid, uuid::Uuid) {
+        let messenger = brenn_messaging::testutils::empty_directory_messenger("brenn-test");
+        let (mine, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        messenger.note_conversation_sent(7, mine, "brenn:src");
+        messenger.note_conversation_sent(8, other, "brenn:src");
+        (messenger, mine, other)
+    }
+
+    #[test]
+    fn beginning_an_empty_context_clears_that_conversations_reads_only() {
+        let (messenger, mine, other) = messenger_with_reads();
+        let start = SessionStart::begin(Some(&*messenger), 7, None);
+        assert!(!start.is_resume());
+        assert!(!messenger.conversation_has_read(7, mine));
+        assert!(messenger.conversation_has_read(8, other));
+    }
+
+    #[test]
+    fn beginning_a_resume_keeps_the_reads() {
+        let (messenger, mine, other) = messenger_with_reads();
+        let start = SessionStart::begin(Some(&*messenger), 7, Some("sess-1".to_string()));
+        assert!(start.is_resume());
+        assert!(messenger.conversation_has_read(7, mine));
+        assert!(messenger.conversation_has_read(8, other));
+    }
+
+    #[test]
+    fn beginning_without_a_messenger_only_decides_the_context() {
+        assert!(!SessionStart::begin(None, 7, None).is_resume());
+        assert!(SessionStart::begin(None, 7, Some("sess-1".to_string())).is_resume());
+    }
+
+    #[tokio::test]
+    async fn the_config_carries_the_begun_session_id() {
+        let app = minimal_test_app_config();
+        let resumed = run_build_cc_session_config_from(
+            &app,
+            chrono_tz::UTC,
+            None,
+            SessionStart::begin(None, 7, Some("sess-1".to_string())),
+        );
+        assert_eq!(resumed.resume_session_id.as_deref(), Some("sess-1"));
+        let fresh = run_build_cc_session_config_from(
+            &app,
+            chrono_tz::UTC,
+            None,
+            SessionStart::begin(None, 7, None),
+        );
+        assert_eq!(fresh.resume_session_id, None);
     }
 }

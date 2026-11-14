@@ -44,26 +44,67 @@ pub const MANIFEST_VERSION: u32 = 3;
 const PROCESSOR_PACKAGE: &str = "brenn:processor";
 
 /// The WIT interfaces a surface-hosted processor may import: the transpilable
-/// profile. `store`/`mqtt`/`tools`/`provides` are backend-only; `dom`/`page-dom` run
+/// profile. `store`/`mqtt`/`tools`/`provides`/`blobs` are backend-only; `dom`/`page-dom` run
 /// the other way and are surface-only, because only a page has a DOM.
 ///
-/// `types` is in the set but is not a capability: it defines the shared record
-/// and enum shapes the other interfaces speak, so every processor imports it and
-/// no host implements it (jco resolves it structurally). It is listed here
-/// because the manifest reports the world's imports truthfully, and a
-/// type-carrying import must not read as an unsatisfiable one.
-const SURFACE_IMPORTS: [&str; 8] = [
-    "types", "ports", "log", "alert", "config", "calls", "dom", "page-dom",
+/// `types` and `bus` are in the set but are not capabilities: they define the
+/// record and enum shapes the other interfaces speak, so a processor imports
+/// them and no host implements them (jco resolves them structurally). `bus` is
+/// imported only by a `brenn:processor@0.2.0` artifact, whose activation it
+/// defines. They are listed here because the manifest reports the world's
+/// imports truthfully, and a type-carrying import must not read as an
+/// unsatisfiable one.
+const SURFACE_IMPORTS: [&str; 9] = [
+    "types", "bus", "ports", "log", "alert", "config", "calls", "dom", "page-dom",
 ];
 
-/// Every WIT interface name `processor.wit` defines. An import outside this set
-/// is manifest/toolchain drift (the build wrote a name no world declares), which
+/// Every WIT interface name the processor WIT files define (`bus` is defined
+/// only in `processor-0.2.wit`, `blobs` only in `processor-0.3.wit`). An import outside this set is
+/// manifest/toolchain drift (the build wrote a name no world declares), which
 /// is a different operator problem from declaring a backend-only component on a
 /// surface — and gets its own panic.
-const KNOWN_IMPORTS: [&str; 12] = [
-    "types", "ports", "log", "alert", "config", "store", "mqtt", "tools", "provides", "calls",
-    "dom", "page-dom",
+const KNOWN_IMPORTS: [&str; 14] = [
+    "types", "bus", "ports", "log", "alert", "config", "store", "mqtt", "tools", "provides",
+    "calls", "blobs", "dom", "page-dom",
 ];
+
+/// Why a record this server reads no further, or a `brenn:processor@0.2.0`
+/// artifact that does not have the contract's shape, is not served: the outcome a caller withholds under a
+/// bundle's mount and refuses under brenn's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnservedRecord {
+    /// The schema version the record declares.
+    pub record_v: u32,
+    /// One sentence naming the cause and what the kind's author does about it.
+    pub reason: String,
+}
+
+/// The component contract a kind's record says its artifact is built against.
+///
+/// The record lists imports without versions, stripped by the rule
+/// [`brenn_wasm::strip_import_version`] states (the build's emitter is held to
+/// it), so the contract's marker interface is stripped by that rule and matched
+/// by its bare name: a record listing it is `brenn:processor@0.2.0`, one without
+/// it `brenn:processor@0.1.0`.
+pub fn record_contract(manifest: &ProcessorManifest) -> brenn_envelope::grants::ProcessorContract {
+    brenn_envelope::grants::ProcessorContract::detect(
+        manifest.imports.iter().map(String::as_str),
+        |import, marker| import == brenn_wasm::strip_import_version(marker),
+    )
+}
+
+/// Why a kind on the byte-carrying contract is not served: its artifact does
+/// not have that contract's shape. One sentence naming the kind, the contract, wasmtime's account and
+/// the migration.
+pub fn stale_contract_reason(kind: &str, refusal: &brenn_wasm::SurfaceComponentRefusal) -> String {
+    use brenn_envelope::grants::ProcessorContract;
+    format!(
+        "processor component {kind:?} declares the component contract {}, but its artifact \
+         does not have that contract's shape ({refusal}). Rebuild the kind against this brenn's \
+         `processor-0.2.wit`.",
+        ProcessorContract::V0_2,
+    )
+}
 
 /// The one promise every record makes, whatever version wrote it: an integer
 /// `v`. Parsed on its own, without `deny_unknown_fields`, so that a record from
@@ -194,8 +235,9 @@ pub fn validate_processor_kind_in(
 ///
 /// On a missing/unparseable manifest, a wrong schema version, a kind/directory
 /// mismatch, a missing listed file, a specification name that is not the one
-/// the kind derives, a backend-only import, or an import name no WIT interface
-/// defines.
+/// the kind derives, a byte-carrying kind whose artifact is unreadable or is not
+/// one this host serves, a backend-only import, or an import name no WIT
+/// interface defines.
 pub fn read_processor_record_in(
     cx: AssetContext,
     surface_root: &Path,
@@ -203,26 +245,29 @@ pub fn read_processor_record_in(
 ) -> ProcessorManifest {
     let AssetContext { when, verdict } = cx;
     read_processor_record_or_version_in(cx, surface_root, kind)
-        .unwrap_or_else(|found| panic!("{when}: {}{verdict}", version_mismatch_reason(kind, found)))
+        .unwrap_or_else(|unserved| panic!("{when}: {}{verdict}", unserved.reason))
 }
 
-/// The same read, with the version verdict handed back instead of panicked on.
+/// The same read, with the two verdicts that withhold a kind handed back
+/// instead of panicked on.
 ///
-/// `Err(v)` is the record's own `v`, for a record this server does not read.
-/// The caller decides what a version mismatch means where it found the tree: a
-/// broken install under brenn's own mount, or a bundle mid-upgrade under any
-/// other declared mount, which is withheld rather than fatal.
+/// `Err` is a record this server does not serve: one whose `v` it does not
+/// read, or a `brenn:processor@0.2.0` artifact that does not have the
+/// contract's shape. The caller decides what that means where
+/// it found the tree: a broken install under brenn's own mount, or a bundle
+/// authored on its own schedule under any other declared mount, which is
+/// withheld rather than fatal.
 ///
 /// # Panics
 ///
 /// On a missing/unreadable manifest, a manifest whose `v` does not parse, and —
 /// once the version matches — everything [`read_processor_record_in`] panics
-/// on.
+/// on, including an unreadable artifact for a kind on the byte-carrying contract.
 pub fn read_processor_record_or_version_in(
     cx: AssetContext,
     surface_root: &Path,
     kind: &str,
-) -> Result<ProcessorManifest, u32> {
+) -> Result<ProcessorManifest, UnservedRecord> {
     let AssetContext { when, verdict } = cx;
     let dir = kind_dir(surface_root, kind);
     let manifest_path = dir.join("manifest.json");
@@ -250,7 +295,10 @@ pub fn read_processor_record_or_version_in(
         )
     });
     if declared.v != MANIFEST_VERSION {
-        return Err(declared.v);
+        return Err(UnservedRecord {
+            record_v: declared.v,
+            reason: version_mismatch_reason(kind, declared.v),
+        });
     }
 
     let manifest: ProcessorManifest = serde_json::from_str(&raw).unwrap_or_else(|err| {
@@ -284,6 +332,47 @@ pub fn read_processor_record_or_version_in(
 
     assert_spec_name_derives(cx, kind, &manifest);
     assert_import_profile(cx, kind, &manifest);
+    // The page's glue is generated from the artifact's own types and checks
+    // nothing against the host, so a 0.2.0 kind is held to the host's shapes
+    // here, on the artifact the transpile consumed. A 0.1.0 kind's artifact is
+    // not opened.
+    if record_contract(&manifest) == brenn_envelope::grants::ProcessorContract::V0_2 {
+        let artifact = component_artifact(kind);
+        let path = dir.join(&artifact);
+        // An unreadable artifact is a broken install, fatal under any mount as
+        // an unreadable record is; only bytes that are not the contract's shape
+        // withhold a bundle's kind.
+        let bytes = std::fs::read(&path).unwrap_or_else(|err| {
+            panic!(
+                "{when}: processor component {kind:?} source artifact {artifact} is unreadable at \
+                 {} ({err}) — its contract shape cannot be checked. Rebuild the surface \
+                 assets (`make build`) and redeploy.{verdict}",
+                path.display(),
+            )
+        });
+        let started = std::time::Instant::now();
+        // TODO(efficiency-surface-type-check-recompiles-every-kind-every-scan):
+        // carry the verdict for an unchanged artifact across scans rather than
+        // compiling every offered kind at boot and at every reload.
+        let checked = brenn_wasm::check_surface_component(&bytes);
+        // One compile per such kind per scan; the time is what says whether
+        // that cost needs a memo. The refusal is logged here with the path,
+        // which the reason served to pages does not carry.
+        tracing::info!(
+            kind = %kind,
+            artifact = %path.display(),
+            elapsed_ms = started.elapsed().as_millis(),
+            accepted = checked.is_ok(),
+            refusal = checked.as_ref().err().map(tracing::field::display),
+            "surface byte-contract artifact checked"
+        );
+        if let Err(refusal) = checked {
+            return Err(UnservedRecord {
+                record_v: manifest.v,
+                reason: stale_contract_reason(kind, &refusal),
+            });
+        }
+    }
 
     Ok(manifest)
 }
@@ -515,9 +604,96 @@ pub fn assert_imports_granted(
     }
 }
 
+/// Refuse an instance whose kind's contract carries only text when any port it
+/// binds, input or output, is on a channel declared `non_text` — page-local or
+/// transportable.
+///
+/// The backend's rule for a consumer, asked of a surface instance. Outputs
+/// count as well as inputs: an instance reads its own parked messages back
+/// through its deferred view, so a 0.1.0 build bound to an output on a
+/// `non_text` channel could be handed a non-text body as a string — and the
+/// page kernel's lowering panics on that. `call` and `sync` ports are bound to
+/// no channel and are not examined.
+///
+/// The declaration is read off the resolved surface: `local_channels` for a
+/// page-local channel, `wire_channels` (the directory's) for a transportable
+/// one. The fix the message names depends on the class: a page-local
+/// channel's declaration is the ports' statement, a transportable one's is the
+/// channel's own.
+///
+/// Asked after the kind's record is read, because the contract is a fact of
+/// the artifact and the configuration does not state it; the caller skips an
+/// instance of a withheld kind, which is not served.
+///
+/// # Panics
+///
+/// On the first such port, naming the surface, the instance, the port, the
+/// channel, the kind and both contracts.
+pub fn assert_contract_carries_bound_channels(
+    cx: AssetContext,
+    surface: &brenn_lib::messaging::config::ResolvedSurface,
+    instance: &str,
+    kind: &str,
+    contract: brenn_envelope::grants::ProcessorContract,
+) {
+    if contract.carries_non_text_bodies() {
+        return;
+    }
+    let AssetContext { when, verdict } = cx;
+    // The class of channel a `non_text` declaration sits in, as the refusal
+    // names it, and the fix it offers.
+    let declared_class = |channel: &str| {
+        if surface
+            .local_channels
+            .iter()
+            .any(|c| c.non_text && c.address == channel)
+        {
+            Some((
+                "a page-local channel declared `non_text`",
+                "drop `non_text` from the ports bound to that channel",
+            ))
+        } else if surface
+            .wire_channels
+            .iter()
+            .any(|c| c.non_text && c.address == channel)
+        {
+            Some((
+                "a channel declared `non_text`",
+                "bind the port to a text-only channel",
+            ))
+        } else {
+            None
+        }
+    };
+    let inputs = surface
+        .subscriptions
+        .iter()
+        .filter(|b| b.instance == instance)
+        .map(|b| ("input", &b.port, &b.channel_address));
+    let outputs = surface
+        .outputs
+        .iter()
+        .filter(|b| b.instance == instance)
+        .map(|b| ("output", &b.port, &b.channel_address));
+    for (direction, port, channel) in inputs.chain(outputs) {
+        if let Some((class, fix)) = declared_class(channel) {
+            panic!(
+                "{when}: [[surface]] {:?}: component {instance:?}'s {direction} port {port:?} is \
+                 bound to {channel}, {class}, and its kind {kind:?} is built against \
+                 {contract}, which carries only text — {fix}, or install a build of the kind \
+                 against {}.{verdict}",
+                surface.slug,
+                brenn_envelope::grants::ProcessorContract::V0_2,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use brenn_envelope::grants::{ComponentGrant, ComponentHost};
+    use std::collections::BTreeSet;
+
+    use brenn_envelope::grants::{ComponentGrant, ComponentHost, ProcessorContract};
 
     use super::{KNOWN_IMPORTS, SURFACE_IMPORTS};
 
@@ -557,9 +733,21 @@ mod tests {
         );
     }
 
-    /// The interface name in an import list that is no capability: it carries
-    /// the shared types every processor speaks and no host implements it.
-    const TYPES: &str = "types";
+    /// The interface names in an import list that are no capability: they
+    /// carry the shapes the processor interfaces speak and no host implements
+    /// them. Derived from the contracts' own type-only lists.
+    fn type_only() -> BTreeSet<&'static str> {
+        ProcessorContract::ALL
+            .into_iter()
+            .flat_map(ProcessorContract::type_only_imports)
+            .map(|import| {
+                let interface = brenn_wasm::strip_import_version(import);
+                interface
+                    .rsplit_once('/')
+                    .map_or(interface, |(_package, name)| name)
+            })
+            .collect()
+    }
 
     /// The grant that names no interface, so no import list can hold it.
     const NO_INTERFACE: ComponentGrant = ComponentGrant::Takeover;
@@ -567,7 +755,7 @@ mod tests {
     /// The interface names the world defines and only a surface host links.
     /// [`KNOWN_IMPORTS`] is "every interface `processor.wit` defines", so it
     /// carries them; a top-level component may not be granted them. That is the
-    /// mirror image of `store`/`mqtt`/`tools`/`provides`, which the world defines and only
+    /// mirror image of `store`/`mqtt`/`tools`/`provides`/`blobs`, which the world defines and only
     /// the backend links.
     const SURFACE_ONLY: [&str; 2] = ["dom", "page-dom"];
 
@@ -581,7 +769,7 @@ mod tests {
             .iter()
             .copied()
             .filter(|import| {
-                *import == TYPES
+                type_only().contains(import)
                     || ComponentGrant::parse(import)
                         .unwrap_or_else(|| panic!("{import} names an interface and no grant word"))
                         .illegal_on(host)
@@ -595,7 +783,7 @@ mod tests {
     /// every deviation named above rather than tolerated as a difference.
     fn assert_pinned(host: ComponentHost, imports: &[&str]) {
         for import in imports {
-            if *import == TYPES {
+            if type_only().contains(import) {
                 continue;
             }
             let grant = ComponentGrant::parse(import)
@@ -641,6 +829,56 @@ mod tests {
                 "`{word}` is refused at the top level and its profile links it"
             );
         }
+    }
+
+    /// A type-only interface is imported with no grant, so both lists carry it
+    /// and none of them may spell a grant word; a contract that gains one fails
+    /// here until the lists follow.
+    #[test]
+    fn the_type_only_imports_are_in_both_import_lists() {
+        let type_only = type_only();
+        assert_eq!(type_only, BTreeSet::from(["bus", "types"]));
+        for name in type_only {
+            assert!(
+                SURFACE_IMPORTS.contains(&name),
+                "`{name}` is type-only and the surface profile omits it"
+            );
+            assert!(
+                KNOWN_IMPORTS.contains(&name),
+                "`{name}` is type-only and the world defines it nowhere"
+            );
+            assert!(
+                ComponentGrant::parse(name).is_none(),
+                "`{name}` is type-only and spells a grant word"
+            );
+        }
+    }
+
+    /// Exactly a record listing the bare `bus` interface is on 0.2.0.
+    #[test]
+    fn a_records_contract_is_read_off_its_bare_imports() {
+        let record = |imports: &[&str]| super::ProcessorManifest {
+            v: super::MANIFEST_VERSION,
+            kind: "panel".to_string(),
+            source_sha256: String::new(),
+            jco_version: String::new(),
+            spec: "panel.spec.brenn".to_string(),
+            spec_sha256: String::new(),
+            imports: imports.iter().map(|i| (*i).to_string()).collect(),
+            files: Vec::new(),
+        };
+        assert_eq!(
+            super::record_contract(&record(&["brenn:processor/types", "brenn:processor/ports"])),
+            ProcessorContract::V0_1,
+        );
+        assert_eq!(
+            super::record_contract(&record(&[
+                "brenn:processor/bus",
+                "brenn:processor/ports",
+                "brenn:processor/types",
+            ])),
+            ProcessorContract::V0_2,
+        );
     }
 
     #[test]

@@ -151,6 +151,46 @@ write_file(
     content = ['{"type": "object"}', ""],
 )
 
+# The page rig's fixture kinds — one raw kind per contract and the guest-SDK
+# kind — staged like served kinds and never served: they are outside
+# `_PROCESSOR_KINDS`, so they are not in `dist`.
+surface_processor_assets(
+    name = "processor-page-test_assets",
+    component = "//brenn-wasm/components/processor-page-test:component",
+    kind = "processor-page-test",
+    spec = "//brenn-wasm/components/processor-page-test:spec/processor-page-test.brenn",
+)
+
+surface_processor_assets(
+    name = "processor-page-bytes-test_assets",
+    component = "//brenn-wasm/components/processor-page-bytes-test:component",
+    kind = "processor-page-bytes-test",
+    spec = "//brenn-wasm/components/processor-page-bytes-test:spec/processor-page-bytes-test.brenn",
+)
+
+surface_processor_assets(
+    name = "processor-sdk-bytes-test_assets",
+    component = "//brenn-wasm/components/processor-sdk-bytes-test:component",
+    kind = "processor-sdk-bytes-test",
+    spec = "//brenn-wasm/components/processor-sdk-bytes-test:spec/processor-sdk-bytes-test.brenn",
+)
+
+# What the page rig serves: the production kernel bundle and the fixture kinds,
+# laid out as `dist` lays them out.
+surface_dist(
+    name = "page_rig_dist",
+    testonly = True,
+    dirname = "page-rig-dist",
+    stages = [
+        ":processor-page-bytes-test_assets",
+        ":processor-page-test_assets",
+        ":processor-sdk-bytes-test_assets",
+        "//surface/kernel:kernel_dist",
+    ],
+    target_compatible_with = HOST_ONLY,
+    visibility = ["//frontend:__pkg__"],
+)
+
 # Derived, not retyped. `surface_processor_component()` mints `<kind>_dist` in every
 # component package, and a hand-written list here is a second edit a mechanical
 # component addition would not know to make — the component would build, lint

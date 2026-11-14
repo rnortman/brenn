@@ -6,11 +6,16 @@ use uuid::Uuid;
 use std::os::unix::fs::OpenOptionsExt as _;
 
 use super::cursors;
+use super::envelope_row::{ENVELOPE_COLUMNS, ENVELOPE_FROM_JOINS};
 use super::shared::{ns_to_utc, parse_rfc3339};
 use super::types::PendingPushRow;
+use crate::blob::HeldAttachments;
 use crate::store::OverflowEvent;
 use brenn_db::format_ts_for_db;
-use brenn_lib::messaging::{ChannelScheme, Impetus, MessageEnvelope, ParticipantId, Urgency};
+use brenn_lib::messaging::{
+    Attachments, ChannelScheme, EnvelopeShape, Impetus, MessageBody, MessageEnvelope,
+    ParticipantId, TransportMeta, Urgency, write_attachment_refs,
+};
 
 // ---------------------------------------------------------------------------
 // Message insert
@@ -28,14 +33,15 @@ pub struct InsertedMessage {
 }
 
 /// Insert a message row in a single transaction. The caller has already
-/// validated channel/sender/budget.
+/// validated channel/sender/budget. The row carries no transport metadata and
+/// no attachments.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_message(
     conn: &Connection,
     channel_uuid: Uuid,
     source: &str,
     sender: &str,
-    body: &str,
+    body: &MessageBody,
     urgency: Urgency,
     envelope_type: ChannelScheme,
     reply_to_uuid: Option<Uuid>,
@@ -57,6 +63,8 @@ pub fn insert_message(
         delivery_deadline,
         deliver_after,
         impetus,
+        None,
+        &HeldAttachments::none(),
         publish_ts_ns,
     );
     tx.commit().expect("messaging: commit tx");
@@ -67,21 +75,28 @@ pub fn insert_message(
 /// responsible for BEGIN/COMMIT (or rollback on panic via the `Transaction`
 /// Drop guard).
 ///
-/// Used by `publish_from_wasm` to batch multiple messages into one outer
-/// transaction. All other callers use `insert_message`.
+/// A non-empty `attachments` is adopted in the same transaction: its blobs'
+/// rows are written and their reference counts raised. The caller has already
+/// called [`HeldAttachments::make_durable`] and, once the transaction commits,
+/// calls [`HeldAttachments::confirm_adopted`].
+///
+/// Used by the `Messenger`, which batches messages into one outer transaction
+/// and is the one writer of `transport`; other callers use `insert_message`.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_message_in_tx(
     tx: &rusqlite::Transaction<'_>,
     channel_uuid: Uuid,
     source: &str,
     sender: &str,
-    body: &str,
+    body: &MessageBody,
     urgency: Urgency,
     envelope_type: ChannelScheme,
     reply_to_uuid: Option<Uuid>,
     delivery_deadline: Option<DateTime<Utc>>,
     deliver_after: Option<DateTime<Utc>>,
     impetus: Option<Impetus>,
+    transport: Option<&TransportMeta>,
+    attachments: &HeldAttachments,
     publish_ts_ns: i64,
 ) -> InsertedMessage {
     let now = format_ts_for_db(Utc::now());
@@ -91,6 +106,7 @@ pub fn insert_message_in_tx(
     let reply_to_bytes = reply_to_uuid.map(|u| u.as_bytes().to_vec());
     let dd = delivery_deadline.map(format_ts_for_db);
     let da = deliver_after.map(format_ts_for_db);
+    let (body_value, content_type) = super::body_columns(body);
 
     let retained_seq = match deliver_after {
         None => Some(allocate_retained_seq(tx, channel_uuid)),
@@ -101,14 +117,14 @@ pub fn insert_message_in_tx(
         "INSERT INTO messaging_messages
          (uuid, channel_uuid, source, sender, body, urgency, envelope_type,
           reply_to_uuid, delivery_deadline, deliver_after, publish_ts_ns, created_at,
-          retained_seq, impetus)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+          retained_seq, impetus, content_type, transport, attachments)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         rusqlite::params![
             uuid_bytes,
             channel_bytes,
             source,
             sender,
-            body,
+            body_value,
             urgency.as_str(),
             envelope_type.as_str(),
             reply_to_bytes,
@@ -118,10 +134,14 @@ pub fn insert_message_in_tx(
             now,
             retained_seq,
             impetus.map(Impetus::as_str),
+            content_type,
+            transport.map(super::transport_column),
+            super::attachments_column(attachments.refs()),
         ],
     )
     .expect("messaging: insert message");
     let message_id = tx.last_insert_rowid();
+    crate::blob::adopt_in_tx(tx, message_id, attachments);
 
     InsertedMessage {
         id: message_id,
@@ -193,6 +213,39 @@ pub fn assign_retained_seqs(conn: &Connection, channel_uuid: Uuid, message_ids: 
 // Bus GC
 // ---------------------------------------------------------------------------
 
+/// The eviction archive's line shape: the text shape, plus the content type
+/// after the body when there is one, and for a non-text body `body_base64`
+/// (standard padded base64) in place of `body`; and each attachment's full
+/// reference. An attachment's bytes are not archived.
+pub(crate) struct ArchiveShape;
+
+impl EnvelopeShape for ArchiveShape {
+    fn serialize_body<S: serde::ser::SerializeStruct>(
+        body: &MessageBody,
+        out: &mut S,
+    ) -> Result<(), S::Error> {
+        use base64ct::Encoding as _;
+        match body.as_text() {
+            Some(text) => out.serialize_field("body", text)?,
+            None => out.serialize_field(
+                "body_base64",
+                &base64ct::Base64::encode_string(body.as_bytes()),
+            )?,
+        }
+        if let Some(content_type) = body.content_type() {
+            out.serialize_field("content_type", content_type)?;
+        }
+        Ok(())
+    }
+
+    fn serialize_attachments<S: serde::ser::SerializeStruct>(
+        attachments: &Attachments,
+        out: &mut S,
+    ) -> Result<(), S::Error> {
+        write_attachment_refs(attachments, out)
+    }
+}
+
 /// What one channel's eviction pass deleted, and whom it cost.
 #[derive(Debug, Default)]
 pub struct BusGcEviction {
@@ -215,7 +268,9 @@ pub struct BusGcEviction {
 /// Steps (all in one `unchecked_transaction`):
 /// 1. Count rows for the channel; if `<= frontier`, returns immediately.
 /// 2. For `archive` sink: SELECT eligible bodies (NOT IN top-frontier set) and
-///    write each as a JSONL line to `archive_path`.
+///    write each as a JSONL line in the [`ArchiveShape`] to `archive_path`. A
+///    body of every kind is archived losslessly: text as `body`, a non-text
+///    body as `body_base64`, each with its `content_type` when it has one.
 /// 3. Delete eligible message rows using the same NOT IN predicate (FTS triggers
 ///    fire on each row DELETE, keeping the FTS index consistent).
 /// 4. Report, per subscriber cursor this pass's eviction outran, how much of
@@ -316,7 +371,7 @@ pub fn bus_gc_evict_channel(
             .prepare(
                 "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                         m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                        rc.address, m.impetus
+                        rc.address, m.impetus, m.content_type, m.transport, m.attachments
                  FROM messaging_messages m
                  LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
                  WHERE m.channel_uuid = ?1
@@ -338,17 +393,21 @@ pub fn bus_gc_evict_channel(
                 rusqlite::params![channel_uuid_bytes, frontier as i64],
                 |row| {
                     let msg_uuid_bytes: Vec<u8> = row.get(0)?;
+                    let message_id = Uuid::from_slice(&msg_uuid_bytes)
+                        .expect("bus_gc_evict_channel: malformed uuid in db");
                     let source: String = row.get(1)?;
                     let sender: String = row.get(2)?;
-                    let body: String = row.get(3)?;
+                    let body = super::read_body(row, 3, 10, message_id)?;
                     let urgency_str: String = row.get(4)?;
                     let delivery_deadline_s: Option<String> = row.get(5)?;
                     let deliver_after_s: Option<String> = row.get(6)?;
                     let publish_ts_ns: i64 = row.get(7)?;
                     let reply_to: Option<String> = row.get(8)?;
                     let impetus_str: Option<String> = row.get(9)?;
+                    let transport = super::read_transport(row, 11, message_id)?;
+                    let attachments = super::read_attachments(row, 12, message_id)?;
                     Ok((
-                        msg_uuid_bytes,
+                        message_id,
                         source,
                         sender,
                         body,
@@ -358,13 +417,15 @@ pub fn bus_gc_evict_channel(
                         publish_ts_ns,
                         reply_to,
                         impetus_str,
+                        transport,
+                        attachments,
                     ))
                 },
             )
             .expect("bus_gc_evict_channel: archive SELECT query")
             .map(|r| {
                 let (
-                    msg_uuid_bytes,
+                    message_id,
                     source,
                     sender,
                     body,
@@ -374,9 +435,9 @@ pub fn bus_gc_evict_channel(
                     publish_ts_ns,
                     reply_to,
                     impetus_str,
+                    transport,
+                    attachments,
                 ) = r.expect("bus_gc_evict_channel: archive SELECT row");
-                let message_id = Uuid::from_slice(&msg_uuid_bytes)
-                    .expect("bus_gc_evict_channel: malformed uuid in db");
                 let urgency = Urgency::parse(&urgency_str).unwrap_or_else(|| {
                     panic!("bus_gc_evict_channel: invalid urgency: {urgency_str:?}")
                 });
@@ -405,6 +466,8 @@ pub fn bus_gc_evict_channel(
                     impetus,
                     urgency,
                     envelope_type: channel_envelope_type,
+                    transport,
+                    attachments,
                 }
             })
             .collect();
@@ -425,7 +488,7 @@ pub fn bus_gc_evict_channel(
                 .open(path)
                 .unwrap_or_else(|e| panic!("bus_gc_evict_channel: open archive {path:?}: {e}"));
             for envelope in &envelopes {
-                let line = serde_json::to_string(envelope)
+                let line = serde_json::to_string(&envelope.shaped::<ArchiveShape>())
                     .expect("bus_gc_evict_channel: serialize envelope");
                 writeln!(file, "{line}").unwrap_or_else(|e| {
                     panic!("bus_gc_evict_channel: write archive {path:?}: {e}")
@@ -439,6 +502,9 @@ pub fn bus_gc_evict_channel(
     // Step 3: delete eligible message rows (FTS trigger fires on each DELETE).
     // Snapshot is stable under the SQLite mutex. Parked rows (retained_seq NULL)
     // are excluded — a long-parked message is never reaped before it releases.
+    // A parked row is not retained and this statement never deletes it, so its
+    // blobs stay referenced. The delete trigger lowers the reference count of
+    // every blob a deleted row named; the bytes go at the next reap.
     let messages_deleted = tx
         .execute(
             "DELETE FROM messaging_messages
@@ -607,19 +673,15 @@ fn depth_limit(depth: brenn_lib::messaging::config::Depth) -> i64 {
 
 /// The one retained-window query body, shared by every retention-order read.
 ///
-/// Selects the 14 envelope columns `super::row_to_envelope` decodes (0-13) plus
-/// `m.id` (14) and `m.retained_seq` (15), newest-first, for channel `?1`.
+/// Selects the 17 envelope columns `super::row_to_envelope` decodes (0-16) plus
+/// `m.id` (17) and `m.retained_seq` (18), newest-first, for channel `?1`.
 /// `where_tail` adds predicates after the retained-set predicate; `limit_param`
 /// names the bind holding the row cap. One copy so a change to the retained-set
 /// predicate cannot land on some reads and miss others.
 fn retained_window_sql(where_tail: &str, limit_param: &str) -> String {
     format!(
-        "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency,
-                m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                c.address, rc.address, m.envelope_type, m.impetus, m.id, m.retained_seq
-         FROM messaging_messages m
-         JOIN messaging_channels c ON c.uuid = m.channel_uuid
-         LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
+        "SELECT {ENVELOPE_COLUMNS}, m.id, m.retained_seq
+         {ENVELOPE_FROM_JOINS}
          WHERE m.channel_uuid = ?1 AND m.retained_seq IS NOT NULL {where_tail}
          ORDER BY m.retained_seq DESC LIMIT {limit_param}"
     )
@@ -635,8 +697,8 @@ fn read_retained_rows(
         .query_map(params, |row| {
             let envelope = super::row_to_envelope(row)?;
             Ok(RetainedRow {
-                id: row.get(14)?,
-                seq: row.get(15)?,
+                id: row.get(17)?,
+                seq: row.get(18)?,
                 envelope,
             })
         })
@@ -781,6 +843,44 @@ pub fn channel_resume_epoch(conn: &Connection, channel_uuid: Uuid) -> Uuid {
         .unwrap_or_else(|e| panic!("messaging: channel {channel_uuid} has no row: {e}"));
     Uuid::from_slice(&bytes)
         .unwrap_or_else(|e| panic!("messaging: channel {channel_uuid} resume_epoch {bytes:?}: {e}"))
+}
+
+/// A retained row found by its message uuid.
+#[derive(Debug, Clone)]
+pub struct RetainedByUuid {
+    pub channel_uuid: Uuid,
+    pub retained_seq: i64,
+    pub envelope: MessageEnvelope,
+}
+
+/// The retained row whose message uuid is `uuid`, with its channel and its
+/// retention position; `None` when no row has that uuid or the row is parked
+/// and so holds no position.
+///
+/// A row is answered whether or not it is still inside its channel's standing
+/// window: the caller compares `retained_seq` against the window.
+pub fn retained_message_by_uuid(conn: &Connection, uuid: Uuid) -> Option<RetainedByUuid> {
+    conn.query_row(
+        &format!(
+            "SELECT {ENVELOPE_COLUMNS}, m.retained_seq {ENVELOPE_FROM_JOINS}
+             WHERE m.uuid = ?1 AND m.retained_seq IS NOT NULL"
+        ),
+        rusqlite::params![uuid.as_bytes().to_vec()],
+        |row| {
+            let envelope = super::row_to_envelope(row)?;
+            let channel_bytes: Vec<u8> = row.get(1)?;
+            let channel_uuid = Uuid::from_slice(&channel_bytes).unwrap_or_else(|e| {
+                panic!("messaging: message {uuid} channel uuid {channel_bytes:?}: {e}")
+            });
+            Ok(RetainedByUuid {
+                channel_uuid,
+                retained_seq: row.get(17)?,
+                envelope,
+            })
+        },
+    )
+    .optional()
+    .expect("query retained_message_by_uuid")
 }
 
 /// How many retained rows the channel still holds above `after_seq`, unclamped.
@@ -961,7 +1061,8 @@ pub fn withdraw_parked_message(conn: &Connection, message_id: i64, caller_sender
 /// unchanged". For nullable columns the inner `Option` encodes the new value
 /// (`Some(v)` to set, `None` to clear / write SQL NULL).
 pub struct EditFieldsApplied<'a> {
-    pub body: Option<&'a str>,
+    /// Replaces the body and its content type together.
+    pub body: Option<&'a MessageBody>,
     pub reply_to_uuid: Option<Option<Uuid>>,
     pub deliver_after: Option<Option<DateTime<Utc>>>,
     pub delivery_deadline: Option<Option<DateTime<Utc>>>,
@@ -1012,11 +1113,14 @@ pub fn update_parked_message(
     }
 
     let mut set_clauses: Vec<&str> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> = Vec::new();
 
     if let Some(body) = fields.body {
+        let (body_value, content_type) = super::body_columns(body);
         set_clauses.push("body = ?");
-        params.push(Box::new(body.to_string()));
+        params.push(Box::new(body_value));
+        set_clauses.push("content_type = ?");
+        params.push(Box::new(content_type));
     }
     if let Some(reply_to) = &fields.reply_to_uuid {
         set_clauses.push("reply_to_uuid = ?");
@@ -1062,14 +1166,14 @@ pub fn update_parked_message(
 /// Deserialize a `MessageEnvelope` from a row with columns:
 /// 0:uuid, 1:source, 2:sender, 3:body, 4:urgency, 5:delivery_deadline,
 /// 6:deliver_after, 7:publish_ts_ns, 8:channel_address, 9:reply_to,
-/// 10:envelope_type, 11:impetus.
+/// 10:envelope_type, 11:impetus, 12:content_type, 13:transport, 14:attachments.
+/// A SELECT that carries further columns puts them after column 14.
 pub(super) fn row_to_message_envelope(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<MessageEnvelope> {
     let msg_uuid_bytes: Vec<u8> = row.get(0)?;
     let source: String = row.get(1)?;
     let sender: String = row.get(2)?;
-    let body: String = row.get(3)?;
     let urgency_str: String = row.get(4)?;
     let delivery_deadline_s: Option<String> = row.get(5)?;
     let deliver_after_s: Option<String> = row.get(6)?;
@@ -1081,6 +1185,9 @@ pub(super) fn row_to_message_envelope(
 
     let message_id = Uuid::from_slice(&msg_uuid_bytes)
         .unwrap_or_else(|e| panic!("messaging: row uuid malformed: {e}"));
+    let body = super::read_body(row, 3, 12, message_id)?;
+    let transport = super::read_transport(row, 13, message_id)?;
+    let attachments = super::read_attachments(row, 14, message_id)?;
     let urgency = Urgency::parse(&urgency_str)
         .unwrap_or_else(|| panic!("messaging: invalid urgency in row: {urgency_str:?}"));
     let delivery_deadline = delivery_deadline_s.map(|s| {
@@ -1111,6 +1218,8 @@ pub(super) fn row_to_message_envelope(
         impetus,
         urgency,
         envelope_type,
+        transport,
+        attachments,
     })
 }
 
@@ -1131,7 +1240,8 @@ pub fn list_pending_messages_for_sender(
     let mut sql = String::from(
         "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                 m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                c.address, rc.address, m.envelope_type, m.impetus
+                c.address, rc.address, m.envelope_type, m.impetus, m.content_type,
+                m.transport, m.attachments
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
@@ -1169,7 +1279,8 @@ pub fn load_envelope_by_uuid(conn: &Connection, uuid: Uuid) -> Option<MessageEnv
     conn.query_row(
         "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                 m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                c.address, rc.address, m.envelope_type, m.impetus
+                c.address, rc.address, m.envelope_type, m.impetus, m.content_type,
+                m.transport, m.attachments
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid

@@ -32,14 +32,15 @@ const CHROME: &str = "    new shell: Shell { chrome = true; grants = []; }\n";
 #[test]
 fn a_handle_less_block_tunes_every_family_the_system_mints() {
     let config = derived(&format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}",
         tuning("mqtt:broker:alice/status"),
         tuning("webhook:alice-inbox"),
         tuning("brenn:tools/pull"),
         tuning("brenn:tool-results/alice"),
+        tuning("brenn:app-tool-results/alice"),
         tuning("brenn:device-location.alice"),
     ));
-    assert_eq!(config.resolved.tunings.len(), 5);
+    assert_eq!(config.resolved.tunings.len(), 6);
     assert!(config.resolved.channels.is_empty());
     assert!(config.channel_uuids.is_empty());
 }
@@ -50,7 +51,8 @@ fn a_handle_less_block_on_a_declarable_address_is_refused() {
         derive_refusal(&tuning("brenn:alice.status")),
         "`brenn:alice.status` names no system-minted family, so a handle-less block tunes \
          nothing; tuning blocks name `mqtt:`, `webhook:`, `brenn:tools/`, \
-         `brenn:tool-results/` and `brenn:device-location.` channels, and a declarable \
+         `brenn:tool-results/`, `brenn:app-tool-results/` and `brenn:device-location.` \
+         channels, and a declarable \
          channel is written `channel <handle> at \"brenn:alice.status\"`"
     );
 }
@@ -1322,6 +1324,137 @@ fn a_tuning_states_no_doctype() {
         "the block tuning `prefix mqtt:broker:alice/` states no doctype: a tuning matches a \
          family the system mints, so it names no one document contract — a doctype belongs \
          on a `channel` declaration, which is one channel"
+    );
+}
+
+/// A tuning block whose body is `attrs`, at `address` (`prefix "…"` or `"…"`).
+fn tuning_with(address: &str, attrs: &str) -> String {
+    format!(
+        "channel at {address} {{\n    push_depth = 4;\n    retain_depth = 16;\n    \
+         standing_retain_depth = 64;\n{attrs}}}\n"
+    )
+}
+
+#[test]
+fn an_ingress_tuning_states_non_text() {
+    support::derived(&tuning_with(
+        "prefix \"mqtt:broker:alice/\"",
+        "    non_text = true;\n",
+    ));
+    support::derived(&tuning_with(
+        "\"webhook:scanner\"",
+        "    non_text = true;\n",
+    ));
+}
+
+#[test]
+fn a_tool_tuning_states_no_non_text() {
+    assert_eq!(
+        derive_refusal(&tuning_with(
+            "prefix \"brenn:tools/\"",
+            "    non_text = true;\n"
+        )),
+        "the block tuning `prefix brenn:tools/` states no non_text: only an `mqtt:` or \
+         `webhook:` tuning takes it, where it selects the raw ingress shape — the payload is \
+         the body; the tool and device-location families are written and read by host code \
+         that parses text"
+    );
+    assert_eq!(
+        derive_refusal(&tuning_with(
+            "prefix \"brenn:device-location.\"",
+            "    non_text = true;\n"
+        )),
+        "the block tuning `prefix brenn:device-location.` states no non_text: only an `mqtt:` \
+         or `webhook:` tuning takes it, where it selects the raw ingress shape — the payload \
+         is the body; the tool and device-location families are written and read by host \
+         code that parses text"
+    );
+}
+
+#[test]
+fn a_raw_mqtt_tuning_states_untyped_content_type() {
+    support::derived(&tuning_with(
+        "prefix \"mqtt:broker:alice/\"",
+        "    non_text = true;\n    untyped_content_type = \"application/octet-stream\";\n",
+    ));
+    support::derived(&tuning_with(
+        "\"mqtt:broker:alice/door\"",
+        "    non_text = true;\n    untyped_content_type = \"text/plain; charset=utf-8\";\n",
+    ));
+}
+
+#[test]
+fn untyped_content_type_outside_the_mqtt_family_is_refused() {
+    for (address, label, attrs) in [
+        (
+            "\"webhook:scanner\"",
+            "webhook:scanner",
+            "    non_text = true;\n    untyped_content_type = \"image/png\";\n",
+        ),
+        (
+            "prefix \"brenn:tools/\"",
+            "prefix brenn:tools/",
+            "    untyped_content_type = \"image/png\";\n",
+        ),
+    ] {
+        assert_eq!(
+            derive_refusal(&tuning_with(address, attrs)),
+            format!(
+                "the block tuning `{label}` states no untyped_content_type: only an `mqtt:` \
+                 tuning takes it — a `webhook:` channel's body is typed by its endpoint, and \
+                 the tool and device-location families are text-only"
+            ),
+        );
+    }
+}
+
+#[test]
+fn untyped_content_type_on_a_wrapped_mqtt_tuning_is_refused() {
+    for attrs in [
+        "    untyped_content_type = \"image/png\";\n",
+        "    non_text = false;\n    untyped_content_type = \"image/png\";\n",
+    ] {
+        assert_eq!(
+            derive_refusal(&tuning_with("prefix \"mqtt:broker:alice/\"", attrs)),
+            "the block tuning `prefix mqtt:broker:alice/` states untyped_content_type without \
+             `non_text = true`: a wrapped `mqtt:` channel's body is the wrapper, so the word \
+             would type nothing"
+        );
+    }
+}
+
+#[test]
+fn a_malformed_untyped_content_type_is_refused() {
+    let over = format!("application/{}", "x".repeat(255));
+    for (content_type, reason) in [
+        ("octet-stream", "expected '/' after the type"),
+        ("", "missing type"),
+        (over.as_str(), "longer than 255 bytes"),
+    ] {
+        let refusal = derive_refusal(&tuning_with(
+            "prefix \"mqtt:broker:alice/\"",
+            &format!("    non_text = true;\n    untyped_content_type = \"{content_type}\";\n"),
+        ));
+        assert_eq!(
+            refusal,
+            format!(
+                "the block tuning `prefix mqtt:broker:alice/` states untyped_content_type \
+                 {content_type:?}, which is not a media type the bus accepts: invalid content \
+                 type {content_type:?}: {reason}"
+            ),
+        );
+    }
+}
+
+#[test]
+fn a_declaration_states_no_untyped_content_type() {
+    let source = "channel m at \"local:alice.m\" {\n    push_depth = 4;\n    \
+                  retain_depth = 16;\n    non_text = true;\n    \
+                  untyped_content_type = \"image/png\";\n}\n";
+    assert_eq!(
+        derive_refusal(source),
+        "`local:alice.m` is a declared channel, so it states no untyped_content_type: its \
+         bodies are typed by their publishers — the word belongs on a raw `mqtt:` tuning"
     );
 }
 

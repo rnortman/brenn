@@ -377,7 +377,7 @@ async fn publish(bridge: &ActiveBridge, bus: &ChatBus, outbound: &Outbound) {
             bridge.conversation_id,
             &bridge.app_slug,
             address,
-            &body,
+            body.as_str().into(),
             Urgency::Normal,
         )
         .await;
@@ -437,7 +437,7 @@ async fn note_record_gap(bridge: &ActiveBridge, bus: &ChatBus) {
             bridge.conversation_id,
             &bridge.app_slug,
             &bus.out,
-            &notice.body(),
+            notice.body().as_str().into(),
             Urgency::Normal,
         )
         .await;
@@ -487,7 +487,7 @@ async fn note_oversize(
             bridge.conversation_id,
             &bridge.app_slug,
             &bus.out,
-            &notice.body(),
+            notice.body().as_str().into(),
             Urgency::Normal,
         )
         .await;
@@ -676,7 +676,13 @@ async fn execute(
     models: &[ModelInfo],
 ) {
     let sender = envelope.sender.as_str().to_string();
-    let command: ChatCommand = match chat::decode(&envelope.body) {
+    // A body that is not text is unusable like one that does not decode; the
+    // rejection names its content type and size, never its bytes.
+    let decoded = match envelope.body.as_text() {
+        Some(text) => chat::decode(text).map_err(|e| e.to_string()),
+        None => Err(format!("body is not text ({})", envelope.body.summary())),
+    };
+    let command: ChatCommand = match decoded {
         Ok(command) => command,
         Err(e) => {
             reject(
@@ -1669,6 +1675,8 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 sink: Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: vec![brenn_lib::messaging::SubscriberEntry {
                 kind: brenn_lib::messaging::SubscriberEntryKind::App(app_slug.to_string()),
@@ -1691,7 +1699,7 @@ mod tests {
             AMBIENCE_UUID,
             "test-source",
             "app:peer",
-            body,
+            &body.into(),
             Urgency::Normal,
             brenn_lib::messaging::ChannelScheme::Brenn,
             None,
@@ -1875,7 +1883,7 @@ mod tests {
         let batches: Vec<ChatStreamEvent> = stream
             .retained_tail(10)
             .iter()
-            .map(|m| chat::decode(&m.envelope.body).expect("decodable batch"))
+            .map(|m| chat::decode(m.envelope.body.as_text().unwrap()).expect("decodable batch"))
             .collect();
         assert_eq!(
             batches,
@@ -1976,7 +1984,7 @@ mod tests {
             conversation_id,
         );
         let result = messenger
-            .publish_from_conversation(conversation_id, APP, &address, body, Urgency::Normal)
+            .publish_from_conversation(conversation_id, APP, &address, body.into(), Urgency::Normal)
             .await;
         assert!(
             matches!(result, PublishResult::Ok { .. }),
@@ -2378,6 +2386,73 @@ mod tests {
         );
     }
 
+    /// A body that is not text is an unusable command: rejected on the record,
+    /// named by its content type and size, and nothing of it reaches the
+    /// conversation.
+    #[tokio::test]
+    async fn a_non_text_body_is_rejected_as_an_unusable_command() {
+        let (bridge, messenger, db) = chat_bridge().await;
+        let conversation_id = bridge.conversation_id;
+        let bus = ChatBus::new(messenger.clone(), &bridge);
+        let commands = command_cursor(&bridge, &bus).await;
+
+        let address = chat_address(
+            &messenger.llm_chat().prefix,
+            APP,
+            ChatLeaf::In,
+            conversation_id,
+        );
+        let body = brenn_lib::messaging::MessageBody::from_parts(
+            Some("application/octet-stream"),
+            b"{\"v\":1}",
+        )
+        .unwrap();
+        // Written into the inbox's store directly: the inbox is text-only, and
+        // every publish path refuses a non-text body for it. This is the
+        // reader's own handling of a row it cannot parse.
+        let inbox = messenger
+            .directory()
+            .resolve(&address)
+            .expect("the conversation's inbox");
+        messenger
+            .store_for(&inbox)
+            .append(brenn_messaging_store::store::NewMessage {
+                source: "test".to_string(),
+                sender: ParticipantId::for_conversation(conversation_id)
+                    .as_str()
+                    .to_string(),
+                body,
+                urgency: Urgency::Normal,
+                envelope_type: inbox.transport_type,
+                reply_to: None,
+                delivery_deadline: None,
+                impetus: None,
+                publish_ts_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap(),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
+            })
+            .await;
+        drain_commands(&bridge, &bus, &commands, &[]).await;
+
+        let events = record_bodies(&messenger, &db, conversation_id).await;
+        let rejections: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::Error { message, .. } if message.contains("unusable command") => {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rejections.len(), 1, "{events:?}");
+        assert!(
+            rejections[0].contains("application/octet-stream, 7 bytes"),
+            "{}",
+            rejections[0]
+        );
+        assert!(!rejections[0].contains("\"v\""), "{}", rejections[0]);
+        assert!(user_rows(&db, conversation_id).await.is_empty());
+    }
+
     /// The rejection detail quotes the decoder's rendering of a body the peer
     /// chose, so it reaches the log through the untrusted-string sanitizer:
     /// escaped and length-capped, not pasted in whole.
@@ -2525,7 +2600,13 @@ mod tests {
         let prewarm = peer_leaf(&bridge, &bus, ChatLeaf::Wake);
 
         let result = messenger
-            .publish_from_conversation(conversation_id, APP, &prewarm.address, "", Urgency::VeryLow)
+            .publish_from_conversation(
+                conversation_id,
+                APP,
+                &prewarm.address,
+                "".into(),
+                Urgency::VeryLow,
+            )
             .await;
         assert!(
             matches!(result, brenn_messaging::PublishResult::Ok { .. }),
@@ -2771,7 +2852,13 @@ mod tests {
         let prewarm = peer_leaf(&bridge, &bus, ChatLeaf::Wake);
 
         messenger
-            .publish_from_conversation(conversation_id, APP, &prewarm.address, "", Urgency::VeryLow)
+            .publish_from_conversation(
+                conversation_id,
+                APP,
+                &prewarm.address,
+                "".into(),
+                Urgency::VeryLow,
+            )
             .await;
         drain_prewarm(&bridge, &bus, &prewarm).await;
 

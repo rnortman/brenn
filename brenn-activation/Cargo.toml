@@ -13,10 +13,10 @@ description = "The processor.wit activation carrier — one shape, every host"
 # reads as an obligation. `brenn-envelope` depends on no workspace crate and
 # compiles for wasm32.
 #
-# An envelope windowed at a guest is still its JSON text at both placements, and
-# a `String` needs no dependency; the generic parameter is what keeps the carrier
-# free of an envelope type even so, and this crate's own tests are its only other
-# instantiation.
+# An envelope windowed at a guest is its JSON text at both placements, and a
+# `String` needs no dependency; the generic parameters keep the carrier free of
+# an envelope type even so. The backend instantiates them with the envelope up
+# to the point it lowers an activation for one component.
 #
 # Two third-party dependencies, both `brenn-envelope`'s own and both here only so
 # the envelope's field types can be spelled in a signature: `chrono` for the

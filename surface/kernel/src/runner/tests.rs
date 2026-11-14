@@ -19,13 +19,15 @@ use std::time::Duration;
 use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::{TransportConnection, TransportError, TransportEvent};
 use brenn_attach_proto::{
-    AlertSeverity, ClientFrame, PublishBatchOutcome, PublishOutcome, ServerFrame,
+    AlertSeverity, ClientFrame, Codec, PublishBatchOutcome, PublishOutcome, ServerFrame,
+    VersionRange, WireMessage,
 };
 use brenn_surface_contract::ActivationError;
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::telemetry::StatusCounters;
 use brenn_surface_schema::{
-    CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, LogLevel, ToastBody, ToastSeverity, ToastSource,
+    CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, LogLevel, SURFACE_ATTACH_VERSION, ToastBody,
+    ToastSeverity, ToastSource,
 };
 use uuid::Uuid;
 
@@ -39,6 +41,8 @@ use crate::test_support::frames::{
 use crate::test_support::pages;
 
 use super::*;
+use brenn_envelope::grants::ProcessorContract;
+use brenn_surface_contract::Activation;
 
 const URL: &str = "wss://host/surface/bar/ws?build=b1";
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
@@ -61,6 +65,7 @@ fn config() -> ConnConfig {
         liveness_multiplier: 3,
         backoff_jitter_seed: 0,
         terminal_close_codes: vec![3001],
+        versions: VersionRange::exactly(SURFACE_ATTACH_VERSION),
     }
 }
 
@@ -139,11 +144,14 @@ fn reporting_doc() -> BindingsDocument {
 fn narrowed_doc() -> BindingsDocument {
     let mut document = reporting_doc();
     document.outputs.retain(|binding| binding.port != "out");
+    document
+        .wire_channels
+        .retain(|wire| wire.channel != WIRE_OUT);
     document.platform.error_report_floor = Some(LogLevel::Error);
     document
 }
 
-fn welcome() -> String {
+fn welcome() -> WireMessage {
     welcome_under(pages::facts())
 }
 
@@ -209,7 +217,7 @@ enum Plan {
 #[derive(Clone)]
 struct Controls {
     plans: Arc<Mutex<VecDeque<Plan>>>,
-    written: Arc<Mutex<Vec<String>>>,
+    written: Arc<Mutex<Vec<WireMessage>>>,
     connects: Arc<AtomicUsize>,
 }
 
@@ -265,14 +273,32 @@ impl Controls {
         }
     }
 
-    fn written(&self) -> Vec<String> {
+    fn written(&self) -> Vec<WireMessage> {
         self.written.lock().unwrap().clone()
+    }
+
+    /// Whether any message the runner wrote holds `needle`'s bytes, in a JSON
+    /// text frame or in a binary frame's header or bodies.
+    fn wrote(&self, needle: &str) -> bool {
+        self.written().iter().any(|message| {
+            let bytes = match message {
+                WireMessage::Text(text) => text.as_bytes(),
+                WireMessage::Binary(bytes) => bytes.as_slice(),
+            };
+            bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())
+        })
     }
 
     fn frames(&self) -> Vec<ClientFrame> {
         self.written()
-            .iter()
-            .map(|text| serde_json::from_str(text).expect("the runner writes client frames"))
+            .into_iter()
+            .map(|message| {
+                Codec::negotiated(SURFACE_ATTACH_VERSION)
+                    .decode_client(message)
+                    .expect("the runner writes client frames")
+            })
             .collect()
     }
 
@@ -301,7 +327,7 @@ impl Controls {
                 } => Some(Published {
                     channel,
                     attribution,
-                    body,
+                    body: body.as_text().expect("a page publishes text").to_string(),
                     correlation,
                 }),
                 _ => None,
@@ -333,7 +359,16 @@ impl Controls {
                     ..
                 } => Some((
                     correlation,
-                    publishes.into_iter().map(|entry| entry.body).collect(),
+                    publishes
+                        .into_iter()
+                        .map(|entry| {
+                            entry
+                                .body
+                                .as_text()
+                                .expect("a page publishes text")
+                                .to_string()
+                        })
+                        .collect(),
                 )),
                 _ => None,
             })
@@ -347,7 +382,7 @@ impl Controls {
 
 struct ScriptedConnector {
     plans: Arc<Mutex<VecDeque<Plan>>>,
-    written: Arc<Mutex<Vec<String>>>,
+    written: Arc<Mutex<Vec<WireMessage>>>,
     connects: Arc<AtomicUsize>,
 }
 
@@ -386,18 +421,18 @@ impl TransportConnector for ScriptedConnector {
 
 struct ScriptedConnection {
     incoming: mpsc::UnboundedReceiver<TransportEvent>,
-    written: Arc<Mutex<Vec<String>>>,
+    written: Arc<Mutex<Vec<WireMessage>>>,
     closed: Arc<AtomicBool>,
     fail_writes: Arc<AtomicUsize>,
 }
 
 impl TransportConnection for ScriptedConnection {
-    async fn send_text(&mut self, text: String) -> Result<(), TransportError> {
+    async fn send(&mut self, message: WireMessage) -> Result<(), TransportError> {
         if self.fail_writes.load(Ordering::SeqCst) > 0 {
             self.fail_writes.fetch_sub(1, Ordering::SeqCst);
             return Err(TransportError::new("scripted write failed"));
         }
-        self.written.lock().unwrap().push(text);
+        self.written.lock().unwrap().push(message);
         Ok(())
     }
 
@@ -464,9 +499,12 @@ impl Running {
     /// control plane as a test states it.
     fn send(&mut self, command: RunnerCommand) {
         match command {
+            // A native entry is on the string contract by its type, which the
+            // handle states for it.
             RunnerCommand::RegisterActivation {
                 instance,
                 entry,
+                contract: _,
                 mount,
             } => {
                 self.handle.register_activation(&instance, entry, mount);
@@ -664,10 +702,13 @@ where
     Box::new(move |activation, buffer| {
         for window in &activation.ports {
             for envelope in window.new_envelopes() {
-                seen.0
-                    .lock()
-                    .unwrap()
-                    .push(brenn_surface_test_fixtures::parse_envelope(envelope).body);
+                seen.0.lock().unwrap().push(
+                    brenn_surface_test_fixtures::parse_envelope(envelope)
+                        .body
+                        .as_text()
+                        .unwrap()
+                        .to_owned(),
+                );
             }
         }
         act(activation, buffer)
@@ -702,7 +743,13 @@ fn windowing(windows: &Windows) -> ActivationEntry {
             .ports
             .iter()
             .flat_map(|window| window.new_envelopes())
-            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
+            .map(|envelope| {
+                brenn_surface_test_fixtures::parse_envelope(envelope)
+                    .body
+                    .as_text()
+                    .unwrap()
+                    .to_owned()
+            })
             .collect();
         windows.0.lock().unwrap().push(bodies);
         Ok(None)
@@ -734,7 +781,7 @@ fn publishing(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
     let (port, body) = (port.to_string(), body.to_string());
     entry(seen, move |_, buffer| {
         buffer
-            .publish(&port, body.clone())
+            .publish(&port, brenn_envelope::GuestBody::Text(body.clone()))
             .expect("the fixture binds the port it publishes on");
         Ok(None)
     })
@@ -758,7 +805,11 @@ fn deferring(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
         }
         let now = activation.now.expect("the page has a wall clock");
         buffer
-            .publish_deferred(&port, body.clone(), now + 20)
+            .publish_deferred(
+                &port,
+                brenn_envelope::GuestBody::Text(body.clone()),
+                now + 20,
+            )
             .expect("the fixture binds the port it publishes on");
         Ok(None)
     })
@@ -778,6 +829,7 @@ fn mount(running: &mut Running, instance: &str, entry: ActivationEntry) {
     running.send(RunnerCommand::RegisterActivation {
         instance: instance.to_string(),
         entry,
+        contract: ProcessorContract::V0_1,
         mount: false,
     });
 }
@@ -788,6 +840,7 @@ fn mount_rendering(running: &mut Running, instance: &str, entry: ActivationEntry
     running.send(RunnerCommand::RegisterActivation {
         instance: instance.to_string(),
         entry,
+        contract: ProcessorContract::V0_1,
         mount: true,
     });
 }
@@ -796,7 +849,7 @@ fn mount_rendering(running: &mut Running, instance: &str, entry: ActivationEntry
 /// one the page will take.
 async fn ack(controls: &Controls, feed: &mpsc::UnboundedSender<TransportEvent>, channel: &str) {
     wait_until(|| controls.subscribed().contains(&channel.to_string())).await;
-    feed.unbounded_send(TransportEvent::Text(subscribe_result(channel, 0)))
+    feed.unbounded_send(TransportEvent::Message(subscribe_result(channel, 0)))
         .unwrap();
 }
 
@@ -807,7 +860,7 @@ fn toasts(page: &SurfacePage) -> Vec<String> {
         .expect("a page hosts its reserved planes from its first instant")
         .retained()
         .map(|(envelope, _)| {
-            serde_json::from_str::<ToastBody>(&envelope.body)
+            serde_json::from_str::<ToastBody>(envelope.body.as_text().unwrap())
                 .expect("the toast plane carries toast bodies")
                 .text
         })
@@ -834,7 +887,7 @@ async fn attach_with(
 async fn attach_as(
     running: &mut Running,
     feed: &mpsc::UnboundedSender<TransportEvent>,
-    welcome: String,
+    welcome: WireMessage,
     document: &BindingsDocument,
 ) {
     for text in [
@@ -843,7 +896,7 @@ async fn attach_as(
         subscribe_result(CONFIG, 1),
         deliver(CONFIG, &document.to_body()),
     ] {
-        feed.unbounded_send(TransportEvent::Text(text)).unwrap();
+        feed.unbounded_send(TransportEvent::Message(text)).unwrap();
     }
     assert!(matches!(running.event().await, Event::Connected { .. }));
 }
@@ -899,9 +952,9 @@ async fn the_handshake_subscribes_the_config_channel_and_announces_nothing() {
     let (feed, _closed, _writes) = controls.succeed();
     let mut running = spawn(&controls);
 
-    feed.unbounded_send(TransportEvent::Text(server_hello()))
+    feed.unbounded_send(TransportEvent::Message(server_hello()))
         .unwrap();
-    feed.unbounded_send(TransportEvent::Text(welcome()))
+    feed.unbounded_send(TransportEvent::Message(welcome()))
         .unwrap();
 
     wait_until(|| controls.subscribed() == vec![CONFIG.to_string()]).await;
@@ -944,13 +997,14 @@ async fn a_mount_subscribes_its_channel_and_an_unmount_closes_it() {
     running.send(RunnerCommand::RegisterActivation {
         instance: "p1".to_string(),
         entry: Box::new(|_, _| Ok(None)),
+        contract: ProcessorContract::V0_1,
         mount: false,
     });
     wait_until(|| controls.subscribed().contains(&WIRE_ONE.to_string())).await;
 
     // Acknowledged first: an unsubscribe of a subscription the peer has not
     // answered yet waits for its result rather than crossing it on the wire.
-    feed.unbounded_send(TransportEvent::Text(subscribe_result(WIRE_ONE, 0)))
+    feed.unbounded_send(TransportEvent::Message(subscribe_result(WIRE_ONE, 0)))
         .unwrap();
     running.send(RunnerCommand::DeregisterActivation {
         instance: "p1".to_string(),
@@ -992,7 +1046,7 @@ async fn an_unreconcilable_frame_takes_the_attachment_fatal() {
 
     // A delivery on a channel this attachment never subscribed: a peer contract
     // the page cannot reconcile.
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "{}")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "{}")))
         .unwrap();
 
     assert!(matches!(running.event().await, Event::Fatal { .. }));
@@ -1011,23 +1065,24 @@ async fn a_write_failure_mid_batch_drops_the_rest_of_it_and_reconnects() {
 
     // Both instances mount before the wiring lands, so the document's own turn
     // composes two `Subscribe`s — and the first of them is the write that fails.
-    feed.unbounded_send(TransportEvent::Text(server_hello()))
+    feed.unbounded_send(TransportEvent::Message(server_hello()))
         .unwrap();
-    feed.unbounded_send(TransportEvent::Text(welcome()))
+    feed.unbounded_send(TransportEvent::Message(welcome()))
         .unwrap();
-    feed.unbounded_send(TransportEvent::Text(subscribe_result(CONFIG, 1)))
+    feed.unbounded_send(TransportEvent::Message(subscribe_result(CONFIG, 1)))
         .unwrap();
     wait_until(|| controls.subscribed() == vec![CONFIG.to_string()]).await;
     for instance in ["p1", "p2"] {
         running.send(RunnerCommand::RegisterActivation {
             instance: instance.to_string(),
             entry: Box::new(|_, _| Ok(None)),
+            contract: ProcessorContract::V0_1,
             mount: false,
         });
     }
     wait_until(|| controls.connects() == 1).await;
     writes.store(1, Ordering::SeqCst);
-    feed.unbounded_send(TransportEvent::Text(deliver(CONFIG, &doc().to_body())))
+    feed.unbounded_send(TransportEvent::Message(deliver(CONFIG, &doc().to_body())))
         .unwrap();
 
     assert!(matches!(running.event().await, Event::Connected { .. }));
@@ -1080,7 +1135,7 @@ async fn a_control_publish_after_a_fatal_still_routes() {
     mount(&mut running, "p2", quiet(&reader));
     wait_until(|| controls.subscribed().contains(&WIRE_TWO.to_string())).await;
 
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "{}")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "{}")))
         .unwrap();
     assert!(matches!(running.event().await, Event::Fatal { .. }));
 
@@ -1197,7 +1252,7 @@ async fn a_delivered_message_reaches_the_entry_that_reads_it() {
     let seen = Seen::default();
     mount(&mut running, "p1", quiet(&seen));
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "hello")))
         .unwrap();
 
     wait_until(|| seen.bodies() == ["hello"]).await;
@@ -1224,7 +1279,7 @@ async fn a_multi_row_pass_wakes_its_reader_once() {
     let windows = Windows::default();
     mount(&mut running, "p1", windowing(&windows));
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver_pass(
+    feed.unbounded_send(TransportEvent::Message(deliver_pass(
         WIRE_ONE,
         &[("m1", 1, 0x1), ("m2", 2, 0x2), ("m3", 3, 0x3)],
     )))
@@ -1259,7 +1314,7 @@ async fn three_separate_frames_wake_their_reader_three_times() {
     mount(&mut running, "p1", windowing(&windows));
     ack(&controls, &feed, WIRE_ONE).await;
     for (body, seq, id) in [("m1", 1, 0x1), ("m2", 2, 0x2), ("m3", 3, 0x3)] {
-        feed.unbounded_send(TransportEvent::Text(deliver_at(WIRE_ONE, body, seq, id)))
+        feed.unbounded_send(TransportEvent::Message(deliver_at(WIRE_ONE, body, seq, id)))
             .unwrap();
     }
 
@@ -1290,7 +1345,7 @@ async fn an_entrys_publish_is_flushed_to_the_peer() {
     let seen = Seen::default();
     mount(&mut running, "p1", publishing(&seen, "out", "made"));
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "hello")))
         .unwrap();
 
     wait_until(|| !controls.batches().is_empty()).await;
@@ -1319,7 +1374,7 @@ async fn a_confined_publish_activates_the_sibling_that_reads_it() {
     );
     mount(&mut running, "p2", quiet(&reader));
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "hello")))
         .unwrap();
 
     wait_until(|| reader.bodies() == ["passed on"]).await;
@@ -1347,7 +1402,7 @@ async fn a_trapped_entry_takes_its_instance_terminal() {
         Box::new(|_, _| panic!("the component fell over")),
     );
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "hello")))
         .unwrap();
 
     assert!(matches!(
@@ -1365,7 +1420,7 @@ async fn a_trapped_entry_takes_its_instance_terminal() {
         Box::new(|_, _| panic!("the component fell over at rung {}", 7)),
     );
     ack(&controls, &feed, WIRE_TWO).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_TWO, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_TWO, "hello")))
         .unwrap();
 
     assert!(matches!(
@@ -1399,15 +1454,15 @@ async fn an_undeclared_publish_traps_and_takes_its_instance_terminal() {
     mount(
         &mut running,
         "p1",
-        Box::new(
-            |_, buffer| match buffer.publish("ghost", "hi".to_string()) {
+        Box::new(|_, buffer| {
+            match buffer.publish("ghost", brenn_envelope::GuestBody::Text("hi".to_string())) {
                 Err(PortFault::Undeclared(port)) => panic!("undeclared port {port}"),
                 other => panic!("expected a vocabulary violation, got {other:?}"),
-            },
-        ),
+            }
+        }),
     );
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "hello")))
         .unwrap();
 
     assert!(matches!(
@@ -1439,14 +1494,14 @@ async fn a_publish_to_an_unwired_declared_port_delivers_nothing_and_runs_on() {
     let seen = Seen::default();
     mount(&mut running, "p1", publishing(&seen, "out", "dropped"));
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "hello")))
         .unwrap();
 
     wait_until(|| seen.count() == 1).await;
     assert!(
-        !controls.written().iter().any(|w| w.contains("dropped")),
+        !controls.wrote("dropped"),
         "an unwired port publishes nowhere: {:?}",
-        controls.written()
+        controls.frames()
     );
     running.task.abort();
 }
@@ -1474,7 +1529,10 @@ async fn a_reply_to_an_async_activation_traps_at_the_completion() {
         "p1",
         Box::new(|_, buffer| {
             buffer
-                .publish("out", "never flushed".to_string())
+                .publish(
+                    "out",
+                    brenn_envelope::GuestBody::Text("never flushed".to_string()),
+                )
                 .expect("the fixture binds the port it publishes on");
             Ok(Some("{\"cancel\":true}".to_string()))
         }),
@@ -1491,10 +1549,7 @@ async fn a_reply_to_an_async_activation_traps_at_the_completion() {
             if instance == "p1" && reason.contains("asked nothing")
     ));
     assert!(
-        !controls
-            .written()
-            .iter()
-            .any(|frame| frame.contains("never flushed")),
+        !controls.wrote("never flushed"),
         "the buffer of a trapped activation is discarded, not written"
     );
     running.task.abort();
@@ -1510,15 +1565,17 @@ async fn an_erring_entry_is_reported_and_keeps_activating() {
     let seen = Seen::default();
     mount(&mut running, "p1", erring(&seen));
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "one")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "one")))
         .unwrap();
 
     assert!(matches!(
         running.event().await,
         Event::ActivationFailed { instance, message } if instance == "p1" && message == "no thanks"
     ));
-    feed.unbounded_send(TransportEvent::Text(deliver_at(WIRE_ONE, "two", 2, 0x9002)))
-        .unwrap();
+    feed.unbounded_send(TransportEvent::Message(deliver_at(
+        WIRE_ONE, "two", 2, 0x9002,
+    )))
+    .unwrap();
     wait_until(|| seen.bodies() == ["one", "two"]).await;
     running.task.abort();
 }
@@ -1537,12 +1594,12 @@ async fn a_component_that_republishes_what_it_reads_does_not_starve_the_page() {
     let seen = Seen::default();
     mount(&mut running, "p1", publishing(&seen, "notes", "again"));
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "kick")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "kick")))
         .unwrap();
     wait_until(|| seen.count() > 20).await;
 
     // The transport is still read while it spins.
-    feed.unbounded_send(TransportEvent::Text(deliver_at(
+    feed.unbounded_send(TransportEvent::Message(deliver_at(
         WIRE_ONE, "arrived", 2, 0x9002,
     )))
     .unwrap();
@@ -1573,11 +1630,11 @@ async fn a_spinning_component_does_not_starve_its_sibling() {
     mount(&mut running, "p2", quiet(&reader));
     ack(&controls, &feed, WIRE_ONE).await;
     ack(&controls, &feed, WIRE_TWO).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "kick")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "kick")))
         .unwrap();
     wait_until(|| spinner.count() > 20).await;
 
-    feed.unbounded_send(TransportEvent::Text(deliver_at(
+    feed.unbounded_send(TransportEvent::Message(deliver_at(
         WIRE_TWO,
         "for the sibling",
         1,
@@ -1601,12 +1658,12 @@ async fn a_metered_flush_is_re_offered_when_the_retry_deadline_fires() {
     let seen = Seen::default();
     mount(&mut running, "p1", publishing(&seen, "out", "made"));
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "hello")))
         .unwrap();
     wait_until(|| !controls.batches().is_empty()).await;
 
     let (correlation, _) = controls.batches()[0].clone();
-    feed.unbounded_send(TransportEvent::Text(frame(
+    feed.unbounded_send(TransportEvent::Message(frame(
         &ServerFrame::PublishBatchResult {
             correlation,
             outcome: PublishBatchOutcome::RateLimited,
@@ -1639,7 +1696,7 @@ async fn a_deferred_publish_reaches_its_reader_when_the_release_deadline_fires()
     mount(&mut running, "p1", deferring(&writer, "notes", "later"));
     mount(&mut running, "p2", quiet(&reader));
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "hello")))
         .unwrap();
     wait_until(|| writer.saw("hello")).await;
 
@@ -1676,10 +1733,12 @@ async fn a_publish_through_the_handle_reaches_the_peer_and_is_answered() {
     );
     assert_eq!(published.body, "written");
 
-    feed.unbounded_send(TransportEvent::Text(frame(&ServerFrame::PublishResult {
-        correlation: published.correlation,
-        outcome: PublishOutcome::Ok,
-    })))
+    feed.unbounded_send(TransportEvent::Message(frame(
+        &ServerFrame::PublishResult {
+            correlation: published.correlation,
+            outcome: PublishOutcome::Ok,
+        },
+    )))
     .unwrap();
     assert_eq!(
         running.event().await,
@@ -1807,7 +1866,7 @@ async fn a_second_document_refreshes_the_gate_and_the_report_floor() {
         .publish("p1", "out", "bound".to_string())
         .expect("the first document binds the port");
 
-    feed.unbounded_send(TransportEvent::Text(deliver_at(
+    feed.unbounded_send(TransportEvent::Message(deliver_at(
         CONFIG,
         &narrowed_doc().to_body(),
         2,
@@ -2044,7 +2103,7 @@ async fn a_rendering_registration_is_answered_with_the_mount_activation() {
     );
 
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "hello")))
         .unwrap();
     wait_until(|| syncs.ports().len() > 1).await;
     assert_eq!(
@@ -2068,7 +2127,7 @@ async fn a_mount_owed_before_the_wiring_is_settled_by_the_document() {
     // Everything of the handshake except the document, so the page is attached
     // and has no wiring.
     for text in [server_hello(), welcome(), subscribe_result(CONFIG, 1)] {
-        feed.unbounded_send(TransportEvent::Text(text)).unwrap();
+        feed.unbounded_send(TransportEvent::Message(text)).unwrap();
     }
     wait_until(|| controls.subscribed() == vec![CONFIG.to_string()]).await;
 
@@ -2083,11 +2142,11 @@ async fn a_mount_owed_before_the_wiring_is_settled_by_the_document() {
         "there is nothing to window against yet, so nothing was called"
     );
 
-    feed.unbounded_send(TransportEvent::Text(deliver(CONFIG, &doc().to_body())))
+    feed.unbounded_send(TransportEvent::Message(deliver(CONFIG, &doc().to_body())))
         .unwrap();
     assert!(matches!(running.event().await, Event::Connected { .. }));
     ack(&controls, &feed, WIRE_ONE).await;
-    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+    feed.unbounded_send(TransportEvent::Message(deliver(WIRE_ONE, "hello")))
         .unwrap();
 
     wait_until(|| syncs.ports().len() > 1).await;
@@ -2114,7 +2173,7 @@ async fn a_mount_owed_by_a_withdrawn_instance_is_dropped_not_retried() {
     // Attached with no document, so the registration's mount is owed rather
     // than served.
     for text in [server_hello(), welcome(), subscribe_result(CONFIG, 1)] {
-        feed.unbounded_send(TransportEvent::Text(text)).unwrap();
+        feed.unbounded_send(TransportEvent::Message(text)).unwrap();
     }
     wait_until(|| controls.subscribed() == vec![CONFIG.to_string()]).await;
 
@@ -2131,7 +2190,7 @@ async fn a_mount_owed_by_a_withdrawn_instance_is_dropped_not_retried() {
     // withdrawal under test would never be the state the mount met.
     settle().await;
 
-    feed.unbounded_send(TransportEvent::Text(deliver(CONFIG, &doc().to_body())))
+    feed.unbounded_send(TransportEvent::Message(deliver(CONFIG, &doc().to_body())))
         .unwrap();
     assert!(matches!(running.event().await, Event::Connected { .. }));
     settle().await;
@@ -2256,7 +2315,7 @@ fn a_called_peers_effects_precede_the_callers_own_completion() {
         crate::outward::SyncCall {
             instance: "p1",
             port: "ask",
-            body: "{}",
+            body: &brenn_envelope::MessageBody::text("{}"),
             chain: &[],
         },
         brenn_attach_client::driver::new_stamp(),
@@ -2268,7 +2327,10 @@ fn a_called_peers_effects_precede_the_callers_own_completion() {
         .expect("p1 assembles a sync-call activation");
     ready
         .buffer
-        .publish("out", "the caller's own".to_string())
+        .publish(
+            "out",
+            brenn_envelope::GuestBody::Text("the caller's own".to_string()),
+        )
         .expect("p1 binds the wire output");
 
     let called = vec![Effect::PublishControl {

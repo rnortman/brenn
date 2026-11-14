@@ -17,6 +17,19 @@ use serde_json::Value;
 pub const INPUT_SCHEMA_SHAPE_REFUSAL: &str =
     "`input_schema` is a JSON schema of the shape a tool's arguments are checked against";
 
+/// The argument a conversation names the attachments it hands a tool in:
+/// `BrennSend`'s, and the one added to the schema of every tool that accepts
+/// attachments. Such a tool's own `input_schema` may not declare it.
+pub const ATTACHMENTS_ARGUMENT: &str = "attachments";
+
+/// Does `schema` declare [`ATTACHMENTS_ARGUMENT`] as a top-level property?
+pub fn declares_attachments_argument(schema: &Value) -> bool {
+    schema
+        .get("properties")
+        .and_then(|properties| properties.get(ATTACHMENTS_ARGUMENT))
+        .is_some()
+}
+
 /// Check that `schema` has the shape a tool's arguments are checked against.
 ///
 /// The root is an object whose `"type"` is the string `"object"`;

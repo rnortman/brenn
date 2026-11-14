@@ -23,6 +23,7 @@ use brenn_lib::messaging::{
     WakeEconomics, webhook_channel_uuid_from_slug,
 };
 use brenn_lib::mqtt::config::{MqttClientIdentity, ResolvedMqttIngressChannel};
+use brenn_lib::webhook::WebhookEndpointConfigRaw;
 use brenn_messaging as messaging;
 use indexmap::IndexMap;
 
@@ -109,6 +110,9 @@ pub struct MessagingPlan {
     /// The global messaging block, for the messenger and the channel
     /// reconstruction commit runs.
     pub messaging_globals: messaging::config::MessagingGlobalConfig,
+    /// The blob store's directory: `messaging { blob_dir }`, or the database
+    /// path with `.blobs` appended.
+    pub blob_dir: std::path::PathBuf,
     /// The `[llm_chat]` block, for the messenger's chat family derivation.
     pub llm_chat: brenn_lib::config::LlmChatConfig,
     /// One entry per consumer holding a non-empty tool grant set, keyed by the
@@ -177,6 +181,56 @@ fn fold_own_inbox(
     all_entries.push(entry);
 }
 
+/// Refuse a webhook endpoint whose channel is `non_text` when its requests
+/// could not become bus bodies: the endpoint's content type, which types every
+/// raw body, must be a media type the bus accepts, and its transport ceiling
+/// must be within the bus's body cap, so the 413 is the refusal a sender meets.
+/// A declared parameter that would make the type non-text is refused, since
+/// the parameterless type is the one a body is judged by.
+///
+/// These hold between an endpoint and a channel of one document only; the
+/// router re-checks the pair a request is actually published under.
+///
+/// # Panics
+///
+/// On any violation, naming the endpoint and the values that disagree.
+fn assert_raw_webhook_endpoint(raw: &WebhookEndpointConfigRaw, max_body_bytes: usize) {
+    let slug = &raw.slug;
+    let content_type = brenn_lib::webhook::normalized_content_type(raw);
+    if let Err(e) = brenn_lib::messaging::check_content_type(&content_type) {
+        panic!(
+            "[[webhook_endpoint]] {slug:?}: content_type {:?} cannot type a raw body ({e}); \
+             its channel \"webhook:{slug}\" states `non_text = true`, so every request body \
+             is published typed with the endpoint's content type — declare a well-formed \
+             media type such as \"application/octet-stream\"",
+            raw.content_type,
+        );
+    }
+    // Normalization drops the declared parameters, so a parameter that makes
+    // the declared type non-text (a non-UTF-8 `charset`) would be ignored and
+    // every body judged and typed as text.
+    let declared_text = brenn_lib::messaging::is_text_content_type(Some(&raw.content_type));
+    let normalized_text = brenn_lib::messaging::is_text_content_type(Some(&content_type));
+    assert!(
+        declared_text == normalized_text,
+        "[[webhook_endpoint]] {slug:?}: content_type {:?} is not a text type by its parameters, \
+         but its channel \"webhook:{slug}\" states `non_text = true` and a raw body is judged and \
+         typed by the endpoint's content type without parameters, {content_type:?}, which is a \
+         text type — drop the parameters and declare a non-text type such as \
+         \"application/octet-stream\" for a body that is not UTF-8",
+        raw.content_type,
+    );
+    assert!(
+        raw.transport_ceiling_bytes <= max_body_bytes,
+        "[[webhook_endpoint]] {slug:?}: transport_ceiling_bytes = {} exceeds \
+         messaging.max_body_bytes = {max_body_bytes}; its channel \"webhook:{slug}\" states \
+         `non_text = true`, so the request body is the bus body — lower the endpoint's \
+         transport_ceiling_bytes to at most messaging.max_body_bytes, or raise \
+         messaging.max_body_bytes",
+        raw.transport_ceiling_bytes,
+    );
+}
+
 /// Lower a document into a [`MessagingPlan`], or `None` when it configures no
 /// messaging at all.
 ///
@@ -239,6 +293,9 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
                 &system_channel_tuning,
                 global_defaults,
             );
+            if resolved_channel.non_text {
+                assert_raw_webhook_endpoint(raw, global_defaults.max_body_bytes);
+            }
             ChannelEntry {
                 uuid: webhook_channel_uuid_from_slug(&raw.slug),
                 address,
@@ -434,6 +491,24 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
         );
         tuned_inbox_slugs.insert(consumer.slug.clone());
     }
+    // --- Apps: one `brenn:app-tool-results/<app-slug>` inbox per app granted
+    // an async tool ---
+    //
+    // Where a tool result that carries attachments to one of the app's
+    // conversations rests. No subscriber, no input port, no derived grant: no
+    // policy covers the namespace, so the entry is all there is.
+    let mut app_inbox_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(registry) = tool_registry {
+        for (app_slug, entry) in brenn_tool_registry::bus_wiring::app_result_inbox_entries(
+            registry,
+            apps.iter().map(|(slug, app)| (slug.as_str(), &*app.policy)),
+            &system_channel_tuning,
+            global_defaults,
+        ) {
+            all_entries.push(entry);
+            app_inbox_slugs.insert(app_slug.to_string());
+        }
+    }
     // --- Provided tools: one `brenn:tool-requests/<slug>` inbox per provider ---
     //
     // Sized from the consumer's own declarations, so it needs no registry and a
@@ -520,6 +595,9 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
         &webhook_slugs,
         &async_tool_names,
         &tuned_inbox_slugs,
+        // An app's inbox needs both the registry and the resolved apps to
+        // decide; a plan missing either skips the family, boot authoritative.
+        inputs.apps.is_some().then_some(&app_inbox_slugs),
         tool_registry.is_some(),
     );
     // System participant specs: every `system:` principal is declared here and
@@ -796,6 +874,8 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
                 s.principal_send_budgets().collect(),
             )
         })
+        // TODO(remote-send-budget-knob): a remote's budget is fixed, with no
+        // operator setting.
         .chain(remote_facts.iter().flat_map(|r| {
             messaging::attach_principal_budgets(
                 messaging::AttachScope::remote(r.slug()),
@@ -816,6 +896,7 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
         registrations,
         attach_send_budgets,
         messaging_globals: config.messaging.clone(),
+        blob_dir: config.messaging.blob_dir_beside(&config.database.path),
         llm_chat: config.llm_chat.clone(),
         tool_caller_grants,
         surface_error_advisory,
@@ -856,6 +937,23 @@ mod tests {
             device_location_users: &[],
         })
         .expect("a document declaring channels configures messaging")
+    }
+
+    /// With no `blob_dir` stated, the plan's blob directory is the configured
+    /// database path with `.blobs` appended; stated, it is taken as given.
+    #[test]
+    fn the_plan_blob_dir_sits_beside_the_configured_database_unless_stated() {
+        use std::path::PathBuf;
+
+        let mut config = config_with_error_channel(Depth::Unbounded);
+        config.database.path = PathBuf::from("/srv/alice/state/brenn.db");
+        assert_eq!(
+            plan_of(&config).blob_dir,
+            PathBuf::from("/srv/alice/state/brenn.db.blobs")
+        );
+
+        config.messaging.blob_dir = Some(PathBuf::from("/srv/alice/blobs"));
+        assert_eq!(plan_of(&config).blob_dir, PathBuf::from("/srv/alice/blobs"));
     }
 
     /// An error channel whose eviction frontier sits at the surface send burst
@@ -1359,6 +1457,7 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
             max_concurrency,
             auto_approve: true,
+            accepts_attachments: false,
         };
         let mut provider =
             WasmConsumerConfigRaw::minimal("prov", "processor-provider-test", &["brenn:work"]);
@@ -1568,6 +1667,7 @@ mod tests {
                 noise: None,
                 wake_min: None,
                 amplification: None,
+                non_text: false,
             }],
             ..crate::test_fixtures::minimal_wasm_consumer()
         }

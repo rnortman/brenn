@@ -1,7 +1,9 @@
 //! Route-level integration tests for `GET /surface/{slug}/ws`: the pre-upgrade
 //! ladder (access → capacity → served-asset build check), the opening frames the
 //! attachment session writes over a real socket, the round trip between an
-//! attached page and the bus through the real `WakeRouter`, and the terminal
+//! attached page and the bus through the real `WakeRouter`, a host publish's
+//! attachments reaching an attached page live, a remote's non-text
+//! body reaching an attached page with its content type, and the terminal
 //! `disconnected` stamp the route writes when the last attachment ends.
 //!
 //! What a frame *means* is the attachment session's own business and is pinned
@@ -17,11 +19,12 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use brenn_attach_proto::{
-    ClientFrame, SUPPORTED_VERSIONS, ServerFrame, SubscribeOutcome, Urgency, VersionRange,
-    max_client_frame_bytes,
+    ClientFrame, Codec, SUPPORTED_VERSIONS, ServerFrame, SubscribeOutcome, Urgency, VersionRange,
+    WireMessage,
 };
 use brenn_messaging::testutils::ephemeral_channel_entry;
 use brenn_obs::alerting::AlertDispatcher;
+use brenn_surface_schema::SURFACE_ATTACH_VERSION;
 use futures::{SinkExt, StreamExt};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
@@ -93,36 +96,51 @@ async fn assert_single_alert(
     );
 }
 
+/// The codec of the version the surface route serves.
+fn surface_codec() -> Codec {
+    Codec::negotiated(SURFACE_ATTACH_VERSION)
+}
+
+/// Decode one server message, text or binary, at the surface route's version.
+fn decode_server(message: WireMessage) -> ServerFrame {
+    surface_codec()
+        .decode_server(message)
+        .expect("server frame parses")
+}
+
 /// Read the next server frame, skipping pings and idle `Heartbeat`s. Panics on
 /// close or timeout.
 async fn next_server_frame(ws: &mut SurfaceWs) -> ServerFrame {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match tokio::time::timeout_at(deadline, ws.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => {
-                let frame: ServerFrame =
-                    serde_json::from_str(t.as_str()).expect("server frame parses");
-                if matches!(frame, ServerFrame::Heartbeat) {
-                    continue;
-                }
-                return frame;
-            }
+        let frame = match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => decode_server(WireMessage::Text(t.to_string())),
+            Ok(Some(Ok(Message::Binary(b)))) => decode_server(WireMessage::Binary(b.to_vec())),
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
             other => panic!("expected a server frame, got {other:?}"),
+        };
+        if matches!(frame, ServerFrame::Heartbeat) {
+            continue;
         }
+        return frame;
     }
 }
 
 async fn send(ws: &mut SurfaceWs, frame: &ClientFrame) {
-    let text = serde_json::to_string(frame).expect("a client frame serializes");
-    ws.send(Message::text(text)).await.expect("send a frame");
+    let message = match surface_codec().encode_client(frame) {
+        WireMessage::Text(text) => Message::text(text),
+        WireMessage::Binary(bytes) => Message::binary(bytes),
+    };
+    ws.send(message).await.expect("send a frame");
 }
 
 /// Read the peer's `Hello`, answer it, and read what follows — the opening
 /// ladder every other test here starts from.
 async fn open_attachment(ws: &mut SurfaceWs) -> ServerFrame {
     match next_server_frame(ws).await {
-        ServerFrame::Hello { versions, .. } => assert_eq!(versions, SUPPORTED_VERSIONS),
+        ServerFrame::Hello { versions, .. } => {
+            assert_eq!(versions, VersionRange::exactly(SURFACE_ATTACH_VERSION))
+        }
         other => panic!("expected the peer's Hello first, got {other:?}"),
     }
     send(
@@ -177,15 +195,15 @@ async fn drain_until_closed_observing(ws: &mut SurfaceWs) -> Option<CloseObserva
             Ok(None) | Ok(Some(Err(_))) => return Some(CloseObservation::Abrupt),
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)))) => continue,
             Ok(Some(Ok(Message::Text(t)))) => {
-                let frame: ServerFrame =
-                    serde_json::from_str(t.as_str()).expect("server frame parses");
+                let frame = decode_server(WireMessage::Text(t.to_string()));
                 assert!(
                     matches!(frame, ServerFrame::Heartbeat),
                     "violation path leaked a response frame before close: {frame:?}"
                 );
             }
-            Ok(Some(Ok(Message::Binary(_)))) => {
-                panic!("violation path sent a binary frame before close")
+            Ok(Some(Ok(Message::Binary(b)))) => {
+                let frame = decode_server(WireMessage::Binary(b.to_vec()));
+                panic!("violation path leaked a response frame before close: {frame:?}")
             }
             Err(_) => return None,
         }
@@ -404,8 +422,10 @@ async fn surface_ws_welcome_carries_this_attachments_transport_facts() {
             max_body_bytes,
             max_frame_bytes,
             alert_granted,
+            blobs,
         } => {
-            assert_eq!(version, SUPPORTED_VERSIONS.max);
+            assert_eq!(blobs, None);
+            assert_eq!(version, SURFACE_ATTACH_VERSION);
             assert_eq!(participant_id, "surface:deskbar");
             assert!(
                 Uuid::parse_str(&session_id).is_ok(),
@@ -415,7 +435,7 @@ async fn surface_ws_welcome_carries_this_attachments_transport_facts() {
             assert_eq!(max_body_bytes, TEST_MAX_BODY_BYTES as u64);
             assert_eq!(
                 max_frame_bytes,
-                max_client_frame_bytes(TEST_MAX_BODY_BYTES) as u64
+                Codec::negotiated(version).max_client_frame_bytes(TEST_MAX_BODY_BYTES) as u64
             );
             // Default-policy surface: the alert plane is deny-by-default.
             assert!(!alert_granted);
@@ -519,9 +539,10 @@ async fn surface_ws_a_publish_reaches_the_bus_and_comes_back_on_the_subscription
         &ClientFrame::Publish {
             channel: EPH_ADDR.to_string(),
             attribution: Some(COMPONENT.to_string()),
-            body: "round trip".to_string(),
+            body: "round trip".into(),
             urgency: Urgency::Normal,
             correlation: Some(7),
+            attachments: Vec::new(),
         },
     )
     .await;
@@ -549,7 +570,7 @@ async fn surface_ws_a_publish_reaches_the_bus_and_comes_back_on_the_subscription
                 let [row] = rows.as_slice() else {
                     panic!("one live publish is a one-row pass, got {rows:?}");
                 };
-                assert_eq!(row.envelope.body, "round trip");
+                assert_eq!(row.envelope.body.as_text(), Some("round trip"));
                 assert_eq!(
                     row.envelope.sender, "surface:deskbar#protobar",
                     "the attribution mints the component's own sub-identity"
@@ -558,6 +579,125 @@ async fn surface_ws_a_publish_reaches_the_bus_and_comes_back_on_the_subscription
             }
             other => panic!("expected a publish answer or a delivery, got {other:?}"),
         }
+    }
+}
+
+/// The host component that publishes with attachments in
+/// [`surface_ws_a_live_publish_carries_its_attachments_to_the_page`].
+const BLOB_PRODUCER: &str = "blob-producer";
+
+/// **A live delivery carries the published message's attachments.** A live
+/// row is not the stored envelope: the publish rebuilds one for the attach
+/// feed, so a host publish naming a blob must reach an attached page's
+/// `Deliver` row with the same references a query of the message would show.
+#[tokio::test]
+async fn surface_ws_a_live_publish_carries_its_attachments_to_the_page() {
+    use brenn_envelope::grants::AppCapability;
+    use brenn_lib::access::AppPolicy;
+    use brenn_lib::access::acl::ChannelMatcher;
+    use brenn_lib::messaging::{
+        AttachmentName, SubscriberEntryKind, SubscriberRegistration, WakeEconomics,
+    };
+    use brenn_messaging::publish::PublishResult;
+    use brenn_messaging::testutils::{TempBlobDir, seal_blob};
+    use brenn_messaging_store::blob::{BlobLimits, BlobStore, HeldAttachments};
+
+    let db = brenn_server::test_support::init_db_memory();
+    let blob_dir = TempBlobDir::new();
+    let blobs = {
+        let conn = db.lock().await;
+        BlobStore::open(
+            blob_dir.path(),
+            BlobLimits {
+                max_blob_bytes: 1 << 20,
+                budget_bytes: 1 << 20,
+            },
+            &conn,
+        )
+    };
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::EphemeralPublish);
+    policy.acls.ephemeral_publish = vec![ChannelMatcher::Exact(EPH_NAME.to_string())];
+    let producer = (
+        SubscriberEntryKind::System(BLOB_PRODUCER.to_string()),
+        SubscriberRegistration {
+            policy: Arc::new(policy),
+            wake: WakeEconomics::Eager,
+        },
+    );
+    // retain_depth 0: the subscribe replays nothing, so the delivery under test
+    // is the live one.
+    let SurfaceTestHarness { state, .. } =
+        brenn_server::routes::surface::test_fixtures::surface_harness_extending_messenger(
+            &db,
+            deskbar_loop(vec![]),
+            vec![],
+            vec![ephemeral_channel_entry(EPH_NAME, 0)],
+            |messenger| {
+                messenger
+                    .with_subscriber_registrations([producer].into())
+                    .with_blob_store(blobs)
+            },
+        )
+        .await;
+    let messenger = Arc::clone(state.messenger.as_ref().expect("the rig has a messenger"));
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(state).await;
+
+    let (mut ws, _session_id) = attach(&base, &token).await;
+    send(
+        &mut ws,
+        &ClientFrame::Subscribe {
+            channel: EPH_ADDR.to_string(),
+            push_depth: 4,
+            retain_depth: 4,
+            resume: None,
+        },
+    )
+    .await;
+    match next_server_frame(&mut ws).await {
+        ServerFrame::SubscribeResult {
+            outcome,
+            replay_count,
+            ..
+        } => {
+            assert_eq!(outcome, SubscribeOutcome::Ok);
+            assert_eq!(replay_count, 0);
+        }
+        other => panic!("expected SubscribeResult, got {other:?}"),
+    }
+
+    let photo = seal_blob(&messenger, b"jpeg bytes");
+    let held = HeldAttachments::new([(AttachmentName::new("photo").unwrap(), photo)])
+        .expect("one attachment");
+    let published = held.refs().clone();
+    let outcome = messenger
+        .publish_from_system_with_attachments(
+            BLOB_PRODUCER,
+            EPH_ADDR,
+            "see attached".into(),
+            Urgency::Normal,
+            None,
+            None,
+            held,
+        )
+        .await;
+    assert!(
+        matches!(outcome, PublishResult::Ok { .. }),
+        "the producer may publish here: {outcome:?}"
+    );
+
+    match next_server_frame(&mut ws).await {
+        ServerFrame::Deliver { channel, rows } => {
+            assert_eq!(channel, EPH_ADDR);
+            let [row] = rows.as_slice() else {
+                panic!("one live publish is a one-row pass, got {rows:?}");
+            };
+            assert_eq!(row.envelope.body.as_text(), Some("see attached"));
+            assert_eq!(row.envelope.attachments, published);
+            assert_eq!(row.envelope.attachments.len(), 1);
+        }
+        other => panic!("expected Deliver, got {other:?}"),
     }
 }
 
@@ -753,6 +893,7 @@ fn spanning_link_config() -> brenn_lib::config::BrennConfig {
                     io_port: true,
                     push_depth: Some(Depth::Bounded(4)),
                     retain_depth: Some(Depth::Bounded(4)),
+                    non_text: false,
                 },
                 LinkEndpointRaw {
                     host: LinkHostRaw::Surface {
@@ -765,6 +906,7 @@ fn spanning_link_config() -> brenn_lib::config::BrennConfig {
                     io_port: true,
                     push_depth: Some(Depth::Bounded(4)),
                     retain_depth: Some(Depth::Bounded(4)),
+                    non_text: false,
                 },
             ],
         }],
@@ -832,10 +974,11 @@ async fn surface_ws_an_auto_channel_carries_a_backend_publish_to_the_page() {
             "worker",
             &[WasmPublish {
                 channel_address: &address,
-                body: "from-the-backend",
+                body: "from-the-backend".into(),
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
+                attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
             }],
         )
         .await;
@@ -846,12 +989,218 @@ async fn surface_ws_an_auto_channel_carries_a_backend_publish_to_the_page() {
             let [row] = rows.as_slice() else {
                 panic!("one backend publish is a one-row pass, got {rows:?}");
             };
-            assert_eq!(row.envelope.body, "from-the-backend");
+            assert_eq!(row.envelope.body.as_text(), Some("from-the-backend"));
         }
         other => panic!("expected Deliver on the auto channel, got {other:?}"),
     }
 
     assert_no_alerts(&flusher, &alerts, "auto channel delivery to a surface").await;
+}
+
+// ---------------------------------------------------------------------------
+// Non-text bodies from a remote to a page
+// ---------------------------------------------------------------------------
+
+/// The `ephemeral:` channel declared `non_text` a remote publishes onto and a
+/// surface binds, bare and scheme-qualified.
+const FRAMES_NAME: &str = "camera.frames";
+const FRAMES_ADDR: &str = "ephemeral:camera.frames";
+
+/// The remote's slug and bearer token.
+const CAMERA_SLUG: &str = "camera";
+const CAMERA_TOKEN: &str = "camera-bearer-token";
+
+/// The surface port bound to [`FRAMES_ADDR`].
+const FRAMES_PORT: &str = "frames";
+
+/// A `[[remote]]` allowed to publish onto [`FRAMES_ADDR`], declared `non_text`,
+/// and `deskbar` reading it through a port that states nothing. The token file
+/// is returned because resolution reads it at boot.
+fn remote_to_surface_config() -> (brenn_lib::config::BrennConfig, tempfile::TempDir) {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    use brenn_lib::messaging::AttachGrant;
+    use brenn_lib::messaging::config::{
+        ChannelConfigRaw, Depth, MessagingGlobalConfig, SurfaceConfigRaw, SurfaceSubscriptionRaw,
+    };
+    use brenn_lib::messaging::remote::RemoteConfigRaw;
+    use brenn_messaging_boot::test_fixtures::{minimal_surface_raw, surface_description_channels};
+    use std::os::unix::fs::PermissionsExt;
+
+    let secrets = tempfile::tempdir().expect("a token directory");
+    let token_file = secrets.path().join("camera.token");
+    std::fs::write(&token_file, format!("{CAMERA_TOKEN}\n")).expect("write the token");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict the token");
+
+    let mut channels = surface_description_channels("deskbar", &["protobar", "chrome"]);
+    channels.push(ChannelConfigRaw {
+        push_depth: Some(Depth::Bounded(4)),
+        retain_depth: Some(Depth::Bounded(4)),
+        non_text: true,
+        ..ChannelConfigRaw::minimal(FRAMES_ADDR)
+    });
+    let camera = RemoteConfigRaw {
+        slug: CAMERA_SLUG.to_string(),
+        token_file,
+        grants: vec![AttachGrant::EphemeralPublish],
+        subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
+        publish_acl: vec![],
+        ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact(FRAMES_NAME.to_string())],
+        publish_burst: None,
+        publish_per_sec: None,
+        max_sessions: None,
+        max_subscriptions: None,
+    };
+    let deskbar = SurfaceConfigRaw {
+        grants: vec![AttachGrant::EphemeralSubscribe],
+        ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(FRAMES_NAME.to_string())],
+        subscriptions: vec![SurfaceSubscriptionRaw {
+            channel: Some(FRAMES_ADDR.to_string()),
+            instance: COMPONENT.to_string(),
+            port: FRAMES_PORT.to_string(),
+            push_depth: Some(Depth::Bounded(4)),
+            retain_depth: None,
+            noise: None,
+            wake_min: None,
+            non_text: false,
+        }],
+        ..minimal_surface_raw()
+    }
+    .implying_component_vocabularies();
+    let config = brenn_lib::config::BrennConfig {
+        messaging: MessagingGlobalConfig::default(),
+        channels,
+        surfaces: vec![deskbar],
+        remotes: vec![camera],
+        ..brenn_lib::config::BrennConfig::default()
+    };
+    (config, secrets)
+}
+
+/// **A remote's non-text body reaches a page byte for byte, with its content
+/// type.** Over the real routes on real sockets, under a configuration the
+/// real planner accepted: a v5 remote session publishes non-UTF-8 bytes typed
+/// `image/jpeg` onto an `ephemeral:` channel declared `non_text`, and the
+/// surface session subscribed to it is delivered the same bytes and the same
+/// type. The server half of the remote-to-surface path; no browser runs here.
+#[tokio::test]
+async fn surface_ws_a_remotes_non_text_body_reaches_the_page_with_its_type() {
+    use brenn_envelope::MessageBody;
+    use brenn_server::test_support::http::remote_ws_open;
+
+    let db = brenn_server::test_support::init_db_memory();
+    let (config, _secrets) = remote_to_surface_config();
+    let harness = crate::surface_boot_harness::booted_surface_harness(&db, &config).await;
+    assert_eq!(
+        harness.surfaces[0].wire_channels,
+        vec![brenn_lib::messaging::config::ResolvedWireChannel {
+            address: FRAMES_ADDR.to_string(),
+            non_text: true,
+        }],
+        "the page is told the channel's declaration"
+    );
+    let flusher = harness.flusher.clone();
+    let alerts = Arc::clone(&harness.alerts);
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(harness.state).await;
+
+    let (mut page, _session_id) = attach(&base, &token).await;
+    send(
+        &mut page,
+        &ClientFrame::Subscribe {
+            channel: FRAMES_ADDR.to_string(),
+            push_depth: 4,
+            retain_depth: 4,
+            resume: None,
+        },
+    )
+    .await;
+    match next_server_frame(&mut page).await {
+        ServerFrame::SubscribeResult {
+            channel, outcome, ..
+        } => {
+            assert_eq!(channel, FRAMES_ADDR);
+            assert_eq!(outcome, SubscribeOutcome::Ok);
+        }
+        other => panic!("expected SubscribeResult, got {other:?}"),
+    }
+
+    // The remote session, offering v5 only, on its own codec.
+    let five = Codec::negotiated(5);
+    let mut camera = remote_ws_open(
+        &http_to_ws_url(&base, &format!("/remote/{CAMERA_SLUG}/ws")),
+        CAMERA_TOKEN,
+    )
+    .await;
+    match next_server_frame(&mut camera).await {
+        ServerFrame::Hello { versions, .. } => assert!(versions.contains(5), "{versions:?}"),
+        other => panic!("expected the peer's Hello first, got {other:?}"),
+    }
+    let send_v5 = async |ws: &mut SurfaceWs, frame: &ClientFrame| {
+        let message = match five.encode_client(frame) {
+            WireMessage::Text(text) => Message::text(text),
+            WireMessage::Binary(bytes) => Message::binary(bytes),
+        };
+        ws.send(message).await.expect("send a frame");
+    };
+    send_v5(
+        &mut camera,
+        &ClientFrame::Hello {
+            versions: VersionRange::exactly(5),
+            ident: "camera".to_string(),
+        },
+    )
+    .await;
+    match next_server_frame(&mut camera).await {
+        ServerFrame::Welcome { version, .. } => assert_eq!(version, 5),
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+    let bytes = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x80, 0xfe];
+    let body =
+        MessageBody::from_parts(Some("image/jpeg"), &bytes).expect("a well-formed non-text body");
+    send_v5(
+        &mut camera,
+        &ClientFrame::Publish {
+            channel: FRAMES_ADDR.to_string(),
+            attribution: None,
+            body,
+            urgency: Urgency::Normal,
+            correlation: Some(1),
+            attachments: Vec::new(),
+        },
+    )
+    .await;
+    match next_server_frame(&mut camera).await {
+        ServerFrame::PublishResult {
+            correlation,
+            outcome,
+        } => {
+            assert_eq!(correlation, Some(1));
+            assert_eq!(outcome, brenn_attach_proto::PublishOutcome::Ok);
+        }
+        other => panic!("expected PublishResult, got {other:?}"),
+    }
+
+    match next_server_frame(&mut page).await {
+        ServerFrame::Deliver { channel, rows } => {
+            assert_eq!(channel, FRAMES_ADDR);
+            let [row] = rows.as_slice() else {
+                panic!("one publish is a one-row pass, got {rows:?}");
+            };
+            assert_eq!(row.envelope.body.as_bytes(), bytes);
+            assert_eq!(row.envelope.body.content_type(), Some("image/jpeg"));
+            assert_eq!(row.envelope.sender, format!("remote:{CAMERA_SLUG}"));
+        }
+        other => panic!("expected Deliver on the frames channel, got {other:?}"),
+    }
+
+    assert_no_alerts(
+        &flusher,
+        &alerts,
+        "a remote's non-text body delivered to a page",
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------

@@ -83,8 +83,6 @@ impl FaultReport {
 pub enum ContractViolation {
     /// Event arrived on a port other than `messages`.
     WrongPort { port: String },
-    /// `envelope_json` did not parse as a `MessageEnvelope`.
-    BadEnvelope(String),
 }
 
 /// The outcome of an accepted `messages` delivery. `Malformed` is a publisher
@@ -245,25 +243,26 @@ impl ProtobarState {
         Self::default()
     }
 
-    /// Handle a `messages`-port delivery. Rejects a wrong port and an
-    /// unparseable envelope (both `ContractViolation`, panic-worthy skew). A
-    /// well-formed envelope whose body violates the convention returns
+    /// Handle a `messages`-port delivery. Rejects a wrong port (a
+    /// `ContractViolation`, panic-worthy skew). An envelope whose body violates the convention returns
     /// `Ingest::Malformed` — slots untouched, counter bumped — rather than
     /// failing: one buggy publisher must not brick a bar showing other
     /// publishers' live messages.
     pub fn on_message(
         &mut self,
         port: &str,
-        envelope_json: &str,
+        envelope: &MessageEnvelope,
         now: DateTime<Utc>,
     ) -> Result<Ingest, ContractViolation> {
         self.check_port(port)?;
-        let envelope: MessageEnvelope = serde_json::from_str(envelope_json)
-            .map_err(|e| ContractViolation::BadEnvelope(e.to_string()))?;
-        match ParsedBody::parse(&envelope.body) {
+        let parsed = match envelope.body.as_text() {
+            Some(text) => ParsedBody::parse(text),
+            None => ParsedBody::Malformed("body is not text".to_string()),
+        };
+        match parsed {
             ParsedBody::Malformed(reason) => {
                 self.malformed += 1;
-                Ok(Ingest::Malformed(FaultReport::new(&envelope, reason)))
+                Ok(Ingest::Malformed(FaultReport::new(envelope, reason)))
             }
             ParsedBody::BareText(text) => {
                 self.store(DEFAULT_PRIORITY, markdown::plain(&text), None, now);
@@ -399,7 +398,8 @@ impl ProtobarState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brenn_surface_test_fixtures::sample_envelope_json;
+    use brenn_envelope::MessageBody;
+    use brenn_surface_test_fixtures::sample_envelope;
 
     /// A fixed render clock for the slot/expiry tests.
     fn now() -> DateTime<Utc> {
@@ -419,8 +419,8 @@ mod tests {
     }
 
     /// A structured body as wire JSON text, wrapped in the sample envelope.
-    fn structured(fields: serde_json::Value) -> String {
-        sample_envelope_json(&fields.to_string())
+    fn structured(fields: serde_json::Value) -> MessageEnvelope {
+        sample_envelope(&fields.to_string())
     }
 
     #[test]
@@ -436,7 +436,7 @@ mod tests {
     fn bare_text_lands_in_normal_slot_verbatim() {
         let mut state = ProtobarState::new();
         assert_eq!(
-            state.on_message("messages", &sample_envelope_json("hello world"), now()),
+            state.on_message("messages", &sample_envelope("hello world"), now()),
             Ok(Ingest::Accepted)
         );
         let display = state.display(now());
@@ -451,7 +451,7 @@ mod tests {
         for raw in [r#""hi""#, "42", "[1,2]", "true", "null"] {
             let mut state = ProtobarState::new();
             assert_eq!(
-                state.on_message("messages", &sample_envelope_json(raw), now()),
+                state.on_message("messages", &sample_envelope(raw), now()),
                 Ok(Ingest::Accepted)
             );
             assert_eq!(rendered_text(&state.display(now())), raw);
@@ -462,7 +462,7 @@ mod tests {
     fn empty_body_renders_empty_not_awaiting() {
         let mut state = ProtobarState::new();
         state
-            .on_message("messages", &sample_envelope_json(""), now())
+            .on_message("messages", &sample_envelope(""), now())
             .unwrap();
         assert_eq!(rendered_text(&state.display(now())), "");
     }
@@ -472,7 +472,7 @@ mod tests {
         let mut state = ProtobarState::new();
         let body = "<script>alert('x')</script>";
         state
-            .on_message("messages", &sample_envelope_json(body), now())
+            .on_message("messages", &sample_envelope(body), now())
             .unwrap();
         assert_eq!(rendered_text(&state.display(now())), body);
     }
@@ -778,7 +778,7 @@ mod tests {
         let mut state = ProtobarState::new();
         // No expiry at all.
         state
-            .on_message("messages", &sample_envelope_json("plain"), now())
+            .on_message("messages", &sample_envelope("plain"), now())
             .unwrap();
         assert_eq!(state.next_expiry(now()), None);
         // A past expiry does not schedule.
@@ -808,7 +808,7 @@ mod tests {
             let mut state = ProtobarState::new();
             // A live message occupies the bar first.
             state
-                .on_message("messages", &sample_envelope_json("live"), now())
+                .on_message("messages", &sample_envelope("live"), now())
                 .unwrap();
             let outcome = state
                 .on_message("messages", &structured(body.clone()), now())
@@ -895,7 +895,7 @@ mod tests {
     fn wrong_port_rejected() {
         let mut state = ProtobarState::new();
         assert_eq!(
-            state.on_message("wrong", &sample_envelope_json("x"), now()),
+            state.on_message("wrong", &sample_envelope("x"), now()),
             Err(ContractViolation::WrongPort {
                 port: "wrong".to_string()
             })
@@ -909,10 +909,20 @@ mod tests {
     }
 
     #[test]
-    fn bad_envelope_rejected() {
+    fn a_non_text_body_is_a_publisher_fault() {
         let mut state = ProtobarState::new();
-        let result = state.on_message("messages", "not json", now());
-        assert!(matches!(result, Err(ContractViolation::BadEnvelope(_))));
+        state
+            .on_message("messages", &sample_envelope("live"), now())
+            .unwrap();
+        let mut envelope = sample_envelope("");
+        envelope.body = MessageBody::from_parts(Some("application/octet-stream"), &[0xff, 0])
+            .expect("a binary body builds");
+        match state.on_message("messages", &envelope, now()) {
+            Ok(Ingest::Malformed(report)) => assert_eq!(report.reason, "body is not text"),
+            other => panic!("expected a malformed-body report, got {other:?}"),
+        }
+        assert_eq!(rendered_text(&state.display(now())), "live");
+        assert_eq!(state.display(now()).status_text, "malformed: 1");
     }
 
     #[test]

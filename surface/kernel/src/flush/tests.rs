@@ -9,7 +9,7 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::TimerChange;
 use brenn_attach_client::router::{RouteOutcome, RouteRequest};
 use brenn_attach_client::subs::Subscriptions;
-use brenn_attach_proto::{ClientFrame, DeferredOpKind};
+use brenn_attach_proto::{ClientFrame, DeferredOpKind, MessageBody};
 use brenn_envelope::Urgency;
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::{
@@ -27,6 +27,7 @@ use crate::test_support::pages;
 use crate::test_support::pages::PRINCIPAL;
 
 use super::*;
+use brenn_envelope::grants::ProcessorContract;
 
 const WIRE: &str = "ephemeral:site.bar.out";
 const NOTES: &str = "local:app/notes";
@@ -128,7 +129,13 @@ impl Page {
         let mut router = LocalRouter::new(planes);
         router.set_principal(PRINCIPAL.to_string());
         for instance in ["p1", "p2", "chrome"] {
-            registrations.register(instance, Some(&bindings), &mut stores, &mut subs);
+            registrations.register(
+                instance,
+                ProcessorContract::V0_1,
+                Some(&bindings),
+                &mut stores,
+                &mut subs,
+            );
             schedules.track(instance, false);
         }
         outbound.reconcile(&bindings, ["p1", "p2", "chrome"].into_iter());
@@ -177,11 +184,13 @@ impl Page {
                 OutputSpec {
                     channel: binding.channel.clone(),
                     default_urgency: binding.urgency,
+                    non_text: self.bindings.carries_non_text(&binding.channel),
                 },
             );
             sink_mt.insert(binding.port.clone(), 1_000_000);
         }
         PublishBuffer::new(
+            instance,
             outputs,
             self.bindings.declared_out_ports(instance),
             sink_mt,
@@ -198,7 +207,7 @@ impl Page {
             RouteRequest {
                 channel: NOTES,
                 origin: Origin::Sub(instance),
-                body: body.to_string(),
+                body: (body.to_string()).into(),
                 stamp,
                 urgency: Urgency::Normal,
                 deliver_after: Some(release_at),
@@ -221,7 +230,7 @@ impl Page {
             .get(channel)
             .expect("the fixture hosts the channel")
             .retained()
-            .map(|(envelope, _)| envelope.body.clone())
+            .map(|(envelope, _)| envelope.body.as_text().unwrap().to_owned())
             .collect()
     }
 
@@ -229,7 +238,7 @@ impl Page {
         self.router
             .parked_for(&self.stores, NOTES, Origin::Sub(instance))
             .into_iter()
-            .map(|entry| entry.body)
+            .map(|entry| entry.body.as_text().expect("a page parks text").to_string())
             .collect()
     }
 }
@@ -263,14 +272,16 @@ fn batch_parts(frame: &ClientFrame) -> (&[BatchEntry], &[BatchDeferredOp]) {
 fn a_transportable_entry_carries_its_captured_channel_and_resolved_urgency() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
-    buffer.publish("out", "hello".to_string()).expect("bound");
+    buffer
+        .publish("out", brenn_envelope::GuestBody::Text("hello".to_string()))
+        .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
 
     let (entries, ops) = batch_parts(&report.steps.frames[0]);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].channel, WIRE);
-    assert_eq!(entries[0].body, "hello");
+    assert_eq!(entries[0].body, MessageBody::from("hello"));
     assert_eq!(
         entries[0].urgency,
         Urgency::High,
@@ -287,7 +298,11 @@ fn a_deferred_transportable_entry_states_its_release_time_verbatim() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
     buffer
-        .publish_deferred("out", "later".to_string(), 9_000)
+        .publish_deferred(
+            "out",
+            brenn_envelope::GuestBody::Text("later".to_string()),
+            9_000,
+        )
         .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
@@ -326,7 +341,12 @@ fn a_transportable_edit_carries_its_replacement_body_and_release_time() {
     let parked = Uuid::from_u128(0x0ff);
     let mut buffer = page.buffer("p1", HashMap::from([("out".to_string(), vec![parked])]));
     buffer
-        .defer_edit("out", 0, Some("rewritten".to_string()), Some(9_000))
+        .defer_edit(
+            "out",
+            0,
+            Some(brenn_envelope::GuestBody::Text("rewritten".to_string())),
+            Some(9_000),
+        )
         .expect("in the window");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(0));
@@ -336,7 +356,7 @@ fn a_transportable_edit_carries_its_replacement_body_and_release_time() {
     assert_eq!(
         ops[0].op,
         DeferredOpKind::Edit {
-            body: Some("rewritten".to_string()),
+            body: Some("rewritten".into()),
             deliver_after: Some(9_000),
         },
         "both halves of the edit reach the frame, and in the right fields"
@@ -352,7 +372,10 @@ fn a_flush_the_wiring_no_longer_admits_is_refused_rather_than_sent() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
     buffer
-        .publish("out", "authorized then".to_string())
+        .publish(
+            "out",
+            brenn_envelope::GuestBody::Text("authorized then".to_string()),
+        )
         .expect("bound");
     // The activation was still running when a second document stopped binding the
     // port its buffer had already resolved.
@@ -369,7 +392,9 @@ fn a_flush_the_wiring_no_longer_admits_is_refused_rather_than_sent() {
 fn a_flush_while_detached_queues_and_sends_nothing() {
     let mut page = Page::new(NoiseLevel::Metered, false);
     let mut buffer = page.buffer("p1", HashMap::new());
-    buffer.publish("out", "hello".to_string()).expect("bound");
+    buffer
+        .publish("out", brenn_envelope::GuestBody::Text("hello".to_string()))
+        .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
     assert!(report.steps.frames.is_empty());
@@ -380,7 +405,7 @@ fn a_flush_while_detached_queues_and_sends_nothing() {
         .on_attached(&page.bindings, &pages::facts(), NOW);
     assert_eq!(
         batch_parts(&steps.frames[0]).0[0].body,
-        "hello",
+        MessageBody::from("hello"),
         "the queued flush goes out when the attachment comes up"
     );
 }
@@ -403,7 +428,10 @@ fn a_confined_entry_reaches_the_channels_readers_and_no_frame() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
     buffer
-        .publish("notes", "page-local".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("page-local".to_string()),
+        )
         .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
@@ -422,14 +450,21 @@ fn a_confined_entry_reaches_the_channels_readers_and_no_frame() {
 fn both_classes_from_one_activation_commit_at_their_own_authority() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
-    buffer.publish("notes", "here".to_string()).expect("bound");
-    buffer.publish("out", "there".to_string()).expect("bound");
+    buffer
+        .publish("notes", brenn_envelope::GuestBody::Text("here".to_string()))
+        .expect("bound");
+    buffer
+        .publish("out", brenn_envelope::GuestBody::Text("there".to_string()))
+        .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(2));
 
     let (entries, _) = batch_parts(&report.steps.frames[0]);
     assert_eq!(
-        entries.iter().map(|e| e.body.as_str()).collect::<Vec<_>>(),
+        entries
+            .iter()
+            .map(|e| e.body.as_text().unwrap())
+            .collect::<Vec<_>>(),
         vec!["there"],
         "only the transportable entry rides the frame"
     );
@@ -440,18 +475,30 @@ fn both_classes_from_one_activation_commit_at_their_own_authority() {
 fn each_class_commits_its_entries_in_call_order() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
-    buffer.publish("out", "first".to_string()).expect("bound");
-    buffer.publish("out", "second".to_string()).expect("bound");
-    buffer.publish("notes", "then".to_string()).expect("bound");
     buffer
-        .publish("notes", "and then".to_string())
+        .publish("out", brenn_envelope::GuestBody::Text("first".to_string()))
+        .expect("bound");
+    buffer
+        .publish("out", brenn_envelope::GuestBody::Text("second".to_string()))
+        .expect("bound");
+    buffer
+        .publish("notes", brenn_envelope::GuestBody::Text("then".to_string()))
+        .expect("bound");
+    buffer
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("and then".to_string()),
+        )
         .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(4));
 
     let (entries, _) = batch_parts(&report.steps.frames[0]);
     assert_eq!(
-        entries.iter().map(|e| e.body.as_str()).collect::<Vec<_>>(),
+        entries
+            .iter()
+            .map(|e| e.body.as_text().unwrap())
+            .collect::<Vec<_>>(),
         vec!["first", "second"],
         "the frame carries its entries in the order the component wrote them"
     );
@@ -471,7 +518,10 @@ fn a_buffered_publish_routes_to_the_channel_that_authorized_it() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
     buffer
-        .publish("notes", "captured".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("captured".to_string()),
+        )
         .expect("bound");
     // A second document rebinds the port, and its channel has a store — so a flush
     // that re-resolved would route there successfully rather than failing loudly.
@@ -493,7 +543,11 @@ fn a_deferred_confined_publish_parks_and_reaches_nobody() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
     buffer
-        .publish_deferred("notes", "soon".to_string(), 9_000)
+        .publish_deferred(
+            "notes",
+            brenn_envelope::GuestBody::Text("soon".to_string()),
+            9_000,
+        )
         .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
@@ -513,7 +567,11 @@ fn a_full_deferred_set_drops_the_schedule_and_counts_it() {
     page.park("p1", "first", 9_000);
     let mut buffer = page.buffer("p1", HashMap::new());
     buffer
-        .publish_deferred("notes", "second".to_string(), 9_000)
+        .publish_deferred(
+            "notes",
+            brenn_envelope::GuestBody::Text("second".to_string()),
+            9_000,
+        )
         .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
@@ -532,7 +590,12 @@ fn a_confined_op_reaches_the_instances_own_parked_message() {
     let parked = page.park("p1", "first", 9_000);
     let mut buffer = page.buffer("p1", HashMap::from([("notes".to_string(), vec![parked])]));
     buffer
-        .defer_edit("notes", 0, Some("rewritten".to_string()), None)
+        .defer_edit(
+            "notes",
+            0,
+            Some(brenn_envelope::GuestBody::Text("rewritten".to_string())),
+            None,
+        )
         .expect("in the window");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(0));
@@ -553,7 +616,11 @@ fn a_control_op_applies_ahead_of_the_same_activations_publishes() {
     let mut buffer = page.buffer("p1", HashMap::from([("notes".to_string(), vec![parked])]));
     buffer.defer_cancel("notes", 0).expect("in the window");
     buffer
-        .publish_deferred("notes", "next".to_string(), 9_000)
+        .publish_deferred(
+            "notes",
+            brenn_envelope::GuestBody::Text("next".to_string()),
+            9_000,
+        )
         .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
@@ -620,7 +687,7 @@ fn a_plane_refusing_a_body_reports_its_reason_and_routes_nothing() {
     buffer
         .publish(
             "over",
-            r#"{"v":1,"holder":"p1","since_stamp":0}"#.to_string(),
+            brenn_envelope::GuestBody::Text(r#"{"v":1,"holder":"p1","since_stamp":0}"#.to_string()),
         )
         .expect("bound");
 
@@ -651,7 +718,7 @@ fn a_refused_confined_edit_changes_nothing_and_reports_its_reason() {
         RouteRequest {
             channel: LOCAL_OVERLAY_STATE_CHANNEL,
             origin: Origin::Sub("chrome"),
-            body: r#"{"v":1,"holder":"p1","since_stamp":0}"#.to_string(),
+            body: r#"{"v":1,"holder":"p1","since_stamp":0}"#.into(),
             stamp,
             urgency: Urgency::Normal,
             deliver_after: Some(9_000),
@@ -670,7 +737,9 @@ fn a_refused_confined_edit_changes_nothing_and_reports_its_reason() {
         .defer_edit(
             "over",
             0,
-            Some(r#"{"v":1,"holder":"ghost","since_stamp":1}"#.to_string()),
+            Some(brenn_envelope::GuestBody::Text(
+                r#"{"v":1,"holder":"ghost","since_stamp":1}"#.to_string(),
+            )),
             None,
         )
         .expect("in the window");
@@ -693,7 +762,9 @@ fn a_refused_confined_edit_changes_nothing_and_reports_its_reason() {
             .into_iter()
             .map(|entry| entry.body)
             .collect::<Vec<_>>(),
-        vec![r#"{"v":1,"holder":"p1","since_stamp":0}"#.to_string()],
+        vec![MessageBody::from(
+            r#"{"v":1,"holder":"p1","since_stamp":0}"#
+        )],
         "a refused edit leaves the parked message alone"
     );
 }
@@ -702,8 +773,12 @@ fn a_refused_confined_edit_changes_nothing_and_reports_its_reason() {
 fn a_confined_publish_that_evicts_a_siblings_position_charges_the_ladder() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
-    buffer.publish("notes", "one".to_string()).expect("bound");
-    buffer.publish("notes", "two".to_string()).expect("bound");
+    buffer
+        .publish("notes", brenn_envelope::GuestBody::Text("one".to_string()))
+        .expect("bound");
+    buffer
+        .publish("notes", brenn_envelope::GuestBody::Text("two".to_string()))
+        .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(2));
 
@@ -723,8 +798,12 @@ fn a_confined_publish_that_evicts_a_siblings_position_charges_the_ladder() {
 fn a_fatal_binding_evicted_by_a_publish_asks_for_a_kill_naming_its_own_instance() {
     let mut page = Page::new(NoiseLevel::Fatal, true);
     let mut buffer = page.buffer("p1", HashMap::new());
-    buffer.publish("notes", "one".to_string()).expect("bound");
-    buffer.publish("notes", "two".to_string()).expect("bound");
+    buffer
+        .publish("notes", brenn_envelope::GuestBody::Text("one".to_string()))
+        .expect("bound");
+    buffer
+        .publish("notes", brenn_envelope::GuestBody::Text("two".to_string()))
+        .expect("bound");
 
     let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(2));
 
@@ -750,8 +829,12 @@ fn a_fatal_binding_evicted_by_a_publish_asks_for_a_kill_naming_its_own_instance(
 fn an_err_discards_the_work_and_counts_the_failure() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
-    buffer.publish("out", "hello".to_string()).expect("bound");
-    buffer.publish("notes", "here".to_string()).expect("bound");
+    buffer
+        .publish("out", brenn_envelope::GuestBody::Text("hello".to_string()))
+        .expect("bound");
+    buffer
+        .publish("notes", brenn_envelope::GuestBody::Text("here".to_string()))
+        .expect("bound");
 
     discard_err(&mut page.ctx(), "p1", buffer);
 
@@ -768,13 +851,18 @@ fn a_kill_strips_positions_discards_the_queue_and_reports_once() {
     let mut page = Page::new(NoiseLevel::Metered, false);
     for body in ["one", "two"] {
         let mut buffer = page.buffer("p2", HashMap::new());
-        buffer.publish("out", body.to_string()).expect("bound");
+        buffer
+            .publish("out", brenn_envelope::GuestBody::Text(body.to_string()))
+            .expect("bound");
         flush_ok(&mut page.ctx(), "p2", buffer, stamps(1));
     }
     // Something p2 is owed, so the position being stripped is observable.
     let mut buffer = page.buffer("p1", HashMap::new());
     buffer
-        .publish("notes", "unread".to_string())
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("unread".to_string()),
+        )
         .expect("bound");
     flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
     assert!(page.owed("p2", "notes"));
@@ -803,7 +891,9 @@ fn a_kill_strips_positions_discards_the_queue_and_reports_once() {
 fn a_kill_that_unblocks_the_last_queue_disarms_the_retry() {
     let mut page = Page::standard();
     let mut first = page.buffer("p2", HashMap::new());
-    first.publish("out", "one".to_string()).expect("bound");
+    first
+        .publish("out", brenn_envelope::GuestBody::Text("one".to_string()))
+        .expect("bound");
     let sent = flush_ok(&mut page.ctx(), "p2", first, stamps(1));
     let correlation = match &sent.steps.frames[0] {
         ClientFrame::PublishBatch { correlation, .. } => *correlation,
@@ -830,7 +920,9 @@ fn a_kill_that_unblocks_the_last_queue_disarms_the_retry() {
 fn a_stamp_count_short_of_the_publishes_panics() {
     let mut page = Page::standard();
     let mut buffer = page.buffer("p1", HashMap::new());
-    buffer.publish("out", "hello".to_string()).expect("bound");
+    buffer
+        .publish("out", brenn_envelope::GuestBody::Text("hello".to_string()))
+        .expect("bound");
     flush_ok(&mut page.ctx(), "p1", buffer, stamps(0));
 }
 
@@ -842,6 +934,8 @@ fn a_confined_publish_before_the_page_has_an_identity_panics() {
     planes.apply(&page.bindings);
     page.router = LocalRouter::new(planes);
     let mut buffer = page.buffer("p1", HashMap::new());
-    buffer.publish("notes", "here".to_string()).expect("bound");
+    buffer
+        .publish("notes", brenn_envelope::GuestBody::Text("here".to_string()))
+        .expect("bound");
     flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
 }

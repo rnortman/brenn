@@ -34,12 +34,16 @@ logs/
 *.db
 *.db-shm
 *.db-wal
+# The blob store's directory beside a database (`messaging { blob_dir }` default).
+*.db.blobs/
 brenn.brenn
 dev/grafdata/
 dev/graf-manifest.toml
-# The synthesized dev mounts document and the mount-shaped symlink trees under
-# it, regenerated on every `make launchdev` / `make e2e`.
+# The synthesized mounts documents and the mount-shaped symlink trees under
+# them: `.dev-mounts` regenerated on every `make launchdev`, `.e2e-mounts` on
+# every `make e2e`.
 /.dev-mounts/
+/.e2e-mounts/
 # The directory `make launchdev` / `make e2e` put on the dev server's PATH: one
 # symlink to the built `brenn-tool`.
 /.dev-bin/

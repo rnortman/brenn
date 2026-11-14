@@ -33,11 +33,12 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use brenn_attach_client::store::ChannelStores;
 use brenn_attach_client::subs::{ResumePolicy, Subscriptions};
 use brenn_attach_proto::ClientFrame;
+use brenn_envelope::grants::ProcessorContract;
 use brenn_queue::CursorOverflow;
 use brenn_surface_schema::{RESERVED_LOCAL_CHANNELS, reserved_local_channel};
 use uuid::Uuid;
@@ -85,13 +86,17 @@ pub fn new_stores(epoch: Uuid) -> SurfaceStores {
 /// counters.
 #[derive(Debug, Default)]
 pub struct StoreReconcile {
-    /// Per channel, the reader positions a shrink retired out from under. A
-    /// depth the operator lowered is as accountable a cause of loss as a burst,
-    /// and the ladder must see it either way. Address-ordered.
+    /// Per channel, the reader positions a shrink retired out from under, or a
+    /// store dropped for holding a non-text body its channel no longer declares.
+    /// A depth the operator lowered is as accountable a cause of loss as a
+    /// burst, and the ladder must see it either way. Address-ordered.
     pub retired: Vec<(String, Vec<CursorOverflow<BindingKey>>)>,
     /// Per channel, the identity that parked each schedule the page dropped with
     /// the channel's store — one entry per parked message, so a caller charging
-    /// a counter per lost schedule reads it straight off. Address-ordered.
+    /// a counter per lost schedule reads it straight off. Address-ordered. A
+    /// store is dropped for one of two causes: the document no longer names its
+    /// channel, or it holds a non-text body the document no longer declares the
+    /// channel may carry.
     ///
     /// A dropped schedule is the only account of a timer a component believes it
     /// set, so it is never silent. Only confined channels can appear: a
@@ -115,13 +120,78 @@ pub struct StoreReconcile {
 /// the per-binding max are load-bearing — `retain_depth` is what a binding reads
 /// as context and `push_depth` is what it can be handed as new — and the store
 /// is the only thing holding either.
+///
+/// A store whose channel the document does not declare `non_text` holds no
+/// non-text body, retained or parked. A store that does — admitted under an
+/// earlier document that declared it — is dropped with the stores the document
+/// no longer names and recreated empty, its parked schedules reported as lost.
+/// Its channel's readers outlive the drop, so every message a reader was still
+/// owed is reported in `retired`, as a shrink to nothing would report it; a
+/// sampled reader holds no position and loses only context, which no shrink
+/// charges either. It is dropped whole rather than edited: a ring with messages
+/// cut out of it has positions and drop counts that describe nothing. A store
+/// holding only text survives a change of declaration untouched.
+///
+/// # Panics
+///
+/// If a reserved plane's store holds a non-text body. No document can declare
+/// a plane `non_text`, so nothing can have admitted one.
 pub fn reconcile_stores(bindings: &AppliedBindings, stores: &mut SurfaceStores) -> StoreReconcile {
+    let holding_undeclared_non_text: Vec<String> = stores
+        .channels()
+        .filter(|channel| !bindings.carries_non_text(channel))
+        .filter(|channel| {
+            let store = stores
+                .get(channel)
+                .expect("surface client: the channel came from this collection");
+            store
+                .retained()
+                .any(|(envelope, _)| !envelope.body.is_text())
+                || store.parked().any(|(envelope, _)| !envelope.body.is_text())
+        })
+        .map(str::to_string)
+        .collect();
+    for channel in &holding_undeclared_non_text {
+        assert!(
+            reserved_local_channel(channel).is_none(),
+            "surface client: reserved plane {channel} holds a non-text body, which nothing can \
+             have admitted"
+        );
+    }
+    // A channel the document no longer names at all is dropped for that cause
+    // alone, and reported as such below.
+    let undeclared_non_text: BTreeSet<String> = holding_undeclared_non_text
+        .into_iter()
+        .filter(|channel| bindings.store_depth(channel).is_some())
+        .collect();
     let dropped = stores.retain(|channel| {
-        bindings.store_depth(channel).is_some() || reserved_local_channel(channel).is_some()
+        !undeclared_non_text.contains(channel)
+            && (bindings.store_depth(channel).is_some()
+                || reserved_local_channel(channel).is_some())
     });
     let mut lost_schedules = Vec::new();
-    for (channel, store) in dropped {
+    let mut retired = Vec::new();
+    for (channel, mut store) in dropped {
         let senders: Vec<String> = store.parked_senders().map(str::to_string).collect();
+        if undeclared_non_text.contains(&channel) {
+            tracing::warn!(
+                %channel,
+                retained = store.retained().count(),
+                schedules = senders.len(),
+                "surface client: this bindings document no longer declares the channel \
+                 `non_text`, dropping its store, which holds a non-text body"
+            );
+            // The channel's readers survive the drop, so what they were owed is a
+            // loss on a live binding: charged as a shrink to nothing would be.
+            let owed = store.retune(0);
+            if !owed.is_empty() {
+                retired.push((channel.clone(), owed));
+            }
+            if !senders.is_empty() {
+                lost_schedules.push((channel, senders));
+            }
+            continue;
+        }
         if senders.is_empty() {
             continue;
         }
@@ -133,13 +203,15 @@ pub fn reconcile_stores(bindings: &AppliedBindings, stores: &mut SurfaceStores) 
         );
         lost_schedules.push((channel, senders));
     }
-    let mut retired = Vec::new();
     for (channel, depth) in bindings.store_depths() {
         let overflow = stores.ensure(channel, depth);
         if !overflow.is_empty() {
             retired.push((channel.to_string(), overflow));
         }
     }
+    // A recreated store reports nothing to `ensure`, so each channel appears at
+    // most once; the sort restores address order across the two sources.
+    retired.sort_by(|a, b| a.0.cmp(&b.0));
     StoreReconcile {
         retired,
         lost_schedules,
@@ -154,6 +226,9 @@ struct Registration {
     /// spelling — its own positions, its own scheduler state — so work minted for
     /// the previous one must not be applied to it.
     generation: u64,
+    /// The component contract the instance's artifact speaks — what it can be
+    /// handed and what it can answer.
+    contract: ProcessorContract,
     /// The transportable channels this instance holds a subscription reference
     /// on, one entry **per input binding** — so two ports of one instance on one
     /// channel hold two references on the one subscription they share.
@@ -173,9 +248,10 @@ struct Registration {
 }
 
 impl Registration {
-    fn new(generation: u64) -> Self {
+    fn new(generation: u64, contract: ProcessorContract) -> Self {
         Self {
             generation,
+            contract,
             subs: Vec::new(),
             failed: false,
         }
@@ -221,6 +297,12 @@ impl Registrations {
         self.entries.get(instance).map(|r| r.generation)
     }
 
+    /// The contract `instance` registered with, or `None` when it is not
+    /// registered.
+    pub fn contract(&self, instance: &str) -> Option<ProcessorContract> {
+        self.entries.get(instance).map(|r| r.contract)
+    }
+
     /// Every registered instance, in id order.
     pub fn instances(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
@@ -249,15 +331,17 @@ impl Registrations {
     pub fn register(
         &mut self,
         instance: &str,
+        contract: ProcessorContract,
         wiring: Option<&AppliedBindings>,
         stores: &mut SurfaceStores,
         subs: &mut Subscriptions,
     ) -> Vec<ClientFrame> {
         let generation = self.next_generation;
         self.next_generation += 1;
-        let prior = self
-            .entries
-            .insert(instance.to_string(), Registration::new(generation));
+        let prior = self.entries.insert(
+            instance.to_string(),
+            Registration::new(generation, contract),
+        );
         assert!(
             prior.is_none(),
             "surface client: instance {instance:?} registered twice"

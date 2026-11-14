@@ -30,6 +30,8 @@ fn nondurable_channel(address: &str, depth: u64) -> brenn_lib::messaging::config
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     }
 }
 
@@ -369,6 +371,8 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
                 noise: NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -505,6 +509,8 @@ async fn build_messaging_keeps_a_dynamic_subscription_on_a_chat_channel() {
                 noise: NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -584,6 +590,8 @@ async fn build_messaging_holds_a_dynamic_subscription_dormant_while_its_block_is
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     };
     // The block that keeps messaging up when the declared one is commented out.
     let inert_block = nondurable_channel("ephemeral:inert", 1);
@@ -726,6 +734,8 @@ async fn build_messaging_prunes_a_dynamic_subscription_when_the_channel_row_is_d
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     };
     let inert_block = nondurable_channel("ephemeral:inert", 1);
     let with_block = BrennConfig {
@@ -838,6 +848,8 @@ async fn build_messaging_does_not_reconstruct_orphan_channel() {
                 noise: NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -921,6 +933,8 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
                 noise: NoiseLevel::Silent,
                 sink: brenn_lib::messaging::config::Sink::Drop,
                 wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: false,
+                untyped_content_type: None,
             },
             subscribers: Vec::new(),
             mount: None,
@@ -1064,6 +1078,8 @@ fn config_with_one_brenn_channel(address: &str) -> (brenn_lib::config::BrennConf
                 noise: None,
                 sink: None,
                 wake_min: None,
+                non_text: false,
+                untyped_content_type: None,
             },
             surface_index_channel(),
         ],
@@ -1228,6 +1244,7 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1442,6 +1459,7 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1513,6 +1531,7 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1661,6 +1680,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
             noise: Some(NoiseLevel::Alarm),
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![brenn_lib::messaging::config::WasmConsumerOutputRaw {
             port: "out".to_string(),
@@ -1668,6 +1688,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         io_ports: vec![],
         config: None,
@@ -1748,6 +1769,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1824,6 +1846,7 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1914,6 +1937,7 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         outputs: vec![],
         io_ports: vec![],
@@ -1970,6 +1994,8 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
+            untyped_content_type: None,
         }],
         surfaces: vec![SurfaceConfigRaw {
             grants: vec![AttachGrant::EphemeralSubscribe],
@@ -2160,6 +2186,8 @@ async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
@@ -2172,6 +2200,7 @@ async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("sensors".to_string())],
         ..minimal_wasm_consumer()
@@ -2245,6 +2274,8 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
+            untyped_content_type: None,
         }
     }
     fn sub(channel: &str, port: &str) -> WasmConsumerSubscriptionRaw {
@@ -2256,6 +2287,7 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
             noise: Some(NoiseLevel::Alarm),
             wake_min: None,
             amplification: None,
+            non_text: false,
         }
     }
 
@@ -2349,6 +2381,8 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
@@ -2361,6 +2395,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         local_subscribe_acl: vec![ChannelMatcherRaw::Exact("scratch".to_string())],
         ..minimal_wasm_consumer()
@@ -2389,20 +2424,25 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         "the WASM consumer's local input is registered as an in-memory ring cursor"
     );
 
-    store.append(brenn_lib::messaging::MessageEnvelope {
-        message_id: uuid::Uuid::new_v4(),
-        source: "node".to_string(),
-        channel: "local:scratch".to_string(),
-        sender: "test-sender".to_string(),
-        publish_ts: chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
-        body: "ping".to_string(),
-        reply_to: None,
-        delivery_deadline: None,
-        deliver_after: None,
-        impetus: None,
-        urgency: brenn_lib::messaging::Urgency::Normal,
-        envelope_type: brenn_lib::messaging::ChannelScheme::Local,
-    });
+    store.append(
+        brenn_lib::messaging::MessageEnvelope {
+            message_id: uuid::Uuid::new_v4(),
+            source: "node".to_string(),
+            channel: "local:scratch".to_string(),
+            sender: "test-sender".to_string(),
+            publish_ts: chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+            body: "ping".into(),
+            reply_to: None,
+            delivery_deadline: None,
+            deliver_after: None,
+            impetus: None,
+            urgency: brenn_lib::messaging::Urgency::Normal,
+            envelope_type: brenn_lib::messaging::ChannelScheme::Local,
+            transport: None,
+            attachments: Default::default(),
+        },
+        brenn_messaging_store::store::no_holds(),
+    );
     let window = store
         .window(&subscriber, 4, 0)
         .expect("the case attached this subscriber");
@@ -2411,7 +2451,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         1,
         "the confined publish is delivered to the WASM consumer's ring cursor"
     );
-    assert_eq!(window.new_entries()[0].message.body, "ping");
+    assert_eq!(window.new_entries()[0].message.body.as_text(), Some("ping"));
 
     let conn = db_probe.lock().await;
     let rows: i64 = conn
@@ -2462,6 +2502,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         ..minimal_wasm_consumer()
     }
@@ -2506,10 +2547,11 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
             "ticker",
             &[WasmPublish {
                 channel_address: &address,
-                body: "tick",
+                body: "tick".into(),
                 urgency: brenn_lib::messaging::Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
+                attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
             }],
         )
         .await;
@@ -2522,7 +2564,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
         1,
         "the component's own publish is delivered back to it"
     );
-    assert_eq!(window.new_entries()[0].message.body, "tick");
+    assert_eq!(window.new_entries()[0].message.body.as_text(), Some("tick"));
     let first_seq = window.new_entries()[0].seq;
 
     // The timer idiom itself: a deferred self-publish parks, is invisible until
@@ -2534,10 +2576,11 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
             "ticker",
             &[WasmPublish {
                 channel_address: &address,
-                body: "wake",
+                body: "wake".into(),
                 urgency: brenn_lib::messaging::Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(due),
+                attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
             }],
         )
         .await;
@@ -2561,7 +2604,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
         1,
         "the released wake reaches the same port that scheduled it"
     );
-    assert_eq!(window.new_entries()[0].message.body, "wake");
+    assert_eq!(window.new_entries()[0].message.body.as_text(), Some("wake"));
 }
 
 /// Naming an io_port's channel `brenn:` is the one line that buys durability, and
@@ -2589,6 +2632,7 @@ async fn build_messaging_gives_a_named_brenn_io_port_channel_a_db_row() {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         ..minimal_wasm_consumer()
     }
@@ -2647,6 +2691,7 @@ async fn auto_channels_list_as_their_durability_says() {
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
+        non_text: false,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "ticker".to_string(),
@@ -2672,6 +2717,8 @@ async fn auto_channels_list_as_their_durability_says() {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
+            untyped_content_type: None,
         }],
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
@@ -2838,6 +2885,8 @@ fn warm_brenn_priming_configs(
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     };
     let channel_only = BrennConfig {
         channels: vec![channel.clone(), surface_index_channel()],
@@ -2854,6 +2903,7 @@ fn warm_brenn_priming_configs(
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         subscribe_acl: vec![ChannelMatcherRaw::Exact(address.to_string())],
         ..minimal_wasm_consumer()
@@ -2876,7 +2926,7 @@ async fn warm_channel_with_messages(db: &brenn_db::Db, channel_uuid: uuid::Uuid,
             channel_uuid,
             "brenn://test",
             "test-sender",
-            &format!("body-{i}"),
+            &format!("body-{i}").into(),
             brenn_lib::messaging::Urgency::Normal,
             brenn_lib::messaging::ChannelScheme::Brenn,
             None,
@@ -2925,7 +2975,7 @@ async fn build_messaging_primes_a_new_durable_wasm_queue_from_the_retained_tail(
     )
     .await
     .into_iter()
-    .map(|(_, envelope)| envelope.body.clone())
+    .map(|(_, envelope)| envelope.body.as_text().unwrap().to_owned())
     .collect();
     assert_eq!(
         owed,
@@ -2968,7 +3018,7 @@ async fn build_messaging_does_not_reprime_a_surviving_durable_wasm_queue() {
     )
     .await
     .into_iter()
-    .map(|(_, envelope)| envelope.body.clone())
+    .map(|(_, envelope)| envelope.body.as_text().unwrap().to_owned())
     .collect();
     assert_eq!(
         owed,
@@ -3033,6 +3083,8 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
@@ -3045,6 +3097,7 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
             noise: None,
             wake_min: None,
             amplification: None,
+            non_text: false,
         }],
         ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("sensors".to_string())],
         ..minimal_wasm_consumer()
@@ -3324,8 +3377,13 @@ fn async_tool_registry_bound(
         ) -> Result<(), AclDenied> {
             Ok(())
         }
-        async fn execute(&self, _c: &ToolCtx, _a: Value) -> Result<Value, ToolError> {
-            Ok(json!({}))
+        async fn execute(
+            &self,
+            _c: &ToolCtx,
+            _a: Value,
+            _h: brenn_tool_registry::HeldAttachments,
+        ) -> Result<brenn_tool_registry::ToolOutput, ToolError> {
+            Ok(json!({}).into())
         }
     }
     std::sync::Arc::new(brenn_tool_registry::ToolRegistry::new(vec![
@@ -3339,6 +3397,7 @@ fn async_tool_registry_bound(
             idempotency: Idempotency::Natural,
             auto_approve: true,
             user_binding,
+            accepts_attachments: false,
         }))),
     ]))
 }
@@ -3559,6 +3618,8 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     };
 
     // No configured surfaces ⇒ derived boot-published set is just the index.
@@ -3620,7 +3681,7 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
         env.sender
     );
     assert!(
-        env.body.contains("build-2"),
+        env.body.as_text().unwrap().contains("build-2"),
         "latest-wins: the newer boot's index doc is what a reader sees, got {:?}",
         env.body
     );
@@ -3631,7 +3692,7 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
         .publish_from_system(
             SURFACE_HELP_COMPONENT,
             "brenn:other",
-            "{}",
+            "{}".into(),
             Urgency::Normal,
             None,
         )
@@ -3718,8 +3779,9 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
         "the boot stamp is written under the surface's own identity, got {:?}",
         env.sender
     );
-    let stamp = brenn_surface_schema::telemetry::DisconnectedStamp::parse(&env.body)
-        .expect("the boot stamp is a valid disconnected stamp");
+    let stamp =
+        brenn_surface_schema::telemetry::DisconnectedStamp::parse(env.body.as_text().unwrap())
+            .expect("the boot stamp is a valid disconnected stamp");
     assert_eq!(stamp.reason, "server restart");
     assert_eq!(stamp.session, None, "a boot stamp precedes every session");
     assert_eq!(stamp.epoch, epoch);
@@ -3810,8 +3872,8 @@ async fn boot_bindings_document_is_published_and_pullable() {
         "the document is written under the reserved single-writer identity, got {:?}",
         env.sender
     );
-    let parsed =
-        BindingsDocument::parse(&env.body).expect("the retained body parses and validates");
+    let parsed = BindingsDocument::parse(env.body.as_text().unwrap())
+        .expect("the retained body parses and validates");
     let expected =
         brenn_surface_server::bindings_doc::build_bindings_document(&result.surfaces[0], &params);
     assert_eq!(
@@ -3940,6 +4002,7 @@ async fn a_named_auto_channel_lists_to_a_third_party_with_its_description() {
 /// Auto-injection means a principal's ACL lists in config no longer enumerate
 /// its full reach, so the boot log is the accounting a config security review
 /// reads instead: one line per (principal, capability, channel).
+// TODO(boot-log-capture-tests-flaky): once failed under full `make check`, no lines captured.
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn boot_logs_every_injected_auto_grant() {
@@ -3997,7 +4060,14 @@ async fn boot_logs_every_injected_auto_grant() {
 #[should_panic(expected = "tunes a channel this config never mints")]
 fn a_tuning_block_for_an_undeclared_webhook_panics() {
     let tuning = tuning_of(&[tuning_raw("webhook:ghost")]);
-    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), true);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        true,
+    );
 }
 
 /// Same for a tool that is not registered.
@@ -4010,6 +4080,7 @@ fn a_tuning_block_for_an_unregistered_tool_panics() {
         &[],
         &["apull"],
         &std::collections::HashSet::new(),
+        None,
         true,
     );
 }
@@ -4025,6 +4096,7 @@ fn a_bare_tuning_block_for_an_unregistered_tool_panics() {
         &[],
         &["apull"],
         &std::collections::HashSet::new(),
+        None,
         true,
     );
 }
@@ -4035,7 +4107,7 @@ fn a_bare_tuning_block_for_an_unregistered_tool_panics() {
 fn a_tuning_block_for_an_ungranted_inbox_panics() {
     let tuning = tuning_of(&[tuning_raw("brenn:tool-results/ghost")]);
     let slugs: std::collections::HashSet<String> = ["sync".to_string()].into_iter().collect();
-    validate_exact_tuning_blocks(&tuning, &[], &["apull"], &slugs, true);
+    validate_exact_tuning_blocks(&tuning, &[], &["apull"], &slugs, None, true);
 }
 
 /// With no tool registry answering, the two tool families have no population
@@ -4048,11 +4120,25 @@ fn without_a_registry_the_tool_arms_are_skipped_and_the_webhook_arm_is_not() {
         tuning_raw("brenn:tools/nope"),
         tuning_raw("brenn:tool-results/ghost"),
     ]);
-    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), false);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        false,
+    );
 
     let webhook = tuning_of(&[tuning_raw("webhook:ghost")]);
     let refused = std::panic::catch_unwind(|| {
-        validate_exact_tuning_blocks(&webhook, &[], &[], &std::collections::HashSet::new(), false);
+        validate_exact_tuning_blocks(
+            &webhook,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+            None,
+            false,
+        );
     });
     assert!(refused.is_err());
 }
@@ -4073,7 +4159,50 @@ fn an_mqtt_block_matching_nothing_boots_and_real_blocks_pass() {
         tuning_raw("brenn:tool-results/sync"),
     ]);
     let slugs: std::collections::HashSet<String> = ["sync".to_string()].into_iter().collect();
-    validate_exact_tuning_blocks(&tuning, &["gh-events"], &["apull"], &slugs, true);
+    validate_exact_tuning_blocks(&tuning, &["gh-events"], &["apull"], &slugs, None, true);
+}
+
+/// An app's result inbox is checked against the apps holding an async tool
+/// grant: an exact block naming one passes, one naming another app is refused.
+#[test]
+fn an_app_inbox_block_names_an_app_holding_an_async_grant() {
+    let apps: std::collections::HashSet<String> = ["home".to_string()].into_iter().collect();
+    let tuning = tuning_of(&[tuning_raw("brenn:app-tool-results/home")]);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        Some(&apps),
+        true,
+    );
+    let ungranted = tuning_of(&[tuning_raw("brenn:app-tool-results/graf")]);
+    let refused = std::panic::catch_unwind(|| {
+        validate_exact_tuning_blocks(
+            &ungranted,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+            Some(&apps),
+            true,
+        );
+    });
+    assert!(refused.is_err());
+    // A consumer slug does not stand in for an app's.
+    let consumers: std::collections::HashSet<String> = ["graf".to_string()].into_iter().collect();
+    let refused = std::panic::catch_unwind(|| {
+        validate_exact_tuning_blocks(&ungranted, &[], &[], &consumers, Some(&apps), true);
+    });
+    assert!(refused.is_err());
+    // Without the apps to check against, the arm is skipped.
+    validate_exact_tuning_blocks(
+        &ungranted,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        true,
+    );
 }
 
 /// A location block is checked for shape: any username registration could
@@ -4081,7 +4210,14 @@ fn an_mqtt_block_matching_nothing_boots_and_real_blocks_pass() {
 #[test]
 fn a_location_block_naming_a_well_formed_user_passes() {
     let tuning = tuning_of(&[tuning_raw("brenn:device-location.alice")]);
-    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), true);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        true,
+    );
 }
 
 /// A remainder no registration could produce tunes a channel that is never
@@ -4090,7 +4226,14 @@ fn a_location_block_naming_a_well_formed_user_passes() {
 #[should_panic(expected = "tunes a location channel no user can have")]
 fn a_location_block_naming_no_possible_user_panics() {
     let tuning = tuning_of(&[tuning_raw("brenn:device-location.not a user!")]);
-    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), true);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        true,
+    );
 }
 
 /// The tuning table reaches every site that mints a system channel.
@@ -4131,6 +4274,8 @@ async fn a_tuning_block_reaches_every_system_channel_mint_site() {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
+            untyped_content_type: None,
         }
     };
     let mut config = BrennConfig {
@@ -4216,6 +4361,8 @@ async fn build_messaging_refuses_a_subscriber_above_the_channel_ceiling() {
             noise: None,
             sink: None,
             wake_min: None,
+            non_text: false,
+            untyped_content_type: None,
         }],
         ..BrennConfig::default()
     };
@@ -4306,6 +4453,8 @@ fn tuning_raw(address: &str) -> brenn_lib::messaging::config::ChannelConfigRaw {
         noise: None,
         sink: None,
         wake_min: None,
+        non_text: false,
+        untyped_content_type: None,
     }
 }
 
@@ -4477,6 +4626,7 @@ fn io_port_at(address: &str) -> brenn_lib::config::BrennConfig {
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
+            non_text: false,
         }],
         ..minimal_wasm_consumer()
     }
@@ -4802,6 +4952,7 @@ async fn commit_refuses_an_apps_map_the_plan_was_not_derived_from() {
 
     let mut config = BrennConfig::default();
     config.channels.push(surface_index_channel());
+    config.messaging.blob_dir = Some(crate::test_fixtures::scratch_blob_dir());
     let planned: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let other: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let registry = Arc::new(brenn_tool_registry::ToolRegistry::new(vec![]));
@@ -5007,7 +5158,7 @@ async fn build_messaging_mints_a_location_channel_per_registered_user() {
         .publish_from_system(
             DEVICE_LOCATION_COMPONENT,
             "brenn:device-location.alice",
-            "{}",
+            "{}".into(),
             brenn_messaging::Urgency::Normal,
             None,
         )
@@ -5016,4 +5167,326 @@ async fn build_messaging_mints_a_location_channel_per_registered_user() {
         matches!(published, brenn_messaging::PublishResult::Ok { .. }),
         "the writer publishes on a user's channel: {published:?}"
     );
+}
+
+/// One refusal per text-only channel the store holds a non-text row for; a
+/// `non_text` channel, and a channel the store holds none for, pass.
+#[test]
+fn text_only_channels_holding_non_text_names_exactly_those() {
+    use brenn_lib::messaging::test_support::test_channel_entry;
+
+    let plain = test_channel_entry("plain", vec![]);
+    let quiet = test_channel_entry("quiet", vec![]);
+    let mut frames = test_channel_entry("frames", vec![]);
+    frames.resolved_channel.non_text = true;
+    let held = [plain.uuid, frames.uuid, uuid::Uuid::new_v4()];
+
+    let refusals = text_only_channels_holding_non_text(&held, [&plain, &quiet, &frames]);
+
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].starts_with("config: channel \"brenn:plain\" is declared text-only"),
+        "{refusals:?}"
+    );
+    assert!(text_only_channels_holding_non_text(&[], [&plain]).is_empty());
+}
+
+/// A system-minted channel's refusal names its tuning block as the remedy,
+/// since an operator can neither declare nor rename the address.
+#[test]
+fn a_system_channel_holding_non_text_is_told_to_state_non_text_in_its_tuning() {
+    use brenn_lib::messaging::test_support::test_channel_entry;
+
+    let mut ingress = test_channel_entry("door", vec![]);
+    ingress.address = "mqtt:broker:cam/door".to_string();
+    let refusals = text_only_channels_holding_non_text(&[ingress.uuid], [&ingress]);
+    assert_eq!(
+        refusals,
+        vec![
+            "config: channel \"mqtt:broker:cam/door\" is declared text-only, but its store \
+             holds messages whose bodies are not text; state `non_text = true` in the \
+             channel's tuning block, or delete the channel's stored messages"
+                .to_string(),
+        ],
+    );
+}
+
+/// The address of the runtime-created channel the two tests below rebuild.
+const REBUILT_MQTT_ADDRESS: &str = "mqtt:homeassistant:cam/runtime/frame";
+
+/// A restart's state for an `mqtt:` channel a runtime subscribe created: its
+/// channel row, the dynamic subscription that keeps it, and one stored message
+/// whose body is not text. The returned config omits the filter and carries
+/// `tuning`, so the channel reaches the directory only by reconstruction.
+async fn rebuilt_mqtt_channel_holding_non_text(
+    tuning: Option<brenn_lib::messaging::config::ChannelConfigRaw>,
+) -> MessagingResult {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::mqtt_channel_uuid_from_address;
+    use brenn_server::test_support::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let channel_uuid = mqtt_channel_uuid_from_address(REBUILT_MQTT_ADDRESS);
+    let static_address = "mqtt:homeassistant:home/static/state";
+    let mut config = BrennConfig {
+        mqtt_clients: vec![minimal_mqtt_client("homeassistant")],
+        apps: vec![app_raw_with_mqtt_subscription("someapp", static_address)],
+        ..BrennConfig::default()
+    };
+    config.channels.push(surface_index_channel());
+    config.channels.extend(tuning);
+    let db = init_db_memory();
+    {
+        let conn = db.lock().await;
+        let channel_entry = brenn_lib::messaging::ChannelEntry {
+            uuid: channel_uuid,
+            address: REBUILT_MQTT_ADDRESS.to_string(),
+            description: None,
+            transport_type: ChannelScheme::Mqtt,
+            resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
+                push_depth: Depth::Bounded(4),
+                retain_depth: Depth::Bounded(4),
+                standing_retain_depth: Depth::Bounded(4),
+                noise: NoiseLevel::Silent,
+                sink: brenn_lib::messaging::config::Sink::Drop,
+                wake_min: brenn_lib::messaging::WakeMin::Normal,
+                non_text: true,
+                untyped_content_type: None,
+            },
+            subscribers: Vec::new(),
+            mount: None,
+        };
+        brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&channel_entry));
+        conn.execute(
+            "INSERT INTO messaging_dynamic_subscriptions \
+             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
+             VALUES (?1, 'graf', '0', '4', 'silent', 'normal', 1, '2026-06-20T00:00:00Z')",
+            rusqlite::params![channel_uuid.as_bytes().to_vec()],
+        )
+        .expect("seed durable dynamic row");
+        brenn_messaging_store::db::insert_message(
+            &conn,
+            channel_uuid,
+            "mqtt:homeassistant",
+            "mqtt:homeassistant",
+            &brenn_envelope::MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8, 0xff, 0x00])
+                .expect("a well-formed binary body"),
+            brenn_lib::messaging::Urgency::Normal,
+            ChannelScheme::Mqtt,
+            None,
+            None,
+            None,
+            None,
+            0,
+        );
+    }
+
+    let mut apps_map: IM<String, AppConfig> = IM::new();
+    let mut graf_app = minimal_app_config("graf", None, vec![]);
+    graf_app.policy = std::sync::Arc::new(
+        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([REBUILT_MQTT_ADDRESS]),
+    );
+    apps_map.insert("graf".to_string(), graf_app);
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    boot_messaging_with(&config, db, &apps, alert_dispatcher, "brenn://test").await
+}
+
+/// A rebuilt channel whose tuning makes it text-only while its store holds a
+/// non-text row refuses the start, as a planned channel does.
+#[tokio::test]
+#[should_panic(
+    expected = "refusing to start:\nconfig: channel \"mqtt:homeassistant:cam/runtime/frame\" is \
+                declared text-only, but its store holds messages whose bodies are not text; \
+                state `non_text = true` in the channel's tuning block"
+)]
+async fn a_rebuilt_text_only_channel_holding_non_text_refuses_the_start() {
+    rebuilt_mqtt_channel_holding_non_text(None).await;
+}
+
+/// Under a raw prefix block the same channel is rebuilt `non_text`, carrying
+/// the block's declared content type, and the start proceeds.
+#[tokio::test]
+async fn a_rebuilt_channel_under_a_raw_prefix_block_carries_its_tuning() {
+    use brenn_lib::messaging::config::ChannelConfigRaw;
+
+    let tuning = ChannelConfigRaw {
+        address: None,
+        address_prefix: Some("mqtt:homeassistant:cam/".to_string()),
+        push_depth: Some(Depth::Bounded(1)),
+        retain_depth: Some(Depth::Bounded(4)),
+        standing_retain_depth: Some(Depth::Bounded(4)),
+        non_text: true,
+        untyped_content_type: Some("application/octet-stream".to_string()),
+        ..ChannelConfigRaw::minimal("unused")
+    };
+    let result = rebuilt_mqtt_channel_holding_non_text(Some(tuning)).await;
+    let messenger = result.messenger.expect("messaging comes up");
+    let channel = messenger
+        .directory()
+        .resolve(REBUILT_MQTT_ADDRESS)
+        .expect("the runtime-created channel is rebuilt");
+    assert!(channel.resolved_channel.non_text);
+    assert_eq!(
+        channel.resolved_channel.untyped_content_type.as_deref(),
+        Some("application/octet-stream"),
+    );
+}
+
+/// Boot opens the blob store over `messaging { blob_dir }`, creating the
+/// directory, and installs it on the messenger it builds.
+#[tokio::test]
+async fn boot_opens_the_blob_store_over_the_configured_directory() {
+    let dir = crate::test_fixtures::scratch_blob_dir();
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    config.messaging.blob_dir = Some(dir.clone());
+
+    let result = boot_messaging(&config, brenn_server::test_support::init_db_memory()).await;
+
+    let messenger = result.messenger.as_ref().unwrap();
+    let blobs = messenger.blob_store().expect("boot installs a blob store");
+    assert_eq!(blobs.usage().charged_bytes, 0);
+    assert!(dir.is_dir(), "boot creates the blob directory");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A blob directory the store cannot account for stops the boot: the store's
+/// refusals run inside `commit_messaging`, before the messenger exists.
+#[tokio::test]
+#[should_panic(expected = "refusing to start: the blob directory holds")]
+async fn boot_refuses_a_blob_directory_holding_a_stranger() {
+    let dir = crate::test_fixtures::scratch_blob_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("notes.txt"), b"not a blob").unwrap();
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    config.messaging.blob_dir = Some(dir);
+
+    boot_messaging(&config, brenn_server::test_support::init_db_memory()).await;
+}
+
+/// A blob directory another database owns stops the boot, whether or not that
+/// database's host is running, and keeps its record.
+#[tokio::test]
+#[should_panic(expected = "belongs to the database of store generation")]
+async fn boot_refuses_a_blob_directory_another_database_owns() {
+    let dir = crate::test_fixtures::scratch_blob_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("owner"), format!("{}\n", uuid::Uuid::new_v4())).unwrap();
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    config.messaging.blob_dir = Some(dir);
+
+    boot_messaging(&config, brenn_server::test_support::init_db_memory()).await;
+}
+
+/// The planner mints `brenn:app-tool-results/<app>` for an app granted an
+/// async registry tool, and for no other: not for an app granted only a fast
+/// tool, not for an app with no tool grant, and not for any app when the plan
+/// has no registry.
+#[test]
+fn the_plan_mints_an_app_result_inbox_only_for_an_app_granted_an_async_tool() {
+    use brenn_lib::access::AppPolicy;
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::app_tool_result_inbox_address;
+    use brenn_lib::tools::ResolvedToolGrant;
+    use brenn_tool_registry::ToolError;
+    use brenn_tool_registry::descriptor::{AclDenied, Idempotency, ToolClass, ToolDescriptor};
+    use brenn_tool_registry::tool::{FastTool, RegisteredTool, ToolCtx};
+    use indexmap::IndexMap as IM;
+    use serde_json::{Value, json};
+
+    struct FPing(ToolDescriptor);
+    impl FastTool for FPing {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.0
+        }
+        fn check_acl(
+            &self,
+            _a: &Value,
+            _c: &[brenn_lib::tools::AclClause],
+        ) -> Result<(), AclDenied> {
+            Ok(())
+        }
+        fn execute(&self, _c: &ToolCtx, _a: Value) -> Result<Value, ToolError> {
+            Ok(json!({}))
+        }
+    }
+    let async_only = async_tool_registry();
+    let apull = async_only
+        .get("apull")
+        .expect("apull is registered")
+        .clone();
+    let registry = Arc::new(brenn_tool_registry::ToolRegistry::new(vec![
+        apull,
+        RegisteredTool::Fast(Arc::new(FPing(ToolDescriptor {
+            name: "fping",
+            mcp_name: "mcp__brenn__FPing",
+            description: "stub fast",
+            input_schema: json!({ "type": "object" }),
+            class: ToolClass::Fast {
+                budget: std::time::Duration::from_millis(5),
+            },
+            acl_keys: &[],
+            idempotency: Idempotency::Natural,
+            auto_approve: true,
+            user_binding: brenn_tool_registry::UserBinding::None,
+            accepts_attachments: false,
+        }))),
+    ]));
+
+    let app_granted = |slug: &str, tools: &[&str]| {
+        let mut app = minimal_app_config(slug, None, vec![]);
+        app.policy = Arc::new(AppPolicy {
+            tool_grants: tools
+                .iter()
+                .map(|t| {
+                    (
+                        t.to_string(),
+                        ResolvedToolGrant {
+                            acl: vec![],
+                            rate_limit: None,
+                        },
+                    )
+                })
+                .collect(),
+            ..AppPolicy::default()
+        });
+        app
+    };
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::from([
+        ("both".to_string(), app_granted("both", &["apull", "fping"])),
+        ("fast".to_string(), app_granted("fast", &["fping"])),
+        ("none".to_string(), app_granted("none", &[])),
+    ]));
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    let mqtt_clients = brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients);
+    let plan_with = |tool_registry| {
+        plan_messaging(&PlanInputs {
+            config: &config,
+            apps: Some(&apps),
+            mqtt_clients: &mqtt_clients,
+            tool_registry,
+            replay_store_paths: &[],
+            device_location_users: &[],
+        })
+        .expect("a channel-declaring document configures messaging")
+    };
+    let minted = |plan: &MessagingPlan| -> Vec<String> {
+        ["both", "fast", "none"]
+            .into_iter()
+            .filter(|slug| {
+                plan.directory
+                    .resolve(&app_tool_result_inbox_address(slug))
+                    .is_some()
+            })
+            .map(String::from)
+            .collect()
+    };
+
+    assert_eq!(minted(&plan_with(Some(&registry))), vec!["both"]);
+    assert_eq!(minted(&plan_with(None)), Vec::<String>::new());
 }

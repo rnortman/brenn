@@ -28,9 +28,12 @@ use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::AppPolicy;
 use brenn_lib::access::acl::ChannelMatcher;
 use indexmap::IndexMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use uuid::Uuid;
+
+/// The attachments of a batch entry that names no blob.
+static NO_ATTACHMENTS: LazyLock<HeldAttachments> = LazyLock::new(HeldAttachments::none);
 
 /// One surface's principal set at the default budget: the kernel grain plus
 /// `instances`, the shape `ResolvedSurface::principal_send_budgets` produces for
@@ -89,6 +92,8 @@ fn surface_channel_entry(subscribers: Vec<SubscriberEntry>) -> ChannelEntry {
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
+            untyped_content_type: None,
         },
         subscribers,
         transport_type: ChannelScheme::Brenn,
@@ -254,8 +259,9 @@ async fn publish_from_surface_ok_stamps_surface_sender_no_budget() {
             AttachScope::surface("durabar"),
             None,
             &addr,
-            "hello",
+            "hello".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -276,7 +282,7 @@ async fn publish_from_surface_ok_stamps_surface_sender_no_budget() {
             .await;
     assert_eq!(
         owed.iter()
-            .map(|(_, e)| e.body.as_str())
+            .map(|(_, e)| e.body.as_text().unwrap())
             .collect::<Vec<_>>(),
         vec!["hello"],
         "the subscriber must be owed the message just published"
@@ -308,8 +314,9 @@ async fn publish_from_surface_missing_grant_is_missing_sender() {
             AttachScope::surface("durabar"),
             None,
             &addr,
-            "hello",
+            "hello".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -334,8 +341,9 @@ async fn publish_from_surface_unknown_slug_is_missing_sender() {
             AttachScope::surface("ghost"),
             None,
             &addr,
-            "hello",
+            "hello".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -360,8 +368,9 @@ async fn publish_from_surface_out_of_acl_is_acl_denied() {
             AttachScope::surface("durabar"),
             None,
             &addr,
-            "hello",
+            "hello".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -387,8 +396,9 @@ async fn publish_from_surface_body_too_large() {
             AttachScope::surface("durabar"),
             None,
             &addr,
-            "abcde",
+            "abcde".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -451,8 +461,9 @@ async fn surface_send_budget_admits_burst_then_exhausts() {
                 AttachScope::surface("durabar"),
                 None,
                 &addr,
-                "x",
+                "x".into(),
                 Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await;
         assert!(
@@ -465,8 +476,9 @@ async fn surface_send_budget_admits_burst_then_exhausts() {
             AttachScope::surface("durabar"),
             None,
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -509,8 +521,9 @@ async fn a_declared_send_burst_override_meters_only_its_own_instance() {
                 AttachScope::surface("durabar"),
                 Some("clock"),
                 &addr,
-                "x",
+                "x".into(),
                 Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await;
         assert!(
@@ -523,8 +536,9 @@ async fn a_declared_send_burst_override_meters_only_its_own_instance() {
             AttachScope::surface("durabar"),
             Some("clock"),
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -541,8 +555,9 @@ async fn a_declared_send_burst_override_meters_only_its_own_instance() {
                     AttachScope::surface("durabar"),
                     who,
                     &addr,
-                    "x",
+                    "x".into(),
                     Urgency::Normal,
+                    HeldAttachments::none(),
                 )
                 .await;
             assert!(
@@ -592,8 +607,9 @@ async fn a_declared_send_refill_override_reaches_the_bucket() {
             AttachScope::surface("durabar"),
             Some("clock"),
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
     };
 
@@ -632,8 +648,9 @@ async fn platform_publish_is_send_budget_exempt() {
                 AttachScope::surface("durabar"),
                 None,
                 &addr,
-                "x",
+                "x".into(),
                 Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await;
     }
@@ -643,8 +660,9 @@ async fn platform_publish_is_send_budget_exempt() {
                 AttachScope::surface("durabar"),
                 None,
                 &addr,
-                "x",
-                Urgency::Normal
+                "x".into(),
+                Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await,
             PublishResult::BudgetExhausted
@@ -653,7 +671,7 @@ async fn platform_publish_is_send_budget_exempt() {
     );
     // The platform path still publishes despite the drained budget.
     let r = m
-        .publish_from_surface_platform("durabar", &addr, "telemetry", Urgency::Normal)
+        .publish_from_surface_platform("durabar", &addr, "telemetry".into(), Urgency::Normal)
         .await;
     assert!(
         matches!(r, PublishResult::Ok { .. }),
@@ -662,7 +680,7 @@ async fn platform_publish_is_send_budget_exempt() {
     // The exemption skips only the budget: an out-of-ACL platform publish is
     // still denied by the normal gates.
     let denied = m
-        .publish_from_surface_platform("durabar", "brenn:not-in-acl", "x", Urgency::Normal)
+        .publish_from_surface_platform("durabar", "brenn:not-in-acl", "x".into(), Urgency::Normal)
         .await;
     assert!(
         matches!(
@@ -685,8 +703,9 @@ async fn surface_send_budget_survives_reconnect() {
                 AttachScope::surface("durabar"),
                 None,
                 &addr,
-                "x",
+                "x".into(),
                 Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await;
     }
@@ -697,8 +716,9 @@ async fn surface_send_budget_survives_reconnect() {
             AttachScope::surface("durabar"),
             None,
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -719,8 +739,9 @@ async fn surface_send_budgets_are_per_slug_independent() {
                 AttachScope::surface("durabar"),
                 None,
                 &addr,
-                "x",
+                "x".into(),
                 Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await;
     }
@@ -729,8 +750,9 @@ async fn surface_send_budgets_are_per_slug_independent() {
             AttachScope::surface("durabar"),
             None,
             &addr,
-            "x",
-            Urgency::Normal
+            "x".into(),
+            Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await,
         PublishResult::BudgetExhausted
@@ -741,8 +763,9 @@ async fn surface_send_budgets_are_per_slug_independent() {
             AttachScope::surface("kitchen"),
             None,
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -768,8 +791,9 @@ async fn component_publish_stamps_sub_identity_sender() {
             AttachScope::surface("durabar"),
             Some("clock"),
             &addr,
-            "hello",
+            "hello".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(matches!(result, PublishResult::Ok { .. }), "got {result:?}");
@@ -798,8 +822,9 @@ async fn component_budgets_are_blast_radius_scoped() {
                 AttachScope::surface("durabar"),
                 Some("clock"),
                 &addr,
-                "x",
+                "x".into(),
                 Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await;
     }
@@ -809,8 +834,9 @@ async fn component_budgets_are_blast_radius_scoped() {
                 AttachScope::surface("durabar"),
                 Some("clock"),
                 &addr,
-                "x",
-                Urgency::Normal
+                "x".into(),
+                Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await,
             PublishResult::BudgetExhausted
@@ -824,8 +850,9 @@ async fn component_budgets_are_blast_radius_scoped() {
             AttachScope::surface("durabar"),
             Some("todos"),
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -840,8 +867,9 @@ async fn component_budgets_are_blast_radius_scoped() {
             AttachScope::surface("durabar"),
             None,
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -906,8 +934,9 @@ async fn same_instance_name_on_two_surfaces_are_distinct_principals() {
                 AttachScope::surface("durabar"),
                 Some("clock"),
                 &addr,
-                "x",
+                "x".into(),
                 Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await;
     }
@@ -916,8 +945,9 @@ async fn same_instance_name_on_two_surfaces_are_distinct_principals() {
             AttachScope::surface("durabar"),
             Some("clock"),
             &addr,
-            "x",
-            Urgency::Normal
+            "x".into(),
+            Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await,
         PublishResult::BudgetExhausted
@@ -927,8 +957,9 @@ async fn same_instance_name_on_two_surfaces_are_distinct_principals() {
             AttachScope::surface("kitchen"),
             Some("clock"),
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -959,8 +990,9 @@ async fn sibling_instances_of_one_kind_get_independent_buckets() {
                 AttachScope::surface("durabar"),
                 Some("agenda-alice"),
                 &addr,
-                "x",
+                "x".into(),
                 Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await;
     }
@@ -970,8 +1002,9 @@ async fn sibling_instances_of_one_kind_get_independent_buckets() {
                 AttachScope::surface("durabar"),
                 Some("agenda-alice"),
                 &addr,
-                "x",
-                Urgency::Normal
+                "x".into(),
+                Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await,
             PublishResult::BudgetExhausted
@@ -983,8 +1016,9 @@ async fn sibling_instances_of_one_kind_get_independent_buckets() {
             AttachScope::surface("durabar"),
             Some("agenda-bob"),
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -1006,8 +1040,9 @@ async fn unbudgeted_component_instance_panics() {
             AttachScope::surface("durabar"),
             Some("never-declared"),
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
 }
@@ -1032,8 +1067,9 @@ async fn surface_send_budget_missing_panics() {
             AttachScope::surface("ghost"),
             None,
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
 }
@@ -1055,10 +1091,11 @@ fn batch<'a>(
         .enumerate()
         .map(|(i, body)| AttachBatchPublish {
             channel_address: addr,
-            body,
+            body: (*body).into(),
             urgency,
             publish_ts_ns: stamp(i),
             deliver_after: None,
+            attachments: &NO_ATTACHMENTS,
         })
         .collect()
 }
@@ -1078,10 +1115,11 @@ fn deferred<'a>(
 ) -> AttachBatchPublish<'a> {
     AttachBatchPublish {
         channel_address: addr,
-        body,
+        body: body.into(),
         urgency: Urgency::Normal,
         publish_ts_ns: stamp(i),
         deliver_after: Some(release_at),
+        attachments: &NO_ATTACHMENTS,
     }
 }
 
@@ -1146,10 +1184,11 @@ async fn a_deferred_batch_entry_parks_and_the_rest_of_the_batch_commits() {
             &[
                 AttachBatchPublish {
                     channel_address: &addr,
-                    body: "now",
+                    body: "now".into(),
                     urgency: Urgency::Normal,
                     publish_ts_ns: stamp(0),
                     deliver_after: None,
+                    attachments: &NO_ATTACHMENTS,
                 },
                 deferred(&addr, "later", 1, later),
             ],
@@ -1314,8 +1353,9 @@ async fn an_ephemeral_publish_feeds_the_surface() {
             AttachScope::surface("durabar"),
             None,
             &addr,
-            "hi",
-            Urgency::Normal
+            "hi".into(),
+            Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await,
         PublishResult::Ok { .. }
@@ -1341,8 +1381,9 @@ async fn a_fed_envelope_carries_the_channels_own_scheme() {
                 AttachScope::surface("durabar"),
                 None,
                 &durable_addr,
-                "hi",
-                Urgency::Normal
+                "hi".into(),
+                Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await,
         PublishResult::Ok { .. }
@@ -1358,8 +1399,9 @@ async fn a_fed_envelope_carries_the_channels_own_scheme() {
             AttachScope::surface("durabar"),
             None,
             &eph_addr,
-            "hi",
-            Urgency::Normal
+            "hi".into(),
+            Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await,
         PublishResult::Ok { .. }
@@ -1384,9 +1426,10 @@ async fn a_released_ephemeral_message_rides_the_surface_feed() {
     m.park_prepaid(
         &destination,
         crate::PrepaidEntry {
-            body: "later",
+            body: "later".into(),
             urgency: Urgency::Normal,
             publish_ts: Utc::now(),
+            attachments: brenn_messaging_store::blob::HeldAttachments::none(),
         },
         later,
     )
@@ -1416,9 +1459,10 @@ async fn a_prepaid_ephemeral_publish_feeds_the_surface() {
         .publish_prepaid(
             &destination,
             crate::PrepaidEntry {
-                body: "flushed",
+                body: "flushed".into(),
                 urgency: Urgency::Normal,
                 publish_ts: Utc::now(),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
             },
         )
         .await;
@@ -1445,17 +1489,19 @@ async fn a_batch_of_ephemeral_entries_commits_to_the_ring_and_feeds() {
             &[
                 AttachBatchPublish {
                     channel_address: &addr,
-                    body: "first",
+                    body: "first".into(),
                     urgency: Urgency::Normal,
                     publish_ts_ns: stamp(0),
                     deliver_after: None,
+                    attachments: &NO_ATTACHMENTS,
                 },
                 AttachBatchPublish {
                     channel_address: &addr,
-                    body: "second",
+                    body: "second".into(),
                     urgency: Urgency::Normal,
                     publish_ts_ns: stamp(1),
                     deliver_after: None,
+                    attachments: &NO_ATTACHMENTS,
                 },
                 deferred(&addr, "scheduled", 2, later),
             ],
@@ -1471,7 +1517,7 @@ async fn a_batch_of_ephemeral_entries_commits_to_the_ring_and_feeds() {
     let retained: Vec<String> = store
         .retained_tail(10)
         .into_iter()
-        .map(|r| r.envelope.body.clone())
+        .map(|r| r.envelope.body.as_text().unwrap().to_owned())
         .collect();
     assert_eq!(
         retained,
@@ -1498,10 +1544,11 @@ async fn a_batch_overrunning_the_ring_enacts_its_overflow_events() {
             &(0..3)
                 .map(|i| AttachBatchPublish {
                     channel_address: &addr,
-                    body: "over",
+                    body: "over".into(),
                     urgency: Urgency::Normal,
                     publish_ts_ns: stamp(i),
                     deliver_after: None,
+                    attachments: &NO_ATTACHMENTS,
                 })
                 .collect::<Vec<_>>(),
             MissingChannelPosture::Invariant,
@@ -1542,10 +1589,11 @@ async fn the_rings_deferred_cap_refuses_one_batch_schedule() {
         (0..5).map(|i| deferred(&addr, "sched", i, later)).collect();
     batch.push(AttachBatchPublish {
         channel_address: &addr,
-        body: "immediate",
+        body: "immediate".into(),
         urgency: Urgency::Normal,
         publish_ts_ns: stamp(5),
         deliver_after: None,
+        attachments: &NO_ATTACHMENTS,
     });
 
     let dropped = m
@@ -1567,7 +1615,7 @@ async fn the_rings_deferred_cap_refuses_one_batch_schedule() {
         store
             .retained_tail(10)
             .into_iter()
-            .map(|r| r.envelope.body.clone())
+            .map(|r| r.envelope.body.as_text().unwrap().to_owned())
             .collect::<Vec<_>>(),
         vec!["immediate".to_string()],
         "the unconditional entry published anyway"
@@ -1618,10 +1666,11 @@ async fn a_parked_batch_entry_is_fed_only_at_its_release() {
         &[
             AttachBatchPublish {
                 channel_address: &addr,
-                body: "now",
+                body: "now".into(),
                 urgency: Urgency::Normal,
                 publish_ts_ns: stamp(0),
                 deliver_after: None,
+                attachments: &NO_ATTACHMENTS,
             },
             deferred(&addr, "later", 1, later),
         ],
@@ -1661,10 +1710,11 @@ async fn the_deferred_cap_refuses_one_schedule_and_the_batch_still_commits() {
                 deferred(&addr, "refused", 1, later),
                 AttachBatchPublish {
                     channel_address: &addr,
-                    body: "immediate",
+                    body: "immediate".into(),
                     urgency: Urgency::Normal,
                     publish_ts_ns: stamp(2),
                     deliver_after: None,
+                    attachments: &NO_ATTACHMENTS,
                 },
             ],
             MissingChannelPosture::Invariant,
@@ -1756,17 +1806,19 @@ async fn publish_batch_from_attacher_preserves_per_entry_urgency() {
         &[
             AttachBatchPublish {
                 channel_address: &addr,
-                body: "low",
+                body: "low".into(),
                 urgency: Urgency::Low,
                 publish_ts_ns: stamp(0),
                 deliver_after: None,
+                attachments: &NO_ATTACHMENTS,
             },
             AttachBatchPublish {
                 channel_address: &addr,
-                body: "high",
+                body: "high".into(),
                 urgency: Urgency::High,
                 publish_ts_ns: stamp(1),
                 deliver_after: None,
+                attachments: &NO_ATTACHMENTS,
             },
         ],
         MissingChannelPosture::Invariant,
@@ -1813,17 +1865,19 @@ async fn a_mid_batch_failure_leaves_zero_rows() {
         let entries = vec![
             AttachBatchPublish {
                 channel_address: &addr2,
-                body: "first",
+                body: "first".into(),
                 urgency: Urgency::Normal,
                 publish_ts_ns: stamp(0),
                 deliver_after: None,
+                attachments: &NO_ATTACHMENTS,
             },
             AttachBatchPublish {
                 channel_address: "brenn:not-in-the-directory",
-                body: "doomed",
+                body: "doomed".into(),
                 urgency: Urgency::Normal,
                 publish_ts_ns: stamp(1),
                 deliver_after: None,
+                attachments: &NO_ATTACHMENTS,
             },
         ];
         m2.publish_batch_from_attacher(
@@ -1966,8 +2020,9 @@ async fn publish_batch_from_attacher_does_not_draw_the_send_budget() {
             AttachScope::surface("durabar"),
             Some("clock"),
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -2003,8 +2058,9 @@ async fn an_oversized_batch_draw_is_refused_and_mints_no_debt() {
             AttachScope::surface("durabar"),
             Some("clock"),
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -2035,8 +2091,9 @@ async fn an_oversized_batch_draw_is_refused_and_mints_no_debt() {
             AttachScope::surface("durabar"),
             Some("todos"),
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -2105,8 +2162,9 @@ async fn setting_one_scopes_budgets_replaces_that_scope_and_no_other() {
                 AttachScope::surface("kiosk"),
                 None,
                 &addr,
-                "x",
-                Urgency::Normal
+                "x".into(),
+                Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await,
             PublishResult::Ok { .. }
@@ -2117,8 +2175,9 @@ async fn setting_one_scopes_budgets_replaces_that_scope_and_no_other() {
             AttachScope::surface("kiosk"),
             None,
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -2134,8 +2193,9 @@ async fn setting_one_scopes_budgets_replaces_that_scope_and_no_other() {
                 AttachScope::surface("durabar"),
                 Some("clock"),
                 &addr,
-                "x",
-                Urgency::Normal
+                "x".into(),
+                Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await,
             PublishResult::Ok { .. }
@@ -2158,8 +2218,9 @@ async fn setting_one_scopes_budgets_replaces_that_scope_and_no_other() {
                 AttachScope::surface("durabar"),
                 Some("clock"),
                 &addr,
-                "x",
-                Urgency::Normal
+                "x".into(),
+                Urgency::Normal,
+                HeldAttachments::none(),
             )
             .await,
             PublishResult::Ok { .. }
@@ -2171,8 +2232,9 @@ async fn setting_one_scopes_budgets_replaces_that_scope_and_no_other() {
             AttachScope::surface("durabar"),
             Some("weather"),
             &addr,
-            "x",
-            Urgency::Normal
+            "x".into(),
+            Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await,
         PublishResult::Ok { .. }
@@ -2184,8 +2246,9 @@ async fn setting_one_scopes_budgets_replaces_that_scope_and_no_other() {
             AttachScope::surface("kiosk"),
             None,
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
     assert!(
@@ -2213,8 +2276,9 @@ async fn a_principal_dropped_by_a_swap_has_no_bucket() {
             AttachScope::surface("durabar"),
             Some("todos"),
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
 }
@@ -2232,8 +2296,9 @@ async fn removing_a_scopes_budgets_leaves_every_other_scope() {
             AttachScope::surface("kiosk"),
             None,
             &addr,
-            "x",
-            Urgency::Normal
+            "x".into(),
+            Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await,
         PublishResult::Ok { .. }
@@ -2254,8 +2319,9 @@ async fn a_removed_scope_has_no_bucket() {
             AttachScope::surface("durabar"),
             None,
             &addr,
-            "x",
+            "x".into(),
             Urgency::Normal,
+            HeldAttachments::none(),
         )
         .await;
 }
@@ -2288,8 +2354,9 @@ async fn a_publish_concurrent_with_a_swap_always_finds_a_bucket() {
                         AttachScope::surface("durabar"),
                         None,
                         &addr,
-                        "x",
+                        "x".into(),
                         Urgency::Normal,
+                        HeldAttachments::none(),
                     )
                     .await;
                 assert!(

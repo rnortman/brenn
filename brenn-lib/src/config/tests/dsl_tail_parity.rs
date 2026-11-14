@@ -136,6 +136,7 @@ fn an_in_tail_accounts_for_the_consumer_and_surface_families() {
         noise,
         wake_min,
         amplification,
+        non_text,
     });
     assert_tail_parity(
         "consumer subscription",
@@ -154,6 +155,7 @@ fn an_in_tail_accounts_for_the_consumer_and_surface_families() {
         retain_depth,
         noise,
         wake_min,
+        non_text,
     });
     assert_tail_parity(
         "surface subscription",
@@ -172,6 +174,7 @@ fn an_out_tail_accounts_for_the_two_output_families() {
         urgency,
         publish_per_activation,
         publish_capacity,
+        non_text,
     });
     assert_tail_parity(
         "consumer output",
@@ -188,6 +191,7 @@ fn an_out_tail_accounts_for_the_two_output_families() {
         urgency,
         publish_per_activation,
         publish_capacity,
+        non_text,
     });
     assert_tail_parity(
         "surface output",
@@ -210,6 +214,7 @@ fn an_io_tail_accounts_for_the_two_io_families() {
         urgency,
         publish_per_activation,
         publish_capacity,
+        non_text,
     });
     assert_tail_parity(
         "consumer io port",
@@ -229,6 +234,7 @@ fn an_io_tail_accounts_for_the_two_io_families() {
         urgency,
         publish_per_activation,
         publish_capacity,
+        non_text,
     });
     assert_tail_parity(
         "surface io port",

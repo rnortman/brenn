@@ -1,3 +1,6 @@
+mod attacher_attachments;
+mod attachments;
+mod body_kinds;
 mod chat_roles;
 mod conversation;
 mod dispatch_row;
@@ -7,8 +10,10 @@ mod publish_core;
 mod scheme_parity;
 mod surface;
 mod system;
+mod text_only_backstop;
 mod transport_ingress;
 mod wasm;
+mod wasm_attachments;
 
 use super::*;
 use crate::config::{
@@ -97,7 +102,7 @@ impl WakeRouter for CountingRouter {
         self.contexts
             .lock()
             .await
-            .push((envelope.body.clone(), retained_seq));
+            .push((envelope.body.as_text().unwrap().to_owned(), retained_seq));
     }
     fn spawn_eager_wake(&self, _key: &crate::SubscriberEntryKind, _subscriber: &ParticipantId) {
         self.eager_wakes.fetch_add(1, Ordering::SeqCst);
@@ -261,6 +266,8 @@ pub(super) async fn build_messenger_with(
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
+            untyped_content_type: None,
         },
         // Subscribers populated below: pa-alice is push-enabled (Unbounded).
         subscribers: std::iter::once(SubscriberEntry {

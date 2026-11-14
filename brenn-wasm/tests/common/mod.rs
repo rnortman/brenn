@@ -8,13 +8,17 @@
 // dead-code warnings at the module level.
 #![allow(dead_code)]
 
+use brenn_activation::{PortWindow, ProcessorActivation};
+use brenn_envelope::testutils::{fixture_envelope, message_id};
+use brenn_envelope::{MessageBody, MessageEnvelope};
 use brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT;
 use brenn_wasm::{
-    GuestAlertSeverity, KvStore, MqttPublishFn, MqttPublishOutcome, OutputAclFn, OutputPortSpec,
-    ProcessorAlerter, ProcessorLoadSpec, ProcessorUrgency, ProvidesCallError, ProvidesHost,
-    ProvidesHostFn, QueuedToolRequest, ReplayComponent, SinkBudget, ToolCallError, ToolHost,
-    ToolHostFn,
+    GuestAlertSeverity, HostActivation, KvStore, MqttPublishFn, MqttPublishOutcome, OutputAclFn,
+    OutputPortSpec, ProcessorAlerter, ProcessorLoadSpec, ProcessorUrgency, ProvidesCallError,
+    ProvidesHost, ProvidesHostFn, QueuedToolRequest, ReplayComponent, SinkBudget, ToolCallError,
+    ToolHost, ToolHostFn,
 };
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -28,6 +32,127 @@ use tempfile::NamedTempFile;
 /// which overflows — a panic in a debug build — as soon as the engine's ticker thread has
 /// fired once. A test that wants "no wall limit" wants this constant.
 pub const GENEROUS_EPOCH_TICKS: u64 = 36_000;
+
+/// The host activation a test's string activation describes.
+///
+/// Each window element is the envelope JSON a 0.1.0 guest is handed, parsed
+/// into the envelope the host carries; each parked payload becomes a text body
+/// in an envelope of its own. Lowering it for a 0.1.0 component hands the guest
+/// what the test wrote, up to the key order and spacing of the JSON.
+///
+/// # Panics
+///
+/// On a window element that is not an envelope's JSON: the host cannot carry
+/// one, so a test that writes one tests nothing the host can do.
+pub fn host_activation(activation: ProcessorActivation) -> HostActivation {
+    brenn_activation::Activation {
+        ports: activation
+            .ports
+            .into_iter()
+            .map(|pw| brenn_activation::PortWindow {
+                port: pw.port,
+                envelopes: pw
+                    .envelopes
+                    .iter()
+                    .map(|json| {
+                        Arc::new(
+                            serde_json::from_str::<MessageEnvelope>(json).unwrap_or_else(|e| {
+                                panic!("a test's window element is not envelope JSON ({e}): {json}")
+                            }),
+                        )
+                    })
+                    .collect(),
+                new_from: pw.new_from,
+                dropped: pw.dropped,
+            })
+            .collect(),
+        deferred: activation
+            .deferred
+            .into_iter()
+            .map(|dw| brenn_activation::DeferredWindow {
+                entries: dw
+                    .entries
+                    .into_iter()
+                    .map(|e| brenn_activation::DeferredEntry {
+                        index: e.index,
+                        payload: parked_envelope(&dw.port, &e.payload),
+                        deliver_after: e.deliver_after,
+                    })
+                    .collect(),
+                port: dw.port,
+            })
+            .collect(),
+        now: activation.now,
+        sync: activation.sync,
+    }
+}
+
+/// A parked message carrying `body` as untyped text, on a channel named for the
+/// output port it was parked through.
+fn parked_envelope(port: &str, body: &str) -> Arc<MessageEnvelope> {
+    Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "message_id": "00000000-0000-0000-0000-0000000000d1",
+            "source": "test",
+            "channel": format!("brenn:{port}"),
+            "sender": "test-sender",
+            "publish_ts": "2026-01-01T00:00:00Z",
+            "body": body,
+            "urgency": "normal",
+            "envelope_type": "brenn",
+        }))
+        .expect("a parked test envelope deserializes"),
+    )
+}
+
+/// The fixture envelope on `channel` carrying `body`, its message id derived
+/// from the label `id`.
+pub fn envelope(channel: &str, id: &str, body: MessageBody) -> Arc<MessageEnvelope> {
+    Arc::new(fixture_envelope(channel, id, body))
+}
+
+/// The message id [`envelope`] stamps for the label `id`, as its header reads.
+pub fn fixture_id(id: &str) -> String {
+    message_id(id).to_string()
+}
+
+/// A body of the given content type and bytes.
+///
+/// # Panics
+///
+/// On a malformed content type, or a text-typed body that is not UTF-8.
+pub fn body(content_type: Option<&str>, bytes: &[u8]) -> MessageBody {
+    MessageBody::from_parts(content_type, bytes).expect("a test body is well-formed")
+}
+
+/// A window on `port` whose entries from `new_from` on are new, nothing dropped.
+pub fn window(
+    port: &str,
+    envelopes: Vec<Arc<MessageEnvelope>>,
+    new_from: u32,
+) -> PortWindow<Arc<MessageEnvelope>> {
+    PortWindow {
+        port: port.to_string(),
+        envelopes,
+        new_from,
+        dropped: 0,
+    }
+}
+
+/// The result words of a byte fixture's JSON report.
+pub fn results(report: &Value) -> Vec<&str> {
+    report["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|r| r.as_str().expect("a result word"))
+        .collect()
+}
+
+/// Lower-case hex of `bytes`, as the byte fixtures report a body.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// Absolute path to a built component artifact, by artifact stem
 /// (e.g. `"brenn_replay"` → `brenn-wasm/target/components/brenn_replay.wasm`).
@@ -122,6 +247,7 @@ impl ToolHost for NotGrantedToolHost {
         _tool: &str,
         _args_json: &str,
         _call_id: &str,
+        _with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
         Err(ToolCallError::NotGranted)
     }
@@ -140,7 +266,12 @@ pub fn noop_tool_host() -> ToolHostFn {
 pub struct NothingPendingProvidesHost;
 
 impl ProvidesHost for NothingPendingProvidesHost {
-    fn complete(&self, _id: &str, _outcome_json: &str) -> Result<(), ProvidesCallError> {
+    fn complete(
+        &self,
+        _id: &str,
+        _outcome_json: &str,
+        _attachments: brenn_wasm::HeldAttachments,
+    ) -> Result<(), ProvidesCallError> {
         Err(ProvidesCallError::NotPending)
     }
     fn queue_async_for(
@@ -149,6 +280,7 @@ impl ProvidesHost for NothingPendingProvidesHost {
         _tool: &str,
         _args_json: &str,
         _call_id: &str,
+        _with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
         Err(ToolCallError::Denied("not pending".to_string()))
     }
@@ -181,6 +313,7 @@ pub fn out_spec(channel_address: &str) -> OutputPortSpec {
         channel_address: channel_address.to_string(),
         default_urgency: ProcessorUrgency::Normal,
         budget: generous_budget(),
+        non_text: false,
     }
 }
 

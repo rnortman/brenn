@@ -70,7 +70,7 @@ async fn chat_messenger() -> Arc<Messenger> {
 }
 
 async fn send(m: &Messenger, app_slug: &str, addr: &str) -> PublishResult {
-    m.publish_from_conversation(CONVERSATION, app_slug, addr, "body", Urgency::Normal)
+    m.publish_from_conversation(CONVERSATION, app_slug, addr, "body".into(), Urgency::Normal)
         .await
 }
 
@@ -172,7 +172,7 @@ async fn the_apps_own_llm_cannot_publish_into_its_chat_tree() {
                 PublishOrigin::Conversation { id: CONVERSATION },
                 OWNER,
                 &target,
-                "body",
+                "body".into(),
                 Urgency::Normal,
                 None,
                 None,
@@ -200,7 +200,7 @@ async fn without_the_harness_policy_there_is_no_bypass() {
             CONVERSATION,
             "no-grants",
             &addr(OWNER, ChatLeaf::Out),
-            "body",
+            "body".into(),
             Urgency::Normal,
         )
         .await;
@@ -260,7 +260,7 @@ async fn a_channel_that_was_never_provisioned_is_unknown() {
     let m = chat_messenger().await;
     let target = chat_address("chat", OWNER, ChatLeaf::Out, 99);
     let result = m
-        .publish_from_conversation(99, OWNER, &target, "body", Urgency::Normal)
+        .publish_from_conversation(99, OWNER, &target, "body".into(), Urgency::Normal)
         .await;
     assert!(
         matches!(result, PublishResult::UnknownChannel(ref a) if *a == target),

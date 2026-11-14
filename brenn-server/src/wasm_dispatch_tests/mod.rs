@@ -69,6 +69,7 @@ pub fn inbox_entry_with_own_subscriber(
     (inbox, channel)
 }
 
+mod blob_conversation_e2e;
 mod git_pipeline_e2e;
 mod git_sync_consumer;
 mod google_calendar_read_e2e;

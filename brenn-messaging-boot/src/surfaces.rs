@@ -6,8 +6,8 @@ use brenn_lib::messaging::config::{
     AttachSendBudget, DEFAULT_PARKED_BATCH_DEPTH, DEFAULT_WASM_PUBLISH_CAPACITY,
     DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth, MessagingGlobalConfig, NoiseLevel,
     ResolvedComponent, ResolvedLocalChannel, ResolvedSubscription, ResolvedSurface,
-    ResolvedSurfaceSubscription, SurfaceBinding, SurfaceCall, SurfaceCallRaw, SurfaceComponentRaw,
-    SurfaceConfigRaw, SurfaceOutput, SurfaceOutputRaw,
+    ResolvedSurfaceSubscription, ResolvedWireChannel, SurfaceBinding, SurfaceCall, SurfaceCallRaw,
+    SurfaceComponentRaw, SurfaceConfigRaw, SurfaceOutput, SurfaceOutputRaw,
 };
 use brenn_lib::messaging::{
     ChannelScheme, ComponentGrant, ComponentHost, EntityKind, MessagingDirectory, Plane, Urgency,
@@ -53,9 +53,10 @@ fn assert_page_depth_within_ceiling(
 /// depth.
 ///
 /// A `local:` channel has no `[[channel]]` block to inherit from — the
-/// per-surface bindings *are* the declaration — so the ring depth is resolved
-/// from the bindings themselves: **the max over the channel's declared bindings'
-/// `retain_depth`, floor 1**. The floor exists because a depth-0 ring would
+/// per-surface bindings *are* the declaration — so its facts are resolved from
+/// the bindings themselves: the ring depth is **the max over the channel's
+/// declared bindings' `retain_depth`, floor 1**, and the channel may carry
+/// non-text bodies iff any binding on it states `non_text`. The floor exists because a depth-0 ring would
 /// silently break the late-attach handoff the local class is for (a chrome that
 /// mounts after a theme publish would never see the theme). Reserved control
 /// channels instead carry contract-fixed depths, so a `retain_depth` on one is
@@ -68,11 +69,12 @@ fn assert_page_depth_within_ceiling(
 /// `retain_depth` set for a reserved control channel.
 // TODO(config-syntax-in-operator-messages): every validator in this file names
 // the surface and its bindings in table notation.
-fn accumulate_local_ring_depth(
+fn accumulate_local_channel(
     slug: &str,
-    depths: &mut IndexMap<String, u64>,
+    channels: &mut IndexMap<String, LocalChannelFold>,
     channel: &str,
     retain_depth: Option<Depth>,
+    non_text: bool,
 ) {
     if let Some(reserved) = brenn_surface_schema::reserved_local_channel(channel) {
         assert!(
@@ -82,7 +84,17 @@ fn accumulate_local_ring_depth(
              override would be silently ignored; remove it",
             reserved.ring_depth,
         );
-        depths.insert(channel.to_string(), reserved.ring_depth);
+        assert!(
+            !non_text,
+            "a binding stating `non_text` on reserved plane {channel:?} passed validation"
+        );
+        channels.insert(
+            channel.to_string(),
+            LocalChannelFold {
+                ring_depth: reserved.ring_depth,
+                non_text: false,
+            },
+        );
         return;
     }
     let depth = match retain_depth {
@@ -103,14 +115,29 @@ fn accumulate_local_ring_depth(
              and must be bounded; give it a number",
         ),
     };
-    let entry = depths.entry(channel.to_string()).or_insert(depth);
-    *entry = (*entry).max(depth);
+    let entry = channels
+        .entry(channel.to_string())
+        .or_insert(LocalChannelFold {
+            ring_depth: depth,
+            non_text,
+        });
+    entry.ring_depth = entry.ring_depth.max(depth);
+    entry.non_text |= non_text;
+}
+
+/// One `local:` channel's facts, folded over the bindings on its address.
+struct LocalChannelFold {
+    /// The max over the bindings' ring depths, floor 1; contract-fixed on a
+    /// reserved plane.
+    ring_depth: u64,
+    /// Whether any binding on the address states `non_text`.
+    non_text: bool,
 }
 
 /// How deep one `local:` binding reads into its channel's router ring when the
 /// kernel windows its port.
 ///
-/// Deliberately the same per-binding resolution [`accumulate_local_ring_depth`]
+/// Deliberately the same per-binding resolution [`accumulate_local_channel`]
 /// folds into the ring depth — reserved channels take the contract-fixed depth,
 /// operator-declared channels the binding's `retain_depth` or the floor 1. The
 /// ring is the fold across every binding; this is one binding's read out of it,
@@ -123,7 +150,7 @@ fn accumulate_local_ring_depth(
 /// value to whoever attaches. A 0 default would leave an unstated binding blind
 /// to a ring the kernel is already filling for it.
 ///
-/// Unbounded is not handled here — [`accumulate_local_ring_depth`] panics on it
+/// Unbounded is not handled here — [`accumulate_local_channel`] panics on it
 /// first, on the same binding.
 fn local_context_depth(channel: &str, retain_depth: Option<Depth>) -> u64 {
     if let Some(reserved) = brenn_surface_schema::reserved_local_channel(channel) {
@@ -133,7 +160,7 @@ fn local_context_depth(channel: &str, retain_depth: Option<Depth>) -> u64 {
         None => 1,
         Some(Depth::Bounded(n)) => n.max(1),
         Some(Depth::Unbounded) => {
-            unreachable!("accumulate_local_ring_depth rejects unbounded local retain_depth")
+            unreachable!("accumulate_local_channel rejects unbounded local retain_depth")
         }
     }
 }
@@ -873,11 +900,17 @@ pub(crate) fn resolve_surfaces(
         // Items 3–5 shared by both binding directions: component must be
         // declared, port charset valid, channel scheme restricted to
         // brenn:/ephemeral:/local: and the referenced channel must exist and
-        // wear the transport its address names. Returns `()`; each caller
-        // re-derives the binding's scheme for its own coverage check (item 6)
-        // after this validation has guaranteed the scheme is one of the three
-        // accepted ones.
-        let validate_binding = |direction: &str, channel: &str, instance: &str, port: &str| {
+        // wear the transport its address names. Returns the directory entry's
+        // `non_text` for a transportable channel and `None` for a `local:` one;
+        // each caller re-derives the binding's scheme for its own coverage
+        // check (item 6) after this validation has guaranteed the scheme is one
+        // of the three accepted ones.
+        let validate_binding = |direction: &str,
+                                channel: &str,
+                                instance: &str,
+                                port: &str,
+                                non_text: bool|
+         -> Option<bool> {
             // Item 5: instance must be declared on this surface.
             assert!(
                 instances.contains(instance),
@@ -933,6 +966,19 @@ pub(crate) fn resolve_surfaces(
                          ingress paths)",
                         entry.transport_type,
                     );
+                    // A port that states `non_text` asks for a channel that
+                    // admits non-text bodies; one that does not state it may
+                    // still be bound to such a channel. On a link the
+                    // statement is the declaration, by the fold, so this
+                    // cannot fire there.
+                    assert!(
+                        !non_text || entry.resolved_channel.non_text,
+                        "config: [[surface]] {slug:?}: {direction} instance {instance:?} port \
+                         {port:?} states `non_text`, but its channel {channel:?} is declared \
+                         text-only — declare the channel `non_text`, or drop `non_text` from the \
+                         port"
+                    );
+                    Some(entry.resolved_channel.non_text)
                 }
                 // `local:` — page-local pub/sub. There is nothing to look up:
                 // local channels are declared per-surface (the binding *is* the
@@ -945,6 +991,12 @@ pub(crate) fn resolve_surfaces(
                          empty local channel",
                     );
                     if brenn_surface_schema::is_reserved_local_namespace(channel) {
+                        assert!(
+                            !non_text,
+                            "config: [[surface]] {slug:?}: {direction} instance {instance:?} \
+                             port {port:?} states `non_text` on the reserved plane {channel:?}: \
+                             the kernel and chrome read every `local:brenn/` plane as text"
+                        );
                         // Reserved namespace: the name must be one the contract
                         // actually defines. `local:brenn/nonesuch` is reserved
                         // (an operator cannot declare it) but undefined — a
@@ -973,6 +1025,7 @@ pub(crate) fn resolve_surfaces(
                              after the local: prefix",
                         );
                     }
+                    None
                 }
                 _ => {
                     unreachable!("the scheme assert above admits only the schemes a surface binds",)
@@ -1030,12 +1083,12 @@ pub(crate) fn resolve_surfaces(
         // the lowering pass assigned — the two directions cannot be wired apart.
         let (io_subscriptions, io_outputs) = super::auto::surface_io_bindings(&surface.io_ports);
 
-        // Ring depth per declared `local:` channel, accumulated across bindings:
-        // reserved channels take the contract-fixed depth, operator-declared
-        // channels the max over their bindings' `retain_depth` (floor 1). First
-        // insertion order is preserved so the bindings document lists them
-        // predictably.
-        let mut local_ring_depths: IndexMap<String, u64> = IndexMap::new();
+        // First insertion order is preserved so the bindings document lists
+        // the channels predictably.
+        let mut local_channel_folds: IndexMap<String, LocalChannelFold> = IndexMap::new();
+        // Every transportable channel a binding names, with the directory's
+        // `non_text`, in first-binding order: subscriptions, then outputs.
+        let mut wire_channel_table: IndexMap<String, bool> = IndexMap::new();
 
         // Subscriptions (input bindings): item 6 coverage is `allows_channel_access`
         // over the full address. Every *transportable* binding additionally
@@ -1076,7 +1129,13 @@ pub(crate) fn resolve_surfaces(
                 sub.channel.as_deref(),
                 auto_wiring.surface_channel(slug, &sub.instance, &sub.port),
             );
-            validate_binding(direction, &channel, &sub.instance, &sub.port);
+            if let Some(declared) =
+                validate_binding(direction, &channel, &sub.instance, &sub.port, sub.non_text)
+            {
+                wire_channel_table
+                    .entry(channel.clone())
+                    .or_insert(declared);
+            }
             assert!(
                 seen_sub_ports.insert((sub.instance.as_str(), sub.port.as_str())),
                 "config: [[surface]] {slug:?}: duplicate {direction} binding for instance \
@@ -1145,18 +1204,19 @@ pub(crate) fn resolve_surfaces(
                 // ladder is binding → global. `push_depth` has no such fallback:
                 // a depth is sized, not defaulted, so the binding states it. The
                 // kernel enacts the resolved noise rung on overflow.
-                accumulate_local_ring_depth(
+                accumulate_local_channel(
                     slug,
-                    &mut local_ring_depths,
+                    &mut local_channel_folds,
                     &channel,
                     sub.retain_depth,
+                    sub.non_text,
                 );
                 (
                     resolve_page_queue_depth(slug, &context, &channel, sub.push_depth, None),
                     // The router's ring is the context source for a `local:`
                     // channel, so this binding's own number is only how deep it
                     // reads into that ring — the ring itself is the max fold
-                    // `accumulate_local_ring_depth` just took, and a reserved
+                    // `accumulate_local_channel` just took, and a reserved
                     // plane's is contract-fixed. A binding that states nothing
                     // still reads 1: the ring's floor is 1 and the planes' whole
                     // point is last-value replay on attach, so 0 here would make
@@ -1350,7 +1410,13 @@ pub(crate) fn resolve_surfaces(
                 out.channel.as_deref(),
                 auto_wiring.surface_channel(slug, &out.instance, &out.port),
             );
-            validate_binding(direction, &channel, &out.instance, &out.port);
+            if let Some(declared) =
+                validate_binding(direction, &channel, &out.instance, &out.port, out.non_text)
+            {
+                wire_channel_table
+                    .entry(channel.clone())
+                    .or_insert(declared);
+            }
             assert!(
                 seen_out_ports.insert((out.instance.as_str(), out.port.as_str())),
                 "config: [[surface]] {slug:?}: duplicate {direction} binding for instance {:?} \
@@ -1363,7 +1429,13 @@ pub(crate) fn resolve_surfaces(
                 // Outputs carry no depth knobs, so an output-only local channel
                 // takes the floor. Registering it here is what makes a
                 // publish-only local channel exist for the router at all.
-                accumulate_local_ring_depth(slug, &mut local_ring_depths, &channel, None);
+                accumulate_local_channel(
+                    slug,
+                    &mut local_channel_folds,
+                    &channel,
+                    None,
+                    out.non_text,
+                );
             }
             outputs.push(SurfaceOutput {
                 channel_address: channel.clone(),
@@ -1522,12 +1594,18 @@ pub(crate) fn resolve_surfaces(
             );
         }
 
-        let local_channels = local_ring_depths
+        let local_channels = local_channel_folds
             .into_iter()
-            .map(|(address, ring_depth)| ResolvedLocalChannel {
+            .map(|(address, fold)| ResolvedLocalChannel {
                 address,
-                ring_depth,
+                ring_depth: fold.ring_depth,
+                non_text: fold.non_text,
             })
+            .collect();
+
+        let wire_channels = wire_channel_table
+            .into_iter()
+            .map(|(address, non_text)| ResolvedWireChannel { address, non_text })
             .collect();
 
         let calls = resolve_surface_calls(slug, &resolved_components, &surface.calls);
@@ -1539,6 +1617,7 @@ pub(crate) fn resolve_surfaces(
             subscriptions,
             wire_subscriptions,
             local_channels,
+            wire_channels,
             outputs,
             calls,
             policy,

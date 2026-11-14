@@ -1,22 +1,19 @@
 load("@wasm_crates//:defs.bzl", "all_crate_deps")
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load(
-    "//bazel/wasm:defs.bzl",
-    "wasm_component",
-    "wasm_guest_cdylib",
-)
+load("//bazel/wasm:defs.bzl", "wasm_component", "wasm_guest_cdylib")
 
 policy_srcs()
 
-# The fixture is a raw-WIT component on purpose — the loop below asserts on the
-# host's own error variants — and links the SDK for one call, so the guest-side
-# `mqtt` wrapper is exercised against a real host callback.
+# Bindings come from the brenn-guest SDK's `generate!`; this crate names no
+# WIT of its own. The loop asserts on the host's own MQTT error variants, which
+# `brenn_guest::mqtt::try_publish` keeps.
 wasm_guest_cdylib(
     name = "brenn-processor-mqtt-test",
-    shared_bindings = "//brenn-wasm:processor_bindings",
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    deps = all_crate_deps(normal = True) + ["//brenn-wasm/components/guest:brenn-guest"],
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-wasm/components/guest:brenn-guest",
+    ],
 )
 
 wasm_component(

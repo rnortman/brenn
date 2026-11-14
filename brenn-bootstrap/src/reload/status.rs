@@ -401,8 +401,8 @@ mod tests {
             .expect("the status channel is declared and readable");
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].sender, "system:config-reload");
-        let read: ReloadStatus =
-            serde_json::from_str(&envelopes[0].body).expect("the retained body is the schema");
+        let read: ReloadStatus = serde_json::from_str(envelopes[0].body.as_text().unwrap())
+            .expect("the retained body is the schema");
         assert_eq!(read, status);
 
         // The facility may report; it may not manufacture the request it
@@ -411,7 +411,7 @@ mod tests {
             .publish_from_system(
                 CONFIG_RELOAD_COMPONENT,
                 RELOAD_ADDRESS,
-                "{}",
+                "{}".into(),
                 Urgency::Normal,
                 None,
             )
@@ -508,7 +508,7 @@ mod tests {
                 .await
                 .expect("the status channel is declared and readable")
                 .into_iter()
-                .map(|envelope| envelope.body)
+                .map(|envelope| envelope.body.as_text().unwrap().to_owned())
                 .collect()
         }
 

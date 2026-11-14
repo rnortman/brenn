@@ -161,6 +161,8 @@ fn channel(scheme: ChannelScheme, bare: &str, subscribers: Vec<SubscriberEntry>)
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
+            non_text: false,
+            untyped_content_type: None,
         },
         subscribers,
         transport_type: scheme,
@@ -306,6 +308,7 @@ impl Backend {
                         fill_mt: 1_000_000_000,
                         capacity_mt: 1_000_000_000,
                     },
+                    non_text: false,
                 },
             );
             outputs.push(WasmOutputPort {
@@ -317,6 +320,7 @@ impl Backend {
                     fill_mt: 1_000_000_000,
                     capacity_mt: 1_000_000_000,
                 },
+                non_text: false,
             });
         }
 
@@ -340,6 +344,7 @@ impl Backend {
                         wake_min: WakeMin::Normal,
                     },
                     amplification_mt: 1000,
+                    non_text: false,
                 }
             })
             .collect();
@@ -431,7 +436,7 @@ impl Backend {
         if sender
             .send(brenn_wasm_dispatch::SyncRequest {
                 port: port.to_string(),
-                body: body.to_string(),
+                body: brenn_envelope::MessageBody::text(body),
                 chain: Vec::new(),
                 reply,
             })
@@ -452,7 +457,7 @@ impl Backend {
         let entry = &self.channels[port];
         self.template
             .messenger
-            .publish_from_system(HOST, &entry.address, body, Urgency::Normal, None)
+            .publish_from_system(HOST, &entry.address, body.into(), Urgency::Normal, None)
             .await
     }
 }
@@ -500,7 +505,7 @@ impl Host for Backend {
         let result = self
             .template
             .messenger
-            .publish_from_system(HOST, &entry.address, body, Urgency::Normal, None)
+            .publish_from_system(HOST, &entry.address, body.into(), Urgency::Normal, None)
             .await;
         assert!(
             matches!(result, PublishResult::Ok { .. }),
@@ -566,7 +571,7 @@ impl Host for Backend {
             .entries
             .iter()
             .filter(|(seq, _)| self.read_through.is_none_or(|read| *seq > read))
-            .map(|(seq, envelope)| (*seq, envelope.body.clone()))
+            .map(|(seq, envelope)| (*seq, envelope.body.as_text().unwrap().to_owned()))
             .collect();
         if let Some((seq, _)) = fresh.last() {
             self.read_through = Some(*seq);
