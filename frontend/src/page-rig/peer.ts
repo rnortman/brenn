@@ -118,6 +118,10 @@ export interface Kit {
         publish_batch_result: Template;
     };
     deliver: BinaryTemplate;
+    /** The same one-row `Deliver`, its row naming the attachments `attached`. */
+    deliver_attached: BinaryTemplate;
+    /** The attachments `deliver_attached` names, as the header writes them. */
+    attached: Json;
     /** `DeferredView` templates, the one at index `n` holding `n` entries. */
     deferred_views: BinaryTemplate[];
     server_samples: ServerSample[];
@@ -589,9 +593,10 @@ export class Peer {
      * Deliver `body` on `channel` to the kernel, as one `Deliver` row: the
      * channel's next `seq`, a fresh cursor and message id. A string is
      * untyped text. Only `ephemeral:` channels: the kit's template stamps every
-     * row's envelope `ephemeral`.
+     * row's envelope `ephemeral`. With `attached`, the row names the kit's
+     * `attached` attachments.
      */
-    deliver(channel: string, body: string | RigBody): void {
+    deliver(channel: string, body: string | RigBody, attached = false): void {
         if (!this.subscribed.has(channel)) {
             this.failures.fatal(`delivery on '${channel}', which the kernel never subscribed`);
         }
@@ -605,7 +610,7 @@ export class Peer {
         this.seqs.set(channel, seq);
         this.send(
             fillBinary(
-                this.kit.deliver,
+                attached ? this.kit.deliver_attached : this.kit.deliver,
                 { channel, seq, cursor: `rig-${seq}`, message_id: crypto.randomUUID() },
                 [typeof body === "string" ? textBody(body) : body],
             ),

@@ -1,7 +1,8 @@
 //! Route-level integration tests for `GET /surface/{slug}/ws`: the pre-upgrade
 //! ladder (access → capacity → served-asset build check), the opening frames the
 //! attachment session writes over a real socket, the round trip between an
-//! attached page and the bus through the real `WakeRouter`, a remote's non-text
+//! attached page and the bus through the real `WakeRouter`, a host publish's
+//! attachments reaching an attached page live, a remote's non-text
 //! body reaching an attached page with its content type, and the terminal
 //! `disconnected` stamp the route writes when the last attachment ends.
 //!
@@ -575,6 +576,125 @@ async fn surface_ws_a_publish_reaches_the_bus_and_comes_back_on_the_subscription
             }
             other => panic!("expected a publish answer or a delivery, got {other:?}"),
         }
+    }
+}
+
+/// The host component that publishes with attachments in
+/// [`surface_ws_a_live_publish_carries_its_attachments_to_the_page`].
+const BLOB_PRODUCER: &str = "blob-producer";
+
+/// **A live delivery carries the published message's attachments.** A live
+/// row is not the stored envelope: the publish rebuilds one for the attach
+/// feed, so a host publish naming a blob must reach an attached page's
+/// `Deliver` row with the same references a query of the message would show.
+#[tokio::test]
+async fn surface_ws_a_live_publish_carries_its_attachments_to_the_page() {
+    use brenn_envelope::grants::AppCapability;
+    use brenn_lib::access::AppPolicy;
+    use brenn_lib::access::acl::ChannelMatcher;
+    use brenn_lib::messaging::{
+        AttachmentName, SubscriberEntryKind, SubscriberRegistration, WakeEconomics,
+    };
+    use brenn_messaging::publish::PublishResult;
+    use brenn_messaging::testutils::{TempBlobDir, seal_blob};
+    use brenn_messaging_store::blob::{BlobLimits, BlobStore, HeldAttachments};
+
+    let db = brenn_server::test_support::init_db_memory();
+    let blob_dir = TempBlobDir::new();
+    let blobs = {
+        let conn = db.lock().await;
+        BlobStore::open(
+            blob_dir.path(),
+            BlobLimits {
+                max_blob_bytes: 1 << 20,
+                budget_bytes: 1 << 20,
+            },
+            &conn,
+        )
+    };
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::EphemeralPublish);
+    policy.acls.ephemeral_publish = vec![ChannelMatcher::Exact(EPH_NAME.to_string())];
+    let producer = (
+        SubscriberEntryKind::System(BLOB_PRODUCER.to_string()),
+        SubscriberRegistration {
+            policy: Arc::new(policy),
+            wake: WakeEconomics::Eager,
+        },
+    );
+    // retain_depth 0: the subscribe replays nothing, so the delivery under test
+    // is the live one.
+    let SurfaceTestHarness { state, .. } =
+        brenn_server::routes::surface::test_fixtures::surface_harness_extending_messenger(
+            &db,
+            deskbar_loop(vec![]),
+            vec![],
+            vec![ephemeral_channel_entry(EPH_NAME, 0)],
+            |messenger| {
+                messenger
+                    .with_subscriber_registrations([producer].into())
+                    .with_blob_store(blobs)
+            },
+        )
+        .await;
+    let messenger = Arc::clone(state.messenger.as_ref().expect("the rig has a messenger"));
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(state).await;
+
+    let (mut ws, _session_id) = attach(&base, &token).await;
+    send(
+        &mut ws,
+        &ClientFrame::Subscribe {
+            channel: EPH_ADDR.to_string(),
+            push_depth: 4,
+            retain_depth: 4,
+            resume: None,
+        },
+    )
+    .await;
+    match next_server_frame(&mut ws).await {
+        ServerFrame::SubscribeResult {
+            outcome,
+            replay_count,
+            ..
+        } => {
+            assert_eq!(outcome, SubscribeOutcome::Ok);
+            assert_eq!(replay_count, 0);
+        }
+        other => panic!("expected SubscribeResult, got {other:?}"),
+    }
+
+    let photo = seal_blob(&messenger, b"jpeg bytes");
+    let held = HeldAttachments::new([(AttachmentName::new("photo").unwrap(), photo)])
+        .expect("one attachment");
+    let published = held.refs().clone();
+    let outcome = messenger
+        .publish_from_system_with_attachments(
+            BLOB_PRODUCER,
+            EPH_ADDR,
+            "see attached".into(),
+            Urgency::Normal,
+            None,
+            None,
+            held,
+        )
+        .await;
+    assert!(
+        matches!(outcome, PublishResult::Ok { .. }),
+        "the producer may publish here: {outcome:?}"
+    );
+
+    match next_server_frame(&mut ws).await {
+        ServerFrame::Deliver { channel, rows } => {
+            assert_eq!(channel, EPH_ADDR);
+            let [row] = rows.as_slice() else {
+                panic!("one live publish is a one-row pass, got {rows:?}");
+            };
+            assert_eq!(row.envelope.body.as_text(), Some("see attached"));
+            assert_eq!(row.envelope.attachments, published);
+            assert_eq!(row.envelope.attachments.len(), 1);
+        }
+        other => panic!("expected Deliver, got {other:?}"),
     }
 }
 

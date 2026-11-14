@@ -1192,6 +1192,138 @@ async fn a_drain_nudge_serves_the_retained_suffix() {
     assert!(!outcome.violation);
 }
 
+/// A blob store over a fresh directory against `db`, one sealed blob in it, and
+/// a durable row on `channel_uuid` naming that blob `photo`, appended through
+/// the channel's durable store. The returned reference is the one the row
+/// stores.
+async fn seed_with_attachment(
+    db: &Db,
+    channel_uuid: Uuid,
+) -> (
+    brenn_lib::messaging::BlobRef,
+    brenn_messaging::testutils::TempBlobDir,
+) {
+    use brenn_messaging_store::store::{DbStore, NewMessage, RetentionStore};
+
+    let dir = brenn_messaging::testutils::TempBlobDir::new();
+    let blobs = {
+        let conn = db.lock().await;
+        brenn_messaging_store::blob::BlobStore::open(
+            dir.path(),
+            brenn_messaging_store::blob::BlobLimits {
+                max_blob_bytes: 1 << 20,
+                budget_bytes: 1 << 20,
+            },
+            &conn,
+        )
+    };
+    let photo = brenn_messaging_store::testutils::seal_bytes(&blobs, "image/jpeg", b"jpeg bytes");
+    let store = DbStore::new(
+        db.clone(),
+        channel_uuid,
+        CHANNEL,
+        brenn_lib::messaging::config::Depth::Unbounded,
+    );
+    store
+        .append(NewMessage {
+            source: "test".into(),
+            sender: "sender".into(),
+            body: r#"{"n":1}"#.into(),
+            urgency: brenn_lib::messaging::Urgency::Normal,
+            envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+            reply_to: None,
+            delivery_deadline: None,
+            impetus: None,
+            publish_ts_ns: 100,
+            attachments: brenn_messaging_store::testutils::held(&[("photo", &photo)]),
+        })
+        .await;
+    (photo.reference(), dir)
+}
+
+/// **A replayed row carries its attachments to a v5 attacher.** The stored
+/// envelope is written in the header shape, so the row's references reach the
+/// attacher in full.
+#[tokio::test]
+async fn a_replayed_row_carries_its_attachments_at_v5() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (mut attachment, channel_uuid) = subscribing_attachment(&db, IDLE_HEARTBEAT_SECS).await;
+    attached_and_subscribed(&mut attachment).await;
+
+    let (photo, _blobs) = seed_with_attachment(&db, channel_uuid).await;
+    attachment.drain_notify.notify_one();
+
+    match attachment.next_frame().await {
+        ServerFrame::Deliver { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            let attachments = &rows[0].envelope.attachments;
+            assert_eq!(attachments.len(), 1, "{attachments:?}");
+            let name = brenn_lib::messaging::AttachmentName::new("photo").expect("a name");
+            assert_eq!(attachments.get(&name), Some(&photo));
+        }
+        other => panic!("expected a Deliver, got {other:?}"),
+    }
+
+    let (outcome, _frames) = attachment.finish().await;
+    assert!(!outcome.violation);
+}
+
+/// **A v4 attacher is handed the same row without the key.** v4 writes the
+/// text shape, which carries no attachments; the row's body is unchanged.
+#[tokio::test]
+async fn a_replayed_row_with_attachments_reaches_v4_without_the_key() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (mut attachment, channel_uuid) = subscribing_attachment(&db, IDLE_HEARTBEAT_SECS).await;
+    let v4 = Codec::negotiated(4);
+    attachment.send_hello(VersionRange::exactly(4));
+    attachment.send(to_message(v4.encode_client(&ClientFrame::Subscribe {
+        channel: CHANNEL.to_string(),
+        push_depth: 8,
+        retain_depth: 8,
+        resume: None,
+    })));
+
+    // Hello, Welcome and SubscribeResult, all text under v4.
+    let mut opening = Vec::new();
+    while opening.len() < 3 {
+        if let Message::Text(text) = v4_next(&mut attachment).await {
+            opening.push(text.as_str().to_string());
+        }
+    }
+    let (_photo, _blobs) = seed_with_attachment(&db, channel_uuid).await;
+    attachment.drain_notify.notify_one();
+    let deliver = loop {
+        let Message::Text(text) = v4_next(&mut attachment).await else {
+            continue;
+        };
+        let frame: serde_json::Value =
+            serde_json::from_str(text.as_str()).expect("a v4 frame is JSON");
+        if frame["type"] == "Deliver" {
+            break frame;
+        }
+    };
+    let rows = deliver["rows"].as_array().expect("a Deliver lists rows");
+    assert_eq!(rows.len(), 1, "{deliver}");
+    assert_eq!(rows[0]["envelope"]["body"], r#"{"n":1}"#, "{deliver}");
+    assert!(
+        !deliver.to_string().contains("attachments"),
+        "a v4 frame has no attachments key: {deliver}"
+    );
+
+    // `finish` decodes with the v5 codec; this session wrote v4.
+    attachment.send(Message::Close(None));
+    let outcome = attachment.join.await.expect("session task");
+    assert!(!outcome.violation);
+}
+
+/// The next websocket message a session wrote, waiting for it.
+async fn v4_next(attachment: &mut Attachment) -> Message {
+    tokio::time::timeout(Duration::from_secs(10), attachment.outbound.recv())
+        .await
+        .expect("the session wrote a message")
+        .expect("the writer is alive")
+}
+
 /// **An attachment that answers nothing for three probes is reaped.** Silence is
 /// the only liveness signal the server has — a half-open socket still claims to
 /// be a socket — and a zombie attachment pins a registry slot against the

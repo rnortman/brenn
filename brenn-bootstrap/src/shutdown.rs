@@ -158,55 +158,87 @@ pub(crate) async fn ingress_cleanup_loop(db: brenn_db::Db, retention_days: u64) 
 ///    accounting point, the sibling of the ring's displacing append. The
 ///    report lands up to one GC interval after the loss — durable eviction is
 ///    itself periodic, and the ladder is minutes-grade.
+///
+/// After every channel, one [`brenn_messaging::Messenger::reap_blobs`] deletes
+/// the blobs the pass's evictions left unheld.
 pub(crate) async fn bus_gc_loop(
     db: brenn_db::Db,
     messenger: std::sync::Arc<brenn_messaging::Messenger>,
     archive_path: Option<std::path::PathBuf>,
 ) {
-    use brenn_messaging_store::db as msg_db;
-
     // Stagger startup to avoid lock contention with the other two hourly loops.
     tokio::time::sleep(std::time::Duration::from_secs(BUS_GC_STAGGER_SECS)).await;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(HOURLY_INTERVAL_SECS)).await;
 
-        // Durable channels only: what this loop evicts is database rows, and a
-        // non-durable channel keeps its bounded window in memory, where the ring
-        // itself is the bound.
-        let channels = messenger.directory().list_durable();
-        let mut total_messages_evicted: usize = 0;
-
-        for entry in &channels {
-            let Some(frontier) = entry.reap_frontier() else {
-                continue; // channel is pinned (Unbounded depth present)
-            };
-
-            // Evict bodies past the frontier.
-            let eviction = {
-                let conn = db.lock().await;
-                msg_db::bus_gc_evict_channel(
-                    &conn,
-                    entry.uuid,
-                    &entry.address,
-                    entry.transport_type,
-                    frontier,
-                    entry.resolved_channel.sink,
-                    archive_path.as_deref(),
-                )
-            };
-            total_messages_evicted += eviction.messages_evicted;
-            // Enacted outside the connection hold: the ladder alarms through
-            // the router, which is no business of the eviction transaction.
-            messenger.enact_overflow_for_channel(&entry.address, &eviction.overflow);
-        }
-
-        if total_messages_evicted > 0 {
+        let pass = bus_gc_pass(&db, &messenger, archive_path.as_deref()).await;
+        if pass.messages_evicted > 0 || pass.reaped.blobs > 0 {
             tracing::info!(
-                messages_evicted = total_messages_evicted,
-                channels_processed = channels.len(),
+                messages_evicted = pass.messages_evicted,
+                channels_processed = pass.channels_processed,
+                blobs_reaped = pass.reaped.blobs,
+                blob_bytes_reaped = pass.reaped.bytes,
                 "bus GC pass complete"
             );
         }
+    }
+}
+
+/// What one [`bus_gc_pass`] did.
+#[derive(Debug)]
+pub(crate) struct BusGcPass {
+    pub(crate) messages_evicted: usize,
+    pub(crate) channels_processed: usize,
+    pub(crate) reaped: brenn_messaging_store::blob::ReapReport,
+}
+
+/// One pass of [`bus_gc_loop`]: evict every durable channel past its frontier,
+/// enact the noise ladder over each eviction, then reap the blobs nothing
+/// holds any longer.
+pub(crate) async fn bus_gc_pass(
+    db: &brenn_db::Db,
+    messenger: &brenn_messaging::Messenger,
+    archive_path: Option<&std::path::Path>,
+) -> BusGcPass {
+    use brenn_messaging_store::db as msg_db;
+
+    // Durable channels only: what this pass evicts is database rows, and a
+    // non-durable channel keeps its bounded window in memory, where the ring
+    // itself is the bound.
+    let channels = messenger.directory().list_durable();
+    let mut messages_evicted: usize = 0;
+
+    for entry in &channels {
+        let Some(frontier) = entry.reap_frontier() else {
+            continue; // channel is pinned (Unbounded depth present)
+        };
+
+        let eviction = {
+            let conn = db.lock().await;
+            msg_db::bus_gc_evict_channel(
+                &conn,
+                entry.uuid,
+                &entry.address,
+                entry.transport_type,
+                frontier,
+                entry.resolved_channel.sink,
+                archive_path,
+            )
+        };
+        messages_evicted += eviction.messages_evicted;
+        // Enacted outside the connection hold: the ladder alarms through
+        // the router, which is no business of the eviction transaction.
+        messenger.enact_overflow_for_channel(&entry.address, &eviction.overflow);
+    }
+
+    // Runs after every eviction so blobs held only by evicted rows go in this
+    // pass, and outside the connection hold, which the reap takes itself.
+    let reaped = messenger.reap_blobs().await;
+
+    BusGcPass {
+        messages_evicted,
+        channels_processed: channels.len(),
+        reaped,
     }
 }

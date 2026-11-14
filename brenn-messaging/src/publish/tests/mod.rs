@@ -1,3 +1,4 @@
+mod attachments;
 mod body_kinds;
 mod chat_roles;
 mod conversation;

@@ -7,6 +7,8 @@
 
 mod apps;
 mod automation;
+#[cfg(test)]
+mod bus_gc_blob_tests;
 mod cc_profile;
 mod cleanup;
 pub mod cli;
@@ -464,6 +466,11 @@ pub async fn run_server(
     // decides every candidate against. The clone gives the running process
     // its own copy of the configuration.
     let config = document.config.clone();
+
+    // TODO(correctness-no-single-instance-guard-before-startup-side-effects):
+    // nothing refuses a second `brenn serve` beside a running one. The refusal
+    // belongs here, before the PID file is overwritten and before the startup
+    // hooks, the container sweep and the usage-session close below.
 
     // Write PID file if configured (used by logrotate's postrotate to send SIGHUP).
     if let Some(ref pid_file_path) = config.server.pid_file {

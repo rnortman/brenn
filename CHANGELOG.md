@@ -4,6 +4,48 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **BREAKING for operators: the database and the blob directory are one unit
+  to back up, restore and roll back.** Attachment bytes live in a directory
+  beside the database (`messaging { blob_dir }`, default the database path
+  with `.blobs` appended), and Brenn refuses to start on a database whose
+  messages name a blob that directory no longer holds. Blob files are deleted
+  as their messages are evicted, so a snapshot of the database alone,
+  restored later, can name files that are gone. Back up and snapshot the two
+  together, and prune them together. Nothing in this release publishes an
+  attachment, so existing database-only snapshots still restore; that stops
+  being true at the first release that publishes one onto a durable channel,
+  and a deploy or backup script must cover the directory before then. To
+  start a host that refuses: delete the message rows the panic names with
+  `sqlite3`. See `docs/message-bus.md`, the blob section's restore paragraph.
+- **For operators and WASM component authors: a blob store, and attachments
+  on bus messages.** A message can now name large byte objects — blobs — by
+  reference, beside its body, which stays capped at `max_body_bytes`. A blob
+  lives exactly as long as a message the host holds names it, or host code
+  holds it open, and is then deleted: at once when only ring channels ever
+  named it, at the next reap (hourly, and after a cancel) when a durable row
+  did. Each message carries up to 32 named attachments in a new open-header
+  key, `attachments`, a map from name to `{id, size, content_type}`. A 0.2.0
+  component sees the full references in its header, on the backend and on a
+  page, and so does an attach v5 session; a conversation is shown each
+  attachment's name, size and content type without its id; the eviction
+  archive records the references but not the bytes; 0.1.0 components and
+  attach v4 sessions see nothing, byte-identically. Nothing outside the host
+  creates or redeems a blob yet, and nothing in this release publishes one:
+  the store, the field and the lifetime rule are the base later releases
+  build producers on. Three new keys in the `messaging` section:
+  `max_blob_bytes` (default 64 MiB), `blob_budget_bytes` (default 1 GiB) and
+  `blob_dir`; the store creates its directory, mode 0700, on first boot, and
+  refuses to start if `PRAGMA synchronous` is below `FULL` or the directory
+  holds anything that is not a blob file. The database gains a nullable
+  `attachments` column on `messaging_messages`, two tables
+  (`messaging_blobs`, `messaging_blob_refs`) and two triggers on the first
+  boot. See `docs/message-bus.md` §2.1.2a and `docs/config-dsl.md`.
+- **For Rust authors building `brenn-envelope` types:**
+  `MessageEnvelope` and `EnvelopeHeader` gain the `attachments` field, so a
+  struct literal needs it (`Default::default()` is the empty map), and the
+  shape trait `BodyShape` is renamed `EnvelopeShape` and gains a required
+  `serialize_attachments`.
+
 - **For operators and WASM component authors: MQTT and webhook ingress can
   carry the payload itself.** A tuning block for an `mqtt:` or `webhook:`
   channel — exact or prefix — may now state `non_text = true`. Such a channel

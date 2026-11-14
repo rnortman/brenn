@@ -955,6 +955,7 @@ dependencies = [
  "brenn-queue",
  "chrono",
  "indexmap",
+ "rand 0.10.1",
  "rusqlite",
  "serde",
  "serde_json",

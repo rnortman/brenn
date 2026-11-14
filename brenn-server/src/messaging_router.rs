@@ -920,6 +920,7 @@ mod tests {
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Brenn,
                 transport: None,
+                attachments: Default::default(),
             }),
         }];
         router
@@ -1419,6 +1420,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
             transport: None,
+            attachments: Default::default(),
         };
         let _ = router.deliver(&key, &Arc::new(env), 1).await;
     }
@@ -1687,6 +1689,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
             transport: None,
+            attachments: Default::default(),
         }
     }
 

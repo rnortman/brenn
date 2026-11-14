@@ -9,13 +9,15 @@
 use super::*;
 
 use brenn_lib::messaging::MessageBody;
+use brenn_lib::messaging::SubscriberRegistration;
 use brenn_lib::messaging::config::{WasmOutputPort, WasmSinkBudget};
 use brenn_wasm::ProcessorContract;
+use std::collections::HashMap;
 
 const BYTES_WASM: &str = "brenn-wasm/target/components/brenn_processor_bytes_test.wasm";
 
 /// The participant subscribed to every report channel.
-const READER: &str = "nt-report-reader";
+pub(super) const READER: &str = "nt-report-reader";
 
 /// Bytes that are not UTF-8 (a JPEG start-of-image marker) and their hex.
 const NOT_UTF8: &[u8] = &[0xff, 0xd8, 0xff, 0x00];
@@ -27,7 +29,11 @@ fn body(content_type: Option<&str>, bytes: &[u8]) -> MessageBody {
 
 /// A `brenn:` channel at `address` whose WASM subscribers are `subscribers`,
 /// each with its push and retain depth.
-fn durable(address: &str, non_text: bool, subscribers: &[(&str, Depth, Depth)]) -> ChannelEntry {
+pub(super) fn durable(
+    address: &str,
+    non_text: bool,
+    subscribers: &[(&str, Depth, Depth)],
+) -> ChannelEntry {
     let mut entry = brenn_channel(address, READER);
     entry.resolved_channel.non_text = non_text;
     entry.subscribers = subscribers
@@ -44,7 +50,7 @@ fn durable(address: &str, non_text: bool, subscribers: &[(&str, Depth, Depth)]) 
 }
 
 /// A report channel read by [`READER`].
-fn report_channel(address: &str) -> ChannelEntry {
+pub(super) fn report_channel(address: &str) -> ChannelEntry {
     durable(
         address,
         false,
@@ -54,6 +60,15 @@ fn report_channel(address: &str) -> ChannelEntry {
 
 /// A messenger over `entries`, every push-enabled subscriber attached at head.
 async fn messenger_over(entries: &[ChannelEntry]) -> Arc<brenn_messaging::Messenger> {
+    attach_subscribers(unattached_messenger(entries, HashMap::new()).await, entries).await
+}
+
+/// A messenger over `entries`, not yet shared, with the WASM subscribers'
+/// registrations and `extra` beside them. No subscriber is attached.
+pub(super) async fn unattached_messenger(
+    entries: &[ChannelEntry],
+    extra: HashMap<SubscriberEntryKind, SubscriberRegistration>,
+) -> Arc<brenn_messaging::Messenger> {
     let db = init_db_memory_lib_slice();
     {
         let conn = db.lock().await;
@@ -64,7 +79,9 @@ async fn messenger_over(entries: &[ChannelEntry]) -> Arc<brenn_messaging::Messen
         .filter(|e| !e.capabilities().durable)
         .cloned()
         .collect();
-    let messenger = brenn_messaging::Messenger::new(
+    let mut registrations = testutils::wasm_registrations(wasm_policies_from_entries(entries));
+    registrations.extend(extra);
+    brenn_messaging::Messenger::new(
         db,
         Arc::new(MessagingDirectory::with_entries(entries.to_vec())),
         Arc::from("test"),
@@ -75,9 +92,15 @@ async fn messenger_over(entries: &[ChannelEntry]) -> Arc<brenn_messaging::Messen
     .with_ring_stores(Arc::new(brenn_messaging_store::store::RingStores::build(
         &rings,
     )))
-    .with_subscriber_registrations(testutils::wasm_registrations(wasm_policies_from_entries(
-        entries,
-    )));
+    .with_subscriber_registrations(registrations)
+}
+
+/// Attach every push-enabled WASM subscriber of `entries` to `messenger` at
+/// head.
+pub(super) async fn attach_subscribers(
+    messenger: Arc<brenn_messaging::Messenger>,
+    entries: &[ChannelEntry],
+) -> Arc<brenn_messaging::Messenger> {
     for entry in entries {
         for sub in &entry.subscribers {
             let SubscriberEntryKind::Wasm(slug) = &sub.kind else {
@@ -97,7 +120,7 @@ async fn messenger_over(entries: &[ChannelEntry]) -> Arc<brenn_messaging::Messen
 }
 
 /// `slug`'s input port reading `entry`, at the depths `entry` registers for it.
-fn input(slug: &str, port: &str, entry: &ChannelEntry) -> WasmInputPort {
+pub(super) fn input(slug: &str, port: &str, entry: &ChannelEntry) -> WasmInputPort {
     let sub = entry
         .subscribers
         .iter()
@@ -119,7 +142,7 @@ fn input(slug: &str, port: &str, entry: &ChannelEntry) -> WasmInputPort {
 }
 
 /// An output port bound to `entry`, as the consumer config carries it.
-fn output(port: &str, entry: &ChannelEntry) -> WasmOutputPort {
+pub(super) fn output(port: &str, entry: &ChannelEntry) -> WasmOutputPort {
     WasmOutputPort {
         port: port.to_string(),
         channel_uuid: entry.uuid,
@@ -174,7 +197,7 @@ fn output_specs(
 }
 
 /// A consumer running the 0.2.0 bytes fixture.
-fn bytes_consumer(
+pub(super) fn bytes_consumer(
     slug: &str,
     messenger: &Arc<brenn_messaging::Messenger>,
     inputs: Vec<WasmInputPort>,
@@ -206,7 +229,7 @@ fn bytes_consumer(
 }
 
 /// One activation of `cfg`, over whatever it is owed.
-async fn activate(cfg: &WasmConsumerConfig) {
+pub(super) async fn activate(cfg: &WasmConsumerConfig) {
     drain_step(cfg, &ParticipantId::for_wasm(&cfg.slug), MountDebt::Settled).await;
 }
 
@@ -217,7 +240,10 @@ async fn command(messenger: &brenn_messaging::Messenger, entry: &ChannelEntry, t
 
 /// Every report published on `address` since the last read, parsed; the
 /// reader is then advanced past them.
-async fn reports(messenger: &brenn_messaging::Messenger, address: &str) -> Vec<serde_json::Value> {
+pub(super) async fn reports(
+    messenger: &brenn_messaging::Messenger,
+    address: &str,
+) -> Vec<serde_json::Value> {
     let reader = ParticipantId::for_wasm(READER);
     let reports = testutils::owed_everywhere(messenger, &reader)
         .await
@@ -234,14 +260,17 @@ async fn reports(messenger: &brenn_messaging::Messenger, address: &str) -> Vec<s
 }
 
 /// The one report published on `address` since the last read.
-async fn one_report(messenger: &brenn_messaging::Messenger, address: &str) -> serde_json::Value {
+pub(super) async fn one_report(
+    messenger: &brenn_messaging::Messenger,
+    address: &str,
+) -> serde_json::Value {
     let mut all = reports(messenger, address).await;
     assert_eq!(all.len(), 1, "one activation, one report: {all:?}");
     all.remove(0)
 }
 
 /// The envelopes a report shows on `port`'s window.
-fn window<'a>(report: &'a serde_json::Value, port: &str) -> &'a Vec<serde_json::Value> {
+pub(super) fn window<'a>(report: &'a serde_json::Value, port: &str) -> &'a Vec<serde_json::Value> {
     report["windows"]
         .as_array()
         .expect("a report lists its windows")
@@ -264,7 +293,7 @@ fn deferred<'a>(report: &'a serde_json::Value, port: &str) -> &'a Vec<serde_json
         .expect("a deferred window lists its entries")
 }
 
-fn results(report: &serde_json::Value) -> Vec<&str> {
+pub(super) fn results(report: &serde_json::Value) -> Vec<&str> {
     report["results"]
         .as_array()
         .expect("a report lists its results")

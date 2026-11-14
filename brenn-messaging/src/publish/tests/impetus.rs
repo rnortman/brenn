@@ -123,6 +123,7 @@ async fn publish_with(m: &Messenger, addr: &str, impetus: Option<Impetus>) -> cr
         None,
         None,
         impetus,
+        brenn_messaging_store::blob::HeldAttachments::none(),
     )
     .await
 }
@@ -304,6 +305,7 @@ async fn a_parked_message_keeps_its_impetus() {
             Some(release_at),
             None,
             Some(Impetus::Replenish),
+            brenn_messaging_store::blob::HeldAttachments::none(),
         )
         .await
     {

@@ -37,6 +37,7 @@ fn bare_envelope() -> MessageEnvelope {
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Ephemeral,
         transport: None,
+        attachments: Default::default(),
     }
 }
 
@@ -58,6 +59,7 @@ fn full_envelope() -> MessageEnvelope {
         urgency: Urgency::High,
         envelope_type: ChannelScheme::Brenn,
         transport: None,
+        attachments: Default::default(),
     }
 }
 

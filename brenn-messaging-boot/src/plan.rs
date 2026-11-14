@@ -110,6 +110,9 @@ pub struct MessagingPlan {
     /// The global messaging block, for the messenger and the channel
     /// reconstruction commit runs.
     pub messaging_globals: messaging::config::MessagingGlobalConfig,
+    /// The blob store's directory: `messaging { blob_dir }`, or the database
+    /// path with `.blobs` appended.
+    pub blob_dir: std::path::PathBuf,
     /// The `[llm_chat]` block, for the messenger's chat family derivation.
     pub llm_chat: brenn_lib::config::LlmChatConfig,
     /// One entry per consumer holding a non-empty tool grant set, keyed by the
@@ -862,6 +865,7 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
         registrations,
         attach_send_budgets,
         messaging_globals: config.messaging.clone(),
+        blob_dir: config.messaging.blob_dir_beside(&config.database.path),
         llm_chat: config.llm_chat.clone(),
         tool_caller_grants,
         surface_error_advisory,
@@ -902,6 +906,23 @@ mod tests {
             device_location_users: &[],
         })
         .expect("a document declaring channels configures messaging")
+    }
+
+    /// With no `blob_dir` stated, the plan's blob directory is the configured
+    /// database path with `.blobs` appended; stated, it is taken as given.
+    #[test]
+    fn the_plan_blob_dir_sits_beside_the_configured_database_unless_stated() {
+        use std::path::PathBuf;
+
+        let mut config = config_with_error_channel(Depth::Unbounded);
+        config.database.path = PathBuf::from("/srv/alice/state/brenn.db");
+        assert_eq!(
+            plan_of(&config).blob_dir,
+            PathBuf::from("/srv/alice/state/brenn.db.blobs")
+        );
+
+        config.messaging.blob_dir = Some(PathBuf::from("/srv/alice/blobs"));
+        assert_eq!(plan_of(&config).blob_dir, PathBuf::from("/srv/alice/blobs"));
     }
 
     /// An error channel whose eviction frontier sits at the surface send burst

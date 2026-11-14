@@ -942,6 +942,7 @@ async fn append_ring_message(
             delivery_deadline: None,
             impetus: None,
             publish_ts_ns: Utc::now().timestamp_nanos_opt().unwrap(),
+            attachments: brenn_messaging_store::blob::HeldAttachments::none(),
         })
         .await;
 }

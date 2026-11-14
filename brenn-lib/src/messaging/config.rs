@@ -473,6 +473,26 @@ pub struct MessagingGlobalConfig {
     /// Global default per-`(sender, channel)` send rate, overridable per
     /// `[[channel]]`.
     pub default_send_rate: SendRate,
+    /// Cap on one blob's extent, bytes. Default 64 MiB.
+    pub max_blob_bytes: u64,
+    /// Cap on the blob store's charged total, bytes. Default 1 GiB.
+    pub blob_budget_bytes: u64,
+    /// Where the blob store's files live. `None` ⇒ the database path with
+    /// `.blobs` appended ([`MessagingGlobalConfig::blob_dir_beside`]): the
+    /// database and the directory are one unit to back up and restore.
+    pub blob_dir: Option<PathBuf>,
+}
+
+impl MessagingGlobalConfig {
+    /// The blob directory for a database at `database`: `blob_dir` when
+    /// stated, else `database` with `.blobs` appended to its file name.
+    pub fn blob_dir_beside(&self, database: &std::path::Path) -> PathBuf {
+        self.blob_dir.clone().unwrap_or_else(|| {
+            let mut dir = database.as_os_str().to_owned();
+            dir.push(".blobs");
+            PathBuf::from(dir)
+        })
+    }
 }
 
 impl Default for MessagingGlobalConfig {
@@ -486,6 +506,9 @@ impl Default for MessagingGlobalConfig {
             // Migration parity: Normal means old-Immediate still wakes, old-None parks.
             default_wake_min: WakeMin::Normal,
             default_send_rate: SendRate::default(),
+            max_blob_bytes: 64 * 1024 * 1024,
+            blob_budget_bytes: 1024 * 1024 * 1024,
+            blob_dir: None,
         }
     }
 }

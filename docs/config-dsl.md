@@ -278,6 +278,21 @@ messaging { max_body_bytes = 393216; }
 - `default_send_rate` — the per-sender, per-channel send rate when a channel
   states none, a `{ burst, refill_interval_secs, refill }` table. Default
   `{ burst = 240, refill_interval_secs = 1, refill = 30 }`.
+- `max_blob_bytes` — the largest blob the blob store holds, in bytes: a cap
+  on one blob's extent. Default 67 108 864 (64 MiB).
+- `blob_budget_bytes` — the most the blob store holds in total, in bytes.
+  Default 1 073 741 824 (1 GiB). A write that would pass either bound is
+  refused to its producer; nothing is evicted to make room. A budget lowered
+  below what the store already holds is accepted, and new blobs are refused
+  until deletions bring the total under it.
+- `blob_dir` — the directory the blob files live in. Default the database
+  path with `.blobs` appended. The database and this directory are one unit
+  to back up, restore and roll back (`docs/message-bus.md` §2.1.2a). Never
+  give two hosts the same `blob_dir`: each deletes at boot every blob file its
+  own database does not name.
+
+`0` for either blob bound, or a `max_blob_bytes` over `blob_budget_bytes`
+(stated or default), is refused at load.
 
 `messaging` is a restart section (see [What reload converges](#what-reload-converges)).
 

@@ -80,6 +80,9 @@ pub fn run_messaging_migrations(conn: &Connection) {
             -- the payload as the body; NULL on every other row. The decoder
             -- panics on a value that does not parse (the host wrote every row).
             transport           TEXT,
+            -- `Attachments` JSON on a row that names blobs; NULL on every other
+            -- row. Written at insert only (`messaging_messages_blob_au`).
+            attachments         TEXT,
             -- Non-brenn envelope rows must never have deliver_after or delivery_deadline;
             -- those are bus-only dispatch fields. This constraint makes the
             -- invariant machine-enforced rather than convention-enforced.
@@ -188,7 +191,12 @@ pub fn run_messaging_migrations(conn: &Connection) {
         conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN transport TEXT;")
             .expect("failed to add messaging_messages.transport column");
     }
+    if !brenn_db::column_exists(conn, "messaging_messages", "attachments") {
+        conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN attachments TEXT;")
+            .expect("failed to add messaging_messages.attachments column");
+    }
     ensure_text_body_fts(conn);
+    ensure_blob_tables(conn);
     if !brenn_db::column_exists(conn, "messaging_channels", "last_retained_seq") {
         conn.execute_batch(
             "ALTER TABLE messaging_channels
@@ -396,6 +404,61 @@ fn ensure_text_body_fts(conn: &Connection) {
         .expect("failed to create messaging_messages FTS triggers");
     tx.commit()
         .expect("commit messaging_messages_fts transaction");
+}
+
+/// The blob tables: one row per blob a durable message has named, one row per
+/// message and blob it names.
+///
+/// `refs` is the number of `messaging_blob_refs` rows naming the blob; the
+/// partial index finds the blobs no row names. `message_id` carries no foreign
+/// key: the delete trigger owns that edge, and a foreign key without a cascade
+/// would refuse the message delete.
+const BLOB_TABLES_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS messaging_blobs (
+        id            TEXT PRIMARY KEY,
+        size          INTEGER NOT NULL,
+        content_type  TEXT NOT NULL,
+        refs          INTEGER NOT NULL DEFAULT 0 CHECK (refs >= 0)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS idx_messaging_blobs_unreferenced
+        ON messaging_blobs(id) WHERE refs = 0;
+    CREATE TABLE IF NOT EXISTS messaging_blob_refs (
+        message_id  INTEGER NOT NULL,
+        blob_id     TEXT NOT NULL REFERENCES messaging_blobs(id),
+        PRIMARY KEY (message_id, blob_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS idx_messaging_blob_refs_blob
+        ON messaging_blob_refs(blob_id);";
+
+/// The triggers that keep `messaging_blobs.refs` equal to its reference rows
+/// whichever statement deletes a message row, and refuse the one update that
+/// could detach a row from its references.
+const BLOB_TRIGGERS_DDL: &str = "
+    DROP TRIGGER IF EXISTS messaging_messages_blob_ad;
+    DROP TRIGGER IF EXISTS messaging_messages_blob_au;
+    CREATE TRIGGER messaging_messages_blob_ad
+        AFTER DELETE ON messaging_messages WHEN old.attachments IS NOT NULL BEGIN
+            UPDATE messaging_blobs SET refs = refs - 1
+             WHERE id IN (SELECT blob_id FROM messaging_blob_refs WHERE message_id = old.id);
+            DELETE FROM messaging_blob_refs WHERE message_id = old.id;
+        END;
+    CREATE TRIGGER messaging_messages_blob_au
+        BEFORE UPDATE OF attachments ON messaging_messages BEGIN
+            SELECT RAISE(ABORT, 'messaging_messages.attachments is written at insert only');
+        END;";
+
+/// Create the blob tables and recreate their triggers, in one transaction, on
+/// every boot: `CREATE TRIGGER IF NOT EXISTS` would keep an older trigger text
+/// under the same name.
+fn ensure_blob_tables(conn: &Connection) {
+    let tx = conn
+        .unchecked_transaction()
+        .expect("begin blob tables transaction");
+    tx.execute_batch(BLOB_TABLES_DDL)
+        .expect("failed to create blob tables");
+    tx.execute_batch(BLOB_TRIGGERS_DDL)
+        .expect("failed to create blob triggers");
+    tx.commit().expect("commit blob tables transaction");
 }
 
 /// Drop the flat `messaging_subscriptions` mirror.
@@ -1107,6 +1170,7 @@ mod tests {
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: 0,
+                attachments: crate::blob::HeldAttachments::none(),
             })
             .await;
         assert_eq!(

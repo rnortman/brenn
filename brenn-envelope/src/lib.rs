@@ -27,6 +27,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub mod addressing;
+pub mod attachment;
 pub mod body;
 pub mod channel_model;
 pub mod chat;
@@ -36,9 +37,13 @@ pub mod shape;
 pub mod testutils;
 pub mod tool_schema;
 
+pub use attachment::{
+    AttachmentName, AttachmentNameError, Attachments, BlobId, BlobRef, MAX_ATTACHMENTS_PER_MESSAGE,
+};
 pub use body::{BodyError, GuestBody, MessageBody, check_content_type, is_text_content_type};
 pub use shape::{
-    BodyShape, EnvelopeHeader, HeaderShape, ShapedEnvelope, TextShape, serialize_text_shape,
+    EnvelopeHeader, EnvelopeShape, HeaderShape, ShapedEnvelope, TextShape, serialize_text_shape,
+    write_attachment_metadata, write_attachment_refs,
 };
 
 // ---------------------------------------------------------------------------
@@ -776,6 +781,11 @@ pub struct MessageEnvelope {
     /// inside the body. Serialized under the header key `transport`, after
     /// `envelope_type`, and omitted when absent.
     pub transport: Option<TransportMeta>,
+    /// The blobs this message carries, by name; empty on a message that
+    /// carries none. Each shape decides what it writes of them
+    /// ([`EnvelopeShape::serialize_attachments`]); every shape omits the key
+    /// when the map is empty.
+    pub attachments: Attachments,
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +813,7 @@ mod tests {
             urgency,
             envelope_type,
             transport: None,
+            attachments: Default::default(),
         }
     }
 
@@ -1243,6 +1254,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Brenn,
             transport: None,
+            attachments: Default::default(),
         };
         let v: Value = serde_json::from_str(&env.to_envelope_json()).unwrap();
         assert_eq!(

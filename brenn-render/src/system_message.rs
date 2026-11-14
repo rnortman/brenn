@@ -946,6 +946,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type,
             transport: None,
+            attachments: Default::default(),
         }
     }
 

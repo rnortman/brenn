@@ -200,6 +200,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
             transport: None,
+            attachments: Default::default(),
         }
     }
 

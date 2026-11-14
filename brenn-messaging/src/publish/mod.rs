@@ -25,7 +25,9 @@ use super::{
     PrepaidDestination, PrepaidEntry, SubscriberEntryKind, Urgency, store,
 };
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
+use brenn_envelope::Attachments;
 use brenn_envelope::grants::AppCapability;
+use brenn_messaging_store::blob::HeldAttachments;
 
 use brenn_obs::security::{DenialKind, SecurityEventType, log_component_security_event};
 
@@ -307,6 +309,7 @@ impl Messenger {
             deliver_after,
             delivery_deadline,
             None,
+            HeldAttachments::none(),
         )
         .await
     }
@@ -365,6 +368,7 @@ impl Messenger {
             None,
             None,
             None,
+            HeldAttachments::none(),
         )
         .await
     }
@@ -407,6 +411,7 @@ impl Messenger {
             None,
             // Server-constructed telemetry: no user gesture behind it.
             None,
+            HeldAttachments::none(),
         )
         .await
     }
@@ -441,6 +446,40 @@ impl Messenger {
             None,
             // In-process substrate output; nothing here descends from a gesture.
             None,
+            HeldAttachments::none(),
+        )
+        .await
+    }
+
+    /// [`Messenger::publish_from_system`] with attachments and an optional
+    /// release time: the one entry point that publishes a message naming blobs.
+    ///
+    /// `attachments` holds every blob it names, so the publish cannot fail on
+    /// them. The channel's store keeps its own holder — a ring entry's holds,
+    /// or a durable row's reference — and `attachments`' holds are released
+    /// when the publish returns, whatever its outcome.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_from_system_with_attachments(
+        &self,
+        component: &str,
+        addr: &str,
+        body: super::MessageBody,
+        urgency: super::Urgency,
+        reply_to: Option<&str>,
+        deliver_after: Option<DateTime<Utc>>,
+        attachments: HeldAttachments,
+    ) -> PublishResult {
+        self.publish_core(
+            PublishOrigin::System,
+            PublishPrincipal::System { component },
+            addr,
+            body,
+            urgency,
+            reply_to,
+            deliver_after,
+            None,
+            None,
+            attachments,
         )
         .await
     }
@@ -483,6 +522,7 @@ impl Messenger {
             // propagate outward through the machinery's republish legs: an
             // attended turn's record must not re-arm every observer downstream.
             None,
+            HeldAttachments::none(),
         )
         .await
     }
@@ -612,6 +652,7 @@ impl Messenger {
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
         impetus: Option<Impetus>,
+        attachments: HeldAttachments,
     ) -> PublishResult {
         let sender = self.principal_identity(principal);
         let result = self
@@ -626,6 +667,7 @@ impl Messenger {
                 deliver_after,
                 delivery_deadline,
                 impetus,
+                attachments,
             )
             .await;
         self.record_publish_denial(&sender, &result);
@@ -724,6 +766,7 @@ impl Messenger {
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
         impetus: Option<Impetus>,
+        attachments: HeldAttachments,
     ) -> PublishResult {
         // 1. Validate address shape, then resolve. Shape errors return
         //    `MalformedAddress`; well-formed
@@ -1065,6 +1108,7 @@ impl Messenger {
         //    schedule is refused at the same channel-wide bound a ring one is.
         channel.assert_may_hold(&body);
         let store = self.store_for(&channel);
+        let attachment_refs = attachments.refs().clone();
         let message = store::NewMessage {
             source: self.source.as_ref().to_owned(),
             sender: sender.to_owned(),
@@ -1075,6 +1119,7 @@ impl Messenger {
             delivery_deadline,
             impetus,
             publish_ts_ns,
+            attachments,
         };
         let (message_id, retained_seq) = match deliver_after {
             Some(release_at) => match store.park(message, release_at).await {
@@ -1138,6 +1183,7 @@ impl Messenger {
                     impetus,
                     urgency,
                     scheme,
+                    attachment_refs,
                 ));
                 self.fan_out_attach_feed(
                     &feed_targets,
@@ -1274,6 +1320,7 @@ fn surface_feed_envelope(
     impetus: Option<Impetus>,
     urgency: Urgency,
     scheme: ChannelScheme,
+    attachments: Attachments,
 ) -> super::MessageEnvelope {
     super::MessageEnvelope {
         message_id,
@@ -1289,6 +1336,7 @@ fn surface_feed_envelope(
         urgency,
         envelope_type: scheme,
         transport: None,
+        attachments,
     }
 }
 
@@ -1335,6 +1383,7 @@ impl Messenger {
             deliver_after,
             None,
             transport,
+            &HeldAttachments::none(),
             publish_ts_ns,
         )
     }
@@ -1497,6 +1546,9 @@ impl Messenger {
                     transport.scheme(),
                     channel.address
                 );
+                // TODO(ingress-oversize-payload-as-blob): a raw payload over the
+                // body cap is refused by its adaptor and never carried as an
+                // attachment.
                 let cap = self.max_body_bytes();
                 assert!(
                     body.len() <= cap,
@@ -1680,6 +1732,7 @@ impl Messenger {
                         delivery_deadline: None,
                         impetus: None,
                         publish_ts_ns: db::utc_to_ns(Utc::now()),
+                        attachments: brenn_messaging_store::blob::HeldAttachments::none(),
                     };
                     nondurable_pending.push((entry, message, release));
                     continue;
@@ -1750,6 +1803,7 @@ impl Messenger {
                             None,
                             publish.urgency,
                             ChannelScheme::Brenn,
+                            Attachments::new(),
                         )),
                         inserted.retained_seq.expect(
                             "publish: an unparked durable message holds a retention position",
@@ -1819,6 +1873,7 @@ impl Messenger {
                             None,
                             urgency,
                             scheme,
+                            Attachments::new(),
                         ));
                         self.fan_out_attach_feed(
                             &feed_targets,
@@ -2174,6 +2229,7 @@ impl Messenger {
                             None,
                             publish.urgency,
                             ChannelScheme::Brenn,
+                            Attachments::new(),
                         )),
                         inserted.retained_seq.expect(
                             "publish: an unparked durable message holds a retention position",

@@ -77,7 +77,21 @@ pub async fn surface_harness_with_siblings(
     db: &brenn_db::Db,
     surface: ResolvedSurface,
     siblings: Vec<ResolvedSurface>,
+    entries: Vec<ChannelEntry>,
+) -> SurfaceTestHarness {
+    surface_harness_extending_messenger(db, surface, siblings, entries, |messenger| messenger).await
+}
+
+/// [`surface_harness_with_siblings`] with `extend` applied to the messenger
+/// before anything shares it, for the builder steps (`with_blob_store`, a
+/// further `with_subscriber_registrations`) that only an unshared messenger
+/// takes.
+pub async fn surface_harness_extending_messenger(
+    db: &brenn_db::Db,
+    surface: ResolvedSurface,
+    siblings: Vec<ResolvedSurface>,
     mut entries: Vec<ChannelEntry>,
+    extend: impl FnOnce(Arc<brenn_messaging::Messenger>) -> Arc<brenn_messaging::Messenger>,
 ) -> SurfaceTestHarness {
     let params = fixtures_config::description_params();
     let status_uuid = uuid::Uuid::new_v4();
@@ -110,14 +124,14 @@ pub async fn surface_harness_with_siblings(
         crate::active_bridge::ActiveBridges::new(),
     ));
     router.register_surface_delivery_routes(&surfaces[0]);
-    let messenger = fixture_messenger(
+    let messenger = extend(fixture_messenger(
         db,
         &entries,
         &surfaces[0],
         Arc::clone(&stores),
         router.clone(),
         TEST_MAX_BODY_BYTES,
-    );
+    ));
     state.messenger = Some(Arc::clone(&messenger));
     state.surfaces.set_runtimes(install_surface_runtimes(
         surfaces,

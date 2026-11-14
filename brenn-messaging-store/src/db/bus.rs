@@ -8,11 +8,12 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use super::cursors;
 use super::shared::{ns_to_utc, parse_rfc3339};
 use super::types::PendingPushRow;
+use crate::blob::HeldAttachments;
 use crate::store::OverflowEvent;
 use brenn_db::format_ts_for_db;
 use brenn_lib::messaging::{
-    BodyShape, ChannelScheme, Impetus, MessageBody, MessageEnvelope, ParticipantId, TransportMeta,
-    Urgency,
+    Attachments, ChannelScheme, EnvelopeShape, Impetus, MessageBody, MessageEnvelope,
+    ParticipantId, TransportMeta, Urgency, write_attachment_refs,
 };
 
 // ---------------------------------------------------------------------------
@@ -31,7 +32,8 @@ pub struct InsertedMessage {
 }
 
 /// Insert a message row in a single transaction. The caller has already
-/// validated channel/sender/budget. The row carries no transport metadata.
+/// validated channel/sender/budget. The row carries no transport metadata and
+/// no attachments.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_message(
     conn: &Connection,
@@ -61,6 +63,7 @@ pub fn insert_message(
         deliver_after,
         impetus,
         None,
+        &HeldAttachments::none(),
         publish_ts_ns,
     );
     tx.commit().expect("messaging: commit tx");
@@ -70,6 +73,11 @@ pub fn insert_message(
 /// Insert a message row under a caller-owned `Transaction`. The caller is
 /// responsible for BEGIN/COMMIT (or rollback on panic via the `Transaction`
 /// Drop guard).
+///
+/// A non-empty `attachments` is adopted in the same transaction: its blobs'
+/// rows are written and their reference counts raised. The caller has already
+/// called [`HeldAttachments::make_durable`] and, once the transaction commits,
+/// calls [`HeldAttachments::confirm_adopted`].
 ///
 /// Used by the `Messenger`, which batches messages into one outer transaction
 /// and is the one writer of `transport`; other callers use `insert_message`.
@@ -87,6 +95,7 @@ pub fn insert_message_in_tx(
     deliver_after: Option<DateTime<Utc>>,
     impetus: Option<Impetus>,
     transport: Option<&TransportMeta>,
+    attachments: &HeldAttachments,
     publish_ts_ns: i64,
 ) -> InsertedMessage {
     let now = format_ts_for_db(Utc::now());
@@ -107,8 +116,8 @@ pub fn insert_message_in_tx(
         "INSERT INTO messaging_messages
          (uuid, channel_uuid, source, sender, body, urgency, envelope_type,
           reply_to_uuid, delivery_deadline, deliver_after, publish_ts_ns, created_at,
-          retained_seq, impetus, content_type, transport)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+          retained_seq, impetus, content_type, transport, attachments)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         rusqlite::params![
             uuid_bytes,
             channel_bytes,
@@ -126,10 +135,12 @@ pub fn insert_message_in_tx(
             impetus.map(Impetus::as_str),
             content_type,
             transport.map(super::transport_column),
+            super::attachments_column(attachments.refs()),
         ],
     )
     .expect("messaging: insert message");
     let message_id = tx.last_insert_rowid();
+    crate::blob::adopt_in_tx(tx, message_id, attachments);
 
     InsertedMessage {
         id: message_id,
@@ -203,10 +214,11 @@ pub fn assign_retained_seqs(conn: &Connection, channel_uuid: Uuid, message_ids: 
 
 /// The eviction archive's line shape: the text shape, plus the content type
 /// after the body when there is one, and for a non-text body `body_base64`
-/// (standard padded base64) in place of `body`.
+/// (standard padded base64) in place of `body`; and each attachment's full
+/// reference. An attachment's bytes are not archived.
 pub(crate) struct ArchiveShape;
 
-impl BodyShape for ArchiveShape {
+impl EnvelopeShape for ArchiveShape {
     fn serialize_body<S: serde::ser::SerializeStruct>(
         body: &MessageBody,
         out: &mut S,
@@ -223,6 +235,13 @@ impl BodyShape for ArchiveShape {
             out.serialize_field("content_type", content_type)?;
         }
         Ok(())
+    }
+
+    fn serialize_attachments<S: serde::ser::SerializeStruct>(
+        attachments: &Attachments,
+        out: &mut S,
+    ) -> Result<(), S::Error> {
+        write_attachment_refs(attachments, out)
     }
 }
 
@@ -351,7 +370,7 @@ pub fn bus_gc_evict_channel(
             .prepare(
                 "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                         m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                        rc.address, m.impetus, m.content_type, m.transport
+                        rc.address, m.impetus, m.content_type, m.transport, m.attachments
                  FROM messaging_messages m
                  LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
                  WHERE m.channel_uuid = ?1
@@ -385,6 +404,7 @@ pub fn bus_gc_evict_channel(
                     let reply_to: Option<String> = row.get(8)?;
                     let impetus_str: Option<String> = row.get(9)?;
                     let transport = super::read_transport(row, 11, message_id)?;
+                    let attachments = super::read_attachments(row, 12, message_id)?;
                     Ok((
                         message_id,
                         source,
@@ -397,6 +417,7 @@ pub fn bus_gc_evict_channel(
                         reply_to,
                         impetus_str,
                         transport,
+                        attachments,
                     ))
                 },
             )
@@ -414,6 +435,7 @@ pub fn bus_gc_evict_channel(
                     reply_to,
                     impetus_str,
                     transport,
+                    attachments,
                 ) = r.expect("bus_gc_evict_channel: archive SELECT row");
                 let urgency = Urgency::parse(&urgency_str).unwrap_or_else(|| {
                     panic!("bus_gc_evict_channel: invalid urgency: {urgency_str:?}")
@@ -444,6 +466,7 @@ pub fn bus_gc_evict_channel(
                     urgency,
                     envelope_type: channel_envelope_type,
                     transport,
+                    attachments,
                 }
             })
             .collect();
@@ -478,8 +501,9 @@ pub fn bus_gc_evict_channel(
     // Step 3: delete eligible message rows (FTS trigger fires on each DELETE).
     // Snapshot is stable under the SQLite mutex. Parked rows (retained_seq NULL)
     // are excluded — a long-parked message is never reaped before it releases.
-    // TODO(blob-attachment-host-sites): a parked row is not retained and this
-    // statement never deletes it; whatever keeps a blob alive counts it as a holder.
+    // A parked row is not retained and this statement never deletes it, so its
+    // blobs stay referenced. The delete trigger lowers the reference count of
+    // every blob a deleted row named; the bytes go at the next reap.
     let messages_deleted = tx
         .execute(
             "DELETE FROM messaging_messages
@@ -648,8 +672,8 @@ fn depth_limit(depth: brenn_lib::messaging::config::Depth) -> i64 {
 
 /// The one retained-window query body, shared by every retention-order read.
 ///
-/// Selects the 16 envelope columns `super::row_to_envelope` decodes (0-15) plus
-/// `m.id` (16) and `m.retained_seq` (17), newest-first, for channel `?1`.
+/// Selects the 17 envelope columns `super::row_to_envelope` decodes (0-16) plus
+/// `m.id` (17) and `m.retained_seq` (18), newest-first, for channel `?1`.
 /// `where_tail` adds predicates after the retained-set predicate; `limit_param`
 /// names the bind holding the row cap. One copy so a change to the retained-set
 /// predicate cannot land on some reads and miss others.
@@ -658,7 +682,7 @@ fn retained_window_sql(where_tail: &str, limit_param: &str) -> String {
         "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency,
                 m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
                 c.address, rc.address, m.envelope_type, m.impetus, m.content_type,
-                m.transport, m.id, m.retained_seq
+                m.transport, m.attachments, m.id, m.retained_seq
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
@@ -677,8 +701,8 @@ fn read_retained_rows(
         .query_map(params, |row| {
             let envelope = super::row_to_envelope(row)?;
             Ok(RetainedRow {
-                id: row.get(16)?,
-                seq: row.get(17)?,
+                id: row.get(17)?,
+                seq: row.get(18)?,
                 envelope,
             })
         })
@@ -1108,8 +1132,8 @@ pub fn update_parked_message(
 /// Deserialize a `MessageEnvelope` from a row with columns:
 /// 0:uuid, 1:source, 2:sender, 3:body, 4:urgency, 5:delivery_deadline,
 /// 6:deliver_after, 7:publish_ts_ns, 8:channel_address, 9:reply_to,
-/// 10:envelope_type, 11:impetus, 12:content_type, 13:transport. A SELECT that
-/// carries further columns puts them after column 13.
+/// 10:envelope_type, 11:impetus, 12:content_type, 13:transport, 14:attachments.
+/// A SELECT that carries further columns puts them after column 14.
 pub(super) fn row_to_message_envelope(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<MessageEnvelope> {
@@ -1129,6 +1153,7 @@ pub(super) fn row_to_message_envelope(
         .unwrap_or_else(|e| panic!("messaging: row uuid malformed: {e}"));
     let body = super::read_body(row, 3, 12, message_id)?;
     let transport = super::read_transport(row, 13, message_id)?;
+    let attachments = super::read_attachments(row, 14, message_id)?;
     let urgency = Urgency::parse(&urgency_str)
         .unwrap_or_else(|| panic!("messaging: invalid urgency in row: {urgency_str:?}"));
     let delivery_deadline = delivery_deadline_s.map(|s| {
@@ -1160,6 +1185,7 @@ pub(super) fn row_to_message_envelope(
         urgency,
         envelope_type,
         transport,
+        attachments,
     })
 }
 
@@ -1181,7 +1207,7 @@ pub fn list_pending_messages_for_sender(
         "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                 m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
                 c.address, rc.address, m.envelope_type, m.impetus, m.content_type,
-                m.transport
+                m.transport, m.attachments
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
@@ -1220,7 +1246,7 @@ pub fn load_envelope_by_uuid(conn: &Connection, uuid: Uuid) -> Option<MessageEnv
         "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                 m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
                 c.address, rc.address, m.envelope_type, m.impetus, m.content_type,
-                m.transport
+                m.transport, m.attachments
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid

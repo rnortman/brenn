@@ -81,6 +81,7 @@ fn insert(
         deliver_after,
         None,
         transport,
+        &crate::blob::HeldAttachments::none(),
         utc_to_ns(Utc::now()),
     );
     tx.commit().unwrap();

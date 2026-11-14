@@ -1652,7 +1652,8 @@ pub mod tests {
         // Golden: the complete SQL string `load_window_snapshot` prepares.
         let golden = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
                       m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
-                      c.address, rc.address, m.envelope_type, m.impetus, m.content_type, m.transport \
+                      c.address, rc.address, m.envelope_type, m.impetus, m.content_type, m.transport, \
+                      m.attachments \
                FROM messaging_messages m \
                JOIN messaging_channels c ON c.uuid = m.channel_uuid \
                LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid \
@@ -1690,6 +1691,7 @@ pub mod tests {
             urgency: Urgency::Normal,
             envelope_type: scheme,
             transport: None,
+            attachments: Default::default(),
         }
     }
 
@@ -1712,13 +1714,10 @@ pub mod tests {
         {
             let store = ring_stores.get(&entry.uuid).expect("registered");
             for (sender, body, ns) in messages {
-                store.append(mk_env(
-                    &entry.address,
-                    ChannelScheme::Ephemeral,
-                    sender,
-                    body,
-                    *ns,
-                ));
+                store.append(
+                    mk_env(&entry.address, ChannelScheme::Ephemeral, sender, body, *ns),
+                    crate::store::no_holds(),
+                );
             }
         }
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
@@ -2028,13 +2027,16 @@ pub mod tests {
             // window a pre-filter clamp would have fetched.
             for i in 0..8u32 {
                 let sender = if i == 0 { "old" } else { "u" };
-                store.append(mk_env(
-                    &entry.address,
-                    ChannelScheme::Ephemeral,
-                    sender,
-                    &format!("m{i}"),
-                    base + i as i64 * 1_000_000_000,
-                ));
+                store.append(
+                    mk_env(
+                        &entry.address,
+                        ChannelScheme::Ephemeral,
+                        sender,
+                        &format!("m{i}"),
+                        base + i as i64 * 1_000_000_000,
+                    ),
+                    crate::store::no_holds(),
+                );
             }
         }
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
@@ -2129,13 +2131,10 @@ pub mod tests {
         let base = utc_to_ns(Utc::now());
         {
             let store = ring_stores.get(&entry.uuid).expect("registered");
-            store.append(mk_env(
-                &entry.address,
-                ChannelScheme::Local,
-                "u",
-                "confined",
-                base,
-            ));
+            store.append(
+                mk_env(&entry.address, ChannelScheme::Local, "u", "confined", base),
+                crate::store::no_holds(),
+            );
         }
         let mut policy = AppPolicy::default();
         policy.grants.insert(AppCapability::LocalSubscribe);

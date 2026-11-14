@@ -576,3 +576,168 @@ pub async fn insert_retain_only(
     )
     .uuid
 }
+
+/// A blob directory under the test's temporary directory, removed with
+/// everything in it when dropped.
+pub struct TempBlobDir(std::path::PathBuf);
+
+impl TempBlobDir {
+    pub fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("brenn-blobs-{}", Uuid::new_v4()));
+        TempBlobDir(path)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    /// Whether the blob `id` still has a file.
+    pub fn holds_file(&self, id: &crate::BlobId) -> bool {
+        brenn_messaging_store::testutils::holds_file(&self.0, id)
+    }
+}
+
+impl Default for TempBlobDir {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for TempBlobDir {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            std::fs::remove_dir_all(&self.0).expect("removing a test blob directory");
+        }
+    }
+}
+
+/// Open a blob store over a fresh temporary directory against `messenger`'s
+/// database, and install it on `messenger`, which must not yet be shared.
+pub async fn install_blob_store(messenger: Arc<Messenger>) -> (Arc<Messenger>, TempBlobDir) {
+    let dir = TempBlobDir::new();
+    (install_blob_store_at(messenger, dir.path()).await, dir)
+}
+
+/// Open a blob store over `dir` against `messenger`'s database — a reopen when
+/// a store was opened there before — and install it on `messenger`, which must
+/// not yet be shared.
+pub async fn install_blob_store_at(
+    messenger: Arc<Messenger>,
+    dir: &std::path::Path,
+) -> Arc<Messenger> {
+    let blobs = {
+        let conn = messenger.db().lock().await;
+        brenn_messaging_store::blob::BlobStore::open(
+            dir,
+            brenn_messaging_store::blob::BlobLimits {
+                max_blob_bytes: 1 << 20,
+                budget_bytes: 4 << 20,
+            },
+            &conn,
+        )
+    };
+    messenger.with_blob_store(blobs)
+}
+
+/// Registrations for the system component `publisher`, allowed to publish onto
+/// every `brenn:` and `ephemeral:` channel.
+pub fn covering_system_publisher(
+    publisher: &str,
+) -> HashMap<SubscriberEntryKind, SubscriberRegistration> {
+    let mut policy = AppPolicy::default();
+    policy
+        .grants
+        .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
+    policy
+        .grants
+        .insert(brenn_envelope::grants::AppCapability::EphemeralPublish);
+    let everything = brenn_lib::access::acl::ChannelMatcher::Prefix(String::new());
+    policy.acls.brenn_publish.push(everything.clone());
+    policy.acls.ephemeral_publish.push(everything);
+    system_registrations(HashMap::from([(publisher.to_string(), policy)]))
+}
+
+/// A messenger over `db` whose directory holds `entries`, with the durable ones
+/// upserted into `db` and a ring store for each other one, a blob store over
+/// `blob_dir`, and [`covering_system_publisher`] for `publisher`. Wakes through
+/// the no-op router.
+pub async fn blob_messenger(
+    db: Db,
+    entries: Vec<ChannelEntry>,
+    publisher: &str,
+    blob_dir: &std::path::Path,
+) -> Arc<Messenger> {
+    let (durable, rings): (Vec<ChannelEntry>, Vec<ChannelEntry>) = entries
+        .iter()
+        .cloned()
+        .partition(|entry| entry.capabilities().durable);
+    {
+        let conn = db.lock().await;
+        upsert_channels(&conn, &durable);
+    }
+    let messenger = Messenger::new(
+        db,
+        Arc::new(MessagingDirectory::with_entries(entries)),
+        Arc::from("test"),
+        Arc::new(IndexMap::new()),
+        Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
+        MessagingGlobalConfig::default(),
+    )
+    .with_subscriber_registrations(covering_system_publisher(publisher))
+    .with_ring_stores(Arc::new(brenn_messaging_store::store::RingStores::build(
+        &rings,
+    )));
+    install_blob_store_at(messenger, blob_dir).await
+}
+
+/// Publish `body` from the system component `publisher` onto `address`, naming
+/// each hold under its name, and return the message's id.
+///
+/// # Panics
+///
+/// If the publish is not `Ok`.
+pub async fn publish_attached(
+    messenger: &Messenger,
+    publisher: &str,
+    address: &str,
+    body: &str,
+    holds: &[(&str, &brenn_messaging_store::blob::BlobHold)],
+    deliver_after: Option<chrono::DateTime<chrono::Utc>>,
+) -> Uuid {
+    match messenger
+        .publish_from_system_with_attachments(
+            publisher,
+            address,
+            body.into(),
+            Urgency::Normal,
+            None,
+            deliver_after,
+            brenn_messaging_store::testutils::held(holds),
+        )
+        .await
+    {
+        crate::PublishResult::Ok { message_id, .. } => message_id,
+        other => panic!("{address}: expected Ok, got {other:?}"),
+    }
+}
+
+/// Redeem `id` through `messenger` and read all of it, or the refusal.
+pub async fn redeem_all(
+    messenger: &Messenger,
+    id: &crate::BlobId,
+) -> Result<Vec<u8>, brenn_messaging_store::blob::BlobError> {
+    let hold = messenger.retain_blob(id).await?;
+    let size = usize::try_from(hold.reference().size).expect("a blob size fits in usize");
+    hold.read(0, size)
+}
+
+/// Create, write and seal one blob in `messenger`'s blob store.
+pub fn seal_blob(messenger: &Messenger, bytes: &[u8]) -> brenn_messaging_store::blob::BlobHold {
+    brenn_messaging_store::testutils::seal_bytes(
+        messenger
+            .blob_store()
+            .expect("the messenger has a blob store"),
+        "application/octet-stream",
+        bytes,
+    )
+}

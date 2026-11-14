@@ -64,6 +64,7 @@ fn filler_envelope() -> MessageEnvelope {
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
         transport: None,
+        attachments: Default::default(),
     }
 }
 

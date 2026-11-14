@@ -2424,21 +2424,25 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         "the WASM consumer's local input is registered as an in-memory ring cursor"
     );
 
-    store.append(brenn_lib::messaging::MessageEnvelope {
-        message_id: uuid::Uuid::new_v4(),
-        source: "node".to_string(),
-        channel: "local:scratch".to_string(),
-        sender: "test-sender".to_string(),
-        publish_ts: chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
-        body: "ping".into(),
-        reply_to: None,
-        delivery_deadline: None,
-        deliver_after: None,
-        impetus: None,
-        urgency: brenn_lib::messaging::Urgency::Normal,
-        envelope_type: brenn_lib::messaging::ChannelScheme::Local,
-        transport: None,
-    });
+    store.append(
+        brenn_lib::messaging::MessageEnvelope {
+            message_id: uuid::Uuid::new_v4(),
+            source: "node".to_string(),
+            channel: "local:scratch".to_string(),
+            sender: "test-sender".to_string(),
+            publish_ts: chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+            body: "ping".into(),
+            reply_to: None,
+            delivery_deadline: None,
+            deliver_after: None,
+            impetus: None,
+            urgency: brenn_lib::messaging::Urgency::Normal,
+            envelope_type: brenn_lib::messaging::ChannelScheme::Local,
+            transport: None,
+            attachments: Default::default(),
+        },
+        brenn_messaging_store::store::no_holds(),
+    );
     let window = store
         .window(&subscriber, 4, 0)
         .expect("the case attached this subscriber");
@@ -4859,6 +4863,7 @@ async fn commit_refuses_an_apps_map_the_plan_was_not_derived_from() {
 
     let mut config = BrennConfig::default();
     config.channels.push(surface_index_channel());
+    config.messaging.blob_dir = Some(crate::test_fixtures::scratch_blob_dir());
     let planned: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let other: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let registry = Arc::new(brenn_tool_registry::ToolRegistry::new(vec![]));
@@ -5238,4 +5243,37 @@ async fn a_rebuilt_channel_under_a_raw_prefix_block_carries_its_tuning() {
         channel.resolved_channel.untyped_content_type.as_deref(),
         Some("application/octet-stream"),
     );
+}
+
+/// Boot opens the blob store over `messaging { blob_dir }`, creating the
+/// directory, and installs it on the messenger it builds.
+#[tokio::test]
+async fn boot_opens_the_blob_store_over_the_configured_directory() {
+    let dir = crate::test_fixtures::scratch_blob_dir();
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    config.messaging.blob_dir = Some(dir.clone());
+
+    let result = boot_messaging(&config, brenn_server::test_support::init_db_memory()).await;
+
+    let messenger = result.messenger.as_ref().unwrap();
+    let blobs = messenger.blob_store().expect("boot installs a blob store");
+    assert_eq!(blobs.usage().charged_bytes, 0);
+    assert!(dir.is_dir(), "boot creates the blob directory");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A blob directory the store cannot account for stops the boot: the store's
+/// refusals run inside `commit_messaging`, before the messenger exists.
+#[tokio::test]
+#[should_panic(expected = "refusing to start: the blob directory holds")]
+async fn boot_refuses_a_blob_directory_holding_a_stranger() {
+    let dir = crate::test_fixtures::scratch_blob_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("notes.txt"), b"not a blob").unwrap();
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    config.messaging.blob_dir = Some(dir);
+
+    boot_messaging(&config, brenn_server::test_support::init_db_memory()).await;
 }

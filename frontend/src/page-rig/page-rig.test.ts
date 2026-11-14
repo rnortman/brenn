@@ -642,6 +642,17 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         expect(feed.envelopes[0]?.header["channel"]).toBe(channel);
     });
 
+    it("delivers a row's attachments to a 0.2.0 kind in its header, in full", async () => {
+        const channel = rig().facts.bytes_feed_channel;
+        const feed = bytesWindowOf(
+            only(await rig().deliver(channel, typed("text/csv", CSV), true), "b-keeper"),
+            "feed",
+        );
+        expect(feed.envelopes).toHaveLength(1);
+        expect(feed.envelopes[0]?.hex).toBe(hexOf(CSV));
+        expect(feed.envelopes[0]?.header["attachments"]).toEqual(rig().kit.attached);
+    });
+
     it("delivers an untyped wire row to a 0.2.0 kind with no content type", async () => {
         const channel = rig().facts.bytes_feed_channel;
         const feed = bytesWindowOf(only(await rig().deliver(channel, TEXT), "b-keeper"), "feed");

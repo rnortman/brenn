@@ -36,6 +36,8 @@ use brenn_queue::{
 /// One subscriber's activation view over this channel's retained ring.
 pub type RingWindow = brenn_queue::Window<Arc<MessageEnvelope>>;
 
+pub use crate::blob::no_holds;
+use crate::blob::{BlobHolds, assert_held};
 use crate::db::ns_to_utc;
 use crate::store::{
     AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
@@ -80,13 +82,45 @@ pub struct ReleasedBatch {
     pub overflow: Vec<OverflowEvent>,
 }
 
+/// What the ring keeps per message: the envelope and a hold on every blob it
+/// names.
+///
+/// Every copy of an entry the ring makes shares one set of holds, so the blobs
+/// are released when the ring's last copy drops — overflow trim, a refused
+/// park, a discarded cancel, an edit's overwrite, or the store itself dropping
+/// — with no removal site doing anything. Nothing outside this module sees the
+/// type: every method handing an entry out hands out only its envelope, so a
+/// reader's `Arc<MessageEnvelope>` holds no blob.
+#[derive(Clone, Debug)]
+struct HeldEnvelope {
+    envelope: Arc<MessageEnvelope>,
+    holds: BlobHolds,
+}
+
+impl HeldEnvelope {
+    /// # Panics
+    ///
+    /// If the envelope names a blob `holds` does not cover.
+    fn new(envelope: MessageEnvelope, holds: BlobHolds) -> Self {
+        assert_held(
+            &envelope.attachments,
+            &holds,
+            format_args!("ring message {}", envelope.message_id),
+        );
+        HeldEnvelope {
+            envelope: Arc::new(envelope),
+            holds,
+        }
+    }
+}
+
 /// This channel, plus the identity the backend reports its positions under. One
 /// lock covers both, so seq assignment, ring append, and cursor bookkeeping are
 /// atomic with respect to every reader: a replay sees a message either entirely
 /// before its resume position or entirely after it.
 #[derive(Debug)]
 struct RingState {
-    core: RingCore<Arc<MessageEnvelope>, Uuid, ParticipantId>,
+    core: RingCore<HeldEnvelope, Uuid, ParticipantId>,
     /// The application each attached subscriber holds its position under, kept
     /// in lockstep with the core's cursors.
     ///
@@ -232,10 +266,15 @@ impl RingStore {
     /// every subscriber still owed them, and each such subscriber is charged
     /// here, by name. The caller enacts the noise ladder over those events; the
     /// store holds no policy about what they are worth.
-    pub fn append(&self, envelope: MessageEnvelope) -> Appended {
-        let envelope = Arc::new(envelope);
+    ///
+    /// # Panics
+    ///
+    /// If the envelope names a blob `holds` does not cover.
+    pub fn append(&self, envelope: MessageEnvelope, holds: BlobHolds) -> Appended {
+        let entry = HeldEnvelope::new(envelope, holds);
+        let envelope = Arc::clone(&entry.envelope);
         let mut state = self.state();
-        let report = state.core.append(Arc::clone(&envelope));
+        let report = state.core.append(entry);
         let overflow = Self::overflow_events(&state, report.overflow);
         drop(state);
         let retained = RetainedMessage {
@@ -284,7 +323,7 @@ impl RingStore {
             .tail(n)
             .map(|e| RetainedMessage {
                 seq: e.seq,
-                envelope: Arc::clone(&e.message),
+                envelope: Arc::clone(&e.message.envelope),
             })
             .collect()
     }
@@ -302,7 +341,11 @@ impl RingStore {
     /// What a subscriber resuming at `resume` is owed, and whether its
     /// continuity broke. The whole retained window plus a typed gap when it did.
     pub fn replay(&self, resume: Option<Resume<Uuid>>) -> Replay<Arc<MessageEnvelope>> {
-        self.state().core.ring().replay(resume)
+        let replay = self.state().core.ring().replay(resume);
+        Replay {
+            messages: replay.messages.into_iter().map(envelope_only).collect(),
+            decision: replay.decision,
+        }
     }
 
     // ── Subscribers ───────────────────────────────────────────────────────
@@ -404,8 +447,8 @@ impl RingStore {
             .map(|entry| {
                 (
                     entry.seq,
-                    entry.message.urgency,
-                    entry.message.delivery_deadline,
+                    entry.message.envelope.urgency,
+                    entry.message.envelope.delivery_deadline,
                 )
             })
             .collect();
@@ -478,9 +521,15 @@ impl RingStore {
         push_limit: u64,
         retain_limit: u64,
     ) -> Option<RingWindow> {
-        self.state()
+        let window = self
+            .state()
             .core
-            .window(subscriber, push_limit, retain_limit)
+            .window(subscriber, push_limit, retain_limit)?;
+        Some(RingWindow {
+            entries: window.entries.into_iter().map(envelope_only).collect(),
+            new_from: window.new_from,
+            push_enabled: window.push_enabled,
+        })
     }
 
     /// Move this subscriber's cursor to `through + 1` and report the unseen
@@ -517,16 +566,25 @@ impl RingStore {
     /// Rejects at the channel-wide cap rather than dropping the oldest parked
     /// message: silently cancelling scheduled work is worse than refusing to
     /// schedule more.
+    ///
+    /// A parked entry holds its blobs exactly as a retained one does; a refused
+    /// park releases them.
+    ///
+    /// # Panics
+    ///
+    /// If the envelope names a blob `holds` does not cover.
     pub fn park(
         &self,
         envelope: MessageEnvelope,
+        holds: BlobHolds,
         release_at: DateTime<Utc>,
     ) -> Result<Uuid, QuotaExceeded> {
         let sender = envelope.sender.clone();
         let message_uuid = envelope.message_id;
+        let entry = HeldEnvelope::new(envelope, holds);
         self.state()
             .core
-            .park(sender, Arc::new(envelope), release_time_of(release_at))?;
+            .park(sender, entry, release_time_of(release_at))?;
         Ok(message_uuid)
     }
 
@@ -555,7 +613,7 @@ impl RingStore {
             .into_iter()
             .map(|released| RetainedMessage {
                 seq: released.seq,
-                envelope: released.message,
+                envelope: Arc::clone(&released.message.envelope),
             })
             .collect();
         for retained in &messages {
@@ -659,15 +717,16 @@ impl RingStore {
             Ok(id) => id,
             Err(outcome) => return outcome,
         };
+        // The edited entry keeps the old one's attachments and shares its holds.
         let edited = body.map(|body| {
-            let mut envelope = (*state
+            let old = &state
                 .core
                 .deferred_entry(id)
                 .expect("checked above")
-                .message)
-                .clone();
+                .message;
+            let mut envelope = (*old.envelope).clone();
             envelope.body = body;
-            Arc::new(envelope)
+            HeldEnvelope::new(envelope, Arc::clone(&old.holds))
         });
         let release_at = release_at.map(release_time_of);
         match state.core.edit_deferred(id, edited, release_at).is_ok() {
@@ -693,7 +752,7 @@ impl RingStore {
     ) -> Result<DeferredId, DeferralOutcome> {
         match state.core.owned_deferred(
             sender,
-            |message| message.message_id == message_uuid,
+            |message| message.envelope.message_id == message_uuid,
             release_time_of(now),
         ) {
             OwnedDeferred::Owned(id, _) => Ok(id),
@@ -707,19 +766,21 @@ impl RingStore {
         }
     }
 
-    fn view(entry: &Deferred<Arc<MessageEnvelope>>) -> DeferredMessage {
+    fn view(entry: &Deferred<HeldEnvelope>) -> DeferredMessage {
         DeferredMessage {
             release_at: instant_of(entry.release_at),
-            envelope: Arc::clone(&entry.message),
+            envelope: Arc::clone(&entry.message.envelope),
         }
     }
 
-    /// Turn a publish-time record into the envelope the ring retains.
+    /// Turn a publish-time record into the envelope the ring retains and the
+    /// holds on the blobs it names.
     ///
     /// The reply address is retained verbatim: there is no join to resolve it
     /// through, so the consumer reads the address directly.
-    fn envelope_of(&self, msg: NewMessage) -> MessageEnvelope {
-        MessageEnvelope {
+    fn envelope_of(&self, msg: NewMessage) -> (MessageEnvelope, BlobHolds) {
+        let (attachments, holds) = msg.attachments.into_parts();
+        let envelope = MessageEnvelope {
             message_id: Uuid::new_v4(),
             source: msg.source,
             channel: self.address.clone(),
@@ -733,7 +794,19 @@ impl RingStore {
             urgency: msg.urgency,
             envelope_type: msg.envelope_type,
             transport: None,
-        }
+            attachments,
+        };
+        (envelope, holds)
+    }
+}
+
+/// A ring entry handed out as its envelope alone.
+fn envelope_only(
+    entry: brenn_queue::Retained<HeldEnvelope>,
+) -> brenn_queue::Retained<Arc<MessageEnvelope>> {
+    brenn_queue::Retained {
+        seq: entry.seq,
+        message: entry.message.envelope,
     }
 }
 
@@ -845,9 +918,9 @@ impl RetentionStore for RingStore {
     /// recorded per subscriber. The bounded ring retires obligations as it
     /// commits, so this is where its overflow is charged and reported.
     async fn append(&self, msg: NewMessage) -> AppendOutcome {
-        let envelope = self.envelope_of(msg);
+        let (envelope, holds) = self.envelope_of(msg);
         let message_uuid = envelope.message_id;
-        let appended = RingStore::append(self, envelope);
+        let appended = RingStore::append(self, envelope, holds);
         AppendOutcome {
             committed: Committed {
                 message_uuid,
@@ -862,8 +935,8 @@ impl RetentionStore for RingStore {
         msg: NewMessage,
         release_at: DateTime<Utc>,
     ) -> Result<Parked, QuotaExceeded> {
-        let envelope = self.envelope_of(msg);
-        let message_uuid = RingStore::park(self, envelope, release_at)?;
+        let (envelope, holds) = self.envelope_of(msg);
+        let message_uuid = RingStore::park(self, envelope, holds, release_at)?;
         Ok(Parked { message_uuid })
     }
 
@@ -974,6 +1047,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Ephemeral,
             transport: None,
+            attachments: Default::default(),
         }
     }
 
@@ -1031,7 +1105,7 @@ mod tests {
 
     fn publish(store: &RingStore, sender: &str, bodies: &[&str]) {
         for body in bodies {
-            store.append(envelope(sender, body));
+            store.append(envelope(sender, body), no_holds());
         }
     }
 
@@ -1080,8 +1154,8 @@ mod tests {
     #[test]
     fn append_assigns_dense_seqs_from_one() {
         let s = store(8);
-        assert_eq!(s.append(envelope("alice", "a")).retained.seq, 1);
-        assert_eq!(s.append(envelope("alice", "b")).retained.seq, 2);
+        assert_eq!(s.append(envelope("alice", "a"), no_holds()).retained.seq, 1);
+        assert_eq!(s.append(envelope("alice", "b"), no_holds()).retained.seq, 2);
         assert_eq!(s.newest_seq(), 2);
     }
 
@@ -1100,7 +1174,11 @@ mod tests {
                 let s = Arc::clone(&s);
                 std::thread::spawn(move || {
                     (0..PER_THREAD)
-                        .map(|_| s.append(envelope(&format!("pub{t}"), "x")).retained.seq)
+                        .map(|_| {
+                            s.append(envelope(&format!("pub{t}"), "x"), no_holds())
+                                .retained
+                                .seq
+                        })
                         .collect::<Vec<u64>>()
                 })
             })
@@ -1118,7 +1196,7 @@ mod tests {
     #[test]
     fn append_returns_the_retained_allocation() {
         let s = store(8);
-        let appended = s.append(envelope("alice", "a"));
+        let appended = s.append(envelope("alice", "a"), no_holds());
         let retained = s.retained_tail(1);
         assert!(Arc::ptr_eq(
             &appended.retained.envelope,
@@ -1131,7 +1209,7 @@ mod tests {
         let epoch = Uuid::new_v4();
         let s = RingStore::with_epoch(Uuid::new_v4(), "ephemeral:room", Depth::Bounded(4), epoch);
         assert_eq!(s.epoch(), epoch);
-        s.append(envelope("alice", "a"));
+        s.append(envelope("alice", "a"), no_holds());
         let replay = s.replay(Some(brenn_queue::Resume { epoch, seq: 1 }));
         assert_eq!(replay.decision, brenn_queue::ReplayDecision::UpToDate);
     }
@@ -1162,8 +1240,8 @@ mod tests {
     fn appends_and_releases_enter_retention_in_order() {
         let s = store(8);
 
-        s.append(envelope("alice", "now"));
-        s.park(envelope("alice", "later"), at(60_000))
+        s.append(envelope("alice", "now"), no_holds());
+        s.park(envelope("alice", "later"), no_holds(), at(60_000))
             .expect("park");
         s.release_due(at(30_000));
         assert_eq!(
@@ -1195,7 +1273,7 @@ mod tests {
         assert_eq!(fresh.decision, ReplayDecision::Fresh);
         assert_eq!(seqs(&fresh), vec![1, 2]);
 
-        s.append(envelope("alice", "c"));
+        s.append(envelope("alice", "c"), no_holds());
         let resumed = s.replay(Some(Resume {
             epoch: s.epoch(),
             seq: 2,
@@ -1223,8 +1301,8 @@ mod tests {
     fn publish_count_counts_retention_entries() {
         let s = store(8);
         assert_eq!(s.publish_count(), 0);
-        s.append(envelope("alice", "a"));
-        s.park(envelope("alice", "later"), at(60_000))
+        s.append(envelope("alice", "a"), no_holds());
+        s.park(envelope("alice", "later"), no_holds(), at(60_000))
             .expect("park");
         assert_eq!(s.publish_count(), 1);
         s.release_due(at(90_000));
@@ -1236,7 +1314,7 @@ mod tests {
     #[test]
     fn a_confined_store_retains_like_any_other() {
         let s = confined_store(4);
-        assert_eq!(s.append(envelope("alice", "a")).retained.seq, 1);
+        assert_eq!(s.append(envelope("alice", "a"), no_holds()).retained.seq, 1);
         assert_eq!(s.retained_tail(10).len(), 1);
         assert_eq!(s.publish_count(), 1);
     }
@@ -1258,12 +1336,14 @@ mod tests {
         s.attach(&sub("proc"), "proc", 8);
         for body in ["a", "b"] {
             assert!(
-                s.append(envelope("alice", body)).overflow.is_empty(),
+                s.append(envelope("alice", body), no_holds())
+                    .overflow
+                    .is_empty(),
                 "nothing evicted yet"
             );
         }
 
-        let evicting = s.append(envelope("alice", "c"));
+        let evicting = s.append(envelope("alice", "c"), no_holds());
         assert_eq!(
             evicting.overflow,
             vec![OverflowEvent {
@@ -1275,7 +1355,7 @@ mod tests {
         // Each append reports only the span it evicted, so the two together
         // report the two lost messages exactly once each.
         assert_eq!(
-            s.append(envelope("alice", "d")).overflow,
+            s.append(envelope("alice", "d"), no_holds()).overflow,
             vec![OverflowEvent {
                 subscriber: sub("proc"),
                 dropped: 1,
@@ -1298,7 +1378,7 @@ mod tests {
         publish(&s, "alice", &["a", "b"]);
         serve(&s, &sub("caught-up"), 8);
 
-        let evicting = s.append(envelope("alice", "c"));
+        let evicting = s.append(envelope("alice", "c"), no_holds());
         assert_eq!(
             evicting.overflow,
             vec![OverflowEvent {
@@ -1323,8 +1403,10 @@ mod tests {
         // its own count rather than folding both into one entry.
         serve(&s, &sub("partial"), 8);
         publish(&s, "alice", &["c"]);
-        s.park(envelope("alice", "x"), at(1_000)).unwrap();
-        s.park(envelope("alice", "y"), at(1_000)).unwrap();
+        s.park(envelope("alice", "x"), no_holds(), at(1_000))
+            .unwrap();
+        s.park(envelope("alice", "y"), no_holds(), at(1_000))
+            .unwrap();
 
         let batch = s.release_due(at(1_000));
         assert_eq!(batch.messages.len(), 2);
@@ -1423,7 +1505,8 @@ mod tests {
     fn parked_messages_are_not_observable_before_release() {
         let s = store(4);
         s.attach(&sub("proc"), "proc", 4);
-        s.park(envelope("alice", "later"), at(2_000)).unwrap();
+        s.park(envelope("alice", "later"), no_holds(), at(2_000))
+            .unwrap();
 
         assert_eq!(s.retained_len(), 0);
         assert!(!s.has_deliverable(&sub("proc")));
@@ -1441,9 +1524,12 @@ mod tests {
     #[test]
     fn releases_are_ordered_by_release_time() {
         let s = store(4);
-        s.park(envelope("alice", "third"), at(3_000)).unwrap();
-        s.park(envelope("alice", "first"), at(1_000)).unwrap();
-        s.park(envelope("alice", "second"), at(2_000)).unwrap();
+        s.park(envelope("alice", "third"), no_holds(), at(3_000))
+            .unwrap();
+        s.park(envelope("alice", "first"), no_holds(), at(1_000))
+            .unwrap();
+        s.park(envelope("alice", "second"), no_holds(), at(2_000))
+            .unwrap();
 
         let released: Vec<String> = s
             .release_due(at(9_000))
@@ -1459,10 +1545,11 @@ mod tests {
     #[test]
     fn deferred_cap_is_channel_wide_and_shared() {
         let s = store(2);
-        s.park(envelope("alice", "a"), at(1_000)).unwrap();
-        s.park(envelope("bob", "b"), at(1_000)).unwrap();
+        s.park(envelope("alice", "a"), no_holds(), at(1_000))
+            .unwrap();
+        s.park(envelope("bob", "b"), no_holds(), at(1_000)).unwrap();
         assert_eq!(
-            s.park(envelope("alice", "c"), at(1_000)),
+            s.park(envelope("alice", "c"), no_holds(), at(1_000)),
             Err(QuotaExceeded { cap: 2 })
         );
         assert_eq!(s.deferred_len(), 2);
@@ -1472,7 +1559,7 @@ mod tests {
     fn zero_retain_depth_parks_nothing() {
         let s = store(0);
         assert_eq!(
-            s.park(envelope("alice", "a"), at(1_000)),
+            s.park(envelope("alice", "a"), no_holds(), at(1_000)),
             Err(QuotaExceeded { cap: 0 })
         );
     }
@@ -1480,9 +1567,11 @@ mod tests {
     #[test]
     fn deferred_view_is_sender_scoped_and_release_ordered() {
         let s = store(8);
-        s.park(envelope("alice", "a-late"), at(3_000)).unwrap();
-        s.park(envelope("bob", "b"), at(2_000)).unwrap();
-        s.park(envelope("alice", "a-soon"), at(1_000)).unwrap();
+        s.park(envelope("alice", "a-late"), no_holds(), at(3_000))
+            .unwrap();
+        s.park(envelope("bob", "b"), no_holds(), at(2_000)).unwrap();
+        s.park(envelope("alice", "a-soon"), no_holds(), at(1_000))
+            .unwrap();
 
         let alice: Vec<String> = s
             .deferred_for_sender("alice")
@@ -1497,7 +1586,9 @@ mod tests {
     #[test]
     fn cancel_removes_the_entry_and_reports_the_release_race() {
         let s = store(4);
-        let id = s.park(envelope("alice", "a"), at(1_000)).unwrap();
+        let id = s
+            .park(envelope("alice", "a"), no_holds(), at(1_000))
+            .unwrap();
         assert_eq!(
             s.cancel_deferred("alice", id, now()),
             DeferralOutcome::Applied
@@ -1514,7 +1605,9 @@ mod tests {
     #[test]
     fn cancel_after_release_is_a_no_op() {
         let s = store(4);
-        let id = s.park(envelope("alice", "a"), at(1_000)).unwrap();
+        let id = s
+            .park(envelope("alice", "a"), no_holds(), at(1_000))
+            .unwrap();
         assert_eq!(s.release_due(at(1_000)).messages.len(), 1);
         assert_eq!(
             s.cancel_deferred("alice", id, now()),
@@ -1527,8 +1620,11 @@ mod tests {
     #[test]
     fn edit_replaces_body_and_reschedules() {
         let s = store(4);
-        let late = s.park(envelope("alice", "late"), at(3_000)).unwrap();
-        s.park(envelope("alice", "soon"), at(1_000)).unwrap();
+        let late = s
+            .park(envelope("alice", "late"), no_holds(), at(3_000))
+            .unwrap();
+        s.park(envelope("alice", "soon"), no_holds(), at(1_000))
+            .unwrap();
 
         assert_eq!(
             s.edit_deferred("alice", late, Some("edited".into()), Some(at(500)), now()),
@@ -1544,7 +1640,9 @@ mod tests {
     #[test]
     fn edit_after_release_is_a_no_op() {
         let s = store(4);
-        let id = s.park(envelope("alice", "a"), at(1_000)).unwrap();
+        let id = s
+            .park(envelope("alice", "a"), no_holds(), at(1_000))
+            .unwrap();
         s.release_due(at(1_000));
         assert_eq!(
             s.edit_deferred("alice", id, Some("edited".into()), None, now()),
@@ -1560,7 +1658,7 @@ mod tests {
     #[test]
     fn touching_another_senders_deferred_message_is_reported() {
         let s = store(4);
-        let id = s.park(envelope("bob", "b"), at(1_000)).unwrap();
+        let id = s.park(envelope("bob", "b"), no_holds(), at(1_000)).unwrap();
         assert_eq!(
             s.cancel_deferred("alice", id, now()),
             DeferralOutcome::WrongSender

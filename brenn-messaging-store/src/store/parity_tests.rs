@@ -139,6 +139,7 @@ fn message(sender: &str, body: &str) -> NewMessage {
         delivery_deadline: None,
         impetus: None,
         publish_ts_ns: utc_to_ns(Utc::now()),
+        attachments: crate::blob::HeldAttachments::none(),
     }
 }
 

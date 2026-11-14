@@ -1200,8 +1200,10 @@ pub async fn build_messaging(
 /// from, on an
 /// absent `server_origin` (a bootstrap bug past the plan), on a
 /// `[[remote]]` token file that is missing, unreadable, empty or
-/// group/world-readable, and on a roster publish or a stored dynamic `mqtt:`
-/// row the host cannot make sense of.
+/// group/world-readable, on a roster publish or a stored dynamic `mqtt:`
+/// row the host cannot make sense of, and on every refusal of
+/// [`BlobStore::open`](brenn_messaging_store::blob::BlobStore::open) — a held
+/// message naming blob bytes that are gone among them.
 pub async fn commit_messaging(
     plan: MessagingPlan,
     app_table: &brenn_lib::config::AppTable,
@@ -1232,6 +1234,7 @@ pub async fn commit_messaging(
         registrations,
         attach_send_budgets,
         messaging_globals,
+        blob_dir,
         llm_chat,
         // The advisory is the caller's to report; nothing commit does reads it.
         surface_error_advisory: _,
@@ -1245,6 +1248,22 @@ pub async fn commit_messaging(
     let ring_stores = Arc::new(brenn_messaging_store::store::RingStores::build(
         &nondurable_channels,
     ));
+
+    // The blob store reconciles the database with its directory and refuses to
+    // start where a held message names bytes that are gone. It runs before the
+    // messenger exists and before the listener is bound, and releases the
+    // connection before `Messenger::new` takes it.
+    let blob_store = {
+        let conn = db.lock().await;
+        brenn_messaging_store::blob::BlobStore::open(
+            &blob_dir,
+            brenn_messaging_store::blob::BlobLimits {
+                max_blob_bytes: messaging_globals.max_blob_bytes,
+                budget_bytes: messaging_globals.blob_budget_bytes,
+            },
+            &conn,
+        )
+    };
 
     // Sync DB state with config: upsert the configured channels here. The
     // durable dynamic subscriptions are merged back *after* the chat backfill
@@ -1297,6 +1316,7 @@ pub async fn commit_messaging(
     .with_subscriber_registrations(registrations)
     .with_attach_send_budgets(attach_send_budgets)
     .with_ring_stores(ring_stores)
+    .with_blob_store(blob_store)
     .with_llm_chat(llm_chat)
     .with_system_channel_tuning(system_channel_tuning.clone());
 

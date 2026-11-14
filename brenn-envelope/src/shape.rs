@@ -1,37 +1,95 @@
 //! The serialized shapes of a [`MessageEnvelope`].
 //!
 //! An envelope is written to several contracts that agree on every field but
-//! the body: the `envelope-json` a component is handed and attach v4 frames
-//! (the text shape, here), what a conversation is shown, and the eviction
-//! archive. Each contract is a [`BodyShape`]; [`ShapedEnvelope`] writes the
-//! envelope's fields once, in one order, and asks the shape for the entries
-//! that stand at the body's position. A new envelope field is therefore added
-//! in one place and appears in every shape; the serializer and the reader
-//! both name every field, so a field missing from either does not compile.
+//! the body and the attachments: the `envelope-json` a component is handed and
+//! attach v4 frames (the text shape, here), the 0.2.0 header, what a
+//! conversation is shown, and the eviction archive. Each contract is an
+//! [`EnvelopeShape`]; [`ShapedEnvelope`] writes the envelope's fields once, in
+//! one order, and asks the shape for the entries that stand at the body's
+//! position and at the attachments' position. A new envelope field that every
+//! shape carries is added in one place; one that not every shape carries is a
+//! method of the trait, which each shape implements. The serializer and the
+//! reader both name every field, so a field missing from either does not
+//! compile.
 
 use std::marker::PhantomData;
 
 use serde::ser::{Error as _, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{ChannelScheme, Impetus, MessageBody, MessageEnvelope, TransportMeta, Urgency};
+use crate::{
+    Attachments, ChannelScheme, Impetus, MessageBody, MessageEnvelope, TransportMeta, Urgency,
+};
 
-/// The entries a contract writes at the body's position.
-pub trait BodyShape {
+/// What a contract writes at the two positions where shapes differ.
+pub trait EnvelopeShape {
     /// Write `body`'s entries into the envelope's struct. Entries the shape
     /// writes follow `sender`/`publish_ts` and precede `reply_to`.
     fn serialize_body<S: SerializeStruct>(body: &MessageBody, out: &mut S) -> Result<(), S::Error>;
+
+    /// Write the `attachments` entry, or nothing. Written last, after
+    /// `transport`.
+    fn serialize_attachments<S: SerializeStruct>(
+        attachments: &Attachments,
+        out: &mut S,
+    ) -> Result<(), S::Error>;
+}
+
+/// Write `attachments` in full — each name with its blob's id, size and
+/// content type — under the key `attachments`; nothing when it is empty.
+pub fn write_attachment_refs<S: SerializeStruct>(
+    attachments: &Attachments,
+    out: &mut S,
+) -> Result<(), S::Error> {
+    if attachments.is_empty() {
+        return out.skip_field("attachments");
+    }
+    out.serialize_field("attachments", attachments)
+}
+
+/// Write `attachments` as metadata — each name with its blob's size and
+/// content type, and no id — under the key `attachments`; nothing when it is
+/// empty.
+pub fn write_attachment_metadata<S: SerializeStruct>(
+    attachments: &Attachments,
+    out: &mut S,
+) -> Result<(), S::Error> {
+    if attachments.is_empty() {
+        return out.skip_field("attachments");
+    }
+    out.serialize_field("attachments", &AttachmentMetadata(attachments))
+}
+
+struct AttachmentMetadata<'a>(&'a Attachments);
+
+impl Serialize for AttachmentMetadata<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Meta<'a> {
+            size: u64,
+            content_type: &'a str,
+        }
+        serializer.collect_map(self.0.iter().map(|(name, r)| {
+            (
+                name,
+                Meta {
+                    size: r.size,
+                    content_type: &r.content_type,
+                },
+            )
+        }))
+    }
 }
 
 /// An envelope serialized in shape `B`.
-pub struct ShapedEnvelope<'a, B: BodyShape> {
+pub struct ShapedEnvelope<'a, B: EnvelopeShape> {
     envelope: &'a MessageEnvelope,
     shape: PhantomData<B>,
 }
 
 impl MessageEnvelope {
     /// This envelope, to be serialized in shape `B`.
-    pub fn shaped<B: BodyShape>(&self) -> ShapedEnvelope<'_, B> {
+    pub fn shaped<B: EnvelopeShape>(&self) -> ShapedEnvelope<'_, B> {
         ShapedEnvelope {
             envelope: self,
             shape: PhantomData,
@@ -39,13 +97,12 @@ impl MessageEnvelope {
     }
 }
 
-impl<B: BodyShape> Serialize for ShapedEnvelope<'_, B> {
+impl<B: EnvelopeShape> Serialize for ShapedEnvelope<'_, B> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // Destructured without `..`, so a field added to the envelope does not
-        // compile until it is written here.
-        // TODO(blob-attachment-host-sites): a key written here is written in
-        // every shape, the 0.1.0 `envelope-json` and attach v4 included; a
-        // header-only key goes through `HeaderShape::serialize_body`.
+        // compile until it is written here. A key written here directly is
+        // written in every shape, the 0.1.0 `envelope-json` and attach v4
+        // included.
         let MessageEnvelope {
             message_id,
             source,
@@ -60,10 +117,11 @@ impl<B: BodyShape> Serialize for ShapedEnvelope<'_, B> {
             urgency,
             envelope_type,
             transport,
+            attachments,
         } = self.envelope;
         // Every field, plus one for a shape that writes a second body entry;
         // a length hint only, which JSON ignores.
-        let mut out = serializer.serialize_struct("MessageEnvelope", 14)?;
+        let mut out = serializer.serialize_struct("MessageEnvelope", 15)?;
         out.serialize_field("message_id", message_id)?;
         out.serialize_field("source", source)?;
         out.serialize_field("channel", channel)?;
@@ -77,6 +135,7 @@ impl<B: BodyShape> Serialize for ShapedEnvelope<'_, B> {
         out.serialize_field("urgency", urgency)?;
         out.serialize_field("envelope_type", envelope_type)?;
         optional_field(&mut out, "transport", transport)?;
+        B::serialize_attachments(attachments, &mut out)?;
         out.end()
     }
 }
@@ -92,14 +151,17 @@ fn optional_field<S: SerializeStruct, T: Serialize>(
     }
 }
 
-/// The text shape: `"body":"…"`, and nothing else at the body's position.
+/// The text shape: `"body":"…"`, and nothing else at the body's position;
+/// no attachments.
 ///
 /// The shape of the 0.1.0 `envelope-json` and of attach v4 frames. A typed
 /// text body is written as exactly its text, without its content type; a
-/// non-text body has no representation here and fails to serialize.
+/// non-text body has no representation here and fails to serialize. Neither
+/// contract's reader can redeem a blob reference, so the shape writes none,
+/// and an envelope's text is the same with or without attachments.
 pub struct TextShape;
 
-impl BodyShape for TextShape {
+impl EnvelopeShape for TextShape {
     fn serialize_body<S: SerializeStruct>(body: &MessageBody, out: &mut S) -> Result<(), S::Error> {
         match body.as_text() {
             Some(text) => out.serialize_field("body", text),
@@ -109,17 +171,32 @@ impl BodyShape for TextShape {
             ))),
         }
     }
+
+    fn serialize_attachments<S: SerializeStruct>(
+        _: &Attachments,
+        _: &mut S,
+    ) -> Result<(), S::Error> {
+        Ok(())
+    }
 }
 
-/// The header shape: nothing at the body's position.
+/// The header shape: nothing at the body's position, the attachments in full.
 ///
-/// The `header` of a 0.2.0 `envelope`, which carries the body beside it as a
-/// content type and bytes. Every body serializes, whatever it holds.
+/// The `header` of a 0.2.0 `envelope` and of an attach v5 row, which carry the
+/// body beside it as a content type and bytes. Every body serializes, whatever
+/// it holds.
 pub struct HeaderShape;
 
-impl BodyShape for HeaderShape {
+impl EnvelopeShape for HeaderShape {
     fn serialize_body<S: SerializeStruct>(_: &MessageBody, _: &mut S) -> Result<(), S::Error> {
         Ok(())
+    }
+
+    fn serialize_attachments<S: SerializeStruct>(
+        attachments: &Attachments,
+        out: &mut S,
+    ) -> Result<(), S::Error> {
+        write_attachment_refs(attachments, out)
     }
 }
 
@@ -192,7 +269,8 @@ impl MessageEnvelope {
 /// The text shape as read: `body` is a JSON string, read as an untyped text
 /// body. A `content_type` or `body_base64` key belongs to another shape and is
 /// refused, so a line in another shape never parses into an envelope that has
-/// lost its body's type.
+/// lost its body's type. The shape carries no attachments; the envelope read
+/// has none.
 #[derive(Deserialize)]
 struct TextShapeIn {
     message_id: uuid::Uuid,
@@ -245,6 +323,7 @@ impl<'de> Deserialize<'de> for MessageEnvelope {
             urgency: w.urgency,
             envelope_type: w.envelope_type,
             transport: w.transport,
+            attachments: Attachments::new(),
         })
     }
 }
@@ -257,10 +336,8 @@ impl<'de> Deserialize<'de> for MessageEnvelope {
 /// purpose: every key it does not know is ignored — including `body`, which
 /// this shape does not hold — so a writer may add keys a reader built before
 /// them skips. A missing optional field reads as absent; a missing required
-/// one is refused.
-// TODO(blob-attachment-host-sites): a header key this struct does not hold is
-// dropped where an envelope is rebuilt from it — on the page, before the guest
-// sees it; extend the struct in the change that writes the key.
+/// one is refused. A key this struct does not hold is dropped where an
+/// envelope is rebuilt from it, so it holds every key [`HeaderShape`] writes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct EnvelopeHeader {
     message_id: uuid::Uuid,
@@ -275,6 +352,8 @@ pub struct EnvelopeHeader {
     urgency: Urgency,
     envelope_type: ChannelScheme,
     transport: Option<TransportMeta>,
+    #[serde(default)]
+    attachments: Attachments,
 }
 
 impl MessageEnvelope {
@@ -296,6 +375,7 @@ impl MessageEnvelope {
             urgency,
             envelope_type,
             transport,
+            attachments,
         } = self;
         EnvelopeHeader {
             message_id: *message_id,
@@ -310,6 +390,7 @@ impl MessageEnvelope {
             urgency: *urgency,
             envelope_type: *envelope_type,
             transport: transport.clone(),
+            attachments: attachments.clone(),
         }
     }
 
@@ -328,6 +409,7 @@ impl MessageEnvelope {
             urgency,
             envelope_type,
             transport,
+            attachments,
         } = header;
         MessageEnvelope {
             message_id,
@@ -343,6 +425,7 @@ impl MessageEnvelope {
             urgency,
             envelope_type,
             transport,
+            attachments,
         }
     }
 }
@@ -369,6 +452,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Brenn,
             transport: None,
+            attachments: Attachments::new(),
         }
     }
 
@@ -460,6 +544,7 @@ mod tests {
             urgency: Urgency::High,
             envelope_type: ChannelScheme::Ephemeral,
             transport: None,
+            attachments: Attachments::new(),
         };
         let parsed: MessageEnvelope = serde_json::from_str(&env.to_envelope_json()).unwrap();
         assert_eq!(parsed, env);
@@ -533,6 +618,7 @@ mod tests {
             urgency: Urgency::High,
             envelope_type: ChannelScheme::Ephemeral,
             transport: None,
+            attachments: Attachments::new(),
         }
     }
 
@@ -702,5 +788,117 @@ mod tests {
         assert!(err.to_string().contains("coap"), "{err}");
         v["body"] = json!("x");
         assert!(serde_json::from_value::<MessageEnvelope>(v).is_err());
+    }
+
+    fn two_attachments() -> Attachments {
+        let name = |s: &str| crate::AttachmentName::new(s).unwrap();
+        let blob = |id: &str, size, ct: &str| crate::BlobRef {
+            id: crate::BlobId::new(id.to_owned()),
+            size,
+            content_type: ct.to_owned(),
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(name("photo"), blob(&"a".repeat(32), 102_400, "image/jpeg"));
+        map.insert(name("notes.txt"), blob(&"b".repeat(32), 7, "text/plain"));
+        Attachments::from_map(map)
+    }
+
+    /// The key is last in the header, after `transport`, with each reference
+    /// in full, in name order; pinned literally.
+    #[test]
+    fn the_header_carries_attachments_in_full_after_transport() {
+        let mut env = with_transport(binary(), mqtt_transport());
+        env.attachments = two_attachments();
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        assert_eq!(
+            env.to_header_json(),
+            format!(
+                concat!(
+                    r#"{{"message_id":"00000000-0000-0000-0000-000000000000","source":"src","#,
+                    r#""channel":"mqtt:broker:cam/front","sender":"alice","#,
+                    r#""publish_ts":"2023-11-14T22:13:20Z","urgency":"normal","#,
+                    r#""envelope_type":"mqtt","transport":{{"mqtt":{{"client_slug":"broker","#,
+                    r#""topic":"cam/front","qos":1,"received_at":"2023-11-14T22:13:21Z"}}}},"#,
+                    r#""attachments":{{"notes.txt":{{"id":"{b}","size":7,"content_type":"text/plain"}},"#,
+                    r#""photo":{{"id":"{a}","size":102400,"content_type":"image/jpeg"}}}}}}"#
+                ),
+                a = a,
+                b = b
+            )
+        );
+    }
+
+    /// An envelope rebuilt from its header keeps its attachments, whatever
+    /// the body.
+    #[test]
+    fn attachments_round_trip_through_header_and_from_header() {
+        let typed = MessageBody::from_parts(Some("text/markdown"), b"# hi").unwrap();
+        for body in [binary(), typed, MessageBody::text("x")] {
+            let mut env = fully_populated(body);
+            env.attachments = two_attachments();
+            let header: EnvelopeHeader = serde_json::from_str(&env.to_header_json()).unwrap();
+            assert_eq!(header, env.header());
+            assert_eq!(MessageEnvelope::from_header(header, env.body.clone()), env);
+        }
+    }
+
+    /// A header written before the key existed reads as no attachments.
+    #[test]
+    fn a_header_without_the_key_reads_as_no_attachments() {
+        let env = envelope(MessageBody::text("x"));
+        let v: serde_json::Value = serde_json::from_str(&env.to_header_json()).unwrap();
+        assert!(v.get("attachments").is_none());
+        let header: EnvelopeHeader = serde_json::from_value(v).unwrap();
+        let rebuilt = MessageEnvelope::from_header(header, env.body.clone());
+        assert!(rebuilt.attachments.is_empty());
+    }
+
+    /// The text shape writes no attachments: an envelope's text is the same
+    /// with or without them, and reads back with none.
+    #[test]
+    fn the_text_shape_omits_attachments() {
+        let plain = envelope(MessageBody::text("x"));
+        let mut with = plain.clone();
+        with.attachments = two_attachments();
+        assert_eq!(with.to_envelope_json(), plain.to_envelope_json());
+        let parsed: MessageEnvelope = serde_json::from_str(&with.to_envelope_json()).unwrap();
+        assert!(parsed.attachments.is_empty());
+    }
+
+    /// The metadata writer gives each name its size and content type and no
+    /// id; both writers skip the key on an empty map.
+    #[test]
+    fn the_metadata_writer_omits_the_id() {
+        struct Meta;
+        impl EnvelopeShape for Meta {
+            fn serialize_body<S: SerializeStruct>(
+                _: &MessageBody,
+                _: &mut S,
+            ) -> Result<(), S::Error> {
+                Ok(())
+            }
+            fn serialize_attachments<S: SerializeStruct>(
+                a: &Attachments,
+                out: &mut S,
+            ) -> Result<(), S::Error> {
+                write_attachment_metadata(a, out)
+            }
+        }
+        let mut env = envelope(MessageBody::text("x"));
+        let empty = serde_json::to_value(env.shaped::<Meta>()).unwrap();
+        assert!(empty.get("attachments").is_none());
+        env.attachments = two_attachments();
+        let text = serde_json::to_string(&env.shaped::<Meta>()).unwrap();
+        assert!(!text.contains(&"a".repeat(32)), "{text}");
+        assert!(!text.contains(&"b".repeat(32)), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["attachments"],
+            json!({
+                "notes.txt": {"size": 7, "content_type": "text/plain"},
+                "photo": {"size": 102400, "content_type": "image/jpeg"},
+            })
+        );
     }
 }

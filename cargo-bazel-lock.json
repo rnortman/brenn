@@ -1,5 +1,5 @@
 {
-  "checksum": "48dbf9a5b1c6c08b072d45e83b87ced0176586a325eb7fdef7525793f2bc6bc3",
+  "checksum": "33b5b15d3f94b01948ab2cef86ae4822506ca3affff6f377315145f0ef282deb",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -4423,6 +4423,10 @@
             {
               "id": "indexmap 2.14.0",
               "target": "indexmap"
+            },
+            {
+              "id": "rand 0.10.1",
+              "target": "rand"
             },
             {
               "id": "rusqlite 0.41.1",

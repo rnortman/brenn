@@ -14,22 +14,23 @@ use super::{ns_to_utc, parse_rfc3339};
 /// Common SELECT base for `messaging_messages` reads that feed
 /// [`row_to_envelope`].
 ///
-/// Covers columns 0–15 (m.uuid .. m.transport), the mandatory channel JOIN,
+/// Covers columns 0–16 (m.uuid .. m.attachments), the mandatory channel JOIN,
 /// and the optional reply-to LEFT JOIN. Terminates with a trailing space
 /// **before** any FTS JOIN or `WHERE` clause so callers can append either
 /// immediately.
 ///
-/// Column layout matches [`row_to_envelope`]'s documented 0–15 contract
+/// Column layout matches [`row_to_envelope`]'s documented 0–16 contract
 /// exactly; do not reorder or add columns here without updating that decoder
 /// and the byte-identity tests.
 pub const SELECT_ENVELOPE_BASE: &str = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
             m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
-            c.address, rc.address, m.envelope_type, m.impetus, m.content_type, m.transport \
+            c.address, rc.address, m.envelope_type, m.impetus, m.content_type, m.transport, \
+            m.attachments \
      FROM messaging_messages m \
      JOIN messaging_channels c ON c.uuid = m.channel_uuid \
      LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid ";
 
-/// Decode one SELECT row (columns 0–15) into a [`MessageEnvelope`].
+/// Decode one SELECT row (columns 0–16) into a [`MessageEnvelope`].
 ///
 /// Column layout expected:
 /// - 0: m.uuid (bytes)  1: m.channel_uuid (bytes, unused)  2: m.source  3: m.sender
@@ -37,9 +38,9 @@ pub const SELECT_ENVELOPE_BASE: &str = "SELECT m.uuid, m.channel_uuid, m.source,
 /// - 7: m.delivery_deadline  8: m.deliver_after  9: m.publish_ts_ns
 /// - 10: c.address (channel address string)  11: rc.address (reply_to, nullable)
 /// - 12: m.envelope_type  13: m.impetus (nullable)  14: m.content_type (nullable)
-/// - 15: m.transport (nullable)
+/// - 15: m.transport (nullable)  16: m.attachments (nullable)
 ///
-/// A SELECT that carries further columns puts them after column 15.
+/// A SELECT that carries further columns puts them after column 16.
 pub fn row_to_envelope(row: &Row) -> rusqlite::Result<MessageEnvelope> {
     let msg_uuid_bytes: Vec<u8> = row.get(0)?;
     // col 1 (channel_uuid bytes) is selected but not used here — address is in col 10.
@@ -59,6 +60,7 @@ pub fn row_to_envelope(row: &Row) -> rusqlite::Result<MessageEnvelope> {
         .unwrap_or_else(|e| panic!("messaging: query row uuid malformed: {e}"));
     let body = super::read_body(row, 4, 14, message_id)?;
     let transport = super::read_transport(row, 15, message_id)?;
+    let attachments = super::read_attachments(row, 16, message_id)?;
     let urgency = Urgency::parse(&urgency_str)
         .unwrap_or_else(|| panic!("messaging: invalid urgency {urgency_str:?}"));
     let delivery_deadline = delivery_deadline_s.and_then(|s| parse_rfc3339(&s));
@@ -85,5 +87,6 @@ pub fn row_to_envelope(row: &Row) -> rusqlite::Result<MessageEnvelope> {
         urgency,
         envelope_type,
         transport,
+        attachments,
     })
 }

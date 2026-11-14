@@ -49,7 +49,22 @@ fn bare_envelope() -> MessageEnvelope {
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Ephemeral,
         transport: None,
+        attachments: Default::default(),
     }
+}
+
+/// One attachment, `photo`, a 100 KiB JPEG.
+fn one_attachment() -> brenn_envelope::Attachments {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(
+        brenn_envelope::AttachmentName::new("photo").unwrap(),
+        brenn_envelope::BlobRef {
+            id: brenn_envelope::BlobId::new("5f0c".repeat(8)),
+            size: 102_400,
+            content_type: "image/jpeg".to_string(),
+        },
+    );
+    brenn_envelope::Attachments::from_map(map)
 }
 
 fn full_envelope(body: MessageBody) -> MessageEnvelope {
@@ -67,6 +82,7 @@ fn full_envelope(body: MessageBody) -> MessageEnvelope {
         urgency: Urgency::High,
         envelope_type: ChannelScheme::Brenn,
         transport: None,
+        attachments: Default::default(),
     }
 }
 
@@ -115,7 +131,7 @@ fn a_publish_is_written_byte_for_byte() {
 }
 
 #[test]
-fn a_two_row_deliver_is_written_byte_for_byte() {
+fn a_three_row_deliver_is_written_byte_for_byte() {
     let png = body(Some("image/png"), &[0x89, b'P', b'N', b'G']);
     let frame = ServerFrame::Deliver {
         channel: "ephemeral:demo".to_string(),
@@ -132,6 +148,16 @@ fn a_two_row_deliver_is_written_byte_for_byte() {
                 cursor: cursor("c-2"),
                 dropped: 0,
             },
+            DeliverRow {
+                envelope: MessageEnvelope {
+                    message_id: Uuid::from_u128(3),
+                    attachments: one_attachment(),
+                    ..bare_envelope()
+                },
+                seq: 3,
+                cursor: cursor("c-3"),
+                dropped: 0,
+            },
         ],
     };
     let header = concat!(
@@ -145,12 +171,18 @@ fn a_two_row_deliver_is_written_byte_for_byte() {
         r#""reply_to":"brenn:replies","delivery_deadline":"2023-11-14T22:15:00Z","#,
         r#""deliver_after":"2023-11-14T22:14:10Z","impetus":"replenish","urgency":"high","#,
         r#""envelope_type":"brenn"},"body":{"len":4,"content_type":"image/png"}},"#,
-        r#""seq":2,"cursor":"c-2","dropped":0}]}"#,
+        r#""seq":2,"cursor":"c-2","dropped":0},"#,
+        r#"{"envelope":{"header":{"message_id":"00000000-0000-0000-0000-000000000003","source":"src","#,
+        r#""channel":"ephemeral:demo","sender":"remote:alice","publish_ts":"2023-11-14T22:13:20Z","#,
+        r#""urgency":"normal","envelope_type":"ephemeral","attachments":{"photo":{"#,
+        r#""id":"5f0c5f0c5f0c5f0c5f0c5f0c5f0c5f0c","size":102400,"content_type":"image/jpeg"}}},"#,
+        r#""body":{"len":5}},"seq":3,"cursor":"c-3","dropped":0}]}"#,
     );
     let mut expected = u32::try_from(header.len()).unwrap().to_be_bytes().to_vec();
     expected.extend_from_slice(header.as_bytes());
     expected.extend_from_slice(b"hello");
     expected.extend_from_slice(&[0x89, b'P', b'N', b'G']);
+    expected.extend_from_slice(b"hello");
     assert_eq!(
         v5().encode_server(&frame),
         WireMessage::Binary(expected.clone())
@@ -324,6 +356,23 @@ fn a_deliver_row_keeps_transport_metadata() {
     ));
     server_round_trip(ServerFrame::Deliver {
         channel: "mqtt:broker:cam/front".to_string(),
+        rows: vec![DeliverRow {
+            envelope,
+            seq: 1,
+            cursor: cursor("c"),
+            dropped: 0,
+        }],
+    });
+}
+
+/// The `attachments` header key crosses v5 the same way, with each
+/// reference in full.
+#[test]
+fn a_deliver_row_keeps_its_attachments() {
+    let mut envelope = full_envelope(jpeg());
+    envelope.attachments = one_attachment();
+    server_round_trip(ServerFrame::Deliver {
+        channel: "brenn:frames".to_string(),
         rows: vec![DeliverRow {
             envelope,
             seq: 1,

@@ -170,7 +170,7 @@ impl Messenger {
         entry: PrepaidEntry,
     ) -> Appended {
         let envelope = self.prepaid_envelope(dest, entry);
-        let appended = dest.store.append(envelope);
+        let appended = dest.store.append(envelope, crate::store::no_holds());
         // Resolved after the append, not memoized on the destination: a
         // subscriber can mint its directory entry mid-flush, and one minted
         // before this read holds a position no earlier resolution would have
@@ -211,7 +211,8 @@ impl Messenger {
         release_at: DateTime<Utc>,
     ) -> Result<Uuid, QuotaExceeded> {
         let envelope = self.prepaid_envelope(dest, entry);
-        dest.store.park(envelope, release_at)
+        dest.store
+            .park(envelope, crate::store::no_holds(), release_at)
     }
 
     /// The per-entry gate every prepaid entry passes, and the envelope it mints.
@@ -253,6 +254,7 @@ impl Messenger {
             urgency,
             envelope_type: dest.scheme,
             transport: None,
+            attachments: Default::default(),
         }
     }
 }

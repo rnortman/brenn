@@ -169,6 +169,21 @@ whole envelope and needs nothing. Attach v5 carries the header as an open
 object too, so the key crosses it with no protocol version bump. `transport`
 took this route through the shared part.
 
+A key not every shape carries takes the second form: it is not written in the
+shared part but by a method of the shape trait, `EnvelopeShape`, which each
+shape implements, so each shape states what it writes. `attachments` took this
+route. It is a map, empty rather than `Option` when unset, and each writer
+skips it when empty, so an envelope without attachments is still
+byte-identical in every shape. `HeaderShape` writes each attachment's full
+reference (`{"photo": {"id": …, "size": N, "content_type": "…"}}`), the
+conversation's shape writes `size` and `content_type` without the id, and the
+text shape — 0.1.0's `envelope-json` and attach v4 — writes nothing, and its
+reader does not hold the field. A 0.2.0 component sees the key in
+`bus.envelope.header` under the growth rule above; nothing a component can
+call yet redeems a reference, and a component's `ports.publish` carries no
+attachments, so republishing a message it was handed drops them
+(`docs/message-bus.md` §2.1.2a).
+
 The limits a host applies — body caps, budgets, depths — are host and operator
 policy, not part of this promise; the refusal a limit draws keeps its variant
 and its meaning.

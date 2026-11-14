@@ -3358,6 +3358,7 @@ mod tests {
             urgency: Urgency::Low,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
             transport: None,
+            attachments: Default::default(),
         };
         let messages = vec![envelope];
         let resp = super::BrennPendingListResponse {
@@ -4519,6 +4520,7 @@ mod tests {
             urgency: brenn_lib::messaging::Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
             transport: None,
+            attachments: Default::default(),
         }
     }
 

@@ -32,6 +32,8 @@
 //!   and `PublishBatchResult`.
 //! - `deliver`: a binary template for a one-row `Deliver` on an `ephemeral:`
 //!   channel.
+//! - `deliver_attached`: the same row naming two attachments, and
+//!   `attached`, those attachments as the header writes them.
 //! - `deferred_views`: binary templates for a `DeferredView`, the one at index
 //!   `n` holding `n` entries, so the rig restates a parked set of any size up
 //!   to [`MAX_VIEW_ENTRIES`] without knowing the frame's shape.
@@ -48,8 +50,8 @@ use brenn_attach_proto::{
     PublishBatchOutcome, PublishOutcome, ServerFrame, SubscribeOutcome, Urgency, VersionRange,
     WireMessage,
 };
-use brenn_envelope::MessageBody;
 use brenn_envelope::grants::ProcessorContract;
+use brenn_envelope::{AttachmentName, Attachments, BlobId, BlobRef, MessageBody};
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::{ComponentGrant, SURFACE_ATTACH_VERSION};
 use serde_json::{Value, json};
@@ -586,6 +588,55 @@ fn deliver_template() -> Value {
     )
 }
 
+/// The attachments the `deliver_attached` template's row names.
+fn rig_attachments() -> Attachments {
+    let named = |name: &str, id: &str, size: u64, content_type: &str| {
+        (
+            AttachmentName::new(name).expect("a rig attachment name"),
+            BlobRef {
+                id: BlobId::new(id.to_string()),
+                size,
+                content_type: content_type.to_string(),
+            },
+        )
+    };
+    Attachments::from_map(
+        [
+            named(
+                "photo",
+                "5f0c0000000000000000000000000001",
+                102_400,
+                "image/jpeg",
+            ),
+            named(
+                "notes.txt",
+                "5f0c0000000000000000000000000002",
+                12,
+                "text/plain",
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+/// The one-row `Deliver` template whose row names [`rig_attachments`].
+fn deliver_attached_template() -> Value {
+    let body = MessageBody::from_parts(Some(BODY_TYPE), b"slot").expect("a typed body");
+    let mut frame = one_row_deliver(
+        &text(CHANNEL),
+        body,
+        number(SEQ),
+        &text(CURSOR),
+        Uuid::parse_str(&text(MESSAGE_ID)).expect("the sentinel is a UUID"),
+    );
+    let ServerFrame::Deliver { rows, .. } = &mut frame else {
+        unreachable!("one_row_deliver builds a Deliver");
+    };
+    rows[0].envelope.attachments = rig_attachments();
+    binary_template(&frame, &[CHANNEL, SEQ, CURSOR, MESSAGE_ID])
+}
+
 /// One `Deliver` the codec encoded, with the values and body that produced
 /// it, for the rig to rebuild from [`deliver_template`] and compare.
 fn deliver_sample(channel: &str, body: MessageBody, seq: u64, cursor: &str, id: Uuid) -> Value {
@@ -833,6 +884,8 @@ pub fn kit() -> Value {
         },
         "answers": answers(),
         "deliver": deliver_template(),
+        "deliver_attached": deliver_attached_template(),
+        "attached": serde_json::to_value(rig_attachments()).expect("attachments serialize"),
         "deferred_views": deferred_view_templates(),
         "server_samples": server_samples(),
         "client_samples": client_samples(),
@@ -1094,6 +1147,35 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&r.cursor).expect("serializes"),
             json!("k5")
+        );
+    }
+
+    #[test]
+    fn the_attached_deliver_template_carries_the_kits_attachments() {
+        let kit = kit();
+        let body = MessageBody::from_parts(Some("text/csv"), b"a,b").expect("typed");
+        let filled = fill_binary(
+            &kit["deliver_attached"],
+            &[
+                ("channel", json!(FEED_CHANNEL)),
+                ("seq", json!(6)),
+                ("cursor", json!("k6")),
+                ("message_id", json!(Uuid::from_u128(0x99).to_string())),
+            ],
+            std::slice::from_ref(&body),
+        );
+        let ServerFrame::Deliver { rows, .. } = filled else {
+            panic!("the attached deliver template is a Deliver");
+        };
+        assert_eq!(rows[0].envelope.attachments, rig_attachments());
+        assert_eq!(rows[0].envelope.body, body);
+        assert_eq!(
+            kit["attached"]["photo"],
+            json!({
+                "id": "5f0c0000000000000000000000000001",
+                "size": 102_400,
+                "content_type": "image/jpeg",
+            })
         );
     }
 

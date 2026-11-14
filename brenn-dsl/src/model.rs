@@ -2009,6 +2009,9 @@ vocabulary! {
         opt default_wake_min: Word,
         opt archive_path: V,
         opt default_send_rate: V,
+        opt max_blob_bytes: V,
+        opt blob_budget_bytes: V,
+        opt blob_dir: V,
     }
 
     /// The `observability` section. The usage sub-section is a `usage`

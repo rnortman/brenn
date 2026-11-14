@@ -784,6 +784,8 @@ pub async fn build_two_channel_setup(
 #[cfg(test)]
 mod alerter;
 #[cfg(test)]
+mod attachments;
+#[cfg(test)]
 mod body_kinds;
 #[cfg(test)]
 mod fanout;

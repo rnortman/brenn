@@ -129,6 +129,10 @@ impl Messenger {
             );
         }
 
+        // 3. The withdrawn row's blobs: the delete released its references, and
+        //    the reap takes the lock released above.
+        self.reap_blobs().await;
+
         // 4. Kick the dispatcher — the cancel may have been the earliest parked
         //    message in the release timer.
         self.dispatch_kick();
@@ -622,6 +626,56 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(100), kick_notified)
             .await
             .expect("dispatch_kick not fired");
+    }
+
+    /// The withdrawal releases the parked row's blob references and the cancel
+    /// reaps them: a blob only the withdrawn message named is gone when the
+    /// cancel returns.
+    #[tokio::test]
+    async fn cancel_deletes_the_blob_only_the_withdrawn_message_named() {
+        let (m, _, _, _, _) = build_messenger(0).await;
+        let (m, blobs) = crate::testutils::install_blob_store(m).await;
+        let photo = crate::testutils::seal_blob(&m, b"withdrawn");
+        let id = photo.id().clone();
+        let entry = m
+            .directory()
+            .resolve(&canonical_address("pa-alice"))
+            .unwrap();
+        let parked = m
+            .store_for(&entry)
+            .park(
+                crate::store::NewMessage {
+                    source: "test-source".to_string(),
+                    sender: "app:pa-bob@test-source".to_string(),
+                    body: "with a photo".into(),
+                    urgency: crate::Urgency::Normal,
+                    envelope_type: ChannelScheme::Brenn,
+                    reply_to: None,
+                    delivery_deadline: None,
+                    impetus: None,
+                    publish_ts_ns: db::utc_to_ns(Utc::now()),
+                    attachments: brenn_messaging_store::blob::HeldAttachments::new([(
+                        crate::AttachmentName::new("photo").unwrap(),
+                        photo,
+                    )])
+                    .unwrap(),
+                },
+                Utc::now() + chrono::Duration::seconds(3600),
+            )
+            .await
+            .expect("park");
+        assert!(blobs.holds_file(&id));
+
+        let result = m.cancel("pa-bob", parked.message_uuid).await;
+        assert!(
+            matches!(result, CancelResult::Ok { .. }),
+            "expected Ok, got {result:?}"
+        );
+        assert!(!blobs.holds_file(&id));
+        assert!(matches!(
+            m.retain_blob(&id).await,
+            Err(brenn_messaging_store::blob::BlobError::NotFound)
+        ));
     }
 
     /// A refused cancel changes nothing: the message it named is in retention and

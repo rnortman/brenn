@@ -765,6 +765,38 @@ either noise it will misread or an injection channel nobody reviewed, and a
 lossy decoding is both. A path that puts a non-text body's bytes, or any
 encoding of them, in front of a model is a finding.
 
+### 7.6 The blob store and attachments
+
+A message may name blobs — immutable byte objects in the host's blob store —
+by reference (`docs/message-bus.md` §2.1.2a).
+
+- **Only host code writes the store.** No component, remote, page or
+  conversation can create a blob or read one's bytes: the one publish entry
+  that accepts attachments, `Messenger::publish_from_system_with_attachments`,
+  and the one redemption entry, `Messenger::retain_blob`, are host APIs, and
+  no production code calls either yet. Every later door that admits an
+  outside producer or reader is a boundary change to review here.
+- **A bounded shared resource.** The store is one pool for every producer,
+  bounded by `max_blob_bytes` per blob and `blob_budget_bytes` in total, both
+  charged on a blob's extent before any byte is written, so a sparse write
+  far out pays for everything below it. Over either bound a write is refused;
+  nothing is evicted and nothing waits. A blob stays charged until its file
+  is unlinked, which bounds the disk a pending reap holds.
+- **The id is an unguessable capability nobody outside the host can
+  redeem.** 128 random bits, not derived from content. Redemption also
+  requires that the blob still has a holder; an id whose holders are gone is
+  refused even while its file awaits the reap. A conversation is shown each
+  attachment's name, size and content type, never its id and never its
+  bytes (§7.5's reason applies). Who may redeem an id they were shown, when an outside reader is
+  admitted, is decided with that door.
+- **The attachment name is the bound on producer text a conversation sees.**
+  1 to 64 bytes of `[A-Za-z0-9._-]`, starting alphanumeric, refused at
+  construction: no whitespace, no markup, no control characters.
+- **The directory.** Created mode 0700 if absent; each blob file is created
+  exclusively with mode 0600. At boot the store refuses to start on a
+  directory entry it does not recognise as a blob file, rather than sweeping
+  something it did not create.
+
 ---
 
 ## 8. Boundary B4/B5 — WASM Guests

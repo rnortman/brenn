@@ -56,6 +56,9 @@ pub(crate) use body_column::{body_columns, read_body};
 mod transport_column;
 pub(crate) use transport_column::{read_transport, transport_column};
 
+mod attachments_column;
+pub(crate) use attachments_column::{attachments_column, parse_attachments, read_attachments};
+
 mod types;
 pub use types::PendingPushRow;
 

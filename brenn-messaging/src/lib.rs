@@ -37,6 +37,9 @@ pub mod system;
 #[cfg(any(test, feature = "testutils"))]
 pub mod testutils;
 
+#[cfg(test)]
+mod blob_cycle;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -58,6 +61,7 @@ pub use brenn_lib::messaging::*;
 // The persistence layer below, bound at the crate root so the engine's modules
 // reach it as `crate::db`, `crate::store`, `crate::ingress`. Not re-exported:
 // crates above name `brenn_messaging_store` themselves.
+use brenn_messaging_store::blob::{BlobError, BlobHold, BlobStore, ReapReport, Retain};
 use brenn_messaging_store::{db, ingress, store};
 pub use edit::{CancelResult, EditFields, EditResult};
 pub use ingress::{
@@ -738,6 +742,10 @@ pub struct Messenger {
     /// a durable channel's messages sit in the database, but its store is still
     /// constructed once per channel and reused.
     ring_stores: Arc<store::RingStores>,
+    /// The blob store attachments name, or `None` on a `Messenger` built
+    /// without one, where no blob can be redeemed and a reap does nothing.
+    /// Boot installs it via [`Messenger::with_blob_store`].
+    blob_store: Option<Arc<BlobStore>>,
     /// The last roster snapshot published per app slug — the dedupe behind
     /// [`Messenger::publish_chat_roster`].
     ///
@@ -1068,6 +1076,7 @@ impl Messenger {
             store_incarnation,
             pending_bus_pushes_scan_count: AtomicU64::new(0),
             ring_stores,
+            blob_store: None,
             chat_roster_published: tokio::sync::Mutex::new(HashMap::new()),
             llm_chat: brenn_lib::config::LlmChatConfig::default(),
             system_channel_tuning: config::SystemChannelTuning::default(),
@@ -1354,6 +1363,58 @@ impl Messenger {
         &self.ring_stores
     }
 
+    /// Install the blob store before the `Messenger` is shared. Same
+    /// once-at-boot contract as [`Messenger::with_ring_stores`].
+    pub fn with_blob_store(mut self: Arc<Self>, blobs: Arc<BlobStore>) -> Arc<Self> {
+        let inner = Arc::get_mut(&mut self).expect(
+            "with_blob_store must run before the Messenger Arc is shared (boot-ordering bug)",
+        );
+        inner.blob_store = Some(blobs);
+        self
+    }
+
+    /// The blob store, if one is installed.
+    pub fn blob_store(&self) -> Option<&Arc<BlobStore>> {
+        self.blob_store.as_ref()
+    }
+
+    /// Take a hold on the blob `id` names, if anything holds it now: an
+    /// in-memory hold or a durable row naming it. `NotFound` otherwise,
+    /// including for an unsealed blob and on a `Messenger` with no blob store.
+    ///
+    /// Answers whether the blob is held by anything, never whether the caller
+    /// may name it.
+    ///
+    /// A blob some in-memory hold already holds is answered from the store's
+    /// index alone; the database lock is taken only when the index cannot
+    /// settle it.
+    pub async fn retain_blob(&self, id: &BlobId) -> Result<BlobHold, BlobError> {
+        let Some(blobs) = &self.blob_store else {
+            return Err(BlobError::NotFound);
+        };
+        match blobs.retain(id) {
+            Retain::Held(hold) => Ok(hold),
+            Retain::NotFound => Err(BlobError::NotFound),
+            Retain::Unsettled => {
+                let conn = self.db.lock().await;
+                blobs.retain_settled(id, &conn)
+            }
+        }
+    }
+
+    /// Delete every blob nothing holds any longer, under the database lock.
+    /// Does nothing on a `Messenger` with no blob store.
+    ///
+    /// Takes the database lock itself, so the caller must not hold the
+    /// connection, and must not have a transaction open on it.
+    pub async fn reap_blobs(&self) -> ReapReport {
+        let Some(blobs) = &self.blob_store else {
+            return ReapReport::default();
+        };
+        let conn = self.db.lock().await;
+        blobs.reap(&conn)
+    }
+
     /// Install the operator's `[llm_chat]` section before the `Messenger` is
     /// shared, replacing the defaults from `new`. Same once-at-boot contract as
     /// [`Messenger::with_ring_stores`].
@@ -1525,11 +1586,16 @@ impl Messenger {
         now: DateTime<Utc>,
     ) -> Option<store::DeferralOutcome> {
         let entry = self.directory.resolve(channel_address)?;
-        Some(
-            self.store_for(&entry)
-                .cancel_deferred(sender, message_uuid, now)
-                .await,
-        )
+        let outcome = self
+            .store_for(&entry)
+            .cancel_deferred(sender, message_uuid, now)
+            .await;
+        // A durable cancel deletes the row and releases its blob references;
+        // the reap takes the lock, so the store must not hold it on return.
+        if outcome == store::DeferralOutcome::Applied && entry.capabilities().durable {
+            self.reap_blobs().await;
+        }
+        Some(outcome)
     }
 
     /// Edit one of `sender`'s parked messages on `channel_address`, named by its
@@ -4317,6 +4383,7 @@ mod tests {
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
             };
             async move {
                 store
@@ -4458,6 +4525,7 @@ mod tests {
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
             };
             async move {
                 store
@@ -4537,6 +4605,7 @@ mod tests {
                         delivery_deadline: None,
                         impetus: None,
                         publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+                        attachments: brenn_messaging_store::blob::HeldAttachments::none(),
                     },
                     now + Duration::seconds(offset),
                 )
@@ -4597,6 +4666,7 @@ mod tests {
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
             };
             async move {
                 store
@@ -5026,6 +5096,7 @@ mod tests {
                     delivery_deadline: None,
                     impetus: None,
                     publish_ts_ns: park_ts,
+                    attachments: brenn_messaging_store::blob::HeldAttachments::none(),
                 },
                 release_at,
             )
@@ -5792,11 +5863,10 @@ mod tests {
         assert!(router.wakes.lock().unwrap().is_empty());
 
         // A publish leaves the subscriber owed → woken with its Wasm key.
-        messenger.ring_store_for(&channel).append(ring_envelope(
-            &channel.address,
-            ChannelScheme::Ephemeral,
-            "hi",
-        ));
+        messenger.ring_store_for(&channel).append(
+            ring_envelope(&channel.address, ChannelScheme::Ephemeral, "hi"),
+            crate::store::no_holds(),
+        );
         messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             *router.wakes.lock().unwrap(),
@@ -5839,11 +5909,10 @@ mod tests {
 
         crate::testutils::insert_bus_message(&messenger, &durable, "owed", ChannelScheme::Brenn)
             .await;
-        messenger.ring_store_for(&ring).append(ring_envelope(
-            &ring.address,
-            ChannelScheme::Local,
-            "owed",
-        ));
+        messenger.ring_store_for(&ring).append(
+            ring_envelope(&ring.address, ChannelScheme::Local, "owed"),
+            crate::store::no_holds(),
+        );
 
         messenger.wake_owed_subscribers(Utc::now()).await;
         let mut woken = router.wakes.lock().unwrap().clone();
@@ -6168,6 +6237,7 @@ mod tests {
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: crate::db::utc_to_ns(Utc::now()),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
             })
             .await;
     }
@@ -6195,6 +6265,7 @@ mod tests {
                 delivery_deadline: Some(deadline),
                 impetus: None,
                 publish_ts_ns: crate::db::utc_to_ns(Utc::now()),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
             })
             .await;
     }
@@ -6464,6 +6535,7 @@ mod tests {
                     delivery_deadline: Some(deadline),
                     impetus: None,
                     publish_ts_ns: crate::db::utc_to_ns(now),
+                    attachments: brenn_messaging_store::blob::HeldAttachments::none(),
                 },
                 now - chrono::Duration::seconds(30),
             )
@@ -6775,11 +6847,10 @@ mod tests {
             )
             .await;
 
-        messenger.ring_store_for(&channel).append(ring_envelope(
-            &channel.address,
-            ChannelScheme::Ephemeral,
-            "hi",
-        ));
+        messenger.ring_store_for(&channel).append(
+            ring_envelope(&channel.address, ChannelScheme::Ephemeral, "hi"),
+            crate::store::no_holds(),
+        );
         messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             *router.wakes.lock().unwrap(),
@@ -6861,11 +6932,10 @@ mod tests {
         let wasm_sub = ParticipantId::for_wasm("waker");
         messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4);
 
-        messenger.ring_store_for(&channel).append(ring_envelope(
-            &channel.address,
-            ChannelScheme::Ephemeral,
-            "quiet",
-        ));
+        messenger.ring_store_for(&channel).append(
+            ring_envelope(&channel.address, ChannelScheme::Ephemeral, "quiet"),
+            crate::store::no_holds(),
+        );
         messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             *router.wakes.lock().unwrap(),
@@ -6880,11 +6950,10 @@ mod tests {
             crate::testutils::ephemeral_channel_entry("detach-ch", 8),
         );
         messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4);
-        messenger.ring_store_for(&channel).append(ring_envelope(
-            &channel.address,
-            ChannelScheme::Ephemeral,
-            "a",
-        ));
+        messenger.ring_store_for(&channel).append(
+            ring_envelope(&channel.address, ChannelScheme::Ephemeral, "a"),
+            crate::store::no_holds(),
+        );
         assert!(messenger.ring_store_for(&channel).is_attached(&wasm_sub));
 
         // Plant the ladder's metered tally for this subscriber.
@@ -6963,6 +7032,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type: scheme,
             transport: None,
+            attachments: Default::default(),
         }
     }
 
@@ -7012,7 +7082,7 @@ mod tests {
                 let env =
                     ring_envelope(&channel.address, ChannelScheme::Ephemeral, &format!("m{i}"));
                 let mid = env.message_id;
-                store.append(env);
+                store.append(env, crate::store::no_holds());
                 mid
             })
             .collect();
@@ -7077,7 +7147,9 @@ mod tests {
         // consumed no ring state.
         let env = ring_envelope(&channel.address, ChannelScheme::Local, "late");
         let mid = env.message_id;
-        messenger.ring_store_for(&channel).append(env);
+        messenger
+            .ring_store_for(&channel)
+            .append(env, crate::store::no_holds());
         let (_wake, snap) = messenger
             .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
@@ -7106,11 +7178,10 @@ mod tests {
         // the cursor takes them → two accountable drops.
         let store = messenger.ring_store_for(&channel);
         for i in 0..4 {
-            store.append(ring_envelope(
-                &channel.address,
-                ChannelScheme::Ephemeral,
-                &format!("d{i}"),
-            ));
+            store.append(
+                ring_envelope(&channel.address, ChannelScheme::Ephemeral, &format!("d{i}")),
+                crate::store::no_holds(),
+            );
         }
 
         let inputs = vec![ring_input(&channel, Depth::Bounded(8), Depth::Bounded(2))];
@@ -7243,11 +7314,10 @@ mod tests {
         messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 1);
         let store = messenger.ring_store_for(&channel);
         for i in 0..3 {
-            store.append(ring_envelope(
-                &channel.address,
-                ChannelScheme::Ephemeral,
-                &format!("n{i}"),
-            ));
+            store.append(
+                ring_envelope(&channel.address, ChannelScheme::Ephemeral, &format!("n{i}")),
+                crate::store::no_holds(),
+            );
         }
         // A bare trigger port: retain_depth 0, so the two the push clamp skips are
         // outside the window entirely and the advance reports them.
@@ -7449,6 +7519,7 @@ mod tests {
             delivery_deadline: None,
             impetus: None,
             publish_ts_ns: db::utc_to_ns(Utc::now()),
+            attachments: brenn_messaging_store::blob::HeldAttachments::none(),
         }
     }
 
@@ -7844,7 +7915,9 @@ mod tests {
         messenger.attach_ring_subscriber(&ring.uuid, &wasm_sub, 4);
         let ctx_env = ring_envelope(&ring.address, ChannelScheme::Ephemeral, "ring-ctx");
         let ctx_mid = ctx_env.message_id;
-        messenger.ring_store_for(&ring).append(ctx_env);
+        messenger
+            .ring_store_for(&ring)
+            .append(ctx_env, crate::store::no_holds());
         // Serve it so it becomes retained-only context, not owed.
         {
             let ring_store = messenger.ring_store_for(&ring);

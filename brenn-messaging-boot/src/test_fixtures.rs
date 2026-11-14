@@ -96,6 +96,7 @@ pub async fn boot_messaging_over_bridges(
     // Must match how boot lists users: every user seated before the boot
     // gets a location channel.
     let users = brenn_db::auth::user::list_usernames(&*db.lock().await);
+    let config = &with_scratch_blob_dir(config);
     build_messaging(
         config,
         db,
@@ -109,6 +110,31 @@ pub async fn boot_messaging_over_bridges(
         &users,
     )
     .await
+}
+
+/// `config` with `messaging { blob_dir }` set to a fresh [`scratch_blob_dir`]
+/// when it states none: a test document's database path is
+/// the default `/var/lib/brenn/brenn.db` while its database is in memory, and
+/// boot creates the blob directory.
+pub fn with_scratch_blob_dir(config: &BrennConfig) -> BrennConfig {
+    let mut config = config.clone();
+    if config.messaging.blob_dir.is_none() {
+        config.messaging.blob_dir = Some(scratch_blob_dir());
+    }
+    config
+}
+
+/// A path that no other boot uses, under the test's scratch space — the test
+/// runner's per-test `TEST_TMPDIR`, which the runner empties before each run,
+/// or the system temporary directory outside one. Boot creates it.
+///
+/// The boot keeps using the directory for as long as its messenger lives,
+/// which no fixture here outlives, so the runner's scratch space rather than a
+/// drop guard is what removes it.
+pub fn scratch_blob_dir() -> std::path::PathBuf {
+    let scratch =
+        std::env::var_os("TEST_TMPDIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    scratch.join(format!("brenn-boot-blobs-{}", uuid::Uuid::new_v4()))
 }
 
 /// A `WasmConsumerIoPortRaw` on `port` (`channel` absent ⇒ anonymous auto

@@ -148,8 +148,11 @@ export interface Page {
     readonly facts: KitPage;
     /** Deliver `lines` as one command on `instance`'s `in` channel, settle, and return the reports produced. */
     command(instance: string, ...lines: string[]): Promise<Report[]>;
-    /** Deliver `body` on `channel` — a string as untyped text — settle, and return the reports produced. */
-    deliver(channel: string, body: string | RigBody): Promise<Report[]>;
+    /**
+     * Deliver `body` on `channel` — a string as untyped text — settle, and return the reports produced.
+     * With `attached`, the row names the kit's `attached` attachments.
+     */
+    deliver(channel: string, body: string | RigBody, attached?: boolean): Promise<Report[]>;
     /** Every report `instance` has published, oldest first. */
     reports(instance: string): Report[];
     /** Every body the kernel published to the wire on `channel`, oldest first. */
@@ -365,9 +368,9 @@ export async function openPage(name: string): Promise<Page> {
             }
             return page.deliver(entry.command_channel, lines.join("\n"));
         },
-        async deliver(channel, body) {
+        async deliver(channel, body, attached = false) {
             const from = nextOrder();
-            peer.deliver(channel, body);
+            peer.deliver(channel, body, attached);
             await rigTimers.settle();
             return reportsSince(from);
         },

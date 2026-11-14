@@ -108,6 +108,9 @@ messaging {
   default_wake_min = normal;
   default_send_rate = { burst = 4, refill_interval_secs = 60, refill = 2 };
   archive_path = "/var/lib/brenn/archive";
+  max_blob_bytes = 67108864;
+  blob_budget_bytes = 1073741824;
+  blob_dir = "/var/lib/brenn/brenn.db.blobs";
 }
 
 observability {

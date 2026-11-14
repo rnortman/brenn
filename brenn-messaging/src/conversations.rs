@@ -1531,6 +1531,7 @@ mod tests {
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: utc_to_ns(chrono::Utc::now()),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
             })
             .await
             .committed

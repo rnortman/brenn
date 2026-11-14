@@ -1,3 +1,4 @@
+mod blob;
 mod body;
 mod bootstrap;
 mod budget;

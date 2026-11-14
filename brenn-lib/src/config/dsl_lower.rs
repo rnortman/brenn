@@ -1737,8 +1737,54 @@ fn global_default_noise(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option
     Some(noise)
 }
 
+/// The blob store's two bounds, each `defaults`' value when unstated.
+///
+/// Refuses a zero on either key and a per-blob cap above the budget, which
+/// would admit a blob the store could never hold. The span of a refusal is the
+/// stated key's, or the block's when the offending value is a default. A bound
+/// whose stated value is refused takes no part in the cap-against-budget check,
+/// so that check never quotes a default in place of what the operator wrote.
+fn blob_bounds(
+    body: &mut Body,
+    defaults: &MessagingGlobalConfig,
+    errors: &mut Vec<Diagnostic>,
+) -> (u64, u64) {
+    let mut bound = |key: &'static str, default: u64, errors: &mut Vec<Diagnostic>| {
+        let Some(value) = body.take(key) else {
+            return Some((default, body.at.clone()));
+        };
+        let span = value.span().clone();
+        match keep(expect_int::<u64>(value, key), errors) {
+            Some(0) => {
+                errors.push(Diagnostic::at(format!("`{key}` must be at least 1"), span));
+                None
+            }
+            Some(n) => Some((n, span)),
+            None => None,
+        }
+    };
+    let max_blob = bound("max_blob_bytes", defaults.max_blob_bytes, errors);
+    let budget = bound("blob_budget_bytes", defaults.blob_budget_bytes, errors);
+    if let (Some((max_blob, max_span)), Some((budget, _))) = (&max_blob, &budget)
+        && max_blob > budget
+    {
+        errors.push(Diagnostic::at(
+            format!(
+                "`max_blob_bytes` is {max_blob}, above `blob_budget_bytes` {budget}: no blob \
+                 that large could ever be stored"
+            ),
+            max_span.clone(),
+        ));
+    }
+    (
+        max_blob.map_or(defaults.max_blob_bytes, |(n, _)| n),
+        budget.map_or(defaults.blob_budget_bytes, |(n, _)| n),
+    )
+}
+
 fn messaging(body: &mut Body, errors: &mut Vec<Diagnostic>) -> MessagingGlobalConfig {
     let defaults = MessagingGlobalConfig::default();
+    let (max_blob_bytes, blob_budget_bytes) = blob_bounds(body, &defaults, errors);
     MessagingGlobalConfig {
         default_send_budget: body
             .int("default_send_budget", errors)
@@ -1757,6 +1803,9 @@ fn messaging(body: &mut Body, errors: &mut Vec<Diagnostic>) -> MessagingGlobalCo
         default_send_rate: body
             .send_rate("default_send_rate", errors)
             .unwrap_or(defaults.default_send_rate),
+        max_blob_bytes,
+        blob_budget_bytes,
+        blob_dir: body.path("blob_dir", errors),
     }
 }
 

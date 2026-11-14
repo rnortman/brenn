@@ -43,8 +43,10 @@ pub struct NoSuchDeferred(pub DeferredId);
 /// Parked messages are not in retention, so the retention bound does not apply
 /// to them and the set carries its own cap. The cap is channel-wide, shared
 /// across senders.
-// TODO(blob-attachment-host-sites): a parked message is not retained and is
-// never evicted; whatever keeps a blob alive counts this set's entries as holders.
+///
+/// A parked entry is not retained and is never evicted: a payload that owns
+/// resources keeps them while parked, and releases them when the entry is
+/// cancelled, replaced or dropped with the set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredSet<M> {
     /// Maximum parked messages, channel-wide. `None` is unbounded — meaningful

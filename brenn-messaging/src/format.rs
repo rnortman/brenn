@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde::ser::SerializeStruct;
 
 use super::{ChannelScheme, MessageEnvelope};
-use brenn_lib::messaging::{BodyShape, MessageBody};
+use brenn_lib::messaging::{Attachments, EnvelopeShape, MessageBody, write_attachment_metadata};
 
 /// Heading line that introduces the messaging sub-block in a wake drain.
 pub const MESSAGING_BATCH_HEADING: &str = "[Brenn messages]";
@@ -74,9 +74,12 @@ pub fn batch_heading(envelopes: &[MessageEnvelope]) -> &'static str {
 /// non-text body is never shown as bytes: `body` is the placeholder
 /// `{"binary":true,"content_type":…,"size":…}`, which no text body can forge
 /// because a text body is always a JSON string.
+///
+/// Each attachment is shown by name with its size and content type; the blob's
+/// id is not written.
 pub struct ConversationShape;
 
-impl BodyShape for ConversationShape {
+impl EnvelopeShape for ConversationShape {
     fn serialize_body<S: SerializeStruct>(body: &MessageBody, out: &mut S) -> Result<(), S::Error> {
         match body.as_text() {
             Some(text) => {
@@ -99,6 +102,13 @@ impl BodyShape for ConversationShape {
                 },
             ),
         }
+    }
+
+    fn serialize_attachments<S: SerializeStruct>(
+        attachments: &Attachments,
+        out: &mut S,
+    ) -> Result<(), S::Error> {
+        write_attachment_metadata(attachments, out)
     }
 }
 
@@ -181,6 +191,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Brenn,
             transport: None,
+            attachments: Default::default(),
         }
     }
 
@@ -376,5 +387,62 @@ mod tests {
             )),
             "{text}"
         );
+    }
+
+    fn with_attachments(body: MessageBody) -> MessageEnvelope {
+        use brenn_lib::messaging::{AttachmentName, Attachments, BlobId, BlobRef};
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            AttachmentName::new("photo").unwrap(),
+            BlobRef {
+                id: BlobId::new("5f0c".repeat(8)),
+                size: 102_400,
+                content_type: "image/jpeg".into(),
+            },
+        );
+        map.insert(
+            AttachmentName::new("notes.txt").unwrap(),
+            BlobRef {
+                id: BlobId::new("9e1d".repeat(8)),
+                size: 7,
+                content_type: "text/plain".into(),
+            },
+        );
+        MessageEnvelope {
+            attachments: Attachments::from_map(map),
+            ..fixed(body)
+        }
+    }
+
+    const ATTACHMENT_METADATA: &str = concat!(
+        r#""attachments":{"notes.txt":{"size":7,"content_type":"text/plain"},"#,
+        r#""photo":{"size":102400,"content_type":"image/jpeg"}}"#
+    );
+
+    /// A conversation is shown each attachment's name, size and content type,
+    /// last, and never the blob's id — in the single and the batch text.
+    #[test]
+    fn attachments_are_shown_by_name_size_and_content_type_without_the_id() {
+        let e = with_attachments(MessageBody::text("see attached"));
+        let tail = &FIXED_TAIL[..FIXED_TAIL.len() - 1];
+        let json = format!(r#"{FIXED_HEAD}"body":"see attached",{tail},{ATTACHMENT_METADATA}}}"#);
+        let single = format_messaging_event_single(&e);
+        assert_eq!(single, format!("{MESSAGING_SINGLE_HEADING}\n\n{json}"));
+        let batch = format_messaging_event_batch(&[e.clone(), e]).unwrap();
+        assert_eq!(
+            batch,
+            format!("{MESSAGING_BATCH_HEADING}\n\n[{json},{json}]")
+        );
+        for text in [&single, &batch] {
+            assert!(!text.contains("5f0c5f0c"), "{text}");
+            assert!(!text.contains("9e1d9e1d"), "{text}");
+        }
+    }
+
+    /// Without attachments the conversation text has no `attachments` key.
+    #[test]
+    fn no_attachments_writes_no_key() {
+        let text = format_messaging_event_single(&fixed(MessageBody::text("hi")));
+        assert!(!text.contains("attachments"), "{text}");
     }
 }

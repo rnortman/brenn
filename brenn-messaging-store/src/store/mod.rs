@@ -23,6 +23,8 @@ pub mod targets;
 
 #[cfg(test)]
 mod parity_tests;
+#[cfg(test)]
+mod ring_blob_tests;
 
 use std::sync::Arc;
 
@@ -46,7 +48,7 @@ use brenn_lib::messaging::config::Depth;
 
 pub use db::DbStore;
 pub use registry::RingStores;
-pub use ring::RingStore;
+pub use ring::{RingStore, no_holds};
 pub use targets::{AttachFeedTarget, TargetResolver};
 
 /// A resolved reply target, carried in both the representations a store may
@@ -85,6 +87,9 @@ pub struct NewMessage {
     /// verbatim on every scheme.
     pub impetus: Option<Impetus>,
     pub publish_ts_ns: i64,
+    /// The blobs the message names, each held until the store has taken its
+    /// own hold or durable reference.
+    pub attachments: crate::blob::HeldAttachments,
 }
 
 /// A store-assigned position, ascending within the store's lifetime. Comparable

@@ -9,6 +9,8 @@
 //!   slice at or below this crate in `run_slice_migrations`.
 //! - [`store`] — the retention stores a channel's messages live in between
 //!   publish and delivery, database-backed or in-memory, behind one contract.
+//! - [`blob`] — the blob store: immutable byte objects that messages name by
+//!   reference, and the holds that keep them.
 //! - [`ingress`] — the persistent shape of an ingress message and the
 //!   repo-sync collapsing helpers over it.
 //!
@@ -18,6 +20,7 @@
 //! The addressing and config vocabulary all three speak is
 //! `brenn_lib::messaging`, below.
 
+pub mod blob;
 pub mod db;
 pub mod ingress;
 pub mod store;

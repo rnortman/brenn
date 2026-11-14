@@ -2428,6 +2428,7 @@ mod tests {
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap(),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
             })
             .await;
         drain_commands(&bridge, &bus, &commands, &[]).await;

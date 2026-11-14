@@ -1746,12 +1746,40 @@ fn archive_line(body: brenn_lib::messaging::MessageBody) -> String {
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
         transport: None,
+        attachments: Default::default(),
     };
     serde_json::to_string(&envelope.shaped::<crate::db::bus::ArchiveShape>()).unwrap()
 }
 
 const ARCHIVE_HEAD: &str = r#"{"message_id":"00000000-0000-0000-0000-000000000000","source":"src","channel":"brenn:chan","sender":"alice","publish_ts":"2023-11-14T22:13:20Z","#;
 const ARCHIVE_TAIL: &str = r#""urgency":"normal","envelope_type":"brenn"}"#;
+
+/// The archive line records each attachment's full reference, last.
+#[test]
+fn archive_shape_records_attachment_references() {
+    use brenn_lib::messaging::{AttachmentName, Attachments, BlobId, BlobRef};
+    let id = "0123456789abcdef".repeat(2);
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(
+        AttachmentName::new("photo").unwrap(),
+        BlobRef {
+            id: BlobId::new(id.clone()),
+            size: 102_400,
+            content_type: "image/jpeg".to_string(),
+        },
+    );
+    let mut envelope: brenn_lib::messaging::MessageEnvelope =
+        serde_json::from_str(&format!(r#"{ARCHIVE_HEAD}"body":"hi",{ARCHIVE_TAIL}"#)).unwrap();
+    envelope.attachments = Attachments::from_map(map);
+    let line = serde_json::to_string(&envelope.shaped::<crate::db::bus::ArchiveShape>()).unwrap();
+    let tail = &ARCHIVE_TAIL[..ARCHIVE_TAIL.len() - 1];
+    assert_eq!(
+        line,
+        format!(
+            r#"{ARCHIVE_HEAD}"body":"hi",{tail},"attachments":{{"photo":{{"id":"{id}","size":102400,"content_type":"image/jpeg"}}}}}}"#
+        )
+    );
+}
 
 #[test]
 fn archive_shape_of_an_untyped_text_body_is_the_text_shape() {

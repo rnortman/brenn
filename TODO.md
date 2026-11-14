@@ -279,45 +279,18 @@ the texts say which release dropped it. Code sites
 
 ## `blob-attachment-host-sites`
 
-Four facts about the host that the design of blobs attached to bus messages
-must deal with. `brenn:processor@0.2.0` publishes two growth rules to
-component authors — the delivery header gains keys, and a new interface may
-act on the ports a component already has — and each fact is a place where the
-host makes one of them, or a blob's lifetime, easy to get wrong.
-(1) A parked message, one published with a future `deliver_after`, is outside
-the retained window: a `DeferredSet` entry beside the ring on a non-durable
-channel, a row whose `retained_seq` is NULL on a durable one. Eviction never
-takes it; it leaves only by cancel or release. Whatever keeps a blob alive
-must therefore count parked messages as holders beside retained ones; a rule
-that counts retained messages only deletes the blobs of a message not yet
-delivered.
-(2) An attachment-carrying publish made through a new interface must be
-pushed into the same per-activation publish buffer as `ports.publish` —
-`ProcessorData::publish_buffer` on the backend, `PublishBuffer::entries` on
-the page — and not into a buffer of its own that is merged at flush. The
-contract promises the flush in call order, and a second buffer loses the
-order between the two interfaces: async tool requests are kept in one today
-and are appended after every port publish.
-(3) A key written in the shared part of the envelope serializer
-(`ShapedEnvelope::serialize`) is written in every shape: the 0.2.0 header, and
-also the 0.1.0 `envelope-json`, attach v4 frames, what a conversation is shown
-and the eviction archive. `HeaderShape::serialize_body` is the header-only
-position, for a key the other shapes must not carry; it is handed the body
-alone today.
-(4) The page does not pass a delivered header through. Attach v5 reads it into
-the typed `EnvelopeHeader`, the page rebuilds a `MessageEnvelope` from that,
-and the guest's header is serialized from the rebuilt envelope. A header key
-`EnvelopeHeader` does not hold is tolerated on read and dropped before the
-guest sees it, so the struct is extended in the same change that first writes
-the key. A remote daemon built at an older `brenn-attach-client` pin drops it
-whatever the page does (`attach-v4-beside-v5`, question 2).
-Done when the blob design states what it does about each of the four and the
-six `TODO(blob-attachment-host-sites)` comments are gone. Code sites:
-`DeferredSet` in `brenn-queue/src/deferred.rs` and the eviction `DELETE` in
-`brenn-messaging-store/src/db/bus.rs` (1); `take_ok_publishes` in
+An attachment-carrying publish made through a new interface — the slice that
+adds the `blobs` WIT interface — must be pushed into the same per-activation
+publish buffer as `ports.publish`: `ProcessorData::publish_buffer` on the
+backend, `PublishBuffer::entries` on the page, and not a buffer of its own that
+is merged at flush. The contract promises the flush in call order, and a
+second buffer loses the order between the two interfaces: async tool requests
+are kept in one today and are appended after every port publish. Done = that
+slice pushes its attachment-carrying publishes into the one buffer on both
+hosts, with a test of the order across the two interfaces on each. Code sites
+(`TODO(blob-attachment-host-sites)`): `take_ok_publishes` in
 `brenn-wasm/src/lib.rs` and `PublishBuffer::entries` in
-`surface/kernel/src/publish_buffer.rs` (2); `ShapedEnvelope::serialize` (3)
-and `EnvelopeHeader` (4) in `brenn-envelope/src/shape.rs`.
+`surface/kernel/src/publish_buffer.rs`.
 
 ## `blob-handle-integrity`
 
@@ -354,28 +327,6 @@ through their context, more likely; e.g. the brenn-tool CLI they have could
 stream it to disk) for later use." (Sizing spike report §1 Q4.3 and §5 OQ2;
 the owner's notes after cycle 1.)
 
-## `blob-store-vs-no-state-store`
-
-Owner ruling needed before the blob store is designed: how a blob store sits
-beside `CLAUDE.md`'s "There is no separate state store, KV API, or config
-layer. Do not add one." The owner has since asked for blobs as a general
-mechanism (camera frames, drive files, component bundles, UI uploads), so the
-store is to be built; what is open is its boundary. The sizing spike's
-reading: a blob exists only as an attachment of a retained message and lives
-and dies with message retention, with no state of its own. That reading does
-not say what holds the blobs of a parked message, which is not retained
-(`blob-attachment-host-sites`). The owner's words
-that bear on it, from the handle lifetime rule in the notes after cycle 1: a
-handle is usable only if it "must currently exist in the retained buffer of
-one of the channels that it has access to", and "An LLM typically would not
-hold on to one of these for long". That bounds the use of a blob reference by
-message retention, which is what the spike's reading assumes; it does not say
-in so many words when the bytes are deleted. Options: confirm the spike's
-reading, which the owner's handle rule fits, and have `CLAUDE.md` say so; or
-state a different boundary, for example blobs that outlive the messages naming
-them, which under the handle rule as written no handle could reach. (Sizing
-spike report §5 OQ4; the owner's notes after cycle 1.)
-
 ## `llm-sees-binary-content`
 
 Owner ruling needed before the blob conversation/tool slice is designed:
@@ -405,6 +356,73 @@ interface designs say what they would cost to extend to in-place mutation, and
 name any choice that forecloses it with what it buys; and decide whether
 in-place mutable blobs are built at all. Done = the owner rules build or
 never, after the immutable design exists. (The owner's notes after cycle 1.)
+The store's half of the first is written: the rustdoc of the `blob` module in
+`brenn-messaging-store/src/blob/mod.rs` and the blob section of
+`docs/message-bus.md` (§2.1.2a) state the cost of extending the store, and no
+store choice forecloses mutation. Three lean on immutability and are named
+there: `size` and `content_type` copied into every reference, bytes synced
+once when a durable row first names them, and reads that take no lock. The
+`blobs` interface's half of the first, and the build-or-never ruling, remain.
+
+## `correctness-boot-blob-sweep-deletes-files-in-a-directory-it-does-not-own`
+
+The blob store's open sweep (`BlobStore::open`,
+`brenn-messaging-store/src/blob/durable.rs`) unlinks every blob file its
+database does not name. An exclusive `flock` on the directory refuses a second
+store while another holds it, but nothing ties the directory to the database
+it belongs to: a host whose `blob_dir` names another host's directory, booted
+while that host is down, deletes the other host's blob files without error, and
+the other host then refuses to start for every message naming them. Decide how
+the directory records its owner (for example the database's store generation in
+one marker entry the sweep admits by name) and what an operator does when the
+marker and the database disagree after a legitimate move or restore; that
+changes the rule that the directory holds nothing but blob files, adds a boot
+refusal, and changes the backup and restore paragraph of `docs/message-bus.md`
+and the operator changelog entry. Done = a store refuses to open a directory
+another database owns, and the restore of a database with its own directory
+still boots. This must land before the first release in which production code
+publishes an attachment onto a durable channel; until then no blob directory
+holds a file a sweep could wrongly delete.
+
+## `correctness-no-single-instance-guard-before-startup-side-effects`
+
+Nothing stops a second `brenn serve` from starting beside a running one on the
+same host and database: `run_server` (`brenn-bootstrap/src/lib.rs`) never checks
+for another instance. Before anything refuses it, the second process does the
+following, in this order. It overwrites the running instance's PID file when
+`server.pid_file` is set (`write_pid_file` writes and renames without reading).
+It pulls each hooked app's `auto_pull` mounts and runs its startup hooks
+(`apps::run_startup_hooks`). When any app uses `container_spawn` it
+force-removes every `brenn-managed` container of the Unix user, running ones
+included (`cleanup::cleanup_stale_containers`), which are the running
+instance's conversation containers; that function's comment states one
+instance per Unix user as a standing constraint, and no code enforces it. It
+opens the database and runs migrations (`init_db`). It closes every open usage
+session, those the running instance is still writing included
+(`close_open_sessions_on_startup`). The PID file, the hooks and the container
+sweep precede the database open. That list is not the whole of startup. More
+runs after the session close and before the refusal, among it a spawned prune
+of usage data older than 90 days (`prune_usage_before`), the start of the
+repo-sync manager when sync-enabled clones are configured, which queues a
+cold-start poll for every remote (`repo_sync::start_repo_sync`), and a
+rewrite of every app's `virtual-tools.json` (`apps::write_virtual_tools`);
+trace `run_server` afresh when designing the guard. Two later steps can refuse
+the second process, and neither is guaranteed to: the blob directory's lock in
+`BlobStore::open`, only when messaging is configured and both processes resolve
+the same `blob_dir`; and the panic on `TcpListener::bind`, the last step of
+startup, only when both bind the same `server.bind_address`. A second process
+that passes both may run as a full server beside the first, on the same
+database. The blob directory's lock is not this guard: it covers the blob store only, is
+taken after every step named above, and is not taken at all without a
+messaging configuration. `brenn invite` and `brenn-cli device` open and write
+the same database while the server runs, by design, so the guard is `serve`'s
+alone. Decide what the guard is keyed on — the database, the Unix user the
+container sweep already assumes, or both — and what holds it. Done = a second
+`brenn serve` against a database a running `brenn serve` holds refuses to start
+before it overwrites the PID file, runs a startup hook, removes a container or
+closes a usage session, with a test. The
+`TODO(correctness-no-single-instance-guard-before-startup-side-effects)`
+comment sits in `run_server`, above the PID file write.
 
 ## `kit-payload-reader-cannot-read-304`
 
@@ -1449,6 +1467,22 @@ the changed set.
 Code site (`TODO(chrome-stale-sections-on-shrink)`):
 `surface/chrome/src/logic.rs` (`ChromeCore::on_surface_state`).
 
+## `ingress-oversize-payload-as-blob`
+
+A raw (`non_text`) MQTT or webhook ingress channel refuses a payload larger
+than a bus body may be (`messaging.max_body_bytes`; a raw webhook endpoint's
+`transport_ceiling_bytes` lies within it), and the design that built the raw
+shape left such payloads to blobs. The blob store and message attachments now
+exist in the host, and no transport adaptor uses them. Decide whether an
+oversize payload on a raw ingress channel is published as a message whose
+attachment is the payload — under what opt-in, with what body, and against
+which bound, since an unauthenticated or merely signed sender then writes to
+the blob store's global budget — or stays refused. Done = the decision
+recorded here and, if built, a webhook and an MQTT test carrying a payload
+larger than `max_body_bytes` to a component as an attachment reference. Code
+site (`TODO(ingress-oversize-payload-as-blob)`): the size refusal in
+`Messenger::publish_transport_ingress` (`brenn-messaging/src/publish/mod.rs`).
+
 ## `ingress-retirement`
 
 **Urgency: near-term — user wants this tackled tomorrow afternoon.**
@@ -2179,8 +2213,10 @@ because no conversation-deletion path exists in the tree yet. Whoever builds
 conversation deletion has to call it in the deletion's own transaction; a delete
 that does not will leak a directory entry, two channel rows, the whole retained
 record, and a cursor row per deleted conversation, with nothing failing to say
-so. Done when conversation deletion tears the chat family down with the
-conversation.
+so. The deletion path follows its commit with `Messenger::reap_blobs`, outside the
+database lock, so the torn-down channels' blobs are deleted then and not at the
+next hourly pass. Done when conversation deletion tears the chat family down with
+the conversation.
 
 Code site (`TODO(chat-deletion-teardown)`):
 `brenn-messaging/src/chat_provision.rs`, on

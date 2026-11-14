@@ -257,6 +257,124 @@ refused (webhook) when it fails it. What still cannot:
 a 0.1.0 component, a remote's attach v4 session, a conversation and every host
 door that takes a string; every body they produce is untyped text.
 
+### 2.1.2a Blobs: bytes a message names
+
+A body is capped at `max_body_bytes` because it is copied into every
+subscriber's window and held in rings. A large object — a photo, a recording,
+a file — rides beside the body instead, as a **blob**: an immutable run of
+bytes in the host's blob store, which a message names by reference. The store
+is in `brenn-messaging-store/src/blob/`.
+
+**A blob is a message's attachment, not a store of its own.** It has no name,
+no listing and no lifetime of its own, and nothing looks one up except
+through a message or a hold. The lifetime rule:
+
+> A blob lives exactly as long as a message the host holds names it, or host
+> code holds it open. When nothing does, it is deleted.
+
+"Holds" means two kinds of holder, counted in two places:
+
+- **An in-memory hold.** Host code holds a blob from sealing it or from
+  redeeming a reference (`Messenger::retain_blob`). A ring channel's entry
+  (`ephemeral:`, `local:`) holds every blob its message names, retained or
+  parked, until the ring drops the entry — overflow, a depth-0 append, a park
+  refused at the cap, a cancel, an edit's overwrite, the channel removed at
+  reload. A copy of an envelope a reader was handed is **not** a holder.
+- **A durable row.** A row of a `brenn:` channel that names a blob is counted
+  in the database, in the transaction that inserts it, and uncounted by a
+  trigger in the transaction of whatever statement deletes it — eviction,
+  withdraw, cancel, chat teardown, an operator's `sqlite3`.
+
+"Deleted" has two moments. A blob stops being **redeemable** the instant its
+last holder lets go — for a durable row, when the deleting statement commits.
+Its **bytes** are unlinked at once if no durable row ever named it (every blob
+only ring messages named); otherwise by the next **reap**, which runs after
+`Messenger::cancel`, after a durable cancel through
+`cancel_deferred_if_present`, at the end of every hourly bus-GC pass, and at
+boot. Until then the file stays on disk and charged to the budget, and
+nothing can reach it. A removal site with no reap call after it only delays
+the unlink to the next hourly pass; which blobs are deleted is decided by the
+two counts, never by who called.
+
+**Attachments.** `MessageEnvelope.attachments` is a map from name to
+reference, empty on a message that has none, and the key is absent from
+every serialization when it is empty.
+
+- A **name** is 1 to 64 bytes, first `[A-Za-z0-9]`, then `[A-Za-z0-9._-]`.
+  It is producer-chosen text a conversation is shown, so the grammar is
+  narrow; a filename that does not fit belongs in the body, keyed by the
+  name.
+- At most **32 attachments** per message. Two names may name the same blob.
+- A **reference** is `{"id": …, "size": N, "content_type": "…"}`. The id is
+  32 lowercase hex characters minted from random bytes, not derived from
+  content, and opaque: a reader must not parse it. There is no digest.
+
+Which reader sees what:
+
+| Reader | `attachments` |
+|---|---|
+| Host code (`Messenger::query`, the stores) | the references |
+| 0.2.0 components (`bus.envelope` header), on the backend and on a page | the references, in full |
+| Attach v5 sessions (`Deliver`), a remote's and every page's, replayed and live | the references, in full |
+| A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, the intercept outcome) | each name with `size` and `content_type`; **no id** |
+| The eviction archive | the references, in full. The bytes are not archived: an archived message's attachments are not recoverable |
+| 0.1.0 components (`envelope-json`), attach v4 sessions | nothing; the envelope is byte-identical to one without attachments |
+
+**Nothing outside the host creates or redeems a blob yet.** The one entry
+point that publishes attachments is host code's
+`Messenger::publish_from_system_with_attachments`, and nothing in the server
+calls it yet; components, remotes, pages and conversations see references as
+metadata only. A remote's replay store and a page's rings do not hold the
+blob, so a reference there can outlive it. A 0.2.0 component that republishes
+a message it was handed sends the body without the attachments: the host
+assigns every envelope field, and a 0.2.0 publish carries a body.
+
+**Bounds.** Three keys in the `messaging` section (`docs/config-dsl.md`):
+`max_blob_bytes` caps one blob's extent (default 64 MiB), `blob_budget_bytes`
+caps the store's charged total (default 1 GiB), `blob_dir` is where the files
+live (default the database path with `.blobs` appended). A write over either
+bound is refused to the producer; nothing is evicted to make room and nothing
+waits. A blob is charged from its first write until its file is unlinked. No
+per-channel setting exists: a reference is inert to a reader that does not
+know it.
+
+**Rows nothing evicts.** Rows of a durable channel that left the
+configuration are kept and never evicted, and so are the blobs they name.
+
+**Backup and restore.** The database and the blob directory are **one unit**
+to back up, restore and roll back. At boot the store reconciles the two and
+refuses to start — naming the blob and the messages — when a message names a
+blob with no reference record, when a referenced blob's file is missing or
+has the wrong length, when a blob's count disagrees with its references,
+when the directory holds an entry that is not a blob file, when another
+open blob store — another host's, or a second host over the same database —
+holds the directory's lock, or when SQLite's `synchronous` is below `FULL`.
+Files no row names are deleted at boot, so two hosts must never share a blob
+directory: the lock stops the second while the first runs, and nothing stops
+it while the first is down. So a
+database restored beside a blob directory that still holds every file its
+rows name boots; a database restored alone, or beside a directory that has
+moved on since the snapshot — as it does at every eviction — refuses when any
+message in it names a blob since deleted. A database-only snapshot, a deploy's
+rollback snapshot included, is therefore sound only while no message in it
+carries an attachment. To start a host that refuses anyway, delete the
+message rows the panic names with `sqlite3`; the trigger keeps the counts
+right, and the next boot's sweep removes what they named.
+
+**Mutability.** A blob is immutable once sealed, and nothing in the store
+forecloses a mutable kind later: the id is random rather than a content hash,
+the reference carries no digest, and the bytes are one file written in place.
+Three choices lean on immutability: `size` and `content_type` are copied into
+every reference, the bytes are synced once when a durable row first names
+them, and reads take no lock. A mutable blob would need a flag fixed at
+create and written into the reference, a write entry on a sealed blob, and a
+rule for each of those three. The cost statement is the `blob` module's
+rustdoc.
+
+What is not built: a WIT interface for components to create or read blobs, a
+conversation tool, connectors that produce blobs, the surface's handling of
+them, and transfer of bytes over attach or to a page.
+
 ### 2.1.3 Limits on a remote's stream of messages
 
 At default configuration, for a remote attacher on attach v5. "Operator" names

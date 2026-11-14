@@ -323,6 +323,7 @@ async fn park_text(m: &Messenger, addr: &str) -> Uuid {
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+                attachments: brenn_messaging_store::blob::HeldAttachments::none(),
             },
             now + Duration::minutes(5),
         )

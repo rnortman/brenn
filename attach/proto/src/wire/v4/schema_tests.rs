@@ -41,6 +41,7 @@ fn sample_envelope() -> MessageEnvelope {
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Ephemeral,
         transport: None,
+        attachments: Default::default(),
     }
 }
 
