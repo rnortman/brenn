@@ -141,6 +141,27 @@ fn read_past_the_size_is_refused() {
 }
 
 #[test]
+fn read_into_fills_the_buffer_and_refuses_past_the_size_untouched() {
+    let f = fixture();
+    let hold = f.sealed(b"0123456789");
+    let mut buf = [b'x'; 4];
+    hold.read_into(3, &mut buf).unwrap();
+    assert_eq!(&buf, b"3456");
+    hold.read_into(6, &mut buf).unwrap();
+    assert_eq!(&buf, b"6789");
+    let mut buf = [b'x'; 4];
+    match hold.read_into(7, &mut buf) {
+        Err(BlobError::OutOfRange {
+            offset: 7,
+            len: 4,
+            size: 10,
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(&buf, b"xxxx");
+}
+
+#[test]
 fn seal_over_a_gap_is_refused_naming_it_then_accepted_once_filled() {
     let f = fixture();
     let mut w = f.store.create("text/plain").unwrap();
@@ -570,4 +591,111 @@ fn holds_are_shareable_across_threads() {
     }
     assert!(f.files().is_empty());
     assert_eq!(f.store.usage(), usage(0, 0, 0));
+}
+
+// ── Reserve ─────────────────────────────────────────────────────────────
+
+/// A reservation charges the blob's whole extent before any byte, and the
+/// writes that fill it charge nothing more.
+#[test]
+fn reserve_charges_the_whole_extent_before_any_write() {
+    let f = fixture();
+    let mut w = f.store.create("application/pdf").unwrap();
+    w.reserve(10).unwrap();
+    assert_eq!(w.extent(), 10);
+    assert_eq!(f.store.usage(), usage(0, 1, 10));
+    w.write(0, b"01234").unwrap();
+    w.write(5, b"56789").unwrap();
+    assert_eq!(f.store.usage(), usage(0, 1, 10));
+    let hold = w.seal().unwrap();
+    assert_eq!(hold.reference().size, 10);
+    assert_eq!(hold.read(0, 10).unwrap(), b"0123456789");
+    assert_eq!(f.store.usage(), usage(1, 0, 10));
+}
+
+/// A reserved extent is a promise of bytes: seal refuses until every byte
+/// below it is written.
+#[test]
+fn seal_after_reserve_refuses_until_the_extent_is_filled() {
+    let f = fixture();
+    let mut w = f.store.create("application/pdf").unwrap();
+    w.reserve(8).unwrap();
+    w.write(0, b"abcd").unwrap();
+    let SealRefused { mut writer, gap } = w.seal().unwrap_err();
+    assert_eq!(gap, 4..8);
+    writer.write(4, b"efgh").unwrap();
+    let hold = writer.seal().unwrap();
+    assert_eq!(hold.read(0, 8).unwrap(), b"abcdefgh");
+}
+
+/// A reservation past the per-blob cap is refused and changes nothing.
+#[test]
+fn reserve_past_the_blob_cap_is_refused_too_large() {
+    let f = fixture();
+    let mut w = f.store.create("application/pdf").unwrap();
+    let err = w.reserve(LIMITS.max_blob_bytes + 1).unwrap_err();
+    assert!(matches!(err, BlobError::TooLarge { max } if max == LIMITS.max_blob_bytes));
+    assert_eq!(w.extent(), 0);
+    assert_eq!(f.store.usage(), usage(0, 1, 0));
+    w.reserve(LIMITS.max_blob_bytes).unwrap();
+}
+
+/// A reservation that would pass the store's budget is refused and changes
+/// nothing; one that fits beside the others is charged.
+#[test]
+fn reserve_past_the_budget_is_refused_budget_exhausted() {
+    let f = fixture_with(BlobLimits {
+        max_blob_bytes: 100,
+        budget_bytes: 150,
+    });
+    let mut first = f.store.create("application/pdf").unwrap();
+    first.reserve(100).unwrap();
+    let mut second = f.store.create("application/pdf").unwrap();
+    let err = second.reserve(51).unwrap_err();
+    assert!(matches!(err, BlobError::BudgetExhausted { budget: 150 }));
+    assert_eq!(second.extent(), 0);
+    assert_eq!(f.store.usage(), usage(0, 2, 100));
+    second.reserve(50).unwrap();
+    assert_eq!(f.store.usage(), usage(0, 2, 150));
+}
+
+/// A reservation at or below the extent changes nothing.
+#[test]
+fn reserve_below_the_extent_changes_nothing() {
+    let f = fixture();
+    let mut w = f.store.create("application/pdf").unwrap();
+    w.write(0, b"abcdef").unwrap();
+    w.reserve(3).unwrap();
+    w.reserve(6).unwrap();
+    assert_eq!(w.extent(), 6);
+    assert_eq!(f.store.usage(), usage(0, 1, 6));
+    w.reserve(0).unwrap();
+    let hold = w.seal().unwrap();
+    assert_eq!(hold.reference().size, 6);
+}
+
+/// A reserved writer dropped unfilled deletes its file and returns its
+/// whole charge.
+#[test]
+fn a_reserved_writer_dropped_unfilled_returns_its_charge() {
+    let f = fixture();
+    let mut w = f.store.create("application/pdf").unwrap();
+    w.reserve(1000).unwrap();
+    w.write(0, b"part").unwrap();
+    assert_eq!(f.store.usage(), usage(0, 1, 1000));
+    assert_eq!(f.files().len(), 1);
+    drop(w);
+    assert_eq!(f.store.usage(), usage(0, 0, 0));
+    assert!(f.files().is_empty());
+}
+
+/// A zero-byte reservation seals an empty blob.
+#[test]
+fn a_zero_byte_reservation_seals_an_empty_blob() {
+    let f = fixture();
+    let mut w = f.store.create("application/pdf").unwrap();
+    w.reserve(0).unwrap();
+    let hold = w.seal().unwrap();
+    assert_eq!(hold.reference().size, 0);
+    assert_eq!(hold.read(0, 0).unwrap(), b"");
 }

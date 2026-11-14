@@ -14,8 +14,10 @@ turn without a round trip through the model for each step.
 - **It is your tools, with your permissions.** `brenn-tool call BrennSend …`
   runs the same code, with the same checks, as the `BrennSend` tool call:
   channel ACLs, the send rate and the per-conversation send budget, schema
-  validation, the registry's per-tool limits. A command can do nothing the
-  tool call could not.
+  validation, the registry's per-tool limits. `call` can do nothing the tool
+  call could not. The two exceptions are `save` and `send`
+  ([Moving bytes](#moving-bytes-save-and-send)), which move a blob's bytes
+  between a file in your environment and the bus, something no tool call does.
 - **There is no credential.** `brenn-tool` talks to a socket that exists only
   inside your conversation's environment (`$BRENN_TOOL_SOCKET`); being able to
   reach it is what makes a call yours. Nothing secret goes on a command line.
@@ -63,6 +65,12 @@ brenn-tool describe <Tool> [--pretty]
 brenn-tool call <Tool> [BASE] [--set K=<json>]... [--str K=<text>]...
                        [--str-file K=<path>]... [--json-file K=<path>]...
                        [--timeout <secs>] [--pretty]
+brenn-tool save <message_id> (--attachment <name> | --body) --out <path>
+                [--timeout <secs>] [--pretty]
+brenn-tool send [BASE] [--set K=<json>]... [--str K=<text>]...
+                [--str-file K=<path>]... [--json-file K=<path>]...
+                --file <name>=<path>... --file-type <name>=<content type>...
+                [--timeout <secs>] [--pretty]
 ```
 
 - `BASE` is the input object: a JSON literal, `-` to read it from stdin, or
@@ -76,10 +84,12 @@ brenn-tool call <Tool> [BASE] [--set K=<json>]... [--str K=<text>]...
   - `--json-file K=<path>` — the value is the JSON parsed from the file.
 - A key given twice — by two options, or by an option and `BASE` — is a usage
   error, never an override. Fields need `BASE` to be an object.
-- `--timeout` (default 300 s) bounds the wait for the answer. It does **not**
-  cancel the call: see below.
+- `--timeout` (default 300 s) bounds the wait for the answer — for `save` and
+  `send`, the whole exchange, bytes included. It does **not** cancel the call:
+  see below.
 - The whole request is assembled before the connection opens, and is capped at
-  1 MiB.
+  1 MiB. For `send` that cap bounds the request line (the `BrennSend` input
+  and the file declarations), not the files, which stream after it.
 
 ## Output and exit codes
 
@@ -97,7 +107,14 @@ Kinds with exit 2:
 - `no_socket` — `BRENN_TOOL_SOCKET` is unset: you are not in an agent's
   environment;
 - `connect`, `protocol` — the socket could not be reached, or answered
-  something unreadable;
+  something unreadable; a `save` whose bytes stopped short of the size the
+  server announced is `protocol`;
+- `file` — `save`'s output file, or one of `send`'s input files, could not be
+  opened, written or renamed, or an input file changed size while it was
+  sent;
+- `transfer_aborted` — the server ended a `send`'s byte phase (the connection
+  stalled past the server's deadline, or the blob store failed a write);
+  nothing was published;
 - `unknown_tool` — no such tool in your configuration (also the answer for a
   tool removed by a configuration reload since you listed it);
 - `not_available` — the tool is not a command; `detail` is the reason;
@@ -117,6 +134,89 @@ again.
 Tools have no result schemas. What a command prints is what the tool returns;
 `describe` shows only the input side. Read a tool's output once and match on
 what you see.
+
+## Moving bytes: `save` and `send`
+
+A message you read may carry attachments: you are shown each one's name, size
+and content type, never its bytes. A message whose body is not text shows a
+placeholder instead of the body. These two commands move such bytes between
+the bus and a file in your environment without putting them through your
+context. They are commands, not tools: `list` does not show them and there is
+no tool call that does what they do.
+
+**Naming a blob.** You name an attachment by the `message_id` of the message
+that carries it and the attachment's name, both as the message shows them;
+you name a body by the `message_id` alone. There are no blob ids to handle.
+A name is admitted only if both hold of that one message:
+
+- **you were handed it** — by a push delivery, `MessageChannelGet`,
+  `BrennPendingList`, an edit's answer, or the answer to your own send — since
+  your conversation started, since its last compaction, since a user last sent
+  it a turn that began with `/`, and since the server last restarted. "Handed"
+  means the host gave it to you; output you threw away (`> /dev/null`) counts.
+- **it is still retained** on a channel your app may read: inside the
+  channel's window (the whole ring on an `ephemeral:`/`local:` channel; the
+  channel's standing retain depth on a durable one), not parked, and not
+  evicted.
+
+The rule is about the message, not the blob: an attachment of an evicted
+message is refused even if another retained message names the same blob, until
+you read that other message.
+
+**`save`** writes an attachment's bytes, or a body's, to `--out`:
+
+```bash
+brenn-tool save 0b6a5c2e-7d1f-4e8a-9c3b-2f4d6e8a10e4 --attachment scan.pdf --out /tmp/scan.pdf
+brenn-tool save 0b6a5c2e-7d1f-4e8a-9c3b-2f4d6e8a10e4 --body --out /tmp/body.bin
+```
+
+It prints `{"path", "size", "content_type"}` (`content_type` is `null` for an
+untyped text body). The bytes go to a temporary file beside `--out` and are
+renamed onto it only once every byte has arrived, so `--out` never holds a
+partial file; an existing file there is replaced. If the command is killed
+mid-transfer the temporary file (`.<name>.<random>.part`) may be left beside
+the target. Once the server has admitted the name the save completes from its
+own hold on the bytes, even if the message is evicted meanwhile.
+
+**`send`** is `call BrennSend` with files attached. `BASE` and the field
+options build the `BrennSend` input exactly as `call` does; forwarded
+attachments ride in its `attachments` field.
+
+```bash
+brenn-tool send --str to=brenn:inbox.out --str body="Scanned receipt." \
+    --file receipt.pdf=/tmp/scan.pdf --file-type receipt.pdf=application/pdf
+```
+
+- Each `--file NAME=PATH` needs a `--file-type NAME=TYPE`; nothing is guessed
+  from an extension. At least one `--file` is required; a send without files
+  is `call BrennSend`.
+- Each file must be a regular file. Its size is declared before any byte is
+  sent; the server refuses the whole send before a byte crosses if a name,
+  type, count or size is wrong. A file that grows or shrinks while it is sent
+  ends the connection, exit 2 `file`, and nothing is published.
+- It prints the `BrennSend` answer. Every refusal `BrennSend` makes (the ACL,
+  the send budget, the rate) applies, after the files have crossed; a refused
+  send leaves no blob behind.
+
+**Bounds.** A file is at most the host's largest blob; one send's files
+together are at most that same size; a message carries at most 32
+attachments, forwarded and files together; the host's blob budget bounds
+everything. Each is a refusal you can read — nothing waits for room.
+
+**Refusals** come back as the tool's own error JSON, exit 1:
+`{"ok": false, "reason": <kind>, "error": <text>}`. The kinds are
+`malformed_message_id`, `malformed_attachment_name`, `not_read`,
+`channel_not_readable`, `not_retained`, `no_such_attachment`,
+`too_many_attachments`, `duplicate_attachment_name`, `malformed_content_type`,
+`no_files`, `blob_too_large`, `send_files_too_large`, `blob_budget_exhausted`
+and `blobs_unavailable`. `not_read` — after a restart, a compaction, or a
+user turn that began with `/` — is cured by reading the message again
+(`MessageChannelGet`) and retrying.
+
+**Without a shell tool there is no `save` or `send`.** Both run through your
+shell. A conversation of an app that lists `Bash` in `disabled_tools` can
+still forward an attachment by reference with `BrennSend`'s `attachments`, and
+can neither save one nor attach a file.
 
 ## Worked example: play a reward and wait for its receipt
 

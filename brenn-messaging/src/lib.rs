@@ -20,6 +20,7 @@
 pub mod chat_provision;
 pub mod chat_roster;
 pub mod config_reload;
+pub mod conversation_blobs;
 pub mod conversations;
 pub mod device_location;
 pub mod dispatcher;
@@ -63,6 +64,7 @@ pub use brenn_lib::messaging::*;
 // crates above name `brenn_messaging_store` themselves.
 use brenn_messaging_store::blob::{BlobError, BlobHold, BlobStore, ReapReport, Retain};
 use brenn_messaging_store::{db, ingress, store};
+pub use conversation_blobs::{AdmittedPart, NameRefusal, NamedPart};
 pub use edit::{CancelResult, EditFields, EditResult};
 pub use ingress::{
     CollapsedDrain, Event as IngressEvent, MAX_DELIVERED_RETENTION_DAYS,
@@ -760,6 +762,11 @@ pub struct Messenger {
     /// snapshot that lands last is the newest one. See
     /// [`Messenger::publish_chat_roster`].
     chat_roster_published: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Per conversation, the bus messages the host has handed it — what
+    /// [`Messenger::admit_conversation_name`] admits a name against. Held
+    /// here rather than on a conversation's bridge so it outlives an idle
+    /// retire and is lost only with the process.
+    conversation_reads: conversation_blobs::ConversationReads,
     /// `[llm_chat]`, the shape of every conversation's chat channel family.
     ///
     /// It lives here rather than being passed at each call because chat channels
@@ -1078,6 +1085,7 @@ impl Messenger {
             ring_stores,
             blob_store: None,
             chat_roster_published: tokio::sync::Mutex::new(HashMap::new()),
+            conversation_reads: conversation_blobs::ConversationReads::default(),
             llm_chat: brenn_lib::config::LlmChatConfig::default(),
             system_channel_tuning: config::SystemChannelTuning::default(),
             db_stores: Mutex::new(HashMap::new()),

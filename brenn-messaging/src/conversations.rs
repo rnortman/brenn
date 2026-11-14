@@ -541,12 +541,15 @@ impl Messenger {
     /// the noise for whatever its windows skipped.
     ///
     /// Called after the batch has been rendered and accepted — the drain's
-    /// at-least-once ack point.
+    /// at-least-once ack point. Every message the batch carried is recorded
+    /// as read by the conversation first, so a name of one of its attachments
+    /// is admitted.
     ///
     /// A span whose position is gone by the time it is advanced is skipped: an
     /// unsubscribe can land between the read that produced the span and this
     /// call, and there is then no position to move and nothing to report.
     pub async fn advance_conversation(&self, conversation_id: i64, delivery: ConversationDelivery) {
+        self.note_conversation_read(conversation_id, &delivery.messages);
         let subscriber = ParticipantId::for_conversation(conversation_id);
         for span in delivery.spans {
             let advanced = self

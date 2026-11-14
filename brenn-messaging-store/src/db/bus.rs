@@ -6,6 +6,7 @@ use uuid::Uuid;
 use std::os::unix::fs::OpenOptionsExt as _;
 
 use super::cursors;
+use super::envelope_row::{ENVELOPE_COLUMNS, ENVELOPE_FROM_JOINS};
 use super::shared::{ns_to_utc, parse_rfc3339};
 use super::types::PendingPushRow;
 use crate::blob::HeldAttachments;
@@ -679,13 +680,8 @@ fn depth_limit(depth: brenn_lib::messaging::config::Depth) -> i64 {
 /// predicate cannot land on some reads and miss others.
 fn retained_window_sql(where_tail: &str, limit_param: &str) -> String {
     format!(
-        "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency,
-                m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                c.address, rc.address, m.envelope_type, m.impetus, m.content_type,
-                m.transport, m.attachments, m.id, m.retained_seq
-         FROM messaging_messages m
-         JOIN messaging_channels c ON c.uuid = m.channel_uuid
-         LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
+        "SELECT {ENVELOPE_COLUMNS}, m.id, m.retained_seq
+         {ENVELOPE_FROM_JOINS}
          WHERE m.channel_uuid = ?1 AND m.retained_seq IS NOT NULL {where_tail}
          ORDER BY m.retained_seq DESC LIMIT {limit_param}"
     )
@@ -847,6 +843,44 @@ pub fn channel_resume_epoch(conn: &Connection, channel_uuid: Uuid) -> Uuid {
         .unwrap_or_else(|e| panic!("messaging: channel {channel_uuid} has no row: {e}"));
     Uuid::from_slice(&bytes)
         .unwrap_or_else(|e| panic!("messaging: channel {channel_uuid} resume_epoch {bytes:?}: {e}"))
+}
+
+/// A retained row found by its message uuid.
+#[derive(Debug, Clone)]
+pub struct RetainedByUuid {
+    pub channel_uuid: Uuid,
+    pub retained_seq: i64,
+    pub envelope: MessageEnvelope,
+}
+
+/// The retained row whose message uuid is `uuid`, with its channel and its
+/// retention position; `None` when no row has that uuid or the row is parked
+/// and so holds no position.
+///
+/// A row is answered whether or not it is still inside its channel's standing
+/// window: the caller compares `retained_seq` against the window.
+pub fn retained_message_by_uuid(conn: &Connection, uuid: Uuid) -> Option<RetainedByUuid> {
+    conn.query_row(
+        &format!(
+            "SELECT {ENVELOPE_COLUMNS}, m.retained_seq {ENVELOPE_FROM_JOINS}
+             WHERE m.uuid = ?1 AND m.retained_seq IS NOT NULL"
+        ),
+        rusqlite::params![uuid.as_bytes().to_vec()],
+        |row| {
+            let envelope = super::row_to_envelope(row)?;
+            let channel_bytes: Vec<u8> = row.get(1)?;
+            let channel_uuid = Uuid::from_slice(&channel_bytes).unwrap_or_else(|e| {
+                panic!("messaging: message {uuid} channel uuid {channel_bytes:?}: {e}")
+            });
+            Ok(RetainedByUuid {
+                channel_uuid,
+                retained_seq: row.get(17)?,
+                envelope,
+            })
+        },
+    )
+    .optional()
+    .expect("query retained_message_by_uuid")
 }
 
 /// How many retained rows the channel still holds above `after_seq`, unclamped.

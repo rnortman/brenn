@@ -614,9 +614,25 @@ impl Drop for TempBlobDir {
 /// Open a blob store over a fresh temporary directory against `messenger`'s
 /// database, and install it on `messenger`, which must not yet be shared.
 pub async fn install_blob_store(messenger: Arc<Messenger>) -> (Arc<Messenger>, TempBlobDir) {
-    let dir = TempBlobDir::new();
-    (install_blob_store_at(messenger, dir.path()).await, dir)
+    install_blob_store_with(messenger, TEST_BLOB_LIMITS).await
 }
+
+/// [`install_blob_store`] with a store of `limits`.
+pub async fn install_blob_store_with(
+    messenger: Arc<Messenger>,
+    limits: brenn_messaging_store::blob::BlobLimits,
+) -> (Arc<Messenger>, TempBlobDir) {
+    let dir = TempBlobDir::new();
+    (open_blob_store(messenger, dir.path(), limits).await, dir)
+}
+
+/// The limits of the blob store [`install_blob_store`] and
+/// [`install_blob_store_at`] open: 1 MiB per blob, 4 MiB in total.
+pub const TEST_BLOB_LIMITS: brenn_messaging_store::blob::BlobLimits =
+    brenn_messaging_store::blob::BlobLimits {
+        max_blob_bytes: 1 << 20,
+        budget_bytes: 4 << 20,
+    };
 
 /// Open a blob store over `dir` against `messenger`'s database — a reopen when
 /// a store was opened there before — and install it on `messenger`, which must
@@ -625,16 +641,17 @@ pub async fn install_blob_store_at(
     messenger: Arc<Messenger>,
     dir: &std::path::Path,
 ) -> Arc<Messenger> {
+    open_blob_store(messenger, dir, TEST_BLOB_LIMITS).await
+}
+
+async fn open_blob_store(
+    messenger: Arc<Messenger>,
+    dir: &std::path::Path,
+    limits: brenn_messaging_store::blob::BlobLimits,
+) -> Arc<Messenger> {
     let blobs = {
         let conn = messenger.db().lock().await;
-        brenn_messaging_store::blob::BlobStore::open(
-            dir,
-            brenn_messaging_store::blob::BlobLimits {
-                max_blob_bytes: 1 << 20,
-                budget_bytes: 4 << 20,
-            },
-            &conn,
-        )
+        brenn_messaging_store::blob::BlobStore::open(dir, limits, &conn)
     };
     messenger.with_blob_store(blobs)
 }

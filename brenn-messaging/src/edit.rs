@@ -36,7 +36,9 @@ pub enum CancelResult {
 /// column unchanged". For nullable columns, `Some(None)` means "clear to NULL".
 #[derive(Debug, Default)]
 pub struct EditFields {
-    pub body: Option<String>,
+    /// The new body. It replaces the stored body and its content type
+    /// together: an untyped body leaves the message untyped.
+    pub body: Option<super::MessageBody>,
     /// `None` = leave; `Some(None)` = clear reply_to to NULL.
     pub reply_to: Option<Option<String>>,
     /// `None` = leave; `Some(None)` = deliver immediately (clear schedule).
@@ -250,9 +252,8 @@ impl Messenger {
         };
 
         // 7. Apply to DB (inside a transaction with A3 re-check).
-        let body = fields.body.as_deref().map(super::MessageBody::text);
         let applied = EditFieldsApplied {
-            body: body.as_ref(),
+            body: fields.body.as_ref(),
             reply_to_uuid: reply_to_resolved,
             deliver_after: applied_deliver_after,
             delivery_deadline: fields.delivery_deadline,
@@ -796,7 +797,7 @@ mod tests {
                 "pa-bob",
                 Uuid::new_v4(),
                 EditFields {
-                    body: Some("x".to_string()),
+                    body: Some(crate::MessageBody::text("x")),
                     ..Default::default()
                 },
             )
@@ -814,7 +815,7 @@ mod tests {
                 "pa-alice",
                 mid,
                 EditFields {
-                    body: Some("hacked".to_string()),
+                    body: Some(crate::MessageBody::text("hacked")),
                     ..Default::default()
                 },
             )
@@ -846,7 +847,7 @@ mod tests {
                 "pa-bob",
                 mid,
                 EditFields {
-                    body: Some("toolong".to_string()),
+                    body: Some(crate::MessageBody::text("toolong")),
                     ..Default::default()
                 },
             )
@@ -1088,7 +1089,7 @@ mod tests {
                 "pa-bob",
                 mid,
                 EditFields {
-                    body: Some("new".to_string()),
+                    body: Some(crate::MessageBody::text("new")),
                     ..Default::default()
                 },
             )
@@ -1113,7 +1114,7 @@ mod tests {
                 "pa-bob",
                 mid,
                 EditFields {
-                    body: Some("updated".to_string()),
+                    body: Some(crate::MessageBody::text("updated")),
                     ..Default::default()
                 },
             )
@@ -1222,7 +1223,7 @@ mod tests {
                 "pa-bob",
                 mid,
                 EditFields {
-                    body: Some("new body".to_string()),
+                    body: Some(crate::MessageBody::text("new body")),
                     ..Default::default()
                 },
             )
@@ -1231,6 +1232,45 @@ mod tests {
             EditResult::Ok { envelope } => assert_eq!(envelope.message_id, mid),
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    /// The body and its content type are replaced together: a typed body is
+    /// stored with its type, and a later untyped body leaves the message
+    /// untyped.
+    #[tokio::test]
+    async fn edit_replaces_the_content_type_with_the_body() {
+        let (m, _, _, _, _) = build_messenger(0).await;
+        let future = Utc::now() + chrono::Duration::seconds(3600);
+        let mid = publish_one(&m, "orig", Some(future)).await;
+        let edit_to = |body: crate::MessageBody| {
+            let m = &m;
+            async move {
+                match m
+                    .edit(
+                        "pa-bob",
+                        mid,
+                        EditFields {
+                            body: Some(body),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    EditResult::Ok { envelope } => envelope,
+                    other => panic!("expected Ok, got {other:?}"),
+                }
+            }
+        };
+
+        let typed =
+            crate::MessageBody::from_parts(Some("application/json"), br#"{"a":1}"#).unwrap();
+        let envelope = edit_to(typed).await;
+        assert_eq!(envelope.body.content_type(), Some("application/json"));
+        assert_eq!(envelope.body.as_text(), Some(r#"{"a":1}"#));
+
+        let envelope = edit_to(crate::MessageBody::text("plain")).await;
+        assert_eq!(envelope.body.content_type(), None);
+        assert_eq!(envelope.body.as_text(), Some("plain"));
     }
 
     // -----------------------------------------------------------------------
@@ -1391,7 +1431,7 @@ mod tests {
                 "no-such-app",
                 mid,
                 EditFields {
-                    body: Some("changed".to_string()),
+                    body: Some(crate::MessageBody::text("changed")),
                     ..Default::default()
                 },
             )

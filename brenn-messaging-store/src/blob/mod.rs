@@ -27,7 +27,8 @@
 //!
 //! # Bounds
 //!
-//! A blob's *extent* is the highest `offset + len` written to it. Each blob's
+//! A blob's *extent* is the highest `offset + len` written to it, or the size
+//! [`BlobWriter::reserve`] raised it to if that is higher. Each blob's
 //! extent is capped at [`BlobLimits::max_blob_bytes`], and the store's charged
 //! total — the sum of every live blob's extent, sealed or not — at
 //! [`BlobLimits::budget_bytes`]. A write that would pass either is refused
@@ -463,7 +464,8 @@ pub struct SealRefused {
 }
 
 impl BlobWriter {
-    /// The highest `offset + len` written so far.
+    /// The highest `offset + len` written so far, or the reserved size if
+    /// that is higher.
     pub fn extent(&self) -> u64 {
         self.extent
     }
@@ -502,6 +504,28 @@ impl BlobWriter {
         }
         self.extent = new_extent;
         self.written = merged;
+        Ok(())
+    }
+
+    /// Raise the extent to `size` and charge for it now, writing nothing, so
+    /// a producer that knows the blob's size is refused for space before its
+    /// first byte rather than part-way through. A `size` at or below the
+    /// extent changes nothing.
+    ///
+    /// Refused `TooLarge` or `BudgetExhausted` as [`BlobWriter::write`] would
+    /// refuse a write ending at `size`; a refusal changes nothing.
+    /// [`BlobWriter::seal`] still refuses until every byte below the extent
+    /// has been written.
+    pub fn reserve(&mut self, size: u64) -> Result<(), BlobError> {
+        if size <= self.extent {
+            return Ok(());
+        }
+        let max = self.store.limits.max_blob_bytes;
+        if size > max {
+            return Err(BlobError::TooLarge { max });
+        }
+        self.store.recharge(&self.id, self.extent, size)?;
+        self.extent = size;
         Ok(())
     }
 
@@ -641,13 +665,22 @@ impl BlobHold {
     /// If the file is missing or shorter than the blob's size: nothing writes
     /// a sealed blob, so its file was removed or cut behind the store.
     pub fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>, BlobError> {
+        self.check_range(offset, len)?;
+        let mut buf = vec![0u8; len];
+        self.read_into(offset, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Exactly `buf.len()` bytes from `offset`, into `buf`: a reader of many
+    /// pieces reuses one buffer.
+    ///
+    /// # Panics
+    ///
+    /// As [`BlobHold::read`].
+    pub fn read_into(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlobError> {
+        let len = buf.len();
+        self.check_range(offset, len)?;
         let size = self.reference.size;
-        let in_range = offset
-            .checked_add(len as u64)
-            .is_some_and(|end| end <= size);
-        if !in_range {
-            return Err(BlobError::OutOfRange { offset, len, size });
-        }
         let path = self.store.path_of(&self.reference.id);
         let file = match File::open(&path) {
             Ok(f) => f,
@@ -656,15 +689,26 @@ impl BlobHold {
             }
             Err(e) => return Err(BlobError::Io(e)),
         };
-        let mut buf = vec![0u8; len];
-        match file.read_exact_at(&mut buf, offset) {
-            Ok(()) => Ok(buf),
+        match file.read_exact_at(buf, offset) {
+            Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => panic!(
                 "held blob's file {} ends inside the read of {len} bytes at offset {offset}; \
                  the blob's size is {size}",
                 path.display()
             ),
             Err(e) => Err(BlobError::Io(e)),
+        }
+    }
+
+    fn check_range(&self, offset: u64, len: usize) -> Result<(), BlobError> {
+        let size = self.reference.size;
+        let in_range = offset
+            .checked_add(len as u64)
+            .is_some_and(|end| end <= size);
+        if in_range {
+            Ok(())
+        } else {
+            Err(BlobError::OutOfRange { offset, len, size })
         }
     }
 }

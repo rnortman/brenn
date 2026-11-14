@@ -15,7 +15,9 @@ use brenn_queue::QuotaExceeded;
 
 use crate::blob::{BlobHold, BlobLimits, BlobStore, BlobUsage, HeldAttachments, Retain};
 use crate::db::utc_to_ns;
-use crate::store::{DeferralOutcome, NewMessage, RetentionStore, RingStore, RingStores, no_holds};
+use crate::store::{
+    DeferralOutcome, NewMessage, RetentionStore, RingNamed, RingStore, RingStores, no_holds,
+};
 use crate::testutils::held as attachments;
 
 const ADDRESS: &str = "ephemeral:pictures";
@@ -428,5 +430,85 @@ fn a_sealed_unpublished_blob_is_deleted_when_its_producer_drops_it() {
     let id = hold.id().clone();
     drop(hold);
     assert!(!f.alive(&id));
+    assert!(f.empty());
+}
+
+// ── Naming one retained message's part ──────────────────────────────────
+
+/// Each of `retained_named`'s four answers.
+#[tokio::test]
+async fn retained_named_answers_by_message_and_name() {
+    let f = fixture();
+    let a = f.sealed(b"aaaa");
+    let ring = ring(4);
+    let uuid = append_naming(&ring, "carries a", &[("photo", &a)]).await;
+    let parked = park_naming(&ring, "parked", &[("photo", &a)], later(10))
+        .await
+        .unwrap();
+
+    match ring.retained_named(uuid, Some(&name("photo"))) {
+        RingNamed::Attachment(envelope, hold) => {
+            assert_eq!(envelope.message_id, uuid);
+            assert_eq!(hold.id(), a.id());
+            assert_eq!(hold.read(0, 4).unwrap(), b"aaaa");
+        }
+        other => panic!("expected the attachment, got {other:?}"),
+    }
+    match ring.retained_named(uuid, None) {
+        RingNamed::Body(envelope) => assert_eq!(envelope.body.as_text(), Some("carries a")),
+        other => panic!("expected the body, got {other:?}"),
+    }
+    match ring.retained_named(uuid, Some(&name("thumb"))) {
+        RingNamed::NoSuchAttachment(envelope) => assert_eq!(envelope.message_id, uuid),
+        other => panic!("expected no such attachment, got {other:?}"),
+    }
+    assert!(matches!(
+        ring.retained_named(Uuid::new_v4(), None),
+        RingNamed::NotRetained
+    ));
+    assert!(
+        matches!(ring.retained_named(parked, None), RingNamed::NotRetained),
+        "a parked message is not retained"
+    );
+}
+
+/// An evicted message is not retained, whatever it named.
+#[tokio::test]
+async fn retained_named_refuses_an_evicted_message() {
+    let f = fixture();
+    let a = f.sealed(b"a");
+    let ring = ring(1);
+    let uuid = append_naming(&ring, "evicted", &[("photo", &a)]).await;
+    append_naming(&ring, "evicts", &[]).await;
+    assert!(matches!(
+        ring.retained_named(uuid, Some(&name("photo"))),
+        RingNamed::NotRetained
+    ));
+}
+
+/// The hold handed out is on the one blob named: after the message is
+/// evicted, it keeps that blob readable while the message's other blob is
+/// unlinked and its charge returned.
+#[tokio::test]
+async fn a_named_hold_keeps_only_the_named_blob_past_eviction() {
+    let f = fixture();
+    let named = f.sealed(b"named bytes");
+    let other = f.sealed(b"other");
+    let (named_id, other_id) = (named.id().clone(), other.id().clone());
+    let ring = ring(1);
+    let uuid = append_naming(&ring, "two", &[("keep", &named), ("drop", &other)]).await;
+    drop((named, other));
+
+    let RingNamed::Attachment(_, hold) = ring.retained_named(uuid, Some(&name("keep"))) else {
+        panic!("the retained message carries the name");
+    };
+    append_naming(&ring, "evicts", &[]).await;
+
+    assert!(f.alive(&named_id), "the named hold keeps its blob");
+    assert!(!f.alive(&other_id), "the other blob had only the entry");
+    assert_eq!(f.blobs.usage().charged_bytes, 11);
+    assert_eq!(hold.read(0, 11).unwrap(), b"named bytes");
+    drop(hold);
+    assert!(!f.alive(&named_id));
     assert!(f.empty());
 }

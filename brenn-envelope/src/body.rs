@@ -243,7 +243,9 @@ impl fmt::Debug for MessageBody {
 ///
 /// A durable row's storage class records this rule's answer at the time the
 /// row was written, and reading a row checks the two agree. A change to this
-/// rule therefore ships with a migration of the stored rows it reclassifies.
+/// rule therefore ships with a migration of the stored rows it reclassifies,
+/// and with a rewording of `brenn_lib::integration::TEXT_CONTENT_TYPES`, the
+/// rule as conversations are told it.
 pub fn is_text_content_type(content_type: Option<&str>) -> bool {
     match content_type {
         None => true,
@@ -573,6 +575,26 @@ mod tests {
         for ct in cases {
             let constructed = MessageBody::from_parts(Some(ct), &[]).map(|_| ());
             assert_eq!(check_content_type(ct), constructed, "{ct:?}");
+        }
+    }
+
+    #[test]
+    fn is_text_content_type_agrees_with_from_parts() {
+        let cases = [
+            "text/plain",
+            "text/markdown; charset=utf-8",
+            "text/plain; charset=US-ASCII",
+            "text/plain; charset=latin1",
+            "application/json",
+            "application/vnd.example+json",
+            "application/octet-stream",
+            "image/png",
+            "",
+            "text/",
+        ];
+        for ct in cases {
+            let built = MessageBody::from_parts(Some(ct), b"").is_ok_and(|b| b.is_text());
+            assert_eq!(is_text_content_type(Some(ct)), built, "{ct:?}");
         }
     }
 

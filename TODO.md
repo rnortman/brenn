@@ -227,23 +227,6 @@ splitting a pass changes how many delivery points it is. Code site
 (`TODO(attach-replay-pass-frame-size)`): `send_pass` in
 `attach/server/src/subscription.rs`.
 
-## `conversation-send-content-type`
-
-Owner ruling needed before the blob conversation/tool slice is designed:
-whether a conversation can state a content type on a message it publishes.
-After the byte-body core the conversation send and edit tools take a string
-body and no content type, so everything a conversation publishes is untyped
-text: a conversation is shown other senders' content types but cannot label
-its own markdown, CSV or JSON, and no planned slice of the binary-bus project
-adds it, while the project spec asks for "text that is not JSON" on the bus.
-Options: add an optional `content_type` argument to the conversation send and
-edit tools, validated by `MessageBody::from_parts`, which changes a tool
-contract with the model; or leave conversations publishing untyped text only,
-with typed bodies coming from components, attachers and transports. The
-byte-body core's design raised it and left it out as "a product decision
-nobody has asked for", and its design gate ruled it "never wanted in this
-cycle".
-
 ## `string-contract-removal`
 
 Remove the string component contract `brenn:processor@0.1.0` when both
@@ -292,51 +275,57 @@ Code site (`TODO(blob-attachment-host-sites)`): `PublishBuffer::entries` in
 
 ## `blob-handle-integrity`
 
-Owner ruling needed before the blob conversation/tool slice is designed:
-whether a blob reference that crosses text (LLMs, JSON bodies) is a plain id
-or a host-tracked handle. Plain id: 128-bit random with a check character,
-validated for existence; authority is by possession, so any conversation that
-has seen an id can name it, including through injected text. Host-tracked: a
-reference is refused unless the host's bookkeeping says the holder may use it;
-about 1,000–1,500 more lines; closes forging and stale access but not an LLM
-forwarding a blob it legitimately holds. The order of the owner's words
-matters. First, in the project spec, written before the sizing spike: "If we
-do the bookkeeping for it (somehow; I haven't worked out how) then it couldn't
-get screwed up or 'forged'. I feel like that could get very complicated
-though; in fact LLMs are pretty good at copying IDs so I'm probably worrying
-about nothing." Then, after reading the spike report that posed this question,
-in the notes after cycle 1, the owner supplied the "how" the spec said was
-missing: "On the subject of the host-tracked handle registry: We have a
-potential lifetime solution there: The handle must currently exist in the
-retained buffer of one of the channels that it has access to, and it must have
-read a message containing the handle since conversation start or the last
-compaction, whichever is more recent. Otherwise it's not usable." The proxy
-that filed this entry reads the later words as the current ones and the
-earlier lean as superseded by them, though the owner called the rule
-"potential" and did not say "build it": unless the owner says otherwise here,
-the blob conversation/tool slice's design starts from the host-tracked form
-under that rule. To confirm: host-tracked under that rule, the rule being a
-starting point the design may refine; or plain id after all. Components get
-unforgeable WIT resources either way. The same note carries a design hint for
-that slice, to be read by its design: "An LLM typically would not hold on to
-one of these for long; it would very quickly forward it, or retrieve the bytes
-and write them to disk (or use a tool that does that without the bytes flowing
-through their context, more likely; e.g. the brenn-tool CLI they have could
-stream it to disk) for later use." (Sizing spike report §1 Q4.3 and §5 OQ2;
-the owner's notes after cycle 1.)
+A conversation names a blob as (message id, attachment name), and the host admits
+the name only for a message it has handed the conversation since the conversation's
+context was last reset. The host clears that record at a compaction boundary, at a
+spawn with no session to resume, and at every user turn whose text as Claude Code
+receives it begins with `/`, since Claude Code may act on such a turn as a command
+that resets its context. Two resets are not covered, and after either the host admits
+a name from a context that no longer holds the message. First, a `--resume` that
+Claude Code answers with a fresh session. Second, a slash command sent while a turn
+is running: the record is cleared at the send, the running turn can still be handed
+messages, and Claude Code resets its context when it reaches the command, so those
+messages stay in the record. Both need a signal from Claude Code that the context
+was reset. The candidate is the session id in the init frame, which the host stores
+at every init frame and compares with nothing; it is not established whether an
+ordinary resume always reports the id it was given, nor what Claude Code emits when
+it acts on a queued slash command. What the gap admits is bounded: the message is
+one the host did hand this conversation, and it must still be retained on a channel
+the app may read. Done = the record is cleared at both resets, with a test of each,
+by a signal whose behaviour was observed against the supported Claude Code version;
+or the documents record that the gap is accepted and why.
 
-## `llm-sees-binary-content`
+## `conversation-blob-name-per-message`
 
-Owner ruling needed before the blob conversation/tool slice is designed:
-whether a conversation should ever see a binary body or attachment as what it
-is, for example an image as an image content block through a tool that renders
-a blob for the model. Options: metadata placeholders only (`{"binary": true,
-"content_type", "size"}`), extending the existing MQTT rule, which the
-byte-body core implements either way; or a rendering path, which is a product
-capability and a new prompt-injection surface (`docs/security-posture.md`, the
-prompt-injection section). (Sizing spike report §5 OQ6.) The
-`TODO(llm-sees-binary-content)` comment sits at the placeholder in
-`ConversationShape` in `brenn-messaging/src/format.rs`.
+A conversation names an attachment as (message id, attachment name), and the host
+admits the name only while that same message is retained on a channel the
+conversation's app may read and has been put into the conversation's context since
+its start or last compaction. A blob the conversation was shown under one message,
+since evicted, that another retained message on a readable channel still names is
+refused until the conversation reads that other message, which it has no way to find
+from the refusal. The rule as first stated asked both conditions of the blob, not of
+one message, and admits that case. Admitting by blob needs the read record to keep the
+blob each read name resolved to, and a lookup from a blob to the retained messages
+naming it — `messaging_blob_refs` for durable channels; ring channels have no such
+index — with the read policy applied to each. Done = a conversation forwards and saves
+an attachment of an evicted message it read while another readable retained message
+names the same blob, and is refused when none does, each with a test; or the
+documents record that the per-message rule is final and why.
+
+## `conversation-blob-files-without-shell`
+
+Saving an attachment or a non-text body to a file, and attaching a file to a send, exist
+only as `brenn-tool` commands, which a conversation runs through its shell tool. An app
+that lists `Bash` in `disabled_tools` gets forwarding by reference and neither of the two:
+its conversations see attachment metadata they cannot turn into bytes. A route through a
+tool call has the server open a path the conversation names under a tree the agent can
+rewrite, which is `security-host-paths-follow-agent-symlinks`; this entry waits on a
+safe-path answer there, or on another route that moves no bytes through the model's
+context. Done = a conversation without the shell tool saves an attachment to a file and
+attaches a file to a send, each with a test; or the documents record that it never will
+and why. Code site (`TODO(conversation-blob-files-without-shell)`): the sentence of the
+`BrennSend` tool description in `brenn-lib/src/integration.rs` that sends a conversation
+to `brenn-tool` for files.
 
 ## `blob-mutability`
 
@@ -403,7 +392,12 @@ reference, and a caller cannot hand a blob to a tool. Build the path: a tool
 request and a tool result that carry named attachments, and a completion that
 attaches blobs the provider sealed or was handed, under the same check on
 which blobs a component may name as a publish; the caller's side — a
-conversation or a component — receives the references. The "Blobs and
+conversation or a component — receives the references. A conversation already
+has a reference form: (message id, attachment name), admitted only for a
+message the host handed it that is still retained on a channel its app may
+read. So a tool result that carries a blob to a conversation needs a message,
+or another holder the conversation can name, for that form to name; a bare
+blob id handed to a conversation is not a form it can redeem. The "Blobs and
 provided tools" paragraph of `docs/component-packages.md` is the starting
 point. Done = a fixture provider is handed a blob on a request and answers a
 request with a blob its caller can read, both by reference with no byte
@@ -434,13 +428,63 @@ The blob store's budget (`blob_budget_bytes`) is one pool. A component granted
 `blobs` may write 64 MiB per activation, and what it publishes lives as long as
 its channels' windows hold it, so over many activations one component can
 exhaust the pool and every other producer is then refused `budget-exhausted`.
-Decide whether a component gets a share of the budget, who is charged for a
-blob that is forwarded and so held by messages of several components, and
-whether the share is operator configuration. Done = one component at its share
-cannot cause another producer's write to be refused, with a test, and
-`docs/security-posture.md` §7.6 no longer states the exposure. Code site
+A conversation is a producer against the same pool too, through a file it
+attaches with `brenn-tool send`: bounded per send (its files together at most
+`max_blob_bytes`) and in flight (eight open socket connections), and not over
+time, so over many sends one conversation can exhaust the pool as a component
+can. Decide whether a component or a conversation gets a share of the budget,
+who is charged for a blob that is forwarded and so held by messages of several
+producers, and whether the share is operator configuration. Done = one
+producer, component or conversation, at its share cannot cause another
+producer's write to be refused, with a test, and `docs/security-posture.md`
+§7.6 no longer states the exposure for either. Code site
 (`TODO(blob-budget-per-component)`):
 `PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION` in `brenn-wasm/src/lib.rs`.
+
+## `blobs-surface-store-budget-refusal`
+
+On the backend host `budget-exhausted` from `blobs.create` and `blobs.write` is
+the blob store's own answer, given while the guest runs. A surface host that
+buffers a fresh blob in page memory and uploads it at the flush learns the
+backend store's verdict only after the guest has returned `ok`, where no
+variant of the interface reaches the component, so a refusal there loses the
+flush. The per-blob cap is static and can be mirrored into the kernel as the
+body cap is; the store's budget is a moving total the page cannot know. The
+slice that serves `blobs` on a surface decides between accepting a lost,
+announced flush for a blob the backend refuses and a change of shape that
+brings the verdict back to the component — which the interface's undeclared
+status (`blobs-interface-stable-declaration`) keeps open — and likewise whether
+a page fetches a binding's attachments before it activates a kind, answering
+`not-found` for one it could not fetch, or fetches lazily, which wants one more
+`open-error` variant. Done = the surface slice's documents state which, with a
+test of a page-made blob the backend store refuses, and
+`blobs-interface-stable-declaration` is not discharged before this is. Code
+site (`TODO(blobs-surface-store-budget-refusal)`): the `budget-exhausted` case
+of `create-error` in `brenn-wasm/wit/processor-0.3.wit`.
+
+## `correctness-brenn-scheme-send-text-shown-to-ephemeral-only-app`
+
+An app is offered `BrennSend` when it holds `MessagingPublish` or
+`EphemeralPublish`, but a `brenn:` publish needs `MessagingPublish`: the
+publish gate picks the grant from the target's scheme
+(`brenn-messaging/src/publish/mod.rs`), and an app without it gets
+`MissingSender`, which `BrennSend` raises as a `BrennPublishDenied` security
+event. An agent whose `publish` entries name only `ephemeral:` addresses
+lowers to exactly that app. It is still told to send to `brenn:`:
+`MessageChannelList` says "Use BrennSend to send to `brenn:` addresses",
+`MessageChannelGet` says "Use BrennSend to publish to `brenn:`", and
+`BrennSend`'s own description presents `brenn:` first among its two schemes,
+all in `messaging_virtual_tools` (`brenn-lib/src/integration.rs`), which is
+told only whether `BrennSend` is offered. The test
+`with_brennsend_the_messaging_texts_name_it` pins the first two sentences
+verbatim for an `EphemeralPublish` app and changes with the fix.
+
+Code site (`TODO(correctness-brenn-scheme-send-text-shown-to-ephemeral-only-app)`):
+the head of `messaging_virtual_tools` in `brenn-lib/src/integration.rs`.
+
+Done = no messaging tool text directs an app without `MessagingPublish` to
+send to `brenn:`, with a test for an `EphemeralPublish`-only app over every
+messaging tool's description and schema.
 
 ## `correctness-no-single-instance-guard-before-startup-side-effects`
 
@@ -541,7 +585,12 @@ even the markdown artifact is absent. Inbound attachments exist in the
 legacy TypeScript UI (the upload route) and not on the bus
 (`chat-bus-attachments`); this entry is the outbound half. The gap surfaced
 in the Fastmail tooling, whose mail-filter export and import route and mail
-attachments would be its first callers. Done is a delivery path for a
+attachments would be its first callers. The bus has a carrier for such a file
+now: an attachment on a message, which a conversation can make from a file
+with `brenn-tool send` and a component through `blobs`. What is missing is a
+surface page that reads a blob. The delivery path is a message attachment read
+on the user's surface, built with or after the work that serves `blobs` on a
+surface page; its shape is not decided. Done is a delivery path for a
 non-markdown file from a tool result or a component to the user's surface.
 The `TODO(agent-file-delivery-beyond-markdown)` comment sits at the
 `DisplayFile` handler's read in
@@ -916,6 +965,45 @@ Code sites (`TODO(test-selinux-positive-paths-silently-skip)`):
 `brenn-lib/src/selinux.rs`, at `test_context`.
 
 Done = an SELinux-enforcing lane runs these tests, and a skip there fails.
+
+## `test-spawn-new-unreachable-in-test-build`
+
+`ActiveBridge::spawn_new` is the function every ordinary wake of a conversation
+goes through, and nothing it does is tested. It is compiled out of reach of
+the test build: it is marked dead code there, its one caller
+(`spawn_and_register_bridge` in `brenn-server/src/state.rs`) and the export of
+`SpawnContext` are `#[cfg(not(test))]`, and tests build a bridge with
+`inject_for_test` instead. The program it starts is fixed in `brenn-cc` —
+`claude`, or `podman` for a containerised app — and the one override, the
+`program_override` of `CcSession::spawn_inner`, is private to that crate.
+
+A test of it needs `spawn_new` and `SpawnContext` compiled and reachable in
+`brenn-server`'s test build; a way for `brenn-server` to replace the spawned
+program, which is a test seam on the process spawn across the two crates and
+whose shape is to be settled with the test; a stub program that answers the
+init handshake; and a fixture that fills every field of `SpawnContext`.
+
+One thing is known to rest on it today. A conversation that starts with an
+empty context has its read record cleared — the record of the messages whose
+attachments it may name — by `SessionStart::begin`. The compiler holds that
+`spawn_new` makes that call and unit tests hold what the call does; nothing
+holds what `spawn_new` passes it. `begin` takes an optional `Messenger`,
+because a server with no messaging configured has none, so a call given no
+`Messenger`, or another conversation's id, compiles, leaves this
+conversation's record as it was and fails no test. The conversation then
+keeps the record of its previous context and the host admits a name from it;
+the message is one the host did hand this conversation, and it must still be
+retained on a channel its app may read. The clear therefore holds only while
+`spawn_new` hands `begin` the bridge's `Messenger` and its own conversation
+id. The profile swap makes the same call, and its tests run it.
+
+Code site (`TODO(test-spawn-new-unreachable-in-test-build)`):
+`brenn-server/src/active_bridge/bridge.rs`, at the `SessionStart::begin` call
+in `spawn_new`.
+
+Done = a test runs `spawn_new` against a stub program, and fails when the
+`SessionStart::begin` call there is given no `Messenger` or another
+conversation's id.
 
 ## `harness-flush-on-err`
 
@@ -2212,8 +2300,12 @@ resolve against, and a partial send (text without the files) would silently
 misrepresent what the peer asked for. Lifting the restriction needs a decision
 about how a bus peer acquires and proves ownership of an upload; the schema
 field is already in place so the change is purely additive when that decision
-lands. Done when a bus `send` with attachments resolves them and reaches the
-harness with the files attached.
+lands. A candidate answer exists now and is not decided: the command message's
+own bus attachments, which the peer can only name if it made or was handed the
+blobs. The command's attachments come from a page, so this is built with or
+after the work that lets a surface page make a blob and publish a message
+naming it, and not before. Done when a bus `send` with attachments resolves
+them and reaches the harness with the files attached.
 
 Code sites (`TODO(chat-bus-attachments)`): `brenn-envelope/src/chat.rs`, the
 `attachments` field on `ChatCommand::Send`; the rejection itself in
@@ -3993,6 +4085,41 @@ way it discovers a panel's, by reading two channels the `.index` names.
 
 Code sites (`TODO(component-descriptions-both-placements)`):
 brenn-lib/src/wasm_package.rs, at `PackageRecord`.
+
+## `tool-text-names-unoffered-tools`
+
+A tool's description, a field description in its schema, and a refusal it
+answers can each direct a conversation to another tool by name. The three send
+tools are offered by grant: `BrennSend` with `MessagingPublish` or
+`EphemeralPublish`, `PwaPushSend` with `PwaPush`, `MqttSend` with
+`MqttPublish`. A text that names one of them unconditionally tells a
+conversation without the grant to use a tool it is not offered.
+
+The messaging tools name `BrennSend` only to a conversation that is offered
+it. What is left, in `brenn-lib/src/integration.rs`: `MessageChannelList` and
+`PwaPushChannelGet`, both always offered, name `PwaPushSend`; `BrennSend`
+names `PwaPushSend`; `PwaPushSend` names `BrennSend`, once as the tool its
+send budget is shared with; `MqttSend` names both. Each function that builds
+these descriptions is given its own tool's grant and no other;
+`core_virtual_tools` reads all three.
+
+The answers a send tool gives a wrong address do the same. Every refusal of
+an address of another send tool's scheme names that tool, in
+`brenn-server/src/messaging_intercept.rs`,
+`brenn-server/src/pwa_push_intercept.rs` and
+`brenn-server/src/mqtt_intercept.rs`. The `WrongProtocol` error texts in
+`brenn-lib/src/mqtt/error.rs` and `brenn-webhook/src/error.rs` name the other
+send tools too; `MqttSend` answers with the first, and the second has no
+caller that reaches a conversation.
+
+Code site (`TODO(tool-text-names-unoffered-tools)`):
+`brenn-lib/src/integration.rs`, in `core_virtual_tools`, where the three
+grants are read and each is handed to one function.
+
+Done = no description shown to a conversation names a tool that conversation
+is not offered, with a test over the combinations of the three grants; and
+every refusal or error text a tool answers with follows the same rule, or the
+documents record why such a text may name a tool the conversation lacks.
 
 
 ## `guest-envelope-accessors`

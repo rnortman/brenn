@@ -762,8 +762,15 @@ shown the placeholder, under this rule unchanged.
 
 The reason is the model's context, not the wire: bytes shown to a model are
 either noise it will misread or an injection channel nobody reviewed, and a
-lossy decoding is both. A path that puts a non-text body's bytes, or any
-encoding of them, in front of a model is a finding.
+lossy decoding is both.
+
+**The save command is not a host path into the context.** `brenn-tool save`
+writes a non-text body's bytes, or an attachment's, to a file in the
+conversation's own environment, by the conversation's own act (§7.6). The
+host never renders them; after the save they are a file like any other there,
+and what the conversation then does with that file is its own business, as
+with a file it downloaded. A *host* path that puts a non-text body's bytes, or
+any encoding of them, in front of a model is a finding.
 
 ### 7.6 The blob store and attachments
 
@@ -779,10 +786,51 @@ by reference (`docs/message-bus.md` §2.1.2a).
   resource handle, never by id: no function of the interface takes an id, so
   an id read from a header, a body or a component's own store opens nothing.
   A handle dies with the activation. Publishing with attachments needs `ports`
-  as well. Remotes, pages and conversations still cannot create a blob or
-  read one's bytes; host code's `Messenger::publish_from_system_with_attachments`
-  has no production caller. Every later door that admits an outside producer
-  or reader is a boundary change to review here.
+  as well. A conversation forwards, saves and attaches blobs by name (below).
+  Remotes and pages still cannot create a blob or read one's bytes; host
+  code's `Messenger::publish_from_system_with_attachments` has no production
+  caller, and is no longer the only non-component entry that publishes
+  attachments: `Messenger::publish_with_attachments` carries a conversation's.
+  Every later door that admits an outside producer or reader is a boundary
+  change to review here.
+- **Who may redeem what: a conversation, by (message id, attachment name).** A
+  conversation is still never shown an id. It names an attachment by the id
+  of the message that carries it and the attachment's name, and one function,
+  `Messenger::admit_conversation_name`, admits the name only when both hold of
+  that one message: the host handed it to this conversation since the
+  conversation's context was last reset as the host sees it (start,
+  compaction, a user turn beginning with `/`; the record is in memory and lost
+  at restart), and it is still inside the window of a channel the app's
+  policy lets it read now. `docs/message-bus.md` §2.1.2a states the rule. An
+  admitted name is held under the store's own lock, so the blob cannot lose
+  its last holder between the check and the hold. A refusal of a name the
+  host never handed over (`not_read`, `channel_not_readable`) is logged at
+  `warn` with app, conversation and message id: it is a mis-copied id or an
+  injected one.
+- **What the rule does not close.** A conversation induced — by text it read —
+  to forward or save a blob it legitimately holds does so: the rule bounds
+  what it can name, not why it names it, and forwarding is a `BrennSend` under
+  every policy `BrennSend` already has. Two resets of the conversation's
+  context are not seen by the host: a resume Claude Code answers with a fresh
+  session, after which the read record still stands, and a slash command a
+  user sends while a turn is running, where messages handed over before Claude
+  Code acts on the command stay in the record (`blob-handle-integrity` in
+  `TODO.md`). A slash command sent to an idle conversation is closed: the host
+  clears the record at every user turn that begins with `/`. What either gap
+  admits is bounded: a message the host did hand this conversation, still
+  retained on a channel its app may read.
+- **Attachment bytes reach a file the model can open.** `brenn-tool save`
+  writes them into the conversation's environment (§7.5); from there the
+  conversation can read them with its own tools. That is the conversation's
+  act on bytes it may name, not a host rendering.
+- **A conversation is a producer.** `brenn-tool send` seals a new blob per
+  attached file. Each file is reserved at its declared size before any byte
+  crosses, so `max_blob_bytes` and `blob_budget_bytes` refuse it up front; one
+  send's files together are at most `max_blob_bytes`; with eight open socket
+  connections per conversation, at most `8 × max_blob_bytes` is charged and
+  unsealed at once. A send refused at publish, or a connection that drops,
+  leaves no blob. Nothing bounds a conversation over time: over many sends it
+  can fill the pool as a component can (`blob-budget-per-component`).
 - **What bounds one activation.** Host constants, not configuration: 1 MiB per
   read and per write call, 64 live `blob` and `writer` handles together,
   4,096 calls of `open`, `read`, `create`, `write` and `seal`, and 64 MiB of
@@ -800,12 +848,13 @@ by reference (`docs/message-bus.md` §2.1.2a).
 - **What does not bound a component.** Over many activations a component can
   fill the store: each activation may write 64 MiB, and what it publishes
   lives as long as the channels' windows hold it. The store's budget is one
-  pool for every producer, so one component can drive it to
-  `budget-exhausted` for all of them. What limits the rate is the per-sink
-  publish budget and the windows' depths; what tells the operator is the
-  post-activation warning that counts the component's budget refusals. A
-  per-component share of the budget is `blob-budget-per-component` in
-  `TODO.md`.
+  pool for every producer, so one component, or one conversation attaching
+  files, can drive it to `budget-exhausted` for all of them. What limits a
+  component's rate is the per-sink publish budget and the windows' depths;
+  what tells the operator is the post-activation warning that counts the
+  component's budget refusals. A conversation's rate is limited by its send
+  budget and rate. A per-producer share of the budget is
+  `blob-budget-per-component` in `TODO.md`.
 - **A bounded shared resource.** The store is one pool for every producer,
   bounded by `max_blob_bytes` per blob and `blob_budget_bytes` in total, both
   charged on a blob's extent before any byte is written, so a sparse write
@@ -817,9 +866,10 @@ by reference (`docs/message-bus.md` §2.1.2a).
   requires that the blob still has a holder; an id whose holders are gone is
   refused even while its file awaits the reap. A conversation is shown each
   attachment's name, size and content type, never its id and never its
-  bytes (§7.5's reason applies). A component is shown ids in its envelope
-  headers and can redeem none of them by id. Who may redeem an id they were
-  shown, when a reader by id is admitted, is decided with that door.
+  bytes in its context (§7.5's reason applies). A component is shown ids in
+  its envelope headers and can redeem none of them by id. No door redeems by
+  id: a component names by handle and a conversation by (message id,
+  attachment name), under the rule above.
 - **The attachment name is the bound on producer text a conversation sees.**
   1 to 64 bytes of `[A-Za-z0-9._-]`, starting alphanumeric, refused at
   construction: no whitespace, no markup, no control characters.
@@ -1677,6 +1727,25 @@ nothing to what a bare CC can already do as that uid.
   connection under a byte cap; a bounded time to send it; a bounded number of
   open requests per conversation, beyond which a connection is answered `busy`
   before any of its bytes are read. No waiting gate sits in front of any tool.
+- **Raw bytes follow the request line for two ops, and stay bounded.** `save`
+  answers a header line and then the blob's or body's bytes; `send_files`
+  declares each file's size, is answered a go-ahead line only after every
+  check that needs no byte — the tool's admission, the `BrennSend` argument
+  checks, each forwarded name, each declaration, and a reservation of every
+  file's declared size in the blob store — and then reads exactly the
+  declared bytes. The request line keeps its byte cap and deadline; the byte
+  phase has its own fixed deadline (300 s), after which the server ends the
+  transfer; one send's files together are at most `max_blob_bytes`; a
+  transfer holds its connection's permit until it ends, so the bound on open
+  requests is a bound on open transfers. A transfer that ends early or hits
+  the deadline is logged, not signalled: it is what a shell timeout killing
+  the client looks like. The violations of the request line are signalled as
+  for every op.
+- **The server opens no path the conversation names.** `brenn-tool`, running
+  in the conversation's environment as the conversation, opens and writes the
+  files; only bytes cross the socket. For a bare app `brenn-tool` runs as the
+  server's uid with no container, and this section claims no confinement of
+  what it can open there.
 - **The listener carries the container's label, never the server's widened
   policy.** Where the host confines containers with SELinux, the socket is
   created under the context configured on the container definition, so the

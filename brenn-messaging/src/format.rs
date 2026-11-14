@@ -89,8 +89,8 @@ impl EnvelopeShape for ConversationShape {
                 }
                 Ok(())
             }
-            // TODO(llm-sees-binary-content): a non-text body reaches a
-            // conversation only as this metadata placeholder.
+            // A non-text body reaches a conversation only as this metadata
+            // placeholder; its bytes reach a file through `brenn-tool save`.
             None => out.serialize_field(
                 "body",
                 &BinaryPlaceholder {

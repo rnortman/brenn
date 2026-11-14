@@ -15,12 +15,14 @@ use std::borrow::Cow;
 
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
+use brenn_envelope::{BodyError, MAX_ATTACHMENTS_PER_MESSAGE};
 use brenn_lib::messaging::{ChannelScheme, MessageEnvelope, Urgency};
 use brenn_messaging::format::{ConversationEnvelopes, ConversationShape};
 use brenn_messaging::{
-    CancelResult, ChannelListing, EditFields, EditResult, MessageQuery, PublishOrigin,
-    PublishResult, QueryError, SubscriptionListing,
+    AdmittedPart, AttachmentName, CancelResult, ChannelListing, EditFields, EditResult,
+    MessageQuery, NamedPart, PublishOrigin, PublishResult, QueryError, SubscriptionListing,
 };
+use brenn_messaging_store::blob::{AttachmentError, BlobHold, HeldAttachments};
 use brenn_obs::security::{DenialKind, SecurityEventType, signal_publish_denial};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -345,17 +347,49 @@ async fn execute_subscription_list(bridge: &ActiveBridge) -> ToolOutcome {
     })
 }
 
-/// `BrennSend`.
+/// A `BrennSend`'s arguments, checked.
+pub(crate) struct SendArgs<'a> {
+    pub to: &'a str,
+    pub body: brenn_lib::messaging::MessageBody,
+    pub urgency: Urgency,
+    pub reply_to: Option<String>,
+    pub deliver_after: Option<DateTime<Utc>>,
+    pub delivery_deadline: Option<DateTime<Utc>>,
+}
+
+/// `BrennSend`: the arguments, the forwarded attachments, the publish.
 async fn execute_send(
     bridge: &ActiveBridge,
     tool_name: &str,
     tool_input: &serde_json::Value,
 ) -> ToolOutcome {
+    let (messenger, args) = match parse_send(bridge, tool_name, tool_input) {
+        Ok(parsed) => parsed,
+        Err(outcome) => return outcome,
+    };
+    let forwarded = match resolve_forwarded(bridge, messenger, tool_name, tool_input).await {
+        Ok(forwarded) => forwarded,
+        Err(outcome) => return outcome,
+    };
+    let attachments = match held_attachments(forwarded) {
+        Ok(attachments) => attachments,
+        Err(outcome) => return outcome,
+    };
+    publish_send(bridge, messenger, args, attachments).await
+}
+
+/// Check a `BrennSend`'s arguments other than `attachments`, or the rejection
+/// to return. A bridge with no `Messenger` is refused after the address checks.
+pub(crate) fn parse_send<'a>(
+    bridge: &'a ActiveBridge,
+    tool_name: &str,
+    tool_input: &'a serde_json::Value,
+) -> Result<(&'a std::sync::Arc<brenn_messaging::Messenger>, SendArgs<'a>), ToolOutcome> {
     // Extract `to` first so cross-protocol errors can fire before the
     // messenger check (cross-protocol misuse doesn't require a messenger).
     let to = match tool_input.get("to").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
-        _ => return reject(tool_name, "missing or empty `to` argument"),
+        _ => return Err(reject(tool_name, "missing or empty `to` argument")),
     };
     // Cross-protocol misuse: pwa_push: addresses must go to PwaPushSend.
     if ChannelScheme::of(to) == Some(ChannelScheme::PwaPush) {
@@ -364,12 +398,12 @@ async fn execute_send(
             to,
             "BrennSend called with pwa_push: address; redirecting LLM to PwaPushSend"
         );
-        return reject(
+        return Err(reject(
             tool_name,
             "BrennSend only accepts `brenn:` and `ephemeral:` addresses. \
              Use PwaPushSend for `pwa_push:` addresses. \
              Use MessageChannelList to discover available channels.",
-        );
+        ));
     }
     // Cross-protocol misuse: mqtt: addresses must go to MqttSend.
     if ChannelScheme::of(to) == Some(ChannelScheme::Mqtt) {
@@ -378,12 +412,12 @@ async fn execute_send(
             to,
             "BrennSend called with mqtt: address; redirecting LLM to MqttSend"
         );
-        return reject(
+        return Err(reject(
             tool_name,
             "BrennSend only accepts `brenn:` and `ephemeral:` addresses. \
              Use MqttSend for `mqtt:` addresses. \
              Use MessageChannelList to discover available channels.",
-        );
+        ));
     }
     // Cross-protocol misuse: webhook: addresses are inbound-only (no outbound
     // send tool).
@@ -393,79 +427,269 @@ async fn execute_send(
             to,
             "BrennSend called with webhook: address; webhook: is inbound-only"
         );
-        return reject(
+        return Err(reject(
             tool_name,
             "BrennSend only accepts `brenn:` and `ephemeral:` addresses. \
              `webhook:` channels are inbound-only in this version. \
              Use MessageChannelList to discover available channels.",
-        );
+        ));
     }
     let Some(messenger) = bridge.messenger() else {
         tracing::warn!(
             tool = tool_name,
             "BrennSend: no Messenger configured; returning error to LLM"
         );
-        return missing_messenger();
+        return Err(missing_messenger());
     };
     let Some(body) = tool_input.get("body").and_then(|v| v.as_str()) else {
-        return reject(tool_name, "missing `body` argument");
+        return Err(reject(tool_name, "missing `body` argument"));
     };
+    let body = text_body(tool_name, body, tool_input.get("content_type"))?;
     // Reject legacy `wake` key — reject-and-teach so a stale-habit LLM isn't
     // silently downgraded to the `urgency` default.
     if tool_input.get("wake").is_some() {
-        return reject(
+        return Err(reject(
             tool_name,
             "unknown field `wake`; use `urgency` (\"very-low\", \"low\", \"normal\", \"high\")",
-        );
+        ));
     }
     // Reject `impetus` by name rather than ignoring it: carried
     // user-interaction authority is not an LLM's to assert, and a model probing
     // for it hears "no" instead of silence.
     if tool_input.get("impetus").is_some() {
-        return reject(
+        return Err(reject(
             tool_name,
             "unknown field `impetus`; a message's user-interaction authority is set \
              by the server, never by a tool call",
-        );
+        ));
     }
     let urgency_str = tool_input
         .get("urgency")
         .and_then(|v| v.as_str())
         .unwrap_or("low");
     let Some(urgency) = Urgency::parse(urgency_str) else {
-        return reject(
+        return Err(reject(
             tool_name,
             &format!(
                 "unknown `urgency` value: {urgency_str:?}; \
                  must be one of \"very-low\", \"low\", \"normal\", \"high\""
             ),
-        );
+        ));
     };
     let reply_to = tool_input
         .get("reply_to")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let deliver_after = match parse_optional_rfc3339(tool_input.get("deliver_after")) {
-        Ok(v) => v,
-        Err(e) => return reject(tool_name, &e),
-    };
-    let delivery_deadline = match parse_optional_rfc3339(tool_input.get("delivery_deadline")) {
-        Ok(v) => v,
-        Err(e) => return reject(tool_name, &e),
-    };
+    let deliver_after = parse_optional_rfc3339(tool_input.get("deliver_after"))
+        .map_err(|e| reject(tool_name, &e))?;
+    let delivery_deadline = parse_optional_rfc3339(tool_input.get("delivery_deadline"))
+        .map_err(|e| reject(tool_name, &e))?;
+    Ok((
+        messenger,
+        SendArgs {
+            to,
+            body,
+            urgency,
+            reply_to,
+            deliver_after,
+            delivery_deadline,
+        },
+    ))
+}
 
+/// A conversation's text body with the content type it states, or the
+/// rejection naming the type. Only a text type is accepted: a conversation
+/// publishes bytes as an attachment, never as a body.
+fn text_body(
+    tool_name: &str,
+    body: &str,
+    content_type: Option<&serde_json::Value>,
+) -> Result<brenn_lib::messaging::MessageBody, ToolOutcome> {
+    let content_type = match content_type {
+        None => return Ok(brenn_lib::messaging::MessageBody::text(body)),
+        Some(serde_json::Value::String(ct)) => ct.as_str(),
+        Some(_) => return Err(reject(tool_name, "`content_type` must be a string")),
+    };
+    let shown = sanitize_untrusted_str(content_type, MAX_LOGGED_UNTRUSTED_BYTES);
+    // `is_text` is `is_text_content_type`'s answer; a refused non-text body is
+    // dropped here, before anything can publish it.
+    match brenn_lib::messaging::MessageBody::from_parts(Some(content_type), body.as_bytes()) {
+        Ok(built) if built.is_text() => Ok(built),
+        Ok(_) => Err(reject(
+            tool_name,
+            &format!(
+                "`content_type` {shown:?} is not a text type; a body is text ({}). \
+                 A conversation publishes bytes as an attachment, never as a body",
+                brenn_lib::integration::TEXT_CONTENT_TYPES
+            ),
+        )),
+        // `reason` and not the error itself: its `Display` repeats the whole
+        // input, which `shown` caps.
+        Err(BodyError::InvalidContentType { reason, .. }) => Err(reject(
+            tool_name,
+            &format!("malformed `content_type` {shown:?}: {reason}"),
+        )),
+        Err(e @ BodyError::NotUtf8 { .. }) => {
+            unreachable!("a `&str` body is UTF-8, yet from_parts refused it: {e}")
+        }
+    }
+}
+
+/// Admit every entry of a `BrennSend`'s `attachments` argument under the
+/// conversation naming rule, each as its new name and one hold on the blob it
+/// names. The first refusal refuses the whole send, and the holds already
+/// taken drop with it.
+pub(crate) async fn resolve_forwarded(
+    bridge: &ActiveBridge,
+    messenger: &brenn_messaging::Messenger,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Result<Vec<(AttachmentName, BlobHold)>, ToolOutcome> {
+    let entries = match tool_input.get("attachments") {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::Object(entries)) => entries,
+        Some(other) => {
+            return Err(reject(
+                tool_name,
+                &format!(
+                    "`attachments` must be an object mapping each new attachment name to \
+                     {{\"message_id\": …, \"name\": …}}, got JSON {}",
+                    json_variant_name(other)
+                ),
+            ));
+        }
+    };
+    if entries.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(refusal(
+            "too_many_attachments",
+            format!(
+                "{} attachments; a message carries at most {MAX_ATTACHMENTS_PER_MESSAGE}",
+                entries.len()
+            ),
+        ));
+    }
+    let mut forwarded = Vec::with_capacity(entries.len());
+    for (new_name, source) in entries {
+        let new_name = attachment_name(new_name)?;
+        let (message_id, name) = forwarded_source(tool_name, &new_name, source)?;
+        let message_id = message_uuid(message_id)?;
+        let name = attachment_name(name)?;
+        match messenger
+            .admit_conversation_name(
+                bridge.conversation_id,
+                &bridge.app_slug,
+                message_id,
+                &NamedPart::Attachment(name),
+            )
+            .await
+        {
+            Ok(AdmittedPart::Attachment(hold)) => forwarded.push((new_name, hold)),
+            Ok(AdmittedPart::Body(_)) => unreachable!("an attachment name admits a hold"),
+            Err(refused) => {
+                return Err(refusal(
+                    refused.reason(),
+                    format!("attachment {new_name}: {refused}"),
+                ));
+            }
+        }
+    }
+    Ok(forwarded)
+}
+
+/// One `attachments` entry's `message_id` and `name`, both strings and
+/// nothing else beside them.
+fn forwarded_source<'a>(
+    tool_name: &str,
+    new_name: &AttachmentName,
+    source: &'a serde_json::Value,
+) -> Result<(&'a str, &'a str), ToolOutcome> {
+    let shape_err = || {
+        reject(
+            tool_name,
+            &format!(
+                "attachment {new_name}: each `attachments` entry must be \
+                 {{\"message_id\": \"<uuid>\", \"name\": \"<attachment name>\"}}"
+            ),
+        )
+    };
+    let fields = source.as_object().ok_or_else(shape_err)?;
+    if fields.len() != 2 {
+        return Err(shape_err());
+    }
+    let message_id = fields
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(shape_err)?;
+    let name = fields
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(shape_err)?;
+    Ok((message_id, name))
+}
+
+/// `id` as a message's UUID, or the `malformed_message_id` refusal.
+pub(crate) fn message_uuid(id: &str) -> Result<uuid::Uuid, ToolOutcome> {
+    uuid::Uuid::parse_str(id).map_err(|_| {
+        refusal(
+            "malformed_message_id",
+            format!(
+                "message_id {:?} is not a UUID",
+                sanitize_untrusted_str(id, MAX_LOGGED_UNTRUSTED_BYTES)
+            ),
+        )
+    })
+}
+
+/// `name` as an attachment name, or the `malformed_attachment_name` refusal.
+pub(crate) fn attachment_name(name: &str) -> Result<AttachmentName, ToolOutcome> {
+    AttachmentName::new(name).map_err(|e| {
+        refusal(
+            "malformed_attachment_name",
+            format!(
+                "{:?}: {e}",
+                sanitize_untrusted_str(name, MAX_LOGGED_UNTRUSTED_BYTES)
+            ),
+        )
+    })
+}
+
+/// The attachments of a send, or the refusal for a count over the bound or
+/// a name given twice.
+pub(crate) fn held_attachments(
+    entries: Vec<(AttachmentName, BlobHold)>,
+) -> Result<HeldAttachments, ToolOutcome> {
+    HeldAttachments::new(entries).map_err(|e| match e {
+        AttachmentError::TooMany { .. } => refusal("too_many_attachments", e.to_string()),
+        AttachmentError::DuplicateName(name) => refusal(
+            "duplicate_attachment_name",
+            format!("attachment name {name} given twice"),
+        ),
+    })
+}
+
+/// Publish a checked `BrennSend` naming `attachments`, signal a denial, and
+/// map the result. A send that publishes is recorded as read by the
+/// conversation.
+pub(crate) async fn publish_send(
+    bridge: &ActiveBridge,
+    messenger: &brenn_messaging::Messenger,
+    args: SendArgs<'_>,
+    attachments: HeldAttachments,
+) -> ToolOutcome {
+    let to = args.to;
     let result = messenger
-        .publish(
+        .publish_with_attachments(
             PublishOrigin::Conversation {
                 id: bridge.conversation_id,
             },
             &bridge.app_slug,
             to,
-            body.into(),
-            urgency,
-            reply_to.as_deref(),
-            deliver_after,
-            delivery_deadline,
+            args.body,
+            args.urgency,
+            args.reply_to.as_deref(),
+            args.deliver_after,
+            args.delivery_deadline,
+            attachments,
         )
         .await;
 
@@ -489,13 +713,16 @@ async fn execute_send(
             message_id,
             address,
             remaining_budget,
-        } => outcome_ok(&BrennSendOk {
-            address: &address,
-            message_id: message_id.to_string(),
-            ok: true,
-            remaining_budget: remaining_budget
-                .expect("Conversation-origin publish returns Some(remaining_budget)"),
-        }),
+        } => {
+            messenger.note_conversation_sent(bridge.conversation_id, message_id, &address);
+            outcome_ok(&BrennSendOk {
+                address: &address,
+                message_id: message_id.to_string(),
+                ok: true,
+                remaining_budget: remaining_budget
+                    .expect("Conversation-origin publish returns Some(remaining_budget)"),
+            })
+        }
         PublishResult::BudgetExhausted => outcome_err(Cow::Borrowed(
             "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
         )),
@@ -520,14 +747,38 @@ async fn execute_send(
             "deferred-message quota exceeded: this channel already holds its cap of {cap} \
              scheduled messages; retry after some release"
         ))),
-        // `Messenger::publish` carries no impetus and the `impetus` key is
-        // rejected by name before we get here, so this is a construction bug,
-        // not an outcome to hand the model.
+        // `Messenger::publish_with_attachments` carries no impetus and the
+        // `impetus` key is rejected by name before we get here, so this is a
+        // construction bug, not an outcome to hand the model.
         PublishResult::ImpetusUnauthorized => unreachable!(
             "BrennSend publish returned ImpetusUnauthorized: this entry point passes no \
              impetus"
         ),
     }
+}
+
+/// A refusal a conversation can tell apart by kind:
+/// `{"error":…,"ok":false,"reason":…}`.
+#[derive(Serialize)]
+struct ToolRefusal<'a> {
+    // alphabetical: error, ok, reason
+    error: Cow<'a, str>,
+    ok: bool,
+    reason: &'a str,
+}
+
+/// The tool's error JSON for a refusal of kind `reason`, logged at `debug`;
+/// the naming rule logs its own refusals.
+pub(crate) fn refusal(reason: &str, error: String) -> ToolOutcome {
+    tracing::debug!(reason, error, "conversation blob verb refused");
+    ToolOutcome::Err(
+        serde_json::to_value(ToolRefusal {
+            error: Cow::Owned(error),
+            ok: false,
+            reason,
+        })
+        .expect("ToolRefusal serialization is infallible"),
+    )
 }
 
 /// `MessageChannelGet`.
@@ -599,7 +850,10 @@ async fn execute_channel_get(
         calling_app_slug: bridge.app_slug.clone(),
     };
     match messenger.query(&q).await {
-        Ok(envelopes) => outcome_ok(&ConversationEnvelopes(&envelopes)),
+        Ok(envelopes) => {
+            messenger.note_conversation_read(bridge.conversation_id, &envelopes);
+            outcome_ok(&ConversationEnvelopes(&envelopes))
+        }
         Err(QueryError::UnknownChannel(addr)) => {
             outcome_err(Cow::Owned(format!("unknown channel address {addr:?}")))
         }
@@ -650,6 +904,7 @@ async fn execute_pending_list(
         });
     }
     let envelopes = messenger.list_pending(&bridge.app_slug, channel_str).await;
+    messenger.note_conversation_read(bridge.conversation_id, &envelopes);
     outcome_ok(&BrennPendingListResponse {
         messages: ConversationEnvelopes(&envelopes),
     })
@@ -702,10 +957,22 @@ async fn execute_edit(
         Ok(u) => u,
         Err(e) => return e,
     };
-    let body = match tool_input.get("body") {
-        None => None,
-        Some(serde_json::Value::String(s)) => Some(s.clone()),
-        Some(_) => return reject(tool_name, "`body` must be a string"),
+    let body = match (tool_input.get("body"), tool_input.get("content_type")) {
+        (None, None) => None,
+        (None, Some(_)) => {
+            return reject(
+                tool_name,
+                "`content_type` without `body`: a content type is replaced only together \
+                 with the body it describes",
+            );
+        }
+        (Some(serde_json::Value::String(s)), content_type) => {
+            match text_body(tool_name, s, content_type) {
+                Ok(body) => Some(body),
+                Err(outcome) => return outcome,
+            }
+        }
+        (Some(_), _) => return reject(tool_name, "`body` must be a string"),
     };
     // Parse deliver_after: distinguish missing from explicit null.
     let obj = tool_input.as_object();
@@ -814,7 +1081,10 @@ async fn execute_edit(
         );
     }
     match result {
-        EditResult::Ok { envelope } => edit_ok_outcome(&envelope),
+        EditResult::Ok { envelope } => {
+            messenger.note_conversation_read(bridge.conversation_id, [&*envelope]);
+            edit_ok_outcome(&envelope)
+        }
         EditResult::UnknownMessage => {
             outcome_err(Cow::Owned(format!("unknown message {message_uuid}")))
         }
@@ -1190,7 +1460,7 @@ fn reject(tool_name: &str, error: &str) -> ToolOutcome {
 
 /// Server constructed without a Messenger (no channels configured). Surfaced
 /// as a tool-result error rather than a panic so the LLM can back off.
-fn missing_messenger() -> ToolOutcome {
+pub(crate) fn missing_messenger() -> ToolOutcome {
     outcome_err(Cow::Borrowed(
         "messaging is not configured on this brenn server",
     ))
@@ -1211,6 +1481,13 @@ pub(crate) fn brenn_channel_denied_msg(addr: &str) -> String {
     };
     format!("channel {addr:?} does not exist or is not in this app's {allowlist} allowlist")
 }
+
+#[cfg(test)]
+pub(crate) mod blob_fixture;
+#[cfg(test)]
+mod blob_tests;
+#[cfg(test)]
+mod content_type_tests;
 
 #[cfg(test)]
 mod tests {

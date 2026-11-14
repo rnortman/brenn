@@ -162,6 +162,9 @@ pub(super) async fn cc_event_loop(
                 .await;
             }
             SessionEvent::CompactBoundary { metadata } => {
+                // Whatever the phase: a compaction the host did not start
+                // drops the handed-over messages from the context all the same.
+                bridge.forget_conversation_reads();
                 handle_compact_boundary(&bridge, metadata.as_ref()).await;
                 let mut state = bridge.compaction.lock().await;
                 if matches!(state.phase, CompactionPhase::Compacting) {

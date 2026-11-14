@@ -27,7 +27,9 @@ use chrono::{DateTime, Utc};
 use tracing::debug;
 use uuid::Uuid;
 
-use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageBody, MessageEnvelope, Urgency};
+use brenn_envelope::{
+    AttachmentName, ChannelCapabilities, ChannelScheme, MessageBody, MessageEnvelope, Urgency,
+};
 use brenn_queue::{
     Advance, CursorOverflow, Deferred, DeferredId, OwnedDeferred, QuotaExceeded, Replay, Resume,
     RingCore,
@@ -37,7 +39,7 @@ use brenn_queue::{
 pub type RingWindow = brenn_queue::Window<Arc<MessageEnvelope>>;
 
 pub use crate::blob::no_holds;
-use crate::blob::{BlobHolds, assert_held};
+use crate::blob::{BlobHold, BlobHolds, assert_held};
 use crate::db::ns_to_utc;
 use crate::store::{
     AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
@@ -66,6 +68,19 @@ pub struct RetainedMessage {
     pub envelope: Arc<MessageEnvelope>,
 }
 
+/// The answer to [`RingStore::retained_named`].
+#[derive(Debug)]
+pub enum RingNamed {
+    /// The message is not in the ring.
+    NotRetained,
+    /// The message is retained; its envelope, holding no blob.
+    Body(Arc<MessageEnvelope>),
+    /// The message is retained and does not carry the name.
+    NoSuchAttachment(Arc<MessageEnvelope>),
+    /// The message is retained and carries the name: one hold, on that blob.
+    Attachment(Arc<MessageEnvelope>, BlobHold),
+}
+
 /// A message that entered retention, with the overflow that entry caused.
 #[derive(Debug, Clone)]
 pub struct Appended {
@@ -90,7 +105,9 @@ pub struct ReleasedBatch {
 /// park, a discarded cancel, an edit's overwrite, or the store itself dropping
 /// — with no removal site doing anything. Nothing outside this module sees the
 /// type: every method handing an entry out hands out only its envelope, so a
-/// reader's `Arc<MessageEnvelope>` holds no blob.
+/// reader's `Arc<MessageEnvelope>` holds no blob. The one exception is
+/// [`RingStore::retained_named`], which also hands out a clone of the one hold
+/// on the one blob its caller named; the entry's shared holds never leave.
 #[derive(Clone, Debug)]
 struct HeldEnvelope {
     envelope: Arc<MessageEnvelope>,
@@ -326,6 +343,51 @@ impl RingStore {
                 envelope: Arc::clone(&e.message.envelope),
             })
             .collect()
+    }
+
+    /// The retained message `message_uuid`, and, when `name` is given, a hold
+    /// on the one blob that name gives. The whole ring is the window searched;
+    /// a parked message is not retained.
+    ///
+    /// The hold is cloned under the ring's lock, so the blob cannot lose its
+    /// last holder between the lookup and the hold. It keeps alive only the
+    /// blob named, never the message's other attachments.
+    ///
+    /// # Panics
+    ///
+    /// If the message carries `name` and the entry holds no blob with the
+    /// reference's id: a ring entry always holds every blob it names.
+    pub fn retained_named(&self, message_uuid: Uuid, name: Option<&AttachmentName>) -> RingNamed {
+        let state = self.state();
+        let Some(entry) = state
+            .core
+            .ring()
+            .iter()
+            .find(|e| e.message.envelope.message_id == message_uuid)
+        else {
+            return RingNamed::NotRetained;
+        };
+        let envelope = Arc::clone(&entry.message.envelope);
+        let Some(name) = name else {
+            return RingNamed::Body(envelope);
+        };
+        let Some(reference) = envelope.attachments.get(name) else {
+            return RingNamed::NoSuchAttachment(envelope);
+        };
+        let hold = entry
+            .message
+            .holds
+            .iter()
+            .find(|h| h.id() == &reference.id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "ring message {message_uuid} on {}: attachment {name} names blob {}, which \
+                     the entry does not hold",
+                    self.address, reference.id
+                )
+            })
+            .clone();
+        RingNamed::Attachment(envelope, hold)
     }
 
     /// Number of retained messages.

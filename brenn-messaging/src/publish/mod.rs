@@ -277,7 +277,7 @@ impl Messenger {
     /// budget. The message body, channel address, and option fields come from
     /// the LLM tool call.
     ///
-    /// Thin wrapper over `publish_core` with the app-sender authority source;
+    /// [`Messenger::publish_with_attachments`] with no attachments;
     /// `publish_from_attacher` is the sibling entry for attach publishers.
     #[allow(clippy::too_many_arguments)]
     pub async fn publish(
@@ -290,6 +290,37 @@ impl Messenger {
         reply_to: Option<&str>,
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
+    ) -> PublishResult {
+        self.publish_with_attachments(
+            origin,
+            sender_app_slug,
+            addr,
+            body,
+            urgency,
+            reply_to,
+            deliver_after,
+            delivery_deadline,
+            HeldAttachments::none(),
+        )
+        .await
+    }
+
+    /// [`Messenger::publish`] for a message naming the blobs `attachments`
+    /// holds. Thin wrapper over `publish_core` with the app-sender authority
+    /// source: every gate, the send budget included, applies unchanged, and a
+    /// parked message carries its attachments into the deferred set.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_with_attachments(
+        &self,
+        origin: PublishOrigin,
+        sender_app_slug: &str,
+        addr: &str,
+        body: super::MessageBody,
+        urgency: super::Urgency,
+        reply_to: Option<&str>,
+        deliver_after: Option<DateTime<Utc>>,
+        delivery_deadline: Option<DateTime<Utc>>,
+        attachments: HeldAttachments,
     ) -> PublishResult {
         assert!(
             !matches!(origin, PublishOrigin::System),
@@ -309,7 +340,7 @@ impl Messenger {
             deliver_after,
             delivery_deadline,
             None,
-            HeldAttachments::none(),
+            attachments,
         )
         .await
     }

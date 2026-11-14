@@ -150,6 +150,30 @@ pub(super) async fn bridge_with_messenger_for_drain()
 pub(super) async fn bridge_with_messenger_for_drain_at_ceiling(
     send_budget: u32,
 ) -> (Arc<ActiveBridge>, broadcast::Receiver<WsServerMessage>) {
+    drain_fixture(send_budget, None).await
+}
+
+/// The system component that publishes onto `test-drain-channel` in
+/// [`bridge_with_blob_messenger_for_drain`].
+pub(super) const DRAIN_TEST_PUBLISHER: &str = "drain-test-publisher";
+
+/// [`bridge_with_messenger_for_drain`] whose messenger also has a blob store
+/// over the returned directory, and lets [`DRAIN_TEST_PUBLISHER`] publish onto
+/// `test-drain-channel` with attachments.
+pub(super) async fn bridge_with_blob_messenger_for_drain() -> (
+    Arc<ActiveBridge>,
+    broadcast::Receiver<WsServerMessage>,
+    brenn_messaging::testutils::TempBlobDir,
+) {
+    let blobs = brenn_messaging::testutils::TempBlobDir::new();
+    let (bridge, rx) = drain_fixture(100, Some(blobs.path())).await;
+    (bridge, rx, blobs)
+}
+
+async fn drain_fixture(
+    send_budget: u32,
+    blob_dir: Option<&std::path::Path>,
+) -> (Arc<ActiveBridge>, broadcast::Receiver<WsServerMessage>) {
     let db = crate::test_support::init_db_memory();
     let (broadcast_tx, broadcast_rx) = broadcast::channel(64);
 
@@ -208,6 +232,15 @@ pub(super) async fn bridge_with_messenger_for_drain_at_ceiling(
         Arc::new(brenn_messaging::query::NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
         brenn_lib::messaging::MessagingGlobalConfig::default(),
     );
+    let messenger = match blob_dir {
+        None => messenger,
+        Some(dir) => {
+            let messenger = messenger.with_subscriber_registrations(
+                brenn_messaging::testutils::covering_system_publisher(DRAIN_TEST_PUBLISHER),
+            );
+            brenn_messaging::testutils::install_blob_store_at(messenger, dir).await
+        }
+    };
     // Boot's attach: the conversation holds a position on every channel its app
     // subscribes to before anything is published.
     messenger.attach_conversation_subscribers().await;

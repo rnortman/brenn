@@ -8,10 +8,12 @@
 //! admission and dispatch as the hook path.
 //!
 //! One connection carries one request line and one response line (the wire
-//! types live in `brenn_tool_proto`). Intake is bounded, not queued: a
-//! connection beyond `MAX_IN_FLIGHT` open ones is answered `busy` before any
-//! of its bytes are read, and a request line is read up to
-//! `MAX_REQUEST_BYTES`.
+//! types live in `brenn_tool_proto`); a `save` follows its response line with
+//! the bytes it names, and a `send_files` follows its go-ahead line with the
+//! client's file bytes. Intake is bounded, not queued: a connection beyond
+//! `MAX_IN_FLIGHT` open ones is answered `busy` before any of its bytes are
+//! read, a request line is read up to `MAX_REQUEST_BYTES`, and a transfer
+//! holds its connection's permit until it ends, within `TRANSFER_DEADLINE`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use super::ActiveBridge;
+use super::blob_transfer::{self, TRANSFER_DEADLINE};
 use super::brenn_tools::{CallOrigin, ExecuteError, execute_tool};
 use super::cc_spawn_config::{find_virtual_tool, virtual_tools};
 
@@ -74,6 +77,7 @@ struct Shared {
     bridge: OnceLock<Weak<ActiveBridge>>,
     in_flight: Arc<Semaphore>,
     read_deadline: Duration,
+    transfer_deadline: Duration,
 }
 
 /// A conversation's tool socket. Closing (or dropping) it stops accepting and
@@ -103,21 +107,23 @@ impl ToolSocket {
         conversation_id: i64,
         selinux_context: Option<&str>,
     ) -> io::Result<Self> {
-        Self::bind_with_read_deadline(
+        Self::bind_with_deadlines(
             tool_socket_root,
             app_slug,
             conversation_id,
             selinux_context,
             REQUEST_READ_DEADLINE,
+            TRANSFER_DEADLINE,
         )
     }
 
-    fn bind_with_read_deadline(
+    pub(super) fn bind_with_deadlines(
         tool_socket_root: &Path,
         app_slug: &str,
         conversation_id: i64,
         selinux_context: Option<&str>,
         read_deadline: Duration,
+        transfer_deadline: Duration,
     ) -> io::Result<Self> {
         let dir = tool_socket_dir(tool_socket_root, app_slug, conversation_id);
         recreate_private_dir(&dir)?;
@@ -150,6 +156,7 @@ impl ToolSocket {
             bridge: OnceLock::new(),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             read_deadline,
+            transfer_deadline,
         });
         #[cfg(test)]
         let listener_fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
@@ -174,6 +181,12 @@ impl ToolSocket {
                 self.shared.conversation_id
             );
         }
+    }
+
+    /// Connections this socket may still open before it answers `busy`.
+    #[cfg(test)]
+    pub(super) fn available_permits(&self) -> usize {
+        self.shared.in_flight.available_permits()
     }
 
     /// The per-conversation directory holding the socket, the mount source
@@ -278,8 +291,11 @@ enum LineError {
 }
 
 /// Read one newline-terminated request line of at most `MAX_REQUEST_BYTES`
-/// bytes, newline excluded.
-async fn read_request_line(read: OwnedReadHalf) -> Result<Vec<u8>, LineError> {
+/// bytes, newline excluded, and return it with the reader, which holds
+/// whatever the client sent after the line.
+async fn read_request_line(
+    read: OwnedReadHalf,
+) -> Result<(Vec<u8>, BufReader<OwnedReadHalf>), LineError> {
     let mut reader = BufReader::new(read).take(MAX_REQUEST_BYTES as u64 + 1);
     let mut buf = Vec::new();
     reader
@@ -288,7 +304,7 @@ async fn read_request_line(read: OwnedReadHalf) -> Result<Vec<u8>, LineError> {
         .map_err(LineError::Io)?;
     if buf.last() == Some(&b'\n') {
         buf.pop();
-        return Ok(buf);
+        return Ok((buf, reader.into_inner()));
     }
     if buf.len() > MAX_REQUEST_BYTES {
         return Err(LineError::TooLong);
@@ -308,7 +324,33 @@ async fn serve_connection(stream: UnixStream, shared: &Shared) {
             signal_violation(shared, &detail, None);
             invalid_request(detail)
         }
-        Ok(Ok(line)) => answer(shared, &line).await,
+        Ok(Ok((line, mut reader))) => match admit_request(shared, &line) {
+            Err(refused) => refused,
+            Ok((bridge, Request::SendFiles { input, files })) => {
+                blob_transfer::serve_send_files(
+                    bridge,
+                    input,
+                    files,
+                    &mut reader,
+                    &mut write,
+                    shared.transfer_deadline,
+                )
+                .await;
+                return;
+            }
+            Ok((bridge, Request::Save { message_id, part })) => {
+                blob_transfer::serve_save(
+                    bridge,
+                    &message_id,
+                    &part,
+                    &mut write,
+                    shared.transfer_deadline,
+                )
+                .await;
+                return;
+            }
+            Ok((bridge, request)) => answer(shared, &bridge, request, &line).await,
+        },
         Ok(Err(LineError::Io(e))) => {
             tracing::debug!(error = %e, "tool socket read failed");
             return;
@@ -334,20 +376,31 @@ async fn serve_connection(stream: UnixStream, shared: &Shared) {
     }
 }
 
-/// Answer one request line.
-async fn answer(shared: &Shared, line: &[u8]) -> Response {
+/// Parse one request line and find the bridge it runs against, or the
+/// response refusing it.
+fn admit_request(shared: &Shared, line: &[u8]) -> Result<(Arc<ActiveBridge>, Request), Response> {
     let request = match Request::parse(line) {
         Ok(request) => request,
         Err(detail) => {
             signal_violation(shared, &detail, Some(line));
-            return invalid_request(detail);
+            return Err(invalid_request(detail));
         }
     };
     let Some(bridge) = shared.bridge.get().and_then(Weak::upgrade) else {
-        return Response::Err(WireError::NotReady {
+        return Err(Response::Err(WireError::NotReady {
             detail: "this conversation is not serving tool calls".into(),
-        });
+        }));
     };
+    Ok((bridge, request))
+}
+
+/// Answer one request that has a single response line.
+async fn answer(
+    shared: &Shared,
+    bridge: &Arc<ActiveBridge>,
+    request: Request,
+    line: &[u8],
+) -> Response {
     match request {
         Request::List => {
             let entries: Vec<CatalogEntry> =
@@ -369,7 +422,7 @@ async fn answer(shared: &Shared, line: &[u8]) -> Response {
         }
         Request::Call { tool, input } => {
             let started = Instant::now();
-            let response = match execute_tool(&bridge, CallOrigin::Socket, &tool, input).await {
+            let response = match execute_tool(bridge, CallOrigin::Socket, &tool, input).await {
                 Ok(super::ToolOutcome::Ok(result)) => Response::Ok(result),
                 Ok(super::ToolOutcome::Err(output)) => {
                     Response::Err(WireError::ToolError { output })
@@ -390,6 +443,9 @@ async fn answer(shared: &Shared, line: &[u8]) -> Response {
             );
             response
         }
+        Request::Save { .. } | Request::SendFiles { .. } => {
+            unreachable!("a transfer is served by the transfer module")
+        }
     }
 }
 
@@ -407,7 +463,7 @@ fn invalid_request(detail: String) -> Response {
     Response::Err(WireError::InvalidRequest { detail })
 }
 
-fn response_line(response: &Response) -> String {
+pub(super) fn response_line(response: &Response) -> String {
     let mut line = response.to_line();
     line.push('\n');
     line
@@ -626,9 +682,11 @@ mod tests {
 
         for bad in [
             &b"garbage\n"[..],
-            b"{\"v\":2,\"op\":\"list\"}\n",
-            b"{\"v\":1,\"op\":\"call\",\"tool\":\"T\"}\n",
-            b"{\"v\":1,\"op\":\"list\"}",
+            b"{\"v\":1,\"op\":\"list\"}\n",
+            b"{\"v\":2,\"op\":\"call\",\"tool\":\"T\"}\n",
+            b"{\"v\":2,\"op\":\"save\",\"message_id\":\"m\"}\n",
+            b"{\"v\":2,\"op\":\"send_files\",\"input\":{}}\n",
+            b"{\"v\":2,\"op\":\"list\"}",
         ] {
             assert!(
                 matches!(
@@ -661,7 +719,7 @@ mod tests {
         }
 
         // A request of exactly the cap is read and parsed.
-        let base = br#"{"v":1,"op":"call","tool":"MessageChannelList","input":{}}"#;
+        let base = br#"{"v":2,"op":"call","tool":"MessageChannelList","input":{}}"#;
         let mut at_cap = base.to_vec();
         at_cap.resize(MAX_REQUEST_BYTES, b' ');
         at_cap.push(b'\n');
@@ -770,12 +828,13 @@ mod tests {
     async fn silent_connections_time_out_and_free_their_permits() {
         let root = tempfile::tempdir().unwrap();
         let (bridge, _e, _b, _a) = test_bridge().await;
-        let s = ToolSocket::bind_with_read_deadline(
+        let s = ToolSocket::bind_with_deadlines(
             root.path(),
             "testapp",
             42,
             None,
             std::time::Duration::from_millis(200),
+            TRANSFER_DEADLINE,
         )
         .unwrap();
         s.attach(Arc::downgrade(&bridge));

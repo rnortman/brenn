@@ -11,24 +11,48 @@ use brenn_lib::messaging::{ChannelScheme, Impetus, MessageEnvelope, Urgency};
 
 use super::{ns_to_utc, parse_rfc3339};
 
+/// The column list as a literal, so [`SELECT_ENVELOPE_BASE`] can be built from
+/// it with `concat!`.
+macro_rules! envelope_columns {
+    () => {
+        "m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
+         m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
+         c.address, rc.address, m.envelope_type, m.impetus, m.content_type, m.transport, \
+         m.attachments"
+    };
+}
+
+/// The FROM clause and its JOINs as a literal, for the same reason.
+macro_rules! envelope_from_joins {
+    () => {
+        "FROM messaging_messages m \
+         JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+         LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid"
+    };
+}
+
+/// Columns 0–16 (m.uuid .. m.attachments) that [`row_to_envelope`] decodes, in
+/// its order; do not reorder or add columns here without updating that
+/// decoder and the byte-identity tests. A read that needs further columns
+/// selects them after these, then [`ENVELOPE_FROM_JOINS`].
+pub(crate) const ENVELOPE_COLUMNS: &str = envelope_columns!();
+
+/// The FROM clause the columns of [`ENVELOPE_COLUMNS`] name: the mandatory
+/// channel JOIN and the optional reply-to LEFT JOIN. No trailing space.
+pub(crate) const ENVELOPE_FROM_JOINS: &str = envelope_from_joins!();
+
 /// Common SELECT base for `messaging_messages` reads that feed
-/// [`row_to_envelope`].
+/// [`row_to_envelope`]: `SELECT` [`ENVELOPE_COLUMNS`] [`ENVELOPE_FROM_JOINS`].
 ///
-/// Covers columns 0–16 (m.uuid .. m.attachments), the mandatory channel JOIN,
-/// and the optional reply-to LEFT JOIN. Terminates with a trailing space
-/// **before** any FTS JOIN or `WHERE` clause so callers can append either
-/// immediately.
-///
-/// Column layout matches [`row_to_envelope`]'s documented 0–16 contract
-/// exactly; do not reorder or add columns here without updating that decoder
-/// and the byte-identity tests.
-pub const SELECT_ENVELOPE_BASE: &str = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
-            m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
-            c.address, rc.address, m.envelope_type, m.impetus, m.content_type, m.transport, \
-            m.attachments \
-     FROM messaging_messages m \
-     JOIN messaging_channels c ON c.uuid = m.channel_uuid \
-     LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid ";
+/// Terminates with a trailing space **before** any FTS JOIN or `WHERE` clause
+/// so callers can append either immediately.
+pub const SELECT_ENVELOPE_BASE: &str = concat!(
+    "SELECT ",
+    envelope_columns!(),
+    " ",
+    envelope_from_joins!(),
+    " "
+);
 
 /// Decode one SELECT row (columns 0–16) into a [`MessageEnvelope`].
 ///

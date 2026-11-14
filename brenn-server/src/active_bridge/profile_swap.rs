@@ -23,7 +23,7 @@ use tracing::{error, info};
 
 use super::ActiveBridge;
 use super::cc_spawn_config::{
-    CcSpawnInputs, build_cc_session_config, conversation_container_suffix,
+    CcSpawnInputs, SessionStart, build_cc_session_config, conversation_container_suffix,
 };
 use crate::model_cache::ModelCache;
 
@@ -44,8 +44,8 @@ pub(in crate::active_bridge) struct RespawnRequest {
     /// The model the conversation is on, when the bridge has asserted one. The
     /// replacement starts on it rather than reverting to the app default.
     pub model: Option<String>,
-    /// The CC session id to `--resume`. `None` when the conversation has none.
-    pub resume_session_id: Option<String>,
+    /// The CC session to `--resume`, or an empty context.
+    pub session_start: SessionStart,
     /// Where the replacement's events go — the bridge's existing event loop.
     pub events: tokio::sync::mpsc::Sender<SessionEvent>,
 }
@@ -105,7 +105,7 @@ impl ServerSwapHost {
                 .clone()
                 .unwrap_or_else(|| self.app_config.model.clone()),
             container_name_suffix: conversation_container_suffix(req.conversation_id),
-            resume_session_id: req.resume_session_id.clone(),
+            session_start: req.session_start.clone(),
             transcript: self.transcript.clone(),
             alert_dispatcher: self.alert_dispatcher.clone(),
             user_tz: self.user_tz,
@@ -320,6 +320,11 @@ async fn swap_session(bridge: &Arc<ActiveBridge>, target: ResolvedProfile) {
         brenn_db::conversation::get_conversation_opt(&conn, bridge.conversation_id)
             .and_then(|c| c.cc_session_id)
     };
+    let session_start = SessionStart::begin(
+        bridge.messenger().map(Arc::as_ref),
+        bridge.conversation_id,
+        resume_session_id,
+    );
     // The model the conversation is actually on. Without it the replacement's
     // `--model` flag would be the app default, silently discarding a
     // `model_override` the conversation was spawned with.
@@ -333,7 +338,7 @@ async fn swap_session(bridge: &Arc<ActiveBridge>, target: ResolvedProfile) {
             conversation_id: bridge.conversation_id,
             profile: target.clone(),
             model,
-            resume_session_id,
+            session_start,
             events: bridge.cc_event_tx.clone(),
         })
         .await;

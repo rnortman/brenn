@@ -1287,3 +1287,91 @@ async fn legacy_websocket_turn(bridge: &Arc<ActiveBridge>, text: &str) -> Option
     )
     .await
 }
+
+const PUSHED_BYTES: &[u8] = b"%PDF- the pushed attachment";
+
+/// Publish a message carrying `scan.pdf` onto the drain channel from a system
+/// component, after the conversation's position is attached, and assert that
+/// nothing has yet made it nameable.
+async fn publish_pushed_attachment(bridge: &ActiveBridge) -> uuid::Uuid {
+    let messenger = bridge
+        .messenger()
+        .expect("the drain fixture wires a messenger");
+    let hold = brenn_messaging::testutils::seal_blob(messenger, PUSHED_BYTES);
+    let message_id = brenn_messaging::testutils::publish_attached(
+        messenger,
+        super::DRAIN_TEST_PUBLISHER,
+        "brenn:test-drain-channel",
+        "a scan",
+        &[("scan.pdf", &hold)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        admit_pushed(bridge, message_id).await.err(),
+        Some(brenn_messaging::NameRefusal::NotRead),
+        "nothing but the drain may make the pushed message nameable"
+    );
+    message_id
+}
+
+async fn admit_pushed(
+    bridge: &ActiveBridge,
+    message_id: uuid::Uuid,
+) -> Result<brenn_messaging::AdmittedPart, brenn_messaging::NameRefusal> {
+    bridge
+        .messenger()
+        .expect("the drain fixture wires a messenger")
+        .admit_conversation_name(
+            bridge.conversation_id,
+            &bridge.app_slug,
+            message_id,
+            &brenn_messaging::NamedPart::Attachment(
+                brenn_messaging::AttachmentName::new("scan.pdf").unwrap(),
+            ),
+        )
+        .await
+}
+
+/// The pushed message's attachment is admitted, and its hold reads the bytes
+/// published.
+async fn assert_pushed_attachment_nameable(bridge: &ActiveBridge, message_id: uuid::Uuid) {
+    match admit_pushed(bridge, message_id).await {
+        Ok(brenn_messaging::AdmittedPart::Attachment(hold)) => {
+            assert_eq!(hold.read(0, PUSHED_BYTES.len()).unwrap(), PUSHED_BYTES);
+        }
+        other => panic!("the drained message's attachment must be admitted; got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_message_the_startup_drain_hands_over_is_nameable() {
+    let (bridge, _broadcast_rx, _blobs) = super::bridge_with_blob_messenger_for_drain().await;
+    let message_id = publish_pushed_attachment(&bridge).await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    drain_pending_events(&bridge).await;
+
+    assert!(
+        !owed_on_the_bus(&bridge).await,
+        "the drain delivered the message"
+    );
+    assert_pushed_attachment_nameable(&bridge, message_id).await;
+}
+
+#[tokio::test]
+async fn a_message_live_delivery_hands_over_is_nameable() {
+    let (bridge, _broadcast_rx, _blobs) = super::bridge_with_blob_messenger_for_drain().await;
+    let message_id = publish_pushed_attachment(&bridge).await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    crate::active_bridge::deliver_conversation_backlog(&bridge)
+        .await
+        .expect("recording session accepts the send");
+
+    assert!(
+        !owed_on_the_bus(&bridge).await,
+        "the delivery advanced the position"
+    );
+    assert_pushed_attachment_nameable(&bridge, message_id).await;
+}

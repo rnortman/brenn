@@ -4,6 +4,30 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **BREAKING for operators who install `brenn-tool` by hand: the tool socket
+  protocol is v2.** The server refuses a v1 `brenn-tool` by name
+  ("unsupported protocol version"). The binary at `tool_cli_path` must be the
+  one built with the server.
+- **For agents and app authors: LLM conversations can now forward, save and
+  attach blobs** (large binary attachments on bus messages). A conversation
+  refers to an attachment by the message id and attachment name it was shown,
+  never by a raw blob id, and only for a message it has actually been handed
+  since its context was last reset (start, compaction, a `/` command, or a
+  server restart) and that is still retained on a channel the app may read;
+  refusals say why (`not_read`, `not_retained`, …). `BrennSend` gains
+  `attachments`, forwarding by reference with no bytes copied. Two new
+  `brenn-tool` commands, run from the conversation's shell: `brenn-tool save`
+  writes an attachment or message body to a file (atomically, once every byte
+  has arrived), and `brenn-tool send` publishes with local files attached.
+  No blob bytes pass through the model's context. Apps that disable `Bash`
+  get forwarding only. See `docs/agent-tool-cli.md` and `docs/message-bus.md`
+  §2.1.2a.
+- **For agents and app authors: a content type on a conversation's text.**
+  `BrennSend` and `BrennMessageEdit` take an optional `content_type`, which
+  must be a text type (`text/*`, `application/json`, `+json`, with a UTF-8
+  or US-ASCII charset if any); binary data goes as an attachment instead. An
+  edit replaces body and type together: `body` without `content_type` leaves
+  the message untyped, and `content_type` without `body` is refused.
 - **For WASM component authors: a `blobs` interface, backend only, not yet
   stable.** A new interface, `brenn:processor/blobs@0.3.0`
   (`brenn-wasm/wit/processor-0.3.wit`), under a new grant word, `blobs`, lets
@@ -65,9 +89,10 @@ All notable changes to Brenn are documented here.
   attachment's name, size and content type without its id; the eviction
   archive records the references but not the bytes; 0.1.0 components and
   attach v4 sessions see nothing, byte-identically. A backend component
-  granted `blobs` creates, reads and forwards blobs (the entry below);
-  remotes, pages and conversations see references as metadata only and can
-  neither create nor redeem one. Three new keys in the `messaging` section:
+  granted `blobs` creates, reads and forwards blobs (the entry below), and a
+  conversation forwards, saves and attaches them by name (the entry above);
+  remotes and pages see references as metadata only and can neither create
+  nor redeem one. Three new keys in the `messaging` section:
   `max_blob_bytes` (default 64 MiB), `blob_budget_bytes` (default 1 GiB) and
   `blob_dir`; the store creates its directory, mode 0700, on first boot, and
   refuses to start if `PRAGMA synchronous` is below `FULL` or the directory

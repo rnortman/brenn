@@ -253,9 +253,12 @@ text-only channel to the component before anything is sent. A transport
 adaptor — an MQTT client or a webhook endpoint — onto its ingress channel when
 that channel takes the raw shape (§2.7.1): the payload with the publisher's or
 endpoint's content type, judged by the rule above, and dropped (MQTT) or
-refused (webhook) when it fails it. What still cannot:
-a 0.1.0 component, a remote's attach v4 session, a conversation and every host
-door that takes a string; every body they produce is untyped text.
+refused (webhook) when it fails it. A conversation, through `BrennSend` and
+`BrennMessageEdit`'s `content_type`, publishes a typed *text* body only: a type
+that is not text by the rule above is refused, and a conversation publishes
+bytes as an attachment (§2.1.2a). What still cannot publish a typed body:
+a 0.1.0 component, a remote's attach v4 session and every host door that takes
+a string; every body they produce is untyped text.
 
 ### 2.1.2a Blobs: bytes a message names
 
@@ -316,7 +319,7 @@ Which reader sees what:
 | Host code (`Messenger::query`, the stores) | the references |
 | 0.2.0 components (`bus.envelope` header), on the backend and on a page | the references, in full |
 | Attach v5 sessions (`Deliver`), a remote's and every page's, replayed and live | the references, in full |
-| A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, the intercept outcome) | each name with `size` and `content_type`; **no id** |
+| A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, the intercept outcome) | each name with `size` and `content_type`; **no id**. It names an attachment by (message id, name), below |
 | The eviction archive | the references, in full. The bytes are not archived: an archived message's attachments are not recoverable |
 | 0.1.0 components (`envelope-json`), attach v4 sessions | nothing; the envelope is byte-identical to one without attachments |
 
@@ -329,14 +332,69 @@ positional writes and seals it, and publishes a message naming blobs it
 opened or made, with `ports` granted as well. Forwarding an attachment is a
 hold on the same blob: no byte is copied. Every blob the activation made and
 no published message names is deleted when the activation ends, and an `Err`
-or trap publishes nothing and deletes everything it made. Host code's
-`Messenger::publish_from_system_with_attachments` is the other publishing
-entry, and nothing in the server calls it yet. Remotes, pages and
-conversations see references as metadata only, and no surface host serves
-the interface. A remote's replay store and a page's rings do not hold the
+or trap publishes nothing and deletes everything it made. A conversation
+does too, by name, below. Host code's
+`Messenger::publish_from_system_with_attachments` is a further publishing
+entry, and nothing in the server calls it outside tests. Remotes and pages
+see references as metadata only, and no surface host serves the interface.
+A remote's replay store and a page's rings do not hold the
 blob, so a reference there can outlive it. `ports.publish` and its siblings
 carry no attachments: a component that republishes a message through them
 sends the body alone.
+
+**A conversation is a holder by name.** It is never shown a blob id. It
+names an attachment as **(message id, attachment name)**, and a message's
+body as (message id, body), and nothing it does with a blob puts the bytes
+through the model's context: `BrennSend`'s `attachments` forwards an
+attachment by reference (a hold on the same blob, no byte copied);
+`brenn-tool save` writes an attachment's or a body's bytes to a file in the
+conversation's environment; `brenn-tool send` attaches a file of the
+conversation's own to a `BrennSend`, which seals a new blob the published
+message names. The two commands are described in `docs/agent-tool-cli.md`
+and need the conversation's shell tool. One function
+admits a name, `Messenger::admit_conversation_name`, and every verb calls it.
+The rule as built asks two things **of the one message named**:
+
+- **The conversation was handed it.** The host keeps, per conversation, the
+  messages it handed over — a push delivery, `MessageChannelGet`,
+  `BrennPendingList`, an edit's answer, and the answer to the conversation's
+  own send, by its id. The record is in memory on the `Messenger`: it
+  survives a bridge being retired and re-spawned and is lost at a server
+  restart. It holds at most 1,024 messages per conversation, oldest dropped
+  first, and at most 256 conversations, the least recently fed dropped
+  whole. It is cleared at a compaction boundary, at a spawn with no session
+  to resume (conversation start), and at every user turn whose text as
+  Claude Code receives it begins with `/`. Every drop and every clear costs a
+  re-read (`not_read`) and never admits wrongly. Two resets of the
+  conversation's context are not seen by the host — a resume Claude Code
+  answers with a fresh session, and a slash command sent while a turn is
+  running — and are tracked as `blob-handle-integrity` in `TODO.md`.
+- **It is still retained on a channel the app may read**: the app's policy
+  allows the channel and the directory resolves it, and the message is
+  inside the **channel's** window — the whole ring on a ring channel; on a
+  durable channel the newest `standing_retain_depth` retained rows, checked
+  by rank so a row past that depth that the hourly reaper has not yet removed
+  is refused. A parked message is not retained. The subscriber's own
+  `retain_depth` plays no part.
+
+On a ring channel the check and the hold are one call under the ring's lock,
+which hands out a hold on the one blob named, not on the message's other
+attachments; on a durable channel the row is read and the blob held under
+one database guard. A retained message naming a blob the store cannot hold is
+a host bug and panics. Once a name is admitted the hold keeps the bytes for
+the transfer whatever happens to the message.
+
+The rule is per message, not per blob: an attachment of an evicted message is
+refused even while another retained, readable message names the same blob,
+and is admitted under that other message once the conversation has read it.
+A rule asked of the blob would admit that case; it needs a lookup from a blob
+to the retained messages naming it, which ring channels lack
+(`conversation-blob-name-per-message` in `TODO.md`).
+
+A file a conversation attaches is written through a writer that reserves the
+file's whole declared size before any byte crosses, so the store's two keys
+refuse it up front; if the publish is refused or the connection ends, the
+writer and the sealed blob drop and nothing remains.
 
 **Bounds.** Three keys in the `messaging` section (`docs/config-dsl.md`):
 `max_blob_bytes` caps one blob's extent (default 64 MiB), `blob_budget_bytes`
@@ -348,7 +406,12 @@ writes in one activation, summed over every `write` — a writer does not
 outlive its activation, and `seal` needs every byte of the blob's extent
 written. So no component can create a blob larger than that bound, whatever
 `max_blob_bytes` is; a higher value admits larger blobs from host code only,
-and no production host code makes one. The per-activation bounds are in
+and no production host code makes one. A conversation's bound does scale with
+the key: one `brenn-tool send` may attach files whose sizes together are at
+most `max_blob_bytes`, each at most `max_blob_bytes`, and a conversation has
+at most eight socket connections open at once, so at most
+`8 × max_blob_bytes` charged and unsealed at a time; nothing bounds it over
+time. The per-activation bounds are in
 `docs/security-posture.md` §7.6. A write over either
 store key is refused to the producer; nothing is evicted to make room and nothing
 waits. A blob is charged from its first write until its file is unlinked. No
@@ -410,8 +473,8 @@ create and written into the reference, a write entry on a sealed blob, and a
 rule for each of those three. The cost statement is the `blob` module's
 rustdoc.
 
-What is not built: the `blobs` interface on a page, a conversation tool,
-connectors that produce blobs, the surface's handling of them, attachments on
+What is not built: the `blobs` interface on a page, save and attach for a
+conversation without a shell tool, connectors that produce blobs, the surface's handling of them, attachments on
 tool calls and their results, and transfer of bytes over attach or to a
 page.
 

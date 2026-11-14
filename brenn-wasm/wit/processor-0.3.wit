@@ -112,6 +112,7 @@ interface blobs {
         /// Not a well-formed media type of at most 255 bytes, as a body's.
         invalid-content-type(string),
         /// The host serving the call is over its budget for blob bytes.
+        /// TODO(blobs-surface-store-budget-refusal)
         budget-exhausted,
         /// The host's filesystem refused to create the blob. Nothing was
         /// created. The string is a host diagnostic.

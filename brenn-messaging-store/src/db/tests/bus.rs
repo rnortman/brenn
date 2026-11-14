@@ -209,6 +209,51 @@ fn lookup_message_for_authorship_reports_whether_the_message_is_still_parked() {
 }
 
 #[test]
+fn retained_message_by_uuid_answers_retained_rows_only() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    ensure_user_and_conv(&conn, 1);
+    ensure_user_and_conv(&conn, 2);
+    let (_, channel_uuid) = make_directory();
+    upsert_channels(
+        &conn,
+        &[ChannelEntry {
+            uuid: channel_uuid,
+            address: canonical_address("test"),
+            description: None,
+            resolved_channel: default_resolved_channel(),
+            subscribers: vec![],
+            transport_type: ChannelScheme::Brenn,
+            mount: None,
+        }],
+    );
+
+    let future = Utc::now() + chrono::Duration::seconds(60);
+    let (_, first_uuid) = insert_msg(&conn, channel_uuid, "alice", "first", None);
+    let (_, parked_uuid) = insert_msg(&conn, channel_uuid, "alice", "later", Some(future));
+    let (_, second_uuid) = insert_msg(&conn, channel_uuid, "alice", "second", None);
+
+    let first = retained_message_by_uuid(&conn, first_uuid).expect("a retained row");
+    assert_eq!(first.channel_uuid, channel_uuid);
+    assert_eq!(first.retained_seq, 1);
+    assert_eq!(first.envelope.message_id, first_uuid);
+    assert_eq!(first.envelope.body.as_text(), Some("first"));
+    let second = retained_message_by_uuid(&conn, second_uuid).expect("a retained row");
+    assert_eq!(second.retained_seq, 2);
+    assert_eq!(
+        channel_retained_count_after_seq(&conn, channel_uuid, first.retained_seq),
+        1,
+        "the caller ranks a row by the retained rows above it"
+    );
+
+    assert!(
+        retained_message_by_uuid(&conn, parked_uuid).is_none(),
+        "a parked row holds no retention position"
+    );
+    assert!(retained_message_by_uuid(&conn, Uuid::new_v4()).is_none());
+}
+
+#[test]
 fn lookup_message_for_authorship_returns_none_for_unknown_uuid() {
     let db = init_db_memory();
     let conn = db.blocking_lock();

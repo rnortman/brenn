@@ -1,5 +1,5 @@
 {
-  "checksum": "33b5b15d3f94b01948ab2cef86ae4822506ca3affff6f377315145f0ef282deb",
+  "checksum": "1393d6c752980449139c7b34d29c302c33927f7e091c8ae3163e20c70db8f849",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -5980,17 +5980,12 @@
               "target": "serde_json"
             },
             {
-              "id": "tokio 1.54.1",
-              "target": "tokio"
-            }
-          ],
-          "selects": {}
-        },
-        "deps_dev": {
-          "common": [
-            {
               "id": "tempfile 3.27.0",
               "target": "tempfile"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
             }
           ],
           "selects": {}
