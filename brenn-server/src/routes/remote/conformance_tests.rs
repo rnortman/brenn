@@ -48,6 +48,8 @@ use super::test_fixtures::{
 };
 use crate::test_support::http::{TestServer, http_base_addr, spawn_test_server};
 
+mod blobs;
+
 /// The rig's `[[remote]]`: the fleet-driver shape of `test_fixtures::FLEET` with
 /// publish rights added on the two outbound prefixes.
 ///
@@ -785,6 +787,7 @@ async fn publishing_under_a_named_attribution_closes_the_attachment(versions: Ve
             attribution: Some("brain".to_string()),
             body: "who said that".into(),
             urgency: Urgency::Normal,
+            attachments: Vec::new(),
         })
         .await;
     expect_detach(&mut rig.client).await;
@@ -1259,9 +1262,9 @@ async fn a_v5_sessions_parked_non_text_entry_is_in_its_own_view_and_not_in_a_v4_
 // Every case above that a v4 daemon can run, run at both offers
 // ---------------------------------------------------------------------------
 
-/// Each case, twice: once from a daemon offering exactly v4 — a daemon built
-/// before v5, which must see what it always saw — and once from one offering
-/// every supported version.
+/// Each case three times: from a daemon offering exactly v4 — a daemon built
+/// before v5, which must see what it always saw — from one offering exactly v5,
+/// built before v6, and from one offering every supported version.
 macro_rules! at_each_offer {
     ($($case:ident),* $(,)?) => {
         $(
@@ -1271,6 +1274,11 @@ macro_rules! at_each_offer {
                 #[tokio::test]
                 async fn offering_v4() {
                     super::$case(VersionRange::exactly(4)).await;
+                }
+
+                #[tokio::test]
+                async fn offering_v5() {
+                    super::$case(VersionRange::exactly(5)).await;
                 }
 
                 #[tokio::test]

@@ -4,8 +4,9 @@
 //! it opens a native websocket, negotiates a version, subscribes channels,
 //! publishes onto them one at a time or as one activation's atomic flush, parks
 //! messages for later and acts on the parked set the peer mirrors back, reads
-//! what comes back, and survives a severed transport by resuming each
-//! subscription from the cursor it held. It knows nothing of
+//! what comes back, moves blob bytes up and down through the client's blob
+//! plane, and survives a severed transport by resuming each subscription from
+//! the cursor it held. It knows nothing of
 //! components, ports, mounts, or pixels — it has no surface crate to know them
 //! from — so whatever it can drive is, by construction, drivable by an attacher
 //! with no page behind it.
@@ -27,9 +28,10 @@
 
 pub mod relay;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
+use brenn_attach_client::blobs::{BlobEvent, BlobPlane, BlobStep};
 use brenn_attach_client::conn::{ConnConfig, ConnEvent};
 use brenn_attach_client::driver::{AttachDriver, DriverStep, IoEvent};
 use brenn_attach_client::publish::{DeferredViews, OutboxSteps, Outboxes, PendingPublishes};
@@ -41,15 +43,18 @@ use brenn_attach_proto::{
 
 // The vocabulary this client's own API is stated in, re-exported so a caller
 // names it through the crate it is calling rather than reaching past it.
+pub use brenn_attach_client::blobs::{OpenRefusal, ReadId, ReadRefusal, UploadRefusal};
 pub use brenn_attach_client::conn::{AttachmentFacts, DetachReason};
 pub use brenn_attach_client::publish::{FlushBatch, PublishRequest};
 pub use brenn_attach_client::subs::{
     ResumePolicy, SubscribeAck, SubscribeSettlement, SubscriptionDepths,
 };
 pub use brenn_attach_proto::{
-    BatchDeferredOp, BatchEntry, DeferredOpKind, DeferredViewEntry, MessageBody,
-    PublishBatchOutcome,
+    AttachmentName, BatchDeferredOp, BatchEntry, BlobFacts, BlobHandle, DeferredOpKind,
+    DeferredViewEntry, MessageBody, PublishAttachment, PublishBatchOutcome,
 };
+pub use brenn_envelope::Attachments;
+pub use uuid::Uuid;
 
 /// How long any awaited helper will pump before it gives up and panics.
 ///
@@ -66,10 +71,15 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// bytes and content type under a version that carries them, its text alone
 /// under one that does not. The rest of the envelope is dropped here: a
 /// conformance run asserts on what the protocol decided, not on what a message
-/// carried.
+/// carried — apart from the message's id and its attachment references, which
+/// are what a blob case opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
     pub channel: String,
+    /// The delivered message's id, which names it to `BlobOpen`.
+    pub message_id: Uuid,
+    /// The references the message carries, by attachment name.
+    pub attachments: Attachments,
     /// The envelope sender the peer minted — bare for the attacher itself, or
     /// carrying the sub-identity an `attribution` named.
     pub sender: String,
@@ -162,6 +172,50 @@ pub enum Observation {
     /// A publish that will never be answered: the transport went away while it
     /// was outstanding.
     PublishLost { correlation: u64 },
+    /// The outbox plane finished with flushes naming these handles: applied,
+    /// handed back lost, or dropped. One occurrence per naming.
+    Released { handles: Vec<BlobHandle> },
+    /// An upload was sealed: the handle is a held blob.
+    Sealed { handle: BlobHandle },
+    /// An upload ended without a held blob.
+    UploadRefused {
+        handle: BlobHandle,
+        reason: UploadRefusal,
+    },
+    /// An open succeeded: the handle is a held blob of `size` bytes.
+    Opened {
+        handle: BlobHandle,
+        size: u64,
+        content_type: String,
+    },
+    /// An open ended without a held blob.
+    OpenRefused {
+        handle: BlobHandle,
+        reason: OpenRefusal,
+    },
+    /// A read delivered every chunk; `bytes` is the range, reassembled.
+    ReadDone {
+        read: ReadId,
+        handle: BlobHandle,
+        bytes: Vec<u8>,
+    },
+    /// A read ended before its last chunk.
+    ReadRefused {
+        read: ReadId,
+        handle: BlobHandle,
+        reason: ReadRefusal,
+    },
+    /// The answer to a blob frame sent with [`AttachClient::send_raw`],
+    /// as the peer wrote it.
+    RawAnswer(ServerFrame),
+}
+
+/// What a successful open told the attacher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedBlob {
+    pub handle: BlobHandle,
+    pub size: u64,
+    pub content_type: String,
 }
 
 /// Which credential this attacher presents on the handshake.
@@ -205,6 +259,17 @@ pub struct AttachClient {
     /// The peer's parked-set mirrors. Read-only here — the server is the parked
     /// set's authority, and this is the client's copy of what it last said.
     views: DeferredViews,
+    /// The blob plane. Its tags are unused: every outcome event carries its
+    /// handle.
+    blobs: BlobPlane<()>,
+    /// Chunks of each read not yet ended, in the order the plane delivered
+    /// them — ascending offset within a read.
+    read_bytes: BTreeMap<ReadId, Vec<u8>>,
+    /// Handles and read correlations named by raw frames, whose answers are
+    /// observed as they are rather than handed to the plane, which never
+    /// minted them.
+    raw_handles: BTreeSet<BlobHandle>,
+    raw_reads: BTreeSet<u64>,
     next_correlation: u64,
     observed: VecDeque<Observation>,
     started: bool,
@@ -251,6 +316,10 @@ impl AttachClient {
             pending: PendingPublishes::new(),
             outboxes: Outboxes::new(),
             views: DeferredViews::new(),
+            blobs: BlobPlane::new(),
+            read_bytes: BTreeMap::new(),
+            raw_handles: BTreeSet::new(),
+            raw_reads: BTreeSet::new(),
             next_correlation: 1,
             observed: VecDeque::new(),
             started: false,
@@ -442,6 +511,7 @@ impl AttachClient {
                 body: body.into(),
                 urgency: Urgency::Normal,
                 deliver_after,
+                attachments: Vec::new(),
             }],
             ops: Vec::new(),
         }
@@ -556,6 +626,222 @@ impl AttachClient {
     /// attachment, because nothing they promise can arrive after one.
     pub async fn next_observation(&mut self) -> Observation {
         self.take_first("an observation", false, |_| true).await
+    }
+
+    /// Upload `bytes` as one blob and wait for its seal.
+    ///
+    /// The chunking is the plane's: every range [`BlobPlane::next_chunk`] names
+    /// is handed over in order, and the plane puts the seal behind the last.
+    ///
+    /// # Panics
+    ///
+    /// When the plane refuses the create locally: a case that wants a server's
+    /// refusal of what the plane would not send sends it with
+    /// [`AttachClient::send_raw`].
+    pub async fn upload(
+        &mut self,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<BlobHandle, UploadRefusal> {
+        let handle = self.send_upload(content_type, bytes).await;
+        self.next_upload_outcome(handle).await.map(|()| handle)
+    }
+
+    /// [`AttachClient::upload`] without waiting: the create, every chunk and
+    /// the seal are written back to back, and the handle is returned.
+    pub async fn send_upload(&mut self, content_type: &str, bytes: &[u8]) -> BlobHandle {
+        let size = bytes.len() as u64;
+        let (handle, mut frames) = self
+            .blobs
+            .create((), content_type, size)
+            .unwrap_or_else(|e| panic!("attach conformance: the plane refused a create: {e:?}"));
+        while let Some(range) = self.blobs.next_chunk(handle) {
+            let start = usize::try_from(range.offset).expect("an offset inside a slice");
+            let chunk = bytes[start..start + range.len].to_vec();
+            frames.extend(self.blobs.write_chunk(handle, chunk));
+        }
+        self.write(frames).await;
+        handle
+    }
+
+    /// The outcome of the upload `handle`, pumping until it arrives.
+    pub async fn next_upload_outcome(&mut self, handle: BlobHandle) -> Result<(), UploadRefusal> {
+        match self
+            .take_first("an upload outcome", true, |o| match o {
+                Observation::Sealed { handle: h }
+                | Observation::UploadRefused { handle: h, .. } => *h == handle,
+                _ => false,
+            })
+            .await
+        {
+            Observation::Sealed { .. } => Ok(()),
+            Observation::UploadRefused { reason, .. } => Err(reason),
+            other => unreachable!("the predicate admits only upload outcomes, got {other:?}"),
+        }
+    }
+
+    /// Open the attachment `name` of `message_id` on `channel` and wait for the
+    /// answer.
+    pub async fn open(
+        &mut self,
+        channel: &str,
+        message_id: Uuid,
+        name: &str,
+    ) -> Result<OpenedBlob, OpenRefusal> {
+        let handle = self.send_open(channel, message_id, name).await;
+        self.next_open_outcome(handle).await
+    }
+
+    /// [`AttachClient::open`] without waiting.
+    ///
+    /// # Panics
+    ///
+    /// On a name outside the attachment name grammar, or when the plane
+    /// refuses the open locally.
+    pub async fn send_open(&mut self, channel: &str, message_id: Uuid, name: &str) -> BlobHandle {
+        let name = AttachmentName::new(name)
+            .unwrap_or_else(|e| panic!("attach conformance: attachment name {name:?}: {e:?}"));
+        let (handle, frame) = self
+            .blobs
+            .open((), channel, message_id, name)
+            .unwrap_or_else(|e| panic!("attach conformance: the plane refused an open: {e:?}"));
+        self.write(vec![frame]).await;
+        handle
+    }
+
+    /// The outcome of the open `handle`, pumping until it arrives.
+    pub async fn next_open_outcome(
+        &mut self,
+        handle: BlobHandle,
+    ) -> Result<OpenedBlob, OpenRefusal> {
+        match self
+            .take_first("an open outcome", true, |o| match o {
+                Observation::Opened { handle: h, .. }
+                | Observation::OpenRefused { handle: h, .. } => *h == handle,
+                _ => false,
+            })
+            .await
+        {
+            Observation::Opened {
+                handle,
+                size,
+                content_type,
+            } => Ok(OpenedBlob {
+                handle,
+                size,
+                content_type,
+            }),
+            Observation::OpenRefused { reason, .. } => Err(reason),
+            other => unreachable!("the predicate admits only open outcomes, got {other:?}"),
+        }
+    }
+
+    /// Read `[offset, offset + len)` of the held blob `handle`, reassembled
+    /// from the plane's chunks.
+    ///
+    /// # Panics
+    ///
+    /// When the plane refuses the read locally (a range past the size).
+    pub async fn read(
+        &mut self,
+        handle: BlobHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, ReadRefusal> {
+        let (read, frames) = self
+            .blobs
+            .read(handle, (), offset, len)
+            .unwrap_or_else(|e| panic!("attach conformance: the plane refused a read: {e:?}"));
+        self.read_bytes.insert(read, Vec::new());
+        self.write(frames).await;
+        match self
+            .take_first("a read outcome", true, |o| match o {
+                Observation::ReadDone { read: r, .. }
+                | Observation::ReadRefused { read: r, .. } => *r == read,
+                _ => false,
+            })
+            .await
+        {
+            Observation::ReadDone { bytes, .. } => Ok(bytes),
+            Observation::ReadRefused { reason, .. } => Err(reason),
+            other => unreachable!("the predicate admits only read outcomes, got {other:?}"),
+        }
+    }
+
+    /// Give the handle up, sending whatever the plane's `close` returns — no
+    /// frame for a handle that is already closing or gone — and answering
+    /// whether a `BlobClose` was sent. Returns without waiting: `BlobClose` has
+    /// no answer, and whatever the close ended joins the observation queue.
+    pub async fn close_blob(&mut self, handle: BlobHandle) -> bool {
+        let step = self.blobs.close(handle);
+        let frames = self.take_blob_step(step);
+        let sent = !frames.is_empty();
+        self.write(frames).await;
+        sent
+    }
+
+    /// Send `frame` as it is, past every plane: for the cases that must put on
+    /// the wire what a conforming plane refuses to.
+    ///
+    /// A blob answer to a handle or read correlation a raw frame named is
+    /// observed as an [`Observation::RawAnswer`]. The plane mints handles and
+    /// correlations upward from 1, so a raw frame names values far above any
+    /// the plane will reach, or it takes over the plane's answers.
+    pub async fn send_raw(&mut self, frame: ClientFrame) {
+        match &frame {
+            ClientFrame::BlobCreate { handle, .. }
+            | ClientFrame::BlobSeal { handle }
+            | ClientFrame::BlobOpen { handle, .. } => {
+                self.raw_handles.insert(*handle);
+            }
+            ClientFrame::BlobRead { correlation, .. } => {
+                self.raw_reads.insert(*correlation);
+            }
+            _ => {}
+        }
+        self.write(vec![frame]).await;
+    }
+
+    /// The next answer to a raw frame, pumping until one arrives.
+    pub async fn next_raw_answer(&mut self) -> ServerFrame {
+        match self
+            .take_first("a raw answer", true, |o| {
+                matches!(o, Observation::RawAnswer(_))
+            })
+            .await
+        {
+            Observation::RawAnswer(frame) => frame,
+            other => unreachable!("the predicate admits only RawAnswer, got {other:?}"),
+        }
+    }
+
+    /// The outcome of the publish sent under `correlation` by
+    /// [`AttachClient::send_publish`], pumping until it arrives.
+    pub async fn next_publish_outcome(&mut self, correlation: u64) -> PublishOutcome {
+        match self
+            .take_first(
+                "a publish answer",
+                true,
+                |o| matches!(o, Observation::Published { correlation: c, .. } if *c == correlation),
+            )
+            .await
+        {
+            Observation::Published { outcome, .. } => outcome,
+            other => unreachable!("the predicate admits only Published, got {other:?}"),
+        }
+    }
+
+    /// The next handles the outbox plane released, pumping until some are.
+    pub async fn next_released(&mut self) -> Vec<BlobHandle> {
+        match self
+            .take_first("released handles", true, |o| {
+                matches!(o, Observation::Released { .. })
+            })
+            .await
+        {
+            Observation::Released { handles } => handles,
+            other => unreachable!("the predicate admits only Released, got {other:?}"),
+        }
     }
 
     /// Whether a live attachment is up right now.
@@ -709,6 +995,7 @@ impl AttachClient {
                     |_, _| true,
                 );
                 frames.extend(self.take_outbox_steps(steps));
+                self.blobs.on_attached(&facts);
                 self.observed.push_back(Observation::Attached(facts));
                 self.emit(frames).await
             }
@@ -717,6 +1004,8 @@ impl AttachClient {
                 let steps = self.outboxes.on_detached();
                 let frames = self.take_outbox_steps(steps);
                 debug_assert!(frames.is_empty(), "a detach produces no frames to send");
+                let events = self.blobs.on_detached();
+                self.take_blob_events(events);
                 for (correlation, _) in self.pending.fail_all() {
                     self.observed
                         .push_back(Observation::PublishLost { correlation });
@@ -788,6 +1077,8 @@ impl AttachClient {
                         for row in rows {
                             self.observed.push_back(Observation::Delivered(Delivery {
                                 channel: channel.clone(),
+                                message_id: row.envelope.message_id,
+                                attachments: row.envelope.attachments,
                                 sender: row.envelope.sender,
                                 body: row.envelope.body,
                                 seq: row.seq,
@@ -845,6 +1136,28 @@ impl AttachClient {
                 });
                 Ok(Vec::new())
             }
+            frame @ (ServerFrame::BlobCreateResult { .. }
+            | ServerFrame::BlobSealResult { .. }
+            | ServerFrame::BlobOpenResult { .. }
+            | ServerFrame::BlobReadResult { .. }) => {
+                let raw = match &frame {
+                    ServerFrame::BlobCreateResult { handle, .. }
+                    | ServerFrame::BlobSealResult { handle, .. }
+                    | ServerFrame::BlobOpenResult { handle, .. } => {
+                        self.raw_handles.contains(handle)
+                    }
+                    ServerFrame::BlobReadResult { correlation, .. } => {
+                        self.raw_reads.remove(correlation)
+                    }
+                    _ => unreachable!("matched as a blob answer above"),
+                };
+                if raw {
+                    self.observed.push_back(Observation::RawAnswer(frame));
+                    return Ok(Vec::new());
+                }
+                let step = self.blobs.on_frame(frame)?;
+                Ok(self.take_blob_step(step))
+            }
             // The connection consumes its own frames and routes nothing else.
             other => Err(format!(
                 "a frame the connection should have consumed reached a plane above it: {other:?}"
@@ -870,7 +1183,72 @@ impl AttachClient {
             self.observed
                 .push_back(Observation::FlushDropped { registrant });
         }
+        if !steps.released.is_empty() {
+            self.observed.push_back(Observation::Released {
+                handles: steps.released,
+            });
+        }
         steps.frames
+    }
+
+    fn take_blob_step(&mut self, step: BlobStep<()>) -> Vec<ClientFrame> {
+        self.take_blob_events(step.events);
+        step.frames
+    }
+
+    /// Turn the plane's events into observations, and a read's chunks into
+    /// its bytes.
+    fn take_blob_events(&mut self, events: Vec<BlobEvent<()>>) {
+        for event in events {
+            let observation = match event {
+                BlobEvent::Sealed { handle, .. } => Observation::Sealed { handle },
+                BlobEvent::UploadRefused { handle, reason, .. } => {
+                    Observation::UploadRefused { handle, reason }
+                }
+                BlobEvent::Opened {
+                    handle,
+                    size,
+                    content_type,
+                    ..
+                } => Observation::Opened {
+                    handle,
+                    size,
+                    content_type,
+                },
+                BlobEvent::OpenRefused { handle, reason, .. } => {
+                    Observation::OpenRefused { handle, reason }
+                }
+                BlobEvent::Chunk { read, bytes, .. } => {
+                    self.read_bytes
+                        .get_mut(&read)
+                        .expect("a chunk of a read this client started")
+                        .extend(bytes);
+                    continue;
+                }
+                BlobEvent::ReadDone { read, handle, .. } => Observation::ReadDone {
+                    read,
+                    handle,
+                    bytes: self
+                        .read_bytes
+                        .remove(&read)
+                        .expect("a read this client started"),
+                },
+                BlobEvent::ReadRefused {
+                    read,
+                    handle,
+                    reason,
+                    ..
+                } => {
+                    self.read_bytes.remove(&read);
+                    Observation::ReadRefused {
+                        read,
+                        handle,
+                        reason,
+                    }
+                }
+            };
+            self.observed.push_back(observation);
+        }
     }
 
     /// [`emit`](AttachClient::emit) for a caller-initiated write, absorbing what

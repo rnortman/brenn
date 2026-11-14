@@ -539,8 +539,13 @@ impl Reactions {
         let OutboxSteps {
             frames,
             dropped,
+            released,
             retry_wakeup,
         } = steps;
+        assert!(
+            released.is_empty(),
+            "surface kernel: a v5 session's flush named a blob handle"
+        );
         self.frames(page, frames);
         for toast in outward::parked_drop_notices(&dropped) {
             self.control(toast);
@@ -718,6 +723,14 @@ fn frame_class(frame: &ClientFrame) -> &'static str {
         ClientFrame::Publish { .. } => "Publish",
         ClientFrame::PublishBatch { .. } => "PublishBatch",
         ClientFrame::Alert { .. } => "Alert",
+        ClientFrame::BlobCreate { .. }
+        | ClientFrame::BlobWrite { .. }
+        | ClientFrame::BlobSeal { .. }
+        | ClientFrame::BlobOpen { .. }
+        | ClientFrame::BlobRead { .. }
+        | ClientFrame::BlobClose { .. } => {
+            panic!("surface client: attach v5, which the page speaks, has no blob frame")
+        }
     }
 }
 

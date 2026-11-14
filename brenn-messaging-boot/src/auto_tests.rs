@@ -1100,6 +1100,7 @@ fn a_document_link_places_the_channel_its_ports_resolve_to() {
 /// Auto-injection means a consumer's ACL lists in config no longer enumerate its
 /// full reach, so the boot log is what restores a complete accounting for a
 /// config security review: one line per (principal, capability, channel).
+// TODO(boot-log-capture-tests-flaky): once failed under full `make check`, no lines captured.
 #[test]
 #[tracing_test::traced_test]
 fn every_injected_grant_is_boot_logged() {

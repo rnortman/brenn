@@ -5,8 +5,8 @@
 //! released.
 
 use super::non_text::{
-    activate, attach_subscribers, bytes_consumer, durable, input, one_report, output,
-    report_channel, unattached_messenger, window,
+    activate, attach_subscribers, bytes_consumer, durable, one_report, report_channel,
+    unattached_messenger, window,
 };
 use super::*;
 

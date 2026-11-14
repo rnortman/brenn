@@ -1,5 +1,5 @@
 {
-  "checksum": "1393d6c752980449139c7b34d29c302c33927f7e091c8ae3163e20c70db8f849",
+  "checksum": "2d3a527e5dc8acf8abc36dc96694a39a8c971b576648d51bf86454b8e230358f",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2573,6 +2573,10 @@
             {
               "id": "tracing 0.1.44",
               "target": "tracing"
+            },
+            {
+              "id": "uuid 1.24.0",
+              "target": "uuid"
             }
           ],
           "selects": {}

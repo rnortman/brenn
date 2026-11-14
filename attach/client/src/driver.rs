@@ -66,7 +66,8 @@ pub struct DriverStep {
     /// a terminal event ends the attachment.
     pub events: Vec<ConnEvent>,
     /// A server frame belonging to a plane above the connection — a
-    /// `SubscribeResult`, `Deliver`, publish result, or deferred view. Never a
+    /// `SubscribeResult`, `Deliver`, publish result, deferred view, or one of
+    /// the four blob answers for [`crate::blobs::BlobPlane::on_frame`]. Never a
     /// `Hello`, `Welcome` or `Heartbeat`: those are the connection's own.
     pub routed: Option<ServerFrame>,
 }

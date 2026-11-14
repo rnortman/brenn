@@ -18,8 +18,8 @@
 use std::time::Duration;
 
 use brenn_attach_proto::{
-    ClientFrame, Codec, HelloRead, MessageBody, SUPPORTED_VERSIONS, ServerFrame, VersionRange,
-    WireMessage, negotiate, read_server_hello,
+    BlobFacts, ClientFrame, Codec, HelloRead, MessageBody, SUPPORTED_VERSIONS, ServerFrame,
+    VersionRange, WireMessage, negotiate, read_server_hello,
 };
 
 use crate::Millis;
@@ -58,6 +58,9 @@ pub struct AttachmentFacts {
     pub max_body_bytes: u64,
     pub max_frame_bytes: u64,
     pub alert_granted: bool,
+    /// This attachment's blob door, as `Welcome` states it; `None` when the
+    /// version carries no blob transfer or the server opened no door.
+    pub blobs: Option<BlobFacts>,
 }
 
 impl AttachmentFacts {
@@ -74,6 +77,19 @@ impl AttachmentFacts {
     /// the next attachment comes up ([`crate::publish::Outboxes::on_attached`]).
     pub fn carries(&self, body: &MessageBody) -> bool {
         self.codec().carries(body)
+    }
+
+    /// The blob door, when this attachment's version carries blob transfer
+    /// **and** the server opened one. Asking the
+    /// [`BlobPlane`](crate::blobs::BlobPlane) to `create` or `open` while this
+    /// is `None` panics. Ask before handing the planes a publish or a flush
+    /// that names a blob handle: while this is `None` such a hand-over is the
+    /// embedder's bug — under v4 or v5 it panics in the batch legality check,
+    /// and under a v6 attachment without a door the peer answers it as a
+    /// violation. Refuse such a flush with
+    /// [`crate::publish::Outboxes::refuse_flush`] instead.
+    pub fn blobs(&self) -> Option<&BlobFacts> {
+        self.blobs.as_ref()
     }
 }
 
@@ -572,6 +588,7 @@ impl Connection {
             max_body_bytes,
             max_frame_bytes,
             alert_granted,
+            blobs,
         } = frame
         else {
             return ConnStep::effects(self.go_fatal(format!(
@@ -594,6 +611,21 @@ impl Connection {
                 self.go_fatal("Welcome states a zero heartbeat interval".to_string()),
             );
         }
+        // The blob plane's two loops advance by these numbers: a zero chunk
+        // bound never finishes an upload or a read, and a zero read window
+        // never sends a read, so either is an undiagnosable spin or hang.
+        if let Some(facts) = &blobs {
+            if facts.max_chunk_bytes == 0 {
+                return ConnStep::effects(
+                    self.go_fatal("Welcome states a zero blob max_chunk_bytes".to_string()),
+                );
+            }
+            if facts.max_inflight_reads == 0 {
+                return ConnStep::effects(
+                    self.go_fatal("Welcome states a zero blob max_inflight_reads".to_string()),
+                );
+            }
+        }
         // The attachment is up: the backoff schedule resets, so the next drop
         // starts from the initial delay rather than wherever the last outage
         // left off.
@@ -612,6 +644,7 @@ impl Connection {
                 max_body_bytes,
                 max_frame_bytes,
                 alert_granted,
+                blobs,
             })),
             ConnEffect::SetWakeup(Some(deadline)),
         ])
@@ -671,6 +704,10 @@ fn frame_type_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::PublishResult { .. } => "PublishResult",
         ServerFrame::PublishBatchResult { .. } => "PublishBatchResult",
         ServerFrame::DeferredView { .. } => "DeferredView",
+        ServerFrame::BlobCreateResult { .. } => "BlobCreateResult",
+        ServerFrame::BlobSealResult { .. } => "BlobSealResult",
+        ServerFrame::BlobOpenResult { .. } => "BlobOpenResult",
+        ServerFrame::BlobReadResult { .. } => "BlobReadResult",
     }
 }
 

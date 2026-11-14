@@ -325,6 +325,7 @@ pub fn facts(max_body_bytes: u64) -> AttachmentFacts {
         )
         .expect("a frame cap fits u64"),
         alert_granted: false,
+        blobs: None,
     }
 }
 
@@ -810,6 +811,7 @@ fn client_frames() -> Vec<ClientFrame> {
             body: typed("text/csv", b"a,b"),
             urgency: Urgency::Normal,
             correlation: Some(1),
+            attachments: Vec::new(),
         },
         ClientFrame::PublishBatch {
             attribution: Some("b-keeper".to_string()),
@@ -820,18 +822,21 @@ fn client_frames() -> Vec<ClientFrame> {
                     body: "{}".into(),
                     urgency: Urgency::Normal,
                     deliver_after: None,
+                    attachments: Vec::new(),
                 },
                 BatchEntry {
                     channel: BYTES_OUT_CHANNEL.to_string(),
                     body: typed("text/markdown", "# é".as_bytes()),
                     urgency: Urgency::High,
                     deliver_after: None,
+                    attachments: Vec::new(),
                 },
                 BatchEntry {
                     channel: BYTES_FEED_CHANNEL.to_string(),
                     body: typed("application/octet-stream", &[0xff, 0x00]),
                     urgency: Urgency::Normal,
                     deliver_after: Some(4_102_444_800_000),
+                    attachments: Vec::new(),
                 },
             ],
             deferred_ops: vec![

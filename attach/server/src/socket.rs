@@ -23,7 +23,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use super::registry::CloseReason;
-use super::session::{AttachSessionCtx, sanitize_client_detail};
+use super::session::{AttachSessionCtx, Outbound, sanitize_client_detail};
 
 /// How long an upgraded socket may stay silent before its `Hello` is overdue.
 ///
@@ -171,6 +171,7 @@ pub fn welcome(ctx: &AttachSessionCtx, version: u32, heartbeat_secs: u32) -> Ser
         max_frame_bytes: Codec::negotiated(version).max_client_frame_bytes(ctx.max_body_bytes)
             as u64,
         alert_granted: ctx.profile.alert_granted(),
+        blobs: ctx.blob_door().map(|door| door.facts()),
     }
 }
 
@@ -236,7 +237,7 @@ pub fn classify_read_error(err: axum::Error) -> InboundError {
 /// answer to its last request; the queue is bounded, so the flush is too.
 pub async fn writer_task<S>(
     mut sink: S,
-    mut rx: mpsc::Receiver<ServerFrame>,
+    mut rx: mpsc::Receiver<Outbound>,
     mut close_rx: oneshot::Receiver<CloseReason>,
     heartbeat: Duration,
     version: Arc<OnceLock<u32>>,
@@ -258,8 +259,10 @@ pub async fn writer_task<S>(
         tokio::select! {
             maybe_frame = rx.recv() => {
                 match maybe_frame {
-                    Some(frame) => {
-                        let msg = encode(&frame, &version);
+                    // A read answer's guard drops with `outbound`, once the
+                    // frame is written.
+                    Some(outbound) => {
+                        let msg = encode(&outbound.frame, &version);
                         if !write_with_watchdog(&mut sink, msg, watchdog).await {
                             return;
                         }
@@ -284,8 +287,8 @@ pub async fn writer_task<S>(
                     close_settled = true;
                     continue;
                 };
-                while let Ok(frame) = rx.try_recv() {
-                    let msg = encode(&frame, &version);
+                while let Ok(outbound) = rx.try_recv() {
+                    let msg = encode(&outbound.frame, &version);
                     if !write_with_watchdog(&mut sink, msg, watchdog).await {
                         return;
                     }

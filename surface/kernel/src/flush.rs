@@ -230,8 +230,13 @@ pub fn kill<P>(ctx: &mut FlushCtx<'_, P>, instance: &str) -> Killed {
     ctx.schedules.finish_terminal(instance);
     let Discarded {
         flushes,
+        released,
         retry_wakeup,
     } = ctx.outbound.discard_parked(instance, ctx.now);
+    assert!(
+        released.is_empty(),
+        "surface kernel: a v5 session's flush named a blob handle"
+    );
     Killed {
         first: true,
         discarded: flushes,
@@ -336,6 +341,7 @@ fn route_publishes<P: PlanePolicy>(
                 body,
                 urgency,
                 deliver_after,
+                attachments: Vec::new(),
             });
             continue;
         }

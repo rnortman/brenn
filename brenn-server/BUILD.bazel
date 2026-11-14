@@ -111,6 +111,7 @@ rust_test(
         "//brenn-wasm:fixture_google_gmail_read",
         "//brenn-wasm:fixture_google_maps_tools",
         "//brenn-wasm:fixture_processor_blob_provider_test",
+        "//brenn-wasm:fixture_processor_blobs_test",
         "//brenn-wasm:fixture_processor_provider_test",
         "//brenn-wasm:fixture_processor_tool_test",
         "//brenn-wasm:fixture_replay",

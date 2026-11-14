@@ -56,12 +56,12 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
-const DISAGREE: &str = "frame header and bodies disagree";
-const MALFORMED_BODY: &str = "malformed body";
-const TEXT_OF_BINARY_KIND: &str = "text frame of a binary kind";
-const BINARY_OF_TEXT_KIND: &str = "binary frame of a text kind";
-const UNPARSEABLE_CLIENT: &str = "unparseable client frame";
-const UNPARSEABLE_SERVER: &str = "unparseable server frame";
+pub(super) const DISAGREE: &str = "frame header and bodies disagree";
+pub(super) const MALFORMED_BODY: &str = "malformed body";
+pub(super) const TEXT_OF_BINARY_KIND: &str = "text frame of a binary kind";
+pub(super) const BINARY_OF_TEXT_KIND: &str = "binary frame of a text kind";
+pub(super) const UNPARSEABLE_CLIENT: &str = "unparseable client frame";
+pub(super) const UNPARSEABLE_SERVER: &str = "unparseable server frame";
 
 const CLIENT_BINARY_KINDS: [&str; 2] = ["Publish", "PublishBatch"];
 const CLIENT_TEXT_KINDS: [&str; 4] = ["Hello", "Subscribe", "Unsubscribe", "Alert"];
@@ -131,7 +131,7 @@ enum ClientBinary<'a> {
 /// content type.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Desc<'a> {
+pub(super) struct Desc<'a> {
     len: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_type: Option<Cow<'a, str>>,
@@ -155,6 +155,8 @@ struct Op<'a> {
     op: OpKind<'a>,
 }
 
+// TODO(attach-tagged-unit-variant-strictness): `deny_unknown_fields` does not
+// refuse an extra key beside the tag of the unit variant `Cancel`.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 enum OpKind<'a> {
@@ -219,7 +221,7 @@ enum ServerBinary<'a> {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Row<'a> {
+pub(super) struct Row<'a> {
     envelope: RowEnvelope<'a>,
     seq: u64,
     cursor: Cow<'a, Cursor>,
@@ -229,7 +231,7 @@ struct Row<'a> {
 /// `{header, body}`: strict itself, while `header` ignores unknown keys.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RowEnvelope<'a> {
+pub(super) struct RowEnvelope<'a> {
     header: Header<'a>,
     body: Desc<'a>,
 }
@@ -237,7 +239,7 @@ struct RowEnvelope<'a> {
 /// A row's `header`: written from the delivered envelope in the header shape,
 /// borrowing it; read as the envelope's fields, boxed so the borrowed
 /// variant does not carry the read one's size.
-enum Header<'a> {
+pub(super) enum Header<'a> {
     Out(&'a MessageEnvelope),
     In(Box<EnvelopeHeader>),
 }
@@ -268,7 +270,7 @@ impl<'de> Deserialize<'de> for Header<'_> {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ViewEntry<'a> {
+pub(super) struct ViewEntry<'a> {
     message_id: Uuid,
     body: Desc<'a>,
     deliver_after: u64,
@@ -303,10 +305,10 @@ pub(super) fn carries(_body: &MessageBody) -> bool {
 /// The body section being written: each body's bytes, in the order their
 /// descriptors are made.
 #[derive(Default)]
-struct BodiesOut<'a>(Vec<&'a [u8]>);
+pub(super) struct BodiesOut<'a>(Vec<&'a [u8]>);
 
 impl<'a> BodiesOut<'a> {
-    fn describe(&mut self, body: &'a MessageBody) -> Desc<'a> {
+    pub(super) fn describe(&mut self, body: &'a MessageBody) -> Desc<'a> {
         self.0.push(body.as_bytes());
         Desc {
             len: u64::try_from(body.len()).expect("a body length fits u64"),
@@ -314,21 +316,27 @@ impl<'a> BodiesOut<'a> {
         }
     }
 
-    fn len(&self) -> usize {
+    /// Append `bytes` raw, with no descriptor: a section whose length its
+    /// frame states in a field of its own.
+    pub(super) fn raw(&mut self, bytes: &'a [u8]) {
+        self.0.push(bytes);
+    }
+
+    pub(super) fn len(&self) -> usize {
         self.0.iter().map(|bytes| bytes.len()).sum()
     }
 }
 
-fn borrowed(s: &str) -> Cow<'_, str> {
+pub(super) fn borrowed(s: &str) -> Cow<'_, str> {
     Cow::Borrowed(s)
 }
 
-fn owned(s: Cow<'_, str>) -> String {
+pub(super) fn owned(s: Cow<'_, str>) -> String {
     s.into_owned()
 }
 
 /// The prefix, the header and the bodies, as one binary message.
-fn binary(header: &impl Serialize, bodies: &BodiesOut<'_>) -> WireMessage {
+pub(super) fn binary(header: &impl Serialize, bodies: &BodiesOut<'_>) -> WireMessage {
     let mut out = Vec::with_capacity(4 + 256 + bodies.len());
     out.extend_from_slice(&[0; 4]);
     serde_json::to_writer(&mut out, header).expect("attach v5: a frame header serializes to JSON");
@@ -341,7 +349,7 @@ fn binary(header: &impl Serialize, bodies: &BodiesOut<'_>) -> WireMessage {
     WireMessage::Binary(out)
 }
 
-fn text(frame: &impl Serialize) -> WireMessage {
+pub(super) fn text(frame: &impl Serialize) -> WireMessage {
     WireMessage::Text(serde_json::to_string(frame).expect("attach v5: a text frame serializes"))
 }
 
@@ -354,14 +362,29 @@ fn batch_out<'a>(
 ) -> ClientBinary<'a> {
     let publishes = publishes
         .iter()
-        .map(|entry| Entry {
-            channel: borrowed(&entry.channel),
-            body: bodies.describe(&entry.body),
-            urgency: entry.urgency,
-            deliver_after: entry.deliver_after,
+        .map(|entry| {
+            super::no_attachments(&entry.attachments);
+            Entry {
+                channel: borrowed(&entry.channel),
+                body: bodies.describe(&entry.body),
+                urgency: entry.urgency,
+                deliver_after: entry.deliver_after,
+            }
         })
         .collect();
-    let deferred_ops = deferred_ops
+    let deferred_ops = ops_out(deferred_ops, bodies);
+    ClientBinary::PublishBatch {
+        attribution: attribution.map(borrowed),
+        correlation,
+        publishes,
+        deferred_ops,
+    }
+}
+
+/// A batch's control ops in the header shape, their edit bodies described in
+/// order.
+fn ops_out<'a>(deferred_ops: &'a [BatchDeferredOp], bodies: &mut BodiesOut<'a>) -> Vec<Op<'a>> {
+    deferred_ops
         .iter()
         .map(|op| Op {
             channel: borrowed(&op.channel),
@@ -377,13 +400,38 @@ fn batch_out<'a>(
                 },
             },
         })
-        .collect();
-    ClientBinary::PublishBatch {
-        attribution: attribution.map(borrowed),
-        correlation,
-        publishes,
-        deferred_ops,
-    }
+        .collect()
+}
+
+/// A `Deliver`'s rows in the header shape, their bodies described in order.
+pub(super) fn rows_out<'a>(rows: &'a [DeliverRow], bodies: &mut BodiesOut<'a>) -> Vec<Row<'a>> {
+    rows.iter()
+        .map(|row| Row {
+            envelope: RowEnvelope {
+                header: Header::Out(&row.envelope),
+                body: bodies.describe(&row.envelope.body),
+            },
+            seq: row.seq,
+            cursor: Cow::Borrowed(&row.cursor),
+            dropped: row.dropped,
+        })
+        .collect()
+}
+
+/// A `DeferredView`'s entries in the header shape, their bodies described in
+/// order.
+pub(super) fn view_out<'a>(
+    entries: &'a [DeferredViewEntry],
+    bodies: &mut BodiesOut<'a>,
+) -> Vec<ViewEntry<'a>> {
+    entries
+        .iter()
+        .map(|entry| ViewEntry {
+            message_id: entry.message_id,
+            body: bodies.describe(&entry.body),
+            deliver_after: entry.deliver_after,
+        })
+        .collect()
 }
 
 pub(super) fn encode_client(frame: &ClientFrame) -> WireMessage {
@@ -432,13 +480,17 @@ pub(super) fn encode_client(frame: &ClientFrame) -> WireMessage {
             body,
             urgency,
             correlation,
-        } => ClientBinary::Publish {
-            channel: borrowed(channel),
-            attribution: attribution.as_deref().map(borrowed),
-            body: bodies.describe(body),
-            urgency: *urgency,
-            correlation: *correlation,
-        },
+            attachments,
+        } => {
+            super::no_attachments(attachments);
+            ClientBinary::Publish {
+                channel: borrowed(channel),
+                attribution: attribution.as_deref().map(borrowed),
+                body: bodies.describe(body),
+                urgency: *urgency,
+                correlation: *correlation,
+            }
+        }
         ClientFrame::PublishBatch {
             attribution,
             correlation,
@@ -451,6 +503,14 @@ pub(super) fn encode_client(frame: &ClientFrame) -> WireMessage {
             deferred_ops,
             &mut bodies,
         ),
+        ClientFrame::BlobCreate { .. }
+        | ClientFrame::BlobWrite { .. }
+        | ClientFrame::BlobSeal { .. }
+        | ClientFrame::BlobOpen { .. }
+        | ClientFrame::BlobRead { .. }
+        | ClientFrame::BlobClose { .. } => {
+            panic!("attach v5 cannot write a blob frame")
+        }
     };
     binary(&header, &bodies)
 }
@@ -462,6 +522,9 @@ fn outcome_out(outcome: PublishOutcome) -> Outcome {
         PublishOutcome::BodyTooLarge { len, max } => Outcome::BodyTooLarge { len, max },
         PublishOutcome::Failed => Outcome::Failed,
         PublishOutcome::TextOnlyChannel => Outcome::TextOnlyChannel,
+        PublishOutcome::AttachmentNotHeld => {
+            panic!("attach v5 cannot write an AttachmentNotHeld publish outcome")
+        }
     }
 }
 
@@ -470,6 +533,9 @@ fn batch_outcome_out(outcome: PublishBatchOutcome) -> BatchOutcome {
         PublishBatchOutcome::Ok => BatchOutcome::Ok,
         PublishBatchOutcome::RateLimited => BatchOutcome::RateLimited,
         PublishBatchOutcome::TextOnlyChannel => BatchOutcome::TextOnlyChannel,
+        PublishBatchOutcome::AttachmentNotHeld => {
+            panic!("attach v5 cannot write an AttachmentNotHeld batch outcome")
+        }
     }
 }
 
@@ -490,7 +556,9 @@ pub(super) fn encode_server(frame: &ServerFrame) -> WireMessage {
             max_body_bytes,
             max_frame_bytes,
             alert_granted,
+            blobs,
         } => {
+            assert!(blobs.is_none(), "attach v5 cannot write a blob door");
             return text(&ServerText::Welcome {
                 version: *version,
                 participant_id: borrowed(participant_id),
@@ -535,18 +603,7 @@ pub(super) fn encode_server(frame: &ServerFrame) -> WireMessage {
         }
         ServerFrame::Deliver { channel, rows } => ServerBinary::Deliver {
             channel: borrowed(channel),
-            rows: rows
-                .iter()
-                .map(|row| Row {
-                    envelope: RowEnvelope {
-                        header: Header::Out(&row.envelope),
-                        body: bodies.describe(&row.envelope.body),
-                    },
-                    seq: row.seq,
-                    cursor: Cow::Borrowed(&row.cursor),
-                    dropped: row.dropped,
-                })
-                .collect(),
+            rows: rows_out(rows, &mut bodies),
         },
         ServerFrame::DeferredView {
             channel,
@@ -555,21 +612,20 @@ pub(super) fn encode_server(frame: &ServerFrame) -> WireMessage {
         } => ServerBinary::DeferredView {
             channel: borrowed(channel),
             attribution: attribution.as_deref().map(borrowed),
-            entries: entries
-                .iter()
-                .map(|entry| ViewEntry {
-                    message_id: entry.message_id,
-                    body: bodies.describe(&entry.body),
-                    deliver_after: entry.deliver_after,
-                })
-                .collect(),
+            entries: view_out(entries, &mut bodies),
         },
+        ServerFrame::BlobCreateResult { .. }
+        | ServerFrame::BlobSealResult { .. }
+        | ServerFrame::BlobOpenResult { .. }
+        | ServerFrame::BlobReadResult { .. } => {
+            panic!("attach v5 cannot write a blob frame")
+        }
     };
     binary(&header, &bodies)
 }
 
 /// A binary message cut into its header and its body section.
-fn split(bytes: &[u8]) -> Result<(&[u8], &[u8]), DecodeError> {
+pub(super) fn split(bytes: &[u8]) -> Result<(&[u8], &[u8]), DecodeError> {
     let Some((prefix, rest)) = bytes.split_first_chunk::<4>() else {
         return Err(DecodeError::new(DISAGREE));
     };
@@ -582,8 +638,8 @@ fn split(bytes: &[u8]) -> Result<(&[u8], &[u8]), DecodeError> {
 }
 
 /// The body section being read: bodies are cut from the front in frame order.
-struct BodiesIn<'b> {
-    rest: &'b [u8],
+pub(super) struct BodiesIn<'b> {
+    pub(super) rest: &'b [u8],
 }
 
 impl BodiesIn<'_> {
@@ -591,20 +647,27 @@ impl BodiesIn<'_> {
     ///
     /// `desc.len` is the peer's number: it is compared, as a `u64`, with what
     /// remains before it is narrowed to an index.
-    fn take(&mut self, desc: Desc<'_>) -> Result<MessageBody, DecodeError> {
-        let remaining = u64::try_from(self.rest.len()).expect("a slice length fits u64");
-        if desc.len > remaining {
-            return Err(DecodeError::new(DISAGREE));
-        }
-        let len = usize::try_from(desc.len).map_err(|_| DecodeError::new(DISAGREE))?;
-        let (bytes, rest) = self.rest.split_at(len);
-        self.rest = rest;
+    pub(super) fn take(&mut self, desc: Desc<'_>) -> Result<MessageBody, DecodeError> {
+        let bytes = self.take_raw(desc.len)?;
         MessageBody::from_parts(desc.content_type.as_deref(), bytes)
             .map_err(|err| DecodeError::with_detail(MALFORMED_BODY, err))
     }
 
+    /// The next `len` bytes, raw. `len` is the peer's number: it is compared,
+    /// as a `u64`, with what remains before it is narrowed to an index.
+    pub(super) fn take_raw(&mut self, len: u64) -> Result<&[u8], DecodeError> {
+        let remaining = u64::try_from(self.rest.len()).expect("a slice length fits u64");
+        if len > remaining {
+            return Err(DecodeError::new(DISAGREE));
+        }
+        let len = usize::try_from(len).map_err(|_| DecodeError::new(DISAGREE))?;
+        let (bytes, rest) = self.rest.split_at(len);
+        self.rest = rest;
+        Ok(bytes)
+    }
+
     /// Every byte of the section is accounted for.
-    fn finish(self) -> Result<(), DecodeError> {
+    pub(super) fn finish(self) -> Result<(), DecodeError> {
         if self.rest.is_empty() {
             Ok(())
         } else {
@@ -624,7 +687,7 @@ fn tag_of(json: &[u8]) -> Option<String> {
 /// A text message's strict parse. Only a message that fails it is read for
 /// its tag: the text schema holds no binary kind, so a binary kind sent as
 /// text always fails, and is then named by its own rule.
-fn parse_text<'de, T: Deserialize<'de>>(
+pub(super) fn parse_text<'de, T: Deserialize<'de>>(
     text: &'de str,
     binary_kinds: &[&str],
     unparseable: &'static str,
@@ -641,7 +704,7 @@ fn parse_text<'de, T: Deserialize<'de>>(
 /// A binary header's strict parse. Only a header that fails it is read for
 /// its tag: the binary schema holds no text kind, so a text kind sent as
 /// binary always fails, and is then named by its own rule.
-fn parse_header<'de, T: Deserialize<'de>>(
+pub(super) fn parse_header<'de, T: Deserialize<'de>>(
     header: &'de [u8],
     text_kinds: &[&str],
     unparseable: &'static str,
@@ -689,6 +752,69 @@ fn client_text_in(frame: ClientText<'_>) -> ClientFrame {
     }
 }
 
+/// A batch's control ops read from the header shape, their edit bodies cut
+/// from the section in order.
+fn ops_in(
+    ops: Vec<Op<'_>>,
+    bodies: &mut BodiesIn<'_>,
+) -> Result<Vec<BatchDeferredOp>, DecodeError> {
+    ops.into_iter()
+        .map(|op| {
+            Ok(BatchDeferredOp {
+                channel: owned(op.channel),
+                message_id: op.message_id,
+                op: match op.op {
+                    OpKind::Cancel => DeferredOpKind::Cancel,
+                    OpKind::Edit {
+                        body,
+                        deliver_after,
+                    } => DeferredOpKind::Edit {
+                        body: body.map(|desc| bodies.take(desc)).transpose()?,
+                        deliver_after,
+                    },
+                },
+            })
+        })
+        .collect()
+}
+
+/// A `Deliver`'s rows read from the header shape, their bodies cut from the
+/// section in order.
+pub(super) fn rows_in(
+    rows: Vec<Row<'_>>,
+    bodies: &mut BodiesIn<'_>,
+) -> Result<Vec<DeliverRow>, DecodeError> {
+    rows.into_iter()
+        .map(|row| {
+            let RowEnvelope { header, body } = row.envelope;
+            Ok(DeliverRow {
+                envelope: MessageEnvelope::from_header(header.into_fields(), bodies.take(body)?),
+                seq: row.seq,
+                cursor: row.cursor.into_owned(),
+                dropped: row.dropped,
+            })
+        })
+        .collect()
+}
+
+/// A `DeferredView`'s entries read from the header shape, their bodies cut
+/// from the section in order.
+pub(super) fn view_in(
+    entries: Vec<ViewEntry<'_>>,
+    bodies: &mut BodiesIn<'_>,
+) -> Result<Vec<DeferredViewEntry>, DecodeError> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            Ok(DeferredViewEntry {
+                message_id: entry.message_id,
+                body: bodies.take(entry.body)?,
+                deliver_after: entry.deliver_after,
+            })
+        })
+        .collect()
+}
+
 fn client_binary_in(
     frame: ClientBinary<'_>,
     bodies: &mut BodiesIn<'_>,
@@ -706,6 +832,7 @@ fn client_binary_in(
             body: bodies.take(body)?,
             urgency,
             correlation,
+            attachments: Vec::new(),
         },
         ClientBinary::PublishBatch {
             attribution,
@@ -721,28 +848,11 @@ fn client_binary_in(
                         body: bodies.take(entry.body)?,
                         urgency: entry.urgency,
                         deliver_after: entry.deliver_after,
+                        attachments: Vec::new(),
                     })
                 })
                 .collect::<Result<_, DecodeError>>()?;
-            let deferred_ops = deferred_ops
-                .into_iter()
-                .map(|op| {
-                    Ok(BatchDeferredOp {
-                        channel: owned(op.channel),
-                        message_id: op.message_id,
-                        op: match op.op {
-                            OpKind::Cancel => DeferredOpKind::Cancel,
-                            OpKind::Edit {
-                                body,
-                                deliver_after,
-                            } => DeferredOpKind::Edit {
-                                body: body.map(|desc| bodies.take(desc)).transpose()?,
-                                deliver_after,
-                            },
-                        },
-                    })
-                })
-                .collect::<Result<_, DecodeError>>()?;
+            let deferred_ops = ops_in(deferred_ops, bodies)?;
             ClientFrame::PublishBatch {
                 attribution: attribution.map(owned),
                 correlation,
@@ -775,6 +885,7 @@ fn server_text_in(frame: ServerText<'_>) -> ServerFrame {
             max_body_bytes,
             max_frame_bytes,
             alert_granted,
+            blobs: None,
         },
         ServerText::Heartbeat => ServerFrame::Heartbeat,
         ServerText::SubscribeResult {
@@ -822,21 +933,7 @@ fn server_binary_in(
     Ok(match frame {
         ServerBinary::Deliver { channel, rows } => ServerFrame::Deliver {
             channel: owned(channel),
-            rows: rows
-                .into_iter()
-                .map(|row| {
-                    let RowEnvelope { header, body } = row.envelope;
-                    Ok(DeliverRow {
-                        envelope: MessageEnvelope::from_header(
-                            header.into_fields(),
-                            bodies.take(body)?,
-                        ),
-                        seq: row.seq,
-                        cursor: row.cursor.into_owned(),
-                        dropped: row.dropped,
-                    })
-                })
-                .collect::<Result<_, DecodeError>>()?,
+            rows: rows_in(rows, bodies)?,
         },
         ServerBinary::DeferredView {
             channel,
@@ -845,16 +942,7 @@ fn server_binary_in(
         } => ServerFrame::DeferredView {
             channel: owned(channel),
             attribution: attribution.map(owned),
-            entries: entries
-                .into_iter()
-                .map(|entry| {
-                    Ok(DeferredViewEntry {
-                        message_id: entry.message_id,
-                        body: bodies.take(entry.body)?,
-                        deliver_after: entry.deliver_after,
-                    })
-                })
-                .collect::<Result<_, DecodeError>>()?,
+            entries: view_in(entries, bodies)?,
         },
     })
 }
@@ -902,7 +990,7 @@ pub(super) fn decode_server(msg: WireMessage) -> Result<ServerFrame, DecodeError
 /// The length of `s` written as the contents of a JSON string, as
 /// `serde_json` escapes it: `"` and `\` and the five short-escaped controls
 /// take two bytes, every other control six, every other byte one.
-fn escaped_len(s: &str) -> usize {
+pub(super) fn escaped_len(s: &str) -> usize {
     s.bytes()
         .map(|byte| match byte {
             b'"' | b'\\' | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' => 2,
@@ -925,7 +1013,7 @@ pub(super) fn batch_charged_bytes(
     publishes: &[BatchEntry],
     deferred_ops: &[BatchDeferredOp],
 ) -> usize {
-    super::sum_op_charges(publishes, deferred_ops, op_charge)
+    super::sum_op_charges(publishes, deferred_ops, op_charge, super::no_attachments)
 }
 
 pub(super) fn check_batch_legality(

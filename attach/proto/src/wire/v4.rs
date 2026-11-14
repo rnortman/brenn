@@ -256,6 +256,7 @@ fn owned(s: Cow<'_, str>) -> String {
 }
 
 fn entry_out(entry: &BatchEntry) -> Entry<'_> {
+    super::no_attachments(&entry.attachments);
     Entry {
         channel: borrowed(&entry.channel),
         body: client_body(&entry.body),
@@ -321,13 +322,17 @@ fn client_out(frame: &ClientFrame) -> Client<'_> {
             body,
             urgency,
             correlation,
-        } => Client::Publish {
-            channel: borrowed(channel),
-            attribution: attribution.as_deref().map(borrowed),
-            body: client_body(body),
-            urgency: *urgency,
-            correlation: *correlation,
-        },
+            attachments,
+        } => {
+            super::no_attachments(attachments);
+            Client::Publish {
+                channel: borrowed(channel),
+                attribution: attribution.as_deref().map(borrowed),
+                body: client_body(body),
+                urgency: *urgency,
+                correlation: *correlation,
+            }
+        }
         ClientFrame::PublishBatch {
             attribution,
             correlation,
@@ -350,6 +355,14 @@ fn client_out(frame: &ClientFrame) -> Client<'_> {
             title: borrowed(title),
             body: borrowed(body),
         },
+        ClientFrame::BlobCreate { .. }
+        | ClientFrame::BlobWrite { .. }
+        | ClientFrame::BlobSeal { .. }
+        | ClientFrame::BlobOpen { .. }
+        | ClientFrame::BlobRead { .. }
+        | ClientFrame::BlobClose { .. } => {
+            panic!("attach v4 cannot write a blob frame")
+        }
     }
 }
 
@@ -362,6 +375,9 @@ fn outcome_out(outcome: PublishOutcome) -> Outcome {
         PublishOutcome::TextOnlyChannel => {
             panic!("attach v4 cannot write a TextOnlyChannel publish outcome")
         }
+        PublishOutcome::AttachmentNotHeld => {
+            panic!("attach v4 cannot write an AttachmentNotHeld publish outcome")
+        }
     }
 }
 
@@ -371,6 +387,9 @@ fn batch_outcome_out(outcome: PublishBatchOutcome) -> BatchOutcome {
         PublishBatchOutcome::RateLimited => BatchOutcome::RateLimited,
         PublishBatchOutcome::TextOnlyChannel => {
             panic!("attach v4 cannot write a TextOnlyChannel batch outcome")
+        }
+        PublishBatchOutcome::AttachmentNotHeld => {
+            panic!("attach v4 cannot write an AttachmentNotHeld batch outcome")
         }
     }
 }
@@ -399,15 +418,19 @@ fn server_out(frame: &ServerFrame) -> Server<'_> {
             max_body_bytes,
             max_frame_bytes,
             alert_granted,
-        } => Server::Welcome {
-            version: *version,
-            participant_id: borrowed(participant_id),
-            session_id: borrowed(session_id),
-            heartbeat_secs: *heartbeat_secs,
-            max_body_bytes: *max_body_bytes,
-            max_frame_bytes: *max_frame_bytes,
-            alert_granted: *alert_granted,
-        },
+            blobs,
+        } => {
+            assert!(blobs.is_none(), "attach v4 cannot write a blob door");
+            Server::Welcome {
+                version: *version,
+                participant_id: borrowed(participant_id),
+                session_id: borrowed(session_id),
+                heartbeat_secs: *heartbeat_secs,
+                max_body_bytes: *max_body_bytes,
+                max_frame_bytes: *max_frame_bytes,
+                alert_granted: *alert_granted,
+            }
+        }
         ServerFrame::Heartbeat => Server::Heartbeat,
         ServerFrame::SubscribeResult {
             channel,
@@ -454,6 +477,12 @@ fn server_out(frame: &ServerFrame) -> Server<'_> {
                 })
                 .collect(),
         },
+        ServerFrame::BlobCreateResult { .. }
+        | ServerFrame::BlobSealResult { .. }
+        | ServerFrame::BlobOpenResult { .. }
+        | ServerFrame::BlobReadResult { .. } => {
+            panic!("attach v4 cannot write a blob frame")
+        }
     }
 }
 
@@ -489,6 +518,7 @@ fn client_in(frame: Client<'_>) -> ClientFrame {
             body: read_body(body),
             urgency,
             correlation,
+            attachments: Vec::new(),
         },
         Client::PublishBatch {
             attribution,
@@ -505,6 +535,7 @@ fn client_in(frame: Client<'_>) -> ClientFrame {
                     body: read_body(entry.body),
                     urgency: entry.urgency,
                     deliver_after: entry.deliver_after,
+                    attachments: Vec::new(),
                 })
                 .collect(),
             deferred_ops: deferred_ops
@@ -561,6 +592,7 @@ fn server_in(frame: Server<'_>) -> ServerFrame {
             max_body_bytes,
             max_frame_bytes,
             alert_granted,
+            blobs: None,
         },
         Server::Heartbeat => ServerFrame::Heartbeat,
         Server::SubscribeResult {
@@ -669,7 +701,7 @@ pub(super) fn batch_charged_bytes(
     publishes: &[BatchEntry],
     deferred_ops: &[BatchDeferredOp],
 ) -> usize {
-    super::sum_op_charges(publishes, deferred_ops, op_charge)
+    super::sum_op_charges(publishes, deferred_ops, op_charge, super::no_attachments)
 }
 
 /// The escaped charged budget, plus a fixed allowance per batch operation for
@@ -749,6 +781,7 @@ mod tests {
             body: "\u{1}".repeat(charge - charge / 2).into(),
             urgency: Urgency::VeryLow,
             deliver_after: Some(u64::MAX),
+            attachments: Vec::new(),
         }
     }
 
@@ -832,6 +865,7 @@ mod tests {
                     body: "hello".into(),
                     urgency: Urgency::Normal,
                     deliver_after: None,
+                    attachments: Vec::new(),
                 }],
                 &[]
             ),

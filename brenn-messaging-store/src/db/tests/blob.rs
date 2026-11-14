@@ -47,13 +47,10 @@ fn owner_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
 /// The blob files in the fixture's blob directory, sorted; the owner record is
 /// not one.
 fn blob_files(dir: &tempfile::TempDir) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(blob_dir(dir))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
+    crate::testutils::blob_files(&blob_dir(dir))
+        .into_iter()
         .filter(|name| name != "owner")
-        .collect();
-    names.sort();
-    names
+        .collect()
 }
 
 async fn fixture() -> Fixture {

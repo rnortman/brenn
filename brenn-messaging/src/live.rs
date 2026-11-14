@@ -24,12 +24,13 @@ use crate::store::RingStore;
 use crate::store::ring::Appended;
 use crate::{ChannelEntry, Messenger, ParticipantId};
 use brenn_lib::access::AppPolicy;
+use brenn_messaging_store::blob::{BlobHolds, HeldAttachments};
 
 /// The decision a replay reached, alongside the replayed messages.
 pub type Replay = ReplayDecision;
 
 /// One entry of an activation flush the caller has already paid for: what to
-/// publish, at which urgency and stamp. Where it goes is a
+/// publish, at which urgency and stamp, naming which blobs. Where it goes is a
 /// [`PrepaidDestination`], resolved separately.
 ///
 /// A struct rather than a parameter list because the two entry points that take
@@ -41,6 +42,8 @@ pub struct PrepaidEntry {
     /// Assigned by the caller in call order across the whole flush, before it was
     /// split by class, so call order stays visible across the class boundary.
     pub publish_ts: DateTime<Utc>,
+    /// The blobs the message names, held: the ring entry keeps these holds.
+    pub attachments: HeldAttachments,
 }
 
 /// Where an activation flush's entries land: the resolved channel and the ring
@@ -169,8 +172,8 @@ impl Messenger {
         dest: &PrepaidDestination,
         entry: PrepaidEntry,
     ) -> Appended {
-        let envelope = self.prepaid_envelope(dest, entry);
-        let appended = dest.store.append(envelope, crate::store::no_holds());
+        let (envelope, holds) = self.prepaid_envelope(dest, entry);
+        let appended = dest.store.append(envelope, holds);
         // Resolved after the append, not memoized on the destination: a
         // subscriber can mint its directory entry mid-flush, and one minted
         // before this read holds a position no earlier resolution would have
@@ -210,23 +213,28 @@ impl Messenger {
         entry: PrepaidEntry,
         release_at: DateTime<Utc>,
     ) -> Result<Uuid, QuotaExceeded> {
-        let envelope = self.prepaid_envelope(dest, entry);
-        dest.store
-            .park(envelope, crate::store::no_holds(), release_at)
+        let (envelope, holds) = self.prepaid_envelope(dest, entry);
+        dest.store.park(envelope, holds, release_at)
     }
 
-    /// The per-entry gate every prepaid entry passes, and the envelope it mints.
+    /// The per-entry gate every prepaid entry passes, the envelope it mints
+    /// naming the entry's attachments, and the holds on the blobs they name.
     /// Shared by the immediate and the parking entry points so one admitted
     /// entry cannot be admitted by two slightly different rules.
     ///
     /// The mint stamps `deliver_after: None` on both paths: a parked message's
     /// release time belongs to the channel's deferred set, and the envelope a
     /// consumer eventually reads is the one that was minted here.
-    fn prepaid_envelope(&self, dest: &PrepaidDestination, entry: PrepaidEntry) -> MessageEnvelope {
+    fn prepaid_envelope(
+        &self,
+        dest: &PrepaidDestination,
+        entry: PrepaidEntry,
+    ) -> (MessageEnvelope, BlobHolds) {
         let PrepaidEntry {
             body,
             urgency,
             publish_ts,
+            attachments,
         } = entry;
         if let Err(e) = check_body_size(&body, self.defaults.max_body_bytes) {
             panic!(
@@ -239,8 +247,9 @@ impl Messenger {
             );
         }
         dest.entry.assert_may_hold(&body);
+        let (attachments, holds) = attachments.into_parts();
 
-        MessageEnvelope {
+        let envelope = MessageEnvelope {
             message_id: Uuid::new_v4(),
             source: self.source().into(),
             channel: dest.entry.address.clone(),
@@ -254,8 +263,9 @@ impl Messenger {
             urgency,
             envelope_type: dest.scheme,
             transport: None,
-            attachments: Default::default(),
-        }
+            attachments,
+        };
+        (envelope, holds)
     }
 }
 
@@ -339,6 +349,7 @@ mod tests {
                         body: body.into(),
                         urgency: Urgency::Normal,
                         publish_ts: Utc::now(),
+                        attachments: HeldAttachments::none(),
                     },
                 )
                 .await
@@ -379,6 +390,7 @@ mod tests {
                     body: "scheduled".into(),
                     urgency: Urgency::Normal,
                     publish_ts: now,
+                    attachments: HeldAttachments::none(),
                 },
                 later,
             )
@@ -422,6 +434,7 @@ mod tests {
                     body: body.into(),
                     urgency: Urgency::Normal,
                     publish_ts: Utc::now(),
+                    attachments: HeldAttachments::none(),
                 },
                 later,
             )

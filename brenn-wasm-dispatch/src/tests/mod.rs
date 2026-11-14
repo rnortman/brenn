@@ -176,6 +176,93 @@ pub fn brenn_channel(address: &str, sub_slug: &str) -> ChannelEntry {
     }
 }
 
+/// `slug`'s input port reading `entry`, at the depths `entry` registers for it.
+pub fn input(slug: &str, port: &str, entry: &ChannelEntry) -> WasmInputPort {
+    let sub = entry
+        .subscribers
+        .iter()
+        .find(|s| s.kind == SubscriberEntryKind::Wasm(slug.to_string()))
+        .unwrap_or_else(|| panic!("{} registers no subscriber {slug}", entry.address));
+    WasmInputPort {
+        port: port.to_string(),
+        sub: ResolvedSubscription {
+            channel_uuid: entry.uuid,
+            channel_address: entry.address.clone(),
+            push_depth: resolve_wasm_window_depth(sub.push_depth, "push_depth", slug),
+            retain_depth: resolve_wasm_window_depth(sub.retain_depth, "retain_depth", slug),
+            noise: NoiseLevel::Silent,
+            wake_min: WakeMin::Normal,
+        },
+        amplification_mt: 1000,
+        non_text: entry.resolved_channel.non_text,
+    }
+}
+
+/// An output port bound to `entry`, as the consumer config carries it.
+pub fn output(port: &str, entry: &ChannelEntry) -> brenn_lib::messaging::config::WasmOutputPort {
+    brenn_lib::messaging::config::WasmOutputPort {
+        port: port.to_string(),
+        channel_uuid: entry.uuid,
+        channel_address: entry.address.clone(),
+        default_urgency: brenn_lib::messaging::Urgency::Normal,
+        budget: brenn_lib::messaging::config::WasmSinkBudget {
+            fill_mt: 1_000_000_000,
+            capacity_mt: 1_000_000_000,
+        },
+        non_text: entry.resolved_channel.non_text,
+    }
+}
+
+/// The consumer config for `component` with these ports.
+pub fn consumer(
+    slug: &str,
+    component: Arc<ProcessorComponent>,
+    messenger: &Arc<brenn_messaging::Messenger>,
+    inputs: Vec<WasmInputPort>,
+    outputs: Vec<brenn_lib::messaging::config::WasmOutputPort>,
+) -> WasmConsumerConfig {
+    WasmConsumerConfig {
+        slug: slug.to_string(),
+        component,
+        notify: Arc::new(Notify::new()),
+        messenger: Arc::clone(messenger),
+        alert_dispatcher: noop_alert_dispatcher().0,
+        inputs,
+        outputs,
+        sync_ports: std::collections::BTreeSet::new(),
+        activation_pacing: unthrottled_pacing(),
+        provider: None,
+    }
+}
+
+/// The output-port specs the component is loaded with, one per bound output.
+pub fn output_specs(
+    outputs: &[brenn_lib::messaging::config::WasmOutputPort],
+) -> std::collections::HashMap<String, brenn_wasm::OutputPortSpec> {
+    outputs
+        .iter()
+        .map(|o| {
+            (
+                o.port.clone(),
+                brenn_wasm::OutputPortSpec {
+                    non_text: o.non_text,
+                    ..test_out_spec(o.channel_address.clone())
+                },
+            )
+        })
+        .collect()
+}
+
+/// FNV-1a over `bytes`, the 64-bit digest the blob fixtures report.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 use brenn_lib::access::test_fixtures::delivery_policy_for_addresses;
 pub use brenn_lib::access::test_fixtures::wasm_policies_from_entries;

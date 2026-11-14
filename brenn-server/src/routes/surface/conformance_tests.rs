@@ -94,6 +94,7 @@ fn publish(body: &str) -> PublishRequest {
         attribution: Some(COMPONENT.to_string()),
         body: body.into(),
         urgency: Urgency::Normal,
+        attachments: Vec::new(),
     }
 }
 

@@ -108,6 +108,20 @@ pub(crate) async fn remote_harness_with_channels(
     block: impl FnOnce(&Path) -> RemoteConfigRaw,
     entries: Vec<ChannelEntry>,
 ) -> RemoteTestHarness {
+    remote_harness_extending_messenger(db, block, entries, |messenger, _| messenger).await
+}
+
+/// [`remote_harness_with_channels`] with `extend` applied to the messenger
+/// before anything shares it, for the builder steps (`with_blob_store`, a
+/// further `with_subscriber_registrations`) that only an unshared messenger
+/// takes. `extend` also gets the wake router, to register a delivery binding
+/// for any subscriber those registrations add.
+pub(crate) async fn remote_harness_extending_messenger(
+    db: &brenn_db::Db,
+    block: impl FnOnce(&Path) -> RemoteConfigRaw,
+    entries: Vec<ChannelEntry>,
+    extend: impl FnOnce(Arc<Messenger>, &crate::messaging_router::WakeRouterImpl) -> Arc<Messenger>,
+) -> RemoteTestHarness {
     let token_file = write_token();
     let raw = block(token_file.path());
     let resolved = resolve_remotes(&[raw], &MessagingGlobalConfig::default());
@@ -135,50 +149,53 @@ pub(crate) async fn remote_harness_with_channels(
     app.singleton = true;
     app.allowed_users = vec![OWNER.to_string()];
     apps.insert(APP.to_string(), app);
-    let messenger = Messenger::new(
-        db.clone(),
-        Arc::clone(&directory),
-        Arc::from("test"),
-        Arc::new(apps),
-        Arc::clone(&router) as Arc<dyn WakeRouter>,
-        MessagingGlobalConfig {
-            max_body_bytes: TEST_MAX_BODY_BYTES,
-            ..Default::default()
-        },
-    )
-    .with_subscriber_registrations(
-        resolved
-            .iter()
-            .map(|remote| {
-                (
-                    SubscriberEntryKind::Remote(remote.slug.clone()),
-                    SubscriberRegistration {
-                        policy: Arc::new(remote.policy.clone()),
-                        wake: WakeEconomics::Eager,
-                    },
-                )
-            })
-            .collect(),
-    )
-    // The roster writer, so a test can publish the app's snapshot the way the
-    // server does: `system:chat-roster` holds the only authority on the address.
-    .with_subscriber_registrations(registrations_from_specs(&[
-        SystemParticipantSpec::publish_only(
-            CHAT_ROSTER_COMPONENT,
-            brenn_lib::messaging::ChannelScheme::Brenn,
-            &[chat_roster_bare_name(
-                &brenn_lib::config::LlmChatConfig::default().prefix,
-                APP,
-            )],
-        ),
-    ]))
-    .with_attach_send_budgets(resolved.iter().flat_map(|remote| {
-        attach_principal_budgets(
-            AttachScope::remote(&remote.slug),
-            vec![(None, AttachSendBudget::default())],
+    let messenger = extend(
+        Messenger::new(
+            db.clone(),
+            Arc::clone(&directory),
+            Arc::from("test"),
+            Arc::new(apps),
+            Arc::clone(&router) as Arc<dyn WakeRouter>,
+            MessagingGlobalConfig {
+                max_body_bytes: TEST_MAX_BODY_BYTES,
+                ..Default::default()
+            },
         )
-    }))
-    .with_ring_stores(Arc::new(RingStores::build(&nondurable)));
+        .with_subscriber_registrations(
+            resolved
+                .iter()
+                .map(|remote| {
+                    (
+                        SubscriberEntryKind::Remote(remote.slug.clone()),
+                        SubscriberRegistration {
+                            policy: Arc::new(remote.policy.clone()),
+                            wake: WakeEconomics::Eager,
+                        },
+                    )
+                })
+                .collect(),
+        )
+        // The roster writer, so a test can publish the app's snapshot the way the
+        // server does: `system:chat-roster` holds the only authority on the address.
+        .with_subscriber_registrations(registrations_from_specs(&[
+            SystemParticipantSpec::publish_only(
+                CHAT_ROSTER_COMPONENT,
+                brenn_lib::messaging::ChannelScheme::Brenn,
+                &[chat_roster_bare_name(
+                    &brenn_lib::config::LlmChatConfig::default().prefix,
+                    APP,
+                )],
+            ),
+        ]))
+        .with_attach_send_budgets(resolved.iter().flat_map(|remote| {
+            attach_principal_budgets(
+                AttachScope::remote(&remote.slug),
+                vec![(None, AttachSendBudget::default())],
+            )
+        }))
+        .with_ring_stores(Arc::new(RingStores::build(&nondurable))),
+        &router,
+    );
 
     let (mut state, alerts, _drainer) = test_state_with_capturing_alerter(db);
     let flusher = state.alert_dispatcher.clone();

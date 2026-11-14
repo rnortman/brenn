@@ -175,6 +175,7 @@ fn block_the_outbox(page: &mut SurfacePage) {
                 body: "{}".into(),
                 urgency: Urgency::Normal,
                 deliver_after: None,
+                attachments: Vec::new(),
             }],
             ops: Vec::new(),
         },

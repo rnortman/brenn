@@ -25,11 +25,16 @@
 //! is sent, so both ends know exactly what they are parsing and leniency could
 //! only mask a bug. A frame malformed for its session's version is a violation
 //! at the server and fatal at the client; nothing is ever decoded a second way.
+//! One exception, in v4 and v5 only: their decoders accept an unknown key beside
+//! the tag of a field-less tagged variant — the `PublishBatch` deferred op
+//! `cancel`, `Heartbeat`, the publish and subscribe outcomes and the gap reason —
+//! where v6 refuses it (`attach-tagged-unit-variant-strictness` in `TODO.md`).
 //!
 //! # The versions this build speaks
 //!
-//! [`SUPPORTED_VERSIONS`] holds two, and one server serves both at once: each
-//! route states the range it serves, and each client the range it offers.
+//! [`SUPPORTED_VERSIONS`] holds three, and one server serves them at once:
+//! each route states the range it serves, and each client the range it
+//! offers.
 //!
 //! - **v4.** Every frame is one JSON text message and every body a JSON
 //!   string; a delivered envelope is written in the text shape, without its
@@ -53,6 +58,23 @@
 //!   bodies raw, as they travel, so the frame cap is the body cap plus fixed
 //!   allowances (204,800 bytes at a 64 KiB body cap, against v4's 532,480).
 //!   The layout in full is the private `wire::v5` module's documentation.
+//! - **v6.** v5 plus blob transfer. A session holds a table of blob
+//!   **handles** the client mints ([`BlobHandle`]): `BlobCreate`, `BlobWrite`
+//!   and `BlobSeal` upload a blob of declared size in positional chunks;
+//!   `BlobOpen` takes a hold on an attachment of a message by `(channel,
+//!   message id, attachment name)`, never by blob id; `BlobRead` reads a byte
+//!   range through a held handle; `BlobClose` gives a handle up. `Publish` and
+//!   each `PublishBatch` entry gain `attachments`, naming held handles.
+//!   [`ServerFrame::Welcome`] gains `blobs` ([`BlobFacts`]), absent when the
+//!   session has no blob door. `BlobWrite` and `BlobReadResult` are binary in
+//!   v5's layout with raw bytes in the body section; the other blob frames
+//!   are text. Every v5 frame keeps its v5 bytes when it carries none of the
+//!   new fields. The layout in full is the private `wire::v6` module's
+//!   documentation.
+//!
+//! **v6 is settled.** Any change to its schema is a new version, served
+//! beside v6 under the rule below; v6 is not removed without the same kind of
+//! announcement v4's removal awaits.
 //!
 //! The batch law and the frame cap belong to a version: [`Codec`] states both,
 //! and [`max_transport_frame_bytes`] is what a route sets as its websocket read
@@ -68,8 +90,8 @@
 //! The one place *data* may grow without a bump is the `header` object of a v5
 //! delivered envelope: it is the only non-strict object in the protocol, and a
 //! reader ignores keys it does not know. That is where references to blob
-//! attachments are expected to appear. v5 itself carries no blob transfer; a
-//! later version is expected to add it.
+//! attachments appear, under v5 and v6 alike. v5 carries no blob transfer;
+//! v6 adds it.
 //!
 //! Bus semantics the frames carry, none of them re-invented here: cursors are
 //! server-minted, opaque and client-held; nothing consumes and nothing acks;
@@ -80,7 +102,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub use brenn_envelope::{BodyError, MessageBody, MessageEnvelope};
+pub use brenn_envelope::attachment::MAX_ATTACHMENT_NAME_LEN;
+pub use brenn_envelope::{
+    AttachmentName, BodyError, MAX_ATTACHMENTS_PER_MESSAGE, MessageBody, MessageEnvelope,
+};
 
 pub mod wire;
 
@@ -133,21 +158,21 @@ impl VersionRange {
 }
 
 /// The transport versions this build speaks: 4, where every frame is JSON text
-/// and every body a string, and 5, where the body-carrying frames are binary
-/// and a body is bytes with its content type.
+/// and every body a string; 5, where the body-carrying frames are binary and a
+/// body is bytes with its content type; and 6, which adds blob transfer.
 ///
 /// A consumer exists that deploys out of lockstep with the backend — a remote
 /// daemon binding the client crate by pin — so the server holds more than one
 /// version at once. Each route serves a range within this one, chosen by the
-/// server, and a daemon reaches v5 only on a route whose range holds it; the
-/// surface route serves the version the page speaks. No length is stated for
-/// v4's service and no release that removes it is named.
+/// server, and a daemon reaches a version only on a route whose range holds
+/// it; the surface route serves the version the page speaks. No length is
+/// stated for v4's service and no release that removes it is named.
 ///
 /// Any schema change still bumps the version. The negotiation mechanism is the
 /// one thing that cannot be added later without breaking the frozen
 /// [`ClientFrame::Hello`] shell.
-// TODO(attach-v4-beside-v5): how long v4 is served beside v5, and when it goes.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange { min: 4, max: 5 };
+// TODO(attach-v4-beside-v5): how long v4 is served beside v5 and v6, and when it goes.
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange { min: 4, max: 6 };
 
 /// The version two ends agree on, or `None` when their ranges do not overlap.
 ///
@@ -177,6 +202,19 @@ pub fn negotiate(a: VersionRange, b: VersionRange) -> Option<u32> {
 /// On a version outside [`SUPPORTED_VERSIONS`], as [`Codec::negotiated`].
 pub fn carries_non_text_bodies(version: u32) -> bool {
     Codec::negotiated(version).carries_non_text_bodies()
+}
+
+/// Whether `version` has the blob frames and the `attachments` field on its
+/// publish frames. True from v6.
+///
+/// A server opens a session's blob door only on a version this is true for,
+/// so no frame a version cannot write is ever built for its session.
+///
+/// # Panics
+///
+/// On a version outside [`SUPPORTED_VERSIONS`], as [`Codec::negotiated`].
+pub fn carries_blob_transfer(version: u32) -> bool {
+    Codec::negotiated(version).carries_blob_transfer()
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +296,9 @@ pub enum ClientFrame {
         /// Routes the eventual [`ServerFrame::PublishResult`] back, or `None` to
         /// ask for no answer.
         correlation: Option<u64>,
+        /// The blobs this message names, each a handle this session holds.
+        /// Non-empty only on a version that [`carries_blob_transfer`].
+        attachments: Vec<PublishAttachment>,
     },
     /// One activation's whole flush, atomically.
     ///
@@ -332,6 +373,63 @@ pub enum ClientFrame {
         title: String,
         body: String,
     },
+    /// Start an upload of `size` bytes under a new `handle`. The whole size is
+    /// reserved against the host's blob limits before any byte is sent.
+    /// Answered by [`ServerFrame::BlobCreateResult`].
+    BlobCreate {
+        handle: BlobHandle,
+        content_type: String,
+        size: u64,
+    },
+    /// Write `bytes` at `offset` of the upload `handle` names. Unanswered.
+    BlobWrite {
+        handle: BlobHandle,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    /// Seal the upload `handle` names, making it a held blob. Answered by
+    /// [`ServerFrame::BlobSealResult`].
+    BlobSeal { handle: BlobHandle },
+    /// Take a hold on the attachment `name` of the message `message_id` on
+    /// `channel`, under a new `handle`. Answered by
+    /// [`ServerFrame::BlobOpenResult`].
+    BlobOpen {
+        handle: BlobHandle,
+        channel: String,
+        message_id: Uuid,
+        name: AttachmentName,
+    },
+    /// Read `len` bytes at `offset` of the held blob `handle` names. Answered
+    /// by [`ServerFrame::BlobReadResult`] carrying `correlation`.
+    BlobRead {
+        correlation: u64,
+        handle: BlobHandle,
+        offset: u64,
+        len: u64,
+    },
+    /// Give `handle` up: an upload's bytes are deleted, a held blob loses this
+    /// session's hold. Unanswered.
+    BlobClose { handle: BlobHandle },
+}
+
+/// A client-minted name for one entry of a session's blob table: an upload
+/// being written or a held blob. Scoped to one attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BlobHandle(pub u64);
+
+/// One attachment a publish names: the message's name for it and the held
+/// blob's handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishAttachment {
+    pub name: AttachmentName,
+    pub handle: BlobHandle,
+}
+
+impl PublishAttachment {
+    pub fn new(name: AttachmentName, handle: BlobHandle) -> Self {
+        Self { name, handle }
+    }
 }
 
 /// One buffered publish inside a [`ClientFrame::PublishBatch`].
@@ -353,6 +451,8 @@ pub struct BatchEntry {
     /// refuses one at buffer time, so an unrepresentable time here is a batch no
     /// conforming client produced.
     pub deliver_after: Option<u64>,
+    /// The blobs this entry's message names, as on [`ClientFrame::Publish`].
+    pub attachments: Vec<PublishAttachment>,
 }
 
 impl BatchEntry {
@@ -365,12 +465,19 @@ impl BatchEntry {
             body,
             urgency,
             deliver_after: None,
+            attachments: Vec::new(),
         }
     }
 
     /// The entry parked until `deliver_after`, epoch milliseconds UTC.
     pub fn deliver_after(mut self, deliver_after: u64) -> Self {
         self.deliver_after = Some(deliver_after);
+        self
+    }
+
+    /// The entry naming `attachments`.
+    pub fn attachments(mut self, attachments: Vec<PublishAttachment>) -> Self {
+        self.attachments = attachments;
         self
     }
 }
@@ -416,6 +523,16 @@ pub enum DeferredOpKind {
         body: Option<MessageBody>,
         deliver_after: Option<u64>,
     },
+}
+
+impl DeferredOpKind {
+    /// The body this op writes: an edit's new body, if it states one.
+    pub fn body(&self) -> Option<&MessageBody> {
+        match self {
+            Self::Edit { body, .. } => body.as_ref(),
+            Self::Cancel => None,
+        }
+    }
 }
 
 /// Severity of a [`ClientFrame::Alert`]. Must stay 1:1 with the WASM WIT
@@ -493,6 +610,10 @@ pub enum ServerFrame {
         /// ungranted alert reaches the server only from a non-conforming client.
         /// The attacher learns its rights from the server and never guesses.
         alert_granted: bool,
+        /// This attachment's blob door, or `None` when it has none: then every
+        /// blob frame and every non-empty `attachments` is a violation. Always
+        /// `None` on a version that does not [`carries_blob_transfer`].
+        blobs: Option<BlobFacts>,
     },
     /// Idle-liveness signal, server → client only: a browser websocket cannot
     /// observe protocol-level pings, so liveness is an application frame and the
@@ -562,6 +683,137 @@ pub enum ServerFrame {
         attribution: Option<String>,
         entries: Vec<DeferredViewEntry>,
     },
+    /// The answer to one [`ClientFrame::BlobCreate`].
+    BlobCreateResult {
+        handle: BlobHandle,
+        outcome: BlobCreateOutcome,
+    },
+    /// The answer to one [`ClientFrame::BlobSeal`].
+    BlobSealResult {
+        handle: BlobHandle,
+        outcome: BlobSealOutcome,
+    },
+    /// The answer to one [`ClientFrame::BlobOpen`].
+    BlobOpenResult {
+        handle: BlobHandle,
+        outcome: BlobOpenOutcome,
+    },
+    /// The answer to one [`ClientFrame::BlobRead`], keyed by its
+    /// `correlation`: several reads may be in flight on one handle.
+    BlobReadResult {
+        correlation: u64,
+        outcome: BlobReadOutcome,
+    },
+}
+
+/// The blob door of one attachment, as [`ServerFrame::Welcome`] advertises
+/// it. A client chunks and bounds against these numbers, never against
+/// constants of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobFacts {
+    /// The largest blob the host stores.
+    pub max_blob_bytes: u64,
+    /// The most bytes one `BlobWrite` carries and one `BlobRead` asks for.
+    pub max_chunk_bytes: u64,
+    /// The most handles the session's table holds, uploads and held blobs
+    /// together.
+    pub max_handles: u32,
+    /// The most blob bytes the session holds at once, summed per handle: the
+    /// declared size of each upload being written and the size of each held
+    /// blob, sealed upload and opened attachment alike.
+    pub max_bytes_held: u64,
+    /// The most read answers carrying bytes the session has in flight.
+    pub max_inflight_reads: u32,
+    /// Whether this session may create blobs.
+    pub upload: bool,
+}
+
+impl BlobFacts {
+    /// Whether a session holding `held` bytes may hold `size` more: the
+    /// checked sum is at most `max_bytes_held`, and an overflow is over. The
+    /// host answers `BytesHeldLimit` by this rule.
+    pub fn admits_bytes_held(&self, held: u64, size: u64) -> bool {
+        held.checked_add(size)
+            .is_some_and(|total| total <= self.max_bytes_held)
+    }
+}
+
+/// Result of a [`ClientFrame::BlobCreate`]. On any outcome but `Ok` the handle
+/// does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobCreateOutcome {
+    Ok,
+    /// `size` is over the host's per-blob cap `max`.
+    BlobTooLarge {
+        size: u64,
+        max: u64,
+    },
+    /// The host's blob pool cannot reserve `size` now.
+    BudgetExhausted,
+    /// The session's table is full.
+    HandleLimit,
+    /// The session's bytes held plus `size` would pass `max_bytes_held`.
+    BytesHeldLimit,
+    /// The host could not create the blob's file.
+    StorageFailed,
+}
+
+/// Result of a [`ClientFrame::BlobSeal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobSealOutcome {
+    Ok,
+    /// `[offset, offset + len)` is the first range not written; the upload
+    /// stays open.
+    Incomplete {
+        offset: u64,
+        len: u64,
+    },
+    /// The handle is not in the session's table.
+    UnknownHandle,
+}
+
+/// Result of a [`ClientFrame::BlobOpen`]. On any outcome but `Ok` the handle
+/// does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobOpenOutcome {
+    Ok {
+        size: u64,
+        content_type: String,
+    },
+    /// The message is not in the channel's window now, is parked, or the
+    /// channel is gone.
+    NotRetained,
+    /// The message carries no attachment of that name.
+    NoSuchAttachment,
+    /// The channel is of the tool-substrate family, whose attachments this
+    /// door never admits.
+    ToolChannel,
+    /// The session's table is full.
+    HandleLimit,
+    /// The session's bytes held plus the blob's `size` would pass
+    /// `max_bytes_held`. A `size` over `max_bytes_held` alone is never
+    /// openable on this door.
+    BytesHeldLimit {
+        size: u64,
+    },
+}
+
+/// Result of a [`ClientFrame::BlobRead`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobReadOutcome {
+    /// Exactly the bytes asked for.
+    Ok { bytes: Vec<u8> },
+    /// The range passes the blob's `size`. Never a short read.
+    OutOfRange { size: u64 },
+    /// The handle is not in the session's table.
+    UnknownHandle,
+    /// The handle is an upload not yet sealed.
+    NotSealed,
+    /// The session has its bound of read answers in flight.
+    TooManyReads,
+    /// The host could not read the blob's file.
+    StorageFailed,
 }
 
 /// One delivered envelope inside a [`ServerFrame::Deliver`] pass.
@@ -683,6 +935,10 @@ pub enum PublishOutcome {
     /// ([`carries_non_text_bodies`]) can write this outcome, since only such a
     /// version can send such a body.
     TextOnlyChannel,
+    /// A handle the publish names is not a held blob of this session. Nothing
+    /// was stored. Only a version that [`carries_blob_transfer`] can write
+    /// this outcome.
+    AttachmentNotHeld,
 }
 
 /// Result of a [`ClientFrame::PublishBatch`].
@@ -704,6 +960,10 @@ pub enum PublishBatchOutcome {
     /// declared to carry only text. Nothing of the batch was applied. Only a
     /// version that carries non-text bodies can write this outcome.
     TextOnlyChannel,
+    /// A handle an entry names is not a held blob of this session. Nothing of
+    /// the batch was applied. Only a version that [`carries_blob_transfer`]
+    /// can write this outcome.
+    AttachmentNotHeld,
 }
 
 /// A gap in the replay window, attached to a
@@ -760,6 +1020,17 @@ pub const MAX_BATCH_OPS: usize = 512;
 /// frame-cap derivation a bound rather than an estimate.
 pub const BATCH_OP_OVERHEAD_BYTES: usize = 256;
 
+/// Per-attachment allowance in the batch law and the frame cap, beside the
+/// name's own length: the keys, the punctuation and a `u64` handle's twenty
+/// digits. An encoded attachment is at most 42 bytes plus its name.
+pub const ATTACHMENT_OVERHEAD_BYTES: usize = 64;
+
+/// The most bytes one `BlobWrite` carries and one `BlobRead` asks for, as a
+/// server advertises it in [`BlobFacts::max_chunk_bytes`] and the v6 frame cap
+/// is derived from. A client chunks against the advertised number, never this
+/// constant.
+pub const BLOB_CHUNK_BYTES: usize = 256 * 1024;
+
 /// Why a [`ClientFrame::PublishBatch`] is not a legal frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchIllegal {
@@ -798,6 +1069,32 @@ mod tests {
 
     fn sample_cursor() -> Cursor {
         serde_json::from_value(json!("opaque-token-7")).unwrap()
+    }
+
+    /// The bytes-held bound admits a sum equal to the limit, refuses one
+    /// byte past it, and refuses an addition that overflows.
+    #[test]
+    fn admits_bytes_held_boundaries() {
+        let facts = BlobFacts {
+            max_blob_bytes: 64,
+            max_chunk_bytes: 16,
+            max_handles: 4,
+            max_bytes_held: 256,
+            max_inflight_reads: 2,
+            upload: true,
+        };
+        assert!(facts.admits_bytes_held(0, 0));
+        assert!(facts.admits_bytes_held(0, 256));
+        assert!(facts.admits_bytes_held(200, 56));
+        assert!(!facts.admits_bytes_held(200, 57));
+        assert!(!facts.admits_bytes_held(0, 257));
+        assert!(!facts.admits_bytes_held(256, 1));
+        let unbounded = BlobFacts {
+            max_bytes_held: u64::MAX,
+            ..facts
+        };
+        assert!(unbounded.admits_bytes_held(u64::MAX - 1, 1));
+        assert!(!unbounded.admits_bytes_held(u64::MAX, 1));
     }
 
     /// The negotiation table, including the rows a hand-written implementation
@@ -853,22 +1150,53 @@ mod tests {
     /// literal below is the acknowledgement that both ends moved together.
     #[test]
     fn the_wire_version_is_pinned_to_this_frame_shape() {
-        assert_eq!(SUPPORTED_VERSIONS, VersionRange { min: 4, max: 5 });
+        assert_eq!(SUPPORTED_VERSIONS, VersionRange { min: 4, max: 6 });
     }
 
     #[test]
-    fn only_v5_carries_non_text_bodies() {
+    fn v5_and_v6_carry_non_text_bodies() {
         assert!(!carries_non_text_bodies(4));
         assert!(carries_non_text_bodies(5));
+        assert!(carries_non_text_bodies(6));
+    }
+
+    #[test]
+    fn only_v6_carries_blob_transfer() {
+        assert!(!carries_blob_transfer(4));
+        assert!(!carries_blob_transfer(5));
+        assert!(carries_blob_transfer(6));
+    }
+
+    #[test]
+    fn a_deferred_ops_body_is_an_edits_stated_body() {
+        let body: MessageBody = "x".into();
+        assert_eq!(DeferredOpKind::Cancel.body(), None);
+        assert_eq!(
+            DeferredOpKind::Edit {
+                body: None,
+                deliver_after: Some(1)
+            }
+            .body(),
+            None
+        );
+        assert_eq!(
+            DeferredOpKind::Edit {
+                body: Some(body.clone()),
+                deliver_after: None
+            }
+            .body(),
+            Some(&body)
+        );
     }
 
     #[test]
     fn contains_table() {
-        let range = VersionRange { min: 4, max: 5 };
+        let range = VersionRange { min: 4, max: 6 };
         assert!(!range.contains(3));
         assert!(range.contains(4));
         assert!(range.contains(5));
-        assert!(!range.contains(6));
+        assert!(range.contains(6));
+        assert!(!range.contains(7));
         assert!(!VersionRange { min: 5, max: 4 }.contains(4));
     }
 
@@ -876,12 +1204,12 @@ mod tests {
     fn contains_range_table() {
         let r = |min, max| VersionRange { min, max };
         for (outer, inner, expected) in [
-            (r(4, 5), r(4, 5), true),
-            (r(4, 5), r(4, 4), true),
-            (r(4, 5), r(5, 5), true),
-            (r(4, 5), r(3, 5), false),
-            (r(4, 5), r(4, 6), false),
-            (r(4, 5), r(6, 9), false),
+            (r(4, 6), r(4, 6), true),
+            (r(4, 6), r(4, 4), true),
+            (r(4, 6), r(5, 6), true),
+            (r(4, 6), r(3, 5), false),
+            (r(4, 6), r(4, 7), false),
+            (r(4, 6), r(7, 9), false),
             (r(4, 4), r(4, 5), false),
             // An empty range is never contained, and an empty outer range
             // holds nothing.

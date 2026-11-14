@@ -455,6 +455,7 @@ dependencies = [
  "brenn-envelope",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

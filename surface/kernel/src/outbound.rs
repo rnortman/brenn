@@ -35,7 +35,7 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::{
     BatchAnswer, Discarded, FlushBatch, OutboxSteps, Outboxes, PendingPublishes, PublishRequest,
 };
-use brenn_attach_proto::{ClientFrame, DeferredOpKind, PublishBatchOutcome, PublishOutcome};
+use brenn_attach_proto::{ClientFrame, PublishBatchOutcome, PublishOutcome};
 use brenn_envelope::{MessageBody, Urgency};
 use brenn_surface_schema::telemetry::ErrorReportDocument;
 use brenn_surface_schema::{LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES};
@@ -348,6 +348,7 @@ impl SurfaceOutbound {
             attribution: Some(req.instance.clone()),
             body: req.body.into(),
             urgency: out.urgency,
+            attachments: Vec::new(),
         };
         let tag = PublishTag::Port {
             instance: req.instance,
@@ -394,6 +395,7 @@ impl SurfaceOutbound {
             attribution: report.subject.map(str::to_owned),
             body: body.into(),
             urgency: PLATFORM_URGENCY,
+            attachments: Vec::new(),
         };
         Some(self.send(PublishTag::ErrorReport, request))
     }
@@ -415,6 +417,7 @@ impl SurfaceOutbound {
             attribution: None,
             body: body.into(),
             urgency: PLATFORM_URGENCY,
+            attachments: Vec::new(),
         };
         self.send(PublishTag::Telemetry(kind), request)
     }
@@ -479,6 +482,7 @@ impl SurfaceOutbound {
                 PublishOutcome::TextOnlyChannel => {
                     unreachable!("refused above: the surface route never sends {outcome:?}")
                 }
+                PublishOutcome::AttachmentNotHeld => not_a_v5_outcome(),
             },
         }
     }
@@ -745,17 +749,9 @@ fn survives(
         .iter()
         .all(|entry| admits(&entry.channel) && carries(&entry.channel, &entry.body))
         && batch.ops.iter().all(|op| {
-            admits(&op.channel) && op_body(&op.op).is_none_or(|body| carries(&op.channel, body))
+            admits(&op.channel) && op.op.body().is_none_or(|body| carries(&op.channel, body))
         })
         && facts.is_none_or(|facts| fits_the_caps(instance, batch, facts))
-}
-
-/// The body a control op writes: an edit's new body, if it states one.
-fn op_body(op: &DeferredOpKind) -> Option<&MessageBody> {
-    match op {
-        DeferredOpKind::Edit { body, .. } => body.as_ref(),
-        DeferredOpKind::Cancel => None,
-    }
 }
 
 /// Whether a flush clears the attachment's two size caps: the protocol's batch
@@ -787,5 +783,10 @@ fn publish_status(outcome: PublishOutcome) -> PublishStatus {
         PublishOutcome::TextOnlyChannel => {
             unreachable!("refused where the result is settled: the surface route never sends it")
         }
+        PublishOutcome::AttachmentNotHeld => not_a_v5_outcome(),
     }
+}
+
+fn not_a_v5_outcome() -> ! {
+    panic!("surface client: attach v5, which the page speaks, has no AttachmentNotHeld outcome")
 }

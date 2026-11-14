@@ -11,7 +11,7 @@ use indexmap::IndexMap;
 use uuid::Uuid;
 
 use super::*;
-use crate::config::{MessagingGlobalConfig, ResolvedMessagingConfig};
+use crate::config::{Depth, MessagingGlobalConfig, ResolvedMessagingConfig, SystemChannelFamily};
 use crate::conversations::ConversationDelivery;
 use crate::db::{init_db_memory, upsert_channels};
 use crate::query::{MessageQuery, NoopWakeRouter};

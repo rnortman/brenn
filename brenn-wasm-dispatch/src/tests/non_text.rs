@@ -10,7 +10,7 @@ use super::*;
 
 use brenn_lib::messaging::MessageBody;
 use brenn_lib::messaging::SubscriberRegistration;
-use brenn_lib::messaging::config::{WasmOutputPort, WasmSinkBudget};
+use brenn_lib::messaging::config::WasmOutputPort;
 use brenn_wasm::ProcessorContract;
 use std::collections::HashMap;
 
@@ -117,83 +117,6 @@ pub(super) async fn attach_subscribers(
         }
     }
     messenger
-}
-
-/// `slug`'s input port reading `entry`, at the depths `entry` registers for it.
-pub(super) fn input(slug: &str, port: &str, entry: &ChannelEntry) -> WasmInputPort {
-    let sub = entry
-        .subscribers
-        .iter()
-        .find(|s| s.kind == SubscriberEntryKind::Wasm(slug.to_string()))
-        .unwrap_or_else(|| panic!("{} registers no subscriber {slug}", entry.address));
-    WasmInputPort {
-        port: port.to_string(),
-        sub: ResolvedSubscription {
-            channel_uuid: entry.uuid,
-            channel_address: entry.address.clone(),
-            push_depth: resolve_wasm_window_depth(sub.push_depth, "push_depth", slug),
-            retain_depth: resolve_wasm_window_depth(sub.retain_depth, "retain_depth", slug),
-            noise: NoiseLevel::Silent,
-            wake_min: WakeMin::Normal,
-        },
-        amplification_mt: 1000,
-        non_text: entry.resolved_channel.non_text,
-    }
-}
-
-/// An output port bound to `entry`, as the consumer config carries it.
-pub(super) fn output(port: &str, entry: &ChannelEntry) -> WasmOutputPort {
-    WasmOutputPort {
-        port: port.to_string(),
-        channel_uuid: entry.uuid,
-        channel_address: entry.address.clone(),
-        default_urgency: brenn_lib::messaging::Urgency::Normal,
-        budget: WasmSinkBudget {
-            fill_mt: 1_000_000_000,
-            capacity_mt: 1_000_000_000,
-        },
-        non_text: entry.resolved_channel.non_text,
-    }
-}
-
-/// The consumer config for `component` with these ports.
-pub(super) fn consumer(
-    slug: &str,
-    component: Arc<ProcessorComponent>,
-    messenger: &Arc<brenn_messaging::Messenger>,
-    inputs: Vec<WasmInputPort>,
-    outputs: Vec<WasmOutputPort>,
-) -> WasmConsumerConfig {
-    WasmConsumerConfig {
-        slug: slug.to_string(),
-        component,
-        notify: Arc::new(Notify::new()),
-        messenger: Arc::clone(messenger),
-        alert_dispatcher: noop_alert_dispatcher().0,
-        inputs,
-        outputs,
-        sync_ports: std::collections::BTreeSet::new(),
-        activation_pacing: unthrottled_pacing(),
-        provider: None,
-    }
-}
-
-/// The output-port specs the component is loaded with, one per bound output.
-pub(super) fn output_specs(
-    outputs: &[WasmOutputPort],
-) -> std::collections::HashMap<String, brenn_wasm::OutputPortSpec> {
-    outputs
-        .iter()
-        .map(|o| {
-            (
-                o.port.clone(),
-                brenn_wasm::OutputPortSpec {
-                    non_text: o.non_text,
-                    ..test_out_spec(o.channel_address.clone())
-                },
-            )
-        })
-        .collect()
 }
 
 /// A consumer running the 0.2.0 bytes fixture.

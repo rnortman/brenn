@@ -151,6 +151,7 @@ fn publish_parts(frame: &ClientFrame) -> (&str, Option<&str>, &str, Urgency, Opt
             body,
             urgency,
             correlation,
+            ..
         } => (
             channel.as_str(),
             attribution.as_deref(),
@@ -175,6 +176,7 @@ fn entry(channel: &str, body: &str) -> BatchEntry {
         body: body.into(),
         urgency: Urgency::Normal,
         deliver_after: None,
+        attachments: Vec::new(),
     }
 }
 

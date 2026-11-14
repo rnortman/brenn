@@ -114,6 +114,7 @@ fn a_publish_is_written_byte_for_byte() {
         body: jpeg(),
         urgency: Urgency::High,
         correlation: Some(7),
+        attachments: Vec::new(),
     };
     let header = r#"{"type":"Publish","channel":"brenn:frames","attribution":"cam","body":{"len":4,"content_type":"image/jpeg"},"urgency":"high","correlation":7}"#;
     let mut expected = vec![0, 0, 0, 141];
@@ -239,6 +240,7 @@ fn the_text_kinds_are_text() {
                 max_body_bytes: 65_536,
                 max_frame_bytes: 204_800,
                 alert_granted: true,
+                blobs: None,
             },
             r#"{"type":"Welcome","version":5,"participant_id":"remote:alice","session_id":"s-1","heartbeat_secs":30,"max_body_bytes":65536,"max_frame_bytes":204800,"alert_granted":true}"#,
         ),
@@ -309,6 +311,7 @@ fn every_body_round_trips_in_every_binary_kind() {
             body: body.clone(),
             urgency: Urgency::Normal,
             correlation: None,
+            attachments: Vec::new(),
         });
         client_round_trip(ClientFrame::PublishBatch {
             attribution: Some("cam".to_string()),
@@ -481,6 +484,7 @@ fn typed_text_keeps_its_type() {
         body: markdown(),
         urgency: Urgency::Normal,
         correlation: None,
+        attachments: Vec::new(),
     });
     let Ok(ClientFrame::Publish { body, .. }) = v5().decode_client(msg) else {
         panic!("a publish reads back");
@@ -903,6 +907,7 @@ fn a_publish_at_the_body_cap_fits() {
         body: MessageBody::from_parts(Some("image/jpeg"), &vec![0; max_body_bytes]).unwrap(),
         urgency: Urgency::VeryLow,
         correlation: Some(u64::MAX),
+        attachments: Vec::new(),
     });
     assert!(msg.len() <= v5().max_client_frame_bytes(max_body_bytes));
 }

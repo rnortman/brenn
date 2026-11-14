@@ -4002,6 +4002,7 @@ async fn a_named_auto_channel_lists_to_a_third_party_with_its_description() {
 /// Auto-injection means a principal's ACL lists in config no longer enumerate
 /// its full reach, so the boot log is the accounting a config security review
 /// reads instead: one line per (principal, capability, channel).
+// TODO(boot-log-capture-tests-flaky): once failed under full `make check`, no lines captured.
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn boot_logs_every_injected_auto_grant() {

@@ -384,6 +384,7 @@ impl Messenger {
         addr: &str,
         body: super::MessageBody,
         urgency: super::Urgency,
+        attachments: HeldAttachments,
     ) -> PublishResult {
         self.publish_core(
             PublishOrigin::System,
@@ -399,7 +400,7 @@ impl Messenger {
             None,
             None,
             None,
-            HeldAttachments::none(),
+            attachments,
         )
         .await
     }
@@ -483,7 +484,7 @@ impl Messenger {
     }
 
     /// [`Messenger::publish_from_system`] with attachments and an optional
-    /// release time: the one entry point that publishes a message naming blobs.
+    /// release time.
     ///
     /// `attachments` holds every blob it names, so the publish cannot fail on
     /// them. The channel's store keeps its own holder — a ring entry's holds,
@@ -2012,6 +2013,9 @@ pub struct AttachBatchPublish<'a> {
     /// park-vs-immediate against the same instant. This entry point re-reads no
     /// clock and re-compares nothing.
     pub deliver_after: Option<DateTime<Utc>>,
+    /// The blobs this entry's message names, held by the caller until the
+    /// batch returns.
+    pub attachments: &'a HeldAttachments,
 }
 
 impl Messenger {
@@ -2072,6 +2076,14 @@ impl Messenger {
     /// discard entries the component published unconditionally over one it merely
     /// scheduled, and a post-activation flush has no error channel back to the
     /// guest to carry either outcome.
+    ///
+    /// **Attachments are stored with their entry.** A durable entry's blobs are
+    /// synced before the database lock is taken, adopted with the entry's row,
+    /// and confirmed after the commit. A ring entry's blobs are neither synced
+    /// nor adopted: the ring keeps the holds. An entry that publishes nothing
+    /// adopts nothing, and a blob only it named is deleted when the caller drops
+    /// its holds. A panic mid-batch leaves the blobs adopted in the rolled-back
+    /// transaction to the next reap.
     ///
     /// Returns the number of entries that published nothing — a schedule the
     /// deferred cap refused, or (under [`MissingChannelPosture::Race`]) a target
@@ -2173,6 +2185,16 @@ impl Messenger {
         // Schedules the deferred cap refused, warned about after the lock is
         // released so the transaction is not held across the logging.
         let mut refused: Vec<(String, u64)> = Vec::new();
+        // The attachments of every durable entry inserted, confirmed once the
+        // transaction has committed.
+        let mut adopted: Vec<&HeldAttachments> = Vec::new();
+
+        // Sync the blobs a durable row will name before the lock.
+        for (publish, _) in &durable {
+            if !publish.attachments.is_empty() {
+                publish.attachments.make_durable();
+            }
+        }
 
         {
             let conn = self.db.lock().await;
@@ -2266,8 +2288,9 @@ impl Messenger {
                         Some(release_at),
                         None, // no delivery_deadline
                         None, // no transport metadata
-                        &HeldAttachments::none(),
+                        publish.attachments,
                     );
+                    adopted.push(publish.attachments);
                     // Not fed now: a parked message is not observable before
                     // release, and the release sweep does its own fan-out.
                     continue;
@@ -2286,8 +2309,9 @@ impl Messenger {
                     None,
                     None, // no delivery_deadline
                     None, // no transport metadata
-                    &HeldAttachments::none(),
+                    publish.attachments,
                 );
+                adopted.push(publish.attachments);
                 if !feed_targets.is_empty()
                     && self
                         .router
@@ -2307,7 +2331,7 @@ impl Messenger {
                             None,
                             publish.urgency,
                             ChannelScheme::Brenn,
-                            Attachments::new(),
+                            publish.attachments.refs().clone(),
                         )),
                         inserted.retained_seq.expect(
                             "publish: an unparked durable message holds a retention position",
@@ -2318,6 +2342,9 @@ impl Messenger {
             }
 
             tx.commit().expect("publish_batch_from_attacher: commit tx");
+            for attachments in adopted {
+                attachments.confirm_adopted();
+            }
         }
 
         // Durable attacher feeds, fanned out after the lock is released.
@@ -2342,6 +2369,7 @@ impl Messenger {
                 body: publish.body.clone(),
                 urgency: publish.urgency,
                 publish_ts: db::ns_to_utc(publish.publish_ts_ns),
+                attachments: publish.attachments.clone(),
             };
             match publish.deliver_after {
                 Some(release_at) => {

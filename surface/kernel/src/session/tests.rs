@@ -235,6 +235,7 @@ fn a_detach_disarms_the_retry_deadline_a_refused_flush_armed() {
                 body: "{}".into(),
                 urgency: Urgency::Normal,
                 deliver_after: None,
+                attachments: Vec::new(),
             }],
             ops: Vec::new(),
         },
@@ -856,6 +857,7 @@ fn an_outbox_pass_sends_its_frames_toasts_each_dropped_flush_and_states_the_time
             OutboxSteps {
                 frames: vec![batch.clone()],
                 dropped: vec!["p2".to_string()],
+                released: Vec::new(),
                 retry_wakeup: Some(TimerChange::Arm(Millis(2_000))),
             },
         );

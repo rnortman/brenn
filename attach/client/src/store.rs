@@ -75,6 +75,16 @@ pub enum DeferOp {
     },
 }
 
+impl DeferOp {
+    /// The body this op writes: an edit's new body, if it states one.
+    pub fn body(&self) -> Option<&MessageBody> {
+        match self {
+            Self::Edit { body, .. } => body.as_ref(),
+            Self::Cancel => None,
+        }
+    }
+}
+
 /// What became of a control op.
 ///
 /// Three outcomes because the two failures mean opposite things about the
@@ -436,13 +446,10 @@ impl<K: Eq + Hash + Clone> ChannelStore<K> {
                     // is "the message" is this layer's knowledge. The envelope's own
                     // `deliver_after` stays `None` — a schedule is the channel's,
                     // held in its deferred set until it releases.
-                    match &op {
-                        DeferOp::Cancel => None,
-                        DeferOp::Edit { body, .. } => body.clone().map(|body| MessageEnvelope {
-                            body,
-                            ..entry.message.clone()
-                        }),
-                    },
+                    op.body().map(|body| MessageEnvelope {
+                        body: body.clone(),
+                        ..entry.message.clone()
+                    }),
                 ),
                 // Due and gone are one outcome: the op named an entry past the
                 // cutoff either way. A due entry is the one the sender's view

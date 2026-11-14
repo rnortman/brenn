@@ -780,6 +780,24 @@ impl fmt::Display for AttachmentError {
 
 impl std::error::Error for AttachmentError {}
 
+/// Whether `names` may be one message's attachment names: at most
+/// [`MAX_ATTACHMENTS_PER_MESSAGE`] of them, none given twice.
+pub fn check_attachment_names<'a>(
+    names: impl IntoIterator<Item = &'a AttachmentName>,
+) -> Result<(), AttachmentError> {
+    let names: Vec<&AttachmentName> = names.into_iter().collect();
+    if names.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(AttachmentError::TooMany { count: names.len() });
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(AttachmentError::DuplicateName(name.clone()));
+        }
+    }
+    Ok(())
+}
+
 /// A message's attachments with a hold on every blob they name: names that
 /// passed [`AttachmentName::new`], a count within the bound, and references
 /// taken from the store's own record of each blob.
@@ -795,17 +813,10 @@ impl HeldAttachments {
         entries: impl IntoIterator<Item = (AttachmentName, BlobHold)>,
     ) -> Result<Self, AttachmentError> {
         let entries: Vec<(AttachmentName, BlobHold)> = entries.into_iter().collect();
-        if entries.len() > MAX_ATTACHMENTS_PER_MESSAGE {
-            return Err(AttachmentError::TooMany {
-                count: entries.len(),
-            });
-        }
+        check_attachment_names(entries.iter().map(|(name, _)| name))?;
         let mut map = std::collections::BTreeMap::new();
         let mut holds: Vec<BlobHold> = Vec::new();
         for (name, hold) in entries {
-            if map.contains_key(&name) {
-                return Err(AttachmentError::DuplicateName(name));
-            }
             map.insert(name, hold.reference());
             if !holds.iter().any(|h| h.id() == hold.id()) {
                 holds.push(hold);

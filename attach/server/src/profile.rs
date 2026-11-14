@@ -125,6 +125,15 @@ pub struct PublishRate {
     pub per_sec: u32,
 }
 
+/// What an attachment's blob door admits, answered by
+/// [`AttachProfile::blob_grant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobGrant {
+    /// Whether the attachment may create blobs. Reading an attachment is
+    /// judged per frame by [`AttachProfile::subscribable`], not here.
+    pub upload: bool,
+}
+
 /// The authority half of an attachment, boot-built by the route that owns the
 /// attacher.
 ///
@@ -272,6 +281,15 @@ pub trait AttachProfile: Send + Sync {
     /// answer, and clamping them against what the channel actually retains is
     /// the caller's, because only the caller holds the channel.
     fn runtime_entry(&self, channel: &str) -> Option<SubscriberEntry>;
+
+    /// Whether this attachment has the blob door, and whether it may create
+    /// blobs. `None`: no blob frame is admitted on this attachment, and a
+    /// publish naming attachments is a violation.
+    ///
+    /// Only the door is answered here. Which attachments a session may open is
+    /// [`AttachProfile::subscribable`] of the message's channel, and where it
+    /// may publish what it holds is [`AttachProfile::publishable`].
+    fn blob_grant(&self) -> Option<BlobGrant>;
 }
 
 #[cfg(test)]

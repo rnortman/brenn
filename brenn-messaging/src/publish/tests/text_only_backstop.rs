@@ -265,6 +265,7 @@ fn prepaid_entry() -> PrepaidEntry {
         body: binary_body(),
         urgency: Urgency::Normal,
         publish_ts: Utc::now(),
+        attachments: brenn_messaging_store::blob::HeldAttachments::none(),
     }
 }
 

@@ -27,12 +27,7 @@ fn fixture() -> Fixture {
 
 impl Fixture {
     fn files(&self) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(self.dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        names
+        crate::testutils::blob_files(self.dir.path())
     }
 
     fn sealed(&self, bytes: &[u8]) -> BlobHold {

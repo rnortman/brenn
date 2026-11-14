@@ -31,6 +31,7 @@ pub mod publish;
 pub mod query;
 pub mod reconcile;
 pub mod repo_sync_cursor;
+pub mod retained_part;
 pub mod slice;
 pub mod subscribe;
 pub mod system;
@@ -66,7 +67,7 @@ use brenn_messaging_store::blob::{
     BlobError, BlobHold, BlobStore, HeldAttachments, ReapReport, Retain,
 };
 use brenn_messaging_store::{db, ingress, store};
-pub use conversation_blobs::{AdmittedPart, HandedToolResult, NameRefusal, NamedPart};
+pub use conversation_blobs::{HandedToolResult, NameRefusal};
 pub use edit::{CancelResult, EditFields, EditResult};
 pub use ingress::{
     CollapsedDrain, Event as IngressEvent, MAX_DELIVERED_RETENTION_DAYS,
@@ -83,6 +84,7 @@ pub use publish::{
     PublishOrigin, PublishResult, WasmPublish, is_well_formed_address,
 };
 pub use query::{MessageQuery, QueryError};
+pub use retained_part::{AdmittedPart, NamedPart, PartRefusal, ToolChannelAttachments};
 
 /// One port's slice of a multi-port activation snapshot.
 ///

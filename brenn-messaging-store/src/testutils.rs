@@ -46,3 +46,20 @@ pub fn held(entries: &[(&str, &crate::blob::BlobHold)]) -> crate::blob::HeldAtta
 pub fn holds_file(dir: &std::path::Path, id: &brenn_envelope::BlobId) -> bool {
     dir.join(id.as_str()).exists()
 }
+
+/// The name of every entry in the store directory `dir`, sorted: the store's
+/// own records and one file per blob.
+pub fn blob_files(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("the blob directory")
+        .map(|entry| {
+            entry
+                .expect("a blob directory entry")
+                .file_name()
+                .into_string()
+                .expect("a UTF-8 file name")
+        })
+        .collect();
+    names.sort();
+    names
+}

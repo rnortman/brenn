@@ -119,7 +119,9 @@ async fn a_valid_token_attaches_and_welcomes_as_the_remote_principal() {
             max_body_bytes,
             max_frame_bytes,
             alert_granted,
+            blobs,
         } => {
+            assert_eq!(blobs, None);
             assert_eq!(version, SUPPORTED_VERSIONS.max);
             assert_eq!(participant_id, "remote:pod-kitchen");
             assert!(
@@ -369,19 +371,19 @@ async fn a_session_cookie_is_not_a_credential_and_there_is_no_redirect() {
     );
 }
 
-/// A v5 binary `Publish` whose body section is shorter than its descriptor says
+/// A binary `Publish` whose body section is shorter than its descriptor says
 /// is a protocol violation: the socket closes and the event names the rule. The
 /// message is a real encoding with its last byte cut, so the header parses and
 /// only the lengths disagree.
 #[tokio::test]
-async fn a_v5_publish_whose_lengths_disagree_closes_with_a_security_event() {
+async fn a_binary_publish_whose_lengths_disagree_closes_with_a_security_event() {
     let db = crate::test_support::init_db_memory();
     let harness = remote_harness(&db, fleet).await;
     let (base, _sd) = spawn_test_server(harness.state.clone()).await;
 
     let mut ws = remote_ws_open(&remote_ws_url(&base, SLUG), TOKEN).await;
     match open_attachment(&mut ws).await {
-        ServerFrame::Welcome { version, .. } => assert_eq!(version, 5),
+        ServerFrame::Welcome { version, .. } => assert_eq!(version, SUPPORTED_VERSIONS.max),
         other => panic!("expected Welcome after the handshake, got {other:?}"),
     }
     let WireMessage::Binary(mut bytes) = codec().encode_client(&ClientFrame::Publish {
@@ -391,8 +393,9 @@ async fn a_v5_publish_whose_lengths_disagree_closes_with_a_security_event() {
             .unwrap(),
         urgency: brenn_attach_proto::Urgency::Normal,
         correlation: Some(1),
+        attachments: Vec::new(),
     }) else {
-        panic!("a v5 Publish is binary");
+        panic!("a Publish is binary");
     };
     bytes.pop();
     send_wire(&mut ws, WireMessage::Binary(bytes)).await;

@@ -17,7 +17,7 @@
 mod tests;
 
 use brenn_attach_proto::{
-    BatchDeferredOp, BatchEntry, DeferredOpKind, DeferredViewEntry, MessageBody,
+    BatchDeferredOp, BatchEntry, DeferredOpKind, DeferredViewEntry, MessageBody, PublishAttachment,
     PublishBatchOutcome, PublishOutcome, ServerFrame, Urgency,
 };
 use brenn_budget::{MAX_PUBLISH_BYTES_PER_ACTIVATION, MAX_PUBLISHES_PER_ACTIVATION};
@@ -27,11 +27,13 @@ use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
 use brenn_messaging::{
     AttachBatchPublish, AttachSendVerdict, MissingChannelPosture, PublishResult,
 };
+use brenn_messaging_store::blob::HeldAttachments;
 use brenn_messaging_store::store::{DeferralOutcome, DeferredMessage};
 use chrono::{DateTime, Utc};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use super::blobs::{BlobTable, check_attachment_shape};
 use super::profile::{DeferredTarget, PublishPosture, TextOnlyPosture};
 use super::registry::DeferredViewPush;
 use super::session::{AttachSessionCtx, FrameOutcome, SessionCounters, sanitize_client_detail};
@@ -72,6 +74,10 @@ pub struct PublishRequest<'a> {
     /// to stamp the envelopes it routes without a server.
     pub urgency: Urgency,
     pub correlation: Option<u64>,
+    /// The blobs the message names, by the session's handles.
+    pub attachments: &'a [PublishAttachment],
+    /// The session's blob table, which `attachments` names handles in.
+    pub blobs: &'a BlobTable,
 }
 
 /// Mint the principal a frame's `attribution` names, or the violation an
@@ -106,12 +112,18 @@ pub(crate) fn admit_attribution_or_violate(
 /// oracle). Neither spends a rate token: a publish that cannot succeed consumes
 /// nothing.
 ///
+/// The attachment list's shape follows the channel: a list on an attachment
+/// without the blob door, over the per-message bound or naming a name twice is
+/// a violation.
+///
 /// Then the body cap (an outcome, metered and escalating — see
 /// [`BODY_TOO_LARGE_VIOLATION_THRESHOLD`]), then the connection's rate bucket
 /// (an outcome; a legitimate retry loop reaches it), then the text-only
 /// refusal (an outcome behind the bucket, so a client looping on it is metered,
 /// or a violation where the route tells its attachers every declaration — see
-/// [`TextOnlyPosture`]), then the bus. What each of
+/// [`TextOnlyPosture`]), then the attachments' handles (`AttachmentNotHeld`
+/// when one is not a held blob of this session, behind the bucket for the same
+/// reason), then the bus. What each of
 /// the bus's own refusals means is the profile's call: on a channel boot proved
 /// reachable and policy-covered an invariant-excluded outcome is a broken
 /// server, and on a diagnostics channel the same outcome is reported instead —
@@ -133,6 +145,8 @@ pub async fn handle_publish(
         body,
         urgency,
         correlation,
+        attachments,
+        blobs,
     } = request;
 
     // 1. Who is sending.
@@ -140,8 +154,11 @@ pub async fn handle_publish(
         return violation;
     }
 
-    // 2. May that sender write here.
+    // 2. May that sender write here, and is what it names well formed.
     if let Err(violation) = assert_publishable(ctx, attribution, channel, "Publish") {
+        return violation;
+    }
+    if let Err(violation) = check_attachment_shape(ctx, attachments, "Publish") {
         return violation;
     }
 
@@ -214,7 +231,19 @@ pub async fn handle_publish(
         return super::session::send_frame(&ctx.tx, frame, counters).await;
     }
 
-    // 6. Publish. The budget bucket is the principal the scope and attribution
+    // 6. The attachments' holds. A handle that is not a held blob — absent, or
+    //    an upload not sealed — is a refused or failed predecessor of a
+    //    pipelined sequence, so it is an answer.
+    let Some(held) = blobs.held_attachments(attachments) else {
+        counters.blobs.publish_not_held += 1;
+        let frame = ServerFrame::PublishResult {
+            correlation,
+            outcome: PublishOutcome::AttachmentNotHeld,
+        };
+        return super::session::send_frame(&ctx.tx, frame, counters).await;
+    };
+
+    // 7. Publish. The budget bucket is the principal the scope and attribution
     //    name together: a sub-identity's retry loop drains its own allowance and
     //    leaves its siblings and the attacher's own writes able to publish.
     //    A non-text body for a channel the door found absent is answered as the
@@ -225,7 +254,7 @@ pub async fn handle_publish(
         TextOnlyDoor::Absent => PublishResult::UnknownChannel(channel.to_string()),
         TextOnlyDoor::Admit => {
             ctx.messenger
-                .publish_from_attacher(scope, attribution, channel, body.clone(), urgency)
+                .publish_from_attacher(scope, attribution, channel, body.clone(), urgency, held)
                 .await
         }
         TextOnlyDoor::Refuse => unreachable!("a refused publish was answered at step 5"),
@@ -337,6 +366,9 @@ pub struct PublishBatchRequest<'a> {
     pub correlation: u64,
     pub publishes: &'a [BatchEntry],
     pub deferred_ops: &'a [BatchDeferredOp],
+    /// The session's blob table, which the entries' attachments name handles
+    /// in.
+    pub blobs: &'a BlobTable,
 }
 
 /// One admitted entry of a batch, resolved against the profile and the flush's
@@ -351,6 +383,13 @@ struct ResolvedBatchEntry<'a> {
     deliver_after: Option<DateTime<Utc>>,
     /// The text-only door's answer for this entry, read once at resolve.
     door: TextOnlyDoor,
+    /// The blobs the entry names, by the session's handles.
+    attachments: &'a [PublishAttachment],
+    /// Whether every handle `attachments` names is a held blob of this
+    /// session. The holds themselves are taken at step 7, once nothing can
+    /// refuse the flush; the table is borrowed for the whole handler, so the
+    /// answer stands until then.
+    attachments_held: bool,
 }
 
 /// One control op of a batch, resolved before any of it is applied: the batch is
@@ -402,6 +441,7 @@ pub async fn handle_publish_batch(
         correlation,
         publishes,
         deferred_ops,
+        blobs,
     } = request;
 
     // 1. Who is sending.
@@ -430,6 +470,13 @@ pub async fn handle_publish_batch(
             deferred_ops.len(),
         ));
     }
+    for entry in publishes {
+        if let Err(violation) =
+            check_attachment_shape(ctx, &entry.attachments, "PublishBatch entry")
+        {
+            return violation;
+        }
+    }
     // Without this arm the entry-count cap alone lets a hostile client hand the
     // server a full batch of max-size bodies — retained rows and their push
     // fan-out — in one frame, on a path whose whole doctrine is that
@@ -439,10 +486,7 @@ pub async fn handle_publish_batch(
     let publish_bytes: usize = publishes.iter().map(|entry| entry.body.len()).sum();
     let edit_bytes: usize = deferred_ops
         .iter()
-        .map(|op| match &op.op {
-            DeferredOpKind::Cancel => 0,
-            DeferredOpKind::Edit { body, .. } => body.as_ref().map_or(0, MessageBody::len),
-        })
+        .map(|op| op.op.body().map_or(0, MessageBody::len))
         .sum();
     let total_bytes = publish_bytes + edit_bytes;
     if total_bytes > MAX_PUBLISH_BYTES_PER_ACTIVATION {
@@ -471,7 +515,7 @@ pub async fn handle_publish_batch(
     //    One clock read serves the whole batch's park-vs-immediate decisions, so
     //    every entry is judged against the same instant.
     let flush_now = Utc::now();
-    let resolved = match resolve_batch_entries(ctx, attribution, publishes, flush_now) {
+    let resolved = match resolve_batch_entries(ctx, attribution, publishes, blobs, flush_now) {
         Ok(resolved) => resolved,
         Err(violation) => return violation,
     };
@@ -553,6 +597,16 @@ pub async fn handle_publish_batch(
         };
         return super::session::send_frame(&ctx.tx, frame, counters).await;
     }
+    // An entry naming a handle that is not a held blob refuses the whole flush
+    // the same way.
+    if resolved.iter().any(|entry| !entry.attachments_held) {
+        counters.blobs.publish_not_held += 1;
+        let frame = ServerFrame::PublishBatchResult {
+            correlation,
+            outcome: PublishBatchOutcome::AttachmentNotHeld,
+        };
+        return super::session::send_frame(&ctx.tx, frame, counters).await;
+    }
 
     // 6. The control ops, ahead of the publishes. A violation here can leave
     //    earlier ops of the same batch applied: whether a message is someone
@@ -615,11 +669,25 @@ pub async fn handle_publish_batch(
              not hold"
         );
     }
-    let mut prev_ts: Option<i64> = None;
-    let batch: Vec<AttachBatchPublish<'_>> = resolved
+    // Each publishing entry's holds are cloned from the table here: every
+    // handle was found held at step 3 and the table has not changed since.
+    let publishing: Vec<&ResolvedBatchEntry<'_>> = resolved
         .iter()
         .filter(|entry| entry.door != TextOnlyDoor::Absent)
+        .collect();
+    let holds: Vec<HeldAttachments> = publishing
+        .iter()
         .map(|entry| {
+            blobs
+                .held_attachments(entry.attachments)
+                .expect("a flush naming an unheld handle was answered at step 5")
+        })
+        .collect();
+    let mut prev_ts: Option<i64> = None;
+    let batch: Vec<AttachBatchPublish<'_>> = publishing
+        .iter()
+        .zip(&holds)
+        .map(|(entry, attachments)| {
             let now_ns = brenn_messaging_store::db::utc_to_ns(Utc::now());
             let ts = match prev_ts {
                 None => now_ns,
@@ -632,6 +700,7 @@ pub async fn handle_publish_batch(
                 urgency: entry.urgency,
                 publish_ts_ns: ts,
                 deliver_after: entry.deliver_after,
+                attachments,
             }
         })
         .collect();
@@ -680,6 +749,7 @@ fn resolve_batch_entries<'a>(
     ctx: &AttachSessionCtx,
     attribution: Option<&str>,
     publishes: &'a [BatchEntry],
+    blobs: &BlobTable,
     flush_now: DateTime<Utc>,
 ) -> Result<Vec<ResolvedBatchEntry<'a>>, FrameOutcome> {
     let mut resolved = Vec::with_capacity(publishes.len());
@@ -710,6 +780,8 @@ fn resolve_batch_entries<'a>(
             urgency: entry.urgency,
             deliver_after,
             door,
+            attachments: &entry.attachments,
+            attachments_held: blobs.holds_all(&entry.attachments),
         });
     }
     Ok(resolved)

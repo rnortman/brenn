@@ -22,13 +22,15 @@ use brenn_messaging::query::NoopWakeRouter;
 use brenn_messaging::{Messenger, MissingChannelPosture, WakeRouter};
 use brenn_obs::alerting::AlertDispatcher;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 use uuid::Uuid;
 
 use crate::profile::{
-    AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts, TextOnlyPosture,
+    AttachProfile, BlobGrant, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts,
+    TextOnlyPosture,
 };
 use crate::registry::{AttachRegistry, SessionCaps};
-use crate::session::AttachSessionCtx;
+use crate::session::{AttachSessionCtx, Outbound};
 
 /// The attacher every attach fixture stands up.
 pub const TEST_ATTACHER: &str = "deskbar";
@@ -83,6 +85,8 @@ pub struct TestProfile {
     /// the runtime-entry hook states the entry it means to see minted, whose
     /// depths the plane then clamps against the channel.
     pub runtime_entry: Option<SubscriberEntry>,
+    /// The blob door this stub grants; `None` unless a suite states one.
+    pub blob_grant: Option<BlobGrant>,
 }
 
 impl Default for TestProfile {
@@ -116,6 +120,7 @@ impl TestProfile {
             missing_channel_posture: MissingChannelPosture::Invariant,
             text_only_posture: TextOnlyPosture::Outcome,
             runtime_entry: None,
+            blob_grant: None,
         }
     }
 }
@@ -195,6 +200,10 @@ impl AttachProfile for TestProfile {
     fn runtime_entry(&self, _channel: &str) -> Option<SubscriberEntry> {
         self.runtime_entry.clone()
     }
+
+    fn blob_grant(&self) -> Option<BlobGrant> {
+        self.blob_grant
+    }
 }
 
 /// A `Messenger` over one durable in-memory channel, and the uuid rows are
@@ -260,6 +269,29 @@ pub async fn one_channel_messenger_declared(
         MessagingGlobalConfig::default(),
     );
     (messenger, channel_uuid)
+}
+
+/// A message on `channel` from `origin` carrying `bytes` as `photo`, and the
+/// blob's id. The publisher keeps no hold, so the message is all that keeps
+/// the blob.
+pub async fn hosted_blob(
+    messenger: &Messenger,
+    origin: &str,
+    channel: &str,
+    bytes: &[u8],
+) -> (Uuid, brenn_envelope::BlobId) {
+    let hold = brenn_messaging::testutils::seal_blob(messenger, bytes);
+    let id = hold.id().clone();
+    let message_id = brenn_messaging::testutils::publish_attached(
+        messenger,
+        origin,
+        channel,
+        "hosted",
+        &[("photo", &hold)],
+        None,
+    )
+    .await;
+    (message_id, id)
 }
 
 /// [`one_channel_messenger`]'s ephemeral twin: one declared `ephemeral:`
@@ -352,9 +384,10 @@ impl AttachCtxBuilder {
         self
     }
 
-    /// The context and the receiver its outbound frames land in.
-    pub fn build(self) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>) {
-        let (tx, rx) = mpsc::channel::<ServerFrame>(OUTBOUND_QUEUE);
+    /// The context and the receiver its outbound frames land in. The blob
+    /// door is opened for the stated version, as the opening sequence opens it.
+    pub fn build(self) -> (AttachSessionCtx, FrameRx) {
+        let (tx, rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE);
         let ctx = AttachSessionCtx {
             profile: self.profile,
             messenger: self.messenger.unwrap_or_else(|| {
@@ -373,7 +406,19 @@ impl AttachCtxBuilder {
             // A built context stands for an attached session, which has agreed
             // a version.
             negotiated_version: Arc::new(std::sync::OnceLock::from(self.version)),
+            blob_door: std::sync::OnceLock::new(),
         };
-        (ctx, rx)
+        ctx.open_blob_door(self.version);
+        (ctx, FrameRx(rx))
+    }
+}
+
+/// The writer queue's receiving end, as a suite with no writer reads it: each
+/// item's frame, its read guard dropped as the writer would drop it.
+pub struct FrameRx(pub mpsc::Receiver<Outbound>);
+
+impl FrameRx {
+    pub fn try_recv(&mut self) -> Result<ServerFrame, TryRecvError> {
+        self.0.try_recv().map(Outbound::into_frame)
     }
 }

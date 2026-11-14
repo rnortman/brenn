@@ -29,9 +29,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::*;
+use crate::blobs::BlobTable;
 use crate::registry::{AttachSessionHandle, PUSH_QUEUE_FRAMES, SessionCaps, SessionPush};
 use crate::session::AttachSessionCtx;
-use crate::test_support::{AttachCtxBuilder, TestProfile};
+use crate::test_support::{AttachCtxBuilder, FrameRx, TestProfile};
 
 /// The attacher every fixture stands up.
 const ATTACHER: &str = "deskbar";
@@ -126,7 +127,7 @@ async fn attach_with(
     profile: TestProfile,
     granted: bool,
     burst: u32,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>) {
+) -> (AttachSessionCtx, FrameRx) {
     attach_with_body_cap(db, profile, granted, burst, MAX_BODY).await
 }
 
@@ -138,7 +139,7 @@ async fn attach_with_body_cap(
     granted: bool,
     burst: u32,
     max_body_bytes: usize,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>) {
+) -> (AttachSessionCtx, FrameRx) {
     attach_at_version(db, profile, granted, burst, max_body_bytes, 4).await
 }
 
@@ -151,7 +152,7 @@ async fn attach_at_version(
     burst: u32,
     max_body_bytes: usize,
     version: u32,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>) {
+) -> (AttachSessionCtx, FrameRx) {
     let entries = build_channel_entries(
         &[
             channel_raw(OUT_BARE),
@@ -222,7 +223,7 @@ async fn attach_at_version(
 
 /// The common attachment: everything granted, a budget wide enough that no test
 /// trips it unless it means to.
-async fn attach(db: &Db) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>) {
+async fn attach(db: &Db) -> (AttachSessionCtx, FrameRx) {
     attach_with(db, profile(), true, 64).await
 }
 
@@ -242,12 +243,17 @@ fn request<'a>(
         body,
         urgency: Urgency::Normal,
         correlation: Some(7),
+        attachments: &[],
+        blobs: &NO_BLOBS,
     }
 }
 
+/// The blob table of a session that holds no handle.
+static NO_BLOBS: std::sync::LazyLock<BlobTable> = std::sync::LazyLock::new(BlobTable::default);
+
 /// The `PublishResult` outcome the handler enqueued, asserting the correlation
 /// rode back with it.
-fn published_outcome(rx: &mut mpsc::Receiver<ServerFrame>) -> PublishOutcome {
+fn published_outcome(rx: &mut FrameRx) -> PublishOutcome {
     match rx.try_recv().expect("a PublishResult frame") {
         ServerFrame::PublishResult {
             correlation,
@@ -752,6 +758,7 @@ fn entry(channel: &str, body: &str, deliver_after: Option<u64>) -> BatchEntry {
         body: body.into(),
         urgency: Urgency::Normal,
         deliver_after,
+        attachments: Vec::new(),
     }
 }
 
@@ -773,12 +780,13 @@ fn batch<'a>(
         correlation: 11,
         publishes,
         deferred_ops,
+        blobs: &NO_BLOBS,
     }
 }
 
 /// The `PublishBatchResult` outcome the handler enqueued, asserting the
 /// correlation rode back with it.
-fn batch_outcome(rx: &mut mpsc::Receiver<ServerFrame>) -> PublishBatchOutcome {
+fn batch_outcome(rx: &mut FrameRx) -> PublishBatchOutcome {
     match rx.try_recv().expect("a PublishBatchResult frame") {
         ServerFrame::PublishBatchResult {
             correlation,
@@ -1631,6 +1639,7 @@ async fn park_under(
                 urgency: Urgency::Normal,
                 publish_ts_ns: brenn_messaging_store::db::utc_to_ns(Utc::now()),
                 deliver_after: Some(release),
+                attachments: &HeldAttachments::none(),
             }],
             MissingChannelPosture::Invariant,
         )
@@ -1837,7 +1846,7 @@ fn a_view_entry_holds_the_parked_body_as_it_is() {
 }
 
 /// The common attachment, negotiated at v5.
-async fn attach_v5(db: &Db) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>) {
+async fn attach_v5(db: &Db) -> (AttachSessionCtx, FrameRx) {
     attach_at_version(db, profile(), true, 64, MAX_BODY, 5).await
 }
 
@@ -2583,7 +2592,7 @@ fn mixed_view() -> crate::registry::DeferredViewPush {
 }
 
 /// The entries of the one `DeferredView` frame `rx` holds.
-fn view_frame(rx: &mut mpsc::Receiver<ServerFrame>) -> Vec<DeferredViewEntry> {
+fn view_frame(rx: &mut FrameRx) -> Vec<DeferredViewEntry> {
     match rx.try_recv().expect("a DeferredView frame") {
         ServerFrame::DeferredView {
             channel,

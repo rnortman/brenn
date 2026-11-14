@@ -26,7 +26,7 @@ use super::*;
 use crate::profile::SubscriptionFacts;
 use crate::registry::{AttachSessionHandle, PUSH_QUEUE_FRAMES, SessionCaps};
 use crate::test_support::{
-    AttachCtxBuilder, TEST_ATTACHER as ATTACHER, TEST_BODY_BYTES, TestProfile,
+    AttachCtxBuilder, FrameRx, TEST_ATTACHER as ATTACHER, TEST_BODY_BYTES, TestProfile,
 };
 
 // ---------------------------------------------------------------------------
@@ -35,10 +35,7 @@ use crate::test_support::{
 
 /// A context over the given profile and alert dispatcher, with an outbound queue
 /// the test reads frames back from.
-fn ctx_with(
-    profile: TestProfile,
-    dispatcher: AlertDispatcher,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>) {
+fn ctx_with(profile: TestProfile, dispatcher: AlertDispatcher) -> (AttachSessionCtx, FrameRx) {
     AttachCtxBuilder::new(profile)
         .alert_dispatcher(dispatcher)
         .build()
@@ -116,7 +113,7 @@ fn publish_counters_move_the_total_and_the_column_together() {
 /// nothing — the session tears down without a security event.
 #[tokio::test]
 async fn send_frame_counts_an_enqueue_and_reports_a_dead_writer() {
-    let (tx, mut rx) = mpsc::channel::<ServerFrame>(4);
+    let (tx, mut rx) = mpsc::channel::<Outbound>(4);
     let mut counters = SessionCounters::default();
 
     assert!(matches!(
@@ -124,7 +121,10 @@ async fn send_frame_counts_an_enqueue_and_reports_a_dead_writer() {
         FrameOutcome::Continue
     ));
     assert_eq!(counters.frames_out, 1);
-    assert!(matches!(rx.try_recv(), Ok(ServerFrame::Heartbeat)));
+    assert!(matches!(
+        rx.try_recv().map(Outbound::into_frame),
+        Ok(ServerFrame::Heartbeat)
+    ));
 
     drop(rx);
     assert!(matches!(
@@ -302,6 +302,7 @@ async fn a_publish_reaches_the_publish_plane() {
             body: "{}".into(),
             urgency: Urgency::Normal,
             correlation: Some(7),
+            attachments: Vec::new(),
         },
     )
     .await;
@@ -596,6 +597,46 @@ async fn an_alert_from_a_declared_but_ungranted_attribution_is_a_violation() {
 struct TestSocket {
     inbound: mpsc::UnboundedReceiver<Result<Message, axum::Error>>,
     outbound: mpsc::UnboundedSender<Message>,
+    gate: Arc<SinkGate>,
+}
+
+/// A gate on [`TestSocket`]'s sink, open unless a test closes it. While it is
+/// closed the writer's next write waits, as against a peer that has stopped
+/// reading; opening it wakes the writer. The inbound half is never gated.
+#[derive(Default)]
+struct SinkGate(std::sync::Mutex<GateState>);
+
+#[derive(Default)]
+struct GateState {
+    closed: bool,
+    waker: Option<std::task::Waker>,
+}
+
+impl SinkGate {
+    fn close(&self) {
+        self.0.lock().expect("sink gate").closed = true;
+    }
+
+    fn open(&self) {
+        let waker = {
+            let mut state = self.0.lock().expect("sink gate");
+            state.closed = false;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn poll_open(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.0.lock().expect("sink gate");
+        if state.closed {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
 }
 
 impl Stream for TestSocket {
@@ -611,8 +652,8 @@ impl Sink<Message> for TestSocket {
     // write error, and the writer's own error path has its own fixture.
     type Error = std::convert::Infallible;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.gate.poll_open(cx).map(Ok)
     }
 
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
@@ -648,6 +689,8 @@ struct Attachment {
     drain_notify: Arc<Notify>,
     /// The same bus the session holds, for seeding rows and reading windows.
     messenger: Arc<Messenger>,
+    /// The gate on the socket's sink.
+    gate: Arc<SinkGate>,
 }
 
 impl Attachment {
@@ -684,6 +727,7 @@ impl Attachment {
         let guard = registry
             .try_register(ATTACHER, handle, SessionCaps::UNCAPPED)
             .expect("uncapped registration");
+        let gate = Arc::new(SinkGate::default());
 
         let join = tokio::spawn(run_attach_session(AttachSessionParams {
             profile: Arc::new(profile),
@@ -707,6 +751,7 @@ impl Attachment {
             socket: TestSocket {
                 inbound: inbound_rx,
                 outbound: outbound_tx,
+                gate: Arc::clone(&gate),
             },
         }));
 
@@ -720,6 +765,7 @@ impl Attachment {
             push_tx,
             drain_notify,
             messenger,
+            gate,
         }
     }
 
@@ -1412,9 +1458,9 @@ async fn a_close_reaches_only_the_named_attacher() {
 const FRAMES: &str = "brenn:frames-demo";
 const FRAMES_BARE: &str = "frames-demo";
 
-/// An attachment whose bare identity may publish onto [`FRAMES`], a channel
-/// declared `non_text`.
-async fn publishing_attachment(db: &Db) -> Attachment {
+/// A bus with [`FRAMES`], a channel declared `non_text`, and the policy under
+/// which the bare identity may publish onto it.
+async fn publishing_messenger(db: &Db) -> (Arc<Messenger>, AppPolicy) {
     use brenn_lib::messaging::AttachScope;
     use brenn_lib::messaging::config::{AttachSendBudget, Depth};
     let (messenger, _uuid) = crate::test_support::one_channel_messenger_declared(
@@ -1441,11 +1487,22 @@ async fn publishing_attachment(db: &Db) -> Attachment {
                 },
             )],
         ));
-    let profile = TestProfile {
+    (messenger, policy)
+}
+
+/// The profile whose bare identity may publish onto [`FRAMES`].
+fn publishing_profile() -> TestProfile {
+    TestProfile {
         publishable: HashMap::from([(None, HashSet::from([FRAMES.to_string()]))]),
         ..TestProfile::new()
-    };
-    Attachment::start_with(profile, messenger, policy, IDLE_HEARTBEAT_SECS)
+    }
+}
+
+/// An attachment whose bare identity may publish onto [`FRAMES`], a channel
+/// declared `non_text`.
+async fn publishing_attachment(db: &Db) -> Attachment {
+    let (messenger, policy) = publishing_messenger(db).await;
+    Attachment::start_with(publishing_profile(), messenger, policy, IDLE_HEARTBEAT_SECS)
 }
 
 /// Negotiate v5 and consume the server's `Hello` and `Welcome`.
@@ -1477,6 +1534,7 @@ async fn a_v5_binary_publish_reaches_the_bus_byte_exact() {
         body: body.clone(),
         urgency: Urgency::Normal,
         correlation: Some(3),
+        attachments: Vec::new(),
     };
     let message = Codec::negotiated(5).encode_client(&frame);
     assert!(
@@ -1521,6 +1579,7 @@ async fn a_truncated_v5_binary_message_is_a_violation_naming_the_rule() {
         body: "{}".into(),
         urgency: Urgency::Normal,
         correlation: None,
+        attachments: Vec::new(),
     };
     let WireMessage::Binary(mut bytes) = Codec::negotiated(5).encode_client(&frame) else {
         panic!("v5 Publish is binary");
@@ -1538,5 +1597,490 @@ async fn a_truncated_v5_binary_message_is_a_violation_naming_the_rule() {
         )),
         "{}",
         alerts[0].2
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Blob frames through the session
+// ---------------------------------------------------------------------------
+
+/// [`publishing_attachment`] with a blob store and the upload door; the store's
+/// directory lives as long as the returned guard.
+async fn blob_attachment(db: &Db) -> (Attachment, brenn_messaging::testutils::TempBlobDir) {
+    let (messenger, policy) = publishing_messenger(db).await;
+    let (messenger, dir) = brenn_messaging::testutils::install_blob_store_with(
+        messenger,
+        brenn_messaging::testutils::TEST_BLOB_LIMITS,
+    )
+    .await;
+    let profile = TestProfile {
+        blob_grant: Some(crate::profile::BlobGrant { upload: true }),
+        ..publishing_profile()
+    };
+    (
+        Attachment::start_with(profile, messenger, policy, IDLE_HEARTBEAT_SECS),
+        dir,
+    )
+}
+
+/// Negotiate v6 and consume the server's `Hello` and a `Welcome` with a door.
+async fn attached_at_v6(attachment: &mut Attachment) {
+    attachment.send_hello(VersionRange::exactly(6));
+    assert!(matches!(
+        attachment.next_frame().await,
+        ServerFrame::Hello { .. }
+    ));
+    match attachment.next_frame().await {
+        ServerFrame::Welcome { version, blobs, .. } => {
+            assert_eq!(version, 6);
+            assert!(blobs.is_some_and(|facts| facts.upload));
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+}
+
+impl Attachment {
+    fn blob_store(&self) -> Arc<brenn_messaging_store::blob::BlobStore> {
+        Arc::clone(self.messenger.blob_store().expect("a blob store"))
+    }
+
+    /// Create `handle` for `bytes`, answered `Ok`, and write them in two
+    /// chunks, the second first; an empty chunk is not sent.
+    async fn blob_written(&mut self, handle: u64, bytes: &[u8]) {
+        use brenn_attach_proto::{BlobCreateOutcome, BlobHandle};
+        self.send_frame(&ClientFrame::BlobCreate {
+            handle: BlobHandle(handle),
+            content_type: "application/octet-stream".to_string(),
+            size: bytes.len() as u64,
+        });
+        match self.next_frame().await {
+            ServerFrame::BlobCreateResult {
+                handle: answered,
+                outcome,
+            } => {
+                assert_eq!(answered, BlobHandle(handle));
+                assert_eq!(outcome, BlobCreateOutcome::Ok);
+            }
+            other => panic!("expected BlobCreateResult, got {other:?}"),
+        }
+        let half = bytes.len() / 2;
+        for (offset, chunk) in [(half, &bytes[half..]), (0, &bytes[..half])] {
+            if chunk.is_empty() {
+                continue;
+            }
+            self.send_frame(&ClientFrame::BlobWrite {
+                handle: BlobHandle(handle),
+                offset: offset as u64,
+                bytes: chunk.to_vec(),
+            });
+        }
+    }
+
+    /// [`Attachment::blob_written`], then sealed and answered `Ok`.
+    async fn blob_uploaded(&mut self, handle: u64, bytes: &[u8]) {
+        use brenn_attach_proto::{BlobHandle, BlobSealOutcome};
+        self.blob_written(handle, bytes).await;
+        self.send_frame(&ClientFrame::BlobSeal {
+            handle: BlobHandle(handle),
+        });
+        match self.next_frame().await {
+            ServerFrame::BlobSealResult {
+                handle: answered,
+                outcome,
+            } => {
+                assert_eq!(answered, BlobHandle(handle));
+                assert_eq!(outcome, BlobSealOutcome::Ok);
+            }
+            other => panic!("expected BlobSealResult, got {other:?}"),
+        }
+    }
+}
+
+/// Every upload frame, a read and a publish naming the handle cross the
+/// session loop into the session's own table; at peer close the table drops
+/// and the store keeps only the blob a message names.
+#[tokio::test]
+async fn blob_frames_reach_the_sessions_table_and_peer_close_drops_it() {
+    use brenn_attach_proto::{
+        AttachmentName, BlobHandle, BlobReadOutcome, PublishAttachment, PublishOutcome,
+    };
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (mut attachment, _dir) = blob_attachment(&db).await;
+    attached_at_v6(&mut attachment).await;
+    let store = attachment.blob_store();
+    let bytes: Vec<u8> = (0..=255u8).collect();
+
+    attachment.blob_uploaded(1, &bytes).await;
+    // An offset and a length that differ, so the two cannot be swapped.
+    attachment.send_frame(&ClientFrame::BlobRead {
+        correlation: 7,
+        handle: BlobHandle(1),
+        offset: 10,
+        len: 20,
+    });
+    match attachment.next_frame().await {
+        ServerFrame::BlobReadResult {
+            correlation,
+            outcome,
+        } => {
+            assert_eq!(correlation, 7);
+            assert_eq!(
+                outcome,
+                BlobReadOutcome::Ok {
+                    bytes: bytes[10..30].to_vec()
+                }
+            );
+        }
+        other => panic!("expected BlobReadResult, got {other:?}"),
+    }
+    attachment.send_frame(&ClientFrame::Publish {
+        channel: FRAMES.to_string(),
+        attribution: None,
+        body: brenn_attach_proto::MessageBody::from("frame"),
+        urgency: Urgency::Normal,
+        correlation: Some(8),
+        attachments: vec![PublishAttachment::new(
+            AttachmentName::new("f").expect("attachment name"),
+            BlobHandle(1),
+        )],
+    });
+    match attachment.next_frame().await {
+        ServerFrame::PublishResult {
+            correlation,
+            outcome,
+        } => {
+            assert_eq!(correlation, Some(8));
+            assert_eq!(outcome, PublishOutcome::Ok);
+        }
+        other => panic!("expected PublishResult, got {other:?}"),
+    }
+    attachment.send_frame(&ClientFrame::BlobClose {
+        handle: BlobHandle(1),
+    });
+
+    // Sealed and never published, and an upload left half written.
+    attachment.blob_uploaded(2, b"sealed").await;
+    attachment.blob_written(3, b"unsealed").await;
+    // An answered frame behind the writes: everything before it is applied.
+    attachment.blob_uploaded(4, b"x").await;
+    let usage = store.usage();
+    assert_eq!((usage.sealed, usage.unsealed), (3, 1));
+
+    let (outcome, _frames) = attachment.finish().await;
+    assert!(!outcome.violation);
+    let usage = store.usage();
+    assert_eq!(
+        (usage.sealed, usage.unsealed),
+        (1, 0),
+        "only the published blob is left"
+    );
+    assert_eq!(usage.charged_bytes, bytes.len() as u64);
+}
+
+/// A violation ends the attachment, and its table drops like any other detach.
+#[tokio::test]
+async fn a_violation_drops_the_sessions_blob_table() {
+    use brenn_attach_proto::BlobHandle;
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (mut attachment, _dir) = blob_attachment(&db).await;
+    attached_at_v6(&mut attachment).await;
+    let store = attachment.blob_store();
+
+    attachment.blob_uploaded(1, b"sealed").await;
+    attachment.blob_written(2, b"unsealed").await;
+    // A handle every client mints once, minted again.
+    attachment.send_frame(&ClientFrame::BlobCreate {
+        handle: BlobHandle(1),
+        content_type: "application/octet-stream".to_string(),
+        size: 1,
+    });
+    let (outcome, _frames) = attachment.join_session().await;
+    assert!(outcome.violation);
+    let usage = store.usage();
+    assert_eq!(
+        (usage.sealed, usage.unsealed, usage.charged_bytes),
+        (0, 0, 0),
+        "the session's uploads are gone"
+    );
+}
+
+/// A host close ends the attachment, and its table drops like any other detach.
+#[tokio::test]
+async fn a_host_close_drops_the_sessions_blob_table() {
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (mut attachment, _dir) = blob_attachment(&db).await;
+    attached_at_v6(&mut attachment).await;
+    let store = attachment.blob_store();
+
+    attachment.blob_uploaded(1, b"sealed").await;
+    attachment.blob_written(2, b"unsealed").await;
+    // An answered frame behind the writes: everything before it is applied.
+    attachment.blob_uploaded(3, b"x").await;
+    let usage = store.usage();
+    assert_eq!((usage.sealed, usage.unsealed), (2, 1));
+
+    let asked = attachment
+        .registry
+        .close_all(ATTACHER, &CloseReason::new(3003, "surface retired"));
+    assert_eq!(asked, 1);
+    let (outcome, closes) = attachment.join_for_closes().await;
+    assert!(!outcome.violation, "a host close is not a violation");
+    assert_eq!(closes, vec![(3003, "surface retired".to_string())]);
+    let usage = store.usage();
+    assert_eq!(
+        (usage.sealed, usage.unsealed, usage.charged_bytes),
+        (0, 0, 0),
+        "the session's uploads are gone"
+    );
+}
+
+const RING: &str = "ephemeral:ring";
+/// `RING`'s depth: this many later messages evict one.
+const RING_DEPTH: u64 = 4;
+const HOST: &str = "host";
+
+/// The session's blob table is dropped before its registry slot is released,
+/// so once the attacher may attach again the ended session holds no blob, even
+/// while its writer is still draining to a peer that has stopped reading.
+///
+/// The session ends on a protocol violation, an exit that leaves the socket
+/// open, so the writer's drain is one a peer can stretch. After a peer Close
+/// the websocket stack refuses the writer's next write and the writer exits;
+/// this socket does not model that refusal, so a gated sink after a Close
+/// would picture a drain production does not have.
+#[tokio::test]
+async fn an_ended_session_holds_no_blob_once_its_slot_is_free() {
+    use brenn_attach_proto::{AttachmentName, BlobHandle, BlobOpenOutcome, BlobReadOutcome};
+    let db = brenn_messaging_store::db::init_db_memory();
+    let dir = brenn_messaging::testutils::TempBlobDir::new();
+    let messenger = brenn_messaging::testutils::blob_messenger(
+        db,
+        vec![brenn_messaging::testutils::ephemeral_channel_entry(
+            "ring", RING_DEPTH,
+        )],
+        HOST,
+        dir.path(),
+    )
+    .await;
+    let facts = SubscriptionFacts {
+        push_depth: 8,
+        retain_depth: 8,
+    };
+    let profile = TestProfile {
+        subscribable: HashMap::from([(RING.to_string(), facts)]),
+        blob_grant: Some(crate::profile::BlobGrant { upload: true }),
+        ..TestProfile::new()
+    };
+    let mut attachment = Attachment::start_with(
+        profile,
+        Arc::clone(&messenger),
+        AppPolicy::default(),
+        IDLE_HEARTBEAT_SECS,
+    );
+    attached_at_v6(&mut attachment).await;
+    let store = attachment.blob_store();
+    let baseline_files = dir.files();
+
+    // Three host messages on `RING`, each naming a blob; the host keeps no hold.
+    let sizes = [100usize, 200, 300];
+    let mut hosted = Vec::new();
+    for size in sizes {
+        hosted
+            .push(crate::test_support::hosted_blob(&messenger, HOST, RING, &vec![7u8; size]).await);
+    }
+    for (handle, (message_id, _)) in (10u64..).zip(&hosted) {
+        attachment.send_frame(&ClientFrame::BlobOpen {
+            handle: BlobHandle(handle),
+            channel: RING.to_string(),
+            message_id: *message_id,
+            name: AttachmentName::new("photo").expect("attachment name"),
+        });
+        match attachment.next_frame().await {
+            ServerFrame::BlobOpenResult {
+                handle: answered,
+                outcome,
+            } => {
+                assert_eq!(answered, BlobHandle(handle));
+                assert!(
+                    matches!(outcome, BlobOpenOutcome::Ok { .. }),
+                    "expected Ok, got {outcome:?}"
+                );
+            }
+            other => panic!("expected BlobOpenResult, got {other:?}"),
+        }
+    }
+    attachment.blob_written(2, b"unsealed").await;
+    // Answered frames behind the writes: everything before them is applied.
+    attachment.blob_uploaded(1, b"sealed").await;
+
+    // Roll the ring past every message that names an opened blob, so the
+    // session's holds are all that keeps them.
+    for _ in 0..RING_DEPTH {
+        brenn_messaging::testutils::publish_attached(&messenger, HOST, RING, "filler", &[], None)
+            .await;
+    }
+    let usage = store.usage();
+    let opened: u64 = sizes.iter().map(|&size| size as u64).sum();
+    assert_eq!(
+        (usage.sealed, usage.unsealed, usage.charged_bytes),
+        (
+            sizes.len() + 1,
+            1,
+            opened + b"sealed".len() as u64 + b"unsealed".len() as u64
+        ),
+        "the store holds exactly the session's blobs"
+    );
+
+    // The peer stops reading. A read answer is queued, and the writer parks
+    // on it; then a handle every client mints once, minted again.
+    attachment.gate.close();
+    attachment.send_frame(&ClientFrame::BlobRead {
+        correlation: 21,
+        handle: BlobHandle(10),
+        offset: 0,
+        len: 5,
+    });
+    attachment.send_frame(&ClientFrame::BlobCreate {
+        handle: BlobHandle(1),
+        content_type: "application/octet-stream".to_string(),
+        size: 1,
+    });
+
+    let one_session = SessionCaps {
+        per_attacher: 1,
+        per_account: usize::MAX,
+    };
+    let registry = attachment.registry.clone();
+    let _successor = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match registry.try_register(ATTACHER, AttachSessionHandle::for_test("dev"), one_session)
+            {
+                Ok(guard) => return guard,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("the ended session released its slot");
+
+    // No await since the slot was seen free: the session is still draining.
+    let usage = store.usage();
+    assert_eq!(
+        (usage.sealed, usage.unsealed, usage.charged_bytes),
+        (0, 0, 0),
+        "a session that no longer counts holds no blob"
+    );
+    for (_, id) in &hosted {
+        assert!(!dir.holds_file(id), "the opened blob's file is gone");
+    }
+    assert_eq!(dir.files(), baseline_files, "no blob file left");
+    assert!(
+        !attachment.join.is_finished(),
+        "the session is still waiting on its writer"
+    );
+
+    attachment.gate.open();
+    let (outcome, frames) = attachment.join_session().await;
+    assert!(outcome.violation);
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::BlobReadResult {
+                correlation: 21,
+                outcome: BlobReadOutcome::Ok { .. },
+            }
+        )),
+        "the drain wrote the queued read answer"
+    );
+}
+
+/// What a client pipelines behind its own seal is answered through the
+/// session loop when the seal is `Incomplete`: a read is `NotSealed` and a
+/// publish `AttachmentNotHeld`, the session stays up and raises no security
+/// event.
+#[tokio::test]
+async fn frames_behind_an_incomplete_seal_are_answers_and_no_security_event() {
+    use brenn_attach_proto::{
+        AttachmentName, BlobHandle, BlobReadOutcome, BlobSealOutcome, PublishAttachment,
+        PublishOutcome,
+    };
+    let db = brenn_messaging_store::db::init_db_memory();
+    let (mut attachment, _dir) = blob_attachment(&db).await;
+    let captured = attachment.captured.clone();
+    attached_at_v6(&mut attachment).await;
+
+    // Sent back to back. Created for ten bytes, written for five: the seal
+    // finds a gap.
+    attachment.send_frame(&ClientFrame::BlobCreate {
+        handle: BlobHandle(2),
+        content_type: "application/octet-stream".to_string(),
+        size: 10,
+    });
+    attachment.send_frame(&ClientFrame::BlobWrite {
+        handle: BlobHandle(2),
+        offset: 0,
+        bytes: b"12345".to_vec(),
+    });
+    attachment.send_frame(&ClientFrame::BlobSeal {
+        handle: BlobHandle(2),
+    });
+    attachment.send_frame(&ClientFrame::BlobRead {
+        correlation: 4,
+        handle: BlobHandle(2),
+        offset: 0,
+        len: 1,
+    });
+    attachment.send_frame(&ClientFrame::Publish {
+        channel: FRAMES.to_string(),
+        attribution: None,
+        body: brenn_attach_proto::MessageBody::from("frame"),
+        urgency: Urgency::Normal,
+        correlation: Some(5),
+        attachments: vec![PublishAttachment::new(
+            AttachmentName::new("f").expect("attachment name"),
+            BlobHandle(2),
+        )],
+    });
+    attachment.send_frame(&ClientFrame::BlobClose {
+        handle: BlobHandle(2),
+    });
+
+    assert!(matches!(
+        attachment.next_frame().await,
+        ServerFrame::BlobCreateResult { .. }
+    ));
+    match attachment.next_frame().await {
+        ServerFrame::BlobSealResult { handle, outcome } => {
+            assert_eq!(handle, BlobHandle(2));
+            assert_eq!(outcome, BlobSealOutcome::Incomplete { offset: 5, len: 5 });
+        }
+        other => panic!("expected BlobSealResult, got {other:?}"),
+    }
+    match attachment.next_frame().await {
+        ServerFrame::BlobReadResult {
+            correlation,
+            outcome,
+        } => {
+            assert_eq!(correlation, 4);
+            assert_eq!(outcome, BlobReadOutcome::NotSealed);
+        }
+        other => panic!("expected BlobReadResult, got {other:?}"),
+    }
+    match attachment.next_frame().await {
+        ServerFrame::PublishResult {
+            correlation,
+            outcome,
+        } => {
+            assert_eq!(correlation, Some(5));
+            assert_eq!(outcome, PublishOutcome::AttachmentNotHeld);
+        }
+        other => panic!("expected PublishResult, got {other:?}"),
+    }
+
+    let (outcome, _frames) = attachment.finish().await;
+    assert!(!outcome.violation);
+    assert!(
+        captured.lock().expect("captured").is_empty(),
+        "no security event"
     );
 }

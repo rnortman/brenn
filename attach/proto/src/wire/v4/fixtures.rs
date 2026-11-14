@@ -104,6 +104,7 @@ fn client_fixtures() -> Vec<(ClientFrame, &'static str)> {
                 body: "{\"n\":1}\n\u{1}é".into(),
                 urgency: Urgency::High,
                 correlation: Some(9),
+                attachments: Vec::new(),
             },
             r#"{"type":"Publish","channel":"brenn:orders","attribution":"ticker","body":"{\"n\":1}\n\u0001é","urgency":"high","correlation":9}"#,
         ),
@@ -114,6 +115,7 @@ fn client_fixtures() -> Vec<(ClientFrame, &'static str)> {
                 body: "".into(),
                 urgency: Urgency::VeryLow,
                 correlation: None,
+                attachments: Vec::new(),
             },
             r#"{"type":"Publish","channel":"ephemeral:status","body":"","urgency":"very-low"}"#,
         ),
@@ -127,12 +129,14 @@ fn client_fixtures() -> Vec<(ClientFrame, &'static str)> {
                         body: "now".into(),
                         urgency: Urgency::Normal,
                         deliver_after: None,
+                        attachments: Vec::new(),
                     },
                     BatchEntry {
                         channel: "brenn:orders".to_string(),
                         body: "later".into(),
                         urgency: Urgency::Low,
                         deliver_after: Some(1_700_000_000_000),
+                        attachments: Vec::new(),
                     },
                 ],
                 deferred_ops: vec![
@@ -219,6 +223,7 @@ fn server_fixtures() -> Vec<(ServerFrame, &'static str)> {
                 max_body_bytes: 65_536,
                 max_frame_bytes: 532_480,
                 alert_granted: false,
+                blobs: None,
             },
             r#"{"type":"Welcome","version":4,"participant_id":"remote:alice","session_id":"sess-1","heartbeat_secs":20,"max_body_bytes":65536,"max_frame_bytes":532480,"alert_granted":false}"#,
         ),
@@ -426,6 +431,12 @@ fn the_fixtures_cover_every_frame_kind() {
             ClientFrame::Publish { .. } => 3,
             ClientFrame::PublishBatch { .. } => 4,
             ClientFrame::Alert { .. } => 5,
+            ClientFrame::BlobCreate { .. }
+            | ClientFrame::BlobWrite { .. }
+            | ClientFrame::BlobSeal { .. }
+            | ClientFrame::BlobOpen { .. }
+            | ClientFrame::BlobRead { .. }
+            | ClientFrame::BlobClose { .. } => unreachable!("not a v4 frame"),
         }] = true;
     }
     assert_eq!(client, [true; 6]);
@@ -440,6 +451,10 @@ fn the_fixtures_cover_every_frame_kind() {
             ServerFrame::PublishResult { .. } => 5,
             ServerFrame::PublishBatchResult { .. } => 6,
             ServerFrame::DeferredView { .. } => 7,
+            ServerFrame::BlobCreateResult { .. }
+            | ServerFrame::BlobSealResult { .. }
+            | ServerFrame::BlobOpenResult { .. }
+            | ServerFrame::BlobReadResult { .. } => unreachable!("not a v4 frame"),
         }] = true;
     }
     assert_eq!(server, [true; 8]);

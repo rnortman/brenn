@@ -149,6 +149,7 @@ fn facts() -> AttachmentFacts {
         max_body_bytes: BODY_CAP,
         max_frame_bytes: 256 * 1024,
         alert_granted: false,
+        blobs: None,
     }
 }
 

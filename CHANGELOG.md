@@ -4,6 +4,44 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Remote attachers can move blob bytes: attach protocol v6.** A native
+  daemon connected over the remote websocket (a "remote attacher") can now
+  read, upload and forward blobs — the large binary attachments on bus
+  messages, e.g. camera frames — instead of seeing only their references.
+  - **For daemon authors:** v6 is v5 plus blob transfer. A session with a
+    blob door (`Welcome.blobs`, `AttachmentFacts::blobs()`) opens an
+    attachment of a message by (channel, message id, attachment name) and
+    reads its bytes by range, uploads a blob of declared size in chunks, and
+    publishes messages naming its blobs by session handle — single publishes
+    and `PublishBatch` entries alike. Forwarding an attachment copies no byte.
+    `brenn-attach-client` gains the `blobs` module (`BlobPlane`), which drives
+    the frames and hands the daemon chunk ranges to read and chunks to write;
+    the crate docs' "For a daemon author: blobs" section walks the loops,
+    handle lifetime and every outcome. v4 and v5 are still served, and a
+    daemon that stays on `exactly(5)` is delivered what it was before:
+    references as metadata, no blob frames. See `docs/message-bus.md` §2.1.2a
+    and §2.1.3.
+  - **BREAKING for operators:** a remote's subscribe ACLs now grant its token
+    the *bytes* of attachments on those channels (v6), not only their
+    references; the tool substrate's channels are excepted. A remote with
+    publish authority is a producer against `blob_budget_bytes`, and every
+    remote session with the blob door — whether or not the remote may
+    publish — can keep up to 4 × `max_blob_bytes` of the pool charged, by
+    uploads or by holding opened attachments. No configuration changes;
+    review remote subscribe matchers. See `docs/security-posture.md` §9a.
+  - **BREAKING for binders of `brenn-attach-client` at the pin bump:**
+    `SUPPORTED_VERSIONS` is 4..=6, so a daemon offering the whole range now
+    negotiates v6; `ClientFrame` and `ServerFrame` gain variants and
+    `PublishOutcome` / `PublishBatchOutcome` gain `AttachmentNotHeld`
+    (exhaustive matches break, deliberately); `ClientFrame::Publish`,
+    `BatchEntry`, `PublishRequest`, `ServerFrame::Welcome` and
+    `AttachmentFacts` gain a field (struct literals break; the constructors do
+    not); `OutboxSteps` and `Discarded` gain `released`, and `Discarded` is no
+    longer `Copy`; a parked flush naming a blob handle is dropped at a detach
+    and reported, and one in flight is forgotten, as every in-flight batch is.
+    Additive: `FlushBatch::handles`, `DeferredOpKind::body`,
+    `store::DeferOp::body`, `Codec::attachments_charged_bytes`, the `blobs`
+    module.
 - **Tool calls can carry blobs (binary attachments).** A tool can now be
   handed blobs with its arguments and answer with blobs beside its result.
   - **For agents and app authors:** a tool result with attachments is shown to

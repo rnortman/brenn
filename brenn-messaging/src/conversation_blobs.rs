@@ -29,13 +29,13 @@ use indexmap::IndexMap;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use brenn_messaging_store::blob::{BlobHold, HeldAttachments, Retain};
-use brenn_messaging_store::store::RingNamed;
+use brenn_messaging_store::blob::HeldAttachments;
 
-use crate::config::{Depth, SystemChannelFamily};
+pub use crate::retained_part::{AdmittedPart, NamedPart};
+use crate::retained_part::{PartRefusal, ToolChannelAttachments};
 use crate::{
-    AttachmentName, Attachments, BlobRef, MessageBody, MessageEnvelope, Messenger, PublishResult,
-    Urgency, app_tool_result_inbox_address,
+    AttachmentName, Attachments, MessageBody, MessageEnvelope, Messenger, PublishResult, Urgency,
+    app_tool_result_inbox_address,
 };
 
 /// The most messages the read record keeps for one conversation.
@@ -43,13 +43,6 @@ pub const READ_RECORD_MESSAGES: usize = 1024;
 
 /// The most conversations the read record keeps.
 pub const READ_RECORD_CONVERSATIONS: usize = 256;
-
-/// What part of a message a conversation names.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NamedPart {
-    Attachment(AttachmentName),
-    Body,
-}
 
 /// Why a name was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,15 +122,6 @@ impl fmt::Display for NameRefusal {
 }
 
 impl std::error::Error for NameRefusal {}
-
-/// What an admitted name gives.
-#[derive(Debug)]
-pub enum AdmittedPart {
-    /// One hold on the named blob, which keeps its bytes whatever then
-    /// happens to the message.
-    Attachment(BlobHold),
-    Body(MessageBody),
-}
 
 /// A tool result's attachments, published to the app's result inbox and
 /// recorded for the conversation that made the call.
@@ -364,13 +348,7 @@ impl Messenger {
                  host wiring bug (the app slug is host-plumbed from the bridge, never tool input)"
             )
         });
-        let not_readable = || NameRefusal::ChannelNotReadable {
-            channel: channel.clone(),
-        };
-        let name = match part {
-            NamedPart::Attachment(name) => Some(name),
-            NamedPart::Body => None,
-        };
+        let attachment = matches!(part, NamedPart::Attachment(_));
         // On the tool substrate's channels a call's attachments are for its
         // parties. A conversation names one only on its own app's result
         // inbox, which no policy covers and the record alone opens: only
@@ -379,117 +357,31 @@ impl Messenger {
         // watch of the traffic, and names bodies only.
         let own_inbox = channel == app_tool_result_inbox_address(app_slug);
         if !own_inbox && !policy.allows_channel_access(&channel) {
-            return Err(not_readable());
+            return Err(NameRefusal::ChannelNotReadable { channel });
         }
-        if !own_inbox
-            && name.is_some()
-            && SystemChannelFamily::of(&channel) == Some(SystemChannelFamily::Tool)
-        {
-            return Err(NameRefusal::ToolChannelAttachment {
-                channel: channel.clone(),
-            });
-        }
-        let entry = self.directory.resolve(&channel).ok_or_else(not_readable)?;
-        let not_retained = || NameRefusal::NotRetained {
-            channel: channel.clone(),
-            attachment: name.is_some(),
+        let tool_channel_attachments = if own_inbox {
+            ToolChannelAttachments::Admitted
+        } else {
+            ToolChannelAttachments::Refused
         };
-        if !entry.capabilities().durable {
-            let ring = self.ring_stores.get(&entry.uuid).unwrap_or_else(|| {
-                panic!(
-                    "messaging: non-durable channel {channel:?} is in the directory but has no \
-                     retention store"
-                )
-            });
-            return match ring.retained_named(message_id, name) {
-                RingNamed::NotRetained => Err(not_retained()),
-                RingNamed::Body(envelope) => Ok(AdmittedPart::Body(envelope.body.clone())),
-                RingNamed::NoSuchAttachment(envelope) => Err(no_such_attachment(&envelope)),
-                RingNamed::Attachment(envelope, hold) => {
-                    let name = name.expect("an attachment answers only a name");
-                    assert_holds_reference(&envelope, name, &hold);
-                    Ok(AdmittedPart::Attachment(hold))
+        self.admit_retained_part(&channel, message_id, part, tool_channel_attachments)
+            .await
+            .map_err(|refusal| match refusal {
+                PartRefusal::ToolChannelAttachment => NameRefusal::ToolChannelAttachment {
+                    channel: channel.clone(),
+                },
+                PartRefusal::ChannelGone => NameRefusal::ChannelNotReadable {
+                    channel: channel.clone(),
+                },
+                PartRefusal::NotRetained => NameRefusal::NotRetained {
+                    channel: channel.clone(),
+                    attachment,
+                },
+                PartRefusal::NoSuchAttachment { carried } => {
+                    NameRefusal::NoSuchAttachment { carried }
                 }
-            };
-        }
-
-        let conn = self.db.lock().await;
-        let Some(row) = crate::db::retained_message_by_uuid(&conn, message_id) else {
-            return Err(not_retained());
-        };
-        if row.channel_uuid != entry.uuid {
-            return Err(not_retained());
-        }
-        if let Depth::Bounded(depth) = entry.resolved_channel.standing_retain_depth {
-            let newer =
-                crate::db::channel_retained_count_after_seq(&conn, entry.uuid, row.retained_seq);
-            let depth = i64::try_from(depth).unwrap_or(i64::MAX);
-            if newer >= depth {
-                return Err(not_retained());
-            }
-        }
-        let envelope = row.envelope;
-        let Some(name) = name else {
-            return Ok(AdmittedPart::Body(envelope.body));
-        };
-        let Some(reference) = envelope.attachments.get(name) else {
-            return Err(no_such_attachment(&envelope));
-        };
-        let blobs = self.blob_store.as_ref().unwrap_or_else(|| {
-            panic!(
-                "messaging: retained message {message_id} on {channel} names blob {} and this \
-                 host has no blob store",
-                reference.id
-            )
-        });
-        let hold = match blobs.retain(&reference.id) {
-            Retain::Held(hold) => hold,
-            Retain::NotFound => panic!(
-                "messaging: retained message {message_id} on {channel} names blob {}, which the \
-                 store does not hold",
-                reference.id
-            ),
-            Retain::Unsettled => blobs
-                .retain_settled(&reference.id, &conn)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "messaging: retained message {message_id} on {channel} names blob {}, \
-                         which the store cannot hold: {e}",
-                        reference.id
-                    )
-                }),
-        };
-        drop(conn);
-        assert_holds_reference(&envelope, name, &hold);
-        Ok(AdmittedPart::Attachment(hold))
+            })
     }
-}
-
-fn no_such_attachment(envelope: &MessageEnvelope) -> NameRefusal {
-    NameRefusal::NoSuchAttachment {
-        carried: envelope
-            .attachments
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect(),
-    }
-}
-
-/// Panic unless `hold` is on the blob `envelope` names as `name`, as the
-/// store recorded it.
-fn assert_holds_reference(envelope: &MessageEnvelope, name: &AttachmentName, hold: &BlobHold) {
-    let named: &BlobRef = envelope.attachments.get(name).unwrap_or_else(|| {
-        panic!(
-            "message {} was admitted for attachment {name}, which it does not carry",
-            envelope.message_id
-        )
-    });
-    assert_eq!(
-        &hold.reference(),
-        named,
-        "message {} names attachment {name} with a reference that differs from the store's",
-        envelope.message_id
-    );
 }
 
 #[cfg(test)]

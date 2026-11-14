@@ -1,3 +1,4 @@
+mod attacher_attachments;
 mod attachments;
 mod body_kinds;
 mod chat_roles;

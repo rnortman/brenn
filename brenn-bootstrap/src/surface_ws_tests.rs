@@ -422,7 +422,9 @@ async fn surface_ws_welcome_carries_this_attachments_transport_facts() {
             max_body_bytes,
             max_frame_bytes,
             alert_granted,
+            blobs,
         } => {
+            assert_eq!(blobs, None);
             assert_eq!(version, SURFACE_ATTACH_VERSION);
             assert_eq!(participant_id, "surface:deskbar");
             assert!(
@@ -540,6 +542,7 @@ async fn surface_ws_a_publish_reaches_the_bus_and_comes_back_on_the_subscription
             body: "round trip".into(),
             urgency: Urgency::Normal,
             correlation: Some(7),
+            attachments: Vec::new(),
         },
     )
     .await;
@@ -1164,6 +1167,7 @@ async fn surface_ws_a_remotes_non_text_body_reaches_the_page_with_its_type() {
             body,
             urgency: Urgency::Normal,
             correlation: Some(1),
+            attachments: Vec::new(),
         },
     )
     .await;

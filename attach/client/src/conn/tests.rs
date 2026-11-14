@@ -38,6 +38,7 @@ fn welcome_frame(version: u32) -> ServerFrame {
         max_body_bytes: 65_536,
         max_frame_bytes: 70_000,
         alert_granted: true,
+        blobs: None,
     }
 }
 
@@ -228,6 +229,7 @@ fn welcome_states_the_attachment_contract_and_arms_liveness() {
             max_body_bytes: 65_536,
             max_frame_bytes: 70_000,
             alert_granted: true,
+            blobs: None,
         }))
     );
     // 20s heartbeat × 3 = 60s of tolerated inbound silence.
@@ -882,4 +884,112 @@ fn a_dropped_connection_forgets_the_version_it_negotiated() {
         Millis(0),
     );
     assert_eq!(conn.version(), None);
+}
+
+fn blob_door() -> BlobFacts {
+    BlobFacts {
+        max_blob_bytes: 1 << 26,
+        max_chunk_bytes: 1 << 18,
+        max_handles: 64,
+        max_bytes_held: 1 << 28,
+        max_inflight_reads: 4,
+        upload: true,
+    }
+}
+
+/// A v6 connection that has agreed a version and is handed `blobs` in its
+/// `Welcome`.
+fn welcome_v6_with(blobs: BlobFacts) -> (Connection, ConnStep) {
+    let (mut conn, _) = Connection::start(config(), Millis(0));
+    conn.on_input(ConnInput::Opened, Millis(0));
+    conn.on_input(peer_hello(VersionRange::exactly(6)), Millis(0));
+    let mut welcome = welcome_frame(6);
+    let ServerFrame::Welcome { blobs: door, .. } = &mut welcome else {
+        unreachable!("welcome_frame builds a Welcome")
+    };
+    *door = Some(blobs);
+    let step = conn.on_input(frame_at(6, welcome), Millis(0));
+    (conn, step)
+}
+
+/// A zero chunk bound never advances an upload or a read: the plane would
+/// spin on empty chunks. The peer's number is refused.
+#[test]
+fn a_welcome_stating_a_zero_blob_chunk_bound_is_fatal() {
+    let (conn, step) = welcome_v6_with(BlobFacts {
+        max_chunk_bytes: 0,
+        ..blob_door()
+    });
+    assert_eq!(conn.state(), ConnState::Terminal);
+    assert!(
+        fatal_detail(&step.effects).contains("zero blob max_chunk_bytes"),
+        "{:?}",
+        step.effects
+    );
+}
+
+/// A zero read window never sends a read: every read would hang unanswered.
+#[test]
+fn a_welcome_stating_a_zero_blob_read_window_is_fatal() {
+    let (conn, step) = welcome_v6_with(BlobFacts {
+        max_inflight_reads: 0,
+        ..blob_door()
+    });
+    assert_eq!(conn.state(), ConnState::Terminal);
+    assert!(
+        fatal_detail(&step.effects).contains("zero blob max_inflight_reads"),
+        "{:?}",
+        step.effects
+    );
+}
+
+/// A zero handle bound hangs nothing: the plane refuses every create and open
+/// locally with a typed error. It is a door that admits nothing, and is
+/// accepted as stated.
+#[test]
+fn a_welcome_stating_a_zero_handle_bound_attaches() {
+    let (conn, step) = welcome_v6_with(BlobFacts {
+        max_handles: 0,
+        ..blob_door()
+    });
+    assert_eq!(conn.state(), ConnState::Active);
+    assert!(
+        matches!(&step.effects[0], ConnEffect::Emit(ConnEvent::Attached(facts))
+            if facts.blobs.map(|b| b.max_handles) == Some(0)),
+        "{:?}",
+        step.effects
+    );
+}
+
+/// The facts' blob door is what `Welcome.blobs` states: present on a v6
+/// attachment whose server opened one, absent on v5.
+#[test]
+fn attachment_facts_carry_the_welcomes_blob_door() {
+    let door = blob_door();
+    for (version, blobs) in [(6, Some(door)), (5, None)] {
+        let (mut conn, _) = Connection::start(config(), Millis(0));
+        conn.on_input(ConnInput::Opened, Millis(0));
+        conn.on_input(peer_hello(VersionRange::exactly(version)), Millis(0));
+        let step = conn.on_input(
+            frame_at(
+                version,
+                ServerFrame::Welcome {
+                    version,
+                    participant_id: "surface:console".to_string(),
+                    session_id: "sess-1".to_string(),
+                    heartbeat_secs: HEARTBEAT_SECS,
+                    max_body_bytes: 65_536,
+                    max_frame_bytes: 70_000,
+                    alert_granted: true,
+                    blobs,
+                },
+            ),
+            Millis(0),
+        );
+        let ConnEffect::Emit(ConnEvent::Attached(facts)) = &step.effects[0] else {
+            panic!("expected Attached, got {:?}", step.effects);
+        };
+        assert_eq!(facts.blobs, blobs, "v{version}");
+        assert_eq!(facts.blobs(), blobs.as_ref(), "v{version}");
+    }
 }

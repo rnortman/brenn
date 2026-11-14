@@ -170,11 +170,19 @@ pub fn on_server_frame(
         ServerFrame::Hello { .. } => unreachable_frame("Hello"),
         ServerFrame::Welcome { .. } => unreachable_frame("Welcome"),
         ServerFrame::Heartbeat => unreachable_frame("Heartbeat"),
+        ServerFrame::BlobCreateResult { .. } => not_a_v5_frame("BlobCreateResult"),
+        ServerFrame::BlobSealResult { .. } => not_a_v5_frame("BlobSealResult"),
+        ServerFrame::BlobOpenResult { .. } => not_a_v5_frame("BlobOpenResult"),
+        ServerFrame::BlobReadResult { .. } => not_a_v5_frame("BlobReadResult"),
     }
 }
 
 fn unreachable_frame(name: &str) -> ! {
     panic!("surface client: the connection consumes {name} itself and routes it to nobody")
+}
+
+fn not_a_v5_frame(name: &str) -> ! {
+    panic!("surface client: attach v5, which the page speaks, has no {name} frame to decode")
 }
 
 /// Settle one channel's `SubscribeResult`.
@@ -384,6 +392,10 @@ fn on_batch_result(
     // The surface route answers a non-text body offered to a text-only channel
     // with a protocol close, never with this outcome, so a peer that sends it
     // is not the server this page was built against.
+    assert!(
+        outcome != PublishBatchOutcome::AttachmentNotHeld,
+        "surface client: attach v5, which the page speaks, has no AttachmentNotHeld outcome"
+    );
     if outcome == PublishBatchOutcome::TextOnlyChannel {
         return Err(format!(
             "PublishBatchResult {correlation} answered {outcome:?}, which the surface route \

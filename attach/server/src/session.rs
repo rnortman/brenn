@@ -34,6 +34,11 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{Instrument, info, info_span, warn};
 use uuid::Uuid;
 
+use super::blobs::{
+    BlobCounters, BlobDoor, BlobOpenRequest, BlobReadRequest, BlobTable, ReadGuard,
+    handle_blob_close, handle_blob_create, handle_blob_open, handle_blob_read, handle_blob_seal,
+    handle_blob_write,
+};
 use super::profile::AttachProfile;
 use super::publish::{
     PublishBatchRequest, PublishRequest, admit_attribution_or_violate, handle_publish,
@@ -52,6 +57,33 @@ use super::subscription::{
 /// Outbound frame queue depth. A slow reader fills this, then the delivery path
 /// blocks (backpressure at the socket) rather than dropping control frames.
 pub const OUTBOUND_QUEUE_FRAMES: usize = 256;
+
+/// One item of the writer queue: a frame, and for a read answer carrying
+/// bytes the guard that counts it in flight until the writer has written it.
+pub struct Outbound {
+    pub frame: ServerFrame,
+    #[expect(
+        dead_code,
+        reason = "held for its drop, which ends the read's count once the frame is written"
+    )]
+    read_guard: Option<ReadGuard>,
+}
+
+impl Outbound {
+    /// The frame, dropping any guard with the item.
+    pub fn into_frame(self) -> ServerFrame {
+        self.frame
+    }
+}
+
+impl From<ServerFrame> for Outbound {
+    fn from(frame: ServerFrame) -> Self {
+        Outbound {
+            frame,
+            read_guard: None,
+        }
+    }
+}
 
 /// Immutable per-connection context every frame handler reads but none mutates.
 /// Built once when the session starts and passed as `&AttachSessionCtx`, so
@@ -93,12 +125,17 @@ pub struct AttachSessionCtx {
     pub ip: IpAddr,
     /// Outbound frame sender to the writer task. Owning it here means dropping
     /// the context at teardown closes the channel and exits the writer.
-    pub tx: mpsc::Sender<ServerFrame>,
+    pub tx: mpsc::Sender<Outbound>,
     /// The transport version the two `Hello` frames agreed on. Set once, by the
     /// opening sequence, before any frame handler runs; read through
     /// [`AttachSessionCtx::version`]. Shared with the writer task, which encodes
     /// with it.
     pub(crate) negotiated_version: Arc<OnceLock<u32>>,
+    /// This attachment's blob door, or `None` when it has none. Set once by
+    /// the opening sequence, beside the version it depends on; `Welcome`
+    /// advertises it and every blob frame and publish asks it, so the two
+    /// cannot disagree.
+    pub(crate) blob_door: OnceLock<Option<BlobDoor>>,
 }
 
 impl AttachSessionCtx {
@@ -122,6 +159,30 @@ impl AttachSessionCtx {
     /// As [`AttachSessionCtx::version`].
     pub fn codec(&self) -> Codec {
         Codec::negotiated(self.version())
+    }
+
+    /// This attachment's blob door, if it has one.
+    ///
+    /// # Panics
+    ///
+    /// Before the opening sequence set it, as [`AttachSessionCtx::version`].
+    pub fn blob_door(&self) -> Option<&BlobDoor> {
+        self.blob_door
+            .get()
+            .expect("a frame handler runs only after the opening sequence set the blob door")
+            .as_ref()
+    }
+
+    /// Set the blob door for the agreed `version`.
+    ///
+    /// # Panics
+    ///
+    /// If it was already set: the opening sequence runs once.
+    pub(crate) fn open_blob_door(&self, version: u32) {
+        let door = BlobDoor::for_session(version, self.profile.as_ref(), &self.messenger);
+        if self.blob_door.set(door).is_err() {
+            panic!("the blob door is set once per attachment");
+        }
     }
 
     /// A protocol violation on this attachment, named by attacher and account.
@@ -214,6 +275,8 @@ pub struct SessionCounters {
     /// the attacher's own publishes name no attribution and have no column here.
     /// The totals are the session's; this is the attributable part of them.
     pub by_attribution: BTreeMap<String, AttributionPublishCounters>,
+    /// The blob plane's counts.
+    pub blobs: BlobCounters,
 }
 
 /// One sub-identity's publish outcomes within a session ([`SessionCounters`]).
@@ -279,11 +342,34 @@ pub fn sanitize_client_detail(s: &str) -> String {
 /// Send one `ServerFrame` to the writer, counting it and mapping a closed
 /// channel (writer gone) to `Disconnect`.
 pub async fn send_frame(
-    tx: &mpsc::Sender<ServerFrame>,
+    tx: &mpsc::Sender<Outbound>,
     frame: ServerFrame,
     counters: &mut SessionCounters,
 ) -> FrameOutcome {
-    match tx.send(frame).await {
+    send_outbound(tx, Outbound::from(frame), counters).await
+}
+
+/// [`send_frame`] for a read answer carrying bytes, with the guard that
+/// counts it in flight until the writer has written it.
+pub(crate) async fn send_read_answer(
+    tx: &mpsc::Sender<Outbound>,
+    frame: ServerFrame,
+    read_guard: ReadGuard,
+    counters: &mut SessionCounters,
+) -> FrameOutcome {
+    let outbound = Outbound {
+        frame,
+        read_guard: Some(read_guard),
+    };
+    send_outbound(tx, outbound, counters).await
+}
+
+async fn send_outbound(
+    tx: &mpsc::Sender<Outbound>,
+    outbound: Outbound,
+    counters: &mut SessionCounters,
+) -> FrameOutcome {
+    match tx.send(outbound).await {
         Ok(()) => {
             counters.frames_out += 1;
             FrameOutcome::Continue
@@ -345,6 +431,9 @@ pub struct SessionState {
     pub cursors: WireCursors,
     pub buckets: SessionBuckets,
     pub counters: SessionCounters,
+    /// The session's blob handles. Dropped with the session: nothing it holds
+    /// outlives the attachment.
+    pub blobs: BlobTable,
 }
 
 impl SessionState {
@@ -361,6 +450,7 @@ impl SessionState {
             cursors: WireCursors::new(store_incarnation),
             buckets: SessionBuckets::new(profile),
             counters: SessionCounters::default(),
+            blobs: BlobTable::default(),
         }
     }
 }
@@ -489,7 +579,7 @@ where
     let negotiated_version = Arc::new(OnceLock::new());
 
     let (sink, mut ws_stream) = socket.split();
-    let (tx, rx) = mpsc::channel::<ServerFrame>(OUTBOUND_QUEUE_FRAMES);
+    let (tx, rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE_FRAMES);
     // The writer owns the sink, so a close frame is the writer's to send: this
     // task decides the reason and hands it over.
     let (writer_close_tx, writer_close_rx) = oneshot::channel::<CloseReason>();
@@ -520,8 +610,12 @@ where
         ip,
         tx,
         negotiated_version,
+        blob_door: OnceLock::new(),
     };
 
+    // Declared after `guard` and `ctx` so an unwinding panic drops the blob table
+    // inside `state` before the guard releases the registry slot, the same order
+    // as the teardown below.
     let mut state = SessionState::new(ctx.profile.as_ref(), active_channels, store_incarnation);
 
     let violation_detail = match open_attachment(
@@ -576,16 +670,34 @@ where
         );
     }
 
+    // Single teardown path. The blob table goes first: every upload is deleted
+    // and every hold given up, off the task because a dropped writer unlinks
+    // its file, as can a dropped hold. It must precede the unregister, because
+    // releasing the registry slot is what lets the attacher attach again, and
+    // the writer's drain after it can be held open by a peer that reads slowly;
+    // so a session that no longer counts against `max_sessions` holds no blob.
+    // The order holds for a session that runs to completion or unwinds; nothing
+    // drops a running session's future short of runtime shutdown, and a caller
+    // that starts doing so must make the table's drop precede the slot's
+    // release there too.
+    std::mem::take(&mut state.blobs).drop_off_task().await;
+
     // Remove this attachment's registration and read the post-removal count in
     // one step, before the context drops, so the route's terminal action has an
     // uncontested answer to "was that the last one".
+    //
+    // TODO(attach-ended-session-drain-unbounded): from here the session is
+    // counted by nothing while its writer drains, and the drain has no overall
+    // deadline.
     let remaining = guard.unregister_returning_remaining();
+    // Unset when the opening sequence never finished.
+    let had_blob_door = ctx.blob_door.get().is_some_and(Option::is_some);
 
-    // Single teardown path: drop the context (its `tx` is the writer sender, so
-    // the writer exits and the socket closes), await the writer, drop the guard
-    // (slot released even on panic). The active set needs no explicit teardown:
-    // the fan-out reaches this attachment only through its registry handle, and
-    // unregistering above is what removes it.
+    // Drop the context (its `tx` is the writer sender, so the writer exits and
+    // the socket closes), await the writer, drop the guard (slot released even
+    // on panic). The active set needs no explicit teardown: the fan-out reaches
+    // this attachment only through its registry handle, and unregistering above
+    // is what removes it.
     drop(ctx);
     writer.await.expect("attach writer task panicked");
     drop(guard);
@@ -608,6 +720,8 @@ where
         // extra lines per detach. Keys are declared attributions, not client
         // strings.
         by_attribution = ?state.counters.by_attribution,
+        // `None` for an attachment without a blob door, which counts nothing.
+        blobs = ?had_blob_door.then_some(&state.counters.blobs),
         "attachment detached"
     );
     AttachSessionOutcome {
@@ -659,6 +773,7 @@ where
     ctx.negotiated_version
         .set(version)
         .expect("the opening sequence runs once per attachment");
+    ctx.open_blob_door(version);
 
     match send_frame(&ctx.tx, welcome(ctx, version, heartbeat_secs), counters).await {
         FrameOutcome::Continue => {}
@@ -918,6 +1033,7 @@ async fn handle_client_frame(
             body,
             urgency,
             correlation,
+            attachments,
         } => {
             handle_publish(
                 ctx,
@@ -928,6 +1044,8 @@ async fn handle_client_frame(
                     body: &body,
                     urgency,
                     correlation,
+                    attachments: &attachments,
+                    blobs: &state.blobs,
                 },
                 &mut state.counters,
             )
@@ -946,6 +1064,7 @@ async fn handle_client_frame(
                     correlation,
                     publishes: &publishes,
                     deferred_ops: &deferred_ops,
+                    blobs: &state.blobs,
                 },
                 &mut state.counters,
             )
@@ -965,6 +1084,80 @@ async fn handle_client_frame(
             &title,
             &body,
         ),
+        ClientFrame::BlobCreate {
+            handle,
+            content_type,
+            size,
+        } => {
+            handle_blob_create(
+                ctx,
+                &mut state.blobs,
+                handle,
+                &content_type,
+                size,
+                &mut state.counters,
+            )
+            .await
+        }
+        ClientFrame::BlobWrite {
+            handle,
+            offset,
+            bytes,
+        } => {
+            handle_blob_write(
+                ctx,
+                &mut state.blobs,
+                handle,
+                offset,
+                bytes,
+                &mut state.counters,
+            )
+            .await
+        }
+        ClientFrame::BlobSeal { handle } => {
+            handle_blob_seal(ctx, &mut state.blobs, handle, &mut state.counters).await
+        }
+        ClientFrame::BlobOpen {
+            handle,
+            channel,
+            message_id,
+            name,
+        } => {
+            handle_blob_open(
+                ctx,
+                &mut state.blobs,
+                BlobOpenRequest {
+                    handle,
+                    channel: &channel,
+                    message_id,
+                    name: &name,
+                },
+                &mut state.counters,
+            )
+            .await
+        }
+        ClientFrame::BlobRead {
+            correlation,
+            handle,
+            offset,
+            len,
+        } => {
+            handle_blob_read(
+                ctx,
+                &mut state.blobs,
+                BlobReadRequest {
+                    correlation,
+                    handle,
+                    offset,
+                    len,
+                },
+                &mut state.counters,
+            )
+            .await
+        }
+        ClientFrame::BlobClose { handle } => {
+            handle_blob_close(ctx, &mut state.blobs, handle, &mut state.counters).await
+        }
     }
 }
 

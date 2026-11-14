@@ -30,8 +30,8 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use brenn_attach_proto::{
-    BatchDeferredOp, BatchEntry, ClientFrame, Codec, DeferredOpKind, DeferredViewEntry,
-    MessageBody, PublishBatchOutcome,
+    BatchDeferredOp, BatchEntry, BlobHandle, ClientFrame, Codec, DeferredViewEntry, MessageBody,
+    PublishAttachment, PublishBatchOutcome, carries_blob_transfer,
 };
 use brenn_envelope::Urgency;
 
@@ -65,6 +65,10 @@ pub struct PublishRequest {
     /// configures before it gets here — the same value it would stamp onto an
     /// envelope it routes itself.
     pub urgency: Urgency,
+    /// The blobs the message names, each a handle the
+    /// [`BlobPlane`](crate::blobs::BlobPlane) holds or is about to hold. Empty
+    /// unless the attachment has a blob door.
+    pub attachments: Vec<PublishAttachment>,
 }
 
 impl PublishRequest {
@@ -75,12 +79,19 @@ impl PublishRequest {
             attribution: None,
             body,
             urgency,
+            attachments: Vec::new(),
         }
     }
 
     /// The same publish, sent under the sub-identity `attribution`.
     pub fn attribution(mut self, attribution: impl Into<String>) -> Self {
         self.attribution = Some(attribution.into());
+        self
+    }
+
+    /// The same publish, naming `attachments`.
+    pub fn attachments(mut self, attachments: Vec<PublishAttachment>) -> Self {
+        self.attachments = attachments;
         self
     }
 }
@@ -94,6 +105,7 @@ pub fn publish_frame(req: PublishRequest, correlation: Option<u64>) -> ClientFra
         body: req.body,
         urgency: req.urgency,
         correlation,
+        attachments: req.attachments,
     }
 }
 
@@ -209,16 +221,34 @@ impl FlushBatch {
         codec.batch_frame_bytes(attribution, &self.entries, &self.ops)
     }
 
+    /// The blob handles this flush's entries name, in entry order, one
+    /// occurrence per attachment that names one.
+    ///
+    /// For the flushes [`Outboxes::deregister`] returns and the one
+    /// [`BatchAnswer::lost`] hands back: each handle is the embedder's to close
+    /// once it gives the flush up.
+    pub fn handles(&self) -> impl Iterator<Item = BlobHandle> + '_ {
+        self.entries
+            .iter()
+            .flat_map(|entry| entry.attachments.iter().map(|attachment| attachment.handle))
+    }
+
+    /// Whether any entry names a blob handle.
+    fn names_handles(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| !entry.attachments.is_empty())
+    }
+
     /// Whether `codec` can write every body this flush holds, entries and
-    /// edits alike.
+    /// edits alike, and the attachments its entries name.
     fn carried_by(&self, codec: Codec) -> bool {
-        self.entries.iter().all(|entry| codec.carries(&entry.body))
-            && self.ops.iter().all(|op| match &op.op {
-                DeferredOpKind::Edit {
-                    body: Some(body), ..
-                } => codec.carries(body),
-                DeferredOpKind::Edit { body: None, .. } | DeferredOpKind::Cancel => true,
-            })
+        (!self.names_handles() || carries_blob_transfer(codec.version()))
+            && self.entries.iter().all(|entry| codec.carries(&entry.body))
+            && self
+                .ops
+                .iter()
+                .all(|op| op.op.body().is_none_or(|body| codec.carries(body)))
     }
 }
 
@@ -245,6 +275,18 @@ pub struct OutboxSteps<K> {
     /// the order they were dropped. A drop is never silent: the embedder counts
     /// it, announces it, or both.
     pub dropped: Vec<K>,
+    /// The blob handles named by every flush this step finished with — applied,
+    /// handed back as [`BatchAnswer::lost`], dropped at the cap or by
+    /// re-validation, or dropped by [`Outboxes::flush`] while detached — one
+    /// occurrence per attachment that named one.
+    ///
+    /// A flush still parked, or re-parked after a refusal, releases nothing: it
+    /// will reach the peer later and the handles it names must still be held
+    /// then. A handle reported here is the embedder's to close as far as this
+    /// flush is concerned; one named by several flushes is reported once per
+    /// naming. [`Outboxes::on_detached`] releases nothing, because every handle
+    /// dies with the attachment.
+    pub released: Vec<BlobHandle>,
     /// The retry timer's instruction, when it changed.
     pub retry_wakeup: Option<TimerChange>,
 }
@@ -254,16 +296,28 @@ impl<K> Default for OutboxSteps<K> {
         Self {
             frames: Vec::new(),
             dropped: Vec::new(),
+            released: Vec::new(),
             retry_wakeup: None,
         }
     }
 }
 
+impl<K> OutboxSteps<K> {
+    /// Account one whole flush dropped from `key`'s outbox: name the registrant
+    /// and release the handles it named.
+    fn drop_flush(&mut self, key: K, batch: &FlushBatch) {
+        self.dropped.push(key);
+        self.released.extend(batch.handles());
+    }
+}
+
 /// What [`Outboxes::discard_parked`] took from one registrant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discarded {
     /// Whole flushes dropped.
     pub flushes: u64,
+    /// The blob handles the dropped flushes named, as [`OutboxSteps::released`].
+    pub released: Vec<BlobHandle>,
     /// The retry timer's instruction, when it changed.
     pub retry_wakeup: Option<TimerChange>,
 }
@@ -280,8 +334,11 @@ pub struct BatchAnswer<K> {
     /// under the same key) while its batch was outstanding, or the embedder took
     /// it terminal and discarded its queue. `None` in every other case, including
     /// an ordinary refusal, which is re-parked. Also the flush the peer
-    /// refused as [`PublishBatchOutcome::TextOnlyChannel`], which can never
-    /// succeed and so is never re-parked.
+    /// refused as [`PublishBatchOutcome::TextOnlyChannel`] or
+    /// [`PublishBatchOutcome::AttachmentNotHeld`], which can never succeed and
+    /// so is never re-parked.
+    ///
+    /// The handles a lost flush names are in `steps.released`.
     pub lost: Option<FlushBatch>,
     /// What the peer answered, so the embedder can tell a refusal from a
     /// renounced flush.
@@ -313,7 +370,8 @@ struct Outbox {
     /// refused and went to the head of the queue for retry.
     in_flight: Option<u64>,
     /// Whole flushes dropped, lifetime — at the cap or on a re-validation the
-    /// embedder refused.
+    /// embedder refused. A flush naming a blob handle is also dropped when it
+    /// is parked at a detach, or handed over while detached.
     dropped: u64,
     /// Whether the embedder has thrown this registrant's queue away, having taken
     /// it terminal.
@@ -497,10 +555,15 @@ impl<K: Clone + Ord> Outboxes<K> {
             .get_mut(key)
             .expect("attach client: discarding the queue of an unregistered registrant");
         let flushes = outbox.parked.len() as u64;
-        outbox.parked.clear();
+        let released = outbox
+            .parked
+            .drain(..)
+            .flat_map(|batch| batch.handles().collect::<Vec<_>>())
+            .collect();
         outbox.discarded = true;
         Discarded {
             flushes,
+            released,
             // Emptying the last blocked queue unblocks the plane, so the timer
             // that was waiting on it has to be told.
             retry_wakeup: self.retry_wakeup(now),
@@ -513,6 +576,24 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// attachment is live, nothing of its own is queued, and none of its own
     /// flushes is unanswered. Otherwise it queues, and the outbox drains in
     /// order.
+    ///
+    /// While detached, a flush naming a blob handle is dropped whole: a handle
+    /// lives only as long as the attachment that minted it, so no later
+    /// attachment can hold it. It is counted against the registrant, named in
+    /// [`OutboxSteps::dropped`] and its handles are in
+    /// [`OutboxSteps::released`], as a drop at the cap is.
+    ///
+    /// # Panics
+    ///
+    /// On an empty batch or an unregistered key. While attached the embedder
+    /// asks the attachment's facts before it hands a flush over —
+    /// [`AttachmentFacts::carries`](crate::conn::AttachmentFacts::carries) for
+    /// each body and [`AttachmentFacts::blobs`](crate::conn::AttachmentFacts::blobs)
+    /// for a flush naming a handle — and accounts one that fails with
+    /// [`refuse_flush`](Self::refuse_flush). A flush the attachment's version
+    /// cannot write panics in the batch legality check; one naming a handle on
+    /// a v6 attachment without a blob door is sent, and the peer answers it as
+    /// a violation.
     pub fn flush<Q>(&mut self, key: &Q, batch: FlushBatch, now: Millis) -> OutboxSteps<K>
     where
         K: Borrow<Q>,
@@ -530,6 +611,18 @@ impl<K: Clone + Ord> Outboxes<K> {
             .get_key_value(key)
             .map(|(key, _)| key.clone())
             .expect("attach client: a flush implies a registered registrant");
+        // Invariant, with `on_detached`: while detached, no parked flush names
+        // a handle.
+        if self.law.is_none() && batch.names_handles() {
+            self.registrants
+                .get_mut::<K>(&key)
+                .expect("attach client: the key came from this map")
+                .dropped += 1;
+            let mut steps = OutboxSteps::default();
+            steps.drop_flush(key, &batch);
+            steps.retry_wakeup = self.retry_wakeup(now);
+            return steps;
+        }
         let mut steps = if self.wire_free_for(&key) {
             OutboxSteps {
                 frames: vec![self.batch_frame(&key, batch)],
@@ -551,6 +644,13 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// changed while the activation that wrote them was still running. This is
     /// where that refusal is accounted, so a flush lost to a contract it no longer
     /// satisfies reads exactly like one lost at the cap or at an attachment.
+    /// The same holds for a flush the live attachment cannot carry: a body
+    /// [`AttachmentFacts::carries`](crate::conn::AttachmentFacts::carries)
+    /// refuses, or a blob handle while
+    /// [`AttachmentFacts::blobs`](crate::conn::AttachmentFacts::blobs) is
+    /// `None`. It takes no batch and releases nothing; a flush refused for a
+    /// missing door names handles of an earlier attachment, whose bookkeeping
+    /// the embedder dropped at the detach that ended it.
     ///
     /// # Panics
     ///
@@ -630,7 +730,7 @@ impl<K: Clone + Ord> Outboxes<K> {
                     outbox.parked.push_back(batch);
                 } else {
                     outbox.dropped += 1;
-                    steps.dropped.push(key.clone());
+                    steps.drop_flush(key.clone(), &batch);
                 }
             }
             steps.frames.extend(self.pump(&key));
@@ -647,16 +747,29 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// flushes themselves survive — they were never sent and are still owed the
     /// wire — and each registrant's in-flight marker clears with the frame it
     /// named, so the next attachment starts free.
+    ///
+    /// A parked flush naming a blob handle can never be applied: the handle
+    /// died with the attachment. It is dropped whole, counted and named in
+    /// [`OutboxSteps::dropped`], as a cap drop is. One in flight may have been
+    /// applied, and is forgotten like every in-flight batch. Nothing is
+    /// released: every handle is gone with the attachment.
     pub fn on_detached(&mut self) -> OutboxSteps<K> {
         self.law = None;
+        let mut steps = OutboxSteps::default();
         self.pending.clear();
-        for outbox in self.registrants.values_mut() {
+        // Invariant, with `flush`: while detached, no parked flush names a
+        // handle.
+        for (key, outbox) in &mut self.registrants {
             outbox.in_flight = None;
+            let before = outbox.parked.len();
+            outbox.parked.retain(|batch| !batch.names_handles());
+            for _ in outbox.parked.len()..before {
+                outbox.dropped += 1;
+                steps.dropped.push(key.clone());
+            }
         }
-        OutboxSteps {
-            retry_wakeup: self.disarm_retry(),
-            ..OutboxSteps::default()
-        }
+        steps.retry_wakeup = self.disarm_retry();
+        steps
     }
 
     /// Settle one `PublishBatchResult`.
@@ -714,14 +827,20 @@ impl<K: Clone + Ord> Outboxes<K> {
             // The registrant that sent it went away under the outstanding frame;
             // its outbox went with it. An `Ok` was applied peer-side regardless,
             // but a refusal drops ok'd entries that were never applied anywhere.
+            // Either way the flush is finished with, so its handles are
+            // released.
+            let steps = OutboxSteps {
+                released: batch.handles().collect(),
+                ..OutboxSteps::default()
+            };
             let lost = match outcome {
                 PublishBatchOutcome::Ok => None,
-                PublishBatchOutcome::RateLimited | PublishBatchOutcome::TextOnlyChannel => {
-                    Some(batch)
-                }
+                PublishBatchOutcome::RateLimited
+                | PublishBatchOutcome::TextOnlyChannel
+                | PublishBatchOutcome::AttachmentNotHeld => Some(batch),
             };
             return Ok(BatchAnswer {
-                steps: OutboxSteps::default(),
+                steps,
                 registrant: key,
                 lost,
                 outcome,
@@ -737,7 +856,10 @@ impl<K: Clone + Ord> Outboxes<K> {
         match outcome {
             // The wire is free for this registrant again: anything that queued
             // behind the frame goes out now rather than waiting a tick.
-            PublishBatchOutcome::Ok => steps.frames.extend(self.pump(&key)),
+            PublishBatchOutcome::Ok => {
+                steps.released.extend(batch.handles());
+                steps.frames.extend(self.pump(&key));
+            }
             PublishBatchOutcome::RateLimited => {
                 // Counted whatever becomes of the flush: the peer's backstop and
                 // the attacher's own limiter disagreed, which is the same evidence
@@ -745,17 +867,21 @@ impl<K: Clone + Ord> Outboxes<K> {
                 outbox.rate_limited += 1;
                 let discarded = outbox.discarded;
                 if discarded {
+                    steps.released.extend(batch.handles());
                     lost = Some(batch);
                 } else {
-                    steps.dropped.extend(self.park(&key, batch, true).dropped);
+                    let parked = self.park(&key, batch, true);
+                    steps.dropped.extend(parked.dropped);
+                    steps.released.extend(parked.released);
                 }
             }
-            // Terminal for this flush: the body it carries will never be text, so
-            // a retry would be refused the same way forever. It is dropped and
-            // counted, handed back as lost, and the wire is free for the next.
-            PublishBatchOutcome::TextOnlyChannel => {
+            // Terminal for this flush: the body it carries will never be text,
+            // or a handle it names is not held, so a retry would be refused the
+            // same way forever. It is dropped and counted, handed back as lost,
+            // and the wire is free for the next.
+            PublishBatchOutcome::TextOnlyChannel | PublishBatchOutcome::AttachmentNotHeld => {
                 outbox.dropped += 1;
-                steps.dropped.push(key.clone());
+                steps.drop_flush(key.clone(), &batch);
                 lost = Some(batch);
                 steps.frames.extend(self.pump(&key));
             }
@@ -858,9 +984,12 @@ impl<K: Clone + Ord> Outboxes<K> {
         }
         let mut steps = OutboxSteps::default();
         while outbox.parked.len() as u64 > outbox.depth {
-            outbox.parked.pop_front();
+            let dropped = outbox
+                .parked
+                .pop_front()
+                .expect("attach client: an outbox over its cap holds a flush");
             outbox.dropped += 1;
-            steps.dropped.push(key.clone());
+            steps.drop_flush(key.clone(), &dropped);
         }
         steps
     }

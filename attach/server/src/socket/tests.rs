@@ -170,8 +170,10 @@ async fn each_offer_against_each_served_range() {
     let cases = [
         (both, VersionRange::exactly(4), Some(4)),
         (both, VersionRange::exactly(5), Some(5)),
+        (both, VersionRange::exactly(6), Some(6)),
         (both, VersionRange { min: 4, max: 5 }, Some(5)),
-        (both, VersionRange { min: 6, max: 9 }, None),
+        (both, VersionRange { min: 4, max: 9 }, Some(6)),
+        (both, VersionRange { min: 7, max: 9 }, None),
         (v4, VersionRange::exactly(5), None),
         (v4, VersionRange { min: 4, max: 5 }, Some(4)),
     ];
@@ -294,6 +296,7 @@ async fn welcome_states_the_transport_contract_of_this_attachment() {
             max_body_bytes,
             max_frame_bytes,
             alert_granted,
+            blobs: None,
         } => {
             assert_eq!(version, 4);
             assert_eq!(participant_id, "surface:deskbar");
@@ -386,7 +389,7 @@ impl Sink<Message> for TestSink {
 /// negotiating).
 fn spawn_writer(
     sink: TestSink,
-    rx: mpsc::Receiver<ServerFrame>,
+    rx: mpsc::Receiver<Outbound>,
     close_rx: oneshot::Receiver<CloseReason>,
     heartbeat: Duration,
     version: Option<u32>,
@@ -450,10 +453,10 @@ async fn the_writer_serializes_in_order_and_exits_when_the_session_drops_its_sen
     let (_close_tx, close_rx) = oneshot::channel();
     let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), Some(4));
 
-    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test"))
+    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test").into())
         .await
         .unwrap();
-    tx.send(ServerFrame::Heartbeat).await.unwrap();
+    tx.send(ServerFrame::Heartbeat.into()).await.unwrap();
     drop(tx);
     writer.await.unwrap();
 
@@ -492,7 +495,7 @@ async fn a_frame_written_since_the_tick_suppresses_the_idle_heartbeat() {
     let (_close_tx, close_rx) = oneshot::channel();
     let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(10), Some(4));
 
-    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test"))
+    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test").into())
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_secs(11)).await;
@@ -518,11 +521,11 @@ async fn a_sink_error_exits_the_writer() {
     let (_close_tx, close_rx) = oneshot::channel();
     let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), Some(4));
 
-    tx.send(ServerFrame::Heartbeat).await.unwrap();
+    tx.send(ServerFrame::Heartbeat.into()).await.unwrap();
     writer.await.unwrap();
     assert!(written_frames(&written).is_empty());
     // The session learns of it the same way it learns of any writer exit.
-    assert!(tx.send(ServerFrame::Heartbeat).await.is_err());
+    assert!(tx.send(ServerFrame::Heartbeat.into()).await.is_err());
 }
 
 /// A reader that stops draining cannot pin the connection open: the watchdog
@@ -534,10 +537,10 @@ async fn a_stalled_sink_exits_the_writer_after_the_watchdog() {
     let (_close_tx, close_rx) = oneshot::channel();
     let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(10), Some(4));
 
-    tx.send(ServerFrame::Heartbeat).await.unwrap();
+    tx.send(ServerFrame::Heartbeat.into()).await.unwrap();
     writer.await.unwrap();
     assert!(written_frames(&written).is_empty());
-    assert!(tx.send(ServerFrame::Heartbeat).await.is_err());
+    assert!(tx.send(ServerFrame::Heartbeat.into()).await.is_err());
 }
 
 fn written_closes(written: &Arc<Mutex<Vec<Message>>>) -> Vec<(u16, String)> {
@@ -570,7 +573,7 @@ async fn a_host_close_writes_the_close_frame_and_exits_the_writer() {
         written_closes(&written),
         vec![(3003, "surface retired".to_string())]
     );
-    assert!(tx.send(ServerFrame::Heartbeat).await.is_err());
+    assert!(tx.send(ServerFrame::Heartbeat.into()).await.is_err());
 }
 
 /// Frames already queued when the close is decided still reach the peer: they
@@ -582,10 +585,10 @@ async fn a_host_close_flushes_what_was_already_queued_first() {
     let (tx, rx) = mpsc::channel(4);
     let (close_tx, close_rx) = oneshot::channel();
 
-    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test"))
+    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test").into())
         .await
         .unwrap();
-    tx.send(ServerFrame::Heartbeat).await.unwrap();
+    tx.send(ServerFrame::Heartbeat.into()).await.unwrap();
     close_tx
         .send(CloseReason::new(3002, "surface reconfigured"))
         .expect("receiver is alive");
@@ -612,7 +615,7 @@ async fn dropping_the_close_sender_writes_no_close_frame() {
     let (close_tx, close_rx) = oneshot::channel();
     let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), Some(4));
 
-    tx.send(ServerFrame::Heartbeat).await.unwrap();
+    tx.send(ServerFrame::Heartbeat.into()).await.unwrap();
     drop(close_tx);
     drop(tx);
     writer.await.unwrap();
@@ -688,7 +691,7 @@ async fn the_hello_is_written_before_a_version_is_in_force() {
     let (_close_tx, close_rx) = oneshot::channel();
     let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), None);
 
-    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test"))
+    tx.send(server_hello(SUPPORTED_VERSIONS, "brenn-server-test").into())
         .await
         .unwrap();
     drop(tx);
@@ -713,7 +716,7 @@ async fn a_frame_before_a_version_is_in_force_panics_the_writer() {
     let (_close_tx, close_rx) = oneshot::channel();
     let (writer, _) = spawn_writer(sink, rx, close_rx, Duration::from_secs(3600), None);
 
-    tx.send(ServerFrame::Heartbeat).await.unwrap();
+    tx.send(ServerFrame::Heartbeat.into()).await.unwrap();
     let err = writer.await.unwrap_err();
     assert!(err.is_panic());
 }

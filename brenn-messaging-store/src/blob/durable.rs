@@ -337,6 +337,8 @@ impl HeldAttachments {
     /// storage failure, as the database commit of the same publish has none;
     /// after a failed sync the bytes' state on disk is unknown, so neither
     /// retrying the sync nor writing the row that names them is sound.
+    // TODO(blob-durable-sync-on-async-task): every caller runs this on an async
+    // task, which stops for each sync.
     pub fn make_durable(&self) {
         let mut dirs: Vec<std::path::PathBuf> = Vec::new();
         let mut synced: Vec<&BlobHold> = Vec::new();

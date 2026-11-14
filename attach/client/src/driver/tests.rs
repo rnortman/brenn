@@ -59,6 +59,7 @@ fn welcome_at(version: u32) -> String {
         max_body_bytes: 4096,
         max_frame_bytes: 8192,
         alert_granted: false,
+        blobs: None,
     })
 }
 
@@ -532,6 +533,7 @@ async fn hello_is_written_as_text_and_a_v5_publish_as_binary() {
         body: body.clone(),
         urgency: brenn_attach_proto::Urgency::Normal,
         correlation: Some(7),
+        attachments: Vec::new(),
     };
     let step = driver.send(vec![publish.clone()]).await;
     assert!(step.events.is_empty());
@@ -571,6 +573,7 @@ async fn a_body_v4_cannot_carry_panics_at_the_encoder() {
             body: MessageBody::from_parts(Some("image/jpeg"), &[0xff, 0xd8]).unwrap(),
             urgency: brenn_attach_proto::Urgency::Normal,
             correlation: Some(1),
+            attachments: Vec::new(),
         }])
         .await;
 }
@@ -999,6 +1002,7 @@ async fn the_attachment_facts_reach_the_embedder_whole() {
             max_body_bytes: 4096,
             max_frame_bytes: 8192,
             alert_granted: false,
+            blobs: None,
         })]
     );
     assert!(driver.is_active());

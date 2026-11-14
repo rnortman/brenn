@@ -197,6 +197,7 @@ fn flush_batch(n: u64) -> FlushBatch {
             body: format!(r#"{{"n":{n}}}"#).into(),
             urgency: WireUrgency::Normal,
             deliver_after: None,
+            attachments: Vec::new(),
         }],
         ops: Vec::new(),
     }

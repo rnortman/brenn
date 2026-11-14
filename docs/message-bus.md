@@ -319,6 +319,7 @@ Which reader sees what:
 | Host code (`Messenger::query`, the stores) | the references |
 | 0.2.0 components (`bus.envelope` header), on the backend and on a page | the references, in full |
 | Attach v5 sessions (`Deliver`), a remote's and every page's, replayed and live | the references, in full |
+| Attach v6 sessions (a remote's) | the references, in full, and the bytes by handle |
 | A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, the intercept outcome) | each name with `size` and `content_type`; **no id**. It names an attachment by (message id, name), below |
 | The eviction archive | the references, in full. The bytes are not archived: an archived message's attachments are not recoverable |
 | 0.1.0 components (`envelope-json`), attach v4 sessions | nothing; the envelope is byte-identical to one without attachments |
@@ -336,9 +337,9 @@ or trap publishes nothing and deletes everything it made. A conversation
 does too, by name, below. Host code's
 `Messenger::publish_from_system_with_attachments` is a further publishing
 entry; the tool substrate publishes a call's request and result through it
-(below). Remotes and pages
-see references as metadata only, and no surface host serves the interface.
-A remote's replay store and a page's rings do not hold the
+(below). A remote attacher on attach v6 does, by handle, below. Pages and
+v4/v5 remotes see references as metadata only, and no surface host serves
+the interface. A remote's replay store and a page's rings do not hold the
 blob, so a reference there can outlive it. `ports.publish` and its siblings
 carry no attachments: a component that republishes a message through them
 sends the body alone.
@@ -411,6 +412,48 @@ A file a conversation attaches is written through a writer that reserves the
 file's whole declared size before any byte crosses, so the store's two keys
 refuse it up front; if the publish is refused or the connection ends, the
 writer and the sealed blob drop and nothing remains.
+
+**A remote attacher is a holder by handle.** On attach v6 a remote's session
+has a blob door when its profile grants one and the host has a blob store;
+`Welcome.blobs` says so and states the bounds below. The session keeps a table
+of **handles** the client mints, each an upload being written or a held blob,
+and every blob frame names one:
+
+- **Opening.** `BlobOpen` names an attachment as **(channel, message id,
+  attachment name)**, never by blob id, and takes a hold on that one blob. The
+  remote must be allowed to subscribe to the channel, asked afresh at every
+  open; a channel outside that authority is a protocol violation. The message
+  must be inside the **channel's** window, as for a conversation — the whole
+  ring, or the newest `standing_retain_depth` retained rows of a durable
+  channel; the remote's own subscribe depth and ceiling play no part — and the
+  tool substrate's four namespaces are refused `ToolChannel`. Both rules are
+  the conversation door's, from the one admission function both doors call,
+  `Messenger::admit_retained_part`; the conversation's read record is not part
+  of it. The answers otherwise are `NotRetained` and `NoSuchAttachment`.
+  `BlobRead` then reads a byte range through the handle, at most one chunk
+  (256 KiB) an answer, and keeps working after the message is evicted.
+- **Uploading.** Only a remote with publish authority (`Welcome.blobs.upload`)
+  may `BlobCreate`: the whole declared size is reserved against the store's
+  two keys before a byte is sent, `BlobWrite` fills it by position and
+  `BlobSeal` makes it a held blob.
+- **Publishing.** `Publish` and each `PublishBatch` entry carry `attachments`,
+  names mapped to held handles, onto a channel the remote may publish to; the
+  message holds the blob as any message does, and a forward of an opened
+  attachment copies no byte. A handle not held answers `AttachmentNotHeld` and
+  publishes nothing.
+- **The session is the holder.** `BlobClose` gives a handle up. When the
+  session ends — however it ends — the table drops: unsealed uploads are
+  deleted, holds are let go, and nothing a remote made survives a detach unless
+  a message names it. The table drops before the session stops counting
+  against `max_sessions`.
+- **Bounds**, per session, each a typed answer: 64 handles (`HandleLimit`);
+  bytes held, 4 × `max_blob_bytes`, the declared sizes of the session's uploads
+  and the sizes of its held blobs, sealed uploads and opened attachments alike,
+  counted per handle (`BytesHeldLimit` on a create and on an open); 4 read
+  answers in flight (`TooManyReads`). An open hold keeps its blob charged after
+  the naming message is evicted, which is why opens count. Across a remote's
+  sessions the bounds multiply by `max_sessions`; nothing bounds a remote over
+  time.
 
 **Bounds.** Three keys in the `messaging` section (`docs/config-dsl.md`):
 `max_blob_bytes` caps one blob's extent (default 64 MiB), `blob_budget_bytes`
@@ -532,11 +575,11 @@ row names is redeemable while the row stays in its window.
 What is not built: the `blobs` interface on a page, save and attach for a
 conversation without a shell tool, connectors that produce blobs, the
 surface's handling of them, attachments on `calls.call` and
-`tools.call-fast`, and transfer of bytes over attach or to a page.
+`tools.call-fast`, and transfer of bytes to a page.
 
 ### 2.1.3 Limits on a remote's stream of messages
 
-At default configuration, for a remote attacher on attach v5. "Operator" names
+At default configuration, for a remote attacher on attach v5 or v6. "Operator" names
 the setting that raises a limit; "fixed" is a compile-time constant. An ingress
 channel (`webhook:`, `mqtt:`) is outside this section: a remote cannot
 subscribe to one, and its subscribe to such an address ends the session as a
@@ -546,6 +589,13 @@ protocol violation.
 |---|---|---|
 | Body cap, one message | 65,536 bytes raw | Operator: `messaging { max_body_bytes }` (restart) |
 | v5 frame cap | 204,800 bytes | Derived from the body cap |
+| v6 frame cap | 274,432 bytes | Derived from the body cap |
+| Blob chunk, one `BlobWrite` or `BlobRead` answer (v6) | 262,144 bytes | Fixed |
+| Blob size (v6) | 64 MiB | Operator: `messaging { max_blob_bytes }` |
+| Blob pool, the whole host (v6) | 1 GiB | Operator: `messaging { blob_budget_bytes }` |
+| Blob handles per session (v6) | 64 | Fixed |
+| Bytes held per session (v6): writers, sealed uploads and opened attachments | 4 × `max_blob_bytes` (256 MiB) | Follows `max_blob_bytes` |
+| Blob read answers in flight per session (v6) | 4 | Fixed |
 | `PublishBatch`, whole frame | 65,536 charged bytes over at most 512 operations; and 4 MiB of bodies per activation, never the binding one below a 4 MiB body cap | The first follows the body cap; the second is fixed |
 | Connection publish bucket (single `Publish`) | burst 60, then 1 per second, per connection | Operator: `publish_burst`, `publish_per_sec` on the `remote` block, up to the bus's `default_send_rate` |
 | Per-(sender, channel) send rate (single `Publish`) | burst 240, then 30 per second | Operator: `messaging { default_send_rate }`, or `send_rate` on the channel |
@@ -576,8 +626,27 @@ What a remote can sustain:
 So a camera frame that fits 64 KiB travels from a remote onto an ephemeral
 channel at 1 per second with no configuration and at up to 30 per second with
 one `remote`-block setting; larger frames need the body cap raised, which
-raises it bus-wide; a durable channel is not a video carrier. These are limits,
-not measurements.
+raises it bus-wide, or a blob per frame on v6; a durable channel is not a
+video carrier. These are limits, not measurements.
+
+A camera frame over the body cap, sent on v6 as a blob per frame onto an
+`ephemeral:` channel, costs **four client frames plus one write per 256 KiB**
+(create, the writes, seal, publish, close) and three answers, none waited for;
+**one connection-bucket token** (the publish) — so the same `publish_per_sec`
+setting that governs body-sized frames governs these, 1 a second by default
+and 30 with one `remote`-block setting — and no send-budget token; and on the
+host **a file create, one file write per 256 KiB and, when the channel's
+window rolls past the frame, an unlink** (no sync on a ring channel). The
+close travels behind the publish (publish-or-drop), so a frame the connection
+bucket refuses is dropped with its blob and the daemon holds no handle past
+the frame it is sending; a daemon that kept handles to retry refused frames
+would meet the 64-handle bound within seconds at the default rate. A reader
+pays an open, one read per 256 KiB and a close. Against that, raising
+`max_body_bytes` costs one frame and no filesystem operation per camera frame,
+and raises the cap for every channel, ring and durable, and every subscriber's
+window copy. On a durable channel a blob per frame also costs a send-budget
+token and two fsyncs, and is not a video carrier, as before. These too are
+limits, not measurements.
 
 **The archive line format.** An `archive` sink writes one JSON object per
 evicted message, one per line. The fields are the envelope's, in its order —

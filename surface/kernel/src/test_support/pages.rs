@@ -41,6 +41,7 @@ pub(crate) fn facts() -> AttachmentFacts {
         max_body_bytes: BODY_CAP,
         max_frame_bytes: 65_536,
         alert_granted: false,
+        blobs: None,
     }
 }
 

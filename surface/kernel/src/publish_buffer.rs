@@ -85,14 +85,6 @@ fn wire_charge(channel: &str, body: Option<&MessageBody>) -> usize {
     Codec::negotiated(SURFACE_ATTACH_VERSION).op_charged_bytes(channel, body)
 }
 
-/// The body a control op writes: an edit's new body, if it states one.
-fn defer_op_body(kind: &DeferOp) -> Option<&MessageBody> {
-    match kind {
-        DeferOp::Edit { body, .. } => body.as_ref(),
-        DeferOp::Cancel => None,
-    }
-}
-
 /// A gate verdict as the component sees it on the publish path.
 ///
 /// The classification is [`brenn_budget::publish_refusal_kind`], shared with the
@@ -341,7 +333,7 @@ impl PublishBuffer {
             .defer_ops
             .iter()
             .filter(|op| channel_is_transportable(&op.channel))
-            .map(|op| wire_charge(&op.channel, defer_op_body(&op.kind)))
+            .map(|op| wire_charge(&op.channel, op.kind.body()))
             .sum();
         entries + ops
     }
@@ -628,7 +620,7 @@ impl PublishBuffer {
                 }
             }
         };
-        let edit_body = defer_op_body(&kind);
+        let edit_body = kind.body();
         let edit_body_len = edit_body.map(MessageBody::len);
         // The wire batch budget, as on the publish path: an op names a channel
         // and an edit carries a body, and the legality law charges both.
@@ -910,6 +902,7 @@ mod tests {
                 body: p.body,
                 urgency: p.urgency,
                 deliver_after: p.deliver_after,
+                attachments: Vec::new(),
             })
             .collect();
         assert_eq!(
@@ -1212,6 +1205,7 @@ mod tests {
                 body: p.body,
                 urgency: p.urgency,
                 deliver_after: p.deliver_after,
+                attachments: Vec::new(),
             })
             .collect();
         assert_eq!(entries.len(), 2);

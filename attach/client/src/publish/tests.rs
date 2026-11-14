@@ -12,6 +12,8 @@ use super::*;
 use brenn_attach_proto::DeferredOpKind;
 use uuid::Uuid;
 
+mod handles;
+
 /// The attachment's advertised body cap, which is also the budget batch
 /// legality spends. Generous against these fixtures' handful of short bodies,
 /// so only the test that states an oversize batch reaches the law.
@@ -34,6 +36,7 @@ fn request(body: &str) -> PublishRequest {
         attribution: Some("alpha".to_string()),
         body: body.into(),
         urgency: Urgency::Normal,
+        attachments: Vec::new(),
     }
 }
 
@@ -43,6 +46,7 @@ fn entry(body: &str) -> BatchEntry {
         body: body.into(),
         urgency: Urgency::Normal,
         deliver_after: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -124,6 +128,7 @@ fn a_publish_frame_carries_the_request_verbatim() {
             body: "hi".into(),
             urgency: Urgency::Normal,
             correlation: Some(7),
+            attachments: Vec::new(),
         }
     );
     assert_eq!(pending.len(), 1);
@@ -463,63 +468,74 @@ fn a_head_the_peer_keeps_refusing_converges_on_counted_drops() {
     assert_eq!(outboxes.parked_len(&alpha()), 1);
 }
 
-/// No retry of a flush refused for a text-only channel can succeed, so it is
-/// dropped and counted rather than parked, and the wire goes to the next flush.
-#[test]
-fn a_text_only_refusal_drops_the_flush_and_pumps_the_next() {
-    let mut outboxes = attached(4);
-    let first = outboxes.flush(&alpha(), batch(&["one"]), now());
-    outboxes.flush(&alpha(), batch(&["two"]), now());
+/// The two refusals no retry can ever turn into an `Ok`: a body that will
+/// never be text, and a handle that is not held.
+const TERMINAL_REFUSALS: [PublishBatchOutcome; 2] = [
+    PublishBatchOutcome::TextOnlyChannel,
+    PublishBatchOutcome::AttachmentNotHeld,
+];
 
-    let answer = outboxes
-        .on_batch_result(
-            correlation_of(&first.frames[0]),
-            PublishBatchOutcome::TextOnlyChannel,
-            now(),
-        )
-        .expect("a correlation this attachment sent");
-    assert_eq!(answer.registrant, alpha());
-    assert_eq!(answer.outcome, PublishBatchOutcome::TextOnlyChannel);
-    assert_eq!(answer.lost, Some(batch(&["one"])));
-    assert_eq!(answer.steps.dropped, vec![alpha()]);
-    assert_eq!(outboxes.dropped_count(&alpha()), 1);
-    assert_eq!(
-        outboxes.rate_limited_count(&alpha()),
-        0,
-        "a text-only refusal is not metering"
-    );
-    assert_eq!(
-        bodies_of(&answer.steps.frames[0]),
-        vec!["two"],
-        "the next flush goes out at once"
-    );
-    assert_eq!(answer.steps.frames.len(), 1);
-    assert_eq!(outboxes.parked_len(&alpha()), 0, "nothing was re-parked");
-    assert_eq!(
-        answer.steps.retry_wakeup, None,
-        "nothing is blocked, so no timer is armed"
-    );
-    assert!(
-        outboxes.on_retry_tick(Millis(2_000)).frames.is_empty(),
-        "the refused flush is never offered again"
-    );
+/// No retry of a flush refused terminally can succeed, so it is dropped and
+/// counted rather than parked, and the wire goes to the next flush.
+#[test]
+fn a_terminal_refusal_drops_the_flush_and_pumps_the_next() {
+    for refusal in TERMINAL_REFUSALS {
+        let mut outboxes = attached(4);
+        let first = outboxes.flush(&alpha(), batch(&["one"]), now());
+        outboxes.flush(&alpha(), batch(&["two"]), now());
+
+        let answer = outboxes
+            .on_batch_result(correlation_of(&first.frames[0]), refusal, now())
+            .expect("a correlation this attachment sent");
+        assert_eq!(answer.registrant, alpha());
+        assert_eq!(answer.outcome, refusal);
+        assert_eq!(answer.lost, Some(batch(&["one"])), "{refusal:?}");
+        assert_eq!(answer.steps.dropped, vec![alpha()], "{refusal:?}");
+        assert_eq!(outboxes.dropped_count(&alpha()), 1, "{refusal:?}");
+        assert_eq!(
+            outboxes.rate_limited_count(&alpha()),
+            0,
+            "{refusal:?} is not metering"
+        );
+        assert_eq!(
+            bodies_of(&answer.steps.frames[0]),
+            vec!["two"],
+            "{refusal:?}: the next flush goes out at once"
+        );
+        assert_eq!(answer.steps.frames.len(), 1, "{refusal:?}");
+        assert_eq!(
+            outboxes.parked_len(&alpha()),
+            0,
+            "{refusal:?}: nothing was re-parked"
+        );
+        assert_eq!(
+            answer.steps.retry_wakeup, None,
+            "{refusal:?}: nothing is blocked, so no timer is armed"
+        );
+        assert!(
+            outboxes.on_retry_tick(Millis(2_000)).frames.is_empty(),
+            "{refusal:?}: the refused flush is never offered again"
+        );
+    }
 }
 
 #[test]
-fn a_text_only_refusal_after_deregistration_hands_the_lost_flush_back() {
-    let mut outboxes = attached(4);
-    let sent = outboxes.flush(&alpha(), batch(&["one"]), now());
-    let correlation = correlation_of(&sent.frames[0]);
-    outboxes.deregister(&alpha());
+fn a_terminal_refusal_after_deregistration_hands_the_lost_flush_back() {
+    for refusal in TERMINAL_REFUSALS {
+        let mut outboxes = attached(4);
+        let sent = outboxes.flush(&alpha(), batch(&["one"]), now());
+        let correlation = correlation_of(&sent.frames[0]);
+        outboxes.deregister(&alpha());
 
-    let answer = outboxes
-        .on_batch_result(correlation, PublishBatchOutcome::TextOnlyChannel, now())
-        .expect("the correlation survives its registrant");
-    assert_eq!(answer.outcome, PublishBatchOutcome::TextOnlyChannel);
-    assert_eq!(answer.lost, Some(batch(&["one"])));
-    assert!(answer.steps.frames.is_empty());
-    assert!(answer.steps.dropped.is_empty());
-    assert!(!outboxes.is_registered(&alpha()));
+        let answer = outboxes
+            .on_batch_result(correlation, refusal, now())
+            .expect("the correlation survives its registrant");
+        assert_eq!(answer.outcome, refusal);
+        assert_eq!(answer.lost, Some(batch(&["one"])), "{refusal:?}");
+        assert!(answer.steps.frames.is_empty(), "{refusal:?}");
+        assert!(answer.steps.dropped.is_empty(), "{refusal:?}");
+        assert!(!outboxes.is_registered(&alpha()));
+    }
 }
 
 // --- the embedder's own discard ----------------------------------------------
@@ -892,6 +908,7 @@ fn an_attach_re_validates_every_queued_flush_against_the_new_contract() {
                 body: "drop".into(),
                 urgency: Urgency::Normal,
                 deliver_after: None,
+                attachments: Vec::new(),
             }],
             ops: Vec::new(),
         },

@@ -595,6 +595,11 @@ impl TempBlobDir {
     pub fn holds_file(&self, id: &crate::BlobId) -> bool {
         brenn_messaging_store::testutils::holds_file(&self.0, id)
     }
+
+    /// The name of every entry in the directory, sorted.
+    pub fn files(&self) -> Vec<String> {
+        brenn_messaging_store::testutils::blob_files(&self.0)
+    }
 }
 
 impl Default for TempBlobDir {

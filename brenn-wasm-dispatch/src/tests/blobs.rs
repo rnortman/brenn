@@ -13,8 +13,7 @@
 //! runs it and `docs/blob-store-timings.md` records a run.
 
 use super::non_text::{
-    READER, activate, attach_subscribers, consumer, input, output, output_specs, report_channel,
-    results, unattached_messenger,
+    READER, activate, attach_subscribers, report_channel, results, unattached_messenger,
 };
 use super::*;
 
@@ -221,15 +220,6 @@ const NOTHING: BlobUsage = BlobUsage {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// Epoch milliseconds an hour from now: a `deliver-after` no test reaches

@@ -8,14 +8,15 @@
 
 mod v4;
 mod v5;
+mod v6;
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BatchDeferredOp, BatchEntry, BatchIllegal, ClientFrame, DeferredOpKind, MAX_BATCH_OPS,
-    MessageBody, SUPPORTED_VERSIONS, ServerFrame, VersionRange,
+    BatchDeferredOp, BatchEntry, BatchIllegal, ClientFrame, MAX_BATCH_OPS, MessageBody,
+    PublishAttachment, SUPPORTED_VERSIONS, ServerFrame, VersionRange,
 };
 
 /// One websocket message, as either end writes or reads it.
@@ -102,6 +103,7 @@ pub struct Codec {
 enum Version {
     V4,
     V5,
+    V6,
 }
 
 impl Codec {
@@ -121,6 +123,7 @@ impl Codec {
         let version = match version {
             4 => Version::V4,
             5 => Version::V5,
+            6 => Version::V6,
             // A supported version with no codec: caught by any test that
             // builds the codec of every supported version.
             other => panic!("attach codec: no codec for supported version {other}"),
@@ -132,6 +135,7 @@ impl Codec {
         match self.version {
             Version::V4 => 4,
             Version::V5 => 5,
+            Version::V6 => 6,
         }
     }
 
@@ -140,6 +144,15 @@ impl Codec {
         match self.version {
             Version::V4 => v4::CARRIES_NON_TEXT_BODIES,
             Version::V5 => v5::CARRIES_NON_TEXT_BODIES,
+            Version::V6 => v6::CARRIES_NON_TEXT_BODIES,
+        }
+    }
+
+    /// Whether this version has the blob frames and publish attachments.
+    pub(crate) fn carries_blob_transfer(self) -> bool {
+        match self.version {
+            Version::V4 | Version::V5 => false,
+            Version::V6 => true,
         }
     }
 
@@ -147,6 +160,7 @@ impl Codec {
         match self.version {
             Version::V4 => v4::encode_client(frame),
             Version::V5 => v5::encode_client(frame),
+            Version::V6 => v6::encode_client(frame),
         }
     }
 
@@ -154,6 +168,7 @@ impl Codec {
         match self.version {
             Version::V4 => v4::encode_server(frame),
             Version::V5 => v5::encode_server(frame),
+            Version::V6 => v6::encode_server(frame),
         }
     }
 
@@ -161,6 +176,7 @@ impl Codec {
         match self.version {
             Version::V4 => v4::decode_client(msg),
             Version::V5 => v5::decode_client(msg),
+            Version::V6 => v6::decode_client(msg),
         }
     }
 
@@ -168,6 +184,7 @@ impl Codec {
         match self.version {
             Version::V4 => v4::decode_server(msg),
             Version::V5 => v5::decode_server(msg),
+            Version::V6 => v6::decode_server(msg),
         }
     }
 
@@ -182,6 +199,7 @@ impl Codec {
         match self.version {
             Version::V4 => v4::carries(body),
             Version::V5 => v5::carries(body),
+            Version::V6 => v6::carries(body),
         }
     }
 
@@ -195,11 +213,30 @@ impl Codec {
         match self.version {
             Version::V4 => v4::op_charge(channel, body),
             Version::V5 => v5::op_charge(channel, body),
+            Version::V6 => v6::op_charge(channel, body),
+        }
+    }
+
+    /// What a batch's attachments charge against the body cap under this
+    /// version: each name's length plus [`ATTACHMENT_OVERHEAD_BYTES`](crate::ATTACHMENT_OVERHEAD_BYTES).
+    /// The second summand, beside [`op_charged_bytes`](Codec::op_charged_bytes),
+    /// of an entry's charge.
+    ///
+    /// # Panics
+    ///
+    /// On a non-empty list under a version that does not
+    /// [`carries_blob_transfer`](crate::carries_blob_transfer).
+    pub fn attachments_charged_bytes(self, attachments: &[PublishAttachment]) -> usize {
+        match self.version {
+            Version::V4 | Version::V5 => no_attachments(attachments),
+            Version::V6 => v6::attachments_charge(attachments),
         }
     }
 
     /// What a batch's two lists charge against the body cap: the sum of
-    /// [`op_charged_bytes`](Codec::op_charged_bytes) over every operation.
+    /// [`op_charged_bytes`](Codec::op_charged_bytes) over every operation, plus
+    /// [`attachments_charged_bytes`](Codec::attachments_charged_bytes) over every
+    /// entry.
     ///
     /// A batch is charged as a whole rather than per entry because it travels as
     /// one frame: what has to be bounded is the frame, and one budget spent
@@ -215,6 +252,7 @@ impl Codec {
         match self.version {
             Version::V4 => v4::batch_charged_bytes(publishes, deferred_ops),
             Version::V5 => v5::batch_charged_bytes(publishes, deferred_ops),
+            Version::V6 => v6::batch_charged_bytes(publishes, deferred_ops),
         }
     }
 
@@ -238,6 +276,7 @@ impl Codec {
         match self.version {
             Version::V4 => v4::check_batch_legality(publishes, deferred_ops, max_body_bytes),
             Version::V5 => v5::check_batch_legality(publishes, deferred_ops, max_body_bytes),
+            Version::V6 => v6::check_batch_legality(publishes, deferred_ops, max_body_bytes),
         }
     }
 
@@ -259,6 +298,7 @@ impl Codec {
         match self.version {
             Version::V4 => v4::max_client_frame_bytes(max_body_bytes),
             Version::V5 => v5::max_client_frame_bytes(max_body_bytes),
+            Version::V6 => v6::max_client_frame_bytes(max_body_bytes),
         }
     }
 
@@ -275,35 +315,44 @@ impl Codec {
         match self.version {
             Version::V4 => v4::batch_frame_bytes(attribution, publishes, deferred_ops),
             Version::V5 => v5::batch_frame_bytes(attribution, publishes, deferred_ops),
+            Version::V6 => v6::batch_frame_bytes(attribution, publishes, deferred_ops),
         }
     }
 }
 
-/// A batch's charge under a version's per-operation charge `op_charge`.
+/// A batch's charge under a version's per-operation charge `op_charge` and its
+/// charge for an entry's attachments `attachment_charge`.
 fn sum_op_charges(
     publishes: &[BatchEntry],
     deferred_ops: &[BatchDeferredOp],
     op_charge: fn(&str, Option<&MessageBody>) -> usize,
+    attachment_charge: fn(&[PublishAttachment]) -> usize,
 ) -> usize {
     let entries: usize = publishes
         .iter()
-        .map(|entry| op_charge(&entry.channel, Some(&entry.body)))
+        .map(|entry| {
+            op_charge(&entry.channel, Some(&entry.body)) + attachment_charge(&entry.attachments)
+        })
         .sum();
     let ops: usize = deferred_ops
         .iter()
-        .map(|op| op_charge(&op.channel, op_body(&op.op)))
+        .map(|op| op_charge(&op.channel, op.op.body()))
         .sum();
     entries + ops
 }
 
-/// The body a control op writes: an edit's new body, if it states one.
-// TODO(deferred-op-body-walk-copies): the same match is written by hand at
-// other sites across the attach crates and the kernel.
-fn op_body(op: &DeferredOpKind) -> Option<&MessageBody> {
-    match op {
-        DeferredOpKind::Edit { body, .. } => body.as_ref(),
-        DeferredOpKind::Cancel => None,
-    }
+/// The attachment charge of a version with no attachments: nothing.
+///
+/// # Panics
+///
+/// On a non-empty list, which such a version cannot write: an embedder asks
+/// [`crate::carries_blob_transfer`] before it names a blob.
+fn no_attachments(attachments: &[PublishAttachment]) -> usize {
+    assert!(
+        attachments.is_empty(),
+        "attach: this version cannot carry publish attachments"
+    );
+    0
 }
 
 /// The batch law's two clauses, over a version's own count and charge.
@@ -447,6 +496,7 @@ pub fn read_server_hello(msg: &WireMessage) -> HelloRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DeferredOpKind;
 
     const HELLO_TEXT: &str =
         r#"{"type":"Hello","versions":{"min":4,"max":5},"ident":"attach-client/0.1.0"}"#;
@@ -638,11 +688,14 @@ mod tests {
             let codec = Codec::negotiated(version);
             let summed: usize = publishes
                 .iter()
-                .map(|entry| codec.op_charged_bytes(&entry.channel, Some(&entry.body)))
+                .map(|entry| {
+                    codec.op_charged_bytes(&entry.channel, Some(&entry.body))
+                        + codec.attachments_charged_bytes(&entry.attachments)
+                })
                 .chain(
                     deferred_ops
                         .iter()
-                        .map(|op| codec.op_charged_bytes(&op.channel, super::op_body(&op.op))),
+                        .map(|op| codec.op_charged_bytes(&op.channel, op.op.body())),
                 )
                 .sum();
             assert_eq!(

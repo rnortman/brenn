@@ -213,6 +213,7 @@ fn flush_batch() -> FlushBatch {
             body: r#"{"n":1}"#.into(),
             urgency: WireUrgency::Normal,
             deliver_after: None,
+            attachments: Vec::new(),
         }],
         ops: Vec::new(),
     }

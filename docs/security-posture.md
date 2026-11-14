@@ -791,8 +791,10 @@ by reference (`docs/message-bus.md` §2.1.2a).
   an id read from a header, a body or a component's own store opens nothing.
   A handle dies with the activation, except one a tool completion named
   (below). Publishing with attachments needs `ports` as well. A conversation
-  forwards, saves and attaches blobs by name (below). Remotes and pages still
-  cannot create a blob or read one's bytes. Host code's
+  forwards, saves and attaches blobs by name (below). A remote on attach v6
+  does both — reads an attachment's bytes and, with publish authority, creates
+  a blob — through the session's blob door reviewed in §9a; pages still
+  cannot. Host code's
   `Messenger::publish_from_system_with_attachments` carries the tool
   substrate's requests and results, and `Messenger::publish_with_attachments`
   a conversation's sends. Every later door that admits an outside producer or
@@ -836,7 +838,10 @@ by reference (`docs/message-bus.md` §2.1.2a).
   a conversation except on its own app's result inbox: `admit_named` refuses
   it `tool_channel_attachment` after the policy check and before any lookup or
   hold, whatever the policy says and however it came to cover the channel.
-  Naming such a message's body is unaffected. Any later door that lets a
+  Naming such a message's body is unaffected. A remote's `BlobOpen` on these
+  channels is refused `ToolChannel` by the same check, in
+  `Messenger::admit_retained_part`, the admission both doors call, whatever
+  the remote's subscribe matchers cover. Any later door that lets a
   participant read an attachment by policy must exclude these channels the
   same way.
 - **Who may redeem what: a conversation, by (message id, attachment name).** A
@@ -879,6 +884,21 @@ by reference (`docs/message-bus.md` §2.1.2a).
   unsealed at once. A send refused at publish, or a connection that drops,
   leaves no blob. Nothing bounds a conversation over time: over many sends it
   can fill the pool as a component can (`blob-budget-per-component`).
+- **A remote is a producer, and a holder.** A remote session on attach v6 with
+  publish authority creates blobs, each reserved at its declared size before
+  any byte crosses. Every v6 session with the door — subscribe-only included —
+  can keep up to `max_bytes_held` (4 × `max_blob_bytes`) of the pool charged:
+  the declared sizes of its uploads plus the sizes of the blobs it holds,
+  sealed uploads and opened attachments alike, counted per handle, with at
+  most 64 handles. An opened attachment stays charged by the session's hold
+  after its message is evicted, which is why opens count. Over the bound a
+  create or an open is refused `BytesHeldLimit`. Everything the session holds
+  is let go when it ends. The bound is on what the session holds: a blob a
+  durable row named stays charged after the session lets go of it until the
+  next reap, as for every holder. Across a remote's sessions the bound multiplies by
+  `max_sessions`; nothing bounds a remote over time: over many uploads it
+  fills the pool through the windows of the channels it publishes to, as a
+  component does (`blob-budget-per-component`).
 - **What bounds one activation.** Host constants, not configuration: 1 MiB per
   read and per write call, 64 live `blob` and `writer` handles together,
   4,096 calls of `open`, `read`, `create`, `write` and `seal`, and 64 MiB of
@@ -922,8 +942,9 @@ by reference (`docs/message-bus.md` §2.1.2a).
   attachment's name, size and content type, never its id and never its
   bytes in its context (§7.5's reason applies). A component is shown ids in
   its envelope headers and can redeem none of them by id. No door redeems by
-  id: a component names by handle and a conversation by (message id,
-  attachment name), under the rule above.
+  id: a component names by handle, a conversation by (message id,
+  attachment name), under the rule above, and a remote by session handle,
+  obtained by (channel, message id, attachment name) or by its own upload.
 - **The attachment name is the bound on producer text a conversation sees.**
   1 to 64 bytes of `[A-Za-z0-9._-]`, starting alphanumeric, refused at
   construction: no whitespace, no markup, no control characters.
@@ -1401,21 +1422,95 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   the route answers `503` with a warning and no security event: a remote at its
   cap is an operator's topology or a netsplit corpse awaiting the heartbeat
   watchdog, and banning the pod's IP for either turns a transient into an outage.
-- **The route serves two wire versions, each strict, and decodes once.** It
-  serves attach protocol v4 (every frame JSON text, bodies strings) and v5
-  (the body-carrying frames binary: a big-endian `u32` header length, a strict
-  JSON header with a `{len, content_type}` descriptor per body, then the raw
-  bodies), negotiated by the frozen `Hello`. A frame malformed for the
-  session's version is a violation with no fallback decoding: a binary message
-  under v4, a text message of a binary kind or a binary message of a text kind
-  under v5, a v5 header whose lengths disagree with the bytes after it, a
-  malformed content type, a text body that is not UTF-8. The decoder compares
-  every peer-supplied length with the bytes that remain and never sums them,
-  so no input makes it panic or wrap. The websocket read cap is set at the
-  upgrade, before a version is agreed, to the largest frame cap among the
-  served versions; after negotiation each frame is checked against its own
-  version's cap (204 800 bytes for v5 at the default body cap, against v4's
-  532 480), and a frame over it is the existing over-cap violation.
+- **The route serves three wire versions and decodes once; v6 is strict, v4
+  and v5 strict but for one gap.** It serves attach protocol v4 (every frame
+  JSON text, bodies strings), v5 (the body-carrying frames binary: a
+  big-endian `u32` header length, a strict JSON header with a
+  `{len, content_type}` descriptor per body, then the raw bodies) and v6 (v5
+  plus the blob transfer frames below), negotiated by the frozen `Hello`. v6
+  refuses an unknown key in every frame; v4 and v5 accept an unknown key
+  beside the tag of a field-less tagged variant — from a client, a
+  `PublishBatch` deferred op `cancel` — without a violation, until
+  `attach-tagged-unit-variant-strictness` in `TODO.md` is done. A frame
+  malformed for the session's version is a violation with no fallback
+  decoding: a binary message under v4, a text message of a binary kind or a
+  binary message of a text kind under v5 and v6, a header whose lengths
+  disagree with the bytes after it, a malformed content type, a text body
+  that is not UTF-8. The decoder compares every peer-supplied length with the
+  bytes that remain and never sums them, so no input makes it panic or wrap.
+  The websocket read cap is set at the upgrade, before a version is agreed, to
+  the largest frame cap among the served versions; after negotiation each
+  frame is checked against its own version's cap (204 800 bytes for v5 and
+  274 432 for v6 at the default body cap, against v4's 532 480), and a frame
+  over it is the existing over-cap violation.
+- **The transfer frames are strict and every number is a checked `u64`.** v6's
+  blob frames are strict like the rest: an unknown field, `attachments` given
+  as anything but a list, an attachment name outside the grammar, a
+  `BlobWrite` or `BlobReadResult` whose `len` disagrees with its body section
+  in either direction, a text `BlobWrite` or a binary `BlobRead` are
+  violations. Offsets, lengths and sizes are `u64` from the peer, and every
+  `offset + len` is a checked addition: overflow is `OutOfRange` for a read
+  and a violation for a write, never a wrap or a panic.
+- **Blob authority is the profile's, re-derived per frame.** A session has a
+  blob door only on v6, with a profile that grants one and a host with a blob
+  store; `Welcome.blobs` says so, and without it every blob frame and every
+  publish with attachments is a violation. `BlobOpen` names an attachment by
+  (channel, message id, attachment name), never by blob id, and is admitted
+  only when the profile grants subscribe authority over the channel, asked at
+  that open — outside it the same violation a `Subscribe` there is — and the
+  message is inside the **channel's** window, not the remote's subscribe
+  depth or ceiling. The tool substrate's channels are refused `ToolChannel`
+  by the admission the conversation door shares (§7.6), logged at `warn` on a
+  session's first. `BlobCreate` needs the door's `upload`, granted only to a
+  remote with publish authority on some channel; a publish naming handles is
+  judged by the existing publish authority for its channel.
+- **What a stolen token now reaches.** On v6, the bytes of every attachment of
+  every message in the window of every channel the remote may subscribe to,
+  the tool channels excepted — where a v5 token reached their references
+  only — and the ability to keep up to `max_bytes_held` (4 × `max_blob_bytes`)
+  of the pool charged per session, by uploads or by holding opened attachments
+  past their messages' eviction (the second is open to a subscribe-only
+  remote), refused beyond that with a typed `BytesHeldLimit` on create and on
+  open. The bound is on what the session holds: a blob a durable row named,
+  once the session lets go of it, stays charged until the next reap, as it
+  does for every holder (`docs/message-bus.md` §2.1.2a). A remote with publish
+  authority is a producer against `blob_budget_bytes` as well (§7.6).
+- **The session is the holder, and nothing survives a detach.** Handles are
+  client-minted and attachment-scoped; the table holds every blob the session
+  names and is dropped when the session ends, however it ends: an unsealed
+  upload's bytes are deleted, holds are let go. A handle carries no
+  attribution and outlives no attachment. The table is dropped before the
+  session's place in the remote's session count is released, so a session that
+  no longer counts against `max_sessions` holds no blob, and the per-session
+  bound times `max_sessions` bounds what a remote's sessions hold at any
+  moment. That closes the blob half only. The writer's queued frames — at most
+  four read answers among them — are not blobs: an ended session's writer keeps
+  them until they are written or its watchdog stops it, which can be after the
+  slot is free. The number of ended sessions whose writers are still draining
+  is not bounded — nothing counts them and the drain has no overall deadline —
+  so the memory their queues pin is not bounded per remote
+  (`attach-ended-session-drain-unbounded` in `TODO.md`).
+- **A pipelined frame is answered, not punished.** A client may send a whole
+  sequence — create, writes, seal, publish, close — without waiting, so every
+  frame valid in the state its predecessors would leave is an answer or a
+  no-op in the state a refused predecessor leaves; only states no refusal
+  produces are violations. The table a reviewer checks a new blob frame
+  against (a handle is absent, a writer, or held):
+
+  | Frame | absent | writer | held |
+  |---|---|---|---|
+  | `BlobCreate`, `BlobOpen` | proceeds | violation | violation |
+  | `BlobWrite` | dropped, counted | written | violation |
+  | `BlobSeal` | answer `UnknownHandle` | answer `Ok` or `Incomplete` | violation |
+  | `BlobRead` | answer `UnknownHandle` | answer `NotSealed` | read |
+  | a publish naming it | answer `AttachmentNotHeld` | answer `AttachmentNotHeld` | published |
+  | `BlobClose` | no-op, counted | bytes deleted | hold dropped |
+
+  `NotRetained`, `NoSuchAttachment`, `ToolChannel` and `NotSealed` are answers
+  and never fail2ban signal; a channel outside subscribe authority is a
+  violation. Each per-session bound — 64 handles, `max_bytes_held`, four read
+  answers in flight — is a typed answer advertised in `Welcome`, and a
+  session's first refusal of each is logged at `warn`.
 - **A remote's bytes and content types are its assertion.** A v5 remote
   publishes bodies of bytes with a content type; the type is validated for
   syntax and, for a text type, the bytes for UTF-8 (`MessageBody::from_parts`),
@@ -1452,6 +1547,37 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   same transport: the durable resume seq is the global message rowid (§6.1), the
   subscribe-op bucket is per-connection (§6.2), and durable publish writes are
   gated only by that per-connection bucket (§6.3).
+- **Transfer frames are unmetered, and an unmetered `BlobOpen` on a durable
+  channel contends for the host's one database lock.** `BlobWrite` and
+  `BlobRead` are bounded in space (blob size, the pool, the session's handle
+  and bytes-held bounds, the in-flight read window) and by the socket in time,
+  with no rate: a camera at 15 frames a second of 300 KB is 4.5 MB/s of
+  legitimate upload, so a default byte rate that admits it bounds nothing. A
+  session can keep one 256 KiB disk operation in progress, continuously.
+  `BlobOpen` on a `brenn:` channel runs its admission under the messenger's
+  database lock — one lookup by message id and one count of the channel's
+  newer retained rows; on an `ephemeral:` channel it takes only that ring's
+  lock.
+  - *What it enables:* a remote token, or a stolen one, looping
+    `BlobOpen`/`BlobClose` over a durable channel it may subscribe to slows
+    every durable publish and read on the host. Nothing but the session's
+    open counter records the loop.
+  - *Why it is bounded:* the lock grants in arrival order and a session
+    handles one frame at a time, so each session has at most one admission
+    waiting or running; another publisher waits behind at most one admission
+    per looping session — two per remote at the default `max_sessions` —
+    never indefinitely. One admission is an indexed lookup plus a count
+    bounded by the channel's retained rows: sustained degradation, not a stall
+    and not growth.
+  - *Why it is accepted:* it is the exposure §6.5 accepts for another
+    unmetered, database-reading frame family, on the same grounds — a
+    household deployment whose remotes the operator admits — and an open's
+    legitimate rate on a durable channel is whatever its publishers' rate is.
+  - *What a later meter costs:* `BlobOpenOutcome` has no rate refusal and a
+    conforming reader's open cannot be made a violation, so metering opens is
+    a new wire version.
+  - *Revisit trigger:* a remote outside the operator's trust, or an admission
+    whose cost stops being bounded by the channel's window.
 
 **What the reviewer verifies:** the token is file-backed, mode-checked, and
 compared in constant time — the comparison is digest-based and fixed-width, so
@@ -1461,7 +1587,18 @@ dummy digest for exactly the same work; every authentication failure is
 indistinguishable to the caller and produces exactly one `AuthFailure`; the
 profile's scheme match is exhaustive and denies by default; the subscription cap
 is enforced; the slug is sanitized wherever it reaches a log or event; the cap
-rejection emits no security event.
+rejection emits no security event. For the blob door: every v6 frame decodes
+strictly and every peer-supplied `offset + len` is a checked addition; the door
+exists only where the version, the profile's grant and the store all allow it,
+and `Welcome.blobs` agrees with the handlers; `BlobOpen` re-derives subscribe
+authority from the profile at every open, admits by the channel's window and
+refuses the tool channels through `Messenger::admit_retained_part`, and no blob
+frame takes or returns a blob id; `BlobCreate` needs `upload`; each frame
+behaves per the handle-state table above, so a pipelined frame behind a refusal
+is an answer or a no-op; the handle bound and the bytes-held bound are checked
+on both create and open — opens count their blob's size — and the read window
+is held in the writer queue; the session's table is dropped at every kind of
+session end, before its registry slot is released; and `BlobOpen` stays unmetered only under the accepted risk above.
 
 ---
 

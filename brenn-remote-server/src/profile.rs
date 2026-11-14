@@ -27,7 +27,8 @@ use brenn_lib::messaging::{AttachScope, ParticipantId, SubscriberEntry, Subscrib
 use brenn_messaging::MissingChannelPosture;
 
 use brenn_attach_server::profile::{
-    AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts, TextOnlyPosture,
+    AttachProfile, BlobGrant, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts,
+    TextOnlyPosture,
 };
 use brenn_attach_server::registry::SessionCaps;
 
@@ -63,6 +64,9 @@ pub struct RemoteProfile {
     policy: Arc<AppPolicy>,
     /// Whether this remote's grants include the alert plane.
     alert_granted: bool,
+    /// Whether this remote holds publish authority of either scheme, which is
+    /// what lets it create blobs.
+    may_publish: bool,
     /// The operator-tuned per-connection publish bucket.
     publish_rate: PublishRate,
     /// Concurrent sessions admitted, per attacher and per account alike.
@@ -86,6 +90,10 @@ impl RemoteProfile {
             ephemeral_subscribe_ceilings: resolved.ephemeral_subscribe_ceilings.clone(),
             policy: Arc::new(resolved.policy.clone()),
             alert_granted: resolved.policy.has_grant(AppCapability::SurfaceAlert),
+            // Boot proved each publish grant comes with its ACL, so a grant
+            // here is authority over at least one channel.
+            may_publish: resolved.policy.has_grant(AppCapability::MessagingPublish)
+                || resolved.policy.has_grant(AppCapability::EphemeralPublish),
             publish_rate: PublishRate {
                 burst: resolved.publish_burst,
                 per_sec: resolved.publish_per_sec,
@@ -254,6 +262,16 @@ impl AttachProfile for RemoteProfile {
             // woken by anything on a channel it holds, not by an urgency
             // threshold it never declared.
             wake_min: None,
+        })
+    }
+
+    fn blob_grant(&self) -> Option<BlobGrant> {
+        // A remote has the door whenever its session speaks a version that
+        // carries it. Creating a blob is for a remote that can publish one
+        // somewhere: a subscribe-only remote could never name what it
+        // uploaded, so reserving pool bytes would be a grant nobody wrote.
+        Some(BlobGrant {
+            upload: self.may_publish,
         })
     }
 }

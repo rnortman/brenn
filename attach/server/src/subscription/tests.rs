@@ -17,13 +17,12 @@ use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::{SubscriberEntry, SubscriberEntryKind};
 use brenn_messaging::{GapReason as BusGapReason, Replay};
 use brenn_messaging_store::store::{ResumeCursor, StoreRetained};
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::*;
 use crate::profile::SubscriptionFacts;
 use crate::session::AttachSessionCtx;
-use crate::test_support::{AttachCtxBuilder, TestProfile, one_channel_messenger};
+use crate::test_support::{AttachCtxBuilder, FrameRx, TestProfile, one_channel_messenger};
 
 /// The one channel every fixture declares, scheme-qualified and bare.
 const ADDR: &str = "brenn:durable-demo";
@@ -39,14 +38,14 @@ async fn attach_at(
     db: &Db,
     push_depth: u64,
     retain_depth: u64,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+) -> (AttachSessionCtx, FrameRx, Uuid) {
     attach_with_floor(db, push_depth, retain_depth, true).await
 }
 
 /// The same attachment with the delivery floor denying [`ADDR`] — the policy
 /// holds the transport grant but no matcher covering the channel, so the profile
 /// still admits the subscription and every send path must refuse it.
-async fn attach_denied(db: &Db) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+async fn attach_denied(db: &Db) -> (AttachSessionCtx, FrameRx, Uuid) {
     attach_with_floor(db, 8, 8, false).await
 }
 
@@ -57,7 +56,7 @@ async fn attach_with_floor(
     push_depth: u64,
     retain_depth: u64,
     granted: bool,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+) -> (AttachSessionCtx, FrameRx, Uuid) {
     let (messenger, channel_uuid) = one_channel_messenger(db, BARE).await;
 
     let mut policy = AppPolicy::default();
@@ -87,7 +86,7 @@ async fn attach_with_floor(
 
 /// The common fold: both knobs at 8, wide enough that no test trips the clamp
 /// unless it means to.
-async fn attach(db: &Db) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+async fn attach(db: &Db) -> (AttachSessionCtx, FrameRx, Uuid) {
     attach_at(db, 8, 8).await
 }
 
@@ -274,7 +273,7 @@ fn subscribe_result(frame: &ServerFrame) -> (u32, Option<ProtoGapReason>) {
 }
 
 /// Drain every frame the handlers enqueued.
-fn frames(rx: &mut mpsc::Receiver<ServerFrame>) -> Vec<ServerFrame> {
+fn frames(rx: &mut FrameRx) -> Vec<ServerFrame> {
     let mut out = Vec::new();
     while let Ok(frame) = rx.try_recv() {
         out.push(frame);
@@ -1121,7 +1120,7 @@ impl Class {
 /// admitting it at depth 8 both ways and the policy covering it.
 struct ParityRig {
     ctx: AttachSessionCtx,
-    rx: mpsc::Receiver<ServerFrame>,
+    rx: FrameRx,
     class: Class,
     channel_uuid: Uuid,
     db: Db,
@@ -1200,6 +1199,7 @@ async fn parity_commit(rig: &mut ParityRig, body: &str) {
                         body: body.into(),
                         urgency: brenn_lib::messaging::Urgency::Normal,
                         publish_ts: chrono::Utc::now(),
+                        attachments: brenn_messaging_store::blob::HeldAttachments::none(),
                     },
                 )
                 .await;
@@ -1433,7 +1433,7 @@ async fn attach_runtime(
     max_active_subscriptions: usize,
     runtime_entry: Option<SubscriberEntry>,
     standing: Depth,
-) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+) -> (AttachSessionCtx, FrameRx, Uuid) {
     let (messenger, channel_uuid) =
         crate::test_support::one_channel_messenger_at_standing(db, BARE, standing).await;
 

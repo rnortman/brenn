@@ -19,7 +19,8 @@ use brenn_lib::messaging::{AttachScope, ComponentGrant, ParticipantId, Subscribe
 use brenn_messaging::MissingChannelPosture;
 
 use brenn_attach_server::profile::{
-    AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts, TextOnlyPosture,
+    AttachProfile, BlobGrant, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts,
+    TextOnlyPosture,
 };
 use brenn_attach_server::registry::SessionCaps;
 
@@ -355,6 +356,11 @@ impl AttachProfile for SurfaceProfile {
     fn runtime_entry(&self, _channel: &str) -> Option<SubscriberEntry> {
         // A surface's directory entries are folded from its declared bindings
         // at boot, before it can attach at all.
+        None
+    }
+
+    fn blob_grant(&self) -> Option<BlobGrant> {
+        // A surface has no blob door yet: no page drives the blob frames.
         None
     }
 }

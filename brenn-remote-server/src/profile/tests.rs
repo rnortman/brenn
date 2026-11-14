@@ -284,6 +284,26 @@ fn the_alert_grant_and_publish_bucket_are_the_operators() {
     assert!(!silent.alert_granted());
 }
 
+/// **A remote has the blob door; it may create blobs only with publish
+/// authority of either scheme.**
+#[test]
+fn the_blob_grant_uploads_only_with_publish_authority() {
+    let (publisher, _token) = fleet();
+    assert_eq!(publisher.blob_grant(), Some(BlobGrant { upload: true }));
+
+    let (ephemeral, _token) = build(|token| RemoteConfigRaw {
+        ephemeral_publish_acl: vec![ChannelMatcherRaw::Prefix("cam.".to_string())],
+        ..remote_raw("camera", token, &[AttachGrant::EphemeralPublish])
+    });
+    assert_eq!(ephemeral.blob_grant(), Some(BlobGrant { upload: true }));
+
+    let (reader, _token) = build(|token| RemoteConfigRaw {
+        subscribe_acl: vec![remote_prefix_ceiling("cam.", 4, 4)],
+        ..remote_raw("viewer", token, &[AttachGrant::Subscribe])
+    });
+    assert_eq!(reader.blob_grant(), Some(BlobGrant { upload: false }));
+}
+
 /// **No parked-set mirrors without an attribution to hold one.** The seeding
 /// sequence walks an empty list, and the budget scope is the operator's slug.
 #[test]

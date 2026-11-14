@@ -137,6 +137,7 @@ fn client_publish_is_pinned() {
             body: "{}".into(),
             urgency: Urgency::High,
             correlation: Some(9),
+            attachments: Vec::new(),
         },
         json!({
             "type": "Publish",
@@ -160,6 +161,7 @@ fn client_publish_omits_an_absent_attribution() {
             body: "{}".into(),
             urgency: Urgency::Normal,
             correlation: None,
+            attachments: Vec::new(),
         },
         json!({
             "type": "Publish",
@@ -182,12 +184,14 @@ fn client_publish_batch_is_pinned() {
                     body: "now".into(),
                     urgency: Urgency::Normal,
                     deliver_after: None,
+                    attachments: Vec::new(),
                 },
                 BatchEntry {
                     channel: "brenn:orders".to_string(),
                     body: "later".into(),
                     urgency: Urgency::Low,
                     deliver_after: Some(1_700_000_000_000),
+                    attachments: Vec::new(),
                 },
             ],
             deferred_ops: vec![
@@ -248,6 +252,7 @@ fn client_publish_batch_omits_an_empty_op_list() {
                 body: "x".into(),
                 urgency: Urgency::VeryLow,
                 deliver_after: None,
+                attachments: Vec::new(),
             }],
             deferred_ops: vec![],
         },
@@ -327,6 +332,7 @@ fn server_welcome_is_pinned() {
             max_body_bytes: 65_536,
             max_frame_bytes: 532_480,
             alert_granted: true,
+            blobs: None,
         },
         json!({
             "type": "Welcome",
@@ -740,6 +746,7 @@ fn publish(body: MessageBody) -> ClientFrame {
         body,
         urgency: Urgency::Normal,
         correlation: None,
+        attachments: Vec::new(),
     }
 }
 

@@ -17,23 +17,6 @@ options affects every HTTP and websocket route and wants a ruling. Code site
 (`TODO(surface-small-row-delivery-latency)`): `axum::serve` in
 `brenn-bootstrap/src/lib.rs`.
 
-## `deferred-op-body-walk-copies`
-
-Refactor, no ruling wanted: "the body a deferred op writes" (`Cancel` none,
-`Edit` its optional body) is still matched by hand in
-`attach/server/src/publish.rs` (two sites), in `FlushBatch::carried_by` in
-`attach/client/src/publish.rs` and in `attach/client/src/store.rs`, beside
-one private helper per crate (`op_body` in `attach/proto/src/wire/mod.rs`,
-`defer_op_body` in `surface/kernel/src/publish_buffer.rs`, `op_body` in
-`surface/kernel/src/outbound.rs`); every match is exhaustive, so a new
-variant fails to compile, but a change to which bodies an op carries — blobs
-attached to messages — must find each one. Done when `DeferredOpKind` and
-`brenn_attach_client::store::DeferOp` each have one public `body()` accessor
-and every site uses it; the accessor adds to `brenn-attach-client`'s public
-API, which out-of-tree daemons take by pin, so it lands with the design that
-next changes that API. Code site (`TODO(deferred-op-body-walk-copies)`):
-`op_body` in `attach/proto/src/wire/mod.rs`.
-
 ## `efficiency-surface-type-check-recompiles-every-kind-every-scan`
 
 Every surface asset scan — at boot and at every reload, inline in the
@@ -170,8 +153,8 @@ belongs with the surface host's byte path. Code site
 ## `attach-v4-beside-v5`
 
 Owner ruling wanted: whether, and for how long, the remote route serves
-attach protocol v4 beside v5. From the release carrying this entry the server
-holds v4 and v5 sessions at once. The owner's spec for the binary bus asks for
+attach protocol v4 beside v5 and v6. The route serves v4, v5 and v6, and the
+server holds sessions of all three at once. The owner's spec for the binary bus asks for
 a dual period for the WIT component contract only; the dual service of two
 wire versions was chosen by the project's owner-proxy, against the
 repository's no-backward-compat default, because the remote route has no
@@ -192,15 +175,14 @@ them outside its test module) with its test files `v4/fixtures.rs` and
 `Version::V4` dispatch arms in `attach/proto/src/wire/mod.rs` and the server's
 v4-only branches (the `Unavailable` answer to a `non_text` subscribe, the v4
 `Deliver` text assertion, the deferred view's cut of non-text entries), a few
-dozen lines. The page is not part of the question. (2) Blob
-transfer for remote attachers is not designed, and under the protocol's
-strict-schema rule ("Any schema change bumps the transport version") it is
-expected to arrive as a version 6 unless that design's growth rule for v5 says
-otherwise: when it does, is the oldest served version dropped, or are three
-served? (3) Where is a version's removal announced to daemon authors? Until
-ruled, v4 stays served, and no document or log line names a removal release.
-Code site (`TODO(attach-v4-beside-v5)`): `SUPPORTED_VERSIONS` in
-`attach/proto/src/lib.rs`.
+dozen lines. The page is not part of the question. (2) Answered: blob
+transfer for remote attachers arrived as v6, and three versions are served,
+ruled by the project's owner-proxy. (3) Where is a version's removal announced
+to daemon authors, now that three are served, and does v5 get a removal rule of
+its own or only v4? Until ruled, v4 and v5 stay served, and no document or log
+line names a removal release. Code site (`TODO(attach-v4-beside-v5)`):
+`SUPPORTED_VERSIONS` in `attach/proto/src/lib.rs`, the range 4..=6 the remote
+route serves.
 
 ## `remote-send-budget-knob`
 
@@ -212,7 +194,8 @@ connection bucket and the channel send rate beside it are operator settings.
 Options: leave it (durable channels and batches are not a remote's streaming
 carriers; ephemeral single publishes are); give the `remote` block a budget
 setting bounded as `publish_burst` is; or exempt ephemeral-only batches from
-the draw, as an ephemeral single publish is exempt. Code site
+the draw, as an ephemeral single publish is exempt. A publish carrying
+attachments draws what the same publish without them draws. Code site
 (`TODO(remote-send-budget-knob)`): `brenn-messaging-boot/src/plan.rs`, where a
 remote's budget is assigned.
 
@@ -223,9 +206,102 @@ holding up to `max(push_depth, retain_depth)` rows, and no bound on that
 frame's size was found at either end short of the native client's library
 default (64 MiB a message). A subscription whose window times the body cap
 exceeds it would fail the transport on every reconnect. Needs a design:
-splitting a pass changes how many delivery points it is. Code site
+splitting a pass changes how many delivery points it is. A delivered row's
+header carries up to 32 attachment references (about 13 KiB) that no frame
+bound counts, and a v6 reader fetches from them. Code site
 (`TODO(attach-replay-pass-frame-size)`): `send_pass` in
 `attach/server/src/subscription.rs`.
+
+## `attach-ended-session-drain-unbounded`
+
+An attach session that has ended gives up its place in its attacher's session
+count before its writer task has finished writing the frames still queued
+(`attach_session`'s teardown in `attach/server/src/session.rs`: the
+unregister, then the context's drop, then the writer's await). From then on
+nothing counts it: the session caps count registry entries, and there is no
+cap on ended sessions still draining or on open sockets, per attacher, per
+address or for the server; the global per-address request bucket limits how
+fast attachments start, not how many exist. The drain has no overall
+deadline, only the per-write watchdog of three heartbeats (60 s at the fixed
+20 s heartbeat), so against a peer that completes each write just inside it
+the writer lives for 256 queued frames times the watchdog — over four hours,
+longer with the ticker's pings between them. What one such session pins is
+its queue: up to `OUTBOUND_QUEUE_FRAMES` (256) frames, and a `Deliver` frame
+has no byte bound (`attach-replay-pass-frame-size`). The exits that leave the
+socket open are a protocol violation, a host close and a liveness reap; after
+a peer Close the websocket stack refuses further writes and the writer exits.
+So an authenticated attacher that ends sessions by such an exit, reads slowly
+and attaches again accumulates ended sessions' queues in host memory with no
+bound per attacher. This holds for every served attach version (v4, v5, v6)
+and for the surface route, which share the teardown. The blob pool is not
+part of it: the session's blob table is dropped before the slot is released,
+so a draining session holds no blob.
+
+The work is to bound it. Needs a design, because each way costs something:
+(a) an overall deadline on an ended session's drain — frames a slow peer
+would still have been sent are dropped at the deadline, so its length is the
+decision; (b) count ended-but-draining sessions against the session caps, or
+a cap of their own — a second count beside the registry's, and an attacher at
+it waits on its own old socket; (c) release the slot only after the writer
+has exited — no new count, but every session's slot, and the surface route's
+last-detach decision, then wait on a peer that will not read for as long as
+the drain runs, so it is tolerable only with (a). Done when the memory ended
+sessions' queues can pin is bounded per attacher by a figure
+`docs/security-posture.md` §9a states, and a test pins it: sessions ended by
+a violation against a sink that has stopped accepting writes, repeated past
+the bound, asserting on what the host still holds for them (writer tasks
+alive, or the attach refused) and not on a log line. Code site
+(`TODO(attach-ended-session-drain-unbounded)`): the unregister in
+`attach_session`'s teardown, `attach/server/src/session.rs`.
+
+## `attach-tagged-unit-variant-strictness`
+
+v4's and v5's schemas are documented as strict, but serde's
+`deny_unknown_fields` does not refuse an extra key beside the tag of an
+internally tagged *unit* variant: their decoders accept a client's
+`PublishBatch` op `{"kind":"cancel","x":0}` as a cancel rather than refusing it
+as a violation, and read the same looseness in `Heartbeat`, the publish and
+subscribe outcomes and the gap reason. Both versions are to refuse it: no
+conforming peer writes the key, so the bytes a conforming peer writes, and the
+pinned fixtures, do not change, and no wire version is needed. v6 writes each
+such variant as a field-less struct variant, which writes the same bytes and
+refuses the key. Done = every internally tagged unit variant in v4's and v5's
+schemas refuses an unknown key — at the server as a violation — with a test per
+enum. The variants are in three files: `OpKind`, `Heartbeat`, `Outcome` and
+`BatchOutcome` in each of `attach/proto/src/wire/v4.rs` and
+`attach/proto/src/wire/v5.rs`, and `SubscribeOutcome` and `GapReason` in
+`attach/proto/src/lib.rs`. Those last two are public in-memory types that v4
+and v5 serialize directly, so rewriting their variants in place changes the API
+every binder of the crate sees. Code site
+(`TODO(attach-tagged-unit-variant-strictness)`): `OpKind` in
+`attach/proto/src/wire/v5.rs`, one of the sites above.
+
+## `attach-client-blob-conveniences`
+
+`brenn-attach-client`'s blob plane hands a daemon chunk ranges to read and
+chunks to write; the daemon owns the file I/O and the loop. No one-call form
+moves a whole blob to or from a file. The plane and the driver are complete
+without one. Done = a Rust daemon downloads an attachment to a file and uploads
+a file as a blob in one call each, on the native transport, with a test of each
+against the real server. Code site (`TODO(attach-client-blob-conveniences)`):
+the module docs of `attach/client/src/blobs.rs`.
+
+## `attach-blob-write-io-failure-test`
+
+The attach server's `BlobWrite` handler has an arm for a filesystem error from
+the blob store: the range stays unwritten, the error is logged on the
+session's first and counted after, and the seal then answers `Incomplete`. No
+test reaches it, because nothing in the tree can make a `BlobWriter`'s write
+fail: the store has no fault seam, and an open file stays writable whatever is
+done to its path. The answers a client gets behind an `Incomplete` seal are
+tested from a gap left by the client instead. Reaching the arm needs a way to
+fail a write, which is a choice about the blob store's test surface (a seam in
+`brenn-messaging-store` behind its `testutils` feature, or a filesystem that
+refuses). Done = a test fails a write mid-upload through the attach server and
+sees the range unwritten, the error counted once in the session's counters,
+the seal answered `Incomplete` naming that range, and the session still up.
+Code site (`TODO(attach-blob-write-io-failure-test)`): the incomplete-seal test
+in `attach/server/src/blobs/tests.rs`.
 
 ## `string-contract-removal`
 
@@ -310,7 +386,34 @@ naming it — `messaging_blob_refs` for durable channels; ring channels have no 
 index — with the read policy applied to each. Done = a conversation forwards and saves
 an attachment of an evicted message it read while another readable retained message
 names the same blob, and is refused when none does, each with a test; or the
-documents record that the per-message rule is final and why.
+documents record that the per-message rule is final and why. A remote
+attacher's `BlobOpen` (attach v6) goes through the same admission and has the
+same per-message property.
+
+## `tool-channel-attachment-watch-authority`
+
+On the four tool-substrate namespaces (`brenn:tools/`, `brenn:tool-requests/`,
+`brenn:tool-results/`, `brenn:app-tool-results/`) a conversation names an attachment
+only on its own app's result inbox. An app whose policy covers the other three reads
+the calls and is shown each attachment's name, size and content type; `BrennSend`,
+`brenn-tool save` and a tool call naming one are refused `tool_channel_attachment`. The
+handle rule this project was given asks two things of a handle — it is in the retained
+buffer of a channel the conversation has access to, and the conversation has read a
+message containing it — and such a watcher meets both, so the refusal is a restriction
+the rule does not state, made so that an upgrade does not widen a grant written when
+tool-call traffic held no files into a read of every file any user hands a tool. Build,
+if a watcher that reaches the files is wanted: an opt-in authority in configuration,
+stated separately from the channel matcher, that lets an app's conversations name
+attachments on the tool-substrate channels it reads, with `docs/security-posture.md`
+§7.6 stating the cross-user reach it grants. Done = an app holding the authority saves
+an attachment of a tool request it read and an app with the matcher alone is still
+refused, each with a test; or `docs/security-posture.md` §7.6 records that no policy
+ever reaches a tool call's attachments and why. A remote attacher's `BlobOpen` on the
+same channels is refused `ToolChannel` by the same check, and an authority that opens
+them to an app would have to say whether it reaches a remote. Code site
+(`TODO(tool-channel-attachment-watch-authority)`): the Tool-family check in
+`Messenger::admit_retained_part` (`brenn-messaging/src/retained_part.rs`), the
+admission every door that names a message's attachment calls.
 
 ## `conversation-blob-files-without-shell`
 
@@ -434,7 +537,10 @@ app's `brenn:app-tool-results/<app-slug>` — each for that channel's window, so
 a caller fills the pool through the channels of the tools it calls and a
 provider through its callers' inboxes, as well as through their own
 publishes; and after a restart an app's inbox holds blobs no conversation can
-name until its window turns over. Decide whether a component or a
+name until its window turns over. A remote attacher on attach v6 is a
+producer against the same pool — bounded per session at 64 handles and
+4 × `max_blob_bytes` held, uploads and opened attachments together, across its
+sessions by `max_sessions`, and not over time. Decide whether a component or a
 conversation gets a share of the budget, who is charged for a blob that is
 forwarded and so held by messages of several producers — a blob handed to a
 tool or returned by one included — and whether the share is operator
@@ -444,6 +550,17 @@ producer's write to be refused, with a test, and `docs/security-posture.md`
 §7.6 no longer states the exposure for either. Code site
 (`TODO(blob-budget-per-component)`):
 `PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION` in `brenn-wasm/src/lib.rs`.
+
+## `blob-durable-sync-on-async-task`
+
+`HeldAttachments::make_durable` fsyncs each blob file and the blob directory on
+the async task that publishes: inside `DbStore::append` and `park`, and in the
+pre-lock passes of `publish_from_wasm` and `publish_batch_from_attacher`. An
+attach session's task is one such caller: its whole select loop — pushes,
+drains, liveness — stops for the sync. Done = no blob fsync runs on an async
+worker thread on any door, with the sync still complete before the row that
+names the blob commits. Code site (`TODO(blob-durable-sync-on-async-task)`):
+`HeldAttachments::make_durable` in `brenn-messaging-store/src/blob/durable.rs`.
 
 ## `blobs-surface-store-budget-refusal`
 
@@ -4627,3 +4744,15 @@ accepted and published once; one for an error that persists, a WASM owner missin
 channel's subscribers, where the retry is answered 500 again and not 409.
 `docs/message-bus.md` §2.7.1 then drops the sentence describing the loss. Code sites: the
 replay check and the `deliver_inbound` call in the inbound handler.
+
+## `boot-log-capture-tests-flaky`
+
+Two log-capture tests in `brenn-messaging-boot` failed once under the full parallel
+`make check` with no log lines captured — `every_injected_grant_is_boot_logged`
+(`src/auto_tests.rs`) and `boot_logs_every_injected_auto_grant` (`src/build_tests.rs`),
+both `#[tracing_test::traced_test]` — and passed when run alone and on the next full
+run. The cause is not established. `make check` is the pre-commit gate, and a test that
+fails there at random teaches retry-until-green. Done = the cause is found and both
+tests pass reliably under the full parallel `make check`, or they are shown to have
+failed for a real reason and that is fixed; a retry is not a fix. Code sites
+(`TODO(boot-log-capture-tests-flaky)`): the two tests.
