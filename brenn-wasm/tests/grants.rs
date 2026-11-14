@@ -256,7 +256,66 @@ fn superset_grants_loads() {
         sync_caller: Some(std::sync::Arc::new(|_: &str, _: &str, _, _| {
             brenn_activation::sync::SyncAnswer::Ok(None)
         })),
+        // ALL grants includes Blobs; the load invariant requires a seam then.
+        blob_host: Some(std::sync::Arc::new(NoBlobs)),
         ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_demo"), "demo-all-grants")
+    });
+}
+
+/// A blob seam for a load whose component never reaches it.
+struct NoBlobs;
+
+impl brenn_wasm::BlobHost for NoBlobs {
+    fn retain(
+        &self,
+        _id: &brenn_envelope::BlobId,
+    ) -> Option<brenn_messaging_store::blob::BlobHold> {
+        unreachable!("the component imports no `blobs`")
+    }
+
+    fn create(
+        &self,
+        _content_type: &str,
+    ) -> Result<brenn_messaging_store::blob::BlobWriter, brenn_messaging_store::blob::BlobError>
+    {
+        unreachable!("the component imports no `blobs`")
+    }
+}
+
+/// The `blobs` fixture loaded without the word is refused by name.
+#[test]
+#[should_panic(expected = "requires ungranted capability \"blobs\"")]
+fn the_blobs_fixture_without_the_word_is_refused() {
+    let _comp = ProcessorComponent::load(ProcessorLoadSpec {
+        input_amplification_mt: common::amp_in(),
+        grants: [ComponentGrant::Ports, ComponentGrant::Log].into(),
+        alerter: noop_alerter(),
+        output_acl: common::allow_all(),
+        ..ProcessorLoadSpec::minimal(
+            &component_path("brenn_processor_blobs_test"),
+            "blobs-no-word",
+        )
+    });
+}
+
+/// The word with no seam is a caller that built its load spec wrong.
+#[test]
+#[should_panic(expected = "blob_host seam (None) and Blobs grant (granted) must both be set")]
+fn the_blobs_word_without_a_seam_is_refused() {
+    let _comp = ProcessorComponent::load(ProcessorLoadSpec {
+        input_amplification_mt: common::amp_in(),
+        grants: [
+            ComponentGrant::Ports,
+            ComponentGrant::Log,
+            ComponentGrant::Blobs,
+        ]
+        .into(),
+        alerter: noop_alerter(),
+        output_acl: common::allow_all(),
+        ..ProcessorLoadSpec::minimal(
+            &component_path("brenn_processor_blobs_test"),
+            "blobs-no-seam",
+        )
     });
 }
 
@@ -351,6 +410,7 @@ fn drift_guard_all_fixture_imports_recognized() {
         "brenn_processor_bytes_test",
         "brenn_processor_page_test",
         "brenn_processor_page_bytes_test",
+        "brenn_processor_blobs_test",
     ];
 
     for fixture in &fixtures {

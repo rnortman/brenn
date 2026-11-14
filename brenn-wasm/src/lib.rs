@@ -14,6 +14,7 @@ use tracing::{debug, error, info, trace, warn};
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable, bindgen};
 use wasmtime::{Config, Engine, EngineWeak, Store, StoreLimits, StoreLimitsBuilder, WasmFeatures};
 
+pub mod blobs;
 pub mod store;
 pub use store::KvStore;
 use store::Transaction;
@@ -45,6 +46,7 @@ use brenn_activation::sync::CallDisposition;
 use brenn_common::sanitize_untrusted_str;
 use brenn_envelope::addressing::PROVIDER_CONCURRENCY_CEILING;
 use brenn_envelope::{GuestBody, MessageBody, MessageEnvelope};
+use brenn_messaging_store::blob::HeldAttachments;
 
 /// The grant vocabulary, re-exported: what a load spec grants, what this host
 /// links and what an operator writes are one set of words, and a caller
@@ -715,6 +717,41 @@ mod processor_v0_2_bindings {
     });
 }
 
+// Bindgen for the `brenn:processor@0.3.0` world, which is the 0.2.0 world
+// with `blobs` imported. Every other interface is mapped onto the modules
+// above, so only `blobs` is generated here. A 0.2.0 artifact that imports
+// `blobs` is still instantiated through the 0.2.0 `ProcessorPre`: the two
+// worlds export the same `receive`.
+#[allow(dead_code)]
+mod processor_v0_3_bindings {
+    wasmtime::component::bindgen!({
+        world: "brenn:processor/processor@0.3.0",
+        path: ["wit/processor.wit", "wit/processor-0.2.wit", "wit/processor-0.3.wit"],
+        with: {
+            "brenn:processor/types@0.1.0": crate::processor_bindings::brenn::processor::types,
+            "brenn:processor/store@0.1.0": crate::processor_bindings::brenn::processor::store,
+            "brenn:processor/log@0.1.0": crate::processor_bindings::brenn::processor::log,
+            "brenn:processor/alert@0.1.0": crate::processor_bindings::brenn::processor::alert,
+            "brenn:processor/config@0.1.0": crate::processor_bindings::brenn::processor::config,
+            "brenn:processor/mqtt@0.1.0": crate::processor_bindings::brenn::processor::mqtt,
+            "brenn:processor/tools@0.1.0": crate::processor_bindings::brenn::processor::tools,
+            "brenn:processor/provides@0.1.0": crate::processor_bindings::brenn::processor::provides,
+            "brenn:processor/dom@0.1.0": crate::processor_bindings::brenn::processor::dom,
+            "brenn:processor/page-dom@0.1.0": crate::processor_bindings::brenn::processor::page_dom,
+            "brenn:processor/bus@0.2.0": crate::processor_v0_2_bindings::brenn::processor0_2_0::bus,
+            "brenn:processor/ports@0.2.0": crate::processor_v0_2_bindings::brenn::processor0_2_0::ports,
+            "brenn:processor/calls@0.2.0": crate::processor_v0_2_bindings::brenn::processor0_2_0::calls,
+            "brenn:processor/blobs@0.3.0.blob": crate::blobs::BlobHandle,
+            "brenn:processor/blobs@0.3.0.writer": crate::blobs::WriterHandle,
+        },
+        // `publish` traps on an undeclared port, and a spent writer traps.
+        imports: {
+            "brenn:processor/blobs@0.3.0": trappable,
+        },
+    });
+}
+
+pub use blobs::{BlobHost, BlobHostFn};
 use processor_bindings::ProcessorPre;
 use processor_bindings::brenn::processor::calls::CallError as CallWitError;
 use processor_bindings::brenn::processor::mqtt::MqttPublishError as MqttPublishWitError;
@@ -1105,6 +1142,34 @@ pub const PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION: usize =
 /// registry asserts the two agree.
 pub const PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES: usize = 512 * 1024;
 
+/// The largest single `blobs` read, in bytes. A guest has 16 MiB of memory, so
+/// a megabyte per call leaves it room for several ranges at once. Host policy,
+/// reported to the guest by `blobs.limits`.
+pub const PROCESSOR_MAX_BLOB_READ_BYTES: u32 = 1024 * 1024;
+
+/// The largest single `blobs` write, in bytes; host policy, as
+/// [`PROCESSOR_MAX_BLOB_READ_BYTES`].
+pub const PROCESSOR_MAX_BLOB_WRITE_BYTES: u32 = 1024 * 1024;
+
+/// The most `blob` and `writer` handles one activation may hold live at once.
+/// A sealed writer passes its slot to the blob it became; dropping a handle
+/// frees one.
+pub const PROCESSOR_MAX_BLOB_HANDLES: usize = 64;
+
+/// The most calls of `open`, `read`, `create`, `write` and `seal` one
+/// activation may make, refused or not: the flood bound on blob calls.
+pub const PROCESSOR_MAX_BLOB_CALLS_PER_ACTIVATION: usize = 4096;
+
+/// The most bytes one activation may write to blobs, summed over every
+/// accepted write's length, so rewrites count. A writer does not outlive its
+/// activation, so no component can create a blob larger than this.
+// `docs/message-bus.md` (blob bounds), `docs/security-posture.md` (what bounds
+// one activation) and the header of `wit/processor-0.3.wit` state this figure
+// as 64 MiB.
+// TODO(blob-budget-per-component): this bounds one activation; nothing bounds
+// one component's share of the store's budget over many.
+pub const PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION: u64 = 64 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Replay-world resource-bound constants.
 //
@@ -1281,6 +1346,10 @@ pub struct ProcessorPublish {
     /// immediately; a future value parks until it. Set only via
     /// `ports.publish-deferred`.
     pub deliver_after: Option<u64>,
+    /// The blobs the message names, held from the buffering call until the
+    /// flush hands them to the store. Empty for a `ports` publish and an async
+    /// tool request, which carry no attachments.
+    pub attachments: HeldAttachments,
 }
 
 /// One buffered deferred-message control op from a guest activation.
@@ -1636,6 +1705,9 @@ struct ProcessorData {
     /// re-arms the remainder rather than the whole; a test hatch that arms a
     /// shorter deadline overrides this so the two stay one number.
     epoch_budget: std::time::Duration,
+    /// The `blobs` interface's seam, what this activation may open, and its
+    /// counts against the blob bounds.
+    blob: blobs::ActivationBlobs,
 }
 
 impl ProcessorData {
@@ -1691,6 +1763,11 @@ enum PublishRefusal {
     /// A non-text body for a port whose channel carries only text.
     TextOnlyChannel,
     QuotaExceeded,
+    /// An attachment name outside the grammar; the diagnostic.
+    InvalidAttachmentName(String),
+    /// An attachment name given twice; the name.
+    DuplicateAttachmentName(String),
+    TooManyAttachments,
 }
 
 impl PublishRefusal {
@@ -1708,9 +1785,21 @@ impl PublishRefusal {
             Self::InvalidBody(_) | Self::TextOnlyChannel => {
                 panic!("host invariant: a 0.1.0 publish drew {self:?}, which untyped text cannot")
             }
+            Self::InvalidAttachmentName(_)
+            | Self::DuplicateAttachmentName(_)
+            | Self::TooManyAttachments => {
+                panic!(
+                    "host invariant: a `ports` publish drew {self:?}, and it carries no attachments"
+                )
+            }
         }
     }
 
+    /// The refusal as a 0.2.0 `ports` publish reads it.
+    ///
+    /// # Panics
+    ///
+    /// On an attachment refusal: a `ports` publish carries no attachments.
     fn into_v0_2(self) -> ports_v0_2::PublishError {
         match self {
             Self::NotPermitted => ports_v0_2::PublishError::NotPermitted,
@@ -1718,6 +1807,13 @@ impl PublishRefusal {
             Self::InvalidBody(why) => ports_v0_2::PublishError::InvalidBody(why),
             Self::TextOnlyChannel => ports_v0_2::PublishError::TextOnlyChannel,
             Self::QuotaExceeded => ports_v0_2::PublishError::QuotaExceeded,
+            Self::InvalidAttachmentName(_)
+            | Self::DuplicateAttachmentName(_)
+            | Self::TooManyAttachments => {
+                panic!(
+                    "host invariant: a `ports` publish drew {self:?}, and it carries no attachments"
+                )
+            }
         }
     }
 }
@@ -1882,12 +1978,17 @@ impl ProcessorData {
     /// deployment topology out of error codes. A port the specification does not
     /// declare at all is a contract violation, and the outer `Err` traps the
     /// activation.
+    ///
+    /// `attachments` is empty for a `ports` publish. Its names are checked
+    /// after the body and before the budgets, and each blob is held from the
+    /// buffering on.
     fn do_publish(
         &mut self,
         port: String,
         body: GuestBody,
         guest_urgency: Option<ProcessorUrgency>,
         deliver_after: Option<u64>,
+        attachments: &[(String, Resource<blobs::BlobHandle>)],
     ) -> wasmtime::Result<Result<(), PublishRefusal>> {
         // Per-activation total-call budget (successful + failed).
         // Checked first to bound log-flood DoS from repeated unbound-port calls by
@@ -1905,7 +2006,7 @@ impl ProcessorData {
         // below.
         let output_ports = Arc::clone(&self.output_ports);
         let Some(spec) = output_ports.get(&port) else {
-            return self.publish_unwired(port, body, deliver_after);
+            return self.publish_unwired(port, body, deliver_after, attachments);
         };
         let channel_address = &spec.channel_address;
         let port_default_urgency = &spec.default_urgency;
@@ -1940,6 +2041,10 @@ impl ProcessorData {
                 .or_insert(0) += 1;
             return Ok(Err(PublishRefusal::TextOnlyChannel));
         }
+        let held = match self.held_attachments(attachments) {
+            Ok(held) => held,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
         // A bound port always has a seeded bucket, so the gate's miss panic is a
         // host invariant violation. Buffered async tool requests ride the entry
         // ceiling with the port publishes — both flush as bus publishes — so
@@ -1964,6 +2069,7 @@ impl ProcessorData {
             urgency,
             reply_to: None,
             deliver_after,
+            attachments: held,
         });
         Ok(Ok(()))
     }
@@ -1984,6 +2090,7 @@ impl ProcessorData {
         port: String,
         body: GuestBody,
         deliver_after: Option<u64>,
+        attachments: &[(String, Resource<blobs::BlobHandle>)],
     ) -> wasmtime::Result<Result<(), PublishRefusal>> {
         if !self.declared_out_ports.contains(&port) {
             return Err(undeclared_port_trap(&self.slug, &port));
@@ -1995,6 +2102,11 @@ impl ProcessorData {
             Ok(body) => body,
             Err(e) => return Ok(Err(PublishRefusal::InvalidBody(e.to_string()))),
         };
+        // The attachments are judged as on a wired port; their holds drop with
+        // the message.
+        if let Err(refusal) = self.held_attachments(attachments) {
+            return Ok(Err(refusal));
+        }
         if let Err(refusal) = self.gate.admit_publish_without_sink(
             body.len(),
             deliver_after,
@@ -2365,7 +2477,7 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
         payload: String,
     ) -> wasmtime::Result<Result<(), PublishError>> {
         Ok(self
-            .do_publish(port, GuestBody::Text(payload), None, None)?
+            .do_publish(port, GuestBody::Text(payload), None, None, &[])?
             .map_err(PublishRefusal::into_v0_1))
     }
 
@@ -2383,7 +2495,7 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
             WitUrgency::High => ProcessorUrgency::High,
         };
         Ok(self
-            .do_publish(port, GuestBody::Text(payload), Some(urgency), None)?
+            .do_publish(port, GuestBody::Text(payload), Some(urgency), None, &[])?
             .map_err(PublishRefusal::into_v0_1))
     }
 
@@ -2395,7 +2507,13 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
     ) -> wasmtime::Result<Result<(), PublishError>> {
         // No clock read here; the host decides park-vs-immediate at flush.
         Ok(self
-            .do_publish(port, GuestBody::Text(payload), None, Some(deliver_after))?
+            .do_publish(
+                port,
+                GuestBody::Text(payload),
+                None,
+                Some(deliver_after),
+                &[],
+            )?
             .map_err(PublishRefusal::into_v0_1))
     }
 
@@ -2439,7 +2557,7 @@ impl ports_v0_2::Host for ProcessorData {
         body: bus_v0_2::Body,
     ) -> wasmtime::Result<Result<(), ports_v0_2::PublishError>> {
         Ok(self
-            .do_publish(port, body.into(), None, None)?
+            .do_publish(port, body.into(), None, None, &[])?
             .map_err(PublishRefusal::into_v0_2))
     }
 
@@ -2456,7 +2574,7 @@ impl ports_v0_2::Host for ProcessorData {
             ports_v0_2::Urgency::High => ProcessorUrgency::High,
         };
         Ok(self
-            .do_publish(port, body.into(), Some(urgency), None)?
+            .do_publish(port, body.into(), Some(urgency), None, &[])?
             .map_err(PublishRefusal::into_v0_2))
     }
 
@@ -2467,7 +2585,7 @@ impl ports_v0_2::Host for ProcessorData {
         deliver_after: u64,
     ) -> wasmtime::Result<Result<(), ports_v0_2::PublishError>> {
         Ok(self
-            .do_publish(port, body.into(), None, Some(deliver_after))?
+            .do_publish(port, body.into(), None, Some(deliver_after), &[])?
             .map_err(PublishRefusal::into_v0_2))
     }
 
@@ -2518,8 +2636,14 @@ impl ProcessorData {
         guest_urgency: Option<ProcessorUrgency>,
         deliver_after: Option<u64>,
     ) -> Result<(), PublishRefusal> {
-        self.do_publish(port, GuestBody::Text(payload), guest_urgency, deliver_after)
-            .expect("the port is in the component's declared vocabulary")
+        self.do_publish(
+            port,
+            GuestBody::Text(payload),
+            guest_urgency,
+            deliver_after,
+            &[],
+        )
+        .expect("the port is in the component's declared vocabulary")
     }
 
     /// Takes the op a test expects buffered, so the test can compare the two;
@@ -2827,9 +2951,9 @@ impl ProcessorData {
     /// caller's result inbox as `reply_to`; ordinary port publishes keep
     /// `reply_to: None`. On `Err`/`Trap` this is never called and both buffers drop
     /// with the store — the trap-discard guarantee.
-    // TODO(blob-attachment-host-sites): a publish from another interface that
-    // must keep call order with `ports.publish` goes into `publish_buffer`
-    // itself; a buffer appended here, as tool requests are, loses that order.
+    ///
+    /// `blobs.publish` entries are in `publish_buffer` itself, in call order
+    /// with the `ports` publishes; tool requests follow them all.
     fn take_ok_publishes(&mut self) -> Vec<ProcessorPublish> {
         // The gate counts the entry ceiling, this buffer holds the entries: a push
         // that skipped `admit_publish` would let the two disagree and the ceiling
@@ -2849,6 +2973,7 @@ impl ProcessorData {
                 urgency: ProcessorUrgency::Normal,
                 reply_to: Some(req.reply_to),
                 deliver_after: None,
+                attachments: HeldAttachments::none(),
             });
         }
         publishes
@@ -3578,8 +3703,10 @@ pub fn capability_for_import(name: &str, contract: ProcessorContract) -> Option<
 /// Deny-by-default is structural: a component importing an interface no grant
 /// added here fails `instantiate_pre`.
 ///
-/// `Ports` and `Calls` link the implementation of `contract`'s own shape; every
-/// other word links the one implementation both contracts import.
+/// `Ports` and `Calls` link the implementation of `contract`'s own shape;
+/// `Blobs` links its one `@0.3.0` interface under either contract, though only
+/// a 0.2.0 artifact can import it; every other word links the one
+/// implementation both contracts import.
 fn add_capability_to_linker(
     grant: ComponentGrant,
     contract: ProcessorContract,
@@ -3604,6 +3731,12 @@ fn add_capability_to_linker(
         (ComponentGrant::Calls, ProcessorContract::V0_2) => {
             calls_v0_2::add_to_linker::<_, HasSelf<ProcessorData>>(linker, |d| d)
         }
+        (ComponentGrant::Blobs, _) => {
+            processor_v0_3_bindings::brenn::processor0_3_0::blobs::add_to_linker::<
+                _,
+                HasSelf<ProcessorData>,
+            >(linker, |d| d)
+        }
         (grant, _) => add_shared_capability_to_linker(grant, linker),
     }
 }
@@ -3615,8 +3748,8 @@ fn add_shared_capability_to_linker(
     linker: &mut Linker<ProcessorData>,
 ) -> wasmtime::Result<()> {
     match grant {
-        ComponentGrant::Ports | ComponentGrant::Calls => {
-            unreachable!("`{}` links a per-contract interface", grant.word())
+        ComponentGrant::Ports | ComponentGrant::Calls | ComponentGrant::Blobs => {
+            unreachable!("`{}` links an interface of its own version", grant.word())
         }
         ComponentGrant::Store => processor_bindings::brenn::processor::store::add_to_linker::<
             _,
@@ -3733,6 +3866,9 @@ pub struct ProcessorLoadSpec<'a> {
     /// enforces the invariant; the host fn is unreachable when the `Calls`
     /// capability is not linked, so `None` is a structural backstop.
     pub sync_caller: Option<SyncCallerFn>,
+    /// Host seam for the `blobs` interface. `Some` iff the component has the
+    /// `Blobs` grant; asserted at load, as `tool_host` is.
+    pub blob_host: Option<BlobHostFn>,
 }
 
 impl<'a> ProcessorLoadSpec<'a> {
@@ -3775,6 +3911,7 @@ impl<'a> ProcessorLoadSpec<'a> {
             declared_call_ports: std::collections::BTreeSet::new(),
             calls: HashMap::new(),
             sync_caller: None,
+            blob_host: None,
         }
     }
 }
@@ -3886,6 +4023,11 @@ pub struct ProcessorComponent {
     /// `None` when the component lacks the `Calls` grant (the `calls` interface
     /// is then unlinked and the host fn unreachable).
     sync_caller: Option<SyncCallerFn>,
+    /// Whether the component holds the `Ports` grant.
+    ports_granted: bool,
+    /// `None` when the component lacks the `Blobs` grant (the `blobs`
+    /// interface is then unlinked and its host fns unreachable).
+    blob_host: Option<BlobHostFn>,
 }
 
 /// The store resource limiter every processor activation runs under.
@@ -4010,6 +4152,13 @@ impl ProcessorComponent {
             spec.sync_caller.is_some(),
             &spec.grants,
             ComponentGrant::Calls,
+        );
+        assert_seam_iff_grant(
+            spec.slug,
+            "blob_host seam",
+            spec.blob_host.is_some(),
+            &spec.grants,
+            ComponentGrant::Blobs,
         );
 
         let component = Component::from_file(&engine, spec.component_path).unwrap_or_else(|e| {
@@ -4137,6 +4286,7 @@ impl ProcessorComponent {
             );
         }
 
+        let ports_granted = spec.grants.contains(&ComponentGrant::Ports);
         Self {
             engine,
             processor_pre,
@@ -4157,6 +4307,8 @@ impl ProcessorComponent {
             declared_call_ports: Arc::new(spec.declared_call_ports),
             calls: Arc::new(spec.calls),
             sync_caller: spec.sync_caller,
+            ports_granted,
+            blob_host: spec.blob_host,
         }
     }
 
@@ -4273,6 +4425,7 @@ impl ProcessorComponent {
                 // Overwritten by `arm_epoch` below, which is the only thing that
                 // sets this field and the deadline it must agree with.
                 epoch_budget: std::time::Duration::ZERO,
+                blob: blobs::ActivationBlobs::new(self.blob_host.clone(), self.ports_granted),
             },
         );
         store.limiter(|d| &mut d.limits);
@@ -4456,6 +4609,16 @@ impl ProcessorComponent {
             .iter()
             .map(|dw| (dw.port.clone(), dw.entries.len() as u32))
             .collect();
+        // What `blobs.open` can name: the attachments of the window messages,
+        // read through the shared envelopes. No hold is taken until the guest
+        // opens one.
+        if store.data().blob.host.is_some() {
+            store.data_mut().blob.handed = activation
+                .ports
+                .iter()
+                .map(|pw| (pw.port.clone(), pw.envelopes.clone()))
+                .collect();
+        }
         let received = match processor_pre {
             ContractPre::V0_1(pre) => Self::receive_v0_1(&mut store, pre, activation),
             ContractPre::V0_2(pre) => Self::receive_v0_2(&mut store, pre, activation),
@@ -4532,6 +4695,28 @@ impl ProcessorComponent {
                     slug = %data.slug,
                     suppressed = ?data.publish_suppressed_by_sink,
                     "wasm publish budget exceeded — publishes dropped"
+                );
+            }
+
+            // Blob calls refused at a host bound, by bound: one line per
+            // activation, so an operator sees it when the guest swallows them.
+            if !data.blob.refusals.is_empty() {
+                warn!(
+                    slug = %data.slug,
+                    refused = ?data.blob.refusals,
+                    "wasm blobs: calls refused at a per-activation bound"
+                );
+            }
+
+            // Blob calls the store refused (over its budget, or its filesystem
+            // failed), by kind: one line per activation, not one per call, so a
+            // guest retrying in a loop writes one line. The first filesystem
+            // failure of the activation was logged at `error` when it happened.
+            if !data.blob.store_refusals.is_empty() {
+                warn!(
+                    slug = %data.slug,
+                    refused = ?data.blob.store_refusals,
+                    "wasm blobs: calls refused by the blob store"
                 );
             }
 
@@ -4898,6 +5083,7 @@ mod processor_store_host_tests {
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
+            blob: blobs::ActivationBlobs::new(None, false),
         };
         (db, kv, data)
     }
@@ -4960,6 +5146,7 @@ mod processor_store_host_tests {
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
+            blob: blobs::ActivationBlobs::new(None, false),
         }
     }
 
@@ -5080,6 +5267,7 @@ mod processor_store_host_tests {
                 GuestBody::Text("body".to_string()),
                 None,
                 None,
+                &[],
             )
             .expect_err("an undeclared port must trap");
         let msg = format!("{trap}");
@@ -5110,6 +5298,7 @@ mod processor_store_host_tests {
                 GuestBody::Text("x".to_string()),
                 None,
                 None,
+                &[],
             )
             .expect("a spent call ceiling answers before the vocabulary check")
             .expect_err("and it answers with a refusal");
@@ -5604,6 +5793,7 @@ mod processor_store_host_tests {
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
+            blob: blobs::ActivationBlobs::new(None, false),
         }
     }
 
@@ -5964,6 +6154,7 @@ mod processor_store_host_tests {
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
+            blob: blobs::ActivationBlobs::new(None, false),
         }
     }
 
@@ -6389,14 +6580,14 @@ mod processor_store_host_tests {
         let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
         let sink = SinkKey::Port("out".to_string());
         let refusal = data
-            .do_publish("out".to_string(), malformed_body(), None, None)
+            .do_publish("out".to_string(), malformed_body(), None, None, &[])
             .expect("declared");
         assert!(
             matches!(refusal, Err(PublishRefusal::InvalidBody(_))),
             "{refusal:?}"
         );
         let refusal = data
-            .do_publish("out".to_string(), non_text_body(), None, None)
+            .do_publish("out".to_string(), non_text_body(), None, None, &[])
             .expect("declared");
         assert_eq!(refusal, Err(PublishRefusal::TextOnlyChannel));
         assert_eq!(data.gate.calls(), 2);
@@ -6423,7 +6614,7 @@ mod processor_store_host_tests {
             },
         );
         data.output_ports = Arc::new(ports);
-        data.do_publish("out".to_string(), non_text_body(), None, None)
+        data.do_publish("out".to_string(), non_text_body(), None, None, &[])
             .expect("declared")
             .expect("a non-text channel takes a non-text body");
         let published = &data.publish_buffer[0].body;
@@ -6437,12 +6628,12 @@ mod processor_store_host_tests {
     fn a_malformed_body_past_the_call_budget_is_quota_exceeded() {
         let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
         for _ in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
-            data.do_publish("out".to_string(), malformed_body(), None, None)
+            data.do_publish("out".to_string(), malformed_body(), None, None, &[])
                 .expect("declared")
                 .expect_err("malformed");
         }
         let refusal = data
-            .do_publish("out".to_string(), malformed_body(), None, None)
+            .do_publish("out".to_string(), malformed_body(), None, None, &[])
             .expect("declared");
         assert_eq!(refusal, Err(PublishRefusal::QuotaExceeded));
     }
@@ -6684,6 +6875,7 @@ mod processor_store_host_tests {
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
+            blob: blobs::ActivationBlobs::new(None, false),
         };
         // Drain A.
         data.do_publish_declared("a".to_string(), "p".to_string(), None, None)
@@ -6882,6 +7074,206 @@ mod processor_store_host_tests {
         data.drop(Resource::new_own(rep1))
             .expect("drop after rollback must succeed");
     }
+
+    /// Attachments named by handles this test never resolves: every refusal
+    /// below is reached before a hold would be taken.
+    fn unresolved(names: &[&str]) -> Vec<(String, Resource<blobs::BlobHandle>)> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| ((*n).to_string(), Resource::new_borrow(i as u32)))
+            .collect()
+    }
+
+    fn publish_with(
+        data: &mut ProcessorData,
+        port: &str,
+        body: GuestBody,
+        attachments: &[(String, Resource<blobs::BlobHandle>)],
+    ) -> Result<(), PublishRefusal> {
+        data.do_publish(port.to_string(), body, None, None, attachments)
+            .expect("declared")
+    }
+
+    #[test]
+    fn attachment_refusals_come_in_the_stated_order_and_charge_only_the_call() {
+        let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
+        let text = || GuestBody::Text("x".to_string());
+        let names: Vec<String> = (0..=brenn_envelope::MAX_ATTACHMENTS_PER_MESSAGE)
+            .map(|i| format!("a{i}"))
+            .collect();
+        let many: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        // The body is judged before the attachments.
+        assert!(matches!(
+            publish_with(
+                &mut data,
+                "out",
+                malformed_body(),
+                &unresolved(&["bad name"])
+            ),
+            Err(PublishRefusal::InvalidBody(_))
+        ));
+        assert_eq!(
+            publish_with(&mut data, "out", text(), &unresolved(&many)),
+            Err(PublishRefusal::TooManyAttachments)
+        );
+        // Too many is answered before a bad name among them.
+        let mut bad_and_many = many.clone();
+        bad_and_many[0] = "-x";
+        assert_eq!(
+            publish_with(&mut data, "out", text(), &unresolved(&bad_and_many)),
+            Err(PublishRefusal::TooManyAttachments)
+        );
+        assert!(matches!(
+            publish_with(&mut data, "out", text(), &unresolved(&["ok", "-x"])),
+            Err(PublishRefusal::InvalidAttachmentName(why)) if why.contains("index 0")
+        ));
+        assert_eq!(
+            publish_with(&mut data, "out", text(), &unresolved(&["a", "b", "a"])),
+            Err(PublishRefusal::DuplicateAttachmentName("a".to_string()))
+        );
+        assert_eq!(data.gate.calls(), 5);
+        assert_eq!(data.gate.entries(), 0);
+        assert_eq!(data.gate.bytes(), 0);
+        assert!(data.publish_buffer.is_empty());
+    }
+
+    #[test]
+    fn an_unwired_port_judges_the_attachments_too() {
+        let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
+        assert_eq!(
+            publish_with(
+                &mut data,
+                UNWIRED_PORT,
+                GuestBody::Text("x".to_string()),
+                &unresolved(&["a", "a"])
+            ),
+            Err(PublishRefusal::DuplicateAttachmentName("a".to_string()))
+        );
+        assert_eq!(data.gate.entries(), 0);
+    }
+
+    #[test]
+    fn a_blobs_publish_without_ports_is_not_permitted_and_charges_the_call() {
+        use processor_v0_3_bindings::brenn::processor0_3_0::blobs::{
+            Host as BlobsHost, PublishError, PublishOptions,
+        };
+        let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
+        let body = || bus_v0_2::Body {
+            content_type: None,
+            bytes: b"x".to_vec(),
+        };
+        let options = || PublishOptions {
+            urgency: None,
+            deliver_after: None,
+        };
+        let refused =
+            BlobsHost::publish(&mut data, "out".to_string(), body(), Vec::new(), options())
+                .expect("no trap");
+        assert!(matches!(refused, Err(PublishError::NotPermitted)));
+        assert_eq!(data.gate.calls(), 1);
+        assert!(data.publish_buffer.is_empty());
+
+        // Each refused call is charged, so a loop reaches the shared ceiling.
+        for _ in 1..MAX_PUBLISH_CALLS_PER_ACTIVATION {
+            let refused =
+                BlobsHost::publish(&mut data, "out".to_string(), body(), Vec::new(), options())
+                    .expect("no trap");
+            assert!(matches!(refused, Err(PublishError::NotPermitted)));
+        }
+        assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION);
+        let refused =
+            BlobsHost::publish(&mut data, "out".to_string(), body(), Vec::new(), options())
+                .expect("no trap");
+        assert!(matches!(refused, Err(PublishError::QuotaExceeded)));
+        assert!(data.publish_buffer.is_empty());
+
+        // With `ports`, an empty list behaves as `ports.publish`.
+        let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
+        data.blob = blobs::ActivationBlobs::new(None, true);
+        BlobsHost::publish(&mut data, "out".to_string(), body(), Vec::new(), options())
+            .expect("no trap")
+            .expect("published");
+        assert_eq!(data.publish_buffer.len(), 1);
+        assert!(data.publish_buffer[0].attachments.is_empty());
+    }
+
+    #[test]
+    #[traced_test]
+    fn store_refusals_are_counted_and_the_first_storage_failure_logged() {
+        use brenn_messaging_store::blob::BlobError;
+        let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
+        for _ in 0..3 {
+            data.note_store_error("write", &BlobError::Io(std::io::Error::other("disk full")));
+        }
+        data.note_store_error("create", &BlobError::BudgetExhausted { budget: 1 });
+        data.note_store_error("write", &BlobError::TooFragmented);
+        assert_eq!(
+            data.blob.store_refusals,
+            std::collections::BTreeMap::from([
+                (blobs::StoreRefusal::BudgetExhausted, 1),
+                (blobs::StoreRefusal::StorageFailed, 3),
+            ])
+        );
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| l.contains("wasm blobs: storage failed"))
+                .count();
+            if n == 1 {
+                Ok(())
+            } else {
+                Err(format!("expected one storage-failed line, got {n}"))
+            }
+        });
+    }
+
+    /// Interleaved `ports` and `blobs` publishes land in one buffer, in call
+    /// order.
+    #[test]
+    fn ports_and_blobs_publishes_share_one_buffer_in_call_order() {
+        use processor_v0_3_bindings::brenn::processor0_3_0::blobs::{
+            Host as BlobsHost, PublishOptions,
+        };
+        let mut data = make_publish_data("brenn:out", Arc::new(|_| true));
+        data.blob = blobs::ActivationBlobs::new(None, true);
+        let body = |t: &str| bus_v0_2::Body {
+            content_type: None,
+            bytes: t.as_bytes().to_vec(),
+        };
+        ports_v0_2::Host::publish(&mut data, "out".to_string(), body("1"))
+            .unwrap()
+            .unwrap();
+        BlobsHost::publish(
+            &mut data,
+            "out".to_string(),
+            body("2"),
+            Vec::new(),
+            PublishOptions {
+                urgency: Some(processor_v0_3_bindings::brenn::processor0_3_0::blobs::Urgency::High),
+                deliver_after: Some(7),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        ports_v0_2::Host::publish_deferred(&mut data, "out".to_string(), body("3"), 9)
+            .unwrap()
+            .unwrap();
+        let got: Vec<(&[u8], ProcessorUrgency, Option<u64>)> = data
+            .publish_buffer
+            .iter()
+            .map(|p| (p.body.as_bytes(), p.urgency, p.deliver_after))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (&b"1"[..], ProcessorUrgency::Normal, None),
+                (&b"2"[..], ProcessorUrgency::High, Some(7)),
+                (&b"3"[..], ProcessorUrgency::Normal, Some(9)),
+            ]
+        );
+    }
 }
 
 // ── calls::Host unit tests ────────────────────────────────────────────────────
@@ -7037,6 +7429,7 @@ mod processor_calls_host_tests {
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
+            blob: blobs::ActivationBlobs::new(None, false),
         };
         (data, seen)
     }
@@ -7213,7 +7606,8 @@ mod processor_calls_host_tests {
                     "out".to_string(),
                     GuestBody::Text(String::new()),
                     None,
-                    None
+                    None,
+                    &[]
                 )
                 .unwrap(),
                 Err(PublishRefusal::QuotaExceeded)
@@ -7433,6 +7827,7 @@ mod processor_config_host_tests {
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
+            blob: blobs::ActivationBlobs::new(None, false),
         };
         (db, kv, data)
     }

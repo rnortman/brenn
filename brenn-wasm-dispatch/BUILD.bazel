@@ -33,12 +33,12 @@ rust_library(
 # messaging store. The suite timed out at `small` (60s) with 17 of 40 done, then
 # at `medium` (300s) with 37 of 48 done on the CI runner. `large` (900s).
 #
-# `data` is the six components these suites open, one fixture target each.
+# `data` is the seven components these suites open, one fixture target each.
 # Runfiles are inputs to the test action, so every component named here is an
 # edge from a guest crate to this binary; the ones that are not named cost
 # nothing when they change.
 #
-# TODO(bazel-fixture-list-guard): which six those are was derived by reading
+# TODO(bazel-fixture-list-guard): which seven those are was derived by reading
 # this crate's artifact-stem call sites, and nothing holds the list to them. A
 # component dropped from the tests keeps its edge here silently; one added
 # without its fixture fails loudly on a missing runfile.
@@ -49,6 +49,7 @@ rust_test(
     crate_features = ["testutils"],
     data = [
         "//brenn-wasm:fixture_git_forge_parser",
+        "//brenn-wasm:fixture_processor_blobs_test",
         "//brenn-wasm:fixture_processor_bytes_test",
         "//brenn-wasm:fixture_processor_demo",
         "//brenn-wasm:fixture_processor_dual",
@@ -58,6 +59,41 @@ rust_test(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-wasm-dispatch"},
+    deps = all_crate_deps(normal_dev = True) + [
+        "//brenn-activation",
+        "//brenn-common",
+        "//brenn-envelope",
+        "//brenn-host-conformance",
+        "//brenn-lib",
+        "//brenn-messaging",
+        "//brenn-messaging-store",
+        "//brenn-obs",
+        "//brenn-tool-registry",
+        "//brenn-wasm",
+    ],
+)
+
+# The blob forwarding measurement: the ignored `tests::blobs::measure` test,
+# which runs ten thousand activations that each read a 100 KiB attachment in
+# full and republish it by reference on an `ephemeral:` channel, and prints
+# activations per second, asserting nothing on time. Run by hand with
+# `bazel test --test_output=all`; `docs/blob-store-timings.md` records a run.
+rust_test(
+    name = "blob_forward_measure",
+    size = "large",
+    args = [
+        "--ignored",
+        "--exact",
+        "tests::blobs::measure",
+        "--nocapture",
+    ],
+    crate = ":brenn-wasm-dispatch",
+    crate_features = ["testutils"],
+    data = ["//brenn-wasm:fixture_processor_blobs_test"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-wasm-dispatch"},
+    tags = ["manual"],
     deps = all_crate_deps(normal_dev = True) + [
         "//brenn-activation",
         "//brenn-common",

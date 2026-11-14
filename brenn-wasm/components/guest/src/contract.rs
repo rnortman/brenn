@@ -1,10 +1,11 @@
 // The one seam between the SDK and the generated bindings.
 //
-// Every generated path, and every record of the contract's `bus`, `ports` and
-// `calls` interfaces, is named here and nowhere else in the SDK: the rest of
-// the crate calls the aliases and conversions below, so a change of contract
-// costs `bindings.rs` and this file. The bindings are the byte-carrying
-// contract's: a body crosses as its content type and bytes, unchanged.
+// Every generated path, and every record of the contract's `bus`, `ports`,
+// `calls` and `blobs` interfaces, is named here and nowhere else in the SDK:
+// the rest of the crate calls the aliases and conversions below, so a change
+// of contract costs `bindings.rs` and this file. The bindings are the
+// byte-carrying contract's: a body crosses as its content type and bytes,
+// unchanged.
 //
 // `pub` and `#[doc(hidden)]` because `export_processor!` expands in the
 // component's crate and names `receive` and the two raw types; nothing here is
@@ -13,13 +14,22 @@
 use crate::bindings;
 use crate::{
     Activation, Body, BodyRef, DeferredEntry, DeferredWindow, Error, Message, PortWindow,
-    Processor, Urgency, calls::CallError,
+    Processor, PublishAttachmentsError, PublishOptions, Urgency,
+    blobs::{BlobLimits, CreateError, Gap, OpenError, ReadError, SealError, WriteError},
+    calls::CallError,
 };
 
 pub(crate) use bindings::brenn::processor0_1_0::{
     alert, config, dom, log, mqtt, page_dom, provides, store, tools,
 };
 use bindings::brenn::processor0_2_0::{bus, calls as raw_calls, ports};
+use bindings::brenn::processor0_3_0::blobs as raw_blobs;
+
+/// A `blob` handle as the host lowered it.
+pub(crate) type RawBlob = raw_blobs::Blob;
+
+/// A `writer` handle as the host lowered it.
+pub(crate) type RawWriter = raw_blobs::Writer;
 
 /// The activation record the export receives.
 pub type RawActivation = bus::Activation;
@@ -84,10 +94,13 @@ fn activation(raw: RawActivation) -> Result<Activation, Error> {
                 pw.port
             )));
         }
+        // A canonical-ABI list's length is a `u32`, so every index fits.
+        let port: std::sync::Arc<str> = pw.port.as_str().into();
         let messages = pw
             .envelopes
             .into_iter()
-            .map(|e| Message::new(e.header, body(e.body)))
+            .zip(0u32..)
+            .map(|(e, index)| Message::new(e.header, body(e.body), port.clone(), index))
             .collect();
         windows.push(PortWindow {
             port: pw.port,
@@ -125,27 +138,52 @@ const NON_TEXT_FIX: &str = "declare `non_text = true` on the channel, or on the 
 
 /// A `PublishError` as the SDK's `Error`, with a per-port diagnostic.
 fn publish_error(port: &str, body: BodyRef<'_>, e: ports::PublishError) -> Error {
+    publish_refusal(&format!("publish to {port}"), Some(body), e)
+}
+
+/// A publish refusal as the SDK's `Error`: `call` names the call, and the
+/// body is described when it is known. The one wording of the refusals
+/// `ports.publish` and `blobs.publish` share.
+fn publish_refusal(call: &str, body: Option<BodyRef<'_>>, e: ports::PublishError) -> Error {
     use ports::PublishError;
+    let described = body.map_or_else(String::new, |b| format!(" ({})", b.describe()));
     match e {
-        PublishError::NotPermitted => {
-            Error::ProcessingFailed(format!("publish to {port}: not-permitted"))
-        }
+        PublishError::NotPermitted => Error::ProcessingFailed(format!("{call}: not-permitted")),
         PublishError::InvalidPayload(m) => {
-            Error::ProcessingFailed(format!("publish to {port}: invalid-payload: {m}"))
+            Error::ProcessingFailed(format!("{call}: invalid-payload: {m}"))
         }
-        PublishError::QuotaExceeded => {
-            Error::QuotaExceeded(format!("publish to {port}: quota-exceeded"))
+        PublishError::QuotaExceeded => Error::QuotaExceeded(format!("{call}: quota-exceeded")),
+        PublishError::InvalidBody(m) => {
+            Error::InvalidBody(format!("{call}: invalid-body{described}: {m}"))
         }
-        PublishError::InvalidBody(m) => Error::InvalidBody(format!(
-            "publish to {port}: invalid-body ({}): {m}",
-            body.describe()
-        )),
         PublishError::TextOnlyChannel => Error::TextOnlyChannel(format!(
-            "publish to {port}: text-only-channel: a non-text body ({}) on a channel not \
-             declared non_text; {NON_TEXT_FIX}",
-            body.describe()
+            "{call}: text-only-channel: a non-text body{described} on a channel not declared \
+             non_text; {NON_TEXT_FIX}"
         )),
     }
+}
+
+/// A [`PublishAttachmentsError`] as the SDK's `Error`. The five refusals it
+/// shares with `ports.publish` read as that call's do.
+pub(crate) fn publish_attachments_error(e: PublishAttachmentsError) -> Error {
+    const CALL: &str = "publish with attachments";
+    let shared = match e {
+        PublishAttachmentsError::NotPermitted => ports::PublishError::NotPermitted,
+        PublishAttachmentsError::InvalidPayload(m) => ports::PublishError::InvalidPayload(m),
+        PublishAttachmentsError::InvalidBody(m) => ports::PublishError::InvalidBody(m),
+        PublishAttachmentsError::TextOnlyChannel => ports::PublishError::TextOnlyChannel,
+        PublishAttachmentsError::QuotaExceeded => ports::PublishError::QuotaExceeded,
+        PublishAttachmentsError::InvalidAttachmentName(n) => {
+            return Error::ProcessingFailed(format!("{CALL}: invalid-attachment-name: {n:?}"));
+        }
+        PublishAttachmentsError::DuplicateAttachmentName(n) => {
+            return Error::ProcessingFailed(format!("{CALL}: duplicate-attachment-name: {n:?}"));
+        }
+        PublishAttachmentsError::TooManyAttachments => {
+            return Error::ProcessingFailed(format!("{CALL}: too-many-attachments"));
+        }
+    };
+    publish_refusal(CALL, None, shared)
 }
 
 /// A `DeferError` as the SDK's `Error`, with a per-port diagnostic.
@@ -237,4 +275,95 @@ pub(crate) fn call(port: &str, request: BodyRef<'_>) -> Result<Option<Body>, Cal
             raw_calls::CallError::QuotaExceeded => CallError::QuotaExceeded,
         }),
     }
+}
+
+pub(crate) fn blob_limits() -> BlobLimits {
+    let raw = raw_blobs::limits();
+    BlobLimits {
+        max_read_bytes: raw.max_read_bytes,
+        max_write_bytes: raw.max_write_bytes,
+    }
+}
+
+pub(crate) fn blob_open(port: &str, index: u32, name: &str) -> Result<RawBlob, OpenError> {
+    raw_blobs::open(port, index, name).map_err(|e| match e {
+        raw_blobs::OpenError::NotPermitted => OpenError::NotPermitted,
+        raw_blobs::OpenError::NotFound => OpenError::NotFound,
+        raw_blobs::OpenError::QuotaExceeded => OpenError::QuotaExceeded,
+    })
+}
+
+pub(crate) fn blob_read(blob: &RawBlob, offset: u64, len: u32) -> Result<Vec<u8>, ReadError> {
+    blob.read(offset, len).map_err(|e| match e {
+        raw_blobs::ReadError::OutOfRange => ReadError::OutOfRange,
+        raw_blobs::ReadError::TooLarge => ReadError::TooLarge,
+        raw_blobs::ReadError::StorageFailed(m) => ReadError::StorageFailed(m),
+        raw_blobs::ReadError::QuotaExceeded => ReadError::QuotaExceeded,
+    })
+}
+
+pub(crate) fn blob_create(content_type: &str) -> Result<RawWriter, CreateError> {
+    raw_blobs::create(content_type).map_err(|e| match e {
+        raw_blobs::CreateError::InvalidContentType(m) => CreateError::InvalidContentType(m),
+        raw_blobs::CreateError::BudgetExhausted => CreateError::BudgetExhausted,
+        raw_blobs::CreateError::StorageFailed(m) => CreateError::StorageFailed(m),
+        raw_blobs::CreateError::QuotaExceeded => CreateError::QuotaExceeded,
+    })
+}
+
+pub(crate) fn blob_write(writer: &RawWriter, offset: u64, bytes: &[u8]) -> Result<(), WriteError> {
+    writer.write(offset, bytes).map_err(|e| match e {
+        raw_blobs::WriteError::TooLarge => WriteError::TooLarge,
+        raw_blobs::WriteError::BlobTooLarge => WriteError::BlobTooLarge,
+        raw_blobs::WriteError::BudgetExhausted => WriteError::BudgetExhausted,
+        raw_blobs::WriteError::TooFragmented => WriteError::TooFragmented,
+        raw_blobs::WriteError::StorageFailed(m) => WriteError::StorageFailed(m),
+        raw_blobs::WriteError::QuotaExceeded => WriteError::QuotaExceeded,
+    })
+}
+
+pub(crate) fn blob_seal(writer: &RawWriter) -> Result<RawBlob, SealError> {
+    writer.seal().map_err(|e| match e {
+        raw_blobs::SealError::Gap(g) => SealError::Gap(Gap {
+            offset: g.offset,
+            len: g.len,
+        }),
+        raw_blobs::SealError::QuotaExceeded => SealError::QuotaExceeded,
+    })
+}
+
+/// `brenn_envelope::Urgency` to the `blobs` interface's own, exhaustively.
+fn blobs_urgency(u: Urgency) -> raw_blobs::Urgency {
+    match u {
+        Urgency::VeryLow => raw_blobs::Urgency::VeryLow,
+        Urgency::Low => raw_blobs::Urgency::Low,
+        Urgency::Normal => raw_blobs::Urgency::Normal,
+        Urgency::High => raw_blobs::Urgency::High,
+    }
+}
+
+pub(crate) fn publish_with_attachments(
+    port: &str,
+    body: BodyRef<'_>,
+    attachments: &[(&str, &RawBlob)],
+    options: PublishOptions,
+) -> Result<(), PublishAttachmentsError> {
+    let options = raw_blobs::PublishOptions {
+        urgency: options.urgency.map(blobs_urgency),
+        deliver_after: options.deliver_after,
+    };
+    raw_blobs::publish(port, raw_body(body), attachments, options).map_err(|e| match e {
+        raw_blobs::PublishError::NotPermitted => PublishAttachmentsError::NotPermitted,
+        raw_blobs::PublishError::InvalidPayload(m) => PublishAttachmentsError::InvalidPayload(m),
+        raw_blobs::PublishError::InvalidBody(m) => PublishAttachmentsError::InvalidBody(m),
+        raw_blobs::PublishError::TextOnlyChannel => PublishAttachmentsError::TextOnlyChannel,
+        raw_blobs::PublishError::QuotaExceeded => PublishAttachmentsError::QuotaExceeded,
+        raw_blobs::PublishError::InvalidAttachmentName(m) => {
+            PublishAttachmentsError::InvalidAttachmentName(m)
+        }
+        raw_blobs::PublishError::DuplicateAttachmentName(m) => {
+            PublishAttachmentsError::DuplicateAttachmentName(m)
+        }
+        raw_blobs::PublishError::TooManyAttachments => PublishAttachmentsError::TooManyAttachments,
+    })
 }

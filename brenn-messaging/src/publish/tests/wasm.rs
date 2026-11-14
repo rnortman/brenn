@@ -744,6 +744,7 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
     let consumer_slug = "wasm-flusher";
     let (m, channel_addr, _router) = build_wasm_output_messenger(consumer_slug).await;
 
+    let none = HeldAttachments::none();
     let publishes = vec![
         WasmPublish {
             channel_address: &channel_addr,
@@ -751,6 +752,7 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: None,
+            attachments: &none,
         },
         WasmPublish {
             channel_address: &channel_addr,
@@ -758,6 +760,7 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: None,
+            attachments: &none,
         },
     ];
     m.publish_from_wasm(consumer_slug, &publishes).await;
@@ -995,6 +998,7 @@ async fn publish_from_wasm_ephemeral_output_feeds_a_subscribing_surface() {
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
+                attachments: &HeldAttachments::none(),
             },
             WasmPublish {
                 channel_address: &addr,
@@ -1002,6 +1006,7 @@ async fn publish_from_wasm_ephemeral_output_feeds_a_subscribing_surface() {
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(chrono::Utc::now() + chrono::Duration::seconds(600)),
+                attachments: &HeldAttachments::none(),
             },
         ],
     )
@@ -1032,6 +1037,7 @@ async fn a_fed_body_shares_the_retained_bodys_allocation() {
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: None,
+            attachments: &HeldAttachments::none(),
         }],
     )
     .await;
@@ -1073,6 +1079,7 @@ async fn publish_from_wasm_ephemeral_output_lands_in_the_ring() {
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: None,
+            attachments: &HeldAttachments::none(),
         }],
     )
     .await;
@@ -1121,6 +1128,7 @@ async fn publish_from_wasm_mixed_batch_commits_both_halves() {
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
+                attachments: &HeldAttachments::none(),
             },
             WasmPublish {
                 channel_address: &ephemeral_addr,
@@ -1128,6 +1136,7 @@ async fn publish_from_wasm_mixed_batch_commits_both_halves() {
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
+                attachments: &HeldAttachments::none(),
             },
         ],
     )
@@ -1180,6 +1189,7 @@ async fn publish_from_wasm_ephemeral_deferred_parks_then_releases() {
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: Some(release_at),
+            attachments: &HeldAttachments::none(),
         }],
     )
     .await;
@@ -1226,6 +1236,7 @@ async fn publish_from_wasm_ephemeral_past_deliver_after_is_immediate() {
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+            attachments: &HeldAttachments::none(),
         }],
     )
     .await;
@@ -1261,6 +1272,7 @@ async fn publish_from_wasm_durable_deferred_parks_the_row() {
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: Some(release_at),
+            attachments: &HeldAttachments::none(),
         }],
     )
     .await;
@@ -1298,6 +1310,7 @@ async fn the_durable_deferred_cap_refuses_a_wasm_park_and_the_flush_carries_on()
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(release_at),
+                attachments: &HeldAttachments::none(),
             },
             WasmPublish {
                 channel_address: &durable_addr,
@@ -1305,6 +1318,7 @@ async fn the_durable_deferred_cap_refuses_a_wasm_park_and_the_flush_carries_on()
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(release_at),
+                attachments: &HeldAttachments::none(),
             },
             WasmPublish {
                 channel_address: &durable_addr,
@@ -1312,6 +1326,7 @@ async fn the_durable_deferred_cap_refuses_a_wasm_park_and_the_flush_carries_on()
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
+                attachments: &HeldAttachments::none(),
             },
         ],
     )
@@ -1376,6 +1391,7 @@ async fn publish_from_wasm_unknown_channel_panics() {
         urgency: Urgency::Normal,
         reply_to: None,
         deliver_after: None,
+        attachments: &HeldAttachments::none(),
     };
     m.publish_from_wasm(consumer_slug, &[bad_publish]).await;
 }
@@ -1395,12 +1411,14 @@ async fn publish_from_wasm_reply_to_resolves_to_channel_uuid() {
         .expect("output channel resolves")
         .uuid;
 
+    let none = HeldAttachments::none();
     let publishes = vec![WasmPublish {
         channel_address: &channel_addr,
         body: "req".into(),
         urgency: Urgency::Normal,
         reply_to: Some(&channel_addr),
         deliver_after: None,
+        attachments: &none,
     }];
     m.publish_from_wasm(consumer_slug, &publishes).await;
 
@@ -1426,12 +1444,14 @@ async fn publish_from_wasm_reply_to_resolves_to_channel_uuid() {
 async fn publish_from_wasm_unknown_reply_to_panics() {
     let consumer_slug = "wasm-bad-reply";
     let (m, channel_addr, _router) = build_wasm_output_messenger(consumer_slug).await;
+    let none = HeldAttachments::none();
     let publishes = vec![WasmPublish {
         channel_address: &channel_addr,
         body: "req".into(),
         urgency: Urgency::Normal,
         reply_to: Some("brenn:tool-results/nonexistent"),
         deliver_after: None,
+        attachments: &none,
     }];
     m.publish_from_wasm(consumer_slug, &publishes).await;
 }
@@ -1452,6 +1472,7 @@ async fn publish_from_wasm_reply_to_reaches_a_ring_channel_as_an_address() {
             urgency: Urgency::Normal,
             reply_to: Some(&durable_addr),
             deliver_after: None,
+            attachments: &HeldAttachments::none(),
         }],
     )
     .await;
@@ -1486,6 +1507,7 @@ async fn a_fed_ring_envelope_carries_the_resolved_reply_address() {
             urgency: Urgency::Normal,
             reply_to: Some(&reply_addr),
             deliver_after: None,
+            attachments: &HeldAttachments::none(),
         }],
     )
     .await;
@@ -1515,6 +1537,7 @@ async fn publish_from_wasm_unknown_reply_to_on_a_ring_channel_panics() {
             urgency: Urgency::Normal,
             reply_to: Some("brenn:tool-results/nonexistent"),
             deliver_after: None,
+            attachments: &HeldAttachments::none(),
         }],
     )
     .await;

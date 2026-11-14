@@ -133,6 +133,7 @@ async fn wasm_publish(m: &Messenger, addr: &str, body: MessageBody) {
             urgency: Urgency::Normal,
             reply_to: None,
             deliver_after: None,
+            attachments: &HeldAttachments::none(),
         }],
     )
     .await;
@@ -224,6 +225,7 @@ async fn a_wasm_flush_that_trips_the_backstop_lands_nothing() {
                         urgency: Urgency::Normal,
                         reply_to: None,
                         deliver_after: None,
+                        attachments: &HeldAttachments::none(),
                     },
                     WasmPublish {
                         channel_address: &plain,
@@ -231,6 +233,7 @@ async fn a_wasm_flush_that_trips_the_backstop_lands_nothing() {
                         urgency: Urgency::Normal,
                         reply_to: None,
                         deliver_after: None,
+                        attachments: &HeldAttachments::none(),
                     },
                 ],
             )

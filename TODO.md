@@ -279,17 +279,15 @@ the texts say which release dropped it. Code sites
 
 ## `blob-attachment-host-sites`
 
-An attachment-carrying publish made through a new interface — the slice that
-adds the `blobs` WIT interface — must be pushed into the same per-activation
-publish buffer as `ports.publish`: `ProcessorData::publish_buffer` on the
-backend, `PublishBuffer::entries` on the page, and not a buffer of its own that
-is merged at flush. The contract promises the flush in call order, and a
-second buffer loses the order between the two interfaces: async tool requests
-are kept in one today and are appended after every port publish. Done = that
-slice pushes its attachment-carrying publishes into the one buffer on both
-hosts, with a test of the order across the two interfaces on each. Code sites
-(`TODO(blob-attachment-host-sites)`): `take_ok_publishes` in
-`brenn-wasm/src/lib.rs` and `PublishBuffer::entries` in
+When a surface host serves the `blobs` interface, its attachment-carrying
+publishes must be pushed into the page's one per-activation publish buffer,
+`PublishBuffer::entries`, and not a buffer of their own merged at flush. The
+contract promises the flush in call order, and a second buffer loses the order
+between `ports` and `blobs`. The backend host already pushes `blobs.publish`
+into `ProcessorData::publish_buffer`. Done = the slice serving the interface on
+a surface pushes its attachment-carrying publishes into
+`PublishBuffer::entries`, with a test of the order across the two interfaces.
+Code site (`TODO(blob-attachment-host-sites)`): `PublishBuffer::entries` in
 `surface/kernel/src/publish_buffer.rs`.
 
 ## `blob-handle-integrity`
@@ -362,27 +360,87 @@ The store's half of the first is written: the rustdoc of the `blob` module in
 store choice forecloses mutation. Three lean on immutability and are named
 there: `size` and `content_type` copied into every reference, bytes synced
 once when a durable row first names them, and reads that take no lock. The
-`blobs` interface's half of the first, and the build-or-never ruling, remain.
+`blobs` interface's half is written too: the header of
+`brenn-wasm/wit/processor-0.3.wit` and the "Blobs and mutability" paragraph of
+`docs/component-packages.md` state what mutation would add to the interface,
+and no choice of the interface forecloses it. Three lean on immutability and
+are named there: `blob` has `read` and no `write`, `size` and `content-type`
+are fixed on a handle, and forwarding shares the blob rather than copying it.
+The build-or-never ruling remains.
 
-## `correctness-boot-blob-sweep-deletes-files-in-a-directory-it-does-not-own`
+## `blobs-interface-stable-declaration`
 
-The blob store's open sweep (`BlobStore::open`,
-`brenn-messaging-store/src/blob/durable.rs`) unlinks every blob file its
-database does not name. An exclusive `flock` on the directory refuses a second
-store while another holds it, but nothing ties the directory to the database
-it belongs to: a host whose `blob_dir` names another host's directory, booted
-while that host is down, deletes the other host's blob files without error, and
-the other host then refuses to start for every message naming them. Decide how
-the directory records its owner (for example the database's store generation in
-one marker entry the sweep admits by name) and what an operator does when the
-marker and the database disagree after a legitimate move or restore; that
-changes the rule that the directory holds nothing but blob files, adds a boot
-refusal, and changes the backup and restore paragraph of `docs/message-bus.md`
-and the operator changelog entry. Done = a store refuses to open a directory
-another database owns, and the restore of a database with its own directory
-still boots. This must land before the first release in which production code
-publishes an attachment onto a durable channel; until then no blob directory
-holds a file a sweep could wrongly delete.
+The `blobs` component interface (`brenn:processor/blobs@0.3.0`) is served by
+the backend host and is not yet declared stable: its file says its shapes are
+expected to change, because no surface host serves it and the surface is where
+a synchronous host must answer a range read without the network, and because
+tool calls do not carry blobs yet (`blobs-on-tool-calls`). Until the
+declaration the rule is: a shape changes in place only while no tagged brenn
+release has served it; a shape a tagged release has served changes only as a
+new version of the interface, served beside the old one for at least one
+release and announced in `CHANGELOG.md`, because brenn releases first and
+out-of-tree components follow — there is no lockstep upgrade. The old version
+may be removed one release after its replacement; nothing longer is promised.
+Declare it stable — the same promise `brenn:processor@0.2.0` carries, in its
+WIT header, `docs/component-packages.md` and a `CHANGELOG.md` entry for
+component authors — once a surface host serves the same interface, or once it
+is decided that surfaces get a different one. Done = the declaration is in
+those three texts, or this entry records why surfaces take another interface
+and the declaration is made for the backend alone. Code site
+(`TODO(blobs-interface-stable-declaration)`): the status paragraph of
+`brenn-wasm/wit/processor-0.3.wit`.
+
+## `blobs-on-tool-calls`
+
+A blob cannot cross a tool call or a sync call. A component serving a registry
+tool (`provides`) is handed its request as JSON text on `tool-requests` and
+answers through `provides.complete` with outcome JSON capped at 512 KiB;
+`tools.call-fast`, `tools.call-async`, `provides.call-async-for`, their results
+on `tool-results`, and `calls.call` carry no attachments either. The `blobs`
+interface lets a component read, make and attach blobs on published messages
+only, so an in-tree Google tool cannot return a mail or Drive attachment by
+reference, and a caller cannot hand a blob to a tool. Build the path: a tool
+request and a tool result that carry named attachments, and a completion that
+attaches blobs the provider sealed or was handed, under the same check on
+which blobs a component may name as a publish; the caller's side — a
+conversation or a component — receives the references. The "Blobs and
+provided tools" paragraph of `docs/component-packages.md` is the starting
+point. Done = a fixture provider is handed a blob on a request and answers a
+request with a blob its caller can read, both by reference with no byte
+copied, and the interface's file states what each call form does with
+attachments. Code site (`TODO(blobs-on-tool-calls)`): the sentence of
+`brenn-wasm/wit/processor-0.3.wit` that says tool calls and completions carry
+no attachments.
+
+## `blobs-parked-message-attachments`
+
+A component cannot see or change the attachments of its own parked messages.
+The deferred window carries a parked message's body, index and release time
+and no header, `blobs.open` reaches port windows only, and `ports.defer-edit`
+replaces body and time. So a component that cancels a parked message to send
+it again cannot re-attach what it carried. Decide how a parked message's
+attachments are shown (the deferred entry's shape is frozen in `bus@0.2.0`, so
+it is a function of `blobs`) and whether an edit may replace them, which also
+replaces the trigger that refuses an update of `messaging_messages.attachments`.
+Done = a component opens an attachment of one of its parked messages by
+reference and, if edits are admitted, replaces a parked message's attachments,
+with tests on a durable and a ring channel. Code site
+(`TODO(blobs-parked-message-attachments)`): the deferred-window sentence of
+`brenn-wasm/wit/processor-0.3.wit`.
+
+## `blob-budget-per-component`
+
+The blob store's budget (`blob_budget_bytes`) is one pool. A component granted
+`blobs` may write 64 MiB per activation, and what it publishes lives as long as
+its channels' windows hold it, so over many activations one component can
+exhaust the pool and every other producer is then refused `budget-exhausted`.
+Decide whether a component gets a share of the budget, who is charged for a
+blob that is forwarded and so held by messages of several components, and
+whether the share is operator configuration. Done = one component at its share
+cannot cause another producer's write to be refused, with a test, and
+`docs/security-posture.md` §7.6 no longer states the exposure. Code site
+(`TODO(blob-budget-per-component)`):
+`PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION` in `brenn-wasm/src/lib.rs`.
 
 ## `correctness-no-single-instance-guard-before-startup-side-effects`
 

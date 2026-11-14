@@ -396,6 +396,11 @@ pub(crate) struct ConsumerLoadContext<'a> {
     /// over it; `None` is a host with no router, where such a consumer cannot
     /// be loaded at all.
     pub sync_router: Option<Arc<brenn_server::messaging_router::WakeRouterImpl>>,
+    /// The blob store as a component reaches it, built once by
+    /// [`brenn_wasm_dispatch::blob_host_over`]. A consumer holding the `blobs`
+    /// grant is loaded with it; `None` is a host with no blob store, where such
+    /// a consumer cannot be loaded at all.
+    pub blob_host: Option<brenn_wasm::BlobHostFn>,
 }
 
 /// A loaded consumer: the instantiated component, what the package bound, and
@@ -525,6 +530,20 @@ pub(crate) fn load_consumer(
     } else {
         None
     };
+    // Blob seam. Set iff the consumer holds the `Blobs` grant — the `blobs`
+    // interface is linked iff this is `Some`, and `ProcessorComponent::load`
+    // re-asserts that invariant.
+    let blob_host: Option<brenn_wasm::BlobHostFn> = consumer
+        .grants
+        .contains(&brenn_lib::messaging::ComponentGrant::Blobs)
+        .then(|| {
+            ctx.blob_host.clone().unwrap_or_else(|| {
+                panic!(
+                    "consumer {}: holds the `blobs` grant on a host with no blob store",
+                    consumer.slug,
+                )
+            })
+        });
     let calls: std::collections::HashMap<String, brenn_wasm::ProcessorCallTarget> = consumer
         .calls
         .iter()
@@ -565,6 +584,7 @@ pub(crate) fn load_consumer(
             declared_call_ports: consumer.call_ports.clone(),
             calls,
             sync_caller,
+            blob_host,
         },
     );
     assert_contract_carries_bound_channels(consumer, component.contract());
@@ -876,6 +896,7 @@ mod tests {
                 declared_call_ports: Default::default(),
                 calls: Default::default(),
                 sync_caller: None,
+                blob_host: None,
             }
         }
 
@@ -1317,6 +1338,7 @@ mod tests {
             provider_runtime: &brenn_tool_registry::ProviderRuntime::new(alert_dispatcher.clone()),
             max_payload_bytes: 1024,
             sync_router: None,
+            blob_host: None,
         };
         let mut consumer = tool_consumer(&[brenn_lib::messaging::ComponentGrant::Ports], &[]);
         consumer.store_path = Some(std::path::PathBuf::from(

@@ -44,7 +44,7 @@ pub const MANIFEST_VERSION: u32 = 3;
 const PROCESSOR_PACKAGE: &str = "brenn:processor";
 
 /// The WIT interfaces a surface-hosted processor may import: the transpilable
-/// profile. `store`/`mqtt`/`tools`/`provides` are backend-only; `dom`/`page-dom` run
+/// profile. `store`/`mqtt`/`tools`/`provides`/`blobs` are backend-only; `dom`/`page-dom` run
 /// the other way and are surface-only, because only a page has a DOM.
 ///
 /// `types` and `bus` are in the set but are not capabilities: they define the
@@ -58,14 +58,14 @@ const SURFACE_IMPORTS: [&str; 9] = [
     "types", "bus", "ports", "log", "alert", "config", "calls", "dom", "page-dom",
 ];
 
-/// Every WIT interface name either processor WIT file defines (`bus` is
-/// defined only in `processor-0.2.wit`). An import outside this set is
+/// Every WIT interface name the processor WIT files define (`bus` is defined
+/// only in `processor-0.2.wit`, `blobs` only in `processor-0.3.wit`). An import outside this set is
 /// manifest/toolchain drift (the build wrote a name no world declares), which
 /// is a different operator problem from declaring a backend-only component on a
 /// surface — and gets its own panic.
-const KNOWN_IMPORTS: [&str; 13] = [
+const KNOWN_IMPORTS: [&str; 14] = [
     "types", "bus", "ports", "log", "alert", "config", "store", "mqtt", "tools", "provides",
-    "calls", "dom", "page-dom",
+    "calls", "blobs", "dom", "page-dom",
 ];
 
 /// Why a record this server reads no further, or a `brenn:processor@0.2.0`
@@ -755,7 +755,7 @@ mod tests {
     /// The interface names the world defines and only a surface host links.
     /// [`KNOWN_IMPORTS`] is "every interface `processor.wit` defines", so it
     /// carries them; a top-level component may not be granted them. That is the
-    /// mirror image of `store`/`mqtt`/`tools`/`provides`, which the world defines and only
+    /// mirror image of `store`/`mqtt`/`tools`/`provides`/`blobs`, which the world defines and only
     /// the backend links.
     const SURFACE_ONLY: [&str; 2] = ["dom", "page-dom"];
 

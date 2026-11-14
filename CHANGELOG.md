@@ -4,6 +4,42 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **For WASM component authors: a `blobs` interface, backend only, not yet
+  stable.** A new interface, `brenn:processor/blobs@0.3.0`
+  (`brenn-wasm/wit/processor-0.3.wit`), under a new grant word, `blobs`, lets
+  a component on the backend host open an attachment of a message in its
+  windows by port, index and name, read it by byte range, create a blob by
+  positional writes and seal it, and publish a message naming blobs it opened
+  or made — forwarding one by reference copies no byte. Publishing with
+  attachments needs `ports` as well; `ports.publish` and its siblings still
+  publish no attachments, so republishing a body drops what it carried. A
+  component names the world `brenn:processor/processor@0.3.0`, the 0.2.0 world
+  with `blobs` imported, and is still a 0.2.0 component; `brenn-guest` binds
+  that world and adds `brenn_guest::blobs`, `publish_with_attachments` and
+  `Message::attachments`. A component that does not call the interface
+  imports nothing new. The word is refused on a placed instance, and a
+  surface refuses a component that imports the interface. The interface is
+  not yet declared stable: a shape changes in place only while no tagged
+  brenn release has served it; a shape a tagged release has served changes
+  only as a new version of the interface, served beside the old one for at
+  least one release and announced here; the old version may be removed one
+  release after its replacement, and nothing longer is promised. See
+  `docs/component-packages.md`.
+- **BREAKING for operators: a blob directory records the database it belongs
+  to.** The blob directory now holds a file `owner`, mode 0600, holding the
+  store generation of its database (`messaging_store_identity.generation`).
+  The first boot over an empty directory writes it; every later boot compares
+  it with the database's. A directory whose record names another database,
+  one that holds blob files and no record, and one whose record is not a
+  single generation line stop the boot, naming both generations, before
+  anything is deleted. A fresh database beside an old blob directory used to
+  start, its boot sweep deleting the old files; it now refuses: remove the
+  directory, or point `messaging { blob_dir }` elsewhere, and the host claims
+  a new one. A database restored or moved together with its own directory
+  boots unchanged. To repair a lost record beside the database that owns the
+  files: `sqlite3 <database> "SELECT generation FROM messaging_store_identity"
+  > <blob_dir>/owner`. See `docs/message-bus.md`, the blob section's backup
+  and restore paragraph.
 - **BREAKING for operators: the database and the blob directory are one unit
   to back up, restore and roll back.** Attachment bytes live in a directory
   beside the database (`messaging { blob_dir }`, default the database path
@@ -11,10 +47,9 @@ All notable changes to Brenn are documented here.
   messages name a blob that directory no longer holds. Blob files are deleted
   as their messages are evicted, so a snapshot of the database alone,
   restored later, can name files that are gone. Back up and snapshot the two
-  together, and prune them together. Nothing in this release publishes an
-  attachment, so existing database-only snapshots still restore; that stops
-  being true at the first release that publishes one onto a durable channel,
-  and a deploy or backup script must cover the directory before then. To
+  together, and prune them together. A component granted `blobs` can
+  publish an attachment onto a durable channel, so a deploy or backup script
+  must cover the directory from this release on. To
   start a host that refuses: delete the message rows the panic names with
   `sqlite3`. See `docs/message-bus.md`, the blob section's restore paragraph.
 - **For operators and WASM component authors: a blob store, and attachments
@@ -29,14 +64,14 @@ All notable changes to Brenn are documented here.
   page, and so does an attach v5 session; a conversation is shown each
   attachment's name, size and content type without its id; the eviction
   archive records the references but not the bytes; 0.1.0 components and
-  attach v4 sessions see nothing, byte-identically. Nothing outside the host
-  creates or redeems a blob yet, and nothing in this release publishes one:
-  the store, the field and the lifetime rule are the base later releases
-  build producers on. Three new keys in the `messaging` section:
+  attach v4 sessions see nothing, byte-identically. A backend component
+  granted `blobs` creates, reads and forwards blobs (the entry below);
+  remotes, pages and conversations see references as metadata only and can
+  neither create nor redeem one. Three new keys in the `messaging` section:
   `max_blob_bytes` (default 64 MiB), `blob_budget_bytes` (default 1 GiB) and
   `blob_dir`; the store creates its directory, mode 0700, on first boot, and
   refuses to start if `PRAGMA synchronous` is below `FULL` or the directory
-  holds anything that is not a blob file. The database gains a nullable
+  holds anything that is not a blob file or its owner record. The database gains a nullable
   `attachments` column on `messaging_messages`, two tables
   (`messaging_blobs`, `messaging_blob_refs`) and two triggers on the first
   boot. See `docs/message-bus.md` §2.1.2a and `docs/config-dsl.md`.

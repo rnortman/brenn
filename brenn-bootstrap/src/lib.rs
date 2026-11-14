@@ -931,6 +931,10 @@ pub async fn run_server(
             provider_runtime: &provider_runtime,
             max_payload_bytes: config.messaging.max_body_bytes,
             sync_router: messaging_result.router.clone(),
+            blob_host: messaging_result
+                .messenger
+                .as_ref()
+                .and_then(brenn_wasm_dispatch::blob_host_over),
         };
         messaging_result
             .wasm_consumers

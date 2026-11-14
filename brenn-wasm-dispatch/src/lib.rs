@@ -492,6 +492,49 @@ pub fn sync_request_channel() -> (
     tokio::sync::mpsc::channel(SYNC_REQUEST_QUEUE_DEPTH)
 }
 
+/// The blob seam a consumer holding the `blobs` grant is loaded with, or
+/// `None` when `messenger` has no blob store.
+///
+/// `retain` blocks on [`Messenger::retain_blob`] through the runtime handle
+/// captured here, from the guest's blocking thread: a blob nothing holds is
+/// `None`, and any other error panics. `create` is the store's own. Here
+/// rather than beside the host's other seams so this crate's suites drive the
+/// production body instead of a copy of it.
+///
+/// # Panics
+///
+/// If no tokio runtime is entered — the handle is captured here, not at the
+/// call.
+#[must_use]
+pub fn blob_host_over(messenger: &Arc<Messenger>) -> Option<brenn_wasm::BlobHostFn> {
+    use brenn_messaging_store::blob::{BlobError, BlobHold, BlobStore, BlobWriter};
+
+    struct MessengerBlobs {
+        messenger: Arc<Messenger>,
+        store: Arc<BlobStore>,
+        handle: tokio::runtime::Handle,
+    }
+    impl brenn_wasm::BlobHost for MessengerBlobs {
+        fn retain(&self, id: &brenn_envelope::BlobId) -> Option<BlobHold> {
+            match self.handle.block_on(self.messenger.retain_blob(id)) {
+                Ok(hold) => Some(hold),
+                Err(BlobError::NotFound) => None,
+                Err(e) => panic!("retaining blob {id} for a component: {e}"),
+            }
+        }
+
+        fn create(&self, content_type: &str) -> Result<BlobWriter, BlobError> {
+            self.store.create(content_type)
+        }
+    }
+    let store = messenger.blob_store()?.clone();
+    Some(Arc::new(MessengerBlobs {
+        messenger: messenger.clone(),
+        store,
+        handle: tokio::runtime::Handle::current(),
+    }))
+}
+
 /// Spawn the off-loop dispatch task for one WASM consumer.
 ///
 /// `sync_rx` is the receiving half of [`sync_request_channel`] — the task is its
@@ -929,6 +972,7 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
                             )
                             .expect("deliver_after was range-validated at buffer time")
                         }),
+                        attachments: &p.attachments,
                     })
                     .collect();
                 cfg.messenger

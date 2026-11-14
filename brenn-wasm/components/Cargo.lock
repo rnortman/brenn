@@ -150,6 +150,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-processor-blobs-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
 name = "brenn-processor-bytes-test"
 version = "0.1.0"
 dependencies = [

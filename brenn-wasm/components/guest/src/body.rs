@@ -1,8 +1,13 @@
 // Message bodies as a component reads and writes them: bytes with an optional
 // content type, owned (`Body`) or borrowed for the host (`BodyRef`), and one
-// window entry (`Message`) pairing a body with its envelope header.
+// window entry (`Message`) pairing a body with its envelope header and its
+// place in the window.
 
-use brenn_envelope::{EnvelopeHeader, MessageBody, MessageEnvelope, is_text_content_type};
+use std::sync::Arc;
+
+use brenn_envelope::{
+    AttachmentName, Attachments, EnvelopeHeader, MessageBody, MessageEnvelope, is_text_content_type,
+};
 
 use crate::Error;
 
@@ -198,19 +203,65 @@ impl<'a> From<&'a Body> for BodyRef<'a> {
     }
 }
 
-/// One window entry: an envelope's header and its body, as handed over.
+/// One window entry: an envelope's header and its body, as handed over, and
+/// where the entry sits: its port and its index in that port's window.
 ///
 /// The header is an open JSON object — every envelope field but the body —
-/// and is parsed only when asked for, by [`Message::envelope`].
+/// and is parsed only when asked for, by [`Message::envelope`] or
+/// [`Message::attachments`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     header_json: String,
     body: Body,
+    port: Arc<str>,
+    index: u32,
+}
+
+/// One attachment of a received message, as its header names it: the name,
+/// the blob's size in bytes and its content type.
+///
+/// Reading its bytes, or forwarding it, takes a handle from
+/// [`crate::blobs::open`] under the `blobs` grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    name: AttachmentName,
+    size: u64,
+    content_type: String,
+}
+
+impl Attachment {
+    /// The name the message gives the attachment.
+    pub fn name(&self) -> &AttachmentName {
+        &self.name
+    }
+
+    /// The blob's size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The blob's content type.
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+}
+
+/// The one header key [`Message::attachments`] reads; every other key is
+/// skipped unparsed into values.
+#[derive(serde::Deserialize)]
+struct AttachmentsHeader {
+    #[serde(default)]
+    attachments: Attachments,
 }
 
 impl Message {
-    pub(crate) fn new(header_json: String, body: Body) -> Message {
-        Message { header_json, body }
+    pub(crate) fn new(header_json: String, body: Body, port: Arc<str>, index: u32) -> Message {
+        Message {
+            header_json,
+            body,
+            port,
+            index,
+        }
     }
 
     /// The envelope header as JSON text: every envelope field but the body.
@@ -224,8 +275,39 @@ impl Message {
         &self.body
     }
 
+    /// The input port whose window handed this message over.
+    pub fn port(&self) -> &str {
+        &self.port
+    }
+
+    /// The message's position in its port's window, valid only in the
+    /// activation that delivered it.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
     pub(crate) fn into_body(self) -> Body {
         self.body
+    }
+
+    /// The attachments the message carries, ordered by name; empty when it
+    /// carries none.
+    ///
+    /// Reads the header's `attachments` key alone and never copies the body.
+    /// Needs no grant: it is the header's metadata. `Err(MalformedEnvelope)`
+    /// when the header does not read.
+    pub fn attachments(&self) -> Result<Vec<Attachment>, Error> {
+        let header: AttachmentsHeader = serde_json::from_str(&self.header_json)
+            .map_err(|e| Error::malformed(format!("envelope header attachments: {e}")))?;
+        Ok(header
+            .attachments
+            .iter()
+            .map(|(name, blob)| Attachment {
+                name: name.clone(),
+                size: blob.size,
+                content_type: blob.content_type.clone(),
+            })
+            .collect())
     }
 
     /// The whole envelope, parsed: the header read as an

@@ -786,6 +786,8 @@ mod alerter;
 #[cfg(test)]
 mod attachments;
 #[cfg(test)]
+mod blobs;
+#[cfg(test)]
 mod body_kinds;
 #[cfg(test)]
 mod fanout;

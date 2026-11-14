@@ -330,7 +330,10 @@ fn wit_source_for_crate(family: &Family, crate_dir: &Path, repo_root: &Path) -> 
             guest_sdk_world_is_processor(repo_root);
             WitSource {
                 path: canonical(GUEST_SDK_WIT_FILE),
-                resolve_with: vec![canonical(GUEST_SDK_RESOLVE_WITH)],
+                resolve_with: GUEST_SDK_RESOLVE_WITH
+                    .iter()
+                    .map(|file| canonical(file))
+                    .collect(),
                 world: GUEST_SDK_WORLD.to_string(),
             }
         }
@@ -341,11 +344,22 @@ fn wit_source_for_crate(family: &Family, crate_dir: &Path, repo_root: &Path) -> 
 }
 
 /// The WIT files and world the brenn-guest SDK generates its bindings from:
-/// the 0.2.0 world, read after the 0.1.0 file whose unchanged interfaces it
-/// imports.
-const GUEST_SDK_WIT_FILE: &str = "processor-0.2.wit";
-const GUEST_SDK_RESOLVE_WITH: &str = "processor.wit";
-const GUEST_SDK_WORLD: &str = "brenn:processor/processor@0.2.0";
+/// the 0.3.0 world (the 0.2.0 world with `blobs` imported), read after the
+/// 0.1.0 and 0.2.0 files whose interfaces it imports, in that order.
+const GUEST_SDK_WIT_FILE: &str = "processor-0.3.wit";
+const GUEST_SDK_RESOLVE_WITH: &[&str] = &["processor.wit", "processor-0.2.wit"];
+const GUEST_SDK_WORLD: &str = "brenn:processor/processor@0.3.0";
+
+/// The `path` list of the SDK's `generate!`, as written there: every
+/// `resolve_with` file, then the world's own file.
+fn guest_sdk_path_list() -> String {
+    let files: Vec<String> = GUEST_SDK_RESOLVE_WITH
+        .iter()
+        .chain(core::iter::once(&GUEST_SDK_WIT_FILE))
+        .map(|file| format!("\"../../wit/{file}\""))
+        .collect();
+    format!("path: [{}]", files.join(", "))
+}
 
 /// Liveness guard for the hard-coded Family B mapping above: the SDK's `generate!`
 /// invocation must still name that file and world. If someone repoints or splits it,
@@ -362,9 +376,7 @@ fn guest_sdk_world_is_processor(repo_root: &Path) {
         .unwrap_or_else(|e| panic!("xtask check-wit: failed to read {sdk_bindings:?}: {e}"));
     for needle in [
         &format!("world: \"{GUEST_SDK_WORLD}\""),
-        &format!(
-            "path: [\"../../wit/{GUEST_SDK_RESOLVE_WITH}\", \"../../wit/{GUEST_SDK_WIT_FILE}\"]"
-        ),
+        &guest_sdk_path_list(),
     ] {
         assert!(
             content.contains(needle.as_str()),
@@ -907,7 +919,7 @@ edition = "2021"
     }
 
     /// A repo root carrying the files the Family B mapping reads: the SDK's
-    /// `generate!` invocation and the WIT file it names.
+    /// `generate!` invocation and the WIT files it names.
     fn temp_repo_with_guest_sdk(generate_invocation: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
@@ -929,13 +941,19 @@ edition = "2021"
             "package test:processor@0.2.0;\nworld processor {}\n",
         )
         .unwrap();
+        fs::write(
+            wit_dir.join("processor-0.3.wit"),
+            "package test:processor@0.3.0;\nworld processor {}\n",
+        )
+        .unwrap();
         fs::write(sdk_src.join("bindings.rs"), generate_invocation).unwrap();
         tmp
     }
 
     const REAL_SDK_GENERATE: &str = "wit_bindgen::generate!({\n    \
-         world: \"brenn:processor/processor@0.2.0\",\n    \
-         path: [\"../../wit/processor.wit\", \"../../wit/processor-0.2.wit\"],\n});\n";
+         world: \"brenn:processor/processor@0.3.0\",\n    \
+         path: [\"../../wit/processor.wit\", \"../../wit/processor-0.2.wit\", \
+         \"../../wit/processor-0.3.wit\"],\n});\n";
 
     /// Family B crates carry no WIT path in Cargo metadata, so the mapping is the SDK's
     /// own world — the same file and world for every guest crate.
@@ -952,9 +970,12 @@ edition = "2021"
                 .canonicalize()
                 .unwrap()
         };
-        assert_eq!(source.path, wit("processor-0.2.wit"));
-        assert_eq!(source.world, "brenn:processor/processor@0.2.0");
-        assert_eq!(source.resolve_with, vec![wit("processor.wit")]);
+        assert_eq!(source.path, wit("processor-0.3.wit"));
+        assert_eq!(source.world, "brenn:processor/processor@0.3.0");
+        assert_eq!(
+            source.resolve_with,
+            vec![wit("processor.wit"), wit("processor-0.2.wit")]
+        );
     }
 
     /// The liveness guard on that hard-coded mapping: an SDK repointed at another world
@@ -965,7 +986,20 @@ edition = "2021"
     fn wit_source_for_crate_panics_when_the_guest_sdk_repoints() {
         let tmp = temp_repo_with_guest_sdk(
             "wit_bindgen::generate!({\n    world: \"something-else\",\n    \
-             path: [\"../../wit/processor.wit\", \"../../wit/processor-0.2.wit\"],\n});\n",
+             path: [\"../../wit/processor.wit\", \"../../wit/processor-0.2.wit\", \
+             \"../../wit/processor-0.3.wit\"],\n});\n",
+        );
+        wit_source_for_crate(&Family::Guest, tmp.path(), tmp.path());
+    }
+
+    /// The guard reads the whole path list: an SDK that drops a file from it is
+    /// repointed as surely as one naming another world.
+    #[test]
+    #[should_panic(expected = "no longer contains")]
+    fn wit_source_for_crate_panics_when_the_guest_sdk_drops_a_file() {
+        let tmp = temp_repo_with_guest_sdk(
+            "wit_bindgen::generate!({\n    world: \"brenn:processor/processor@0.3.0\",\n    \
+             path: [\"../../wit/processor.wit\", \"../../wit/processor-0.3.wit\"],\n});\n",
         );
         wit_source_for_crate(&Family::Guest, tmp.path(), tmp.path());
     }

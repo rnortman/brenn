@@ -157,7 +157,7 @@ pub(super) fn output(port: &str, entry: &ChannelEntry) -> WasmOutputPort {
 }
 
 /// The consumer config for `component` with these ports.
-fn consumer(
+pub(super) fn consumer(
     slug: &str,
     component: Arc<ProcessorComponent>,
     messenger: &Arc<brenn_messaging::Messenger>,
@@ -179,7 +179,7 @@ fn consumer(
 }
 
 /// The output-port specs the component is loaded with, one per bound output.
-fn output_specs(
+pub(super) fn output_specs(
     outputs: &[WasmOutputPort],
 ) -> std::collections::HashMap<String, brenn_wasm::OutputPortSpec> {
     outputs

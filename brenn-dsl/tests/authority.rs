@@ -2090,6 +2090,10 @@ fn a_backend_only_capability_is_refused_on_a_placed_instance() {
             "mqtt",
             "`mqtt` is backend-only in v1; a surface-hosted component cannot be granted it",
         ),
+        (
+            "blobs",
+            "`blobs` is backend-only: no surface host serves blob bytes yet",
+        ),
     ] {
         assert!(
             derive_refusals(&placed_panel(word, "")).contains(&expected.to_string()),
@@ -4404,7 +4408,7 @@ fn a_refused_ceiling_word_suppresses_the_fit_check() {
     assert_eq!(
         derive_refusal(&packaged_page(" { grants = [dom, chrome, subscribe]; }")),
         "`chrome` is not a grant word, so it caps nothing; a ceiling names `alert`, \
-         `calls`, `config`, `dom`, `dynamic_subscribe`, `ephemeral_publish`, \
+         `blobs`, `calls`, `config`, `dom`, `dynamic_subscribe`, `ephemeral_publish`, \
          `ephemeral_subscribe`, `log`, `mqtt`, `page-dom`, `ports`, `provides`, `publish`, \
          `pwa_push`, `store`, `subscribe`, `takeover` or `tools`"
     );

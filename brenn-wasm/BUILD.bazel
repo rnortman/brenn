@@ -20,6 +20,7 @@ COMPONENT_NAMES = [
     "google-gmail-organize",
     "google-gmail-read",
     "google-maps-tools",
+    "processor-blobs-test",
     "processor-bytes-test",
     "processor-call-test",
     "processor-config",
@@ -283,6 +284,7 @@ rust_library(
         "//brenn-budget",
         "//brenn-common",
         "//brenn-envelope",
+        "//brenn-messaging-store",
     ],
 )
 
@@ -333,6 +335,7 @@ WASM_TEST_SUITES = [
             "google-maps-tools",
             "meeting",
             "mode-clock",
+            "processor-blobs-test",
             "processor-call-test",
             "processor-config",
             "processor-demo",
@@ -396,8 +399,17 @@ WASM_TEST_SUITES = [
         [],
     ),
     (
+        "blobs",
+        ["processor-blobs-test"],
+        [],
+        # The seam is a real `BlobStore`.
+        ["//brenn-messaging-store"],
+        [],
+    ),
+    (
         "bytes_contract",
         [
+            "processor-blobs-test",
             "processor-bytes-test",
             "processor-exhaust",
             "processor-stale-contract-test",
@@ -410,6 +422,7 @@ WASM_TEST_SUITES = [
     (
         "grants",
         [
+            "processor-blobs-test",
             "processor-bytes-test",
             "processor-config",
             "processor-demo",
@@ -423,7 +436,8 @@ WASM_TEST_SUITES = [
             "processor-store-rt",
         ],
         [],
-        [],
+        # The stub blob seam names the store's types.
+        ["//brenn-messaging-store"],
         [],
     ),
     ("instantiation_fail", ["processor-exhaust"], [], [], []),

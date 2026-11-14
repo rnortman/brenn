@@ -40,6 +40,22 @@ fn blob_dir(dir: &tempfile::TempDir) -> std::path::PathBuf {
     dir.path().join("db.blobs")
 }
 
+fn owner_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    blob_dir(dir).join("owner")
+}
+
+/// The blob files in the fixture's blob directory, sorted; the owner record is
+/// not one.
+fn blob_files(dir: &tempfile::TempDir) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(blob_dir(dir))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != "owner")
+        .collect();
+    names.sort();
+    names
+}
+
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let db = init_db_memory();
@@ -511,12 +527,16 @@ async fn restart_keeps_durable_blobs_and_sweeps_everything_else() {
     let mut unsealed = f.blobs.create("text/plain").unwrap();
     unsealed.write(0, b"half").unwrap();
     std::mem::forget((durable, unpublished, unsealed));
-    assert_eq!(std::fs::read_dir(blob_dir(&f.dir)).unwrap().count(), 3);
+    assert_eq!(blob_files(&f.dir).len(), 3);
 
     let f = f.restart().await;
     f.assert_readable(&durable_id, b"durable").await;
     assert!(!f.file_exists(&unpublished_id));
-    assert_eq!(std::fs::read_dir(blob_dir(&f.dir)).unwrap().count(), 1);
+    assert_eq!(blob_files(&f.dir), vec![durable_id.as_str().to_owned()]);
+    assert!(
+        owner_path(&f.dir).is_file(),
+        "the sweep keeps the owner record"
+    );
     assert_eq!(f.blobs.usage().charged_bytes, 7);
     assert_eq!(f.blobs.usage().sealed, 1);
 }
@@ -562,7 +582,7 @@ async fn a_store_opened_over_a_lowered_budget_refuses_creates_until_under_it() {
         f.blobs.create("text/plain"),
         Err(BlobError::BudgetExhausted { budget: 4 })
     ));
-    assert_eq!(std::fs::read_dir(blob_dir(&f.dir)).unwrap().count(), 1);
+    assert_eq!(blob_files(&f.dir).len(), 1);
 
     f.sql("DELETE FROM messaging_messages").await;
     assert_eq!(f.reap().await, ReapReport { blobs: 1, bytes: 5 });
@@ -665,4 +685,238 @@ fn open_creates_the_directory_owner_only() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o700);
+}
+
+// ---------------------------------------------------------------------------
+// The owner record
+// ---------------------------------------------------------------------------
+
+fn migrated_conn() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    crate::db::run_slice_migrations(&conn);
+    conn
+}
+
+fn generation_of(conn: &Connection) -> Uuid {
+    read_store_identity(conn).generation
+}
+
+/// The panic message of `open`, which must refuse.
+fn refusal(open: impl FnOnce() -> Arc<BlobStore>) -> String {
+    let Err(refused) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open)) else {
+        panic!("the open must be refused");
+    };
+    refused
+        .downcast_ref::<String>()
+        .expect("the refusal is a formatted panic")
+        .clone()
+}
+
+impl Fixture {
+    /// Release the directory lock, as a crashed host's death does, so another
+    /// open may be tried over the directory while the fixture is kept.
+    fn crash(&self) {
+        self.blobs.release_dir_lock();
+    }
+
+    async fn generation(&self) -> Uuid {
+        generation_of(&*self.db.lock().await)
+    }
+}
+
+#[tokio::test]
+async fn a_fresh_directory_is_claimed_with_the_database_generation() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture().await;
+    let record = std::fs::read_to_string(owner_path(&f.dir)).unwrap();
+    assert_eq!(record, format!("{}\n", f.generation().await));
+    let mode = std::fs::metadata(owner_path(&f.dir))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(!blob_dir(&f.dir).join("owner.tmp").exists());
+}
+
+#[tokio::test]
+async fn a_reopen_on_the_same_database_keeps_the_record_and_the_blobs() {
+    let (f, id) = one_durable_blob().await;
+    let record = std::fs::read(owner_path(&f.dir)).unwrap();
+    let f = f.restart().await;
+    assert_eq!(std::fs::read(owner_path(&f.dir)).unwrap(), record);
+    f.assert_readable(&id, b"bytes").await;
+}
+
+/// The case the directory lock cannot cover: the owning host is down.
+#[tokio::test]
+async fn open_refuses_a_directory_another_database_owns_and_deletes_nothing() {
+    let (f, id) = one_durable_blob().await;
+    let ours = f.generation().await;
+    f.crash();
+    let other = migrated_conn();
+    let theirs = generation_of(&other);
+    let message = refusal(|| BlobStore::open(&blob_dir(&f.dir), LIMITS, &other));
+    assert!(message.contains(&ours.to_string()), "{message}");
+    assert!(message.contains(&theirs.to_string()), "{message}");
+    assert!(
+        message.contains("point messaging blob_dir elsewhere"),
+        "{message}"
+    );
+    assert!(f.file_exists(&id), "the refusal swept nothing");
+    assert_eq!(
+        std::fs::read_to_string(owner_path(&f.dir)).unwrap(),
+        format!("{ours}\n")
+    );
+}
+
+#[tokio::test]
+async fn open_refuses_blob_files_with_no_owner_record() {
+    let (f, id) = one_durable_blob().await;
+    std::fs::remove_file(owner_path(&f.dir)).unwrap();
+    f.crash();
+    let message = refusal(|| {
+        let conn = f.db.try_lock().expect("the database is unlocked");
+        BlobStore::open(&blob_dir(&f.dir), LIMITS, &conn)
+    });
+    assert!(
+        message.contains("holds 1 blob files and no owner record"),
+        "{message}"
+    );
+    assert!(f.file_exists(&id));
+    assert!(!owner_path(&f.dir).exists(), "a refusal claims nothing");
+}
+
+/// Records that do not hold exactly one generation line, each refused over a
+/// directory with a blob file and over one without.
+#[tokio::test]
+async fn open_refuses_a_malformed_owner_record() {
+    let malformed = |generation: Uuid| -> Vec<String> {
+        vec![
+            String::new(),
+            "\n".to_owned(),
+            "not a generation\n".to_owned(),
+            generation.to_string(),
+            format!("{generation}\n{generation}\n"),
+            format!("{}\n", generation.to_string().to_uppercase()),
+            format!("{}\n", generation.simple()),
+            format!("{generation}\n{}", "x".repeat(100)),
+        ]
+    };
+
+    let (f, id) = one_durable_blob().await;
+    f.crash();
+    let generation = f.generation().await;
+    for record in malformed(generation) {
+        std::fs::write(owner_path(&f.dir), &record).unwrap();
+        let message = refusal(|| {
+            let conn = f.db.try_lock().expect("the database is unlocked");
+            BlobStore::open(&blob_dir(&f.dir), LIMITS, &conn)
+        });
+        assert!(
+            message.contains("does not hold one store generation"),
+            "{record:?}: {message}"
+        );
+        assert!(f.file_exists(&id));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let conn = migrated_conn();
+    for record in malformed(generation_of(&conn)) {
+        std::fs::write(dir.path().join("owner"), &record).unwrap();
+        let message = refusal(|| BlobStore::open(dir.path(), LIMITS, &conn));
+        assert!(
+            message.contains("does not hold one store generation"),
+            "{record:?}: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("owner")).unwrap(),
+            record
+        );
+    }
+}
+
+#[test]
+fn open_refuses_an_owner_record_that_is_not_a_regular_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("owner")).unwrap();
+    let conn = migrated_conn();
+    let message = refusal(|| BlobStore::open(dir.path(), LIMITS, &conn));
+    assert!(message.contains("is not a regular file"), "{message}");
+}
+
+/// A restore, or a move, of the database with its own directory keeps them
+/// equal: the generation is a row of the one and the record a file of the
+/// other.
+#[tokio::test]
+async fn a_database_and_directory_copied_to_new_paths_boot() {
+    let (f, id) = one_durable_blob().await;
+    let moved = tempfile::tempdir().unwrap();
+    let database = moved.path().join("restored.db");
+    f.db.lock()
+        .await
+        .execute("VACUUM INTO ?1", [database.to_str().unwrap()])
+        .unwrap();
+    let directory = moved.path().join("restored.blobs");
+    std::fs::create_dir(&directory).unwrap();
+    for entry in std::fs::read_dir(blob_dir(&f.dir)).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), directory.join(entry.file_name())).unwrap();
+    }
+
+    let conn = Connection::open(&database).unwrap();
+    conn.pragma_update(None, "synchronous", "FULL").unwrap();
+    let blobs = BlobStore::open(&directory, LIMITS, &conn);
+    let Retain::Unsettled = blobs.retain(&id) else {
+        panic!("a durable blob is settled against the database");
+    };
+    let hold = blobs
+        .retain_settled(&id, &conn)
+        .expect("the restored blob redeems");
+    assert_eq!(hold.read(0, 5).unwrap(), b"bytes");
+}
+
+#[test]
+fn a_leftover_temporary_beside_no_record_is_removed_and_the_directory_claimed() {
+    for leftover in [String::new(), format!("{}\n", Uuid::new_v4())] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("owner.tmp"), &leftover).unwrap();
+        let conn = migrated_conn();
+        BlobStore::open(dir.path(), LIMITS, &conn);
+        assert!(!dir.path().join("owner.tmp").exists(), "{leftover:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("owner")).unwrap(),
+            format!("{}\n", generation_of(&conn))
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_leftover_temporary_beside_a_valid_record_is_removed() {
+    let (f, id) = one_durable_blob().await;
+    let tmp = blob_dir(&f.dir).join("owner.tmp");
+    std::fs::write(&tmp, b"torn").unwrap();
+    let f = f.restart().await;
+    assert!(!tmp.exists());
+    f.assert_readable(&id, b"bytes").await;
+}
+
+#[tokio::test]
+async fn a_leftover_temporary_beside_a_foreign_record_survives_the_refusal() {
+    let (f, _) = one_durable_blob().await;
+    let tmp = blob_dir(&f.dir).join("owner.tmp");
+    std::fs::write(&tmp, b"torn").unwrap();
+    f.crash();
+    let other = migrated_conn();
+    refusal(|| BlobStore::open(&blob_dir(&f.dir), LIMITS, &other));
+    assert_eq!(std::fs::read(&tmp).unwrap(), b"torn");
+}
+
+#[test]
+fn a_temporary_that_is_not_a_regular_file_is_a_stranger() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("owner.tmp")).unwrap();
+    let conn = migrated_conn();
+    let message = refusal(|| BlobStore::open(dir.path(), LIMITS, &conn));
+    assert!(message.contains("which is not a blob file"), "{message}");
+    assert!(!dir.path().join("owner").exists());
 }

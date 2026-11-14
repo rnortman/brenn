@@ -2883,11 +2883,28 @@ mod tests {
         );
     }
 
+    /// The manifest lists `bus` so the refusal is proved for a
+    /// `brenn:processor@0.2.0` kind, where the `store` test above proves it for
+    /// a 0.1.0 one.
+    #[test]
+    #[should_panic(
+        expected = "imports \"brenn:processor/blobs\", which no surface can satisfy — it is backend-only"
+    )]
+    fn validate_surface_assets_panics_on_backend_only_blobs_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "blobs-rt", &["bus", "ports", "blobs"], |_| {});
+        validate_one_root(
+            dir.path(),
+            &[resolved_with_processor("deskbar", "blobs-rt")],
+        );
+    }
+
     /// The real backend fixture `processor-store-rt`, laid out as a deployed
     /// surface tree from its **actual bytes and actual import profile**, and run
     /// through the real boot validation.
     ///
-    /// The synthetic sibling above pins the rejection *mechanism* against a
+    /// The synthetic `store` test above pins the rejection *mechanism* against a
     /// hand-written `["ports", "store"]` manifest. This pins its *premise*: that
     /// the artifact backend tests load really does import `store`, so the
     /// mechanism is not rejecting a strawman. Nothing here is hand-written — the

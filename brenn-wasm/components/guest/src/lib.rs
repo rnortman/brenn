@@ -2,10 +2,12 @@
 //
 // Provides typed ergonomics on top of the raw WIT bindings:
 // - `Error` / `Processor` trait / `Activation` / `PortWindow` — dispatch
-// - `Body` / `BodyRef` / `Message` — bodies as bytes with an optional content
-//   type, and window entries
+// - `Body` / `BodyRef` / `Message` / `Attachment` — bodies as bytes with an
+//   optional content type, window entries, and the attachments one names
 // - `MessageEnvelopeExt` — typed envelope helpers
 // - `publish` / `publish_json` / `publish_with_urgency` / `OutPort<T>` — ports
+// - `publish_with_attachments` — a publish carrying named blobs (`ports` and
+//   `blobs`)
 // - `store::Transaction` RAII guard — eliminates the leaked-tx trap footgun
 // - `log` / `alert` modules — fire-and-forget diagnostics
 // - `config` module — operator config access
@@ -15,6 +17,8 @@
 // - `tools` module — async tool calls and the result envelope they answer with
 // - `provides` module — serve the tools the class declares, acting for the
 //   requesting user
+// - `blobs` module — open a received attachment, read it by byte range, and
+//   make a blob by positional writes
 // - `dom` module — element handles and mutators, for a page-hosted component
 // - `export_processor!` macro — wires `Processor` impl to the WIT export
 //
@@ -50,13 +54,14 @@ mod body;
 #[doc(hidden)]
 pub use bindings::export;
 use body::UNTYPED_TEXT;
-pub use body::{Body, BodyRef, Message};
+pub use body::{Attachment, Body, BodyRef, Message};
 
 // ── re-exports ────────────────────────────────────────────────────────────────
 
 pub use brenn_envelope::{
-    BodyError, ChannelScheme, MessageBody, MessageEnvelope, MqttEnvelope, MqttPayloadBody,
-    MqttTransport, TransportMeta, Urgency, WebhookEnvelope, WebhookTransport, is_text_content_type,
+    AttachmentName, BodyError, ChannelScheme, MessageBody, MessageEnvelope, MqttEnvelope,
+    MqttPayloadBody, MqttTransport, TransportMeta, Urgency, WebhookEnvelope, WebhookTransport,
+    is_text_content_type,
 };
 pub use serde;
 pub use serde_json;
@@ -686,6 +691,76 @@ pub fn publish_deferred<'a>(
     deliver_after: u64,
 ) -> Result<(), Error> {
     contract::publish_deferred(port, body.into(), deliver_after)
+}
+
+/// How a [`publish_with_attachments`] message is published: `None` in a field
+/// is what [`publish`] does — the port's configured default urgency, and
+/// publication at the flush.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PublishOptions {
+    /// The message's urgency, or `None` for the port's default.
+    pub urgency: Option<Urgency>,
+    /// Hold the message until this instant, epoch milliseconds UTC, as
+    /// [`publish_deferred`]; `None` publishes at the flush.
+    pub deliver_after: Option<u64>,
+}
+
+/// Why [`publish_with_attachments`] refused a message. The first five mean
+/// what the matching [`publish`] refusals mean.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublishAttachmentsError {
+    /// The component lacks the `ports` grant, or the bound channel fails the
+    /// host's output ACL.
+    NotPermitted,
+    /// The body is over the size cap, with the host's diagnostic. The body
+    /// alone is weighed, never the attachments.
+    InvalidPayload(String),
+    /// The body is malformed, with the host's diagnostic.
+    InvalidBody(String),
+    /// A non-text body on a channel not declared `non_text`. A text body may
+    /// carry attachments of any content type.
+    TextOnlyChannel,
+    /// This activation's publish budget is spent.
+    QuotaExceeded,
+    /// An attachment name outside the grammar of [`AttachmentName::new`],
+    /// with the name.
+    InvalidAttachmentName(String),
+    /// The same attachment name given twice, with the name.
+    DuplicateAttachmentName(String),
+    /// More than [`brenn_envelope::MAX_ATTACHMENTS_PER_MESSAGE`] attachments.
+    TooManyAttachments,
+}
+
+impl From<PublishAttachmentsError> for Error {
+    fn from(e: PublishAttachmentsError) -> Error {
+        contract::publish_attachments_error(e)
+    }
+}
+
+/// Buffer a message on the named output port carrying `body` and each named
+/// blob, with `options`.
+///
+/// **Requires grants:** `"ports"` to publish, and `"blobs"` for the interface
+/// this calls and for any [`blobs::Blob`] to pass. Without `"ports"` every
+/// call is [`PublishAttachmentsError::NotPermitted`].
+///
+/// The message takes its place in call order among the other publishes of
+/// the activation and is flushed with them, iff `receive` returns `Ok`. It
+/// holds its blobs from this call: the handles may be dropped after it.
+/// Forwarding a received attachment is opening it with [`blobs::open`] and
+/// passing the handle, which copies no byte. The same blob may appear under
+/// two names. An empty list publishes as [`publish`] does.
+pub fn publish_with_attachments<'a>(
+    port: &str,
+    body: impl Into<BodyRef<'a>>,
+    attachments: &[(&str, &blobs::Blob)],
+    options: PublishOptions,
+) -> Result<(), PublishAttachmentsError> {
+    let raw: Vec<(&str, &contract::RawBlob)> = attachments
+        .iter()
+        .map(|(name, blob)| (*name, blob.raw()))
+        .collect();
+    contract::publish_with_attachments(port, body.into(), &raw, options)
 }
 
 /// Cancel one of this component's own parked messages on `port`, named by its
@@ -1339,6 +1414,328 @@ pub mod store {
         fn drop(&mut self) {
             if let Some(tx) = self.inner.take() {
                 tx.rollback();
+            }
+        }
+    }
+}
+
+// ── blobs ─────────────────────────────────────────────────────────────────────
+
+pub mod blobs {
+    //! Reading a received attachment by byte range, and making a blob.
+    //!
+    //! **Requires grant:** `"blobs"` in the component's grants. If the grant is
+    //! absent the host does not link the `brenn:processor/blobs` interface and
+    //! any import of it causes a load-time panic. Backend only: a placed
+    //! instance cannot hold the grant.
+    //!
+    //! A component names a blob only by a [`Blob`] handle, and gets one in
+    //! exactly two ways: [`open`], for an attachment of a message in this
+    //! activation's input port windows, and [`Writer::seal`], for a blob it
+    //! made in this activation. A handle is a hold: the blob is not deleted
+    //! under it. Nothing outlives the activation: on `Ok` the messages it
+    //! published hold their blobs, and every other handle and writer drops, so
+    //! a sealed blob no message names and an unsealed writer's bytes are
+    //! deleted. On `Err` or a trap nothing is published and every blob the
+    //! activation made is deleted.
+    //!
+    //! Publishing a blob is [`crate::publish_with_attachments`], at the crate
+    //! root with every other publish, because it also needs `"ports"`.
+    //!
+    //! The host bounds the size of one read and one write ([`limits`]), the
+    //! live handles, the blob calls and the bytes written per activation; each
+    //! bound is a typed refusal, `QuotaExceeded` or `TooLarge`, never a wait.
+
+    use super::{Error, Message};
+    use crate::contract::{self, RawBlob, RawWriter};
+
+    /// The host's per-call bounds, in bytes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct BlobLimits {
+        /// The largest single [`Blob::read`].
+        pub max_read_bytes: u32,
+        /// The largest single [`Writer::write`].
+        pub max_write_bytes: u32,
+    }
+
+    /// The host's per-call bounds, so a guest chunks without learning them by
+    /// failing. [`Blob::read_all`] and [`Writer::write_all`] chunk by them.
+    pub fn limits() -> BlobLimits {
+        contract::blob_limits()
+    }
+
+    /// Why [`open`] gave no handle.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum OpenError {
+        /// The message carries no attachment of that name, or is not one this
+        /// activation delivered.
+        NotPermitted,
+        /// The message names the blob and nothing holds it any longer.
+        NotFound,
+        /// The activation holds as many handles, or has made as many blob
+        /// calls, as the host allows.
+        QuotaExceeded,
+    }
+
+    /// Why [`Blob::read`] returned no bytes.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ReadError {
+        /// The range passes the blob's size. Never a short read.
+        OutOfRange,
+        /// The length is over [`BlobLimits::max_read_bytes`].
+        TooLarge,
+        /// The host's filesystem refused the read, with its diagnostic.
+        StorageFailed(String),
+        /// The activation has made as many blob calls as the host allows.
+        QuotaExceeded,
+    }
+
+    /// Why [`create`] gave no writer.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum CreateError {
+        /// Not a well-formed media type, with the diagnostic.
+        InvalidContentType(String),
+        /// The host is over its budget for blob bytes.
+        BudgetExhausted,
+        /// The host's filesystem refused to create the blob, with its
+        /// diagnostic. Nothing was created.
+        StorageFailed(String),
+        /// The activation holds as many handles, or has made as many blob
+        /// calls, as the host allows.
+        QuotaExceeded,
+    }
+
+    /// Why [`Writer::write`] wrote nothing. A refused write changes nothing.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum WriteError {
+        /// The bytes are longer than [`BlobLimits::max_write_bytes`].
+        TooLarge,
+        /// The write would take the blob past the largest blob the host
+        /// accepts.
+        BlobTooLarge,
+        /// The write would take the host past its budget for blob bytes.
+        BudgetExhausted,
+        /// The write would leave the blob with more disjoint written ranges
+        /// than the host tracks.
+        TooFragmented,
+        /// The host's filesystem refused the write, with its diagnostic. The
+        /// range counts as unwritten and the writer stays usable.
+        StorageFailed(String),
+        /// The activation has made as many blob calls, or written as many
+        /// bytes, as the host allows.
+        QuotaExceeded,
+    }
+
+    /// A range of a blob no write has covered.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Gap {
+        pub offset: u64,
+        pub len: u64,
+    }
+
+    /// Why [`Writer::seal`] did not seal.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SealError {
+        /// The first range below the highest byte written that no write
+        /// covered.
+        Gap(Gap),
+        /// The activation has made as many blob calls as the host allows.
+        QuotaExceeded,
+    }
+
+    /// A refused [`Writer::seal`]: the writer, still open, and why.
+    pub struct SealRefused {
+        pub writer: Writer,
+        pub error: SealError,
+    }
+
+    impl core::fmt::Debug for SealRefused {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("SealRefused")
+                .field("error", &self.error)
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// A blob refusal as the crate's `Error`: `QuotaExceeded` stays the
+    /// transient refusal, every other fails the activation.
+    fn failed(call: &str, variant: impl core::fmt::Display) -> Error {
+        Error::ProcessingFailed(format!("blobs {call}: {variant}"))
+    }
+
+    fn quota(call: &str) -> Error {
+        Error::QuotaExceeded(format!("blobs {call}: quota-exceeded"))
+    }
+
+    impl From<OpenError> for Error {
+        fn from(e: OpenError) -> Error {
+            match e {
+                OpenError::NotPermitted => failed("open", "not-permitted"),
+                OpenError::NotFound => failed("open", "not-found"),
+                OpenError::QuotaExceeded => quota("open"),
+            }
+        }
+    }
+
+    impl From<ReadError> for Error {
+        fn from(e: ReadError) -> Error {
+            match e {
+                ReadError::OutOfRange => failed("read", "out-of-range"),
+                ReadError::TooLarge => failed("read", "too-large"),
+                ReadError::StorageFailed(m) => failed("read", format_args!("storage-failed: {m}")),
+                ReadError::QuotaExceeded => quota("read"),
+            }
+        }
+    }
+
+    impl From<CreateError> for Error {
+        fn from(e: CreateError) -> Error {
+            match e {
+                CreateError::InvalidContentType(m) => {
+                    failed("create", format_args!("invalid-content-type: {m}"))
+                }
+                CreateError::BudgetExhausted => failed("create", "budget-exhausted"),
+                CreateError::StorageFailed(m) => {
+                    failed("create", format_args!("storage-failed: {m}"))
+                }
+                CreateError::QuotaExceeded => quota("create"),
+            }
+        }
+    }
+
+    impl From<WriteError> for Error {
+        fn from(e: WriteError) -> Error {
+            match e {
+                WriteError::TooLarge => failed("write", "too-large"),
+                WriteError::BlobTooLarge => failed("write", "blob-too-large"),
+                WriteError::BudgetExhausted => failed("write", "budget-exhausted"),
+                WriteError::TooFragmented => failed("write", "too-fragmented"),
+                WriteError::StorageFailed(m) => {
+                    failed("write", format_args!("storage-failed: {m}"))
+                }
+                WriteError::QuotaExceeded => quota("write"),
+            }
+        }
+    }
+
+    impl From<SealRefused> for Error {
+        fn from(e: SealRefused) -> Error {
+            match e.error {
+                SealError::Gap(g) => failed(
+                    "seal",
+                    format_args!("gap of {} bytes at offset {}", g.len, g.offset),
+                ),
+                SealError::QuotaExceeded => quota("seal"),
+            }
+        }
+    }
+
+    /// A sealed, immutable blob this activation holds.
+    pub struct Blob {
+        raw: RawBlob,
+    }
+
+    /// A handle to the attachment `name` of `message`, which must be one this
+    /// activation delivered in an input port window.
+    ///
+    /// Takes a hold and reads no byte: forwarding the handle with
+    /// [`crate::publish_with_attachments`] copies nothing.
+    pub fn open(message: &Message, name: &str) -> Result<Blob, OpenError> {
+        contract::blob_open(message.port(), message.index(), name).map(|raw| Blob { raw })
+    }
+
+    impl Blob {
+        pub(crate) fn raw(&self) -> &RawBlob {
+            &self.raw
+        }
+
+        /// The blob's size in bytes.
+        pub fn size(&self) -> u64 {
+            self.raw.size()
+        }
+
+        /// The content type the blob was created with.
+        pub fn content_type(&self) -> String {
+            self.raw.content_type()
+        }
+
+        /// Exactly the bytes `[offset, offset + len)`.
+        pub fn read(&self, offset: u64, len: u32) -> Result<Vec<u8>, ReadError> {
+            contract::blob_read(&self.raw, offset, len)
+        }
+
+        /// The whole blob, read in chunks of [`BlobLimits::max_read_bytes`].
+        ///
+        /// Every chunk is a blob call against the activation's bound. The
+        /// result is allocated at the blob's size before the first read, so
+        /// reading whole needs free guest memory for the blob plus one chunk.
+        ///
+        /// For blobs the caller knows are small. The host caps guest memory
+        /// (16 MiB on the backend) and accepts blobs far larger, and the size
+        /// of a received attachment is the producer's choice; bound
+        /// [`Blob::size`] before calling, and read a larger blob by range.
+        ///
+        /// # Traps
+        ///
+        /// If the blob does not fit the guest's free memory: the host traps a
+        /// memory growth it refuses, so the activation ends with no `Err` to
+        /// handle.
+        pub fn read_all(&self) -> Result<Vec<u8>, ReadError> {
+            let size = self.size();
+            let chunk = u64::from(limits().max_read_bytes.max(1));
+            let mut bytes = Vec::with_capacity(
+                usize::try_from(size).expect("a blob read whole fits the guest's address space"),
+            );
+            let mut offset = 0;
+            while offset < size {
+                let len = (size - offset).min(chunk);
+                let len32 = u32::try_from(len).expect("a chunk is at most a u32");
+                bytes.extend_from_slice(&self.read(offset, len32)?);
+                offset += len;
+            }
+            Ok(bytes)
+        }
+    }
+
+    /// A blob being written. Dropped unsealed, its bytes are deleted.
+    pub struct Writer {
+        raw: RawWriter,
+    }
+
+    /// Start a blob with `content_type`.
+    pub fn create(content_type: &str) -> Result<Writer, CreateError> {
+        contract::blob_create(content_type).map(|raw| Writer { raw })
+    }
+
+    impl Writer {
+        /// Write `bytes` at `offset`, in any order, over bytes already
+        /// written.
+        pub fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), WriteError> {
+            contract::blob_write(&self.raw, offset, bytes)
+        }
+
+        /// Write `bytes` from offset 0, in chunks of
+        /// [`BlobLimits::max_write_bytes`].
+        pub fn write_all(&self, bytes: &[u8]) -> Result<(), WriteError> {
+            let chunk = usize::try_from(limits().max_write_bytes.max(1))
+                .expect("a u32 fits a wasm32 usize");
+            let mut offset = 0u64;
+            for piece in bytes.chunks(chunk) {
+                self.write(offset, piece)?;
+                offset += piece.len() as u64;
+            }
+            Ok(())
+        }
+
+        /// Seal the blob. Refused, the writer comes back open with why, to be
+        /// filled and sealed again.
+        pub fn seal(self) -> Result<Blob, SealRefused> {
+            match contract::blob_seal(&self.raw) {
+                Ok(raw) => Ok(Blob { raw }),
+                Err(error) => Err(SealRefused {
+                    writer: self,
+                    error,
+                }),
             }
         }
     }

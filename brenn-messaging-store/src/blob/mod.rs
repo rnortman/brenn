@@ -227,9 +227,11 @@ impl BlobStore {
         }
     }
 
-    /// A store over `dir`, which must exist, with an empty index.
-    #[cfg(test)]
-    pub(crate) fn for_tests(dir: &Path, limits: BlobLimits) -> Arc<Self> {
+    /// A store over `dir`, which must exist, with an empty index, no database
+    /// and no directory lock: it reads and writes no owner record, and a blob
+    /// it holds can never be adopted.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn for_tests(dir: &Path, limits: BlobLimits) -> Arc<Self> {
         Arc::new(BlobStore {
             dir: dir.to_owned(),
             limits,
@@ -254,7 +256,9 @@ impl BlobStore {
         {
             let index = self.lock();
             if index.charged > self.limits.budget_bytes {
-                tracing::warn!(
+                // `debug`: the refusal is returned, and the caller reports it
+                // at its own rate.
+                tracing::debug!(
                     charged = index.charged,
                     budget = self.limits.budget_bytes,
                     "blob store above its budget; create refused"
@@ -371,7 +375,9 @@ impl BlobStore {
         if to > from {
             let charged = index.charged - from + to;
             if charged > self.limits.budget_bytes {
-                tracing::warn!(
+                // `debug`: the refusal is returned, and the caller reports it
+                // at its own rate.
+                tracing::debug!(
                     charged = index.charged,
                     requested = to - from,
                     budget = self.limits.budget_bytes,

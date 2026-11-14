@@ -12,6 +12,7 @@ mod system;
 mod text_only_backstop;
 mod transport_ingress;
 mod wasm;
+mod wasm_attachments;
 
 use super::*;
 use crate::config::{

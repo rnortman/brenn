@@ -1459,6 +1459,7 @@ dependencies = [
  "brenn-common",
  "brenn-envelope",
  "brenn-meeting",
+ "brenn-messaging-store",
  "brenn-page-harness",
  "chrono",
  "rusqlite",

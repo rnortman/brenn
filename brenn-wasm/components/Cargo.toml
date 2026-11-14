@@ -32,6 +32,7 @@ members = [
     "google-gmail-organize",
     "google-gmail-read",
     "google-maps-tools",
+    "processor-blobs-test",
     "processor-bytes-test",
     "processor-call-test",
     "processor-config",

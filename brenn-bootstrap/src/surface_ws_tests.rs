@@ -975,6 +975,7 @@ async fn surface_ws_an_auto_channel_carries_a_backend_publish_to_the_page() {
                 urgency: Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
+                attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
             }],
         )
         .await;

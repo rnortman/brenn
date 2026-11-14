@@ -24,6 +24,7 @@ const SDK_COMPONENTS: &[&str] = &[
     "google-gmail-organize",
     "google-gmail-read",
     "google-maps-tools",
+    "processor-blobs-test",
     "processor-call-test",
     "processor-config",
     "processor-demo",

@@ -233,17 +233,18 @@ pub fn build_wasm_policy(
 
     let mut grant_set = GrantSet::default();
     for grant in grants {
-        // Six grants name no capability. `tools` is authority the resolved
+        // Seven grants name no capability. `tools` is authority the resolved
         // tool-grant map carries key by key; `calls` reaches a peer of the
         // consumer's own placement, wired by the document; `provides` answers
-        // requests the host delivers to a system-minted inbox. None of the three
+        // requests the host delivers to a system-minted inbox; `blobs` reads
+        // what the host delivered and publishes under `ports`. None of the four
         // has anything to insert here. `takeover`, `dom` and `page-dom` are page
         // capabilities and this is the backend consumer path, which has no page;
         // the DSL refuses all three on a top-level instance, so reaching here
         // means that refusal was bypassed.
         let Some(cap) = grant.app_capability() else {
-            use crate::messaging::ComponentGrant::{Calls, Provides, Tools};
-            if matches!(grant, Tools | Calls | Provides) {
+            use crate::messaging::ComponentGrant::{Blobs, Calls, Provides, Tools};
+            if matches!(grant, Tools | Calls | Provides | Blobs) {
                 continue;
             }
             panic!(
@@ -1193,8 +1194,8 @@ mod tests {
     }
 
     #[test]
-    fn wasm_tools_calls_and_provides_insert_no_capability() {
-        // All three are legal on a top-level consumer and name no capability;
+    fn wasm_tools_calls_provides_and_blobs_insert_no_capability() {
+        // All four are legal on a top-level consumer and name no capability;
         // the policy carries none of them and the build does not refuse them.
         let policy = build_wasm_policy(
             "proc",
@@ -1202,6 +1203,7 @@ mod tests {
                 ComponentGrant::Tools,
                 ComponentGrant::Calls,
                 ComponentGrant::Provides,
+                ComponentGrant::Blobs,
             ],
             WasmAclsRaw::default(),
         );

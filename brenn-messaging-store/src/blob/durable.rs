@@ -1,5 +1,6 @@
 //! The durable half of a blob's lifetime: adoption by a durable message row,
-//! redemption against the database, the reap, and the reconciliation at open.
+//! redemption against the database, the reap, and the reconciliation at open,
+//! with the directory's owner record.
 //!
 //! Every function here that takes a `Connection` runs with the database lock
 //! held by its caller. The database is always read before the index lock is
@@ -39,17 +40,22 @@ impl BlobStore {
     /// the directory, and return it with every surviving blob indexed
     /// *Durable*.
     ///
-    /// Creates `dir` with mode 0700 if absent. Then deletes every blob row no
-    /// message names, with its file, and every file no row names: every blob
-    /// only ring messages named, every unsealed blob and every sealed blob
-    /// never published before the restart.
+    /// Creates `dir` with mode 0700 if absent. Checks the directory's `owner`
+    /// record against the database's store generation, and claims a directory
+    /// that holds no record and no blob file by writing one. Then deletes every
+    /// blob row no message names, with its file, and every file no row names:
+    /// every blob only ring messages named, every unsealed blob and every
+    /// sealed blob never published before the restart.
     ///
     /// # Panics
     ///
     /// Refuses to start, naming the blob and the messages, when `PRAGMA
     /// synchronous` is below `FULL`; when another open store, in this process
     /// or another, holds `dir`'s lock; when `dir` holds an entry that is not a
-    /// regular file named by 32 lowercase hex characters; when a message names
+    /// regular file named by 32 lowercase hex characters, its `owner` record,
+    /// or a regular file `owner.tmp`; when the `owner` record names another
+    /// database's generation, is not a regular file holding one generation
+    /// line, or is absent beside blob files; when a message names
     /// a blob that has no reference row or no blob row; when a referenced blob
     /// has no file or a file of the wrong length; or when a blob's `refs`
     /// disagrees with its reference rows or a reference row names a message
@@ -74,10 +80,10 @@ impl BlobStore {
             .create(dir)
             .unwrap_or_else(|e| panic!("creating blob directory {}: {e}", dir.display()));
         let dir_lock = lock_dir(dir);
-        // TODO(correctness-boot-blob-sweep-deletes-files-in-a-directory-it-does-not-own):
-        // the lock refuses a directory another live store holds; nothing yet
-        // refuses one that belongs to another database whose host is down.
-        let files = list_blob_files(dir);
+        let listing = list_dir(dir);
+        let generation = crate::db::read_store_identity(conn).generation;
+        check_or_claim_owner(dir, &listing, generation);
+        let files = listing.blobs;
 
         check_message_references(conn);
         check_reference_counts(conn);
@@ -160,7 +166,7 @@ impl BlobStore {
         Arc::new(BlobStore {
             dir: dir.to_owned(),
             limits,
-            generation: Some(crate::db::read_store_identity(conn).generation),
+            generation: Some(generation),
             dir_lock: Some(dir_lock),
             index: Mutex::new(index),
         })
@@ -488,39 +494,168 @@ fn lock_dir(dir: &Path) -> File {
     }
 }
 
-/// Every file in `dir`, by name, with its length.
+/// The record in a blob directory naming the database that owns it: the
+/// database's store generation, hyphenated lowercase, and a newline.
+const OWNER_FILE: &str = "owner";
+
+/// The name the owner record is written under before it is renamed into place.
+const OWNER_TMP_FILE: &str = "owner.tmp";
+
+/// The longest owner record read: one generation line is 37 bytes.
+const OWNER_MAX_BYTES: u64 = 64;
+
+/// What a blob directory holds.
+struct DirListing {
+    /// Every blob file, by name, with its length.
+    blobs: HashMap<String, u64>,
+    /// `Some(true)` for a regular file `owner`, `Some(false)` for an `owner`
+    /// of any other type, `None` without one.
+    owner: Option<bool>,
+    /// Whether a regular file `owner.tmp` is present.
+    owner_tmp: bool,
+}
+
+/// List `dir`: its blob files, its owner record and the record's temporary.
 ///
 /// # Panics
 ///
-/// On an entry that is not a regular file named as a blob id: the sweep
+/// On an entry that is none of those three — a regular file named as a blob
+/// id, an entry named `owner`, a regular file named `owner.tmp`: the sweep
 /// deletes files, and it deletes nothing it does not recognise.
-fn list_blob_files(dir: &Path) -> HashMap<String, u64> {
+fn list_dir(dir: &Path) -> DirListing {
     let entries = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("reading blob directory {}: {e}", dir.display()));
-    let mut files = HashMap::new();
+    let mut listing = DirListing {
+        blobs: HashMap::new(),
+        owner: None,
+        owner_tmp: false,
+    };
     for entry in entries {
         let entry =
             entry.unwrap_or_else(|e| panic!("reading blob directory {}: {e}", dir.display()));
         let path = entry.path();
         let meta = fs::symlink_metadata(&path)
             .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-        let name = entry
-            .file_name()
-            .into_string()
-            .ok()
-            .filter(|name| is_minted_id(name));
-        match name {
-            Some(name) if meta.file_type().is_file() => {
-                files.insert(name, meta.len());
+        let is_file = meta.file_type().is_file();
+        match entry.file_name().to_str() {
+            Some(OWNER_FILE) => listing.owner = Some(is_file),
+            Some(OWNER_TMP_FILE) if is_file => listing.owner_tmp = true,
+            Some(name) if is_file && is_minted_id(name) => {
+                listing.blobs.insert(name.to_owned(), meta.len());
             }
             _ => panic!(
-                "refusing to start: the blob directory holds {}, which is not a blob file; \
-                 move it out of the directory",
+                "refusing to start: the blob directory holds {}, which is not a blob file \
+                 or its owner record; move it out of the directory",
                 path.display()
             ),
         }
     }
-    files
+    listing
+}
+
+/// Refuse unless `dir`'s owner record names `generation`; claim a directory
+/// with no record and no blob file. Unlinks a leftover `owner.tmp` on both
+/// paths that go on and touches nothing on a refusal.
+///
+/// # Panics
+///
+/// On a record naming another generation, on a record that is not a regular
+/// file holding one generation line, and on blob files with no record: in
+/// each case the host cannot tell that the files are this database's, and the
+/// open sweep would delete them.
+fn check_or_claim_owner(dir: &Path, listing: &DirListing, generation: Uuid) {
+    let owner = dir.join(OWNER_FILE);
+    match listing.owner {
+        Some(true) => {
+            let recorded = read_owner(&owner).unwrap_or_else(|| {
+                panic!(
+                    "refusing to start: the blob directory's owner record {} does not hold one \
+                     store generation; if this database owns the directory, write its \
+                     generation back: sqlite3 <database> \"SELECT generation FROM \
+                     messaging_store_identity\" > {}; see {RESTORE_DOC}",
+                    owner.display(),
+                    owner.display()
+                )
+            });
+            if recorded != generation {
+                panic!(
+                    "refusing to start: the blob directory {} belongs to the database of store \
+                     generation {recorded}, and this database's generation is {generation}; \
+                     its files are another store's: remove the directory, or point \
+                     messaging blob_dir elsewhere, for this database to claim a new one; \
+                     see {RESTORE_DOC}",
+                    dir.display()
+                );
+            }
+        }
+        Some(false) => panic!(
+            "refusing to start: the blob directory's owner record {} is not a regular file; \
+             see {RESTORE_DOC}",
+            owner.display()
+        ),
+        None if !listing.blobs.is_empty() => panic!(
+            "refusing to start: the blob directory {} holds {} blob files and no owner \
+             record, so the host cannot tell which database they belong to; if it is this \
+             one, write its generation: sqlite3 <database> \"SELECT generation FROM \
+             messaging_store_identity\" > {}; otherwise move the directory away; see \
+             {RESTORE_DOC}",
+            dir.display(),
+            listing.blobs.len(),
+            owner.display()
+        ),
+        None => {
+            if listing.owner_tmp {
+                unlink(&dir.join(OWNER_TMP_FILE));
+            }
+            claim(dir, generation);
+            tracing::info!(dir = %dir.display(), %generation, "blob directory claimed");
+            return;
+        }
+    }
+    if listing.owner_tmp {
+        unlink(&dir.join(OWNER_TMP_FILE));
+    }
+}
+
+/// The generation an owner record holds, `None` when it does not hold exactly
+/// one generation line.
+fn read_owner(path: &Path) -> Option<Uuid> {
+    let file =
+        File::open(path).unwrap_or_else(|e| panic!("opening owner record {}: {e}", path.display()));
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(&file, OWNER_MAX_BYTES + 1),
+        &mut bytes,
+    )
+    .unwrap_or_else(|e| panic!("reading owner record {}: {e}", path.display()));
+    let line = std::str::from_utf8(&bytes).ok()?.strip_suffix('\n')?;
+    let generation = Uuid::parse_str(line).ok()?;
+    (generation.hyphenated().to_string() == line).then_some(generation)
+}
+
+/// Write `dir`'s owner record so that `owner` is absent or whole at every
+/// instant: write `owner.tmp`, sync it, rename it into place, sync the
+/// directory.
+fn claim(dir: &Path, generation: Uuid) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let tmp = dir.join(OWNER_TMP_FILE);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .unwrap_or_else(|e| panic!("creating {}: {e}", tmp.display()));
+    file.write_all(format!("{generation}\n").as_bytes())
+        .and_then(|()| file.sync_all())
+        .unwrap_or_else(|e| panic!("writing {}: {e}", tmp.display()));
+    drop(file);
+    let owner = dir.join(OWNER_FILE);
+    fs::rename(&tmp, &owner)
+        .unwrap_or_else(|e| panic!("renaming {} to {}: {e}", tmp.display(), owner.display()));
+    File::open(dir)
+        .and_then(|f| f.sync_all())
+        .unwrap_or_else(|e| panic!("syncing blob directory {}: {e}", dir.display()));
 }
 
 /// Refuse unless every blob a message's `attachments` names has a reference row and

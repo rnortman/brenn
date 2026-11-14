@@ -1,0 +1,30 @@
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "grant_parity_test", "wasm_component", "wasm_guest_cdylib")
+
+policy_srcs()
+
+# Bindings come from the brenn-guest SDK's `generate!`; this crate names no
+# WIT of its own.
+wasm_guest_cdylib(
+    name = "brenn-processor-blobs-test",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-wasm/components/guest:brenn-guest",
+    ],
+)
+
+wasm_component(
+    name = "component",
+    module = ":brenn-processor-blobs-test",
+    visibility = ["//visibility:public"],
+)
+
+# The specification is held to the artifact's imports here rather than through
+# `COMPONENT_PACKAGES`: the fixture is test-only and never packaged.
+grant_parity_test(
+    name = "grant_parity",
+    component = ":component",
+    spec = "spec/processor-blobs-test.brenn",
+)

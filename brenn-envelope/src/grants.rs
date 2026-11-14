@@ -73,6 +73,10 @@ pub enum ComponentGrant {
     /// component's class declares, and act for the requesting user while
     /// serving one. Backend-only: a surface host links no tool substrate.
     Provides,
+    /// `brenn:processor/blobs` — read the blobs the activation's messages
+    /// carry by byte range, create blobs, and publish messages that carry
+    /// them. Backend-only: no surface host serves blob bytes yet.
+    Blobs,
     /// Fullscreen takeover of the page the component is placed on. Names no WIT
     /// interface: the capability is a binding to a takeover-plane channel, and
     /// the grant is what consents to that binding.
@@ -198,7 +202,7 @@ pub enum ComponentHost {
 impl ComponentGrant {
     /// Every capability a component may be granted, in the order they are
     /// listed.
-    pub const ALL: [ComponentGrant; 12] = [
+    pub const ALL: [ComponentGrant; 13] = [
         ComponentGrant::Ports,
         ComponentGrant::Store,
         ComponentGrant::Log,
@@ -208,6 +212,7 @@ impl ComponentGrant {
         ComponentGrant::Tools,
         ComponentGrant::Calls,
         ComponentGrant::Provides,
+        ComponentGrant::Blobs,
         ComponentGrant::Takeover,
         ComponentGrant::Dom,
         ComponentGrant::PageDom,
@@ -225,6 +230,7 @@ impl ComponentGrant {
             Self::Tools => "tools",
             Self::Calls => "calls",
             Self::Provides => "provides",
+            Self::Blobs => "blobs",
             Self::Takeover => "takeover",
             Self::Dom => "dom",
             Self::PageDom => "page-dom",
@@ -248,7 +254,11 @@ impl ComponentGrant {
     ///
     /// A word means the same capability under either contract. `ports` and
     /// `calls` carry message bodies, so their interfaces are re-declared at
-    /// 0.2.0; every other interface keeps its 0.1.0 name under both.
+    /// 0.2.0; every other interface keeps its 0.1.0 name under both, except
+    /// `blobs`, which is `@0.3.0` under both. An artifact importing it imports
+    /// `bus@0.2.0` too, because the interface uses its `body`, so it is always
+    /// detected as 0.2.0 and the name under 0.1.0 never matches a real
+    /// artifact.
     ///
     /// `Takeover` is the exception for the reason it is everywhere else: it is
     /// consent to a binding, gated at the binding, with no interface behind it.
@@ -269,6 +279,7 @@ impl ComponentGrant {
             (Self::Mqtt, _) => "brenn:processor/mqtt@0.1.0",
             (Self::Tools, _) => "brenn:processor/tools@0.1.0",
             (Self::Provides, _) => "brenn:processor/provides@0.1.0",
+            (Self::Blobs, _) => "brenn:processor/blobs@0.3.0",
             (Self::Dom, _) => "brenn:processor/dom@0.1.0",
             (Self::PageDom, _) => "brenn:processor/page-dom@0.1.0",
             (Self::Takeover, _) => return None,
@@ -302,6 +313,9 @@ impl ComponentGrant {
             (ComponentHost::Surface, Self::Provides) => Some(
                 "`provides` is backend-only: the surface host links no tool substrate to serve requests from",
             ),
+            (ComponentHost::Surface, Self::Blobs) => {
+                Some("`blobs` is backend-only: no surface host serves blob bytes yet")
+            }
             (ComponentHost::TopLevel, Self::Takeover) => {
                 Some("`takeover` is a page capability; a top-level consumer has no page")
             }
@@ -318,14 +332,17 @@ impl ComponentGrant {
     /// The unified capability this grant becomes once a policy is built, or
     /// `None` for the one grant that names no capability.
     ///
-    /// Six grants name none, for five reasons. `Takeover` is consent to a
+    /// Seven grants name none, for six reasons. `Takeover` is consent to a
     /// binding, gated at the binding, and no policy grant set carries it.
     /// `Tools` names authority the resolved tool-grant map carries in full, key
     /// by key, so there is no single capability it becomes. `Provides` answers
     /// requests the host itself delivers and admits, so the authority is the
     /// class's declaration and the system-minted request inbox. `Calls` reaches a
     /// peer of the caller's own placement and no channel, so no ACL plane names
-    /// what it may do; the document's wiring is the whole authority. `Dom` and
+    /// what it may do; the document's wiring is the whole authority. `Blobs`
+    /// reads only what the host delivered to the component, writes within the
+    /// blob store's and the host's own bounds, and publishes under `Ports`.
+    /// `Dom` and
     /// `PageDom` are gated in the page, by the kernel, on the grant word
     /// itself, and the backend policy vocabulary has no term for either.
     /// Whether a `None` here is a refusal or a skip belongs to the caller.
@@ -340,6 +357,7 @@ impl ComponentGrant {
             Self::Tools
             | Self::Calls
             | Self::Provides
+            | Self::Blobs
             | Self::Takeover
             | Self::Dom
             | Self::PageDom => {
@@ -877,6 +895,7 @@ mod tests {
             | ComponentGrant::Tools
             | ComponentGrant::Calls
             | ComponentGrant::Provides
+            | ComponentGrant::Blobs
             | ComponentGrant::Takeover
             | ComponentGrant::Dom
             | ComponentGrant::PageDom => {}
@@ -1069,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn six_component_grants_name_no_capability_and_the_rest_name_one() {
+    fn seven_component_grants_name_no_capability_and_the_rest_name_one() {
         for grant in ComponentGrant::ALL {
             let mapped = grant.app_capability();
             match grant {
@@ -1077,6 +1096,7 @@ mod tests {
                 | ComponentGrant::Tools
                 | ComponentGrant::Calls
                 | ComponentGrant::Provides
+                | ComponentGrant::Blobs
                 | ComponentGrant::Dom
                 | ComponentGrant::PageDom => assert_eq!(mapped, None),
                 _ => assert!(mapped.is_some(), "{grant:?} names no capability"),
@@ -1092,7 +1112,8 @@ mod tests {
     /// see it, so the totality is asserted rather than assumed.
     ///
     /// Under 0.2.0 the two body-carrying interfaces, `ports` and `calls`, are
-    /// at 0.2.0 and every other at 0.1.0.
+    /// at 0.2.0; `blobs` is at 0.3.0 under either contract; every other is at
+    /// 0.1.0.
     #[test]
     fn every_grant_but_takeover_links_an_interface() {
         for contract in ProcessorContract::ALL {
@@ -1106,6 +1127,7 @@ mod tests {
                 assert!(grant.names_interface(), "{grant:?}");
                 let import = import.unwrap_or_else(|| panic!("{grant:?} links no interface"));
                 let version = match (contract, grant) {
+                    (_, ComponentGrant::Blobs) => "0.3.0",
                     (ProcessorContract::V0_2, ComponentGrant::Ports | ComponentGrant::Calls) => {
                         "0.2.0"
                     }
@@ -1215,8 +1237,12 @@ mod tests {
     }
 
     #[test]
-    fn tools_and_provides_are_backend_only_words() {
-        for grant in [ComponentGrant::Tools, ComponentGrant::Provides] {
+    fn tools_provides_and_blobs_are_backend_only_words() {
+        for grant in [
+            ComponentGrant::Tools,
+            ComponentGrant::Provides,
+            ComponentGrant::Blobs,
+        ] {
             assert!(
                 grant.illegal_on(ComponentHost::Surface).is_some(),
                 "{grant:?} is admitted on a host with no tool substrate"

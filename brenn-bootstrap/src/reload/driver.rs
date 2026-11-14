@@ -1093,6 +1093,7 @@ impl ReloadDriver {
             provider_runtime: &self.env.provider_runtime,
             max_payload_bytes: self.env.max_payload_bytes,
             sync_router: Some(self.env.router.clone()),
+            blob_host: brenn_wasm_dispatch::blob_host_over(&self.env.messenger),
         };
         let mut loaded = Vec::new();
         let mut refusals = Vec::new();
@@ -2762,6 +2763,7 @@ channel scratch at "ephemeral:scratch" {{
                     provider_runtime: &provider_runtime,
                     max_payload_bytes: document.config.messaging.max_body_bytes,
                     sync_router: Some(router.clone()),
+                    blob_host: brenn_wasm_dispatch::blob_host_over(&messenger),
                 },
                 consumer,
                 None,
@@ -5308,6 +5310,7 @@ channel sink at "brenn:sink" {{
                     urgency: brenn_lib::messaging::Urgency::Normal,
                     reply_to: None,
                     deliver_after: None,
+                    attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
                 }],
             )
             .await;

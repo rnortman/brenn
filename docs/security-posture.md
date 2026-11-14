@@ -770,12 +770,42 @@ encoding of them, in front of a model is a finding.
 A message may name blobs — immutable byte objects in the host's blob store —
 by reference (`docs/message-bus.md` §2.1.2a).
 
-- **Only host code writes the store.** No component, remote, page or
-  conversation can create a blob or read one's bytes: the one publish entry
-  that accepts attachments, `Messenger::publish_from_system_with_attachments`,
-  and the one redemption entry, `Messenger::retain_blob`, are host APIs, and
-  no production code calls either yet. Every later door that admits an
-  outside producer or reader is a boundary change to review here.
+- **Host code and components granted `blobs` write the store.** A backend
+  WASM component granted `blobs` reads and writes it through
+  `brenn:processor/blobs@0.3.0`. It can name only a blob the host handed it in
+  this activation — an attachment of a message in its windows, named by port,
+  index and attachment name, looked up in a table the host built from what it
+  delivered — or one it made in this activation, and it names either by a
+  resource handle, never by id: no function of the interface takes an id, so
+  an id read from a header, a body or a component's own store opens nothing.
+  A handle dies with the activation. Publishing with attachments needs `ports`
+  as well. Remotes, pages and conversations still cannot create a blob or
+  read one's bytes; host code's `Messenger::publish_from_system_with_attachments`
+  has no production caller. Every later door that admits an outside producer
+  or reader is a boundary change to review here.
+- **What bounds one activation.** Host constants, not configuration: 1 MiB per
+  read and per write call, 64 live `blob` and `writer` handles together,
+  4,096 calls of `open`, `read`, `create`, `write` and `seal`, and 64 MiB of
+  accepted writes summed over the activation. That last is the host's fixed
+  per-activation write bound, apart from `max_blob_bytes`: since a writer does
+  not outlive its activation and `seal` needs the whole extent written, no
+  component can make a blob larger than that bound, however high
+  `max_blob_bytes` is set. Each refusal is typed, and the
+  host logs one `warn` per activation that hit a bound, naming the component,
+  even when the guest swallows the error. Calls the store refuses — over its
+  budget, or its filesystem failing (`storage-failed`) — are counted the same
+  way into one `warn` per activation, and the activation's first storage
+  failure is logged at `error` with its I/O error, so a guest retrying in a
+  loop writes one line, not one per call.
+- **What does not bound a component.** Over many activations a component can
+  fill the store: each activation may write 64 MiB, and what it publishes
+  lives as long as the channels' windows hold it. The store's budget is one
+  pool for every producer, so one component can drive it to
+  `budget-exhausted` for all of them. What limits the rate is the per-sink
+  publish budget and the windows' depths; what tells the operator is the
+  post-activation warning that counts the component's budget refusals. A
+  per-component share of the budget is `blob-budget-per-component` in
+  `TODO.md`.
 - **A bounded shared resource.** The store is one pool for every producer,
   bounded by `max_blob_bytes` per blob and `blob_budget_bytes` in total, both
   charged on a blob's extent before any byte is written, so a sparse write
@@ -787,15 +817,21 @@ by reference (`docs/message-bus.md` §2.1.2a).
   requires that the blob still has a holder; an id whose holders are gone is
   refused even while its file awaits the reap. A conversation is shown each
   attachment's name, size and content type, never its id and never its
-  bytes (§7.5's reason applies). Who may redeem an id they were shown, when an outside reader is
-  admitted, is decided with that door.
+  bytes (§7.5's reason applies). A component is shown ids in its envelope
+  headers and can redeem none of them by id. Who may redeem an id they were
+  shown, when a reader by id is admitted, is decided with that door.
 - **The attachment name is the bound on producer text a conversation sees.**
   1 to 64 bytes of `[A-Za-z0-9._-]`, starting alphanumeric, refused at
   construction: no whitespace, no markup, no control characters.
 - **The directory.** Created mode 0700 if absent; each blob file is created
   exclusively with mode 0600. At boot the store refuses to start on a
-  directory entry it does not recognise as a blob file, rather than sweeping
-  something it did not create.
+  directory entry it does not recognise as a blob file or its owner record,
+  rather than sweeping something it did not create. The owner record, a
+  mode-0600 file `owner` holding the database's store generation, ties the
+  directory to one database: a store refuses a directory whose record names
+  another database, or that holds blob files and no record, before it deletes
+  anything, so a host pointed at another host's directory cannot sweep it
+  even while that host is down and its lock is free.
 
 ---
 

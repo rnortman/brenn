@@ -320,20 +320,37 @@ Which reader sees what:
 | The eviction archive | the references, in full. The bytes are not archived: an archived message's attachments are not recoverable |
 | 0.1.0 components (`envelope-json`), attach v4 sessions | nothing; the envelope is byte-identical to one without attachments |
 
-**Nothing outside the host creates or redeems a blob yet.** The one entry
-point that publishes attachments is host code's
-`Messenger::publish_from_system_with_attachments`, and nothing in the server
-calls it yet; components, remotes, pages and conversations see references as
-metadata only. A remote's replay store and a page's rings do not hold the
-blob, so a reference there can outlive it. A 0.2.0 component that republishes
-a message it was handed sends the body without the attachments: the host
-assigns every envelope field, and a 0.2.0 publish carries a body.
+**Who creates and redeems a blob.** A backend WASM component granted
+`blobs` does, through the `brenn:processor/blobs@0.3.0` interface
+(`brenn-wasm/wit/processor-0.3.wit`, `docs/component-packages.md`): it opens
+an attachment of a message in this activation's windows by its place —
+port, index, name — never by id, reads it by byte range, creates a blob by
+positional writes and seals it, and publishes a message naming blobs it
+opened or made, with `ports` granted as well. Forwarding an attachment is a
+hold on the same blob: no byte is copied. Every blob the activation made and
+no published message names is deleted when the activation ends, and an `Err`
+or trap publishes nothing and deletes everything it made. Host code's
+`Messenger::publish_from_system_with_attachments` is the other publishing
+entry, and nothing in the server calls it yet. Remotes, pages and
+conversations see references as metadata only, and no surface host serves
+the interface. A remote's replay store and a page's rings do not hold the
+blob, so a reference there can outlive it. `ports.publish` and its siblings
+carry no attachments: a component that republishes a message through them
+sends the body alone.
 
 **Bounds.** Three keys in the `messaging` section (`docs/config-dsl.md`):
 `max_blob_bytes` caps one blob's extent (default 64 MiB), `blob_budget_bytes`
 caps the store's charged total (default 1 GiB), `blob_dir` is where the files
-live (default the database path with `.blobs` appended). A write over either
-bound is refused to the producer; nothing is evicted to make room and nothing
+live (default the database path with `.blobs` appended). Raising
+`max_blob_bytes` does not let a component make a larger blob: apart from that
+key, the host has a fixed per-activation write bound — at most 64 MiB of blob
+writes in one activation, summed over every `write` — a writer does not
+outlive its activation, and `seal` needs every byte of the blob's extent
+written. So no component can create a blob larger than that bound, whatever
+`max_blob_bytes` is; a higher value admits larger blobs from host code only,
+and no production host code makes one. The per-activation bounds are in
+`docs/security-posture.md` §7.6. A write over either
+store key is refused to the producer; nothing is evicted to make room and nothing
 waits. A blob is charged from its first write until its file is unlinked. No
 per-channel setting exists: a reference is inert to a reader that does not
 know it.
@@ -346,12 +363,34 @@ to back up, restore and roll back. At boot the store reconciles the two and
 refuses to start — naming the blob and the messages — when a message names a
 blob with no reference record, when a referenced blob's file is missing or
 has the wrong length, when a blob's count disagrees with its references,
-when the directory holds an entry that is not a blob file, when another
+when the directory holds an entry that is not a blob file or its owner
+record, when another
 open blob store — another host's, or a second host over the same database —
 holds the directory's lock, or when SQLite's `synchronous` is below `FULL`.
 Files no row names are deleted at boot, so two hosts must never share a blob
-directory: the lock stops the second while the first runs, and nothing stops
-it while the first is down. So a
+directory: the lock stops the second while the first runs, and the owner
+record stops it while the first is down.
+
+*The owner record.* The directory holds one file besides its blobs, `owner`,
+holding the store generation of the database it belongs to
+(`messaging_store_identity.generation`). The first boot over an empty
+directory writes it (through a temporary `owner.tmp`, renamed into place);
+every later boot compares it with the database's and refuses to start, naming
+both generations, when they differ, and when the directory holds blob files
+and no record, or a record that is not one generation line. Restoring or
+moving the database and its directory together keeps the two equal. The two
+remedies:
+
+- *A fresh or replaced database beside an old directory* — the record names
+  another generation. The old files are another store's and this database
+  names none of them: remove the directory, or point `messaging { blob_dir }`
+  elsewhere, and the host claims a new one.
+- *A lost or damaged record beside the database that does own the files* —
+  write the database's generation back:
+  `sqlite3 <database> "SELECT generation FROM messaging_store_identity" > <blob_dir>/owner`.
+
+The host never adopts a foreign directory and never repairs a record on its
+own. So a
 database restored beside a blob directory that still holds every file its
 rows name boots; a database restored alone, or beside a directory that has
 moved on since the snapshot — as it does at every eviction — refuses when any
@@ -371,9 +410,10 @@ create and written into the reference, a write entry on a sealed blob, and a
 rule for each of those three. The cost statement is the `blob` module's
 rustdoc.
 
-What is not built: a WIT interface for components to create or read blobs, a
-conversation tool, connectors that produce blobs, the surface's handling of
-them, and transfer of bytes over attach or to a page.
+What is not built: the `blobs` interface on a page, a conversation tool,
+connectors that produce blobs, the surface's handling of them, attachments on
+tool calls and their results, and transfer of bytes over attach or to a
+page.
 
 ### 2.1.3 Limits on a remote's stream of messages
 

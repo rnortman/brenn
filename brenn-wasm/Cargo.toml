@@ -14,9 +14,12 @@ semver = "1.0.28"
 brenn-budget = { version = "0.1.0", path = "../brenn-budget" }
 brenn-activation = { version = "0.1.0", path = "../brenn-activation" }
 brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
+brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
 
 [dev-dependencies]
 tempfile = "3"
+# `BlobStore::for_tests`, the `blobs` suite's seam.
+brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store", features = ["testutils"] }
 # Read by the `surface_dom` suite alone (cargo has no per-test dependency
 # granularity; the Bazel graph gives them to that one target).
 brenn-page-harness = { version = "0.1.0", path = "../surface/page-harness" }

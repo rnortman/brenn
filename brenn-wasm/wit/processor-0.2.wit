@@ -53,7 +53,9 @@ package brenn:processor@0.2.0;
 /// its shape last changed. A component is told apart by the interface carrying
 /// its activation: `brenn:processor/bus@0.2.0` here, `types@0.1.0` under the
 /// string contract. Read both files together, `processor.wit` first, and name
-/// the world `brenn:processor/processor@0.2.0`.
+/// the world `brenn:processor/processor@0.2.0`. A component that imports
+/// `blobs` reads `processor-0.3.wit` as well and names its world,
+/// `brenn:processor/processor@0.3.0`.
 ///
 /// Every semantic of the 0.1.0 shapes not restated here — buffering and the
 /// atomic flush, unwired and undeclared ports, the mount activation, index
@@ -83,7 +85,10 @@ interface bus {
         /// Its `transport` key is present on a message a transport adaptor
         /// published in the raw ingress shape, whose body is the transport's
         /// payload: an object with one member named for the transport, `mqtt`
-        /// or `webhook`, holding that transport's metadata.
+        /// or `webhook`, holding that transport's metadata. Its `attachments`
+        /// key is present on a message that carries attachments: an object
+        /// mapping each attachment's name to `{id, size, content_type}`;
+        /// `processor-0.3.wit` says what a component can do with one.
         header: string,
         /// The message body, byte-exact, with the content type it was
         /// published with.

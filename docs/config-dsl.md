@@ -279,7 +279,11 @@ messaging { max_body_bytes = 393216; }
   states none, a `{ burst, refill_interval_secs, refill }` table. Default
   `{ burst = 240, refill_interval_secs = 1, refill = 30 }`.
 - `max_blob_bytes` — the largest blob the blob store holds, in bytes: a cap
-  on one blob's extent. Default 67 108 864 (64 MiB).
+  on one blob's extent. Default 67 108 864 (64 MiB). The key bounds what the
+  store holds, not what a component can make: a component's blob is also
+  bounded by the host's per-activation write ceiling, a constant no key
+  moves, so raising this key does not let a component make a larger blob
+  (`docs/security-posture.md` §7.6).
 - `blob_budget_bytes` — the most the blob store holds in total, in bytes.
   Default 1 073 741 824 (1 GiB). A write that would pass either bound is
   refused to its producer; nothing is evicted to make room. A budget lowered
@@ -2014,6 +2018,13 @@ is gated at the binding instead. Which of them a host can implement is fixed —
 page has no `store` and no `mqtt`, a top-level consumer has no page to take
 over — and the illegal word is refused by name at the instance rather than left
 out of the vocabulary.
+
+`blobs` grants the `brenn:processor/blobs@0.3.0` interface: reading the
+attachments of the messages an activation is handed, creating blobs, and
+publishing messages that name them. It is top-level only — refused by name on
+a placed instance, since no page host serves blob bytes — and pairs with no
+wiring, like `log`: a component that only reads blobs binds no output. A
+component that publishes with attachments also needs `ports`.
 
 A `surface` or a `remote` — the two attach-route entities, a browser page and
 a native daemon — writes **plane** words instead: `subscribe`, `publish`, and

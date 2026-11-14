@@ -1,0 +1,246 @@
+package brenn:processor@0.3.0;
+
+/// The `blobs` interface: read, create and attach blobs.
+///
+/// `0.3.0` is this interface's version, not a third component contract. A
+/// component that imports `blobs` is a `brenn:processor@0.2.0` component: it
+/// is told apart by `bus@0.2.0`, which it imports because `blobs` uses
+/// `bus.body`, and everything `processor-0.2.wit` and `processor.wit` say of
+/// it holds. Read the three files together, `processor.wit` first, and name
+/// the world `brenn:processor/processor@0.3.0`, which is the 0.2.0 world with
+/// `blobs` imported.
+///
+/// Served by the backend host only. A surface refuses a component that
+/// imports it, and the grant word `blobs` is refused on a placed instance.
+///
+/// NOT YET DECLARED STABLE. Shapes in this file are expected to change. A
+/// shape changes in place only while no tagged brenn release has served it. A
+/// shape a tagged release has served changes only as a new version of this
+/// interface, served beside the old one for at least one release and
+/// announced in `CHANGELOG.md`; the old version may be removed one release
+/// after its replacement, and nothing longer is promised.
+/// TODO(blobs-interface-stable-declaration)
+///
+/// Who may name a blob. A component names a blob only by a `blob` handle,
+/// and gets one in exactly two ways: `open`, for an attachment of a message
+/// in one of this activation's input port windows, and `writer.seal`, for a
+/// blob it made in this activation. No function takes a blob id. An id in a
+/// header, a body or a component's own store opens nothing.
+///
+/// Lifetime. A handle is a hold: a blob with an open handle is not deleted
+/// under it. Nothing a component holds outlives the activation. On `ok` the
+/// messages it published hold the blobs they name, as every message does;
+/// every other handle and writer is dropped, so a sealed blob no published
+/// message names and an unsealed writer's bytes are deleted. On `err` or a
+/// trap nothing is published, and every blob the activation made is deleted.
+/// A blob it only opened lives on by the messages that name it.
+///
+/// Bounds. The largest read and write, how many handles an activation may
+/// hold, how many calls it may make and how many bytes it may write are host
+/// policy, not part of any promise; `limits` reports the two per-call sizes.
+/// The refusal a bound draws keeps its variant and its meaning. On this host
+/// the bytes one activation may write come to 64 MiB and a writer does not
+/// outlive its activation, so a component cannot make a larger blob; that is
+/// host policy like every bound here, not a promise of the interface.
+///
+/// What the other functions do with attachments. `ports.publish`,
+/// `publish-with-urgency` and `publish-deferred` publish a message that
+/// carries no attachments: republishing a body does not forward what the
+/// original carried. `ports.defer-edit` replaces a parked message's body and
+/// time and keeps its attachments; `ports.defer-cancel` releases them with
+/// the message. The deferred window shows a parked message's body, index and
+/// release time and not its attachments, and no function of this interface
+/// reads or edits them. TODO(blobs-parked-message-attachments)
+/// A `receive` reply, `calls.call`, `tools.call-fast`, `tools.call-async`,
+/// `provides.call-async-for`, their results on `tool-results`, a request on
+/// `tool-requests` and `provides.complete` carry no attachments: a blob
+/// reaches another component only on a published message.
+/// TODO(blobs-on-tool-calls)
+///
+/// Mutability. A sealed blob is immutable, and a handle to one is proof that
+/// nothing changes under its reader. The interface does not entrench that:
+/// an in-place mutable blob would add a mutability flag at `create`, a write
+/// path on a handle to a sealed mutable blob, and a way for a reader to learn
+/// which kind it holds, so a blob without the flag keeps its guarantee. Three
+/// choices lean on immutability and none forecloses mutation: `blob` has
+/// `read` and no `write`, which makes a handle that proof; `size` and
+/// `content-type` are fixed on a handle, so no call fails and a guest sizes
+/// its reads once, where a mutable blob needs a fixed extent or a size "at
+/// open"; and forwarding shares the blob rather than copying it, which is
+/// zero copy, and for a mutable blob would show every holder every write.
+
+interface blobs {
+    use brenn:processor/bus@0.2.0.{body};
+
+    /// The largest single read and single write the host serving the call
+    /// accepts, in bytes.
+    record blob-limits {
+        max-read-bytes: u32,
+        max-write-bytes: u32,
+    }
+
+    /// This host's per-call bounds, so a guest chunks without learning them
+    /// by failing.
+    limits: func() -> blob-limits;
+
+    variant open-error {
+        /// `(port, index, name)` names no attachment of a message in this
+        /// activation's input port windows: an unknown port, an index past
+        /// the window, or a name the message does not carry.
+        not-permitted,
+        /// The message names the blob, and nothing holds it any longer: its
+        /// last holder let go after the activation's windows were read.
+        not-found,
+        /// The activation holds as many handles as the host allows, or has
+        /// made as many blob calls as it allows.
+        quota-exceeded,
+    }
+
+    variant read-error {
+        /// `offset + len` passes the blob's size. Never a short read.
+        out-of-range,
+        /// `len` is over `limits().max-read-bytes`.
+        too-large,
+        /// The host's filesystem refused the read. The string is a host
+        /// diagnostic, opaque to the component.
+        storage-failed(string),
+        /// The activation has made as many blob calls as the host allows.
+        quota-exceeded,
+    }
+
+    variant create-error {
+        /// Not a well-formed media type of at most 255 bytes, as a body's.
+        invalid-content-type(string),
+        /// The host serving the call is over its budget for blob bytes.
+        budget-exhausted,
+        /// The host's filesystem refused to create the blob. Nothing was
+        /// created. The string is a host diagnostic.
+        storage-failed(string),
+        /// The activation holds as many handles as the host allows, or has
+        /// made as many blob calls as it allows.
+        quota-exceeded,
+    }
+
+    variant write-error {
+        /// `bytes` is longer than `limits().max-write-bytes`.
+        too-large,
+        /// The write would take the blob past the largest blob the host
+        /// serving the call accepts.
+        blob-too-large,
+        /// The write would take the host serving the call past its budget
+        /// for blob bytes.
+        budget-exhausted,
+        /// The write would leave the blob with more disjoint written ranges
+        /// than the host tracks.
+        too-fragmented,
+        /// The host's filesystem refused the write. The range counts as
+        /// unwritten and the writer stays usable. The string is a host
+        /// diagnostic.
+        storage-failed(string),
+        /// The activation has made as many blob calls, or written as many
+        /// bytes, as the host allows.
+        quota-exceeded,
+    }
+
+    /// A range of a blob no write has covered.
+    record gap {
+        offset: u64,
+        len: u64,
+    }
+
+    variant seal-error {
+        /// The first range below the highest byte written that no write
+        /// covered. The writer stays open, to be filled and sealed again.
+        gap(gap),
+        /// The activation has made as many blob calls as the host allows.
+        quota-exceeded,
+    }
+
+    /// A sealed, immutable blob this activation holds.
+    resource blob {
+        /// The blob's size in bytes.
+        size: func() -> u64;
+        /// The content type the blob was created with.
+        content-type: func() -> string;
+        /// Exactly the bytes `[offset, offset + len)`. A zero-length read
+        /// inside the blob is empty.
+        read: func(offset: u64, len: u32) -> result<list<u8>, read-error>;
+    }
+
+    /// A handle to the attachment `name` of the message at `index` in input
+    /// port `port`'s window, as this activation delivered it. Takes a hold
+    /// and reads no byte, so forwarding an attachment copies nothing.
+    open: func(port: string, index: u32, name: string) -> result<blob, open-error>;
+
+    /// A blob being written. Dropped unsealed, its bytes are deleted.
+    resource writer {
+        /// Write `bytes` at `offset`, in any order, over bytes already
+        /// written. A refused write changes nothing.
+        write: func(offset: u64, bytes: list<u8>) -> result<_, write-error>;
+        /// Seal the blob when every byte below the highest written is
+        /// covered. On success the writer is spent: a further `write` or
+        /// `seal` on it traps. An empty blob seals.
+        seal: func() -> result<blob, seal-error>;
+    }
+
+    /// Start a blob with `content-type`.
+    create: func(content-type: string) -> result<writer, create-error>;
+
+    /// Message urgency, as `ports.urgency`.
+    enum urgency { very-low, low, normal, high }
+
+    record publish-options {
+        /// `none` is the port's configured default.
+        urgency: option<urgency>,
+        /// Hold the message until this time, epoch milliseconds UTC, as
+        /// `ports.publish-deferred`; `none` publishes at the flush.
+        deliver-after: option<u64>,
+    }
+
+    variant publish-error {
+        /// The component lacks the `ports` grant, or the bound channel fails
+        /// the host's output ACL. As `ports.publish-error.not-permitted`.
+        not-permitted,
+        /// As `ports.publish-error.invalid-payload`; the body alone is
+        /// weighed, never the attachments.
+        invalid-payload(string),
+        /// As `ports.publish-error.invalid-body`.
+        invalid-body(string),
+        /// As `ports.publish-error.text-only-channel`. The body is judged;
+        /// a text body may carry attachments of any content type.
+        text-only-channel,
+        /// As `ports.publish-error.quota-exceeded`.
+        quota-exceeded,
+        /// An attachment name outside the grammar: 1 to 64 bytes, the first
+        /// ASCII alphanumeric, the rest ASCII alphanumeric or `.`, `_`, `-`.
+        invalid-attachment-name(string),
+        /// The same name given twice.
+        duplicate-attachment-name(string),
+        /// More than 32 attachments.
+        too-many-attachments,
+    }
+
+    /// Buffer one message for the channel bound to `port`, carrying `body`
+    /// and each named blob. Buffering, the atomic flush and the answer to
+    /// `port` are those of `ports.publish`, and the message keeps its place
+    /// in call order among the `ports` publishes. Publishing needs the
+    /// `ports` grant. The same blob may be named twice. An empty list
+    /// behaves as `ports.publish`. The message holds its blobs from this
+    /// call; the component may drop its handles.
+    ///
+    /// The checks run in a fixed order: the call budget shared with `ports`;
+    /// the `ports` grant; the port (undeclared traps); the output ACL; the
+    /// body (`invalid-body`, then `text-only-channel`); the attachments
+    /// (`too-many-attachments`, `invalid-attachment-name`,
+    /// `duplicate-attachment-name`); then the size cap and budgets. A
+    /// declared, unwired port checks everything that needs no channel and
+    /// drops the message.
+    publish: func(port: string, body: body,
+        attachments: list<tuple<string, borrow<blob>>>,
+        options: publish-options) -> result<_, publish-error>;
+}
+
+world processor {
+    include brenn:processor/processor@0.2.0;
+    import blobs;
+}

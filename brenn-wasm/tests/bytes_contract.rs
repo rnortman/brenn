@@ -647,6 +647,24 @@ fn the_surface_check_refuses_a_string_contract_component_by_name() {
     );
 }
 
+/// A 0.2.0 component importing `blobs` is refused at the name stage: no
+/// surface host serves the interface.
+#[test]
+fn the_surface_check_refuses_a_blobs_importer_by_name() {
+    let bytes = artifact_bytes("brenn_processor_blobs_test");
+    let refusal = brenn_wasm::check_surface_component(&bytes)
+        .expect_err("a blobs importer is refused on a surface");
+    assert_eq!(
+        refusal.stage,
+        brenn_wasm::SurfaceComponentStage::Name,
+        "{refusal}"
+    );
+    assert!(
+        refusal.detail.contains("brenn:processor/blobs@0.3.0"),
+        "{refusal}"
+    );
+}
+
 #[test]
 fn the_surface_check_refuses_a_file_that_is_not_a_component_by_name() {
     let refusal = brenn_wasm::check_surface_component(b"not a component")

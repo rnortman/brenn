@@ -1,5 +1,5 @@
 {
-  "checksum": "007d1629bdc7fce532b43de04202b4d1a1cab90953c5360373b8fe4d6fc318bd",
+  "checksum": "5e4518ab924613d92dda6c33786037e1c03e2c5ac80598bab7acc70bfa9e9380",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -605,6 +605,24 @@
           ],
           "selects": {}
         },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-blobs-test 0.1.0": {
+      "name": "brenn-processor-blobs-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -4478,6 +4496,7 @@
     "brenn-google-maps-tools 0.1.0": "brenn-wasm/components/google-maps-tools",
     "brenn-google-workspace 0.1.0": "brenn-wasm/components/host-crates/brenn-google-workspace",
     "brenn-guest 0.1.0": "brenn-wasm/components/guest",
+    "brenn-processor-blobs-test 0.1.0": "brenn-wasm/components/processor-blobs-test",
     "brenn-processor-bytes-test 0.1.0": "brenn-wasm/components/processor-bytes-test",
     "brenn-processor-call-test 0.1.0": "brenn-wasm/components/processor-call-test",
     "brenn-processor-config 0.1.0": "brenn-wasm/components/processor-config",

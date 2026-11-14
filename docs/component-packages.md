@@ -40,8 +40,9 @@ bundle built earlier, against a brenn commit the host did not choose. The host
 and the bundle are installed by different releases, so a cut in one of these is
 a boot refusal on somebody else's machine:
 
-- the WIT packages `brenn:processor` and `brenn:replay` — a new capability is a
-  new interface; a breaking change to a shape is a new version of the
+- the WIT packages `brenn:processor` (`brenn-wasm/wit/processor.wit`,
+  `processor-0.2.wit` and `processor-0.3.wit`, read together) and
+  `brenn:replay` — a new capability is a new interface; a breaking change to a shape is a new version of the
   interfaces that change and of no other, so an interface's version is the
   version at which its shape last changed. brenn releases first and serves the
   old and the new `brenn:processor` contract together for a period;
@@ -101,6 +102,54 @@ kind with no `provide` statement is unaffected. The request body (`{"v": 1, "id"
 and the tool-result body grow by added fields, which `brenn-guest` ignores; `v`
 moves only for a change a provider built against the older body would misread,
 and `brenn-guest` refuses a version it does not know.
+
+A third additive change in force: **`brenn:processor/blobs@0.3.0`**, the
+interface a component reads, creates and attaches blobs through, in
+`brenn-wasm/wit/processor-0.3.wit`. It is a new interface and a new grant word
+(`blobs`). `0.3.0` is the interface's version, not a third component
+contract: a component that imports it is a 0.2.0 component, told apart by
+`bus@0.2.0`, and names the world `brenn:processor/processor@0.3.0`, which is
+the 0.2.0 world with `blobs` imported. A kind that does not name `blobs` in
+`requires` does not import it, and its artifact, its record and its spec are
+what they were. A kind that does is backend-only — a surface refuses a
+component that imports it, and the word is refused on a placed instance —
+and needs a brenn new enough to link it, by the same ordering rule as `calls`.
+Publishing with attachments goes through `blobs.publish` and needs `ports` as
+well; `ports.publish` still carries none. The interface is **not yet declared
+stable**: a shape changes in place only while no tagged brenn release has
+served it; a shape a tagged release has served changes only as a new version
+of the interface, served beside the old one for at least one release and
+announced in `CHANGELOG.md`; the old version may be removed one release after
+its replacement, and nothing longer is promised.
+
+**Blobs and provided tools.** A tool call, a tool completion and a sync call
+carry no blob yet: `calls.call`, `tools.call-fast`, `tools.call-async`,
+`provides.call-async-for`, their results on `tool-results`, a request on
+`tool-requests` and `provides.complete` have no attachments. The shape can
+grow there. `tool-requests` and `tool-results` are ordinary input port
+windows, so once their messages carry attachments `blobs.open` reaches them by
+`(port, index, name)` with no change. An attachment-carrying completion is a
+function taking the same list of named `blob` handles `blobs.publish` takes —
+added to `blobs` before its declaration, or to a successor of `provides`. A
+blob lives while something holds it, and an activation's handles and buffered
+publishes are two kinds of holder; an immediate completion would clone the
+hold into the host's pending-result record, a third holder, which a later
+`Err` or trap of the activation, dropping only the first two, does not
+retract. What is undecided is the holder on the caller's side: a blob has no
+lifetime apart from a message or host code holding it.
+
+**Blobs and mutability.** A sealed blob is immutable, and the interface does
+not entrench it: an in-place mutable blob would add a mutability flag at
+`create`, a write path on a handle to a sealed mutable blob, and a way for a
+reader to learn which kind it holds, so a blob without the flag keeps its
+guarantee. All three are additions. Three choices lean on immutability and
+none forecloses mutation: `blob` has `read` and no `write`, so a handle to a
+sealed blob is proof nothing changes under its reader — mutation adds a write
+path, on `blob` or a third resource; `size` and `content-type` are fixed on a
+handle, so no call fails and a guest sizes its reads once — mutation needs a
+fixed extent or a size "at open"; and forwarding shares the blob rather than
+copying it, which is zero copy — mutation adds nothing there, but every holder
+then sees every write, a concurrency rule this interface does not yet state.
 
 **The byte-carrying contract.** The backend host serves two
 `brenn:processor` contracts side by side. Under the string contract, `brenn:processor@0.1.0` (`brenn-wasm/wit/processor.wit`),
@@ -179,10 +228,12 @@ reference (`{"photo": {"id": …, "size": N, "content_type": "…"}}`), the
 conversation's shape writes `size` and `content_type` without the id, and the
 text shape — 0.1.0's `envelope-json` and attach v4 — writes nothing, and its
 reader does not hold the field. A 0.2.0 component sees the key in
-`bus.envelope.header` under the growth rule above; nothing a component can
-call yet redeems a reference, and a component's `ports.publish` carries no
-attachments, so republishing a message it was handed drops them
-(`docs/message-bus.md` §2.1.2a).
+`bus.envelope.header` under the growth rule above. The id there redeems
+nothing: a component granted `blobs` opens an attachment by its place in the
+activation — port, index and name — and forwards it by passing the handle to
+`blobs.publish`. A component's `ports.publish` carries no attachments, so
+republishing a message through it drops them (`docs/message-bus.md`
+§2.1.2a).
 
 The limits a host applies — body caps, budgets, depths — are host and operator
 policy, not part of this promise; the refusal a limit draws keeps its variant

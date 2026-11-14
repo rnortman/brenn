@@ -2551,6 +2551,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
                 urgency: brenn_lib::messaging::Urgency::Normal,
                 reply_to: None,
                 deliver_after: None,
+                attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
             }],
         )
         .await;
@@ -2579,6 +2580,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
                 urgency: brenn_lib::messaging::Urgency::Normal,
                 reply_to: None,
                 deliver_after: Some(due),
+                attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
             }],
         )
         .await;
@@ -5271,6 +5273,21 @@ async fn boot_refuses_a_blob_directory_holding_a_stranger() {
     let dir = crate::test_fixtures::scratch_blob_dir();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("notes.txt"), b"not a blob").unwrap();
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    config.messaging.blob_dir = Some(dir);
+
+    boot_messaging(&config, brenn_server::test_support::init_db_memory()).await;
+}
+
+/// A blob directory another database owns stops the boot, whether or not that
+/// database's host is running, and keeps its record.
+#[tokio::test]
+#[should_panic(expected = "belongs to the database of store generation")]
+async fn boot_refuses_a_blob_directory_another_database_owns() {
+    let dir = crate::test_fixtures::scratch_blob_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("owner"), format!("{}\n", uuid::Uuid::new_v4())).unwrap();
     let mut config = BrennConfig::default();
     config.channels.push(surface_index_channel());
     config.messaging.blob_dir = Some(dir);

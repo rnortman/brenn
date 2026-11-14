@@ -1353,6 +1353,10 @@ impl Messenger {
     /// Always inserts with no impetus. `transport` is the transport metadata
     /// of a message a transport adaptor published with the payload as the
     /// body, `None` from every other path.
+    ///
+    /// `attachments` are adopted in `tx`: the caller has called
+    /// [`HeldAttachments::make_durable`] on them before taking the lock, and
+    /// calls [`HeldAttachments::confirm_adopted`] once `tx` commits.
     #[allow(clippy::too_many_arguments)]
     fn insert_message(
         &self,
@@ -1368,6 +1372,7 @@ impl Messenger {
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
         transport: Option<&super::TransportMeta>,
+        attachments: &HeldAttachments,
     ) -> InsertedMessage {
         channel.assert_may_hold(body);
         insert_message_in_tx(
@@ -1383,7 +1388,7 @@ impl Messenger {
             deliver_after,
             None,
             transport,
-            &HeldAttachments::none(),
+            attachments,
             publish_ts_ns,
         )
     }
@@ -1582,6 +1587,7 @@ impl Messenger {
                 None, // no deliver_after — transport ingress is always immediate
                 None, // no delivery_deadline
                 transport.as_ref(),
+                &HeldAttachments::none(),
             );
             tx.commit().expect("messaging: commit transport ingress tx");
         }
@@ -1609,6 +1615,10 @@ pub struct WasmPublish<'a> {
     /// until it; a past/absent value commits immediately. Mutually exclusive with
     /// `reply_to` in practice (tool requests never defer).
     pub deliver_after: Option<DateTime<Utc>>,
+    /// The blobs the message names, held by the caller for the whole flush.
+    /// The channel's store takes its own holder: a durable row adopts them, a
+    /// ring entry keeps a clone of the holds.
+    pub attachments: &'a HeldAttachments,
 }
 
 impl Messenger {
@@ -1625,6 +1635,14 @@ impl Messenger {
     ///
     /// Each publish carries its own urgency: port-configured default (for `publish`)
     /// or guest-supplied (for `publish-with-urgency`).
+    ///
+    /// Attachments of a durable entry are synced before the database lock is
+    /// taken, adopted with the entry's row, and confirmed after the commit; an
+    /// entry the deferred cap refuses adopts nothing, and a blob only it named
+    /// is deleted when the caller drops its holds. A ring entry's attachments
+    /// are neither synced nor adopted: the ring keeps the holds. A panic
+    /// mid-flush leaves the blobs adopted in the rolled-back transaction to the
+    /// next reap.
     pub async fn publish_from_wasm(&self, consumer_slug: &str, publishes: &[WasmPublish<'_>]) {
         if publishes.is_empty() {
             return;
@@ -1661,6 +1679,27 @@ impl Messenger {
         // after the lock is released so the durable transaction is not held
         // across the logging.
         let mut refused: Vec<(String, u64)> = Vec::new();
+        // The attachments of every durable entry inserted, confirmed once the
+        // transaction has committed. An entry the deferred cap refused is not
+        // here: nothing adopted its blobs.
+        let mut adopted: Vec<&HeldAttachments> = Vec::new();
+
+        // Sync the blobs a durable row will name before the lock. A ring entry's blobs stay unsynced.
+        for publish in publishes {
+            if publish.attachments.is_empty() {
+                continue;
+            }
+            let channel_addr = publish.channel_address;
+            let entry = self.directory.resolve(channel_addr).unwrap_or_else(|| {
+                panic!(
+                    "publish_from_wasm: channel {channel_addr:?} not in directory — \
+                     boot validation should have caught this (slug={consumer_slug})"
+                )
+            });
+            if entry.capabilities().durable {
+                publish.attachments.make_durable();
+            }
+        }
 
         {
             let conn = self.db.lock().await;
@@ -1732,7 +1771,7 @@ impl Messenger {
                         delivery_deadline: None,
                         impetus: None,
                         publish_ts_ns: db::utc_to_ns(Utc::now()),
-                        attachments: brenn_messaging_store::blob::HeldAttachments::none(),
+                        attachments: publish.attachments.clone(),
                     };
                     nondurable_pending.push((entry, message, release));
                     continue;
@@ -1780,7 +1819,9 @@ impl Messenger {
                     release,
                     None, // no delivery_deadline
                     None, // no transport metadata
+                    publish.attachments,
                 );
+                adopted.push(publish.attachments);
                 // A parked message is not observable before release, so it must
                 // not be fed now.
                 if release.is_none()
@@ -1803,7 +1844,7 @@ impl Messenger {
                             None,
                             publish.urgency,
                             ChannelScheme::Brenn,
-                            Attachments::new(),
+                            publish.attachments.refs().clone(),
                         )),
                         inserted.retained_seq.expect(
                             "publish: an unparked durable message holds a retention position",
@@ -1814,6 +1855,9 @@ impl Messenger {
             }
 
             tx.commit().expect("publish_from_wasm: commit tx");
+            for attachments in adopted {
+                attachments.confirm_adopted();
+            }
             debug!(
                 consumer_slug = consumer_slug,
                 publish_count = publishes.len(),
@@ -1856,6 +1900,7 @@ impl Messenger {
                         .reply_to
                         .as_ref()
                         .map(|target| target.address.clone());
+                    let attachment_refs = message.attachments.refs().clone();
                     let outcome = store.append(message).await;
                     self.enact_overflow_events(&entry, &outcome.overflow);
                     let feed_targets = self.attached_feed_targets(&entry);
@@ -1873,7 +1918,7 @@ impl Messenger {
                             None,
                             urgency,
                             scheme,
-                            Attachments::new(),
+                            attachment_refs,
                         ));
                         self.fan_out_attach_feed(
                             &feed_targets,
@@ -2190,6 +2235,7 @@ impl Messenger {
                         Some(release_at),
                         None, // no delivery_deadline
                         None, // no transport metadata
+                        &HeldAttachments::none(),
                     );
                     // Not fed now: a parked message is not observable before
                     // release, and the release sweep does its own fan-out.
@@ -2209,6 +2255,7 @@ impl Messenger {
                     None,
                     None, // no delivery_deadline
                     None, // no transport metadata
+                    &HeldAttachments::none(),
                 );
                 if !feed_targets.is_empty()
                     && self
